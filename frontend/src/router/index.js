@@ -6,7 +6,7 @@ const routes = [
   {
     path: '/',
     component: () => import('@/layouts/MainLayout.vue'),
-    redirect: '/vouchers',
+    redirect: '/books',
     children: [
       { path: 'books', name: 'books', component: () => import('@/views/book/BookManager.vue'), meta: { title: '账套管理' } },
       { path: 'openings', name: 'openings', component: () => import('@/views/book/OpeningBalance.vue'), meta: { title: '期初余额' } },
@@ -27,7 +27,7 @@ const routes = [
       { path: 'users', name: 'users', component: () => import('@/views/system/UserAdmin.vue'), meta: { title: '用户与授权' } }
     ]
   },
-  { path: '/:pathMatch(.*)*', redirect: '/vouchers' }
+  { path: '/:pathMatch(.*)*', redirect: '/books' }
 ]
 
 const router = createRouter({ history: createWebHashHistory(), routes })

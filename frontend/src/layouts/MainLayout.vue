@@ -23,16 +23,17 @@
 
     <el-container>
       <el-header height="52px" class="topbar no-print">
+        <!-- 只显示账套名：公司名只是账套的属性，切账套时不需要看 -->
         <el-select
           v-model="store.bookId"
           size="default"
-          style="width: 240px"
+          style="width: 180px"
           @change="onBookChange"
         >
           <el-option
             v-for="b in store.books"
             :key="b.id"
-            :label="`${b.company_name} · ${b.name}`"
+            :label="b.name"
             :value="b.id"
           />
         </el-select>

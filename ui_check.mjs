@@ -25,9 +25,25 @@ await step('登录', async () => {
   await page.waitForSelector('.el-aside', { timeout: 15000 })
   await page.waitForTimeout(800)
 })
-await page.screenshot({ path: `${out}/02-vouchers.png` })
+await page.screenshot({ path: `${out}/02-books.png` })
+
+await step('登录后落在账套管理', async () => {
+  await page.waitForSelector('text=账套是独立的记账单元', { timeout: 10000 })
+})
+
+await step('顶栏账套选择器只显示账套名', async () => {
+  await page.click('.topbar .el-select >> nth=0')
+  await page.waitForTimeout(500)
+  const labels = await page.locator('.el-select-dropdown__item').allInnerTexts()
+  if (!labels.length) throw new Error('下拉为空')
+  if (labels.some(l => l.includes('·'))) throw new Error('下拉里还有「单位 · 账套」的拼接: ' + labels[0])
+  console.log('   下拉项:', labels.join(' / '))
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(300)
+})
 
 await step('凭证列表有数据', async () => {
+  await page.click('.el-menu-item:has-text("凭证")')
   await page.waitForSelector('.el-table__row', { timeout: 10000 })
   const n = await page.locator('.el-table__row').count()
   if (n === 0) throw new Error('凭证列表为空')

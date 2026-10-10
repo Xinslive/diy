@@ -36,7 +36,7 @@ async function submit() {
   loading.value = true
   try {
     await store.login(username.value, password.value)
-    router.push('/vouchers')
+    router.push('/books')
   } catch (e) {
     ElMessage.error(e.response?.data?.detail || '登录失败')
   } finally {
