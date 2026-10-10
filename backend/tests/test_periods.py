@@ -521,6 +521,9 @@ def test_跨年后账簿连续且本年累计归零(db, book, periods, subjects,
                        {"subject_id": bank, "direction": "DEBIT", "amount": Decimal("50"), "summary": "n"},
                        {"subject_id": revenue, "direction": "CREDIT", "amount": Decimal("50"), "summary": "n"},
                    ])
+    # 2027-02 要记账，先按规矩把 2027-01 结账（上一期封了账这一期才能记）
+    jan27.locked = True
+    db.commit()
     post_vouchers(db, [db.scalar(select(Voucher.id).where(
         Voucher.book_id == book.id).order_by(Voucher.id.desc()).limit(1))], admin_user)
 

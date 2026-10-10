@@ -30,7 +30,7 @@ os.environ["JWT_SECRET"] = "test-secret-not-for-production"
 os.environ["DB_ECHO"] = "false"
 
 from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import create_engine, select, text  # noqa: E402
+from sqlalchemy import create_engine, select, text, update  # noqa: E402
 
 from app.core.db import SessionLocal, engine  # noqa: E402
 from app.core.init_db import init_database  # noqa: E402
@@ -247,6 +247,20 @@ def make_voucher(db, book, admin_user):
         if posted:
             from app.accounting.vouchers import post_vouchers
 
+            # 业务规矩：上一期结账了本期才能记账。测试里直接建凭证不会走结账流程，
+            # 这里把该凭证之前的期间直接标成已结账，只为满足这个前置条件 ——
+            # 用 update 而不是 close_period，是不想顺带把别的凭证自动记账掉。
+            vp = db.get(Period, v.period_id)
+            db.execute(
+                update(Period)
+                .where(
+                    Period.book_id == book.id,
+                    Period.ord < vp.ord,
+                    Period.locked.is_(False),
+                )
+                .values(locked=True)
+            )
+            db.commit()
             post_vouchers(db, [v.id], admin_user)
             db.refresh(v)
         return v

@@ -300,3 +300,98 @@ def test_默认按日期倒序(db, book, make_voucher):
     b = make_voucher("2026-01-20", dr=[("100201", 1, "x")], cr=[("600101", 1, "x")])
     rows, _ = query_vouchers(db, book.id)
     assert [r.id for r in rows] == [b.id, a.id]
+
+
+# --------------------------------------------------------------------- 记账门槛
+# 业务规矩：只有上一期结账了，本期才允许记账。
+# 上一期没封账，本期凭证再去改上期已经变动的数字，账就再也对不回来了。
+
+
+def test_第一个期间可以记账_没有上一期可依(db, book, subjects, make_voucher, admin_user):
+    """账套的第一个期间没有上一期，不该被这条规矩挡住。"""
+    v = make_voucher("2026-01-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+
+    post_vouchers(db, [v.id], admin_user)
+    assert db.get(Voucher, v.id).status == "POSTED"
+
+
+def test_上一期没结账不能记账(db, book, periods, subjects, make_voucher, admin_user):
+    v = make_voucher("2026-02-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+
+    with pytest.raises(ValueError) as e:
+        post_vouchers(db, [v.id], admin_user)
+    msg = str(e.value)
+    assert "2026-02" in msg and "2026-01" in msg, msg
+    assert db.get(Voucher, v.id).status == "UNPOSTED", "被拦下来时不该留下已记账"
+
+
+def test_上一期结账后本期就能记账(db, book, periods, subjects, make_voucher, admin_user):
+    v = make_voucher("2026-02-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    periods[1].locked = True
+    db.commit()
+
+    post_vouchers(db, [v.id], admin_user)
+    assert db.get(Voucher, v.id).status == "POSTED"
+
+
+def test_反结账上一期后本期又记不了账(db, book, periods, subjects, make_voucher, admin_user):
+    """上一期一旦反结账，本期已记的凭证不受影响，但新的记账又被挡住。"""
+    v = make_voucher("2026-02-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    periods[1].locked = True
+    db.commit()
+    post_vouchers(db, [v.id], admin_user)
+
+    periods[1].locked = False
+    db.commit()
+    v2 = make_voucher("2026-02-11", dr=[("100201", 50, "x")], cr=[("600101", 50, "x")])
+    with pytest.raises(ValueError):
+        post_vouchers(db, [v2.id], admin_user)
+    assert db.get(Voucher, v2.id).status == "UNPOSTED"
+
+
+def test_批量记账时报出全部未结账的上一期(db, book, periods, subjects, make_voucher, admin_user):
+    """一次批多个期间时，错误信息要把每一处该先结谁的账都说清楚。"""
+    a = make_voucher("2026-02-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    periods[1].locked = True
+    b = make_voucher("2026-03-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    db.commit()
+
+    with pytest.raises(ValueError) as e:
+        post_vouchers(db, [a.id, b.id], admin_user)
+    msg = str(e.value)
+    assert "2026-03" in msg and "2026-02" in msg, msg
+    assert db.get(Voucher, b.id).status == "UNPOSTED"
+
+
+def test_跨年看的是上年十二月(db, book, admin_user, subjects, make_voucher):
+    """2027-01 的上一期是 2026-12，靠 ord 跨年度连续，不能只看同年。"""
+    from app.accounting.periods import carry_forward_profit, close_period, year_end_carry
+
+    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")],
+                 posted=True)
+    db.commit()
+    # 年度结转要求全年封账，先把 2026 整年结掉，再把 12 月退回来当「未结账」
+    dec26 = db.scalar(select(Period).where(Period.book_id == book.id,
+                                           Period.year == 2026, Period.month == 12))
+    carry_forward_profit(db, book.id, dec26, admin_user)
+    close_period(db, dec26, admin_user)
+    year_end_carry(db, book, admin_user)
+    dec26.locked = False
+    db.commit()
+
+    jan27 = db.scalar(select(Period).where(Period.book_id == book.id,
+                                           Period.year == 2027, Period.month == 1))
+    v = make_voucher("2027-01-15", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    db.commit()
+
+    with pytest.raises(ValueError) as e:
+        post_vouchers(db, [v.id], admin_user)
+    assert "2026-12" in str(e.value), str(e.value)
+
+    dec26 = db.scalar(select(Period).where(Period.book_id == book.id,
+                                           Period.year == 2026, Period.month == 12))
+    dec26.locked = True
+    db.commit()
+    post_vouchers(db, [v.id], admin_user)
+    assert db.get(Voucher, v.id).status == "POSTED"
+    assert jan27.locked is False

@@ -38,7 +38,9 @@
       </el-button>
 
       <template v-if="store.canWrite">
-        <el-button type="primary" :disabled="!selection.length" @click="post">记账</el-button>
+        <el-tooltip :content="postBlockedTip" placement="top" :disabled="!postBlocked">
+          <el-button type="primary" :disabled="!selection.length || postBlocked" @click="post">记账</el-button>
+        </el-tooltip>
         <el-button :disabled="!selection.length" @click="unpost">反记账</el-button>
         <el-button type="danger" plain :disabled="!selection.length" @click="removeAll">删除</el-button>
         <el-button type="primary" @click="$router.push('/vouchers/new')">新增凭证</el-button>
@@ -78,9 +80,9 @@
         <el-table-column label="贷方合计" width="130" align="right">
           <template #default="{ row }"><span class="money">{{ fmt(row.total_credit) }}</span></template>
         </el-table-column>
-        <el-table-column label="状态" width="112" align="center">
+        <el-table-column label="状态" width="90" align="center">
           <template #default="{ row }">
-            <el-tag v-if="row.status === 'POSTED'" type="success" size="small">已记账 · 已锁</el-tag>
+            <el-tag v-if="row.status === 'POSTED'" type="success" size="small">已记账</el-tag>
             <el-tag v-else type="warning" size="small">未记账</el-tag>
           </template>
         </el-table-column>
@@ -119,7 +121,7 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, Operation, Printer, Sort, Upload } from '@element-plus/icons-vue'
@@ -138,6 +140,21 @@ const selection = ref([])
 function isLocked(row) {
   return row.status === 'POSTED' || !!store.currentPeriod?.locked
 }
+
+/** 记账门槛：只有上一期结账了，本期才允许记账。
+ *  ord 在账套内跨年度连续，所以 1 月的上一期自动就是上年 12 月。
+ *  这里跟后端 post_vouchers 是同一条规矩，只是提前告诉用户，省得点了才报错。 */
+const prevPeriod = computed(() => {
+  const cur = store.currentPeriod
+  if (!cur) return null
+  return store.periods.find((p) => p.ord === cur.ord - 1) || null
+})
+const postBlocked = computed(() => !!prevPeriod.value && !prevPeriod.value.locked)
+const postBlockedTip = computed(() =>
+  postBlocked.value
+    ? `请先在「期末处理」结账 ${prevPeriod.value.code}，${store.currentPeriod.code} 才能记账`
+    : ''
+)
 
 const query = reactive({
   keyword: '', status: '', source: '',

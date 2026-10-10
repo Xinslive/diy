@@ -38,17 +38,20 @@
           />
         </el-select>
 
-        <!-- 期间按年度分组：账套跨多年，月份单独看没有意义 -->
-        <el-select v-model="store.periodId" size="default" style="width: 168px" @change="onPeriodChange">
-          <el-option-group v-for="y in yearGroups" :key="y.year" :label="`${y.year} 年`">
-            <el-option v-for="p in y.periods" :key="p.id" :label="p.code" :value="p.id">
-              <span>{{ p.code }}</span>
-              <el-tag v-if="p.locked" size="small" type="success" style="float: right">已结账</el-tag>
-              <el-tag v-else-if="p.unposted > 0" size="small" type="warning" style="float: right">
-                未记账 {{ p.unposted }}
-              </el-tag>
-            </el-option>
-          </el-option-group>
+        <!-- 年份和月份拆成两个下拉：
+             账套跨多年，一个下拉塞 24 个月份，鼠标得划过半个屏幕。
+             拆开后「哪一年」最多几个选项，「几月」固定 12 个，两下点完。 -->
+        <el-select v-model="selYear" size="default" style="width: 104px" @change="onYearChange">
+          <el-option v-for="y in availableYears" :key="y" :label="`${y} 年`" :value="y" />
+        </el-select>
+        <el-select v-model="selMonth" size="default" style="width: 122px" @change="onMonthChange">
+          <el-option v-for="p in monthsOfYear" :key="p.id" :label="`${p.month} 月`" :value="p.month">
+            <span>{{ p.month }} 月</span>
+            <el-tag v-if="p.locked" size="small" type="success" style="float: right">已结账</el-tag>
+            <el-tag v-else-if="p.unposted > 0" size="small" type="warning" style="float: right">
+              未记账 {{ p.unposted }}
+            </el-tag>
+          </el-option>
         </el-select>
 
         <span class="spacer" />
@@ -86,23 +89,34 @@ const router = useRouter()
 // 切换账套/期间后让当前页面重新取数
 const viewKey = computed(() => `${route.name}-${store.bookId}-${store.periodId}`)
 
-// 期间下拉按年度分组，最新年度排最前
-const yearGroups = computed(() => {
-  const byYear = new Map()
-  for (const p of store.periods) {
-    if (!byYear.has(p.year)) byYear.set(p.year, [])
-    byYear.get(p.year).push(p)
-  }
-  return [...byYear.entries()]
-    .sort((a, b) => b[0] - a[0])
-    .map(([year, periods]) => ({ year, periods }))
-})
+// 年份下拉：这套账有哪几年，最新的排最前
+const availableYears = computed(() =>
+  [...new Set(store.periods.map((p) => p.year))].sort((a, b) => b - a)
+)
+
+// 当前看的是哪一年、哪一月 —— 直接从正在看的期间反推，
+// 不另存一份，免得两边对不上
+const selYear = computed(() => store.currentPeriod?.year ?? store.currentYear)
+const selMonth = computed(() => store.currentPeriod?.month)
+
+// 月份下拉：只列这一年真实存在的期间（启用月份可能不是 1 月）
+const monthsOfYear = computed(() =>
+  store.periods
+    .filter((p) => p.year === selYear.value)
+    .sort((a, b) => a.month - b.month)
+)
 
 async function onBookChange(id) {
   await store.setBook(id)
 }
-function onPeriodChange(id) {
-  store.setPeriod(id)
+// 切年份：落在该年「正在用的」那个期间（没结账的最后一期，没凭证的取最多那张）
+function onYearChange(y) {
+  store.setYear(y)
+}
+// 切月份：直接落到那一个月
+function onMonthChange(m) {
+  const target = store.periods.find((p) => p.year === selYear.value && p.month === m)
+  if (target) store.setPeriod(target.id)
 }
 function onCommand(cmd) {
   if (cmd === 'logout') {

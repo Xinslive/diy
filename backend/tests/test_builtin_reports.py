@@ -89,7 +89,7 @@ def test_年初余额不随月份变化(db, book, periods, subjects, make_vouche
 
 def _make_year(db, book, periods, subjects, admin_user):
     """造一年业务：每月一笔收租 + 一笔费用。"""
-    from app.accounting.periods import carry_forward_profit
+    from app.accounting.periods import carry_forward_profit, close_period
     from app.accounting.vouchers import post_vouchers
     from app.models import Voucher, Period
 
@@ -102,6 +102,9 @@ def _make_year(db, book, periods, subjects, admin_user):
                 Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD",
                 Voucher.period_id == periods[m].id)).all()
         ], admin_user)
+        # 真实流程就是这样：当月记账 → 结转损益 → 结账，下个月才允许再记凭证。
+        # 少了这一步，m+1 月会因为「上一期未结账」而记不了账。
+        close_period(db, periods[m], admin_user)
     db.commit()
 
 
@@ -139,7 +142,14 @@ def test_未结转时差额正好是本期净利润(db, book, periods, subjects,
     说明差额不是算错了，而是确实就是还没进本年利润的那部分损益。
     """
     from app.accounting.vouchers import post_vouchers
+    from app.models import Period
 
+    # 按规矩记账前得先封住前两个月；这个用例只关心第 3 个月「还没结转」的状态
+    for p in db.scalars(
+        select(Period).where(Period.book_id == book.id, Period.month.in_([1, 2]))
+    ).all():
+        p.locked = True
+    db.commit()
     post_vouchers(db, [_mk(db, book, admin_user, subjects, 3).id], admin_user)
     rows = cells(render(db, book, periods[3], "BALANCE_SHEET"))
     gap = num(rows["资产总计"][1]) - num(rows["负债和所有者权益总计"][1])

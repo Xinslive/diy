@@ -215,12 +215,38 @@ def post_vouchers(db: Session, voucher_ids: list[int], user: SysUser,
         return 0
     vouchers = list(db.scalars(select(Voucher).where(Voucher.id.in_(voucher_ids))).all())
     period_ids = {v.period_id for v in vouchers}
-    locked = db.execute(
-        select(Period.year, Period.month).where(Period.id.in_(period_ids), Period.locked.is_(True))
-    ).all()
+    rows = db.execute(select(Period).where(Period.id.in_(period_ids))).scalars().all() if period_ids else []
+
+    locked = sorted(p.code for p in rows if p.locked)
     if locked:
-        codes = [period_label(y, m) for y, m in locked]
-        raise ValueError(f"会计期间 {', '.join(codes)} 已结账，不能记账")
+        raise ValueError(f"会计期间 {', '.join(locked)} 已结账，不能记账")
+
+    # **只有上一期已结账，本期才允许记账。**
+    # 上一期没封账，本期凭证再去改上期已经变动的数字，账就对不回来了 ——
+    # 这正是「先结账、再记下个月」这条规矩要挡住的事。
+    # 账套的第一个期间没有上一期，不受此限制。
+    prev_ords = {p.ord - 1 for p in rows if not p.locked}
+    prev_rows = (
+        db.execute(
+            select(Period).where(
+                Period.book_id.in_({p.book_id for p in rows}),
+                Period.ord.in_(prev_ords),
+            )
+        ).scalars().all()
+        if prev_ords
+        else []
+    )
+    prev_map = {(p.book_id, p.ord): p for p in prev_rows}
+    pending = {}
+    for p in rows:
+        if p.locked:
+            continue
+        prev = prev_map.get((p.book_id, p.ord - 1))
+        if prev is not None and not prev.locked:
+            pending[p.code] = prev.code
+    if pending:
+        detail = "；".join(f"{code} 需先结账 {prev}" for code, prev in sorted(pending.items()))
+        raise ValueError(f"上一期尚未结账，不能记账：{detail}")
 
     count = 0
     for v in vouchers:
