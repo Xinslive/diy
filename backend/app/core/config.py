@@ -16,6 +16,9 @@ class Settings(BaseSettings):
 
     default_timezone: str = "Asia/Shanghai"
 
+    # 自助注册开关。公司内部开放时置 true；对外暴露时置 false，改为管理员开号。
+    registration_enabled: bool = True
+
 
 @lru_cache
 def get_settings() -> Settings:

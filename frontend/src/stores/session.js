@@ -13,6 +13,8 @@ export const useSessionStore = defineStore('session', {
   }),
   getters: {
     isAuthed: (s) => !!s.token,
+    // 直接用后端下发的字段，别在前端拿用户名另立一套标准
+    isAdmin: (s) => !!s.user?.is_admin,
     currentBook: (s) => s.books.find((b) => b.id === s.bookId) || null,
     currentPeriod: (s) => s.periods.find((p) => p.id === s.periodId) || null,
     canWrite: (s) => s.currentBook?.role !== 'VIEWER'
@@ -25,6 +27,18 @@ export const useSessionStore = defineStore('session', {
       localStorage.setItem('cwq_token', data.access_token)
       localStorage.setItem('cwq_user', JSON.stringify(data.user))
       await this.loadBooks()
+    },
+    /** 重新拉一次登录态。
+     *  localStorage 里的 user 是登录那一刻的快照：老版本缓存的 user 没有
+     *  is_admin 字段，不刷新的话管理员会凭空丢掉「用户与授权」菜单。
+     *  顺带也能让被降权的人立刻生效。 */
+    async refreshMe() {
+      try {
+        this.user = await authApi.me()
+        localStorage.setItem('cwq_user', JSON.stringify(this.user))
+      } catch {
+        this.logout()
+      }
     },
     logout() {
       this.token = ''

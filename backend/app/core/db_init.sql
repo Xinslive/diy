@@ -265,3 +265,7 @@ BEGIN
         END IF;
     END IF;
 END $$;
+
+-- ---------- 迁移：管理员从「用户名叫 admin」改成独立字段 ----------
+ALTER TABLE sys_user ADD COLUMN IF NOT EXISTS is_admin boolean NOT NULL DEFAULT false;
+UPDATE sys_user SET is_admin = true WHERE username = 'admin';

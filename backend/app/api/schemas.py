@@ -22,6 +22,14 @@ class TokenOut(BaseModel):
     user: dict
 
 
+class RegisterIn(BaseModel):
+    # 自助注册只允许字母数字下划线，避免带空格/中文的口令在日志和口令提示里混淆
+    username: str = Field(min_length=3, max_length=32, pattern=r"^[A-Za-z0-9_]+$")
+    # 比管理员建号更严：管理员建号 6 位，自助注册 8 位
+    password: str = Field(min_length=8, max_length=128)
+    real_name: str = Field(default="", max_length=64)
+
+
 # ---- 账套 ----
 class BookIn(BaseModel):
     # 公司名只是账套的一个文本属性，没有独立的「公司」实体

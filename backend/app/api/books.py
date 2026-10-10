@@ -56,6 +56,10 @@ def list_my_books(user: SysUser = Depends(get_current_user), db: Session = Depen
 
 @router.post("", status_code=201)
 def create_book(payload: BookIn, user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    # 开放自助注册后，账套必须由管理员开：否则任何人都能注册一个号自己建账，
+    # 「管理员授权」这层就形同虚设了。
+    if not user.is_admin:
+        raise HTTPException(403, "只有系统管理员可以新建账套")
     exists = db.scalar(
         select(Book).where(
             Book.company_name == payload.company_name,

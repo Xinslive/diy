@@ -29,7 +29,7 @@ ROLES = ("OWNER", "ACCOUNTANT", "VIEWER")
 
 
 def _is_admin(user: SysUser) -> bool:
-    return user.username in ("admin",)
+    return user.is_admin
 
 
 def _require_admin(user: SysUser) -> None:
@@ -40,7 +40,7 @@ def _require_admin(user: SysUser) -> None:
 def _serialize(u: SysUser, links: dict[int, str]) -> dict:
     return {
         "id": u.id, "username": u.username, "real_name": u.real_name,
-        "active": u.active,
+        "active": u.active, "is_admin": u.is_admin,
         "books": [{"book_id": bid, "role": role} for bid, role in sorted(links.items())],
     }
 
@@ -89,6 +89,8 @@ def _check_roles(items: list[dict]) -> None:
 
 @router.get("/users")
 def list_users(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    # 这里能看到所有人的密码状态和账套授权，必须限管理员
+    _require_admin(user)
     links = _links_by_user(db)
     rows = db.scalars(select(SysUser).order_by(SysUser.id)).all()
     return [_serialize(u, links.get(u.id, {})) for u in rows]
@@ -163,6 +165,7 @@ def delete_user(user_id: int, user: SysUser = Depends(get_current_user),
 @router.get("/books")
 def all_books(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
     """授权界面需要看到全部账套，而不只是自己有权的那几个。"""
+    _require_admin(user)
     rows = db.execute(
         select(Book, func.count(UserBook.id))
         .outerjoin(UserBook, UserBook.book_id == Book.id)
@@ -178,6 +181,8 @@ def all_books(user: SysUser = Depends(get_current_user), db: Session = Depends(g
 @router.get("/audit-logs")
 def audit_logs(limit: int = 100, user: SysUser = Depends(get_current_user),
                db: Session = Depends(get_db)):
+    # 全局审计跨所有账套，普通用户只能看自己账套的（/books/{id}/audit-logs）
+    _require_admin(user)
     rows = db.scalars(select(AuditLog).order_by(AuditLog.id.desc())
                       .limit(min(max(limit, 1), 500))).all()
     return [{"id": r.id, "username": r.username, "action": r.action, "entity": r.entity,

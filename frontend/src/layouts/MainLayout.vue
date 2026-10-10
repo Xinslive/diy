@@ -17,7 +17,7 @@
         <el-menu-item index="/subjects"><el-icon><Collection /></el-icon>科目表</el-menu-item>
         <el-menu-item index="/print-templates"><el-icon><Printer /></el-icon>打印模板</el-menu-item>
         <el-menu-item index="/audit"><el-icon><Document /></el-icon>操作日志</el-menu-item>
-        <el-menu-item index="/users"><el-icon><User /></el-icon>用户与授权</el-menu-item>
+        <el-menu-item v-if="store.isAdmin" index="/users"><el-icon><User /></el-icon>用户与授权</el-menu-item>
       </el-menu>
     </el-aside>
 
@@ -97,6 +97,7 @@ function onCommand(cmd) {
 }
 
 onMounted(async () => {
+  await store.refreshMe()
   if (!store.books.length) await store.loadBooks()
 })
 watch(() => store.bookId, async (id) => {

@@ -20,6 +20,9 @@ class SysUser(Base, TimestampMixin):
     password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
     real_name: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # 管理员标记。原来靠「用户名恰好叫 admin」来判断，测试里造不出管理员，
+    # 而且用户名是能改的 —— 权限判据必须存在字段里。
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
 class UserBook(Base, TimestampMixin):

@@ -103,11 +103,42 @@ def admin_user(db):
         password_hash=hash_password("admin123"),
         real_name="测试管理员",
         active=True,
+        is_admin=True,
     )
     db.add(u)
     db.commit()
     db.refresh(u)
     return u
+
+
+@pytest.fixture
+def plain_user(db):
+    """一个**不是**管理员的普通用户，用来验权限边界。
+
+    跟 admin_user 成对：只测管理员能做什么是不够的，必须同时测普通用户
+    什么都做不了。
+    """
+    from app.core.security import hash_password
+
+    u = SysUser(
+        username=f"staff_{uuid.uuid4().hex[:10]}",
+        password_hash=hash_password("staff123"),
+        real_name="测试员工",
+        active=True,
+        is_admin=False,
+    )
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    return u
+
+
+@pytest.fixture
+def plain_auth(client, plain_user):
+    r = client.post("/api/auth/login",
+                    json={"username": plain_user.username, "password": "staff123"})
+    assert r.status_code == 200, f"登录失败：{r.text}"
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
 
 
 @pytest.fixture

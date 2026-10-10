@@ -40,7 +40,11 @@ npm install
 npm run dev        # http://localhost:5173
 ```
 
-演示账号：`admin / 123456`、`zhangsan / 123456`
+演示账号：`admin / 123456`（管理员）、`zhangsan / 123456`（普通用户）
+
+登录页有**注册**页签，同事可以自助开号。注册只创建账号，**不授予任何账套** ——
+需要管理员在「用户与授权」里分配。用户名限 3-32 位字母/数字/下划线，密码至少 8 位。
+不想对外开放注册时，`.env` 里把 `REGISTRATION_ENABLED` 置 false 即可。
 
 ### 4. 生成演示账套（推荐）
 
@@ -107,7 +111,7 @@ cd backend
 | 期初余额 | `/openings` | 按科目分组录入、**借贷实时试算平衡**、Excel 导入导出 |
 | 期末处理 | `/periods` | 结转损益 / 结账 / **批量反结账** / 年度结转 |
 | 科目表 | `/subjects` | 树形维护，**每账套独立** |
-| 系统 | `/users` `/audit` | 用户授权（OWNER / ACCOUNTANT / VIEWER）、审计日志 |
+| 系统 | `/users` `/audit` | 用户授权（OWNER / ACCOUNTANT / VIEWER）、审计日志。仅管理员可见 |
 
 ---
 

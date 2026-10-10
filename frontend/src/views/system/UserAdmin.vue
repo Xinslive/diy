@@ -140,7 +140,7 @@ const ROLES = ['OWNER', 'ACCOUNTANT', 'VIEWER']
 const ROLE_CN = { OWNER: '负责人', ACCOUNTANT: '会计', VIEWER: '只读' }
 const ROLE_TAG = { OWNER: 'danger', ACCOUNTANT: 'primary', VIEWER: 'info' }
 
-const isAdmin = computed(() => store.user?.username === 'admin')
+const isAdmin = computed(() => store.isAdmin)
 
 const dlgUser = ref(false)
 const dlgBooks = ref(false)

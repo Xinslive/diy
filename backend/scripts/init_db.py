@@ -36,7 +36,7 @@ def seed() -> None:
             return
 
         admin = SysUser(username="admin", password_hash=hash_password("123456"),
-                        real_name="系统管理员", active=True)
+                        real_name="系统管理员", active=True, is_admin=True)
         zhang = SysUser(username="zhangsan", password_hash=hash_password("123456"),
                         real_name="张三", active=True)
         db.add_all([admin, zhang])

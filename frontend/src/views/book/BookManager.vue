@@ -5,7 +5,8 @@
         <h2 class="page-title">账套管理</h2>
         <div class="muted">账套是独立的记账单元；公司名只是账套上的一个属性，同一家公司可以开多个账套</div>
       </div>
-      <el-button type="primary" @click="openCreate">新建账套</el-button>
+      <!-- 建账套是管理员的事：自助注册进来的账号不该绕过授权自己开账 -->
+      <el-button v-if="store.isAdmin" type="primary" @click="openCreate">新建账套</el-button>
     </div>
 
     <div class="card" v-loading="loading">
@@ -43,7 +44,10 @@
           </template>
         </el-table-column>
       </el-table>
-      <el-empty v-if="!loading && !store.books.length" description="还没有账套，先新建一个" />
+      <el-empty
+        v-if="!loading && !store.books.length"
+        :description="store.isAdmin ? '还没有账套，先新建一个' : '还没有分配到账套，请联系管理员在「用户与授权」里授权'"
+      />
     </div>
 
     <el-dialog v-model="visible" title="新建账套" width="520px">

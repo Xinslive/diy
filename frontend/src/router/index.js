@@ -24,7 +24,7 @@ const routes = [
       { path: 'vouchers/organize', name: 'voucher-organize', component: () => import('@/views/voucher/VoucherOrganize.vue'), meta: { title: '整理凭证' } },
       { path: 'vouchers/import', name: 'voucher-import', component: () => import('@/views/voucher/VoucherImport.vue'), meta: { title: '凭证导入' } },
       { path: 'print-templates', name: 'print-templates', component: () => import('@/views/print/PrintTemplate.vue'), meta: { title: '打印模板' } },
-      { path: 'users', name: 'users', component: () => import('@/views/system/UserAdmin.vue'), meta: { title: '用户与授权' } }
+      { path: 'users', name: 'users', component: () => import('@/views/system/UserAdmin.vue'), meta: { title: '用户与授权', adminOnly: true } }
     ]
   },
   { path: '/:pathMatch(.*)*', redirect: '/books' }
@@ -36,6 +36,8 @@ router.beforeEach((to) => {
   const store = useSessionStore()
   if (to.meta.public) return true
   if (!store.isAuthed) return { name: 'login' }
+  // 菜单已经对非管理员隐藏，这里再兜一道：手敲地址栏也不该进来
+  if (to.meta.adminOnly && !store.isAdmin) return { name: 'books' }
   return true
 })
 

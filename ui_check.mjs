@@ -160,6 +160,11 @@ await step('改纸型后预览跟着变', async () => {
 })
 await page.screenshot({ path: `${out}/15-print-a5.png` })
 
+await step('管理员能看到「用户与授权」', async () => {
+  const n = await page.locator('.el-menu-item:has-text("用户与授权")').count()
+  if (n !== 1) throw new Error('管理员菜单项数量异常: ' + n)
+})
+
 await step('用户与授权页', async () => {
   await page.goto(BASE + '/#/users', { waitUntil: 'networkidle' })
   await page.waitForSelector('.el-table__row', { timeout: 10000 })
