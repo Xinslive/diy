@@ -8,6 +8,8 @@ const routes = [
     component: () => import('@/layouts/MainLayout.vue'),
     redirect: '/vouchers',
     children: [
+      { path: 'books', name: 'books', component: () => import('@/views/book/BookManager.vue'), meta: { title: '账套管理' } },
+      { path: 'openings', name: 'openings', component: () => import('@/views/book/OpeningBalance.vue'), meta: { title: '期初余额' } },
       { path: 'vouchers', name: 'vouchers', component: () => import('@/views/voucher/VoucherList.vue'), meta: { title: '凭证' } },
       { path: 'vouchers/new', name: 'voucher-new', component: () => import('@/views/voucher/VoucherEdit.vue'), meta: { title: '新增凭证' } },
       { path: 'vouchers/:id', name: 'voucher-edit', component: () => import('@/views/voucher/VoucherEdit.vue'), meta: { title: '修改凭证' } },

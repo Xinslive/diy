@@ -75,7 +75,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import * as api from '@/api/report'
-import { reportXlsx, openPrint } from '@/api/print'
+import { downloadFile, openPrint } from '@/api/print'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 
@@ -181,7 +181,8 @@ function previewHtml() {
 }
 
 function exportXlsx() {
-  window.open(reportXlsx(store.bookId, templateId.value, store.periodId))
+  downloadFile(`/books/${store.bookId}/print/report.xlsx`,
+    { template_id: templateId.value, period_id: store.periodId }, '报表.xlsx')
 }
 
 onMounted(async () => {

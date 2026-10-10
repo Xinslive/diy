@@ -112,9 +112,15 @@ def admin_user(db):
 
 @pytest.fixture
 def auth(client, admin_user):
+    """带 token 的请求头。
+
+    必须用 ``admin_user.username`` 而不是写死用户名：admin_user 每个用例都新建
+    一个随机账号，写死会让这个夹具永远登录失败 —— 之前就是这么写的，只是
+    一直没有用例真的用到它，HTTP 层的接口因此一条都没被测过。
+    """
     r = client.post("/api/auth/login",
-                    json={"username": "test_admin", "password": "admin123"})
-    assert r.status_code == 200, r.text
+                    json={"username": admin_user.username, "password": "admin123"})
+    assert r.status_code == 200, f"登录失败：{r.text}"
     return {"Authorization": f"Bearer {r.json()['access_token']}"}
 
 

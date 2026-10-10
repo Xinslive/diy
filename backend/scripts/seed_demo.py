@@ -95,15 +95,30 @@ def wipe_book(db, book_id: int) -> None:
     db.commit()
 
 
-def clean_test_books(db) -> int:
-    """清掉历史测试脚本留下的账套。名字匹配已知模式才动手。"""
+def clean_test_books(db) -> tuple[int, int]:
+    """清掉历史测试脚本留下的账套，以及因此变成空壳的公司。
+
+    返回 (账套数, 空壳公司数)。名字必须匹配已知模式才动手，避免误删真实账套。
+    """
     import re
 
-    pat = re.compile(r"^(租金账套|管理费账套|模块测试账套)")
+    # 开户测试 是浏览器端 e2e（onboard.mjs）建的账套，同样属于测试残留
+    pat = re.compile(r"^(租金账套|管理费账套|模块测试账套|开户测试)")
     ids = [b.id for b in db.scalars(select(Book)).all() if pat.match(b.name)]
     for bid in ids:
         wipe_book(db, bid)
-    return len(ids)
+    db.flush()
+
+    # 账套删干净后，挂着零个账套的公司就是纯垃圾（测试脚本每次都建一家新公司）。
+    # 只删没有任何账套的公司，不碰真实公司。
+    orphans = [
+        c.id for c in db.scalars(select(SysCompany)).all()
+        if not db.scalar(select(Book.id).where(Book.company_id == c.id).limit(1))
+    ]
+    for cid in orphans:
+        db.delete(db.get(SysCompany, cid))
+    db.commit()
+    return len(ids), len(orphans)
 
 
 def drop_demo(db) -> None:
@@ -342,8 +357,8 @@ def main() -> int:
             return 1
 
         if "--clean" in sys.argv:
-            n = clean_test_books(db)
-            print(f"已清理 {n} 个历史测试账套")
+            n_book, n_company = clean_test_books(db)
+            print(f"已清理 {n_book} 个历史测试账套、{n_company} 家空壳公司")
             return 0
 
         if "--reset" in sys.argv or db.scalar(select(Book).where(Book.name == BOOK_NAME)):

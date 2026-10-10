@@ -6,6 +6,8 @@
         <span class="name">财务记账</span>
       </div>
       <el-menu :default-active="$route.path" router class="menu">
+        <el-menu-item index="/books"><el-icon><Folder /></el-icon>账套管理</el-menu-item>
+        <el-menu-item index="/openings"><el-icon><Coin /></el-icon>期初余额</el-menu-item>
         <el-menu-item index="/vouchers"><el-icon><Tickets /></el-icon>凭证</el-menu-item>
         <el-menu-item index="/balance"><el-icon><Grid /></el-icon>科目余额表</el-menu-item>
         <el-menu-item index="/general-ledger"><el-icon><Notebook /></el-icon>总账</el-menu-item>
@@ -71,7 +73,7 @@
 import { computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from '@/stores/session'
-import { ArrowDown, Calendar, Collection, DataAnalysis, Document, Grid, List, Notebook, Printer, Tickets, User } from '@element-plus/icons-vue'
+import { ArrowDown, Calendar, Coin, Collection, DataAnalysis, Document, Folder, Grid, List, Notebook, Printer, Tickets, User } from '@element-plus/icons-vue'
 
 const store = useSessionStore()
 const route = useRoute()

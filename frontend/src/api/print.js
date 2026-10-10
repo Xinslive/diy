@@ -59,3 +59,54 @@ export async function openPrint(path, params = {}) {
     w.print()
   }, 600)
 }
+
+/**
+ * 带鉴权下载文件。
+ *
+ * **不能用 `window.open(apiUrl(...))`**：token 存在 localStorage，由 axios 拦截器
+ * 注入到请求头，`window.open` 发出去的裸请求没有 Authorization，后端直接 401，
+ * 用户看到的是新标签页里一个 JSON 错误，而不是文件。
+ */
+export async function downloadFile(path, params = {}, fallbackName = '导出.xlsx') {
+  let res
+  try {
+    res = await http.get(path, { params, responseType: 'blob' })
+  } catch (e) {
+    // 出错时 axios 抛异常，响应体也是 blob，得自己解
+    const detail = await blobDetail(e?.response)
+    ElMessage.error(detail || '导出失败')
+    return
+  }
+  if ((res.headers['content-type'] || '').includes('application/json')) {
+    ElMessage.error((await blobDetail(res)) || '导出失败')
+    return
+  }
+  saveBlob(res.data, filenameOf(res) || fallbackName)
+}
+
+function blobDetail(res) {
+  try {
+    return JSON.parse(res.data.text())?.detail
+  } catch {
+    return null
+  }
+}
+
+function filenameOf(res) {
+  const cd = res.headers['content-disposition'] || ''
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(cd)
+  if (star) return decodeURIComponent(star[1])
+  const plain = /filename="?([^";]+)"?/i.exec(cd)
+  return plain ? decodeURIComponent(plain[1]) : null
+}
+
+function saveBlob(data, name) {
+  const url = URL.createObjectURL(new Blob([data]))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 2000)
+}

@@ -19,6 +19,7 @@ dist/
 # 调试产物
 .shots/
 dbg*.mjs
+dl.mjs
 *.log
 
 # 编辑器

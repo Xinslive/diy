@@ -11,3 +11,9 @@ export const unclose = (id, pid, revertPosting = true) =>
   http.post(`/books/${id}/periods/${pid}/unclose`, { revert_posting: revertPosting }).then(r => r.data)
 export const yearEnd = (id, newBookName) => http.post(`/books/${id}/year-end`, { new_book_name: newBookName || null }).then(r => r.data)
 export const auditLogs = (id, limit = 100) => http.get(`/books/${id}/audit-logs`, { params: { limit } }).then(r => r.data)
+
+export const getOpenings = (id) => http.get(`/books/${id}/openings`).then(r => r.data)
+export const parseOpenings = (id, fd) => {
+  const h = { 'Content-Type': 'multipart/form-data' }
+  return http.post(`/books/${id}/openings/parse`, fd, { headers: h }).then(r => r.data)
+}

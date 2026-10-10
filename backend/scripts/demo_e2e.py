@@ -68,10 +68,11 @@ def main() -> int:
 
     # ---------------------------------------------------------------- 2 期初
     step(2, "录入期初余额")
+    # 金额一律「借正贷负」：银行存款 200000 借方为正，权益类科目是贷方余额故取负
     openings = [
         {"subject_id": S["100201"], "amount": "200000"},   # 银行存款
-        {"subject_id": S["4001"], "amount": "80000"},       # 实收资本
-        {"subject_id": S["4104"], "amount": "120000"},      # 未分配利润（借正贷负下会存为负数）
+        {"subject_id": S["4001"], "amount": "-80000"},     # 实收资本（贷方余额）
+        {"subject_id": S["4104"], "amount": "-120000"},    # 未分配利润（贷方余额）
     ]
     r = client.post(f"/api/books/{BID}/periods", headers=H, json=openings)
     check("期初余额写入", r.status_code == 200, r.text[:80])

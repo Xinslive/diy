@@ -65,7 +65,7 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import * as api from '@/api/ledger'
-import { balanceXlsx, openPrint } from '@/api/print'
+import { downloadFile, openPrint } from '@/api/print'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 
@@ -96,7 +96,8 @@ function previewHtml() {
 }
 
 function exportXlsx() {
-  window.open(balanceXlsx(store.bookId, { period_id: store.periodId, include_unposted: includeUnposted.value }))
+  downloadFile(`/books/${store.bookId}/print/balance.xlsx`,
+    { period_id: store.periodId, include_unposted: includeUnposted.value }, '科目余额表.xlsx')
 }
 function doPrint() { window.print() }
 

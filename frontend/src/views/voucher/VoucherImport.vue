@@ -161,7 +161,7 @@ function onFile(f) {
 }
 
 function downloadTemplate() {
-  window.open(voucherApi.importTemplateUrl(store.bookId), '_blank')
+  downloadFile(`/books/${store.bookId}/vouchers/import-template.xlsx`, {}, '凭证导入模板.xlsx')
 }
 
 async function upload() {

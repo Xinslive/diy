@@ -44,7 +44,7 @@
 <script setup>
 import { onMounted, ref, watch } from 'vue'
 import * as api from '@/api/ledger'
-import { generalXlsx, openPrint } from '@/api/print'
+import { downloadFile, openPrint } from '@/api/print'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 
@@ -73,7 +73,8 @@ function previewHtml() {
 }
 
 function exportXlsx() {
-  window.open(generalXlsx(store.bookId, { period_id: toId.value }))
+  downloadFile(`/books/${store.bookId}/print/general-ledger.xlsx`,
+    { period_id: toId.value }, '总账.xlsx')
 }
 
 onMounted(() => { toId.value = store.periodId; load() })

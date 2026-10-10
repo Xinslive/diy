@@ -34,6 +34,12 @@ def _money_style(ws, row: int, cols: range):
         ws.cell(row=row, column=c).number_format = "#,##0.00"
 
 
+def _to_bytes(wb: Workbook) -> bytes:
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 # --------------------------------------------------------------------- 记账凭证
 
 
@@ -263,3 +269,49 @@ def report_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def opening_balance_excel(rows: list[dict], *, company: str, book_name: str, year: int,
+                          month: int) -> bytes:
+    """期初余额表（导入模板 / 导出当前录入值 共用一份格式）。
+
+    列刻意做成「财务系统间最好抄」的样子：科目编码、科目名称、方向、期初余额。
+    方向列是必填的 —— 同一个正数在借方科目和贷方科目上存进去是不一样的，
+    光看金额抄不出方向，会静默记反。
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "期初余额"
+
+    ws.merge_cells("A1:D1")
+    ws["A1"] = f"{company}"
+    ws["A1"].font = Font(size=13, bold=True)
+    ws["A1"].alignment = Alignment(horizontal="center")
+    ws.merge_cells("A2:D2")
+    ws["A2"] = f"{book_name}　期初余额表　{year}年{month}月"
+    ws["A2"].font = Font(size=11, bold=True)
+    ws["A2"].alignment = Alignment(horizontal="center")
+
+    head = ["科目编码", "科目名称", "方向", "期初余额"]
+    for i, h in enumerate(head, start=1):
+        c = ws.cell(row=4, column=i, value=h)
+        c.font = Font(bold=True)
+        c.alignment = Alignment(horizontal="center")
+        c.border = Border(bottom=Side(style="thin"))
+
+    r = 5
+    for row in rows:
+        ws.cell(row=r, column=1, value=row["code"])
+        ws.cell(row=r, column=2, value=row["name"])
+        ws.cell(row=r, column=3, value=row["direction"])
+        ws.cell(row=r, column=4, value=row["amount"])
+        r += 1
+
+    if r > 5:
+        _money_style(ws, 4, range(4, 5))     # 列格式（作用于整个 D 列）
+        for rr in range(5, r):
+            ws.cell(row=rr, column=4).number_format = "#,##0.00"
+    for col, w in zip("ABCD", (14, 32, 10, 18)):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A5"
+    return _to_bytes(wb)
