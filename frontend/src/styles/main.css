@@ -1,0 +1,88 @@
+:root {
+  --cwq-bg: #f4f6f9;
+  --cwq-border: #e4e7ed;
+  --cwq-text: #303133;
+  --cwq-muted: #909399;
+  --cwq-primary: #2563eb;
+  --cwq-ok: #16a34a;
+  --cwq-warn: #d97706;
+  --cwq-danger: #dc2626;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+  font-size: 14px;
+  color: var(--cwq-text);
+  background: var(--cwq-bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 金额一律等宽对齐，便于竖向比对 */
+.money, .num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+}
+
+.page { padding: 16px; }
+
+.page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.page-title {
+  font-size: 17px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: #fff;
+  border: 1px solid var(--cwq-border);
+  border-radius: 6px;
+}
+
+.toolbar .spacer { flex: 1; }
+
+.card { background: #fff; border: 1px solid var(--cwq-border); border-radius: 6px; padding: 14px; }
+
+.muted { color: var(--cwq-muted); }
+
+.tag-ok { color: var(--cwq-ok); font-weight: 600; }
+.tag-bad { color: var(--cwq-danger); font-weight: 600; }
+
+.balance-check {
+  display: flex;
+  gap: 20px;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+.balance-check.ok { background: #f0fdf4; color: #15803d; }
+.balance-check.bad { background: #fef2f2; color: #b91c1c; }
+
+.el-table .cell { font-variant-numeric: tabular-nums; }
+
+/* 打印区域 */
+@media print {
+  .no-print, .el-aside, .el-header, .el-menu { display: none !important; }
+  .el-main { padding: 0 !important; }
+  body { background: #fff; }
+  .card { border: none; padding: 0; }
+  @page { size: A4 portrait; margin: 12mm; }
+}

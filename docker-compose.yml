@@ -1,0 +1,38 @@
+# 生产环境单容器部署：Postgres + API + 前端静态文件
+# 用法：docker compose up -d
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: cwq-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cwq
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?必须设置}
+      POSTGRES_DB: cwq
+      TZ: Asia/Shanghai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # 不对宿主机暴露端口，只走内部网络
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cwq -d cwq"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./backend
+    container_name: cwq-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://cwq:${POSTGRES_PASSWORD}@db:5432/cwq
+      JWT_SECRET: ${JWT_SECRET:?必须设置}
+      TZ: Asia/Shanghai
+    expose:
+      - "8000"
+
+volumes:
+  pgdata:

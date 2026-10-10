@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+.vite/
+*.local
+
+# 环境与密钥
+.env
+.env.*
+!.env.example
+
+# 调试产物
+.shots/
+dbg*.mjs
+*.log
+
+# 编辑器
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,15 @@
+# 发布脚本：rsync 代码 -> 重启 API -> 跑测试 -> 失败自动回滚
+[Unit]
+Description=发布云财务记账系统
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/cwq
+
+ExecStartPre=/usr/local/bin/deploy.sh --check-only
+ExecStart=/usr/local/bin/deploy.sh
+
+[Install]
+WantedBy=multi-user.target

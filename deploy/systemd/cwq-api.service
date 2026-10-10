@@ -1,0 +1,29 @@
+[Unit]
+Description=云财务记账系统 API (FastAPI)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=cwq
+Group=cwq
+WorkingDirectory=/opt/cwq/backend
+EnvironmentFile=/opt/cwq/backend/.env
+Environment=TZ=Asia/Shanghai
+ExecStart=/opt/cwq/backend/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 --port 8000 \
+    --workers 2 --timeout-keep-alive 120
+Restart=always
+RestartSec=3
+
+# 财务系统只读自己的代码目录，能写的地方只有日志
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cwq/backend/logs
+StandardOutput=append:/opt/cwq/backend/logs/api.log
+StandardError=append:/opt/cwq/backend/logs/api.err.log
+
+[Install]
+WantedBy=multi-user.target
