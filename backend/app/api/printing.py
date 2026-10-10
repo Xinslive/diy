@@ -353,7 +353,7 @@ def print_report(book_id: int, template_id: int, period_id: int,
     rtpl = db.get(ReportTemplate, template_id)
     if rtpl is None:
         raise HTTPException(404, "报表模板不存在")
-    payload = evaluate(db, template_id, book, period, False)
+    payload = pv.visible_report_payload(evaluate(db, template_id, book, period, False))
 
     tpl = _tpl_dict(_template(db, book, "REPORT", print_template_id))
     tpl["title"] = {**tpl.get("title", {}), "text": rtpl.name}
@@ -431,7 +431,7 @@ def export_report(book_id: int, template_id: int, period_id: int, book: Book = D
     tpl = db.get(ReportTemplate, template_id)
     if tpl is None:
         raise HTTPException(404, "报表模板不存在")
-    payload = evaluate(db, template_id, book, period, False)
+    payload = pv.visible_report_payload(evaluate(db, template_id, book, period, False))
     payload["name"] = tpl.name
     company = db.get(SysCompany, book.company_id)
     data = xl.report_excel(payload, company=company.name, book_name=book.name)

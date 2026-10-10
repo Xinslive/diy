@@ -28,7 +28,8 @@ from app.core.db import SessionLocal  # noqa: E402
 from app.ledger import queries  # noqa: E402
 from app.ledger.engine import LedgerEngine  # noqa: E402
 from app.models import (  # noqa: E402
-    Book, Entry, Period, PeriodOpening, Subject, SysCompany, SysUser, UserBook, Voucher,
+    Book, Entry, Period, PeriodOpening, ReportTemplate, Subject, SysCompany, SysUser,
+    UserBook, Voucher,
 )
 from app.seed.chart_of_accounts import install_chart  # noqa: E402
 
@@ -102,12 +103,20 @@ def clean_test_books(db) -> tuple[int, int]:
     """
     import re
 
-    # 开户测试 是浏览器端 e2e（onboard.mjs）建的账套，同样属于测试残留
+    # 开户测试/设计器E2E 是浏览器端 e2e 建的账套与报表模板，同样属于测试残留
     pat = re.compile(r"^(租金账套|管理费账套|模块测试账套|开户测试)")
     ids = [b.id for b in db.scalars(select(Book)).all() if pat.match(b.name)]
     for bid in ids:
         wipe_book(db, bid)
     db.flush()
+
+    # e2e 每跑一次就留下一张「设计器E2Exxxx」报表模板，同样清掉
+    junk_tpl = db.scalars(select(ReportTemplate).where(
+        ReportTemplate.name.like("设计器E2E%"))).all()
+    for t in junk_tpl:
+        db.delete(t)          # 模板下的行/列/单元格随外键 CASCADE 一起走
+    db.flush()
+    print(f"已清理 {len(junk_tpl)} 张 e2e 报表模板")
 
     # 账套删干净后，挂着零个账套的公司就是纯垃圾（测试脚本每次都建一家新公司）。
     # 只删没有任何账套的公司，不碰真实公司。

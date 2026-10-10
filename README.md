@@ -101,7 +101,7 @@ cd backend
 | 凭证整理 | `/vouchers/organize` | 断号体检、重编号、按日期排序重排 |
 | 凭证导入 | `/vouchers/import` | Excel 三段式：暂存 → 预览 → 确认入库 |
 | 账簿 | `/balance` `/general-ledger` `/detail-ledger` | 科目余额表 / 总账 / 明细账，含试算平衡 |
-| 报表 | `/reports` | 资产负债表 / 利润表，**每格公式可配** |
+| 报表 | `/reports` | 资产负债表 / 利润表，**每格公式可配 + 行列可增删改** |
 | 打印 | `/print-templates` | 自由模板、纸型方向可调、实时预览 |
 | 账套管理 | `/books` | 新建账套（同公司自动归并）、切换账套、看结账进度 |
 | 期初余额 | `/openings` | 按科目分组录入、**借贷实时试算平衡**、Excel 导入导出 |
@@ -134,10 +134,11 @@ cd backend
 ```bash
 cd backend
 
-.venv/bin/python -m pytest                      # 183 个单元/接口测试
+.venv/bin/python -m pytest                      # 201 个单元/接口测试
 .venv/bin/python scripts/demo_e2e.py            # 69 项端到端流程
 .venv/bin/python scripts/demo_modules.py        # 53 项模块冒烟
 node onboard.mjs                                # 12 步浏览器开户全流程（需前后端都起着）
+node report_design.mjs                          # 7 步浏览器报表设计器（需前后端都起着）
 ```
 
 - pytest 用**独立测试库** `cwq_test`，每个用例一个全新账套，绝不碰开发库

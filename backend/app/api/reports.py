@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.schemas import CellIn
@@ -14,6 +14,8 @@ from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book
 from app.models import (Book, Period, ReportCell, ReportCol, ReportResult, ReportRow,
                      ReportTemplate, SysUser, UserBook)
+from app.reports.evaluate import COL_KINDS
+from app.reports.formula import no_to_col, rewrite_refs
 
 router = APIRouter(prefix="/api/reports", tags=["报表"])
 
@@ -140,6 +142,21 @@ class ReportTemplatePatch(BaseModel):
     remark: Optional[str] = None
 
 
+class ReportRowPatch(BaseModel):
+    label: Optional[str] = None
+    indent: Optional[int] = None
+    bold: Optional[bool] = None
+    hidden: Optional[bool] = None
+    style: Optional[dict] = None
+
+
+class ReportColPatch(BaseModel):
+    label: Optional[str] = None
+    kind: Optional[str] = None
+    hidden: Optional[bool] = None
+    width: Optional[int] = None
+
+
 #: 行号位移的临时偏移。必须够大，确保搬走的行号不会撞上任何现存行号。
 _ROW_SHIFT = 100_000
 
@@ -180,6 +197,58 @@ def _shift_rows(db: Session, template_id: int, at: int, direction: int):
     except Exception:
         db.rollback()
         raise
+
+
+@contextmanager
+def _shift_cols(db: Session, template_id: int, at: int, direction: int):
+    """在第 ``at`` 列处插入/删除一列，把后缀整体平移一格。
+
+    和 :func:`_shift_rows` 同一个理由：``uq_report_col`` / ``uq_report_cell`` 是即时
+    唯一约束，直接改列号会在中间态撞库。
+    """
+    cols = list(db.scalars(
+        select(ReportCol).where(ReportCol.template_id == template_id)).all())
+    cells = list(db.scalars(
+        select(ReportCell).where(ReportCell.template_id == template_id)).all())
+
+    moved_cols = [c for c in cols if c.col_no >= at]
+    moved_cells = [c for c in cells if c.col_no >= at]
+
+    for c in moved_cols:
+        c.col_no += _ROW_SHIFT
+    for c in moved_cells:
+        c.col_no += _ROW_SHIFT
+    db.flush()
+
+    try:
+        yield
+        db.flush()
+        for c in moved_cols:
+            c.col_no = c.col_no - _ROW_SHIFT + direction
+        for c in moved_cells:
+            c.col_no = c.col_no - _ROW_SHIFT + direction
+        db.flush()
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _rewrite_formulas(db: Session, template_id: int, *, row_shift=None, col_shift=None) -> int:
+    """行列位移后，把整张表的公式引用同步改一遍。
+
+    要改的是**全部**单元格，不只是被挪动的那些：第 5 行的公式完全可能引用
+    第 20 行。只改被挪的格子，另一半引用会静默失准。
+
+    返回改写条数（公式为空或没被引用影响的不算）。
+    """
+    touched = 0
+    for c in db.scalars(select(ReportCell)
+                        .where(ReportCell.template_id == template_id)).all():
+        new = rewrite_refs(c.formula, row_shift=row_shift, col_shift=col_shift)
+        if new != c.formula:
+            c.formula = new
+            touched += 1
+    return touched
 
 
 def _clone_skeleton(db: Session, src_id: int, dst_id: int) -> None:
@@ -264,6 +333,33 @@ def delete_template(template_id: int, book_id: Optional[int] = None,
     return {"ok": True}
 
 
+@router.patch("/templates/{template_id}/rows/{row_no}")
+def update_row(template_id: int, row_no: int, payload: ReportRowPatch, book_id: Optional[int] = None,
+               user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    """改行的标签/缩进/加粗/隐藏。
+
+    只靠插删行拼不出想要的表 —— 「合计行加粗」「几行不打印」都得能单独调。
+    """
+    if not _can_write(db, user, book_id):
+        raise HTTPException(403, "没有可写账套的权限")
+    row = db.scalar(select(ReportRow).where(ReportRow.template_id == template_id,
+                                             ReportRow.row_no == row_no))
+    if row is None:
+        raise HTTPException(404, "行不存在")
+    if payload.label is not None:
+        row.label = payload.label[:128]
+    if payload.indent is not None:
+        row.indent = max(0, min(6, payload.indent))
+    if payload.bold is not None:
+        row.bold = payload.bold
+    if payload.hidden is not None:
+        row.hidden = payload.hidden
+    if payload.style is not None:
+        row.style = payload.style
+    db.commit()
+    return {"ok": True, "row_no": row_no}
+
+
 @router.post("/templates/{template_id}/rows")
 def add_row(template_id: int, payload: dict, book_id: Optional[int] = None,
             user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -285,8 +381,9 @@ def add_row(template_id: int, payload: dict, book_id: Optional[int] = None,
                          bold=bool(payload.get("bold", False)),
                          hidden=bool(payload.get("hidden", False)),
                          style=payload.get("style") or {}))
+    shifted = _rewrite_formulas(db, template_id, row_shift=(at, +1))
     db.commit()
-    return {"ok": True, "row_no": at}
+    return {"ok": True, "row_no": at, "formulas_shifted": shifted}
 
 
 @router.delete("/templates/{template_id}/rows/{row_no}")
@@ -305,5 +402,102 @@ def delete_row(template_id: int, row_no: int, book_id: Optional[int] = None,
         db.delete(row)
         for c in doomed:
             db.delete(c)
+    # 删除用 at+1：被删掉的行号本身不再参与映射
+    shifted = _rewrite_formulas(db, template_id, row_shift=(row_no + 1, -1))
     db.commit()
-    return {"ok": True, "deleted_cells": len(doomed)}
+    return {"ok": True, "deleted_cells": len(doomed), "formulas_shifted": shifted}
+
+
+# --------------------------------------------------------------------- 列
+#
+# 「自由可调」不只是改公式：利润表想加一列「上年同期」、资产负债表想多拆一个
+# 层级，都得能自己加列。所以列和行一样支持增删改，且同样要同步改写公式引用
+# （插一列会让 B 列变成 C 列，公式里的 B10 得跟着走）。
+
+
+@router.post("/templates/{template_id}/cols", status_code=201)
+def add_col(template_id: int, payload: dict, book_id: Optional[int] = None,
+            user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    """在指定位置插入一列。默认沿用左边那一列的取数口径。"""
+    if not _can_write(db, user, book_id):
+        raise HTTPException(403, "没有可写账套的权限")
+    if db.get(ReportTemplate, template_id) is None:
+        raise HTTPException(404, "报表模板不存在")
+    cols = list(db.scalars(select(ReportCol).where(ReportCol.template_id == template_id)
+                           .order_by(ReportCol.col_no)).all())
+    at = int(payload.get("col_no") or (cols[-1].col_no + 1 if cols else 1))
+    if at <= 1:
+        raise HTTPException(400, "列号从 2 开始，第 1 列是固定的「项目」列")
+
+    # 口径默认「沿用左边最近的一个数值列」；左边一个都没有（插在标签列右边，
+    # 最常见的用法）就退回整张表的第一个数值列。绝不能继承 STATIC —— 第 1 列
+    # 是固定的「项目」标签列，继承它会造出一个既不显示、又没有任何取数口径的
+    # 幽灵列，看着像插成功了，导出却没有这一列。
+    value_cols = [c for c in cols if c.kind != "STATIC"]
+    left = [c for c in value_cols if c.col_no < at]
+    neighbour = left[-1] if left else (value_cols[0] if value_cols else None)
+    kind = str(payload.get("kind") or (neighbour.kind if neighbour else "BALANCE_CLOSING"))
+    if kind == "STATIC" or kind not in COL_KINDS:
+        raise HTTPException(400, f"未知的取数口径 {kind}，可选：{', '.join(sorted(COL_KINDS))}")
+
+    with _shift_cols(db, template_id, at, direction=+1):
+        db.add(ReportCol(template_id=template_id, col_no=at,
+                         label=str(payload.get("label") or "新列"),
+                         kind=kind,
+                         hidden=bool(payload.get("hidden", False)),
+                         width=int(payload.get("width") or 140)))
+    shifted = _rewrite_formulas(db, template_id, col_shift=(at, +1))
+    db.commit()
+    return {"ok": True, "col_no": at, "letter": no_to_col(at), "formulas_shifted": shifted}
+
+
+@router.patch("/templates/{template_id}/cols/{col_no}")
+def update_col(template_id: int, col_no: int, payload: ReportColPatch, book_id: Optional[int] = None,
+               user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not _can_write(db, user, book_id):
+        raise HTTPException(403, "没有可写账套的权限")
+    col = db.scalar(select(ReportCol).where(ReportCol.template_id == template_id,
+                                             ReportCol.col_no == col_no))
+    if col is None:
+        raise HTTPException(404, "列不存在")
+    if payload.kind is not None and payload.kind != col.kind:
+        if payload.kind != "STATIC" and payload.kind not in COL_KINDS:
+            raise HTTPException(400, f"未知的取数口径 {payload.kind}")
+        col.kind = payload.kind
+    if payload.label is not None:
+        col.label = payload.label[:64]
+    if payload.hidden is not None:
+        col.hidden = payload.hidden
+    if payload.width is not None:
+        col.width = max(60, min(600, payload.width))
+    db.commit()
+    return {"ok": True, "col_no": col_no}
+
+
+@router.delete("/templates/{template_id}/cols/{col_no}")
+def delete_col(template_id: int, col_no: int, book_id: Optional[int] = None,
+               user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not _can_write(db, user, book_id):
+        raise HTTPException(403, "没有可写账套的权限")
+    col = db.scalar(select(ReportCol).where(ReportCol.template_id == template_id,
+                                             ReportCol.col_no == col_no))
+    if col is None:
+        raise HTTPException(404, "列不存在")
+    if col.kind == "STATIC":
+        raise HTTPException(400, "「项目」列是固定列，不能删")
+    remaining = db.scalar(
+        select(func.count()).select_from(ReportCol).where(
+            ReportCol.template_id == template_id, ReportCol.col_no != col_no,
+            ReportCol.kind != "STATIC"))
+    if not remaining:
+        raise HTTPException(400, "至少要保留一个数值列")
+
+    doomed = list(db.scalars(select(ReportCell).where(
+        ReportCell.template_id == template_id, ReportCell.col_no == col_no)).all())
+    with _shift_cols(db, template_id, col_no, direction=-1):
+        db.delete(col)
+        for c in doomed:
+            db.delete(c)
+    shifted = _rewrite_formulas(db, template_id, col_shift=(col_no + 1, -1))
+    db.commit()
+    return {"ok": True, "deleted_cells": len(doomed), "formulas_shifted": shifted}

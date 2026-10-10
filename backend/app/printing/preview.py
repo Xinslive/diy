@@ -130,18 +130,47 @@ def detail_rows(payload: dict) -> list[dict]:
     return out
 
 
+def visible_report_payload(payload: dict) -> dict:
+    """剔除隐藏行/列，并把每行的 cells 对齐到可见列上。
+
+    报表模板的 hidden 是给设计者用的开关，打印和导出都该尊重它。这里统一在
+    入口归一化，下游（HTML 打印 / Excel 导出）就不用各自处理一遍 ——
+    两处各处理一遍的话，隐藏中间一列时单元格按���标对齐就会整列错位。
+    """
+    cols = [c for c in payload.get("cols", []) if not c.get("hidden")]
+    col_nos = [c.get("col_no") for c in cols]
+    rows = []
+    for row in payload.get("rows", []):
+        if row.get("hidden"):
+            continue
+        by_no = {c.get("col_no"): c for c in row.get("cells", [])}
+        rows.append({**row, "hidden": False,
+                     "cells": [by_no.get(no) or {"col_no": no, "value": None,
+                                                 "formula": "", "error": ""}
+                               for no in col_nos]})
+    return {**payload, "cols": cols, "rows": rows}
+
+
 def report_rows(payload: dict) -> list[dict]:
-    """报表 -> 打印行。列按 payload['cols'] 展开成 value0..valueN。"""
+    """报表 -> 打印行。列按 payload['cols'] 展开成 value0..valueN。
+
+    隐藏行/列已由 :func:`visible_report_payload` 剔除，这里只做形状转换。
+    """
     out = []
     cols = payload.get("cols", [])
-    for i, row in enumerate(payload.get("rows", [])):
+    visible_col_nos = [c.get("col_no") for c in cols]
+    for row in payload.get("rows", []):
         item = {
             "label": row.get("label", ""),
             "indent": row.get("indent", 0),
             "bold": row.get("bold", False),
-            "hidden": row.get("hidden", False),
+            "hidden": False,
         }
-        for j, cell in enumerate(row.get("cells", [])):
+        # 按可见列的 col_no 对齐，而不是照抄 cells 的下标：隐藏掉中间一列之后
+        # 下标就和列对不上了，数字会整列错位。
+        by_no = {c.get("col_no"): c for c in row.get("cells", [])}
+        for j, col_no in enumerate(visible_col_nos):
+            cell = by_no.get(col_no) or {}
             item[f"value{j}"] = cell.get("value", "")
             item[f"_err{j}"] = cell.get("error", "")
         out.append(item)

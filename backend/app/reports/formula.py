@@ -416,3 +416,63 @@ def _truthy(v: Any) -> bool:
         return D(v) != 0
     except FormulaError:
         return bool(v)
+
+
+# ------------------------------------------------------------- 地址改写
+
+
+def rewrite_refs(src: str, row_shift: tuple[int, int] | None = None,
+                 col_shift: tuple[int, int] | None = None) -> str:
+    """按行列位移改写公式里所有单元格地址。
+
+    ``row_shift=(at, delta)`` 表示「行号 >= at 的引用加上 delta」，插入时传
+    ``(at, +1)``，删除时传 ``(at + 1, -1)``（删除要跳过被删的那一行本身）。
+
+    为什么必须有这个：公式是**按地址**写的（``合计(B2:B8)``）。在中间插一行，
+    下面那些行整体下移，但公式里的 8 还指着原来那行 —— 报表照样能算出一个
+    看起来正常的数字，错了也看不出来。这类静默错误比报错危险得多。
+
+    字符串字面量和 ``{{期间}}`` 占位符原样保留：``科目("1001","期末",{{本期}})``
+    里的 "1001" 是科目编码，不是地址。
+    """
+    if not src or (not row_shift and not col_shift):
+        return src
+
+    out: list[str] = []
+    i, n = 0, len(src)
+    while i < n:
+        ch = src[i]
+        if ch in "\"'":
+            j = src.find(ch, i + 1)
+            j = n - 1 if j < 0 else j
+            out.append(src[i:j + 1])
+            i = j + 1
+            continue
+        if ch == "{":
+            j = src.find("}}", i)
+            if j < 0:
+                out.append(src[i:])
+                break
+            out.append(src[i:j + 2])
+            i = j + 2
+            continue
+        if IDENT_START.match(ch):
+            j = i
+            while j < n and IDENT_PART.match(src[j]):
+                j += 1
+            word = src[i:j]
+            m = CELL_RE.match(word)
+            if m:
+                col, row = col_to_no(m.group(1)), int(m.group(2))
+                if row_shift and row >= row_shift[0]:
+                    row += row_shift[1]
+                if col_shift and col >= col_shift[0]:
+                    col += col_shift[1]
+                # 被删没了的引用留空，好过留一个指向不存在单元格的非法地址
+                word = "" if (col < 1 or row < 1) else f"{no_to_col(col)}{row}"
+            out.append(word)
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
