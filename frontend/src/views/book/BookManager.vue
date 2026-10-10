@@ -8,8 +8,8 @@
           不会新开账套
         </div>
       </div>
-      <!-- 建账套是管理员的事：自助注册进来的账号不该绕过授权自己开账 -->
-      <el-button v-if="store.isAdmin" type="primary" @click="openCreate">新建账套</el-button>
+      <!-- 谁都能建账套，建完自己就是 OWNER；管理员授权管的是别人的账套 -->
+      <el-button type="primary" @click="openCreate">新建账套</el-button>
     </div>
 
     <div class="card" v-loading="loading">
@@ -67,7 +67,7 @@
       </el-table>
       <el-empty
         v-if="!loading && !store.books.length"
-        :description="store.isAdmin ? '还没有账套，先新建一个' : '还没有分配到账套，请联系管理员在「用户与授权」里授权'"
+        description="还没有账套，点右上角「新建账套」自己开一个；也可以请管理员在「用户与授权」里把已有账套授权给你"
       />
     </div>
 
@@ -99,10 +99,10 @@
         <el-button size="small" type="primary" class="mt" @click="goOpenings(newBookId)">
           去录期初余额
         </el-button>
-        <el-button size="small" class="mt" @click="visible = false">稍后再说</el-button>
+        <el-button size="small" class="mt" @click="closeCreate">稍后再说</el-button>
       </el-alert>
       <template #footer>
-        <el-button @click="visible = false">关闭</el-button>
+        <el-button @click="closeCreate">关闭</el-button>
         <el-button type="primary" :loading="saving" :disabled="!canSubmit" @click="submit">
           创建账套
         </el-button>
@@ -167,8 +167,16 @@ function onYearPick(row, y) {
   if (row.id === store.bookId) store.setYear(y)
 }
 
+function closeCreate() {
+  visible.value = false
+  newBookId.value = 0
+  // 不清掉的话，下次重挂载又会把「刚建好账套」的弹窗弹出来
+  store.setLastCreatedBook(0)
+}
+
 function openCreate() {
   newBookId.value = 0
+  store.setLastCreatedBook(0)
   form.company_name = ''
   form.name = `${form.start_year} 账套`
   form.start_month = 1
@@ -180,6 +188,9 @@ async function submit() {
   try {
     const book = await api.createBook({ ...form })
     newBookId.value = book.id
+    // 建第一个账套时 bookId 从 0 变过来，页面会整个重挂载，
+    // 这里先把 id 存到 store，挂载后好把提示接回来
+    store.setLastCreatedBook(book.id)
     await store.loadBooks()
     ElMessage.success(`账套《${book.company_name} · ${book.name}》已创建，标准科目表已装载`)
   } catch (e) {
@@ -240,6 +251,13 @@ onMounted(async () => {
     await store.loadBooks()
     const b = store.currentBook
     if (b && store.currentPeriod?.year) picked[b.id] = store.currentPeriod.year
+    // 重挂载后把「刚建好账套」的提示接回来，并直接把弹窗开出来，
+    // 免得用户建完账不知道下一步该录期初
+    const last = store.lastCreatedBookId
+    if (last && store.books.some((x) => x.id === last)) {
+      newBookId.value = last
+      visible.value = true
+    }
   } finally {
     loading.value = false
   }

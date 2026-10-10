@@ -71,8 +71,10 @@ FORBIDDEN = [
     ("改他人资料",   "patch", "/api/system/users/1", {"password": "abcd1234"}),
     ("删他人",       "delete", "/api/system/users/1", None),
     ("给别人授权账套", "put", "/api/system/users/1/books", []),
-    ("新建账套",     "post", "/api/books", {"company_name": "X", "name": "X", "start_year": 2026}),
 ]
+# 注意「新建账套」不在上面这份名单里：自助注册开着，再卡管理员开户的话，
+# 新同事得先找人开户才能干活。建账的人自动是 OWNER，边界落在
+# 「只能授权别人的账套」，不是「只有管理员能建账」。
 
 
 #: 操作日志里的「快照」等同全量凭证副本，普通会计不该看到别人的操作痕迹
@@ -141,3 +143,57 @@ def test_管理员标记不靠用户名():
 
     assert _is_admin(SysUser(username="admin", is_admin=False)) is False
     assert _is_admin(SysUser(username="zhangsan", is_admin=True)) is True
+
+
+# --------------------------------------------------------------------- 建账套的口子
+
+
+def test_普通用户可以自己建账套(client, db, plain_auth, plain_user):
+    """自助注册开着，普通用户就该能自己开账干活，不必先找人开户。"""
+    from app.models import UserBook
+
+    r = client.post("/api/books", headers=plain_auth,
+                    json={"company_name": "新同事公司", "name": "自己开的账", "start_year": 2026})
+    assert r.status_code == 201, f"普通用户建账被拒：{r.status_code} {r.text}"
+    got = client.get("/api/books", headers=plain_auth).json()
+    assert [b["name"] for b in got] == ["自己开的账"]
+    # 建账的人自动是 OWNER：改账套名这些得靠这个角色
+    link = db.query(UserBook).filter_by(user_id=plain_user.id, book_id=got[0]["id"]).one_or_none()
+    assert link is not None and link.role == "OWNER", "建账的人没拿到 OWNER"
+
+
+def test_自己建的账套周期表科目表都齐(client, plain_auth):
+    """建账不只是插一行 book：12 个会计期间和整套科目表都要装好，
+    否则新账套一进去就是空的，没法记第一笔。"""
+    r = client.post("/api/books", headers=plain_auth,
+                    json={"company_name": "甲", "name": "乙", "start_year": 2026})
+    book_id = r.json()["id"]
+    periods = client.get(f"/api/books/{book_id}/periods", headers=plain_auth).json()
+    assert len(periods) == 12, f"新建账套应有 12 个期间，实际 {len(periods)}"
+    subjects = client.get(f"/api/books/{book_id}/subjects", headers=plain_auth).json()
+    assert len(subjects) > 30, "科目表没装上"
+
+
+def test_建账留了审计(client, plain_auth, book, db):
+    """口子放开后，「这个账套是谁开的」必须查得到。"""
+    from app.models import AuditLog
+
+    client.post("/api/books", headers=plain_auth,
+                json={"company_name": "留痕公司", "name": "留痕账套", "start_year": 2026})
+    rows = db.query(AuditLog).filter(AuditLog.entity == "book",
+                                    AuditLog.action == "CREATE").all()
+    assert rows, "新建账套没有写审计日志"
+    assert any("留痕账套" in (r.detail or "") for r in rows)
+
+
+def test_重名账套还是不让建(client, plain_auth):
+    """口子开了，但同一个公司下的账套名仍要唯一 —— 否则报表页眉会分不清。"""
+    body = {"company_name": "同名公司", "name": "同名账套", "start_year": 2026}
+    assert client.post("/api/books", headers=plain_auth, json=body).status_code == 201
+    again = client.post("/api/books", headers=plain_auth, json=body)
+    assert again.status_code == 400, f"重名账套没拦住：{again.status_code} {again.text}"
+
+
+def test_没登录不能建账套(client):
+    assert client.post("/api/books",
+                       json={"company_name": "X", "name": "X", "start_year": 2026}).status_code == 401

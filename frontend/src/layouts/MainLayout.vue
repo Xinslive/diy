@@ -81,7 +81,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from '@/stores/session'
 import { ArrowDown, Calendar, Coin, Collection, DataAnalysis, Document, Folder, Grid, List, Notebook, Printer, Tickets, User } from '@element-plus/icons-vue'
@@ -128,6 +128,15 @@ function onCommand(cmd) {
     router.push('/login')
   }
 }
+
+// 离开账套页就清掉「刚建好账套」的提示，免得下次回来又弹一遍已经过期的
+// 引导。建账当下那一次 remount 路由没变，所以提示接得回来。
+watch(
+  () => route.name,
+  (name) => {
+    if (name !== 'books') store.setLastCreatedBook(0)
+  }
+)
 
 onMounted(async () => {
   await store.refreshMe()

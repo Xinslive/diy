@@ -88,10 +88,13 @@ def list_my_books(user: SysUser = Depends(get_current_user), db: Session = Depen
 
 @router.post("", status_code=201)
 def create_book(payload: BookIn, user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    # 开放自助注册后，账套必须由管理员开：否则任何人都能注册一个号自己建账，
-    # 「管理员授权」这层就形同虚设了。
-    if not user.is_admin:
-        raise HTTPException(403, "只有系统管理员可以新建账套")
+    """任何登录用户都能建账套，建完自己就是 OWNER。
+
+    这里不设管理员门槛：**自助注册已经开着**，再卡「必须管理员开账」的话，
+    新同事得先找管理员开户才能开始干活。建账的人自动拿到 OWNER，
+    所以「谁建的」这件事始终清晰 —— 管理员授权那层管的是**别人的**账套，
+    不影响这道边界。
+    """
     exists = db.scalar(
         select(Book).where(
             Book.company_name == payload.company_name,
@@ -113,6 +116,15 @@ def create_book(payload: BookIn, user: SysUser = Depends(get_current_user), db: 
     subjects = install_chart(db, book.id)
 
     db.add(UserBook(user_id=user.id, book_id=book.id, role="OWNER"))
+    db.flush()
+
+    # 建账口子放开后，「这个账套是谁开的」必须查得到 —— 走审计日志留痕
+    from app.accounting.audit_helper import log
+
+    log(db, action="CREATE", entity="book", entity_id=book.id, user=user, book_id=book.id,
+        detail=f"新建账套 {book.company_name} · {book.name}",
+        after={"company_name": book.company_name, "name": book.name,
+               "start_year": book.start_year, "start_month": book.start_month})
     db.commit()
     db.refresh(book)
     return {"id": book.id, "company_name": book.company_name, "name": book.name,

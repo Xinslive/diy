@@ -9,7 +9,11 @@ export const useSessionStore = defineStore('session', {
     books: [],
     bookId: Number(localStorage.getItem('cwq_book') || 0),
     periods: [],
-    periodId: Number(localStorage.getItem('cwq_period') || 0)
+    periodId: Number(localStorage.getItem('cwq_period') || 0),
+    // 刚建好的账套。放在 store 而不是组件里，是因为建完第一个账套时
+    // bookId 会从 0 变成新账套，MainLayout 的 viewKey 一变整个页面就重新挂载，
+    // 组件内的 newBookId 会被丢掉，「下一步录期初余额」的提示就没了。
+    lastCreatedBookId: 0
   }),
   getters: {
     isAuthed: (s) => !!s.token,
@@ -55,6 +59,7 @@ export const useSessionStore = defineStore('session', {
       localStorage.removeItem('cwq_user')
       localStorage.removeItem('cwq_book')
       localStorage.removeItem('cwq_period')
+      this.lastCreatedBookId = 0
     },
     /** 拉账套列表，并保证当前账套/期间一定能落到一个有效值上。
      *
@@ -116,6 +121,11 @@ export const useSessionStore = defineStore('session', {
       if (!year) return
       const id = this.defaultPeriodId(year)
       if (id) this.setPeriod(id)
+    },
+
+    /** 记下刚建好的账套：页面会因 viewKey 变化重新挂载，提示得跨过这一次挂载。 */
+    setLastCreatedBook(id) {
+      this.lastCreatedBookId = id || 0
     },
 
     setPeriod(id) {
