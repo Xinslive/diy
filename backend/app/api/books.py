@@ -14,7 +14,7 @@ from app.accounting import periods as svc
 from app.api.schemas import BookIn, OpeningIn, UncloseIn, YearEndIn
 from app.core.db import get_db
 from app.core.deps import get_book_link, get_current_user, get_my_book
-from app.models import Book, Period, PeriodOpening, Subject, SysCompany, SysUser, UserBook, Voucher
+from app.models import Book, Period, PeriodOpening, Subject, SysUser, UserBook, Voucher
 
 router = APIRouter(prefix="/api/books", tags=["账套与期间"])
 
@@ -36,44 +36,38 @@ def list_my_books(user: SysUser = Depends(get_current_user), db: Session = Depen
         ).all()
     )
     rows = db.execute(
-        select(Book, UserBook.role, SysCompany.name)
+        select(Book, UserBook.role)
         .join(UserBook, UserBook.book_id == Book.id)
-        .join(SysCompany, SysCompany.id == Book.company_id)
         .where(UserBook.user_id == user.id)
-        .order_by(Book.year, Book.name)
+        .order_by(Book.company_name, Book.name, Book.year)
     ).all()
     return [
         {
             "id": b.id, "name": b.name, "year": b.year, "start_month": b.start_month,
-            "company": company, "role": role, "status": b.status,
+            "company_name": b.company_name, "role": role, "status": b.status,
             "closed_periods": db.scalar(
                 select(func.count()).select_from(Period).where(
                     Period.book_id == b.id, Period.locked.is_(True))
             ),
         }
-        for b, role, company in rows
+        for b, role in rows
     ]
 
 
 @router.post("", status_code=201)
 def create_book(payload: BookIn, user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    company = None
-    if payload.company_id:
-        company = db.get(SysCompany, payload.company_id)
-    if company is None:
-        company = db.scalar(select(SysCompany).where(SysCompany.name == payload.company_name))
-    if company is None:
-        company = SysCompany(name=payload.company_name)
-        db.add(company)
-        db.flush()
-
     exists = db.scalar(
-        select(Book).where(Book.company_id == company.id, Book.name == payload.name, Book.year == payload.year)
+        select(Book).where(
+            Book.company_name == payload.company_name,
+            Book.name == payload.name,
+            Book.year == payload.year,
+        )
     )
     if exists:
-        raise HTTPException(400, f"账套「{payload.name} {payload.year}」已存在")
+        raise HTTPException(
+            400, f"账套「{payload.company_name} · {payload.name} {payload.year}」已存在")
 
-    book = Book(company_id=company.id, name=payload.name, year=payload.year,
+    book = Book(company_name=payload.company_name, name=payload.name, year=payload.year,
                 start_month=payload.start_month)
     db.add(book)
     db.flush()
@@ -87,16 +81,15 @@ def create_book(payload: BookIn, user: SysUser = Depends(get_current_user), db: 
     db.add(UserBook(user_id=user.id, book_id=book.id, role="OWNER"))
     db.commit()
     db.refresh(book)
-    return {"id": book.id, "name": book.name, "year": book.year, "subjects_installed": subjects}
+    return {"id": book.id, "company_name": book.company_name, "name": book.name,
+            "year": book.year, "subjects_installed": subjects}
 
 
 @router.get("/{book_id}")
 def get_book(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    company = db.get(SysCompany, book.company_id)
     return {
-        "id": book.id, "name": book.name, "year": book.year,
+        "id": book.id, "company_name": book.company_name, "name": book.name, "year": book.year,
         "start_month": book.start_month, "status": book.status,
-        "company": {"id": company.id, "name": company.name},
     }
 
 
@@ -189,14 +182,13 @@ def export_openings(book_id: int, book: Book = Depends(get_my_book), db: Session
         select(Subject).where(Subject.book_id == book.id, Subject.active.is_(True),
                               Subject.is_leaf.is_(True)).order_by(Subject.code)
     ).all()
-    company = db.get(SysCompany, book.company_id)
     data = xl.opening_balance_excel(
         # 导出用的是**实际**方位：反方向余额（应收账款贷方等）导出后再导入必须
         # 原样回来，用科目自然方向导出会把方向洗成正的
         [{"code": s_.code, "name": s_.name,
           "direction": ("借" if st > 0 else "贷") if st != 0 else ("借" if s_.direction == "DEBIT" else "贷"),
           "amount": float(abs(st))} for s_ in subjects for st in [saved.get(s_.id, Decimal("0"))]],
-        company=company.name, book_name=book.name, year=first.year, month=first.month,
+        company=book.company_name, book_name=book.name, year=first.year, month=first.month,
     )
     return Response(content=data, media_type=XLSX_MIME,
                     headers={"Content-Disposition": _xlsx_name(f"期初余额_{book.name}.xlsx")})

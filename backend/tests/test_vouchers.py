@@ -62,13 +62,11 @@ def test_跨账套科目被拒(db, book, admin_user, subjects):
     import uuid
 
     from app.accounting.periods import create_periods
-    from app.models import Book, Subject, SysCompany
+    from app.models import Book, Subject
     from app.seed.chart_of_accounts import install_chart
 
-    other_company = SysCompany(name=f"别家{uuid.uuid4().hex[:6]}")
-    db.add(other_company)
-    db.flush()
-    other = Book(company_id=other_company.id, name="别家账套", year=2026, start_month=1)
+    other = Book(company_name=f"别家{uuid.uuid4().hex[:6]}", name="别家账套",
+                 year=2026, start_month=1)
     db.add(other)
     db.flush()
     create_periods(db, other)

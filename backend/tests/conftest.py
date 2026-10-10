@@ -35,7 +35,7 @@ from sqlalchemy import create_engine, select, text  # noqa: E402
 from app.core.db import SessionLocal, engine  # noqa: E402
 from app.core.init_db import init_database  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402
-from app.models import Book, Period, Subject, SysCompany, SysUser, UserBook  # noqa: E402
+from app.models import Book, Period, Subject, SysUser, UserBook  # noqa: E402
 
 
 # --------------------------------------------------------------------- 建库
@@ -134,10 +134,7 @@ def book(db, admin_user):
     from app.seed.chart_of_accounts import install_chart
 
     tag = uuid.uuid4().hex[:8]
-    company = SysCompany(name=f"测试公司{tag}")
-    db.add(company)
-    db.flush()
-    b = Book(company_id=company.id, name=f"账套{tag}", year=2026, start_month=1)
+    b = Book(company_name=f"测试公司{tag}", name=f"账套{tag}", year=2026, start_month=1)
     db.add(b)
     db.flush()
     create_periods(db, b)

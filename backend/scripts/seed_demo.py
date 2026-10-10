@@ -28,7 +28,7 @@ from app.core.db import SessionLocal  # noqa: E402
 from app.ledger import queries  # noqa: E402
 from app.ledger.engine import LedgerEngine  # noqa: E402
 from app.models import (  # noqa: E402
-    Book, Entry, Period, PeriodOpening, ReportTemplate, Subject, SysCompany, SysUser,
+    Book, Entry, Period, PeriodOpening, ReportTemplate, Subject, SysUser,
     UserBook, Voucher,
 )
 from app.seed.chart_of_accounts import install_chart  # noqa: E402
@@ -118,16 +118,8 @@ def clean_test_books(db) -> tuple[int, int]:
     db.flush()
     print(f"已清理 {len(junk_tpl)} 张 e2e 报表模板")
 
-    # 账套删干净后，挂着零个账套的公司就是纯垃圾（测试脚本每次都建一家新公司）。
-    # 只删没有任何账套的公司，不碰真实公司。
-    orphans = [
-        c.id for c in db.scalars(select(SysCompany)).all()
-        if not db.scalar(select(Book.id).where(Book.company_id == c.id).limit(1))
-    ]
-    for cid in orphans:
-        db.delete(db.get(SysCompany, cid))
     db.commit()
-    return len(ids), len(orphans)
+    return len(ids)
 
 
 def drop_demo(db) -> None:
@@ -136,13 +128,7 @@ def drop_demo(db) -> None:
 
 
 def build(db, user: SysUser) -> Book:
-    company = db.scalar(select(SysCompany).where(SysCompany.name == "启明物业管理有限公司"))
-    if company is None:
-        company = SysCompany(name="启明物业管理有限公司")
-        db.add(company)
-        db.flush()
-
-    book = Book(company_id=company.id, name=BOOK_NAME, year=YEAR, start_month=1)
+    book = Book(company_name="启明物业管理有限公司", name=BOOK_NAME, year=YEAR, start_month=1)
     db.add(book)
     db.flush()
     create_periods(db, book)
@@ -366,8 +352,8 @@ def main() -> int:
             return 1
 
         if "--clean" in sys.argv:
-            n_book, n_company = clean_test_books(db)
-            print(f"已清理 {n_book} 个历史测试账套、{n_company} 家空壳公司")
+            n_book = clean_test_books(db)
+            print(f"已清理 {n_book} 个历史测试账套")
             return 0
 
         if "--reset" in sys.argv or db.scalar(select(Book).where(Book.name == BOOK_NAME)):

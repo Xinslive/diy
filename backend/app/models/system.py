@@ -1,4 +1,7 @@
-"""系统域：用户、公司、账套授权。"""
+"""系统域：用户、账套授权。
+
+没有「公司」这一层：公司名是账套的一个文本属性，见 ``app.models.book.Book``。
+"""
 from __future__ import annotations
 
 from typing import Optional
@@ -19,21 +22,12 @@ class SysUser(Base, TimestampMixin):
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
-class SysCompany(Base, TimestampMixin):
-    """公司。一个公司可以同时存在多个账套（如租金账套、管理费账套）。"""
-
-    __tablename__ = "sys_company"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String(128), nullable=False)
-    code: Mapped[str] = mapped_column(String(64), default="", nullable=False)
-    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-
-    books: Mapped[list["Book"]] = relationship(back_populates="company")
-
-
 class UserBook(Base, TimestampMixin):
-    """账套授权。role 决定该用户在此账套内的权限范围。"""
+    """账套授权。role 决定该用户在此账套内的权限范围。
+
+    授权直接挂在账套上，没有公司这一层：同一家公司开多个账套（租金 / 管理费）时，
+    每个账套各授权一次即可。
+    """
 
     __tablename__ = "sys_user_book"
     __table_args__ = (UniqueConstraint("user_id", "book_id", name="uq_user_book"),)

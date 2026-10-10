@@ -24,11 +24,11 @@ class TokenOut(BaseModel):
 
 # ---- 账套 ----
 class BookIn(BaseModel):
-    company_name: str
-    name: str
+    # 公司名只是账套的一个文本属性，没有独立的「公司」实体
+    company_name: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=128)
     year: int
     start_month: int = Field(1, ge=1, le=12)
-    company_id: Optional[int] = None
 
 
 class OpeningIn(BaseModel):

@@ -58,6 +58,23 @@ body {
 
 .toolbar .spacer { flex: 1; }
 
+/* 卡片页眉：标题 + 提示并排，不加样式时两段文字会连成一串 */
+.card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.card-head .title {
+  font-weight: 600;
+}
+
+.card-head .hint {
+  font-size: 12px;
+  color: var(--cwq-muted);
+}
+
 .card { background: #fff; border: 1px solid var(--cwq-border); border-radius: 6px; padding: 14px; }
 
 .muted { color: var(--cwq-muted); }

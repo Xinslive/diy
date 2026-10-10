@@ -2,7 +2,7 @@
   <div class="page">
     <div class="page-head">
       <h2 class="page-title">期末处理</h2>
-      <span class="muted">{{ store.currentBook?.company }} · {{ store.currentBook?.name }} {{ store.currentBook?.year }}</span>
+      <span class="muted">{{ store.currentBook?.company_name }} · {{ store.currentBook?.name }} {{ store.currentBook?.year }}</span>
     </div>
 
     <div class="grid">

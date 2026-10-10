@@ -118,13 +118,11 @@ def test_cross_book_subject_rejected(client, auth, db, book, subjects, admin_use
     import uuid
 
     from app.accounting.periods import create_periods
-    from app.models import Book, Subject, SysCompany, UserBook
+    from app.models import Book, Subject, UserBook
     from app.seed.chart_of_accounts import install_chart
 
-    company = SysCompany(name=f"别家公司{uuid.uuid4().hex[:8]}")
-    db.add(company)
-    db.flush()
-    other = Book(company_id=company.id, name="别家账套", year=2026, start_month=1)
+    other = Book(company_name=f"别家公司{uuid.uuid4().hex[:8]}", name="别家账套",
+                 year=2026, start_month=1)
     db.add(other)
     db.flush()
     create_periods(db, other)

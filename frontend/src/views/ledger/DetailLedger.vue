@@ -21,7 +21,7 @@
       <div class="report-head">
         <h2 class="report-title">明 细 账</h2>
         <div class="report-sub">
-          {{ store.currentBook?.company }} · {{ data.subject?.code }} {{ data.subject?.name }}
+          {{ store.currentBook?.company_name }} · {{ data.subject?.code }} {{ data.subject?.name }}
           · {{ data.from_period }} 至 {{ data.to_period }}
         </div>
       </div>

@@ -32,7 +32,7 @@
           <el-option
             v-for="b in store.books"
             :key="b.id"
-            :label="`${b.company} · ${b.name} ${b.year}`"
+            :label="`${b.company_name} · ${b.name}`"
             :value="b.id"
           />
         </el-select>

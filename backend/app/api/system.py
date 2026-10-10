@@ -1,4 +1,4 @@
-"""系统管理：用户、账套授权、公司。
+"""系统管理：用户、账套授权。
 
 内部系统只有几十个人，但「谁能看哪个账套」这件事必须落在数据库里，
 不能靠前端藏按钮。因此权限模型只有三个角色：
@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from app.core.db import get_db
 from app.core.deps import get_current_user
 from app.core.security import hash_password
-from app.models import (AuditLog, Book, SysCompany, SysUser, UserBook)
+from app.models import AuditLog, Book, SysUser, UserBook
 
 router = APIRouter(prefix="/api/system", tags=["系统管理"])
 
@@ -157,50 +157,19 @@ def delete_user(user_id: int, user: SysUser = Depends(get_current_user),
     return {"ok": True}
 
 
-# --------------------------------------------------------------------- 公司
-
-
-class CompanyIn(BaseModel):
-    name: str = Field(min_length=1, max_length=128)
-    code: str = ""
-    active: bool = True
-
-
-@router.get("/companies")
-def list_companies(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = db.execute(
-        select(SysCompany, func.count(Book.id))
-        .outerjoin(Book, Book.company_id == SysCompany.id)
-        .group_by(SysCompany.id).order_by(SysCompany.id)
-    ).all()
-    return [{"id": c.id, "name": c.name, "code": c.code, "active": c.active,
-             "book_count": n} for c, n in rows]
-
-
-@router.post("/companies", status_code=201)
-def create_company(payload: CompanyIn, user: SysUser = Depends(get_current_user),
-                   db: Session = Depends(get_db)):
-    _require_admin(user)
-    if db.scalar(select(SysCompany).where(SysCompany.name == payload.name)):
-        raise HTTPException(400, f"公司「{payload.name}」已存在")
-    c = SysCompany(name=payload.name, code=payload.code, active=payload.active)
-    db.add(c)
-    db.commit()
-    db.refresh(c)
-    return {"id": c.id, "name": c.name, "code": c.code}
+# --------------------------------------------------------------------- 账套
 
 
 @router.get("/books")
 def all_books(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
     """授权界面需要看到全部账套，而不只是自己有权的那几个。"""
     rows = db.execute(
-        select(Book, SysCompany.name, func.count(UserBook.id))
-        .join(SysCompany, SysCompany.id == Book.company_id)
+        select(Book, func.count(UserBook.id))
         .outerjoin(UserBook, UserBook.book_id == Book.id)
-        .group_by(Book.id, SysCompany.name).order_by(Book.year, Book.id)
+        .group_by(Book.id).order_by(Book.company_name, Book.name, Book.year)
     ).all()
-    return [{"id": b.id, "name": b.name, "year": b.year, "company": company,
-             "member_count": n} for b, company, n in rows]
+    return [{"id": b.id, "company_name": b.company_name, "name": b.name, "year": b.year,
+             "member_count": n} for b, n in rows]
 
 
 # --------------------------------------------------------------------- 全局审计

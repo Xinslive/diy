@@ -302,10 +302,16 @@ token 在 localStorage 由 axios 拦截器注入，所以 `iframe.src` / `window
 
 ---
 
-## 10. 数据模型（17 张表）
+## 10. 数据模型（16 张表）
 
 **账套与授权**
-`sys_user` `sys_company` `book` `sys_user_book`（OWNER / ACCOUNTANT / VIEWER）
+`sys_user` `book` `sys_user_book`（OWNER / ACCOUNTANT / VIEWER）
+
+> **没有「公司」这一层。** 公司名是 `book.company_name` 上的一个文本属性，不是实体。
+> 早先版本建过 `sys_company` 表并让账套外键指过去，代价是：建账套前必须先建公司、
+> 报表和打印每次都要多回查一次公司、年度结转还要跨实体复制一条没有信息量的关联、
+> 授权本来就在账套上，公司这层一点忙都帮不上。现在 `(company_name, name, year)` 三元组
+> 既保证唯一，也让页眉、报表、打印直接读账套字段即可。
 
 **账套内数据**（全部带 `book_id`，每个账套独立）
 `subject`（树形 + `carry_forward` 标记损益类）`period` `period_opening`

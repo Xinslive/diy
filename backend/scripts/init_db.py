@@ -16,7 +16,7 @@ from sqlalchemy import select, text  # noqa: E402
 from app.core.db import Base, SessionLocal, engine  # noqa: E402
 from app.core.init_db import init_database  # noqa: E402
 from app.core.security import hash_password  # noqa: E402
-from app.models import Book, Period, Subject, SysCompany, SysUser, UserBook  # noqa: E402
+from app.models import Book, Period, Subject, SysUser, UserBook  # noqa: E402
 
 
 def reset() -> None:
@@ -42,12 +42,8 @@ def seed() -> None:
         db.add_all([admin, zhang])
         db.flush()
 
-        company = SysCompany(name="紫欣星悦荟", code="ZX")
-        db.add(company)
-        db.flush()
-
         for name, start_month in [("租金账套", 1), ("管理费账套", 1)]:
-            book = Book(company_id=company.id, name=name, year=2026, start_month=start_month)
+            book = Book(company_name="紫欣星悦荟", name=name, year=2026, start_month=start_month)
             db.add(book)
             db.flush()
             create_periods(db, book)
@@ -57,7 +53,7 @@ def seed() -> None:
 
         db.commit()
         print("· 已创建用户 admin / zhangsan（密码均为 123456）")
-        print("· 已创建公司「紫欣星悦荟」及 2 个账套（租金账套、管理费账套），各含 2026 全年 12 个会计期间")
+        print("· 已创建 2 个账套（紫欣星悦荟 · 租金账套 / 管理费账套），各含 2026 全年 12 个会计期间")
     finally:
         db.close()
 

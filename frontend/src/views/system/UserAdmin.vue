@@ -17,9 +17,6 @@
         <el-button type="primary" :disabled="!isAdmin" @click="openCreate">
           <el-icon><Plus /></el-icon>&nbsp;新建用户
         </el-button>
-        <el-button :disabled="!isAdmin" @click="openCompany">
-          <el-icon><OfficeBuilding /></el-icon>&nbsp;新建公司
-        </el-button>
       </div>
 
       <el-table :data="users" border size="default">
@@ -51,22 +48,6 @@
             <el-button link type="primary" :disabled="!isAdmin" @click="openReset(row)">重置密码</el-button>
             <el-button link type="danger" :disabled="!isAdmin || row.username === 'admin'"
                        @click="remove(row)">删除</el-button>
-          </template>
-        </el-table-column>
-      </el-table>
-    </el-card>
-
-    <el-card shadow="never" class="mt">
-      <template #header><span class="title">公司</span></template>
-      <el-table :data="companies" border size="small">
-        <el-table-column prop="name" label="公司名称" min-width="220" />
-        <el-table-column prop="code" label="编码" width="140" />
-        <el-table-column prop="book_count" label="账套数" width="90" align="center" />
-        <el-table-column label="账套" min-width="300">
-          <template #default="{ row }">
-            <el-tag v-for="b in booksOf(row.name)" :key="b.id" size="small" class="mr">
-              {{ b.name }} {{ b.year }}
-            </el-tag>
           </template>
         </el-table-column>
       </el-table>
@@ -140,31 +121,18 @@
         <el-button type="primary" :loading="busy" @click="savePassword">重置</el-button>
       </template>
     </el-dialog>
-
-    <!-- 新建公司 -->
-    <el-dialog v-model="dlgCompany" title="新建公司" width="420px">
-      <el-form label-width="80px">
-        <el-form-item label="公司名称"><el-input v-model="companyForm.name" /></el-form-item>
-        <el-form-item label="编码"><el-input v-model="companyForm.code" /></el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="dlgCompany = false">取消</el-button>
-        <el-button type="primary" :loading="busy" @click="saveCompany">创建</el-button>
-      </template>
-    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, OfficeBuilding } from '@element-plus/icons-vue'
+import { Plus } from '@element-plus/icons-vue'
 import * as sysApi from '@/api/system'
 import { useSessionStore } from '@/stores/session'
 
 const store = useSessionStore()
 const users = ref([])
-const companies = ref([])
 const books = ref([])
 const busy = ref(false)
 
@@ -177,21 +145,18 @@ const isAdmin = computed(() => store.user?.username === 'admin')
 const dlgUser = ref(false)
 const dlgBooks = ref(false)
 const dlgReset = ref(false)
-const dlgCompany = ref(false)
 const target = ref(null)
 const newPassword = ref('')
-const companyForm = reactive({ name: '', code: '' })
 const userForm = reactive({ username: '', real_name: '', password: '', books: {} })
 const grant = reactive({ books: {} })
 
 const bookRows = computed(() =>
-  books.value.map((b) => ({ id: b.id, label: `${b.company} · ${b.name} ${b.year}` }))
+  books.value.map((b) => ({ id: b.id, label: `${b.company_name} · ${b.name} ${b.year}` }))
 )
 const bookLabel = (id) => {
   const b = books.value.find((x) => x.id === id)
-  return b ? `${b.name} ${b.year}` : `#${id}`
+  return b ? `${b.company_name} · ${b.name} ${b.year}` : `#${id}`
 }
-const booksOf = (companyName) => books.value.filter((b) => b.company === companyName)
 
 function blankGrant() {
   const g = {}
@@ -201,7 +166,6 @@ function blankGrant() {
 
 async function load() {
   users.value = await sysApi.users()
-  companies.value = await sysApi.companies()
   books.value = await sysApi.allBooks()
 }
 
@@ -280,23 +244,6 @@ async function remove(row) {
   }
   await sysApi.deleteUser(row.id)
   ElMessage.success('已删除')
-  await load()
-}
-
-function openCompany() {
-  companyForm.name = ''
-  companyForm.code = ''
-  dlgCompany.value = true
-}
-
-async function saveCompany() {
-  if (!companyForm.name) {
-    ElMessage.warning('公司名称不能为空')
-    return
-  }
-  await sysApi.createCompany({ ...companyForm })
-  ElMessage.success('已创建')
-  dlgCompany.value = false
   await load()
 }
 

@@ -227,3 +227,41 @@ END; $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_opening_guard ON period_opening;
 CREATE TRIGGER trg_opening_guard BEFORE UPDATE ON period_opening
     FOR EACH ROW EXECUTE FUNCTION fn_opening_guard();
+
+-- =====================================================================
+-- 迁移：取消「公司」实体，公司名下沉为账套属性
+--
+-- 公司表不持有任何账簿数据 —— 没有科目、没有凭证、没有期间、没有权限，
+-- 唯一职责就是一个名字。把它建模成实体的代价是：建账套前必须先建公司、
+-- 报表/打印再多一次外键查询、年度结转还要跨实体复制一条没有信息量的关联。
+-- 账套本身才是会计上自洽的单元，公司名降级成 company_name 文本即可。
+--
+-- 本段幂等：新建的库跳过，老库执行一次，之后每次 init 都不再动。
+-- =====================================================================
+DO $$
+BEGIN
+    IF to_regclass('sys_company') IS NOT NULL THEN
+        ALTER TABLE book ADD COLUMN IF NOT EXISTS company_name varchar(128);
+
+        -- 先把公司名抄进账套，再拆外键
+        UPDATE book b SET company_name = c.name
+          FROM sys_company c
+         WHERE c.id = b.company_id AND b.company_name IS NULL;
+
+        ALTER TABLE book DROP CONSTRAINT IF EXISTS book_company_id_fkey;
+        ALTER TABLE book DROP COLUMN IF EXISTS company_id;
+        DROP TABLE IF EXISTS sys_company CASCADE;
+    END IF;
+
+    -- 账套唯一性：同一单位、同一账套名、同一年度只能有一个账套
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'book' AND column_name = 'company_name') THEN
+        UPDATE book SET company_name = '未命名单位'
+         WHERE company_name IS NULL OR btrim(company_name) = '';
+        ALTER TABLE book ALTER COLUMN company_name SET NOT NULL;
+
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_book') THEN
+            ALTER TABLE book ADD CONSTRAINT uq_book UNIQUE (company_name, name, year);
+        END IF;
+    END IF;
+END $$;

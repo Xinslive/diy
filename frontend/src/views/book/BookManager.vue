@@ -3,20 +3,20 @@
     <div class="page-head">
       <div>
         <h2 class="page-title">账套管理</h2>
-        <div class="muted">一个公司可以有多套账（如按年度、按核算主体分别建账）</div>
+        <div class="muted">账套是独立的记账单元；公司名只是账套上的一个属性，同一家公司可以开多个账套</div>
       </div>
       <el-button type="primary" @click="openCreate">新建账套</el-button>
     </div>
 
     <div class="card" v-loading="loading">
       <el-table :data="store.books" border>
-        <el-table-column label="账套名称" min-width="200">
+        <el-table-column label="单位名称" prop="company_name" min-width="180" />
+        <el-table-column label="账套名称" min-width="180">
           <template #default="{ row }">
             <el-link type="primary" @click="switchTo(row.id)">{{ row.name }}</el-link>
             <el-tag v-if="row.id === store.bookId" size="small" type="success" class="ml">当前</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="公司" prop="company" min-width="160" />
         <el-table-column label="年度" prop="year" width="90" align="center" />
         <el-table-column label="启用月" width="90" align="center">
           <template #default="{ row }">{{ row.start_month }}月</template>
@@ -50,10 +50,11 @@
       <el-form :model="form" label-width="100px">
         <el-form-item label="公司名称" required>
           <el-input v-model="form.company_name" placeholder="如：启明物业管理有限公司" />
-          <div class="muted tip">同名公司会自动归到一起，不重复建</div>
+          <div class="muted tip">用于报表、凭证页眉的「单位名称」，同一家公司可以开多个账套</div>
         </el-form-item>
         <el-form-item label="账套名称" required>
-          <el-input v-model="form.name" placeholder="如：启明物业 2026" />
+          <el-input v-model="form.name" placeholder="如：租金账套" />
+          <div class="muted tip">同一单位下的业务用途，如租金账套、管理费账套</div>
         </el-form-item>
         <el-form-item label="会计年度" required>
           <el-select v-model="form.year" style="width: 100%">
@@ -118,7 +119,7 @@ async function submit() {
     const book = await api.createBook({ ...form })
     newBookId.value = book.id
     await store.loadBooks()
-    ElMessage.success(`账套《${book.name}》已创建，标准科目表已装载`)
+    ElMessage.success(`账套《${book.company_name} · ${book.name}》已创建，标准科目表已装载`)
   } catch (e) {
     ElMessage.error(e?.response?.data?.detail || '创建失败')
   } finally {

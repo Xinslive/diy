@@ -386,7 +386,7 @@ def year_end_carry(db: Session, book: Book, user: SysUser, new_book_name: str | 
 
     # 2. 生成下一年度账套
     new_book = Book(
-        company_id=book.company_id,
+        company_name=book.company_name,
         name=new_book_name or f"{book.name} {book.year + 1}",
         year=book.year + 1,
         start_month=book.start_month,

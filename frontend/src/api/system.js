@@ -6,8 +6,5 @@ export const updateUser = (id, payload) => http.patch(`/system/users/${id}`, pay
 export const setUserBooks = (id, books) => http.put(`/system/users/${id}/books`, books).then(r => r.data)
 export const deleteUser = (id) => http.delete(`/system/users/${id}`).then(r => r.data)
 
-export const companies = () => http.get('/system/companies').then(r => r.data)
-export const createCompany = (payload) => http.post('/system/companies', payload).then(r => r.data)
-
 export const allBooks = () => http.get('/system/books').then(r => r.data)
 export const auditLogs = (limit = 200) => http.get('/system/audit-logs', { params: { limit } }).then(r => r.data)

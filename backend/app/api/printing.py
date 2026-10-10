@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 from app.api.vouchers import _serialize
 from app.core.db import get_db
 from app.core.deps import get_book_link, get_current_user, get_my_book
-from app.models import Book, Period, PrintTemplate, SysCompany, SysUser, UserBook
+from app.models import Book, Period, PrintTemplate, SysUser, UserBook
 from app.printing import excel as xl
 from app.printing import preview as pv
 from app.printing.template import (
@@ -399,9 +399,8 @@ def export_balance(book_id: int, period_id: Optional[int] = None, book: Book = D
     period = _period(db, book.id, period_id)
     subjects = queries.subject_tree(db, book.id)
     rows, check = queries.balance_sheet_of_accounts(db, book.id, subjects, period, include_unposted)
-    company = db.get(SysCompany, book.company_id)
     data = xl.balance_excel({"rows": rows, "check": check, "period": period.code},
-                            company=company.name, book_name=book.name)
+                            company=book.company_name, book_name=book.name)
     return Response(content=data, media_type=XLSX_MIME,
                     headers={"Content-Disposition": _filename(f"科目余额表_{period.code}.xlsx")})
 
@@ -414,9 +413,8 @@ def export_general(book_id: int, period_id: Optional[int] = None, book: Book = D
     period = _period(db, book.id, period_id)
     subjects = queries.subject_tree(db, book.id)
     rows = queries.general_ledger(db, book.id, subjects, period, period, include_unposted)
-    company = db.get(SysCompany, book.company_id)
     data = xl.general_ledger_excel({"rows": rows, "from_period": period.code, "to_period": period.code},
-                                   company=company.name, book_name=book.name)
+                                   company=book.company_name, book_name=book.name)
     return Response(content=data, media_type=XLSX_MIME,
                     headers={"Content-Disposition": _filename(f"总账_{period.code}.xlsx")})
 
@@ -433,7 +431,6 @@ def export_report(book_id: int, template_id: int, period_id: int, book: Book = D
         raise HTTPException(404, "报表模板不存在")
     payload = pv.visible_report_payload(evaluate(db, template_id, book, period, False))
     payload["name"] = tpl.name
-    company = db.get(SysCompany, book.company_id)
-    data = xl.report_excel(payload, company=company.name, book_name=book.name)
+    data = xl.report_excel(payload, company=book.company_name, book_name=book.name)
     return Response(content=data, media_type=XLSX_MIME,
                     headers={"Content-Disposition": _filename(f"{tpl.name}_{period.code}.xlsx")})

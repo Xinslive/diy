@@ -11,7 +11,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.models import Book, Period, Subject, SysCompany
+from app.models import Book, Period, Subject
 
 _CATEGORY_CN = {"ASSET": "资产", "LIABILITY": "负债", "EQUITY": "所有者权益",
                 "COST": "成本", "PROFIT": "损益"}
@@ -20,13 +20,14 @@ _CATEGORY_CN = {"ASSET": "资产", "LIABILITY": "负债", "EQUITY": "所有者�
 def context(db: Session, book: Book, period: Period | None = None, /, **extra: Any) -> dict:
     """页眉上下文。公司名/账套名/期间这些每个模板都要用。
 
+    公司名直接取账套上的 company_name，不再回查公司表。
+
     ``period`` 刻意做成仅位置参数，这样调用方既可以
     ``context(db, book, p)``，也可以 ``context(db, book, p, period="2026-01 至 2026-12")``
     覆盖副标题而不撞名。
     """
-    company = db.get(SysCompany, book.company_id)
     ctx = {
-        "company": company.name if company else "",
+        "company": book.company_name,
         "book": book.name,
         "period": period.code if period is not None else "",
     }
