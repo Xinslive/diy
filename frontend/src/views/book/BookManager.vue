@@ -32,8 +32,11 @@
               @click.stop
             >
               <el-option v-for="y in row.years" :key="y.year" :label="`${y.year} 年`" :value="y.year">
-                <span>{{ y.year }} 年</span>
-                <el-tag v-if="y.carried" size="small" type="info" style="float: right">已结完</el-tag>
+                <!-- 同 MainLayout：float 会让「已结完」跟年份文字上下错开 -->
+                <span class="year-opt">
+                  <span>{{ y.year }} 年</span>
+                  <el-tag v-if="y.carried" size="small" type="info">已结完</el-tag>
+                </span>
               </el-option>
             </el-select>
           </template>
@@ -244,6 +247,9 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+/* 年度下拉选项：文字在左、「已结完」贴右且垂直居中 */
+.year-opt { display: flex; align-items: center; }
+.year-opt .el-tag { margin-left: auto; }
 .page-title { margin: 0 0 2px; font-size: 18px; }
 .ml { margin-left: 8px; }
 .tip { font-size: 12px; margin-top: 2px; }

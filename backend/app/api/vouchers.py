@@ -8,7 +8,7 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, tuple_
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
@@ -361,6 +361,30 @@ def sort_entries(voucher_id: int, payload: dict, book: Book = Depends(get_my_boo
         detail=f"整理凭证 {v.voucher_no} 的分录顺序")
     db.commit()
     return _serialize(db, v)
+
+
+@router.get("/{voucher_id}/neighbour")
+def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+              link: UserBook = Depends(get_book_link), user: SysUser = Depends(get_current_user)):
+    """同一会计期间内的前一张 / 后一张。
+
+    顺序按 (日期, id) **升序** —— 也就是凭证的录入顺序，不是列表页那个倒序：
+    连续录入时「后一张」应该是接下来要填的那张，不该是列表里上一行。
+    只在同期间内跳，跨期跳过去日期会突然变掉，很容易误改。
+    """
+    v = db.get(Voucher, voucher_id)
+    if v is None or v.book_id != book.id:
+        raise HTTPException(404, "凭证不存在")
+    scope = (Voucher.book_id == book.id, Voucher.period_id == v.period_id)
+    prev_id = db.scalar(
+        select(Voucher.id).where(*scope, tuple_(Voucher.voucher_date, Voucher.id) < (v.voucher_date, v.id))
+        .order_by(Voucher.voucher_date.desc(), Voucher.id.desc()).limit(1)
+    )
+    next_id = db.scalar(
+        select(Voucher.id).where(*scope, tuple_(Voucher.voucher_date, Voucher.id) > (v.voucher_date, v.id))
+        .order_by(Voucher.voucher_date, Voucher.id).limit(1)
+    )
+    return {"prev_id": prev_id, "next_id": next_id}
 
 
 @router.get("/{voucher_id}")

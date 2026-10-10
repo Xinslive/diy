@@ -395,3 +395,52 @@ def test_跨年看的是上年十二月(db, book, admin_user, subjects, make_vou
     post_vouchers(db, [v.id], admin_user)
     assert db.get(Voucher, v.id).status == "POSTED"
     assert jan27.locked is False
+
+
+# --------------------------------------------------------------------- 前一张/后一张
+
+
+def test_前一张后一张按录入顺序翻(client, auth, book, make_voucher):
+    """同期间内按 (日期, id) 升序翻 —— 连续录入时「后一张」是接下来要填的那张。"""
+    v1 = make_voucher("2026-01-05", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    v2 = make_voucher("2026-01-10", dr=[("100201", 200, "x")], cr=[("600101", 200, "x")])
+    v3 = make_voucher("2026-01-20", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")])
+
+    def nb(v):
+        r = client.get(f"/api/books/{book.id}/vouchers/{v.id}/neighbour", headers=auth)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    assert nb(v1) == {"prev_id": None, "next_id": v2.id}
+    assert nb(v2) == {"prev_id": v1.id, "next_id": v3.id}
+    assert nb(v3) == {"prev_id": v2.id, "next_id": None}
+
+
+def test_同一天的多张凭证按录入先后排(client, auth, book, make_voucher):
+    """同一天的两张凭证必须能区分前后，否则「后一张」会来回跳。"""
+    a = make_voucher("2026-01-05", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    b = make_voucher("2026-01-05", dr=[("100201", 200, "x")], cr=[("600101", 200, "x")])
+
+    r = client.get(f"/api/books/{book.id}/vouchers/{b.id}/neighbour", headers=auth).json()
+    assert r == {"prev_id": a.id, "next_id": None}
+    assert client.get(f"/api/books/{book.id}/vouchers/{a.id}/neighbour", headers=auth).json() == {
+        "prev_id": None, "next_id": b.id}
+
+
+def test_前后张不跨会计期间(client, auth, book, make_voucher):
+    """1 月最后一张的后一张不该跳到 2 月 —— 跳过去日期会突然变掉。"""
+    jan = make_voucher("2026-01-28", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    feb = make_voucher("2026-02-03", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+
+    assert client.get(f"/api/books/{book.id}/vouchers/{jan.id}/neighbour", headers=auth).json()["next_id"] is None
+    assert client.get(f"/api/books/{book.id}/vouchers/{feb.id}/neighbour", headers=auth).json()["prev_id"] is None
+
+
+def test_别的账套的凭证查不到前后张(client, auth, db, book, make_voucher):
+    from app.models import Book
+    other = db.scalar(select(Book).where(Book.id != book.id).limit(1))
+    if other is None:
+        return
+    v = make_voucher("2026-01-05", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    code = client.get(f"/api/books/{other.id}/vouchers/{v.id}/neighbour", headers=auth).status_code
+    assert code in (403, 404), f"不该返回 {code}"

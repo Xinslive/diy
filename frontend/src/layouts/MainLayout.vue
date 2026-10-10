@@ -46,11 +46,15 @@
         </el-select>
         <el-select v-model="selMonth" size="default" style="width: 122px" @change="onMonthChange">
           <el-option v-for="p in monthsOfYear" :key="p.id" :label="`${p.month} 月`" :value="p.month">
-            <span>{{ p.month }} 月</span>
-            <el-tag v-if="p.locked" size="small" type="success" style="float: right">已结账</el-tag>
-            <el-tag v-else-if="p.unposted > 0" size="small" type="warning" style="float: right">
-              未记账 {{ p.unposted }}
-            </el-tag>
+            <!-- 选项行本身是 .el-select-dropdown__item，display 是 list-item，
+                 不是 flex。所以对齐不能指望 float 或 margin-left:auto：
+                 float 会把标签提出行内流、跟月份文字上下错开一小截。
+                 自己套一层 flex 才能既贴右又上下居中。 -->
+            <span class="period-opt">
+              <span>{{ p.month }} 月</span>
+              <el-tag v-if="p.locked" size="small" type="success">已结账</el-tag>
+              <el-tag v-else-if="p.unposted > 0" size="small" type="warning">未记账 {{ p.unposted }}</el-tag>
+            </span>
           </el-option>
         </el-select>
 
@@ -135,6 +139,10 @@ onMounted(async () => {
 
 <style scoped>
 .shell { height: 100vh; }
+
+/* 下拉选项自己排版：文字在左、标记贴右，且上下严格居中对齐 */
+.period-opt { display: flex; align-items: center; }
+.period-opt .el-tag { margin-left: auto; }
 
 .brand {
   display: flex; align-items: center; gap: 8px;

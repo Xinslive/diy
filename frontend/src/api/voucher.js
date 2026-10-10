@@ -1,6 +1,7 @@
 import { http, apiUrl } from './client'
 export const queryVouchers = (bookId, params) => http.get(`/books/${bookId}/vouchers`, { params }).then(r => r.data)
 export const getVoucher = (bookId, id) => http.get(`/books/${bookId}/vouchers/${id}`).then(r => r.data)
+export const neighbour = (bookId, id) => http.get(`/books/${bookId}/vouchers/${id}/neighbour`).then(r => r.data)
 export const createVoucher = (bookId, payload) => http.post(`/books/${bookId}/vouchers`, payload).then(r => r.data)
 export const updateVoucher = (bookId, id, payload) => http.put(`/books/${bookId}/vouchers/${id}`, payload).then(r => r.data)
 export const deleteVoucher = (bookId, id) => http.delete(`/books/${bookId}/vouchers/${id}`).then(r => r.data)

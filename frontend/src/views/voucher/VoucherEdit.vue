@@ -10,7 +10,14 @@
       <span class="muted">附件</span>
       <el-input-number v-model="form.attachments" :min="0" :max="999" style="width: 100px" />
       <span class="spacer" />
-      <el-button :disabled="readonly" @click="addRow">增加分录</el-button>
+      <!-- 连续录入用：前一张/后一张在同期间内翻，插入/增加直接开一张新的。
+           原来那个「增加分录」按钮去掉了 —— 分录靠回车往下加，不用专门去找按钮。 -->
+      <el-button-group>
+        <el-button :disabled="!prevId" @click="goNeighbour('prev')">前一张</el-button>
+        <el-button :disabled="!nextId" @click="goNeighbour('next')">后一张</el-button>
+      </el-button-group>
+      <el-button :disabled="!canAdd" @click="insertVoucher">插入凭证</el-button>
+      <el-button :disabled="!canAdd" @click="addVoucher">增加凭证</el-button>
       <el-button type="primary" :loading="saving" :disabled="!store.canWrite || readonly" @click="save">保存</el-button>
       <el-button v-if="voucherId" :disabled="form.status === 'POSTED'" @click="printVoucher">打印预览</el-button>
     </div>
@@ -32,7 +39,7 @@
         <el-table-column type="index" label="#" width="46" align="center" />
         <el-table-column label="会计科目" min-width="300">
           <template #default="{ row }">
-            <el-select v-model="row.subject_id" :disabled="readonly" filterable placeholder="选择科目" style="width: 100%" @change="onSubject(row)">
+            <el-select v-model="row.subject_id" :disabled="readonly" filterable placeholder="选择科目" style="width: 100%" :ref="(el) => setSubjectRef(el, $index)" @change="onSubject(row)">
               <el-option v-for="s in subjectOptions" :key="s.id" :label="`${s.code} ${s.name}`" :value="s.id" />
             </el-select>
           </template>
@@ -51,7 +58,7 @@
           </template>
         </el-table-column>
         <el-table-column label="摘要" min-width="220">
-          <template #default="{ row }"><el-input v-model="row.summary" :disabled="readonly" /></template>
+          <template #default="{ row }"><el-input v-model="row.summary" :disabled="readonly" @keyup.enter="addRow" /></template>
         </el-table-column>
         <el-table-column width="52" align="center">
           <template #default="{ $index }">
@@ -102,7 +109,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import * as api from '@/api/voucher'
@@ -118,6 +125,9 @@ const voucherId = computed(() => Number(route.params.id || 0))
 const saving = ref(false)
 const subjects = ref([])
 const printVisible = ref(false)
+// 同期间内的前一张 / 后一张，由后端按「录入顺序」算好
+const prevId = ref(null)
+const nextId = ref(null)
 
 const form = reactive({
   voucher_no: '', voucher_date: '', status: 'UNPOSTED',
@@ -128,6 +138,9 @@ const locked = computed(() => !!store.currentPeriod?.locked)
 const posted = computed(() => form.status === 'POSTED')
 // 只读：期间已结账，或凭证本身已记账
 const readonly = computed(() => locked.value || posted.value)
+
+// 能不能开新凭证：只读账套不行，期间已结账也不行
+const canAdd = computed(() => store.canWrite && !locked.value)
 
 const subjectOptions = computed(() => subjects.value.filter((s) => s.is_leaf))
 const num = (v) => (v === '' || v === null || v === undefined ? 0 : Number(v))
@@ -154,6 +167,13 @@ function onSubject(row) {
     }
   }
 }
+// 每行的科目下拉要能拿到实例，回车加完行直接聚焦过去，不用鼠标去找
+const subjectRefs = new Map()
+function setSubjectRef(el, idx) {
+  if (el) subjectRefs.set(idx, el)
+  else subjectRefs.delete(idx)
+}
+
 function addRow() {
   // 自动补一行方向相反的分录，符合连续录入的习惯
   const last = form.entries[form.entries.length - 1]
@@ -163,10 +183,41 @@ function addRow() {
     amount: '',
     summary: last ? last.summary : ''
   })
+  if (readonly.value) return
+  nextTick(() => subjectRefs.get(form.entries.length - 1)?.focus?.())
+}
+
+/** 前一张 / 后一张：只在同一会计期间内翻，跳到最前/最后一张时按钮自己禁用。 */
+function goNeighbour(which) {
+  const id = which === 'prev' ? prevId.value : nextId.value
+  if (id) router.push(`/vouchers/${id}`)
+}
+
+/** 插入凭证：接着当前这张开一张新的，日期沿用当前凭证的日期。
+ *  只跳到空白页，不预先落库 —— 空凭证一旦存进去就会占号、还会漏在列表里。 */
+function insertVoucher() {
+  router.push({ name: 'voucher-new', query: { date: form.voucher_date } })
+}
+
+/** 增加凭证：不受当前凭证日期影响，按所在期间的默认日期另起一张。 */
+function addVoucher() {
+  router.push({ name: 'voucher-new' })
+}
+
+async function loadNeighbour() {
+  if (!voucherId.value) {
+    prevId.value = null
+    nextId.value = null
+    return
+  }
+  const r = await api.neighbour(store.bookId, voucherId.value)
+  prevId.value = r.prev_id
+  nextId.value = r.next_id
 }
 
 async function load() {
   subjects.value = await subjectApi.subjectFlat(store.bookId)
+  subjectRefs.clear()
   if (voucherId.value) {
     const v = await api.getVoucher(store.bookId, voucherId.value)
     Object.assign(form, {
@@ -176,10 +227,14 @@ async function load() {
         subject_id: e.subject_id, direction: e.direction, amount: e.amount, summary: e.summary
       }))
     })
+    await loadNeighbour()
   } else {
-    form.voucher_date = defaultDate()
+    // 「插入凭证」会把当前凭证的日期带过来
+    form.voucher_date = route.query.date || defaultDate()
     addRow()
     addRow()
+    prevId.value = null
+    nextId.value = null
   }
 }
 
@@ -225,7 +280,8 @@ onMounted(async () => {
   if (!store.periodId) return
   await load()
 })
-watch(() => [store.bookId, store.periodId], load)
+// 前一张/后一张只是换 route.params，组件不会重新挂载 —— 必须盯着 id
+watch(() => [store.bookId, store.periodId, route.params.id], load)
 </script>
 
 <style scoped>
