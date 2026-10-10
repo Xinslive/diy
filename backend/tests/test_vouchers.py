@@ -66,7 +66,7 @@ def test_跨账套科目被拒(db, book, admin_user, subjects):
     from app.seed.chart_of_accounts import install_chart
 
     other = Book(company_name=f"别家{uuid.uuid4().hex[:6]}", name="别家账套",
-                 year=2026, start_month=1)
+                 start_year=2026, start_month=1)
     db.add(other)
     db.flush()
     create_periods(db, other)
@@ -169,18 +169,32 @@ def test_批量记账和反记账(db, book, make_voucher, admin_user):
     assert unpost_vouchers(db, [v.id for v in vs], admin_user) == 0
 
 
-def test_改凭证后自动回到未记账(db, book, subjects, make_voucher, admin_user):
-    """已记账的凭证被改动，账簿口径必须立刻跟着变，所以要退回未记账。"""
+def test_已记账凭证锁住不能改(db, book, subjects, make_voucher, admin_user):
+    """已记账的分录已经被总账和报表引用，改它必须先反记账。
+
+    允许直接改的话，凭证上写的是一个数、报表上是另一个数，
+    而且没有任何痕迹能说清差在哪一步。
+    """
     v = make_voucher("2026-01-05", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")], posted=True)
+    with pytest.raises(ValueError, match="已记账"):
+        update_voucher(db, v, admin_user, {
+            "entries": _entries(subjects, [("100201", 250, "改")], [("600101", 250, "改")])})
+    db.rollback()
+    db.refresh(v)
+    assert v.status == "POSTED"
+
+    # 反记账之后就能改了
+    unpost_vouchers(db, [v.id], admin_user)
+    db.refresh(v)
+    assert v.status == "UNPOSTED"
     update_voucher(db, v, admin_user, {
         "entries": _entries(subjects, [("100201", 250, "改")], [("600101", 250, "改")])})
     db.refresh(v)
     assert v.status == "UNPOSTED"
-    assert v.posted_at is None
 
 
 def test_改凭证换月后分录期间同步(db, book, periods, subjects, make_voucher, admin_user):
-    v = make_voucher("2026-01-31", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")], posted=True)
+    v = make_voucher("2026-01-31", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
     update_voucher(db, v, admin_user, {"voucher_date": date(2026, 3, 15)})
     db.refresh(v)
     assert v.period_id == periods[3].id
@@ -196,16 +210,25 @@ def test_删除凭证连同分录(db, book, make_voucher, admin_user):
     assert db.scalars(select(Entry).where(Entry.voucher_id == vid)).all() == []
 
 
-def test_已记账凭证可直接删除但要留快照(db, book, make_voucher, admin_user):
-    """没有审核环节，所以不拦着删已记账凭证。
+def test_已记账凭证不能删_先反记账才行(db, book, make_voucher, admin_user):
+    v = make_voucher("2026-01-05", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")],
+                     posted=True, summary="原来的内容")
+    vid = v.id
+    with pytest.raises(ValueError, match="已记账"):
+        delete_voucher(db, v, admin_user)
+    db.rollback()
 
-    但凭证号会复用，删掉之后凭证号就可能被别的凭证占用 ——
-    唯一能还原「原来那张是什么」的东西就是审计快照。
-    """
+    unpost_vouchers(db, [vid], admin_user)
+    delete_voucher(db, db.get(Voucher, vid), admin_user)
+    assert db.get(Voucher, vid) is None
+
+
+def test_删除凭证要留内容快照(db, book, make_voucher, admin_user):
+    """凭证号会复用，删掉之后唯一能还原「原来那张是什么」的东西就是审计快照。"""
     from app.models import AuditLog
 
     v = make_voucher("2026-01-05", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")],
-                     posted=True, summary="原来的内容")
+                     summary="原来的内容")
     vid, vno = v.id, v.voucher_no
     delete_voucher(db, v, admin_user)
     assert db.get(Voucher, vid) is None

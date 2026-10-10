@@ -68,16 +68,17 @@
           </el-form-item>
 
           <el-divider content-position="left">标题</el-divider>
-          <el-form-item label="主标题"><el-input v-model="tpl.title.text" @change="normalize" /></el-form-item>
+          <el-form-item label="主标题"><el-input v-model="tpl.title.text" @input="schedulePreview" @change="normalize" /></el-form-item>
           <el-form-item label="字号">
             <el-input-number v-model="tpl.title.size" :min="8" :max="40" size="small" @change="normalize" />
             <el-checkbox v-model="tpl.title.bold" class="ml" @change="normalize">加粗</el-checkbox>
           </el-form-item>
-          <el-form-item label="副标题"><el-input v-model="tpl.subtitle.text" placeholder="留空则显示期间" @change="normalize" /></el-form-item>
+          <el-form-item label="副标题"><el-input v-model="tpl.subtitle.text" placeholder="留空则显示期间"
+                       @input="schedulePreview" @change="normalize" /></el-form-item>
 
           <el-divider content-position="left">字体</el-divider>
           <el-form-item label="字体">
-            <el-input v-model="tpl.font.family" @change="normalize" />
+            <el-input v-model="tpl.font.family" @input="schedulePreview" @change="normalize" />
           </el-form-item>
           <el-form-item label="字号">
             <el-input-number v-model="tpl.font.size" :min="6" :max="24" :step="0.5" size="small" @change="normalize" />
@@ -91,7 +92,8 @@
             </el-checkbox-group>
           </el-form-item>
           <el-form-item label="页脚">
-            <el-input v-model="tpl.footer.text" placeholder="自定义页脚文字" @change="normalize" />
+            <el-input v-model="tpl.footer.text" placeholder="自定义页脚文字"
+                      @input="schedulePreview" @change="normalize" />
           </el-form-item>
           <el-form-item label="页码">
             <el-checkbox v-model="tpl.footer.show_page_no" @change="normalize">显示页码</el-checkbox>
@@ -125,7 +127,8 @@
           </el-table-column>
           <el-table-column label="表头" width="84">
             <template #default="{ row }">
-              <el-input v-model="row.label" size="small" style="width: 100%" @change="normalize" />
+              <el-input v-model="row.label" size="small" style="width: 100%"
+                        @input="schedulePreview" @change="normalize" />
             </template>
           </el-table-column>
           <el-table-column label="宽度" width="94">
@@ -145,7 +148,8 @@
           </el-table-column>
           <el-table-column width="52" align="center">
             <template #default="{ $index }">
-              <el-button link type="danger" :icon="Delete" @click="tpl.columns.splice($index, 1)" />
+              <el-button link type="danger" :icon="Delete" :disabled="tpl.columns.length <= 1"
+                         @click="removeColumn($index)" />
             </template>
           </el-table-column>
           <el-table-column width="74" align="center">
@@ -167,10 +171,8 @@
         <template #header>
           <div class="card-head">
             <span class="title">预览</span>
-            <el-select v-model="previewTplId" size="small" style="width: 150px">
-              <el-option label="默认模板" :value="0" />
-              <el-option v-for="t in listOfScope" :key="t.id" :label="t.name" :value="t.id" />
-            </el-select>
+            <el-tag v-if="previewing" size="small" type="info" effect="plain">渲染中…</el-tag>
+            <el-tag v-else-if="dirty" size="small" type="warning" effect="plain">未保存</el-tag>
             <el-button size="small" @click="refreshPreview"><el-icon><Refresh /></el-icon></el-button>
             <el-button size="small" type="primary" @click="doPrint">
               <el-icon><Printer /></el-icon>&nbsp;打印
@@ -196,7 +198,10 @@
           </el-form-item>
         </el-form>
 
-        <iframe ref="frame" class="preview" :srcdoc="previewHtml" title="打印预览"></iframe>
+        <div v-if="previewError" class="preview-err">
+          <el-alert type="warning" :closable="false" show-icon :title="previewError" />
+        </div>
+        <iframe v-else ref="frame" class="preview" :srcdoc="previewHtml" title="打印预览"></iframe>
       </el-card>
     </div>
 
@@ -251,12 +256,13 @@ const subjects = ref([])
 const reports = ref([])
 const saving = ref(false)
 
-const previewTplId = ref(0)
 const previewPeriodId = ref(store.periodId)
 const fromPeriodId = ref(null)
 const previewSubjectId = ref(null)
 const previewReportId = ref(null)
 const previewHtml = ref('')
+const previewError = ref('')
+const previewing = ref(false)
 let previewToken = 0
 
 const SCOPES = {
@@ -279,6 +285,10 @@ const COLUMN_KEYS = [
 ]
 
 const listOfScope = computed(() => list.value.filter((t) => t.scope === scope.value))
+
+/** 当前草稿是否与已保存内容不同 —— 用来提示「未保存」，免得以为已经存进去了。 */
+const savedSnapshot = ref('')
+const dirty = computed(() => !!templateId.value && JSON.stringify(tpl.value) !== savedSnapshot.value)
 const metaOn = computed({
   get: () => Object.keys(tpl.value?.meta || {}).filter((k) => tpl.value.meta[k]),
   set: (keys) => {
@@ -293,7 +303,7 @@ function normalize() {
   if (!tpl.value.meta) tpl.value.meta = {}
   Object.keys(META_CN).forEach((k) => { if (!(k in tpl.value.meta)) tpl.value.meta[k] = false })
   if (!tpl.value.show) tpl.value.show = {}
-  refreshPreview()
+  schedulePreview()
 }
 
 const round = (n) => Math.round(n * 10000) / 10000
@@ -308,6 +318,12 @@ function move(i, d) {
 
 function addColumn() {
   tpl.value.columns.push({ key: 'summary', label: '新列', width: 10, align: 'left', indent: 0 })
+  normalize()
+}
+
+function removeColumn(i) {
+  if (tpl.value.columns.length <= 1) return   // 至少留一列，否则模板是非法的
+  tpl.value.columns.splice(i, 1)
   normalize()
 }
 
@@ -326,8 +342,9 @@ async function loadTemplate(id) {
     ? (await printApi.templateDetail(store.bookId, id)).content
     : clone(meta.value.defaults[scope.value] || EMPTY_TPL)
   tpl.value = clone({ ...clone(EMPTY_TPL), ...base })
-  previewTplId.value = id
   normalize()
+  // 等列宽归一化完再取快照，否则「刚打开就显示未保存」是假警报
+  savedSnapshot.value = JSON.stringify(tpl.value)
 }
 
 async function loadPreviewData() {
@@ -340,10 +357,32 @@ async function loadPreviewData() {
   }
 }
 
-/** 返回 [path, params]，交给 fetchPrintHtml / openPrint */
+/**
+ * 预览请求体：带上**当前未保存的草稿**。
+ *
+ * 这是「改一下右边立刻变」的全部秘密 —— 预览不吃已保存的模板（那要先点保存，
+ * 还得刷新），而是把编辑器里这份 JSON 直接发给后端渲染一遍。
+ */
+function previewPayload() {
+  return {
+    scope: scope.value,
+    content: tpl.value,
+    period_id: previewPeriodId.value,
+    from_period_id: fromPeriodId.value || undefined,
+    subject_id: previewSubjectId.value || undefined,
+    report_template_id: previewReportId.value || undefined,
+  }
+}
+
+/**
+ * 正式打印：与预览**同一个范围、同一个期间**，只是模板换成已保存的那份。
+ *
+ * 打印走 template_id 而不是草稿，是因为打印窗口里的东西可能被人另存为 PDF
+ * 发出去 —— 必须对应一条真正存了档的版式，而不是编辑器里还没保存的状态。
+ */
 function buildTarget() {
   const pid = previewPeriodId.value
-  const tp = previewTplId.value || undefined
+  const tp = templateId.value || undefined
   const b = store.bookId
   switch (scope.value) {
     case 'LEDGER':
@@ -364,14 +403,34 @@ function buildTarget() {
 
 async function refreshPreview() {
   if (!store.bookId) return
-  const [path, params] = buildTarget()
   const token = ++previewToken
+  previewing.value = true
   try {
-    const html = await printApi.fetchPrintHtml(path, params)
-    if (token === previewToken) previewHtml.value = html   // 丢弃过期响应
-  } catch {
-    if (token === previewToken) previewHtml.value = '<p style="padding:20px;color:#999">预览加载失败</p>'
+    const html = await printApi.previewHtml(store.bookId, previewPayload())
+    if (token !== previewToken) return              // 过期响应直接丢弃，避免旧结果盖掉新的
+    previewHtml.value = html
+    previewError.value = ''
+  } catch (e) {
+    if (token !== previewToken) return
+    const detail = e.response?.data?.detail
+    // 草稿处于半成品状态（列全删了、科目没选）是正常编辑过程，
+    // 就地显示原因即可，不该弹一个红色报错打断。
+    previewError.value = typeof detail === 'string' ? detail : '预览加载失败'
+  } finally {
+    if (token === previewToken) previewing.value = false
   }
+}
+
+/**
+ * 防抖刷新。
+ *
+ * 输入框每敲一个字就发一次请求的话，一个标题就能打出几十个请求；
+ * 但完全不等又会让人觉得「不跟手」。250ms 是两者之间的平衡点。
+ */
+let previewTimer = null
+function schedulePreview(delay = 250) {
+  clearTimeout(previewTimer)
+  previewTimer = setTimeout(refreshPreview, delay)
 }
 
 function doPrint() {
@@ -385,6 +444,7 @@ async function save() {
     await printApi.updateTemplate(store.bookId, templateId.value, { content: tpl.value })
     ElMessage.success('模板已保存')
     await loadTemplates()
+    await loadTemplate(templateId.value)      // 重新取回服务端归一化后的内容
   } finally {
     saving.value = false
   }
@@ -459,6 +519,7 @@ watch(() => store.bookId, async () => {
   width: 100%; height: 68vh; border: 1px solid var(--cwq-border);
   border-radius: 4px; background: #fff;
 }
+.preview-err { height: 68vh; display: flex; align-items: flex-start; padding-top: 24px; }
 .margins { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 8px; width: 100%; }
 .margins > div { display: flex; align-items: center; gap: 5px; }
 .margins .mlabel { font-size: 12px; color: #888; width: 28px; flex: none; }

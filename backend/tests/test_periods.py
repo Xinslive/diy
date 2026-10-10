@@ -4,7 +4,7 @@
     1. 月度结转 = 自动生成结转损益凭证
     2. 不审核凭证，只有 未记账 / 已记账 两态
     3. 要有便捷的批量反结账（改老凭证时用）
-    4. 年度结转生成新账套
+    4. 年度结转给同一个账套追加下一年度
 所以这里每条用例都按「用户实际操作顺序」写，而不是按函数名排列。
 """
 from decimal import Decimal
@@ -101,19 +101,24 @@ def test_损益未结平时拒绝结账(db, book, periods, subjects, admin_user,
     assert periods[1].locked is False
 
 
-def test_重复结转被拦住(db, book, periods, subjects, admin_user, make_voucher):
-    """连点两次「结转损益」会生成两张凭证，本年利润直接翻倍 —— 必须挡住。"""
+def test_重复结转不会翻倍而是删旧重建(db, book, periods, subjects, admin_user, make_voucher):
+    """连点两次「结转损益」不能生成两张凭证 —— 本年利润会凭空翻倍。
+
+    处理方式不是报错拦人，而是删掉上一轮自己生成的结转凭证、按最新余额重算。
+    这是财务最常见的动作：结完发现金额不对，改完直接再点一次。
+    """
     make_voucher("2026-01-10", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
-    carry_forward_profit(db, book.id, periods[1], admin_user)
+    first = carry_forward_profit(db, book.id, periods[1], admin_user)
 
-    with pytest.raises(ValueError, match="已执行过结转损益"):
-        carry_forward_profit(db, book.id, periods[1], admin_user)
-    db.rollback()
+    second = carry_forward_profit(db, book.id, periods[1], admin_user)
 
+    assert second["removed"] == first["vouchers"]
+    assert second["replaced"] is True
+    # 全账套的结转凭证仍然只有本次生成的这一张，没有叠加
     assert db.scalar(
         select(func.count()).select_from(Voucher).where(
             Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD")
-    ) == 1
+    ) == len(second["vouchers"])
 
 
 def test_删掉结转凭证后可以重新结转(db, book, periods, subjects, admin_user, make_voucher):
@@ -128,6 +133,99 @@ def test_删掉结转凭证后可以重新结转(db, book, periods, subjects, ad
 
     r = carry_forward_profit(db, book.id, periods[1], admin_user)
     assert len(r["vouchers"]) == 1
+
+
+def test_重新结转删掉旧凭证再按最新余额生成(db, book, periods, subjects, admin_user, make_voucher):
+    """财务改完凭证发现上次结转金额不对时，要能一键重结转，而不是自己去凭证列表删。"""
+    make_voucher("2026-01-10", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
+    first = carry_forward_profit(db, book.id, periods[1], admin_user)
+    old_ids = set(db.scalars(select(Voucher.id).where(
+        Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD")).all())
+
+    # 补一笔新的收入，重结转后金额应按最新余额重算
+    make_voucher("2026-01-20", dr=[("100201", 200, "y")], cr=[("600101", 200, "y")], posted=True)
+    r = carry_forward_profit(db, book.id, periods[1], admin_user, replace=True)
+
+    assert r["replaced"] is True
+    assert r["removed"] == first["vouchers"]          # 旧凭证号被回报给前端做提示
+    new_ids = set(db.scalars(select(Voucher.id).where(
+        Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD")).all())
+    assert new_ids and not (new_ids & old_ids)        # 旧行真的没了，不是被改标记
+
+    # 金额按 300+200 重算，而不是沿用旧的 300
+    income = dict((c, Decimal(a)) for c, _n, a in r["income"])
+    assert income["600101"] == Decimal("500")
+
+
+def test_重新结转不误伤同期手工凭证(db, book, periods, subjects, admin_user, make_voucher):
+    """只有 source=CARRY_FORWARD 的凭证可以被删，同期手工凭证必须原样留着。"""
+    make_voucher("2026-01-10", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
+    manual = make_voucher("2026-01-11", dr=[("100201", 50, "手工")],
+                          cr=[("600101", 50, "手工")], posted=True)
+    carry_forward_profit(db, book.id, periods[1], admin_user)
+
+    carry_forward_profit(db, book.id, periods[1], admin_user, replace=True)
+
+    still = db.get(Voucher, manual.id)
+    assert still is not None, "手工凭证被误删了"
+
+
+def test_重新结转留下审计日志(db, book, periods, subjects, admin_user, make_voucher):
+    """凭证号可复用，删掉的结转凭证必须留快照，否则事后查无对证。"""
+    from app.models import AuditLog
+
+    make_voucher("2026-01-10", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
+    first = carry_forward_profit(db, book.id, periods[1], admin_user)
+    carry_forward_profit(db, book.id, periods[1], admin_user, replace=True)
+
+    row = db.scalar(
+        select(AuditLog)
+        .where(AuditLog.entity == "voucher", AuditLog.action == "DELETE")
+        .order_by(AuditLog.id.desc())
+    )
+    assert row is not None
+    assert first["vouchers"][0] in row.detail
+    assert row.before, "删除审计必须带凭证快照"
+
+
+def test_重新结转后余额仍然结平(db, book, periods, subjects, admin_user, make_voucher):
+    """重结转是一次完整替换：跑完之后损益科目照旧能结平，不能留下两张半吊子凭证。"""
+    make_voucher("2026-01-10", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
+    carry_forward_profit(db, book.id, periods[1], admin_user)
+    carry_forward_profit(db, book.id, periods[1], admin_user, replace=True)
+
+    assert db.scalar(select(func.count()).select_from(Voucher).where(
+        Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD")) == 1
+
+    # 结转凭证默认未记账，账簿看不见；记账后损益才归零
+    post_vouchers(db, [
+        v.id for v in db.scalars(
+            select(Voucher).where(Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD")
+        ).all()
+    ], admin_user)
+
+    assert bal(db, book, periods, subjects, "600101") == Decimal("0")
+    assert bal(db, book, periods, subjects, "4103") == Decimal("-300")
+
+
+def test_重新结转保留已记账状态(db, book, periods, subjects, admin_user, make_voucher):
+    """旧凭证如果已记账，重结转生成的新凭证也应当是已记账的。
+
+    否则用户明明已经记完账，点一次重结转，账簿上的数字会突然「消失」一部分。
+    """
+    make_voucher("2026-01-10", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
+    carry_forward_profit(db, book.id, periods[1], admin_user)
+    old = db.scalars(select(Voucher).where(
+        Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD")).all()
+    post_vouchers(db, [v.id for v in old], admin_user)
+
+    carry_forward_profit(db, book.id, periods[1], admin_user, replace=True)
+    db.expire_all()
+
+    new = db.scalars(select(Voucher).where(
+        Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD")).all()
+    assert new and all(v.status == "POSTED" for v in new), "重结转后凭证掉回未记账了"
+    assert bal(db, book, periods, subjects, "600101") == Decimal("0")
 
 
 def test_已结账期间不能结转(db, book, periods, subjects, admin_user, make_voucher):
@@ -314,6 +412,51 @@ def test_反结账后修改旧凭证再重新结账(db, book, periods, subjects,
     assert eng.figures(profit, periods[1].ord).closing == D("-250")
 
 
+# ----------------------------------------------------------------- 反结账 → 结转 → 结账
+
+
+def test_反结账后能直接结转损益(db, book, periods, subjects, admin_user, make_voucher):
+    """这一条钉的是「结转+结账不顺」那个真问题。
+
+    批量反结账会把区间内的凭证全部退回**未记账**，而账簿默认口径只统计
+    已记账凭证 —— 于是按已记账算出来的损益全是 0，结转损益回一句
+    「本期损益类科目全部为 0，无需结转」，用户明明看到满屏的收入凭证却
+    结不了转。结转要的是「本期实际发生额」，跟记账状态无关。
+    """
+    make_voucher("2026-01-10", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
+    carry_forward_profit(db, book.id, periods[1], admin_user)
+    close_period(db, periods[1], admin_user)
+    assert db.get(Period, periods[1].id).locked is True
+
+    batch_unclose(db, book.id, periods[1], admin_user)          # 凭证全部回到未记账
+
+    r = carry_forward_profit(db, book.id, periods[1], admin_user)   # 不该再报「无需结转」
+    assert r["replaced"] is True
+    assert r["income"] == [("600101", subjects["600101"].name, "300.00")]
+
+    close_period(db, periods[1], admin_user)                   # 结账跟着走通
+    assert db.get(Period, periods[1].id).locked is True
+
+
+def test_结账会把结转凭证一起自动记账(db, book, periods, subjects, admin_user, make_voucher):
+    make_voucher("2026-01-10", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
+    carry_forward_profit(db, book.id, periods[1], admin_user)
+    assert db.scalars(select(Voucher.status).where(
+        Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD")).all() == ["UNPOSTED"]
+
+    close_period(db, periods[1], admin_user)
+    assert db.scalars(select(Voucher.status).where(
+        Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD")).all() == ["POSTED"]
+
+
+def test_损益没结平就不许结账并说明先结转(db, book, periods, subjects, admin_user, make_voucher):
+    make_voucher("2026-01-10", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
+    with pytest.raises(ValueError, match="请先执行「结转损益」"):
+        close_period(db, periods[1], admin_user)
+    db.rollback()
+    assert db.get(Period, periods[1].id).locked is False
+
+
 # --------------------------------------------------------------------- 年度结转
 
 
@@ -325,98 +468,152 @@ def _close_year(db, book, periods, admin_user):
         close_period(db, periods[m], admin_user)
 
 
-def test_年度结转生成新账套并带入期初(db, book, periods, admin_user, make_voucher):
+def test_年度结转给同一账套追加下一年度(db, book, periods, admin_user, make_voucher):
+    """年度是账套的属性：一个账套一个年度一个账套的做法已经取消。"""
     make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
 
+    before = db.scalar(select(func.count()).select_from(Book))
     r = year_end_carry(db, book, admin_user)
 
-    new_book = db.get(Book, r["new_book_id"])
-    assert new_book.year == 2027
     assert r["new_year"] == 2027
-    assert db.get(Book, book.id).status == "CLOSED"
+    assert r["book_id"] == book.id
+    # 账套数量没变 —— 以前这里是 +1，多出一条「租金账套 XXXX 2027」
+    assert db.scalar(select(func.count()).select_from(Book)) == before
 
-    # 新账套第一期期初 = 旧账套期末
-    first = db.scalar(
-        select(Period).where(Period.book_id == new_book.id).order_by(Period.ord).limit(1)
-    )
-    bank_new = db.scalar(
-        select(Subject).where(Subject.book_id == new_book.id, Subject.code == "100201")
-    )
-    opening = db.scalar(
-        select(PeriodOpening).where(
-            PeriodOpening.book_id == new_book.id,
-            PeriodOpening.subject_id == bank_new.id,
-        )
-    )
+    years = db.scalars(
+        select(Period.year).where(Period.book_id == book.id)
+        .group_by(Period.year).order_by(Period.year)).all()
+    assert years == [2026, 2027]
+
+
+def test_年度结转把本年期末写成下一年1月期初(db, book, periods, subjects, admin_user, make_voucher):
+    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")], posted=True)
+    _close_year(db, book, periods, admin_user)
+
+    year_end_carry(db, book, admin_user)
+
+    jan27 = db.scalar(select(Period).where(Period.book_id == book.id, Period.year == 2027,
+                                          Period.month == 1))
+    bank = sid(subjects, "100201")
+    opening = db.scalar(select(PeriodOpening).where(
+        PeriodOpening.period_id == jan27.id, PeriodOpening.subject_id == bank))
     assert opening is not None and opening.amount == Decimal("1000")
 
 
-def test_年度结转继承科目表与用户授权(db, book, periods, admin_user, make_voucher):
-    make_voucher("2026-01-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")], posted=True)
+def test_跨年后账簿连续且本年累计归零(db, book, periods, subjects, admin_user, make_voucher):
+    """跨年最容易出的两个错：期初断档、本年累计变成两年累计。"""
+    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
-    r = year_end_carry(db, book, admin_user)
-    new_book_id = r["new_book_id"]
+    year_end_carry(db, book, admin_user)
 
-    old = db.scalars(select(Subject).where(Subject.book_id == book.id)).all()
-    new = db.scalars(select(Subject).where(Subject.book_id == new_book_id)).all()
-    assert len(old) == len(new)
-    assert {s.code for s in old} == {s.code for s in new}
+    from datetime import date
+    jan27 = db.scalar(select(Period).where(Period.book_id == book.id, Period.year == 2027,
+                                          Period.month == 1))
+    feb27 = db.scalar(select(Period).where(Period.book_id == book.id, Period.year == 2027,
+                                          Period.month == 2))
+    dec26 = db.scalar(select(Period).where(Period.book_id == book.id, Period.year == 2026,
+                                          Period.month == 12))
+    bank, revenue = sid(subjects, "100201"), sid(subjects, "600101")
 
-    from app.models import UserBook
-    assert db.scalar(
-        select(UserBook).where(UserBook.book_id == new_book_id, UserBook.user_id == admin_user.id)
-    ) is not None
+    create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2027, 2, 10),
+                   entries=[
+                       {"subject_id": bank, "direction": "DEBIT", "amount": Decimal("50"), "summary": "n"},
+                       {"subject_id": revenue, "direction": "CREDIT", "amount": Decimal("50"), "summary": "n"},
+                   ])
+    post_vouchers(db, [db.scalar(select(Voucher.id).where(
+        Voucher.book_id == book.id).order_by(Voucher.id.desc()).limit(1))], admin_user)
+
+    eng = LedgerEngine(db, book.id)
+    # ord 跨年度连续：2027-01 紧接 2026-12
+    assert jan27.ord == dec26.ord + 1
+    # 期初断档是最致命的错：上一年期末必须等于下一年期初
+    assert eng.figures(bank, jan27.ord).opening == eng.figures(bank, dec26.ord).closing == Decimal("1000")
+    assert eng.figures(bank, feb27.ord).closing == Decimal("1050")
+    # 本年累计只在 2027 年里数：不能把 2026 年那 1000 也算进来
+    assert eng.figures(bank, jan27.ord).dr_cum == Decimal("0")
+    assert eng.figures(bank, feb27.ord).dr_cum == Decimal("50")
+    # 2026 年的本年累计仍然是 1000
+    assert eng.figures(bank, dec26.ord).dr_cum == Decimal("1000")
 
 
-def test_年度结转把本年利润转到未分配利润(db, book, periods, admin_user, make_voucher):
+def test_年度结转把本年利润转到未分配利润(db, book, periods, subjects, admin_user, make_voucher):
     """利润表算出来的钱，最终要落到 4104 未分配利润上。"""
     make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
 
-    r = year_end_carry(db, book, admin_user)
-    new_book = db.get(Book, r["new_book_id"])
+    year_end_carry(db, book, admin_user)
 
-    retained = db.scalar(
-        select(Subject).where(Subject.book_id == new_book.id, Subject.code == "4104")
-    )
-    first = db.scalar(
-        select(Period).where(Period.book_id == new_book.id).order_by(Period.ord).limit(1)
-    )
-    opening = db.scalar(
-        select(PeriodOpening).where(
-            PeriodOpening.book_id == new_book.id, PeriodOpening.subject_id == retained.id
-        )
-    )
+    retained = sid(subjects, "4104")
+    jan27 = db.scalar(select(Period).where(Period.book_id == book.id, Period.year == 2027,
+                                          Period.month == 1))
+    opening = db.scalar(select(PeriodOpening).where(
+        PeriodOpening.period_id == jan27.id, PeriodOpening.subject_id == retained))
     assert opening is not None and opening.amount == Decimal("-1000")   # 贷方未分配利润
 
 
-def test_新账套期初可被新凭证正确累加(db, book, periods, admin_user, make_voucher):
-    """跨年度后，期初必须能被引擎读到并继续滚存。"""
+def test_已结出下一年度后不能再结一次(db, book, periods, admin_user, make_voucher):
+    """结完 2026 之后，账套的「当前年度」就是 2027。
+
+    再点年度结转应该针对 2027，而且得先结完 2027 的账 ——
+    不能悄悄把 2027 直接跳到 2028。
+    """
     make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
-    r = year_end_carry(db, book, admin_user)
-    new_book = db.get(Book, r["new_book_id"])
+    year_end_carry(db, book, admin_user)
 
-    first = db.scalar(
-        select(Period).where(Period.book_id == new_book.id).order_by(Period.ord).limit(1)
-    )
-    second = db.scalar(
-        select(Period).where(Period.book_id == new_book.id, Period.ord == 2)
-    )
-    bank = db.scalar(select(Subject).where(Subject.book_id == new_book.id, Subject.code == "100201"))
-    revenue = db.scalar(select(Subject).where(Subject.book_id == new_book.id, Subject.code == "600101"))
+    with pytest.raises(ValueError, match="2027 年度结转前必须全部结账"):
+        year_end_carry(db, book, admin_user)
+    db.rollback()
 
-    from datetime import date
-    create_voucher(db, book_id=new_book.id, user=admin_user,
-                   voucher_date=date(2027, 2, 10),
-                   entries=[
-                       {"subject_id": bank.id, "direction": "DEBIT", "amount": Decimal("50"), "summary": "n"},
-                       {"subject_id": revenue.id, "direction": "CREDIT", "amount": Decimal("50"), "summary": "n"},
-                   ])
-    post_vouchers(db, [db.scalar(select(Voucher.id).where(
-        Voucher.book_id == new_book.id).order_by(Voucher.id.desc()).limit(1))], admin_user)
 
-    eng = LedgerEngine(db, new_book.id)
-    assert eng.figures(bank.id, first.ord).closing == Decimal("1000")
-    assert eng.figures(bank.id, second.ord).closing == Decimal("1050")
+def test_年度结转不接受跨过一年的目标(db, book, periods, admin_user, make_voucher):
+    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")], posted=True)
+    _close_year(db, book, periods, admin_user)
+
+    with pytest.raises(ValueError, match="只能结转到紧接的下一个年度"):
+        year_end_carry(db, book, admin_user, 2029)
+    db.rollback()
+
+
+# --------------------------------------------------------------------- HTTP 层
+#
+# 上面测的是 service 层。这里补两条真实请求：前端按钮就是靠这两个接口驱动的，
+# 少测一层就可能「函数对了但页面点不动」。
+
+
+def test_状态接口在未结转时返回空(client, auth, book, periods):
+    r = client.get(f"/api/books/{book.id}/periods/{periods[1].id}/carry-forward", headers=auth)
+    assert r.status_code == 200
+    assert r.json() == {"period": "2026-01", "has": False, "vouchers": [], "posted": False}
+
+
+def test_重新结转走HTTP接口(client, auth, book, periods, make_voucher):
+    make_voucher("2026-01-10", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
+    first = client.post(f"/api/books/{book.id}/periods/{periods[1].id}/carry-forward",
+                        json={}, headers=auth)
+    assert first.status_code == 200, first.text
+    old = first.json()["vouchers"]
+
+    st = client.get(f"/api/books/{book.id}/periods/{periods[1].id}/carry-forward", headers=auth).json()
+    assert st["has"] is True and st["vouchers"] == old
+
+    # 重复点同一个按钮不再报错：直接删旧重建
+    rebuilt = client.post(f"/api/books/{book.id}/periods/{periods[1].id}/carry-forward",
+                          json={"replace": True}, headers=auth)
+    assert rebuilt.status_code == 200, rebuilt.text
+    body = rebuilt.json()
+    assert body["replaced"] is True and body["removed"] == old
+    assert body["vouchers"]                              # 生成了新的
+
+
+def test_只读账套不能结转(client, db, book, periods, plain_user, plain_auth):
+    """只读成员连「重新结转」都不该能点 —— 那会删凭证。"""
+    from app.models import UserBook
+
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="VIEWER"))
+    db.commit()
+    r = client.post(f"/api/books/{book.id}/periods/{periods[1].id}/carry-forward",
+                    json={"replace": True}, headers=plain_auth)
+    assert r.status_code == 403
+    assert "只读" in r.json()["detail"]

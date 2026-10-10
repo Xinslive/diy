@@ -130,6 +130,11 @@ def update_voucher(
     period = db.get(Period, voucher.period_id)
     if period.locked:
         raise ValueError(f"{period.code} 已结账，不能修改凭证")
+    # 已记账 = 已进账簿，数字已经被总账/报表引用。改它必须先反记账，
+    # 否则「报表里的数和凭证里写的数」会对不上，且没人知道差在哪一步。
+    if voucher.status == "POSTED":
+        raise ValueError(
+            f"凭证 {voucher.voucher_no} 已记账，不能修改。请先在凭证列表里「反记账」再改。")
 
     if "voucher_date" in payload and payload["voucher_date"]:
         new_date = payload["voucher_date"]
@@ -182,6 +187,9 @@ def update_voucher(
 
 def delete_voucher(db: Session, voucher: Voucher, user: SysUser) -> None:
     """删除凭证。因为编号可复用，必须把内容快照写进审计日志。"""
+    if voucher.status == "POSTED":
+        raise ValueError(
+            f"凭证 {voucher.voucher_no} 已记账，不能删除。请先在凭证列表里「反记账」再删。")
     snapshot = voucher_snapshot(voucher)
     log(
         db,
@@ -200,7 +208,9 @@ def delete_voucher(db: Session, voucher: Voucher, user: SysUser) -> None:
 # --------------------------------------------------------------------- 记账
 
 
-def post_vouchers(db: Session, voucher_ids: list[int], user: SysUser) -> int:
+def post_vouchers(db: Session, voucher_ids: list[int], user: SysUser,
+                  commit: bool = True) -> int:
+    """批量记账。``commit=False`` 让调用方把多步操作合成一个事务。"""
     if not voucher_ids:
         return 0
     vouchers = list(db.scalars(select(Voucher).where(Voucher.id.in_(voucher_ids))).all())
@@ -227,7 +237,8 @@ def post_vouchers(db: Session, voucher_ids: list[int], user: SysUser) -> int:
     db.flush()
     log(db, action="POST", entity="voucher", entity_id="batch", user=user,
         book_id=vouchers[0].book_id, detail=f"记账 {count} 张凭证", after={"ids": voucher_ids})
-    db.commit()
+    if commit:
+        db.commit()
     return count
 
 

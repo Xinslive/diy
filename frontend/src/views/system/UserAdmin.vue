@@ -151,11 +151,12 @@ const userForm = reactive({ username: '', real_name: '', password: '', books: {}
 const grant = reactive({ books: {} })
 
 const bookRows = computed(() =>
-  books.value.map((b) => ({ id: b.id, label: `${b.company_name} · ${b.name} ${b.year}` }))
+  // 年度是账套的属性，账套本身不再按年度拆开，所以这里不带年份
+  books.value.map((b) => ({ id: b.id, label: `${b.company_name} · ${b.name}` }))
 )
 const bookLabel = (id) => {
   const b = books.value.find((x) => x.id === id)
-  return b ? `${b.company_name} · ${b.name} ${b.year}` : `#${id}`
+  return b ? `${b.company_name} · ${b.name}` : `#${id}`
 }
 
 function blankGrant() {

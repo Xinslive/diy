@@ -39,6 +39,7 @@ from app.models import (
     UserBook,
     Voucher,
 )
+from app.models.book import period_ord
 
 PROFIT_SUBJECT_CODE = "4103"     # 本年利润
 RETAINED_SUBJECT_CODE = "4104"   # 利润分配 — 未分配利润
@@ -235,28 +236,77 @@ def batch_unclose(
 # --------------------------------------------------------------------- 结转损益
 
 
-def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUser) -> dict:
-    """月末结转损益：把损益类科目余额结转到「本年利润」。"""
-    period = db.execute(select(Period).where(Period.id == period.id).with_for_update()).scalar_one()
-    if period.locked:
-        raise ValueError(f"{period.code} 已结账，不能结转")
+def carry_forward_status(db: Session, period: Period) -> dict:
+    """本期是否已结转损益，以及已生成哪几张凭证。
 
-    # 幂等护栏：结转生成的凭证默认是「未记账」，而账簿默认口径只统计已记账，
-    # 所以「损益是否已结平」这判断在刚结转完是看不见的 —— 连点两次就会生成
-    # 两张结转凭证，把本年利润翻倍。必须显式挡一次。
-    existing = list(
+    前端据此把按钮在「执行结转损益」和「重新结转损益」之间切换，
+    并在确认框里点名将被删除的凭证 —— 删之前必须让人知道删的是哪几张。
+    """
+    rows = _carry_forward_vouchers(db, period)
+    return {
+        "period": period.code,
+        "has": bool(rows),
+        "vouchers": [v.voucher_no for v in rows],
+        # 全都已记账才算已记账：混着来的话重结转会按未记账处理，需要提示用户
+        "posted": bool(rows) and all(v.status == "POSTED" for v in rows),
+    }
+
+
+def _carry_forward_vouchers(db: Session, period: Period) -> list[Voucher]:
+    return list(
         db.scalars(
             select(Voucher).where(
                 Voucher.period_id == period.id, Voucher.source == "CARRY_FORWARD"
             ).order_by(Voucher.id)
         ).all()
     )
-    if existing:
-        nos = "、".join(v.voucher_no for v in existing)
-        raise ValueError(
-            f"{period.code} 已执行过结转损益（凭证 {nos}）。"
-            f"如需重新结转，请先删除这几张凭证再操作。"
+
+
+def _drop_carry_forward(db: Session, period: Period, existing: list[Voucher],
+                        user: SysUser) -> list[str]:
+    """删掉本期已生成的结转凭证，为重新结转腾位置。
+
+    只删 ``source == "CARRY_FORWARD"`` 的凭证：同期的手工凭证哪怕金额一样也
+    不该被牵连。每张都留下审计快照 —— 凭证号可复用，删掉就再也查不回来了。
+    """
+    from app.accounting.audit_helper import voucher_snapshot
+
+    removed = []
+    for v in existing:
+        log(
+            db, action="DELETE", entity="voucher", entity_id=v.id, user=user,
+            book_id=v.book_id,
+            detail=f"重新结转损益：删除旧结转凭证 {v.voucher_no}",
+            before=voucher_snapshot(v),
         )
+        removed.append(v.voucher_no)
+        db.delete(v)
+    db.flush()
+    return removed
+
+
+def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUser,
+                         replace: bool = True) -> dict:
+    """月末结转损益：把损益类科目余额结转到「本年利润」。
+
+    永远「先删旧、再重算」：本期只要已经有结转凭证，就删掉重新生成。
+    财务最常见的动作就是「结完发现金额不对，改完再结一次」，
+    让人自己去凭证列表里找出来删，既啰嗦又容易漏。
+    """
+    period = db.execute(select(Period).where(Period.id == period.id).with_for_update()).scalar_one()
+    if period.locked:
+        raise ValueError(f"{period.code} 已结账，不能结转")
+
+    existing = _carry_forward_vouchers(db, period)
+    removed: list[str] = []
+    keep_posted = False
+    if existing:
+        # 记账状态要跟着重来：账簿只统计已记账凭证，若旧的是已记账而新生成的是
+        # 未记账，用户点一次重结转，账上的数字就会凭空变一笔。
+        keep_posted = all(v.status == "POSTED" for v in existing)
+        removed = _drop_carry_forward(db, period, existing, user)
+        # 旧凭证已经 flush 掉，下面重算余额时看到的才是「未结转」的真实损益
+        db.flush()
 
     profit = _subject_by_code(db, book_id, PROFIT_SUBJECT_CODE)
     if profit is None:
@@ -274,7 +324,12 @@ def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUse
         ).all()
     )
 
-    eng = LedgerEngine(db, book_id)
+    # 口径：**含未记账**。账簿默认只统计已记账凭证，可反结账会把区间内的凭证
+    # 全部退回未记账 —— 那一刻按已记账口径算出来的损益全是 0，
+    # 结转损益就会回一句「无需结转」，而用户明明看到满屏的收入凭证。
+    # 期末结转要的是「本期实际发生额」，跟记账状态无关；
+    # 新生成的结转凭证默认也是未记账，结账时统一自动记账，口径自然对齐。
+    eng = LedgerEngine(db, book_id, include_unposted=True)
     fmap = eng.compute([s.id for s in subjects], period.ord)
 
     income, expense = [], []
@@ -285,13 +340,18 @@ def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUse
         (expense if bal > 0 else income).append((s, abs(bal)))
 
     if not income and not expense:
-        raise ValueError("本期损益类科目全部为 0，无需结转")
+        raise ValueError(
+            f"{period.code} 损益类科目本期发生额全部为 0，没有可结转的内容"
+            + ("（该期间已结账，若要重做请先反结账）" if not removed else "")
+        )
 
     from app.accounting.vouchers import create_voucher
 
     last_day = date(period.year, period.month, _days_in_month(period.year, period.month))
     created = []
 
+    # 两张凭证一起提交，不各自 commit：replace 模式下旧凭证已经删掉了，
+    # 中途失败若留下「删了旧的、只生成一半新的」，比直接报错糟糕得多。
     if income:
         entries = [{"subject_id": s.id, "direction": "DEBIT", "amount": amt,
                     "summary": f"结转{period.code}损益"} for s, amt in income]
@@ -299,7 +359,7 @@ def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUse
                         "amount": sum(a for _, a in income), "summary": f"结转{period.code}损益"})
         created.append(create_voucher(
             db, book_id=book_id, user=user, voucher_date=last_day, entries=entries,
-            source="CARRY_FORWARD", remark=f"{period.code} 结转损益（收入类）"))
+            source="CARRY_FORWARD", remark=f"{period.code} 结转损益（收入类）", commit=False))
 
     if expense:
         entries = [{"subject_id": profit.id, "direction": "DEBIT",
@@ -308,11 +368,30 @@ def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUse
                      "summary": f"结转{period.code}损益"} for s, amt in expense]
         created.append(create_voucher(
             db, book_id=book_id, user=user, voucher_date=last_day, entries=entries,
-            source="CARRY_FORWARD", remark=f"{period.code} 结转损益（成本费用类）"))
+            source="CARRY_FORWARD", remark=f"{period.code} 结转损益（成本费用类）", commit=False))
+
+    nos = [v.voucher_no for v in created]
+    if created and keep_posted:
+        from app.accounting.vouchers import post_vouchers
+
+        post_vouchers(db, [v.id for v in created], user, commit=False)
+    db.commit()
+
+    log(
+        db, action="CARRY_FORWARD", entity="period", entity_id=period.id, user=user,
+        book_id=book_id,
+        detail=(
+            f"结转损益 {period.code}，生成凭证 {'、'.join(nos)}"
+            + (f"，删除旧结转凭证 {'、'.join(removed)}" if removed else "")
+        ),
+    )
+    db.commit()
 
     return {
         "period": period.code,
-        "vouchers": [v.voucher_no for v in created],
+        "vouchers": nos,
+        "removed": removed,
+        "replaced": bool(removed),
         "income": [(s.code, s.name, str(amt)) for s, amt in income],
         "expense": [(s.code, s.name, str(amt)) for s, amt in expense],
     }
@@ -325,8 +404,20 @@ def _days_in_month(year: int, month: int) -> int:
 # --------------------------------------------------------------------- 年度结转
 
 
-def year_end_carry(db: Session, book: Book, user: SysUser, new_book_name: str | None = None) -> dict:
-    """年度结转：生成本年利润结转凭证，并生成下一年度账套及其期初余额。"""
+def year_end_carry(db: Session, book: Book, user: SysUser, new_year: int | None = None) -> dict:
+    """年度结转：给**同一个账套**追加下一个会计年度。
+
+    以前这里是「新建一个下一年度的账套」—— 复制科目表、复制授权、再把
+    本年期末余额搬过去当新账套的期初。后果是账套列表一年一行，
+    同一个单位被拆成一堆「租金账套037569 / 租金账套037569 2027」，
+    用户每过一年就要重新认一遍哪个才是自己在用的。
+
+    正确做法：年度只是账套的一个属性。结转要做的是
+      1) 结转本年利润（落在本年 12 月）
+      2) 追加下一年的 12 个会计期间，ord 接着往下排
+      3) 把本年期末余额写成下一年 1 月的期初快照
+    科目表、授权、期初录入都不用动 —— 它们本来就是账套的属性。
+    """
     from app.accounting.vouchers import create_voucher, post_vouchers
 
     periods = list(
@@ -334,11 +425,20 @@ def year_end_carry(db: Session, book: Book, user: SysUser, new_book_name: str | 
     )
     if not periods:
         raise ValueError("账套尚未初始化会计期间")
-    last = periods[-1]
 
-    open_periods = [p.code for p in periods if not p.locked]
+    # 只在「最后一个年度」上做结转，已经结出更晚年度了就别重复结
+    current_year = periods[-1].year
+    if new_year is not None and new_year != current_year + 1:
+        raise ValueError(
+            f"只能结转到紧接的下一个年度（{current_year + 1}），收到的是 {new_year}")
+    target_year = current_year + 1
+
+    year_periods = [p for p in periods if p.year == current_year]
+    open_periods = [p.code for p in year_periods if not p.locked]
     if open_periods:
-        raise ValueError(f"年度结转前必须全部结账，仍未结账：{', '.join(open_periods)}")
+        raise ValueError(f"{current_year} 年度结转前必须全部结账，仍未结账：{', '.join(open_periods)}")
+
+    last = year_periods[-1]
 
     # 1. 结转本年利润
     #    这张凭证必须落在本年最后一个月，若该期已结账则先解锁再补做 ——
@@ -367,100 +467,74 @@ def year_end_carry(db: Session, book: Book, user: SysUser, new_book_name: str | 
                  "summary": "结转本年利润"},
             ]
             create_voucher(db, book_id=book.id, user=user,
-                           voucher_date=date(book.year, 12, 31), entries=entries,
-                           source="CARRY_FORWARD", remark=f"{book.year}年 结转本年利润")
+                           voucher_date=date(current_year, 12, 31), entries=entries,
+                           source="CARRY_FORWARD", remark=f"{current_year}年 结转本年利润")
             db.commit()
 
             # 追加凭证后 12 月又变成未记账，重新记账并结账
-            from app.accounting.vouchers import post_vouchers
-
             new_id = db.scalar(
                 select(Voucher.id).where(
-                    Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD"
+                    Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD",
+                    Voucher.remark == f"{current_year}年 结转本年利润",
                 ).order_by(Voucher.id.desc()).limit(1)
             )
             post_vouchers(db, [new_id], user)
             close_period(db, last, user)
-
     db.commit()
 
-    # 2. 生成下一年度账套
-    new_book = Book(
-        company_name=book.company_name,
-        name=new_book_name or f"{book.name} {book.year + 1}",
-        year=book.year + 1,
-        start_month=book.start_month,
-    )
-    db.add(new_book)
-    db.flush()
-    # 继承源账套的授权，新账套才对老用户可见
-    for link in db.scalars(select(UserBook).where(UserBook.book_id == book.id)).all():
-        db.add(UserBook(user_id=link.user_id, book_id=new_book.id, role=link.role))
-    _copy_subjects(db, book.id, new_book.id)
-    _create_periods(db, new_book)
+    # 2. 追加下一年的会计期间（ord 跨年度连续，接着往下排）
+    new_periods = ensure_periods(db, book, target_year)
 
-    # 3. 期初余额 = 本年期末余额
+    # 3. 下一年 1 月的期初 = 本年期末
     eng = LedgerEngine(db, book.id)
     subjects = db.scalars(
         select(Subject).where(Subject.book_id == book.id, Subject.is_leaf.is_(True),
                               Subject.active.is_(True))).all()
     fmap = eng.compute([s.id for s in subjects], last.ord)
 
-    new_leaves = {
-        s.code: s for s in db.scalars(
-            select(Subject).where(Subject.book_id == new_book.id, Subject.is_leaf.is_(True))
-        ).all()
-    }
-    first_period = db.scalar(
-        select(Period).where(Period.book_id == new_book.id).order_by(Period.ord).limit(1)
-    )
+    first = new_periods[0]
+    # 已经结过一次就不重复写，否则「再点一次年度结转」会叠加出一份期初
+    exists = db.scalar(select(PeriodOpening.id).where(PeriodOpening.period_id == first.id).limit(1))
+    if exists is not None:
+        raise ValueError(f"{target_year} 年度已经结转过了（{first.code} 已有期初余额）")
+
     count = 0
     for s in subjects:
         amount = fmap[s.id].closing
         if amount == ZERO:
             continue
-        target = new_leaves.get(s.code)
-        if target is None:
-            continue
-        db.add(PeriodOpening(book_id=new_book.id, period_id=first_period.id,
-                             subject_id=target.id, amount=amount))
+        db.add(PeriodOpening(book_id=book.id, period_id=first.id,
+                             subject_id=s.id, amount=amount))
         count += 1
 
-    book.status = "CLOSED"
     log(db, action="YEAR_END", entity="book", entity_id=book.id, user=user,
         book_id=book.id,
-        detail=f"年度结转：{book.year} → {new_book.year}，结转 {count} 条期初余额")
+        detail=f"年度结转：{current_year} → {target_year}，结转 {count} 条期初余额")
     db.commit()
-    return {"source_book": book.id, "new_book_id": new_book.id,
-            "new_year": new_book.year, "carried_subjects": count,
-            "unlocked_for_carry": unlocked_for_carry}
+    return {"book_id": book.id, "new_year": target_year, "carried_subjects": count,
+            "first_period": first.code, "unlocked_for_carry": unlocked_for_carry}
 
 
-def _copy_subjects(db: Session, src_book: int, dst_book: int) -> None:
-    rows = db.scalars(
-        select(Subject).where(Subject.book_id == src_book).order_by(Subject.code)
-    ).all()
-    id_map: dict[int, int] = {}
-    for s in rows:
-        new = Subject(
-            book_id=dst_book, code=s.code, name=s.name, parent_id=None, level=s.level,
-            category=s.category, direction=s.direction, is_leaf=s.is_leaf,
-            carry_forward=s.carry_forward, sort_no=s.sort_no, active=s.active,
-            ext_attrs=s.ext_attrs,
-        )
-        db.add(new)
-        db.flush()
-        id_map[s.id] = new.id
-    for s in rows:
-        if s.parent_id and s.parent_id in id_map:
-            target = db.get(Subject, id_map[s.id])
-            target.parent_id = id_map[s.parent_id]
-    db.flush()
+def ensure_periods(db: Session, book: Book, year: int) -> list[Period]:
+    """确保某个年度的 12 个会计期间存在，返回该年度的期间（按 ord 升序）。
 
-
-def _create_periods(db: Session, book: Book) -> list[Period]:
-    out = [Period(book_id=book.id, year=book.year, month=m, ord=m, locked=False)
-           for m in range(1, 13)]
+    账套第一年从 start_month 开始（启用月之前不出现在账上），
+    之后的年度都从 1 月起。已存在就原样返回，不改动任何期间状态。
+    """
+    rows = list(
+        db.scalars(
+            select(Period).where(Period.book_id == book.id, Period.year == year)
+            .order_by(Period.ord)
+        ).all()
+    )
+    if rows:
+        return rows
+    months = range(book.start_month, 13) if year == book.start_year else range(1, 13)
+    out = [
+        Period(book_id=book.id, year=year, month=m,
+               ord=period_ord(year, m, book.start_year), locked=False)
+        for m in months
+    ]
     for p in out:
         db.add(p)
     db.flush()
@@ -468,4 +542,5 @@ def _create_periods(db: Session, book: Book) -> list[Period]:
 
 
 def create_periods(db: Session, book: Book) -> list[Period]:
-    return _create_periods(db, book)
+    """建账套时铺第一年的会计期间。"""
+    return ensure_periods(db, book, book.start_year)

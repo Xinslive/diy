@@ -166,6 +166,13 @@ def batch_delete(payload: BatchIds, book: Book = Depends(get_my_book), db: Sessi
     _guard(link)
     rows = list(db.scalars(select(Voucher).where(
         Voucher.id.in_(payload.ids), Voucher.book_id == book.id)).all())
+    # 先整批体检再删：批量选中 20 张、其中 1 张已记账时，
+    # 逐张删到那张才报错的话，用户只知道「删失败」却不知道是哪一张。
+    posted = [v.voucher_no for v in rows if v.status == "POSTED"]
+    if posted:
+        raise HTTPException(
+            400, f"已记账的凭证不能删除，请先反记账：{'、'.join(posted[:10])}"
+                 + ("…" if len(posted) > 10 else ""))
     try:
         for v in rows:
             svc.delete_voucher(db, v, user)

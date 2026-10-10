@@ -5,7 +5,7 @@
 
 三个原语：
     期初期初期初期初(科目, 期间)
-    借方累计(科目, 期间)     账套起始月 .. 期间 的已记账借方合计
+    借方累计(科目, 期间)     该期间**本年 1 月** .. 期间的已记账借方合计
     贷方累计(科目, 期间)
 
 派生：
@@ -26,6 +26,7 @@ from sqlalchemy import Select, and_, func, select
 from sqlalchemy.orm import Session
 
 from app.models import Book, Entry, Period, PeriodOpening, Subject, Voucher
+from app.models.book import book_first_ord
 
 ZERO = Decimal("0")
 
@@ -37,8 +38,8 @@ class Figures:
     subject_id: int
     ord: int
     opening: Decimal = ZERO      # signed
-    dr_cum: Decimal = ZERO       # 累计借方发生额
-    cr_cum: Decimal = ZERO       # 累计贷方发生额
+    dr_cum: Decimal = ZERO       # **本年**累计借方发生额（每年 1 月归零）
+    cr_cum: Decimal = ZERO       # **本年**累计贷方发生额（每年 1 月归零）
     period_dr: Decimal = ZERO    # 当期借方发生额
     period_cr: Decimal = ZERO    # 当期贷方发生额
 
@@ -177,6 +178,23 @@ class LedgerEngine:
         out.update({k: v for k, v in own.items() if k not in out})
         return out
 
+    def range_movements(self, subject_ids: list[int], from_ord: int,
+                        to_ord: int) -> dict[int, tuple[Decimal, Decimal]]:
+        """区间发生额合计：subject_id -> (借方, 贷方)。
+
+        不能用「累计相减」求区间发生额 —— dr_cum/cr_cum 是**本年**累计，
+        区间跨过年界（比如 2026-12 到 2027-02）时相减会得到乱七八糟的数。
+        这里直接把区间内各期的发生额加起来，跨多少年都对。
+        """
+        moves = self._cum_movements(to_ord)
+        acc = {sid: [ZERO, ZERO] for sid in subject_ids}
+        for (sid, o), (dr, cr) in moves.items():
+            cell = acc.get(sid)
+            if cell is not None and from_ord <= o <= to_ord:
+                cell[0] += dr
+                cell[1] += cr
+        return {sid: (cell[0], cell[1]) for sid, cell in acc.items()}
+
     # ---------------- 批量计算 ----------------
 
     def compute(self, subject_ids: list[int] | None = None, up_to_ord: int | None = None) -> dict[int, Figures]:
@@ -185,8 +203,7 @@ class LedgerEngine:
         报表模板会同时引用几十个科目，批量接口保证每个科目只扫一次索引。
         """
         pmap = self._period_map()
-        book = self._book()
-        start = book.start_month
+        start = book_first_ord(self._book())
         top = up_to_ord if up_to_ord is not None else max(pmap) if pmap else start
         if top < start:
             top = start
@@ -202,10 +219,14 @@ class LedgerEngine:
             )
 
         # 逐期推进：
-        #   期初(P)   = 期初(P-1) + 本期借方(P-1) - 本期贷方(P-1)
-        #   借方累计(P) = 借方累计(P-1) + 本期借方(P)
+        #   期初(P)     = 期初(P-1) + 本期借方(P-1) - 本期贷方(P-1)
+        #   本年借方累计(P) = 本年借方累计(P-1) + 本期借方(P)
         # 注意这里用的是「本期发生额」而不是「累计发生额」——
         # 用累计值会让期初逐月重复累加，余额虚增。
+        #
+        # ord 是跨年度连续的，所以「本年累计」必须在每个年度的 1 月归零。
+        # 不归零的话，2027 年 1 月的「本年累计」会把 2026 全年的数也算进去，
+        # 利润表 / 资产负债表的年初数就会变成「两年累计」。
         result: dict[int, Figures] = {}
         for sid in subject_ids:
             opening = snapshots.get((sid, start), ZERO)
@@ -214,6 +235,10 @@ class LedgerEngine:
             for o in range(start, top + 1):
                 if (sid, o) in snapshots:
                     opening = snapshots[(sid, o)]
+                if o > start and (o - 1) % 12 == 0:
+                    # 跨进新的一年：期初延续（快照已在上一步写入），
+                    # 本年累计从零开始
+                    dr_cum = cr_cum = ZERO
 
                 dr, cr = moves.get((sid, o), (ZERO, ZERO))
                 dr_cum += dr

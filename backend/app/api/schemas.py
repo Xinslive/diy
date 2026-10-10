@@ -35,8 +35,18 @@ class BookIn(BaseModel):
     # 公司名只是账套的一个文本属性，没有独立的「公司」实体
     company_name: str = Field(min_length=1, max_length=128)
     name: str = Field(min_length=1, max_length=128)
-    year: int
+    # 账套的起始会计年度。一个账套跨多个年度，这里填「从哪一年开始记」
+    start_year: int
     start_month: int = Field(1, ge=1, le=12)
+
+
+class BookEditIn(BaseModel):
+    """改账套的属性：只允许动名字，不动账上的任何数字。"""
+    company_name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+
+    def changes(self) -> dict:
+        return {k: v for k, v in self.model_dump().items() if v is not None}
 
 
 class OpeningIn(BaseModel):
@@ -95,12 +105,22 @@ class BatchIds(BaseModel):
 
 
 # ---- 期间 ----
+class CarryForwardIn(BaseModel):
+    """结转损益的入参。
+
+    结转永远是「有旧凭证就删掉重算」，这个字段保留只是为了兼容旧前端调用，
+    不再影响行为。
+    """
+    replace: bool = True
+
+
 class UncloseIn(BaseModel):
     revert_posting: bool = True
 
 
 class YearEndIn(BaseModel):
-    new_book_name: Optional[str] = None
+    # 年度结转不再新建账套，只能指定「紧接的下一个年度」
+    new_year: Optional[int] = None
 
 
 # ---- 报表 ----

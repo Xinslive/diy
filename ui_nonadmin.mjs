@@ -1,0 +1,26 @@
+import { chromium } from 'playwright'
+const b = await chromium.launch(); const p = await b.newPage({ viewport: { width: 1400, height: 900 } })
+const errs = []
+await p.goto('http://127.0.0.1:5173', { waitUntil: 'networkidle' })
+await p.locator('input').nth(0).fill('acct_ui')
+await p.locator('input').nth(1).fill('acct12345')
+const btn = p.locator('button:has-text("登录")')
+if (await btn.count()) { await btn.click(); await p.waitForTimeout(2500) }
+else { await p.click('button:has-text("注册")'); await p.waitForTimeout(2000)
+  await p.locator('input').nth(0).fill('acct_ui'); await p.locator('input').nth(1).fill('acct12345')
+  await p.locator('input').nth(2).fill('测试会计').catch(()=>{})
+  await p.click('button:has-text("注册并登录"), button:has-text("登录")'); await p.waitForTimeout(2500) }
+const items = (await p.locator('.el-menu .el-menu-item').allInnerTexts()).map(s => s.trim())
+console.log('普通用户菜单:', items.join(' | '))
+if (items.some(t => t.includes('操作日志'))) errs.push('普通用户仍能看到操作日志')
+if (items.some(t => t.includes('用户与授权'))) errs.push('普通用户仍能看到用户与授权')
+await p.goto('http://127.0.0.1:5173/#/audit'); await p.waitForTimeout(1500)
+const url = p.url()
+console.log('直接敲 /#/audit 之后:', url)
+if (url.includes('/audit')) errs.push('普通用户手敲地址栏进了操作日志')
+await p.goto('http://127.0.0.1:5173/#/users'); await p.waitForTimeout(1500)
+console.log('直接敲 /#/users 之后:', p.url())
+if (p.url().includes('/users')) errs.push('普通用户手敲地址栏进了用户与授权')
+await p.screenshot({ path: '/Volumes/KIOXIA/home/Documents/ChatGPT/财务记账系统/.shots/v-nonadmin.png' })
+console.log(errs.length ? '❌ ' + errs.join('\n') : '✅ 普通用户看不到操作日志，也进不去')
+await b.close()

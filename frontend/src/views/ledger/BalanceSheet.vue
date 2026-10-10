@@ -16,7 +16,7 @@
       <div class="report-head">
         <h2 class="report-title">科目余额表</h2>
         <div class="report-sub">
-          {{ store.currentBook?.company_name }} · {{ store.currentBook?.name }} {{ store.currentBook?.year }}
+          {{ store.currentBook?.company_name }} · {{ store.currentBook?.name }} {{ store.currentPeriod?.code }}
           · 期间 {{ data.period }}
         </div>
       </div>

@@ -122,7 +122,7 @@ def test_cross_book_subject_rejected(client, auth, db, book, subjects, admin_use
     from app.seed.chart_of_accounts import install_chart
 
     other = Book(company_name=f"别家公司{uuid.uuid4().hex[:8]}", name="别家账套",
-                 year=2026, start_month=1)
+                 start_year=2026, start_month=1)
     db.add(other)
     db.flush()
     create_periods(db, other)
@@ -261,3 +261,85 @@ def test_parse_rejects_garbage_and_empty(client, auth, book_id):
     r2 = client.post(f"/api/books/{book_id}/openings/parse", headers=auth, files={
         "file": ("o.xlsx", _xlsx([]), XLSX_MIME)})
     assert r2.status_code == 400
+
+
+# --------------------------------------------------------------------- 账套本身
+
+
+def test_账套列表一行一个账套并带年度列表(client, auth, book, db, admin_user):
+    """年度是账套的属性，列表里不能一年一行。"""
+    make = client.post("/api/books", json={
+        "company_name": book.company_name, "name": book.name,
+        "start_year": 2026, "start_month": 1}, headers=auth)
+    assert make.status_code == 400, "同名账套应该被挡住"
+
+    got = client.get("/api/books", headers=auth).json()
+    row = next(b for b in got if b["id"] == book.id)
+    assert row["start_year"] == 2026
+    assert row["latest_year"] == 2026
+    assert [y["year"] for y in row["years"]] == [2026]
+    assert row["years"][0]["total"] == 12
+    assert row["years"][0]["closed"] == 0
+    assert row["years"][0]["carried"] is False
+
+
+def test_年度结转后列表仍是同一行年度变多(client, auth, db, book, periods, make_voucher, admin_user):
+    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")], posted=True)
+
+    from app.accounting.periods import carry_forward_profit, close_period
+    from app.models import Voucher
+
+    for m in range(1, 13):
+        if db.scalar(select(Voucher.id).where(
+                Voucher.book_id == book.id, Voucher.period_id == periods[m].id)):
+            carry_forward_profit(db, book.id, periods[m], admin_user)
+        close_period(db, periods[m], admin_user)
+
+    r = client.post(f"/api/books/{book.id}/year-end", json={}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.json()["new_year"] == 2027
+
+    got = client.get("/api/books", headers=auth).json()
+    assert len([b for b in got if b["company_name"] == book.company_name
+                and b["name"] == book.name]) == 1
+    row = next(b for b in got if b["id"] == book.id)
+    assert [y["year"] for y in row["years"]] == [2026, 2027]
+    assert row["latest_year"] == 2027
+    assert row["years"][0]["carried"] is True     # 2026 已结完
+    assert row["years"][1]["carried"] is False    # 2027 才刚开始
+
+
+def test_可以改账套名和单位名(client, auth, book):
+    r = client.put(f"/api/books/{book.id}",
+                   json={"company_name": "新单位名", "name": "新账套名"}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"id": book.id, "company_name": "新单位名", "name": "新账套名"}
+
+    again = client.get(f"/api/books/{book.id}", headers=auth).json()
+    assert again["company_name"] == "新单位名" and again["name"] == "新账套名"
+
+
+def test_改账套名_重名要挡并且留痕(client, db, book, auth):
+    # 同一个单位下已经有一个同名账套了
+    client.post("/api/books", json={"company_name": book.company_name, "name": "重复的名字",
+                                    "start_year": 2026}, headers=auth)
+
+    dup = client.put(f"/api/books/{book.id}", json={"name": "重复的名字"}, headers=auth)
+    assert dup.status_code == 400 and "同名" in dup.json()["detail"]
+
+    ok = client.put(f"/api/books/{book.id}", json={"name": "改名了"}, headers=auth)
+    assert ok.status_code == 200
+
+    from app.models import AuditLog
+    row = db.scalar(select(AuditLog).where(
+        AuditLog.book_id == book.id, AuditLog.action == "UPDATE", AuditLog.entity == "book"))
+    assert row is not None and row.before["name"] == book.name
+
+
+def test_非所有者改不了账套名(client, db, plain_auth, plain_user, book):
+    from app.models import UserBook
+
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="ACCOUNTANT"))
+    db.commit()
+    r = client.put(f"/api/books/{book.id}", json={"name": "改名"}, headers=plain_auth)
+    assert r.status_code == 403

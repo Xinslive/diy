@@ -10,8 +10,8 @@
       <span class="muted">附件</span>
       <el-input-number v-model="form.attachments" :min="0" :max="999" style="width: 100px" />
       <span class="spacer" />
-      <el-button @click="addRow">增加分录</el-button>
-      <el-button type="primary" :loading="saving" :disabled="!store.canWrite" @click="save">保存</el-button>
+      <el-button :disabled="readonly" @click="addRow">增加分录</el-button>
+      <el-button type="primary" :loading="saving" :disabled="!store.canWrite || readonly" @click="save">保存</el-button>
       <el-button v-if="voucherId" :disabled="form.status === 'POSTED'" @click="printVoucher">打印预览</el-button>
     </div>
 
@@ -23,20 +23,23 @@
           <el-tag v-else type="warning" size="small">未记账</el-tag>
         </div>
         <div v-if="locked" class="tag-bad">当前期间已结账，不可修改</div>
+        <div v-else-if="posted" class="tag-bad">
+          已记账凭证已锁定，不能修改。请在凭证列表点「反记账」后再改。
+        </div>
       </div>
 
       <el-table :data="form.entries" border size="default" class="entries">
         <el-table-column type="index" label="#" width="46" align="center" />
         <el-table-column label="会计科目" min-width="300">
           <template #default="{ row }">
-            <el-select v-model="row.subject_id" filterable placeholder="选择科目" style="width: 100%" @change="onSubject(row)">
+            <el-select v-model="row.subject_id" :disabled="readonly" filterable placeholder="选择科目" style="width: 100%" @change="onSubject(row)">
               <el-option v-for="s in subjectOptions" :key="s.id" :label="`${s.code} ${s.name}`" :value="s.id" />
             </el-select>
           </template>
         </el-table-column>
         <el-table-column label="方向" width="96" align="center">
           <template #default="{ row }">
-            <el-radio-group v-model="row.direction" size="small">
+            <el-radio-group v-model="row.direction" :disabled="readonly" size="small">
               <el-radio-button value="DEBIT">借</el-radio-button>
               <el-radio-button value="CREDIT">贷</el-radio-button>
             </el-radio-group>
@@ -44,15 +47,15 @@
         </el-table-column>
         <el-table-column label="金额" width="160" align="right">
           <template #default="{ row }">
-            <el-input v-model="row.amount" placeholder="0.00" class="money" @keyup.enter="addRow" />
+            <el-input v-model="row.amount" :disabled="readonly" placeholder="0.00" class="money" @keyup.enter="addRow" />
           </template>
         </el-table-column>
         <el-table-column label="摘要" min-width="220">
-          <template #default="{ row }"><el-input v-model="row.summary" /></template>
+          <template #default="{ row }"><el-input v-model="row.summary" :disabled="readonly" /></template>
         </el-table-column>
         <el-table-column width="52" align="center">
           <template #default="{ $index }">
-            <el-button link type="danger" @click="form.entries.splice($index, 1)">删</el-button>
+            <el-button link type="danger" :disabled="readonly" @click="form.entries.splice($index, 1)">删</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -65,7 +68,7 @@
         </div>
       </div>
 
-      <el-input v-model="form.remark" placeholder="备注" class="remark" />
+      <el-input v-model="form.remark" :disabled="readonly" placeholder="备注" class="remark" />
     </div>
 
     <!-- 打印预览 -->
@@ -122,6 +125,9 @@ const form = reactive({
 })
 
 const locked = computed(() => !!store.currentPeriod?.locked)
+const posted = computed(() => form.status === 'POSTED')
+// 只读：期间已结账，或凭证本身已记账
+const readonly = computed(() => locked.value || posted.value)
 
 const subjectOptions = computed(() => subjects.value.filter((s) => s.is_leaf))
 const num = (v) => (v === '' || v === null || v === undefined ? 0 : Number(v))
@@ -186,6 +192,9 @@ function defaultDate() {
 }
 
 async function save() {
+  if (readonly.value) {
+    return ElMessage.warning(posted.value ? '已记账凭证不能修改，请先反记账' : '当前期间已结账，不能修改凭证')
+  }
   const entries = form.entries
     .filter((e) => e.subject_id && num(e.amount))
     .map((e) => ({

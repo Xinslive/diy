@@ -344,8 +344,13 @@ def _page_css(tpl: dict) -> str:
         size_line = "A5 landscape" if landscape else "A5"
 
     border = "1px solid #333" if tpl.get("body", {}).get("border", True) else "none"
+    # 屏幕预览必须用**同一套**纸型与页边距，否则「所见即所得」是假的：
+    # 用户在左边把 A4 改成 A5、把页边距调小，右边预览纹丝不动，
+    # 等真打印出来才发现版式不对 —— 那就失去了预览的意义。
+    mt, mr, mb, ml = (m.get(k, 10) for k in ("top", "right", "bottom", "left"))
+
     return f"""
-@page {{ size: {size_line}; margin: {m.get('top',10)}mm {m.get('right',10)}mm {m.get('bottom',10)}mm {m.get('left',10)}mm; }}
+@page {{ size: {size_line}; margin: {mt}mm {mr}mm {mb}mm {ml}mm; }}
 * {{ box-sizing: border-box; }}
 html, body {{ margin:0; padding:0; }}
 body {{
@@ -375,8 +380,11 @@ table.grid tfoot td {{ font-weight:700; }}
   display:flex; justify-content:space-between; }}
 @media screen {{
   body {{ background:#f0f0f0; padding:16px; }}
-  .page {{ background:#fff; margin:0 auto 16px; padding:12mm;
-    box-shadow:0 2px 12px rgba(0,0,0,.18); width:fit-content; }}
+  /* 宽度=纸型宽，内容区=纸型宽-左右边距，与打印时的 @page 完全一致 */
+  .page {{ background:#fff; margin:0 auto 16px;
+    box-sizing:border-box; width:{w}mm; min-height:{h}mm;
+    padding:{mt}mm {mr}mm {mb}mm {ml}mm;
+    box-shadow:0 2px 12px rgba(0,0,0,.18); }}
   .page-note {{ text-align:center; color:#888; font-size:12px; margin:10px 0; }}
 }}
 @media print {{ body {{ background:#fff; padding:0; }} .page {{ box-shadow:none; padding:0; margin:0; }} }}

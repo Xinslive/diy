@@ -14,6 +14,16 @@ export const generalHtml = (bookId, params) => apiUrl(`/books/${bookId}/print/ge
 export const detailHtml = (bookId, params) => apiUrl(`/books/${bookId}/print/detail-ledger.html`, params)
 export const reportHtml = (bookId, params) => apiUrl(`/books/${bookId}/print/report.html`, params)
 
+/**
+ * 按**草稿**模板渲染一页预览 HTML。
+ *
+ * 用 POST 而不是 GET：草稿是整个模板 JSON，塞不进 URL（而且模板名可能很长）。
+ * 服务端只渲染不落库，所以可以一边调版式一边看效果。
+ */
+export const previewHtml = (bookId, payload) =>
+  http.post(`/books/${bookId}/print/preview`, payload, { responseType: 'text' })
+    .then((r) => r.data)
+
 // ---- 打印模板 ----
 export const templateMeta = (bookId) => http.get(`/books/${bookId}/print/templates/meta`).then(r => r.data)
 export const templates = (bookId) => http.get(`/books/${bookId}/print/templates`).then(r => r.data)

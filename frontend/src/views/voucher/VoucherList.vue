@@ -1,13 +1,13 @@
 <template>
   <div class="page">
     <div class="toolbar no-print">
-      <el-select v-model="query.from_period_id" placeholder="起" clearable style="width: 108px">
+      <el-select v-model="query.from_period_id" placeholder="起" clearable style="width: 108px" @change="follow = false">
         <el-option v-for="p in store.periods" :key="p.id" :label="p.code" :value="p.id" />
       </el-select>
-      <el-select v-model="query.to_period_id" placeholder="止" clearable style="width: 108px">
+      <el-select v-model="query.to_period_id" placeholder="止" clearable style="width: 108px" @change="follow = false">
         <el-option v-for="p in store.periods" :key="p.id" :label="p.code" :value="p.id" />
       </el-select>
-      <el-button text type="primary" @click="query.to_period_id = null; query.from_period_id = null; load()">全部期间</el-button>
+      <el-button text type="primary" :disabled="!follow" @click="showAllPeriods">全部期间</el-button>
       <el-input v-model="query.keyword" placeholder="凭证号 / 摘要" clearable style="width: 180px" @keyup.enter="load" />
       <el-select v-model="query.status" placeholder="状态" clearable style="width: 120px">
         <el-option label="未记账" value="UNPOSTED" />
@@ -78,9 +78,9 @@
         <el-table-column label="贷方合计" width="130" align="right">
           <template #default="{ row }"><span class="money">{{ fmt(row.total_credit) }}</span></template>
         </el-table-column>
-        <el-table-column label="状态" width="88" align="center">
+        <el-table-column label="状态" width="112" align="center">
           <template #default="{ row }">
-            <el-tag v-if="row.status === 'POSTED'" type="success" size="small">已记账</el-tag>
+            <el-tag v-if="row.status === 'POSTED'" type="success" size="small">已记账 · 已锁</el-tag>
             <el-tag v-else type="warning" size="small">未记账</el-tag>
           </template>
         </el-table-column>
@@ -91,10 +91,13 @@
             <span v-else class="muted">手工</span>
           </template>
         </el-table-column>
-        <el-table-column v-if="store.canWrite" label="操作" width="150" fixed="right">
+        <el-table-column v-if="store.canWrite" label="操作" width="168" fixed="right">
           <template #default="{ row }">
-            <el-button link type="primary" @click="open(row)">查看/改</el-button>
-            <el-button link type="danger" :disabled="row.status === 'POSTED' && !canEdit" @click="removeOne(row)">删除</el-button>
+            <!-- 已记账凭证锁定：只能看，改/删都要先反记账 -->
+            <el-button link type="primary" @click="open(row)">
+              {{ row.status === 'POSTED' ? '查看' : '查看/改' }}
+            </el-button>
+            <el-button link type="danger" :disabled="isLocked(row)" @click="removeOne(row)">删除</el-button>
           </template>
         </el-table-column>
         <template #empty><span class="muted">当前条件下没有凭证</span></template>
@@ -116,7 +119,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, Operation, Printer, Sort, Upload } from '@element-plus/icons-vue'
@@ -131,13 +134,37 @@ const rows = ref([])
 const total = ref(0)
 const loading = ref(false)
 const selection = ref([])
-const canEdit = computed(() => !store.currentPeriod?.locked)
+/** 这张凭证能不能改/删：期间已结账、或本身已记账，都锁死。 */
+function isLocked(row) {
+  return row.status === 'POSTED' || !!store.currentPeriod?.locked
+}
 
 const query = reactive({
   keyword: '', status: '', source: '',
-  from_period_id: null, to_period_id: null,   // 默认看全部期间
+  // 默认跟随顶栏选中的月份：进凭证页看到的就是「现在正在记的那个月」，
+  // 不用每次都重新拉一遍日期范围
+  from_period_id: null, to_period_id: null,
   page: 1, page_size: 50
 })
+// 顶栏期间变化时是否自动跟着走；用户手动改过起止或点了「全部期间」就停止跟随
+const follow = ref(true)
+
+function showAllPeriods() {
+  follow.value = false
+  query.to_period_id = null
+  query.from_period_id = null
+  query.page = 1
+  load()
+}
+
+/** 把凭证范围对齐到顶栏选中的月份。 */
+function syncToCurrentPeriod({ reload = true } = {}) {
+  if (!follow.value || !store.periodId) return
+  query.from_period_id = store.periodId
+  query.to_period_id = store.periodId
+  query.page = 1
+  if (reload) load()
+}
 
 function firstSummary(row) {
   const s = row.entries.find((e) => e.summary)?.summary
@@ -194,12 +221,23 @@ async function unpost() {
   load()
 }
 async function removeOne(row) {
+  if (isLocked(row)) {
+    return ElMessage.warning(
+      row.status === 'POSTED'
+        ? `凭证 ${row.voucher_no} 已记账，不能删除；请先「反记账」`
+        : `${row.voucher_no} 所在期间已结账，不能删除`)
+  }
   await ElMessageBox.confirm(`确认删除凭证 ${row.voucher_no}？删除后凭证号可被后续凭证复用。`, '删除凭证', { type: 'warning' })
   await api.deleteVoucher(store.bookId, row.id)
   ElMessage.success('已删除')
   load()
 }
 async function removeAll() {
+  const posted = selection.value.filter((v) => v.status === 'POSTED')
+  if (posted.length) {
+    return ElMessage.warning(
+      `选中的 ${posted.length} 张凭证已记账，不能删除：${posted.slice(0, 5).map((v) => v.voucher_no).join('、')}`)
+  }
   await ElMessageBox.confirm(`确认删除选中的 ${selection.value.length} 张凭证？`, '批量删除', { type: 'warning' })
   const r = await api.batchDelete(store.bookId, selection.value.map((x) => x.id))
   ElMessage.success(`已删除 ${r.deleted} 张`)
@@ -208,11 +246,13 @@ async function removeAll() {
 
 onMounted(() => {
   query.page = 1
-  load()
+  syncToCurrentPeriod()
 })
 watch(() => store.bookId, () => {
   query.page = 1
   selection.value = []
-  load()
+  syncToCurrentPeriod()
 })
+// 顶栏切月份，凭证列表跟着切
+watch(() => store.periodId, () => syncToCurrentPeriod())
 </script>

@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.ledger.engine import ZERO, Figures, LedgerEngine, display_side
 from app.models import Book, Entry, Period, Subject, Voucher
+from app.models.book import book_first_ord
 
 CATEGORY_ORDER = {"ASSET": 0, "LIABILITY": 1, "EQUITY": 2, "COST": 3, "PROFIT": 4}
 
@@ -144,23 +145,24 @@ def general_ledger(
 ) -> list[dict]:
     """总账：每个科目一行，含区间期初、本期发生、累计发生、期末。"""
     eng = LedgerEngine(db, book_id, include_unposted)
-    fmap = eng.compute([s.id for s in subjects], to_period.ord)
+    ids = [s.id for s in subjects]
+    fmap = eng.compute(ids, to_period.ord)
+    # 区间发生额单独算，不能拿本年累计相减：区间跨年时两边的累计口径不同
+    pmap = eng.range_movements(ids, from_period.ord, to_period.ord)
 
-    has_prev = from_period.ord > 1
+    book = eng._book()
+    has_prev = from_period.ord > book_first_ord(book)
     if has_prev:
-        prev_map = eng.compute([s.id for s in subjects], from_period.ord - 1)
+        prev_map = eng.compute(ids, from_period.ord - 1)
 
     out = []
     for s in subjects:
         f = fmap[s.id]
+        p_dr, p_cr = pmap[s.id]
         if has_prev:
-            prev = prev_map[s.id]
-            opening = prev.closing
-            p_dr = f.dr_cum - prev.dr_cum
-            p_cr = f.cr_cum - prev.cr_cum
+            opening = prev_map[s.id].closing
         else:
             opening = f.opening
-            p_dr, p_cr = f.period_dr, f.period_cr
 
         closing = opening + p_dr - p_cr
         side, amount = display_side(s, closing)

@@ -188,3 +188,125 @@ def test_纸型映射表完整():
     for key in ("A4", "A3", "A5", "B5"):
         assert PAPERS[key]["w"] > 0 and PAPERS[key]["h"] > 0
     assert PAPERS["A4_LANDSCAPE"]["w"] > PAPERS["A4_LANDSCAPE"]["h"]
+
+
+# --------------------------------------------------------------------- 设计器实时预览
+#
+# 用户诉求是「左边改版式，右边立刻变」。这靠一个接口保证：
+# 预览吃的是**还没保存的草稿**，并且和正式打印共用同一个渲染函数。
+
+
+def test_预览用草稿模板渲染(client, auth, book, periods, make_voucher):
+    """改标题后预览应立刻出现新标题，不必先保存。"""
+    make_voucher("2026-01-05", dr=[("100201", 300, "首月租金")],
+                 cr=[("600101", 300, "首月租金")], posted=True)
+    r = client.post(
+        f"/api/books/{book.id}/print/preview",
+        json={"scope": "VOUCHER", "content": {"title": {"text": "草稿专用抬头"}},
+              "period_id": periods[1].id},
+        headers=auth,
+    )
+    assert r.status_code == 200, r.text
+    assert "草稿专用抬头" in r.text
+
+
+def test_预览不写库(client, auth, book, periods, make_voucher):
+    """预览只渲染不落库 —— 否则调一次版式就凭空多出一个模板。"""
+    make_voucher("2026-01-05", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
+    before = len(client.get(f"/api/books/{book.id}/print/templates", headers=auth).json())
+
+    client.post(
+        f"/api/books/{book.id}/print/preview",
+        json={"scope": "VOUCHER", "content": {"title": {"text": "只看一眼"}},
+              "period_id": periods[1].id},
+        headers=auth,
+    )
+
+    after = client.get(f"/api/books/{book.id}/print/templates", headers=auth).json()
+    assert len(after) == before
+
+
+def test_预览与正式打印排版一致(client, auth, book, periods, make_voucher):
+    """同一份模板内容，预览和打印必须渲染出同样的 HTML。
+
+    这是「所见即所得」的全部含义 —— 两边一旦分叉，预览就失去意义了。
+    """
+    make_voucher("2026-01-05", dr=[("100201", 300, "首月租金")],
+                 cr=[("600101", 300, "首月租金")], posted=True)
+    content = {"title": {"text": "记 账 凭 证"}, "font": {"size": 9}}
+
+    prev = client.post(
+        f"/api/books/{book.id}/print/preview",
+        json={"scope": "VOUCHER", "content": content, "period_id": periods[1].id},
+        headers=auth,
+    )
+    # 打印接口读的是「该范围的内置默认模板」，这里传同样的默认内容
+    tpl_id = client.post(
+        f"/api/books/{book.id}/print/templates",
+        json={"scope": "VOUCHER", "name": "对照模板", "content": content},
+        headers=auth,
+    ).json()["id"]
+    printed = client.get(
+        f"/api/books/{book.id}/print/vouchers.html",
+        params={"period_id": periods[1].id, "template_id": tpl_id},
+        headers=auth,
+    )
+
+    assert prev.status_code == 200 and printed.status_code == 200
+
+    def body(h):
+        # 预览页顶部多一行「只显示前 3 张」的说明，那是给人看的，不属于排版
+        return h.split("<body>")[1].replace(
+            '<p class="page-note">预览只显示前 3 张凭证，打印时输出该期间全部凭证。</p>', ""
+        )
+
+    assert body(prev.text) == body(printed.text)
+
+
+def test_草稿半成品时预览给出可读提示(client, auth, book, periods):
+    """把所有列删掉时不该 500 —— 设计器正要允许你这么干。"""
+    r = client.post(
+        f"/api/books/{book.id}/print/preview",
+        json={"scope": "VOUCHER", "content": {"columns": []}, "period_id": periods[1].id},
+        headers=auth,
+    )
+    assert r.status_code == 422
+    assert "预览" in r.json()["detail"]
+
+
+def test_预览不传期间时与打印一致地回落到最后一期(client, auth, book, make_voucher):
+    """_period() 一直有「不传就取最后一期」的兜底，预览不能自己另立一套规则。"""
+    make_voucher("2026-01-05", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
+    r = client.post(f"/api/books/{book.id}/print/preview",
+                    json={"scope": "BALANCE", "content": {}}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert "2026-12" in r.text
+
+
+def test_预览凭证只取前三张(client, auth, book, periods, make_voucher):
+    """预览限定张数，否则一个大期间的凭证能把改版式卡死。"""
+    for i in range(1, 7):
+        make_voucher(f"2026-01-0{i}", dr=[("100201", 100 + i, f"第{i}笔")],
+                     cr=[("600101", 100 + i, f"第{i}笔")], posted=True)
+    r = client.post(
+        f"/api/books/{book.id}/print/preview",
+        json={"scope": "VOUCHER", "content": {}, "period_id": periods[1].id},
+        headers=auth,
+    )
+    assert r.status_code == 200
+    assert r.text.count('class="grid"') == 3
+    assert "预览只显示前 3 张" in r.text
+
+
+def test_只读账套也能预览(client, auth, db, book, periods, plain_user):
+    """预览是只读动作，只读账套必须能用（保存模板才需要写权限）。"""
+    from app.models import UserBook
+
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="VIEWER"))
+    db.commit()
+    r = client.post(
+        f"/api/books/{book.id}/print/preview",
+        json={"scope": "BALANCE", "content": {}, "period_id": periods[1].id},
+        headers=auth,
+    )
+    assert r.status_code == 200, r.text

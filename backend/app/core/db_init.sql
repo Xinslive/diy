@@ -105,6 +105,61 @@ DROP TRIGGER IF EXISTS trg_entry_lock_guard ON entry;
 CREATE TRIGGER trg_entry_lock_guard BEFORE INSERT OR UPDATE OR DELETE ON entry
     FOR EACH ROW EXECUTE FUNCTION fn_entry_lock_guard();
 
+-- ---------- 2b. 已记账凭证锁定 ----------
+-- 「已记账」意味着这张凭证的每一笔分录已经被总账、科目余额表、报表引用。
+-- 事后直接改它，报表里的数和凭证里写的数就对不上，而且没有任何痕迹说明
+-- 差在哪一步 —— 这是会计系统最贵的一类脏数据。所以已记账凭证必须先反记账。
+--
+-- 例外只有两处，都是系统内部动作：
+--   1) 记账 / 反记账这一次状态跳转
+--   2) 「整理凭证」重编号（只动 voucher_no，不碰账内数字）
+--   3) 结转凭证（CARRY_FORWARD）由系统生成，「重新结转损益」要能整张重做
+CREATE OR REPLACE FUNCTION fn_posted_voucher_guard() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        -- 唯一合法的状态跳转：未记账 → 已记账，及它的反向
+        IF NEW.status IS DISTINCT FROM OLD.status THEN
+            IF NOT ((OLD.status = 'UNPOSTED' AND NEW.status = 'POSTED')
+                 OR (OLD.status = 'POSTED'   AND NEW.status = 'UNPOSTED')) THEN
+                RAISE EXCEPTION '凭证 % 的状态只能由未记账改已记账（或反向），不能直接改写', OLD.voucher_no
+                    USING ERRCODE = 'check_violation';
+            END IF;
+            RETURN NEW;
+        END IF;
+
+        -- 只改凭证号：整理凭证在重编号，不影响任何账内数字，放行
+        IF NEW.voucher_no IS DISTINCT FROM OLD.voucher_no
+           AND NEW.voucher_date  IS NOT DISTINCT FROM OLD.voucher_date
+           AND NEW.period_id     IS NOT DISTINCT FROM OLD.period_id
+           AND NEW.source        IS NOT DISTINCT FROM OLD.source
+           AND NEW.remark        IS NOT DISTINCT FROM OLD.remark
+           AND NEW.attachments   IS NOT DISTINCT FROM OLD.attachments
+           AND NEW.created_by    IS NOT DISTINCT FROM OLD.created_by
+           AND NEW.posted_by     IS NOT DISTINCT FROM OLD.posted_by
+           AND NEW.posted_at     IS NOT DISTINCT FROM OLD.posted_at THEN
+            RETURN NEW;
+        END IF;
+    END IF;
+
+    -- 结转凭证是系统自己生成的，「重新结转损益」允许整张删掉重做
+    IF OLD.source = 'CARRY_FORWARD' THEN
+        IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.status = 'POSTED' THEN
+        RAISE EXCEPTION '凭证 % 已记账，不能修改或删除；如需改动请先反记账', OLD.voucher_no
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_posted_voucher_guard ON voucher;
+CREATE TRIGGER trg_posted_voucher_guard BEFORE UPDATE OR DELETE ON voucher
+    FOR EACH ROW EXECUTE FUNCTION fn_posted_voucher_guard();
+
 -- ---------- 3. 借贷平衡（延迟到事务提交时校验） ----------
 CREATE OR REPLACE FUNCTION fn_check_voucher_balance() RETURNS trigger AS $$
 DECLARE
@@ -265,6 +320,54 @@ BEGIN
         END IF;
     END IF;
 END $$;
+
+-- =====================================================================
+-- 迁移：年度从「账套的身份」降级为「账套的属性」
+--
+-- 旧模型：book 表一行 = 一个「公司 + 账套名 + 年度」三元组，年度结转时
+-- 整套复制出下一年的账套。结果是账套列表一年一行，同一家单位被拆成
+-- 「租金账套037569」「租金账套037569 2027」两条，用户得自己记哪个在用。
+--
+-- 新模型：book 表一行 = 一个账套，start_year 是它的起始年度，
+-- 会计期间（period）按 ord = (year - start_year) * 12 + month 跨年度连续铺开。
+-- 科目表、权限、期初录入都只跟账套走，年度结转只是「追加下一年的 12 个期间」。
+--
+-- 本段幂等：新库跳过，老库执行一次。
+-- =====================================================================
+DO $$
+DECLARE
+    v_old_year boolean;
+    v_dupes   integer;
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'book' AND column_name = 'year') THEN
+        ALTER TABLE book RENAME COLUMN year TO start_year;
+    END IF;
+
+    -- ord 现在要跨年度连续：单年度账套的 ord 本来就等于月份，重排是恒等变换；
+    -- 已经被合并过的多年度账套会在合并脚本里算好，这里只处理单年度的
+    UPDATE period p
+       SET ord = (p.year - b.start_year) * 12 + p.month
+      FROM book b
+     WHERE b.id = p.book_id
+       AND p.ord <> (p.year - b.start_year) * 12 + p.month;
+
+    -- 唯一键去掉年度。老库里可能已经有「一个年度一个账套」留下的重复行，
+    -- 这时不能建约束（否则服务起不来），只警告，等合并脚本跑完再建。
+    SELECT count(*) INTO v_dupes FROM (
+        SELECT company_name, name FROM book GROUP BY company_name, name HAVING count(*) > 1
+    ) d;
+    IF v_dupes = 0 THEN
+        ALTER TABLE book DROP CONSTRAINT IF EXISTS uq_book;
+        ALTER TABLE book ADD CONSTRAINT uq_book UNIQUE (company_name, name);
+    ELSE
+        RAISE WARNING
+            '检测到 % 组同名账套（如「租金账套037569」与「租金账套037569 2027」是同一年代结转留下的）。'
+            '请运行 python scripts/merge_book_years.py --apply 合并成「一个账套多个年度」。', v_dupes;
+    END IF;
+END $$;
+
+ALTER TABLE book ALTER COLUMN start_year SET NOT NULL;
 
 -- ---------- 迁移：管理员从「用户名叫 admin」改成独立字段 ----------
 ALTER TABLE sys_user ADD COLUMN IF NOT EXISTS is_admin boolean NOT NULL DEFAULT false;

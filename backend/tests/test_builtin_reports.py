@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy import select
 
 from app.reports.evaluate import evaluate
-from app.models import ReportCell, ReportTemplate, Subject
+from app.models import ReportCell, ReportTemplate, Subject, Voucher
 
 
 @pytest.fixture
@@ -205,3 +205,57 @@ def test_报表求值不报错(db, book, periods, subjects, make_voucher, tpl):
         data = render(db, book, periods[1], code)
         assert data["rows"]
         assert not data.get("errors"), data.get("errors")
+
+
+# --------------------------------------------------------------------- 跨年度
+
+
+def test_跨年后年初余额等于上年期末(db, book, periods, subjects, admin_user, make_voucher):
+    """年度结转之后，资产负债表下一年 1 月的「年初余额」必须等于上一年 12 月的「期末余额」。
+
+    不相等意味着期初断档 —— 整条利润链会在跨年那一刻悄悄错掉，
+    而且平时根本看不出来（每个年度单独看都平）。
+    """
+    from app.accounting.periods import carry_forward_profit, close_period, year_end_carry
+    from app.models import Period
+
+    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")], posted=True)
+    for m in range(1, 13):
+        has = db.scalar(select(Voucher.id).where(
+            Voucher.book_id == book.id, Voucher.period_id == periods[m].id))
+        if has:
+            carry_forward_profit(db, book.id, periods[m], admin_user)
+        close_period(db, periods[m], admin_user)
+    year_end_carry(db, book, admin_user)
+
+    jan27 = db.scalar(select(Period).where(Period.book_id == book.id,
+                                          Period.year == 2027, Period.month == 1))
+    last = cells(render(db, book, jan27, "BALANCE_SHEET"))
+    prev = cells(render(db, book, periods[12], "BALANCE_SHEET"))
+
+    # 资产负债表每行的第 2 格是期末余额，第 3 格是年初余额
+    for label in ("货币资金", "负债和所有者权益总计"):
+        assert num(last[label][2]) == num(prev[label][1]), label
+
+
+def test_跨年后本年累计不带上一年(db, book, periods, subjects, admin_user, make_voucher):
+    """`dr_cum` 是「本年累计」，每年 1 月必须归零。
+
+    不归零的话 2027 年 1 月的利润表会把 2026 全年的收入也算进「本年金额」。
+    """
+    from app.accounting.periods import carry_forward_profit, close_period, year_end_carry
+    from app.models import Period, Voucher
+
+    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")], posted=True)
+    for m in range(1, 13):
+        if db.scalar(select(Voucher.id).where(
+                Voucher.book_id == book.id, Voucher.period_id == periods[m].id)):
+            carry_forward_profit(db, book.id, periods[m], admin_user)
+        close_period(db, periods[m], admin_user)
+    year_end_carry(db, book, admin_user)
+
+    jan27 = db.scalar(select(Period).where(Period.book_id == book.id,
+                                          Period.year == 2027, Period.month == 1))
+    pf = cells(render(db, book, jan27, "INCOME_SHEET"))
+    assert num(pf["一、营业收入"][0]) == Decimal("0")
+    assert num(pf["三、利润总额"][0]) == Decimal("0")

@@ -41,6 +41,17 @@ def get_my_book(book_id: int, db: Session = Depends(get_db), user: SysUser = Dep
     return book
 
 
+def require_admin(user: SysUser = Depends(get_current_user)) -> SysUser:
+    """系统管理员专用依赖。
+
+    操作日志里存着每次删除/修改的完整凭证快照 —— 等同于全量凭证副本，
+    普通会计不该看到别人的操作痕迹。
+    """
+    if not user.is_admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "只有系统管理员可以访问")
+    return user
+
+
 def require_write(book: Book, user: SysUser, link: UserBook) -> None:
     if link.role == "VIEWER":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "当前账套为只读权限")

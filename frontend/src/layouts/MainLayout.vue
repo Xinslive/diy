@@ -16,7 +16,7 @@
         <el-menu-item index="/periods"><el-icon><Calendar /></el-icon>期末处理</el-menu-item>
         <el-menu-item index="/subjects"><el-icon><Collection /></el-icon>科目表</el-menu-item>
         <el-menu-item index="/print-templates"><el-icon><Printer /></el-icon>打印模板</el-menu-item>
-        <el-menu-item index="/audit"><el-icon><Document /></el-icon>操作日志</el-menu-item>
+        <el-menu-item v-if="store.isAdmin" index="/audit"><el-icon><Document /></el-icon>操作日志</el-menu-item>
         <el-menu-item v-if="store.isAdmin" index="/users"><el-icon><User /></el-icon>用户与授权</el-menu-item>
       </el-menu>
     </el-aside>
@@ -38,14 +38,17 @@
           />
         </el-select>
 
-        <el-select v-model="store.periodId" size="default" style="width: 150px" @change="onPeriodChange">
-          <el-option v-for="p in store.periods" :key="p.id" :label="p.code" :value="p.id">
-            <span>{{ p.code }}</span>
-            <el-tag v-if="p.locked" size="small" type="success" style="float: right">已结账</el-tag>
-            <el-tag v-else-if="p.unposted > 0" size="small" type="warning" style="float: right">
-              未记账 {{ p.unposted }}
-            </el-tag>
-          </el-option>
+        <!-- 期间按年度分组：账套跨多年，月份单独看没有意义 -->
+        <el-select v-model="store.periodId" size="default" style="width: 168px" @change="onPeriodChange">
+          <el-option-group v-for="y in yearGroups" :key="y.year" :label="`${y.year} 年`">
+            <el-option v-for="p in y.periods" :key="p.id" :label="p.code" :value="p.id">
+              <span>{{ p.code }}</span>
+              <el-tag v-if="p.locked" size="small" type="success" style="float: right">已结账</el-tag>
+              <el-tag v-else-if="p.unposted > 0" size="small" type="warning" style="float: right">
+                未记账 {{ p.unposted }}
+              </el-tag>
+            </el-option>
+          </el-option-group>
         </el-select>
 
         <span class="spacer" />
@@ -71,7 +74,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, watch } from 'vue'
+import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from '@/stores/session'
 import { ArrowDown, Calendar, Coin, Collection, DataAnalysis, Document, Folder, Grid, List, Notebook, Printer, Tickets, User } from '@element-plus/icons-vue'
@@ -82,6 +85,18 @@ const router = useRouter()
 
 // 切换账套/期间后让当前页面重新取数
 const viewKey = computed(() => `${route.name}-${store.bookId}-${store.periodId}`)
+
+// 期间下拉按年度分组，最新年度排最前
+const yearGroups = computed(() => {
+  const byYear = new Map()
+  for (const p of store.periods) {
+    if (!byYear.has(p.year)) byYear.set(p.year, [])
+    byYear.get(p.year).push(p)
+  }
+  return [...byYear.entries()]
+    .sort((a, b) => b[0] - a[0])
+    .map(([year, periods]) => ({ year, periods }))
+})
 
 async function onBookChange(id) {
   await store.setBook(id)
@@ -98,10 +113,9 @@ function onCommand(cmd) {
 
 onMounted(async () => {
   await store.refreshMe()
-  if (!store.books.length) await store.loadBooks()
-})
-watch(() => store.bookId, async (id) => {
-  if (id) await store.loadPeriods()
+  // loadBooks 内部一定会跟一次 loadPeriods，这里不再单独 watch bookId ——
+  // 否则一次切账套会打两遍接口，期间下拉还会闪一次空列表
+  if (!store.books.length || !store.periods.length) await store.loadBooks()
 })
 </script>
 

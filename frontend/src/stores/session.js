@@ -17,7 +17,14 @@ export const useSessionStore = defineStore('session', {
     isAdmin: (s) => !!s.user?.is_admin,
     currentBook: (s) => s.books.find((b) => b.id === s.bookId) || null,
     currentPeriod: (s) => s.periods.find((p) => p.id === s.periodId) || null,
-    canWrite: (s) => s.currentBook?.role !== 'VIEWER'
+    canWrite: (s) => s.currentBook?.role !== 'VIEWER',
+    /** 正在看的年度 —— 年度是账套的属性，不是另一个账套。
+     *  由期间反推，不再单独存一份，免得两边对不上。 */
+    currentYear: (s) => s.periods.find((p) => p.id === s.periodId)?.year
+      ?? s.books.find((b) => b.id === s.bookId)?.latest_year ?? 0,
+    /** 当前年度的期间，页面上按年度分组用 */
+    periodsOfYear: (s) => (y) => s.periods.filter((p) => p.year === y),
+    yearsOfBook: (s) => (b) => (b?.years || []).map((y) => y.year).sort((x, y) => y - x)
   },
   actions: {
     async login(username, password) {
@@ -49,38 +56,72 @@ export const useSessionStore = defineStore('session', {
       localStorage.removeItem('cwq_book')
       localStorage.removeItem('cwq_period')
     },
+    /** 拉账套列表，并保证当前账套/期间一定能落到一个有效值上。
+     *
+     *  这里必须**无条件**跟着 loadPeriods：以前只在「记住的账套 id 失效」时才
+     *  走 setBook，于是「localStorage 里的账套还在、期间数组却是空的」这种状态
+     *  没人收拾 —— 表现就是顶栏期间下拉点开只有「无数据」。 */
     async loadBooks() {
       this.books = await bookApi.listBooks()
       if (!this.books.find((b) => b.id === this.bookId)) {
-        this.setBook(this.books[0]?.id)
+        this.bookId = 0
+        this.periodId = 0
       }
+      if (!this.bookId) this.bookId = this.books[0]?.id || 0
+      if (this.bookId) localStorage.setItem('cwq_book', String(this.bookId))
+      await this.loadPeriods()
     },
+
+    /** 换账套：默认进最新年度。 */
     async setBook(id) {
+      const changed = this.bookId !== id
       this.bookId = id
       localStorage.setItem('cwq_book', String(id))
+      if (changed) {
+        // 换账套后旧的 periodId 一定不属于新账套，先清掉避免期间下拉闪旧值
+        this.periods = []
+        this.periodId = 0
+      }
       await this.loadPeriods()
     },
     async loadPeriods() {
-      if (!this.bookId) return
+      if (!this.bookId) {
+        this.periods = []
+        this.periodId = 0
+        return
+      }
       this.periods = await bookApi.listPeriods(this.bookId)
       if (!this.periods.find((p) => p.id === this.periodId)) {
-        this.setPeriod(this.defaultPeriodId())
+        // 记住的期间已经不存在（换年度 / 反结账）—— 落在最新年度最「在用」的那一期
+        const latest = this.books.find((b) => b.id === this.bookId)?.latest_year
+        this.setPeriod(this.defaultPeriodId(latest))
       }
     },
     /** 默认停在「正在用的」那个期间：
      *  1) 最后一个未结账的期间（正在记账的）
      *  2) 凭证最多的期间（全部结完账时，至少能看到东西）
      *  3) 第一个期间 */
-    defaultPeriodId() {
-      const open = [...this.periods].reverse().find((p) => !p.locked)
+    defaultPeriodId(year) {
+      const pool = year ? this.periods.filter((p) => p.year === year) : this.periods
+      if (!pool.length) return undefined
+      const open = [...pool].reverse().find((p) => !p.locked)
       if (open) return open.id
-      const busiest = [...this.periods].sort((a, b) => b.vouchers - a.vouchers)[0]
-      return (busiest?.vouchers ? busiest : this.periods[0])?.id
+      const busiest = [...pool].sort((a, b) => b.vouchers - a.vouchers)[0]
+      return (busiest?.vouchers ? busiest : pool[0])?.id
+    },
+
+    /** 切到某个年度：停在该年度「正在用的」那个期间。
+     *  进入账套默认就是最新年度，往年可以手动选回来。 */
+    setYear(year) {
+      if (!year) return
+      const id = this.defaultPeriodId(year)
+      if (id) this.setPeriod(id)
     },
 
     setPeriod(id) {
-      this.periodId = id
-      localStorage.setItem('cwq_period', String(id))
+      this.periodId = id || 0
+      if (id) localStorage.setItem('cwq_period', String(id))
+      else localStorage.removeItem('cwq_period')
     },
     periodCodeOf(id) {
       return this.periods.find((p) => p.id === id)?.code || ''

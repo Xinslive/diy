@@ -169,10 +169,10 @@ def all_books(user: SysUser = Depends(get_current_user), db: Session = Depends(g
     rows = db.execute(
         select(Book, func.count(UserBook.id))
         .outerjoin(UserBook, UserBook.book_id == Book.id)
-        .group_by(Book.id).order_by(Book.company_name, Book.name, Book.year)
+        .group_by(Book.id).order_by(Book.company_name, Book.name)
     ).all()
-    return [{"id": b.id, "company_name": b.company_name, "name": b.name, "year": b.year,
-             "member_count": n} for b, n in rows]
+    return [{"id": b.id, "company_name": b.company_name, "name": b.name,
+             "start_year": b.start_year, "member_count": n} for b, n in rows]
 
 
 # --------------------------------------------------------------------- 全局审计

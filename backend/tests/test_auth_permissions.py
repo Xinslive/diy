@@ -71,8 +71,26 @@ FORBIDDEN = [
     ("改他人资料",   "patch", "/api/system/users/1", {"password": "abcd1234"}),
     ("删他人",       "delete", "/api/system/users/1", None),
     ("给别人授权账套", "put", "/api/system/users/1/books", []),
-    ("新建账套",     "post", "/api/books", {"company_name": "X", "name": "X", "year": 2026}),
+    ("新建账套",     "post", "/api/books", {"company_name": "X", "name": "X", "start_year": 2026}),
 ]
+
+
+#: 操作日志里的「快照」等同全量凭证副本，普通会计不该看到别人的操作痕迹
+def test_操作日志只有管理员能看(client, db, plain_auth, plain_user, book):
+    from app.models import UserBook
+
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="ACCOUNTANT"))
+    db.commit()
+
+    r = client.get(f"/api/books/{book.id}/audit-logs", headers=plain_auth)
+    assert r.status_code == 403, f"会计能看到操作日志：{r.status_code} {r.text}"
+
+
+def test_管理员仍然看得到操作日志(client, auth, book, make_voucher):
+    make_voucher("2026-01-05", dr=[("100201", 10, "x")], cr=[("600101", 10, "x")])
+    r = client.get(f"/api/books/{book.id}/audit-logs", headers=auth)
+    assert r.status_code == 200
+    assert any(x["action"] == "CREATE" for x in r.json())
 
 
 @pytest.mark.parametrize("label,method,path,body", FORBIDDEN, ids=[c[0] for c in FORBIDDEN])

@@ -11,9 +11,10 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.accounting import periods as svc
-from app.api.schemas import BookIn, OpeningIn, UncloseIn, YearEndIn
+from app.api.schemas import (BookEditIn, BookIn, CarryForwardIn, OpeningIn,
+                           UncloseIn, YearEndIn)
 from app.core.db import get_db
-from app.core.deps import get_book_link, get_current_user, get_my_book
+from app.core.deps import get_book_link, get_current_user, get_my_book, require_admin
 from app.models import Book, Period, PeriodOpening, Subject, SysUser, UserBook, Voucher
 
 router = APIRouter(prefix="/api/books", tags=["账套与期间"])
@@ -27,31 +28,62 @@ def _xlsx_name(name: str) -> str:
     return f"attachment; filename*=UTF-8''{quote(name)}"
 
 
-@router.get("")
-def list_my_books(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    closed_counts = dict(
+def _years_of(db: Session, book_id: int) -> list[dict]:
+    """账套下每个会计年度的结账进度。
+
+    账套列表要显示「已结账 n/12 期」「使用中/已结转」，而这两个数都是
+    **按年度**算的 —— 2026 年结完了不代表 2027 年也结完了。
+    """
+    rows = db.execute(
+        select(
+            Period.year,
+            func.count(Period.id),
+            func.count(Period.id).filter(Period.locked.is_(True)),
+        )
+        .where(Period.book_id == book_id)
+        .group_by(Period.year)
+        .order_by(Period.year)
+    ).all()
+    vouchers = dict(
         db.execute(
-            select(Period.book_id, func.count())
-            .where(Period.locked.is_(True)).group_by(Period.book_id)
+            select(Period.year, func.count(Voucher.id))
+            .join(Voucher, Voucher.period_id == Period.id)
+            .where(Period.book_id == book_id)
+            .group_by(Period.year)
         ).all()
     )
+    return [
+        {
+            "year": year,
+            "total": total,
+            "closed": closed,
+            "vouchers": vouchers.get(year, 0),
+            "carried": closed >= total,
+        }
+        for year, total, closed in rows
+    ]
+
+
+@router.get("")
+def list_my_books(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
     rows = db.execute(
         select(Book, UserBook.role)
         .join(UserBook, UserBook.book_id == Book.id)
         .where(UserBook.user_id == user.id)
-        .order_by(Book.company_name, Book.name, Book.year)
+        .order_by(Book.company_name, Book.name)
     ).all()
-    return [
-        {
-            "id": b.id, "name": b.name, "year": b.year, "start_month": b.start_month,
-            "company_name": b.company_name, "role": role, "status": b.status,
-            "closed_periods": db.scalar(
-                select(func.count()).select_from(Period).where(
-                    Period.book_id == b.id, Period.locked.is_(True))
-            ),
-        }
-        for b, role in rows
-    ]
+    out = []
+    for b, role in rows:
+        years = _years_of(db, b.id)
+        out.append({
+            "id": b.id, "name": b.name, "company_name": b.company_name,
+            "start_year": b.start_year, "start_month": b.start_month,
+            "role": role, "status": b.status,
+            # 年度是账套的属性，列表一行一个账套，年度由前端下拉选
+            "years": years,
+            "latest_year": years[-1]["year"] if years else b.start_year,
+        })
+    return out
 
 
 @router.post("", status_code=201)
@@ -64,15 +96,13 @@ def create_book(payload: BookIn, user: SysUser = Depends(get_current_user), db: 
         select(Book).where(
             Book.company_name == payload.company_name,
             Book.name == payload.name,
-            Book.year == payload.year,
         )
     )
     if exists:
-        raise HTTPException(
-            400, f"账套「{payload.company_name} · {payload.name} {payload.year}」已存在")
+        raise HTTPException(400, f"账套「{payload.company_name} · {payload.name}」已存在")
 
-    book = Book(company_name=payload.company_name, name=payload.name, year=payload.year,
-                start_month=payload.start_month)
+    book = Book(company_name=payload.company_name, name=payload.name,
+                start_year=payload.start_year, start_month=payload.start_month)
     db.add(book)
     db.flush()
 
@@ -86,15 +116,52 @@ def create_book(payload: BookIn, user: SysUser = Depends(get_current_user), db: 
     db.commit()
     db.refresh(book)
     return {"id": book.id, "company_name": book.company_name, "name": book.name,
-            "year": book.year, "subjects_installed": subjects}
+            "start_year": book.start_year, "subjects_installed": subjects}
 
 
 @router.get("/{book_id}")
 def get_book(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     return {
-        "id": book.id, "company_name": book.company_name, "name": book.name, "year": book.year,
-        "start_month": book.start_month, "status": book.status,
+        "id": book.id, "company_name": book.company_name, "name": book.name,
+        "start_year": book.start_year, "start_month": book.start_month,
+        "status": book.status, "years": _years_of(db, book.id),
     }
+
+
+@router.put("/{book_id}")
+def update_book(book_id: int, payload: BookEditIn, book: Book = Depends(get_my_book),
+                db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
+                user: SysUser = Depends(get_current_user)):
+    """改账套名 / 单位名。
+
+    只允许 OWNER 改 —— 账套名会出现在每一页的页眉、每一张凭证的打印抬头、
+    每一份导出的 Excel 上，名字错了整批单据都得重打。
+    """
+    if link.role != "OWNER":
+        raise HTTPException(403, "只有账套所有者可以修改账套名和单位名")
+    changes = payload.changes()
+    if not changes:
+        return {"id": book.id, "company_name": book.company_name, "name": book.name}
+    dup = db.scalar(
+        select(Book).where(
+            Book.id != book.id,
+            Book.company_name == changes.get("company_name", book.company_name),
+            Book.name == changes.get("name", book.name),
+        )
+    )
+    if dup:
+        raise HTTPException(400, "已存在同名的账套，请换一个名字")
+    before = {"company_name": book.company_name, "name": book.name}
+    for k, v in changes.items():
+        setattr(book, k, v)
+    db.flush()
+    from app.accounting.audit_helper import log
+
+    log(db, action="UPDATE", entity="book", entity_id=book.id, user=user, book_id=book.id,
+        detail="修改账套属性：" + "、".join(f"{k}={v}" for k, v in changes.items()),
+        before=before, after=changes)
+    db.commit()
+    return {"id": book.id, "company_name": book.company_name, "name": book.name}
 
 
 @router.get("/{book_id}/periods")
@@ -380,13 +447,31 @@ def set_openings(book_id: int, payload: list[OpeningIn], book: Book = Depends(ge
     return {"ok": True, "count": len(payload)}
 
 
+@router.get("/{book_id}/periods/{period_id}/carry-forward")
+def carry_forward_status(book_id: int, period_id: int, book: Book = Depends(get_my_book),
+                         db: Session = Depends(get_db)):
+    """本期有没有结转过 —— 前端用它决定显示「执行」还是「重新结转」。"""
+    period = svc.get_period(db, book.id, period_id)
+    return svc.carry_forward_status(db, period)
+
+
 @router.post("/{book_id}/periods/{period_id}/carry-forward")
-def carry_forward(book_id: int, period_id: int, book: Book = Depends(get_my_book),
-                  db: Session = Depends(get_db), user: SysUser = Depends(get_current_user)):
+def carry_forward(book_id: int, period_id: int,
+                  payload: Optional[CarryForwardIn] = None,
+                  book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                  link: UserBook = Depends(get_book_link),
+                  user: SysUser = Depends(get_current_user)):
+    # replace=True 会删凭证，只读账套必须挡住（与凭证删除接口同一条规矩）
+    if link.role == "VIEWER":
+        raise HTTPException(403, "只读账套不能执行结转损益")
     period = svc.get_period(db, book.id, period_id)
     try:
-        return svc.carry_forward_profit(db, book.id, period, user)
+        # 永远「先删旧结转凭证再重算」，payload 只为兼容旧前端保留
+        return svc.carry_forward_profit(
+            db, book.id, period, user, replace=bool(payload.replace) if payload else True
+        )
     except ValueError as e:
+        db.rollback()
         raise HTTPException(400, str(e))
 
 
@@ -421,14 +506,15 @@ def unclose_period(book_id: int, period_id: int, payload: UncloseIn, book: Book 
 def year_end(book_id: int, payload: YearEndIn, book: Book = Depends(get_my_book),
              db: Session = Depends(get_db), user: SysUser = Depends(get_current_user)):
     try:
-        return svc.year_end_carry(db, book, user, payload.new_book_name)
+        return svc.year_end_carry(db, book, user, payload.new_year)
     except ValueError as e:
+        db.rollback()
         raise HTTPException(400, str(e))
 
 
 @router.get("/{book_id}/audit-logs")
 def audit_logs(book_id: int, limit: int = Query(100, le=1000), book: Book = Depends(get_my_book),
-               db: Session = Depends(get_db)):
+               db: Session = Depends(get_db), _admin: SysUser = Depends(require_admin)):
     from app.models import AuditLog
 
     rows = db.scalars(

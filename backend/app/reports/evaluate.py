@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.ledger.engine import ZERO, LedgerEngine
 from app.models import Book, Period, ReportCell, ReportCol, ReportRow, Subject
+from app.models.book import book_first_ord, period_ord, year_start_ord
 from app.reports.formula import D, Evaluator, FormulaError
 
 # 列类型 -> (取数口径, 期间占位符)
@@ -29,7 +30,9 @@ class ReportContext:
         self.db = db
         self.book = book
         self.period = period
-        self.start_ord = book.start_month
+        # 「本年」起点：账套第一年从启用月开始，之后每年从 1 月开始。
+        # ord 跨年度连续，所以这里不能直接拿 start_month 当第 N 年的年初。
+        self.start_ord = year_start_ord(book.start_year, period.year, book.start_month)
         self.eng = LedgerEngine(db, book.id, include_unposted)
         # 结转损益凭证不计入损益额，否则月度结转之后利润表全是 0
         self.eng_pf = LedgerEngine(db, book.id, include_unposted, exclude_carry_forward=True)
@@ -51,23 +54,33 @@ class ReportContext:
         return s.id if s else None
 
     # -- 期间 --
+    def _ym(self, ord_: int) -> tuple[int, int]:
+        """ord -> (year, month)。ord 跨年度连续，直接当月份用会算错年份。"""
+        idx = ord_ - 1
+        return self.book.start_year + idx // 12, idx % 12 + 1
+
+    def _synthetic(self, ord_: int) -> Period:
+        # 夹在账套第一个期间上：账套第一期没有「上期」，别算出 ord=0 这种不存在的期间
+        ord_ = max(ord_, book_first_ord(self.book))
+        y, m = self._ym(ord_)
+        return Period(book_id=self.book.id, year=y, month=m, ord=ord_)
+
     def resolve_period(self, expr) -> Period | None:
         if expr in (None, "", "{{本期}}", "{{期末}}"):
             return self.period
         if expr == "{{上期}}":
-            prev = self.period.ord - 1
-            return Period(book_id=self.book.id, year=self.period.year, month=max(prev, 1), ord=prev)
+            # 跨年时 ord-1 自然落到上一年的 12 月
+            return self._synthetic(self.period.ord - 1)
         if expr == "{{年初}}":
-            return Period(
-                book_id=self.book.id, year=self.period.year, month=self.start_ord, ord=self.start_ord
-            )
+            return self._synthetic(self.start_ord)
         text = str(expr).strip()
         if "-" in text:
             y, m = text.split("-", 1)
-            return Period(book_id=self.book.id, year=int(y), month=int(m), ord=int(m))
+            y, m = int(y), int(m)
+            return self._synthetic(period_ord(y, m, self.book.start_year))
         if text.isdigit():
             y = int(text)
-            return Period(book_id=self.book.id, year=y, month=12, ord=12)
+            return self._synthetic(period_ord(y, 12, self.book.start_year))
         raise FormulaError(f"无法识别的期间: {expr}")
 
     # -- 账簿原语 --
