@@ -191,6 +191,25 @@ B17 = B9+B16                      资产总计
 - 期间占位符：`{{本期}}` `{{上期}}` `{{年初}}` `{{期末}}`
 - 单元格引用带**环检测**，循环引用不会死循环
 
+### 期间占位符必须跟着列类型走
+每种列类型有自己的取数口径**和**期间：
+
+| 列类型 | 口径 | 占位符 |
+|---|---|---|
+| `BALANCE_CLOSING` | 期末余额 | `{{本期}}` |
+| `BALANCE_OPENING` | 期初余额 | **`{{年初}}`** |
+| `PERIOD_AMOUNT` | 本期金额 | `{{本期}}` |
+| `YTD_AMOUNT` | 本年累计 | `{{本期}}` |
+
+> `KIND_FOR` 曾经对所有 kind 都写死 `{{本期}}`，于是资产负债表的「年初余额」列
+> 显示成了当前月的期初（12 月的期初 = 11 月底余额），跟上年年报的期末数对不上。
+> 而这正是财务唯一会手工去核的那一列。改 `builtin_reports.KIND_FOR` 时注意占位符也在里面。
+
+### 单元格必须自带 `col_no`
+`evaluate()` 返回的每个 cell 都要带 `col_no`。前端按下标渲染表格，
+而下标是 0 基、列号是 1 基 —— 拿 `ci` 当 `col_no` 存公式会**整体错位一列**：
+点「期末余额」存进去的其实是 STATIC 列。同理 `dirty` 的键也必须用 `col_no`。
+
 ### 求值上下文
 `ReportContext` 把账簿引擎和模板胶合起来，并向 `Evaluator` 暴露：
 `subject_id(code)` / `opening` / `debit_cum` / `credit_cum` / `closing` /
@@ -290,6 +309,7 @@ token 在 localStorage 由 axios 拦截器注入，所以 `iframe.src` / `window
 | `test_vouchers.py` | 编号、校验、两态、批量、查询 |
 | `test_organize.py` | 断号、重排、两阶段改号 |
 | `test_importer.py` | 三段式导入 |
+| `test_builtin_reports.py` | 内置模板的**数字勾稽**（资产=负债+权益、年初余额口径、结转排除） |
 
 **测试库物理隔离**：`conftest.py` 在 import 任何 `app.*` 之前把 `DATABASE_URL`
 改写成 `cwq_test`。必须这么写 —— `app.core.db.engine` 在 import 期就建好连接池了。

@@ -100,23 +100,29 @@ TEMPLATES = [
     },
 ]
 
+# 列类型 -> (取数口径, 期间占位符)
+# 占位符必须跟着列类型走：BALANCE_OPENING 是「年初余额」，要取账套启用月的期初，
+# 而不是当前月的期初。早期版本这里对所有 kind 都写死 {{本期}}，
+# 于是资产负债表的年初余额列显示成了 12 月的期初（11 月底余额），
+# 跟上年期末根本对不上 —— 而这正是财务唯一会去核的那一列。
 KIND_FOR = {
-    "BALANCE_CLOSING": "期末余额",
-    "BALANCE_OPENING": "期初余额",
-    "PERIOD_AMOUNT": "本期金额",
-    "YTD_AMOUNT": "本年累计",
-    "PERIOD_DEBIT": "本期借方",
-    "PERIOD_CREDIT": "本期贷方",
+    "BALANCE_CLOSING": ("期末余额", "{{本期}}"),
+    "BALANCE_OPENING": ("期初余额", "{{年初}}"),
+    "PERIOD_AMOUNT": ("本期金额", "{{本期}}"),
+    "YTD_AMOUNT": ("本年累计", "{{本期}}"),
+    "PERIOD_DEBIT": ("本期借方", "{{本期}}"),
+    "PERIOD_CREDIT": ("本期贷方", "{{本期}}"),
 }
 
 
 def _formula(kind: str, codes: list[str], template: str | None) -> str:
     """科目编码前加 '-' 表示减项（如累计折旧、跌价准备）。"""
+    label, placeholder = KIND_FOR[kind]
     if template in ("sum", "sum_amount") and codes:
         parts = []
         for c in codes:
             sign = "-" if c.startswith("-") else "+"
-            parts.append(f'{sign}科目("{c.lstrip("-")}","{KIND_FOR[kind]}",{{{{本期}}}})')
+            parts.append(f'{sign}科目("{c.lstrip("-")}","{label}",{placeholder})')
         return parts[0].lstrip("+") + "".join(parts[1:])
     if template:
         from app.reports.formula import no_to_col
@@ -182,4 +188,4 @@ def install(db: Session) -> None:
                         template_id=tpl.id, row_no=row_no, col_no=col.col_no, formula=formula
                     )
                 )
-        db.flush()
+        db.commit()

@@ -185,15 +185,18 @@ def evaluate(
         row_values = []
         for c in cols:
             src = formulas.get((r.row_no, c.col_no), "")
+            # col_no 必须带在 cell 里：前端按下标渲染表格，而下标是 0 基、
+            # 列号是 1 基，前端拿 ci 当 col_no 存公式会整体错位一列。
+            base = {"col_no": c.col_no, "label": c.label, "kind": c.kind}
             if not src.strip():
-                row_values.append({"value": None, "formula": "", "error": ""})
+                row_values.append({**base, "value": None, "formula": "", "error": ""})
                 continue
             try:
                 value = evaluator.run(src)
-                row_values.append({"value": str(value), "formula": src, "error": ""})
+                row_values.append({**base, "value": str(value), "formula": src, "error": ""})
             except FormulaError as e:
                 errors.append(f"{r.label}(第{r.row_no}行 第{c.label}列): {e}")
-                row_values.append({"value": None, "formula": src, "error": str(e)})
+                row_values.append({**base, "value": None, "formula": src, "error": str(e)})
         grid.append(
             {
                 "row_no": r.row_no,

@@ -28,20 +28,20 @@
       <table class="report-table" v-loading="loading">
         <thead>
           <tr>
-            <th class="c-label">{{ template?.name }}</th>
-            <th v-for="c in data.cols" :key="c.col_no" :style="{ width: `${c.width}px` }">{{ c.label }}</th>
+            <th class="c-label" style="width:260px">项目</th>
+            <th v-for="c in valueCols" :key="c.col_no" :style="{ width: `${c.width}px` }">{{ c.label }}</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="row in data.rows" :key="row.row_no" :class="{ bold: row.bold }">
             <td class="c-label" :style="{ paddingLeft: `${8 + row.indent * 16}px` }">{{ row.label }}</td>
             <td
-              v-for="(cell, ci) in row.cells"
-              :key="ci"
+              v-for="cell in rowCells(row)"
+              :key="cell.col_no"
               class="c-num"
               :class="{ editable: editMode, error: cell.error }"
               :title="cell.formula || ''"
-              @click="editMode && onCellClick(row, ci, cell)"
+              @click="editMode && onCellClick(row, cell)"
             >
               <span v-if="cell.error" class="tag-bad">!</span>
               {{ cell.value !== null && cell.value !== undefined ? fmt(cell.value) : '' }}
@@ -53,7 +53,7 @@
       <!-- 公式编辑 -->
       <el-dialog v-model="formulaVisible" title="编辑单元格公式" width="560px" class="no-print">
         <div class="muted" style="margin-bottom:6px">
-          {{ editing?.row?.label }} · {{ data.cols[editing?.colIndex ?? 0]?.label }}
+          {{ editing?.row?.label }} · {{ editing?.label }}
         </div>
         <el-input v-model="editingFormula" placeholder='例：科目("1001","期末",{{本期}})' />
         <div class="fn-list">
@@ -94,6 +94,15 @@ const editing = ref(null)
 const editingFormula = ref('')
 const dirty = reactive({})
 
+// STATIC 列（科目行标题）在左边单独一列渲染，表格里不再重复一遍，
+// 否则表头会比表体多一列，数字全错位。
+const valueCols = computed(() => data.value.cols.filter((c) => c.kind !== 'STATIC'))
+
+function rowCells(row) {
+  const ids = new Set(valueCols.value.map((c) => c.col_no))
+  return row.cells.filter((c) => ids.has(c.col_no))
+}
+
 const FN_HELP = [
   { sig: '科目("1001","期末",{{本期}})', desc: '取科目余额 / 发生额；口径：期初、期末余额、借方累计、贷方累计、本期借方、本期贷方、本期金额、本年累计' },
   { sig: '合计(B2:B8)', desc: '单元格区域求和' },
@@ -104,14 +113,14 @@ const FN_HELP = [
   { sig: '{{本期}} {{上期}} {{年初}}', desc: '期间占位符' }
 ]
 
-function onCellClick(row, colIndex, cell) {
-  editing.value = { row, colIndex }
-  editingFormula.value = dirty[`${row.row_no}:${colIndex}`] ?? cell.formula ?? ''
+function onCellClick(row, cell) {
+  editing.value = { row, colNo: cell.col_no, label: cell.label }
+  editingFormula.value = dirty[`${row.row_no}:${cell.col_no}`] ?? cell.formula ?? ''
   formulaVisible.value = true
 }
 
 function applyFormula() {
-  dirty[`${editing.value.row.row_no}:${editing.value.colIndex}`] = editingFormula.value
+  dirty[`${editing.value.row.row_no}:${editing.value.colNo}`] = editingFormula.value
   formulaVisible.value = false
   load(true)
 }
@@ -144,13 +153,13 @@ async function load(keepDirty = false) {
     data.value = res
     if (editMode.value && keepDirty) {
       for (const row of res.rows) {
-        row.cells.forEach((cell, ci) => {
-          const key = `${row.row_no}:${ci}`
+        // 键必须用 cell.col_no（1 基），跟 onCellClick 存进去的一致。
+        // 用数组下标 ci（0 基）会永远匹配不上，编辑中的公式就"丢了"
+        row.cells.forEach((cell) => {
+          const key = `${row.row_no}:${cell.col_no}`
           if (dirty[key] !== undefined) {
             cell.formula = dirty[key]
-            try {
-              cell.value = evalFormulaPreview(dirty[key], row, ci, res)
-            } catch { cell.error = '' }
+            cell.value = '（待保存后重算）'
           }
         })
       }
@@ -158,12 +167,6 @@ async function load(keepDirty = false) {
   } finally {
     loading.value = false
   }
-}
-
-// 前端对未保存的公式做个近似预览，正式结果以保存后重算为准
-function evalFormulaPreview(formula, row, colIndex, res) {
-  if (!formula || !formula.trim()) return null
-  return '（待保存后重算）'
 }
 
 function onTemplateChange(id) {
