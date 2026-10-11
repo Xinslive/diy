@@ -14,6 +14,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.utils import get_column_letter
 
+ZERO = Decimal("0")
+
 THIN = Side(style="thin", color="000000")
 MEDIUM = Side(style="medium", color="000000")
 BOX = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
@@ -27,6 +29,32 @@ def _num(v) -> Optional[float]:
     if v is None or v == "":
         return None
     return float(Decimal(str(v)))
+
+
+def _d(v) -> Decimal:
+    """宽松取数：None / 空串 / 已经是 Decimal 都吃得下。"""
+    if v in (None, ""):
+        return ZERO
+    return Decimal(str(v))
+
+
+def _text(value) -> str:
+    """把用户可控文本写成**纯字符串**，不让 Excel 当公式执行。
+
+    openpyxl 看到以 ``=``/``+``/``-``/``@`` 开头的字符串会把它标成公式
+    （``cell.data_type == 'f'``）。摘要、备注、科目名都是用户填的，
+    摘要写个 ``=1+1`` 导出后在 Excel 里就是一格可执行公式 ——
+    别人打开可能触发外部链接请求，显示出来的也不是原文。
+
+    这不是洁癖：导出文件是要发给客户和审计方的，账上的字必须原样显示。
+    加一个前导单引号是 Excel 自己的「强制文本」记法，读起来仍是原文。
+    """
+    if value is None:
+        return ""
+    text = str(value)
+    if text[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
 
 
 def _money_style(ws, row: int, cols: range):
@@ -63,6 +91,12 @@ def vouchers_excel(rows: list[dict], *, title: str = "记账凭证", period: str
     for i, h in enumerate(headers, start=1):
         ws.column_dimensions[get_column_letter(i)].width = widths[i - 1]
 
+    # 本页合计要**累计本批所有凭证**。原来写在 for 循环外面、直接引用
+    # 循环变量 v，取到的是**最后一张**的合计 —— 导出 2 张各 100 的凭证，
+    # 合计写出来是 200 而不是 300。凭证导出的合计错了会直接对不上账。
+    sum_dr = ZERO
+    sum_cr = ZERO
+
     r = 4
     ws.cell(row=r, column=1, value="日期").font = Font(bold=True)
     ws.cell(row=r, column=2, value="凭证字号").font = Font(bold=True)
@@ -75,15 +109,17 @@ def vouchers_excel(rows: list[dict], *, title: str = "记账凭证", period: str
         ws.cell(row=r, column=c).border = Border(left=THIN, right=THIN, top=MEDIUM, bottom=MEDIUM)
 
     for v in rows:
+        sum_dr += _d(v.get("total_debit"))
+        sum_cr += _d(v.get("total_credit"))
         first = r + 1
         for i, e in enumerate(v["entries"]):
             row = first + i
-            ws.cell(row=row, column=1, value=v["voucher_date"] if i == 0 else None).alignment = CENTER
-            ws.cell(row=row, column=2, value=v["voucher_no"] if i == 0 else None).alignment = CENTER
-            ws.cell(row=row, column=3, value=e["summary"]).alignment = LEFT
-            subj = f'{e["subject_code"]} {e["subject_name"]}'
-            if e["direction"] == "DEBIT":
-                subj = subj
+            ws.cell(row=row, column=1,
+                    value=_text(v["voucher_date"]) if i == 0 else None).alignment = CENTER
+            ws.cell(row=row, column=2,
+                    value=_text(v["voucher_no"]) if i == 0 else None).alignment = CENTER
+            ws.cell(row=row, column=3, value=_text(e["summary"])).alignment = LEFT
+            subj = _text(f'{e["subject_code"]} {e["subject_name"]}')
             ws.cell(row=row, column=4, value=subj).alignment = LEFT
             ws.cell(row=row, column=5,
                     value=_num(e["amount"]) if e["direction"] == "DEBIT" else None).alignment = RIGHT
@@ -96,10 +132,14 @@ def vouchers_excel(rows: list[dict], *, title: str = "记账凭证", period: str
         _money_style(ws, last, range(5, 7))
         r = last
 
-    ws.cell(row=r + 2, column=3, value="本页合计").font = Font(bold=True)
-    ws.cell(row=r + 2, column=5, value=_num(v["total_debit"])).font = Font(bold=True)
-    ws.cell(row=r + 2, column=6, value=_num(v["total_credit"])).font = Font(bold=True)
-    _money_style(ws, r + 2, range(5, 7))
+    # 空结果也要能导出：原来这一段在 for 循环**外面**却引用了循环变量 v，
+    # rows 为空时 v 从未被赋值 → UnboundLocalError → 500。
+    # 「这个期间没有凭证」是完全正常的筛选结果，不该报错。
+    if rows:
+        ws.cell(row=r + 2, column=3, value="本页合计").font = Font(bold=True)
+        ws.cell(row=r + 2, column=5, value=_num(sum_dr)).font = Font(bold=True)
+        ws.cell(row=r + 2, column=6, value=_num(sum_cr)).font = Font(bold=True)
+        _money_style(ws, r + 2, range(5, 7))
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -140,10 +180,11 @@ def balance_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     totals = [0.0] * 6
     for row in payload["rows"]:
         r += 1
-        values = [row["code"], row["name"], row["opening_direction"], _num(row["opening"]),
+        values = [_text(row["code"]), _text(row["name"]), _text(row["opening_direction"]),
+                  _num(row["opening"]),
                   _num(row["period_debit"]), _num(row["period_credit"]),
                   _num(row["ytd_debit"]), _num(row["ytd_credit"]),
-                  row["direction"], _num(row["closing"])]
+                  _text(row["direction"]), _num(row["closing"])]
         for i, v in enumerate(values, start=1):
             c = ws.cell(row=r, column=i, value=v)
             c.border = BOX
@@ -206,7 +247,8 @@ def general_ledger_excel(payload: dict, *, company: str, book_name: str) -> byte
 
     for row in payload["rows"]:
         r += 1
-        values = [row["code"], row["name"], row["opening_direction"], _num(row["opening"]),
+        values = [_text(row["code"]), _text(row["name"]), _text(row["opening_direction"]),
+                  _num(row["opening"]),
                   _num(row["period_debit"]), _num(row["period_credit"]),
                   _num(row["ytd_debit"]), _num(row["ytd_credit"]), _num(row["closing"])]
         for i, v in enumerate(values, start=1):
@@ -242,7 +284,7 @@ def report_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     r = 4
     for idx, col in enumerate(payload["cols"], start=1):
         ws.column_dimensions[get_column_letter(idx)].width = col.get("width", 120) / 7
-        c = ws.cell(row=r, column=idx, value=col["label"])
+        c = ws.cell(row=r, column=idx, value=_text(col["label"]))
         c.font = Font(bold=True)
         c.alignment = CENTER
         c.border = Border(left=THIN, right=THIN, top=MEDIUM, bottom=MEDIUM)
@@ -264,7 +306,7 @@ def report_excel(payload: dict, *, company: str, book_name: str) -> bytes:
         r += 2
         ws.cell(row=r, column=1, value="公式错误：").font = Font(bold=True, color="CC0000")
         for i, e in enumerate(payload["errors"][:20]):
-            ws.cell(row=r + i + 1, column=1, value=e).font = Font(color="CC0000")
+            ws.cell(row=r + i + 1, column=1, value=_text(e)).font = Font(color="CC0000")
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -301,10 +343,10 @@ def opening_balance_excel(rows: list[dict], *, company: str, book_name: str, yea
 
     r = 5
     for row in rows:
-        ws.cell(row=r, column=1, value=row["code"])
-        ws.cell(row=r, column=2, value=row["name"])
-        ws.cell(row=r, column=3, value=row["direction"])
-        ws.cell(row=r, column=4, value=row["amount"])
+        ws.cell(row=r, column=1, value=_text(row["code"]))
+        ws.cell(row=r, column=2, value=_text(row["name"]))
+        ws.cell(row=r, column=3, value=_text(row["direction"]))
+        ws.cell(row=r, column=4, value=_num(row["amount"]))
         r += 1
 
     if r > 5:
