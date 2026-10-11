@@ -135,12 +135,42 @@ def update_user(user_id: int, payload: UserPatch, user: SysUser = Depends(get_cu
 def set_books(user_id: int, books: list[dict], user: SysUser = Depends(get_current_user),
               db: Session = Depends(get_db)):
     """整份替换某用户的账套授权列表。"""
+    from app.accounting.audit_helper import log
+
     _require_admin(user)
     target = db.get(SysUser, user_id)
     if target is None:
         raise HTTPException(404, "用户不存在")
     _check_roles(books)
+    # P3-10：授权变更过去不留痕。它是整个权限体系的入口动作 ——
+    # 出了「谁看到了不该看的数据」这种事，第一条要查的就是授权什么时候、
+    # 被谁、升到了什么角色。这份表按账套逐条记，且**逐个账套写一条**：
+    # 授权的粒度是 (用户, 账套)，合并成一条就看不出是哪个账套被动了。
+    before = {str(link.book_id): link.role for link in db.scalars(
+        select(UserBook).where(UserBook.user_id == user_id)).all()}
     _apply_links(db, target, books)
+    # 会话是 autoflush=False（app/core/db.py），_apply_links 刚 add 的
+    # UserBook 在 flush 之前对查询不可见 —— 不 flush 的话 after 永远是空的，
+    # 于是「新增授权」这种最该留痕的情况反而一条审计都不写。
+    db.flush()
+    after = {str(link.book_id): link.role for link in db.scalars(
+        select(UserBook).where(UserBook.user_id == user_id)).all()}
+
+    for book_id in set(before) | set(after):
+        old_role, new_role = before.get(book_id), after.get(book_id)
+        if old_role == new_role:
+            continue
+        if old_role and new_role:
+            what = f"变更 {target.username} 对账套 {book_id} 的授权：{old_role} → {new_role}"
+        elif new_role:
+            what = f"授予 {target.username} 账套 {book_id} 的 {new_role} 权限"
+        else:
+            what = f"收回 {target.username} 对账套 {book_id} 的 {old_role} 权限"
+        log(db, action="UPDATE_BOOK_ACCESS", entity="user_book",
+            entity_id=f"{user_id}:{book_id}", user=user, book_id=int(book_id),
+            detail=what,
+            before={"user": target.username, "role": old_role},
+            after={"user": target.username, "role": new_role})
     db.commit()
     return _serialize(target, {b["book_id"]: b["role"] for b in books})
 

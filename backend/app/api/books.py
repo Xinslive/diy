@@ -527,19 +527,27 @@ async def parse_openings(book_id: int, file: UploadFile = File(...),
 @router.post("/{book_id}/periods")
 def set_openings(book_id: int, payload: list[OpeningIn], period_id: int | None = None,
                  book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                 user: SysUser = Depends(get_current_user),
                  _link: UserBook = Depends(require_book_write)):
     """录入**某一期**的期初余额。
 
     不传 period_id 就是启用期间（老行为）。传了就写那一期：跨年记账时，
     上一年结转过来的数要是对不上，改这一期比去翻上一年的凭证省事得多。
     """
+    from app.accounting.audit_helper import log
+
     period = _openings_period(db, book, period_id)
     editable, reason = _openings_editable(db, period)
     if not editable:
         raise HTTPException(400, reason)
 
-    # 期初快照有数据库触发器保护（禁止 UPDATE），这里整体重建
-    for row in db.scalars(select(PeriodOpening).where(PeriodOpening.period_id == period.id)).all():
+    # 期初快照有数据库触发器保护（禁止 UPDATE），这里整体重建。
+    # 旧值必须**先取出来**：整体重建之后原值就没了，而审计恰恰要靠它。
+    before_rows = db.scalars(select(PeriodOpening).where(
+        PeriodOpening.period_id == period.id)).all()
+    before = {str(o.subject_id): str(o.amount) for o in before_rows}
+
+    for row in before_rows:
         db.delete(row)
     db.flush()
 
@@ -583,6 +591,23 @@ def set_openings(book_id: int, payload: list[OpeningIn], period_id: int | None =
     for subject_id, amount in planned:
         db.add(PeriodOpening(book_id=book.id, period_id=period.id,
                              subject_id=subject_id, amount=amount))
+
+    # P3-10：期初写入过去完全不留痕。期初是账面数字的起点，
+    # 一旦存歪，之后每个月、每张账簿、每份报表都会跟着歪，而且极难回溯
+    # 到是「录期初那一刻就差了」。审计里要能看出每个科目改前改后是多少。
+    changed = [
+        f"{subject_id}: {before.get(str(subject_id), '—')} → {amount}"
+        for subject_id, amount in planned
+        if before.get(str(subject_id), "0") != str(amount)
+    ]
+    log(db, action="SET_OPENINGS", entity="period_opening", entity_id=period.id,
+        user=user, book_id=book.id,
+        detail=f"录入 {period.code} 期初：{len(planned)} 个科目"
+               + (f"，变动 {len(changed)} 项" if changed else "")
+               + (f"（{'；'.join(changed[:10])}"
+                  + ("…" if len(changed) > 10 else "") + "）" if changed else ""),
+        before=before,
+        after={str(subject_id): str(amount) for subject_id, amount in planned})
     db.commit()
     return {"ok": True, "count": len(payload), "period": period.code}
 

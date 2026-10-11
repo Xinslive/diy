@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.accounting.audit_helper import log
 from app.api.schemas import CellIn
 from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
@@ -86,15 +87,29 @@ def save_cells(template_id: int, payload: list[CellIn], db: Session = Depends(ge
     if not _can_write(db, user, book_id):
         raise HTTPException(403, "没有可写账套的权限")
 
+    # P3-10：改公式必须留 before。公式写错一个字符，报表就会悄无声息地
+    # 少算一列，而页面照样渲染得出来 —— 没有原公式根本无从判断是哪改坏的。
+    before: dict[str, str] = {}
+    after: dict[str, str] = {}
     for item in payload:
         cell = db.scalar(select(ReportCell).where(
             ReportCell.template_id == template_id, ReportCell.row_no == item.row_no,
             ReportCell.col_no == item.col_no))
+        key = f"r{item.row_no}c{item.col_no}"
         if cell:
+            before[key] = cell.formula
             cell.formula = item.formula
         else:
             db.add(ReportCell(template_id=template_id, row_no=item.row_no,
                               col_no=item.col_no, formula=item.formula))
+        after[key] = item.formula
+    db.flush()
+
+    if before or after:
+        log(db, action="UPDATE_REPORT_CELLS", entity="report_template",
+            entity_id=template_id, user=user, book_id=book_id,
+            detail=f"修改报表 {template_id} 的 {len(after)} 个单元格公式",
+            before=before, after=after)
     db.commit()
     return {"ok": True, "updated": len(payload)}
 

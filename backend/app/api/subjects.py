@@ -5,12 +5,23 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.accounting.audit_helper import log
 from app.api.schemas import SubjectIn
 from app.core.db import get_db
-from app.core.deps import get_my_book, require_book_write
-from app.models import Book, Entry, PeriodOpening, Subject, UserBook
+from app.core.deps import get_current_user, get_my_book, require_book_write
+from app.models import Book, Entry, PeriodOpening, Subject, SysUser, UserBook
 
 router = APIRouter(prefix="/api/books/{book_id}/subjects", tags=["科目"])
+
+
+def _subject_snapshot(s: Subject) -> dict:
+    """科目快照。改名、换父、停用都靠它还原「改之前长什么样」。"""
+    return {
+        "id": s.id, "code": s.code, "name": s.name, "category": s.category,
+        "direction": s.direction, "parent_id": s.parent_id, "level": s.level,
+        "is_leaf": s.is_leaf, "carry_forward": s.carry_forward,
+        "active": s.active, "sort_no": s.sort_no,
+    }
 
 
 def _tree(rows: list[Subject]) -> list[dict]:
@@ -93,7 +104,8 @@ def frequent_subjects(book: Book = Depends(get_my_book), db: Session = Depends(g
 
 @router.post("", status_code=201)
 def create_subject(payload: SubjectIn, book: Book = Depends(get_my_book),
-                   db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write)):
+                   db: Session = Depends(get_db), user: SysUser = Depends(get_current_user),
+                   _link: UserBook = Depends(require_book_write)):
     exists = db.scalar(select(Subject).where(Subject.book_id == book.id, Subject.code == payload.code))
     if exists:
         raise HTTPException(400, f"科目编码已存在: {payload.code}")
@@ -113,6 +125,12 @@ def create_subject(payload: SubjectIn, book: Book = Depends(get_my_book),
     # 它错了会让期初录入拒掉本该能录的科目（或者反过来允许录到汇总级上），
     # 两头都是账面错误。更新路径有 _sync_leaf_flags，新建路径原先漏了。
     _sync_leaf_flags(db, None, payload.parent_id)
+    db.flush()
+    # P3-10：建科目过去不留痕。新增一个科目会让科目表、总账、报表的
+    # 行列结构都变，事后没人说得清「这个科目是什么时候、谁加的」。
+    log(db, action="CREATE_SUBJECT", entity="subject", entity_id=s.id, user=user,
+        book_id=book.id, detail=f"新增科目 {s.code} {s.name}",
+        after=_subject_snapshot(s))
     db.commit()
     db.refresh(s)
     return {"id": s.id, "code": s.code, "name": s.name}
@@ -181,10 +199,13 @@ def _sync_leaf_flags(db: Session, old_parent_id: int | None, new_parent_id: int 
 
 @router.patch("/{subject_id}")
 def update_subject(subject_id: int, payload: SubjectIn, book: Book = Depends(get_my_book),
-                   db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write)):
+                   db: Session = Depends(get_db), user: SysUser = Depends(get_current_user),
+                   _link: UserBook = Depends(require_book_write)):
     s = db.get(Subject, subject_id)
     if s is None or s.book_id != book.id:
         raise HTTPException(404, "科目不存在")
+    before = _subject_snapshot(s)
+    was_active = s.active
     used = db.scalar(select(Entry).where(Entry.subject_id == subject_id).limit(1))
     if used and (s.code != payload.code or s.direction != payload.direction or s.category != payload.category):
         raise HTTPException(400, "科目已被凭证使用，不能修改编码 / 类别 / 余额方向")
@@ -205,6 +226,16 @@ def update_subject(subject_id: int, payload: SubjectIn, book: Book = Depends(get
     # 有分录的科目删不掉（下面 400），停用才是那条正路。
     if payload.active is not None:
         s.active = payload.active
+    db.flush()
+    # P3-10：停用尤其要留痕。老凭证还指着这个科目（停用不是删除），
+    # 出问题时「它什么时候被停的、谁停的」是第一条要问的事。
+    verb = "停用" if (was_active and not s.active) else (
+        "启用" if (not was_active and s.active) else "修改")
+    log(db, action="UPDATE_SUBJECT", entity="subject", entity_id=s.id, user=user,
+        book_id=book.id,
+        detail=f"{verb}科目 {s.code} {s.name}"
+               + (f"（active {was_active} → {s.active}）" if was_active != s.active else ""),
+        before=before, after=_subject_snapshot(s))
     db.commit()
     db.refresh(s)
     return {"id": s.id, "code": s.code, "name": s.name}
@@ -212,10 +243,13 @@ def update_subject(subject_id: int, payload: SubjectIn, book: Book = Depends(get
 
 @router.delete("/{subject_id}")
 def delete_subject(subject_id: int, book: Book = Depends(get_my_book),
-                   db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write)):
+                   db: Session = Depends(get_db), user: SysUser = Depends(get_current_user),
+                   _link: UserBook = Depends(require_book_write)):
     s = db.get(Subject, subject_id)
     if s is None or s.book_id != book.id:
         raise HTTPException(404, "科目不存在")
+    # 快照要在 delete 之前取 —— 删掉之后就再也拼不回来了。
+    before = _subject_snapshot(s)
     if db.scalar(select(Entry).where(Entry.subject_id == subject_id).limit(1)):
         raise HTTPException(400, "科目已被凭证使用，不能删除；可改为停用")
     if db.scalar(select(Subject).where(Subject.parent_id == subject_id).limit(1)):
@@ -236,6 +270,10 @@ def delete_subject(subject_id: int, book: Book = Depends(get_my_book),
         raise HTTPException(
             400, f"该科目有 {n_openings} 期期初余额，不能删除；可改为停用"
                  "（停用不影响历史统计与年度结转）")
+    # P3-10：删科目必须留 before 快照。这是少数「事后无法从库里还原」
+    # 的写路径 —— 没有快照的话，被删掉的科目长什么样只能靠人回忆。
+    log(db, action="DELETE_SUBJECT", entity="subject", entity_id=subject_id, user=user,
+        book_id=book.id, detail=f"删除科目 {s.code} {s.name}", before=before)
     db.delete(s)
     db.commit()
     return {"ok": True}
