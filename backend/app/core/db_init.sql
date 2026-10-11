@@ -388,3 +388,40 @@ ALTER TABLE subject ADD COLUMN IF NOT EXISTS fx_calc  boolean NOT NULL DEFAULT f
 
 UPDATE book SET subject_code_rule = '4-2-2-2'
  WHERE subject_code_rule IS NULL OR btrim(subject_code_rule) = '';
+
+-- =====================================================================
+-- 迁移：period_opening.subject_id 改成 RESTRICT（审计 P1-05）
+--
+-- 原来是 ON DELETE CASCADE。应用层删科目时只检查了 Entry 引用和下级科目，
+-- 没检查期初，于是「只被期初引用、没有凭证引用」的科目一删，
+-- 期初记录随之级联消失，余额凭空漂移（实测：2 条期初删成 1 条，0 → -100）。
+-- 没有任何报错或审计线索 —— 属���静默数据损失。
+--
+-- 改完之后数据库层也兜底：即使将来有人绕过应用层直接删，
+-- 有期初引用的科目删不掉。这是本项目护栏的一贯做法
+-- （结账、凭证编辑、期初不可变都由触发器挡）。
+--
+-- 幂等：先删旧约束再加新的，跑第二遍结果一致。
+-- 已有脏数据（期初引用了已不存在的科目）不会被这条 ALTER 影响 —— 外键
+-- 从 CASCADE 改 RESTRICT 不校验存量行。
+-- =====================================================================
+DO $$
+DECLARE
+    v_old text;
+BEGIN
+    SELECT conname INTO v_old
+      FROM pg_constraint
+     WHERE conrelid = 'period_opening'::regclass
+       AND contype = 'f'
+       AND conkey = ARRAY[(SELECT attnum FROM pg_attribute
+                            WHERE attrelid = 'period_opening'::regclass
+                              AND attname = 'subject_id')];
+
+    IF v_old IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE period_opening DROP CONSTRAINT %I', v_old);
+    END IF;
+
+    ALTER TABLE period_opening
+        ADD CONSTRAINT fk_period_opening_subject
+        FOREIGN KEY (subject_id) REFERENCES subject(id) ON DELETE RESTRICT;
+END $$;
