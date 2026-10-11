@@ -8,6 +8,7 @@ from collections import defaultdict
 from decimal import Decimal
 from typing import Optional
 
+from fastapi import HTTPException
 from sqlalchemy import Select, and_, func, select
 from sqlalchemy.orm import Session
 
@@ -52,6 +53,28 @@ def subject_tree(db: Session, book_id: int) -> list[Subject]:
 # --------------------------------------------------------------------- 明细账
 
 
+def subject_of_book(db: Session, book_id: int, subject_id: int) -> Subject:
+    """取**属于本账套**的科目，取不到就 404。
+
+    以前这里是裸的 ``db.get(Subject, subject_id)``，不带 book_id 约束 ——
+    同一个文件里 ``general`` 校验了期间归属，``detail`` 却不校验科目，
+    两种口径。后果不是泄露金额（分录查询自带 Entry.book_id 过滤），
+    而是别的账套的科目元数据（编码、名称、余额方向）会跨账套参与计算，
+    页面看着正常、实际是空账，用户会以为这个科目真的一分钱没有。
+
+    更糟的是传一个**不存在**的 id：``db.get`` 返回 None，
+    后面 ``display_side(None, ...)`` 直接 AttributeError → 500。
+    用户手输一个错 id 就能让接口报服务器错误，而不是「科目不存在」。
+
+    这里不拦 ``is_leaf``：上级科目是合法 ID，点它的小计行应当看到
+    空账而不是 404。末级性由调用方在需要时自己判断。
+    """
+    subject = db.get(Subject, subject_id)
+    if subject is None or subject.book_id != book_id:
+        raise HTTPException(404, "科目不存在")
+    return subject
+
+
 def detail_ledger(
     db: Session,
     book_id: int,
@@ -62,7 +85,7 @@ def detail_ledger(
 ) -> dict:
     """明细账：逐笔列出分录并滚动计算余额。"""
     eng = LedgerEngine(db, book_id, include_unposted)
-    subject = db.get(Subject, subject_id)
+    subject = subject_of_book(db, book_id, subject_id)
     rows = []
 
     # 区间期初 = 起始期间的期初
