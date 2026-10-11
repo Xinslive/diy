@@ -33,8 +33,22 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
-def create_access_token(user_id: int, username: str) -> tuple[str, int]:
-    expires = datetime.now(timezone.utc) + timedelta(minutes=settings.access_token_minutes)
+def token_minutes_for(is_admin: bool) -> int:
+    """这个身份该发多长的令牌。
+
+    管理员令牌更短（审计 P3-04 建议 3）：管理员能开号、能看全量操作日志，
+    令牌一旦泄露，暴露的权限面比普通会计大得多，所以窗口就该更短。
+
+    取**较小者**而不是直接用管理员值 —— 有人把全局配成 30 分钟时，
+    管理员这一档不该反过来把有效期拉长。
+    """
+    if not is_admin:
+        return settings.access_token_minutes
+    return min(settings.access_token_minutes, settings.admin_token_minutes)
+
+
+def create_access_token(user_id: int, username: str, is_admin: bool = False) -> tuple[str, int]:
+    expires = datetime.now(timezone.utc) + timedelta(minutes=token_minutes_for(is_admin))
     payload = {"sub": str(user_id), "username": username, "exp": expires}
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm), int(
         expires.timestamp()

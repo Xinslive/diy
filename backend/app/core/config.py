@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     jwt_secret: str = DEFAULT_JWT_SECRET
     jwt_algorithm: str = "HS256"
     access_token_minutes: int = 720
+    # 管理员令牌有效期上限（审计 P3-04 建议 3：令牌有效期按角色区分，管理员更短）。
+    # 取「与 access_token_minutes 的较小者」而不是直接生效 ——
+    # 有人把全局配成 30 分钟时，不该被管理员上限反而拉长。
+    admin_token_minutes: int = 240
+
+    # 登录失败锁定（审计 P3-04 建议 4）。
+    login_max_failures: int = 5
+    login_lock_minutes: int = 15
 
     default_timezone: str = "Asia/Shanghai"
 

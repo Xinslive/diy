@@ -4,9 +4,11 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 from typing import Optional
 
-from sqlalchemy import Boolean, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import (Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, func)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
@@ -23,6 +25,14 @@ class SysUser(Base, TimestampMixin):
     # 管理员标记。原来靠「用户名恰好叫 admin」来判断，测试里造不出管理员，
     # 而且用户名是能改的 —— 权限判据必须存在字段里。
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # 登录失败计数与锁定截止时间（审计 P3-04 建议 4：登录接口增加限流与失败次数锁定）。
+    #
+    # 放**账号**上而不是内存里：多进程部署时每个进程各有一份内存计数，
+    # 攻击者打满 N 个进程就能把 N 次额度用满，等于没锁。放内存还有一个更麻烦的问题 ——
+    # 重启即清零，于是「慢速爆破」（每秒一次，攒够就停）根本不会触发阈值。
+    failed_logins: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
 
 
 class UserBook(Base, TimestampMixin):

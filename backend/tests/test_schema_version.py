@@ -122,21 +122,15 @@ def test_存量库_拒绝启动且不自动_stamp(scratch):
     assert current_revision(eng) is None, "居然自动 stamp 了 —— 这是最不能发生的那种自动"
 
 
-def test_库比代码旧_让运维_upgrade(scratch, monkeypatch):
+def test_库比代码旧_让运维_upgrade(scratch):
     """「库停在旧版本」—— 这是最常见、也最该被好好提示的一种情况。
 
-    现在仓库里只有 baseline 一个 revision，所以构造不出一个**真实的**旧版本号。
-    与其为了测试硬造一个空迁移（那等于往版本历史里塞假动作），
-    不如把「已知版本集合」替换掉，单独验证这条分支的判断和提示 ——
-    分支逻辑才是这里要守的东西，多一个假 revision 反而会让人误以为
-    已经验证过「真实的降级 → 升级」这条路。
+    用的就是仓库里真实的上一版 revision，不造假版本号：这条分支的意义在于
+    「库落后一版时给的提示对不对」，拿一个代码里根本没见过的版本号去测它，
+    走的是另一条分支（见下面 test_库比代码新）。
     """
-    import app.core.schema_version as sv
-
     eng, _ = scratch
-    monkeypatch.setattr(sv, "_known_revisions",
-                        lambda: {"0001_baseline", "0000_真实存在的旧版本"})
-    _stamp(eng, "0000_真实存在的旧版本")
+    _stamp(eng, "0001_baseline")
     with pytest.raises(SchemaVersionError) as e:
         assert_schema_ready(eng)
     msg = str(e.value)
