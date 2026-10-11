@@ -23,7 +23,8 @@ from sqlalchemy import create_engine, text
 
 from app.core.db import engine
 from app.core.schema_version import (SchemaVersionError, assert_schema_ready,
-                                     current_revision, head_revision)
+                                     base_revision, current_revision,
+                                     head_revision)
 from tests.conftest import TEST_DB_URL
 
 BACKEND = pathlib.Path(__file__).resolve().parents[1]
@@ -122,15 +123,51 @@ def test_存量库_拒绝启动且不自动_stamp(scratch):
     assert current_revision(eng) is None, "居然自动 stamp 了 —— 这是最不能发生的那种自动"
 
 
+def test_存量库_stamp_到最早那版_不是_head(scratch):
+    """``stamp head`` 会让之后的 revision 一次都不跑 —— 那就是 P3-01 本人的行为。
+
+    所以提示语里给的必须是 base（0001_baseline），并且要跟着 ``upgrade head``；
+    只给 stamp 一条命令的话，运维做完还是停在「版本对了但结构不对」的状态，
+    而且再也看不出来。
+    """
+    eng, _ = scratch
+    _fake_table(eng)
+    with pytest.raises(SchemaVersionError) as e:
+        assert_schema_ready(eng)
+    msg = str(e.value)
+
+    base = base_revision()
+    head = head_revision()
+    assert base and head and base != head, (
+        f"这条用例要求 base({base}) != head({head})；"
+        f"只有一条 revision 时谈「stamp 到哪」是没有意义的")
+    assert f"alembic stamp {base}" in msg, f"没让运维 stamp 到最早的 {base}：{msg}"
+    assert f"alembic upgrade head" in msg, f"stamp 之后没让继续 upgrade：{msg}"
+    assert f"alembic stamp {head}" not in msg, (
+        f"居然建议 stamp head —— 那等于断言这个库已经是最新的，"
+        f"之后的 migration 全部被跳过：{msg}")
+    # 得解释清楚为什么不是 head，否则运维会理所当然地改成 stamp head
+    assert "静默不生效" in msg, f"没解释 stamp head 的后果：{msg}"
+
+
+def test_base_是真实存在的_最老_revision():
+    """base_revision() 不是常量，必须真的来自仓库里那份 revision 目录。"""
+    from app.core.schema_version import _known_revisions
+
+    known = _known_revisions()
+    base = base_revision()
+    assert base in known, f"base {base} 不在 {sorted(known)} 里 —— 这条建议是假的"
+
+
 def test_库比代码旧_让运维_upgrade(scratch):
     """「库停在旧版本」—— 这是最常见、也最该被好好提示的一种情况。
 
-    用的就是仓库里真实的上一版 revision，不造假版本号：这条分支的意义在于
-    「库落后一版时给的提示对不对」，拿一个代码里根本没见过的版本号去测它，
+    用的就是仓库里真实的旧 revision，不造假版本号：这条分支的意义在于
+    「库落后时给的提示对不对」，拿一个代码里根本没见过的版本号去测它，
     走的是另一条分支（见下面 test_库比代码新）。
     """
     eng, _ = scratch
-    _stamp(eng, "0001_baseline")
+    _stamp(eng, base_revision())
     with pytest.raises(SchemaVersionError) as e:
         assert_schema_ready(eng)
     msg = str(e.value)
@@ -149,6 +186,158 @@ def test_库比代码新_提示方向而不是让_upgrade(scratch):
         assert_schema_ready(eng)
     msg = str(e.value)
     assert "回滚" in msg, f"没识别出这是代码回滚导致的版本超前：{msg}"
+
+
+# ------------------------------------------------- 0003：存量库收敛，且幂等
+
+def test_期初外键是_RESTRICT_不是_CASCADE(db):
+    """P1-05 的护栏：删科目不能连带删掉期初余额。
+
+    ``ON DELETE CASCADE`` 在这里是**静默数据损失** —— 删一个只被期初引用、
+    没有凭证引用的科目，期初行会一起消失，余额漂移，事后没有任何线索。
+    这里查的是数据库里的事实，不是 ORM 声明：ORM 写着 RESTRICT 和库里
+    真的是 RESTRICT 是两件事（P3-01 的整个教训）。
+    """
+    row = db.execute(text("""
+        SELECT c.confdeltype::text
+          FROM pg_constraint c
+          JOIN pg_attribute a
+            ON a.attrelid = c.conrelid
+           AND a.attnum = ANY (c.conkey)
+           AND a.attname = 'subject_id'
+         WHERE c.conrelid = 'period_opening'::regclass
+           AND c.contype = 'f'
+    """)).scalar()
+    assert row == "r", (
+        f"period_opening.subject_id 的外键删除动作是 {row!r}，不是 RESTRICT(r) —— "
+        f"删科目会连带删掉期初余额")
+
+
+def test_期初外键约束名和_db_init_一致(db):
+    """两条改这条外键的路径（baseline 重放 db_init.sql / 0003）必须留下同一个名字。
+
+    名字不一致不代表功能坏，但会让「这条约束是谁建的」再也查不清 ——
+    而「每处结构变化都有出处」正是 P3-01 想要的结果。
+    """
+    names = set(db.execute(text(
+        "SELECT conname FROM pg_constraint "
+        "WHERE conrelid = 'period_opening'::regclass AND contype = 'f'"
+    )).scalars().all())
+    assert "fk_period_opening_subject" in names, (
+        f"约束名对不上 db_init.sql 里 P1-05 那段 DO 块：{sorted(names)}")
+
+
+def test_period_ord_是_integer(db):
+    """模型是 ``Integer``，库里就不能是 ``smallint``。
+
+    ord = (year - start_year) * 12 + month，理论上永远用不满 smallint 的
+    32767 —— 但「理论够用」不是理由。结构必须和模型一致，否则下一轮
+    「改类型」又会留下同样的化石，而这类差异只有逐项对比才能发现。
+    """
+    t = db.execute(text("""
+        SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+         WHERE attrelid = 'period'::regclass AND attname = 'ord' AND attnum > 0
+    """)).scalar()
+    assert t == "integer", f"period.ord 的类型是 {t}，不是 integer"
+
+
+def test_0003_重复执行不改变结构(db, monkeypatch):
+    """幂等：已经收敛的库再跑一次 0003，结构不该有任何变化。
+
+    必要性在于运维会重跑。不幂等的 migration 重跑一次就多一个约束，
+    而这类问题往往在很久以后才以「基线对不上」的形式冒出来。
+    """
+    rev = _load_0003()
+    # 不关连接：连接归 session 所有，由 db 夹具的 rollback 收尾。
+    # 这里 with 出去的话 session 就再也 rollback 不回来了。
+    conn = db.connection()
+    monkeypatch.setattr(rev, "op", _OpShim(conn))
+
+    before = _converge_snapshot(conn)
+    rev.upgrade()
+    assert _converge_snapshot(conn) == before, "跑了一次 0003 就把结构改动了"
+
+    rev.upgrade()
+    assert _converge_snapshot(conn) == before, "0003 不幂等：第二次执行改动了结构"
+
+
+def test_0003_能把_CASCADE_收敛成_RESTRICT(scratch, monkeypatch):
+    """正向验证：拿一个「create_all 时代」的库结构，0003 之后应该和 baseline 一致。
+
+    只测「已经是目标形态时不动」是不够的 —— 那证明不了它真的会把错的改对。
+    这里在 scratch schema 里摆出开发库当年那个状态（小int + CASCADE），
+    跑一遍 0003，再逐项比。
+    """
+    eng, _ = scratch
+    with eng.begin() as conn:
+        conn.exec_driver_sql("CREATE TABLE subject (id INTEGER PRIMARY KEY)")
+        conn.exec_driver_sql("CREATE TABLE period (id INTEGER PRIMARY KEY, ord SMALLINT NOT NULL)")
+        conn.exec_driver_sql(
+            "CREATE TABLE period_opening (id INTEGER PRIMARY KEY, subject_id INTEGER NOT NULL, "
+            "CONSTRAINT period_opening_subject_id_fkey FOREIGN KEY (subject_id) "
+            "REFERENCES subject(id) ON DELETE CASCADE)")
+
+    rev = _load_0003()
+    with eng.connect() as c:
+        monkeypatch.setattr(rev, "op", _OpShim(c))
+        rev.upgrade()
+        act = c.execute(text("""
+            SELECT confdeltype::text FROM pg_constraint
+             WHERE conrelid = 'period_opening'::regclass AND contype = 'f'
+        """)).scalar()
+        typ = c.execute(text("""
+            SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+             WHERE attrelid = 'period'::regclass AND attname = 'ord' AND attnum > 0
+        """)).scalar()
+    assert act == "r", f"外键没收敛到 RESTRICT，还是 {act!r}"
+    assert typ == "integer", f"period.ord 没收敛到 integer，还是 {typ!r}"
+
+
+class _OpShim:
+    """``alembic.op`` 的替身，只提供 0003 用到的那一个方法。
+
+    0003 的 upgrade 里除了 ``op.get_bind()`` 没有别的 op 调用（它写的都是
+    手写 ALTER，因为「把 CASCADE 改成 RESTRICT 并重命名」没有 op 级原语）。
+    所以这里不需要伪造 MigrationContext —— 换成真 context 反而会把用例
+    的重点（幂等、收敛）淹没在 alembic 内部机制里。
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def get_bind(self):
+        return self._conn
+
+
+def _load_0003():
+    """按路径加载 0003。
+
+    不用 ``import migrations.versions.0003_converge_legacy``：revision 的文件名
+    以数字开头，不是合法标识符，import 语句写不出来。
+    """
+    import importlib.util
+
+    path = BACKEND / "migrations" / "versions" / "0003_converge_legacy.py"
+    spec = importlib.util.spec_from_file_location("rev_0003", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _converge_snapshot(conn) -> tuple:
+    """0003 关心的那部分结构。"""
+    def rows(table):
+        return tuple(sorted(conn.execute(text(
+            f"SELECT conname || ':' || confdeltype::text FROM pg_constraint "
+            f"WHERE conrelid = '{table}'::regclass")).scalars().all()))
+
+    return (
+        rows("period_opening"),
+        rows("period"),
+        conn.execute(text("SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+                          "WHERE attrelid='period'::regclass AND attname='ord' "
+                          "AND attnum>0")).scalar(),
+    )
 
 
 # ------------------------------------------------------ 静态守卫：启动不许建表

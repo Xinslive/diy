@@ -108,7 +108,7 @@ def assert_schema_ready(engine: Engine | None = None) -> str:
                 f"  执行：cd {BACKEND_ROOT} && .venv/bin/alembic upgrade head\n"
                 f"（服务不会替你建表了：启动时自动建表正是 P3-01 要去掉的行为）"
             )
-        raise _legacy_error(head, existing)
+        raise _legacy_error(head, base_revision(), existing)
 
     known = _known_revisions()
     if current in known:
@@ -120,7 +120,30 @@ def assert_schema_ready(engine: Engine | None = None) -> str:
     raise _unknown_error(current, head)
 
 
-def _legacy_error(head: str, existing: int) -> SchemaVersionError:
+def base_revision() -> str | None:
+    """这份代码里最早的 revision（baseline）。
+
+    存量库要 stamp 的是它，不是 head —— 理由见 :func:`_legacy_error`。
+    """
+    from alembic.script import ScriptDirectory
+
+    try:
+        return ScriptDirectory.from_config(_config()).get_base()
+    except Exception:
+        return None
+
+
+def _legacy_error(head: str, base: str | None, existing: int) -> SchemaVersionError:
+    target = base or head
+    stamp_note = (
+        f"注意 stamp 的是 **{target}** 而不是 {head}：stamp head 等于断言"
+        f"「这个库已经等于最新版本」，那样 {head} 之后的 migration 一次都不会跑 —— "
+        f"这正是 P3-01 说的那种「改完了但静默不生效」。\n"
+        f"stamp 到最早那版再 upgrade，后面的每一条 revision 都会老老实实跑一遍；"
+        f"其中 {target} 之后的 revision 正是用来把「create_all 建出来的老结构」"
+        f"收敛到 baseline 的。\n"
+    ) if base and base != head else ""
+
     return SchemaVersionError(
         f"数据库里已经有 {existing} 张表，但没有 alembic_version —— 这是引入 Alembic "
         f"之前建的存量库，代码无法确认它当前对应哪个版本。\n"
@@ -128,10 +151,12 @@ def _legacy_error(head: str, existing: int) -> SchemaVersionError:
         f"而这个断言没法验证，一旦库其实已经跑在别的版本上，"
         f"后面的 migration 会在错误的结构上执行。\n"
         f"  1) 先确认这个库的代码就是引入 Alembic 之前那一版、且跑得正常；\n"
-        f"  2) 备份；\n"
-        f"  3) 执行：cd {BACKEND_ROOT} && .venv/bin/alembic stamp {head}\n"
+        f"  2) 备份（dump 或快照，别跳过）；\n"
+        f"  3) 执行：cd {BACKEND_ROOT} && .venv/bin/alembic stamp {target}\n"
+        f"  4) 执行：cd {BACKEND_ROOT} && .venv/bin/alembic upgrade head\n"
+        f"{stamp_note}"
         f"  如果这个库其实已经在跑更新的代码，请人工核对结构后，"
-        f"改用能反映真实结构的版本号 stamp，而不是 {head}。"
+        f"改用能反映真实结构的版本号 stamp，而不是 {target}。"
     )
 
 
