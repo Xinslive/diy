@@ -537,17 +537,43 @@ def export_balance(book_id: int, period_id: Optional[int] = None, book: Book = D
 
 
 @router.get("/general-ledger.xlsx")
-def export_general(book_id: int, period_id: Optional[int] = None, book: Book = Depends(get_my_book),
-                   db: Session = Depends(get_db), include_unposted: bool = Query(False)):
+def export_general(book_id: int, period_id: Optional[int] = None,
+                   from_period_id: Optional[int] = None,
+                   book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                   include_unposted: bool = Query(False), leaf_only: bool = Query(False)):
+    """总账导出。
+
+    原来这个接口**只认 period_id**，把 from/to 都当成同一期：前端页面显示的
+    是「起始月 ~ 结束月」这一段，下载下来的却是起始月到结束月的**全部**
+    （因为 period_id 之外没有下界）。屏幕上是一页、文件里是全账，数字对不上，
+    用户只会以为导出坏了。审计第 7.3 节把「总账导出：区间与页面显示一致」
+    列为验收项。
+
+    现在与 general-ledger.html 的口径一致：认 from_period_id，缺省则退化成
+    单期导出（老调用方不受影响）。
+    """
     from app.ledger import queries
 
-    period = _period(db, book.id, period_id)
+    to_period = _period(db, book.id, period_id)
+    if from_period_id:
+        from_period = db.get(Period, from_period_id)
+        if from_period is None or from_period.book_id != book.id:
+            raise HTTPException(404, "起始期间不存在")
+        if from_period.ord > to_period.ord:
+            from_period, to_period = to_period, from_period
+    else:
+        from_period = to_period
+
     subjects = queries.subject_tree(db, book.id)
-    rows = queries.general_ledger(db, book.id, subjects, period, period, include_unposted)
-    data = xl.general_ledger_excel({"rows": rows, "from_period": period.code, "to_period": period.code},
-                                   company=book.company_name, book_name=book.name)
+    if leaf_only:
+        subjects = [s for s in subjects if s.is_leaf]
+    rows = queries.general_ledger(db, book.id, subjects, from_period, to_period, include_unposted)
+    data = xl.general_ledger_excel(
+        {"rows": rows, "from_period": from_period.code, "to_period": to_period.code},
+        company=book.company_name, book_name=book.name)
+    span = from_period.code if from_period.id == to_period.id else f"{from_period.code}-{to_period.code}"
     return Response(content=data, media_type=XLSX_MIME,
-                    headers={"Content-Disposition": _filename(f"总账_{period.code}.xlsx")})
+                    headers={"Content-Disposition": _filename(f"总账_{span}.xlsx")})
 
 
 @router.get("/report.xlsx")

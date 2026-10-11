@@ -2,6 +2,9 @@ import { defineStore } from 'pinia'
 import * as authApi from '@/api/auth'
 import * as bookApi from '@/api/book'
 
+/** 能写的角色。与后端 ROLES（app/api/system.py）保持一致。 */
+const WRITABLE_ROLES = ['OWNER', 'ACCOUNTANT']
+
 export const useSessionStore = defineStore('session', {
   state: () => ({
     token: localStorage.getItem('cwq_token') || '',
@@ -21,7 +24,18 @@ export const useSessionStore = defineStore('session', {
     isAdmin: (s) => !!s.user?.is_admin,
     currentBook: (s) => s.books.find((b) => b.id === s.bookId) || null,
     currentPeriod: (s) => s.periods.find((p) => p.id === s.periodId) || null,
-    canWrite: (s) => s.currentBook?.role !== 'VIEWER',
+    /** 当前账套能不能写。**失败时关闭（fail-closed）**。
+     *
+     *  原来是 ``s.currentBook?.role !== 'VIEWER'`` —— 黑名单写法。
+     *  currentBook 为 null 时（账套还没加载完、加载失败、刚切账套的
+     *  中间态）得到 undefined !== 'VIEWER' → **true**，于是加载间隙里
+     *  可写按钮是亮的，点下去被后端 403 拒掉。
+     *
+     *  改成白名单：认不得的角色一律当不能写。后端认的是 OWNER /
+     *  ACCOUNTANT（见 ROLES），前端跟着认同一份，不要各立一套标准。
+     *  多认一个角色只会在后端拒的时候让用户困惑，少认一个顶多按钮
+     *  灰着 —— 两个方向的代价不对称。 */
+    canWrite: (s) => !!s.currentBook && WRITABLE_ROLES.includes(s.currentBook.role),
     /** 正在看的年度 —— 年度是账套的属性，不是另一个账套。
      *  由期间反推，不再单独存一份，免得两边对不上。 */
     currentYear: (s) => s.periods.find((p) => p.id === s.periodId)?.year

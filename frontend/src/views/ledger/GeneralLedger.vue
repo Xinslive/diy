@@ -73,8 +73,14 @@ function previewHtml() {
 }
 
 function exportXlsx() {
+  // from_period_id 必须一起传。页面显示的是「起始月 ~ 结束月」这一段，
+  // 导出却只给了 period_id（= 结束月），后端就按「从最早期间到该月」
+  // 导 —— 屏幕上是一页，下载下来是全账，数字对不上，用户只会以为导出坏了。
+  // 审计第 7.3 节把「总账导出：区间与页面显示一致」列为验收项。
+  //
+  // 与上面 previewHtml 的口径保持一致：那边是 from_period_id || undefined。
   downloadFile(`/books/${store.bookId}/print/general-ledger.xlsx`,
-    { period_id: toId.value }, '总账.xlsx')
+    { period_id: toId.value, from_period_id: fromId.value || undefined }, '总账.xlsx')
 }
 
 onMounted(() => { toId.value = store.periodId; load() })
