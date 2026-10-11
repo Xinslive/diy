@@ -83,9 +83,11 @@ export const useSessionStore = defineStore('session', {
       this.bookId = id
       localStorage.setItem('cwq_book', String(id))
       if (changed) {
-        // 换账套后旧的 periodId 一定不属于新账套，先清掉避免期间下拉闪旧值
+        // 换账套后旧的 periodId 一定不属于新账套，先清掉避免期间下拉闪旧值。
+        // 进账套一律按「最早还在用的年度 + 最早未结账月」落位，不接着上次的账套看。
         this.periods = []
         this.periodId = 0
+        localStorage.removeItem('cwq_period')
       }
       await this.loadPeriods()
     },
@@ -97,22 +99,41 @@ export const useSessionStore = defineStore('session', {
       }
       this.periods = await bookApi.listPeriods(this.bookId)
       if (!this.periods.find((p) => p.id === this.periodId)) {
-        // 记住的期间已经不存在（换年度 / 反结账）—— 落在最新年度最「在用」的那一期
-        const latest = this.books.find((b) => b.id === this.bookId)?.latest_year
-        this.setPeriod(this.defaultPeriodId(latest))
+        // 记住的期间已经不存在（换年度 / 反结账）—— 落在「还在用的」那一期
+        this.setPeriod(this.defaultPeriodId(this.defaultYear()))
       }
     },
-    /** 默认停在「正在用的」那个期间：
-     *  1) 最后一个未结账的期间（正在记账的）
-     *  2) 凭证最多的期间（全部结完账时，至少能看到东西）
-     *  3) 第一个期间 */
+    /** 默认停在的期间（用户 2026-10-11 定的口径）：
+     *
+     *  年度 = **最早一个还在用**的年度：至少有一个月没结账的年度里最靠前的那个。
+     *    2026 全结完并已年度结转、2027 刚开好 → 2027（2027 每个月都没结账）
+     *    2026 全结完但没年度结转 → 2026（2026 才是还在用的那一年）
+     *
+     *  月份 = 该年度里**最靠前的一个未结账月份**；全年都结完了就停在 12 月。
+     *    结到 2026-12 且已结转 → 2027-01
+     *    结到 2026-12 未结转 → 2026-12
+     *    结到 2027-02      → 2027-03
+     *
+     *  以前这里是「最后一个未结账的期间」，一年没结完就会直接跳到 12 月，
+     *  打开账套看到的不是眼下该干活的那个月。
+     */
     defaultPeriodId(year) {
-      const pool = year ? this.periods.filter((p) => p.year === year) : this.periods
+      const pool = this.periods
       if (!pool.length) return undefined
-      const open = [...pool].reverse().find((p) => !p.locked)
+      const pool0 = year ? pool.filter((p) => p.year === year) : pool
+      if (!pool0.length) return undefined
+
+      const open = pool0.find((p) => !p.locked)     // 数组按 ord 升序，最靠前即最小
       if (open) return open.id
-      const busiest = [...pool].sort((a, b) => b.vouchers - a.vouchers)[0]
-      return (busiest?.vouchers ? busiest : pool[0])?.id
+      return pool0[pool0.length - 1].id              // 全结完 → 该年度最后一个月（12 月）
+    },
+
+    /** 默认年度：最早一个还有月份没结账的年度；全都结完就取最后一年。 */
+    defaultYear() {
+      if (!this.periods.length) return undefined
+      const years = [...new Set(this.periods.map((p) => p.year))].sort((a, b) => a - b)
+      return years.find((y) => this.periods.some((p) => p.year === y && !p.locked))
+        ?? years[years.length - 1]
     },
 
     /** 切到某个年度：停在该年度「正在用的」那个期间。

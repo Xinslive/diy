@@ -1,111 +1,205 @@
 <template>
   <div class="page">
-    <div class="page-head">
-      <h2 class="page-title">期末处理</h2>
-      <span class="muted">
-        {{ store.currentBook?.company_name }} · {{ store.currentBook?.name }} {{ store.currentPeriod?.code }}
-      </span>
-    </div>
-
-    <div class="grid">
-      <div class="card">
-        <h3>会计期间 {{ store.currentYear }} 年</h3>
-        <el-table ref="periodTable" :data="yearPeriods" border size="small" highlight-current-row
-                  :current-row-key="store.periodId" @current-change="(row) => row && store.setPeriod(row.id)">
-          <el-table-column label="期间" width="90" prop="code" />
-          <el-table-column label="凭证数" width="80" align="center" prop="vouchers" />
-          <el-table-column label="未记账" width="80" align="center" prop="unposted" />
-          <el-table-column label="状态" width="100" align="center">
-            <template #default="{ row }">
-              <el-tag v-if="row.locked" type="success" size="small">已结账</el-tag>
-              <el-tag v-else type="warning" size="small">未结账</el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="结账人" prop="closed_by" />
-        </el-table>
-        <div v-if="store.yearsOfBook(store.currentBook).length > 1" class="years">
-          <span class="muted">切年度</span>
-          <el-radio-group :model-value="store.currentYear" size="small" @change="store.setYear">
-            <el-radio-button v-for="y in store.yearsOfBook(store.currentBook)" :key="y" :value="y">
-              {{ y }}
-            </el-radio-button>
-          </el-radio-group>
-        </div>
-      </div>
-
-      <div class="card actions">
-        <h3>当前期间 {{ store.currentPeriod?.code }}</h3>
-
-        <div class="act">
-          <div class="act-title">1 · 结转损益</div>
-          <p class="muted">
-            把损益类科目本期发生额结转到「本年利润」，生成记账凭证（默认未记账，结账时统一自动记账）。
-            本期已有结转凭证时会<b>直接删掉、按最新余额重新生成</b>，不用手动清理。
-          </p>
-          <div v-if="carryInfo.has" class="carry-state">
-            <el-tag type="success" size="small" effect="plain">本期已结转</el-tag>
-            <span class="muted">凭证 {{ carryInfo.vouchers.join('、') }}{{ carryInfo.posted ? '（已记账）' : '（未记账）' }}</span>
-          </div>
-          <el-button type="primary" :loading="carrying" :disabled="!store.canWrite || store.currentPeriod?.locked" @click="doCarry">
-            {{ carryInfo.has ? '重新结转损益' : '执行结转损益' }}
-          </el-button>
-        </div>
-
-        <div class="act">
-          <div class="act-title">2 · 结账</div>
-          <p class="muted">锁定期间。锁定后任何凭证的新增/修改/删除都会被数据库拒绝。</p>
-          <el-button type="success" :disabled="!store.canWrite || store.currentPeriod?.locked" @click="doClose">
-            结账 {{ store.currentPeriod?.code }}
-          </el-button>
-        </div>
-
-        <div class="act">
-          <div class="act-title">3 · 批量反结账</div>
-          <p class="muted">
-            从选定期间起，连续解锁到最后一个已结账期间，区间内已记账凭证自动回到未记账。
-            结账越靠前影响范围越大，执行前请先看预览。
-          </p>
-          <el-button type="danger" plain :disabled="!store.canWrite" @click="previewUnclose">查看影响范围</el-button>
-        </div>
-
-        <div class="act">
-          <div class="act-title">4 · 年度结转</div>
-          <p class="muted">
-            把本年利润转到未分配利润，并在<strong>同一个账套</strong>里追加下一年度的 12 个会计期间，
-            本年期末余额自动成为下一年 1 月的期初。科目表和账套授权都不用动。
-          </p>
-          <el-button :loading="yearEnding" :disabled="!store.canWrite" @click="doYearEnd">
-            结转到 {{ store.currentYear + 1 }} 年
-          </el-button>
-        </div>
+    <div class="headline">
+      <div class="headline-main">
+        <span class="eyebrow">当前期间</span>
+        <span class="headline-code">{{ store.currentPeriod?.code || '—' }}</span>
+        <el-tag v-if="store.currentPeriod?.locked" type="success" effect="light" size="small">已结账</el-tag>
+        <el-tag v-else type="warning" effect="light" size="small">未结账</el-tag>
       </div>
     </div>
+
+    <!-- 四个操作：平级的四块，不编号。
+         它们不是一条必须按顺序走的流程，编号会让人以为漏了一步就做错了。
+         每块只说两件事：我现在是什么状态，以及我能点什么。 -->
+    <div class="ops">
+      <!-- 结转损益 -->
+      <div class="tile">
+        <div class="tile-head">
+          <span class="tile-icon blue"><el-icon><Switch /></el-icon></span>
+          <span class="tile-title">结转损益</span>
+        </div>
+        <div class="tile-status" :class="prevBlocked ? 'warn' : (carryInfo.has ? 'ok' : 'idle')">
+          <template v-if="prevBlocked">
+            <el-icon><Warning /></el-icon>
+            <span>{{ prevPeriod.code }} 未结账</span>
+          </template>
+          <template v-else-if="carryInfo.has">
+            <el-icon><CircleCheck /></el-icon>
+            <span>已结转 · {{ carryInfo.vouchers.join('、') }}</span>
+          </template>
+          <template v-else>
+            <span class="plain">本期尚未结转</span>
+          </template>
+        </div>
+        <p class="tile-desc">损益类科目本期发生额 → 本年利润。</p>
+        <el-button class="tile-btn" type="primary" :loading="carrying"
+                   :disabled="!store.canWrite || store.currentPeriod?.locked || prevBlocked" @click="doCarry">
+          {{ prevBlocked ? '先结上一月' : (carryInfo.has ? '重新结转' : '执行结转') }}
+        </el-button>
+      </div>
+
+      <!-- 结账 -->
+      <div class="tile">
+        <div class="tile-head">
+          <span class="tile-icon green"><el-icon><Lock /></el-icon></span>
+          <span class="tile-title">结账</span>
+        </div>
+        <div class="tile-status" :class="store.currentPeriod?.locked ? 'ok' : 'idle'">
+          <template v-if="store.currentPeriod?.locked">
+            <el-icon><CircleCheck /></el-icon><span>本期已结账</span>
+          </template>
+          <template v-else><span class="plain">本期未结账</span></template>
+        </div>
+        <p class="tile-desc">锁定本期，之后凭证不可再改。</p>
+        <el-button class="tile-btn" type="success" :disabled="!store.canWrite || store.currentPeriod?.locked"
+                   @click="doClose">
+          {{ store.currentPeriod?.locked ? '已结账' : `结账 ${store.currentPeriod?.code}` }}
+        </el-button>
+      </div>
+
+      <!-- 批量反结账 -->
+      <div class="tile">
+        <div class="tile-head">
+          <span class="tile-icon red"><el-icon><Unlock /></el-icon></span>
+          <span class="tile-title">批量反结账</span>
+        </div>
+        <div class="tile-status" :class="uncloseCount ? 'warn' : 'idle'">
+          <template v-if="uncloseCount">
+            <el-icon><Warning /></el-icon>
+            <span>可解锁 {{ uncloseCount }} 个期间</span>
+          </template>
+          <template v-else><span class="plain">本期及之后没有已结账期间</span></template>
+        </div>
+        <p class="tile-desc">从本期起连续解锁到最后一个已结账期间。</p>
+        <el-button class="tile-btn" type="danger" plain :disabled="!store.canWrite || !uncloseCount"
+                   @click="previewUnclose">
+          查看影响范围
+        </el-button>
+      </div>
+
+      <!-- 年度结转 -->
+      <div class="tile">
+        <div class="tile-head">
+          <span class="tile-icon purple"><el-icon><Calendar /></el-icon></span>
+          <span class="tile-title">年度结转</span>
+        </div>
+        <div class="tile-status" :class="yearComplete ? 'ok' : 'warn'">
+          <template v-if="yearComplete">
+            <el-icon><CircleCheck /></el-icon><span>本年已全部结账，可结转</span>
+          </template>
+          <template v-else><span class="plain">还剩 {{ yearPeriods.length - closedCount }} 个月未结账</span></template>
+        </div>
+        <p class="tile-desc">
+          把 {{ store.currentYear }} 年期末余额带成 {{ store.currentYear + 1 }} 年 1 月的期初。
+        </p>
+        <el-button class="tile-btn" :loading="yearEnding" :disabled="!store.canWrite" @click="doYearEnd">
+          结转到 {{ store.currentYear + 1 }} 年
+        </el-button>
+      </div>
+    </div>
+
+    <!-- 整年进度：12 个月铺满一屏，账结到哪儿一眼看完 -->
+    <div class="card year-card">
+      <div class="card-head">
+        <span class="title">{{ store.currentYear }} 年结账进度</span>
+        <span class="hint">{{ closedCount }} / {{ yearPeriods.length }} 个月已结账</span>
+      </div>
+
+      <div class="months">
+        <button v-for="p in yearPeriods" :key="p.id" type="button"
+                class="month" :class="monthClass(p)"
+                @click="store.setPeriod(p.id)">
+          <span class="m-code">{{ p.code }}</span>
+          <span class="m-stat">{{ p.vouchers ? `${p.vouchers} 张` : '无凭证' }}</span>
+          <span class="m-bar" aria-hidden="true">
+            <span class="m-bar-fill" :style="{ width: p.locked ? '100%' : (p.vouchers ? '45%' : '0%') }" />
+          </span>
+        </button>
+      </div>
+
+      <div class="legend muted">
+        <span><i class="dot ok" />已结账</span>
+        <span><i class="dot warn" />未结账</span>
+        <span><i class="dot idle" />无凭证</span>
+        <span><i class="dot cur" />当前所在</span>
+      </div>
+    </div>
+
+    <ConfirmDialog v-model="dlgShown" v-bind="dlg" @confirm="resolveAsk(true)" @cancel="resolveAsk(false)" />
   </div>
 </template>
 
 <script setup>
-import { computed, ref, watch, onMounted, nextTick } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { computed, ref, watch, onMounted } from 'vue'
+import { ElMessage } from 'element-plus'
 import * as api from '@/api/book'
+import { voucherPeriodCheck } from '@/api/voucher'
 import { useSessionStore } from '@/stores/session'
+import ConfirmDialog from '@/components/ConfirmDialog.vue'
+import { Calendar, CircleCheck, Lock, Switch, Unlock, Warning } from '@element-plus/icons-vue'
 
 const store = useSessionStore()
 const carryInfo = ref({ has: false, vouchers: [], posted: false })
 const carrying = ref(false)
 const yearEnding = ref(false)
-const periodTable = ref(null)
 
-// 期末处理只管当前年度：一次结一个年度，看别的年度先切年度
+// 期末处理只管当前年度：一次结一个年度，看别的年度先切顶栏
 const yearPeriods = computed(() => store.periodsOfYear(store.currentYear))
-
-// 期间换了年度后，把表格的高亮行滚到当前期间
-watch([() => store.periodId, yearPeriods], async () => {
-  await nextTick()
-  const tbl = periodTable.value
-  if (!tbl) return
-  const i = yearPeriods.value.findIndex((p) => p.id === store.periodId)
-  if (i >= 0) tbl.setCurrentRow(yearPeriods.value[i])
+const closedCount = computed(() => yearPeriods.value.filter((p) => p.locked).length)
+const yearComplete = computed(
+  () => yearPeriods.value.length > 0 && closedCount.value === yearPeriods.value.length
+)
+// 本期及之后还有多少个已结账期间 —— 决定「批量反结账」有没有得解、影响多大
+const uncloseCount = computed(() => {
+  const cur = store.currentPeriod
+  if (!cur) return 0
+  return store.periods.filter((p) => p.ord >= cur.ord && p.locked).length
 })
+
+// 结转损益的硬前置：上一个月没结账，本月就不能结转。
+// 后端已经拦了，这里再拦一道是为了「点之前就看得出来」——
+// 结转走本年累计口径，顺序错了会把上月的钱扫进本月，单看本月凭证发现不了。
+const prevPeriod = computed(() => {
+  const cur = store.currentPeriod
+  if (!cur) return null
+  return store.periods.find(p => p.ord === cur.ord - 1) || null
+})
+const prevBlocked = computed(() => !!prevPeriod.value && !prevPeriod.value.locked)
+
+/** 月份小块的配色：一眼分清「已收尾」「有凭证没收尾」「本月空着」。 */
+function monthClass(p) {
+  return {
+    locked: p.locked,
+    pending: !p.locked && p.vouchers > 0,
+    idle: !p.locked && !p.vouchers,
+    current: p.id === store.periodId
+  }
+}
+
+/* ---- 确认弹窗 ---- */
+// 一个 Promise 化的壳：调用方写 `if (!await ask({...})) return`，
+// 取消走 resolve(false)，不再有「取消 = 未捕获异常」的老毛病。
+const dlgShown = ref(false)
+const dlg = ref({ title: '', lead: '', chips: [], confirmText: '确定', tone: 'primary', icon: CircleCheck })
+let askResolve = null
+
+function ask(opts) {
+  dlg.value = {
+    title: '', lead: '', chips: [],
+    confirmText: '确定', tone: 'primary', icon: CircleCheck,
+    ...opts
+  }
+  dlgShown.value = true
+  return new Promise((resolve) => { askResolve = resolve })
+}
+
+function resolveAsk(ok) {
+  dlgShown.value = false
+  const r = askResolve
+  askResolve = null
+  r?.(ok)
+}
 
 /**
  * 结转损益。重复执行是安全的：后端永远「先删旧凭证再重算」。
@@ -114,21 +208,24 @@ watch([() => store.periodId, yearPeriods], async () => {
  */
 async function doCarry() {
   const p = store.currentPeriod
-  const already = carryInfo.value.has
-  if (already) {
-    await ElMessageBox.confirm(
-      `${p.code} 已有结转凭证 ${carryInfo.value.vouchers.join('、')}。\n\n` +
-      `继续将先删除它们，再按当前损益类科目余额重新生成结转凭证。` +
-      `删除不可撤销（会记入操作日志）。`,
-      '重新结转损益',
-      { type: 'warning', confirmButtonText: '删除并重新结转', cancelButtonText: '取消' }
-    )
-  } else {
-    await ElMessageBox.confirm(
-      `将 ${p.code} 损益类科目余额结转到「本年利润」，生成记账凭证。损益科目本期有发生额时才能执行。`,
-      '结转损益', { type: 'info' }
-    )
+  // 前端也守一道：按钮虽然已经禁了，但「先结上一月」这句话本身比后端
+  // 抛出来的整句报错更早出现在屏幕上，而且指明了该去结哪个月。
+  if (prevBlocked.value) {
+    return ElMessage.warning(`请先结账 ${prevPeriod.value.code}，再给 ${p.code} 结转损益`)
   }
+  const ok = carryInfo.value.has
+    ? await ask({
+        tone: 'warning', icon: Switch, title: '重新结转损益',
+        chips: carryInfo.value.vouchers,
+        lead: '先删除旧结转凭证，再按最新余额重新生成。',
+        confirmText: '删除并重新结转'
+      })
+    : await ask({
+        tone: 'primary', icon: Switch, title: '结转损益', chips: [p.code],
+        lead: '损益类科目本期发生额 → 本年利润',
+        confirmText: '结转'
+      })
+  if (!ok) return
 
   carrying.value = true
   try {
@@ -148,23 +245,42 @@ async function doCarry() {
 }
 
 /** 本期已有哪些结转凭证 —— 决定按钮是「执行」还是「重新结转」。 */
+const EMPTY_CARRY = { has: false, vouchers: [], posted: false }
 async function loadCarryInfo() {
   const p = store.currentPeriod
-  if (!p) return (carryInfo.value = { has: false, vouchers: [], posted: false })
+  if (!p) return (carryInfo.value = { ...EMPTY_CARRY })
+  const bookId = store.bookId
+  const periodId = p.id
   try {
-    const r = await api.carryForwardInfo(store.bookId, p.id)
+    const r = await api.carryForwardInfo(bookId, periodId)
+    // 切账套时旧请求可能后到，迟到的响应会盖掉新账套的状态
+    if (store.bookId !== bookId || store.periodId !== periodId) return
     carryInfo.value = r
   } catch {
-    carryInfo.value = { has: false, vouchers: [], posted: false }
+    if (store.bookId !== bookId || store.periodId !== periodId) return
+    carryInfo.value = { ...EMPTY_CARRY }
   }
 }
 
 async function doClose() {
   const p = store.currentPeriod
-  await ElMessageBox.confirm(
-    `结账 ${p.code}？结账后该期间凭证不可再改。前面若有未结账期间会一并结账。`,
-    '结账', { type: 'warning' }
-  )
+  // 封账之前先体检一次：断号、时序不对的月份一旦锁进历史，纸质凭证按号装订
+  // 就跟系统对不上了。与其等接口报错，不如在点确认之前就把差在哪儿说清楚。
+  try {
+    const chk = await voucherPeriodCheck(store.bookId, p.id)
+    if (!chk.clean) {
+      return ElMessage.warning(
+        `${p.code} 的凭证还没整理干净，先别结账：${chk.blocking.join('；')}。`
+        + `请到「凭证 → 整理凭证」把号排好再来。`
+      )
+    }
+  } catch {
+    // 体检只是提前说一声，体检挂了不该挡住结账 —— 真有问题的后端也会拦
+  }
+  if (!await ask({
+    tone: 'success', icon: Lock, title: '结账', chips: [p.code],
+    lead: '锁定后凭证不可再改。', confirmText: '结账'
+  })) return
   try {
     const r = await api.closePeriod(store.bookId, p.id)
     await store.loadPeriods()
@@ -183,42 +299,32 @@ async function previewUnclose() {
   const r = await api.unclosePreview(store.bookId, p.id)
   if (!r.periods.length) return ElMessage.info('所选期间及其之后没有已结账的期间，无需反结账')
 
-  try {
-    await ElMessageBox.confirm(
-      `将从 ${r.periods[0]} 起连续解锁 ${r.periods.length} 个期间：` +
-      `${r.periods.join('、')}。\n\n其中 ${r.will_unpost_vouchers} 张已记账凭证会回到未记账状态，` +
-      `改完凭证后需要重新记账。`,
-      '批量反结账预览',
-      {
-        type: 'warning',
-        confirmButtonText: '确认反结账',
-        cancelButtonText: '取消',
-        dangerouslyUseHTMLString: false
-      }
-    )
-  } catch {
-    return   // 用户点了取消
-  }
+  const ok = await ask({
+    tone: 'danger', icon: Unlock, title: '批量反结账', chips: r.periods,
+    lead: `从 ${r.periods[0]} 起连续解锁 ${r.periods.length} 个期间`,
+    confirmText: '反结账'
+  })
+  if (!ok) return
 
   const done = await api.unclose(store.bookId, p.id, true)
   await store.loadPeriods()
   ElMessage.success(`已解锁 ${done.periods.length} 个期间，${done.unposted_vouchers} 张凭证转未记账`)
 }
 
-watch(() => store.periodId, loadCarryInfo)
+watch([() => store.periodId, () => store.bookId], loadCarryInfo)
 onMounted(loadCarryInfo)
 
 async function doYearEnd() {
   const from = store.currentYear
-  await ElMessageBox.confirm(
-    `结转到 ${from + 1} 年？\n\n` +
-    `会在本账套内追加 ${from + 1} 年的 12 个会计期间，并把 ${from} 年期末余额写成 ${from + 1} 年 1 月的期初。` +
-    `若 ${from} 年还有未结账的期间，会先拒绝并告诉你是哪几个月。`,
-    '年度结转', { type: 'warning', confirmButtonText: `结转到 ${from + 1} 年` }
-  )
+  if (!await ask({
+    tone: 'warning', icon: Calendar, title: '年度结转',
+    chips: [`${from} → ${from + 1}`],
+    lead: '期末余额转为下一年 1 月期初',
+    confirmText: `结转到 ${from + 1} 年`
+  })) return
   yearEnding.value = true
   try {
-    const r = await api.yearEnd(store.bookId)
+    const r = await api.yearEnd(store.bookId, from, from + 1)
     await store.loadBooks()
     await store.loadPeriods()
     store.setYear(r.new_year)
@@ -232,13 +338,159 @@ async function doYearEnd() {
 </script>
 
 <style scoped>
-.grid { display: grid; grid-template-columns: 1.1fr .9fr; gap: 14px; align-items: start; }
-.years { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 12px; }
-h3 { margin: 0 0 12px; font-size: 15px; }
-.act { padding: 12px 0; border-bottom: 1px dashed var(--cwq-border); }
-.act:last-child { border-bottom: none; }
-.act-title { font-weight: 600; margin-bottom: 4px; }
-.act p { margin: 0 0 10px; font-size: 12px; line-height: 1.6; }
-.carry-state { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 12px; }
-.tip { margin-left: 8px; font-size: 12px; }
+.page { padding: 18px 16px 24px; max-width: 1440px; }
+
+/* ---- 页首 ---- */
+.headline {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.headline-main { display: flex; align-items: baseline; gap: 10px; }
+.eyebrow { font-size: 12px; color: var(--cwq-muted); }
+.headline-code {
+  font-size: 26px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 四个操作块 ---- */
+.ops {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-bottom: 14px;
+}
+@media (max-width: 1280px) { .ops { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 680px)  { .ops { grid-template-columns: 1fr; } }
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  border: 1px solid var(--cwq-border);
+  border-radius: 8px;
+  padding: 14px;
+}
+.tile-head { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; }
+.tile-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  font-size: 15px;
+  flex: none;
+}
+.tile-icon.blue   { background: #eff5ff; color: #2563eb; }
+.tile-icon.green  { background: #f0fdf4; color: #16a34a; }
+.tile-icon.red    { background: #fef2f2; color: #dc2626; }
+.tile-icon.purple { background: #f5f3ff; color: #7c3aed; }
+.tile-title { font-weight: 600; font-size: 14px; }
+
+/* 状态行是这一块的重点：颜色 + 图标，不用读文字就知道能不能点 */
+.tile-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  line-height: 1.5;
+  margin-bottom: 8px;
+  min-height: 18px;
+}
+.tile-status.ok   { color: #15803d; }
+.tile-status.warn { color: #b45309; }
+.tile-status.idle { color: var(--cwq-muted); }
+.tile-status .el-icon { flex: none; }
+
+.tile-desc {
+  margin: 0 0 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--cwq-muted);
+  flex: 1;
+}
+.tile-btn { width: 100%; margin: 0; }
+
+/* ---- 整年月度宫格 ---- */
+.year-card { padding: 16px; }
+
+.months {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin: 18px 0 16px;
+}
+@media (max-width: 1280px) { .months { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 720px)  { .months { grid-template-columns: repeat(2, 1fr); } }
+
+.month {
+  appearance: none;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  padding: 18px 18px 16px;
+  min-height: 104px;
+  border-radius: 8px;
+  border: 1px solid var(--cwq-border);
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: space-between;
+  transition: border-color .15s, box-shadow .15s, background-color .15s;
+}
+.month:hover { border-color: #c3cad6; }
+.month:focus-visible { outline: 2px solid var(--cwq-primary); outline-offset: 1px; }
+
+.m-code { font-size: 16px; font-weight: 650; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
+.m-stat { font-size: 13px; color: var(--cwq-muted); font-variant-numeric: tabular-nums; }
+
+.m-bar {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: #eef1f5;
+  overflow: hidden;
+}
+.m-bar-fill { display: block; height: 100%; border-radius: 2px; }
+
+.month.locked { background: #f6fbf7; border-color: #cfe9d6; }
+.month.locked .m-code { color: #15803d; }
+.month.locked .m-bar-fill { background: var(--cwq-ok); }
+
+.month.pending { background: #fffdf6; border-color: #f0dcb0; }
+.month.pending .m-code { color: #b45309; }
+.month.pending .m-bar-fill { background: var(--cwq-warn); }
+
+.month.idle .m-code { color: #a8abb2; }
+
+.month.current {
+  border-color: var(--cwq-primary);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, .18);
+}
+
+.legend {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--cwq-border);
+}
+.legend i {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+.dot.ok   { background: var(--cwq-ok); }
+.dot.warn { background: var(--cwq-warn); }
+.dot.idle { background: #d5d8dd; }
+.dot.cur  { background: var(--cwq-primary); }
 </style>

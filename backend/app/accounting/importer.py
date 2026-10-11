@@ -86,19 +86,44 @@ def _as_date(value: Any) -> date | None:
     return None
 
 
-def _as_decimal(value: Any) -> Decimal:
+def _parse_amount(value: Any) -> tuple[Decimal, str | None]:
+    """把单元格解析成金额，返回 (金额, 错误说明)。
+
+    原来这里是 ``except: return Decimal("0")`` —— 解析不了就当 0，
+    不报错、不留痕。审计实测：一条含「非法金额行」的导入文件，
+    5 条分录只入库 2 条，批次仍报 ok=true，错误列表**是空的**。
+    用户以为凭证齐了，实际少记了金额，而且没有任何告警 ——
+    这是财务软件里最容易造成实际损失的一类缺陷。
+
+    所以规则改成：**解析不了必须说出来**。金额按 0 参与后续计算只是为了让
+    流程继续走完，真正的处置权在调用方 —— 它必须把这条错误挂到凭证上。
+    """
     if value in (None, ""):
-        return Decimal("0")
+        return Decimal("0"), None
     if isinstance(value, (int, float, Decimal)):
-        return money(value)
+        try:
+            return money(value), None
+        except Exception as exc:
+            return Decimal("0"), f"{value!r} 不是合法金额（{exc}）"
     text = str(value).strip().replace(",", "").replace("，", "")
     text = text.replace("¥", "").replace("￥", "").strip()
     if text.endswith("%"):
-        return Decimal("0")
+        # 原来直接返回 0。金额列写百分比，99% 的可能是从别处粘串了整列。
+        return Decimal("0"), f"{text!r} 是百分比，金额列不该出现百分号"
     try:
-        return money(text)
+        return money(text), None
     except Exception:
-        return Decimal("0")
+        return Decimal("0"), f"{text!r} 无法解析为金额"
+
+
+def _as_decimal(value: Any) -> Decimal:
+    """宽松版：只用于「有就用、没有就 0」的场合（如附单据数）。
+
+    **不要**用它解析借贷方金额 —— 那样会把解析失败悄悄吞掉。
+    金额一律走 :func:`_parse_amount`。
+    """
+    amount, _err = _parse_amount(value)
+    return amount
 
 
 def _subject_index(db: Session, book_id: int) -> tuple[dict[str, Subject], dict[str, Subject]]:
@@ -179,8 +204,10 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
             current["errors"].append("没有任何分录")
         elif dr != cr:
             current["errors"].append(f"借贷不平衡：借 {dr} / 贷 {cr}")
-        elif dr <= 0:
-            current["errors"].append("金额必须大于 0")
+        elif dr == 0 and cr == 0:
+            # 只挡「全零」，不挡负数：红字凭证（-300 / -300）是冲销，
+            # 照样是平的、照样该存 —— 冲掉一张记错的凭证正是记账的日常。
+            current["errors"].append("借贷金额相抵为 0，这张凭证什么也没记")
         current["ok"] = not current["errors"]
         vouchers.append(current)
         current = None
@@ -228,29 +255,76 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
                     f"第 {line_no} 行：{subject.code} {subject.name} 不是明细科目，凭证要记在明细级")
                 subject = None
 
-        dr = _as_decimal(col("debit", row)) if "debit" in mapping else Decimal("0")
-        cr = _as_decimal(col("credit", row)) if "credit" in mapping else Decimal("0")
-        if not dr and not cr and "amount" in mapping:
-            amt = _as_decimal(col("amount", row))
-            direction = str(col("direction", row) or "").strip()
-            if direction in ("借", "DEBIT", "D"):
-                dr = amt
-            else:
-                cr = amt
+        # 借贷方向由「值填在哪一列」决定，**不能靠正负猜**。
+        #
+        # 原来写的是 ``direction = "DEBIT" if dr > 0 else "CREDIT"``，
+        # 由此产生两个后果：
+        #   · 红字（负数）分录在这一行被 ``dr <= 0 and cr <= 0`` 静默丢弃 ——
+        #     冲销一张记错的凭证正是记账的日常，它恰恰是最该保真的场景；
+        #   · 同一行借贷两列都填了值时，只按借方算，贷方那栏的值凭空消失，
+        #     连报错都没有。
+        raw_dr = col("debit", row)
+        raw_cr = col("credit", row)
+        dr, dr_err = _parse_amount(raw_dr)
+        cr, cr_err = _parse_amount(raw_cr)
+        for msg in (dr_err, cr_err):
+            if msg:
+                current["errors"].append(f"第 {line_no} 行：{msg}")
 
-        if subject is None or (dr <= 0 and cr <= 0):
-            if subject is None and subject_raw in (None, "") and (dr or cr):
+        direction: str | None = None
+        amount = Decimal("0")
+        amount_raw = ""
+
+        # 「填了」的标准是**解析出来是不是非零**，不是单元格空不空：
+        # 财务导出的表常在对面那栏填 0 而不是留空（测试数据就是这个样子），
+        # 按「非空」判定会把每一行都误判成「借贷都填了」。
+        dr_filled = raw_dr not in (None, "") and dr != 0
+        cr_filled = raw_cr not in (None, "") and cr != 0
+
+        if dr_filled and cr_filled:
+            current["errors"].append(
+                f"第 {line_no} 行：借方和贷方都填了金额"
+                f"（借 {raw_dr} / 贷 {raw_cr}），一行只能有一条分录")
+        elif dr_filled:
+            direction, amount, amount_raw = "DEBIT", dr, str(raw_dr)
+        elif cr_filled:
+            direction, amount, amount_raw = "CREDIT", cr, str(raw_cr)
+        elif "amount" in mapping and col("amount", row) not in (None, ""):
+            # 单金额 + 方向列的老表格式
+            raw_amt = col("amount", row)
+            amt, amt_err = _parse_amount(raw_amt)
+            if amt_err:
+                current["errors"].append(f"第 {line_no} 行：{amt_err}")
+            d = str(col("direction", row) or "").strip()
+            if amt == 0:
+                pass                      # 金额 0：不生成行（错误若已记过就够了）
+            elif d in ("借", "DEBIT", "D"):
+                direction, amount, amount_raw = "DEBIT", amt, str(raw_amt)
+            elif d in ("贷", "CREDIT", "C"):
+                direction, amount, amount_raw = "CREDIT", amt, str(raw_amt)
+            else:
+                current["errors"].append(
+                    f"第 {line_no} 行：金额 {raw_amt!r} 无法判断方向，"
+                    f"方向列填「{d or '空'}」，只认 借/贷 或 DEBIT/CREDIT")
+
+        if direction is None:
+            # 这一行没有金额：表头、空行、说明文字都走这条路，不该报错。
+            # 真正的非法金额（乱码、百分比）已经在上面记进 errors 了。
+            continue
+        if subject is None:
+            # 找不到科目 / 不是明细科目：原因上面已经记过，这里只补「压根没填科目」
+            if subject_raw in (None, ""):
                 current["errors"].append(f"第 {line_no} 行：有金额但没填科目")
             continue
 
-        direction = "DEBIT" if dr > 0 else "CREDIT"
         current["entries"].append(
             {
                 "subject_id": subject.id,
                 "subject_code": subject.code,
                 "subject_name": subject.name,
                 "direction": direction,
-                "amount": str(dr if direction == "DEBIT" else cr),
+                "amount": str(amount),
+                "amount_raw": amount_raw,     # 留原始值：出问题时能对上源文件
                 "summary": str(col("summary", row) or ""),
             }
         )

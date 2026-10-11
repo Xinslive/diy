@@ -61,6 +61,19 @@
           :title="`忽略了无法识别的列：${result.unknown_headers.join('、')}`"
         />
 
+        <!-- 被丢弃的行必须显眼。原来只有表格里一个「有问题」标签，鼠标悬停
+             才看得到原因 —— 而审计记录的那个场景正是「用户什么都不知道」。
+             丢行数直接顶到提示条上，不靠悬停。 -->
+        <el-alert
+          v-if="droppedLines.length"
+          type="error" :closable="false" show-icon class="mb"
+          :title="`有 ${droppedLines.length} 行数据没能生成分录，导入后不会出现在账上`"
+        >
+          <ul class="drop-list">
+            <li v-for="d in droppedLines" :key="d.voucherKey + '-' + d.line">{{ d.text }}</li>
+          </ul>
+        </el-alert>
+
         <el-table :data="result.vouchers" size="small" border max-height="460"
                   :row-class-name="({ row }) => (row.ok ? '' : 'row-bad')">
           <el-table-column prop="line" label="行号" width="60" align="center" />
@@ -138,8 +151,8 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { computed, ref, onMounted } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Upload, UploadFilled, Download } from '@element-plus/icons-vue'
 import * as voucherApi from '@/api/voucher'
 import { useSessionStore } from '@/stores/session'
@@ -174,7 +187,42 @@ async function upload() {
   }
 }
 
+// 有行被丢弃时，导入按钮要先把「哪些没进去」摆出来再说 ——
+// 点一下就入库、事后才发现少记了金额，是最难挽回的一类操作。
+const droppedLines = computed(() => {
+  const out = []
+  for (const v of result.value.vouchers || []) {
+    for (const e of v.errors || []) {
+      if (/没有生成任何分录|无法解析为金额|百分号|都填了金额|无法判断方向/.test(e)) {
+        out.push({
+          voucherKey: `${v.voucher_no || '自动'}@${v.line}`,
+          line: v.line,
+          text: `第 ${v.line} 行（凭证 ${v.voucher_no || '自动'}）：${e}`,
+        })
+      }
+    }
+  }
+  return out
+})
+
 async function commit() {
+  const bad = result.value.error_count || 0
+  const dropped = droppedLines.value.length
+  if (bad || dropped) {
+    const detail = [
+      bad ? `${bad} 张凭证校验不通过，不会导入` : '',
+      dropped ? `${dropped} 行数据被丢弃，不会出现在账上` : '',
+    ].filter(Boolean).join('；')
+    try {
+      await ElMessageBox.confirm(
+        `${detail}。仍然只导入通过的 ${result.value.ok_count} 张吗？`,
+        '确认部分导入',
+        { type: 'warning', confirmButtonText: `只导入 ${result.value.ok_count} 张`, cancelButtonText: '返回检查' }
+      )
+    } catch {
+      return   // 用户点了「返回检查」
+    }
+  }
   committing.value = true
   try {
     const res = await voucherApi.commitImport(store.bookId, result.value.batch_id)
@@ -218,4 +266,5 @@ onMounted(loadHistory)
 .entry .dr { color: #c0392b; }
 .entry .cr { color: #1e8449; }
 :deep(.row-bad) { background: #fdf0ef; }
+.drop-list { margin: 6px 0 0; padding-left: 20px; font-size: 12px; line-height: 1.8; }
 </style>

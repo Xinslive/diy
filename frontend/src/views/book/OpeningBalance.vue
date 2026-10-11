@@ -4,7 +4,7 @@
       <div>
         <h2 class="page-title">期初余额</h2>
         <div class="muted">
-          {{ store.currentBook?.name }} · 启用期间 {{ data.period }}
+          {{ store.currentBook?.name }} · {{ data.period }} 期初余额
           <template v-if="!data.editable">（{{ data.reason }}）</template>
         </div>
       </div>
@@ -20,7 +20,7 @@
     </div>
 
     <el-alert v-if="!data.editable" type="warning" :closable="false" class="mb">
-      {{ data.reason }}。如需调整，先在「期末处理」反结账，或直接改第一期间的凭证。
+      {{ data.reason }}。如需调整，先在「期末处理」反结账，或直接改该期间的凭证。
     </el-alert>
 
     <div class="card mb" :class="balanced ? 'ok' : 'bad'">
@@ -47,32 +47,47 @@
           </tr>
         </thead>
         <tbody>
-          <tr v-for="s in rowsOf(cat.key)" :key="s.id">
+          <tr v-for="s in rowsOf(cat.key)" :key="s.id" :class="{ 'is-parent': !s.is_leaf }">
             <td class="code" :style="{ paddingLeft: 8 + (s.level - 1) * 16 + 'px' }">{{ s.code }}</td>
             <td>{{ s.name }}</td>
             <td class="dir">
-              <template v-if="s.is_leaf">
-                <el-tag
-                  :type="sides[s.id] === '借' ? 'primary' : 'warning'"
-                  size="small"
-                  class="flip"
-                  :title="flipHint(s)"
-                  @click="flip(s)"
-                >{{ sides[s.id] }}</el-tag>
-              </template>
-              <span v-else class="muted">{{ s.natural_side }}</span>
+              <!-- 上级科目也摆成同款标签：这一列看着该是齐的，
+                   偏偏上一级是一行灰字，一眼扫下去像少了东西。
+                   差别只留在能不能点 —— 上级的方位是下级合计出来的，没有可翻的 -->
+              <el-tag
+                :type="sideOf(s) === '借' ? 'primary' : 'warning'"
+                size="small"
+                :class="{ flip: s.is_leaf }"
+                :title="s.is_leaf ? flipHint(s) : '上级科目：方位和金额都是下面这些明细的合计'"
+              >{{ sideOf(s) }}</el-tag>
               <el-tooltip v-if="reverse(s)" content="与科目默认方向相反" placement="top">
                 <span class="rev">反</span>
               </el-tooltip>
             </td>
             <td class="amt">
               <el-input
+                v-if="s.is_leaf"
                 v-model="amounts[s.id]"
-                :disabled="!data.editable || !s.is_leaf"
+                :disabled="!data.editable"
                 size="small"
                 class="money"
                 align="right"
                 @blur="dirty = true"
+              />
+              <!-- 上级不能录（期初只能记在末级上），但也不能空着：
+                   空格子看着像没录，而「银行存款这一行到底装了多少」恰恰是这张表最该答的。
+
+                   这里还是**同一个输入框**、只是置灰，不是另外画一个盒子：
+                   这一列一列看下来必须是同一种格子 —— 自个儿拿 div 仿一个，
+                   高度、内边距、千分位、小数位总会差一点，看着就像另一种东西。
+                   写法也跟着下面一样：两位小数、不加千分位。 -->
+              <el-input
+                v-else
+                :model-value="Number(subTotal(s)).toFixed(2)"
+                disabled
+                size="small"
+                class="money sub-total"
+                align="right"
               />
             </td>
           </tr>
@@ -122,6 +137,29 @@ function signedOf(s) {
   return sides[s.id] === '贷' ? -v : v
 }
 
+/**
+ * 上级科目的期初 = 它这一支所有末级科目的合计（借正贷负，逐层往下加）。
+ *
+ *  期初只能记在末级上，上级录不了也存不进去；但一行空白摆在表里，
+ *  「银行存款」到底装了多少钱就成了问不出来的事 —— 而这恰恰是翻这张表的目的。
+ *  合计按带符号加，方向相反的余额会自己抵掉，不会两行都往上堆。
+ */
+const subTotal = (s) => {
+  if (s.is_leaf) return signedOf(s)
+  let total = 0
+  for (const c of childrenOf(s.id)) total += subTotal(c)
+  return total
+}
+const childrenOf = (id) => data.value.subjects.filter((x) => x.parent_id === id)
+
+/** 上级的方位跟着这一支的合计走：正的在借方、负的在贷方；
+ *  加起来正好 0 就没方位可言，退回科目本身的自然方向。 */
+function sideOf(s) {
+  if (s.is_leaf) return sides[s.id]
+  const t = subTotal(s)
+  return t ? (t > 0 ? '借' : '贷') : s.natural_side
+}
+
 const reverse = (s) => s.is_leaf && sides[s.id] !== s.natural_side
 const flipHint = (s) => `点击切换为${sides[s.id] === '借' ? '贷' : '借'}（科目默认 ${s.natural_side}）`
 
@@ -154,7 +192,10 @@ function rowsOf(cat) {
 
 async function load() {
   if (!store.bookId) return router.push('/books')
-  data.value = await api.getOpenings(store.bookId)
+  // 跟顶栏那一期走：期初是「这一期开始时账上该有多少钱」，问的是某个月，
+  // 不是问整个账套。以前这个页面永远拿启用期间，2027 年一个凭证都没有，
+  // 屏幕上也还是 2026-01 那份锁死的数，看着像坏了。
+  data.value = await api.getOpenings(store.bookId, store.periodId)
   for (const k of Object.keys(amounts)) delete amounts[k]
   for (const k of Object.keys(sides)) delete sides[k]
   for (const s of data.value.subjects) {
@@ -174,7 +215,7 @@ async function save() {
   }
   saving.value = true
   try {
-    await api.setOpenings(store.bookId, rows)
+    await api.setOpenings(store.bookId, rows, store.periodId)
     ElMessage.success(`已保存 ${rows.length} 条期初余额`)
     await load()
   } catch (e) {
@@ -212,7 +253,8 @@ async function onFile(file) {
 }
 
 function exportXlsx() {
-  downloadFile(`/books/${store.bookId}/openings.xlsx`, {}, '期初余额.xlsx')
+  downloadFile(`/books/${store.bookId}/openings.xlsx`,
+    store.periodId ? { period_id: store.periodId } : {}, '期初余额.xlsx')
 }
 function downloadTpl() {
   // 模板就是「导出当前」——科目已经在库里，导出来填金额即可
@@ -220,6 +262,8 @@ function downloadTpl() {
 }
 
 watch(() => store.bookId, load)
+// 顶栏换月/换年，这一页也得跟着换 —— 换个空月份进来还锁着，用户只会以为坏了
+watch(() => store.periodId, load)
 onMounted(load)
 </script>
 
@@ -241,4 +285,7 @@ onMounted(load)
 .grid .dir .flip { cursor: pointer; user-select: none; }
 .grid .dir .rev { margin-left: 4px; font-size: 11px; color: var(--cwq-danger); }
 .grid .amt { width: 220px; }
+/* 上级科目的小计跟别的格子长得一模一样，只把字加粗一点 ——
+   「这是下级加出来的」靠粗体说，不靠换个盒子说 */
+.grid .sub-total :deep(input) { font-weight: 600; }
 </style>

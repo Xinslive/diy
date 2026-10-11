@@ -44,7 +44,11 @@
         <el-select v-model="selYear" size="default" style="width: 104px" @change="onYearChange">
           <el-option v-for="y in availableYears" :key="y" :label="`${y} 年`" :value="y" />
         </el-select>
-        <el-select v-model="selMonth" size="default" style="width: 122px" @change="onMonthChange">
+        <!-- 月份和年份一样宽：两个下拉并排摆着，宽度不一样看着就像没对齐。
+             收窄之后月份那一格放得下「12 月」；「已结账」那个标记在**选项行**里，
+             宽度不够就由下面的 period-popper 单独给面板撑开，不牵连触发器。 -->
+        <el-select v-model="selMonth" size="default" style="width: 104px"
+                   popper-class="period-popper" @change="onMonthChange">
           <el-option v-for="p in monthsOfYear" :key="p.id" :label="`${p.month} 月`" :value="p.month">
             <!-- 选项行本身是 .el-select-dropdown__item，display 是 list-item，
                  不是 flex。所以对齐不能指望 float 或 margin-left:auto：
@@ -52,8 +56,10 @@
                  自己套一层 flex 才能既贴右又上下居中。 -->
             <span class="period-opt">
               <span>{{ p.month }} 月</span>
+              <!-- 只标「已结账」。原来还在未结账的月份上挂一个「未记账 19」——
+                   那是期间状态，不是这个月有几张没记，而列表页本来就能一眼看见。
+                   一半月份带数字一半不带，扫下来只会被那个数字勾走。 -->
               <el-tag v-if="p.locked" size="small" type="success">已结账</el-tag>
-              <el-tag v-else-if="p.unposted > 0" size="small" type="warning">未记账 {{ p.unposted }}</el-tag>
             </span>
           </el-option>
         </el-select>
@@ -150,8 +156,18 @@ onMounted(async () => {
 .shell { height: 100vh; }
 
 /* 下拉选项自己排版：文字在左、标记贴右，且上下严格居中对齐 */
-.period-opt { display: flex; align-items: center; }
+.period-opt { display: flex; align-items: center; gap: 8px; }
 .period-opt .el-tag { margin-left: auto; }
+
+/* 面板跟触发器一样宽 —— 比触发器宽出来的每一像素，都让这个下拉在顶栏上
+   显得比旁边那个「年份」宽一圈。两边一致才是对齐。
+   宽度收回来是有代价的：Element Plus 默认给选项行左右各 20px 内边距，
+   104px 的框里扣掉 40px 根本放不下「1 月 + 已结账」，所以内边距和标记
+   都得跟着收一收。原来的做法是把触发器撑到 122px 去迁就面板 ——
+   那是让一个元素替另一个元素让步，顶栏照样看着没对齐。 */
+:global(.period-popper.el-popper) { min-width: 104px !important; width: 104px; }
+:global(.period-popper .el-select-dropdown__item) { padding: 0 8px; }
+:global(.period-popper .el-tag) { height: 18px; padding: 0 5px; font-size: 11px; }
 
 .brand {
   display: flex; align-items: center; gap: 8px;
