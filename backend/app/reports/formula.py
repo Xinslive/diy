@@ -45,6 +45,13 @@ IDENT_PART = re.compile(r"[一-鿿A-Za-z0-9_]")
 CELL_RE = re.compile(r"^\$?([A-Za-z]{1,3})\$?([0-9]+)$")
 NUM_RE = re.compile(r"^[0-9]+(\.[0-9]+)?$")
 
+# 公式长度上限。一个单元格里的公式写几万字符没有任何业务含义，
+# 但它会让解析器、递归求值都跟着一起做无用功。
+MAX_FORMULA_LEN = 4000
+# 括号嵌套深度上限。递归下降解析 + 递归求值都是按栈走的，
+# 深度不设限的话 "(" * 5000 这种输入能把 Python 栈打爆。
+MAX_NEST_DEPTH = 64
+
 
 class FormulaError(Exception):
     pass
@@ -60,6 +67,9 @@ class Token:
 
 
 def tokenize(src: str) -> list[Token]:
+    if len(src) > MAX_FORMULA_LEN:
+        raise FormulaError(
+            f"公式过长（{len(src)} 字，上限 {MAX_FORMULA_LEN}）")
     tokens: list[Token] = []
     i, n = 0, len(src)
     while i < n:
@@ -118,6 +128,17 @@ def tokenize(src: str) -> list[Token]:
             else:
                 tokens.append(Token("IDENT", word))
             i = j
+        else:
+            # **必须有这一步。**
+            # 上面每个分支都自己推进 i，可它们一个都没覆盖 ``@`` ``#`` ``\``
+            # ``$`` 这类字符 —— 循环条件 ``while i < n`` 于是永远成立，
+            # 而 i 纹丝不动：单个非法字符就能让这个请求永久挂起，
+            # 前端只会一直转圈。审计用 ``tokenize("1@2")`` 加 2 秒超时复现过：
+            # 进程无输出被超时杀死。
+            #
+            # 这是典型的「漏一个分支就死循环」：往上翻 git 也看不出来，
+            # 因为所有已有分支看起来都正常。
+            raise FormulaError(f"无法识别的字符 {ch!r}（第 {i + 1} 字）")
     tokens.append(Token("EOF", None))
     return tokens
 
@@ -149,6 +170,10 @@ class Parser:
         self.src = src
         self.tokens = tokenize(src)
         self.pos = 0
+        # 括号 / 函数的嵌套深度。递归下降解析和递归求值都是拿 Python 调用栈
+        # 扛的，深度不设限的话 "((((...))))" 这种输入能把栈打爆 ——
+        # 那是 500 层的 RecursionError，接口直接 500，用户只看到「转圈然后出错」。
+        self.depth = 0
 
     @property
     def cur(self) -> Token:
@@ -204,6 +229,17 @@ class Parser:
         return self.primary()
 
     def primary(self):
+        self.depth += 1
+        if self.depth > MAX_NEST_DEPTH:
+            self.depth -= 1
+            raise FormulaError(
+                f"公式嵌套层数超过 {MAX_NEST_DEPTH}，请拆成几行分别计算")
+        try:
+            return self._primary()
+        finally:
+            self.depth -= 1
+
+    def _primary(self):
         tok = self.cur
         if tok.kind == "NUMBER":
             self.pos += 1
