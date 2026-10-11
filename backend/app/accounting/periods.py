@@ -60,8 +60,12 @@ def _subject_by_code(db: Session, book_id: int, code: str) -> Optional[Subject]:
 # --------------------------------------------------------------------- 结账
 
 
-def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = True) -> dict:
-    """关闭指定期间，并顺带关闭其之前所有未结账期间。"""
+def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = True,
+                 commit: bool = True) -> dict:
+    """关闭指定期间，并顺带关闭其之前所有未结账期间。
+
+    ``commit=False`` 让调用方把多步操作合成一个事务（年度结转用它）。
+    """
     target = db.execute(
         select(Period).where(Period.id == period.id).with_for_update()
     ).scalar_one()
@@ -140,7 +144,8 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
             + (f"，自动记账 {auto_posted} 张" if auto_posted else "")
         ),
     )
-    db.commit()
+    if commit:
+        db.commit()
     return {
         "period": target.code,
         "auto_closed_periods": auto_closed,
@@ -201,12 +206,15 @@ def preview_unclose(db: Session, book_id: int, period: Period) -> dict:
 
 
 def batch_unclose(
-    db: Session, book_id: int, period: Period, user: SysUser, revert_posting: bool = True
+    db: Session, book_id: int, period: Period, user: SysUser, revert_posting: bool = True,
+    commit: bool = True,
 ) -> dict:
     """批量反结账：从指定期间起，连续解锁到最后一个已锁期间。
 
     区间内的已记账凭证自动回到未记账 —— 账套已解锁而凭证仍标记「已记账」，
     账簿默认口径下余额会凭空消失，用户改完凭证重新记账时数字会跳变。
+
+    ``commit=False`` 让调用方把多步操作合成一个事务（年度结转用它）。
     """
     locked = list(
         db.execute(
@@ -251,7 +259,8 @@ def batch_unclose(
                f"{reverted} 张凭证转未记账",
         after=preview,
     )
-    db.commit()
+    if commit:
+        db.commit()
     return {**preview, "unposted_vouchers": reverted}
 
 
@@ -515,8 +524,19 @@ def _refresh_opening(db: Session, book_id: int, first: Period,
 
 
 def year_end_carry(db: Session, book: Book, user: SysUser,
-                   from_year: int | None = None, new_year: int | None = None) -> dict:
+                   from_year: int | None = None, new_year: int | None = None,
+                   commit: bool = True) -> dict:
     """年度结转：给**同一个账套**追加下一个会计年度。
+
+    **全程单一事务**：解锁 12 月 → 删旧结转凭证 → 建结转凭证 → 记账 → 结账
+    → 追加次年期间 → 刷新期初，任何一步失败都整体回滚。
+
+    原来这条链路中间 commit 了四次，路由层的 ``db.rollback()`` 只能撤销
+    最后一次之后的部分。审计实测：构造「次年已有凭证」让它失败，接口返回 400
+    「2027 年已经有 1 张凭证」，但本年利润已经被冲平（-100 → 0）、
+    未分配利润已经变成 -100、结转凭证还留在库里。
+    失败响应让用户以为「什么都没发生」而重试或改数，
+    而库里已经有半成品 —— 这比报错本身危险得多。
 
     以前这里是「新建一个下一年度的账套」—— 复制科目表、复制授权、再把
     本年期末余额搬过去当新账套的期初。后果是账套列表一年一行，
@@ -573,7 +593,7 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
         bal = eng.figures(profit.id, last.ord).closing
         if bal != ZERO:
             if last.locked:
-                batch_unclose(db, book.id, last, user, revert_posting=True)
+                batch_unclose(db, book.id, last, user, revert_posting=True, commit=False)
                 last = db.get(Period, last.id)
                 unlocked_for_carry = True
             # 借贷方向必须**按 bal 的正负分两套**。系统内部口径是「借正贷负」
@@ -595,7 +615,6 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
                      if v.remark == f"{current_year}年 结转本年利润"]
             if stale:
                 _drop_carry_forward(db, last, stale, user)
-                db.commit()
 
             # 冲平本年利润 = 往它余额的反方向记一笔同额分录。
             # 盈利在贷方（负）→ 借方冲平；亏损在借方（正）→ 贷方冲平。
@@ -610,13 +629,12 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
             ]
             v = create_voucher(db, book_id=book.id, user=user,
                                voucher_date=date(current_year, 12, 31), entries=entries,
-                               source="CARRY_FORWARD", remark=f"{current_year}年 结转本年利润")
-            db.commit()
+                               source="CARRY_FORWARD", remark=f"{current_year}年 结转本年利润",
+                               commit=False)
 
             # 追加凭证后 12 月又变成未记账，重新记账并结账
-            post_vouchers(db, book.id, [v.id], user)
-            close_period(db, last, user)
-    db.commit()
+            post_vouchers(db, book.id, [v.id], user, commit=False)
+            close_period(db, last, user, commit=False)
 
     # 2. 追加下一年的会计期间（ord 跨年度连续，接着往下排）
     new_periods = ensure_periods(db, book, target_year)
@@ -634,7 +652,8 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
     log(db, action="YEAR_END", entity="book", entity_id=book.id, user=user,
         book_id=book.id,
         detail=f"年度结转：{current_year} → {target_year}，结转 {count} 条期初余额")
-    db.commit()
+    if commit:
+        db.commit()
     return {"book_id": book.id, "new_year": target_year, "carried_subjects": count,
             "first_period": first.code, "unlocked_for_carry": unlocked_for_carry}
 
