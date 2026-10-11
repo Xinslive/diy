@@ -23,6 +23,9 @@ importers:
       pinia:
         specifier: ^2.3.0
         version: 2.3.1(vue@3.5.43)
+      pinyin-pro:
+        specifier: ^3.29.5
+        version: 3.29.5
       vue:
         specifier: ^3.5.13
         version: 3.5.43
@@ -639,6 +642,9 @@ packages:
       typescript:
         optional: true
 
+  pinyin-pro@3.29.5:
+    resolution: {integrity: sha512-Fk5YoRmtdHqJWqAuzYVG/NzvzeCbaG+ZEwbY6Nbps3QAIrvQQEtcm49frcyCM8i2b5najnzPDtYqrHRYTTiuwQ==}
+
   postcss@8.5.29:
     resolution: {integrity: sha512-49cGhUbXj8Qenv0iTMxA1cFBzxXoctpC9Ujd77t1WcbJIr6nF/eI7g/8MgxrYldFRuAXvja7xQRwavoW7kgrxQ==}
     engines: {node: ^10 || ^12 || >=14}
@@ -1212,6 +1218,8 @@ snapshots:
       vue-demi: 0.14.10(vue@3.5.43)
     transitivePeerDependencies:
       - '@vue/composition-api'
+
+  pinyin-pro@3.29.5: {}
 
   postcss@8.5.29:
     dependencies:

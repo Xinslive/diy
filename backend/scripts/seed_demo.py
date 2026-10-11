@@ -22,7 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import func, select  # noqa: E402
 
-from app.accounting.periods import carry_forward_profit, close_period, create_periods  # noqa: E402
+from app.accounting.periods import (  # noqa: E402
+    carry_forward_profit, close_period, create_periods, ensure_periods,
+)
 from app.accounting.vouchers import create_voucher, post_vouchers  # noqa: E402
 from app.core.db import SessionLocal  # noqa: E402
 from app.ledger import queries  # noqa: E402
@@ -34,7 +36,7 @@ from app.models import (  # noqa: E402
 from app.seed.chart_of_accounts import install_chart  # noqa: E402
 
 D = Decimal
-BOOK_NAME = "启明物业 2026"
+BOOK_NAME = "启明物业"
 YEAR = 2026
 
 # ---------------------------------------------------------------- 期初余额
@@ -81,12 +83,18 @@ def money(v) -> Decimal:
 def wipe_book(db, book_id: int) -> None:
     """删掉一个账套的全部数据。
 
-    必须**先解锁期间**：``trg_voucher_delete_guard`` 会拦住已结账期间的凭证删除
-    —— 这正是它该做的事，所以清理脚本要按规矩来，不能绕。
-    分录随凭证级联删除（ondelete=CASCADE），不用单独处理。
+    两道闸门都得**按规矩过**，不能关掉触发器硬删：
+      1. ``trg_voucher_delete_guard`` 拦已结账期间的删除 → 先解锁期间
+      2. ``trg_posted_voucher_guard`` 拦已记账凭证的删除     → 先反记账
+
+    反记账（POSTED → UNPOSTED）是触发器明确放行的唯一状态跳转，
+    走的是业务上的那条路，而不是抄近道。分录随凭证级联删除，不用单独处理。
     """
     db.execute(Period.__table__.update()
                .where(Period.book_id == book_id).values(locked=False))
+    db.execute(Voucher.__table__.update()
+               .where(Voucher.book_id == book_id, Voucher.status == "POSTED")
+               .values(status="UNPOSTED"))
     db.execute(Voucher.__table__.delete().where(Voucher.book_id == book_id))
     db.execute(PeriodOpening.__table__.delete().where(PeriodOpening.book_id == book_id))
     db.execute(Period.__table__.delete().where(Period.book_id == book_id))
@@ -128,7 +136,9 @@ def drop_demo(db) -> None:
 
 
 def build(db, user: SysUser) -> Book:
-    book = Book(company_name="启明物业管理有限公司", name=BOOK_NAME, year=YEAR, start_month=1)
+    # start_year 是这套账的**起始**年度（年度结转只往后追加，不新建账套）
+    book = Book(company_name="启明物业管理有限公司", name=BOOK_NAME,
+                start_year=YEAR, start_month=1)
     db.add(book)
     db.flush()
     create_periods(db, book)
@@ -203,6 +213,18 @@ def build(db, user: SysUser) -> Book:
             ("100201", "CREDIT", str(money(collect) * D("1.06")), "支付代收水电费"),
         ], f"{m}月 结清代收水电")
 
+        # 12. 缴纳上期增值税及附加
+        prev_vat2 = (money(MONTHS[idx - 2][0]) * VAT_RENT * D("1.0")
+                     + money(MONTHS[idx - 2][1]) * VAT_MF) if idx >= 2 else money(rent) * VAT_RENT
+        surcharge = money(prev_vat2) * D("0.12")
+        if idx >= 2:
+            voucher(day(10), [
+                ("2221", "DEBIT", str(prev_vat2), f"缴纳{m - 1}月增值税"),
+                ("100201", "CREDIT", str(prev_vat2), f"缴纳{m - 1}月增值税"),
+                ("6403", "DEBIT", str(surcharge), f"{m - 1}月城建税及附加"),
+                ("2221", "CREDIT", str(surcharge), f"{m - 1}月城建税及附加"),
+            ], "缴纳税费")
+
         # 6. 保洁绿化外包
         voucher(day(12), [
             ("640101", "DEBIT", str(clean), f"{m}月保洁绿化支出"),
@@ -215,17 +237,19 @@ def build(db, user: SysUser) -> Book:
             ("2202", "CREDIT", str(util), f"{m}月水电能耗"),
         ], f"{m}月 水电能耗")
 
+        # 10.6 支付上月挂账的水电能耗（形成应付账款 → 次月付款的滚动）
+        if idx >= 2:
+            prev_util = MONTHS[idx - 2][3]
+            voucher(day(14), [
+                ("2202", "DEBIT", str(prev_util), f"支付{m - 1}月水电能耗"),
+                ("100201", "CREDIT", str(prev_util), f"支付{m - 1}月水电能耗"),
+            ], f"支付{m - 1}月水电能耗")
+
         # 8. 计提工资
         voucher(day(15), [
             ("6602", "DEBIT", str(salary), f"{m}月职工薪酬"),
             ("2211", "CREDIT", str(salary), f"{m}月职工薪酬"),
         ], f"{m}月 计提工资")
-
-        # 9. 发放工资
-        voucher(day(20), [
-            ("2211", "DEBIT", str(salary), f"{m}月发放工资"),
-            ("100201", "CREDIT", str(salary), f"{m}月发放工资"),
-        ], f"{m}月 发放工资")
 
         # 10. 办公及差旅（现金支付，所以要先有备用金，见 10.5）
         voucher(day(18), [
@@ -239,31 +263,11 @@ def build(db, user: SysUser) -> Book:
             ("100201", "CREDIT", str(CASH_FLOAT), "提取备用金"),
         ], f"{m}月 提取备用金")
 
-        # 10.6 支付上月挂账的水电能耗（形成应付账款 → 次月付款的滚动）
-        if idx >= 2:
-            prev_util = MONTHS[idx - 2][3]
-            voucher(day(14), [
-                ("2202", "DEBIT", str(prev_util), f"支付{m - 1}月水电能耗"),
-                ("100201", "CREDIT", str(prev_util), f"支付{m - 1}月水电能耗"),
-            ], f"支付{m - 1}月水电能耗")
-
-        # 11. 计提折旧
-        voucher(day(25), [
-            ("6602", "DEBIT", DEP, f"{m}月计提折旧"),
-            ("1602", "CREDIT", DEP, f"{m}月计提折旧"),
-        ], f"{m}月 计提折旧")
-
-        # 12. 缴纳上期增值税及附加
-        prev_vat2 = (money(MONTHS[idx - 2][0]) * VAT_RENT * D("1.0")
-                     + money(MONTHS[idx - 2][1]) * VAT_MF) if idx >= 2 else money(rent) * VAT_RENT
-        surcharge = money(prev_vat2) * D("0.12")
-        if idx >= 2:
-            voucher(day(10), [
-                ("2221", "DEBIT", str(prev_vat2), f"缴纳{m - 1}月增值税"),
-                ("100201", "CREDIT", str(prev_vat2), f"缴纳{m - 1}月增值税"),
-                ("6403", "DEBIT", str(surcharge), f"{m - 1}月城建税及附加"),
-                ("2221", "CREDIT", str(surcharge), f"{m - 1}月城建税及附加"),
-            ], "缴纳税费")
+        # 9. 发放工资
+        voucher(day(20), [
+            ("2211", "DEBIT", str(salary), f"{m}月发放工资"),
+            ("100201", "CREDIT", str(salary), f"{m}月发放工资"),
+        ], f"{m}月 发放工资")
 
         # 13. 银行手续费与利息
         voucher(day(21), [
@@ -274,6 +278,12 @@ def build(db, user: SysUser) -> Book:
         ], "银行结算")
 
         print(f"  {YEAR}-{m:02d} 业务凭证录入完成")
+        # 11. 计提折旧
+        voucher(day(25), [
+            ("6602", "DEBIT", DEP, f"{m}月计提折旧"),
+            ("1602", "CREDIT", DEP, f"{m}月计提折旧"),
+        ], f"{m}月 计提折旧")
+
 
         # 月末：结转损益 + 结账（12 月故意留着）
         if m != LAST_OPEN:
@@ -287,6 +297,16 @@ def build(db, user: SysUser) -> Book:
             close_period(db, periods[m], user)
             print(f"  {YEAR}-{m:02d} 结转损益 {len(r['vouchers'])} 张 → 已结账")
 
+    # 下一年也开好 12 个空期间。一套真在用的账，跨年前就会把下一年准备好，
+    # 人第二天上班直接就能在新年里记账，不必先去设置里点一次「新增年度」。
+    #
+    # 走 ensure_periods 而不是 year_end_carry：年度结转要求全年都结账，
+    # 而 12 月是特意留着不结账的（留给上手试结转/结账）。
+    # 这也不影响账 —— 期初是**推导值**（期初 P = 期末 P-1），
+    # 2027 的期初会自动等于 2026 的期末，不存在快照要搬。
+    ensure_periods(db, book, YEAR + 1)
+    db.commit()
+
     db.refresh(book)
     return book
 
@@ -296,8 +316,11 @@ def build(db, user: SysUser) -> Book:
 
 def verify(db, book: Book) -> bool:
     eng = LedgerEngine(db, book.id)
+    # **只取本年**：账套现在跨了两年（2026 的账 + 2027 的空期间），
+    # 还按 p.month 建字典的话 2027-01 会把 2026-01 顶掉，自检就成了对着空账本念经
     periods = {p.month: p for p in
-               db.scalars(select(Period).where(Period.book_id == book.id)).all()}
+               db.scalars(select(Period).where(Period.book_id == book.id,
+                                                Period.year == YEAR)).all()}
     tree = queries.subject_tree(db, book.id)
     ok = True
 
