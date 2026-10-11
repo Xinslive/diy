@@ -8,16 +8,17 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import select, tuple_
+from sqlalchemy import func, select, tuple_
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from app.accounting import importer as svc_import
 from app.accounting import organize as svc_organize
 from app.accounting import vouchers as svc
+from app.accounting.util import find_period
 from app.api.schemas import BatchIds, VoucherIn
 from app.core.db import get_db
-from app.core.deps import get_book_link, get_current_user, get_my_book
+from app.core.deps import get_current_user, get_my_book, require_book_write
 from app.models import (Book, Entry, ImportBatch, Period, Subject, SysUser,
                      UserBook, Voucher)
 
@@ -41,6 +42,9 @@ def _serialize(db: Session, v: Voucher) -> dict:
     entries = sorted(v.entries, key=lambda e: e.line_no)
     subs = {s.id: s for s in db.scalars(
         select(Subject).where(Subject.book_id == v.book_id)).all()}
+    # 合计走 side_totals：红字（负数）算到对面去，两栏都只摆正数
+    dr_total, cr_total = svc.side_totals(
+        [{"direction": e.direction, "amount": e.amount} for e in entries])
     return {
         "id": v.id, "voucher_no": v.voucher_no, "voucher_date": v.voucher_date.isoformat(),
         "status": v.status, "source": v.source, "remark": v.remark,
@@ -48,8 +52,8 @@ def _serialize(db: Session, v: Voucher) -> dict:
         "posted_by": v.posted_by,
         "posted_at": v.posted_at.isoformat() if v.posted_at else None,
         "period_id": v.period_id,
-        "total_debit": str(sum(e.amount for e in entries if e.direction == "DEBIT")),
-        "total_credit": str(sum(e.amount for e in entries if e.direction == "CREDIT")),
+        "total_debit": str(dr_total),
+        "total_credit": str(cr_total),
         "entries": [
             {
                 "id": e.id, "line_no": e.line_no, "subject_id": e.subject_id,
@@ -60,11 +64,6 @@ def _serialize(db: Session, v: Voucher) -> dict:
             for e in entries
         ],
     }
-
-
-def _guard(link: UserBook) -> None:
-    if link.role == "VIEWER":
-        raise HTTPException(403, "只读账套不能修改凭证")
 
 
 @router.get("")
@@ -88,14 +87,13 @@ def query(book: Book = Depends(get_my_book), db: Session = Depends(get_db),
 
 @router.post("", status_code=201)
 def create(payload: VoucherIn, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-           link: UserBook = Depends(get_book_link), user: SysUser = Depends(get_current_user)):
-    _guard(link)
+           _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
     try:
         v = svc.create_voucher(
             db, book_id=book.id, user=user, voucher_date=payload.voucher_date,
             entries=[e.model_dump() for e in payload.entries], remark=payload.remark,
             attachments=payload.attachments, source=payload.source,
-            voucher_no=payload.voucher_no,
+            voucher_no=payload.voucher_no, insert_after_id=payload.insert_after,
         )
     except ValueError as e:
         db.rollback()
@@ -105,9 +103,8 @@ def create(payload: VoucherIn, book: Book = Depends(get_my_book), db: Session = 
 
 @router.put("/{voucher_id}")
 def update(voucher_id: int, payload: VoucherIn, book: Book = Depends(get_my_book),
-           db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
+           db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
            user: SysUser = Depends(get_current_user)):
-    _guard(link)
     v = db.get(Voucher, voucher_id)
     if v is None or v.book_id != book.id:
         raise HTTPException(404, "凭证不存在")
@@ -123,8 +120,7 @@ def update(voucher_id: int, payload: VoucherIn, book: Book = Depends(get_my_book
 
 @router.delete("/{voucher_id}")
 def remove(voucher_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-           link: UserBook = Depends(get_book_link), user: SysUser = Depends(get_current_user)):
-    _guard(link)
+           _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
     v = db.get(Voucher, voucher_id)
     if v is None or v.book_id != book.id:
         raise HTTPException(404, "凭证不存在")
@@ -138,8 +134,7 @@ def remove(voucher_id: int, book: Book = Depends(get_my_book), db: Session = Dep
 
 @router.post("/post")
 def post_many(payload: BatchIds, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-              link: UserBook = Depends(get_book_link), user: SysUser = Depends(get_current_user)):
-    _guard(link)
+              _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
     try:
         n = svc.post_vouchers(db, payload.ids, user)
     except ValueError as e:
@@ -150,8 +145,7 @@ def post_many(payload: BatchIds, book: Book = Depends(get_my_book), db: Session 
 
 @router.post("/unpost")
 def unpost_many(payload: BatchIds, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-                link: UserBook = Depends(get_book_link), user: SysUser = Depends(get_current_user)):
-    _guard(link)
+                _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
     try:
         n = svc.unpost_vouchers(db, payload.ids, user)
     except ValueError as e:
@@ -162,8 +156,7 @@ def unpost_many(payload: BatchIds, book: Book = Depends(get_my_book), db: Sessio
 
 @router.post("/batch-delete")
 def batch_delete(payload: BatchIds, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-                 link: UserBook = Depends(get_book_link), user: SysUser = Depends(get_current_user)):
-    _guard(link)
+                 _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
     rows = list(db.scalars(select(Voucher).where(
         Voucher.id.in_(payload.ids), Voucher.book_id == book.id)).all())
     # 先整批体检再删：批量选中 20 张、其中 1 张已记账时，
@@ -187,19 +180,17 @@ def batch_delete(payload: BatchIds, book: Book = Depends(get_my_book), db: Sessi
 
 class OrganizeIn(BaseModel):
     period_id: Optional[int] = None      # 为空表示整个账套逐期整理
-    strategy: Literal["GAPS", "RENUM", "SORT_DATE", "SORT_DATE_DESC"] = "GAPS"
-    include_system: bool = False         # 是否把结转损益等系统凭证一起重排
+    strategy: Literal["RENUM", "SORT_DATE"] = "SORT_DATE"
 
 
 @router.post("/organize/preview")
 def organize_preview(payload: OrganizeIn, book: Book = Depends(get_my_book),
-                     db: Session = Depends(get_db), link: UserBook = Depends(get_book_link)):
-    """先看差异再确认。GAPS 只体检，其余给出逐张对照表。"""
-    _guard(link)
+                     db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write)):
+    """先看差异再确认。计划阶段只算，不碰数据。"""
     try:
         plans = svc_organize.plan_organize(
             db, book_id=book.id, period_id=payload.period_id,
-            strategy=payload.strategy, include_system=payload.include_system)
+            strategy=payload.strategy)
     except ValueError as e:
         raise HTTPException(400, str(e))
     out = [p.to_dict() for p in plans]
@@ -213,12 +204,11 @@ def organize_preview(payload: OrganizeIn, book: Book = Depends(get_my_book),
 
 @router.post("/organize")
 def organize(payload: OrganizeIn, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-             link: UserBook = Depends(get_book_link), user: SysUser = Depends(get_current_user)):
-    _guard(link)
+             _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
     try:
         result = svc_organize.apply_organize(
             db, book_id=book.id, user=user, period_id=payload.period_id,
-            strategy=payload.strategy, include_system=payload.include_system)
+            strategy=payload.strategy)
     except ValueError as e:
         db.rollback()
         raise HTTPException(400, str(e))
@@ -250,7 +240,7 @@ def import_template(book: Book = Depends(get_my_book)):
         c.alignment = Alignment(horizontal="center")
     for col, w in zip("ABCDEFGHI", (12, 12, 24, 14, 20, 14, 14, 10, 24)):
         ws.column_dimensions[col].width = w
-    ws.append(["2026-01-15", "记0001", "收到租金", "1001", "库存现金", 5000, "", 1, "示例行，导入前请删除"])
+    ws.append(["2026-01-15", "记001", "收到租金", "1001", "库存现金", 5000, "", 1, "示例行，导入前请删除"])
     ws.append(["", "", "收到租金", "6001", "主营业务收入", "", 5000, "", ""])
     ws.append(["2026-01-20", "", "支付水电费", "6602", "管理费用/水电费", 800, "", 2, "日期为空表示接上一张"])
     ws.append(["", "", "支付水电费", "1002", "银行存款", "", 800, "", ""])
@@ -267,10 +257,9 @@ def import_template(book: Book = Depends(get_my_book)):
 
 @router.post("/import")
 def upload_import(file: UploadFile = File(...), book: Book = Depends(get_my_book),
-                  db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
+                  db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
                   user: SysUser = Depends(get_current_user)):
     """上传并解析，暂存待确认。不写任何凭证。"""
-    _guard(link)
     if not (file.filename or "").lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(400, "只支持 .xlsx 格式（另存为 xlsx 后重试）")
     data = file.file.read()
@@ -303,8 +292,7 @@ def list_imports(book: Book = Depends(get_my_book), db: Session = Depends(get_db
 
 @router.post("/import/{batch_id}/commit")
 def commit_import(batch_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-                  link: UserBook = Depends(get_book_link), user: SysUser = Depends(get_current_user)):
-    _guard(link)
+                  _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
     batch = db.get(ImportBatch, batch_id)
     if batch is None or batch.book_id != book.id:
         raise HTTPException(404, "导入批次不存在")
@@ -322,8 +310,7 @@ def commit_import(batch_id: int, book: Book = Depends(get_my_book), db: Session 
 
 @router.post("/import/{batch_id}/discard")
 def discard_import(batch_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-                   link: UserBook = Depends(get_book_link), user: SysUser = Depends(get_current_user)):
-    _guard(link)
+                   _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
     batch = db.get(ImportBatch, batch_id)
     if batch is None or batch.book_id != book.id:
         raise HTTPException(404, "导入批次不存在")
@@ -337,44 +324,121 @@ def discard_import(batch_id: int, book: Book = Depends(get_my_book), db: Session
 # ===================================================================== 重排分录顺序
 
 
-@router.post("/{voucher_id}/sort-entries")
-def sort_entries(voucher_id: int, payload: dict, book: Book = Depends(get_my_book),
-                 db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
+
+
+@router.get("/next")
+def next_voucher(period_id: Optional[int] = None, book: Book = Depends(get_my_book),
+                 db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
                  user: SysUser = Depends(get_current_user)):
-    """按科目编码重排分录行，导出/打印更整齐。"""
-    _guard(link)
-    v = db.get(Voucher, voucher_id)
+    """新开一张时页面上要预填的两个值：下一个凭证号、这个期间最后一张的日期。
+
+    号码直接调 `svc.next_voucher_no` —— **跟落库时是同一个函数**。
+    预览号和实际发号必须是同一套口径，所以宁可去后端问，也不在这儿照着列表
+    猜一个「最大号 +1」（期间里号是可以回收复用的，猜错就是白填一次）。
+    """
+    period = db.get(Period, period_id) if period_id else find_period(db, book.id, date.today())
+    if period is None or period.book_id != book.id:
+        raise HTTPException(404, "会计期间不存在")
+    last = db.scalar(
+        select(func.max(Voucher.voucher_date))
+        .where(Voucher.book_id == book.id, Voucher.period_id == period.id))
+    return {
+        "voucher_no": svc.next_voucher_no(db, period),
+        "voucher_date": last.isoformat() if last else None,
+        "period_id": period.id,
+        "locked": period.locked,
+    }
+
+
+@router.get("/insert-preview")
+def insert_preview(after_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                   _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
+    """「插入凭证」页面要预填的东西：插在谁后面、这张拿哪个号、谁要顺位。
+
+    跟 `/vouchers/next` 一个道理 —— 号码口径只有后端一份，页面自己猜就一定会猜错。
+    这里只算不改：顺延跟建凭证在同一个事务里，空着退出不会顶走谁的号。
+    """
+    v = db.get(Voucher, after_id)
     if v is None or v.book_id != book.id:
-        raise HTTPException(404, "凭证不存在")
-    if str(payload.get("by", "code")) != "code":
-        raise HTTPException(400, "目前只支持按科目编码排序")
+        raise HTTPException(404, "参照凭证不存在")
+    period = db.get(Period, v.period_id)
+    try:
+        slot = svc.insert_slot(db, v)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {
+        "anchor_id": v.id,
+        "anchor_no": v.voucher_no,
+        "voucher_no": slot["no"],
+        "voucher_date": v.voucher_date.isoformat(),
+        "period_id": v.period_id,
+        "locked": bool(period and period.locked),
+        "anchor_posted": v.status == "POSTED",
+        "moved": slot["moved"],
+    }
 
-    subs = {s.id: s for s in db.scalars(
-        select(Subject).where(Subject.book_id == book.id)).all()}
-    entries = sorted(v.entries, key=lambda e: subs[e.subject_id].code if e.subject_id in subs else "")
-    for i, e in enumerate(entries, start=1):
-        e.line_no = i
-    db.flush()
-    from app.accounting.audit_helper import log
 
-    log(db, action="SORT", entity="voucher", entity_id=v.id, user=user, book_id=book.id,
-        detail=f"整理凭证 {v.voucher_no} 的分录顺序")
-    db.commit()
-    return _serialize(db, v)
+@router.get("/period-check")
+def period_check(period_id: Optional[int] = None, book: Book = Depends(get_my_book),
+                 db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write)):
+    """某个期间的「整理就绪」体检：断号 + 时序。全程只读。
+
+    「断号检查」不再是整理凭证里的一个选项了 —— 用户不该为了看一眼有没有断号
+    先想明白该选哪个「方式」。这里把体检单独开一个口：凭证列表页顶上说一声，
+    整理凭证页拿它决定「按当前顺序重新编号」能不能用。
+    """
+    period = db.get(Period, period_id) if period_id else find_period(db, book.id, date.today())
+    if period is None or period.book_id != book.id:
+        raise HTTPException(404, "会计期间不存在")
+    return svc_organize.check_period(db, period)
 
 
 @router.get("/{voucher_id}/neighbour")
 def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-              link: UserBook = Depends(get_book_link), user: SysUser = Depends(get_current_user)):
-    """同一会计期间内的前一张 / 后一张。
+              _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user),
+              keyword: Optional[str] = None, min_amount: Optional[Decimal] = None,
+              max_amount: Optional[Decimal] = None):
+    """前一张 / 后一张 —— 翻的是**列表里那个结果集**，不是同期间的全部凭证。
 
-    顺序按 (日期, id) **升序** —— 也就是凭证的录入顺序，不是列表页那个倒序：
-    连续录入时「后一张」应该是接下来要填的那张，不该是列表里上一行。
-    只在同期间内跳，跨期跳过去日期会突然变掉，很容易误改。
+    带着筛选条件来（凭证号/摘要、分录金额区间）时，就在筛选结果里前后挪，并允许跨月跨年：
+    筛出「每月一张凭证号含 16 的」，进 8 月那张，前一张就是 7 月那张。
+
+    两种情况下顺序都是**时间正序**，不是列表那个倒序：前一张是更早的，后一张是更晚的。
+    列表倒着排是为了让最新的一眼在顶上，而「前一张 / 后一张」是翻时间的动作 ——
+    混成同一个顺序，在 8 月那张点前一张会跳去 9 月，怎么点都回不来。
+    不带条件时同样按 (日期, id) 升序，只把范围收在同期间内，
+    连续录一叠凭证时「后一张」该是接下来要填的那张。
+
+    结果集可能跨很多页，`page_size` 上限 200，所以要翻页收齐再定位。
     """
     v = db.get(Voucher, voucher_id)
     if v is None or v.book_id != book.id:
         raise HTTPException(404, "凭证不存在")
+
+    if keyword or min_amount is not None or max_amount is not None:
+        ids: list[int] = []
+        total = 0
+        for page in range(1, 101):           # 封顶 20000 张，够用了，也防死循环
+            rows, total = svc.query_vouchers(
+                db, book.id, keyword=keyword, min_amount=min_amount, max_amount=max_amount,
+                page=page, page_size=200)
+            ids.extend(r.id for r in rows)
+            if len(ids) >= total or not rows:
+                break
+        # query_vouchers 是倒序（新的在前），这里翻过来成正序。
+        # 顺带把日期相同那批的先后也一起翻了：倒序是 id 降，翻过来正好是 id 升，
+        # 跟不带条件时 `tuple_(date, id)` 升序的那条路对得上。
+        ids.reverse()
+        try:
+            i = ids.index(voucher_id)
+        except ValueError:                   # 这张不在结果集里（比如筛选条件刚改过）
+            return {"prev_id": None, "next_id": None, "scope": "filtered", "index": -1, "total": len(ids)}
+        return {
+            "prev_id": ids[i - 1] if i > 0 else None,
+            "next_id": ids[i + 1] if i < len(ids) - 1 else None,
+            "scope": "filtered", "index": i, "total": len(ids),
+        }
+
     scope = (Voucher.book_id == book.id, Voucher.period_id == v.period_id)
     prev_id = db.scalar(
         select(Voucher.id).where(*scope, tuple_(Voucher.voucher_date, Voucher.id) < (v.voucher_date, v.id))
@@ -384,7 +448,7 @@ def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = 
         select(Voucher.id).where(*scope, tuple_(Voucher.voucher_date, Voucher.id) > (v.voucher_date, v.id))
         .order_by(Voucher.voucher_date, Voucher.id).limit(1)
     )
-    return {"prev_id": prev_id, "next_id": next_id}
+    return {"prev_id": prev_id, "next_id": next_id, "scope": "period", "index": None, "total": None}
 
 
 @router.get("/{voucher_id}")

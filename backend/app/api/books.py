@@ -14,7 +14,9 @@ from app.accounting import periods as svc
 from app.api.schemas import (BookEditIn, BookIn, CarryForwardIn, OpeningIn,
                            UncloseIn, YearEndIn)
 from app.core.db import get_db
-from app.core.deps import get_book_link, get_current_user, get_my_book, require_admin
+from app.core.deps import (get_book_link, get_current_user, get_my_book, require_admin,
+                        require_book_write)
+from app.ledger.engine import LedgerEngine
 from app.models import Book, Period, PeriodOpening, Subject, SysUser, UserBook, Voucher
 
 router = APIRouter(prefix="/api/books", tags=["账套与期间"])
@@ -78,6 +80,7 @@ def list_my_books(user: SysUser = Depends(get_current_user), db: Session = Depen
         out.append({
             "id": b.id, "name": b.name, "company_name": b.company_name,
             "start_year": b.start_year, "start_month": b.start_month,
+            "subject_code_rule": b.subject_code_rule,
             "role": role, "status": b.status,
             # 年度是账套的属性，列表一行一个账套，年度由前端下拉选
             "years": years,
@@ -105,7 +108,8 @@ def create_book(payload: BookIn, user: SysUser = Depends(get_current_user), db: 
         raise HTTPException(400, f"账套「{payload.company_name} · {payload.name}」已存在")
 
     book = Book(company_name=payload.company_name, name=payload.name,
-                start_year=payload.start_year, start_month=payload.start_month)
+                start_year=payload.start_year, start_month=payload.start_month,
+                subject_code_rule=payload.subject_code_rule)
     db.add(book)
     db.flush()
 
@@ -131,10 +135,36 @@ def create_book(payload: BookIn, user: SysUser = Depends(get_current_user), db: 
             "start_year": book.start_year, "subjects_installed": subjects}
 
 
+def _max_subject_level(db: Session, book_id: int) -> int:
+    """这个账套已经用到的最深科目级次。"""
+    return db.scalar(
+        select(func.max(Subject.level)).where(Subject.book_id == book_id)
+    ) or 1
+
+
+def _check_code_rule(db: Session, book: Book, rule: str) -> str:
+    """挡掉「级次调到比已有科目还浅」的规则。
+
+    规则只是**今后**新增科目怎么接号的模板，但级次是有下限的：
+    账上已经有三级科目，规则却改成两级，新增时 `segmentOf` 会按最后一段
+    给它接号，接出来的编码和现有科目的编码对不齐，科目表当场乱掉。
+    """
+    levels = len(rule.split("-"))
+    used = _max_subject_level(db, book.id)
+    if levels < used:
+        raise HTTPException(
+            400, f"科目级次不能调到 {levels} 级：这个账套已经有 {used} 级的科目"
+        )
+    return rule
+
+
 @router.get("/{book_id}")
 def get_book(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     return {
         "id": book.id, "company_name": book.company_name, "name": book.name,
+        "subject_code_rule": book.subject_code_rule,
+        # 前端据此把不该选的级次直接置灰 —— 只在编辑弹窗里要，别塞进账套列表
+        "subject_max_level": _max_subject_level(db, book.id),
         "start_year": book.start_year, "start_month": book.start_month,
         "status": book.status, "years": _years_of(db, book.id),
     }
@@ -143,11 +173,16 @@ def get_book(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
 @router.put("/{book_id}")
 def update_book(book_id: int, payload: BookEditIn, book: Book = Depends(get_my_book),
                 db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
-                user: SysUser = Depends(get_current_user)):
+                user: SysUser = Depends(get_current_user),
+                _w: UserBook = Depends(require_book_write)):
     """改账套名 / 单位名。
 
     只允许 OWNER 改 —— 账套名会出现在每一页的页眉、每一张凭证的打印抬头、
     每一份导出的 Excel 上，名字错了整批单据都得重打。
+
+    额外挂 ``require_book_write`` 是为了让「每个写接口都挂写依赖」成为**机械可查**
+    的不变量（tests/test_viewer_matrix.py 遍历路由表检查），而不是靠人记得。
+    它比下面的 OWNER 判断更宽松，叠加不会改变实际口径，只是把基础那道门先关上。
     """
     if link.role != "OWNER":
         raise HTTPException(403, "只有账套所有者可以修改账套名和单位名")
@@ -163,6 +198,8 @@ def update_book(book_id: int, payload: BookEditIn, book: Book = Depends(get_my_b
     )
     if dup:
         raise HTTPException(400, "已存在同名的账套，请换一个名字")
+    if "subject_code_rule" in changes:
+        _check_code_rule(db, book, changes["subject_code_rule"])
     before = {"company_name": book.company_name, "name": book.name}
     for k, v in changes.items():
         setattr(book, k, v)
@@ -207,33 +244,97 @@ def list_periods(book: Book = Depends(get_my_book), db: Session = Depends(get_db
     ]
 
 
-@router.get("/{book_id}/openings")
-def get_openings(book_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    """期初余额录入页用：一次拿全科目树 + 已录入值 + 是否还能改。"""
-    first = db.scalar(
-        select(Period).where(Period.book_id == book.id).order_by(Period.ord).limit(1)
-    )
-    saved = {
+def _openings_period(db: Session, book: Book, period_id: int | None) -> Period:
+    """期初页面对齐顶栏：要看哪一期，就返回哪一期。
+
+    以前这里永远返回「第一个期间」，页面也不带参数 —— 于是顶栏切到 2027 年，
+    屏幕上摆的还是 2026-01 那份数，还配一句「账套已有业务数据」。
+    用户看到的和顶栏选的对不上，怎么改都像是在跟一个不认识的页面较劲。
+    """
+    stmt = select(Period).where(Period.book_id == book.id)
+    if period_id is not None:
+        period = db.scalar(stmt.where(Period.id == period_id))
+        if period is None:
+            raise HTTPException(404, "会计期间不存在或不属于该账套")
+        return period
+    first = db.scalar(stmt.order_by(Period.ord).limit(1))
+    if first is None:
+        raise HTTPException(400, "账套还没有会计期间")
+    return first
+
+
+def _openings_editable(db: Session, period: Period) -> tuple[bool, str | None]:
+    """这一期的期初还能不能改，以及为什么不能。
+
+    判据是「**从这一期往后**有没有落到业务数据」，不是「整个账套有没有凭证」。
+    改的是这一期的期初，前面已经封账的期间动不了；而只要这一期及其之后
+    一个凭证都没有，这笔期初就还没被任何账簿、报表引用过 —— 换句话说，
+    用户切到一个空年份时看到的那份期初，本来就是可以改的。
+    """
+    n = db.scalar(
+        select(func.count()).select_from(Voucher).where(
+            Voucher.period_id.in_(
+                select(Period.id).where(
+                    Period.book_id == period.book_id, Period.ord >= period.ord)
+            )
+        )
+    ) or 0
+    if n:
+        return False, f"{period.code} 及其之后的期间已有业务数据（{n} 张凭证），期初余额不能再改"
+    # 兜底：结账必然已经把凭证记账了，走不到这里；留着是为了万一将来出现
+    # 「无凭证结账」的路径，别让它悄悄变成可写。
+    if period.locked:
+        return False, f"{period.code} 已结账，期初余额不能再改"
+    return True, None
+
+
+def _openings_amounts(db: Session, book: Book, period: Period,
+                      subjects: list[Subject]) -> dict[int, Decimal]:
+    """这一期的期初：优先取快照，没有快照就按账簿实际在用的那个数算。
+
+    快照只在两个地方产生 —— 账套启用、年度结转。所以 2027 年 2 月往后的
+    期间本来就没有快照，账簿里的期初是由上一期期末实时推导的。
+    页面如果一律显示 0，用户对不上总账，还以为账空了。
+    """
+    snap = {
         o.subject_id: o.amount
-        for o in db.scalars(select(PeriodOpening).where(PeriodOpening.period_id == first.id)).all()
+        for o in db.scalars(
+            select(PeriodOpening).where(PeriodOpening.period_id == period.id)).all()
     }
+    if snap:
+        return snap
+    leaves = [s_.id for s_ in subjects if s_.is_leaf]
+    if not leaves:
+        return {}
+    figures = LedgerEngine(db, book.id).compute(leaves, up_to_ord=period.ord)
+    return {sid: f.opening for sid, f in figures.items()}
+
+
+@router.get("/{book_id}/openings")
+def get_openings(book_id: int, period_id: int | None = None,
+                 book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
+    """期初余额录入页用：一次拿全科目树 + 这一期的期初 + 是否还能改。"""
+    period = _openings_period(db, book, period_id)
+    editable, reason = _openings_editable(db, period)
     subjects = db.scalars(
         select(Subject).where(Subject.book_id == book.id, Subject.active.is_(True))
         .order_by(Subject.code)
     ).all()
-    has_voucher = db.scalar(select(Voucher.id).where(Voucher.book_id == book.id).limit(1)) is not None
+    saved = _openings_amounts(db, book, period, subjects)
     return {
-        "period_id": first.id,
-        "period": first.code,
-        "year": first.year,
-        "month": first.month,
-        "editable": not has_voucher,
-        "reason": None if not has_voucher else "账套已有业务数据，期初余额不能再改",
+        "period_id": period.id,
+        "period": period.code,
+        "year": period.year,
+        "month": period.month,
+        "editable": editable,
+        "reason": reason,
         "subjects": [
             {
                 "id": s_.id, "code": s_.code, "name": s_.name,
                 "category": s_.category, "direction": s_.direction,
                 "is_leaf": s_.is_leaf, "level": s_.level, "carry_forward": s_.carry_forward,
+                # 页面要把上级科目做成小计行（显示它这一支的合计），得知道谁是谁的爹
+                "parent_id": s_.parent_id,
                 # 内部统一「借正贷负」。side 是这笔期初**实际**所在的方位，
                 # 可能与科目自然方向相反（应收账款挂预收、应交税费留抵都属正常），
                 # 所以不能按 direction 反推，否则往返一次就把余额方向洗掉了。
@@ -250,21 +351,19 @@ def get_openings(book_id: int, book: Book = Depends(get_my_book), db: Session = 
 
 
 @router.get("/{book_id}/openings.xlsx")
-def export_openings(book_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
+def export_openings(book_id: int, period_id: int | None = None,
+                    book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     """导出成可再导入的 Excel —— 既是备份，也是给下一个人填的模板。"""
     from app.printing import excel as xl
 
-    first = db.scalar(
-        select(Period).where(Period.book_id == book.id).order_by(Period.ord).limit(1)
-    )
-    saved = {
-        o.subject_id: o.amount
-        for o in db.scalars(select(PeriodOpening).where(PeriodOpening.period_id == first.id)).all()
-    }
+    # 导的必须是屏幕上那一期：页面跟着顶栏走，导出还停在第一期的话，
+    # 备份下来的数字和眼前看到的对不上，出了错根本查不出是哪一份。
+    first = _openings_period(db, book, period_id)
     subjects = db.scalars(
         select(Subject).where(Subject.book_id == book.id, Subject.active.is_(True),
                               Subject.is_leaf.is_(True)).order_by(Subject.code)
     ).all()
+    saved = _openings_amounts(db, book, first, subjects)
     data = xl.opening_balance_excel(
         # 导出用的是**实际**方位：反方向余额（应收账款贷方等）导出后再导入必须
         # 原样回来，用科目自然方向导出会把方向洗成正的
@@ -281,6 +380,11 @@ def export_openings(book_id: int, book: Book = Depends(get_my_book), db: Session
 async def parse_openings(book_id: int, file: UploadFile = File(...),
                          book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     """解析期初余额 Excel，**只解析不落库** —— 前端先给用户预览，确认后才写。
+
+    虽然是 POST，但它**不改任何数据**：只解析出一个 preview 返回给前端。
+    真正落库的是 ``set_openings``（那里挂了 require_book_write）。
+    所以这里不挂写依赖 —— 只读账号也该能预览自己账上的期初表。
+    
 
     为什么不按「第 1 行是表头」写死：导出的模板自己就带两行大标题，而且用户
     从别处抄来的表几乎不可能是干净的四列。这里改成**认表头** —— 扫前若干行找到
@@ -413,16 +517,21 @@ async def parse_openings(book_id: int, file: UploadFile = File(...),
 
 
 @router.post("/{book_id}/periods")
-def set_openings(book_id: int, payload: list[OpeningIn], book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    """录入账套期初余额（只在启用月份之前允许一次）。"""
-    first = db.scalar(
-        select(Period).where(Period.book_id == book.id).order_by(Period.ord).limit(1)
-    )
-    if db.scalar(select(Voucher).where(Voucher.book_id == book.id).limit(1)):
-        raise HTTPException(400, "账套已有业务数据，不能再修改期初余额")
+def set_openings(book_id: int, payload: list[OpeningIn], period_id: int | None = None,
+                 book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                 _link: UserBook = Depends(require_book_write)):
+    """录入**某一期**的期初余额。
+
+    不传 period_id 就是启用期间（老行为）。传了就写那一期：跨年记账时，
+    上一年结转过来的数要是对不上，改这一期比去翻上一年的凭证省事得多。
+    """
+    period = _openings_period(db, book, period_id)
+    editable, reason = _openings_editable(db, period)
+    if not editable:
+        raise HTTPException(400, reason)
 
     # 期初快照有数据库触发器保护（禁止 UPDATE），这里整体重建
-    for row in db.scalars(select(PeriodOpening).where(PeriodOpening.period_id == first.id)).all():
+    for row in db.scalars(select(PeriodOpening).where(PeriodOpening.period_id == period.id)).all():
         db.delete(row)
     db.flush()
 
@@ -453,10 +562,10 @@ def set_openings(book_id: int, payload: list[OpeningIn], book: Book = Depends(ge
             400, f"期初试算不平：借方合计 {dr}，贷方合计 {cr}，差额 {dr - cr}")
 
     for subject_id, amount in planned:
-        db.add(PeriodOpening(book_id=book.id, period_id=first.id,
+        db.add(PeriodOpening(book_id=book.id, period_id=period.id,
                              subject_id=subject_id, amount=amount))
     db.commit()
-    return {"ok": True, "count": len(payload)}
+    return {"ok": True, "count": len(payload), "period": period.code}
 
 
 @router.get("/{book_id}/periods/{period_id}/carry-forward")
@@ -471,11 +580,9 @@ def carry_forward_status(book_id: int, period_id: int, book: Book = Depends(get_
 def carry_forward(book_id: int, period_id: int,
                   payload: Optional[CarryForwardIn] = None,
                   book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-                  link: UserBook = Depends(get_book_link),
+                  # replace=True 会删凭证，只读账套必须挡住（与凭证删除接口同一条规矩）
+                  _link: UserBook = Depends(require_book_write),
                   user: SysUser = Depends(get_current_user)):
-    # replace=True 会删凭证，只读账套必须挡住（与凭证删除接口同一条规矩）
-    if link.role == "VIEWER":
-        raise HTTPException(403, "只读账套不能执行结转损益")
     period = svc.get_period(db, book.id, period_id)
     try:
         # 永远「先删旧结转凭证再重算」，payload 只为兼容旧前端保留
@@ -489,7 +596,8 @@ def carry_forward(book_id: int, period_id: int,
 
 @router.post("/{book_id}/periods/{period_id}/close")
 def close_period(book_id: int, period_id: int, book: Book = Depends(get_my_book),
-                 db: Session = Depends(get_db), user: SysUser = Depends(get_current_user)):
+                 db: Session = Depends(get_db), user: SysUser = Depends(get_current_user),
+                 _link: UserBook = Depends(require_book_write)):
     period = svc.get_period(db, book.id, period_id)
     try:
         return svc.close_period(db, period, user)
@@ -506,7 +614,8 @@ def unclose_preview(book_id: int, period_id: int, book: Book = Depends(get_my_bo
 
 @router.post("/{book_id}/periods/{period_id}/unclose")
 def unclose_period(book_id: int, period_id: int, payload: UncloseIn, book: Book = Depends(get_my_book),
-                   db: Session = Depends(get_db), user: SysUser = Depends(get_current_user)):
+                   db: Session = Depends(get_db), user: SysUser = Depends(get_current_user),
+                   _link: UserBook = Depends(require_book_write)):
     period = svc.get_period(db, book.id, period_id)
     try:
         return svc.batch_unclose(db, book.id, period, user, payload.revert_posting)
@@ -516,9 +625,10 @@ def unclose_period(book_id: int, period_id: int, payload: UncloseIn, book: Book 
 
 @router.post("/{book_id}/year-end")
 def year_end(book_id: int, payload: YearEndIn, book: Book = Depends(get_my_book),
-             db: Session = Depends(get_db), user: SysUser = Depends(get_current_user)):
+             db: Session = Depends(get_db), user: SysUser = Depends(get_current_user),
+             _link: UserBook = Depends(require_book_write)):
     try:
-        return svc.year_end_carry(db, book, user, payload.new_year)
+        return svc.year_end_carry(db, book, user, payload.from_year, payload.new_year)
     except ValueError as e:
         db.rollback()
         raise HTTPException(400, str(e))

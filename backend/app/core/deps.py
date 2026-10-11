@@ -62,3 +62,33 @@ def get_book_link(book_id: int, db: Session = Depends(get_db), user: SysUser = D
     if link is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "没有该账套的访问权限")
     return link
+
+
+def require_book_write(book_id: int, db: Session = Depends(get_db),
+                       user: SysUser = Depends(get_current_user)) -> UserBook:
+    """**账套写操作统一依赖**：既要归属这个账套，又要能写。
+
+    为什么抽成依赖：权限校验散在各路由里，历史上就这么漏过。
+    ``close_period`` / ``unclose_period`` / ``year_end`` / ``set_openings``
+    当时只挂了 ``get_my_book``（它只查「有没有授权」，不查角色），而同一个文件里的
+    ``carry_forward`` 查了 —— 于是 VIEWER 能结账、反结账、年度结转、篡改期初。
+
+    **规则：新增写接口一律挂这个依赖**，不要手写 ``if link.role == "VIEWER"``。
+    漏挂时 ``tests/test_auth_permissions.py`` 的全量矩阵用例会红 ——
+    用测试盯住「每个写接口都挡住了 VIEWER」，而不是靠人记得。
+
+    返回 ``UserBook``：调用方通常已经通过 ``get_my_book`` 拿到账套了，
+    两个依赖可以并排挂，不冲突。
+    """
+    # 直接调函数体而不是再挂一次 Depends：这里三个参数都由外层依赖注入了，
+    # 走 get_book_link() 等于再查一次 UserBook。
+    link = _link_or_403(db, user.id, book_id)
+    require_write(None, user, link)  # type: ignore[arg-type]
+    return link
+
+
+def _link_or_403(db: Session, user_id: int, book_id: int) -> UserBook:
+    link = db.scalar(select(UserBook).where(UserBook.user_id == user_id, UserBook.book_id == book_id))
+    if link is None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "没有该账套的访问权限")
+    return link

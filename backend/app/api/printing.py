@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.api.vouchers import _serialize
 from app.core.db import get_db
-from app.core.deps import get_book_link, get_current_user, get_my_book
+from app.core.deps import get_current_user, get_my_book, require_book_write
 from app.models import Book, Period, PrintTemplate, SysUser, UserBook
 from app.printing import excel as xl
 from app.printing import preview as pv
@@ -31,8 +31,11 @@ from app.printing.template import (
     PAPERS,
     SCOPES,
     render_table_page,
-    render_voucher_page,
+    render_voucher_sheet,
+    split_voucher,
     validate_template,
+    voucher_rows_per_page,
+    voucher_slots_per_page,
 )
 
 router = APIRouter(prefix="/api/books/{book_id}/print", tags=["打印与导出"])
@@ -145,9 +148,8 @@ def template_detail(template_id: int, book: Book = Depends(get_my_book),
 
 @router.post("/templates", status_code=201)
 def create_template(payload: TemplateIn, book: Book = Depends(get_my_book),
-                    db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
+                    db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
                     user: SysUser = Depends(get_current_user)):
-    _require_write(link)
     if payload.scope not in SCOPES:
         raise HTTPException(400, f"未知打印范围：{payload.scope}，可选：{'、'.join(SCOPES)}")
     try:
@@ -168,9 +170,8 @@ def create_template(payload: TemplateIn, book: Book = Depends(get_my_book),
 
 @router.put("/templates/{template_id}")
 def update_template(template_id: int, payload: TemplatePatch, book: Book = Depends(get_my_book),
-                    db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
+                    db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
                     user: SysUser = Depends(get_current_user)):
-    _require_write(link)
     t = db.get(PrintTemplate, template_id)
     if t is None:
         raise HTTPException(404, "打印模板不存在")
@@ -201,9 +202,8 @@ def update_template(template_id: int, payload: TemplatePatch, book: Book = Depen
 
 @router.delete("/templates/{template_id}")
 def delete_template(template_id: int, book: Book = Depends(get_my_book),
-                    db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
+                    db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
                     user: SysUser = Depends(get_current_user)):
-    _require_write(link)
     t = db.get(PrintTemplate, template_id)
     if t is None:
         raise HTTPException(404, "打印模板不存在")
@@ -216,10 +216,9 @@ def delete_template(template_id: int, book: Book = Depends(get_my_book),
 
 @router.post("/templates/{template_id}/copy")
 def copy_template(template_id: int, book: Book = Depends(get_my_book),
-                  db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
+                  db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
                   user: SysUser = Depends(get_current_user)):
     """复制一份再改 —— 改模板前先留个底，财务自己就能做。"""
-    _require_write(link)
     src = db.get(PrintTemplate, template_id)
     if src is None:
         raise HTTPException(404, "打印模板不存在")
@@ -230,11 +229,6 @@ def copy_template(template_id: int, book: Book = Depends(get_my_book),
     db.commit()
     db.refresh(t)
     return {"id": t.id, "scope": t.scope, "name": t.name, "content": t.content}
-
-
-def _require_write(link: UserBook) -> None:
-    if link.role == "VIEWER":
-        raise HTTPException(403, "只读账套不能修改打印模板")
 
 
 def _clear_other_defaults(db: Session, keep: PrintTemplate) -> None:
@@ -267,28 +261,44 @@ def _html_response(doc: str) -> Response:
 def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
                   status: Optional[str] = None, max_pages: Optional[int] = None,
                   note: str = "") -> str:
-    """记账凭证：一页一张。``max_pages`` 只给预览用（限张数保证改版式时的响应速度）。"""
+    """记账凭证：A4 一页两张、A5 一页一张，每张最多 5 行摘要、超出续到下一张。
+
+    ``max_pages`` 限的是**原始凭证张数**（只给预览用，保证改版式时的响应速度），
+    不是分片数 —— 否则一张 12 行的凭证会把「只预览 3 张」变成只看它自己。
+    """
     from app.accounting.vouchers import query_vouchers
 
     vouchers, _ = query_vouchers(db, book.id, from_period=period, to_period=period,
                                  status=status, page_size=5000)
     vouchers = sorted(vouchers, key=lambda v: (v.voucher_date, v.voucher_no))
-    total = max(len(vouchers), 1)
     shown = vouchers[:max_pages] if max_pages else vouchers
 
-    ctx = pv.context(db, book, period)
-    pages = [render_voucher_page(tpl, ctx, _serialize(db, v), i, total)
-             for i, v in enumerate(shown, start=1)]
+    rows_per_page = voucher_rows_per_page(tpl)
+    slots = voucher_slots_per_page(tpl)
 
-    if not pages:
-        doc = render_voucher_page(tpl, ctx, {
+    # 先分片再排版：一张 12 行的凭证会变成 记001-1 / 记001-2 / 记001-3，
+    # 它们占三个槽位，可能跨物理页。
+    pieces: list[dict] = []
+    for v in shown:
+        pieces.extend(split_voucher(_serialize(db, v), rows_per_page))
+
+    if not pieces:
+        pieces = split_voucher({
             "voucher_no": "", "voucher_date": "", "entries": [], "total_debit": 0,
             "total_credit": 0, "remark": "", "attachments": 0,
-        }, 1, 1)
-    elif len(pages) == 1:
-        doc = pages[0]
+        }, rows_per_page)
+
+    sheets = [pieces[i:i + slots] for i in range(0, len(pieces), slots)]
+    total_pages = len(sheets)
+
+    ctx = pv.context(db, book, period)
+    docs = [render_voucher_sheet(tpl, ctx, group, i, total_pages)
+            for i, group in enumerate(sheets, start=1)]
+
+    if len(docs) == 1:
+        doc = docs[0]
     else:
-        doc = pages[0].split("</head>")[0] + "</head><body>" + "".join(pages) + "</body></html>"
+        doc = docs[0].split("</head>")[0] + "</head><body>" + "".join(docs) + "</body></html>"
 
     return _with_note(doc, note)
 
@@ -399,7 +409,7 @@ def _render_scope(
 def print_vouchers(book_id: int, period_id: Optional[int] = None,
                    template_id: Optional[int] = None, status: Optional[str] = None,
                    book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    """记账凭证：一页一张。"""
+    """记账凭证：A4 每页 2 张、A5 每页 1 张，每张最多 5 行摘要。"""
     tpl = _tpl_dict(_template(db, book, "VOUCHER", template_id))
     return _html_response(_render_scope(db, book, "VOUCHER", tpl,
                                         period_id=period_id, status=status))

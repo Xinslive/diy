@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.api.schemas import CellIn
 from app.core.db import get_db
-from app.core.deps import get_current_user, get_my_book
+from app.core.deps import get_current_user, get_my_book, require_book_write
 from app.models import (Book, Period, ReportCell, ReportCol, ReportResult, ReportRow,
                      ReportTemplate, SysUser, UserBook)
 from app.reports.evaluate import COL_KINDS
@@ -28,8 +28,13 @@ def templates(db: Session = Depends(get_db)):
 
 
 def _can_write(db: Session, user: SysUser, book_id: int | None = None) -> bool:
-    """报表模板跨账套共享，因此只要用户对任一账套有写权限即可修改。"""
-    stmt = select(UserBook).where(UserBook.user_id == user.id)
+    """报表模板跨账套共享，因此只要用户对任一账套有**写**权限即可修改。
+
+    这里原来只查「有没有这条授权」，没查角色 —— 于是 VIEWER（只读）也能改公式、
+    增删行列。授权存在 ≠ 有权写，少了 role 这一层判断，整套只读模型在这条路径上
+    就形同虚设。补上 ``role != "VIEWER"``。
+    """
+    stmt = select(UserBook).where(UserBook.user_id == user.id, UserBook.role != "VIEWER")
     if book_id:
         stmt = stmt.where(UserBook.book_id == book_id)
     return db.scalar(stmt.limit(1)) is not None
@@ -96,7 +101,8 @@ def save_cells(template_id: int, payload: list[CellIn], db: Session = Depends(ge
 
 @router.post("/{template_id}/persist")
 def persist(template_id: int, book_id: int, period_id: int, db: Session = Depends(get_db),
-            book: Book = Depends(get_my_book)):
+            book: Book = Depends(get_my_book),
+            _link: UserBook = Depends(require_book_write)):
     """把一次求值结果落库，便于导出和排查。"""
     from app.reports.evaluate import evaluate
 

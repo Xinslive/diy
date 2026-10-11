@@ -1,0 +1,205 @@
+"""VIEWER 写权限全量矩阵（P1-02）。
+
+审计报告 P1-02：``close_period`` / ``unclose_period`` / ``year_end`` /
+``set_openings`` 只挂了 ``get_my_book``（查「有没有授权」，不查角色），
+于是只读账号能封账、解封账、年度结转、篡改期初 —— 动态复现 HTTP 200。
+
+这类问题的麻烦不在修一条，而在**保证以后不再漏一条**。所以这里写两条：
+
+1. ``test_每个账套写接口都挂了写依赖`` —— 遍历 FastAPI 路由表，逐个检查写接口
+   有没有挂 ``require_book_write``。以后新增写接口忘了挂，这条直接红。
+   它守的是「别忘了加」。
+2. ``test_VIEWER_调用每个账套写接口都被拒`` —— 真发 HTTP 请求，用 VIEWER 把
+   矩阵挨个打一遍，断言全是 403。它守的是「加了还得真的管用」。
+
+单点断言（「结账返回 403」）只覆盖那一条；这两条一起才是防线。
+"""
+from __future__ import annotations
+
+import pytest
+from fastapi.routing import APIRoute
+
+from app.core.deps import require_book_write
+
+# 不属于「账套写权限」范畴的写接口，各有各的门禁，单独看待：
+#   /api/auth/*         登录注册，本来就对匿名开放
+#   /api/system/*       管理员专属（require_admin）
+#   POST /api/books     建自己的账套，建完自动 OWNER
+#   .../print/preview   只渲染 HTML 不落库，只读账号本来就该能预览
+#     （见 tests/test_print_template.py::test_只读账套也能预览）
+#   .../openings/parse  只解析成 preview 返回，不落库；落库走 set_openings
+#   .../organize/preview  只算计划不执行，执行走 /organize
+_EXEMPT_EXACT = {
+    "/api/books",
+    "/api/books/{book_id}/print/preview",
+    "/api/books/{book_id}/openings/parse",
+    "/api/books/{book_id}/vouchers/organize/preview",
+}
+_EXEMPT_PREFIXES = ("/api/auth/", "/api/system/")
+_REPORTS_PREFIX = "/api/reports/"   # 报表走 reports._can_write，另有用例
+
+
+def _all_routes() -> list[APIRoute]:
+    """摊平 app 的路由表。
+
+    注意 ``include_router`` 放进来的不是裸 APIRoute，而是一层 ``_IncludedRouter``
+    包装（FastAPI 新版本才有的内部结构）。只认 ``.routes`` 会一条写接口都遍历不到 ——
+    那时这条用例会「通过」，但其实什么都没检查，是最坏的那种假绿。
+    这里两种形态都认。
+    """
+    from app.main import app
+
+    out: list[APIRoute] = []
+    seen: set[int] = set()
+    stack = list(app.routes)
+    while stack:
+        r = stack.pop()
+        if id(r) in seen:
+            continue
+        seen.add(id(r))
+        if isinstance(r, APIRoute):
+            out.append(r)
+            continue
+        for attr in ("routes", "original_router"):
+            inner = getattr(r, attr, None)
+            inner = getattr(inner, "routes", None) if inner is not None else None
+            stack.extend(inner or [])
+    return out
+
+
+def _dep_calls(route: APIRoute) -> set:
+    """这条路由**直接**声明的依赖函数集合。"""
+    calls: set = set()
+
+    def walk(dep) -> None:
+        for d in dep.dependencies or []:
+            if d.call is not None:
+                calls.add(d.call)
+            walk(d)
+
+    walk(route.dependant)
+    return calls
+
+
+def test_每个账套写接口都挂了写依赖():
+    """新增写接口忘了挂 require_book_write —— 这条用例会红。"""
+    missing = []
+    for r in _all_routes():
+        if not (set(r.methods or ()) & {"POST", "PUT", "PATCH", "DELETE"}):
+            continue
+        path = r.path
+        if path in _EXEMPT_EXACT or path.startswith(_EXEMPT_PREFIXES) \
+                or path.startswith(_REPORTS_PREFIX):
+            continue
+        if require_book_write not in _dep_calls(r):
+            missing.append(f"{sorted(set(r.methods))[0]:6} {path}")
+    assert not missing, (
+        "这些写接口没挂 require_book_write，VIEWER 能直接调用：\n" + "\n".join(missing))
+
+
+def _make_voucher_as(client, headers) -> tuple[int, int]:
+    """以管理员身份建一张凭证，返回 (凭证 id, 账套 id)。
+
+    凭证必须由**能写的人**造：VIEWER 自己建凭证本来就被 403 挡着。
+    矩阵里那些 ``{voucher_id}`` 路径参数需要真实存在、能被解析出来的 id，
+    否则 404 会把 403 的断言糊弄过去 —— 测的就不是权限了。
+    """
+    r = client.post("/api/books", headers=headers,
+                    json={"company_name": "矩阵测试公司", "name": "矩阵测试账套",
+                          "start_year": 2026})
+    assert r.status_code == 201, r.text
+    book_id = r.json()["id"]
+
+    subs = client.get(f"/api/books/{book_id}/subjects/flat", headers=headers).json()
+    dr = next(s for s in subs if s["category"] == "ASSET")
+    cr = next(s for s in subs if s["category"] in ("LIABILITY", "REVENUE"))
+
+    r = client.post(f"/api/books/{book_id}/vouchers", headers=headers, json={
+        "voucher_date": "2026-01-15",
+        "entries": [
+            {"subject_id": dr["id"], "direction": "DEBIT", "amount": "100.00", "summary": "矩阵"},
+            {"subject_id": cr["id"], "direction": "CREDIT", "amount": "100.00", "summary": "矩阵"},
+        ],
+    })
+    assert r.status_code == 201, r.text
+    return r.json()["id"], book_id
+
+
+def test_VIEWER_调用每个账套写接口都被拒(client, db, book, plain_user, plain_auth, auth):
+    """VIEWER 对本账套的写操作必须全部 403 —— 一个都不能过。"""
+    from app.models import UserBook
+
+    vid, _other_book_id = _make_voucher_as(client, auth)
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="VIEWER"))
+    db.commit()
+
+    periods = client.get(f"/api/books/{book.id}/periods", headers=plain_auth).json()
+    pid = periods[0]["id"]
+
+    cases = [
+        ("期初写入", "POST", f"/api/books/{book.id}/periods", []),
+        ("结账", "POST", f"/api/books/{book.id}/periods/{pid}/close", None),
+        ("反结账", "POST", f"/api/books/{book.id}/periods/{pid}/unclose",
+         {"revert_posting": True}),
+        ("结转损益", "POST", f"/api/books/{book.id}/periods/{pid}/carry-forward", {}),
+        ("年度结转", "POST", f"/api/books/{book.id}/year-end", {"from_year": 2026}),
+        ("建凭证", "POST", f"/api/books/{book.id}/vouchers",
+         {"voucher_date": "2026-01-15", "entries": []}),
+        ("改凭证", "PUT", f"/api/books/{book.id}/vouchers/{vid}",
+         {"voucher_date": "2026-01-15", "entries": []}),
+        ("删凭证", "DELETE", f"/api/books/{book.id}/vouchers/{vid}", None),
+        ("批量记账", "POST", f"/api/books/{book.id}/vouchers/post", {"ids": [vid]}),
+        ("批量反记账", "POST", f"/api/books/{book.id}/vouchers/unpost", {"ids": [vid]}),
+        ("批量删除", "POST", f"/api/books/{book.id}/vouchers/batch-delete", {"ids": [vid]}),
+        ("整理凭证", "POST", f"/api/books/{book.id}/vouchers/organize", {}),
+        ("提交导入", "POST", f"/api/books/{book.id}/vouchers/import/999999/commit", None),
+        ("作废导入", "POST", f"/api/books/{book.id}/vouchers/import/999999/discard", None),
+        ("新建科目", "POST", f"/api/books/{book.id}/subjects",
+         {"code": "9999", "name": "只读新建", "category": "ASSET", "direction": "DEBIT"}),
+        ("改账套", "PUT", f"/api/books/{book.id}", {"name": "只读改名"}),
+        ("新建打印模板", "POST", f"/api/books/{book.id}/print/templates",
+         {"scope": "VOUCHER", "name": "只读模板", "content": {}}),
+        ("报表落库", "POST",
+         f"/api/reports/1/persist?book_id={book.id}&period_id={pid}", None),
+        ("改报表公式", "PUT", f"/api/reports/1/cells?book_id={book.id}", []),
+        ("新建报表模板", "POST", f"/api/reports/templates?book_id={book.id}",
+         {"name": "只读报表"}),
+    ]
+
+    leaked = []
+    for label, method, path, body in cases:
+        kwargs = {"headers": plain_auth}
+        if body is not None:
+            kwargs["json"] = body
+        r = client.request(method, path, **kwargs)
+        if r.status_code != 403:
+            leaked.append(f"{label:10} {method:6} {path} -> {r.status_code}")
+    assert not leaked, "VIEWER 竟然能写：\n" + "\n".join(leaked)
+
+
+def test_ACCOUNTANT_写权限没有被收紧(client, db, book, plain_user, plain_auth):
+    """收紧只针对 VIEWER。会计该能做的还得能做，否则等于把账锁死。"""
+    from app.models import UserBook
+
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="ACCOUNTANT"))
+    db.commit()
+
+    r = client.post(f"/api/books/{book.id}/subjects", headers=plain_auth,
+                    json={"code": "1998", "name": "会计建的科目", "category": "ASSET",
+                          "direction": "DEBIT"})
+    assert r.status_code == 201, f"会计连建科目都不行：{r.status_code} {r.text}"
+
+
+def test_VIEWER_仍然能读(client, db, book, plain_user, plain_auth):
+    """只读不是不能用。读路径必须照常работа —— 否则就是权限模型整体崩了。"""
+    from app.models import UserBook
+
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="VIEWER"))
+    db.commit()
+
+    for path in (f"/api/books/{book.id}",
+                 f"/api/books/{book.id}/periods",
+                 f"/api/books/{book.id}/subjects",
+                 f"/api/books/{book.id}/vouchers"):
+        r = client.get(path, headers=plain_auth)
+        assert r.status_code == 200, f"只读账号读不了 {path}：{r.status_code} {r.text}"
