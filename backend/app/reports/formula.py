@@ -6,6 +6,7 @@
 
 语法
 ----
+    compare := expr (('<'|'>'|'<='|'>='|'='|'<>'|'!=') expr)*   优先级最低
     expr    := term (('+' | '-') term)*
     term    := factor (('*' | '/') factor)*
     factor  := '-' factor | primary
@@ -190,25 +191,34 @@ class Parser:
         if not self.src.strip():
             return None
         # parse() 可能被多次调用，__init__ 里已经去掉过 "="
-        node = self.expr()
+        # 入口取**最松**的那条规则（比较）：比较号两边才能各含加减。
+        node = self.compare()
         if self.cur.kind != "EOF":
             raise FormulaError(f"公式尾部有多余内容: {self.src[self.pos:]}")
         return node
 
     def expr(self):
-        node = self.compare()
+        """加减。比比较紧、比乘除松。"""
+        node = self.term()
         while self.cur.kind == "OP" and self.cur.value in "+-":
             op = self.cur.value
             self.pos += 1
-            node = ("bin", op, node, self.compare())
+            node = ("bin", op, node, self.term())
         return node
 
     def compare(self):
-        node = self.term()
+        """比较 —— 全链条上**最松**的一条：``compare -> expr -> term``。
+
+        层级不能反过来。写成 ``expr -> compare -> term``（加减在外层）
+        时，``1+2>5`` 会解析成 ``1 + (2>5)``：加减先吃掉 ``1``，
+        再把比较的结果当成自己的右操作数 —— 求值 1 而不是 0，
+        ``IF(1+2>5,...)`` 于是走进错误分支，**且全程不报错**。
+        """
+        node = self.expr()
         while self.cur.kind == "OP" and self.cur.value in ("<", ">", "<=", ">=", "=", "<>", "!="):
             op = self.cur.value
             self.pos += 1
-            node = ("cmp", op, node, self.term())
+            node = ("cmp", op, node, self.expr())
         return node
 
     def term(self):
@@ -261,16 +271,19 @@ class Parser:
             self.pos += 1
             self.eat("PUNCT", "(")
             args = []
+            # 实参同样从最松的规则起步：IF(1+2>5,100,200) 里那个
+            # 比较号必须能在实参内部被吃掉，否则会一路冒泡成
+            # 「公式尾部有多余内容」。
             if not (self.cur.kind == "PUNCT" and self.cur.value == ")"):
-                args.append(self.expr())
+                args.append(self.compare())
                 while self.cur.kind == "PUNCT" and self.cur.value == ",":
                     self.pos += 1
-                    args.append(self.expr())
+                    args.append(self.compare())
             self.eat("PUNCT", ")")
             return ("call", tok.value, args)
         if tok.kind == "PUNCT" and tok.value == "(":
             self.pos += 1
-            node = self.expr()
+            node = self.compare()
             self.eat("PUNCT", ")")
             return node
         raise FormulaError(f"无法解析的记号: {tok.value}")
