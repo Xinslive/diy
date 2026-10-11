@@ -25,6 +25,94 @@ TEST_DB_URL = os.environ.get(
     "CWQ_TEST_DATABASE_URL",
     "postgresql+psycopg://cwq:cwq123@localhost:15432/cwq_test",
 )
+
+
+# --------------------------------------------------------------------- 测试库护栏
+#
+# 下面第 64 行是 ``DROP SCHEMA public CASCADE``。整个测试套件的正确性、
+# 可重复执行性都靠它，但它**完全依赖操作者把环境变量填对**：
+#
+#     CWQ_TEST_DATABASE_URL=postgresql+psycopg://cwq:cwq123@127.0.0.1:5432/cwq \
+#         pytest
+#
+# 一次误配，开发库当场消失。这不是理论场景 —— 变量名合法，
+# 而仓库根目录的 .env.example 里就摆着这么一条 ``.../cwq`` 的开发连接串，
+# 照着改掉末尾的库名就够了。
+#
+# 所以护栏不能只写在文档里，要写进代码，且**默认拒绝启动**。
+# 数据库名必须带 test 标记；连到远端主机时还要额外显式确认。
+
+# 常见生产/共享主机名。这些名字出现时一律拒绝，不给「大概不是生产」的余地。
+FORBIDDEN_HOSTS = frozenset({
+    "db", "db-master", "postgres", "postgresql",   # docker-compose/k8s 里的默认服务名
+    "prod", "production", "prod-db", "prod-postgres", "prod-db-1",
+    "rds", "rds-primary", "aurora", "cloudsql",
+})
+
+
+class UnsafeTestDatabase(RuntimeError):
+    """测试库配置不安全 —— 拒绝启动，而不是先删库再解释。"""
+
+
+def _assert_safe_test_db(url: str) -> tuple[str, str]:
+    """校验测试库 URL，返回 (主机, 库名)。
+
+    刻意在**任何连接建立之前**就抛错：护栏要是先连上再说，
+    「连得上」这一步本身就已经在错误的库上跑过连接逻辑了。
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    name = (parsed.path or "").lstrip("/")
+
+    if not name:
+        raise UnsafeTestDatabase(
+            f"测试库 URL 里没有库名，拒绝启动：{_mask(url)}")
+    if not name.endswith("_test"):
+        raise UnsafeTestDatabase(
+            f"测试库名必须以 _test 结尾，实际是 {name!r} —— 拒绝启动。\n"
+            f"  目标：{_mask(url)}\n"
+            "  原因：测试夹具会执行 DROP SCHEMA public CASCADE，"
+            "指错库等于当场删库。\n"
+            "  改法：把库名改成 xxx_test，或设置 CWQ_TEST_DATABASE_URL 指向测试库。"
+        )
+    if host.lower() in FORBIDDEN_HOSTS:
+        raise UnsafeTestDatabase(
+            f"测试库指向了疑似生产/共享主机 {host!r} —— 拒绝启动。\n"
+            f"  目标：{_mask(url)}"
+        )
+    return host, name
+
+
+def _mask(url: str) -> str:
+    """打日志用的连接串：去掉密码。日志会被人看到，密码不该出现在里面。"""
+    from urllib.parse import urlparse
+
+    p = urlparse(url)
+    if p.password:
+        return url.replace(p.password, "***")
+    return url
+
+
+_assert_safe_test_db(TEST_DB_URL)
+
+# 远端主机再加一道：本地库误配最多毁掉本机开发数据，远端可能就是生产。
+# 用 CWQ_ALLOW_REMOTE_TEST_DB=1 显式确认，意图要摆在明面上。
+_HOST, _NAME = _assert_safe_test_db(TEST_DB_URL)
+if _HOST not in ("localhost", "127.0.0.1", "::1", "") and \
+        os.environ.get("CWQ_ALLOW_REMOTE_TEST_DB") != "1":
+    raise UnsafeTestDatabase(
+        f"测试库在远端主机 {_HOST!r} 上，且未设置 CWQ_ALLOW_REMOTE_TEST_DB=1 —— 拒绝启动。\n"
+        f"  目标：{_mask(TEST_DB_URL)}\n"
+        "  确认这确实是测试库之后，设置 CWQ_ALLOW_REMOTE_TEST_DB=1 再跑。"
+    )
+
+# DROP SCHEMA 之前把目标喊出来。这一行不是给人看的礼貌，是**事后唯一的线索**：
+# 真出了事，日志里至少能证明当时连的是哪个库。
+print(f"[conftest] 测试库护栏通过：{_mask(TEST_DB_URL)}"
+      f"（库名 {len(_NAME)} 字符，将执行 DROP SCHEMA public CASCADE）")
+
 os.environ["DATABASE_URL"] = TEST_DB_URL
 os.environ["JWT_SECRET"] = "test-secret-not-for-production"
 os.environ["DB_ECHO"] = "false"
