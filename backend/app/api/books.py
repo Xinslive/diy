@@ -317,8 +317,11 @@ def get_openings(book_id: int, period_id: int | None = None,
     """期初余额录入页用：一次拿全科目树 + 这一期的期初 + 是否还能改。"""
     period = _openings_period(db, book, period_id)
     editable, reason = _openings_editable(db, period)
+    # 不过滤 active。年度结转会把**全部末级科目**的期末余额刷成次年期初，
+    # 页面却把停用科目藏起来的话，那些期初在界面上是隐形的 ——
+    # 用户看到「这个科目没有期初」，实际库里有。口径必须两边一致。
     subjects = db.scalars(
-        select(Subject).where(Subject.book_id == book.id, Subject.active.is_(True))
+        select(Subject).where(Subject.book_id == book.id)
         .order_by(Subject.code)
     ).all()
     saved = _openings_amounts(db, book, period, subjects)
@@ -360,8 +363,10 @@ def export_openings(book_id: int, period_id: int | None = None,
     # 导的必须是屏幕上那一期：页面跟着顶栏走，导出还停在第一期的话，
     # 备份下来的数字和眼前看到的对不上，出了错根本查不出是哪一份。
     first = _openings_period(db, book, period_id)
+    # 与录入页同一口径（含停用）。导少了行，用户核对时会以为账丢了；
+    # 更糟的是导出的文件再导入回来会平白少一笔。
     subjects = db.scalars(
-        select(Subject).where(Subject.book_id == book.id, Subject.active.is_(True),
+        select(Subject).where(Subject.book_id == book.id,
                               Subject.is_leaf.is_(True)).order_by(Subject.code)
     ).all()
     saved = _openings_amounts(db, book, first, subjects)
@@ -436,9 +441,11 @@ async def parse_openings(book_id: int, file: UploadFile = File(...),
     if head_idx is None:
         head_idx, cols = 0, {"code": 0, "name": 1, "direction": 2, "amount": 3}
 
+    # 解析不过滤 active：导出那一侧已经含停用科目了，这侧再过滤就
+    # 造出一个「导得出来、导不回去」的坑 —— 用户只能手工改表。
     by_code, by_name = {}, {}
     for s_ in db.scalars(select(Subject).where(
-            Subject.book_id == book.id, Subject.active.is_(True))).all():
+            Subject.book_id == book.id)).all():
         by_code[s_.code] = s_
         by_name[s_.name] = s_
 

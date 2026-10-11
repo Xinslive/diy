@@ -102,11 +102,13 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
     # 的收入一并扫进本年利润，于是 11 月的钱出现在 12 月的凭证里，
     # 两边都「结账成功」，账面却已经错了，而且再也查不出来是谁动的手。
     eng = LedgerEngine(db, target.book_id)
+            # 不过滤 active：停用 ≠ 删除。结账校验漏掉停用科目的话，
+            # 一个挂着余额的停用损益科目能被直接结过去 —— 期间锁了、
+            # 损益却留在科目上跨年，而且没有任何报错。
     subjects = db.scalars(
         select(Subject).where(
             Subject.book_id == target.book_id,
             Subject.carry_forward.is_(True),
-            Subject.active.is_(True),
             Subject.is_leaf.is_(True),
         )
     ).all()
@@ -362,12 +364,13 @@ def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUse
     if profit is None:
         raise ValueError(f"账套缺少「本年利润」科目（编码 {PROFIT_SUBJECT_CODE}）")
 
+    # 结转损益的科目集合同样不过滤 active：停用的收入/费用科目如果被排除，
+    # 它的本年累计就不会被结走，损益永远留在科目上，本年利润也算不对。
     subjects = list(
         db.scalars(
             select(Subject).where(
                 Subject.book_id == book_id,
                 Subject.carry_forward.is_(True),
-                Subject.active.is_(True),
                 Subject.is_leaf.is_(True),
                 Subject.id != profit.id,
             ).order_by(Subject.code)
@@ -641,9 +644,12 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
 
     # 3. 下一年 1 月的期初 = 本年期末
     eng = LedgerEngine(db, book.id)
+    # **审计 P2-08 最严重的一条**：这里原来带 Subject.active 过滤，
+    # 于是停用科目的期末余额不会被写进次年期初 —— 「停用」这个本该
+    # 安全的操作变成了账务断层，次年账凭空少一笔且无任何提示。
+    # 期初快照必须覆盖**全部末级科目**，与是否停用无关。
     subjects = db.scalars(
-        select(Subject).where(Subject.book_id == book.id, Subject.is_leaf.is_(True),
-                              Subject.active.is_(True))).all()
+        select(Subject).where(Subject.book_id == book.id, Subject.is_leaf.is_(True))).all()
     fmap = eng.compute([s.id for s in subjects], last.ord)
 
     first = new_periods[0]

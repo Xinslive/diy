@@ -31,11 +31,19 @@ def _entry_stmt(book_id: int, include_unposted: bool) -> Select:
 
 
 def subject_tree(db: Session, book_id: int) -> list[Subject]:
-    """按会计科目表顺序返回所有科目（含非明细级）。"""
+    """按会计科目表顺序返回所有科目（含非明细级、**含停用**）。
+
+    刻意不过滤 ``active``：停用的语义是「不让再选它」，不是「删掉它」——
+    老凭证还指着它，账还得算得出来、还得看得见。过滤掉的话，历史余额
+    在界面上直接消失，用户会以为账丢了。
+
+    写路径另有闸门（``accounting/vouchers.py`` 建凭证时校验科目可用），
+    这里是只读展示，不该再拦一道。
+    """
     return list(
         db.scalars(
             select(Subject)
-            .where(Subject.book_id == book_id, Subject.active.is_(True))
+            .where(Subject.book_id == book_id)
             .order_by(Subject.category, Subject.code)
         ).all()
     )

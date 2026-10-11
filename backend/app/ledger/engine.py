@@ -212,9 +212,12 @@ class LedgerEngine:
         snapshots = self._openings()
 
         if subject_ids is None:
+            # 不过滤 active：这是**默认的全科目集**，报表总额、账簿汇总都走它。
+            # 停用科目被排除的话，上级科目合计会偏小、报表总额会缺一块，
+            # 而用户完全看不出少了什么。写路径的停用闸门在 vouchers.py。
             subject_ids = list(
                 self.db.scalars(
-                    select(Subject.id).where(Subject.book_id == self.book_id, Subject.active.is_(True))
+                    select(Subject.id).where(Subject.book_id == self.book_id)
                 ).all()
             )
 

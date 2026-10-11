@@ -114,7 +114,14 @@ def side_totals(entries: list[dict]) -> tuple[Decimal, Decimal]:
     return dr, cr
 
 
-def _validate_entries(db: Session, book_id: int, entries: list[dict]) -> None:
+# 系统自己生成的凭证：结转损益、年度结转。
+# 它们搬的是**已经存在**的余额，不是「给这个科目记一笔新账」，
+# 所以不受「停用科目不能新记」的闸门约束（审计 P2-08）。
+SYSTEM_SOURCES = ("CARRY_FORWARD",)
+
+
+def _validate_entries(db: Session, book_id: int, entries: list[dict],
+                      allow_inactive: bool = False) -> None:
     if not entries:
         raise ValueError("凭证至少需要一条分录")
     dr = sum(money(e["amount"]) for e in entries if e["direction"] == "DEBIT")
@@ -128,13 +135,13 @@ def _validate_entries(db: Session, book_id: int, entries: list[dict]) -> None:
         raise ValueError("凭证金额不能是 0")
 
     subject_ids = {e["subject_id"] for e in entries}
-    rows = db.execute(
-        select(Subject.id, Subject.code, Subject.name, Subject.is_leaf).where(
-            Subject.book_id == book_id,
-            Subject.id.in_(subject_ids),
-            Subject.active.is_(True),
-        )
-    ).all()
+    stmt = select(Subject.id, Subject.code, Subject.name, Subject.is_leaf).where(
+        Subject.book_id == book_id,
+        Subject.id.in_(subject_ids),
+    )
+    if not allow_inactive:
+        stmt = stmt.where(Subject.active.is_(True))
+    rows = db.execute(stmt).all()
     found = {r.id for r in rows}
     missing = subject_ids - found
     if missing:
@@ -197,7 +204,7 @@ def create_voucher(
         }
         for e in entries
     ]
-    _validate_entries(db, book_id, payload)
+    _validate_entries(db, book_id, payload, allow_inactive=source in SYSTEM_SOURCES)
 
     # 插入位上号沿用参照凭证的号（页面预填的就是它），后面的整体顺延。
     # 人要是自己改过号，以人填的为准 —— 顺位照做，占的是那个号。
