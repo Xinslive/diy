@@ -26,6 +26,7 @@ from typing import Optional
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.accounting import organize as svc_organize
 from app.accounting.audit_helper import log
 from app.accounting.util import ZERO, money, period_label
 from app.ledger.engine import LedgerEngine
@@ -76,20 +77,26 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
         ).scalars()
     )
 
+    # 整条链都要先过一遍「整理就绪」：断号、时序不对的月份一旦封进历史，
+    # 纸质凭证按号装订就跟系统对不上，再想改只能作废重记。
+    svc_organize.assert_tidy(db, chain)
+
     auto_closed, auto_posted = [], 0
+    pending = []
     for p in chain:
         if p.locked:
             continue
         posted = _auto_post(db, p, user) if auto_post else _check_unposted(db, p)
         auto_posted += posted
-        if p.id != target.id:
-            auto_closed.append(p.code)
-        p.locked = True
-        p.closed_at = func.now()
-        p.closed_by = user.username
-        p.version += 1
+        pending.append(p)
 
-    # 损益科目必须已结平
+    # 链上**每一期**都要损益结平，不是只看最后那一期。
+    #
+    # 以前只查 target，漏出来的是这样的事故：用户删掉 11 月的结转凭证，
+    # 直接去结 12 月 —— 12 月连带把 11 月一起锁了，而 11 月的损益还挂在收入
+    # 科目上没人结走。结转损益是按**本年累计**算的，12 月那张凭证会把 11 月
+    # 的收入一并扫进本年利润，于是 11 月的钱出现在 12 月的凭证里，
+    # 两边都「结账成功」，账面却已经错了，而且再也查不出来是谁动的手。
     eng = LedgerEngine(db, target.book_id)
     subjects = db.scalars(
         select(Subject).where(
@@ -99,15 +106,30 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
             Subject.is_leaf.is_(True),
         )
     ).all()
-    residual = []
-    for s in subjects:
-        f = eng.figures(s.id, target.ord)
-        if abs(f.closing) > ZERO:
-            residual.append(f"{s.code} {s.name} 余额 {f.closing}")
-    if residual:
+    # 一次算到最后一期，中间每一期的中间结果都会留在缓存里
+    eng.compute([s.id for s in subjects], max(p.ord for p in pending))
+    unsettled = []
+    for p in pending:
+        residual = [
+            f"{s.code} {s.name} 余额 {f.closing}"
+            for s in subjects
+            if abs((f := eng.figures(s.id, p.ord)).closing) > ZERO
+        ]
+        if residual:
+            unsettled.append(f"{p.code}：{'，'.join(residual)}")
+    if unsettled:
         raise ValueError(
-            "以下损益科目尚有余额，请先执行「结转损益」：\n" + "\n".join(residual)
+            "以下期间还没做「结转损益」，损益科目有余额，不能结账：\n" + "\n".join(unsettled)
         )
+
+    # 体检全过了才真的上锁 —— 别一边改 locked 一边验，验不过就是脏数据
+    for p in pending:
+        if p.id != target.id:
+            auto_closed.append(p.code)
+        p.locked = True
+        p.closed_at = func.now()
+        p.closed_by = user.username
+        p.version += 1
 
     log(
         db, action="CLOSE", entity="period", entity_id=target.id, user=user,
@@ -297,6 +319,25 @@ def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUse
     if period.locked:
         raise ValueError(f"{period.code} 已结账，不能结转")
 
+    # 上一个月没结账，就不许先给这个月结转。
+    #
+    # 结转损益走的是「本年累计」口径：本年利润要的是从年初到现在的总损益。
+    # 所以 12 月那张凭证天生就会把 11 月没结走的收入一起扫进来。正常情况下
+    # 11 月已经结过转、收入科目余额是 0，扫进来的是 0，没有影响；
+    # 但要是 11 月的结转凭证被删了、又没补上，11 月的收入就会顶着 12 月的
+    # 凭证走掉 —— 11 月结账时报「已结账」，12 月凭证里却写着 11 月的钱。
+    # 拦住入口比事后查账便宜得多：上个月没封口，这个月就别想结转。
+    prev = db.scalar(
+        select(Period).where(
+            Period.book_id == period.book_id, Period.ord == period.ord - 1
+        )
+    )
+    if prev is not None and not prev.locked:
+        raise ValueError(
+            f"{prev.code} 还没结账，不能先给 {period.code} 结转损益。"
+            f"请先结账 {prev.code}。"
+        )
+
     existing = _carry_forward_vouchers(db, period)
     removed: list[str] = []
     keep_posted = False
@@ -374,7 +415,7 @@ def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUse
     if created and keep_posted:
         from app.accounting.vouchers import post_vouchers
 
-        post_vouchers(db, [v.id for v in created], user, commit=False)
+        post_vouchers(db, book_id, [v.id for v in created], user, commit=False)
     db.commit()
 
     log(
@@ -404,7 +445,77 @@ def _days_in_month(year: int, month: int) -> int:
 # --------------------------------------------------------------------- 年度结转
 
 
-def year_end_carry(db: Session, book: Book, user: SysUser, new_year: int | None = None) -> dict:
+def _last_active_year(db: Session, book_id: int, periods: list[Period]) -> int:
+    """最后一个**账上真有动静**的年度，也就是「本年」。
+
+    账套会提前把下一年的 12 个空期间铺好 —— 真实用法就是这样：跨年前把新年
+    开好，第二天上班直接进新年记账，不必先去设置里点一次「新增年度」。
+    所以 period 表里的最后一年通常是「还没开始的空年度」，不能拿它当本年，
+    否则在 2026 年末尾点「结转到 2027 年」，后端却去查 2027 有没有全部结账，
+    报出来的年度和用户点的年度对不上。
+
+    判据是「这一年的账上有没有东西」：有过凭证，或写过期初快照。
+    两者都没有的年度只是预留的空壳，不参与年度结转。
+    """
+    years = {p.year for p in periods}
+
+    voucher_years = set(db.scalars(
+        select(Period.year)
+        .join(Voucher, Voucher.period_id == Period.id)
+        .where(Voucher.book_id == book_id)
+        .distinct()
+    ).all())
+    opening_years = set(db.scalars(
+        select(Period.year)
+        .join(PeriodOpening, PeriodOpening.period_id == Period.id)
+        .where(PeriodOpening.book_id == book_id)
+        .distinct()
+    ).all())
+
+    active = (voucher_years | opening_years) & years
+    # 一本全新的账还什么都没记：退回启用年度，让「还没结账」的提示指向对的那一年
+    return max(active) if active else min(years)
+
+
+def _refresh_opening(db: Session, book_id: int, first: Period,
+                     fmap: dict, subjects: list[Subject]) -> int:
+    """把本年期末余额写成下一年 1 月的期初，返回写入条数。
+
+    「刷新」而不是「叠加」：期初是一次快照，重写就重写。
+    这里刻意允许**覆盖**已存在的期初 —— 财务上最常见的动作就是
+    「结完 2026 之后又回去改了 2026 的数」，改完必须能再结一次把
+    2027 年 1 月的期初带过来，否则新账和旧账的年初数永远对不上。
+
+    但只要下一年已经记了账，就不能动它的期初：
+    那时的期初已经被凭证引用，硬改会让已记账的凭证和新期初对不上。
+    """
+    used = db.scalar(
+        select(func.count(Voucher.id))
+        .join(Period, Period.id == Voucher.period_id)
+        .where(Period.book_id == book_id, Period.year == first.year)
+    )
+    if used:
+        raise ValueError(
+            f"{first.year} 年已经有 {used} 张凭证，不能再刷新期初余额。"
+            f"要改 {first.year - 1} 年的数，请先反结账并处理掉 {first.year} 年的凭证。")
+
+    # 重写而不是叠加：先清掉这一期旧的快照
+    db.query(PeriodOpening).filter(PeriodOpening.period_id == first.id).delete(
+        synchronize_session=False)
+
+    count = 0
+    for s in subjects:
+        amount = fmap[s.id].closing
+        if amount == ZERO:
+            continue
+        db.add(PeriodOpening(book_id=book_id, period_id=first.id,
+                             subject_id=s.id, amount=amount))
+        count += 1
+    return count
+
+
+def year_end_carry(db: Session, book: Book, user: SysUser,
+                   from_year: int | None = None, new_year: int | None = None) -> dict:
     """年度结转：给**同一个账套**追加下一个会计年度。
 
     以前这里是「新建一个下一年度的账套」—— 复制科目表、复制授权、再把
@@ -426,8 +537,19 @@ def year_end_carry(db: Session, book: Book, user: SysUser, new_year: int | None 
     if not periods:
         raise ValueError("账套尚未初始化会计期间")
 
-    # 只在「最后一个年度」上做结转，已经结出更晚年度了就别重复结
-    current_year = periods[-1].year
+    # 「本年」优先取前端传来的那个年度 —— 用户在页面上看的是哪一年，
+    # 就结转哪一年，别让后端替用户猜。猜错的话报错年度和按钮上的年度对不上，
+    # 用户只会觉得自己点错了。
+    if from_year is not None:
+        known_years = sorted({p.year for p in periods})
+        if from_year not in known_years:
+            raise ValueError(
+                f"本账套没有 {from_year} 年的会计期间，"
+                f"现有年度：{', '.join(str(y) for y in known_years)}")
+        current_year = from_year
+    else:
+        current_year = _last_active_year(db, book.id, periods)
+
     if new_year is not None and new_year != current_year + 1:
         raise ValueError(
             f"只能结转到紧接的下一个年度（{current_year + 1}），收到的是 {new_year}")
@@ -459,6 +581,15 @@ def year_end_carry(db: Session, book: Book, user: SysUser, new_year: int | None 
             #   亏损 bal>0 -> 借 本年利润 | 贷 未分配利润（冲减留存收益）
             # 早期版本按符号把两个科目的借贷对调了，盈利时会做成
             # 「借 未分配利润 / 贷 本年利润」，等于凭空给留存收益记了一笔借方。
+            #
+            # 12 月里已有的结转凭证先删掉再重做：改了 2026 的数再点一次年度结转
+            # 是常规操作，不删就会叠出第二张结转凭证，未分配利润凭空翻倍。
+            stale = [v for v in _carry_forward_vouchers(db, last)
+                     if v.remark == f"{current_year}年 结转本年利润"]
+            if stale:
+                _drop_carry_forward(db, last, stale, user)
+                db.commit()
+
             amt = abs(bal)
             entries = [
                 {"subject_id": profit.id, "direction": "DEBIT", "amount": amt,
@@ -466,19 +597,13 @@ def year_end_carry(db: Session, book: Book, user: SysUser, new_year: int | None 
                 {"subject_id": retained.id, "direction": "CREDIT", "amount": amt,
                  "summary": "结转本年利润"},
             ]
-            create_voucher(db, book_id=book.id, user=user,
-                           voucher_date=date(current_year, 12, 31), entries=entries,
-                           source="CARRY_FORWARD", remark=f"{current_year}年 结转本年利润")
+            v = create_voucher(db, book_id=book.id, user=user,
+                               voucher_date=date(current_year, 12, 31), entries=entries,
+                               source="CARRY_FORWARD", remark=f"{current_year}年 结转本年利润")
             db.commit()
 
             # 追加凭证后 12 月又变成未记账，重新记账并结账
-            new_id = db.scalar(
-                select(Voucher.id).where(
-                    Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD",
-                    Voucher.remark == f"{current_year}年 结转本年利润",
-                ).order_by(Voucher.id.desc()).limit(1)
-            )
-            post_vouchers(db, [new_id], user)
+            post_vouchers(db, book.id, [v.id], user)
             close_period(db, last, user)
     db.commit()
 
@@ -493,20 +618,8 @@ def year_end_carry(db: Session, book: Book, user: SysUser, new_year: int | None 
     fmap = eng.compute([s.id for s in subjects], last.ord)
 
     first = new_periods[0]
-    # 已经结过一次就不重复写，否则「再点一次年度结转」会叠加出一份期初
-    exists = db.scalar(select(PeriodOpening.id).where(PeriodOpening.period_id == first.id).limit(1))
-    if exists is not None:
-        raise ValueError(f"{target_year} 年度已经结转过了（{first.code} 已有期初余额）")
-
-    count = 0
-    for s in subjects:
-        amount = fmap[s.id].closing
-        if amount == ZERO:
-            continue
-        db.add(PeriodOpening(book_id=book.id, period_id=first.id,
-                             subject_id=s.id, amount=amount))
-        count += 1
-
+    refreshed = _refresh_opening(db, book.id, first, fmap, subjects)
+    count = refreshed
     log(db, action="YEAR_END", entity="book", entity_id=book.id, user=user,
         book_id=book.id,
         detail=f"年度结转：{current_year} → {target_year}，结转 {count} 条期初余额")

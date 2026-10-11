@@ -73,12 +73,6 @@ def detail(book_id: int, subject_id: int, period_id: Optional[int] = None,
     return queries.detail_ledger(db, book.id, subject_id, from_period, to_period, include_unposted)
 
 
-@router.get("/voucher-no-preview")
-def voucher_no_preview(book_id: int, period_id: int, book: Book = Depends(get_my_book),
-                       db: Session = Depends(get_db)):
-    from app.accounting.vouchers import next_voucher_no
-
-    period = db.get(Period, period_id)
-    if period is None or period.book_id != book.id:
-        raise HTTPException(404, "会计期间不存在")
-    return {"next": next_voucher_no(db, period)}
+# 原来的 `GET /ledger/voucher-no-preview`（只回一个 `next` 号码）撤了：
+# 前端一处都没接它，而新开凭证真正需要的是「号码 + 期间最后一张的日期」两个值，
+# 那已经在 `GET /books/{id}/vouchers/next` 里了 —— 留在 ledger 底下也放错了地方。

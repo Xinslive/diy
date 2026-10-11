@@ -95,9 +95,9 @@ def _make_year(db, book, periods, subjects, admin_user):
 
     for m in range(1, 13):
         v = _mk(db, book, admin_user, subjects, m)
-        post_vouchers(db, [v.id], admin_user)
+        post_vouchers(db, book.id, [v.id], admin_user)
         carry_forward_profit(db, book.id, periods[m], admin_user)
-        post_vouchers(db, [
+        post_vouchers(db, book.id, [
             x.id for x in db.scalars(select(Voucher).where(
                 Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD",
                 Voucher.period_id == periods[m].id)).all()
@@ -150,7 +150,7 @@ def test_未结转时差额正好是本期净利润(db, book, periods, subjects,
     ).all():
         p.locked = True
     db.commit()
-    post_vouchers(db, [_mk(db, book, admin_user, subjects, 3).id], admin_user)
+    post_vouchers(db, book.id, [_mk(db, book, admin_user, subjects, 3).id], admin_user)
     rows = cells(render(db, book, periods[3], "BALANCE_SHEET"))
     gap = num(rows["资产总计"][1]) - num(rows["负债和所有者权益总计"][1])
     assert gap == Decimal("10000"), "差额应当等于本期净利润 10000"

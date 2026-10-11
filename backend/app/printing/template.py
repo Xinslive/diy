@@ -43,18 +43,26 @@ PAPERS: dict[str, dict] = {
 
 DIRECTIONS = ("portrait", "landscape")
 
+LINE_STYLES = ("solid", "dashed", "dotted")
 ALIGN = ("left", "center", "right")
+ELEMENT_TYPES = ("text", "table", "line", "rectangle")
+ELEMENT_BINDS = {
+    "title", "subtitle", "company", "book", "period", "voucher_no", "date",
+    "attachments", "accountant", "checker", "cashier", "remark", "capital",
+    "footer", "custom", "entries",
+}
 
 
 # --------------------------------------------------------------------- 默认模板
 
 DEFAULT_TEMPLATES: dict[str, dict] = {
     "VOUCHER": {
-        "paper": "A4", "orientation": "landscape",
+        "paper": "A4", "orientation": "portrait",
         "margins": {"top": 10, "right": 8, "bottom": 10, "left": 8},
         "title": {"text": "记 账 凭 证", "size": 18, "bold": True, "align": "center"},
         "subtitle": {"text": "", "size": 11, "bold": False, "align": "center"},
         "font": {"family": "宋体", "size": 10},
+        "voucher": {"rows_per_page": 5, "split_number": True, "fill_rows": True},
         "show": {"period": True, "voucher_no": True, "date": True,
                  "attachments": True, "remark": True, "page_no": True},
         "columns": [
@@ -70,6 +78,29 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
         "footer": {"text": "", "show_page_no": True,
                    "format": "第 {page} 页　共 {total} 页"},
         "body": {"repeat_header": True, "border": True},
+        # 凭证专用的可视化布局。坐标均为当前凭证格的百分比，前端可以直接拖拽。
+        "elements": [
+            {"id": "title", "type": "text", "bind": "title", "text": "记 账 凭 证",
+             "x": 32, "y": 3, "w": 36, "h": 8, "font_size": 18, "bold": True, "align": "center"},
+            {"id": "company", "type": "text", "bind": "company", "text": "单位：{company}",
+             "x": 3, "y": 12, "w": 32, "h": 5, "font_size": 9, "align": "left"},
+            {"id": "period", "type": "text", "bind": "period", "text": "期间：{period}",
+             "x": 36, "y": 12, "w": 28, "h": 5, "font_size": 9, "align": "center"},
+            {"id": "voucher_no", "type": "text", "bind": "voucher_no", "text": "凭证字号：{voucher_no}",
+             "x": 66, "y": 12, "w": 31, "h": 5, "font_size": 9, "align": "right"},
+            {"id": "date", "type": "text", "bind": "date", "text": "日期：{date}",
+             "x": 66, "y": 17, "w": 31, "h": 5, "font_size": 9, "align": "right"},
+            {"id": "table", "type": "table", "bind": "entries", "text": "分录表格",
+             "x": 3, "y": 23, "w": 94, "h": 57, "font_size": 9, "border": True},
+            {"id": "capital", "type": "text", "bind": "capital", "text": "合计大写：{capital}",
+             "x": 3, "y": 82, "w": 64, "h": 5, "font_size": 9, "align": "left"},
+            {"id": "attachments", "type": "text", "bind": "attachments", "text": "附单据：{attachments}",
+             "x": 68, "y": 82, "w": 29, "h": 5, "font_size": 9, "align": "right"},
+            {"id": "remark", "type": "text", "bind": "remark", "text": "备注：{remark}",
+             "x": 3, "y": 88, "w": 94, "h": 5, "font_size": 9, "align": "left"},
+            {"id": "footer", "type": "text", "bind": "footer", "text": "第 {page} 页　共 {total} 页",
+             "x": 3, "y": 94, "w": 94, "h": 4, "font_size": 8, "align": "right"},
+        ],
     },
     "LEDGER": {
         "paper": "A4", "orientation": "portrait",
@@ -226,6 +257,58 @@ def validate_template(scope: str, content: dict | None) -> dict:
     for c in cleaned:
         c["width"] = round(c["width"] / total * 100.0, 4)   # 归一化到 100%
     merged["columns"] = cleaned
+
+    if scope == "VOUCHER":
+        voucher = merged.setdefault("voucher", {})
+        try:
+            rows_per_page = int(voucher.get("rows_per_page", 5) or 5)
+        except (TypeError, ValueError):
+            rows_per_page = 5
+        # 会计凭证的物理版式固定最多五行，不能通过模板把分录挤到下一张纸上。
+        voucher["rows_per_page"] = max(1, min(5, rows_per_page))
+        voucher["split_number"] = bool(voucher.get("split_number", True))
+        voucher["fill_rows"] = bool(voucher.get("fill_rows", True))
+
+        elements = merged.get("elements") or []
+        clean_elements: list[dict] = []
+        for i, raw in enumerate(elements):
+            if not isinstance(raw, dict):
+                continue
+            element_type = str(raw.get("type", "text"))
+            if element_type not in ELEMENT_TYPES:
+                element_type = "text"
+            bind = str(raw.get("bind", "custom"))
+            if bind not in ELEMENT_BINDS:
+                bind = "custom"
+
+            def _number(key: str, default: float, low: float, high: float) -> float:
+                try:
+                    value = float(raw.get(key, default))
+                except (TypeError, ValueError):
+                    value = default
+                return max(low, min(high, value))
+
+            clean_elements.append(
+                {
+                    "id": str(raw.get("id") or f"element-{i + 1}"),
+                    "type": element_type,
+                    "bind": bind,
+                    "text": str(raw.get("text", "")),
+                    "x": _number("x", 5, 0, 100),
+                    "y": _number("y", 5, 0, 100),
+                    "w": _number("w", 30, 1, 100),
+                    "h": _number("h", 6, 1, 100),
+                    "font_size": _number("font_size", merged["font"].get("size", 10), 6, 40),
+                    "bold": bool(raw.get("bold", False)),
+                    "align": raw.get("align") if raw.get("align") in ALIGN else "left",
+                    "visible": bool(raw.get("visible", True)),
+                    "border": bool(raw.get("border", True)),
+                    # 线宽/线型会拼进 style 属性，必须过白名单，不能原样透传
+                    "line_width": _number("line_width", 0.3, 0.1, 3),
+                    "line_style": raw.get("line_style") if raw.get("line_style") in LINE_STYLES else "solid",
+                }
+            )
+        merged["elements"] = clean_elements
     return merged
 
 
@@ -378,16 +461,51 @@ table.grid tr.total td {{ font-weight:700; }}
 table.grid tfoot td {{ font-weight:700; }}
 .doc-footer {{ margin-top:8px; font-size:9pt; color:#333;
   display:flex; justify-content:space-between; }}
+/* 凭证按「槽位」铺在纸上：A4 一页两个槽位，A5 一个。
+   槽位是元素的定位参照（.voucher-element 的百分比坐标都相对它），
+   因此槽位高度必须等于纸面去掉上下边距后的净高，否则内容会溢出到第二张纸。 */
+.voucher-sheet-page {{ width:100%; height:calc({h}mm - {mt}mm - {mb}mm); overflow:hidden; }}
+.voucher-sheet {{ display:grid; gap:3mm; height:100%; }}
+.voucher-sheet.slots-1 {{ grid-template-columns:minmax(0,1fr); grid-template-rows:minmax(0,1fr); }}
+.voucher-sheet.slots-2.flow-rows {{ grid-template-columns:minmax(0,1fr); grid-template-rows:repeat(2,minmax(0,1fr)); }}
+.voucher-sheet.slots-2.flow-columns {{ grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-rows:minmax(0,1fr); }}
+.voucher-slot {{ position:relative; min-width:0; min-height:0; overflow:hidden; }}
+.voucher-element {{ position:absolute; overflow:hidden; white-space:pre-wrap;
+  word-break:break-word; line-height:1.3; padding:0 1mm; }}
+.voucher-element.line {{ height:0 !important; padding:0; border-top:0.3mm solid #000; }}
+.voucher-element.rectangle {{ border:0.3mm solid #000; padding:0; }}
+.voucher-element.table {{ padding:0; white-space:normal; }}
+/* 关框线只去线，不去表格：行列位置和行高还得留着，否则整张凭证会塌一块。 */
+.voucher-element.table.no-border table.grid th,
+.voucher-element.table.no-border table.grid td {{ border:none; }}
+/* 凭证是固定版式：表头 +（分录行 + 合计行）必须**恰好**占满表格，所以每一行
+   都显式给同一个高度。不能只写 height:100% 让浏览器自己分配 —— 它不会平均分给
+   tbody 里的各行，而是把余量塞给最后一行，于是合计行变成一条肥带、空行又比
+   有字的分录行矮胖不一。--vrow 由 _voucher_table_html 按行数算好后内联给出。 */
+.voucher-element.table table.grid {{ height:100%; font-size:inherit; }}
+.voucher-element.table table.grid th {{ height:var(--vhead); }}
+.voucher-element.table table.grid td {{ height:var(--vrow); }}
+.voucher-element.table table.grid th,
+.voucher-element.table table.grid td {{ padding:0.5mm 1mm; vertical-align:middle;
+  overflow:hidden; text-overflow:ellipsis; }}
 @media screen {{
-  body {{ background:#f0f0f0; padding:16px; }}
+  /* 左右不能留内边距：预览 iframe 的宽度就等于纸宽（A5=559px），
+     body 一旦 padding:16px，内容区只剩 527px 装不下 559px 的纸 ——
+     左边凭空多一道灰边，右边还会被裁掉 16px。页与页之间靠 margin 分隔。 */
+  body {{ background:#f0f0f0; padding:0; }}
   /* 宽度=纸型宽，内容区=纸型宽-左右边距，与打印时的 @page 完全一致 */
-  .page {{ background:#fff; margin:0 auto 16px;
+  .page {{ background:#fff; margin:0 0 16px;
     box-sizing:border-box; width:{w}mm; min-height:{h}mm;
     padding:{mt}mm {mr}mm {mb}mm {ml}mm;
     box-shadow:0 2px 12px rgba(0,0,0,.18); }}
   .page-note {{ text-align:center; color:#888; font-size:12px; margin:10px 0; }}
 }}
-@media print {{ body {{ background:#fff; padding:0; }} .page {{ box-shadow:none; padding:0; margin:0; }} }}
+@media print {{
+  body {{ background:#fff; padding:0; }}
+  .page {{ box-shadow:none; padding:0; margin:0; }}
+  .voucher-sheet-page {{ break-after:page; page-break-after:always; }}
+  .voucher-sheet-page:last-child {{ break-after:auto; page-break-after:auto; }}
+}}
 """
 
 
@@ -482,8 +600,188 @@ def render_table_page(tpl: dict, ctx: dict, rows: list[dict], page: int, total: 
 </div></body></html>"""
 
 
-def render_voucher_page(tpl: dict, ctx: dict, voucher: dict, page: int, total: int) -> str:
-    """记账凭证：一页一张，含附件数、合计行与金额大写。"""
+# --------------------------------------------------------------------- 凭证版式
+#
+# 会计凭证是**固定版式**，不是可以随便塞内容的表格：
+#
+#   * 一张凭证最多 5 行摘要，超出的行续到下一张凭证上打印（记001-1 / 记001-2）；
+#   * A4 一页 2 张（A4 纵向上下排、A4 横向左右排），A5 一页 1 张；
+#   * 每一张的位置、字号由模板的 elements 决定 —— 坐标是「当前槽位」的百分比，
+#     所以同一份元素在不同纸型上自动等比缩放，模板不必为 A4/A5 各存一份。
+
+MAX_VOUCHER_ROWS = 5
+#: 表头占表格高度的比例。前端算行高毫米数时用同一个值，改这里要同步改前端。
+VOUCHER_HEAD_PCT = 14.0
+#: 一页能放两张凭证的纸型。其余（A5/B5/连续纸）一张。
+TWO_UP_PAPERS = {"A4", "A3", "A4_LANDSCAPE"}
+
+#: 元素没写死文字时，各字段的默认写法。
+ELEMENT_DEFAULT_TEXT = {
+    "title": "记 账 凭 证",
+    "subtitle": "{subtitle}",
+    "company": "单位：{company}",
+    "book": "账套：{book}",
+    "period": "期间：{period}",
+    "voucher_no": "凭证字号：{voucher_no}",
+    "date": "日期：{date}",
+    "attachments": "附单据：{attachments}",
+    "accountant": "制单：{accountant}",
+    "checker": "审核：{checker}",
+    "cashier": "出纳：{cashier}",
+    "remark": "备注：{remark}",
+    "capital": "合计大写：{capital}",
+    "footer": "第 {page} 页　共 {total} 页",
+    "entries": "",
+}
+
+
+def voucher_rows_per_page(tpl: dict) -> int:
+    """一张凭证最多几行。validate_template 已经把越界的值夹回 1~5。"""
+    try:
+        n = int((tpl.get("voucher") or {}).get("rows_per_page", MAX_VOUCHER_ROWS))
+    except (TypeError, ValueError):
+        return MAX_VOUCHER_ROWS
+    return max(1, min(MAX_VOUCHER_ROWS, n))
+
+
+def voucher_slots_per_page(tpl: dict) -> int:
+    """一张物理纸放几张凭证。"""
+    return 2 if str(tpl.get("paper", "A4")) in TWO_UP_PAPERS else 1
+
+
+def _entry_amount(entry: dict) -> Decimal:
+    raw = entry.get("amount")
+    if raw in (None, ""):
+        return Decimal("0")
+    try:
+        return Decimal(str(raw))
+    except Exception:  # noqa: BLE001
+        return Decimal("0")
+
+
+def _slice_total(entries: list[dict], direction: str) -> Decimal:
+    """拆出来的每一张自己那几行的合计，口径跟凭证上的合计一致：
+    红字（负数）算到对面去 —— 拆页是排版，不是改账。"""
+    dr = cr = Decimal("0")
+    for e in entries:
+        amt = _entry_amount(e)
+        if amt > 0:
+            if e.get("direction") == "DEBIT":
+                dr += amt
+            else:
+                cr += amt
+        elif amt < 0:
+            if e.get("direction") == "DEBIT":
+                cr += -amt
+            else:
+                dr += -amt
+    return dr if direction == "DEBIT" else cr
+
+
+def split_voucher(voucher: dict, rows_per_page: int) -> list[dict]:
+    """把一张凭证按最多 ``rows_per_page`` 行拆成若干张可独立打印的凭证。
+
+    * 不超行数时原样返回一张，凭证号**不变** —— 没拆过就不能加后缀，
+      否则账上叫记001 的凭证打出来变成记001-1，对不上号。
+    * 拆开时凭证号追加 ``-1``、``-2``，借方/贷方合计按各自那几行重算。
+    """
+    entries = voucher.get("entries") or []
+    rows_per_page = max(1, int(rows_per_page))
+    if len(entries) <= rows_per_page:
+        piece = dict(voucher)
+        piece["slice_index"] = 1
+        piece["slice_total"] = 1
+        return [piece]
+
+    chunks = [entries[i:i + rows_per_page] for i in range(0, len(entries), rows_per_page)]
+    out: list[dict] = []
+    for i, chunk in enumerate(chunks, start=1):
+        piece = dict(voucher)
+        piece["entries"] = chunk
+        piece["total_debit"] = str(_slice_total(chunk, "DEBIT"))
+        piece["total_credit"] = str(_slice_total(chunk, "CREDIT"))
+        piece["voucher_no"] = f"{voucher.get('voucher_no', '')}-{i}"
+        piece["slice_index"] = i
+        piece["slice_total"] = len(chunks)
+        out.append(piece)
+    return out
+
+
+def _cn_capital_safe(value: Any) -> str:
+    try:
+        return to_cn_capital(Decimal(str(value or 0)))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _element_values(tpl: dict, ctx: dict, voucher: dict, page: int, total_pages: int) -> dict:
+    """元素占位符能取到的值。凭证字段来自这张（分片后的）凭证，其余来自账套上下文。"""
+    return {
+        "title": (tpl.get("title") or {}).get("text", ""),
+        "subtitle": (tpl.get("subtitle") or {}).get("text", "") or ctx.get("period", ""),
+        "company": ctx.get("company", ""),
+        "book": ctx.get("book", ""),
+        "period": ctx.get("period", ""),
+        "voucher_no": voucher.get("voucher_no", ""),
+        "date": voucher.get("voucher_date", ""),
+        "attachments": voucher.get("attachments") or "",
+        "accountant": voucher.get("accountant", ""),
+        "checker": voucher.get("checker", ""),
+        "cashier": voucher.get("cashier", ""),
+        "remark": voucher.get("remark") or "",
+        "capital": _cn_capital_safe(voucher.get("total_debit")),
+        "page": page,
+        "total": total_pages,
+    }
+
+
+def _fill(text: str, values: dict) -> str:
+    """替换 {field} 占位符。字段缺失时留空，不把占位符原样印到纸上。"""
+    for key, value in values.items():
+        text = text.replace("{" + key + "}", str(value if value is not None else ""))
+    return text
+
+
+def _element_enabled(tpl: dict, bind: str) -> bool:
+    """旧模板用 meta / show 开关控制页眉显示，元素化之后这两组开关继续有效。"""
+    meta = tpl.get("meta") or {}
+    show = tpl.get("show") or {}
+    if bind in META_LABELS and not meta.get(bind, True):
+        return False
+    if bind in ("period", "voucher_no", "date", "attachments", "remark"):
+        if not show.get(bind, True):
+            return False
+    if bind == "footer" and not show.get("page_no", True):
+        return False
+    return True
+
+
+def _voucher_total_row(tpl: dict, voucher: dict) -> str:
+    """合计行。借/贷方金额放在对应的列上，金额列不存在时退回旧的「倒数第三列」。"""
+    cols = tpl["columns"]
+    n = len(cols)
+    dr_i = next((i for i, c in enumerate(cols) if c["key"] == "debit"), None)
+    cr_i = next((i for i, c in enumerate(cols) if c["key"] == "credit"), None)
+    dr = _fmt(voucher.get("total_debit") or 0)
+    cr = _fmt(voucher.get("total_credit") or 0)
+    label_at = dr_i - 1 if dr_i else max(0, n - 3)
+    cells = []
+    for i, c in enumerate(cols):
+        cls = "num" if c["align"] == "right" else ("ctr" if c["align"] == "center" else "")
+        if dr_i is not None and i == dr_i:
+            text = dr
+        elif cr_i is not None and i == cr_i:
+            text = cr
+        elif i == label_at:
+            text = "合　计"
+        else:
+            text = ""
+        cells.append(f'<td class="{cls}">{_esc(text)}</td>')
+    return '<tr class="total">' + "".join(cells) + "</tr>"
+
+
+def _voucher_table_html(tpl: dict, voucher: dict) -> str:
+    """分录表格。表头、金额千分位、合计行与旧版一致，只是行数由外层分片保证。"""
     cols = tpl["columns"]
     colgroup = "".join(f'<col style="width:{c["width"]}%" />' for c in cols)
     head = "".join(
@@ -491,75 +789,109 @@ def render_voucher_page(tpl: dict, ctx: dict, voucher: dict, page: int, total: i
     )
 
     rows = []
-    entries = voucher.get("entries", [])
-    for e in entries:
+    for e in voucher.get("entries") or []:
         tds = []
         for c in cols:
             key = c["key"]
             if key == "subject":
                 text = f"{e.get('subject_code','')} {e.get('subject_name','')}".strip()
+            elif key in ("debit", "credit"):
+                # 分录只有 direction + amount，borrow/credit 两列要按方向取金额，
+                # 方向对不上就留空（不能把同一笔金额同时印在借方和贷方）。
+                text = e.get("amount", "") if e.get("direction") == key.upper() else ""
             else:
                 text = e.get(key, "")
             cls = "num" if c["align"] == "right" else ("ctr" if c["align"] == "center" else "")
-            tds.append(f'<td class="{cls}">{_esc(_fmt(text) if c["align"]=="right" else text)}</td>')
-        rows.append(f"<tr>{''.join(tds)}</tr>")
+            shown = _fmt(text) if c["align"] == "right" else text
+            tds.append(f'<td class="{cls}">{_esc(shown)}</td>')
+        rows.append("<tr>" + "".join(tds) + "</tr>")
 
-    dr = voucher.get("total_debit") or 0
-    cr = voucher.get("total_credit") or 0
-    total_label = "合　计"
-    tail: list[str] = []
-    if cols:
-        last_two = cols[-2:]
-        span = len(cols) - 2
-        head_cells = "".join(
-            f'<td class="{"num" if c["align"]=="right" else ("ctr" if c["align"]=="center" else "")}">'
-            f'{_esc(total_label) if i == max(0, span - 1) else ""}</td>'
-            for i, c in enumerate(cols)
-        )
-        tail.append(f"<tr class='total'>{head_cells}</tr>")
-    else:
-        tail = []
+    if (tpl.get("voucher") or {}).get("fill_rows", True):
+        # 补足空行：凭证是固定版式，3 行和 5 行的凭证高度必须一样，
+        # 否则叠放的两张在纸上的分界线会错位。
+        blank = "<td></td>" * len(cols)
+        rows += ["<tr>" + blank + "</tr>"] * max(0, voucher_rows_per_page(tpl) - len(rows))
 
-    show = tpl.get("show", {}) or {}
-    remark_row = ""
-    if show.get("remark", True) and voucher.get("remark"):
-        remark_row = (
-            f'<div style="margin-top:6px;font-size:10pt">'
-            f'<b>备注：</b>{_esc(voucher.get("remark"))}</div>'
-        )
-
-    meta = dict(ctx)
-    meta.update(
-        {
-            "voucher_no": voucher.get("voucher_no", ""),
-            "date": voucher.get("voucher_date", ""),
-            "attachments": voucher.get("attachments") or "",
-        }
-    )
-    capital = (
-        f'<div style="margin-top:4px;font-size:10pt"><b>合计大写：</b>'
-        f'{_esc(to_cn_capital(Decimal(str(dr))))}</div>'
-        if to_cn_capital(Decimal(str(dr)))
-        else ""
+    head_pct = VOUCHER_HEAD_PCT
+    row_pct = (100.0 - head_pct) / (voucher_rows_per_page(tpl) + 1)
+    heights = f' style="--vhead:{head_pct:g}%;--vrow:{row_pct:g}%"'
+    return (
+        '<table class="grid"' + heights + "><colgroup>" + colgroup + "</colgroup>"
+        + "<thead><tr>" + head + "</tr></thead>"
+        + "<tbody>" + "".join(rows) + _voucher_total_row(tpl, voucher) + "</tbody></table>"
     )
 
+
+def _element_style(el: dict) -> str:
+    return (
+        f"left:{el['x']}%;top:{el['y']}%;width:{el['w']}%;height:{el['h']}%;"
+        f"font-size:{el['font_size']}pt;text-align:{el.get('align', 'left')};"
+        + ("font-weight:700;" if el.get("bold") else "")
+    )
+
+
+def _element_border(el: dict) -> str:
+    """线条/矩形的边框。线宽线型由模板控制，写死成 0.3mm 实线就没法改了。"""
+    width = el.get("line_width", 0.3)
+    style = el.get("line_style", "solid")
+    return f"{width}mm {style} #000"
+
+
+def _voucher_element_html(tpl: dict, ctx: dict, voucher: dict, el: dict,
+                          page: int, total_pages: int) -> str:
+    # 元素自己的显隐（画布上的「显示」开关 / 元素列表的隐藏按钮）
+    if not el.get("visible", True):
+        return ""
+    etype = el.get("type", "text")
+    style = _element_style(el)
+    if etype == "line":
+        return (f'<div class="voucher-element line" style="{style}border-top:{_element_border(el)};'
+                f'border-right:0;border-bottom:0;border-left:0"></div>')
+    if etype == "rectangle":
+        return f'<div class="voucher-element rectangle" style="{style}border:{_element_border(el)}"></div>'
+    if etype == "table":
+        # 框线是每个表格自己的开关，不跟全局「表格边框」设置混在一起
+        cls = "voucher-element table" if el.get("border", True) else "voucher-element table no-border"
+        return f'<div class="{cls}" style="{style}">{_voucher_table_html(tpl, voucher)}</div>'
+
+    bind = el.get("bind", "custom")
+    if not _element_enabled(tpl, bind):
+        return ""
+    text = _fill(el.get("text") or ELEMENT_DEFAULT_TEXT.get(bind, ""),
+                 _element_values(tpl, ctx, voucher, page, total_pages))
+    if not text.strip():
+        return ""
+    return f'<div class="voucher-element text" style="{style}">{_esc(text)}</div>'
+
+
+def render_voucher_sheet(tpl: dict, ctx: dict, vouchers: list[dict],
+                         page: int, total_pages: int) -> str:
+    """一张**物理纸**。``vouchers`` 是要放进本页槽位的凭证（分片后）。"""
+    slots = voucher_slots_per_page(tpl)
+    # A4 横向时上下两张会非常扁，横排更符合直觉；纵向则上下叠。
+    flow = "flow-columns" if slots == 2 and tpl.get("orientation") == "landscape" else "flow-rows"
+    inner = ""
+    for v in vouchers:
+        elements = "".join(
+            _voucher_element_html(tpl, ctx, v, el, page, total_pages)
+            for el in (tpl.get("elements") or []) if el.get("visible", True)
+        )
+        inner += f'<div class="voucher-slot">{elements}</div>'
+
+    doc_title = _esc((tpl.get("title") or {}).get("text", "") or "记账凭证")
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
-<title>{_esc(voucher.get('voucher_no','记账凭证'))}</title>
+<title>{doc_title}</title>
 <style>{_page_css(tpl)}</style></head><body>
 <div class="page">
-  <h1 class="doc-title">{_esc(tpl.get('title',{}).get('text','记 账 凭 证'))}</h1>
-  <p class="doc-subtitle">{_esc(tpl.get('subtitle',{}).get('text',''))}</p>
-  {_meta_html(tpl, meta)}
-  <table class="grid"><colgroup>{colgroup}</colgroup>
-    <thead><tr>{head}</tr></thead>
-    <tbody>{''.join(rows)}{''.join(tail)}</tbody>
-    <tfoot><tr>
-      <td colspan="{len(cols)}">{capital}</td>
-    </tr></tfoot>
-  </table>
-  {remark_row}
-  {_footer_html(tpl, page, total)}
+  <div class="voucher-sheet-page">
+    <div class="voucher-sheet slots-{slots} {flow}">{inner}</div>
+  </div>
 </div></body></html>"""
+
+
+def render_voucher_page(tpl: dict, ctx: dict, voucher: dict, page: int, total: int) -> str:
+    """单张凭证占一整张纸（兼容旧调用与空数据占位）。"""
+    return render_voucher_sheet(tpl, ctx, [voucher], page, total)
 
 
 def wrap_pages(pages: list[str], note: str = "") -> str:

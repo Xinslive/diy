@@ -38,12 +38,16 @@ class BookIn(BaseModel):
     # 账套的起始会计年度。一个账套跨多个年度，这里填「从哪一年开始记」
     start_year: int
     start_month: int = Field(1, ge=1, le=12)
+    # 科目编码规则，如「4-2-2-2」；决定新增科目自动接几位号
+    subject_code_rule: str = Field("4-2-2-2", pattern=r"^\d+(-\d+)*$")
 
 
 class BookEditIn(BaseModel):
-    """改账套的属性：只允许动名字，不动账上的任何数字。"""
+    """改账套的属性：只允许动名字和科目编码规则，不动账上的任何数字。"""
     company_name: Optional[str] = Field(default=None, min_length=1, max_length=128)
     name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    # 改了规则只影响**今后**新增科目的自动接号，已有科目的编码一律不动
+    subject_code_rule: Optional[str] = Field(default=None, pattern=r"^\d+(-\d+)*$")
 
     def changes(self) -> dict:
         return {k: v for k, v in self.model_dump().items() if v is not None}
@@ -64,6 +68,12 @@ class SubjectIn(BaseModel):
     carry_forward: bool = False
     is_leaf: bool = True
     sort_no: int = 0
+    qty_calc: bool = False
+    aux_calc: bool = False
+    fx_calc: bool = False
+    # 只有「改」才用得上：停用科目。留空表示不动。
+    # 新增一律启用，不走这个字段 —— 刚建的科目没人会要它是停用的。
+    active: Optional[bool] = None
 
 
 # ---- 凭证 ----
@@ -82,6 +92,9 @@ class VoucherIn(BaseModel):
     attachments: int = 0
     voucher_no: Optional[str] = None
     source: Literal["MANUAL", "IMPORT", "CARRY_FORWARD"] = "MANUAL"
+    # 「插入凭证」告诉后端插在谁的后面：新凭证拿这个号，后面的号整体顺位。
+    # 留空就是普通的新增凭证（取期间内最大号 +1）。
+    insert_after: Optional[int] = None
 
 
 class VoucherOut(BaseModel):
@@ -121,6 +134,8 @@ class UncloseIn(BaseModel):
 class YearEndIn(BaseModel):
     # 年度结转不再新建账套，只能指定「紧接的下一个年度」
     new_year: Optional[int] = None
+    # 页面上正在看的那一年：结转就从这一年起算，不然后端只能靠猜
+    from_year: Optional[int] = None
 
 
 # ---- 报表 ----

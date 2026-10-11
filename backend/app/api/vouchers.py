@@ -136,7 +136,7 @@ def remove(voucher_id: int, book: Book = Depends(get_my_book), db: Session = Dep
 def post_many(payload: BatchIds, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
               _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
     try:
-        n = svc.post_vouchers(db, payload.ids, user)
+        n = svc.post_vouchers(db, book.id, payload.ids, user)
     except ValueError as e:
         db.rollback()
         raise HTTPException(400, str(e))
@@ -147,7 +147,7 @@ def post_many(payload: BatchIds, book: Book = Depends(get_my_book), db: Session 
 def unpost_many(payload: BatchIds, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                 _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
     try:
-        n = svc.unpost_vouchers(db, payload.ids, user)
+        n = svc.unpost_vouchers(db, book.id, payload.ids, user)
     except ValueError as e:
         db.rollback()
         raise HTTPException(400, str(e))

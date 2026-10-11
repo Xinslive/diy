@@ -5,11 +5,16 @@
 --   2. 已结账期间禁止任何凭证写入（INSERT / UPDATE / DELETE）
 --   3. 凭证号在同一期间内唯一
 --   4. 已被使用的科目不允许改编码 / 类别 / 余额方向
+--   5. 分录金额不得为 0（负数合法：红字冲销）
 -- =====================================================================
 
 -- ---------- 基础约束 ----------
+-- 金额允许为负：红字冲销。一张红字凭证借贷两边都是负的（-300 / -300），
+-- 它是平的、也该存 —— 冲掉一张记错的凭证本来就是记账的日常。
+-- 真正要挡的是「一条金额为 0 的分录」：那是没填，不是记了 0 块。
 ALTER TABLE entry   DROP CONSTRAINT IF EXISTS ck_entry_amount_positive;
-ALTER TABLE entry   ADD  CONSTRAINT ck_entry_amount_positive CHECK (amount > 0);
+ALTER TABLE entry   DROP CONSTRAINT IF EXISTS ck_entry_amount_nonzero;
+ALTER TABLE entry   ADD  CONSTRAINT ck_entry_amount_nonzero CHECK (amount <> 0);
 ALTER TABLE entry   DROP CONSTRAINT IF EXISTS ck_entry_direction;
 ALTER TABLE entry   ADD  CONSTRAINT ck_entry_direction CHECK (direction IN ('DEBIT','CREDIT'));
 ALTER TABLE voucher DROP CONSTRAINT IF EXISTS ck_voucher_status;
@@ -372,3 +377,14 @@ ALTER TABLE book ALTER COLUMN start_year SET NOT NULL;
 -- ---------- 迁移：管理员从「用户名叫 admin」改成独立字段 ----------
 ALTER TABLE sys_user ADD COLUMN IF NOT EXISTS is_admin boolean NOT NULL DEFAULT false;
 UPDATE sys_user SET is_admin = true WHERE username = 'admin';
+
+-- =====================================================================
+-- 科目体系的两处补充（幂等）：账套的科目编码规则 + 科目的三个核算开关
+-- =====================================================================
+ALTER TABLE book    ADD COLUMN IF NOT EXISTS subject_code_rule varchar(32) NOT NULL DEFAULT '4-2-2-2';
+ALTER TABLE subject ADD COLUMN IF NOT EXISTS qty_calc boolean NOT NULL DEFAULT false;
+ALTER TABLE subject ADD COLUMN IF NOT EXISTS aux_calc boolean NOT NULL DEFAULT false;
+ALTER TABLE subject ADD COLUMN IF NOT EXISTS fx_calc  boolean NOT NULL DEFAULT false;
+
+UPDATE book SET subject_code_rule = '4-2-2-2'
+ WHERE subject_code_rule IS NULL OR btrim(subject_code_rule) = '';

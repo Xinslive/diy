@@ -8,6 +8,7 @@ from typing import Optional
 from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.orm import Session
 
+from app.accounting import organize as svc_organize
 from app.accounting.audit_helper import log, voucher_snapshot
 from app.accounting.util import find_period, money, period_label
 from app.models import Book, Entry, Period, Subject, SysUser, Voucher
@@ -23,10 +24,94 @@ def next_voucher_no(db: Session, period: Period, prefix: str = "记") -> str:
         .where(Voucher.period_id == period.id)
     )
     seq = (int(last) + 1) if last and str(last).strip().isdigit() else 1
-    return f"{prefix}{seq:04d}"
+    # 三位数够一个月的凭证用。四位（记0022）看着像系统自动加的零，反而难扫。
+    return f"{prefix}{seq:03d}"
+
+
+# --------------------------------------------------------------------- 插入位
+
+
+def insert_slot(db: Session, anchor: Voucher) -> dict:
+    """插入凭证要占的那个号：参照凭证自己的号，参照及以后的号整体顺延 +1。
+
+    记001..记010，打开记006 插入 —— 存下去之后新凭证拿记006，
+    原记006..记010 变成记007..记011。顺延按**号**算，不按日期：
+    凭证号才是这个期间里的顺序，日期排出来的次序交给「整理凭证」管。
+
+    这里只算不改。改号和建凭证必须落在同一个事务里：中途放弃一张空凭证，
+    后面那叠号就该原封不动 —— 空凭证占着号、把别的凭证顶走，才是真事故。
+    """
+    prefix, seq = svc_organize.split_no(anchor.voucher_no)
+    if seq == 0:
+        raise ValueError(
+            f"凭证号 {anchor.voucher_no} 不是「凭证字 + 序号」，插入凭证要照着它顺位，请先整理凭证"
+        )
+    rows = list(db.scalars(
+        select(Voucher).where(Voucher.period_id == anchor.period_id)
+    ).all())
+    moved = []
+    for v in rows:
+        p, s = svc_organize.split_no(v.voucher_no)
+        if p == prefix and s >= seq:
+            moved.append({"id": v.id, "from": v.voucher_no, "to": f"{prefix}{s + 1:03d}"})
+    moved.sort(key=lambda m: m["from"])
+    return {"prefix": prefix, "seq": seq, "no": anchor.voucher_no, "moved": moved}
+
+
+def _apply_shift(db: Session, anchor: Voucher) -> list[dict]:
+    """把参照凭证及其后面的号整体 +1。两阶段改号，避开即时唯一约束。
+
+    直接把 记006 改成 记007 会当场撞上原来那张记007 —— ``uq_voucher_period_no``
+    是即时约束，不像平衡检查那样延迟到提交。所以先整体挪到 ∥<id> 临时号再写最终号，
+    跟整理凭证用的是同一套路子。
+    """
+    plan = insert_slot(db, anchor)
+    moved = plan["moved"]
+    if not moved:
+        return moved
+
+    targets = []
+    for m in moved:
+        v = db.get(Voucher, m["id"])
+        targets.append((v, m["to"]))
+    for v, _new_no in targets:
+        v.voucher_no = f"{svc_organize.PARK_PREFIX}{v.id}"
+    db.flush()
+    for v, new_no in targets:
+        v.voucher_no = new_no
+    db.flush()
+    return moved
 
 
 # --------------------------------------------------------------------- 校验
+
+
+def side_totals(entries: list[dict]) -> tuple[Decimal, Decimal]:
+    """凭证两栏的合计：**红字算到对面去**。
+
+    贷方红字（负数）本质是借方，借方红字本质是贷方 —— 这是红字的本意，
+    不是「贷方减了 300」。所以每栏只加正数：
+
+        借方合计 = 借方正数 + 贷方红字（绝对值）
+        贷方合计 = 贷方正数 + 借方红字（绝对值）
+
+    跟「带符号的两边相等」完全等价（移项即可），所以拿它判平也对；
+    但它是**给人看**的那个数：两栏都摆得下正数，一眼比得出大小。
+    """
+    dr = cr = Decimal("0")
+    for e in entries:
+        amt = money(e["amount"])
+        if amt > 0:
+            if e["direction"] == "DEBIT":
+                dr += amt
+            else:
+                cr += amt
+        elif amt < 0:
+            if e["direction"] == "DEBIT":
+                cr += -amt
+            else:
+                dr += -amt
+    return dr, cr
 
 
 def _validate_entries(db: Session, book_id: int, entries: list[dict]) -> None:
@@ -36,22 +121,32 @@ def _validate_entries(db: Session, book_id: int, entries: list[dict]) -> None:
     cr = sum(money(e["amount"]) for e in entries if e["direction"] == "CREDIT")
     if dr != cr:
         raise ValueError(f"借贷不平衡：借方 {dr} / 贷方 {cr}")
-    if dr <= 0:
-        raise ValueError("凭证金额必须大于 0")
+    # 负数是**红字冲销**，一张红字凭证借贷两边都是负的（-300 / -300），
+    # 照样是平的、照样该存 —— 冲掉一张记错的凭证正是记账的日常。
+    # 所以这里只挡「全零」，不挡负数。
+    if dr == 0:
+        raise ValueError("凭证金额不能是 0")
 
     subject_ids = {e["subject_id"] for e in entries}
-    found = set(
-        db.scalars(
-            select(Subject.id).where(
-                Subject.book_id == book_id,
-                Subject.id.in_(subject_ids),
-                Subject.active.is_(True),
-            )
-        ).all()
-    )
+    rows = db.execute(
+        select(Subject.id, Subject.code, Subject.name, Subject.is_leaf).where(
+            Subject.book_id == book_id,
+            Subject.id.in_(subject_ids),
+            Subject.active.is_(True),
+        )
+    ).all()
+    found = {r.id for r in rows}
     missing = subject_ids - found
     if missing:
         raise ValueError(f"科目不存在或已停用: {sorted(missing)}")
+
+    # 末级科目这道关口放在服务端，不能只指望前端面板不给选：
+    # 接口能被直接调、导入能绕、老的行早就挂上去了 —— 前端拦一遍，这里再拦一遍，
+    # 才轮得到「账上不可能出现挂在上级科目上的分录」这句话。
+    # 挂错了不是显示难看：明细账、科目余额表都按末级出账，这笔分录会在账上凭空消失。
+    non_leaf = sorted(f"{r.code} {r.name}" for r in rows if not r.is_leaf)
+    if non_leaf:
+        raise ValueError(f"不是末级科目，请改到末级科目：{'、'.join(non_leaf)}")
 
 
 # --------------------------------------------------------------------- 写操作
@@ -69,6 +164,7 @@ def create_voucher(
     source: str = "MANUAL",
     voucher_no: str | None = None,
     period_id: int | None = None,
+    insert_after_id: int | None = None,
     commit: bool = True,
 ) -> Voucher:
     period = db.get(Period, period_id) if period_id else find_period(db, book_id, voucher_date)
@@ -76,6 +172,20 @@ def create_voucher(
         raise ValueError("会计期间不存在")
     if period.locked:
         raise ValueError(f"{period.code} 已结账，不能新增凭证")
+
+    # 插入凭证：先认下参照凭证。顺延跟建凭证在同一个事务里做完，
+    # 半路退出（一个格子都没填）就不会动别人的号。
+    anchor: Voucher | None = None
+    if insert_after_id is not None:
+        anchor = db.get(Voucher, insert_after_id)
+        if anchor is None or anchor.book_id != book_id:
+            raise ValueError("插入位置的参照凭证不存在")
+        if anchor.period_id != period.id:
+            where = db.get(Period, anchor.period_id)
+            raise ValueError(
+                f"只能插在同一个会计期间里：参照凭证 {anchor.voucher_no} 在 "
+                f"{where.code if where else '别的期间'}，这张在 {period.code}"
+            )
 
     payload = [
         {
@@ -89,10 +199,36 @@ def create_voucher(
     ]
     _validate_entries(db, book_id, payload)
 
+    # 插入位上号沿用参照凭证的号（页面预填的就是它），后面的整体顺延。
+    # 人要是自己改过号，以人填的为准 —— 顺位照做，占的是那个号。
+    moved: list[dict] = []
+    moving_ids: set[int] = set()
+    if anchor is not None:
+        moved = insert_slot(db, anchor)["moved"]
+        moving_ids = {m["id"] for m in moved}
+        no = voucher_no or insert_slot(db, anchor)["no"]
+    else:
+        no = voucher_no or next_voucher_no(db, period)
+
+    # 页面上会预填下一个号（/vouchers/next），两个人同时开一张就会撞号。
+    # 撞了就报人话 —— 数据库只会说「违反唯一约束 uq_voucher_period_no」，
+    # 看到的人不知道该改哪个字段。
+    #
+    # 必须在顺位**之前**查一次：号被顶走是这一笔唯一不可逆的副作用，
+    # 先顺位再发现撞号，事务虽然会回滚，可这一层代码不该依赖调用方记得回滚。
+    # 顺位会把参照凭证的旧号腾出来，所以占用检查要把「待顺位的那几张」排除掉。
+    taken = db.scalar(select(Voucher.id).where(
+        Voucher.period_id == period.id, Voucher.voucher_no == no))
+    if taken is not None and taken not in moving_ids:
+        raise ValueError(f"凭证号 {no} 在 {period.code} 已经有一张了，请改一个号")
+
+    if moved:
+        moved = _apply_shift(db, anchor)
+
     voucher = Voucher(
         book_id=book_id,
         period_id=period.id,
-        voucher_no=voucher_no or next_voucher_no(db, period),
+        voucher_no=no,
         voucher_date=voucher_date,
         status="UNPOSTED",
         source=source,
@@ -107,6 +243,19 @@ def create_voucher(
         db.add(Entry(voucher_id=voucher.id, line_no=i, **e))
 
     db.flush()
+    if moved:
+        # 号被顶走这件事必须留痕：事后有人问「记007 怎么变成这笔了」，
+        # 操作日志里能一句话说清是老几号顺位过来的。
+        log(
+            db,
+            action="RENAME",
+            entity="voucher",
+            entity_id=",".join(str(m["id"]) for m in moved),
+            user=user,
+            book_id=book_id,
+            detail="插入凭证顺位：" + "、".join(f"{m['from']}→{m['to']}" for m in moved),
+            before={"moved": [{k: str(v) for k, v in m.items()} for m in moved]},
+        )
     log(
         db,
         action="CREATE",
@@ -208,18 +357,54 @@ def delete_voucher(db: Session, voucher: Voucher, user: SysUser) -> None:
 # --------------------------------------------------------------------- 记账
 
 
-def post_vouchers(db: Session, voucher_ids: list[int], user: SysUser,
+def _resolve_vouchers(db: Session, book_id: int, voucher_ids: list[int]) -> list[Voucher]:
+    """把请求的 ID 列表解析成**确实属于 book_id**的凭证集合。
+
+    为什么必须带 book_id 一起查：原来只有 ``Voucher.id.in_(ids)``，
+    路由层拿到的 book 压根没往下传 —— 于是拿着 A 账套的接口就能把
+    B 账套的凭证状态改掉（审计 P1-01，动态复现 HTTP 200）。
+    凭证状态直接决定它算不算进余额表、总账和报表，这是跨账套数据完整性破口。
+
+    为什么整体拒绝而不是「跳过越界的、成功的照样成功」：
+    部分成功最坏 —— 用户以为 3 张都记上了，实际 2 张、而且报错被淹在
+    「已记账 1 张」这种成功计数里。这里改成**一个不对就全批拒绝**。
+
+    另外顺带解决 P1-08：原来查不到就直接访问 ``vouchers[0]``，
+    传不存在的 ID → IndexError → HTTP 500。500 会掩盖真实原因
+    （是不存在？是无权？还是服务端坏了？），也不符合 API 契约。
+    """
+    wanted = sorted(set(voucher_ids))
+    rows = list(db.scalars(
+        select(Voucher).where(Voucher.id.in_(wanted), Voucher.book_id == book_id)
+    ).all())
+    found = {v.id for v in rows}
+    missing = [i for i in wanted if i not in found]
+    if missing:
+        raise ValueError(
+            f"凭证不存在或不属于当前账套，已整批拒绝：{', '.join(str(i) for i in missing[:10])}"
+            + ("…" if len(missing) > 10 else ""))
+    return rows
+
+
+def post_vouchers(db: Session, book_id: int, voucher_ids: list[int], user: SysUser,
                   commit: bool = True) -> int:
-    """批量记账。``commit=False`` 让调用方把多步操作合成一个事务。"""
+    """批量记账。``book_id`` 是**必填**的账套归属约束，不是可选参数。
+
+    ``commit=False`` 让调用方把多步操作合成一个事务。
+    """
     if not voucher_ids:
         return 0
-    vouchers = list(db.scalars(select(Voucher).where(Voucher.id.in_(voucher_ids))).all())
+    vouchers = _resolve_vouchers(db, book_id, voucher_ids)
     period_ids = {v.period_id for v in vouchers}
     rows = db.execute(select(Period).where(Period.id.in_(period_ids))).scalars().all() if period_ids else []
 
     locked = sorted(p.code for p in rows if p.locked)
     if locked:
         raise ValueError(f"会计期间 {', '.join(locked)} 已结账，不能记账")
+
+    # 号段有洞、或者号序跟日期对不上：这个月就还不能记账。记了账这些凭证就锁死，
+    # 而纸质的已经打印装订，月底对不上账只能整月作废重来。
+    svc_organize.assert_tidy(db, rows)
 
     # **只有上一期已结账，本期才允许记账。**
     # 上一期没封账，本期凭证再去改上期已经变动的数字，账就对不回来了 ——
@@ -261,17 +446,22 @@ def post_vouchers(db: Session, voucher_ids: list[int], user: SysUser,
         v.posted_by = user.username
         count += 1
     db.flush()
+    # book_id 用请求带来的，不取 vouchers[0].book_id：批次里的凭证经过
+    # _resolve_vouchers 已保证同属一个账套，但审计记录的归属不该依赖
+    # 「碰巧第一张是谁」这种实现细节。
     log(db, action="POST", entity="voucher", entity_id="batch", user=user,
-        book_id=vouchers[0].book_id, detail=f"记账 {count} 张凭证", after={"ids": voucher_ids})
+        book_id=book_id, detail=f"记账 {count} 张凭证", after={"ids": voucher_ids})
     if commit:
         db.commit()
     return count
 
 
-def unpost_vouchers(db: Session, voucher_ids: list[int], user: SysUser) -> int:
+def unpost_vouchers(db: Session, book_id: int, voucher_ids: list[int], user: SysUser,
+                    commit: bool = True) -> int:
+    """批量反记账。归属约束与 post_vouchers 同一条，不能一边松一边紧。"""
     if not voucher_ids:
         return 0
-    vouchers = list(db.scalars(select(Voucher).where(Voucher.id.in_(voucher_ids))).all())
+    vouchers = _resolve_vouchers(db, book_id, voucher_ids)
     period_ids = {v.period_id for v in vouchers}
     locked = db.execute(
         select(Period.year, Period.month).where(Period.id.in_(period_ids), Period.locked.is_(True))
@@ -290,8 +480,9 @@ def unpost_vouchers(db: Session, voucher_ids: list[int], user: SysUser) -> int:
         count += 1
     db.flush()
     log(db, action="UNPOST", entity="voucher", entity_id="batch", user=user,
-        book_id=vouchers[0].book_id, detail=f"反记账 {count} 张凭证", before={"ids": voucher_ids})
-    db.commit()
+        book_id=book_id, detail=f"反记账 {count} 张凭证", before={"ids": voucher_ids})
+    if commit:
+        db.commit()
     return count
 
 
@@ -351,13 +542,15 @@ def query_vouchers(
     if subject_id:
         stmt = stmt.where(Voucher.id.in_(select(Entry.voucher_id).where(Entry.subject_id == subject_id)))
     if min_amount is not None or max_amount is not None:
-        amt = select(Entry.voucher_id, func.sum(Entry.amount).label("total"))
-        amt = amt.where(Entry.book_id == book_id).group_by(Entry.voucher_id).having(
-            func.sum(Entry.amount) >= money(min_amount or 0)
-        )
+        # 「金额」筛的是**某一条分录**的金额，不是整张凭证的合计 ——
+        # 只要有一行落在区间里，这张凭证就该被捞出来。
+        # 所以这里不做求和，直接拿单条 entry 的 amount 比。
+        amt = select(Entry.voucher_id).where(Entry.book_id == book_id)
+        if min_amount is not None:
+            amt = amt.where(Entry.amount >= money(min_amount))
         if max_amount is not None:
-            amt = amt.having(func.sum(Entry.amount) <= money(max_amount))
-        stmt = stmt.where(Voucher.id.in_(amt.subquery().select()))
+            amt = amt.where(Entry.amount <= money(max_amount))
+        stmt = stmt.where(Voucher.id.in_(amt))
 
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     stmt = (

@@ -161,6 +161,95 @@ def test_openings_not_editable_for_other_user_book(client, auth, book_id):
         assert r.status_code in (401, 403, 404), (path, r.status_code)
 
 
+# ------------------------------------------------ 期初跟着顶栏那一期走
+
+
+def test_openings_follow_selected_period(client, auth, book_id, periods, subjects, make_voucher):
+    """切到空的后续期间，期初就该能改。
+
+    以前这个页面永远显示启用期间，还用「账套里有没有凭证」一句话判死 ——
+    于是顶栏停在 2027 年、那边一张凭证都没有，屏幕上也还是 2026-01 那份
+    锁死的数，用户只会以为页面坏了。
+    """
+    make_voucher("2026-01-15", dr=[("100201", 100000, "存钱")],
+                 cr=[("4001", 100000, "存钱")], posted=True)
+
+    first = client.get(f"/api/books/{book_id}/openings", headers=auth).json()
+    assert first["period"] == "2026-01"
+    assert first["editable"] is False and "业务数据" in first["reason"], first
+
+    feb = client.get(f"/api/books/{book_id}/openings?period_id={periods[2].id}",
+                     headers=auth).json()
+    assert feb["period"] == "2026-02", feb
+    assert feb["editable"] is True, feb
+    assert feb["reason"] is None, feb
+    # 2 月本来就没有快照（快照只有启用和年度结转两处产生），页面上要显示的是
+    # 账簿真正在用的那个数 —— 上期期末 —— 而不是一片 0，否则对不上总账
+    bank = next(s for s in feb["subjects"] if s["code"] == "100201")
+    assert Decimal(bank["signed"]) == Decimal("100000"), bank
+
+
+def test_save_later_period_opening_and_ledger_follows(
+        client, db, auth, book_id, periods, subjects, make_voucher):
+    """改了后续期间的期初，账簿立刻按新数算；启用期间那份不动。"""
+    from app.ledger.engine import LedgerEngine
+
+    make_voucher("2026-01-15", dr=[("100201", 100000, "存钱")],
+                 cr=[("4001", 100000, "存钱")], posted=True)
+    feb = periods[2]
+
+    r = client.post(f"/api/books/{book_id}/periods?period_id={feb.id}", headers=auth, json=[
+        {"subject_id": subjects["100201"].id, "amount": "120000"},
+        {"subject_id": subjects["1122"].id, "amount": "-120000"},
+    ])
+    assert r.status_code == 200, r.text
+    assert r.json()["period"] == "2026-02", r.json()
+
+    got = client.get(f"/api/books/{book_id}/openings?period_id={feb.id}",
+                     headers=auth).json()
+    bank = next(s for s in got["subjects"] if s["code"] == "100201")
+    assert Decimal(bank["signed"]) == Decimal("120000"), bank
+
+    sid = subjects["100201"].id
+    assert LedgerEngine(db, book_id).compute([sid], up_to_ord=feb.ord)[sid].opening \
+        == Decimal("120000")
+    # 启用期间是另一份快照，不该被这次保存顺手改掉
+    assert LedgerEngine(db, book_id).compute([sid], up_to_ord=periods[1].ord)[sid].opening \
+        == Decimal("0")
+
+
+def test_openings_locked_only_from_the_period_with_vouchers(
+        client, auth, book_id, periods, subjects, make_voucher):
+    """锁的是「从这一期往后有没有凭证」，不是整个账套。"""
+    make_voucher("2026-03-05", dr=[("100201", 100, "买货")], cr=[("4001", 100, "买货")])
+
+    r = client.post(f"/api/books/{book_id}/periods?period_id={periods[2].id}", headers=auth,
+                    json=[{"subject_id": subjects["100201"].id, "amount": "1"}])
+    assert r.status_code == 400 and "业务数据" in r.json()["detail"], r.json()
+
+    mar = client.get(f"/api/books/{book_id}/openings?period_id={periods[3].id}",
+                     headers=auth).json()
+    assert mar["editable"] is False, mar
+    apr = client.get(f"/api/books/{book_id}/openings?period_id={periods[4].id}",
+                     headers=auth).json()
+    assert apr["editable"] is True, apr
+
+
+def test_export_follows_selected_period(client, auth, book_id, periods, subjects):
+    """导出的是屏幕上那一期 —— 否则备份下来的数跟眼前看到的对不上。"""
+    client.post(f"/api/books/{book_id}/periods?period_id={periods[5].id}", headers=auth, json=[
+        {"subject_id": subjects["100201"].id, "amount": "5000"},
+        {"subject_id": subjects["1122"].id, "amount": "-5000"},
+    ])
+    r = client.get(f"/api/books/{book_id}/openings.xlsx?period_id={periods[5].id}",
+                   headers=auth)
+    assert r.status_code == 200, r.text
+    ws = load_workbook(io.BytesIO(r.content)).active
+    assert "2026年5月" in ws["A2"].value, ws["A2"].value
+    exported = {row[0]: row[3] for row in ws.iter_rows(min_row=5, values_only=True)}
+    assert exported["100201"] == 5000, exported["100201"]
+
+
 # ------------------------------------------------------------------ Excel
 
 
@@ -334,6 +423,31 @@ def test_改账套名_重名要挡并且留痕(client, db, book, auth):
     row = db.scalar(select(AuditLog).where(
         AuditLog.book_id == book.id, AuditLog.action == "UPDATE", AuditLog.entity == "book"))
     assert row is not None and row.before["name"] == book.name
+
+
+def test_科目级次不能调到比已有科目还浅(client, db, book, auth, subjects):
+    """规则只是「今后新增科目怎么接号」的模板，但级次有下限。
+
+    账上已经有三级科目，规则却改成两级，新增时按最后一段接号，
+    接出来的编码跟现有科目对不齐，科目表当场乱掉 —— 所以后端必须挡。
+    """
+    from app.models import Subject
+
+    deep = Subject(book_id=book.id, code="10020101", name="三级科目",
+                   category="ASSET", direction="DEBIT", is_leaf=True, level=3,
+                   parent_id=subjects["100201"].id, active=True)
+    db.add(deep)
+    db.commit()
+
+    r = client.put(f"/api/books/{book.id}", json={"subject_code_rule": "4-2"}, headers=auth)
+    assert r.status_code == 400, r.text
+    assert "3 级" in r.json()["detail"], r.json()
+
+    ok = client.put(f"/api/books/{book.id}", json={"subject_code_rule": "4-3-2"}, headers=auth)
+    assert ok.status_code == 200, ok.text
+    detail = client.get(f"/api/books/{book.id}", headers=auth).json()
+    assert detail["subject_code_rule"] == "4-3-2"
+    assert detail["subject_max_level"] == 3
 
 
 def test_非所有者改不了账套名(client, db, plain_auth, plain_user, book):

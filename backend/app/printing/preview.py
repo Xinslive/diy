@@ -136,7 +136,7 @@ def visible_report_payload(payload: dict) -> dict:
 
     报表模板的 hidden 是给设计者用的开关，打印和导出都该尊重它。这里统一在
     入口归一化，下游（HTML 打印 / Excel 导出）就不用各自处理一遍 ——
-    两处各处理一遍的话，隐藏中间一列时单元格按���标对齐就会整列错位。
+    两处各处理一遍的话，隐藏中间一列时单元格按坐标对齐就会整列错位。
     """
     cols = [c for c in payload.get("cols", []) if not c.get("hidden")]
     col_nos = [c.get("col_no") for c in cols]

@@ -102,7 +102,9 @@ def _as_decimal(value: Any) -> Decimal:
 
 
 def _subject_index(db: Session, book_id: int) -> tuple[dict[str, Subject], dict[str, Subject]]:
-    """返回 (编码索引, 名称索引)。只索引叶子科目。"""
+    """返回 (编码索引, 名称索引)。末级和上级都收进来：
+    匹配到上级科目时才能说清「不是明细科目」，而不是含糊地报一句「找不到科目」——
+    「1002 银行存款」在这个账套里明明存在，只是不能往它身上记。"""
     rows = db.scalars(
         select(Subject).where(Subject.book_id == book_id, Subject.active.is_(True))
     ).all()
@@ -218,6 +220,13 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
             if subject is None:
                 unknown_subjects[key] = "科目编码或名称在本账套不存在"
                 current["errors"].append(f"第 {line_no} 行：找不到科目「{key}」")
+            elif not subject.is_leaf:
+                # 表里写的是上级科目。它存在，只是不能往它身上记：
+                # 说清楚是哪一行、哪个科目，人改表还是改科目决定权都在自己手上
+                unknown_subjects[key] = "不是明细科目，凭证要记在明细级"
+                current["errors"].append(
+                    f"第 {line_no} 行：{subject.code} {subject.name} 不是明细科目，凭证要记在明细级")
+                subject = None
 
         dr = _as_decimal(col("debit", row)) if "debit" in mapping else Decimal("0")
         cr = _as_decimal(col("credit", row)) if "credit" in mapping else Decimal("0")

@@ -57,6 +57,10 @@ class Book(Base, TimestampMixin):
     start_year: Mapped[int] = mapped_column(Integer, nullable=False)
     # 账套启用月份（1..12），只对 start_year 那一年生效；之后的年度从 1 月起
     start_month: Mapped[int] = mapped_column(SmallInteger, default=1, nullable=False)
+    # 科目编码规则：逐级几位，如「4-2-2-2」= 一级 4 位、二级 2 位……
+    # 新增科目时按它自动接号（1002 银行存款 → 100204），并显示在新增科目的提示里。
+    # 这是账套自己的科目体系属性，所以挂在账套上而不是写死在前端。
+    subject_code_rule: Mapped[str] = mapped_column(String(32), default="4-2-2-2", nullable=False)
     # 保留字段：ACTIVE / CLOSED。年度结转不再新建账套，这里不再由结转改写，
     # 只留给「停用账套」这类运营语义使用。
     status: Mapped[str] = mapped_column(String(16), default="ACTIVE", nullable=False)

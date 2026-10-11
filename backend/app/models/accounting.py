@@ -49,6 +49,12 @@ class Subject(Base, TimestampMixin):
     is_leaf: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # 结转损益开关：损益类科目月末是否参与自动结转
     carry_forward: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 三个核算开关（对应柠檬云的「数量核算 / 辅助核算 / 外币核算」）：
+    # 勾了以后这张科目的分录要填数量、辅助项、外币汇率。先只存标记，
+    # 分录上的三种明细由 entry.aux_ref 承载。
+    qty_calc: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    aux_calc: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    fx_calc: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     sort_no: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # 预留：个性化属性，避免后期改表
@@ -66,7 +72,7 @@ class Voucher(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     book_id: Mapped[int] = mapped_column(ForeignKey("book.id", ondelete="CASCADE"), nullable=False)
     period_id: Mapped[int] = mapped_column(ForeignKey("period.id"), nullable=False)
-    # 凭证字 + 编号，例如 记-0001
+    # 凭证字 + 编号，例如 记-001
     voucher_no: Mapped[str] = mapped_column(String(32), nullable=False)
     voucher_date: Mapped[date] = mapped_column(Date, nullable=False)
     # UNPOSTED 未记账 / POSTED 已记账

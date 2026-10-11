@@ -106,6 +106,25 @@ def test_科目不存在被标为不通过(db, book):
     assert any("999999" in e for e in r["vouchers"][0]["errors"])
 
 
+def test_上级科目被标为不通过(db, book, subjects):
+    """表里写「1002 银行存款」这种上级科目，必须当场挑明，不是默默记到它头上。
+
+    它在账套里明明存在，所以不能报「找不到科目」—— 那会让人以为是编码写错了，
+    去改表里的编码，越改越离谱。得说清是「不是明细科目」。
+    """
+    assert subjects["1002"].is_leaf is False      # 前提：这本账里它真的是上级科目
+    data = _xlsx(["日期", "凭证号", "摘要", "科目编码", "借方", "贷方"], [
+        ["2026-01-05", "记-1", "x", "1002", 1000, 0],
+        [None, None, "x", "600101", 0, 1000],
+    ])
+    r = parse_workbook(data, book.id, db)
+    v = r["vouchers"][0]
+    assert v["ok"] is False
+    assert any("1002" in e and "不是明细科目" in e for e in v["errors"]), v["errors"]
+    # 而且这条分录根本不该被拼进去：拼进去了，落库时它就成了挂在上级科目上的分录
+    assert [e["subject_code"] for e in v["entries"]] == ["600101"], v["entries"]
+
+
 def test_解析阶段不写库(db, book, admin_user):
     """最关键的一条：预览阶段数据库必须纹丝不动。"""
     data = _xlsx(["日期", "凭证号", "摘要", "科目编码", "借方", "贷方"], _good_rows())
@@ -211,7 +230,7 @@ def test_提交时的意外失败整体回滚(db, book, admin_user, subjects):
                                  "amount": "10", "summary": "x"},
                                 {"subject_id": subjects["600101"].id, "direction": "CREDIT",
                                  "amount": "10", "summary": "x"}])
-    post_vouchers(db, [v.id], admin_user)
+    post_vouchers(db, book.id, [v.id], admin_user)
     jan = db.scalar(select(Period).where(Period.book_id == book.id, Period.month == 1))
     carry_forward_profit(db, book.id, jan, admin_user)
     close_period(db, jan, admin_user)

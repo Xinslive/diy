@@ -261,7 +261,7 @@ def make_voucher(db, book, admin_user):
                 .values(locked=True)
             )
             db.commit()
-            post_vouchers(db, [v.id], admin_user)
+            post_vouchers(db, book.id, [v.id], admin_user)
             db.refresh(v)
         return v
 
