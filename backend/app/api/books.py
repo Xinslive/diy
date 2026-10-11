@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import io
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.accounting import periods as svc
+from app.accounting.util import money
 from app.api.schemas import (BookEditIn, BookIn, CarryForwardIn, OpeningIn,
                            UncloseIn, YearEndIn)
 from app.core.db import get_db
@@ -545,9 +546,20 @@ def set_openings(book_id: int, payload: list[OpeningIn], period_id: int | None =
         # 「借正贷负」是全系统内部口径，期初也照此存。
         # 刻意**不**按 subject.direction 纠正符号：科目属性是「通常方向」，
         # 不是强约束——应收账款出现贷方余额、应交税费出现负数都是真实业务。
-        amount = Decimal(str(item.amount))
-        if not amount.is_finite():
-            raise HTTPException(400, f"科目 {subject.code} 金额非法")
+        # **先按数据库精度量化，再校验、再落库。**
+        #
+        # 原来试算平衡用的是全精度 Decimal，落库时列是 Numeric(20,2) 才被截断 ——
+        # 于是「校验的数」和「存储的数」不是同一个数。审计实测：
+        # 提交 0.005 + 0.005 - 0.010，全精度和是 0.000（试算通过），
+        # 接口返回 200，而库里实际存下来的和是 0.01。
+        #
+        # 后果比���错更麻烦：期初差 0.01 会顺着 LedgerEngine 传导到之后
+        # 每一个月、每一张账簿、每一份报表，而且极难回溯到是「期初录入时」
+        # 就已经差了。
+        try:
+            amount = money(item.amount)
+        except (InvalidOperation, TypeError, ValueError):
+            raise HTTPException(400, f"科目 {subject.code} 金额非法：{item.amount!r}")
         if amount != 0 and not subject.is_leaf:
             raise HTTPException(400, f"{subject.code} {subject.name} 不是明细科目，期初应录在明细级")
 

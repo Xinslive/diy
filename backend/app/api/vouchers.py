@@ -159,6 +159,19 @@ def batch_delete(payload: BatchIds, book: Book = Depends(get_my_book), db: Sessi
                  _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
     rows = list(db.scalars(select(Voucher).where(
         Voucher.id.in_(payload.ids), Voucher.book_id == book.id)).all())
+    # ID 集合必须解析完整。少了哪张就整批拒绝，不做「删掉找得到的那些」。
+    # 原来这里直接把查询结果拿去删：传 3 个 id、其中 1 个不存在（或属于别的
+    # 账套），返回 {"deleted": 2} 且不置一词 —— 用户以为自己删了 3 张，
+    # 实际 2 张，那 1 张还好好地躺在列表里。
+    # 列表页状态过期、并发删除、跨账套误选都会走到这条路。
+    wanted = sorted(set(payload.ids))
+    found = {v.id for v in rows}
+    missing = [i for i in wanted if i not in found]
+    if missing:
+        raise HTTPException(
+            400, f"凭证不存在或不属于当前账套，已整批拒绝："
+                 f"{', '.join(str(i) for i in missing[:10])}"
+                 + ("…" if len(missing) > 10 else ""))
     # 先整批体检再删：批量选中 20 张、其中 1 张已记账时，
     # 逐张删到那张才报错的话，用户只知道「删失败」却不知道是哪一张。
     posted = [v.voucher_no for v in rows if v.status == "POSTED"]
@@ -167,8 +180,12 @@ def batch_delete(payload: BatchIds, book: Book = Depends(get_my_book), db: Sessi
             400, f"已记账的凭证不能删除，请先反记账：{'、'.join(posted[:10])}"
                  + ("…" if len(posted) > 10 else ""))
     try:
+        # 一批要么全删要么一张不删。逐张各自 commit 的话，删到第 5 张失败时
+        # 前 4 张已经落在库里，回滚也回滚不回来 —— 用户收到 400，
+        # 账上却少了 4 张，且没有「哪几张成功了」的信息。
         for v in rows:
-            svc.delete_voucher(db, v, user)
+            svc.delete_voucher(db, v, user, commit=False)
+        db.commit()
     except ValueError as e:
         db.rollback()
         raise HTTPException(400, str(e))

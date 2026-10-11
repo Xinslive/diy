@@ -334,8 +334,14 @@ def update_voucher(
     return voucher
 
 
-def delete_voucher(db: Session, voucher: Voucher, user: SysUser) -> None:
-    """删除凭证。因为编号可复用，必须把内容快照写进审计日志。"""
+def delete_voucher(db: Session, voucher: Voucher, user: SysUser,
+                   commit: bool = True) -> None:
+    """删除凭证。因为编号可复用，必须把内容快照写进审计日志。
+
+    ``commit=False`` 让调用方把多步操作合成一个事务（批量删除用它）。
+    批量删到第 5 张失败时，前 4 张不该已经落在库里 ——
+    用户收到的是 400「删失败」，而账上少了 4 张，且没人告诉他少了哪几张。
+    """
     if voucher.status == "POSTED":
         raise ValueError(
             f"凭证 {voucher.voucher_no} 已记账，不能删除。请先在凭证列表里「反记账」再删。")
@@ -351,7 +357,8 @@ def delete_voucher(db: Session, voucher: Voucher, user: SysUser) -> None:
         before=snapshot,
     )
     db.delete(voucher)
-    db.commit()
+    if commit:
+        db.commit()
 
 
 # --------------------------------------------------------------------- 记账
