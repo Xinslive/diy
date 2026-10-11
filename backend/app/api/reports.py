@@ -22,7 +22,20 @@ router = APIRouter(prefix="/api/reports", tags=["报表"])
 
 
 @router.get("/templates")
-def templates(db: Session = Depends(get_db)):
+def templates(db: Session = Depends(get_db), user: SysUser = Depends(get_current_user)):
+    """报表模板列表：要求登录。
+
+    审计 P3-09 原判 C 级「待产品确认」，理由是模板跨账套共享。
+    这里的结论是「跨账套共享」≠「对外部公开」：
+
+    * 共享指的是同一次部署内多个账套复用同一套模板，背后还是同一批会计；
+    * 模板的行、列、单元格公式就是这套单位算账的口径，属于内部经营信息；
+    * 前端不存在合法的匿名消费方 —— 报表设计页在应用外壳内，必然已登录。
+
+    所以加登录校验对现有流程零影响，只挡掉设计意图之外的调用。
+    静态守卫见 ``tests/test_report_design_auth.py::test_报表接口全部要求登录``。
+    """
+    _ = user
     rows = db.scalars(select(ReportTemplate).order_by(ReportTemplate.id)).all()
     return [{"id": t.id, "code": t.code, "name": t.name, "type": t.type,
              "is_builtin": t.is_builtin, "remark": t.remark} for t in rows]
@@ -42,7 +55,14 @@ def _can_write(db: Session, user: SysUser, book_id: int | None = None) -> bool:
 
 
 @router.get("/{template_id}/design")
-def design(template_id: int, db: Session = Depends(get_db)):
+def design(template_id: int, db: Session = Depends(get_db),
+           user: SysUser = Depends(get_current_user)):
+    """模板的行 / 列 / 单元格公式结构：要求登录（审计 P3-09，理由同 ``templates``）。
+
+    这里返回的是取数公式本身 —— 比报表名和科目名更能说明一家单位怎么算账，
+    所以这条比 ``/templates`` 更不该匿名开放。
+    """
+    _ = user
     tpl = db.get(ReportTemplate, template_id)
     if tpl is None:
         raise HTTPException(404, "报表模板不存在")
