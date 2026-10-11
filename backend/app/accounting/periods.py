@@ -576,11 +576,18 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
                 batch_unclose(db, book.id, last, user, revert_posting=True)
                 last = db.get(Period, last.id)
                 unlocked_for_carry = True
-            # 无论盈亏，本年利润都是「借方冲平」，未分配利润都是「贷方增加」：
-            #   盈利 bal<0 -> 借 本年利润 | 贷 未分配利润（增加留存收益）
-            #   亏损 bal>0 -> 借 本年利润 | 贷 未分配利润（冲减留存收益）
-            # 早期版本按符号把两个科目的借贷对调了，盈利时会做成
-            # 「借 未分配利润 / 贷 本年利润」，等于凭空给留存收益记了一笔借方。
+            # 借贷方向必须**按 bal 的正负分两套**。系统内部口径是「借正贷负」
+            # （closing = opening + period_dr - period_cr），所以：
+            #
+            #   盈利 bal<0（本年利润在贷方）→ 借 本年利润 / 贷 未分配利润（留存收益增加）
+            #   亏损 bal>0（本年利润在借方）→ 贷 本年利润 / 借 未分配利润（留存收益减少）
+            #
+            # 之前这里不分盈亏，一律生成「借本年利润 / 贷未分配利润」，
+            # 代码注释还声称两种情况都成立 —— 这个判断是错的：
+            # 亏损时那样做等于给本年利润**再记一笔借方**，
+            # 审计实测 100 的亏损被结成 200（不但没冲平，还翻倍），
+            # 未分配利润方向也跟着反。因为分录借贷平衡，系统自检不会报错，
+            # 错误会静默沉淀并污染次年每一份报表。
             #
             # 12 月里已有的结转凭证先删掉再重做：改了 2026 的数再点一次年度结转
             # 是常规操作，不删就会叠出第二张结转凭证，未分配利润凭空翻倍。
@@ -590,11 +597,15 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
                 _drop_carry_forward(db, last, stale, user)
                 db.commit()
 
+            # 冲平本年利润 = 往它余额的反方向记一笔同额分录。
+            # 盈利在贷方（负）→ 借方冲平；亏损在借方（正）→ 贷方冲平。
             amt = abs(bal)
+            profit_dir = "DEBIT" if bal < 0 else "CREDIT"
             entries = [
-                {"subject_id": profit.id, "direction": "DEBIT", "amount": amt,
+                {"subject_id": profit.id, "direction": profit_dir, "amount": amt,
                  "summary": "结转本年利润"},
-                {"subject_id": retained.id, "direction": "CREDIT", "amount": amt,
+                {"subject_id": retained.id,
+                 "direction": "CREDIT" if bal < 0 else "DEBIT", "amount": amt,
                  "summary": "结转本年利润"},
             ]
             v = create_voucher(db, book_id=book.id, user=user,
