@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import DBAPIError
 
 from app.api import auth, books, ledger, printing, reports, subjects, system, vouchers
-from app.core.config import settings
+from app.core.config import detect_env, settings
 
 log = logging.getLogger("cwq")
 
@@ -61,11 +61,17 @@ async def dbapi_error_handler(request, exc: DBAPIError):
 
 @app.on_event("startup")
 def startup() -> None:
+    from app.core.config import validate_production_settings
     from app.core.init_db import init_database
 
+    # P3-04：校验必须在 init_database **之前**。
+    # 反过来的话，进程会先把 schema 建好、种子数据灌进去，再因为配置
+    # 不合格退出 —— 库已经被改动过了，而运维看到的是「启动失败」。
+    validate_production_settings(settings)
     init_database()
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "service": "cwq-accounting", "env": "dev" if settings.jwt_secret.startswith("dev-") else "prod"}
+    # 与启动校验共用 detect_env，避免出现「校验说 prod、健康检查说 dev」。
+    return {"ok": True, "service": "cwq-accounting", "env": detect_env(settings)}

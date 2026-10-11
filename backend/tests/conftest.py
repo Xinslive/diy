@@ -115,6 +115,9 @@ print(f"[conftest] 测试库护栏通过：{_mask(TEST_DB_URL)}"
 
 os.environ["DATABASE_URL"] = TEST_DB_URL
 os.environ["JWT_SECRET"] = "test-secret-not-for-production"
+# APP_ENV 默认是 prod（fail-closed，见 config.py app_env 字段）。
+# 测试要显式声明自己是测试环境，否则 startup 的生产配置校验会直接拦停整套测试。
+os.environ["APP_ENV"] = "test"
 os.environ["DB_ECHO"] = "false"
 
 from fastapi.testclient import TestClient  # noqa: E402

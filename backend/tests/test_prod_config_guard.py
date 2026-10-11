@@ -1,0 +1,148 @@
+"""生产配置的启动硬校验（审计 P3-04）。
+
+审计的原话是「**区分不等于阻断**」：``/api/health`` 早就靠 secret 是否
+以 ``dev-`` 开头来判断环境了，说明团队知道要区分，但那个判断只影响
+健康检查的返回值 —— 带着默认 secret 的进程照样正常启动、正常签发令牌。
+
+对一套记账系统来说这意味着：任何拿到默认配置启动的人，
+签出来的 token 全世界都能伪造（HS256 是对称签名，密钥就是源码里的
+那一串）。
+
+这些配置**没有被利用过**，这里要修的是「不该能启动」而不是「已出事」。
+所以用例直接调校验函数，而不是真的起进程 —— 校验逻辑必须能脱离
+FastAPI 启动单独测。
+"""
+from __future__ import annotations
+
+import pytest
+
+from app.core.config import Settings, validate_production_settings
+
+GOOD_SECRET = "a" * 48
+GOOD_DB = "postgresql+psycopg://cwq:Str0ngP%40ss@db.internal:5432/cwq"
+
+
+def _prod(**kw):
+    base = dict(jwt_secret=GOOD_SECRET, database_url=GOOD_DB)
+    base.update(kw)
+    return Settings(**base)
+
+
+def _check(s):
+    """按**生产**环境校验。
+
+    必须显式传 env="prod"：conftest 里设了 APP_ENV=test，不写的话
+    detect_env 会返回 test，校验直接跳过 —— 下面这些用例就全成了
+    「DID NOT RAISE」。这是本文件第一个版本的真实经历。
+    """
+    return validate_production_settings(s, env="prod")
+
+
+# --------------------------------------------------------------------- 正常放行
+
+
+def test_合规生产配置通过校验():
+    _check(_prod())          # 不抛异常即通过
+
+
+def test_默认配置在没人显式声明环境时也必须被拦下():
+    """**这条是整个修复的核心。**
+
+    审计说的「区分不等于阻断」具体就是这个形态：旧口径是
+    「secret 以 dev- 开头 ⇒ dev」，而默认 secret 恰好就叫
+    dev-secret-change-me-before-deploy —— 配置自己给自己开了免检，
+    于是带默认密钥启动一路畅通。
+
+    所以必须验证：什么都不配（app_env 取默认 prod）时，默认配置被拦。
+    显式 app_env="" 是为了不让 conftest 里的 APP_ENV=test 混进来。
+    """
+    with pytest.raises(ValueError):
+        validate_production_settings(
+            Settings(jwt_secret="dev-secret-change-me-before-deploy", app_env=""))
+
+
+def test_dev环境不校验():
+    """开发机用默认 secret 是正常的 —— 拦掉它只会让人学会用绕过开关。"""
+    s = Settings(jwt_secret="dev-secret-change-me-before-deploy")
+    validate_production_settings(s, env="dev")
+    validate_production_settings(s, env="test")
+
+
+# --------------------------------------------------------------------- 必须拦下
+
+
+def test_默认secret拒绝启动():
+    with pytest.raises(ValueError) as e:
+        _check(_prod(jwt_secret="dev-secret-change-me-before-deploy"))
+    assert "JWT" in str(e.value).upper() or "secret" in str(e.value).lower()
+
+
+def test_secret太短拒绝启动():
+    """HS256 的密钥长度直接决定暴力破解的成本。太短等于没设。"""
+    with pytest.raises(ValueError):
+        _check(_prod(jwt_secret="short"))
+
+
+@pytest.mark.parametrize("secret,why", [
+    ("dev-secret-change-me-before-deploy", "官方默认值"),
+    ("changeme", "常见的占位符"),
+    ("secret", "secret 字样"),
+    ("your-secret-here", "模板占位符"),
+])
+def test_弱口令清单里的secret一律拒绝(secret, why):
+    with pytest.raises(ValueError):
+        _check(_prod(jwt_secret=secret))
+
+
+def test_数据库URL带默认口令拒绝启动():
+    """config.py 里的默认口令是 cwq123，写死在源码里。"""
+    with pytest.raises(ValueError) as e:
+        _check(_prod(
+            database_url="postgresql+psycopg://cwq:cwq123@localhost:15432/cwq"))
+    assert "口令" in str(e.value) or "密码" in str(e.value)
+
+
+def test_一次报出所有问题():
+    """配置错了就让人一项项试错，是把人往「干脆全用默认值」推。
+    该一次说清哪儿不对。"""
+    with pytest.raises(ValueError) as e:
+        _check(_prod(
+            jwt_secret="dev-secret-change-me-before-deploy",
+            database_url="postgresql+psycopg://cwq:cwq123@localhost:5432/cwq"))
+    msg = str(e.value)
+    assert msg.count("\n") >= 2 or "；" in msg or "," in msg, (
+        f"应当一次列出全部问题，实际：{msg}")
+
+
+# --------------------------------------------------------------------- 健康检查口径
+
+
+def test_健康检查的环境判定与校验用的是同一个口径():
+    """原来健康检查靠 secret 是否以 dev- 开头判断环境 —— 那只是**显示**。
+
+    如果校验用另一套口径，就会出现「校验说你是 prod、健康检查说你是
+    dev」这种自相矛盾，排查时很难看出来。
+    """
+    from app.core.config import detect_env
+
+    # 显式指定优先
+    assert detect_env(_prod(), env="dev") == "dev"
+    assert detect_env(_prod(), env="prod") == "prod"
+    # **没声明就是 prod**：判定「像不像开发环境」等于让配置自己给自己
+    # 开免检，而默认配置恰好就长成 dev-secret-* 的样子。
+    #
+    # 这里必须显式 app_env=""：conftest 设了 APP_ENV=test，pydantic-settings
+    # 会把它读进 Settings，不覆盖的话读到的就不是默认值了。
+    assert detect_env(Settings(jwt_secret=GOOD_SECRET, app_env="")) == "prod"
+    assert detect_env(Settings(jwt_secret="dev-secret-change-me-before-deploy",
+                               app_env="")) == "prod"
+    assert detect_env(Settings(app_env="dev")) == "dev"
+
+
+def test_校验会记入日志(caplog):
+    """运维要能从日志确认「这次启动到底过了哪些检查」。"""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="app.core.config"):
+        _check(_prod())
+    assert caplog.records, "配置校验结果没有写进日志"

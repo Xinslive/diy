@@ -14,9 +14,26 @@ import pytest
 
 
 # --------------------------------------------------------------------- 注册
+#
+# ``registration_enabled`` 的**默认值现在是 False**（审计 P3-04 第 2 条）：
+# 对外暴露时开放自助注册等于把系统变成谁都能建号的公共资源。
+# 所以这几条测试要测「注册开着的时候行为对不对」，得自己把开关打开 ——
+# 就像真实部署里显式设 REGISTRATION_ENABLED=true 那样。
+# 默认关闭这件事由 test_prod_config_guard.py 单独钉住。
 
 
-def test_注册成功但拿不到任何账套(client, plain_auth):
+@pytest.fixture
+def registration_on():
+    from app.core.config import settings
+
+    settings.registration_enabled = True
+    try:
+        yield
+    finally:
+        settings.registration_enabled = False
+
+
+def test_注册成功但拿不到任何账套(client, plain_auth, registration_on):
     """注册只开账号。**不自动授权任何账套** —— 授权是管理员的事。"""
     r = client.post("/api/auth/register",
                     json={"username": "brandnew01", "password": "abcd1234", "real_name": "新同事"})
@@ -36,12 +53,12 @@ def test_注册成功但拿不到任何账套(client, plain_auth):
     ({"username": "has space", "password": "abcd1234"}, "用户名含空格"),
     ({"username": "ab", "password": "abcd1234"}, "用户名过短"),
 ])
-def test_注册参数被拒(client, payload, why):
+def test_注册参数被拒(client, payload, why, registration_on):
     r = client.post("/api/auth/register", json=payload)
     assert r.status_code == 422, f"{why} 竟然通过了：{r.text}"
 
 
-def test_用户名不可重复(client):
+def test_用户名不可重复(client, registration_on):
     body = {"username": "dupuser01", "password": "abcd1234"}
     assert client.post("/api/auth/register", json=body).status_code == 201
     r = client.post("/api/auth/register", json=body)
@@ -50,15 +67,13 @@ def test_用户名不可重复(client):
 
 
 def test_注册开关关掉后拒绝(client):
+    """默认就该是关的 —— 这条不设夹具，钉的是默认值本身。"""
     from app.core.config import settings
 
-    settings.registration_enabled = False
-    try:
-        r = client.post("/api/auth/register", json={"username": "closed01", "password": "abcd1234"})
-        assert r.status_code == 403
-        assert "未开放自助注册" in r.json()["detail"]
-    finally:
-        settings.registration_enabled = True
+    assert settings.registration_enabled is False, "自助注册默认必须是关闭的"
+    r = client.post("/api/auth/register", json={"username": "closed01", "password": "abcd1234"})
+    assert r.status_code == 403
+    assert "未开放自助注册" in r.json()["detail"]
 
 
 # --------------------------------------------------------------------- 权限边界

@@ -100,7 +100,16 @@ else
 fi
 
 echo "2) 后端 :8000"
-start_one backend "$ROOT/backend" api .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+# --reload 只盯 app/：改后端代码立刻生效，不用每次手工重启。
+# 不加的话 uvicorn 会把改过的文件一直缓存着 —— 页面上看着像 bug 修了，
+# 其实跑的还是十分钟前的旧代码（踩过：结转守卫改了，报错文案还是旧的）。
+#
+# APP_ENV=dev 是必需的：生产配置校验默认按 prod 处理（fail-closed），
+# 本机没有 .env 时会带着默认密钥被拒绝启动。显式声明开发环境即可跳过。
+# 用 export 而不是「VAR=x 命令」的前缀写法：前缀写法在 bash 里作用于
+# **函数**时，变量会在函数返回后仍然留着，容易在后面几行意外生效。
+export APP_ENV="${APP_ENV:-dev}"
+start_one backend "$ROOT/backend" api .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload --reload-dir app
 
 echo "3) 前端 :5173"
 start_one frontend "$ROOT/frontend" vite npm run dev -- --host 127.0.0.1 --port 5173
