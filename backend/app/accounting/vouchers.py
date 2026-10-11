@@ -9,6 +9,7 @@ from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.accounting import organize as svc_organize
+from app.accounting.organize import split_no
 from app.accounting.audit_helper import log, voucher_snapshot
 from app.accounting.util import find_period, money, period_label
 from app.models import Book, Entry, Period, Subject, SysUser, Voucher
@@ -18,12 +19,42 @@ from app.models import Book, Entry, Period, Subject, SysUser, Voucher
 
 
 def next_voucher_no(db: Session, period: Period, prefix: str = "记") -> str:
-    """期间内顺序编号。凭证号允许回收复用，因此取「当前最大值 + 1」即可。"""
-    last = db.scalar(
-        select(func.max(func.substring(Voucher.voucher_no, 3)))
-        .where(Voucher.period_id == period.id)
-    )
-    seq = (int(last) + 1) if last and str(last).strip().isdigit() else 1
+    """期间内顺序编号。凭证号允许回收复用，因此取「当前最大值 + 1」即可。
+
+    原来这行是 ``max(substring(voucher_no, 3))``，两个假设都不成立：
+
+    **① 固定偏移 3。** ``substring(x, 3)`` 假设凭证字恰好 2 个汉字，
+    从第 3 个字符起截。而 ``organize.NO_PATTERN`` 允许 1~4 个非数字字符
+    作前缀，导入功能也允许用户自带凭证号。实测（修复前）：
+
+        库里只有 银009   → 发出 记010（截断位置错了，序号对但前缀被吞）
+        库里只有 记账凭证009 → 发出 记001
+
+    **② max() 作用在字符串上。** PostgreSQL 对 text 的 max 是字典序，
+    ``"099" > "1000"``。所以超过 999 张就回绕。实测（修复前）：
+
+        库里只有 记100   → 发出 记001  ← 字典序 "00" 赢过 "100"
+        库里只有 记199   → 发出 记100
+        库里只有 记999   → 发出 记100
+
+    两个缺陷叠在一起，探针 13 组里 10 组结果是错的。
+
+    改成把该期间的号全取出来，用 ``organize.split_no`` 在**应用层**按
+    整数求最大值：前缀按传入的 prefix 走，序号按数值比。
+    """
+    nos = db.scalars(
+        select(Voucher.voucher_no).where(Voucher.period_id == period.id)
+    ).all()
+    # 只看**与本次前缀相同**的号。这不是额外的洁癖，organize 里
+    # ``_check``/``_dominant_prefix`` 本来就是按前缀分组的：凭证字不同
+    # 就是不同的号段，跨前缀比序号没有意义。
+    #
+    # 否则「记-2」会被解析成 (前缀「记-」, 序号 2)，把「记」的下一个号
+    # 顶到 003 —— 用户看着 记001/记002 空着，发号却说 记003。
+    # 同理「记-年结」这类解析不出序号的返回 0，本来就不该参与递增。
+    seq = max((n for no in nos
+               if (n := split_no(no)[1]) > 0 and split_no(no)[0] == prefix),
+              default=0) + 1
     # 三位数够一个月的凭证用。四位（记0022）看着像系统自动加的零，反而难扫。
     return f"{prefix}{seq:03d}"
 
