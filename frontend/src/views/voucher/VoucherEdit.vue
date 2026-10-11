@@ -704,14 +704,23 @@ function addVoucher() {
   router.push({ name: 'voucher-new' })
 }
 
-async function loadNeighbour() {
+/** 拉上一张/下一张的导航信息。
+ *
+ *  seq 传进来是为了丢弃过期响应：load() 里那次必须传，而保存成功后的那次
+ *  （保存不走 load()，没有并发）可以省略 —— 所以只在**显式给了**的情况下
+ *  才判代次，免得把保存路径也卡住。
+ */
+async function loadNeighbour(seq) {
+  if (seq !== undefined && stale(seq)) return
   if (!voucherId.value) {
     prevId.value = null
     nextId.value = null
     neighbourScope.value = ''
     return
   }
-  const r = await api.neighbour(store.bookId, voucherId.value, listFilter.value)
+  const myId = voucherId.value
+  const r = await api.neighbour(store.bookId, myId, listFilter.value)
+  if ((seq !== undefined && stale(seq)) || voucherId.value !== myId) return
   prevId.value = r.prev_id
   nextId.value = r.next_id
   neighbourScope.value = r.scope === 'filtered'
@@ -719,15 +728,38 @@ async function loadNeighbour() {
     : ''
 }
 
+/** load() 的代次标记。
+ *
+ *  切换凭证只改 route.params.id，组件不重新挂载，load() 会被反复触发；
+ *  而 load() 内部要先 await loadSubjects() 再 await getVoucher()，两次调用
+ *  天然会交错。于是「先发的请求后到」时，那份**旧**响应会
+ *  Object.assign(form, ...) 覆盖掉新凭证的表单 —— 页面上显示的是 A 凭证的
+ *  编号配着 B 凭证的分录，而且没有任何报错。
+ *
+ *  每次 load() 领一个自增代次；任何 await 之后先确认代次仍是自己的，
+ *  不是就直接返回，不碰任何状态。没有 AbortController 是因为这里有 4 个
+ *  分散的 await 点，逐个判代次比在每处都塞 signal 更容易看漏 ——
+ *  看漏一处就是一个静默覆盖。
+ */
+let loadSeq = 0
+/** 响应回来后确认「我还是最新那一次」，不是就说明该丢弃了。 */
+function stale(seq) { return seq !== loadSeq }
+
 async function load() {
+  const seq = ++loadSeq
+  const myId = Number(route.params.id || 0)
   // 先认下路由里的 id，再去拉科目：换凭证的那一瞬间，工具栏不该还挂着上一张的打印预览
-  voucherId.value = Number(route.params.id || 0)
+  voucherId.value = myId
   savedAt.value = ''
   insertCtx.value = null
   await loadSubjects()
+  if (stale(seq)) return
   subjectRefs.clear()
-  if (voucherId.value) {
-    const v = await api.getVoucher(store.bookId, voucherId.value)
+  if (myId) {
+    const v = await api.getVoucher(store.bookId, myId)
+    if (stale(seq)) return
+    // 双重确认：代次之外再核对 id，防的是「代次对上了但期间切换了」
+    if (Number(route.params.id || 0) !== myId) return
     voucherPeriod.value = store.periods.find((p) => p.id === v.period_id) || null
     Object.assign(form, {
       voucher_no: v.voucher_no, voucher_date: v.voucher_date, status: v.status,
@@ -738,7 +770,7 @@ async function load() {
     })
     ensureRows(4)
     lastSaved.value = entrySig.value      // 刚打开的这张就是「已保存」的样子，别一进来就重存一遍
-    await loadNeighbour()
+    await loadNeighbour(seq)
   } else {
     // 新开一张：凭证号和日期都先替人填好。
     // 号码问后端要（`/vouchers/next`），因为它跟落库时用的是同一个发号函数 ——
@@ -752,17 +784,20 @@ async function load() {
     const after = Number(route.query.after || 0)
     if (after) {
       const ip = await loadInsertPreview(after)
+      if (stale(seq)) return
       insertCtx.value = ip
       if (ip) {
         form.voucher_no = ip.voucher_no || ''
         form.voucher_date = ip.voucher_date || route.query.date || defaultDate()
       } else {
         const n = await loadNextDefaults()
+        if (stale(seq)) return
         form.voucher_no = n.voucher_no || ''
         form.voucher_date = route.query.date || n.voucher_date || defaultDate()
       }
     } else {
       const n = await loadNextDefaults()
+      if (stale(seq)) return
       form.voucher_no = n.voucher_no || ''
       form.voucher_date = route.query.date || n.voucher_date || defaultDate()
     }
