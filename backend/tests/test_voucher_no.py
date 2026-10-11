@@ -11,10 +11,22 @@ def _mk(db, book, make_voucher, no):
 
 
 def test_四位号补成三位(db, book, make_voucher):
+    """只补零、不改数字：记0001 → 记001，数字部分一个都不动。
+
+    这里**不**断言 ``changed == 2``。repad 扫的是整张 voucher 表，而前面的导入
+    用例会 commit 留下一批 记-1 / 记-2 —— 那些也是「前缀+数字」，同样会被计入，
+    所以计数本来就大于 2。
+
+    早先这条能稳定拿到 2，是因为每个 TestClient 启动都会跑一遍
+    ``init_database()``，顺手把全库补了零并 commit —— 于是它断言的其实是
+    「上一个用例留下的库长什么样」，不是「补零对不对」。P3-01 把启动时的建表/
+    补零去掉之后，这个隐含依赖没了，断言才露出来。
+    真正要守的是这两张凭证本身，补零没做、对做错了，下面两行都会红。
+    """
     a = _mk(db, book, make_voucher, "记0001")
     b = _mk(db, book, make_voucher, "记0022")
     changed, _ = repad_voucher_numbers(db)
-    assert changed == 2
+    assert changed >= 2, "两张四位号都没被处理，补零没生效"
     db.refresh(a); db.refresh(b)
     assert a.voucher_no == "记001"     # 数字没变，只是少了一个零
     assert b.voucher_no == "记022"

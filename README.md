@@ -43,11 +43,22 @@ cd backend
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
+# 首次安装：执行迁移建表（schema 只由这里负责）
+.venv/bin/alembic upgrade head
+
 .venv/bin/uvicorn app.main:app --reload --port 8000
 ```
 
-- 接口文档：http://localhost:8000/docs
-- 启动时会自动 `init_database()`：建表 + 装载标准科目表 + 创建演示账号
+- 接口文档：http://localhost.8000/docs
+- **启动不会建表**：服务启动时只校验 schema 版本，对不上就拒绝启动并打印
+  该执行哪条命令。表结构的变更一律写成 `backend/migrations/versions/` 下的
+  revision 走评审，不再靠应用启动时「把缺的补上」。
+
+  > 存量库（引入 Alembic 之前建的、且没有 `alembic_version` 的库）需要人工确认后
+  > 执行 `alembic stamp 0001_baseline`，不会自动标记 —— 自动 stamp 等于替人断言
+  > 「这个库恰好等于 baseline」，而那个断言无法验证。
+
+- 演示数据（标准科目表、演示账号）：`python scripts/init_db.py --reset`
 
 ### 3. 起前端
 

@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sqlalchemy import delete, select, text  # noqa: E402
 
 from app.core.db import SessionLocal, engine  # noqa: E402
-from app.core.init_db import init_database  # noqa: E402
+from app.core.schema_version import assert_schema_ready  # noqa: E402
 from app.models import Book, Period, PeriodOpening, Subject, UserBook  # noqa: E402
 from app.models.book import period_ord  # noqa: E402
 
@@ -162,8 +162,10 @@ def _drop_dependents(db, donor: Book) -> None:
 
 if __name__ == "__main__":
     apply_it = "--apply" in sys.argv
-    # 表结构迁移（year -> start_year）要先跑，否则 ORM 读不到 start_year
-    init_database()
+    # 只校验 schema 版本，**不**在这里迁移。合并年份要动的是数据，
+    # 而表结构变不变由部署流程负责；让一个数据脚本顺手改生产库的表结构，
+    # 出事时说不清是哪一步干的。
+    assert_schema_ready()
     db = SessionLocal()
     try:
         groups = find_groups(db)

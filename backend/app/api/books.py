@@ -568,7 +568,7 @@ def set_openings(book_id: int, payload: list[OpeningIn], period_id: int | None =
         # 提交 0.005 + 0.005 - 0.010，全精度和是 0.000（试算通过），
         # 接口返回 200，而库里实际存下来的和是 0.01。
         #
-        # 后果比���错更麻烦：期初差 0.01 会顺着 LedgerEngine 传导到之后
+        # 后果比写错更麻烦：期初差 0.01 会顺着 LedgerEngine 传导到之后
         # 每一个月、每一张账簿、每一份报表，而且极难回溯到是「期初录入时」
         # 就已经差了。
         try:

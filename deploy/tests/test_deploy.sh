@@ -54,6 +54,14 @@ EOF
   printf '#!/bin/sh\necho "pytest $*" >> "$DEPDIR/calls"\nexit ${STUB_PYTEST_RC:-0}\n' \
     > "$APP/backend/.venv/bin/python"
   printf '#!/bin/sh\necho "pip $*" >> "$DEPDIR/calls"\nexit 0\n' > "$APP/backend/.venv/bin/pip"
+  # deploy.sh 现在会跑 ``alembic upgrade head``。没有这个桩，set -e 会在
+  # 迁移那一步直接中断 —— 断言「没重启服务」之类又全部成立，一片绿，
+  # 但那只是因为脚本中途死了。
+  printf '#!/bin/sh\necho "alembic $*" >> "$DEPDIR/calls"\nexit ${STUB_ALEMBIC_RC:-0}\n' \
+    > "$APP/backend/.venv/bin/alembic"
+  # 数据库备份也走 venv 里的 python（脚本是 python 写的），桩要认它
+  printf '#!/bin/sh\nif [ "$1" = "scripts/db_backup.py" ]; then echo "SELECT 1;"; exit 0; fi\necho "pytest $*" >> "$DEPDIR/calls"\nexit ${STUB_PYTEST_RC:-0}\n' \
+    > "$APP/backend/.venv/bin/python"
   chmod +x "$DEPDIR/bin"/* "$APP/backend/.venv/bin"/*
   : > "$DEPDIR/calls"
 }
@@ -178,6 +186,45 @@ for i in 1 2 3 4 5; do mkdir -p "$APP/.releases/2020010$i-000000"; done
 run_script >/dev/null
 N=$(find "$APP/.releases" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
 if [[ "${N:-99}" -le 3 ]]; then ok "旧备份已清理（剩 $N 份）"; else no "备份没清理（剩 ${N:-?} 份）"; fi
+
+echo "== 8. 迁移由发布流程执行（P3-01）=="
+setup_sandbox
+run_script >/dev/null
+assert_ran "全量发布" || exit 1
+if calls | grep -q "alembic upgrade head"; then
+  ok "发布流程执行了 alembic upgrade head"
+else
+  no "没有执行迁移 —— 表结构变更只能靠人工，迟早会漏"
+fi
+# 顺序比有没有跑更重要：测试不过就中止，生产库不该已经被迁移过
+setup_sandbox
+export STUB_PYTEST_RC=1
+run_script >/dev/null
+unset STUB_PYTEST_RC
+assert_ran "测试失败的发布流程" || exit 1
+if calls | grep -q "alembic upgrade head"; then
+  no "测试没过却先迁移了生产库"
+else
+  ok "测试没过就不迁移（schema 保持在迁移前的状态）"
+fi
+
+# 迁移失败必须拦住发布：库迁移了一半而代码没换，状态最糟
+setup_sandbox
+export STUB_ALEMBIC_RC=1
+OUT=$(run_script)
+unset STUB_ALEMBIC_RC
+assert_ran "迁移失败的发布流程" || exit 1
+if calls | grep -q "systemctl restart"; then
+  no "迁移失败却重启了服务"
+else
+  ok "迁移失败没有重启"
+fi
+if calls | grep -q "mv "; then
+  no "迁移失败却切换了前端产物"
+else
+  ok "迁移失败没有切换前端产物"
+fi
+if grep -q "迁移失败" <<<"$OUT"; then ok "明确报出迁移失败"; else no "没有明确报错"; fi
 
 echo
 echo "通过 $PASS / 失败 $FAIL"

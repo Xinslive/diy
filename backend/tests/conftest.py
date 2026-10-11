@@ -124,7 +124,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import create_engine, select, text, update  # noqa: E402
 
 from app.core.db import SessionLocal, engine  # noqa: E402
-from app.core.init_db import init_database  # noqa: E402
+from app.core.schema_version import upgrade_to_head  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402
 from app.models import Book, Period, Subject, SysUser, UserBook  # noqa: E402
 
@@ -154,7 +154,10 @@ def _test_database():
     with engine.begin() as conn:
         conn.exec_driver_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
 
-    init_database(engine)
+    # 用迁移建库，而不是 create_all。这样「baseline 迁移能不能重建出一套
+    # 能用的 schema」就不是靠人相信，而是被整份测试套件天天验证 ——
+    # 建少一个触发器、少一列，后面 500 多条用例就会红。
+    upgrade_to_head(engine)
     yield
     with engine.begin() as conn:
         conn.exec_driver_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")

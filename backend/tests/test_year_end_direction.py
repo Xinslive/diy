@@ -62,7 +62,7 @@ def _retained_opening_2027(db, book, subject_id):
 
 
 def test_盈利年度结转后本年利润归零(db, book, periods, subjects, admin_user, make_voucher):
-    """收入 > 费用：留���收益增加。"""
+    """收入 > 费用：留存收益增加。"""
     make_voucher("2026-01-10", dr=[("100201", 1000, "x")],
                  cr=[("600101", 1000, "x")], posted=True)
     _close_year(db, book, periods, admin_user)

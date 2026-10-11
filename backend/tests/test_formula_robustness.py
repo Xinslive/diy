@@ -92,7 +92,7 @@ def test_循环引用被检出(db, book, periods):
 
     守护在 ``evaluate.ReportContext.cell`` 的 ``_visiting`` 集合里
     （审计建议补的那一条里，它本来就有）。这里钉住它不被后续改动弄坏：
-    报错必须是 FormulaError，不能是 RecursionError ���— 后者会变成 HTTP 500。
+    报错必须是 FormulaError，不能是 RecursionError —— 后者会变成 HTTP 500。
     """
     from app.reports.evaluate import EvalContext
 

@@ -62,13 +62,20 @@ async def dbapi_error_handler(request, exc: DBAPIError):
 @app.on_event("startup")
 def startup() -> None:
     from app.core.config import validate_production_settings
-    from app.core.init_db import init_database
+    from app.core.schema_version import assert_schema_ready
 
-    # P3-04：校验必须在 init_database **之前**。
+    # P3-04：配置校验必须在碰库**之前**。
     # 反过来的话，进程会先把 schema 建好、种子数据灌进去，再因为配置
     # 不合格退出 —— 库已经被改动过了，而运维看到的是「启动失败」。
     validate_production_settings(settings)
-    init_database()
+
+    # P3-01：这里**只校验版本，不执行任何 DDL**。
+    # 原来这里是 ``init_database()`` —— 每次启动都 create_all + 重放 db_init.sql。
+    # 而 create_all 只建缺失的表、不改已存在的表，于是「给已有表加 NOT NULL 列」
+    # 这类变更在生产上会静默不生效：服务照常启动，问题到运行时才炸。
+    # 建表、改表的职责已经移交 Alembic（backend/migrations/），
+    # 版本对不上就拒绝启动，并打印该执行哪条命令。
+    assert_schema_ready()
 
 
 @app.get("/api/health")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""一键初始化：建表 + 护栏 + 内置报表模板 + 演示数据。
+"""一键初始化：执行迁移建表 + 护栏 + 内置报表模板 + 演示数据。
 
     python scripts/init_db.py --reset
 """
@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sqlalchemy import select, text  # noqa: E402
 
 from app.core.db import Base, SessionLocal, engine  # noqa: E402
-from app.core.init_db import init_database  # noqa: E402
+from app.core.schema_version import upgrade_to_head  # noqa: E402
 from app.core.security import hash_password  # noqa: E402
 from app.models import Book, Period, Subject, SysUser, UserBook  # noqa: E402
 
@@ -61,7 +61,9 @@ def seed() -> None:
 if __name__ == "__main__":
     if "--reset" in sys.argv:
         reset()
-    init_database()
+    # 建表交给 Alembic（P3-01）。这里不再 ``create_all`` ——
+    # 那正是「服务启动时自己把缺的补上」的做法，schema 版本因此无从记录。
+    upgrade_to_head()
     seed()
     with engine.connect() as conn:
         tables = conn.execute(text(

@@ -160,7 +160,7 @@ def _descendant_ids(db: Session, subject_id: int) -> set[int]:
 def _check_parent(db: Session, book: Book, parent_id: int | None, self_id: int | None) -> Subject | None:
     """校验要挂的父节点：必须属于本账套，且不能构成环。
 
-    新建科目时有这条校验（P1-06：更新路径**没有**），于��拿着另一个账套的
+    新建科目时有这条校验（P1-06：更新路径**没有**），于是拿着另一个账套的
     科目 id 来改父节点，HTTP 200 —— 该科目随即从本账套的科目树里消失，
     变成 UI 上不可见、库里还在、还被分录引用的孤儿节点。
     对使用者来说这是最难排查的一类问题：看不见但还在参与计算。
@@ -187,7 +187,7 @@ def _sync_leaf_flags(db: Session, old_parent_id: int | None, new_parent_id: int 
         if not pid:
             continue
         # 会话是 autoflush=False（见 app/core/db.py），刚改的 parent_id 还没落库，
-        # 下面的查询看不见它 —— ��把「有新下级」误判成 False，父节点就不更新。
+        # 下面的查询看不见它 —— 会把「有新下级」误判成 False，父节点就不更新。
         db.flush()
         has_child = db.scalar(
             select(Subject.id).where(Subject.parent_id == pid).limit(1)
