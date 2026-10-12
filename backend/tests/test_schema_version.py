@@ -340,6 +340,47 @@ def _converge_snapshot(conn) -> tuple:
     )
 
 
+# ------------------------------------- 静态守卫：脚本别和模型脱节
+
+def test_脚本里构造_ORM_的字段名都真实存在():
+    """``Book(year=...)`` 这类过时字段名，只在**运行时**才炸。
+
+    而且炸的位置很坏：``scripts/init_db.py --reset`` 是先 ``DROP SCHEMA`` 再播种，
+    字段名一错就是「库已经清空、数据一条没建」，而 README 里恰好写着这条命令。
+
+    守的是「脚本和模型脱节」这一整类问题 —— 和 P3-01 是同一个病根：
+    约束写在某个地方，真跑起来时却没人核对它还对不对。
+    """
+    import app.models  # noqa: F401  确保所有模型都已注册
+    from app.models.base import Base
+
+    # registry 里有全部已注册模型，包括多继承/混入的那些；
+    # __subclasses__() 只到第一层，会漏。
+    registry = {
+        mapper.class_.__name__: {a.key for a in mapper.attrs}
+        for mapper in Base.registry.mappers
+    }
+
+    offenders = []
+    for py in sorted((BACKEND / "scripts").glob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        for node in ast.walk(tree):
+            # 只看 Book(...)、SysUser(...) 这种直接构造，不追别名/工厂
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            fields = registry.get(node.func.id)
+            if fields is None:
+                continue
+            for kw in node.keywords:
+                if kw.arg and kw.arg not in fields:
+                    offenders.append(
+                        f"{py.name}:{node.lineno} {node.func.id}({kw.arg}=...) "
+                        f"—— 模型里没有这个字段")
+
+    assert not offenders, ("脚本里构造 ORM 用了不存在的字段，跑起来才炸：\n"
+                           + "\n".join(offenders))
+
+
 # ------------------------------------------------------ 静态守卫：启动不许建表
 
 def _calls_named(tree, names: set[str]) -> set[str]:

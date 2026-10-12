@@ -545,9 +545,14 @@ grid 的 `gap: 1px + 背景色` 直接就是格子线，列宽只写在 `grid-te
   **这是刻意的**，不是漏迁：改已结账的凭证号等于篡改历史账。
 
 > 踩过的坑：最初那版是全表补零，被触发器当场顶回来，整个事务回滚、一张都没改成；
-> 而异常被 `init_database` 的 `except Exception` 吞成一行「安装内置报表模板失败」——
-> 日志看着像「什么都没发生」，数据其实没迁。现在 `repad_voucher_numbers` 在 SQL
-> 层就只挑未结账的期间，压根不往护栏上撞；跳过的张数也会报出来，不闷头吞。
+> 而异常被当时的启动初始化函数（`app/core/init_db.py` 里的 `init_database`，
+> 已在 P3-01 引入 Alembic 时删除）用一个 `except Exception` 吞成一行
+> 「安装内置报表模板失败」—— 日志看着像「什么都没发生」，数据其实没迁。
+> 现在 `repad_voucher_numbers` 在 SQL 层就只挑未结账的期间，压根不往护栏上撞；
+> 跳过的张数也会报出来，不闷头吞。
+>
+> 教训本身没有因为文件被删而失效：**宽泛的异常兜底 + 笼统的错误文案 = 静默失败**。
+> 现在任何批量数据订正都要报出「处理了几条、跳过几条、为什么跳过」。
 
 ### 已记账凭证锁定
 已记账 = 分录已经被总账、科目余额表、报表引用。直接改它会出现
@@ -820,7 +825,14 @@ token 在 localStorage 由 axios 拦截器注入，所以 `iframe.src` / `window
 ### 加一张新表
 1. `app/models/` 建模型，`book_id` 必带
 2. 需要护栏就在 `app/core/db_init.sql` 加触发器
-3. `init_db.py` 里注册
+3. **加一条 Alembic revision**（`alembic revision -m "..."`），把建表 DDL 写进去。
+   不要指望 `create_all` 补：它只建缺失的表，对**已存在**的表一眼都不看，
+   「给已有表加 NOT NULL 列」「改列类型」「加索引」都会静默不生效 ——
+   这正是 P3-01 要去掉的东西，启动路径上已经没有任何 DDL 了。
+
+   另有一条纪律：baseline 是**冻结的显式 DDL**，不是 `create_all`。
+   如果写成 `create_all`，它会跟着模型走，于是后面每条 revision 都在
+   和一个已经建好的表撞 DuplicateColumn。
 
 ### 加一个新打印模板类型
 1. `app/printing/preview.py` 加一个 `Virtual` 实现

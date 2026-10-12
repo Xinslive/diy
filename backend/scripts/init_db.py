@@ -43,7 +43,10 @@ def seed() -> None:
         db.flush()
 
         for name, start_month in [("租金账套", 1), ("管理费账套", 1)]:
-            book = Book(company_name="紫欣星悦荟", name=name, year=2026, start_month=start_month)
+            # 字段是 start_year 不是 year（模型在年度结转改造时改过：
+            # 账套记的是「从哪一年开始」，不是「当前是哪一年」）。
+            book = Book(company_name="紫欣星悦荟", name=name,
+                        start_year=2026, start_month=start_month)
             db.add(book)
             db.flush()
             create_periods(db, book)
