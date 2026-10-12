@@ -132,8 +132,11 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
         "font": {"family": "宋体", "size": 9},
         "show": {"period": True, "page_no": True},
         "columns": [
-            {"key": "date", "label": "日期", "width": 8, "align": "center"},
+            {"key": "month", "label": "月", "width": 5, "align": "center"},
+            {"key": "day", "label": "日", "width": 5, "align": "center"},
             {"key": "voucher_no", "label": "凭证字号", "width": 10, "align": "center"},
+            {"key": "code", "label": "科目编码", "width": 10, "align": "center"},
+            {"key": "name", "label": "科目名称", "width": 16, "align": "left"},
             {"key": "summary", "label": "摘　要", "width": 24, "align": "left"},
             {"key": "debit", "label": "借方金额", "width": 11, "align": "right"},
             {"key": "credit", "label": "贷方金额", "width": 11, "align": "right"},

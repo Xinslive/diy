@@ -320,6 +320,8 @@ def _render_scope(
     period_id: Optional[int] = None,
     from_period_id: Optional[int] = None,
     subject_id: Optional[int] = None,
+    from_subject_id: Optional[int] = None,
+    to_subject_id: Optional[int] = None,
     report_template_id: Optional[int] = None,
     include_unposted: bool = False,
     leaf_only: bool = False,
@@ -362,11 +364,19 @@ def _render_scope(
     if scope == "DETAIL_LEDGER":
         if not subject_id:
             raise HTTPException(400, "明细账预览需要先选择一个科目")
-        payload = queries.detail_ledger(db, book.id, subject_id, from_period, to_period,
-                                        include_unposted)
+        payload = queries.detail_ledger(
+            db, book.id, subject_id, from_period, to_period, include_unposted,
+            from_subject_id=from_subject_id, to_subject_id=to_subject_id,
+        )
         subj = payload["subject"]
+        subject_caption = f"{subj['code']} {subj['name']}"
+        if payload.get("subject_range"):
+            subject_caption += (
+                f"（{payload['subject_range']['from']['code']} 至 "
+                f"{payload['subject_range']['to']['code']}）"
+            )
         ctx = pv.context(db, book, to_period,
-                         subject=f"{subj['code']} {subj['name']}",
+                         subject=subject_caption,
                          period=f"{payload['from_period']} 至 {payload['to_period']}"
                          if payload["from_period"] != payload["to_period"] else payload["from_period"])
         doc = render_table_page(tpl, ctx, pv.detail_rows(payload), 1, 1)
@@ -440,11 +450,14 @@ def print_general(book_id: int, period_id: Optional[int] = None,
 @router.get("/detail-ledger.html")
 def print_detail(book_id: int, subject_id: int, period_id: Optional[int] = None,
                  from_period_id: Optional[int] = None, template_id: Optional[int] = None,
+                 from_subject_id: Optional[int] = None, to_subject_id: Optional[int] = None,
                  include_unposted: bool = Query(False),
                  book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     tpl = _tpl_dict(_template(db, book, "DETAIL_LEDGER", template_id))
     return _html_response(_render_scope(db, book, "DETAIL_LEDGER", tpl, period_id=period_id,
                                         from_period_id=from_period_id, subject_id=subject_id,
+                                        from_subject_id=from_subject_id,
+                                        to_subject_id=to_subject_id,
                                         include_unposted=include_unposted))
 
 
@@ -471,6 +484,8 @@ class PreviewIn(BaseModel):
     period_id: Optional[int] = None
     from_period_id: Optional[int] = None
     subject_id: Optional[int] = None
+    from_subject_id: Optional[int] = None
+    to_subject_id: Optional[int] = None
     report_template_id: Optional[int] = None
 
 
@@ -496,6 +511,8 @@ def preview_draft(payload: PreviewIn, book: Book = Depends(get_my_book),
             period_id=payload.period_id,
             from_period_id=payload.from_period_id,
             subject_id=payload.subject_id,
+            from_subject_id=payload.from_subject_id,
+            to_subject_id=payload.to_subject_id,
             report_template_id=payload.report_template_id,
             max_pages=3 if payload.scope == "VOUCHER" else None,
             note=note,
@@ -592,3 +609,33 @@ def export_report(book_id: int, template_id: int, period_id: int, book: Book = D
     data = xl.report_excel(payload, company=book.company_name, book_name=book.name)
     return Response(content=data, media_type=XLSX_MIME,
                     headers={"Content-Disposition": _filename(f"{tpl.name}_{period.code}.xlsx")})
+
+
+@router.get("/detail-ledger.xlsx")
+def export_detail_ledger(book_id: int, subject_id: int, period_id: Optional[int] = None,
+                         from_period_id: Optional[int] = None,
+                         from_subject_id: Optional[int] = None,
+                         to_subject_id: Optional[int] = None,
+                         include_unposted: bool = Query(False),
+                         book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
+    from app.ledger import queries
+
+    to_period = _period(db, book.id, period_id)
+    if to_period.book_id != book.id:
+        raise HTTPException(404, "会计期间不存在")
+    if from_period_id:
+        from_period = db.get(Period, from_period_id)
+        if from_period is None or from_period.book_id != book.id:
+            raise HTTPException(404, "起始期间不存在")
+    else:
+        from_period = to_period
+
+    payload = queries.detail_ledger(
+        db, book.id, subject_id, from_period, to_period, include_unposted,
+        from_subject_id=from_subject_id, to_subject_id=to_subject_id,
+    )
+    data = xl.detail_ledger_excel(payload, book_name=book.name)
+    span = from_period.code if from_period.id == to_period.id else f"{from_period.code}-{to_period.code}"
+    code = payload["subject"]["code"]
+    return Response(content=data, media_type=XLSX_MIME,
+                    headers={"Content-Disposition": _filename(f"明细账_{code}_{span}.xlsx")})

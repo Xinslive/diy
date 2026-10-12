@@ -82,81 +82,222 @@ def detail_ledger(
     from_period: Period,
     to_period: Period,
     include_unposted: bool = False,
+    from_subject_id: int | None = None,
+    to_subject_id: int | None = None,
 ) -> dict:
-    """明细账：逐笔列出分录并滚动计算余额。"""
-    eng = LedgerEngine(db, book_id, include_unposted)
+    """明细账：末级逐笔展示；父级按科目树汇总并展开所选子科目范围。"""
     subject = subject_of_book(db, book_id, subject_id)
-    rows = []
+    if from_period.ord > to_period.ord:
+        raise HTTPException(400, "起始期间不能晚于结束期间")
 
-    # 区间期初 = 起始期间的期初
-    opening_before = eng.opening(subject_id, from_period.ord)
-    side, amount = display_side(subject, opening_before)
-    running = opening_before
-    rows.append(
-        {
-            "kind": "OPENING",
-            "voucher_no": "期初余额",
-            "voucher_date": None,
-            "period": f"{from_period.year}-{from_period.month:02d}",
-            "summary": "期初余额",
-            "debit": ZERO,
-            "credit": ZERO,
-            "direction": side,
-            "balance": amount,
-        }
-    )
+    eng = LedgerEngine(db, book_id, include_unposted)
+    periods = eng.periods()
+    range_periods = [p for p in periods if from_period.ord <= p.ord <= to_period.ord]
+    if not range_periods:
+        raise HTTPException(400, "所选期间范围内没有会计期间")
+    first_period_by_year: dict[int, Period] = {}
+    for period in periods:
+        first_period_by_year.setdefault(period.year, period)
 
-    period_labels = {
-        p.id: f"{p.year}-{p.month:02d}"
-        for p in db.scalars(select(Period).where(Period.book_id == book_id)).all()
+    all_subjects = subject_tree(db, book_id)
+    children: dict[int, list[Subject]] = defaultdict(list)
+    by_id = {s.id: s for s in all_subjects}
+    for child in all_subjects:
+        if child.parent_id in by_id:
+            children[child.parent_id].append(child)
+    for siblings in children.values():
+        siblings.sort(key=lambda s: (s.sort_no, s.code))
+
+    comprehensive = bool(children.get(subject.id))
+    selected_branches: list[Subject] = []
+    if comprehensive:
+        siblings = children[subject.id]
+        start_subject = subject_of_book(db, book_id, from_subject_id) if from_subject_id else siblings[0]
+        end_subject = subject_of_book(db, book_id, to_subject_id) if to_subject_id else siblings[-1]
+        if start_subject.parent_id != subject.id or end_subject.parent_id != subject.id:
+            raise HTTPException(400, "起止科目必须是所选父科目的直接下级科目")
+        sibling_index = {s.id: i for i, s in enumerate(siblings)}
+        start_index = sibling_index[start_subject.id]
+        end_index = sibling_index[end_subject.id]
+        if start_index > end_index:
+            raise HTTPException(400, "起始科目不能排在结束科目之后")
+        selected_branches = siblings[start_index:end_index + 1]
+    else:
+        if from_subject_id is not None or to_subject_id is not None:
+            raise HTTPException(400, "起止科目范围仅适用于有下级科目的父科目")
+
+    included_nodes: set[int] = set()
+    selected_leaf_ids: list[int] = []
+    branch_order: dict[int, list[Subject]] = {}
+
+    def collect(node: Subject) -> None:
+        included_nodes.add(node.id)
+        node_children = children.get(node.id, [])
+        branch_order[node.id] = node_children
+        if not node_children:
+            selected_leaf_ids.append(node.id)
+            return
+        for child in node_children:
+            collect(child)
+
+    included_nodes.add(subject.id)
+    branch_order[subject.id] = selected_branches if comprehensive else []
+    if comprehensive:
+        for branch in selected_branches:
+            collect(branch)
+    else:
+        selected_leaf_ids = [subject.id]
+
+    # 只计算本次范围内的末级科目。父级期初快照会包含所有子科目，不能直接拿来
+    # 作为缩小范围后的期初余额；逐个汇总选中的末级科目才能排除范围外分支。
+    eng.compute(selected_leaf_ids, to_period.ord)
+    opening_by_leaf = {
+        leaf_id: eng.opening(leaf_id, from_period.ord) for leaf_id in selected_leaf_ids
     }
 
-    stmt = (
-        _entry_stmt(book_id, include_unposted)
-        .where(Entry.subject_id == subject_id)
-        .where(Entry.period_ord >= from_period.ord, Entry.period_ord <= to_period.ord)
-        .order_by(Voucher.voucher_date, Voucher.voucher_no, Entry.line_no)
-    )
-    dr_sum = cr_sum = ZERO
-    for entry, voucher, _subj in db.execute(stmt).all():
-        running += entry.amount if entry.direction == "DEBIT" else -entry.amount
-        dr_sum += entry.amount if entry.direction == "DEBIT" else ZERO
-        cr_sum += entry.amount if entry.direction == "CREDIT" else ZERO
-        side, amount = display_side(subject, running)
-        rows.append(
-            {
-                "kind": "ENTRY",
-                "voucher_id": voucher.id,
-                "voucher_no": voucher.voucher_no,
-                "voucher_date": voucher.voucher_date.isoformat(),
-                "period": period_labels.get(voucher.period_id, ""),
-                "summary": entry.summary,
-                "debit": entry.amount if entry.direction == "DEBIT" else ZERO,
-                "credit": entry.amount if entry.direction == "CREDIT" else ZERO,
-                "direction": side,
-                "balance": amount,
-                "status": voucher.status,
-            }
-        )
+    opening_by_node: dict[int, Decimal] = {}
 
-    side, amount = display_side(subject, running)
-    rows.append(
-        {
-            "kind": "TOTAL",
-            "voucher_no": "本期合计",
+    def opening_for_node(node_id: int) -> Decimal:
+        node_children = branch_order.get(node_id, [])
+        if node_children:
+            opening = sum((opening_for_node(child.id) for child in node_children), ZERO)
+        else:
+            opening = opening_by_leaf.get(node_id, ZERO)
+        opening_by_node[node_id] = opening
+        return opening
+
+    opening_for_node(subject.id)
+
+    earliest_ytd_ord = min(first_period_by_year[p.year].ord for p in range_periods)
+    monthly_moves: dict[tuple[int, int], list[Decimal]] = defaultdict(lambda: [ZERO, ZERO])
+    entries_by_leaf_period: dict[tuple[int, int], list[tuple[Entry, Voucher]]] = defaultdict(list)
+    if selected_leaf_ids:
+        stmt = (
+            _entry_stmt(book_id, include_unposted)
+            .where(Entry.subject_id.in_(selected_leaf_ids))
+            .where(Entry.period_ord >= earliest_ytd_ord, Entry.period_ord <= to_period.ord)
+            .order_by(Entry.period_ord, Voucher.voucher_date, Voucher.voucher_no, Entry.line_no)
+        )
+        parent_by_id = {s.id: s.parent_id for s in all_subjects}
+        for entry, voucher, _subj in db.execute(stmt).all():
+            debit = entry.amount if entry.direction == "DEBIT" else ZERO
+            credit = entry.amount if entry.direction == "CREDIT" else ZERO
+            current = entry.subject_id
+            while current in included_nodes:
+                totals = monthly_moves[(current, entry.period_ord)]
+                totals[0] += debit
+                totals[1] += credit
+                parent_id = parent_by_id.get(current)
+                if parent_id is None:
+                    break
+                current = parent_id
+            if entry.period_ord >= from_period.ord:
+                entries_by_leaf_period[(entry.subject_id, entry.period_ord)].append((entry, voucher))
+
+    ytd_moves: dict[tuple[int, int], tuple[Decimal, Decimal]] = {}
+    ytd_by_node = {node_id: [ZERO, ZERO] for node_id in included_nodes}
+    current_year = None
+    for period in periods:
+        if period.ord < earliest_ytd_ord or period.ord > to_period.ord:
+            continue
+        if period.year != current_year:
+            ytd_by_node = {node_id: [ZERO, ZERO] for node_id in included_nodes}
+            current_year = period.year
+        for node_id in included_nodes:
+            month = monthly_moves[(node_id, period.ord)]
+            ytd_by_node[node_id][0] += month[0]
+            ytd_by_node[node_id][1] += month[1]
+            if period.ord >= from_period.ord:
+                ytd_moves[(node_id, period.ord)] = tuple(ytd_by_node[node_id])
+
+    rows: list[dict] = []
+    subject_by_id = by_id
+
+    def account_row(kind: str, node: Subject, period: Period, **values) -> dict:
+        row = {
+            "kind": kind,
+            "subject_id": node.id,
+            "subject_code": node.code,
+            "subject_name": node.name,
+            "subject_level": node.level,
+            "voucher_no": "",
             "voucher_date": None,
-            "period": "",
+            "period": f"{period.year}-{period.month:02d}",
             "summary": "",
-            "debit": dr_sum,
-            "credit": cr_sum,
-            "direction": side,
-            "balance": amount,
+            "debit": ZERO,
+            "credit": ZERO,
+            "direction": "平",
+            "balance": None,
         }
-    )
+        row.update(values)
+        return row
+
+    def append_account(node_id: int) -> None:
+        node = subject_by_id[node_id]
+        node_children = branch_order.get(node_id, [])
+        is_leaf = not node_children
+        running = opening_by_node.get(node_id, ZERO)
+        side, amount = display_side(node, running)
+        rows.append(account_row(
+            "OPENING", node, from_period,
+            voucher_no="期初余额", summary="期初余额", direction=side, balance=amount,
+        ))
+
+        for period in range_periods:
+            if is_leaf:
+                for entry, voucher in entries_by_leaf_period.get((node_id, period.ord), []):
+                    debit = entry.amount if entry.direction == "DEBIT" else ZERO
+                    credit = entry.amount if entry.direction == "CREDIT" else ZERO
+                    running += debit - credit
+                    side, amount = display_side(node, running)
+                    rows.append(account_row(
+                        "ENTRY", node, period,
+                        voucher_id=voucher.id,
+                        voucher_no=voucher.voucher_no,
+                        voucher_date=voucher.voucher_date.isoformat(),
+                        summary=entry.summary,
+                        debit=debit,
+                        credit=credit,
+                        direction=side,
+                        balance=amount,
+                        status=voucher.status,
+                    ))
+
+            month_debit, month_credit = monthly_moves[(node_id, period.ord)]
+            ytd_debit, ytd_credit = ytd_moves[(node_id, period.ord)]
+            if not is_leaf:
+                running += month_debit - month_credit
+            balance_side, balance_amount = display_side(node, running)
+            rows.append(account_row(
+                "MONTH_TOTAL", node, period,
+                summary="本月合计", debit=month_debit, credit=month_credit,
+                direction=balance_side, balance=balance_amount,
+            ))
+            rows.append(account_row(
+                "YTD_TOTAL", node, period,
+                summary="累计", debit=ytd_debit, credit=ytd_credit,
+                direction=balance_side, balance=balance_amount,
+            ))
+
+        for child in node_children:
+            append_account(child.id)
+
+    append_account(subject.id)
+    range_info = None
+    if comprehensive:
+        range_info = {
+            "from": {"id": selected_branches[0].id, "code": selected_branches[0].code,
+                     "name": selected_branches[0].name},
+            "to": {"id": selected_branches[-1].id, "code": selected_branches[-1].code,
+                   "name": selected_branches[-1].name},
+        }
 
     return {
         "subject": {"id": subject.id, "code": subject.code, "name": subject.name,
-                    "direction": subject.direction, "category": subject.category},
+                    "direction": subject.direction, "category": subject.category,
+                    "level": subject.level, "is_leaf": not comprehensive},
+        "comprehensive": comprehensive,
+        "subject_range": range_info,
         "from_period": f"{from_period.year}-{from_period.month:02d}",
         "to_period": f"{to_period.year}-{to_period.month:02d}",
         "rows": rows,

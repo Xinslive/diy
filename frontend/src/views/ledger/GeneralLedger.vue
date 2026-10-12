@@ -82,7 +82,7 @@ async function load() {
   loading.value = true
   try {
     data.value = await api.general(store.bookId, {
-      from_period_id: fromId.value, to_period_id: toId.value, leaf_only: leafOnly.value,
+      from_period_id: fromId.value, period_id: toId.value, leaf_only: leafOnly.value,
       include_unposted: includeUnposted.value
     })
   } finally {

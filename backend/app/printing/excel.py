@@ -262,6 +262,99 @@ def general_ledger_excel(payload: dict, *, company: str, book_name: str) -> byte
     return buf.getvalue()
 
 
+def detail_ledger_excel(payload: dict, *, book_name: str) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "明细账"
+    ws.sheet_view.showGridLines = False
+
+    subject = payload.get("subject", {})
+    subject_range = payload.get("subject_range")
+    comprehensive = bool(payload.get("comprehensive"))
+    headers = ["凭证号"]
+    widths = [13]
+    if comprehensive:
+        headers.extend(["科目编码", "科目名称"])
+        widths.extend([13, 26])
+    headers.extend(["摘要", "借方", "贷方", "方向", "余额"])
+    widths.extend([42, 15, 15, 9, 17])
+    last_col = len(headers) + 2
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
+    ws.cell(row=1, column=1, value="明细账").font = Font(name="宋体", size=16, bold=True)
+    ws.cell(row=1, column=1).alignment = CENTER
+    ws.row_dimensions[1].height = 30
+
+    subtitle = f"{book_name} · {subject.get('code', '')} {subject.get('name', '')}"
+    if subject_range:
+        subtitle += f" · {subject_range['from']['code']} 至 {subject_range['to']['code']}"
+    subtitle += f" · {payload.get('from_period', '')} 至 {payload.get('to_period', '')}"
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
+    ws.cell(row=2, column=1, value=_text(subtitle)).alignment = CENTER
+
+    for col, width in enumerate([8, 8, *widths], start=1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    year = str(payload.get("from_period", ""))[:4]
+    ws.merge_cells(start_row=4, start_column=1, end_row=4, end_column=2)
+    ws.cell(row=4, column=1, value=f"{year}年" if year else "日期")
+    ws.cell(row=5, column=1, value="月")
+    ws.cell(row=5, column=2, value="日")
+    for col, header in enumerate(headers, start=3):
+        ws.merge_cells(start_row=4, start_column=col, end_row=5, end_column=col)
+        ws.cell(row=4, column=col, value=header)
+
+    header_border = Border(left=THIN, right=THIN, top=MEDIUM, bottom=MEDIUM)
+    for row_num in (4, 5):
+        for col in range(1, last_col + 1):
+            cell = ws.cell(row=row_num, column=col)
+            cell.font = Font(name="宋体", size=10, bold=True)
+            cell.alignment = CENTER
+            cell.border = header_border
+    ws.row_dimensions[4].height = 22
+    ws.row_dimensions[5].height = 21
+
+    money_cols = [last_col - 3, last_col - 2, last_col]
+    row_num = 6
+    subject_level = int(subject.get("level") or 1)
+    for row in payload.get("rows", []):
+        voucher_date = str(row.get("voucher_date") or "")
+        period = str(row.get("period") or "")
+        date_value = voucher_date or period
+        month = date_value[5:7] if len(date_value) >= 7 else ""
+        day = voucher_date[8:10] if len(voucher_date) >= 10 else ""
+        kind = row.get("kind")
+        values = [month, day, _text(row.get("voucher_no") if kind == "ENTRY" else "")]
+        if comprehensive:
+            depth = max(0, int(row.get("subject_level") or 1) - subject_level)
+            name = f"{'　' * depth}{row.get('subject_name', '')}"
+            values.extend([_text(row.get("subject_code", "")), _text(name)])
+        summary = "累　　计" if kind == "YTD_TOTAL" else row.get("summary", "")
+        values.extend([
+            _text(summary), _num(row.get("debit")), _num(row.get("credit")),
+            _text(row.get("direction")), _num(row.get("balance")),
+        ])
+        is_total = kind in ("OPENING", "MONTH_TOTAL", "YTD_TOTAL")
+        for col, value in enumerate(values, start=1):
+            cell = ws.cell(row=row_num, column=col, value=value)
+            cell.border = BOX
+            cell.font = Font(name="宋体", size=10, bold=is_total)
+            cell.alignment = CENTER if col in (1, 2, last_col - 1) else (
+                RIGHT if col in money_cols else LEFT
+            )
+        _money_style(ws, row_num, money_cols)
+        ws.row_dimensions[row_num].height = 21
+        row_num += 1
+
+    ws.freeze_panes = "A6"
+    ws.print_title_rows = "1:5"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    return _to_bytes(wb)
+
+
 # --------------------------------------------------------------------- 报表
 
 

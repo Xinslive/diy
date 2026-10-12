@@ -18,7 +18,7 @@
       rows="1"
       :value="text"
       :disabled="disabled"
-      placeholder="科目编码或名称"
+      :placeholder="placeholder"
       autocomplete="off"
       spellcheck="false"
       @focus="onFocus"
@@ -43,16 +43,18 @@
         <button v-for="(n, i) in visible" :key="n.id" class="sp-item"
                 :class="{ 'is-on': n.id === modelValue, 'is-cursor': i === cursor, 'is-parent': hasKids(n) }"
                 :style="{ paddingLeft: `${12 + n.depth * 16}px` }"
-                :title="hasKids(n) ? `点开看下面的明细科目` : ''"
-                @click="onRow(n)" @mouseenter="onHover($event, i)">
+                :title="hasKids(n) ? (selectParents ? '点击选择，点箭头展开下级科目' : '点开看下面的明细科目') : ''"
+                @click="onRow(n, $event)" @mouseenter="onHover($event, i)">
           <span class="sp-caret">{{ !hasKids(n) ? '' : isOpen(n) ? '▾' : '▸' }}</span>
           <span class="sp-code">{{ n.code }}</span>
           <span class="sp-name">{{ n.name }}</span>
         </button>
-        <p v-if="!visible.length" class="sp-empty">没找到这个科目，可以在下面点「＋ 点击添加」</p>
+        <p v-if="!visible.length" class="sp-empty">
+          {{ allowAdd ? '没找到这个科目，可以在下面点「＋ 点击添加」' : '没有找到匹配的科目' }}
+        </p>
       </div>
 
-      <button class="sp-add" @click="onAdd">＋ 点击添加</button>
+      <button v-if="allowAdd" class="sp-add" @click="onAdd">＋ 点击添加</button>
     </div>
   </div>
 </template>
@@ -63,10 +65,13 @@ import { CATEGORY_LABEL, ensurePinyin, matchSubject } from '@/utils/subjectCode'
 
 const props = defineProps({
   modelValue: { type: [Number, String], default: null },
-  /** 全量科目（含上级），扁平的一条条，带 parent_id / level / is_leaf。
-   *  末级**可以选**，上级只用来展开 —— 凭证只记在末级上。 */
+  /** 全量科目（含上级），扁平的一条条，带 parent_id / level / is_leaf。 */
   options: { type: Array, default: () => [] },
-  disabled: { type: Boolean, default: false }
+  disabled: { type: Boolean, default: false },
+  allowAdd: { type: Boolean, default: true },
+  /** 默认只选末级；综合账等场景可同时选择上级科目。 */
+  selectParents: { type: Boolean, default: false },
+  placeholder: { type: String, default: '科目编码或名称' }
 })
 const emit = defineEmits(['update:modelValue', 'change', 'add', 'editing', 'enter', 'picked', 'left', 'right'])
 
@@ -148,7 +153,7 @@ const editing = computed(() => (current.value ? String(current.value.code ?? '')
 const marking = computed(() => focused.value
   && text.value.trim() !== editing.value.trim())
 watch(marking, (v) => emit('editing', v), { immediate: true })
-const isNonLeaf = computed(() => !!current.value && current.value.is_leaf === false)
+const isNonLeaf = computed(() => !props.selectParents && !!current.value && current.value.is_leaf === false)
 
 // 外面改了选中科目（打开一张老凭证、回车加行自动带过去），格子里的字跟着走。
 // immediate 是必须的：打开老凭证时首帧 display 就已经是科目名，
@@ -277,8 +282,11 @@ function toggle(n) {
 }
 
 /** 点一行：带下级的只是展开，不带下级的（末级）才算选中 */
-function onRow(n) {
-  if (hasKids(n)) { toggle(n); return }
+function onRow(n, event) {
+  if (hasKids(n) && (!props.selectParents || event?.target.closest('.sp-caret'))) {
+    toggle(n)
+    return
+  }
   pick(n)
 }
 
@@ -500,6 +508,19 @@ function onKeydown(e) {
   // 左右键一动，被换走的是人手里正录的那一格，不是下面那块列表。
   // 展开/收起交给点 ▸ 或 →、↑↓ 走到那一行再回车。
   if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    const at = visible.value[cursor.value]
+    if (props.selectParents && open.value && at && hasKids(at) && !hit.value) {
+      if (e.key === 'ArrowRight' && !expanded.value.has(at.id)) {
+        e.preventDefault()
+        toggle(at)
+        return
+      }
+      if (e.key === 'ArrowLeft' && expanded.value.has(at.id)) {
+        e.preventDefault()
+        toggle(at)
+        return
+      }
+    }
     // 整格选中还挂着：这一下先收选区、按浏览器的老规矩挪一格光标。
     // 不这么做，按一下方向键人就被甩到隔壁格去了，全选永远消不掉。
     const el = e.target
@@ -535,7 +556,7 @@ function onKeydown(e) {
   } else if (e.key === 'Enter') {
     e.preventDefault()
     // 停在上级科目上：展开它，别急着当成选中
-    if (at && hasKids(at)) { toggle(at); return }
+    if (at && hasKids(at) && !props.selectParents) { toggle(at); return }
     if (at) { pick(at, true); return }
     // 一条都没有：没打关键字就是把面板收了让路；打了关键字还没匹配上，
     // 字留在格子里继续改 —— 什么都不做才是对的

@@ -62,7 +62,8 @@ def general(book_id: int, period_id: Optional[int] = None, from_period_id: Optio
 @router.get("/detail")
 def detail(book_id: int, subject_id: int, period_id: Optional[int] = None,
            from_period_id: Optional[int] = None, book: Book = Depends(get_my_book),
-           db: Session = Depends(get_db), include_unposted: bool = Query(False)):
+           db: Session = Depends(get_db), include_unposted: bool = Query(False),
+           from_subject_id: Optional[int] = None, to_subject_id: Optional[int] = None):
     to_period = _period(db, book.id, period_id)
     if from_period_id:
         from_period = db.get(Period, from_period_id)
@@ -70,7 +71,10 @@ def detail(book_id: int, subject_id: int, period_id: Optional[int] = None,
             raise HTTPException(404, "起始期间不存在")
     else:
         from_period = to_period
-    return queries.detail_ledger(db, book.id, subject_id, from_period, to_period, include_unposted)
+    return queries.detail_ledger(
+        db, book.id, subject_id, from_period, to_period, include_unposted,
+        from_subject_id=from_subject_id, to_subject_id=to_subject_id,
+    )
 
 
 @router.get("/voucher-balances")

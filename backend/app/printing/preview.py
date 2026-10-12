@@ -100,34 +100,35 @@ def general_rows(rows: list[dict]) -> list[dict]:
 def detail_rows(payload: dict) -> list[dict]:
     """明细账 -> 打印行。payload 来自 queries.detail_ledger。"""
     out: list[dict] = []
-    meta = payload.get("subject") or {}
     for r in payload.get("rows", []):
-        if r.get("kind") in ("OPENING", "TOTAL"):
-            out.append(
-                {
-                    "date": "",
-                    "voucher_no": "",
-                    "summary": r.get("voucher_no") or r.get("summary", ""),
-                    "debit": "",
-                    "credit": "",
-                    "direction": r.get("direction", ""),
-                    "balance": r.get("balance", ""),
-                    "__kind": "TOTAL",
-                }
-            )
+        voucher_date = str(r.get("voucher_date") or "")
+        period = str(r.get("period") or "")
+        date_value = voucher_date or (period[-2:] if r.get("kind") in ("MONTH_TOTAL", "YTD_TOTAL") else "")
+        base = {
+            "date": voucher_date or date_value,
+            "month": date_value[5:7] if len(date_value) >= 7 else date_value,
+            "day": date_value[8:10] if len(date_value) >= 10 else "",
+            "code": r.get("subject_code", ""),
+            "name": ("　" * max(0, int(r.get("subject_level", 1)) - 1)) + r.get("subject_name", ""),
+            "level": r.get("subject_level", ""),
+            "voucher_no": r.get("voucher_no", ""),
+            "summary": r.get("summary", ""),
+            "debit": r.get("debit", ""),
+            "credit": r.get("credit", ""),
+            "direction": r.get("direction", ""),
+            "balance": r.get("balance", ""),
+        }
+        if r.get("kind") in ("MONTH_TOTAL", "YTD_TOTAL"):
+            base["__kind"] = "TOTAL" if r.get("kind") == "MONTH_TOTAL" else "SUBTOTAL"
+            out.append(base)
             continue
-        out.append(
-            {
-                "date": str(r.get("voucher_date") or ""),
-                "voucher_no": r.get("voucher_no", ""),
-                "summary": r.get("summary", ""),
-                "debit": r.get("debit", ""),
-                "credit": r.get("credit", ""),
-                "direction": r.get("direction", ""),
-                "balance": r.get("balance", ""),
-                "__kind": r.get("kind", "") if r.get("kind") in ("TOTAL", "SUBTOTAL") else "",
-            }
-        )
+        if r.get("kind") in ("OPENING", "TOTAL"):
+            base.update({"date": "", "month": "", "day": "", "voucher_no": "",
+                         "summary": r.get("voucher_no") or r.get("summary", ""),
+                         "debit": "", "credit": "", "__kind": "TOTAL"})
+            out.append(base)
+            continue
+        out.append(base)
     return out
 
 

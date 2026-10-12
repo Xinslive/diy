@@ -142,10 +142,22 @@
 
         <el-form v-if="scope === 'DETAIL_LEDGER' || scope === 'REPORT'" :inline="true" class="preview-opts">
           <el-form-item v-if="scope === 'DETAIL_LEDGER'" label="科目">
-            <el-select v-model="previewSubjectId" size="small" style="width: 180px" @change="refreshPreview">
-              <el-option v-for="s in subjects" :key="s.id" :label="`${s.code} ${s.name}`" :value="s.id" />
+            <el-select v-model="previewSubjectId" size="small" style="width: 180px" @change="onPreviewSubjectChange">
+              <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
             </el-select>
           </el-form-item>
+          <template v-if="scope === 'DETAIL_LEDGER' && previewRangeSubjects.length">
+            <el-form-item label="科目起">
+              <el-select v-model="previewFromSubjectId" size="small" style="width: 180px" @change="onPreviewFromSubjectChange">
+                <el-option v-for="s in previewRangeSubjects" :key="s.id" :label="`${s.code} ${s.name}`" :value="s.id" />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="止">
+              <el-select v-model="previewToSubjectId" size="small" style="width: 180px" @change="onPreviewToSubjectChange">
+                <el-option v-for="s in previewRangeSubjects" :key="s.id" :label="`${s.code} ${s.name}`" :value="s.id" />
+              </el-select>
+            </el-form-item>
+          </template>
           <el-form-item v-if="scope === 'REPORT'" label="报表">
             <el-select v-model="previewReportId" size="small" style="width: 150px" @change="refreshPreview">
               <el-option v-for="r in reports" :key="r.id" :label="r.name" :value="r.id" />
@@ -318,6 +330,8 @@ const previewPeriodId = computed(() =>
   store.periodId || store.currentPeriod?.id || store.periods[store.periods.length - 1]?.id || null)
 const fromPeriodId = ref(null)
 const previewSubjectId = ref(null)
+const previewFromSubjectId = ref(null)
+const previewToSubjectId = ref(null)
 const previewReportId = ref(null)
 const previewHtml = ref('')
 const previewError = ref('')
@@ -350,6 +364,8 @@ const FIELD_DOC = [
     title: '账簿通用',
     items: [
       { key: 'date', desc: '凭证日期' },
+      { key: 'month', desc: '月份' },
+      { key: 'day', desc: '日期' },
       { key: 'voucher_no', desc: '凭证字号' },
       { key: 'direction', desc: '借贷方向' },
       { key: 'balance', desc: '该科目余额' },
@@ -384,7 +400,7 @@ const FIELD_DOC = [
 
 const COLUMN_KEYS = [
   'line_no', 'summary', 'subject', 'debit', 'credit',
-  'date', 'voucher_no', 'direction', 'balance',
+  'date', 'month', 'day', 'voucher_no', 'direction', 'balance',
   'code', 'name', 'level',
   'opening_debit', 'opening_credit', 'period_debit', 'period_credit',
   'closing_debit', 'closing_credit', 'opening', 'closing',
@@ -413,6 +429,8 @@ function onPaperChange() {
 
 const listOfScope = computed(() => list.value.filter((t) => t.scope === scope.value))
 const isVoucher = computed(() => scope.value === 'VOUCHER')
+const selectedPreviewSubject = computed(() => subjects.value.find((s) => s.id === previewSubjectId.value))
+const previewRangeSubjects = computed(() => selectedPreviewSubject.value?.children || [])
 const rowCountTip = computed(() => tpl.value?.voucher?.rows_per_page || 5)
 /** 用一张 12 行的凭证当例子，把分页编号格式串渲染成看得懂的样子。 */
 const splitExample = computed(() => {
@@ -514,10 +532,49 @@ async function loadTemplate(id) {
 }
 
 async function loadPreviewData() {
-  subjects.value = await subjectApi.subjectFlat(store.bookId)
-  if (!previewSubjectId.value && subjects.value.length) previewSubjectId.value = subjects.value[0].id
+  const tree = await subjectApi.subjectTree(store.bookId, { include_inactive: true })
+  const flatten = (nodes, parentId = null) => nodes.flatMap((node) => {
+    const item = { ...node, parent_id: parentId }
+    return [item, ...flatten(node.children || [], node.id)]
+  })
+  subjects.value = flatten(tree)
+  if (!previewSubjectId.value || !subjects.value.some((s) => s.id === previewSubjectId.value)) {
+    previewSubjectId.value = subjects.value.find((s) => s.is_leaf && s.active)?.id || subjects.value[0]?.id || null
+  }
+  resetPreviewSubjectRange()
   reports.value = await reportApi.templates()
   if (!previewReportId.value && reports.value.length) previewReportId.value = reports.value[0].id
+}
+
+function subjectLabel(s) {
+  const indent = '　'.repeat(Math.max(0, s.level - 1))
+  const kind = s.children?.length ? '（综合）' : ''
+  const inactive = s.active ? '' : '（停用）'
+  return `${indent}${s.code} ${s.name}${kind}${inactive}`
+}
+
+function resetPreviewSubjectRange() {
+  previewFromSubjectId.value = previewRangeSubjects.value[0]?.id ?? null
+  previewToSubjectId.value = previewRangeSubjects.value.at(-1)?.id ?? null
+}
+
+function onPreviewSubjectChange() {
+  resetPreviewSubjectRange()
+  refreshPreview()
+}
+
+function onPreviewFromSubjectChange() {
+  const start = previewRangeSubjects.value.findIndex((s) => s.id === previewFromSubjectId.value)
+  const end = previewRangeSubjects.value.findIndex((s) => s.id === previewToSubjectId.value)
+  if (start > end) previewToSubjectId.value = previewFromSubjectId.value
+  refreshPreview()
+}
+
+function onPreviewToSubjectChange() {
+  const start = previewRangeSubjects.value.findIndex((s) => s.id === previewFromSubjectId.value)
+  const end = previewRangeSubjects.value.findIndex((s) => s.id === previewToSubjectId.value)
+  if (end < start) previewFromSubjectId.value = previewToSubjectId.value
+  refreshPreview()
 }
 
 /**
@@ -533,6 +590,8 @@ function previewPayload() {
     period_id: previewPeriodId.value,
     from_period_id: fromPeriodId.value || undefined,
     subject_id: previewSubjectId.value || undefined,
+    from_subject_id: previewRangeSubjects.value.length ? previewFromSubjectId.value : undefined,
+    to_subject_id: previewRangeSubjects.value.length ? previewToSubjectId.value : undefined,
     report_template_id: previewReportId.value || undefined,
   }
 }
@@ -553,7 +612,10 @@ function buildTarget() {
               { period_id: pid, template_id: tp, from_period_id: fromPeriodId.value || undefined }]
     case 'DETAIL_LEDGER':
       return [`/books/${b}/print/detail-ledger.html`,
-              { period_id: pid, template_id: tp, subject_id: previewSubjectId.value }]
+              { period_id: pid, from_period_id: fromPeriodId.value || undefined,
+                template_id: tp, subject_id: previewSubjectId.value,
+                from_subject_id: previewRangeSubjects.value.length ? previewFromSubjectId.value : undefined,
+                to_subject_id: previewRangeSubjects.value.length ? previewToSubjectId.value : undefined }]
     case 'BALANCE':
       return [`/books/${b}/print/balance.html`, { period_id: pid, template_id: tp }]
     case 'REPORT':
