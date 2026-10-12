@@ -18,6 +18,9 @@
           </el-select>
         </el-form-item>
         <el-form-item>
+          <el-button @click="doRename" :disabled="!templateId || !store.canWrite">
+            <el-icon><EditPen /></el-icon>&nbsp;重命名
+          </el-button>
           <el-button @click="doCopy" :disabled="!templateId"><el-icon><CopyDocument /></el-icon>&nbsp;复制一份</el-button>
           <el-button @click="doCreate"><el-icon><Plus /></el-icon>&nbsp;新建空白</el-button>
           <el-button type="danger" plain :disabled="!templateId" @click="doDelete">
@@ -108,6 +111,19 @@
           <el-form-item label="重复表头">
             <el-switch v-model="tpl.body.repeat_header" @change="normalize" />
           </el-form-item>
+
+          <template v-if="isVoucher">
+            <el-divider content-position="left">分页</el-divider>
+            <el-form-item label="分页编号">
+              <el-input v-model="tpl.voucher.split_format" @input="schedulePreview" @change="normalize" />
+            </el-form-item>
+            <div class="ph-tip">
+              凭证字号按这个格式加分页号：<b>{{ splitExample }}</b>；
+              超过 {{ rowCountTip }} 行拆成多张时页码跟着变（如 002/006），不拆的是 001/001。
+              占位符 {page} 本张页码、{pages} 总页数、{first} 起始行、{last} 结束行、{lines} 总行数，
+              数字自动补零到三位。
+            </div>
+          </template>
         </el-form>
       </el-card>
 
@@ -242,7 +258,7 @@
 <script setup>
 import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Top, Bottom, Plus, CopyDocument, Refresh, Printer } from '@element-plus/icons-vue'
+import { Delete, EditPen, Top, Bottom, Plus, CopyDocument, Refresh, Printer } from '@element-plus/icons-vue'
 import VoucherLayoutEditor from '@/components/VoucherLayoutEditor.vue'
 import * as printApi from '@/api/print'
 import * as reportApi from '@/api/report'
@@ -269,7 +285,8 @@ const EMPTY_TPL = {
   columns: [{ key: 'summary', label: '摘要', width: 40, align: 'left', indent: 0 }],
   footer: { text: '', show_page_no: true, format: '第 {page} 页　共 {total} 页' },
   body: { repeat_header: true, border: true },
-  voucher: { rows_per_page: 5, split_number: true, fill_rows: true },
+  voucher: { rows_per_page: 5, split_number: true, fill_rows: true,
+             split_format: '{voucher_no} - {page}/{pages}' },
   elements: [],
 }
 
@@ -396,6 +413,17 @@ function onPaperChange() {
 
 const listOfScope = computed(() => list.value.filter((t) => t.scope === scope.value))
 const isVoucher = computed(() => scope.value === 'VOUCHER')
+const rowCountTip = computed(() => tpl.value?.voucher?.rows_per_page || 5)
+/** 用一张 12 行的凭证当例子，把分页编号格式串渲染成看得懂的样子。 */
+const splitExample = computed(() => {
+  const fmt = tpl.value?.voucher?.split_format || '{voucher_no} - {page}/{pages}'
+  const pages = Math.ceil(12 / (rowCountTip.value || 5))
+  const width = Math.max(3, String(pages).length)
+  const z = (n) => String(n).padStart(width, '0')
+  return fmt.replace(/\{(\w+)\}/g, (_, k) =>
+    ({ voucher_no: '记001号', page: z(1), pages: z(pages),
+       first: z(1), last: z(rowCountTip.value), lines: z(12) }[k] ?? ''))
+})
 const voucherSlots = computed(() => (TWO_UP_PAPERS.includes(tpl.value.paper) ? 2 : 1))
 function paperLabel(key) {
   return isVoucher.value ? (PAPER_LABEL[key] || key) : key
@@ -714,6 +742,29 @@ async function save() {
   }
 }
 
+/**
+ * 改模板名。名字只存在数据库里，跟版式内容无关 ——
+ * 改名不该动版式，也不该把「未保存」这个提示点出来（它只比对 tpl）。
+ */
+async function doRename() {
+  const cur = listOfScope.value.find((t) => t.id === templateId.value)
+  if (!cur) return
+  let name
+  try {
+    ;({ value: name } = await ElMessageBox.prompt('模板名称', '重命名打印模板', {
+      inputValue: cur.name,
+      inputValidator: (v) => (v && v.trim() ? true : '名称不能为空'),
+    }))
+  } catch {
+    return                       // 点了取消
+  }
+  const next = name.trim()
+  if (next === cur.name) return
+  await printApi.updateTemplate(store.bookId, cur.id, { name: next })
+  ElMessage.success(`已改名为「${next}」`)
+  await loadTemplates()
+}
+
 async function doCopy() {
   const t = await printApi.copyTemplate(store.bookId, templateId.value)
   ElMessage.success(`已复制为「${t.name}」`)
@@ -821,6 +872,11 @@ watch(() => store.bookId, async () => {
 }
 .card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .card-head .title { font-weight: 600; font-size: 14px; color: var(--cwq-text); }
+.ph-tip {
+  font-size: 12px; color: #909399; line-height: 1.7;
+  padding: 0 0 4px; word-break: break-word;
+}
+.ph-tip b { color: var(--cwq-text); }
 .panel :deep(.el-form-item) { margin-bottom: 12px; }
 .panel :deep(.el-form-item__content) { min-width: 0; }
 .panel :deep(.el-input), .panel :deep(.el-select) { min-width: 0; max-width: 100%; }

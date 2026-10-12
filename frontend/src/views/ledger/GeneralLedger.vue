@@ -3,13 +3,14 @@
     <div class="toolbar no-print">
       <span class="muted">起</span>
       <el-select v-model="fromId" style="width: 120px" @change="load">
-        <el-option v-for="p in store.periods" :key="p.id" :label="p.code" :value="p.id" />
+        <el-option v-for="p in yearPeriods" :key="p.id" :label="p.code" :value="p.id" />
       </el-select>
       <span class="muted">止</span>
       <el-select v-model="toId" style="width: 120px" @change="load">
-        <el-option v-for="p in store.periods" :key="p.id" :label="p.code" :value="p.id" />
+        <el-option v-for="p in yearPeriods" :key="p.id" :label="p.code" :value="p.id" />
       </el-select>
       <el-checkbox v-model="leafOnly" label="仅明细科目" @change="load" />
+      <el-checkbox v-model="includeUnposted" label="包含未记账凭证" @change="load" />
       <span class="spacer" />
       <el-button @click="previewHtml">模板预览/打印</el-button>
       <el-button @click="window.print()">打印本页</el-button>
@@ -42,7 +43,7 @@
 </template>
 
 <script setup>
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import * as api from '@/api/ledger'
 import { downloadFile, openPrint } from '@/api/print'
 import { useSessionStore } from '@/stores/session'
@@ -54,13 +55,35 @@ const loading = ref(false)
 const fromId = ref(store.periodId)
 const toId = ref(store.periodId)
 const leafOnly = ref(true)
+/** 未记账凭证也参与计算 —— 默认开，理由同明细账。 */
+const includeUnposted = ref(true)
+
+/** 起止只列顶栏那个年份的期间。列全部年份时，顶栏停在 2027、
+ *  下拉里却能翻出 2026-06，翻过去算的是另一本账。 */
+const yearPeriods = computed(() => store.periodsOfYear(store.currentYear))
+
+/** 起止必须落在顶栏那个年份里；落空了就回到顶栏当前那一期。
+ *  换年份后原来那个 id 不在新列表里，el-select 会显示成空白或裸 id，
+ *  而传出去的就是一个不属于当前年份的下界/上界。 */
+function anchorPeriods() {
+  const pool = yearPeriods.value
+  if (!pool.length) { fromId.value = null; toId.value = null; return }
+  const cur = pool.some((p) => p.id === store.periodId) ? store.periodId : pool[0].id
+  if (!pool.some((p) => p.id === fromId.value)) fromId.value = cur
+  if (!pool.some((p) => p.id === toId.value)) toId.value = cur
+}
 
 async function load() {
   if (!store.bookId) return
+  // 期间还没灌完就查，后端会拿**它自己默认的那一期**当上下界 ——
+  // 请求里压根没有 from/to，回来的数是另一段区间，页面上看着还像那么回事。
+  // 与其先显示一个错的再纠正，不如等 store.periods 到位（上面的 watch 会再触发一次）。
+  if (!yearPeriods.value.length) return
   loading.value = true
   try {
     data.value = await api.general(store.bookId, {
-      from_period_id: fromId.value, to_period_id: toId.value, leaf_only: leafOnly.value
+      from_period_id: fromId.value, to_period_id: toId.value, leaf_only: leafOnly.value,
+      include_unposted: includeUnposted.value
     })
   } finally {
     loading.value = false
@@ -69,6 +92,7 @@ async function load() {
 function previewHtml() {
   openPrint(`/books/${store.bookId}/print/general-ledger.html`, {
     period_id: toId.value, from_period_id: fromId.value || undefined,
+    leaf_only: leafOnly.value, include_unposted: includeUnposted.value,
   })
 }
 
@@ -80,11 +104,19 @@ function exportXlsx() {
   //
   // 与上面 previewHtml 的口径保持一致：那边是 from_period_id || undefined。
   downloadFile(`/books/${store.bookId}/print/general-ledger.xlsx`,
-    { period_id: toId.value, from_period_id: fromId.value || undefined }, '总账.xlsx')
+    { period_id: toId.value, from_period_id: fromId.value || undefined,
+      leaf_only: leafOnly.value, include_unposted: includeUnposted.value }, '总账.xlsx')
 }
 
-onMounted(() => { toId.value = store.periodId; load() })
-watch(() => store.bookId, load)
+onMounted(() => { toId.value = store.periodId; anchorPeriods(); load() })
+watch(() => store.bookId, () => { anchorPeriods(); load() })
+// 年份一变，起止跟着重新落在新年份里；
+// 顺带接住「页面比 store.periods 先加载完」那一路（periods 到位后 currentYear 才成真值）
+// 盯着**年份和期间数**，不是只盯年份：
+// store.loadBooks() 先灌 books、再灌 periods，currentYear 会先从 books 的
+// latest_year 变成真值，那一刻 periods 还是空的。只盯年份的话 watcher 只响一次，
+// 打在空列表上，之后 periods 到位也不再响 —— 起止就一直停在 null 上。
+watch(() => [store.currentYear, store.periods.length], () => { anchorPeriods(); load() })
 </script>
 
 <style scoped>

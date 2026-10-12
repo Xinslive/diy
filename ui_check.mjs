@@ -92,7 +92,7 @@ await step('打开利润表', async () => {
 await page.screenshot({ path: `${out}/07-income-report.png` })
 
 await step('期末处理面板', async () => {
-  await page.click('.el-menu-item:has-text("期末处理")')
+  await page.click('.el-menu-item:has-text("期末结账")')
   await page.waitForSelector('.act-title', { timeout: 10000 })
   await page.waitForTimeout(400)
 })

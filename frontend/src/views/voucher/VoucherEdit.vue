@@ -85,12 +85,20 @@
                  所以还得把指针穿透掉，让点击落到格子上，提示才出得来 -->
             <div class="vg-cell td td-sum" :class="{ 'is-blocked': blocked(i) }"
                  @click="warnBlocked(i)">
-              <!-- 点一下整格选中：摘要多半是同一句话抄好几遍，
-                   要改就整句重打，不必先把光标挪到末尾一个一个退格 -->
-              <input v-model="row.summary" class="cell-input" :disabled="readonly || blocked(i)"
-                     :ref="(el) => setSumRef(el, i)"
-                     placeholder="摘要" @focus="activeRow = row"
-                     @click="selectText($event)" @keydown.enter.prevent="moveNext(i, 'sum')" />
+              <!-- 光标进这一格就整格选中：摘要多半是同一句话抄好几遍，
+                   要改就整句重打，不必先把光标挪到末尾一个一个退格。
+                   但只管刚进来的那一下 —— 再点一下、再按一下方向键，
+                   光标就该回到人放的位置，好改其中几个字。
+                   用 textarea 而不是 input：摘要写长了单行框会把它截在边上，
+                   看不见自己到底写了什么，得专门点进去拖光标才看得到 ——
+                   写满一行自动折成两行（最多两行，再多就在框里滚）。 -->
+              <textarea v-model="row.summary" class="cell-input" rows="1"
+                        :disabled="readonly || blocked(i)"
+                        :ref="(el) => setSumRef(el, i)"
+                        placeholder="摘要" @focus="focusSumText(i, $event)"
+                        @click="selectText($event)" @input="autosizeSum($event.target)"
+                        @keydown="onSumKeydown(i, $event)"
+                        @keydown.enter.prevent="moveNext(i, 'sum')" />
             </div>
             <div class="vg-cell td td-subj"
                  :class="{ 'is-blocked': blocked(i), 'is-bad': badSubject(row) }"
@@ -102,10 +110,16 @@
                 :disabled="readonly || blocked(i)"
                 @focusin="activeRow = row"
                 @change="onSubject(row)"
-                @add="openSubjectCreate(i)"
+                @add="(kw) => openSubjectCreate(i, kw)"
+                @editing="(v) => onMarking(row, v)"
                 @enter="moveNext(i, 'subj')"
                 @picked="moveNext(i, 'subj')"
+                @left="moveSide(i, 'subj', -1)" @right="moveSide(i, 'subj', 1)"
               />
+              <!-- 辅助记账：这个科目当前还剩多少（借正贷负）。压在格子左下角，
+                   不占行高 —— 分录格是「从上往下写」的一张纸，正中得留给科目名。
+                   只读时不显示：余额是给「正在录」的人看的，核对账另有科目余额表。 -->
+              <span v-if="balanceText(row)" class="subj-balance">{{ balanceText(row) }}</span>
             </div>
             <div class="vg-cell td td-amt d" :class="{ 'is-blocked': blocked(i) }"
                  @click="warnBlocked(i)">
@@ -117,6 +131,7 @@
                 @focus="activeRow = row"
                 @enter="moveNext(i, 'd')"
                 @up="moveRow(i, -1, 'd')" @down="moveRow(i, 1, 'd')"
+                @left="moveSide(i, 'd', -1)" @right="moveSide(i, 'd', 1)"
                 @balance="autoBalance(i, 'd')"
               />
             </div>
@@ -130,6 +145,7 @@
                 @focus="activeRow = row"
                 @enter="moveNext(i, 'c')"
                 @up="moveRow(i, -1, 'c')" @down="moveRow(i, 1, 'c')"
+                @left="moveSide(i, 'c', -1)" @right="moveSide(i, 'c', 1)"
                 @balance="autoBalance(i, 'c')"
               />
             </div>
@@ -142,9 +158,10 @@
           </div>
 
           <div class="vg-row vg-total">
-            <div class="vg-cell td td-sumcell">合计：{{ amountToChinese(total.debit) }}</div>
-            <!-- 合计是 0 就不往格子里塞「0」：空格子比一个孤零零的 0 干净，
-                 左边那行「合计：零元整」已经说清楚了 -->
+            <!-- 合计格只写「合计」两个字，靠右贴住借方金额列。中文大写搬到打印模板去了
+                 （打印的「合计大写」由后端出），纸上那张凭证才留得住这张老规矩 -->
+            <div class="vg-cell td td-sumcell">合计</div>
+            <!-- 合计是 0 就不往格子里塞「0」：空格子比一个孤零零的 0 干净 -->
             <div class="vg-cell td td-total d"><AmountCells :value="money2(total.debit)" /></div>
             <div class="vg-cell td td-total c"><AmountCells :value="money2(total.credit)" /></div>
           </div>
@@ -156,18 +173,16 @@
         <span class="foot-right">
           <span v-if="saving" class="muted">正在自动保存…</span>
           <span v-else-if="savedAt" class="saved-tag">已自动保存 {{ savedAt }}</span>
-          <span class="muted">借方合计 <b>{{ fmt(total.debit) }}</b></span>
-          <span class="muted">贷方合计 <b>{{ fmt(total.credit) }}</b></span>
           <span v-if="nonLeafRows.length" class="tag-bad">
             第 {{ form.entries.indexOf(nonLeafRows[0]) + 1 }} 行不是末级科目
           </span>
           <span v-if="blank" class="muted">还没录金额</span>
           <span v-else-if="balanced" class="tag-ok">借贷平衡 ✓</span>
-          <span v-else class="tag-bad">差额 {{ fmt(Math.abs(total.debit - total.credit)) }}</span>
+          <span v-else class="tag-bad">{{ diffTag }}</span>
         </span>
       </div>
 
-      <SubjectFormDialog v-model="subjectCreateOpen" :tree="subjectTree"
+      <SubjectFormDialog v-model="subjectCreateOpen" :tree="subjectTree" :preset="subjectPreset"
                         @saved="onSubjectCreated" />
     </div>
 
@@ -207,9 +222,10 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import * as api from '@/api/voucher'
 import * as subjectApi from '@/api/subject'
+import * as ledgerApi from '@/api/ledger'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
-import { amountToChinese } from '@/utils/money'
+import { displayBalance } from '@/utils/balanceSign'
 import AmountGrid from '@/components/AmountGrid.vue'
 import SubjectPicker from '@/components/SubjectPicker.vue'
 import SubjectFormDialog from '@/components/SubjectFormDialog.vue'
@@ -322,8 +338,12 @@ const badSubject = (row) => {
 /** 在凭证里当场加一个科目：加完自动选中，接着就能填金额 */
 const subjectCreateOpen = ref(false)
 const subjectCreateRow = ref(0)
-function openSubjectCreate(i) {
+/** 人刚在格子里敲的那串字（填了查不到的编码再点添加）。带进弹窗去自动铺，
+ *  不用人把同一串号在两个地方各敲一遍。 */
+const subjectPreset = ref('')
+function openSubjectCreate(i, kw) {
   subjectCreateRow.value = i
+  subjectPreset.value = String(kw || '').trim()
   subjectCreateOpen.value = true
 }
 async function onSubjectCreated(s) {
@@ -341,12 +361,131 @@ async function loadSubjects() {
   const walk = (nodes, parent = null) => nodes.forEach((n) => {
     flat.push({
       id: n.id, code: n.code, name: n.name, category: n.category,
+      // direction 是科目表里那一列「余额方向」，科目格余额的正负就是按它定的
+      direction: n.direction,
       level: n.level, parent_id: parent, is_leaf: n.is_leaf
     })
     if (n.children?.length) walk(n.children, n.id)
   })
   walk(tree, null)
   subjects.value = flat
+}
+
+// ---- 科目余额：每行科目格左下角那个数字 ----
+// 辅助记账时看着余额填金额，用不着跳去科目余额表。
+const balances = ref({})
+/** 这张凭证自己的期间 id。直接取接口给的 period_id，不去 store.periods 里反查。 */
+const voucherPeriodId = ref(0)
+
+/**
+ * 算余额取哪一期。
+ *
+ * 老凭证用它自己那张的：翻一张 2026-12 的老凭证，顶栏可能停在 2027-01，
+ * 页眉写的是凭证自己的期间，余额却按顶栏那期算，两处对不上。
+ * 新凭证以顶栏为准（保存时也是按顶栏那期落的）。
+ *
+ * 新凭证这一支尤其不能靠 store.periods 反查：那个数组是异步灌的，
+ * 页面完全可能比它先加载完 —— 那一刻 currentPeriod 还是空的，余额就一直拉不出来。
+ * 底下那个 watch 接的就是这一下：periodId 从 0 变成真值时再拉一次。
+ */
+const balancePeriodId = computed(() => voucherPeriodId.value || store.currentPeriod?.id || 0)
+
+let balanceSeq = 0
+/**
+ * 拉「除本张以外」的科目余额。
+ *
+ * voucherId 传上去让后端把这张自己剔掉：它是**基数**，本张正在填的分录
+ * 由前端 ownDelta 补回去（见 balanceText）。两者必须分开，否则这张被算两遍 ——
+ * 它 0.7 秒后就自动保存，落了库还留在账上，前端再加一次就翻倍了。
+ *
+ * 好处顺带白拿：基数只在这张/这期换的时候拉一次，录入过程中一个数都不发，
+ * 格子里那个数是本机算出来的，敲完就变，没有「等一下才动」。
+ *
+ * 代次守卫跟 load() 一个道理：翻凭证翻得快时先发的那一趟可能后到，
+ * 晚到的那一趟才配写进 balances.value。
+ */
+async function loadBalances() {
+  const seq = ++balanceSeq
+  const periodId = balancePeriodId.value
+  if (!store.bookId || !periodId) { balances.value = {}; return }
+  try {
+    const d = await ledgerApi.voucherBalances(store.bookId, {
+      period_id: periodId,
+      voucher_id: voucherId.value || undefined
+    })
+    if (seq !== balanceSeq) return
+    balances.value = d.balances || {}
+  } catch {
+    if (seq !== balanceSeq) return
+    balances.value = {}   // 拉不到就不显示，绝不拿旧数字挡住这一格
+  }
+}
+
+// 期间或凭证换了就重拉。voucherId 也在盯着：前一张/后一张翻的是不同凭证，
+// 各自要剔掉的是自己那张 —— 同一期里翻 balancePeriodId 不会变，光盯它就翻不动了。
+watch([balancePeriodId, voucherId], loadBalances, { immediate: true })
+
+/**
+ * 这张凭证**自己**给每个科目带来的变动（借正贷负）。
+ *
+ * 辅助记账要看的是「这一张存下去之后还剩多少」，不是「存之前还剩多少」：
+ * 往 1001 贷方填 3000 万，那一格就该从 36,500 走到 -29,963,500。
+ * 所以显示值 = 剔除本张后的账上余额 + 本张正在填的分录。
+ *
+ * 算一次全表，不在模板里逐行遍历 —— 每次敲键重算一遍 O(行数) 就够，
+ * 摊到每行各算一次是 O(行数²)。
+ */
+const ownDelta = computed(() => {
+  const m = {}
+  for (const e of form.entries) {
+    if (!e.subject_id) continue
+    const a = num(e.amount)
+    if (!a) continue
+    m[e.subject_id] = (m[e.subject_id] || 0) + (e.direction === 'DEBIT' ? a : -a)
+  }
+  return m
+})
+
+/**
+ * 这一行显示的余额文本：纯数字，不带「借/贷」也不带「余额」两个字。
+ *
+ * 正负按科目表那一列「余额方向」定，不是按实际落在借方还是贷方：
+ * 借属性借正贷负、贷属性借负贷正（见 utils/balanceSign.js）。
+ * 0 显示成空 —— 一个空科目没有余额可言，写个「0.00」只会在每张凭证上多几行噪音。
+ * 千分位由 fmt 统一带，跟页脚合计、科目余额表是同一套写法。
+ */
+/**
+ * 哪几行正在「标记科目」。
+ *
+ *  用**分录对象**当键而不是行号：插入、删除、翻凭证都在动行号，
+ *  按行号记的标记会跟着行搬家，余额就收错了行。翻凭证时整套换掉，这里也整套清掉。
+ */
+const markingRows = ref(new Set())
+function onMarking(row, on) {
+  const next = new Set(markingRows.value)
+  if (on) next.add(row); else next.delete(row)
+  markingRows.value = next
+}
+
+const balanceText = (row) => {
+  if (readonly.value) return ''          // 只读凭证是给人核对和打印的，不是给人录入的
+  // 人正在这一格里敲科目：角上那个数是上一个科目的余额，
+  // 摆在还没对上号的字旁边，人会照着它填金额。先收起来，选定了再给
+  if (markingRows.value.has(row)) return ''
+  const sid = row?.subject_id
+  if (!sid) return ''
+  // balances 是「账上除本张以外」的，ownDelta 是「本张正在填的」，
+  // 两个加起来才是「这一张存下去之后的余额」。加了本张的分录，
+  // 一个空科目也会被自己这笔钱点亮 —— 600101 原本余额是 0，
+  // 借方填了 3000 万就该显示出来，而不是空着。
+  //
+  // 借贷先按引擎口径（借正贷负）加总，**加完再按科目余额方向翻正负**：
+  // 贷属性的科目（负债/权益/收入）借方有余额时显示负数，一眼看出录反了方向。
+  // 翻只在这一处发生，别在 ownDelta 里提前翻 —— 那样基数和增量两套符号会打架。
+  const sub = subjectOf(sid)
+  const n = displayBalance(sub?.direction, num(balances.value[sid]) + (ownDelta.value[sid] || 0))
+  if (!n) return ''
+  return fmt(n)
 }
 
 // ---- 借方/贷方是两个独立格子，数据层还是一个 direction + amount ----
@@ -418,12 +557,17 @@ const total = computed(() => {
   }
   return { debit, credit }
 })
-/** 平不平。**红字凭证（借贷两边都是负的）也是平的** —— 它冲的是老账，
- *  照样该存、该记账。所以判据是「两边相等且不是全零」，不是「大于 0」。
- *  「不是全零」看带符号那一对：正负相抵成 0 的凭证（借100 / 借-100 / 贷50 / 贷-50）
- *  看着是平的，其实什么也没记，后端也拒，不能让它自动存下去。 */
-const balanced = computed(() =>
-  total.value.debit === total.value.credit && signedTotal.value.debit !== 0)
+/**
+ * 平不平：**借方合计 = 贷方合计，就是平的**。
+ *
+ *  两种看着「不像平」的形状都是平的，别去替人把它们判成不平：
+ *  红字凭证（借 −300 / 贷 −300）冲的是老账，照样该存；
+ *  正负相抵（借 111 / 借 −111）记的是一次冲销 —— 红字把 −111 搬去了对面，
+ *  两栏一样大，就该按平处理（2026-10-12 用户明确要求的）。
+ *
+ *  一条都还没录是另一回事：那走 `blank`，页脚说「还没录金额」，不是「平」。
+ */
+const balanced = computed(() => total.value.debit === total.value.credit)
 // 「这张凭证现在长什么样」：自动保存靠它判断有没有改动。没动过就不重存。
 const entrySig = computed(() => JSON.stringify([
   form.voucher_date, form.voucher_no, form.attachments, form.remark,
@@ -431,8 +575,19 @@ const entrySig = computed(() => JSON.stringify([
 ]))
 const lastSaved = ref('')      // 上一次落库的签名
 const savedAt = ref('')        // 上一次落库的时间，页脚上给个准信
-// 一分钱都还没录的时候别急着报红字「差额 0.00」，那是噪音不是提示
+/**
+ * 差额要说清是**哪一边大**。
+ *
+ *  只写「差额 90.00」，90 这个数看着像凭空冒出来的；其实两栏摆在那儿，
+ * 一眼比得出大小。不说方向，人还得自己回头数一遍是借多还是贷多，
+ * 才知道该往哪一格补 —— 而这恰恰是页脚这句话唯一该干的事。
+ */
+const diffTag = computed(() => `${total.value.debit > total.value.credit ? '借方大' : '贷方大'} ${
+  fmt(Math.abs(total.value.debit - total.value.credit))}`)
+
+// 一分钱都还没录的时候别急着报红字，那是噪音不是提示
 const blank = computed(() => total.value.debit === 0 && total.value.credit === 0)
+
 
 function subjectText(id) {
   const s = subjects.value.find((x) => x.id === id)
@@ -456,9 +611,32 @@ function setSubjectRef(el, idx) {
   else subjectRefs.delete(idx)
 }
 function setSumRef(el, idx) {
-  if (el) sumRefs.set(idx, el)
+  if (el) { sumRefs.set(idx, el); nextTick(() => autosizeSum(el)) }
   else sumRefs.delete(idx)
 }
+
+/**
+ * 摘要格按内容长高：写满一行折成两行，最多两行，再多就在框里滚。
+ *
+ *  高度得自己算，因为格子（td-sum）是定高的 68px，框也铺满整格：
+ * 框若一直是单行高，长摘要就贴着上边沿被截掉，看不见写了什么。
+ * 先把 height 撤成 auto 量出内容真正要多少，再取 min(内容, 两行) ——
+ * 少了 min，超长摘要会把框撑到五行、盖住下面那一行；少了 auto，量到的永远是当前高度。
+ */
+function autosizeSum(el) {
+  if (!el) return
+  sumArmed = false        // 已经动手改了：整格选中到此为止，别等下一帧又划掉刚打的字
+  const lh = parseFloat(getComputedStyle(el).lineHeight) || 21
+  const max = lh * 2
+  el.style.height = 'auto'
+  const need = el.scrollHeight
+  el.style.height = Math.min(need, max) + 'px'
+  el.style.overflowY = need > max ? 'auto' : 'hidden'
+}
+/** 摘要一改、列宽一变（窗口缩放），折行位置就变了，高度得跟着重量一遍 */
+watch(() => form.entries.map((e) => e.summary).join('\u0001'), () => {
+  nextTick(() => sumRefs.forEach((el) => autosizeSum(el)))
+})
 function setAmtRef(el, idx, side) {
   const k = `${idx}:${side}`
   if (el) amtRefs.set(k, el)
@@ -474,9 +652,40 @@ function focusSum(i) {
   })
 }
 
+/**
+ * 整格选中只在**刚进这一格**的那一下有效，跟科目格一个规矩。
+ *
+ *  摘要多半是同一句话抄好几遍，改的时候常常是整句重打 —— 这时候全选省事。
+ *  但偶尔只想改中间几个字（日期、金额、一个词），全选又按不掉、也点不掉的话，
+ *  这一格就只能整段覆盖着改。过了进格的那一下，人再点、再按方向键，
+ *  都是他自己要挪光标，别再抢。
+ */
+let sumArmed = false
+
+/** 整格选中（连同「下一帧再补一次」那一下） */
+function selectAllSum(el) {
+  if (!el?.select) return
+  el.select()
+  sumArmed = true
+  // Chrome 把「光标落到点上的那个位置」排在 click 处理器**之后**才做，
+  // 刚选好的整格会被抹成一个光标位。下一帧再选一次，抹掉的正是它。
+  requestAnimationFrame(() => {
+    if (sumArmed && document.activeElement === el && el.selectionStart === el.selectionEnd) el.select()
+    sumArmed = false
+  })
+}
+
 /** 点哪个格就选中哪个格的字：改内容整句重打，省得先按住退格键一路退到头 */
 function selectText(e) {
-  e?.target?.select?.()
+  const el = e?.target
+  if (!el?.select || !sumArmed) return       // 已经是自己点进来的：光标落在点上
+  selectAllSum(el)
+}
+
+/** 光标进摘要格：把这一句让出来，接着打就是重打 */
+function focusSumText(i, e) {
+  activeRow.value = form.entries[i]
+  selectAllSum(e?.target)
 }
 
 /**
@@ -494,6 +703,56 @@ function moveRow(i, delta, side) {
   const row = form.entries[at]
   activeRow.value = row
   nextTick(() => amtRefs.get(`${at}:${side}`)?.focus?.())
+}
+
+/**
+ * 金额格的光标走到头，方向键往旁边那一格走 —— 跟 ↑↓ 走相邻行是同一个手势。
+ *
+ *  横向的口子跟纵向不一样：借方的左边是会计科目，右边是贷方；
+ *  贷方的左边是借方，右边已经是表格外头了 —— 到头就停住，
+ *  凭空把光标甩到别处去只会让人丢了自己正在记的那一行。
+ *
+ *  落过去一律走 focus()：键盘进来的光标照旧落到元/角之间那条红线上，
+ *  跟 Tab、跟上下键进来是同一个约定，鼠标点过去的那一套不掺和进来。
+ */
+/**
+ * 摘要格的方向键：走到头就跟金额格、科目格一样**换格子**。
+ *
+ *  整行是「摘要 → 会计科目 → 借方 → 贷方」，手一路往右敲下来，
+ *  到摘要末尾再按一下 → 却只能把光标按在原地 —— 明明右边就摆着下一格。
+ *  到头才换、不到头照旧在格内挪光标：有选区时也先收选区，跟别处一个规矩。
+ *
+ *  ← 到头没地方去：左边那一列是序号，不可编辑 —— 停住，别把人甩到别处去。
+ */
+function onSumKeydown(i, e) {
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
+  const el = e.target
+  const s = el.selectionStart ?? 0
+  if ((el.selectionEnd ?? s) !== s) return        // 有选区：先照默认的收掉
+  const edge = e.key === 'ArrowRight' ? el.value.length : 0
+  if (s !== edge) return                          // 还在格内：交给默认行为
+  if (e.key === 'ArrowLeft') return               // 左边是序号，没有可编辑的格子
+  e.preventDefault()
+  moveSide(i, 'sum', 1)
+}
+
+function moveSide(i, side, dir) {
+  if (blocked(i)) return warnBlocked(i)
+  activeRow.value = form.entries[i]
+  nextTick(() => {
+    // 左边：摘要的左边是序号（不可编辑），科目的左边是摘要，借方的左边是科目，
+    // 贷方的左边是借方。右边：科目的右边是借方，借方的右边是贷方，
+    // 贷方的右边已经是表格外头了 —— 到头就停住。
+    if (dir < 0) {
+      if (side === 'subj') return sumRefs.get(i)?.focus?.()
+      if (side === 'd') return subjectRefs.get(i)?.focusInput?.()
+      if (side === 'c') return amtRefs.get(`${i}:d`)?.focus?.()
+      return
+    }
+    if (side === 'sum') return subjectRefs.get(i)?.focusInput?.()
+    if (side === 'subj') return amtRefs.get(`${i}:d`)?.focus?.()
+    if (side === 'd') return amtRefs.get(`${i}:c`)?.focus?.()
+  })
 }
 
 /**
@@ -755,12 +1014,16 @@ async function load() {
   await loadSubjects()
   if (stale(seq)) return
   subjectRefs.clear()
+  // 标记状态是拿**分录对象**当键的，而分录对象刚被换了一整套 ——
+  // 不清的话，上一张还在标记的行会留在集合里，白收着这张的余额
+  markingRows.value = new Set()
   if (myId) {
     const v = await api.getVoucher(store.bookId, myId)
     if (stale(seq)) return
     // 双重确认：代次之外再核对 id，防的是「代次对上了但期间切换了」
     if (Number(route.params.id || 0) !== myId) return
     voucherPeriod.value = store.periods.find((p) => p.id === v.period_id) || null
+    voucherPeriodId.value = v.period_id   // store.periods 还没灌完时也能算余额
     Object.assign(form, {
       voucher_no: v.voucher_no, voucher_date: v.voucher_date, status: v.status,
       attachments: v.attachments, remark: v.remark,
@@ -802,6 +1065,7 @@ async function load() {
       form.voucher_date = route.query.date || n.voucher_date || defaultDate()
     }
     voucherPeriod.value = null   // 新凭证还没保存，期间以保存时按日期落库为准
+    voucherPeriodId.value = 0    // 还没落库：期间跟顶栏（保存时也是按顶栏那期落的）
     ensureRows(4)
     prevId.value = null
     nextId.value = null
@@ -880,6 +1144,7 @@ async function save({ quiet = false } = {}) {
       // replaceState 不触发 hashchange，router 内部状态原样保留。
       history.replaceState(history.state, '', `#/vouchers/${saved.id}`)
       voucherPeriod.value = store.periods.find((p) => p.id === saved.period_id) || null
+      voucherPeriodId.value = saved.period_id
       // 顺位已经落库，这张从「待插入」变成普通凭证：说明条收起来，
       // 再改内容走的是 update，不会把后面那叠号再顶一次
       insertCtx.value = null
@@ -914,9 +1179,15 @@ watch([entrySig, balanced], () => {
   if (entrySig.value === lastSaved.value) return    // 跟刚落库的那一版一模一样，不用再存
   autoSaveTimer = setTimeout(autoSave, AUTO_SAVE_DELAY)
 })
-onBeforeUnmount(() => clearTimeout(autoSaveTimer))
+onBeforeUnmount(() => {
+  clearTimeout(autoSaveTimer)
+  window.removeEventListener('resize', reAutosizeSums)
+})
+/** 摘要列宽跟着窗口变，折行位置跟着变，双行的框得重新量 */
+function reAutosizeSums() { sumRefs.forEach((el) => autosizeSum(el)) }
 
 onMounted(async () => {
+  window.addEventListener('resize', reAutosizeSums)
   if (!store.periodId) return
   await load()
 })
@@ -1026,7 +1297,23 @@ watch(() => [store.bookId, store.periodId, route.params.id], load)
 /* 分录行 */
 .td-idx { grid-column: 1; justify-content: center; color: var(--cwq-muted); }
 .td-sum { grid-column: 2; }
-.td-subj { grid-column: 3; }
+.td-subj { grid-column: 3; position: relative; }
+
+/* 科目余额：贴在格子左下角，字号比科目名小一号、灰一档。
+   绝对定位而不是并排放 —— 并排会把 SubjectPicker 挤窄（它靠 flex: 1 铺满整格），
+   科目名一长就得缩成省略号，那才是真干扰。
+   pointer-events: none：它只是给人看的一个数，别挡住这一格的点击（点格子要能选科目）。 */
+.subj-balance {
+  position: absolute;
+  left: 12px;
+  bottom: 8px;
+  font-size: 12px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--cwq-muted);
+  pointer-events: none;
+}
+
 /* 前面有没写完的分录时，这几格一起不开张：淡一点 + 指针变禁止，点一下说清差在哪。
    禁用的 input 收不到点击事件（浏览器压根不给它派发），所以还得把指针穿透掉，
    让点击落到格子上，提示才出得来 —— 否则点半天没反应，人只会以为页面卡了 */
@@ -1035,16 +1322,24 @@ watch(() => [store.bookId, store.periodId, route.params.id], load)
 /* 挂到了上级科目：红框 + 红字。这一格不改掉，整张凭证都存不下去 */
 .is-bad { box-shadow: inset 0 0 0 2px #f56c6c; }
 .is-bad :deep(.sp-input) { color: #d93025; font-weight: 600; }
-.is-blocked .cell-input { opacity: .45; }
-.is-blocked :deep(.sp-input) { opacity: .45; }
-.is-blocked :deep(.amt) { opacity: .42; }
+/* 开不开张只决定「能不能写」，不决定「长什么样」：
+   前面还有没写完的分录时，后面几行不开张，可它们跟别的格子长得一模一样。
+   褪色看着像「这几格的数据丢了/坏了」，其实只是还没轮到你写 ——
+   跟已记账凭证那个道理一样（见 readonly_styling）：锁的是写入路径，不是外观。
+   点一下照旧说清差在哪，够用了，不必靠变淡来暗示。 */
 .is-blocked .cell-input,
 .is-blocked :deep(.sp-input),
 .is-blocked :deep(.amt-input) { pointer-events: none; }
 .td-amt.d { grid-column: 4; } .td-amt.c { grid-column: 5; }
 
-/* 合计行：合计中文写在左边，金额跟分录一样落进同一套格子里 */
-.vg-total .td-sumcell { grid-column: 1 / 4; padding: 0 16px; font-weight: 600; font-size: 14px; }
+/* 合计行：两个字靠右贴住借方金额列，金额跟分录一样落进同一套格子里 */
+.vg-total .td-sumcell {
+  grid-column: 1 / 4;
+  padding: 0 16px;
+  font-weight: 600;
+  font-size: 14px;
+  justify-content: flex-end;  /* 格子是 flex 容器（见 .vg-cell），摆位置的是它，不是 text-align */
+}
 .vg-total .td-total { display: block; }
 .vg-total .td-total.d { grid-column: 4; } .vg-total .td-total.c { grid-column: 5; }
 .vg-total .vg-cell { background: var(--vg-total); }
@@ -1066,21 +1361,32 @@ watch(() => [store.bookId, store.periodId, route.params.id], load)
 .vg-row.is-on .vg-del > * { visibility: visible; }
 
 /* 格里就是一个普通输入框，不带边框，才像一张填在纸上的凭证 */
+/* textarea：高度由 autosizeSum 按内容写进 style，这里只给初值（一行）。
+   line-height 必须写成固定值 —— autosizeSum 要靠它算「两行有多高」，
+   写成 normal 量不出来。resize:none 是不要右下角那个拖拽把手：
+   那是给固定尺寸的框准备的，这一格高度由内容说了算。 */
 .cell-input {
   width: 100%;
-  height: 100%;
+  height: 22px;
   border: 0;
   outline: none;
   background: transparent;
   padding: 0 12px;
   font: inherit;
   font-size: 14px;
+  line-height: 22px;
   color: var(--cwq-text);
+  resize: none;
+  overflow-y: hidden;
+  display: block;
 }
 .cell-input::placeholder { color: #c0c4cc; }
 
 /* 自动保存的报平安：绿，但比「借贷平衡」淡一点 —— 平衡是状态，保存是动作 */
-.saved-tag { color: #529b2e; font-size: 12px; }
+/* 自动保存的「准信」：页脚里最该被一眼扫到的一句，字号抬到 13px 并加粗。
+   12px 的小绿字混在页脚一排灰字里，录凭证的人根本不会注意到它，
+   那这条准信等于没有 —— 存没存进去、存的哪一刻，全靠它说。 */
+.saved-tag { color: #529b2e; font-size: 13px; font-weight: 700; }
 
 .row-del { font-size: 17px; color: #d93025; cursor: pointer; }
 .row-del.is-off { color: #dcdfe6; cursor: not-allowed; }

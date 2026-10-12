@@ -43,8 +43,8 @@
             </template>
             <template v-else-if="el.type === 'table'">
               <div class="tmock" :class="{ noborder: el.border === false }"
-                   :style="{ '--vhead': HEAD_PCT + '%', '--vrow': rowPct + '%' }">
-                <div class="thead">
+                   :style="{ '--vhead': headPctOf(el) + '%', '--vrow': rowPctOf(el) + '%' }">
+                <div v-if="el.show_header !== false" class="thead">
                   <span v-for="(c, i) in tpl.columns" :key="i" :style="{ width: c.width + '%' }">{{ c.label }}</span>
                 </div>
                 <div v-for="n in rowCount" :key="n" class="trow">
@@ -52,7 +52,7 @@
                 </div>
                 <div class="trow total">
                   <span v-for="(c, i) in tpl.columns" :key="i" :style="{ width: c.width + '%' }">
-                    {{ i === 2 ? '合　计' : '' }}
+                    {{ i === labelAt ? labelOf(el) : '' }}
                   </span>
                 </div>
               </div>
@@ -112,6 +112,29 @@
               </label>
             </div>
             <div class="tip-line">分录行与合计行等高，改行高等于改表格高度（最多 5 行）。</div>
+
+            <div class="rail-head gap">表头</div>
+            <div class="grid2">
+              <label>显示表头
+                <input type="checkbox" :checked="cur.show_header !== false"
+                       @change="setShowHeader($event.target.checked)" />
+              </label>
+              <label>列头高(mm)
+                <input :value="headerMm.toFixed(1)" type="number" min="0" max="60" step="0.5"
+                       :disabled="cur.show_header === false"
+                       @change="setHeaderMm($event.target.value)" />
+              </label>
+            </div>
+            <div class="tip-line">不显示表头时，剩下的高度全部分给分录行和合计行。</div>
+
+            <div class="rail-head gap">合计行</div>
+            <div class="colw">
+              <label>
+                <span>合计文字</span>
+                <input :value="labelOf(cur)" type="text" maxlength="8"
+                       @change="setTotalLabel($event.target.value)" />
+              </label>
+            </div>
             <div class="rail-head gap">列宽（%）</div>
             <div class="colw">
               <label v-for="(c, i) in tpl.columns" :key="i">
@@ -204,7 +227,8 @@ const FIELD_CN = Object.fromEntries(FIELDS.map((f) => [f.value, f.label]))
 /** 画布上的示例值，让画布看起来和真打印一致。 */
 const SAMPLE = {
   title: '记 账 凭 证', subtitle: '', company: '紫欣星悦荟', book: '租金账套',
-  period: '2026-01', voucher_no: '记001', date: '2026-01-05', attachments: '2',
+  // 画布上的示例值要跟打印出来的一致：日期是中文写法，凭证号带分页号
+  period: '2026-01', voucher_no: '记001号 - 001/001', date: '2026年01月05日', attachments: '2',
   accountant: '', checker: '', cashier: '', remark: '首月租金',
   capital: '壹仟贰佰叁拾肆元伍角陆分', page: '1', total: '1', custom: '',
 }
@@ -225,13 +249,39 @@ const rowCount = computed(() => {
 /**
  * 分录行高（mm）。行高不是独立配置项，而是由表格元素的高度推导出来的 ——
  * 两者必须是同一个数，存两份必然会打架。
+ * 表头有没有、占多高也是模板的一部分，所以行高按**元素**算而不是按全局算：
+ * 一张凭证上摆两个表格，各自定义表头高度时画布和打印才对得上。
  */
-const rowPct = computed(() => (100 - HEAD_PCT) / (rowCount.value + 1))
+function headPctOf(el) {
+  if (!el || el.show_header === false) return 0
+  const v = Number(el.header_height)
+  return Number.isFinite(v) && v >= 0 ? clamp(v, 0, 100) : HEAD_PCT
+}
+function rowPctOf(el) {
+  return (100 - headPctOf(el)) / (rowCount.value + 1)
+}
+/** 表格元素占槽位多高（mm）—— 毫米和百分比之间就靠它换算。 */
+function tableMm(el) {
+  return slotMm.value.h * (Number(el?.h) || 0) / 100
+}
 const rowMm = computed(() => {
   const c = cur.value
   if (!c || c.type !== 'table') return 0
-  return (slotMm.value.h * (Number(c.h) || 0) / 100) * rowPct.value / 100
+  return tableMm(c) * rowPctOf(c) / 100
 })
+const headerMm = computed(() => {
+  const c = cur.value
+  if (!c || c.type !== 'table') return 0
+  return tableMm(c) * headPctOf(c) / 100
+})
+
+/** 合计行那个标签落在哪一列 —— 与后端 _voucher_total_row 同一个算法。 */
+const labelAt = computed(() => {
+  const cols = props.tpl.columns || []
+  const dr = cols.findIndex((c) => c.key === 'debit')
+  return dr > 0 ? dr - 1 : Math.max(0, cols.length - 3)
+})
+function labelOf(el) { return el?.total_label ?? '合　计' }
 
 /** 每列的右边界（累计百分比），画布上拿它放拖拽把手。 */
 const colBounds = computed(() => {
@@ -344,9 +394,27 @@ function setRowMm(mm) {
   const c = cur.value
   const v = Number(mm)
   if (!c || c.type !== 'table' || !(v > 0)) return
-  c.h = clamp((v * 10000) / (slotMm.value.h * rowPct.value), 5, 100 - c.y)
+  // 行 mm = 槽位高 × 元素高% × 行占比%，反解出元素高度百分比
+  c.h = clamp((v * 10000) / (slotMm.value.h * rowPctOf(c)), 5, 100 - c.y)
   changed()
 }
+
+/**
+ * 列头高度是「占表格高度的比例」，改它只在这张表格内部重新分配 ——
+ * 表格本身不缩放，所以不会把别的元素挤出槽位，分录行会自动补上差的那截。
+ */
+function setHeaderMm(mm) {
+  const c = cur.value
+  const v = Number(mm)
+  const tableH = tableMm(c)
+  if (!c || c.type !== 'table' || !(v >= 0) || !(tableH > 0)) return
+  c.header_height = clamp((v * 100) / tableH, 0, 100)
+  changed()
+}
+
+function setShowHeader(v) { if (cur.value) { cur.value.show_header = !!v; changed() } }
+
+function setTotalLabel(v) { if (cur.value) { cur.value.total_label = String(v ?? ''); changed() } }
 
 function setRows(v) {
   const n = Math.round(Number(v))
@@ -598,6 +666,9 @@ watch(() => [props.tpl.paper, props.tpl.orientation, props.slots, props.tpl.marg
   width: 100%; min-width: 0; padding: 3px 5px; font-size: 12px;
   border: 1px solid var(--cwq-border); border-radius: 3px;
 }
+/* 复选框跟着文字走，别被上面的 width:100% 拉成一整行 */
+.grid2 input[type=checkbox] { width: auto; margin: 0; }
+.grid2 input:disabled { background: #f5f7fa; color: #c0c4cc; }
 .row-btns { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; }
 .row-btns :deep(.el-button) { margin-left: 0; padding: 5px 8px; }
 .colw { display: flex; flex-direction: column; gap: 4px; }

@@ -97,9 +97,211 @@ body {
 
 /* 打印区域 */
 @media print {
-  .no-print, .el-aside, .el-header, .el-menu { display: none !important; }
-  .el-main { padding: 0 !important; }
-  body { background: #fff; }
+  /* 外壳现在是 flex + overflow，光把导航藏掉不够：
+     .shell 的 100vh / overflow:hidden 和 .content 的 overflow:auto 还在，
+     多页内容会被裁在一屏里，第二页往后的行根本进不了打印队列。
+     所以藏完导航还得把外壳的定高与滚动一并放开，让内容自己撑开。 */
+  .no-print { display: none !important; }
+  html, body, #app { height: auto; overflow: visible; background: #fff; }
+  .shell { height: auto; overflow: visible; --sb-w: 0px !important; }
+  .main { margin-left: 0; height: auto; display: block; }
+  .content { overflow: visible; }
+  .page { padding: 0 !important; }
   .card { border: none; padding: 0; }
   @page { size: A4 portrait; margin: 12mm; }
 }
+
+/* ── 外壳：顶部模块条 + 标签栏 + 左侧二级菜单 ────────────────────────
+   壳是浅色的。深色只适合做「一点点强调」—— 顶栏一条深蓝的 logo 块、
+   选中项左侧一道竖条。整片铺深色会把旁边表格里的红绿数字一起压暗，
+   数字是这软件里唯一真正要看的东西，不该跟导航抢亮度。 */
+:root {
+  --cwq-chrome-bg: #ffffff;
+  --cwq-chrome-2: #f7f8fa;      /* 侧栏 */
+  --cwq-chrome-text: #5b6472;
+  --cwq-chrome-strong: #1f2733; /* 标题级文字 */
+  --cwq-chrome-active: #2563eb;
+  --cwq-tabbar: #f2f4f7;
+  --cwq-hairline: #e8ebf0;
+  /* 顶部一行的总高（顶栏 + 它的下边线）。侧栏表头必须跟它**一模一样高** ——
+     侧栏和顶栏并排，两条本该连成一条的下边线差了几像素，
+     就会在左上角露出一道错位的横线，看着像没对齐。 */
+  --cwq-chrome-top: 52px;
+}
+
+/* 侧栏是**一整条通栏的固定列**：y=0 到屏幕底，宽度 --sb-w。
+   顶栏、标签栏、内容统统从它右边开始（.main 的 margin-left）——
+   标签栏横穿侧栏顶上那一段是最难看的地方：深色被浅色切断，
+   左边那条竖带看着像只剩了半截。参考站就是 .layui-side fixed 全高 + 右侧统一偏移。 */
+.shell {
+  --sb-w: 220px;
+  height: 100vh; overflow: hidden;
+}
+/* 收起到 60px 图标带，不是 0。
+   整条收走的话，菜单项全没了，想看别的模块得先展开再点、再收起 —— 两次点击。
+   留一条图标带，常用的几项一直点得到，位置也不跳。 */
+.shell.sb-off { --sb-w: 60px; }
+
+.main {
+  margin-left: var(--sb-w); height: 100vh;
+  display: flex; flex-direction: column; min-width: 0;
+  transition: margin-left .2s ease;
+}
+
+.topbar {
+  display: flex; align-items: center; gap: 4px; flex: 0 0 auto;
+  height: var(--cwq-chrome-top); padding: 0 12px 0 8px;
+  background: var(--cwq-chrome-bg); color: var(--cwq-chrome-text);
+  border-bottom: 1px solid var(--cwq-hairline);
+  box-shadow: 0 1px 2px rgba(20, 28, 40, .04);
+}
+.topbar .spacer { flex: 1; }
+
+.topbar .icon-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; border: 0; border-radius: 8px;
+  background: transparent; color: var(--cwq-chrome-text);
+  cursor: pointer; font-size: 17px; transition: background .15s, color .15s;
+}
+.topbar .icon-btn:hover { background: #f1f4f9; color: var(--cwq-chrome-strong); }
+
+/* 品牌徽标拿掉后，折叠按钮和模块菜单之间得自己留出呼吸位：
+   原来这 16px 是 .brand 的 padding 顺带给的，删了就会 4px 硬贴。 */
+.modules { display: flex; align-items: center; height: 100%; overflow-x: auto; margin-left: 12px; }
+.modules::-webkit-scrollbar { display: none; }
+.module {
+  position: relative;
+  display: flex; align-items: center; gap: 6px; height: 100%;
+  padding: 0 15px; border: 0; background: transparent;
+  color: var(--cwq-chrome-text); font-size: 14px;
+  white-space: nowrap; cursor: pointer; transition: color .15s;
+}
+.module:hover { color: var(--cwq-chrome-strong); }
+.module.active { color: var(--cwq-chrome-active); font-weight: 600; }
+/* 选中项下方那道细蓝线。比整块换色安静得多，也不会让顶栏被切成一段一段。 */
+.module.active::after {
+  content: ''; position: absolute; left: 12px; right: 12px; bottom: 0;
+  height: 2px; border-radius: 2px 2px 0 0; background: var(--cwq-chrome-active);
+}
+
+/* 顶栏里的下拉：白底上要靠描边立住，不然和文字糊成一片 */
+.topbar .ctx-select { width: 150px; margin-left: 8px; }
+.topbar .ctx-year { width: 104px; }
+.topbar .ctx-select .el-select__wrapper {
+  background: #f7f8fa; box-shadow: inset 0 0 0 1px var(--cwq-hairline); border-radius: 8px;
+  transition: background .15s, box-shadow .15s;
+}
+.topbar .ctx-select .el-select__wrapper:hover { background: #eef1f6; }
+.topbar .ctx-select .el-select__wrapper.is-focused {
+  background: #fff; box-shadow: inset 0 0 0 1px var(--cwq-chrome-active);
+}
+.topbar .ctx-select .el-select__placeholder,
+.topbar .ctx-select .el-select__selected-item { color: var(--cwq-chrome-strong); }
+.topbar .ctx-tag { margin: 0 6px; }
+.topbar .user {
+  display: flex; align-items: center; gap: 4px;
+  padding: 6px 10px; border-radius: 8px; cursor: pointer;
+  color: var(--cwq-chrome-strong); white-space: nowrap; transition: background .15s;
+}
+.topbar .user:hover { background: #f1f4f9; }
+
+/* ── 标签栏 ────────────────────────────────────────────────────── */
+.tabbar {
+  display: flex; align-items: stretch; gap: 5px; flex: 0 0 auto;
+  height: 38px; padding: 5px 8px;
+  background: var(--cwq-tabbar); border-bottom: 1px solid var(--cwq-hairline);
+}
+.tb-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 28px; border: 1px solid transparent; border-radius: 6px;
+  background: transparent; color: var(--cwq-chrome-text); cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.tb-btn:hover:not(:disabled) { background: #fff; color: var(--cwq-chrome-active); }
+.tb-btn:disabled { color: #c3c9d4; cursor: not-allowed; }
+
+.tb-scroll { display: flex; align-items: stretch; gap: 5px; flex: 1; min-width: 0; overflow-x: auto; }
+.tb-scroll::-webkit-scrollbar { height: 0; }
+.tb-tab {
+  display: flex; align-items: center; gap: 6px; padding: 0 8px 0 13px;
+  border: 1px solid transparent; border-radius: 7px;
+  background: transparent; color: var(--cwq-chrome-text); font-size: 13px;
+  white-space: nowrap; cursor: pointer; user-select: none; transition: background .15s, color .15s;
+}
+.tb-tab:hover { background: rgba(255, 255, 255, .8); color: var(--cwq-chrome-strong); }
+.tb-tab.active {
+  background: #fff; color: var(--cwq-chrome-active); font-weight: 600;
+  border-color: var(--cwq-hairline);
+  box-shadow: 0 1px 3px rgba(20, 28, 40, .07);
+}
+.tb-close {
+  display: flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; padding: 0; font-size: 12px;
+  border: 0; border-radius: 50%; background: transparent;
+  color: #a9b0bd; cursor: pointer; transition: background .15s, color .15s;
+}
+.tb-close:hover { background: #dfe4ec; color: var(--cwq-chrome-strong); }
+.tb-tab:focus-visible { outline: 2px solid var(--cwq-chrome-active); outline-offset: 1px; }
+.tb-more { display: flex; align-items: center; }
+
+/* ── 主体 ─────────────────────────────────────────────────────── */
+.sidebar {
+  position: fixed; left: 0; top: 0; bottom: 0; z-index: 20;
+  width: var(--sb-w); overflow-y: auto; overflow-x: hidden;
+  background: var(--cwq-chrome-2); color: var(--cwq-chrome-text);
+  border-right: 1px solid var(--cwq-hairline);
+  /* 宽度跟着 .main 的 margin-left 一起动；不然侧栏先到位、内容区还在滑 */
+  transition: width .2s ease;
+}
+.sb-head {
+  display: flex; align-items: center; gap: 8px;
+  /* 高度取顶栏那个变量，别自己写死：两行不等高，下面那条横线就错开了 */
+  height: var(--cwq-chrome-top); padding: 0 16px;
+  font-size: 12px; font-weight: 600;
+  color: var(--cwq-chrome-strong); letter-spacing: .4px;
+  border-bottom: 1px solid var(--cwq-hairline);
+}
+.sb-list { list-style: none; margin: 0; padding: 6px 0; }
+.sb-list li {
+  position: relative;
+  display: flex; align-items: center; gap: 9px;
+  padding: 9px 16px 9px 19px; font-size: 13px; cursor: pointer;
+  white-space: nowrap; color: var(--cwq-chrome-text); transition: background .15s, color .15s;
+}
+.sb-list li:hover { background: #eef1f6; color: var(--cwq-chrome-strong); }
+.sb-list li:focus-visible { outline: 2px solid var(--cwq-chrome-active); outline-offset: -2px; }
+/* 选中项：淡蓝底 + 左侧竖条 + 蓝字。
+   不用整块饱和蓝实心 —— 一列 4 个菜单全用重底色，整条侧栏会往下沉，
+   比深色版还闷。 */
+.sb-list li.active {
+  background: #e7efff; color: var(--cwq-chrome-active); font-weight: 600;
+}
+.sb-list li.active::before {
+  content: ''; position: absolute; left: 0; top: 4px; bottom: 4px;
+  width: 3px; border-radius: 0 3px 3px 0; background: var(--cwq-chrome-active);
+}
+
+/* 收起态：只留图标，居中。文字藏掉但图标留着 —— 这是「收窄」不是「删掉」。 */
+.sb-off .sb-label { display: none; }
+.sb-off .sb-head { justify-content: center; padding-left: 0; padding-right: 0; }
+.sb-off .sb-list li { justify-content: center; padding: 10px 0; }
+/* 图标带太窄，图标本身要撑得住，才不像一排小点 */
+.sb-off .sb-list .el-icon { font-size: 18px; }
+.sb-off .sb-head .el-icon { font-size: 18px; }
+/* 悬停时给一点点反馈，不然一条光溜溜的灰带看不出能不能点 */
+.sb-off .sb-list li:hover { background: #e3e8f0; }
+
+.content { flex: 1; min-height: 0; overflow: auto; }
+
+/* ── 期间下拉：月份在左、「已结账」贴右，且上下居中 ──────────────────
+   选项行是 .el-select-dropdown__item，display 是 list-item 不是 flex，
+   所以对齐不能靠 float 或 margin-left:auto —— float 会把标签提出行内流、
+   跟月份文字上下错开一小截。套一层 flex 才能既贴右又上下居中。 */
+.period-opt { display: flex; align-items: center; gap: 8px; }
+.period-opt .el-tag { margin-left: auto; }
+/* 面板跟触发器一样宽：比触发器宽出来的每一像素，都让它在顶栏上显得比
+   旁边那个「年份」宽一圈。两边一致才是对齐。代价是要收掉 Element 默认的
+   选项行左右各 20px 内边距 —— 92px 的框里扣掉 40px 根本放不下「1 月 + 已结账」。 */
+.period-popper.el-popper { min-width: 104px !important; width: 104px; }
+.period-popper .el-select-dropdown__item { padding: 0 8px; }
+.period-popper .el-tag { height: 18px; padding: 0 5px; font-size: 11px; }

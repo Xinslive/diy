@@ -2,8 +2,8 @@
   <div class="page">
     <div class="toolbar no-print">
       <el-select v-model="includeUnposted" style="width: 150px" @change="load">
+        <el-option label="包含未记账凭证" :value="true" />
         <el-option label="仅已记账凭证" :value="false" />
-        <el-option label="含未记账凭证" :value="true" />
       </el-select>
       <el-checkbox v-model="onlyLeaf" label="仅显示明细科目" @change="load" />
       <span class="spacer" />
@@ -72,7 +72,7 @@ import { fmt } from '@/utils/format'
 const store = useSessionStore()
 const data = ref({ rows: [], check: {} })
 const loading = ref(false)
-const includeUnposted = ref(false)
+const includeUnposted = ref(true)
 const onlyLeaf = ref(true)
 
 const visibleRows = computed(() => (onlyLeaf.value ? data.value.rows.filter((r) => r.is_leaf) : data.value.rows))

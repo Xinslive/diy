@@ -20,7 +20,7 @@
     </div>
 
     <el-alert v-if="!data.editable" type="warning" :closable="false" class="mb">
-      {{ data.reason }}。如需调整，先在「期末处理」反结账，或直接改该期间的凭证。
+      {{ data.reason }}。如需调整，先在「期末结账」反结账，或直接改该期间的凭证。
     </el-alert>
 
     <div class="card mb" :class="balanced ? 'ok' : 'bad'">

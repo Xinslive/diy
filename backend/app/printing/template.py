@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import html
+import re
 from datetime import datetime
 from typing import Any
 
@@ -268,6 +269,10 @@ def validate_template(scope: str, content: dict | None) -> dict:
         voucher["rows_per_page"] = max(1, min(5, rows_per_page))
         voucher["split_number"] = bool(voucher.get("split_number", True))
         voucher["fill_rows"] = bool(voucher.get("fill_rows", True))
+        # 拆页后凭证号的写法，默认「记001 - 001/006」。空串等于退回默认写法，
+        # 免得有人把输入框清空之后凭证号就变成了光秃秃的「记001」。
+        split_format = str(voucher.get("split_format") or "").strip()
+        voucher["split_format"] = split_format or SPLIT_NUMBER_FORMAT
 
         elements = merged.get("elements") or []
         clean_elements: list[dict] = []
@@ -303,6 +308,10 @@ def validate_template(scope: str, content: dict | None) -> dict:
                     "align": raw.get("align") if raw.get("align") in ALIGN else "left",
                     "visible": bool(raw.get("visible", True)),
                     "border": bool(raw.get("border", True)),
+                    # 表格专用：表头可以不印，高度（占表格的百分比）也归模板管
+                    "show_header": bool(raw.get("show_header", True)),
+                    "header_height": _number("header_height", VOUCHER_HEAD_PCT, 0, 100),
+                    "total_label": str(raw.get("total_label", VOUCHER_TOTAL_LABEL)),
                     # 线宽/线型会拼进 style 属性，必须过白名单，不能原样透传
                     "line_width": _number("line_width", 0.3, 0.1, 3),
                     "line_style": raw.get("line_style") if raw.get("line_style") in LINE_STYLES else "solid",
@@ -604,7 +613,8 @@ def render_table_page(tpl: dict, ctx: dict, rows: list[dict], page: int, total: 
 #
 # 会计凭证是**固定版式**，不是可以随便塞内容的表格：
 #
-#   * 一张凭证最多 5 行摘要，超出的行续到下一张凭证上打印（记001-1 / 记001-2）；
+#   * 一张凭证最多 5 行摘要，超出的行续到下一张凭证上打印
+#     （记001号 - 001/006 / 记001号 - 002/006）；
 #   * A4 一页 2 张（A4 纵向上下排、A4 横向左右排），A5 一页 1 张；
 #   * 每一张的位置、字号由模板的 elements 决定 —— 坐标是「当前槽位」的百分比，
 #     所以同一份元素在不同纸型上自动等比缩放，模板不必为 A4/A5 各存一份。
@@ -612,6 +622,11 @@ def render_table_page(tpl: dict, ctx: dict, rows: list[dict], page: int, total: 
 MAX_VOUCHER_ROWS = 5
 #: 表头占表格高度的比例。前端算行高毫米数时用同一个值，改这里要同步改前端。
 VOUCHER_HEAD_PCT = 14.0
+#: 合计行里那个标签的默认文字。老模板没有这个字段，按这个显示。
+VOUCHER_TOTAL_LABEL = "合　计"
+#: 拆页后的凭证号写法：{voucher_no} - {page}/{pages} → 记001号 - 001/006。
+#: 模板可以改这个格式串，占位符见 _split_number。
+SPLIT_NUMBER_FORMAT = "{voucher_no} - {page}/{pages}"
 #: 一页能放两张凭证的纸型。其余（A5/B5/连续纸）一张。
 TWO_UP_PAPERS = {"A4", "A3", "A4_LANDSCAPE"}
 
@@ -678,12 +693,43 @@ def _slice_total(entries: list[dict], direction: str) -> Decimal:
     return dr if direction == "DEBIT" else cr
 
 
-def split_voucher(voucher: dict, rows_per_page: int) -> list[dict]:
+#: 分页编号格式串里的占位符。
+_SPLIT_TOKEN = re.compile(r"\{(\w+)\}")
+
+
+def split_number(voucher_no: str, index: int, total: int,
+                 first: int, last: int, lines: int, fmt: str | None = None) -> str:
+    """把分页信息套进模板给的格式串。
+
+    ``记001`` + 第 2 张、共 6 张 → ``记001 - 002/006``。数字统一补零到三位
+    （跟凭证号本身的记001 一样宽），页数超过 999 位会自己加宽。
+    """
+    voucher_no = str(voucher_no or "")
+    if not voucher_no.strip():
+        return ""            # 空凭证（空数据占位）不需要编号
+    fmt = fmt or SPLIT_NUMBER_FORMAT
+    width = max(3, len(str(max(total, lines))))
+    values = {
+        "voucher_no": voucher_no,
+        "page": str(index).zfill(width),
+        "pages": str(total).zfill(width),
+        "first": str(first).zfill(width),
+        "last": str(last).zfill(width),
+        "lines": str(lines).zfill(width),
+    }
+    return _SPLIT_TOKEN.sub(lambda m: values.get(m.group(1), ""), str(fmt))
+
+
+def split_voucher(voucher: dict, rows_per_page: int, fmt: str | None = None) -> list[dict]:
     """把一张凭证按最多 ``rows_per_page`` 行拆成若干张可独立打印的凭证。
 
-    * 不超行数时原样返回一张，凭证号**不变** —— 没拆过就不能加后缀，
-      否则账上叫记001 的凭证打出来变成记001-1，对不上号。
-    * 拆开时凭证号追加 ``-1``、``-2``，借方/贷方合计按各自那几行重算。
+    * 凭证号一律按模板格式带分页号：不拆的是「记001号 - 001/001」，拆开的
+      是「记001号 - 001/006」。撕开的几张凭这个认得出是同一张凭证，没拆的那张
+      也和拆过的长得一样，不用先数张数再对号。
+    * 拆页只是排版，账上的凭证号一个字都不改。
+    * 合计是**累计**的：第二张印的是前两张加起来的数，最后一张等于整张凭证的合计。
+      拆页只是排版，不会把一张凭证的账算成好几张 —— 只按本页几行重算的话，
+      每张都印着「合　计」却对不上整张凭证的数，撕开就对不了账。
     """
     entries = voucher.get("entries") or []
     rows_per_page = max(1, int(rows_per_page))
@@ -691,18 +737,28 @@ def split_voucher(voucher: dict, rows_per_page: int) -> list[dict]:
         piece = dict(voucher)
         piece["slice_index"] = 1
         piece["slice_total"] = 1
+        piece["voucher_no"] = split_number(voucher.get("voucher_no", ""), 1, 1,
+                                           1, len(entries), len(entries), fmt)
         return [piece]
 
     chunks = [entries[i:i + rows_per_page] for i in range(0, len(entries), rows_per_page)]
+    total_pages = len(chunks)
+    lines = len(entries)
+    voucher_no = voucher.get("voucher_no", "")
+    run_dr = run_cr = Decimal("0")
     out: list[dict] = []
     for i, chunk in enumerate(chunks, start=1):
         piece = dict(voucher)
         piece["entries"] = chunk
-        piece["total_debit"] = str(_slice_total(chunk, "DEBIT"))
-        piece["total_credit"] = str(_slice_total(chunk, "CREDIT"))
-        piece["voucher_no"] = f"{voucher.get('voucher_no', '')}-{i}"
+        run_dr += _slice_total(chunk, "DEBIT")
+        run_cr += _slice_total(chunk, "CREDIT")
+        piece["total_debit"] = str(run_dr)
+        piece["total_credit"] = str(run_cr)
+        first = (i - 1) * rows_per_page + 1
+        piece["voucher_no"] = split_number(voucher_no, i, total_pages,
+                                          first, first + len(chunk) - 1, lines, fmt)
         piece["slice_index"] = i
-        piece["slice_total"] = len(chunks)
+        piece["slice_total"] = total_pages
         out.append(piece)
     return out
 
@@ -714,6 +770,19 @@ def _cn_capital_safe(value: Any) -> str:
         return ""
 
 
+def cn_date(value: Any) -> str:
+    """``2026-01-05`` -> ``2026年01月05日``。
+
+    中文记账凭证上的日期就是这么写的；不是 ISO 日期就原样返回，别把
+    空值或者别的东西掰成一段假日期。
+    """
+    text = str(value or "").strip()
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", text)
+    if not m:
+        return text
+    return f"{m.group(1)}年{int(m.group(2)):02d}月{int(m.group(3)):02d}日"
+
+
 def _element_values(tpl: dict, ctx: dict, voucher: dict, page: int, total_pages: int) -> dict:
     """元素占位符能取到的值。凭证字段来自这张（分片后的）凭证，其余来自账套上下文。"""
     return {
@@ -723,7 +792,7 @@ def _element_values(tpl: dict, ctx: dict, voucher: dict, page: int, total_pages:
         "book": ctx.get("book", ""),
         "period": ctx.get("period", ""),
         "voucher_no": voucher.get("voucher_no", ""),
-        "date": voucher.get("voucher_date", ""),
+        "date": cn_date(voucher.get("voucher_date", "")),
         "attachments": voucher.get("attachments") or "",
         "accountant": voucher.get("accountant", ""),
         "checker": voucher.get("checker", ""),
@@ -756,8 +825,11 @@ def _element_enabled(tpl: dict, bind: str) -> bool:
     return True
 
 
-def _voucher_total_row(tpl: dict, voucher: dict) -> str:
-    """合计行。借/贷方金额放在对应的列上，金额列不存在时退回旧的「倒数第三列」。"""
+def _voucher_total_row(tpl: dict, voucher: dict, el: dict | None = None) -> str:
+    """合计行。借/贷方金额放在对应的列上，金额列不存在时退回旧的「倒数第三列」。
+
+    「合　计」三个字由表格元素的 total_label 决定，不同模板可以写「合计」「小计」。
+    """
     cols = tpl["columns"]
     n = len(cols)
     dr_i = next((i for i, c in enumerate(cols) if c["key"] == "debit"), None)
@@ -765,6 +837,7 @@ def _voucher_total_row(tpl: dict, voucher: dict) -> str:
     dr = _fmt(voucher.get("total_debit") or 0)
     cr = _fmt(voucher.get("total_credit") or 0)
     label_at = dr_i - 1 if dr_i else max(0, n - 3)
+    label = (el or {}).get("total_label", VOUCHER_TOTAL_LABEL)
     cells = []
     for i, c in enumerate(cols):
         cls = "num" if c["align"] == "right" else ("ctr" if c["align"] == "center" else "")
@@ -773,15 +846,30 @@ def _voucher_total_row(tpl: dict, voucher: dict) -> str:
         elif cr_i is not None and i == cr_i:
             text = cr
         elif i == label_at:
-            text = "合　计"
+            text = label
         else:
             text = ""
         cells.append(f'<td class="{cls}">{_esc(text)}</td>')
     return '<tr class="total">' + "".join(cells) + "</tr>"
 
 
-def _voucher_table_html(tpl: dict, voucher: dict) -> str:
-    """分录表格。表头、金额千分位、合计行与旧版一致，只是行数由外层分片保证。"""
+def table_head_pct(el: dict | None) -> float:
+    """表头占表格高度的百分比。表头关掉就是 0，高度全给分录行和合计行。"""
+    if not el or el.get("show_header") is False:
+        return 0.0
+    try:
+        pct = float(el.get("header_height", VOUCHER_HEAD_PCT))
+    except (TypeError, ValueError):
+        pct = VOUCHER_HEAD_PCT
+    return max(0.0, min(100.0, pct))
+
+
+def _voucher_table_html(tpl: dict, voucher: dict, el: dict | None = None) -> str:
+    """分录表格。表头、金额千分位、合计行与旧版一致，只是行数由外层分片保证。
+
+    表头本身也是模板的一部分：可以不显示，高度（占表格的百分比）也归模板管，
+    关掉表头之后剩下的高度全部分给分录行和合计行。
+    """
     cols = tpl["columns"]
     colgroup = "".join(f'<col style="width:{c["width"]}%" />' for c in cols)
     head = "".join(
@@ -812,13 +900,16 @@ def _voucher_table_html(tpl: dict, voucher: dict) -> str:
         blank = "<td></td>" * len(cols)
         rows += ["<tr>" + blank + "</tr>"] * max(0, voucher_rows_per_page(tpl) - len(rows))
 
-    head_pct = VOUCHER_HEAD_PCT
+    head_pct = table_head_pct(el)
     row_pct = (100.0 - head_pct) / (voucher_rows_per_page(tpl) + 1)
     heights = f' style="--vhead:{head_pct:g}%;--vrow:{row_pct:g}%"'
+    # 老模板没有 show_header，按「有表头」处理，否则升级后所有凭证的表头会消失
+    show_head = not el or el.get("show_header") is not False
+    thead = f"<thead><tr>{head}</tr></thead>" if show_head else ""
     return (
         '<table class="grid"' + heights + "><colgroup>" + colgroup + "</colgroup>"
-        + "<thead><tr>" + head + "</tr></thead>"
-        + "<tbody>" + "".join(rows) + _voucher_total_row(tpl, voucher) + "</tbody></table>"
+        + thead
+        + "<tbody>" + "".join(rows) + _voucher_total_row(tpl, voucher, el) + "</tbody></table>"
     )
 
 
@@ -852,7 +943,7 @@ def _voucher_element_html(tpl: dict, ctx: dict, voucher: dict, el: dict,
     if etype == "table":
         # 框线是每个表格自己的开关，不跟全局「表格边框」设置混在一起
         cls = "voucher-element table" if el.get("border", True) else "voucher-element table no-border"
-        return f'<div class="{cls}" style="{style}">{_voucher_table_html(tpl, voucher)}</div>'
+        return f'<div class="{cls}" style="{style}">{_voucher_table_html(tpl, voucher, el)}</div>'
 
     bind = el.get("bind", "custom")
     if not _element_enabled(tpl, bind):

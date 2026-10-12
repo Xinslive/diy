@@ -65,6 +65,9 @@ class LedgerEngine:
     # 结转损益是内部结转：排除后统计的是「真实的经营损益」，
     # 利润表必须用它，否则月度结转之后损益类科目本期净额恒为 0。
     exclude_carry_forward: bool = False
+    # 排除某一张凭证。凭证录入页要看「除这张以外」的余额：那张凭证自己正在被编辑，
+    # 边填边自动保存，它要是算进去，余额会跟着手上这张一起动 —— 看的是自己写进去的数。
+    exclude_voucher_id: int | None = None
     _figures: dict[tuple[int, int], Figures] = field(default_factory=dict)
 
     # ---------------- 基础查询 ----------------
@@ -138,6 +141,8 @@ class LedgerEngine:
             stmt = stmt.where(Voucher.status == "POSTED")
         if self.exclude_carry_forward:
             stmt = stmt.where(Voucher.source != "CARRY_FORWARD")
+        if self.exclude_voucher_id:
+            stmt = stmt.where(Voucher.id != self.exclude_voucher_id)
 
         rolled: dict[tuple[int, int], list[Decimal]] = {}
         ancestors = self._ancestor_map()

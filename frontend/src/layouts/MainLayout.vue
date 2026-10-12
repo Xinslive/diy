@@ -1,111 +1,196 @@
 <template>
-  <el-container class="shell">
-    <el-aside width="196px" class="no-print">
-      <div class="brand">
-        <span class="logo">CWQ</span>
-        <span class="name">财务记账</span>
+  <!-- --sb-w 跟着折叠状态变：侧栏是一整条通栏的固定列，
+       顶栏/标签栏/内容统统从它右边开始，所以这个宽度就是左边那条留白。 -->
+  <div class="shell" :class="{ 'sb-off': tabs.sidebarCollapsed }">
+    <!-- 收起时不是整条消失，而是收成一条图标带（220px ⇄ 60px）。
+         菜单项还在、位置也不跳，只是没了文字；靠 title 提示是什么。 -->
+    <aside class="sidebar no-print">
+      <div class="sb-head" :title="shownModule?.title">
+        <el-icon><component :is="shownModule?.icon" /></el-icon>
+        <span class="sb-label">{{ shownModule?.title }}</span>
       </div>
-      <el-menu :default-active="$route.path" router class="menu">
-        <el-menu-item index="/books"><el-icon><Folder /></el-icon>账套管理</el-menu-item>
-        <el-menu-item index="/openings"><el-icon><Coin /></el-icon>期初余额</el-menu-item>
-        <el-menu-item index="/vouchers"><el-icon><Tickets /></el-icon>凭证</el-menu-item>
-        <el-menu-item index="/balance"><el-icon><Grid /></el-icon>科目余额表</el-menu-item>
-        <el-menu-item index="/general-ledger"><el-icon><Notebook /></el-icon>总账</el-menu-item>
-        <el-menu-item index="/detail-ledger"><el-icon><List /></el-icon>明细账</el-menu-item>
-        <el-menu-item index="/reports"><el-icon><DataAnalysis /></el-icon>报表</el-menu-item>
-        <el-menu-item index="/periods"><el-icon><Calendar /></el-icon>期末处理</el-menu-item>
-        <el-menu-item index="/subjects"><el-icon><Collection /></el-icon>科目表</el-menu-item>
-        <el-menu-item index="/print-templates"><el-icon><Printer /></el-icon>打印模板</el-menu-item>
-        <el-menu-item v-if="store.isAdmin" index="/audit"><el-icon><Document /></el-icon>操作日志</el-menu-item>
-        <el-menu-item v-if="store.isAdmin" index="/users"><el-icon><User /></el-icon>用户与授权</el-menu-item>
-      </el-menu>
-    </el-aside>
+      <ul class="sb-list">
+        <!-- role + tabindex + title 三样都要：收起后只剩图标，
+             没有可访问名的话读屏用户会听到一串「图像」，完全不知道是哪个菜单。
+             tabindex 则是让它能靠键盘走到 —— 鼠标能点的，键盘也得能到。 -->
+        <li v-for="it in shownModule?.items || []" :key="it.name"
+            role="button" tabindex="0" :aria-label="it.title" :title="it.title"
+            :aria-current="it.name === activeKey ? 'page' : null"
+            :class="{ active: it.name === activeKey }"
+            @click="router.push({ name: it.name })"
+            @keydown.enter="router.push({ name: it.name })">
+          <el-icon><component :is="it.icon" /></el-icon><span class="sb-label">{{ it.title }}</span>
+        </li>
+      </ul>
+    </aside>
 
-    <el-container>
-      <el-header height="52px" class="topbar no-print">
-        <!-- 只显示账套名：公司名只是账套的属性，切账套时不需要看 -->
-        <el-select
-          v-model="store.bookId"
-          size="default"
-          style="width: 180px"
-          @change="onBookChange"
+    <div class="main">
+    <!-- ── 顶部：折叠按钮 + 模块菜单 + 全局账套/期间 + 账号 ─────────── -->
+    <header class="topbar no-print">
+      <button class="icon-btn" :title="tabs.sidebarCollapsed ? '展开菜单' : '收起菜单'" @click="tabs.toggleSidebar()">
+        <el-icon><Fold v-if="!tabs.sidebarCollapsed" /><Expand v-else /></el-icon>
+      </button>
+
+      <nav class="modules">
+        <button
+          v-for="m in nav"
+          :key="m.key"
+          class="module"
+          :class="{ active: m.key === activeModule }"
+          @click="onModuleClick(m)"
         >
-          <el-option
-            v-for="b in store.books"
-            :key="b.id"
-            :label="b.name"
-            :value="b.id"
-          />
-        </el-select>
+          <el-icon><component :is="m.icon" /></el-icon>{{ m.title }}
+        </button>
+      </nav>
 
-        <!-- 年份和月份拆成两个下拉：
-             账套跨多年，一个下拉塞 24 个月份，鼠标得划过半个屏幕。
-             拆开后「哪一年」最多几个选项，「几月」固定 12 个，两下点完。 -->
-        <el-select v-model="selYear" size="default" style="width: 104px" @change="onYearChange">
-          <el-option v-for="y in availableYears" :key="y" :label="`${y} 年`" :value="y" />
-        </el-select>
-        <!-- 月份和年份一样宽：两个下拉并排摆着，宽度不一样看着就像没对齐。
-             收窄之后月份那一格放得下「12 月」；「已结账」那个标记在**选项行**里，
-             宽度不够就由下面的 period-popper 单独给面板撑开，不牵连触发器。 -->
-        <el-select v-model="selMonth" size="default" style="width: 104px"
-                   popper-class="period-popper" @change="onMonthChange">
-          <el-option v-for="p in monthsOfYear" :key="p.id" :label="`${p.month} 月`" :value="p.month">
-            <!-- 选项行本身是 .el-select-dropdown__item，display 是 list-item，
-                 不是 flex。所以对齐不能指望 float 或 margin-left:auto：
-                 float 会把标签提出行内流、跟月份文字上下错开一小截。
-                 自己套一层 flex 才能既贴右又上下居中。 -->
-            <span class="period-opt">
-              <span>{{ p.month }} 月</span>
-              <!-- 只标「已结账」。原来还在未结账的月份上挂一个「未记账 19」——
-                   那是期间状态，不是这个月有几张没记，而列表页本来就能一眼看见。
-                   一半月份带数字一半不带，扫下来只会被那个数字勾走。 -->
-              <el-tag v-if="p.locked" size="small" type="success">已结账</el-tag>
-            </span>
-          </el-option>
-        </el-select>
+      <div class="spacer" />
 
-        <span class="spacer" />
-
-        <el-tag v-if="store.currentBook?.role === 'VIEWER'" type="info">只读</el-tag>
-        <el-dropdown @command="onCommand">
-          <span class="user">
-            {{ store.user?.real_name || store.user?.username }}<el-icon><ArrowDown /></el-icon>
+      <!-- 账套/期间是全局上下文，跟着顶栏走。菜单挪到左边之后这里成了
+           顶栏唯一的「我现在在看哪本账」提示，不能再往侧栏里塞。 -->
+      <el-select v-model="store.bookId" class="ctx-select" @change="onBookChange">
+        <el-option v-for="b in store.books" :key="b.id" :label="b.name" :value="b.id" />
+      </el-select>
+      <el-select v-model="selYear" class="ctx-select ctx-year" @change="onYearChange">
+        <el-option v-for="y in availableYears" :key="y" :label="`${y} 年`" :value="y" />
+      </el-select>
+      <el-select
+        v-model="selMonth"
+        class="ctx-select ctx-year"
+        popper-class="period-popper"
+        @change="onMonthChange"
+      >
+        <el-option v-for="p in monthsOfYear" :key="p.id" :label="`${p.month} 月`" :value="p.month">
+          <span class="period-opt">
+            <span>{{ p.month }} 月</span>
+            <el-tag v-if="p.locked" size="small" type="success">已结账</el-tag>
           </span>
-          <template #dropdown>
-            <el-dropdown-menu>
-              <el-dropdown-item command="logout">退出登录</el-dropdown-item>
-            </el-dropdown-menu>
-          </template>
-        </el-dropdown>
-      </el-header>
+        </el-option>
+      </el-select>
 
-      <el-main>
+      <el-tag v-if="store.currentBook?.role === 'VIEWER'" type="info" class="ctx-tag">只读</el-tag>
+      <el-dropdown @command="onCommand">
+        <span class="user">
+          {{ store.user?.real_name || store.user?.username }}<el-icon><ArrowDown /></el-icon>
+        </span>
+        <template #dropdown>
+          <el-dropdown-menu>
+            <el-dropdown-item command="logout">退出登录</el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
+    </header>
+
+    <!-- ── 标签栏：打开过的页面，可关闭、可左右翻 ───────────────────── -->
+    <div class="tabbar no-print">
+      <button class="tb-btn" :disabled="!tabs.canClosePrev" title="关闭上一页" @click="closePrev">
+        <el-icon><ArrowLeft /></el-icon>
+      </button>
+      <button class="tb-btn" :disabled="!tabs.canClosePrev" title="关闭下一页" @click="closeNext">
+        <el-icon><ArrowRight /></el-icon>
+      </button>
+      <button class="tb-btn" title="回到首页" @click="router.push('/books')">
+        <el-icon><HomeFilled /></el-icon>
+      </button>
+
+      <div class="tb-scroll">
+        <!-- 标签本身要能聚焦、关闭按钮要是真 button：
+             一律用 div + 图标的话，关闭按钮在无障碍树里根本不存在，
+             读屏用户跳不到，纯图标按钮也点不中（只有 8×8 的 svg 命中区）。 -->
+        <div v-for="t in tabs.opened" :key="t.key" class="tb-tab" :class="{ active: t.key === activeKey }"
+             role="tab" :aria-selected="t.key === activeKey" tabindex="0"
+             @click="router.push(t.path)"
+             @keydown.enter="router.push(t.path)">
+          <span>{{ t.title }}</span>
+          <button v-if="tabs.opened.length > 1" type="button" class="tb-close"
+                  :aria-label="`关闭 ${t.title}`" title="关闭" @click.stop="closeTab(t.key)">
+            <el-icon><Close /></el-icon>
+          </button>
+        </div>
+      </div>
+
+      <el-dropdown class="tb-more" @command="onTabCommand">
+        <button class="tb-btn" title="标签操作"><el-icon><DArrowRight /></el-icon></button>
+        <template #dropdown>
+          <el-dropdown-menu>
+            <el-dropdown-item command="others" :disabled="!tabs.canClosePrev">关闭其他</el-dropdown-item>
+            <el-dropdown-item command="all" :disabled="!tabs.canClosePrev">关闭全部</el-dropdown-item>
+          </el-dropdown-menu>
+        </template>
+      </el-dropdown>
+    </div>
+
+      <main class="content">
         <router-view :key="viewKey" />
-      </el-main>
-    </el-container>
-  </el-container>
+      </main>
+    </div>
+  </div>
 </template>
 
 <script setup>
-import { computed, onMounted, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from '@/stores/session'
-import { ArrowDown, Calendar, Coin, Collection, DataAnalysis, Document, Folder, Grid, List, Notebook, Printer, Tickets, User } from '@element-plus/icons-vue'
+import { useTabsStore } from '@/stores/tabs'
+import { landingOf, menuKeyOf, visibleNav } from '@/router/nav'
+import {
+  ArrowDown, ArrowLeft, ArrowRight, Close, DArrowRight, Expand, Fold, HomeFilled,
+} from '@element-plus/icons-vue'
 
 const store = useSessionStore()
+const tabs = useTabsStore()
 const route = useRoute()
 const router = useRouter()
 
+const nav = computed(() => visibleNav(store.isAdmin))
+
 // 切换账套/期间后让当前页面重新取数
 const viewKey = computed(() => `${route.name}-${store.bookId}-${store.periodId}`)
+
+/** 当前标签页 / 侧栏高亮的 key —— 凭证三种路由共用一个入口，所以不能直接用 route.name */
+const activeKey = computed(() => menuKeyOf(route.name))
+
+/** 当前该亮哪个顶部模块：以当前路由在菜单里的归属为准，而不是记住上次点的那个。
+ *  记住会出岔子：手敲地址栏进 /users 时顶部还亮着「凭证处理」，侧栏也跟着空。 */
+const activeModuleObj = computed(
+  () => nav.value.find((m) => m.items.some((it) => it.name === activeKey.value)) || null
+)
+const activeModule = ref('')
+
+/** 侧栏显示哪个模块 —— 跟顶部高亮的是同一个。
+ *  侧栏如果自己去按 route 推，点了顶部「凭证处理」却还列着「科目余额表」，
+ *  顶部亮着一个模块、侧边列着另一个模块的菜单，两处对不上。 */
+const shownModule = computed(
+  () => nav.value.find((m) => m.key === activeModule.value) || activeModuleObj.value
+)
+
+/**
+ * 点顶部模块：换侧栏，并在跨模块时落到这个模块的入口页
+ * （凭证处理 → 凭证，账簿报表 → 明细账，基础资料 → 账套管理）。
+ *
+ * 已经在这个模块里就**只换侧栏不动页面** —— 正看着科目余额表时点一下
+ * 「账簿报表」被弹回明细账，手上的位置就白费了。
+ */
+function onModuleClick(m) {
+  activeModule.value = m.key
+  if (activeModuleObj.value?.key === m.key) return
+  router.push({ name: landingOf(m) })
+}
+
+// 只在**路由本身**变了的时候，把顶部模块拉回当前页所属的模块。
+// 不能反过来把 activeModule 绑死在点击上：手敲地址栏进 /users 时，
+// 顶部必须跟着亮「系统管理」，不能停在用户上次点的「凭证处理」。
+watch(
+  activeModuleObj,
+  (m) => { if (m) activeModule.value = m.key },
+  { immediate: true }
+)
 
 // 年份下拉：这套账有哪几年，最新的排最前
 const availableYears = computed(() =>
   [...new Set(store.periods.map((p) => p.year))].sort((a, b) => b - a)
 )
 
-// 当前看的是哪一年、哪一月 —— 直接从正在看的期间反推，
-// 不另存一份，免得两边对不上
+// 当前看的是哪一年、哪一月 —— 直接从正在看的期间反推，不另存一份
 const selYear = computed(() => store.currentPeriod?.year ?? store.currentYear)
 const selMonth = computed(() => store.currentPeriod?.month)
 
@@ -119,11 +204,9 @@ const monthsOfYear = computed(() =>
 async function onBookChange(id) {
   await store.setBook(id)
 }
-// 切年份：落在该年「正在用的」那个期间（没结账的最后一期，没凭证的取最多那张）
 function onYearChange(y) {
   store.setYear(y)
 }
-// 切月份：直接落到那一个月
 function onMonthChange(m) {
   const target = store.periods.find((p) => p.year === selYear.value && p.month === m)
   if (target) store.setPeriod(target.id)
@@ -131,12 +214,41 @@ function onMonthChange(m) {
 function onCommand(cmd) {
   if (cmd === 'logout') {
     store.logout()
+    tabs.reset()
     router.push('/login')
   }
 }
 
-// 离开账套页就清掉「刚建好账套」的提示，免得下次回来又弹一遍已经过期的
-// 引导。建账当下那一次 remount 路由没变，所以提示接得回来。
+/* ── 标签栏 ─────────────────────────────────────────────────────── */
+watch(() => route.name, () => tabs.open(route), { immediate: true })
+
+function closeTab(key) {
+  const { next } = tabs.close(key, activeKey.value)
+  if (next) router.push(next)
+}
+
+function closePrev() {
+  const i = tabs.indexOfKey(activeKey.value)
+  if (i > 0) closeTab(tabs.opened[i - 1].key)
+}
+function closeNext() {
+  const i = tabs.indexOfKey(activeKey.value)
+  if (i >= 0 && i < tabs.opened.length - 1) closeTab(tabs.opened[i + 1].key)
+}
+
+function onTabCommand(cmd) {
+  if (cmd === 'others') {
+    tabs.closeOthers(activeKey.value)
+  } else if (cmd === 'all') {
+    tabs.closeAll()
+    router.push('/books')
+  }
+}
+
+// 登出把标签清掉：下一个登录的人不该看见上一个用户开着的页面
+watch(() => store.token, (t, old) => { if (old && !t) tabs.reset() })
+
+// 离开账套页就清掉「刚建好账套」的提示，免得下次回来又弹一遍已经过期的引导
 watch(
   () => route.name,
   (name) => {
@@ -146,45 +258,6 @@ watch(
 
 onMounted(async () => {
   await store.refreshMe()
-  // loadBooks 内部一定会跟一次 loadPeriods，这里不再单独 watch bookId ——
-  // 否则一次切账套会打两遍接口，期间下拉还会闪一次空列表
   if (!store.books.length || !store.periods.length) await store.loadBooks()
 })
 </script>
-
-<style scoped>
-.shell { height: 100vh; }
-
-/* 下拉选项自己排版：文字在左、标记贴右，且上下严格居中对齐 */
-.period-opt { display: flex; align-items: center; gap: 8px; }
-.period-opt .el-tag { margin-left: auto; }
-
-/* 面板跟触发器一样宽 —— 比触发器宽出来的每一像素，都让这个下拉在顶栏上
-   显得比旁边那个「年份」宽一圈。两边一致才是对齐。
-   宽度收回来是有代价的：Element Plus 默认给选项行左右各 20px 内边距，
-   104px 的框里扣掉 40px 根本放不下「1 月 + 已结账」，所以内边距和标记
-   都得跟着收一收。原来的做法是把触发器撑到 122px 去迁就面板 ——
-   那是让一个元素替另一个元素让步，顶栏照样看着没对齐。 */
-:global(.period-popper.el-popper) { min-width: 104px !important; width: 104px; }
-:global(.period-popper .el-select-dropdown__item) { padding: 0 8px; }
-:global(.period-popper .el-tag) { height: 18px; padding: 0 5px; font-size: 11px; }
-
-.brand {
-  display: flex; align-items: center; gap: 8px;
-  padding: 14px 16px; border-bottom: 1px solid var(--cwq-border);
-}
-.logo {
-  background: var(--cwq-primary); color: #fff; font-weight: 700;
-  padding: 2px 6px; border-radius: 4px; font-size: 12px; letter-spacing: .5px;
-}
-.name { font-weight: 600; }
-
-.menu { border-right: none; }
-
-.topbar {
-  display: flex; align-items: center; gap: 10px;
-  background: #fff; border-bottom: 1px solid var(--cwq-border);
-}
-.topbar .spacer { flex: 1; }
-.user { cursor: pointer; display: flex; align-items: center; gap: 4px; color: var(--cwq-text); }
-</style>

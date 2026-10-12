@@ -21,7 +21,9 @@ await page.goto(BASE, { waitUntil: 'networkidle' })
 await page.locator('input').nth(0).fill('admin')
 await page.locator('input').nth(1).fill('123456')
 await page.click('button:has-text("登录")')
-await page.waitForSelector('.el-aside', { timeout: 15000 })
+// 侧栏现在是 .sidebar（不再是 el-aside）—— 等一个已经删掉的类名，
+// 脚本会一直超时，报错还长得像「登录失败」。同 ui_voucher.mjs。
+await page.waitForSelector('.sidebar .sb-list li', { timeout: 15000 })
 await sleep(1800)
 await page.locator('.topbar .el-select').first().click(); await sleep(800)
 await page.locator('.el-select-dropdown__item:visible', { hasText: '启明物业' }).first().click()
@@ -33,8 +35,10 @@ await check('格子里没有「选择科目」按钮', await page.locator('.td-s
 const subjCell = page.locator('.td-subj .sp-input').first()
 const cellBox = await page.locator('.td-subj').first().boundingBox()
 const inputBox = await subjCell.boundingBox()
-await check('输入框铺满整格',
-  Math.abs(cellBox.width - inputBox.width) < 2 && Math.abs(cellBox.height - inputBox.height) < 2, true)
+// 框横向铺满整格，纵向只占内容那几行 —— 写满一行自己折成两行（最多两行）。
+// 格子下半截（压着科目余额）空着，点那儿也算「点这一格」，见下面 onCellClick。
+await check('框横向铺满整格', Math.abs(cellBox.width - inputBox.width) < 2, true)
+await check('框纵向只占一行（写长了才长成两行）', inputBox.height < cellBox.height, true)
 await subjCell.click(); await sleep(700)
 await check('点一下就出面板', await page.locator('.sp-panel').isVisible(), true)
 await check('面板里没有标题、没有搜索框',
@@ -64,14 +68,19 @@ await page.locator('.sp-tab', { hasText: '全部' }).click(); await sleep(400)
 // 选一个科目
 await subjCell.fill('库存现金'); await sleep(500)
 await page.locator('.sp-item').first().click(); await sleep(500)
-await check('选中后写回格子', await subjCell.inputValue(), '1001 库存现金')
+// 点面板里的科目选中时焦点还留在格子上 → 写的是编码（人接着打就是改科目）；
+// 等焦点离开这一格，才换回一级一级拼出来的全名给读凭证的人看
+await check('选中后写回格子（焦点还在这一格 → 写的是编码）',
+  await subjCell.inputValue(), '1001')
 await check('选完面板收起', await page.locator('.sp-panel').count(), 0)
 
 // 打了半天没选中：别让格子上写的和实际挂的科目说两套话
+// 点已经聚焦的这一格 = 把光标放到点上（好改其中几位），整格重打得自己先全选
 await subjCell.click(); await sleep(400)
+await subjCell.press('ControlOrMeta+a')
 await page.keyboard.type('查无此科目'); await sleep(500)
-await page.locator('.td-sum input').first().click(); await sleep(400)
-await check('认不出来的字回填成原来的', await subjCell.inputValue(), '1001 库存现金')
+await page.locator('.td-sum textarea').first().click(); await sleep(400)
+await check('认不出来的字回填成原来的', await subjCell.inputValue(), '库存现金')
 
 // ---- 新增科目 ----
 await subjCell.click(); await sleep(500)
@@ -109,7 +118,8 @@ const created = await page.evaluate(async () => {
 await check('科目真的建出来了', created && created.code, '100204')
 await check('类别继承上级', created?.category, 'ASSET')
 await check('核算标记一律是关的', [created?.qty, created?.aux], [false, false])
-await check('建完自动选中', await page.locator('.td-subj .sp-input').first().inputValue(), '100204 UI 验收科目')
+await check('建完自动选中（银行存款底下的 UI 验收科目，名字一级一级拼）',
+  await page.locator('.td-subj .sp-input').first().inputValue(), '银行存款/UI 验收科目')
 
 // ---- 科目余额表：编码规则在，没有核算列 ----
 await page.goto(`${BASE}/#/subjects`); await sleep(1800)

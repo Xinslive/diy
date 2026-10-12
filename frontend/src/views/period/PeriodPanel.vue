@@ -144,7 +144,7 @@ const carryInfo = ref({ has: false, vouchers: [], posted: false })
 const carrying = ref(false)
 const yearEnding = ref(false)
 
-// 期末处理只管当前年度：一次结一个年度，看别的年度先切顶栏
+// 期末结账只管当前年度：一次结一个年度，看别的年度先切顶栏
 const yearPeriods = computed(() => store.periodsOfYear(store.currentYear))
 const closedCount = computed(() => yearPeriods.value.filter((p) => p.locked).length)
 const yearComplete = computed(

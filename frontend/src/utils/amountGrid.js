@@ -36,6 +36,38 @@ export function sanitizeAmount(v) {
   return d ? `${sign}${i}.${d}` : `${sign}${i}`
 }
 
+/**
+ * 负号是**整格的属性**，按一下翻一下。
+ *
+ *  负号不是插在数字中间的一个字符，是这一格朝哪边：光标在万位上按「-」，
+ *  人想的是「这一笔是冲销的」，不是「在万位左边插个符号」。所以按下就翻整格，
+ *  再按一次翻回来 —— 一个键管一件事，不必先把光标挪到最前头。
+ *
+ *  · 「1234.56」→ 「-1234.56」→ 「1234.56」
+ *  · 空格子 → 「-」（先摆好方向，接着敲的 5 就直接成 -5）
+ *  · 「0.00」零没有方向可谈，按空格子算，按一下得「-」
+ */
+export function toggleAmountSign(v) {
+  const s = sanitizeAmount(v)
+  if (!s) return '-'
+  if (s === '-') return ''
+  const neg = s.startsWith('-')
+  const body = neg ? s.slice(1) : s
+  if (/^0(?:\.0+)?$/.test(body)) return neg ? '' : '-'   // 零算空格子，别摆出「-0.00」这种没人写的数
+  return neg ? body : `-${body}`
+}
+
+/**
+ * 框里该摆的字：值的样子，外加**刚敲下去、还没跟上一个数字的小数点**。
+ *
+ *  值里不留那个点（2332. 就是 2332），可框里必须留着：少了它，
+ *  接着敲的「5」就变成了在末尾接着打 5 —— 「2332」敲「.5」该得 2332.50，不是 23325。
+ */
+export function amountInputText(typed, next) {
+  const n = String(next ?? '')
+  return n && /[.]$/.test(String(typed ?? '')) && !n.includes('.') ? `${n}.` : n
+}
+
 /** 这个金额是不是红字（负数）。落格显示、合计行、打印都按它决定上不上红。 */
 export function isNegativeAmount(v) {
   return Number(v) < 0

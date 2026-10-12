@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.ledger import queries
 from app.core.db import get_db
 from app.core.deps import get_my_book
-from app.models import Book, Period
+from app.models import Book, Period, Voucher
 
 router = APIRouter(prefix="/api/books/{book_id}/ledger", tags=["账簿"])
 
@@ -71,6 +71,26 @@ def detail(book_id: int, subject_id: int, period_id: Optional[int] = None,
     else:
         from_period = to_period
     return queries.detail_ledger(db, book.id, subject_id, from_period, to_period, include_unposted)
+
+
+@router.get("/voucher-balances")
+def voucher_balances(book_id: int, period_id: Optional[int] = None,
+                     voucher_id: Optional[int] = Query(None),
+                     book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
+    """凭证录入页每行科目格左下角那个数字。
+
+    传 ``voucher_id`` 是为了把这张自己剔掉 —— 它会边填边自动保存，
+    算进去的话余额跟着自己动。口径见 ``queries.voucher_subject_balances``。
+    """
+    period = _period(db, book.id, period_id)
+    if voucher_id:
+        v = db.get(Voucher, voucher_id)
+        # 跨账套的凭证 id 一律当没传：宁可少剔一张，也不能把别家账的数字端回来
+        if v is not None and v.book_id != book.id:
+            voucher_id = None
+    balances = queries.voucher_subject_balances(db, book.id, period, exclude_voucher_id=voucher_id)
+    return {"period_id": period.id, "period": period.code,
+            "balances": {str(k): v for k, v in balances.items()}}
 
 
 # 原来的 `GET /ledger/voucher-no-preview`（只回一个 `next` 号码）撤了：

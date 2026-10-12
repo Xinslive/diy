@@ -854,17 +854,20 @@ def test_合计口径_借方红字算到贷方():
     assert [str(x) for x in side_totals(entries)] == ["200.00", "200.00"]
 
 
-def test_合计口径_两张正负相抵的凭证不许存(db, book, admin_user, subjects):
-    """借100 / 借-100 / 贷50 / 贷-50 带符号是平的，但什么也没记 —— 挡掉。
+def test_合计口径_正负相抵的凭证按平处理(db, book, admin_user, subjects):
+    """借100 / 借-100 / 贷50 / 贷-50：合计 150 / 150，两栏一样大 —— 就是平的，该存。
 
-    合计看着倒是 150 / 150，平得漂亮，可账上一笔都没动：这种凭证存进去，
-    报表上的数会莫名多出一截，还查不出是哪张凭证干的。
+    红字把负数搬去了对面，带符号那一对是 0/0，可人看着两栏相等就是平的
+    （2026-10-12 用户明确要求这么判）。早先把这类凭证挡在门外，前端摆的红字
+    跟「差额 0.00」自相矛盾，用户一看就知道是程序判错了。
     """
     rows = _entries(subjects,
                     [("100201", 100, "x"), ("100201", -100, "x")],
                     [("600101", 50, "x"), ("600101", -50, "x")])
-    with pytest.raises(ValueError, match="不能是 0"):
-        create_voucher(
-            db, book_id=book.id, user=admin_user, voucher_date=date(2026, 3, 1),
-            entries=rows,
-        )
+    v = create_voucher(
+        db, book_id=book.id, user=admin_user, voucher_date=date(2026, 3, 1),
+        entries=rows,
+    )
+    # 存下来了，四条分录原样保留（红字的负号没被吃掉）
+    assert [str(e.amount) for e in v.entries] == \
+        ["100.00", "-100.00", "50.00", "-50.00"]

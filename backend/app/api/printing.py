@@ -276,11 +276,12 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
     rows_per_page = voucher_rows_per_page(tpl)
     slots = voucher_slots_per_page(tpl)
 
-    # 先分片再排版：一张 12 行的凭证会变成 记001-1 / 记001-2 / 记001-3，
-    # 它们占三个槽位，可能跨物理页。
+    # 先分片再排版：一张 12 行的凭证会变成 记001 - 001/003 / 002/003 / 003/003，
+    # 它们占三个槽位，可能跨物理页。分页编号的写法由模板的 split_format 决定。
+    split_format = (tpl.get("voucher") or {}).get("split_format")
     pieces: list[dict] = []
     for v in shown:
-        pieces.extend(split_voucher(_serialize(db, v), rows_per_page))
+        pieces.extend(split_voucher(_serialize(db, v), rows_per_page, split_format))
 
     if not pieces:
         pieces = split_voucher({

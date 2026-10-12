@@ -27,8 +27,10 @@
       autocomplete="off"
       @input="onInput"
       @focus="onFocus"
-      @click.stop="selectAll"
+      @mousedown="byMouse = true"
+      @click="onClick"
       @blur="onBlur"
+      @keydown="onKeydown"
       @keydown.enter.prevent="$emit('enter')"
       @keydown.up.prevent="$emit('up')"
       @keydown.down.prevent="$emit('down')"
@@ -37,15 +39,15 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import AmountCells from './AmountCells.vue'
-import { caretBoundary, sanitizeAmount } from '@/utils/amountGrid'
+import { amountInputText, caretBoundary, sanitizeAmount, toggleAmountSign } from '@/utils/amountGrid'
 
 const props = defineProps({
   modelValue: { type: [String, Number], default: '' },
   readonly: { type: Boolean, default: false }
 })
-const emit = defineEmits(['update:modelValue', 'enter', 'focus', 'up', 'down', 'balance'])
+const emit = defineEmits(['update:modelValue', 'enter', 'focus', 'up', 'down', 'left', 'right', 'balance'])
 
 const el = ref(null)
 const focused = ref(false)
@@ -58,8 +60,8 @@ const raw = computed(() => sanitizeAmount(props.modelValue))
 /**
  * 落在格子里的样子：**角分永远补齐两位**。
  *
- *  凭证上没有「二千三百三十二块」这种写法，只有二千三百三十二元零角零分；
- *  合计行也一直按两位小数落格。分录行空着角分，同一张纸上两行写法对不上，
+ *  角分是这笔钱的一部分，不是可有可无的小数位：合计行也一直按两位小数落格，
+ *  跟打印出来那张纸上的写法一致。合计行落 2332.00、分录行落 2332，看着像少了一笔，
  *  人会以为这笔钱还没录完。敲「2332」就该看到 2332.00。
  *
  *  补出来的 0 是**格子的底子**，不是人敲的数：光标仍停在最后一个手敲的数位上，
@@ -72,17 +74,31 @@ const shown = computed(() => {
   return d.length >= 2 ? s : `${i}.${d.padEnd(2, '0')}`
 })
 
+/** 这次聚焦是鼠标点进来的吗。mousedown 先于 focus，所以这里分得出两条路 */
+let byMouse = false
 function onFocus() {
   focused.value = true
-  selectAll()
-  syncSelection()
+  // 鼠标点进来：浏览器已经把光标摆到点中的位置，别再去动它 ——
+  // 人要点哪儿就得能在哪儿落笔；「一律落到元/角」是把点哪儿的能力也一起收走了
+  // 键盘进来（Tab、↑↓）：没有点中的位置可依，才落到元/角之间
+  if (byMouse) byMouse = false
+  else caretToDecimal()
   // 聚焦要把「当前行」告诉外面：整行高亮跟着光标走
   emit('focus')
 }
-/** 整格选中：改金额就是重打一遍，不用先把旧数字拖掉。
- *  再点一次已经聚焦的格子不会触发 focus，所以 click 上也得来一遍。 */
-function selectAll() {
-  el.value?.select()
+/**
+ * 只用在**键盘**进来的时候（见 onFocus）：光标落到**元/角之间那根红线**上，
+ * 那儿是小数点该在的地方。整格选中看着省事，实际改不了小数位：
+ * 光标被按在末尾，想填角分得先退格把小数点顶出来，而金额天天在改的就是角分。
+ *
+ *  空格子也落到同一个位置，第一个数字正好落进元位。
+ */
+function caretToDecimal() {
+  const e = el.value
+  if (!e) return
+  const dot = e.value.indexOf('.')
+  const pos = dot === -1 ? e.value.length : dot + 1
+  e.setSelectionRange(pos, pos)
   syncSelection()
 }
 function onInput(e) {
@@ -96,11 +112,130 @@ function onInput(e) {
     emit('balance')
     return
   }
-  emit('update:modelValue', sanitizeAmount(typed))
-  // 打字之后光标已经挪位了：selectionchange 在受控输入里不一定按时来，主动对一次
-  nextTickSelection()
+  const pos = e.target.selectionStart ?? typed.length
+  const next = sanitizeAmount(typed)
+  // 小数点刚敲下去、角分还没跟上来的那一瞬，框里得**留着那个点**
+  const shownNext = amountInputText(typed, next)
+  // 框里的字**当场**收回值的样子。少了这一步，受控的值没变 → Vue 不重渲染这一格 →
+  // 手敲进去的多余负号就留在框里（「-303000-」），人看着跟存的数对不上；
+  // 接着敲的数字还会被那个多出来的负号顶到别的数位上去。
+  if (e.target.value !== shownNext) e.target.value = shownNext
+  emit('update:modelValue', next)
+  // 受控输入把值重写一遍，浏览器就把光标甩到末尾 —— 在元/角之间改角分时，
+  // 「1234.56」敲一个 9 变成「1234.95」（尾上那个 6 被两位小数的上限截掉），
+  // 字符串短了一位，光标就跟着掉到最后一位，再敲的数字全跑到分位去了。
+  // 记下按键时它停在哪，写回去时摆回同一个位置。
+  nextTickSelection(pos)
 }
+/**
+ * 点一下：光标落到**鼠标点中的那条落格线**上，而不是浏览器自己算的那个位置。
+ *
+ *  这层输入框是透明的，字还是靠左排的、字号也小，它眼里「点 20% 处」约莫落在第三个字旁边；
+ *  可人眼睛看的是右边那 11 格（亿…分）。两者对不上，点千位却把光标放到了末尾 ——
+ *  「点哪儿选中哪儿」就成了一句空话。
+ *
+ *  所以这里自己按 x 换算：格宽是十一等分，第 k 条缝就是 k/11，
+ *  再把「第 k 条缝」反推成字符串里的第几个字（跟 caretBoundary 正对着写，
+ *  一头一尾必须同一套规则）。反推完只挪光标、不改值。
+ *
+ *  有选区就说明人在拖选（或者双击选词），那是有意选的，别去动它。
+ */
+function onClick(e) {
+  const inp = el.value
+  if (!inp) return
+  const s0 = inp.selectionStart ?? 0
+  if ((inp.selectionEnd ?? s0) !== s0) return
+  const p = posFromX(e.clientX)
+  inp.setSelectionRange(p, p)
+  syncSelection()
+}
+
+/** 鼠标 x → 字符串里的位置。反过来就是 caretBoundary，两边必须对得上。 */
+function posFromX(clientX) {
+  const inp = el.value
+  const r = inp.getBoundingClientRect()
+  const k = Math.max(0, Math.min(11, Math.round(((clientX - r.left) / r.width) * 11)))
+  const v = sanitizeAmount(inp.value)
+  const dot = v.indexOf('.')
+  // 整数右对齐占 亿…元 九格，所以「第 k 条缝」在整数里是 k - 9 + 整数长度个字
+  const head = dot === -1 ? v : v.slice(0, dot)
+  const p = k <= 9 ? k - 9 + head.length : (dot === -1 ? v.length : dot + 1 + (k - 9))
+  return Math.max(0, Math.min(p, v.length))
+}
+
+/**
+ * 退格/删除不许只吃掉那个小数点。
+ *
+ *  点格子时光标落在元/角之间，也就是**紧贴在小数点后面**（老数据存回来是「200.00」，
+ *  角分两位是它自带的）。这时候按一下退格，默认行为会把小数点删掉：
+ *  「200.00」→「20000」，金额凭空大了一百倍，还被自动保存存进账里。
+ *
+ *  所以光标紧贴小数点时的退格/删除，一并把小数点和它后面的小数删干净 ——
+ *  人想抹的本来就是「那角分」，不是「那个点」。
+ */
+/**
+ * 按一下负号：整格翻负号。
+ *
+ *  光标要跟着挪一位，翻完它还压在**原来那个数字上** —— 人在哪一位上按的，
+ *  翻完就该还在哪一位上接着敲。光标跟着数一起走，才对得上「我看的是哪一格」。
+ */
+function toggleSign() {
+  const inp = el.value
+  if (!inp) return
+  const shownBefore = inp.value
+  // 光标位置得**先记下来**：往 input.value 上赋值，浏览器顺手把光标甩到末尾，
+  // 之后再问 selectionStart 拿到的永远是末尾 —— 那光标就跟着数跑了，不跟人走。
+  const pos = inp.selectionStart ?? 0
+  const after = toggleAmountSign(shownBefore)
+  const shownAfter = amountInputText(shownBefore, after)
+  if (inp.value !== shownAfter) inp.value = shownAfter
+  emit('update:modelValue', after)
+  nextTickSelection(pos + shownAfter.length - shownBefore.length)
+}
+
+function onKeydown(e) {
+  const inp = el.value
+  if (!inp) return
+
+  // 负号是**整格的属性**：光标在哪一位数上都一样，按一下整格翻负，再按一下翻正。
+  // 它不是往数字中间插的字符，所以不用先挪光标，也不用管有没有选区。
+  if (e.key === '-') {
+    e.preventDefault()
+    toggleSign()
+    return
+  }
+
+  // 光标走到这一头的边界上，方向键就**出格**：← 出到左边那一格，→ 出到右边那一格。
+  //
+  // 金额是「一格一格填」的，光标压在最高位左边再按 ←，浏览器只会把它按在原地 ——
+  // 可人按这一下想的就是「退回上一格」，跟退格键是一回事，却什么都没发生。
+  // 整张凭证一路向右录下来，回头想改一下科目，却得先 Tab 绕一圈找回来。
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    const s = inp.selectionStart ?? 0
+    if ((inp.selectionEnd ?? s) !== s) return    // 有选区：先照默认的收掉选区，别急着出格
+    const edge = e.key === 'ArrowLeft' ? 0 : inp.value.length
+    if (s !== edge) return                      // 还在这一格里头走：交给默认行为
+    e.preventDefault()
+    emit(e.key === 'ArrowLeft' ? 'left' : 'right')
+    return
+  }
+
+  if (e.key !== 'Backspace' && e.key !== 'Delete') return
+  const v = inp.value
+  const dot = v.indexOf('.')
+  if (dot === -1) return
+  const s = inp.selectionStart ?? 0
+  if (s !== (inp.selectionEnd ?? s)) return          // 有选区：按默认的来
+  const atDot = e.key === 'Backspace' ? s === dot + 1 : s === dot
+  if (!atDot) return
+  e.preventDefault()
+  inp.value = v.slice(0, dot)
+  inp.setSelectionRange(dot, dot)
+  onInput({ target: inp })     // onInput 读的是 e.target，这里直接把框本身当 target 递进去
+}
+
 function onBlur() {
+  byMouse = false        // 走了就把「刚才是鼠标点进来的」作废，别留给下一次键盘聚焦
   focused.value = false
   caret.value = -1
   sel.value = null
@@ -122,11 +257,27 @@ function syncSelection() {
     ? [caretBoundary(e.value, s), caretBoundary(e.value, t)]
     : null
 }
-/** 受控 value 换过之后浏览器还攥着旧选区，等下一帧再对一次，别用上一版的数 */
-let selTimer = null
-function nextTickSelection() {
-  clearTimeout(selTimer)
-  selTimer = setTimeout(syncSelection, 0)
+/**
+ * 受控 value 换过之后浏览器还攥着旧选区，等 DOM 更新完再对一次，别用上一版的数。
+ * pos 给了就把光标摆回那个位置（超过新长度就压在末尾）。
+ *
+ *  必须用 nextTick（微任务）而不是 setTimeout：连续打字时两次按键之间只隔一个任务，
+ *  setTimeout 还没轮到执行，下一个数字就照着被甩到末尾的光标插进去了 ——
+ *  「1234.56」在元/角之间连敲两个 9，本该得到 1234.99，实测成了 1234.959。
+ */
+let pending = 0
+function nextTickSelection(pos) {
+  const mine = ++pending
+  nextTick(() => {
+    if (mine !== pending) return          // 后一次输入已经把这次作废了
+    if (pos != null && focused.value && el.value) {
+      // 长度是**框里那串字**的长度：input 元素自己没有 length（那是 textarea 的），
+      // 取错了会算出 NaN，光标被 setSelectionRange 甩到 0 —— 下一个数字就从最前面插进来了
+      const p = Math.min(pos, el.value.value.length)
+      el.value.setSelectionRange(p, p)
+    }
+    syncSelection()
+  })
 }
 // 方向键、鼠标拖选、双击选词都只动选区不动 value，keydown/input 一个都不触发 ——
 // 唯一能把它们全兜住的是 selectionchange
@@ -140,7 +291,6 @@ watch(focused, (v) => {
   else document.removeEventListener('selectionchange', onSelectionChange)
 })
 onBeforeUnmount(() => {
-  clearTimeout(selTimer)
   document.removeEventListener('selectionchange', onSelectionChange)
 })
 

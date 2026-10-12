@@ -70,26 +70,43 @@ await page.goto(BASE, { waitUntil: 'networkidle' })
 await page.locator('input').nth(0).fill('admin')
 await page.locator('input').nth(1).fill('123456')
 await page.click('button:has-text("登录")')
-await page.waitForSelector('.el-aside', { timeout: 15000 })
+// 侧栏现在是 .sidebar（不再是 el-aside）—— 等一个已经删掉的类名，
+// 脚本会一直超时，报错还长得像「登录失败」。同 ui_voucher.mjs。
+await page.waitForSelector('.sidebar .sb-list li', { timeout: 15000 })
 await sleep(1800)
 await page.locator('.topbar .el-select').first().click(); await sleep(800)
 await page.locator('.el-select-dropdown__item:visible', { hasText: '启明物业' }).first().click()
 await sleep(1800)
 
-// ==================================================== 1. 摘要：点一下整格选中
+// ==================================================== 1. 摘要：光标进这一格就整格选中
 await page.goto(`${BASE}/#/vouchers/new`); await sleep(2000)
-await rows().nth(0).locator('.td-sum input').click()
-await page.keyboard.type('房租收入'); await sleep(300)
-// 点在文字中间：光标不该停在那儿，整句都该选中
-const box = await rows().nth(0).locator('.td-sum input').boundingBox()
+const sum0 = rows().nth(0).locator('.td-sum textarea')
+await sum0.fill('房租收入'); await sleep(300)
+await page.locator('.td-idx').first().click(); await sleep(300)   // 焦点先挪到序号格
+await sum0.click(); await sleep(350)
+// 光标进这一格时整句让出来了：接着打就是重打一遍
+await check('光标进摘要格 = 整格选中', await page.evaluate(() => {
+  const el = document.activeElement
+  return [el.selectionStart, el.selectionEnd, el.value]
+}), [0, 4, '房租收入'])
+// 但人已经在这格里待过了，再点一下是要改其中几个字，不是又要重打 ——
+// 全选按不掉、也点不掉的话，这一句就只能整段盖着改。
+// 点在框的中段（文字右边还有空白）：没有位置可落，光标落到末尾
+const box = await sum0.boundingBox()
 await page.mouse.click(box.x + box.width * 0.5, box.y + box.height / 2); await sleep(250)
-await check('点摘要格整格选中', await page.evaluate(() => {
+await check('再点一下摘要格 → 光标落到点上，不替他整格选中', await page.evaluate(() => {
+  const el = document.activeElement
+  return [el.selectionStart, el.selectionEnd, el.value]
+}), [4, 4, '房租收入'])
+// 要整句重打，自己按全选就行
+await page.keyboard.press('ControlOrMeta+a'); await sleep(200)
+await check('自己按全选还是全选', await page.evaluate(() => {
   const el = document.activeElement
   return [el.selectionStart, el.selectionEnd, el.value]
 }), [0, 4, '房租收入'])
 await page.keyboard.press('Backspace'); await sleep(250)
-await check('一键就删空了', await rows().nth(0).locator('.td-sum input').inputValue(), '')
-await rows().nth(0).locator('.td-sum input').fill('房租收入'); await sleep(200)
+await check('一键就删空了', await sum0.inputValue(), '')
+await rows().nth(0).locator('.td-sum textarea').fill('房租收入'); await sleep(200)
 
 // ==================================================== 2. 金额格 ↑/↓ 换行
 await pickSubject(0, 'kcxj')
@@ -122,12 +139,22 @@ await page.keyboard.press('Backspace'); await sleep(250)
 
 // ==================================================== 3. 「=」自动配平 + 红字
 const foot = async () => (await page.locator('.vfoot').innerText()).replace(/\s+/g, ' ')
+/** 合计行的金额：页脚那两个「借方合计/贷方合计」已经去掉了（合计格里摆着同样的数），
+ *  金额一律从合计行读。格子上是逐格落的数字，拼回来才是能比对的金额。 */
+const totalOf = async (side) => {
+  const t = await page.locator(`.vg-total .td-total.${side}`)
+    .evaluate((el) => el.textContent.replace(/\s+/g, ''))
+  if (!t) return '0.00'
+  const neg = t[0] === '\u2212' || t[0] === '-'
+  const d = neg ? t.slice(1) : t
+  return (neg ? '-' : '') + d.slice(0, -2) + '.' + d.slice(-2)
+}
 // 借 100 / 借 200，第三行（空行）往贷方敲 = → 补 300
 await rows().nth(2).locator('.td-amt.c .amt').click(); await sleep(300)
 await page.keyboard.type('='); await sleep(600)
 await check('空行往贷方敲「=」补上差额 300', await rows().nth(2).locator('.td-amt.c .amt-input').inputValue(), '300')
 await check('补完就平了', (await foot()).includes('借贷平衡'), true)
-await check('合计中文也补上了', await page.locator('.td-sumcell').innerText(), '合计：叁佰元整')
+await check('合计格照旧只有「合计」', await page.locator('.td-sumcell').innerText(), '合计')
 
 // 已经补对了还敲 =：数字不变，也不啰嗦
 await page.keyboard.press('='); await sleep(700)
@@ -140,12 +167,12 @@ await rows().nth(2).locator('.td-amt.c .amt').click(); await sleep(250)
 await page.keyboard.type('Backspace'); await sleep(300)
 await rows().nth(2).locator('.td-amt.d .amt').click(); await sleep(250)
 await page.keyboard.type('200'); await sleep(500)
-await check('第三行现在借方 200', await foot().then(t => t.includes('借方合计 500.00')), true)
+await check('第三行现在借方 200', await totalOf('d'), '500.00')
 await rows().nth(2).locator('.td-amt.c .amt').click(); await sleep(250)
 await page.keyboard.type('='); await sleep(700)
 await check('往贷方敲「=」补 300（这一行从借 200 变成贷 300）',
   await rows().nth(2).locator('.td-amt.c .amt-input').inputValue(), '300')
-await check('这一行的 200 没有被顶掉：借方合计还是 300', (await foot()).includes('借方合计 300.00'), true)
+await check('这一行的 200 没有被顶掉：借方合计还是 300', await totalOf('d'), '300.00')
 await check('补完正好平', (await foot()).includes('借贷平衡'), true)
 await page.screenshot({ path: OUT + 'voucher-balance-flip.png' })
 
@@ -156,18 +183,24 @@ await page.keyboard.type('='); await sleep(800)
 await check('空行 + 已平：这一格空着', await rows().nth(3).locator('.td-amt.c .amt-input').inputValue(), '')
 await check('并说一声已经平了',
   (await page.locator('.el-message').allTextContents()).some(t => t.includes('已经平了')), true)
-await rows().nth(3).locator('.td-sum input').fill(''); await sleep(300)
+await rows().nth(3).locator('.td-sum textarea').fill(''); await sleep(300)
 
 // ---- 改成红字负数：合计按「负数算到对面」的口径
+// 点金额格不再整格选中，改数前自己先全选掉再打
+// 负号是**整格的属性**而不是插进去的字符，所以打法是「先把数重打成 300，再按一下 -」
+// ——全选后直接打「-300」是不行的，那个 - 翻的是整格的符号，不是替掉选中的数字
 await rows().nth(2).locator('.td-amt.c .amt').click(); await sleep(250)
-await page.keyboard.type('-300'); await sleep(700)
-await check('负数落在贷方格里', await rows().nth(2).locator('.td-amt.c .amt-input').inputValue(), '-300')
+await page.keyboard.press('ControlOrMeta+A')
+await page.keyboard.type('300'); await sleep(400)
+await check('先重打成正数 300', await rows().nth(2).locator('.td-amt.c .amt-input').inputValue(), '300')
+await page.keyboard.press('-'); await sleep(700)
+await check('按一下「-」整格翻负', await rows().nth(2).locator('.td-amt.c .amt-input').inputValue(), '-300')
 await check('红字是红的', await page.evaluate(() => getComputedStyle(
   document.querySelectorAll('.vg-row')[3].querySelector('.td-amt.c .amt-cell')).color),
   'rgb(217, 48, 37)')
-await check('借 100+200、贷 -300 → 借方合计 600', (await foot()).includes('借方合计 600.00'), true)
-await check('贷方合计 0', (await foot()).includes('贷方合计 0.00'), true)
-await check('差额 600', (await foot()).includes('差额 600.00'), true)
+await check('借 100+200、贷 -300 → 借方合计 600', await totalOf('d'), '600.00')
+await check('贷方合计 0', await totalOf('c'), '0.00')
+await check('并说清是借方大 600', (await foot()).includes('借方大 600.00'), true)
 await check('合计行不再是一片红（负数已经算到对面）',
   await page.evaluate(() => document.querySelector('.vg-total .td-total.c .amt-cells')?.classList.contains('is-red')), false)
 await page.screenshot({ path: OUT + 'voucher-red-negative.png' })

@@ -15,7 +15,7 @@ const row = p.locator('.el-table__body tr').filter({ hasText: '结转流程自�
 await row.locator('button:has-text("进入")').click(); await sleep(1800)
 
 await step('期末处理页：期间表只列当前年度，并能切到 2026-01', async () => {
-  await p.click('.el-menu-item:has-text("期末处理")'); await sleep(1500)
+  await p.click('.el-menu-item:has-text("期末结账")'); await sleep(1500)
   const h3 = (await p.locator('.card h3').first().innerText()).trim()
   console.log('   ', h3)
   if (!h3.includes('2026')) throw new Error(h3)
@@ -58,7 +58,7 @@ await step('再点一次「重新结转损益」：提示会删哪几张，然�
 })
 
 await step('结账走通', async () => {
-  await p.click('.el-menu-item:has-text("期末处理")'); await sleep(1200)
+  await p.click('.el-menu-item:has-text("期末结账")'); await sleep(1200)
   await p.click('button:has-text("结账")'); await sleep(600)
   await p.click('.el-message-box__btns .el-button--primary'); await sleep(2000)
   console.log('   提示:', await toast())
@@ -75,7 +75,7 @@ await step('已结账期间凭证被锁死', async () => {
 })
 
 await step('年度结转前没结完账会被拦并点名是哪几个月', async () => {
-  await p.click('.el-menu-item:has-text("期末处理")'); await sleep(1200)
+  await p.click('.el-menu-item:has-text("期末结账")'); await sleep(1200)
   await p.locator('.card .el-table__body tr').filter({ hasText: '2026-12' }).first().click()
   await sleep(900)
   await p.click('button:has-text("结转到")'); await sleep(700)

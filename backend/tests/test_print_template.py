@@ -6,6 +6,7 @@ import pytest
 
 from app.printing.template import (
     DEFAULT_TEMPLATES,
+    cn_date,
     PAPERS,
     SCOPES,
     merge_defaults,
@@ -161,7 +162,7 @@ def test_凭证页含关键要素():
     assert "壹仟贰佰叁拾肆元伍角陆分" in html   # 金额大写
     assert "首月租金" in html                     # 备注
     assert "附单据" in html                       # 附单据数
-    assert "2026-01-05" in html                   # 制单日期
+    assert "2026年01月05日" in html                # 制单日期按中文写
     assert "凭证字号" in html
 
 
@@ -320,7 +321,7 @@ def test_只读账套也能预览(client, auth, db, book, periods, plain_user):
 # --------------------------------------------------------------------- 凭证分片
 #
 # 会计凭证的物理规则：一张最多 5 行摘要，超出的行续到下一张凭证打印，
-# 凭证号带分页号（记001-1 / 记001-2），这样撕开的两张仍然对得上同一张凭证。
+# 凭证号带分页号（记001 - 001/006），这样撕开的两张仍然对得上同一张凭证。
 
 
 def _entries(n: int) -> list[dict]:
@@ -337,25 +338,86 @@ def _voucher(no: str = "记001", n: int = 3, **kw) -> dict:
             "remark": "首月租金", "entries": _entries(n), **kw}
 
 
-def test_五行以内不拆也不加后缀():
-    """没拆过就不能加 -1：账上叫记001，打出来必须是记001。"""
+def test_五行以内不拆但仍带分页号():
+    """不拆的是 001/001 —— 和拆过的那几张长得一样，撕开/没撕开一眼能认出来。"""
     pieces = split_voucher(_voucher(n=5), 5)
     assert len(pieces) == 1
-    assert pieces[0]["voucher_no"] == "记001"
+    assert pieces[0]["voucher_no"] == "记001 - 001/001"
+    # 账上的凭证号一个字都没动，分页号只是打印时加的
+    assert pieces[0]["entries"] == _entries(5)
+
+
+def test_日期按中文打印():
+    """凭证上的日期是「2026年01月05日」，不是 ISO 的 2026-01-05。"""
+    tpl = validate_template("VOUCHER", {})
+    html = render_voucher_page(tpl, {}, _voucher(), 1, 1)
+    assert "2026年01月05日" in html
+    assert "2026-01-05" not in html
+
+
+def test_非ISO日期原样输出():
+    assert cn_date("") == ""
+    assert cn_date("不是日期") == "不是日期"
 
 
 def test_超五行拆成多张并加分页号():
+    """分页号写成 记001 - 001/006：既是凭证号，又看得出是第几张、共几张。"""
     pieces = split_voucher(_voucher(n=12), 5)
-    assert [p["voucher_no"] for p in pieces] == ["记001-1", "记001-2", "记001-3"]
+    assert [p["voucher_no"] for p in pieces] == [
+        "记001 - 001/003", "记001 - 002/003", "记001 - 003/003"]
     assert [len(p["entries"]) for p in pieces] == [5, 5, 2]
 
 
-def test_分片各自重算借贷合计():
-    """第二片只有第 6~10 行，合计必须按这几行算，不能沿用整张凭证的数。"""
+def test_分页编号格式可配():
+    """模板可以换写法，也能换成「起始行/总行数」。"""
+    pieces = split_voucher(_voucher(n=29), 5, "{voucher_no} - {first}/{lines}")
+    assert pieces[0]["voucher_no"] == "记001 - 001/029"
+    assert pieces[1]["voucher_no"] == "记001 - 006/029"
+    assert pieces[-1]["voucher_no"] == "记001 - 026/029"
+
+
+def test_分页编号按模板走():
+    tpl = validate_template("VOUCHER", {"voucher": {"split_format": "{voucher_no}（续{page}）"}})
+    fmt = tpl["voucher"]["split_format"]
+    assert split_voucher(_voucher(n=12), 5, fmt)[1]["voucher_no"] == "记001（续002）"
+
+
+def test_分页编号空串退回默认写法():
+    """输入框被清空不能变成「不加分页号」—— 没拆过的凭证本来就该是记001。"""
+    tpl = validate_template("VOUCHER", {"voucher": {"split_format": "   "}})
+    pieces = split_voucher(_voucher(n=12), 5, tpl["voucher"]["split_format"])
+    assert pieces[0]["voucher_no"] == "记001 - 001/003"
+
+
+def test_分片合计逐页累计():
+    """拆页是排版，不是把一张凭证的账算成好几张：
+    第二张印前两张加起来的数，最后一张等于整张凭证的合计。"""
     pieces = split_voucher(_voucher(n=12), 5)
     assert pieces[0]["total_debit"] == "30"      # 第 1、3、5 行
-    assert pieces[1]["total_debit"] == "20"      # 第 7、9 行
-    assert pieces[2]["total_debit"] == "10"      # 第 11 行
+    assert pieces[1]["total_debit"] == "50"      # 加上第 7、9 行
+    assert pieces[2]["total_debit"] == "60"      # 加上第 11 行 = 整张凭证
+    assert pieces[0]["total_credit"] == "20"
+    assert pieces[-1]["total_credit"] == "60"
+
+
+def test_最后一页合计等于整张凭证():
+    """最后一页必须能和账上的原凭证对上，不然撕开就没法核。"""
+    whole = _voucher(n=29)
+    pieces = split_voucher(whole, 5)
+    dr = sum(float(e["amount"]) for e in whole["entries"] if e["direction"] == "DEBIT")
+    assert float(pieces[-1]["total_debit"]) == dr
+
+
+def test_累计合计的金额大写跟着走():
+    """合计大写取的是这张分片的合计，最后一张要印整张凭证的大写。"""
+    tpl = validate_template("VOUCHER", {"elements": [
+        {"id": "cap", "type": "text", "bind": "capital",
+         "text": "合计大写：{capital}", "x": 3, "y": 82, "w": 64, "h": 5},
+    ]})
+    pieces = split_voucher(_voucher(n=12), 5)
+    html = render_voucher_sheet(tpl, {}, pieces, 1, 1)
+    assert "陆拾元整" in html
+    assert "叁拾元整" in html
 
 
 def test_分片保留原始行号():
@@ -367,6 +429,45 @@ def test_分片行数可调但上限五行():
     tpl = validate_template("VOUCHER", {"voucher": {"rows_per_page": 99}})
     assert voucher_rows_per_page(tpl) == 5
     assert len(split_voucher(_voucher(n=12), voucher_rows_per_page(tpl))) == 3
+
+
+# --------------------------------------------------------------------- 模板改名
+
+
+def test_模板可以改名且不动版式(client, auth, book):
+    """界面上「重命名」走的就是这个 PUT：只换名字，内容一个字都不许变。"""
+    created = client.post(
+        f"/api/books/{book.id}/print/templates",
+        json={"scope": "VOUCHER", "name": "改名前", "content": {"paper": "A5"}},
+        headers=auth,
+    ).json()
+    before = client.get(f"/api/books/{book.id}/print/templates/{created['id']}",
+                        headers=auth).json()["content"]
+
+    r = client.put(f"/api/books/{book.id}/print/templates/{created['id']}",
+                   json={"name": "改名后"}, headers=auth)
+    assert r.status_code == 200, r.text
+    after = client.get(f"/api/books/{book.id}/print/templates/{created['id']}",
+                       headers=auth).json()
+    assert after["name"] == "改名后"
+    assert after["content"] == before
+    names = [t["name"] for t in client.get(f"/api/books/{book.id}/print/templates",
+                                           headers=auth).json()]
+    assert "改名后" in names
+
+
+def test_改名不影响已保存的版式内容(client, auth, book):
+    """改名不是「重新保存」：content 没传就不能动它，否则默认值会盖掉用户改的纸型。"""
+    created = client.post(
+        f"/api/books/{book.id}/print/templates",
+        json={"scope": "VOUCHER", "name": "A5 版", "content": {"paper": "A5"}},
+        headers=auth,
+    ).json()
+    client.put(f"/api/books/{book.id}/print/templates/{created['id']}",
+               json={"name": "A5 版（终版）"}, headers=auth)
+    again = client.get(f"/api/books/{book.id}/print/templates/{created['id']}",
+                       headers=auth).json()
+    assert again["content"]["paper"] == "A5"
 
 
 # --------------------------------------------------------------------- 每页几张
@@ -433,7 +534,8 @@ def test_十二行凭证打印时占满三张A4(client, auth, book, periods, mak
     r = client.get(f"/api/books/{book.id}/print/vouchers.html",
                    params={"period_id": periods[1].id}, headers=auth)
     assert r.status_code == 200, r.text
-    assert "记001-1" in r.text and "记001-2" in r.text and "记001-3" in r.text
+    assert "记001 - 001/003" in r.text and "记001 - 002/003" in r.text
+    assert "记001 - 003/003" in r.text
     assert r.text.count('class="voucher-slot"') == 3      # 3 个槽位
     assert r.text.count('<div class="page">') == 2         # A4 两槽位 → 2 张纸
 
@@ -474,7 +576,7 @@ def test_预览的分片与正式打印一致(client, auth, book, periods, make_
         return h.split("<body>")[1].replace(
             '<p class="page-note">预览只显示前 3 张凭证，打印时输出该期间全部凭证。</p>', "")
 
-    assert "记001-2" in prev.text
+    assert "记001 - 002/002" in prev.text
     assert body(prev.text) == body(printed.text)
 
 
@@ -540,6 +642,66 @@ def test_表格框线可单独关掉():
     assert html.count('<table class="grid"') == 1
     assert "--vrow:" in html                     # 行高照样算给行
     assert "摘　要" in html                        # 内容照印
+
+
+# --------------------------------------------------------------------- 表头与合计行
+
+
+def _table_tpl(**el):
+    base = {"id": "t", "type": "table", "bind": "entries", "x": 3, "y": 20, "w": 94, "h": 60}
+    return validate_template("VOUCHER", {"elements": [{**base, **el}]})
+
+
+def test_表头默认显示():
+    tpl = validate_template("VOUCHER", {})
+    table_el = next(e for e in tpl["elements"] if e["type"] == "table")
+    assert table_el["show_header"] is True
+    html = render_voucher_sheet(tpl, {}, [_voucher()], 1, 1)
+    assert "<thead>" in html and "摘　要" in html
+
+
+def test_表头可以关掉且高度让给分录行():
+    """关掉表头不能塌一行 —— 剩下的高度全给分录行，表格还是占满原位。"""
+    tpl = _table_tpl(show_header=False)
+    html = render_voucher_sheet(tpl, {}, [_voucher()], 1, 1)
+    assert "<thead>" not in html
+    head, row = (float(x) for x in re.search(
+        r"--vhead:([\d.]+)%;--vrow:([\d.]+)%", html).groups())
+    assert head == 0
+    assert abs(head + row * 6 - 100) < 0.01
+    # 分录 5 行 + 合计行，正文照旧
+    assert html.count("<tr") >= 6
+
+
+def test_表头高度可配():
+    tpl = _table_tpl(header_height=25)
+    html = render_voucher_sheet(tpl, {}, [_voucher()], 1, 1)
+    head, row = (float(x) for x in re.search(
+        r"--vhead:([\d.]+)%;--vrow:([\d.]+)%", html).groups())
+    assert head == 25
+    assert abs(head + row * 6 - 100) < 0.01
+    assert "摘　要" in html
+
+
+def test_表头高度越界被夹住():
+    tpl = _table_tpl(header_height=999)
+    assert tpl["elements"][0]["header_height"] == 100
+    tpl2 = _table_tpl(header_height="不是数字")
+    assert tpl2["elements"][0]["header_height"] == 14
+
+
+def test_合计文字可配():
+    """合计行那个标签归模板管，不写就还是「合　计」。"""
+    assert "合　计" in render_voucher_sheet(_table_tpl(), {}, [_voucher()], 1, 1)
+    html = render_voucher_sheet(_table_tpl(total_label="本页合计"), {}, [_voucher()], 1, 1)
+    assert "本页合计" in html and "合　计" not in html
+
+
+def test_合计文字可以留空():
+    html = render_voucher_sheet(_table_tpl(total_label=""), {}, [_voucher()], 1, 1)
+    body = re.search(r"<tbody>(.*?)</tbody>", html, re.S).group(1)
+    total_row = [r for r in body.split("<tr") if "total" in r][0]
+    assert "合" not in total_row
 
 
 def test_表格默认有框线():

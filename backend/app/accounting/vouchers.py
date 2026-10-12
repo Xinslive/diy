@@ -161,8 +161,12 @@ def _validate_entries(db: Session, book_id: int, entries: list[dict],
         raise ValueError(f"借贷不平衡：借方 {dr} / 贷方 {cr}")
     # 负数是**红字冲销**，一张红字凭证借贷两边都是负的（-300 / -300），
     # 照样是平的、照样该存 —— 冲掉一张记错的凭证正是记账的日常。
-    # 所以这里只挡「全零」，不挡负数。
-    if dr == 0:
+    # **正负相抵**（借 111 / 借 -111）同理：红字把 -111 搬去了对面，两栏一样大，
+    # 按「借贷合计相等」就是平的（2026-10-12 用户明确要求这么判），也该存。
+    #
+    # 只挡**一条金额都没填**的：每条都是 0，那不是「记了 0 块」，是没填。
+    # 它存进去，报表上凭空多出一张凭证，还查不出是哪张干的。
+    if all(money(e["amount"]) == 0 for e in entries):
         raise ValueError("凭证金额不能是 0")
 
     subject_ids = {e["subject_id"] for e in entries}
