@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from app.api.vouchers import _serialize
 from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
-from app.models import Book, Period, PrintTemplate, SysUser, UserBook
+from app.models import Book, Period, PrintTemplate, SysUser, UserBook, Voucher
 from app.printing import excel as xl
 from app.printing import preview as pv
 from app.printing.template import (
@@ -260,7 +260,7 @@ def _html_response(doc: str) -> Response:
 
 def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
                   status: Optional[str] = None, max_pages: Optional[int] = None,
-                  note: str = "") -> str:
+                  note: str = "", voucher_ids: Optional[list[int]] = None) -> str:
     """记账凭证：A4 一页两张、A5 一页一张，每张最多 5 行摘要、超出续到下一张。
 
     ``max_pages`` 限的是**原始凭证张数**（只给预览用，保证改版式时的响应速度），
@@ -268,10 +268,26 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
     """
     from app.accounting.vouchers import query_vouchers
 
-    vouchers, _ = query_vouchers(db, book.id, from_period=period, to_period=period,
-                                 status=status, page_size=5000)
-    vouchers = sorted(vouchers, key=lambda v: (v.voucher_date, v.voucher_no))
+    if voucher_ids is None:
+        vouchers, _ = query_vouchers(db, book.id, from_period=period, to_period=period,
+                                     status=status, page_size=5000)
+    else:
+        ids = list(dict.fromkeys(voucher_ids))
+        vouchers = list(db.scalars(select(Voucher).where(
+            Voucher.book_id == book.id, Voucher.id.in_(ids)
+        )).all())
+        if len(vouchers) != len(ids):
+            raise HTTPException(404, "所选凭证不存在或不属于当前账套")
+    vouchers = sorted(vouchers, key=lambda v: (v.voucher_date, v.voucher_no, v.id))
     shown = vouchers[:max_pages] if max_pages else vouchers
+
+    period_codes = {}
+    if voucher_ids is not None and shown:
+        periods = db.scalars(select(Period).where(
+                Period.book_id == book.id,
+                Period.id.in_({v.period_id for v in shown}),
+            )).all()
+        period_codes = {p.id: p.code for p in periods}
 
     rows_per_page = voucher_rows_per_page(tpl)
     slots = voucher_slots_per_page(tpl)
@@ -281,7 +297,9 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
     split_format = (tpl.get("voucher") or {}).get("split_format")
     pieces: list[dict] = []
     for v in shown:
-        pieces.extend(split_voucher(_serialize(db, v), rows_per_page, split_format))
+        voucher = _serialize(db, v)
+        voucher["period"] = period_codes.get(v.period_id, period.code)
+        pieces.extend(split_voucher(voucher, rows_per_page, split_format))
 
     if not pieces:
         pieces = split_voucher({
@@ -326,6 +344,7 @@ def _render_scope(
     include_unposted: bool = False,
     leaf_only: bool = False,
     status: Optional[str] = None,
+    voucher_ids: Optional[list[int]] = None,
     max_pages: Optional[int] = None,
     note: str = "",
 ) -> str:
@@ -336,7 +355,7 @@ def _render_scope(
 
     if scope == "VOUCHER":
         return _voucher_html(db, book, period, tpl, status=status,
-                             max_pages=max_pages, note=note)
+                             max_pages=max_pages, note=note, voucher_ids=voucher_ids)
 
     if scope == "BALANCE":
         subjects = queries.subject_tree(db, book.id)
@@ -419,11 +438,23 @@ def _render_scope(
 @router.get("/vouchers.html")
 def print_vouchers(book_id: int, period_id: Optional[int] = None,
                    template_id: Optional[int] = None, status: Optional[str] = None,
+                   voucher_ids: Optional[str] = None,
                    book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     """记账凭证：A4 每页 2 张、A5 每页 1 张，每张最多 5 行摘要。"""
+    selected_ids = None
+    if voucher_ids is not None:
+        try:
+            selected_ids = list(dict.fromkeys(
+                int(value.strip()) for value in voucher_ids.split(',') if value.strip()
+            ))
+        except ValueError as exc:
+            raise HTTPException(422, "所选凭证编号格式无效") from exc
+        if not selected_ids or any(voucher_id <= 0 for voucher_id in selected_ids):
+            raise HTTPException(422, "至少选择一张有效凭证")
     tpl = _tpl_dict(_template(db, book, "VOUCHER", template_id))
     return _html_response(_render_scope(db, book, "VOUCHER", tpl,
-                                        period_id=period_id, status=status))
+                                        period_id=period_id, status=status,
+                                        voucher_ids=selected_ids))
 
 
 @router.get("/balance.html")

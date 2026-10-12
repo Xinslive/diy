@@ -1,72 +1,84 @@
 <template>
-  <div class="page">
-    <div class="page-head">
-      <div>
-        <h2 class="page-title">账套管理</h2>
-        <div class="muted">
-          账套是独立的记账单元，一个账套可以记很多个年度；年度结转只是在同一个账套里往下追加一年，
-          不会新开账套
-        </div>
+  <div class="page book-page">
+    <div class="book-page-head">
+      <div class="book-page-heading">
+        <h2 class="book-page-title">账套管理</h2>
+        <span class="book-count">{{ store.books.length }} 个账套</span>
       </div>
       <!-- 谁都能建账套，建完自己就是 OWNER；管理员授权管的是别人的账套 -->
-      <el-button type="primary" @click="openCreate">新建账套</el-button>
+      <el-button type="primary" class="create-book-button" @click="openCreate">
+        <el-icon><Plus /></el-icon>
+        新建账套
+      </el-button>
     </div>
 
-    <div class="card" v-loading="loading">
-      <el-table :data="store.books" border>
-        <el-table-column label="单位名称" prop="company_name" min-width="180" />
-        <el-table-column label="账套名称" min-width="170">
-          <template #default="{ row }">
-            <el-link type="primary" @click="switchTo(row.id, pickedYear(row))">{{ row.name }}</el-link>
-            <el-tag v-if="row.id === store.bookId" size="small" type="success" class="ml">当前</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="年度" width="118" align="center">
-          <template #default="{ row }">
-            <!-- 默认停在最新年度；要看往年就手动切，进去的账就是选中的那一年 -->
+    <section class="book-grid" v-loading="loading" aria-label="账套列表">
+      <article
+        v-for="row in store.books"
+        :key="row.id"
+        class="book-tile"
+        :class="{ 'is-current': row.id === store.bookId }"
+        :aria-label="`账套：${row.name}`"
+      >
+        <div class="book-tile-head">
+          <div class="book-tile-ident">
+            <span class="book-tile-icon" aria-hidden="true"><el-icon><Folder /></el-icon></span>
+            <div class="book-tile-title">
+              <el-link class="book-name-link" type="primary" @click="switchTo(row.id, pickedYear(row))">
+                {{ row.name }}
+              </el-link>
+              <el-tag v-if="row.id === store.bookId" size="small" type="success">当前</el-tag>
+            </div>
+          </div>
+          <el-tag :type="yearOf(row).carried ? 'info' : 'success'" size="small">
+            {{ yearOf(row).carried ? '已结转' : '使用中' }}
+          </el-tag>
+        </div>
+
+        <div class="book-tile-meta">
+          <div class="book-fact">
+            <span class="book-fact-label">会计年度</span>
+            <!-- 默认停在最新年度；选择其他年度会同步到顶栏 -->
             <el-select
               :model-value="pickedYear(row)"
+              class="book-year-select"
               size="small"
-              style="width: 100%"
               @change="(v) => onYearPick(row, v)"
               @click.stop
             >
               <el-option v-for="y in row.years" :key="y.year" :label="`${y.year} 年`" :value="y.year">
-                <!-- 同 MainLayout：float 会让「已结完」跟年份文字上下错开 -->
                 <span class="year-opt">
                   <span>{{ y.year }} 年</span>
                   <el-tag v-if="y.carried" size="small" type="info">已结完</el-tag>
                 </span>
               </el-option>
             </el-select>
-          </template>
-        </el-table-column>
-        <el-table-column label="已结账" width="120" align="center">
-          <template #default="{ row }">
-            <span :class="yearOf(row).carried ? 'ok' : ''">
+          </div>
+          <div class="book-fact book-fact-closed">
+            <span class="book-fact-label">已结账</span>
+            <strong :class="yearOf(row).carried ? 'ok' : ''">
               {{ yearOf(row).closed }} / {{ yearOf(row).total }} 期
-            </span>
-          </template>
-        </el-table-column>
-        <el-table-column label="状态" width="100" align="center">
-          <template #default="{ row }">
-            <el-tag :type="yearOf(row).carried ? 'info' : 'success'" size="small">
-              {{ yearOf(row).carried ? '已结转' : '使用中' }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="操作" width="140" align="center">
-          <template #default="{ row }">
-            <el-button link type="primary" @click="switchTo(row.id, pickedYear(row))">进入</el-button>
-            <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
-          </template>
-        </el-table-column>
-      </el-table>
+            </strong>
+          </div>
+        </div>
+
+        <div class="book-tile-actions">
+          <el-button type="primary" plain class="enter-book-button" @click="switchTo(row.id, pickedYear(row))">
+            进入账套<el-icon><Right /></el-icon>
+          </el-button>
+          <el-tooltip content="编辑账套" placement="top">
+            <el-button circle class="edit-book-button" :aria-label="`编辑账套 ${row.name}`" @click="openEdit(row)">
+              <el-icon><Edit /></el-icon>
+            </el-button>
+          </el-tooltip>
+        </div>
+      </article>
+
       <el-empty
         v-if="!loading && !store.books.length"
         description="还没有账套，点右上角「新建账套」自己开一个；也可以请管理员在「用户与授权」里把已有账套授权给你"
       />
-    </div>
+    </section>
 
     <el-dialog v-model="visible" title="新建账套" width="520px">
       <el-form :model="form" label-width="100px">
@@ -154,6 +166,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { Edit, Folder, Plus, Right } from '@element-plus/icons-vue'
 import * as api from '@/api/book'
 import { useSessionStore } from '@/stores/session'
 
@@ -299,7 +312,6 @@ async function submitEdit() {
 async function switchTo(id, year) {
   await store.setBook(id)
   if (year) store.setYear(year)
-  ElMessage.success(`已进入《${store.currentBook?.name}》${store.currentPeriod?.code || ''}`)
   router.push('/vouchers')
 }
 
@@ -341,12 +353,130 @@ onMounted(async () => {
 .rule-note { margin-left: 10px; color: var(--cwq-danger); font-size: 12px; white-space: nowrap; }
 .rule-sample { color: var(--cwq-ok); font-size: 14px; letter-spacing: 1px; margin-left: 75px; }
 <style scoped>
+.book-page { padding: 24px; }
+.book-page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.book-page-heading { display: flex; align-items: center; gap: 12px; }
+.book-page-title {
+  margin: 0;
+  color: var(--cwq-chrome-strong);
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.book-count {
+  padding-left: 12px;
+  border-left: 1px solid #d9dfe7;
+  color: #778292;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.create-book-button { min-height: 38px; padding: 0 16px; }
+.create-book-button :deep(.el-icon) { margin-right: 5px; }
+.book-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr));
+  align-items: stretch;
+  gap: 12px;
+}
+.book-tile {
+  display: flex;
+  min-width: 0;
+  min-height: 170px;
+  flex-direction: column;
+  padding: 14px 16px 12px;
+  background: #fff;
+  border: 1px solid #e2e7ed;
+  border-radius: 8px;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+.book-tile:hover {
+  border-color: #cbd6e2;
+  box-shadow: 0 5px 16px rgb(31 39 51 / 6%);
+}
+.book-tile.is-current {
+  background: #f9fbff;
+  border-color: #c5d8f0;
+  box-shadow: inset 3px 0 0 var(--cwq-primary);
+}
+.book-tile-head { display: flex; min-height: 42px; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.book-tile-ident { display: flex; min-width: 0; align-items: flex-start; gap: 9px; }
+.book-tile-icon {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  place-items: center;
+  color: #68788b;
+  background: #f1f4f7;
+  border-radius: 7px;
+  font-size: 15px;
+}
+.book-tile.is-current .book-tile-icon { color: #2864a8; background: #eaf2fc; }
+.book-tile-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 7px;
+  padding-top: 3px;
+}
+.book-name-link {
+  min-width: 0;
+  color: #2c3848;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-align: left;
+  white-space: normal;
+}
+.book-name-link :deep(.el-link__inner) { text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.book-tile-meta {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  margin-top: 8px;
+  padding: 9px 0;
+  border-top: 1px solid #edf0f3;
+  border-bottom: 1px solid #edf0f3;
+}
+.book-fact { display: flex; min-width: 0; align-items: center; gap: 7px; }
+.book-fact + .book-fact { padding-left: 18px; border-left: 1px solid #edf0f3; }
+.book-fact-label { flex: 0 0 auto; color: #8993a1; font-size: 12px; line-height: 1.4; }
+.book-fact strong { color: #3a4655; font-size: 14px; font-weight: 600; }
+.book-year-select { width: 100px; }
+.book-tile-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; padding-top: 8px; }
+.enter-book-button { min-width: 92px; }
+.enter-book-button :deep(.el-button__text) { font-size: 12px; }
+.enter-book-button :deep(.el-icon) { margin-left: 6px; }
+.enter-book-button { height: 30px; padding: 0 10px; }
+.edit-book-button { width: 30px; height: 30px; }
 /* 年度下拉选项：文字在左、「已结完」贴右且垂直居中 */
 .year-opt { display: flex; align-items: center; }
 .year-opt .el-tag { margin-left: auto; }
-.page-title { margin: 0 0 2px; font-size: 18px; }
-.ml { margin-left: 8px; }
 .mt { margin-top: 8px; }
 .mb { margin-bottom: 12px; }
 .ok { color: var(--cwq-ok); font-weight: 600; }
+
+@media (max-width: 700px) {
+  .book-page { padding: 16px; }
+  .book-page-head { margin-bottom: 18px; }
+  .book-page-title { font-size: 20px; }
+  .book-grid { grid-template-columns: 1fr; gap: 10px; }
+  .book-tile { min-height: 166px; padding: 14px; }
+}
+@media (max-width: 420px) {
+  .book-page-heading { align-items: flex-start; flex-direction: column; gap: 4px; }
+  .book-count { padding-left: 0; border-left: 0; }
+  .book-page-head { align-items: flex-end; }
+  .create-book-button { padding: 0 11px; }
+  .book-tile-meta { gap: 8px; }
+  .book-fact { align-items: flex-start; flex-direction: column; gap: 4px; }
+  .book-fact + .book-fact { padding-left: 12px; }
+  .book-year-select { width: 110px; }
+}
 </style>

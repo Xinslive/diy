@@ -103,8 +103,8 @@ body {
      所以藏完导航还得把外壳的定高与滚动一并放开，让内容自己撑开。 */
   .no-print { display: none !important; }
   html, body, #app { height: auto; overflow: visible; background: #fff; }
-  .shell { height: auto; overflow: visible; --sb-w: 0px !important; }
-  .main { margin-left: 0; height: auto; display: block; }
+  .shell { width: 100%; min-width: 0; margin: 0; height: auto; overflow: visible; --sb-w: 0px !important; }
+  .main { width: 100%; margin-left: 0; height: auto; display: block; }
   .content { overflow: visible; }
   .page { padding: 0 !important; }
   .card { border: none; padding: 0; }
@@ -129,12 +129,15 @@ body {
   --cwq-chrome-top: 52px;
 }
 
-/* 侧栏是**一整条通栏的固定列**：y=0 到屏幕底，宽度 --sb-w。
+/* 侧栏是外壳左侧的全高列：y=0 到屏幕底，宽度 --sb-w。
    顶栏、标签栏、内容统统从它右边开始（.main 的 margin-left）——
    标签栏横穿侧栏顶上那一段是最难看的地方：深色被浅色切断，
-   左边那条竖带看着像只剩了半截。参考站就是 .layui-side fixed 全高 + 右侧统一偏移。 */
+   左边那条竖带看着像只剩了半截。侧栏与顶栏、内容一并随外壳居中。 */
 .shell {
   --sb-w: 220px;
+  position: relative;
+  width: max(1280px, 74vw);
+  margin-inline: auto;
   height: 100vh; overflow: hidden;
 }
 /* 收起到 60px 图标带，不是 0。
@@ -143,7 +146,7 @@ body {
 .shell.sb-off { --sb-w: 60px; }
 
 .main {
-  margin-left: var(--sb-w); height: 100vh;
+  width: auto; margin-left: var(--sb-w); height: 100vh;
   display: flex; flex-direction: column; min-width: 0;
   transition: margin-left .2s ease;
 }
@@ -246,7 +249,7 @@ body {
 
 /* ── 主体 ─────────────────────────────────────────────────────── */
 .sidebar {
-  position: fixed; left: 0; top: 0; bottom: 0; z-index: 20;
+  position: absolute; left: 0; top: 0; bottom: 0; z-index: 20;
   width: var(--sb-w); overflow-y: auto; overflow-x: hidden;
   background: var(--cwq-chrome-2); color: var(--cwq-chrome-text);
   border-right: 1px solid var(--cwq-hairline);

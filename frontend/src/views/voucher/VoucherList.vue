@@ -7,15 +7,15 @@
 
            「金额」筛的是**某一条分录**的金额，不是整张凭证的合计：
            只要凭证里有任意一行落在这个区间，整张就被捞出来。 -->
-      <el-input v-model="query.keyword" placeholder="凭证号 / 摘要" clearable style="width: 180px" @keyup.enter="load" />
+      <el-input v-model="query.keyword" placeholder="凭证号 / 摘要" clearable style="width: 108px" @keyup.enter="load" />
       <el-tooltip content="按分录金额筛选：凭证里有任意一行落在这个区间，整张都会被列出来" placement="top">
         <span class="muted">分录金额</span>
       </el-tooltip>
       <el-input-number v-model="query.min_amount" :controls="false" :min="0" :precision="2"
-                       :value-on-clear="null" placeholder="从" style="width: 104px" @keyup.enter="load" />
+                       :value-on-clear="null" placeholder="从" style="width: 78px" @keyup.enter="load" />
       <span class="muted">—</span>
       <el-input-number v-model="query.max_amount" :controls="false" :min="0" :precision="2"
-                       :value-on-clear="null" placeholder="到" style="width: 104px" @keyup.enter="load" />
+                       :value-on-clear="null" placeholder="到" style="width: 78px" @keyup.enter="load" />
       <el-button @click="load">查询</el-button>
 
       <span class="spacer" />
@@ -26,13 +26,12 @@
            腾出来的宽度正好够把原来塞在「更多」里的两个常用项摆到明面上 ——
            一个只剩一个选项的下拉框，本身就是个没意义的容器。 -->
       <el-button @click="printVouchers">
-        <el-icon><Printer /></el-icon>&nbsp;打印预览
+        <el-icon><Printer /></el-icon>&nbsp;{{ selection.length ? `打印所选（${selection.length}）` : '打印预览' }}
       </el-button>
 
       <template v-if="store.canWrite">
         <el-button :icon="Sort" @click="router.push('/vouchers/organize')">整理凭证</el-button>
         <el-button :icon="Upload" @click="router.push('/vouchers/import')">导入凭证</el-button>
-        <el-button type="danger" plain :disabled="!selection.length" @click="removeAll">删除</el-button>
         <el-button type="primary" @click="$router.push('/vouchers/new')">新增凭证</el-button>
       </template>
     </div>
@@ -74,7 +73,7 @@
         @selection-change="selection = $event"
         @row-dblclick="(row) => open(row)"
       >
-        <el-table-column type="selection" width="42" :selectable="() => store.canWrite" />
+        <el-table-column type="selection" width="42" />
         <!-- 日期不许折行：'2026-12-31' 断成两行，扫一列日期全靠猜 -->
         <el-table-column prop="voucher_date" label="日期" width="124" class-name="nowrap" label-class-name="nowrap" />
         <el-table-column prop="voucher_no" label="凭证号" width="95" />
@@ -238,7 +237,11 @@ const notReady = computed(() => {
 })
 
 function printVouchers() {
-  openPrint(`/books/${store.bookId}/print/vouchers.html`, { period_id: store.periodId })
+  const params = { period_id: store.periodId }
+  if (selection.value.length) {
+    params.voucher_ids = selection.value.map((voucher) => voucher.id).join(',')
+  }
+  openPrint(`/books/${store.bookId}/print/vouchers.html`, params)
 }
 
 function open(row) {
@@ -252,23 +255,11 @@ async function removeOne(row) {
         ? `凭证 ${row.voucher_no} 已记账，不能删除；请先「反记账」`
         : `${row.voucher_no} 所在期间已结账，不能删除`)
   }
-  await ElMessageBox.confirm(`确认删除凭证 ${row.voucher_no}？删除后凭证号可被后续凭证复用。`, '删除凭证', { type: 'warning' })
+  await ElMessageBox.confirm(`确认删除凭证 ${row.voucher_no}？`, '删除凭证', { type: 'warning' })
   await api.deleteVoucher(store.bookId, row.id)
   ElMessage.success('已删除')
   load()
 }
-async function removeAll() {
-  const posted = selection.value.filter((v) => v.status === 'POSTED')
-  if (posted.length) {
-    return ElMessage.warning(
-      `选中的 ${posted.length} 张凭证已记账，不能删除：${posted.slice(0, 5).map((v) => v.voucher_no).join('、')}`)
-  }
-  await ElMessageBox.confirm(`确认删除选中的 ${selection.value.length} 张凭证？`, '批量删除', { type: 'warning' })
-  const r = await api.batchDelete(store.bookId, selection.value.map((x) => x.id))
-  ElMessage.success(`已删除 ${r.deleted} 张`)
-  load()
-}
-
 onMounted(() => {
   query.page = 1
   restoreFilterFromUrl()

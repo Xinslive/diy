@@ -277,7 +277,7 @@ def main() -> int:
     check("列宽归一化到 100%", abs(sum(c["width"] for c in created["content"]["columns"]) - 100) < 0.01)
 
     st, patched = call("PUT", f"/api/books/{bid}/print/templates/{tid}", {
-        "content": {"title": {"text": "记 帐 凭 证"}, "font": {"family": "仿宋", "size": 11}}
+        "content": {"title": {"text": "记 账 凭 证"}, "font": {"family": "仿宋", "size": 11}}
     })
     check("修改模板（只传局部）", st == 200 and patched["content"]["font"]["size"] == 11)
     check("未传的列被保留", len(patched["content"]["columns"]) == 5,

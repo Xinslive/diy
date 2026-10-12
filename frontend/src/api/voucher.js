@@ -16,7 +16,6 @@ export const updateVoucher = (bookId, id, payload) => http.put(`/books/${bookId}
 export const deleteVoucher = (bookId, id) => http.delete(`/books/${bookId}/vouchers/${id}`).then(r => r.data)
 export const postVouchers = (bookId, ids) => http.post(`/books/${bookId}/vouchers/post`, { ids }).then(r => r.data)
 export const unpostVouchers = (bookId, ids) => http.post(`/books/${bookId}/vouchers/unpost`, { ids }).then(r => r.data)
-export const batchDelete = (bookId, ids) => http.post(`/books/${bookId}/vouchers/batch-delete`, { ids }).then(r => r.data)
 export const nextNo = (bookId, periodId) => http.get(`/books/${bookId}/ledger/voucher-no-preview`, { params: { period_id: periodId } }).then(r => r.data)
 
 // ---- 整理凭证 ----

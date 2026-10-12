@@ -213,9 +213,16 @@ def merge_defaults(scope: str, content: dict | None) -> dict:
     return _deep_merge(base, content or {})
 
 
+def _correct_voucher_title(text: str) -> str:
+    return re.sub(r"记\s*帐\s*凭\s*证", "记 账 凭 证", text)
+
+
 def validate_template(scope: str, content: dict | None) -> dict:
     """校验并归一化模板内容。返回合并默认值后的模板。"""
     merged = merge_defaults(scope, content)
+    if scope == "VOUCHER" and isinstance(merged.get("title"), dict):
+        merged["title"]["text"] = _correct_voucher_title(
+            str(merged["title"].get("text", "")))
 
     paper = merged.get("paper", "A4")
     if isinstance(paper, dict):          # 兼容早期写法 {"w":..,"h":..}
@@ -288,6 +295,9 @@ def validate_template(scope: str, content: dict | None) -> dict:
             bind = str(raw.get("bind", "custom"))
             if bind not in ELEMENT_BINDS:
                 bind = "custom"
+            text = str(raw.get("text", ""))
+            if bind == "title":
+                text = _correct_voucher_title(text)
 
             def _number(key: str, default: float, low: float, high: float) -> float:
                 try:
@@ -301,7 +311,7 @@ def validate_template(scope: str, content: dict | None) -> dict:
                     "id": str(raw.get("id") or f"element-{i + 1}"),
                     "type": element_type,
                     "bind": bind,
-                    "text": str(raw.get("text", "")),
+                    "text": text,
                     "x": _number("x", 5, 0, 100),
                     "y": _number("y", 5, 0, 100),
                     "w": _number("w", 30, 1, 100),
@@ -788,12 +798,13 @@ def cn_date(value: Any) -> str:
 
 def _element_values(tpl: dict, ctx: dict, voucher: dict, page: int, total_pages: int) -> dict:
     """元素占位符能取到的值。凭证字段来自这张（分片后的）凭证，其余来自账套上下文。"""
+    period = voucher.get("period") or ctx.get("period", "")
     return {
         "title": (tpl.get("title") or {}).get("text", ""),
-        "subtitle": (tpl.get("subtitle") or {}).get("text", "") or ctx.get("period", ""),
+        "subtitle": (tpl.get("subtitle") or {}).get("text", "") or period,
         "company": ctx.get("company", ""),
         "book": ctx.get("book", ""),
-        "period": ctx.get("period", ""),
+        "period": period,
         "voucher_no": voucher.get("voucher_no", ""),
         "date": cn_date(voucher.get("voucher_date", "")),
         "attachments": voucher.get("attachments") or "",
@@ -972,7 +983,7 @@ def render_voucher_sheet(tpl: dict, ctx: dict, vouchers: list[dict],
         )
         inner += f'<div class="voucher-slot">{elements}</div>'
 
-    doc_title = _esc((tpl.get("title") or {}).get("text", "") or "记账凭证")
+    doc_title = _esc((tpl.get("title") or {}).get("text", "") or "记 账 凭 证")
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>{doc_title}</title>
 <style>{_page_css(tpl)}</style></head><body>
