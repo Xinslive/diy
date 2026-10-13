@@ -26,6 +26,34 @@ TEST_DB_URL = os.environ.get(
     "postgresql+psycopg://cwq:cwq123@localhost:15432/cwq_test",
 )
 
+# ---- xdist 并行：每个 worker 用自己独立的库 -------------------------------
+#
+# 为什么必须分库：session 级夹具 _test_database 会 ``DROP SCHEMA public CASCADE``。
+# N 个 worker 共用一个库的话，它们开局就互相把对方的表删了，症状是
+# 「单独跑全绿、-n 4 跑出一堆 relation does not exist」，而且**时好时坏**——
+# 取决于谁先跑到哪里。这类 flaky 比慢更糟。
+#
+# 库名规则：``cwq_test`` → ``<runuid>_gw0_cwq_test``。
+#
+# 护栏要求库名以 ``_test`` 结尾，所以前缀放在 ``_test`` **之前**：
+# 否则护栏会把并行当成误配拦下来。
+#
+# 为什么还要带 runuid（PYTEST_XDIST_TESTRUNUID，xdist 给每次运行的唯一 id），
+# 光有 worker 号不够 —— **两次并行的 pytest 会撞**。这不是理论问题：
+# 只按 worker 分库（cwq_test → gw0_cwq_test）时，一个终端里跑全量、
+# 另一个终端里跑单个文件，两个进程会各自 DROP 同一个库，
+# 于是「一堆 relation does not exist」+「时好时坏」。
+# 曾经就在这里踩到：一轮验证里 1004 条冒出 7 failed / 105 errors，
+# 而同一批文件单独跑全绿 —— 排查半天才发现是另一个终端的测试在跑。
+#
+# 串行（不传 -n）时两个变量都为空，URL 原样保留 —— 默认行为一个字没变。
+_WORKER = os.environ.get("PYTEST_XDIST_WORKER")
+if _WORKER:
+    _run = os.environ.get("PYTEST_XDIST_TESTRUNUID") or "0"
+    _base, _sep, _tail = TEST_DB_URL.rpartition("/")
+    # rpartition 拿到的 _tail 里含查询串吗？不含 —— 连接串的库名段在最后一个 "/" 之后。
+    TEST_DB_URL = f"{_base}{_sep}{_run}_{_WORKER}_{_tail}"
+
 
 # --------------------------------------------------------------------- 测试库护栏
 #
@@ -162,6 +190,53 @@ def _test_database():
     with engine.begin() as conn:
         conn.exec_driver_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
 
+    # 并行时连**库本身**一起删掉，不能只清 schema。
+    #
+    # 库名带 runuid（每次运行都不同），所以只清 schema 等于每跑一轮
+    # 就在 postgres 实例上留 6 个空库 —— 跑十轮就是 60 个，
+    # 攒着攒着 `\\l` 就没法看了，而这实例上还坐着开发库和别的库。
+    #
+    # 必须先 dispose 掉 engine：连接池里还留着连到本库的连接时，
+    # DROP DATABASE 会一直等锁（实测卡到超时）。dispose 之后再用 admin 连。
+    if _WORKER:
+        engine.dispose()
+        admin = create_engine(_admin_url(), isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
+        finally:
+            admin.dispose()
+
+
+# --------------------------------------------------------------------- 口令哈希缓存
+#
+# hash_password 是 pbkdf2-sha256 / 24 万轮，**一次 21ms**。而下面两个用户夹具
+# 用的口令是写死的字符串（admin123 / staff123），于是 1004 条测试要为两个
+# 固定口令反复算 2000 次哈希 —— 实测约 42s，占全量 194s 的 22%，
+# 是这套夹具里最大的一笔冤枉开销。
+#
+# 为什么缓存安全：
+#   · 存进 sys_user 的还是**真哈希**，登录走的是真的 verify_password，
+#     校验路径一秒没变、强度一秒没降；
+#   · 抽的是「盐 + 轮数 + 摘要」整串，不是摘要本身，而 pbkdf2 每次随机盐，
+#     同一个口令在库里本来就长得不一样 —— 跨测试复用同一个盐不新增任何暴露：
+#     这些账号每个用例建完就随事务回滚，没人会去爆破测试库的哈希；
+#   · 只在测试进程内缓存，**生产代码一行没动**，_ITERATIONS 仍是 24 万。
+#
+# 真要较真的话这也是「测试替身」的标准做法：被测的是权限边界和账务逻辑，
+# 不是 KDF 的抗爆破性；真测那个，测试库里再留一个专用小轮数用例即可。
+
+_PASSWORD_HASH_CACHE: dict[str, str] = {}
+
+
+def _cached_hash(password: str) -> str:
+    """口令 -> 哈希，全程只算一次（见上面关于安全性的说明）。"""
+    if password not in _PASSWORD_HASH_CACHE:
+        from app.core.security import hash_password
+
+        _PASSWORD_HASH_CACHE[password] = hash_password(password)
+    return _PASSWORD_HASH_CACHE[password]
+
 
 # --------------------------------------------------------------------- 基础夹具
 
@@ -190,11 +265,9 @@ def admin_user(db):
     不复用 session 级用户：测试之间会 rollback，而被其它测试引用的行不能删。
     干脆每次新建，彻底避免互相引用。
     """
-    from app.core.security import hash_password
-
     u = SysUser(
         username=f"admin_{uuid.uuid4().hex[:10]}",
-        password_hash=hash_password("admin123"),
+        password_hash=_cached_hash("admin123"),
         real_name="测试管理员",
         active=True,
         is_admin=True,
@@ -212,11 +285,9 @@ def plain_user(db):
     跟 admin_user 成对：只测管理员能做什么是不够的，必须同时测普通用户
     什么都做不了。
     """
-    from app.core.security import hash_password
-
     u = SysUser(
         username=f"staff_{uuid.uuid4().hex[:10]}",
-        password_hash=hash_password("staff123"),
+        password_hash=_cached_hash("staff123"),
         real_name="测试员工",
         active=True,
         is_admin=False,

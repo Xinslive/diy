@@ -36,6 +36,7 @@ pydantic-settings==2.15.0
 pygments==2.21.0
 pyjwt==2.15.1
 pytest==9.1.1
+pytest-xdist==3.8.0
 python-dotenv==1.2.4
 python-multipart==0.0.32
 pyyaml==6.0.3
