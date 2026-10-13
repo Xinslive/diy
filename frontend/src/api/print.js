@@ -44,30 +44,61 @@ export const copyTemplate = (bookId, id) => http.post(`/books/${bookId}/print/te
 export const fetchPrintHtml = (path, params = {}) =>
   http.get(path, { params, responseType: 'text' }).then((r) => r.data)
 
-/** 在新窗口里打开打印页并唤起打印。内容与预览完全一致。 */
-export async function openPrint(path, params = {}) {
-  let html
+/**
+ * 取回打印页的 HTML，出错时把服务端的话原样弹出来，返回 null。
+ *
+ * 「预览」和「打印」共用这一份 HTML 字符串，所以屏幕上看到的版式和纸上印出来的
+ * 一定是同一份渲染 —— 这也正是打印前要给预览的意义。
+ */
+export async function loadPrintHtml(path, params = {}) {
   try {
-    html = await fetchPrintHtml(path, params)
+    return await fetchPrintHtml(path, params)
   } catch (e) {
-    if (e.response?.data && typeof e.response.data === 'object' && e.response.data.detail) {
-      ElMessage.error(e.response.data.detail)
-    }
-    return
+    const data = e?.response?.data
+    ElMessage.error(
+      (data && typeof data === 'object' && data.detail) || '打印内容生成失败'
+    )
+    return null
   }
+}
+
+/**
+ * 把打印页 HTML 写进新窗口，**但不唤起打印**。
+ *
+ * 打印不该由「点一下按钮」直接发生：纸型、模板、范围都得先让人看过一眼。
+ * 唤起打印交给 {@link printWindow}，由调用方在自己的弹窗里决定时机。
+ */
+export function openPrintWindow(html) {
   const w = window.open('', '_blank')
   if (!w) {
     ElMessage.warning('浏览器拦截了新窗口，请允许弹出窗口后重试')
-    return
+    return null
   }
   w.document.open()
   w.document.write(html)
   w.document.close()
+  return w
+}
+
+/** 对已打开的打印窗口唤起打印。等字体与布局稳定再打，否则 Chrome 偶尔会打出空白页。 */
+export function printWindow(w) {
+  if (!w) return
   // 等字体与布局稳定再唤起打印，否则 Chrome 偶尔会打出空白页
   setTimeout(() => {
     w.focus()
     w.print()
   }, 600)
+}
+
+/**
+ * 「打开并立刻打印」的旧入口，保留给**没有预览环节**的场合。
+ *
+ * 凡是让人能先看一眼的打印（凭证、账簿、报表）都应改用 PrintDialog ——
+ * 直接 print() 会把一整叠纸塞进打印机，而用户还没确认过纸型和模板。
+ */
+export async function openPrint(path, params = {}) {
+  const html = await loadPrintHtml(path, params)
+  if (html) printWindow(openPrintWindow(html))
 }
 
 /**

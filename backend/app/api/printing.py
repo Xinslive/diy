@@ -29,6 +29,7 @@ from app.printing import excel as xl
 from app.printing import preview as pv
 from app.printing.template import (
     DEFAULT_TEMPLATES,
+    DIRECTIONS,
     PAPERS,
     SCOPES,
     render_table_page,
@@ -127,6 +128,48 @@ def _template(db: Session, book: Book, scope: str, template_id: int | None) -> P
 
 def _tpl_dict(t) -> dict:
     return validate_template(t.scope, t.content or {})
+
+
+def _with_paper(tpl: dict, paper: str | None, orientation: str | None) -> dict:
+    """按本次打印的要求临时改纸型/方向 —— 只影响这一次，不落库。
+
+    **为什么单独开这条路**：纸型原先只有一条入口，就是改模板存起来。但临时
+    换纸是高频且一次性的小事 —— 同一张凭证先用 A4 打一张给领导签字，再改 A5
+    塞进凭证册第二层，为此去改「默认模板」等于把整本账的默认纸型都换掉，
+    后面每一次正常打印都得记得改回来。改回去这件事必然有人忘。
+
+    所以这里只在**这一页**生效：新函数返回一份新字典，``tpl`` 本身不动，
+    模板表里的那份内容更是原封不动。下一次不带参数打印，拿回来的仍是原来
+    的纸型（``print_template.paper`` 那列是保存时冗余出来的副本，渲染层
+    从来不读它，这里也不碰）。
+
+    两个参数都可以只给一个：只给方向、纸型仍走模板；只给纸型、方向仍走
+    模板。都没给就原样返回同一个对象 —— 不复制，也就没有「为了打印而复制
+    出一份字典」这种看不出来的开销。
+    """
+    if paper is None and orientation is None:
+        return tpl
+    if paper is not None and paper not in PAPERS:
+        # 白名单而不是「查到就用」：纸型是前端拼 URL 传进来的任意字符串，
+        # 认不出来就该当场说清楚，而不是让 _page_css 悄悄退回 A4 打出来
+        # （见 template.py::_page_css 的 ``PAPERS.get(paper, PAPERS["A4"])``）——
+        # 那种退化会让「我明明选了 A3」和实际拿到的纸对不上。
+        raise HTTPException(400, f"不支持的纸型：{paper}")
+    if orientation is not None and orientation not in DIRECTIONS:
+        raise HTTPException(400, f"不支持的方向：{orientation}")
+
+    # 覆盖没给的字段取模板自己的值；纸型沿用原对象（老数据可能是
+    # {"w":..,"h":..} 这种写法，见 validate_template），不为了凑成字符串
+    # 而改写它 —— 这一层只负责「替换用户指定的那几项」。
+    eff_paper = paper if paper is not None else tpl.get("paper", "A4")
+    eff_orientation = (orientation if orientation is not None
+                       else tpl.get("orientation", "portrait"))
+    # 与 validate_template 同一条规则：A4_LANDSCAPE 这个纸名本身就表示
+    # 横版，放着 portrait 打印出来是竖着的 A4，两头都不是。这里以纸型为准，
+    # 否则用户会被浏览器按竖版缩放成一张谁也不想要的纸。
+    if eff_paper == "A4_LANDSCAPE":
+        eff_orientation = "landscape"
+    return {**tpl, "paper": eff_paper, "orientation": eff_orientation}
 
 
 # ===================================================================== 打印模板 CRUD
@@ -571,6 +614,7 @@ def _render_scope(
 def print_vouchers(book_id: int, period_id: Optional[int] = None,
                    template_id: Optional[int] = None, status: Optional[str] = None,
                    voucher_ids: Optional[str] = None,
+                   paper: Optional[str] = None, orientation: Optional[str] = None,
                    book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     """记账凭证：A4 每页 2 张、A5 每页 1 张，每张最多 5 行摘要。"""
     selected_ids = None
@@ -584,6 +628,10 @@ def print_vouchers(book_id: int, period_id: Optional[int] = None,
         if not selected_ids or any(voucher_id <= 0 for voucher_id in selected_ids):
             raise HTTPException(422, "至少选择一张有效凭证")
     tpl = _tpl_dict(_template(db, book, "VOUCHER", template_id))
+    # 纸型临时覆盖顺带也改了「一页几张」：voucher_slots_per_page 按纸型判断，
+    # A4/A3 是 2 张、A5 是 1 张。这不是副作用，是这张纸本来就能放几张 ——
+    # 换成 A5 还硬塞两张，打出来就是两张叠在一起，谁也读不了。
+    tpl = _with_paper(tpl, paper, orientation)
     return _html_response(_render_scope(db, book, "VOUCHER", tpl,
                                         period_id=period_id, status=status,
                                         voucher_ids=selected_ids))
@@ -592,8 +640,10 @@ def print_vouchers(book_id: int, period_id: Optional[int] = None,
 @router.get("/balance.html")
 def print_balance(book_id: int, period_id: Optional[int] = None,
                   template_id: Optional[int] = None, include_unposted: bool = Query(False),
+                  paper: Optional[str] = None, orientation: Optional[str] = None,
                   book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    tpl = _tpl_dict(_template(db, book, "BALANCE", template_id))
+    tpl = _with_paper(_tpl_dict(_template(db, book, "BALANCE", template_id)),
+                      paper, orientation)
     return _html_response(_render_scope(db, book, "BALANCE", tpl,
                                         period_id=period_id, include_unposted=include_unposted))
 
@@ -602,8 +652,10 @@ def print_balance(book_id: int, period_id: Optional[int] = None,
 def print_general(book_id: int, period_id: Optional[int] = None,
                   from_period_id: Optional[int] = None, template_id: Optional[int] = None,
                   include_unposted: bool = Query(False), leaf_only: bool = Query(False),
+                  paper: Optional[str] = None, orientation: Optional[str] = None,
                   book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    tpl = _tpl_dict(_template(db, book, "LEDGER", template_id))
+    tpl = _with_paper(_tpl_dict(_template(db, book, "LEDGER", template_id)),
+                      paper, orientation)
     return _html_response(_render_scope(db, book, "LEDGER", tpl, period_id=period_id,
                                         from_period_id=from_period_id,
                                         include_unposted=include_unposted,
@@ -615,8 +667,10 @@ def print_detail(book_id: int, subject_id: int, period_id: Optional[int] = None,
                  from_period_id: Optional[int] = None, template_id: Optional[int] = None,
                  from_subject_id: Optional[int] = None, to_subject_id: Optional[int] = None,
                  include_unposted: bool = Query(False),
+                 paper: Optional[str] = None, orientation: Optional[str] = None,
                  book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    tpl = _tpl_dict(_template(db, book, "DETAIL_LEDGER", template_id))
+    tpl = _with_paper(_tpl_dict(_template(db, book, "DETAIL_LEDGER", template_id)),
+                      paper, orientation)
     return _html_response(_render_scope(db, book, "DETAIL_LEDGER", tpl, period_id=period_id,
                                         from_period_id=from_period_id, subject_id=subject_id,
                                         from_subject_id=from_subject_id,
@@ -627,8 +681,10 @@ def print_detail(book_id: int, subject_id: int, period_id: Optional[int] = None,
 @router.get("/report.html")
 def print_report(book_id: int, template_id: int, period_id: int,
                  print_template_id: Optional[int] = None,
+                 paper: Optional[str] = None, orientation: Optional[str] = None,
                  book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    tpl = _tpl_dict(_template(db, book, "REPORT", print_template_id))
+    tpl = _with_paper(_tpl_dict(_template(db, book, "REPORT", print_template_id)),
+                      paper, orientation)
     return _html_response(_render_scope(db, book, "REPORT", tpl, period_id=period_id,
                                         report_template_id=template_id))
 

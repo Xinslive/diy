@@ -128,6 +128,16 @@
         />
       </div>
     </div>
+
+    <!-- 打印不直接出纸：先弹窗选模板和纸型、看预览，确认了才打 -->
+    <PrintDialog
+      v-model="printVisible"
+      :book-id="store.bookId"
+      :path="printPath"
+      scope="VOUCHER"
+      :params="printParams"
+      title="打印记账凭证"
+    />
   </div>
 </template>
 
@@ -137,7 +147,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Printer, Sort, Upload } from '@element-plus/icons-vue'
 import * as api from '@/api/voucher'
-import { openPrint } from '@/api/print'
+import PrintDialog from '@/components/PrintDialog.vue'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 
@@ -280,12 +290,23 @@ const notReady = computed(() => {
   return parts.length ? `${r.period} ${parts.join('；')}` : ''
 })
 
-function printVouchers() {
+const printVisible = ref(false)
+const printPath = computed(() => `/books/${store.bookId}/print/vouchers.html`)
+/**
+ * 打印范围：勾选了就只打勾选的，没勾选就打整个期间。
+ * 「打印所选」和「打印预览」共用这一份范围 —— 两个按钮指的是同一件事的两种范围，
+ * 不该各自算一遍，否则两边的凭证数会悄悄对不上。
+ */
+const printParams = computed(() => {
   const params = { period_id: store.periodId }
   if (selection.value.length) {
     params.voucher_ids = selection.value.map((voucher) => voucher.id).join(',')
   }
-  openPrint(`/books/${store.bookId}/print/vouchers.html`, params)
+  return params
+})
+
+function printVouchers() {
+  printVisible.value = true
 }
 
 function open(row) {

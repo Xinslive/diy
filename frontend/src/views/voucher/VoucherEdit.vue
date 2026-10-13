@@ -190,33 +190,14 @@
                         @saved="onSubjectCreated" />
     </div>
 
-    <!-- 打印预览 -->
-    <el-dialog v-model="printVisible" title="记账凭证（打印预览）" width="820px">
-      <div class="print-area">
-        <div class="print-title">记 账 凭 证</div>
-        <table class="print-table">
-          <tbody>
-            <tr v-for="(e, i) in form.entries" :key="i">
-              <td class="w-date">{{ i === 0 ? form.voucher_date : '' }}</td>
-              <td class="w-no">{{ i === 0 ? form.voucher_no : '' }}</td>
-              <td>{{ e.summary }}</td>
-              <td>{{ subjectText(e.subject_id) }}</td>
-              <td class="w-amt" :class="{ 'is-red': num(e.amount) < 0 }">{{ e.direction === 'DEBIT' ? fmt(num(e.amount)) : '' }}</td>
-              <td class="w-amt" :class="{ 'is-red': num(e.amount) < 0 }">{{ e.direction === 'CREDIT' ? fmt(num(e.amount)) : '' }}</td>
-            </tr>
-            <tr class="print-total">
-              <td colspan="4">合计</td>
-              <td class="w-amt">{{ fmt(total.debit) }}</td>
-              <td class="w-amt">{{ fmt(total.credit) }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <template #footer>
-        <el-button @click="printVisible = false">关闭</el-button>
-        <el-button type="primary" class="no-print" onclick="window.print()">打印</el-button>
-      </template>
-    </el-dialog>
+    <PrintDialog
+      v-model="printVisible"
+      :book-id="store.bookId"
+      :path="printPath"
+      scope="VOUCHER"
+      :params="printParams"
+      title="打印记账凭证"
+    />
   </div>
 </template>
 
@@ -227,7 +208,6 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import * as api from '@/api/voucher'
 import * as subjectApi from '@/api/subject'
 import * as ledgerApi from '@/api/ledger'
-import { openPrint } from '@/api/print'
 import { useSessionStore } from '@/stores/session'
 import { useTabsStore } from '@/stores/tabs'
 import { fmt } from '@/utils/format'
@@ -237,6 +217,7 @@ import SubjectPicker from '@/components/SubjectPicker.vue'
 import SubjectFormDialog from '@/components/SubjectFormDialog.vue'
 import AmountCells from '@/components/AmountCells.vue'
 import AmountUnits from '@/components/AmountUnits.vue'
+import PrintDialog from '@/components/PrintDialog.vue'
 import { Bottom, CircleCloseFilled, EditPen, Top } from '@element-plus/icons-vue'
 
 const store = useSessionStore()
@@ -256,7 +237,6 @@ const voucherId = ref(0)
 const saving = ref(false)
 const subjects = ref([])
 const subjectTree = ref([])
-const printVisible = ref(false)
 // 「插入凭证」这一次的目标：插在谁后面、这张拿哪个号、谁要顺位。
 // 只在 voucher-new 且带 ?after= 时有值；存下去就清掉（那时候它已经是张普通凭证了）。
 const insertCtx = ref(null)
@@ -1119,6 +1099,10 @@ function addVoucher() {
   router.push({ name: 'voucher-new' })
 }
 
+// 打印不直接出纸：先弹窗选模板和纸型、看预览，确认了才打。
+const printVisible = ref(false)
+const printPath = computed(() => `/books/${store.bookId}/print/vouchers.html`)
+
 /** 打印这一张凭证。
  *
  *  模板里这个「打印预览」按钮挂的是 `printVoucher`，而这个函数曾经**根本不存在** ——
@@ -1127,18 +1111,22 @@ function addVoucher() {
  *
  *  期间取**这张凭证自己的** `voucherPeriodId`，不是顶栏那个 —— 顶栏停在别的月时
  *  打开一张旧凭证，打印出来的东西必须仍然是这张凭证所属期间的（P1-16 同一条理由）。
+ *
+ *  这个回落口径只写在 printParams 一处：守卫和弹窗读的是同一个值，
+ *  分成两处各算一次，日后改了一处就会悄悄打错月。
  */
+const printParams = computed(() => ({
+  period_id: voucherPeriodId.value || store.periodId,
+  voucher_ids: String(voucherId.value),
+}))
+
 function printVoucher() {
   if (!voucherId.value) return
-  const periodId = voucherPeriodId.value || store.periodId
-  if (!store.bookId || !periodId) {
+  if (!store.bookId || !printParams.value.period_id) {
     ElMessage.warning('账套或期间还没就绪，打印需要稍等一下')
     return
   }
-  openPrint(`/books/${store.bookId}/print/vouchers.html`, {
-    period_id: periodId,
-    voucher_ids: String(voucherId.value),
-  })
+  printVisible.value = true
 }
 
 /** 拉上一张/下一张的导航信息。
@@ -1754,12 +1742,7 @@ watch(() => [store.bookId, store.periodId, route.params.id], async () => {
 .foot-right { display: inline-flex; align-items: baseline; gap: 22px; }
 .foot-right b { font-variant-numeric: tabular-nums; color: var(--cwq-text); }
 
-.w-date { width: 90px; } .w-no { width: 80px; } .w-amt { width: 110px; text-align: right; }
-.print-area { padding: 8px; }
-.print-title { text-align: center; font-size: 18px; font-weight: 700; letter-spacing: 6px; margin-bottom: 14px; }
-.print-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.print-table td { border: 1px solid #dcdfe6; padding: 7px 8px; }
-.print-total td { font-weight: 700; background: #fafafa; }
-/* 红字冲销：负数用红字打出来，跟账上写法一致 */
-.print-table td.is-red { color: #d93025; }
+/* 打印预览与打印都已改走 PrintDialog，页内不再留任何打印用样式：
+   预览由后端渲染的那份 HTML 负责，页内再留一套就是两套版式，
+   改了一处另一处不动，打出来才发现走错了分支。 */
 </style>

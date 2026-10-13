@@ -59,13 +59,17 @@
         </el-table-column>
       </el-table>
     </div>
+
+    <PrintDialog v-model="printVisible" :book-id="store.bookId" :path="printPath"
+                 scope="BALANCE" :params="printParams" title="打印科目余额表" />
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import * as api from '@/api/ledger'
-import { downloadFile, openPrint } from '@/api/print'
+import { downloadFile } from '@/api/print'
+import PrintDialog from '@/components/PrintDialog.vue'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 
@@ -90,10 +94,15 @@ async function load() {
 }
 
 function previewHtml() {
-  openPrint(`/books/${store.bookId}/print/balance.html`, {
-    period_id: store.periodId, include_unposted: includeUnposted.value,
-  })
+  printVisible.value = true
 }
+
+const printVisible = ref(false)
+const printPath = computed(() => `/books/${store.bookId}/print/balance.html`)
+/** 只有范围，模板 id 由弹窗自己选 —— 它得让用户在打之前改主意。 */
+const printParams = computed(() => ({
+  period_id: store.periodId, include_unposted: includeUnposted.value,
+}))
 
 function exportXlsx() {
   downloadFile(`/books/${store.bookId}/print/balance.xlsx`,

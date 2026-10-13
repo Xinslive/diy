@@ -39,13 +39,17 @@
         <el-table-column label="期末余额" width="130" align="right"><template #default="{ row }"><b>{{ fmt(row.closing) }}</b></template></el-table-column>
       </el-table>
     </div>
+
+    <PrintDialog v-model="printVisible" :book-id="store.bookId" :path="printPath"
+                 scope="LEDGER" :params="printParams" title="打印总账" />
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import * as api from '@/api/ledger'
-import { downloadFile, openPrint } from '@/api/print'
+import { downloadFile } from '@/api/print'
+import PrintDialog from '@/components/PrintDialog.vue'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 
@@ -90,11 +94,16 @@ async function load() {
   }
 }
 function previewHtml() {
-  openPrint(`/books/${store.bookId}/print/general-ledger.html`, {
-    period_id: toId.value, from_period_id: fromId.value || undefined,
-    leaf_only: leafOnly.value, include_unposted: includeUnposted.value,
-  })
+  printVisible.value = true
 }
+
+const printVisible = ref(false)
+const printPath = computed(() => `/books/${store.bookId}/print/general-ledger.html`)
+/** 只有范围，模板 id 由弹窗自己选 —— 它得让用户在打之前改主意。 */
+const printParams = computed(() => ({
+  period_id: toId.value, from_period_id: fromId.value || undefined,
+  leaf_only: leafOnly.value, include_unposted: includeUnposted.value,
+}))
 
 function exportXlsx() {
   // from_period_id 必须一起传。页面显示的是「起始月 ~ 结束月」这一段，
@@ -102,7 +111,7 @@ function exportXlsx() {
   // 导 —— 屏幕上是一页，下载下来是全账，数字对不上，用户只会以为导出坏了。
   // 审计第 7.3 节把「总账导出：区间与页面显示一致」列为验收项。
   //
-  // 与上面 previewHtml 的口径保持一致：那边是 from_period_id || undefined。
+  // 与上面 printParams 的口径保持一致：那边是 from_period_id || undefined。
   downloadFile(`/books/${store.bookId}/print/general-ledger.xlsx`,
     { period_id: toId.value, from_period_id: fromId.value || undefined,
       leaf_only: leafOnly.value, include_unposted: includeUnposted.value }, '总账.xlsx')

@@ -152,6 +152,16 @@
         <el-button type="primary" @click="applyFormula">应用</el-button>
       </template>
     </el-dialog>
+
+    <!-- 打印不直接出纸：先弹窗选模板和纸型、看预览，确认了才打 -->
+    <PrintDialog
+      v-model="printVisible"
+      :book-id="store.bookId"
+      :path="printPath"
+      scope="REPORT"
+      :params="printParams"
+      title="打印财务报表"
+    />
   </div>
 </template>
 
@@ -160,7 +170,8 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as api from '@/api/report'
-import { downloadFile, openPrint } from '@/api/print'
+import { downloadFile } from '@/api/print'
+import PrintDialog from '@/components/PrintDialog.vue'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 
@@ -429,10 +440,19 @@ function onTemplateChange(id) {
   dirtyKeysReset()
   load()
 }
+const printVisible = ref(false)
+const printPath = computed(() => `/books/${store.bookId}/print/report.html`)
+/**
+ * report.html 的 template_id 是**报表**模板（哪张表、哪些行），不是版式；
+ * 用户选的打印版式由 PrintDialog 自己按 print_template_id 送过去 ——
+ * 这里两个都塞的话，后端只会看到一个。
+ */
+const printParams = computed(() => ({
+  template_id: templateId.value, period_id: store.periodId,
+}))
+
 function previewHtml() {
-  openPrint(`/books/${store.bookId}/print/report.html`, {
-    template_id: templateId.value, period_id: store.periodId,
-  })
+  printVisible.value = true
 }
 function exportXlsx() {
   downloadFile(`/books/${store.bookId}/print/report.xlsx`,

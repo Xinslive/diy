@@ -43,7 +43,7 @@
           <el-divider content-position="left">纸张</el-divider>
           <el-form-item label="纸型">
             <el-select v-model="tpl.paper" style="width: 100%" @change="onPaperChange">
-              <el-option v-for="p in meta.papers" :key="p.key" :value="p.key"
+              <el-option v-for="p in paperOptions" :key="p.key" :value="p.key"
                          :label="paperLabel(p.key)" />
             </el-select>
           </el-form-item>
@@ -266,7 +266,7 @@
         <template #header>
           <div class="card-head"><span class="title">版式编辑</span></div>
         </template>
-        <VoucherLayoutEditor :tpl="tpl" :slots="voucherSlots" @change="onLayoutChange" />
+        <VoucherLayoutEditor :tpl="tpl" :slots="voucherSlots" :papers="meta.papers || []" @change="onLayoutChange" />
       </el-card>
 
     </div>
@@ -279,6 +279,9 @@
       <span class="spacer"></span>
       <el-tag v-if="dirty" size="small" type="warning" effect="plain">未保存</el-tag>
     </div>
+
+    <PrintDialog v-model="printVisible" :book-id="store.bookId" :path="printPath"
+                 :scope="scope" :params="printParams" :title="printTitle" />
   </div>
 </template>
 
@@ -287,10 +290,14 @@ import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, EditPen, Top, Bottom, Plus, CopyDocument, Refresh, Printer } from '@element-plus/icons-vue'
 import VoucherLayoutEditor from '@/components/VoucherLayoutEditor.vue'
+import PrintDialog from '@/components/PrintDialog.vue'
 import * as printApi from '@/api/print'
 import * as reportApi from '@/api/report'
 import * as subjectApi from '@/api/subject'
 import { useSessionStore } from '@/stores/session'
+import {
+  DEFAULT_ORIENTATION, TWO_UP_PAPERS, paperLabel as labelPaper, pickPapers,
+} from '@/utils/paper'
 
 function clone(o) {
   return JSON.parse(JSON.stringify(o))
@@ -317,17 +324,7 @@ const EMPTY_TPL = {
   elements: [],
 }
 
-/** 一页能放两张凭证的纸型，要和后端 TWO_UP_PAPERS 保持一致。 */
-const TWO_UP_PAPERS = ['A4', 'A3', 'A4_LANDSCAPE']
-const PAPER_LABEL = {
-  A4: 'A4（每页 2 张凭证）',
-  A3: 'A3（每页 2 张凭证）',
-  A4_LANDSCAPE: 'A4 横向（每页 2 张凭证）',
-  A5: 'A5（每页 1 张凭证）',
-  B5: 'B5（每页 1 张凭证）',
-  CONTINUOUS: '连续纸（每页 1 张凭证）',
-}
-
+/** 纸型常量统一收在 utils/paper：整个系统只对外提供 A4 / A5。 */
 const meta = ref({ papers: [], defaults: {} })
 const scope = ref('VOUCHER')
 const templateId = ref(0)
@@ -424,12 +421,6 @@ const COLUMN_KEYS = [
 
 const openFieldGroup = ref(['凭证分录'])
 
-/** 各纸型的惯用方向：记账凭证在 A5/B5 上是横向小册子，A4/A3 则是纵向。 */
-const DEFAULT_ORIENTATION = {
-  A4: 'portrait', A3: 'portrait', A4_LANDSCAPE: 'landscape',
-  A5: 'landscape', B5: 'landscape', CONTINUOUS: 'landscape',
-}
-
 function onOrientationChange() {
   contentH.value = 0
   normalize()
@@ -458,8 +449,10 @@ const splitExample = computed(() => {
        first: z(1), last: z(rowCountTip.value), lines: z(12) }[k] ?? ''))
 })
 const voucherSlots = computed(() => (TWO_UP_PAPERS.includes(tpl.value.paper) ? 2 : 1))
+/** 纸型下拉只给系统对外提供的两种，与打印弹窗共用同一份口径。 */
+const paperOptions = computed(() => pickPapers(meta.value.papers || []))
 function paperLabel(key) {
-  return isVoucher.value ? (PAPER_LABEL[key] || key) : key
+  return labelPaper(key, isVoucher.value)
 }
 
 /** 拖拽过程每帧都在改坐标，只重排防抖刷新，不碰列宽归一化。 */
@@ -614,32 +607,39 @@ function previewPayload() {
 /**
  * 正式打印：与预览**同一个范围、同一个期间**，只是模板换成已保存的那份。
  *
- * 打印走 template_id 而不是草稿，是因为打印窗口里的东西可能被人另存为 PDF
- * 发出去 —— 必须对应一条真正存了档的版式，而不是编辑器里还没保存的状态。
+ * 打印走已保存的版式而不是编辑器里的草稿，是因为打印窗口里的东西可能被人另存为 PDF
+ * 发出去 —— 必须对应一条真正存了档的版式。所以这里**只交范围**，
+ * print_template_id 交给弹窗：它选的也是模板表里已保存的那些行，草稿压根进不了这条路。
+ *
+ * report.html 的两个 id 是反的（版式走 print_template_id、报表走 template_id），
+ * 和上面 PrintDialog 的约定一致：REPORT 分支只传报表模板 id，版式 id 留给弹窗补。
  */
-function buildTarget() {
+const printTarget = computed(() => {
   const pid = previewPeriodId.value
-  const tp = templateId.value || undefined
   const b = store.bookId
   switch (scope.value) {
     case 'LEDGER':
-      return [`/books/${b}/print/general-ledger.html`,
-              { period_id: pid, template_id: tp, from_period_id: fromPeriodId.value || undefined }]
+      return { path: `/books/${b}/print/general-ledger.html`,
+               params: { period_id: pid, from_period_id: fromPeriodId.value || undefined } }
     case 'DETAIL_LEDGER':
-      return [`/books/${b}/print/detail-ledger.html`,
-              { period_id: pid, from_period_id: fromPeriodId.value || undefined,
-                template_id: tp, subject_id: previewSubjectId.value,
-                from_subject_id: previewRangeSubjects.value.length ? previewFromSubjectId.value : undefined,
-                to_subject_id: previewRangeSubjects.value.length ? previewToSubjectId.value : undefined }]
+      return { path: `/books/${b}/print/detail-ledger.html`,
+               params: { period_id: pid, from_period_id: fromPeriodId.value || undefined,
+                 subject_id: previewSubjectId.value,
+                 from_subject_id: previewRangeSubjects.value.length ? previewFromSubjectId.value : undefined,
+                 to_subject_id: previewRangeSubjects.value.length ? previewToSubjectId.value : undefined } }
     case 'BALANCE':
-      return [`/books/${b}/print/balance.html`, { period_id: pid, template_id: tp }]
+      return { path: `/books/${b}/print/balance.html`, params: { period_id: pid } }
     case 'REPORT':
-      return [`/books/${b}/print/report.html`,
-              { period_id: pid, print_template_id: tp, template_id: previewReportId.value }]
+      return { path: `/books/${b}/print/report.html`,
+               params: { period_id: pid, template_id: previewReportId.value } }
     default:
-      return [`/books/${b}/print/vouchers.html`, { period_id: pid, template_id: tp }]
+      return { path: `/books/${b}/print/vouchers.html`, params: { period_id: pid } }
   }
-}
+})
+const printPath = computed(() => printTarget.value.path)
+const printParams = computed(() => printTarget.value.params)
+const printTitle = computed(() => `打印${SCOPES[scope.value]}`)
+const printVisible = ref(false)
 
 async function refreshPreview() {
   if (!store.bookId) return
@@ -674,16 +674,19 @@ function schedulePreview(delay = 250) {
   previewTimer = setTimeout(refreshPreview, delay)
 }
 
-/** 纸型物理尺寸（mm），和后端 PAPERS 保持一致。 */
-const PAPER_MM = {
-  A4: [210, 297], A3: [297, 420], A5: [148, 210], B5: [176, 250],
-  A4_LANDSCAPE: [297, 210], CONTINUOUS: [100, 297],
-}
 const MM2PX = 96 / 25.4
 
-/** 当前纸张在 96dpi 下的像素尺寸；orientation 为横向时宽高互换。 */
+/**
+ * 当前纸张在 96dpi 下的像素尺寸；orientation 为横向时宽高互换。
+ *
+ * 尺寸取自后端 meta 下发的 papers（w/h 单位毫米），不在这里写死一份常量：
+ * 后端 PAPERS 一改，这份表就会悄悄过期 —— 而且过期时没有任何报错，
+ * 只是预览框按错误的宽度缩放，看着还挺正常。
+ */
 const pagePx = computed(() => {
-  const [w, h] = PAPER_MM[tpl.value.paper] || PAPER_MM.A4
+  const spec = (meta.value.papers || []).find((p) => p.key === tpl.value.paper)
+  const w = spec?.w || 210
+  const h = spec?.h || 297
   const landscape = tpl.value.orientation === 'landscape'
   return {
     w: Math.round((landscape ? h : w) * MM2PX),
@@ -803,8 +806,7 @@ function measurePreview() {
 onBeforeUnmount(() => { ro?.disconnect(); ro = null; disconnectInnerRO() })
 
 function doPrint() {
-  const [path, params] = buildTarget()
-  printApi.openPrint(path, params)
+  printVisible.value = true
 }
 
 async function save() {

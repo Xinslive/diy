@@ -82,6 +82,9 @@
         <template #empty><span class="muted">请先选择科目</span></template>
       </el-table>
     </div>
+
+    <PrintDialog v-model="printVisible" :book-id="store.bookId" :path="printPath"
+                 scope="DETAIL_LEDGER" :params="printParams" title="打印明细账" />
   </div>
 </template>
 
@@ -90,7 +93,8 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import * as api from '@/api/ledger'
 import * as subjectApi from '@/api/subject'
-import { downloadFile, openPrint } from '@/api/print'
+import { downloadFile } from '@/api/print'
+import PrintDialog from '@/components/PrintDialog.vue'
 import SubjectPicker from '@/components/SubjectPicker.vue'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
@@ -243,13 +247,20 @@ watch(() => store.bookId, async () => {
 watch(() => [store.currentYear, store.periods.length], () => { anchorPeriods(); load() })
 
 function previewHtml() {
-  openPrint(`/books/${store.bookId}/print/detail-ledger.html`, {
-    subject_id: subjectId.value, period_id: toId.value, from_period_id: fromId.value || undefined,
-    from_subject_id: isComprehensive.value ? fromSubjectId.value : undefined,
-    to_subject_id: isComprehensive.value ? toSubjectId.value : undefined,
-    include_unposted: includeUnposted.value,
-  })
+  printVisible.value = true
 }
+
+const printVisible = ref(false)
+const printPath = computed(() => `/books/${store.bookId}/print/detail-ledger.html`)
+/** 只有范围，模板 id 由弹窗自己选 —— 它得让用户在打之前改主意。
+ *  subject_id 是这个接口必填的，少了它预览直接 400。 */
+const printParams = computed(() => ({
+  subject_id: subjectId.value,
+  period_id: toId.value, from_period_id: fromId.value || undefined,
+  from_subject_id: isComprehensive.value ? fromSubjectId.value : undefined,
+  to_subject_id: isComprehensive.value ? toSubjectId.value : undefined,
+  include_unposted: includeUnposted.value,
+}))
 
 function exportXlsx() {
   downloadFile(`/books/${store.bookId}/print/detail-ledger.xlsx`, {

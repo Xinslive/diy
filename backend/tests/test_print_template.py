@@ -193,7 +193,17 @@ def test_渲染会转义HTML():
 def test_纸型映射表完整():
     for key in ("A4", "A3", "A5", "B5"):
         assert PAPERS[key]["w"] > 0 and PAPERS[key]["h"] > 0
-    assert PAPERS["A4_LANDSCAPE"]["w"] > PAPERS["A4_LANDSCAPE"]["h"]
+
+
+def test_横版纸型打出来确实是横向():
+    """``A4_LANDSCAPE`` 断言的是**渲染结果**而不是表里的宽高 ——
+    表里存什么无所谓，用户拿到的是 ``@page`` 里那个尺寸。
+    曾经把横向宽高存进 ``PAPERS``，又被 ``orientation`` 换了一遍，
+    名字叫横版、实际打出 A4 纵向。"""
+    tpl = validate_template("VOUCHER", {"paper": "A4_LANDSCAPE"})
+    doc = render_table_page(tpl, {}, [], 1, 1)
+    assert _page_size(doc) == "297mm 210mm"
+    assert "210mm 297mm" not in doc
 
 
 # --------------------------------------------------------------------- 设计器实时预览
@@ -1127,3 +1137,125 @@ def test_设为默认_不会清掉别的账套的默认模板(client, db, auth, 
     a = _printed(client, auth, book.id)
     assert "BOOK-A-NEW" in a
     assert db.get(PrintTemplate, theirs).is_default is True
+
+
+# --------------------------------------------------------------------- 打印时临时改纸型
+#
+# ``paper`` / ``orientation`` 回答的是「**这一次**打印用哪张纸」，不是
+# 「把模板改成哪张纸」。临时换纸是常事 —— 打一张 A4 给领导签字，再打 A5 存进
+# 凭证册第二层；而为这个去改默认模板，等于把整本账的默认纸型都换掉，之后
+# 每一次正常打印都得记得改回来。改回来这件事必然有人忘。
+
+
+def _page_size(doc: str) -> str:
+    """从打印页里取出 ``@page { size: … }`` 里的那一段。"""
+    return re.search(r"@page \{ size: ([^;]+);", doc).group(1)
+
+
+def test_改纸型只影响这一次打印(client, auth, book):
+    """不带参数是模板自己的版式，传了 paper 就换一张 —— 打印完自动换回。"""
+    url = f"/api/books/{book.id}/print/balance.html"
+    assert _page_size(client.get(url, headers=auth).text) == "A4 landscape"
+    assert _page_size(client.get(url, params={"paper": "B5", "orientation": "portrait"},
+                                 headers=auth).text) == "176mm 250mm"
+
+
+def test_改方向纵向横向互换(client, auth, book):
+    """纵向模板转横向，以及转回来。"""
+    url = f"/api/books/{book.id}/print/general-ledger.html"
+    assert _page_size(client.get(url, headers=auth).text) == "A4"
+    assert _page_size(client.get(url, params={"orientation": "landscape"},
+                                 headers=auth).text) == "A4 landscape"
+
+
+def test_非A4A5纸型的方向体现在宽高顺序上(client, auth, book):
+    """B5 没有 CSS 关键字写法，方向只能靠宽高互换体现出来。"""
+    url = f"/api/books/{book.id}/print/balance.html"
+    portrait = _page_size(client.get(url, params={"paper": "B5", "orientation": "portrait"},
+                                     headers=auth).text)
+    landscape = _page_size(client.get(url, params={"paper": "B5", "orientation": "landscape"},
+                                      headers=auth).text)
+    assert (portrait, landscape) == ("176mm 250mm", "250mm 176mm")
+
+
+def test_未知纸型当场报错而不是悄悄退回A4(client, auth, book):
+    """退化会让「我明明选了 A3」和实际拿到的纸对不上，必须当场说清楚。"""
+    r = client.get(f"/api/books/{book.id}/print/balance.html",
+                   params={"paper": "泰坦纸"}, headers=auth)
+    assert r.status_code == 400
+    assert "不支持的纸型" in r.json()["detail"]
+
+
+def test_未知方向报错(client, auth, book):
+    r = client.get(f"/api/books/{book.id}/print/balance.html",
+                   params={"orientation": "diagonal"}, headers=auth)
+    assert r.status_code == 400
+    assert "不支持的方向" in r.json()["detail"]
+
+
+def test_横版纸型强制横向(client, auth, book):
+    """``A4_LANDSCAPE`` 这个纸名本身就表示横版，显式传 portrait 也扳不回来。"""
+    url = f"/api/books/{book.id}/print/balance.html"
+    alone = client.get(url, params={"paper": "A4_LANDSCAPE"}, headers=auth)
+    forced = client.get(url, params={"paper": "A4_LANDSCAPE", "orientation": "portrait"},
+                        headers=auth)
+    assert forced.status_code == 200, forced.text
+    assert _page_size(forced.text) == _page_size(alone.text)
+
+
+def test_覆盖不写库_下一次打印拿回原来的纸型(client, auth, book):
+    """临时换纸最怕的是「换着换着把模板换了」—— 存起来的那份必须纹丝不动。"""
+    tpl_id = client.post(f"/api/books/{book.id}/print/templates",
+                         json={"scope": "BALANCE", "name": "A3 账套",
+                               "content": {"paper": "A3"}}, headers=auth).json()["id"]
+    params = {"template_id": tpl_id}
+
+    printed = client.get(f"/api/books/{book.id}/print/balance.html",
+                         params={**params, "paper": "A5", "orientation": "portrait"},
+                         headers=auth)
+    assert _page_size(printed.text) == "A5"
+
+    again = client.get(f"/api/books/{book.id}/print/balance.html",
+                       params=params, headers=auth)
+    assert _page_size(again.text) == "420mm 297mm"        # A3 横版，没被改掉
+    stored = client.get(f"/api/books/{book.id}/print/templates/{tpl_id}", headers=auth).json()
+    assert stored["content"]["paper"] == "A3"
+    assert stored["paper"] == "A3"
+
+
+def test_凭证改纸型会连每页张数一起改(client, auth, book, periods, make_voucher):
+    """纸型同时决定「一页放几张」：A4 两张、A5 一张。
+
+    这不是顺带发生的副作用，是这张纸本来就能放几张 —— 换成 A5 还硬塞两张，
+    打出来就是两张叠在一起，谁也读不了。
+    """
+    make_voucher("2026-01-05", dr=[("100201", 10, "x")], cr=[("600101", 10, "x")],
+                 posted=True)
+    make_voucher("2026-01-06", dr=[("100201", 20, "y")], cr=[("600101", 20, "y")],
+                 posted=True)
+    url = f"/api/books/{book.id}/print/vouchers.html"
+
+    a4 = client.get(url, params={"period_id": periods[1].id}, headers=auth)
+    assert a4.text.count('<div class="page">') == 1        # 两张凭证挤一页
+    a5 = client.get(url, params={"period_id": periods[1].id, "paper": "A5"},
+                    headers=auth)
+    assert a5.text.count('<div class="page">') == 2        # 一页一张 → 两张纸
+
+
+def test_两个参数都不给时原样返回同一个对象():
+    """不复制 —— 「为了打印而凭空多一份字典」是没人看得见的开销。"""
+    from app.api.printing import _with_paper
+    from app.printing.template import validate_template
+
+    tpl = validate_template("VOUCHER", {})
+    assert _with_paper(tpl, None, None) is tpl
+
+
+def test_覆盖只改副本不动模板本身():
+    from app.api.printing import _with_paper
+    from app.printing.template import validate_template
+
+    tpl = validate_template("VOUCHER", {"paper": "A3", "orientation": "portrait"})
+    out = _with_paper(tpl, "A5", "landscape")
+    assert (out["paper"], out["orientation"]) == ("A5", "landscape")
+    assert (tpl["paper"], tpl["orientation"]) == ("A3", "portrait")

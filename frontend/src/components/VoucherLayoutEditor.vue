@@ -211,6 +211,8 @@ const props = defineProps({
   tpl: { type: Object, required: true },
   /** 每页几张凭证，由纸型决定 */
   slots: { type: Number, default: 2 },
+  /** 后端 meta.papers：[{ key, w, h, landscape }, ...]，w/h 单位毫米，由父组件传入。 */
+  papers: { type: Array, default: () => [] },
 })
 const emit = defineEmits(['change'])
 
@@ -312,11 +314,16 @@ const canvasH = ref(360)
 const drag = ref(null)
 let ro = null
 
-const PAPERS = { A4: [210, 297], A3: [297, 420], A5: [148, 210], B5: [176, 250], CONTINUOUS: [240, 140] }
-
-/** 单个槽位的真实毫米尺寸 —— 画布要按它算比例，否则拖出来的位置不是打印位置。 */
+/**
+ * 单个槽位的真实毫米尺寸 —— 画布要按它算比例，否则拖出来的位置不是打印位置。
+ *
+ * 尺寸由父组件把后端 meta 的 papers 传进来，本组件不另存一份常量：后端 PAPERS 一改，
+ * 各存一份的表就会各自悄悄过期，而且过期时没有任何报错，只是画布按错的纸型算比例。
+ */
 const slotMm = computed(() => {
-  const [pw, ph] = PAPERS[props.tpl.paper] || PAPERS.A4
+  const spec = props.papers.find((p) => p.key === props.tpl.paper)
+  const pw = spec?.w || 210
+  const ph = spec?.h || 297
   const land = props.tpl.orientation === 'landscape'
   const w = land ? ph : pw
   const h = land ? pw : ph
