@@ -111,6 +111,10 @@ def create_subject(payload: SubjectIn, book: Book = Depends(get_my_book),
         raise HTTPException(400, f"科目编码已存在: {payload.code}")
 
     parent = _check_parent(db, book, payload.parent_id, self_id=None)
+    # P1-1：父科目一旦有了下级就不再是末级，它**自己那份**余额（分录、期初）
+    # 就脱离了明细口径。必须在动手之前就挡下来。
+    if parent is not None:
+        _assert_no_own_balance(db, parent, action=f"在它下面新建子科目 {payload.code}")
 
     s = Subject(
         book_id=book.id, code=payload.code, name=payload.name, category=payload.category,
@@ -178,6 +182,57 @@ def _check_parent(db: Session, book: Book, parent_id: int | None, self_id: int |
     if self_id is not None and parent_id in _descendant_ids(db, self_id):
         raise HTTPException(400, "上级科目不能是它自己的下级（会形成循环）")
     return parent
+
+
+def _balance_at_subject(db: Session, subject_id: int) -> tuple[int, int]:
+    """该科目**自己**身上挂着多少东西：(分录条数, 非零期初期数)。"""
+    n_entries = db.scalar(
+        select(func.count()).select_from(Entry).where(Entry.subject_id == subject_id)
+    ) or 0
+    n_openings = db.scalar(
+        select(func.count()).select_from(PeriodOpening).where(
+            PeriodOpening.subject_id == subject_id, PeriodOpening.amount != 0)
+    ) or 0
+    return n_entries, n_openings
+
+
+def _assert_no_own_balance(db: Session, subject: Subject, action: str) -> None:
+    """没有自带余额的科目才允许被「升格」为汇总级（审计 P1-1）。
+
+    **为什么 fail-closed。** 明细账、科目余额表都按末级出账，凭证校验和期初写入
+    又都拿 ``is_leaf`` 当权威判据。父科目一旦挂上子科目就不再是末级，
+    它自己那些分录/期初就成了「挂在汇总级上的余额」——
+    年度结转过去只取末级科目写次年期初，于是这笔钱在某一年凭空消失、零提示
+    （审计实测：100201 期末 1000，次年期初 0，对手科目 6001 还在，
+    科目余额表试算不平）。
+
+    这里选「拒绝」而不是「放行但警告」，理由和 P1-01 让 is_leaf 改由服务端派生
+    是同一个：**错误的账面数字事后极难察觉，而拦住入口的代价只是多一次改挂操作。**
+    放过它就等于把一次可预防的账务断层写进库里。
+
+    报错要能指导下一步怎么做，而不是只说「不允许」：正确的处理是
+    **先建一个末级科目、把分录改挂过去**，余额随之下沉，之后再来建子科目。
+
+    存量数据里已经升格、身上又带着余额的科目不在这里拦（拦不住历史），
+    由 ``accounting/periods.year_end_carry`` 的兜底把余额结转过去。
+    """
+    n_entries, n_openings = _balance_at_subject(db, subject.id)
+    if not (n_entries or n_openings):
+        return
+    what = []
+    if n_entries:
+        what.append(f"{n_entries} 条分录")
+    if n_openings:
+        what.append(f"{n_openings} 期非零期初余额")
+    raise HTTPException(
+        400,
+        f"{subject.code} {subject.name} 上已经有{'、'.join(what)}，不能{action}。"
+        f"它一旦有了下级就不再是末级科目，自己那份余额就会脱离明细口径 —— "
+        f"年度结转按末级科目取数，这笔钱会在次年凭空消失。"
+        f"\n处理办法：先新建一个末级科目（先不要挂在它下面），把这些分录逐条改挂到"
+        f"新科目上、期初余额也重新录到新科目上；余额下沉之后再{action}。"
+        f"如果只是想停用这个科目，那用「停用」即可 —— 停用不影响历史统计与年度结转。"
+    )
 
 
 def _children_map(db: Session, book_id: int) -> dict[int, list[int]]:
@@ -295,6 +350,17 @@ def update_subject(subject_id: int, payload: SubjectIn, book: Book = Depends(get
     # 连带环路检测与 level 跟随。
     if payload.parent_id != s.parent_id:
         parent = _check_parent(db, book, payload.parent_id, self_id=subject_id)
+        # P1-1：改父级是「升格」的另一个入口，有两道：
+        #   ① 新父节点因此有了下级，它自己那份余额会脱离明细口径；
+        #   ② 被移动的这个科目若原本是末级，挂上去之后它也不再是末级，
+        #      它自己的分录同样会脱离明细口径。
+        # 只在「**新出现的**升格」上拦：本来就已有下级的科目（is_leaf=False）
+        # 再挪一次位置并不会让它损失什么，不该借这条规则卡住正常的整理。
+        if parent is not None:
+            _assert_no_own_balance(db, parent, action=f"在它下面挂子科目 {s.code}")
+        if payload.parent_id is not None and s.is_leaf:
+            _assert_no_own_balance(
+                db, s, action=f"改挂到上级科目 {parent.code}" if parent else "改挂到上级科目")
         old_parent_id = s.parent_id
         s.parent_id = payload.parent_id
         s.level = (parent.level + 1) if parent else 1

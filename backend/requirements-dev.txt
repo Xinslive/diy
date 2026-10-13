@@ -1,0 +1,15 @@
+# 开发/测试依赖（**不**装到生产机上）。
+#
+# 生产只需要 requirements.txt。原来 pytest 直接躺在那份清单里，于是每台生产机
+# 都装着测试框架 —— 不是安全问题，是「机器上装的到底是给谁用的」说不清。
+#
+# 开发环境装 requirements-dev.lock（运行时 + 开发，一次装齐）。
+
+-r requirements.txt
+
+# 测试套件的唯一 runner
+pytest>=9.1.1
+
+# fastapi.testclient 底下是 httpx。app/ 自己不 import 它，
+# 但 scripts/demo_e2e.py 用它跑端到端演示，所以算开发依赖而不是运行时。
+httpx>=0.28.1

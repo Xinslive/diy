@@ -197,6 +197,11 @@ watch(() => form.parent_id, (id) => {
 })
 
 async function submit() {
+  // 新增科目是个**写**动作。凭证页的科目格在只读时是关着的，但这个弹窗还有
+  // 别的入口（科目余额表的「下级」），VIEWER 照样能走到这里 ——
+  // 挡在发请求之前，别让人白等一趟 403。
+  // 认的是 store 那份写权限白名单，与后端的 ROLES 是同一份名单。
+  if (!store.canWrite) return ElMessage.warning('这个账套是只读的，不能新增科目')
   if (!form.code.trim()) return ElMessage.warning('科目编码不能为空')
   if (!form.name.trim()) return ElMessage.warning('科目名称不能为空')
   saving.value = true
@@ -205,6 +210,8 @@ async function submit() {
       parent_id: form.parent_id || null,
       code: form.code.trim(), name: form.name.trim(),
       category: form.category, direction: form.direction,
+      // is_leaf 由服务端按「有没有下级」算（ARCHITECTURE §9.6），客户端提交的值不读。
+      // 这里仍然带上，只是让老接口也能正常收下 —— 别把它当一道防线。
       is_leaf: true, carry_forward: false, sort_no: 0
     })
     ElMessage.success(`已新增科目 ${created.code} ${created.name}`)

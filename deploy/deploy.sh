@@ -2,7 +2,14 @@
 # 发布脚本。三个铁律：
 #   1. 先跑测试再切流量 —— 测试不过就不重启
 #   2. 备份上一版代码，回滚是改回来而不是重新编译
-#   3. 数据库不在这条链路里（无 migration），schema 由应用启动时自建
+#   3. 表结构变更只由 Alembic 负责，发布流程会先备份数据库再执行
+#      ``alembic upgrade head``；迁移失败就不重启、不切前端产物
+#
+# **第 3 条原来是反的（P3-13）。** 旧注释写的是「数据库不在这条链路里（无
+# migration），schema 由应用启动时自建」，而实现恰恰相反：第 6 步执行的就是
+# ``alembic upgrade head``。注释说没有、代码在做，后果是看脚本的人按注释理解
+# ——以为发版完全不碰数据库，于是在没有备份、没打算回滚的情况下发版。注释必须
+# 和实现一致，否则它比没有注释更危险。
 set -euo pipefail
 
 APP=${APP_DIR:-/opt/cwq}
@@ -42,6 +49,7 @@ if [[ "${1:-}" == "--check-only" ]]; then
   log "  当前分支: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 未知)"
   log "  待发布分支: $(resolve_branch)"
   log "  后端依赖: $([[ -x ./.venv/bin/python ]] && echo 已就绪 || echo '缺失 .venv')"
+  log "  后端锁文件: $([[ -f backend/requirements-dev.lock ]] && echo requirements-dev.lock || echo '缺失 —— 将退回未锁定的 requirements.txt')"
   log "  前端锁文件: $([[ -f frontend/pnpm-lock.yaml ]] && echo pnpm-lock.yaml || echo '缺失')"
   log "  磁盘可用: $(df -h "$APP" | awk 'NR==2{print $4}')"
   exit 0
@@ -80,7 +88,28 @@ log "  已备份到 ${RELEASES}/${STAMP}"
 
 log "3/7 装依赖"
 cd "$APP/backend"
-./.venv/bin/pip install -q -r requirements.txt
+# 装**开发锁**（requirements-dev.lock = 运行时锁 + pytest + httpx），不是
+# requirements-dev.txt。原因有二：
+#   * 逐包定版 —— requirements*.txt 全是「>=」，装它等于每次发布都换一套版本。
+#     那次测试跑通的依赖，和这次要发布的依赖，可能根本不是同一套东西；
+#   * 必须含 pytest —— 第 4 步的测试闸要用它。只装 requirements.lock（纯运行时）
+#     会让这台机器上 pytest 消失，测试闸直接跑不起来。这台发布机因此装着
+#     pytest，是「它要先考试才能上岗」的代价，不是把测试框架塞进了生产镜像。
+if [[ -f requirements-dev.lock ]]; then
+  ./.venv/bin/pip install -q -r requirements-dev.lock
+elif [[ -f requirements.lock ]]; then
+  log "⚠️  缺 requirements-dev.lock，只装运行时依赖 —— 第 4 步的测试闸可能跑不起来"
+  ./.venv/bin/pip install -q -r requirements.lock
+elif [[ -f requirements.txt ]]; then
+  log "⚠️  缺锁文件，本次退回未锁定的 requirements.txt —— 版本可能与测试时不同"
+  ./.venv/bin/pip install -q -r requirements.txt
+else
+  # 既没有锁也没有清单：这不是 git 拉下来的仓库，是个手工搭的目录
+  # （deploy/tests/test_deploy.sh 的沙箱就是这种形状，.venv 里全是桩）。
+  # 这里不中止 —— 中止只会让沙箱在第 3 步就死掉，后面所有断言又会变成
+  # 「脚本压根没跑起来所以什么都没发生」的假绿。但要喊出来。
+  log "⚠️  这个发布目录里既没有锁文件也没有 requirements.txt，跳过装依赖"
+fi
 
 log "4/7 跑测试（不通过就中止，不重启）"
 if ! ./.venv/bin/python -m pytest -q; then
@@ -110,13 +139,23 @@ log "6/7 备份数据库并执行迁移"
 # 迁移这步直接失败退出，连带后面「保留 KEEP 份备份」也一起不执行。
 cd "$APP/backend"
 DUMP="$RELEASES/$STAMP/database-before-migration.sql"
+# 备份失败**必须**中止（P2-25）。
+#
+# 原来这里是「备份失败只喊一句，迁移照跑」。但备份是这个系统唯一的退路 ——
+# 凭证号可回收、审计快照不可再生，迁移把表结构改坏之后能救命的只有这份 dump。
+# 退路失败还继续往前走，等于「以为有退路」和「没有退路」两种状态跑在同一段
+# 代码里，而且分不出来。真要豁免，就在 pg_dump 装不上的时候把备份步骤整个
+# 去掉并让发布失败，不要留一个「记得看一眼日志」的分支 —— 没人会看。
 if ./.venv/bin/python scripts/db_backup.py > "$DUMP" 2>"$RELEASES/$STAMP/db_backup.err"; then
   log "  数据库已备份到 ${DUMP}（$(wc -l < "$DUMP") 行）"
 else
-  # 备份失败不直接中止：有些部署的数据库在实例上、pg_dump 本机装不了，
-  # 硬中止会把这条路径彻底堵死。但必须喊出来 —— 没人知道备份其实没成。
-  log "⚠️  数据库备份失败，见 ${RELEASES}/${STAMP}/db_backup.err；迁移仍会执行"
+  log "❌ 数据库备份失败，见 ${RELEASES}/${STAMP}/db_backup.err"
+  log "   没有退路就不迁移：生产库的 schema 一个字节都没动，保持现状不变"
+  log "   修好备份（装 postgresql-client，或核对 DATABASE_URL）后重新发布"
+  exit 1
 fi
+# 恢复命令一并打出来：出事时要靠它，而临场想起来的命令一定是错的
+log "  万一要回退：cd $APP/backend && .venv/bin/python scripts/db_backup.py --restore --file ${DUMP}"
 if ! ./.venv/bin/alembic upgrade head; then
   log "❌ 数据库迁移失败，保持现状不变（前端产物没切、没重启）"
   log "   库已回滚到迁移前状态；修好 revision 后重新发布即可"

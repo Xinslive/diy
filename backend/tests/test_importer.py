@@ -266,3 +266,45 @@ def test_导入批次可查(db, book, admin_user):
     row = db.scalar(select(ImportBatch).where(ImportBatch.book_id == book.id))
     assert row.id == batch.id
     assert row.filename == "导入.xlsx"
+
+
+# --------------------------------------------------------------------- 时间口径
+# 审计 P2-23：``committed_at`` 原来写的是 ``datetime.now()``（本地 naive 时间），
+# 而列是 ``DateTime(timezone=True)``。psycopg 会按数据库会话的 TimeZone 把它
+# 当本地时间解释 —— 同一份数据在不同部署的时区下会偏掉 8 小时。
+#
+# 它不是显示问题：``purge_stale_batches`` 的 TTL 清理拿 UTC 的 cutoff 去比
+# ``created_at``，两边时区不一致的话，过期批次要么永远清不掉、要么刚上传就被清。
+# 凭证的 ``posted_at`` 一直写的是 UTC，所以这个字段是全链路唯一的例外。
+
+
+def test_入库时间带时区且是UTC(db, book, admin_user):
+    data = _xlsx(["日期", "凭证号", "摘要", "科目编码", "借方", "贷方"], _good_rows())
+    batch = stage(db, book.id, admin_user, "t.xlsx", data)
+    commit(db, batch, admin_user)
+    db.refresh(batch)
+
+    assert batch.committed_at is not None
+    assert batch.committed_at.tzinfo is not None, (
+        f"committed_at 是 naive 时间，部署在非 UTC 时区就会偏：{batch.committed_at}")
+    assert batch.committed_at.utcoffset().total_seconds() == 0, (
+        f"committed_at 不是 UTC：{batch.committed_at}")
+
+
+def test_入库时间与记账时间同一时源(db, book, admin_user, make_voucher):
+    """导入批次与手工凭证的两种时间戳必须落在同一个时区口径上 ——
+    naive 与 aware 相减会直接抛 TypeError，而 TTL 清理正是拿它们做减法。"""
+    from datetime import timedelta, timezone as _tz
+
+    data = _xlsx(["日期", "凭证号", "摘要", "科目编码", "借方", "贷方"], _good_rows())
+    batch = stage(db, book.id, admin_user, "t.xlsx", data)
+    commit(db, batch, admin_user)
+    posted = make_voucher("2026-02-10", dr=[("100201", 100, "x")],
+                          cr=[("600101", 100, "x")], posted=True)
+
+    db.refresh(batch)
+    assert batch.committed_at.tzinfo == _tz.utc
+    assert posted.posted_at is not None and posted.posted_at.tzinfo is not None, \
+        f"posted_at 没有时区：{posted.posted_at}"
+    # 两个时间戳直接相减不会抛 TypeError（naive 与 aware 相减就是这个错）
+    assert batch.committed_at <= posted.posted_at + timedelta(days=1)

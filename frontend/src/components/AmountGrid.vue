@@ -8,7 +8,7 @@
        只是叠上一根会眨的光标，让人知道下一个数字落在第几格。
        真要是聚焦时把落格层藏掉、换成一块白底大字，这一格就退化成
        一个普通大输入框，11 条线和它们代表的记账口径全白画了。 -->
-  <div class="amt" :class="{ 'is-focus': focused, 'is-ro': readonly }">
+  <div class="amt" :class="{ 'is-focus': focused, 'is-ro': readonly, 'is-clip': clipNote }">
     <AmountCells class="amt-bg" :value="shown" :caret="caret" :sel="sel" />
 
     <!-- 透明输入层：键盘行为完全按普通数字输入框来，只是把结果显示成分栏的样子。
@@ -35,13 +35,22 @@
       @keydown.up.prevent="$emit('up')"
       @keydown.down.prevent="$emit('down')"
     />
+    <!-- 截断提示：角上一个小三角 + 一条提示说清楚丢的是哪几位。
+         这一格只有 11 个数位的位置，值再长也落不下（钱没有第 10 个「元」位），
+         所以超出来的部分只能丢 —— 但**必须让人看见丢了**（审计 P2-19）：
+         悄悄截断的代价是这笔数看着对、其实少了几位，而且已经跟着自动保存存进账里。 -->
+    <span v-if="clipNote" class="amt-clip" :title="clipNote" />
+
   </div>
 </template>
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
 import AmountCells from './AmountCells.vue'
-import { amountInputText, caretBoundary, sanitizeAmount, toggleAmountSign } from '@/utils/amountGrid'
+import {
+  amountInputText, caretBoundary, sanitizeAmount, sanitizeAmountDetailed, toggleAmountSign,
+} from '@/utils/amountGrid'
 
 const props = defineProps({
   modelValue: { type: [String, Number], default: '' },
@@ -54,6 +63,24 @@ const focused = ref(false)
 /** 光标 / 选中落在第几条格缝（0-11）；-1 = 不画 */
 const caret = ref(-1)
 const sel = ref(null)
+/** 这次净化丢了东西的话（一行字），角上挂个标、弹一条提示。null = 没有 */
+const clipNote = ref(null)
+
+/**
+ * 把「丢了几位」说出来。
+ *
+ *  净化照丢不误 —— 11 根格线摆在那儿，第 10 个整数位无处可落 ——
+ * 但不能让人以为那几位是自己没敲（值看着对、其实少了几位，
+ * 而这一格会跟着自动保存存进账里）。角标标在这一格上，提示说清楚丢的是哪几位。
+ * 重新敲成不超长的值就撤掉，走了这一格也撤掉 —— 提示只对当下这笔负责。
+ */
+function reportClipping(notices) {
+  clipNote.value = notices.length ? notices.map((n) => n.text).join('；') : null
+  for (const n of notices) {
+    // grouping：连续敲第 10、11 位弹的是同一条，合并成一条，别刷屏
+    ElMessage.warning(`金额超位：${n.text}`, { grouping: true, duration: 2600 })
+  }
+}
 
 const raw = computed(() => sanitizeAmount(props.modelValue))
 
@@ -113,7 +140,11 @@ function onInput(e) {
     return
   }
   const pos = e.target.selectionStart ?? typed.length
-  const next = sanitizeAmount(typed)
+  // 净化把「丢过东西」的地方一并说出来：钱只有 亿…分 那么多格，超出的位
+  // 落不下只能丢，但丢了就得有人知道（审计 P2-19）。提示挂在这一格的角上，
+  // 同时弹一条 —— grouping 让连续敲第 10、11 位只弹一条，不会刷屏。
+  const { value: next, notices } = sanitizeAmountDetailed(typed)
+  reportClipping(notices)
   // 小数点刚敲下去、角分还没跟上来的那一瞬，框里得**留着那个点**
   const shownNext = amountInputText(typed, next)
   // 框里的字**当场**收回值的样子。少了这一步，受控的值没变 → Vue 不重渲染这一格 →
@@ -156,10 +187,17 @@ function posFromX(clientX) {
   const r = inp.getBoundingClientRect()
   const k = Math.max(0, Math.min(11, Math.round(((clientX - r.left) / r.width) * 11)))
   const v = sanitizeAmount(inp.value)
-  const dot = v.indexOf('.')
-  // 整数右对齐占 亿…元 九格，所以「第 k 条缝」在整数里是 k - 9 + 整数长度个字
-  const head = dot === -1 ? v : v.slice(0, dot)
-  const p = k <= 9 ? k - 9 + head.length : (dot === -1 ? v.length : dot + 1 + (k - 9))
+  // 负号**不占位**（整格的属性，不是第一个数位）—— 与 caretBoundary 对称：
+  // 整数右对齐占 亿…元 九格，所以「第 k 条缝」在整数里是 k - 9 + 整数长度个字，
+  // 前面若带负号还要把摘掉负号让出来的那一位补回去。
+  const neg = v.startsWith('-')
+  const signLen = neg ? 1 : 0
+  const body = neg ? v.slice(1) : v
+  const bdot = body.indexOf('.')
+  const head = bdot === -1 ? body : body.slice(0, bdot)
+  const p = k <= 9
+    ? signLen + k - 9 + head.length
+    : (bdot === -1 ? v.length : signLen + bdot + 1 + (k - 9))
   return Math.max(0, Math.min(p, v.length))
 }
 
@@ -239,6 +277,7 @@ function onBlur() {
   focused.value = false
   caret.value = -1
   sel.value = null
+  clipNote.value = null  // 提示只对当下这一笔负责，人已经走了就不用再挂着
   document.removeEventListener('selectionchange', onSelectionChange)
 }
 
@@ -311,6 +350,23 @@ defineExpose({ focus: () => el.value?.focus() })
 /* 聚焦：绿框套住整格，但**不铺白底**。铺了就把这一行的淡绿底和落格线盖掉，
    而这一格在纸面上本来就不是一块白板 —— 它是 11 个数位挨着排的一格。 */
 .amt.is-focus { box-shadow: inset 0 0 0 2px #44b44a; }
+/* 超位被截断：框上再套一道琥珀色，角上挂一个小三角。
+   三角压在**最左**（亿位那一格）—— 绝大多数金额右对齐，左边是空的，
+   摆在这儿不会盖住任何一个已经落好的数位。
+   完整的话在 title 和那条提示里，三角只负责说「是这一格」。 */
+.amt.is-clip { box-shadow: inset 0 0 0 2px #e6a23c; }
+.amt.is-clip.is-focus { box-shadow: inset 0 0 0 2px #e6a23c; }
+
+.amt-clip {
+  position: absolute;
+  left: 1px;
+  top: 1px;
+  width: 0;
+  height: 0;
+  border-left: 6px solid transparent;
+  border-top: 6px solid #e6a23c;
+  pointer-events: auto;
+}
 
 .amt-bg { position: absolute; inset: 0; }
 

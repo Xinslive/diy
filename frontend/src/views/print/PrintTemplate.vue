@@ -170,8 +170,23 @@
         </div>
         <div v-else ref="box" class="preview-box">
           <div ref="stage" class="preview-stage" :style="stageStyle">
+            <!--
+              sandbox 是第三道防线（模板校验 + 文档内 CSP meta 已经在前两处）。
+
+              为什么是 allow-same-origin 而**不加** allow-scripts：
+              measurePreview() 要读 contentDocument、getComputedStyle、还要在里面
+              建 ResizeObserver 来量真实高度 —— 去掉 allow-same-origin 这些全部失效，
+              预览框会退回固定高度并被裁掉多页。
+              而不写 allow-scripts，iframe 里的脚本一律不执行：即使模板内容
+              （或更老的数据、或有人直接改库）里带着 </style><script>…，
+              也跑不起来。这正是存储型 XSS 需要的唯一能力。
+
+              注意别写成 sandbox="allow-scripts allow-same-origin" ——
+              两者同时给等于没 sandbox：脚本能跑 + 同源 = 可以读父页的
+              document.cookie 和 localStorage（token 就在里面）。
+            -->
             <iframe ref="frame" class="preview" :srcdoc="previewHtml" title="打印预览"
-                    :style="frameStyle" @load="measurePreview"></iframe>
+                    sandbox="allow-same-origin" :style="frameStyle" @load="measurePreview"></iframe>
           </div>
         </div>
       </el-card>

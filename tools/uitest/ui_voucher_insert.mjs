@@ -9,7 +9,7 @@ import { chromium } from 'playwright'
 import { fileURLToPath } from 'node:url'
 
 const BASE = 'http://127.0.0.1:5173'
-const OUT = fileURLToPath(new URL('./.shots/', import.meta.url))
+const OUT = fileURLToPath(new URL('../../.shots/', import.meta.url))
 const FAKE_ID = 987655
 const fails = []
 const browser = await chromium.launch()

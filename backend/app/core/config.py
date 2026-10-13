@@ -17,6 +17,7 @@ import logging
 import re
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 log = logging.getLogger("app.core.config")
@@ -33,6 +34,15 @@ WEAK_SECRETS = frozenset({
     "changeme", "change-me", "secret", "your-secret-here",
     "please-change-me", "todo", "none", "null", "password",
 })
+
+# 日志级别白名单（审计 P3-14）。
+#
+# 不用 logging._nameToLevel：那是个私有字典，Python 版本间会变，
+# 而这里是要拿它做**启动校验**的依据。
+LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET")
+# 生产环境禁止的级别：DEBUG 会把 SQLAlchemy 的 SQL、绑定参数连同账套数据
+# 一并打进日志，而日志是被采集、被转发、被存盘的。
+PROD_FORBIDDEN_LOG_LEVELS = ("DEBUG",)
 
 
 class Settings(BaseSettings):
@@ -72,7 +82,22 @@ class Settings(BaseSettings):
     # 但人上传完忘了点确认的批次会一直在）。见 importer.purge_stale_batches。
     import_batch_ttl_days: int = 7
 
-    default_timezone: str = "Asia/Shanghai"
+    # 这里曾经有一个 ``default_timezone: str = "Asia/Shanghai"``，现在**没有**了
+    # （审计 P2-23）。它定义了但全仓零引用，而三个真正需要时区的时源已经各自
+    # 收敛到唯一的正确写法：
+    #   * 写入侧一律 UTC aware（``importer.committed_at``、
+    #     ``vouchers.posted_at`` 用 ``datetime.now(timezone.utc)``），
+    #     列是 ``DateTime(timezone=True)``，psycopg 按会话 TimeZone 还原；
+    #   * 服务端取「此刻」一律 ``func.now()``（``periods.py`` 原先的第三时源），
+    #     时区由数据库会话决定，不经过 Python。
+    #
+    # **为什么删掉而不是接上**：留着一个看起来能配、实际什么都不做的配置项，
+    # 比没有更危险 —— 运维设了 ``DEFAULT_TIMEZONE=UTC`` 会合理地相信行为变了，
+    # 而什么都不会变；而真要「接上」，得让某段代码按它做时区换算，那是在已经
+    # 统一成 UTC 的路径上重新引入一个换算点。
+    #
+    # 部署时区仍然由**进程/数据库会话**的 TZ 决定（docker-compose.yml 与
+    # deploy/systemd 里的 TZ=Asia/Shanghai），这一层不归配置项管。
 
     # 运行环境。**默认 prod** —— 也就是「按最坏情况处理」。
     #
@@ -87,6 +112,32 @@ class Settings(BaseSettings):
     # 开放自助注册等于把系统变成任何人都能建号的公共资源，而记账系统
     # 的门槛应该是「管理员开号」。公司内部要开，显式置 true。
     registration_enabled: bool = False
+
+    # 日志级别（审计 P3-14）。
+    #
+    # 以前根日志级别完全取决于进程外面怎么配（systemd / gunicorn / shell），
+    # 于是「这个环境到底在打什么」是个要人去翻部署配置才能回答的问题，
+    # 而默认在 root 上没有 handler 时 logging 只会 WARNING ——
+    # 审计里点名的「护栏 4xx 零日志」（P2-24）就是这么来的。
+    #
+    # 默认 INFO：启动校验、生产配置校验、登录审计这些运维必须看得见的事
+    # 在 INFO 及以上；SQL 回显、SQLAlchemy echo 那些调试内容一律不默认开。
+    log_level: str = "INFO"
+
+    @field_validator("log_level")
+    @classmethod
+    def _check_log_level(cls, v: str) -> str:
+        """非法级别**拒绝启动**，不是静默回退到 INFO。
+
+        静默回退看着更「宽容」，实际是把「我以为在打 DEBUG」这件事藏起来 ——
+        排查时人只会去看代码，不会去看日志里少了什么。报错信息里列出合法取值，
+        改法直接写在屏幕上。
+        """
+        v = (v or "").strip().upper()
+        if v not in LOG_LEVELS:
+            raise ValueError(
+                f"LOG_LEVEL={v!r} 不是合法日志级别，可选：{'、'.join(LOG_LEVELS)}")
+        return v
 
 
 def detect_env(settings: "Settings", env: str | None = None) -> str:
@@ -140,6 +191,15 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
             f"数据库口令仍是默认值（{DEFAULT_DB_PASSWORD!r}）—— "
             "同样公开在源码里")
 
+    # P3-14：级别配置对了不代表级别**安全**。生产开 DEBUG 时，
+    # DB_ECHO 一旦也开着，SQLAlchemy 会把带绑定参数的 SQL 全打进日志 ——
+    # 也就是把全公司的凭证金额复制进日志系统，而日志通常比数据库备份还多人能读。
+    if settings.log_level in PROD_FORBIDDEN_LOG_LEVELS:
+        problems.append(
+            f"LOG_LEVEL={settings.log_level} 不允许用于生产环境 —— "
+            "调试级内容（若同时 DB_ECHO=true，还包括全量 SQL 与账套数据）"
+            "不该进生产日志。排查请临时开，看完就改回来。")
+
     if problems:
         raise ValueError(
             "生产配置校验不通过，拒绝启动：\n  - "
@@ -151,6 +211,7 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
     checks = [
         f"JWT_SECRET 非默认值且 ≥{MIN_SECRET_BYTES} 字节",
         "数据库口令非默认值",
+        f"日志级别 {settings.log_level}（生产不允许 DEBUG）",
     ]
     log.info("生产配置校验通过：%s", "；".join(checks))
     return checks

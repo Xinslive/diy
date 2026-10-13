@@ -436,6 +436,10 @@ def test_科目级次不能调到比已有科目还浅(client, db, book, auth, s
     deep = Subject(book_id=book.id, code="10020101", name="三级科目",
                    category="ASSET", direction="DEBIT", is_leaf=True, level=3,
                    parent_id=subjects["100201"].id, active=True)
+    # 同样是「构造底层状态」：父科目 100201 此刻是末级，直接挂下级会让
+    # trg_subject_leaf_parent_guard 在提交时拒绝（审计 P2-04 收尾）。
+    # 真实接口会顺手把父级改成非末级，这里显式补上，让库自洽。
+    subjects["100201"].is_leaf = False
     db.add(deep)
     db.commit()
 

@@ -1,7 +1,20 @@
-"""凭证：增删改查、批量、记账/反记账。"""
+"""凭证：增删改查、批量、记账/反记账。
+
+**为什么每条 except 都写着 ``(ValueError, ArithmeticError)``**（审计 P1-21）：
+``decimal.InvalidOperation`` 的祖先链是 ``InvalidOperation → DecimalException
+→ ArithmeticError → Exception`` —— 它**不是 ValueError 的子类**。而
+``accounting.util.money`` 对 ``1e30`` 这类量级正是抛它。原来这些路由只写
+``except ValueError``，于是一张凭证提交 ``amount: 1e30`` 就得到 500：
+用户填错一个数，服务端崩给他一个「服务器错误」，而且整张凭证的校验全部中断。
+
+``ArithmeticError`` 是 Decimal 整个异常族的公共祖先，列在这里等于「Decimal
+侧的任何算术异常都算 400」。服务层的 ``money()`` 也已经把同类异常翻译成
+ValueError 了，这里是第二道。
+"""
 from __future__ import annotations
 
 import io
+import logging
 from datetime import date
 from decimal import Decimal
 from typing import Literal, Optional
@@ -9,7 +22,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import func, select, tuple_
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.accounting import importer as svc_import
@@ -17,11 +30,13 @@ from app.accounting import organize as svc_organize
 from app.accounting import vouchers as svc
 from app.accounting.util import find_period
 from app.api.schemas import BatchIds, VoucherIn
-from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
+from app.core.uploads import UploadTooLarge, read_upload
 from app.models import (Book, Entry, ImportBatch, Period, Subject, SysUser,
                      UserBook, Voucher)
+
+log = logging.getLogger("app.api.vouchers")
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -39,10 +54,20 @@ def _diag(exc: DBAPIError) -> str:
 router = APIRouter(prefix="/api/books/{book_id}/vouchers", tags=["凭证"])
 
 
-def _serialize(db: Session, v: Voucher) -> dict:
+def _book_subjects(db: Session, book_id: int) -> dict[int, Subject]:
+    """一次取回这个账套的全部科目，按 id 建索引。
+
+    序列化一张凭证要显示科目编码与名称，而序列化 200 张凭证如果每张查一次，
+    就是一个 200 页的列表接口发 200 条同样的 SELECT（审计 P3-12）。
+    """
+    return {s.id: s for s in db.scalars(
+        select(Subject).where(Subject.book_id == book_id)).all()}
+
+
+def _serialize(db: Session, v: Voucher, subs: dict[int, Subject] | None = None) -> dict:
     entries = sorted(v.entries, key=lambda e: e.line_no)
-    subs = {s.id: s for s in db.scalars(
-        select(Subject).where(Subject.book_id == v.book_id)).all()}
+    # 列表页由调用方一次取好传进来；单张场景（建/改/删后回显）这里兜底。
+    subs = _book_subjects(db, v.book_id) if subs is None else subs
     # 合计走 side_totals：红字（负数）算到对面去，两栏都只摆正数
     dr_total, cr_total = svc.side_totals(
         [{"direction": e.direction, "amount": e.amount} for e in entries])
@@ -82,8 +107,10 @@ def query(book: Book = Depends(get_my_book), db: Session = Depends(get_db),
         status=status, source=source, keyword=keyword, min_amount=min_amount,
         max_amount=max_amount, subject_id=subject_id, page=page, page_size=page_size,
     )
+    # 科目一次取好，逐张序列化共用（审计 P3-12：200 行的页原来发 200 条同样的查询）
+    subs = _book_subjects(db, book.id)
     return {"total": total, "page": page, "page_size": page_size,
-            "items": [_serialize(db, v) for v in rows]}
+            "items": [_serialize(db, v, subs) for v in rows]}
 
 
 @router.post("", status_code=201)
@@ -96,7 +123,7 @@ def create(payload: VoucherIn, book: Book = Depends(get_my_book), db: Session = 
             attachments=payload.attachments, source=payload.source,
             voucher_no=payload.voucher_no, insert_after_id=payload.insert_after,
         )
-    except ValueError as e:
+    except (ValueError, ArithmeticError) as e:
         db.rollback()
         raise HTTPException(400, str(e))
     return _serialize(db, v)
@@ -113,7 +140,7 @@ def update(voucher_id: int, payload: VoucherIn, book: Book = Depends(get_my_book
         data = payload.model_dump()
         data["entries"] = [e.model_dump() for e in payload.entries]
         svc.update_voucher(db, v, user, data)
-    except ValueError as e:
+    except (ValueError, ArithmeticError) as e:
         db.rollback()
         raise HTTPException(400, str(e))
     return _serialize(db, v)
@@ -127,7 +154,7 @@ def remove(voucher_id: int, book: Book = Depends(get_my_book), db: Session = Dep
         raise HTTPException(404, "凭证不存在")
     try:
         svc.delete_voucher(db, v, user)
-    except ValueError as e:
+    except (ValueError, ArithmeticError) as e:
         db.rollback()
         raise HTTPException(400, str(e))
     return {"ok": True}
@@ -138,7 +165,7 @@ def post_many(payload: BatchIds, book: Book = Depends(get_my_book), db: Session 
               _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
     try:
         n = svc.post_vouchers(db, book.id, payload.ids, user)
-    except ValueError as e:
+    except (ValueError, ArithmeticError) as e:
         db.rollback()
         raise HTTPException(400, str(e))
     return {"posted": n}
@@ -149,7 +176,7 @@ def unpost_many(payload: BatchIds, book: Book = Depends(get_my_book), db: Sessio
                 _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
     try:
         n = svc.unpost_vouchers(db, book.id, payload.ids, user)
-    except ValueError as e:
+    except (ValueError, ArithmeticError) as e:
         db.rollback()
         raise HTTPException(400, str(e))
     return {"unposted": n}
@@ -187,7 +214,7 @@ def batch_delete(payload: BatchIds, book: Book = Depends(get_my_book), db: Sessi
         for v in rows:
             svc.delete_voucher(db, v, user, commit=False)
         db.commit()
-    except ValueError as e:
+    except (ValueError, ArithmeticError) as e:
         db.rollback()
         raise HTTPException(400, str(e))
     return {"deleted": len(rows)}
@@ -209,7 +236,7 @@ def organize_preview(payload: OrganizeIn, book: Book = Depends(get_my_book),
         plans = svc_organize.plan_organize(
             db, book_id=book.id, period_id=payload.period_id,
             strategy=payload.strategy)
-    except ValueError as e:
+    except (ValueError, ArithmeticError) as e:
         raise HTTPException(400, str(e))
     out = [p.to_dict() for p in plans]
     return {
@@ -227,7 +254,7 @@ def organize(payload: OrganizeIn, book: Book = Depends(get_my_book), db: Session
         result = svc_organize.apply_organize(
             db, book_id=book.id, user=user, period_id=payload.period_id,
             strategy=payload.strategy)
-    except ValueError as e:
+    except (ValueError, ArithmeticError) as e:
         db.rollback()
         raise HTTPException(400, str(e))
     except DBAPIError as e:
@@ -274,32 +301,26 @@ def import_template(book: Book = Depends(get_my_book)):
 
 
 @router.post("/import")
-def upload_import(file: UploadFile = File(...), book: Book = Depends(get_my_book),
-                  db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
-                  user: SysUser = Depends(get_current_user)):
+async def upload_import(file: UploadFile = File(...), book: Book = Depends(get_my_book),
+                        db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
+                        user: SysUser = Depends(get_current_user)):
     """上传并解析，暂存待确认。不写任何凭证。"""
     if not (file.filename or "").lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(400, "只支持 .xlsx 格式（另存为 xlsx 后重试）")
-    # 读取长度必须带上限（审计 P2-02）。原来是 `file.file.read()` —— 无参数
-    # 意味着「有多少读多少」，Nginx 那条 50m 只是最后一道闸，而它是**请求体**
+    # 容量闸住在共享工具里（审计 P1-4 / P2-02）。原来是 ``file.file.read()`` ——
+    # 无参数意味着「有多少读多少」，Nginx 那条 50m 只是最后一道闸，而它是**请求体**
     # 限制：压缩过的上传、拆成多次的请求都能绕过，而且解析器拿到之后
     # 会把每一行都累积进内存。
     #
-    # 两道检查：file.size 是 Starlette 在收到请求时记下的字节数，
-    # 先用它拒掉明显超限的（连读都不读）；再按上限 +1 读一次，
-    # 处理 size 不可信的情况。
-    limit = settings.import_max_bytes
-    size = getattr(file, "size", None)
-    if size is not None and size > limit:
-        raise HTTPException(
-            413, f"文件 {size // 1024} KB 超过导入上限 {limit // 1024} KB，请拆成多份导入")
-    data = file.file.read(limit + 1)
-    if len(data) > limit:
-        raise HTTPException(
-            413, f"文件超过导入上限 {limit // 1024} KB，请拆成多份导入")
+    # 第二、三道闸（zip 中央目录声明的解压体积、遍历过程中的行数）在 service 层，
+    # 与期初余额解析共用同一套 —— 两处曾是同一种入口的两种长法。
     try:
+        data = await read_upload(file)
         batch = svc_import.stage(db, book.id, user, file.filename, data)
-    except ValueError as e:
+    except UploadTooLarge as e:
+        # 413 而不是 400：文件太大是「换个更小的再来」，不是参数写错了。
+        raise HTTPException(413, str(e))
+    except (ValueError, ArithmeticError) as e:
         raise HTTPException(400, str(e))
     return {
         "batch_id": batch.id, "filename": batch.filename, "status": batch.status,
@@ -313,19 +334,34 @@ def upload_import(file: UploadFile = File(...), book: Book = Depends(get_my_book
 
 @router.get("/import")
 def list_imports(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    # P2-02：进列表页顺带清掉「传完没确认」的过期批次。
-    # 挂在读接口上是因为这是唯一保证它**一定会被触发**的地方 ——
-    # 没人会为了清理去跑一个定时任务，而导入历史是每次进来都要看的页面。
-    svc_import.purge_stale_batches(db, book.id)
+    # P2-22：这是**只读**接口，却会 DELETE + COMMIT（``purge_stale_batches``）。
+    # 原来清理排在返回构造**之前**：一旦下面序列化批次时抛异常（比如 payload
+    # 里混进了非 JSON 的值），用户拿到 500，而那一批过期批次**已经被删掉了** ——
+    # 一个失败的请求留下了它不该有的副作用，且没有任何记录说明删了什么。
+    #
+    # 顺序反过来：先把响应算出来，再清理。序列化失败时什么都没删，
+    # 清理失败也不影响这一页已经算好的结果。
+    #
+    # 清理本身**不取消** —— 「传完没确认的过期批次」要有人负责清，而这是
+    # 唯一保证一定会被触发的地方（没人会为了清理去跑定时任务）。
     rows = db.scalars(
         select(ImportBatch).where(ImportBatch.book_id == book.id)
         .order_by(ImportBatch.id.desc()).limit(100)
     ).all()
-    return [{"id": b.id, "filename": b.filename, "status": b.status, "total": b.total,
-             "ok_count": b.ok_count, "error_count": b.error_count,
-             "committed_count": b.committed_count, "message": b.message,
-             "created_by": b.created_by, "created_at": b.created_at.isoformat()}
-            for b in rows]
+    items = [{"id": b.id, "filename": b.filename, "status": b.status, "total": b.total,
+              "ok_count": b.ok_count, "error_count": b.error_count,
+              "committed_count": b.committed_count, "message": b.message,
+              "created_by": b.created_by, "created_at": b.created_at.isoformat()}
+             for b in rows]
+    try:
+        svc_import.purge_stale_batches(db, book.id)
+    except SQLAlchemyError:
+        # 清理失败不该让「看导入历史」这一页 500。过期批次留在库里，
+        # 下次进来还会再清一次 —— 那是可重试的状态，500 不可重试。
+        db.rollback()
+        log.warning("清理过期导入批次失败（账套 %s），本次只返回列表", book.id,
+                    exc_info=True)
+    return items
 
 
 @router.post("/import/{batch_id}/commit")
@@ -336,7 +372,7 @@ def commit_import(batch_id: int, book: Book = Depends(get_my_book), db: Session 
         raise HTTPException(404, "导入批次不存在")
     try:
         result = svc_import.commit(db, batch, user)
-    except ValueError as e:
+    except (ValueError, ArithmeticError) as e:
         db.rollback()
         raise HTTPException(400, str(e))
     batch.message = result["message"]
@@ -354,7 +390,7 @@ def discard_import(batch_id: int, book: Book = Depends(get_my_book), db: Session
         raise HTTPException(404, "导入批次不存在")
     try:
         svc_import.discard(db, batch)
-    except ValueError as e:
+    except (ValueError, ArithmeticError) as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
 
@@ -402,7 +438,7 @@ def insert_preview(after_id: int, book: Book = Depends(get_my_book), db: Session
     period = db.get(Period, v.period_id)
     try:
         slot = svc.insert_slot(db, v)
-    except ValueError as e:
+    except (ValueError, ArithmeticError) as e:
         raise HTTPException(400, str(e))
     return {
         "anchor_id": v.id,

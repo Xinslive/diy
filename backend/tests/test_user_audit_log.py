@@ -121,12 +121,36 @@ def test_审计里绝不能出现口令或散列(client, db, admin_user, plain_u
 
 
 def test_没改任何东西时不产生噪音日志(client, db, admin_user, plain_user):
-    """提交了与现值相同的字段不算一次变更，日志不该凭空多一条。"""
+    """提交了与现值相同的字段不算一次变更，日志不该凭空多一条。
+
+    边界是「**不产生任何后果**的提交才算噪音」：这里只回传同值的
+    ``real_name``。不能拿 ``active`` 来试 —— 带 active 的提交会触发
+    token_version += 1，即该账号全部在用令牌当场作废（P1-8），
+    那是有后果的写入，必须留痕，见下面两条用例。
+    """
     hdr = _admin(client, admin_user)
     before = len(_logs(db, "UPDATE_USER"))
     client.patch(f"/api/system/users/{plain_user.id}", headers=hdr,
-                 json={"real_name": plain_user.real_name, "active": True})
+                 json={"real_name": plain_user.real_name})
     assert len(_logs(db, "UPDATE_USER")) == before
+
+
+def test_提交与现值相同的active也要留痕(client, db, admin_user, plain_user):
+    """**这条是 P1-8 的核心**：撤销必须与留痕成对出现。
+
+    过去的条件是「active 非空就 token_version += 1」，而日志只在字段真的
+    变了时才写 —— 前端表单原样回传 ``{"active": true}`` 就会静默踢掉
+    这个人所有设备的会话，审计里一条都没有。
+    """
+    hdr = _admin(client, admin_user)
+    r = client.patch(f"/api/system/users/{plain_user.id}", headers=hdr,
+                     json={"active": plain_user.active})
+    assert r.status_code == 200, r.text
+
+    entry = [x for x in _logs(db, "UPDATE_USER") if str(x.entity_id) == str(plain_user.id)][-1]
+    assert "撤销" in entry.detail, f"同值提交没有留下撤销记录：{entry.detail}"
+    assert entry.after and "token_version" in entry.after, (
+        f"撤销后的 token_version 没进 after：{entry.after}")
 
 
 # --------------------------------------------------------------------- 删除

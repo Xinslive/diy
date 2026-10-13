@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+import re
+import sys
+import uuid
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import DBAPIError
@@ -14,11 +16,57 @@ from app.core.config import detect_env, settings
 
 log = logging.getLogger("cwq")
 
+
+def configure_logging() -> None:
+    """把日志级别钉在配置上，不看进程外面怎么配（审计 P3-14）。
+
+    以前这里只有一句 ``log = logging.getLogger("cwq")``：级别完全由外部
+    环境决定，而 root 上没有 handler 时 logging 的兜底是 WARNING ——
+    于是 INFO 及以下全部静默丢弃。审计点名的「护栏 4xx 零日志」（P2-24）
+    就是这么来的：那条日志不是没写，是写了也被级别过滤掉了。
+
+    ``basicConfig`` 单独用是不够的：**root 上已经有 handler 时它是空操作**
+    （gunicorn、uvicorn、systemd 都会先加），此时只有 level 参数被应用上，
+    格式不生效、level 也常常不是我们想要的那一档。所以两件事都显式做。
+    """
+    logging.basicConfig(
+        level=settings.log_level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        stream=sys.stderr,
+    )
+    logging.getLogger().setLevel(settings.log_level)
+
+
+configure_logging()
+
+
+def api_docs_urls(env: str | None = None) -> dict[str, str | None]:
+    """按环境决定要不要挂接口文档。**生产默认关**（审计 P1-7）。
+
+    ``/openapi.json`` 不是一张无害的静态图片，它是一份完整的路由表 +
+    每个接口的请求模型 + 每个字段的约束 —— 等于主动告诉未授权方
+    「这个系统有哪些入口、各自要什么、哪些参数能传」。
+    配合越权或鉴权漏挂，一份 schema 足以把「哪些接口没挂鉴权依赖」
+    变成一条可批量自动化探测的清单。``/docs`` 还额外挂着 CDN 上的
+    Swagger UI 资源，等于往外发请求。
+
+    只用 ``detect_env`` 判定，与启动校验 / 健康检查同一个口径 ——
+    出现「校验说你是 prod、文档却开着」这种自相矛盾的配置最难排查。
+    写成「默认开、显式关」的话，默认值自己给自己开了免检（本项目
+    在 JWT_SECRET 上已经吃过一次这个亏，见 app_env 字段注释）。
+    """
+    if detect_env(settings, env) in ("dev", "test"):
+        return {"docs_url": "/docs", "redoc_url": "/redoc",
+                "openapi_url": "/openapi.json"}
+    return {"docs_url": None, "redoc_url": None, "openapi_url": None}
+
+
 app = FastAPI(
     title="财务记账系统 API",
     description="多账套云财务记账系统。核心原则：唯一事实来源是凭证与分录，"
                 "余额 / 账簿 / 报表 / 打印全部由同一套聚合引擎派生。",
     version="0.1.0",
+    **api_docs_urls(),
 )
 
 app.add_middleware(
@@ -29,6 +77,39 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# 外部请求号原样透传，只认这几种字符、限长 64。
+#
+# 透传而不是一律自造：前端 / 网关 / 采集链路已经把同一条链路的请求串起来了，
+# 后端再另起一个号，前端报障时两边对不上号。过滤是为了不让任意长、任意字符的
+# 头进日志 —— 它是**要被人读、被人搜、可能被人抄进工单**的字段。
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _request_id(request: Request) -> str:
+    rid = request.headers.get("x-request-id", "")
+    if _REQUEST_ID_RE.match(rid):
+        return rid
+    return uuid.uuid4().hex[:16]
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """给每个请求发一个号，并贯穿到响应头与日志（审计 P2-24）。
+
+    为什么必须有号：一次 500 之后，用户手里只有一句「页面打不开」，
+    服务端日志里是几百上千行并发请求 —— 没有号根本对不上是哪一行。
+    有了号，用户截图里的那串字符就能在日志里定位到唯一一条。
+
+    ``request.state`` 落在 scope 上，所以中间件里写的号，异常处理器里读得到
+    （异常处理器与路由共享同一个 Request scope）。
+    """
+    rid = _request_id(request)
+    request.state.request_id = rid
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = rid
+    return response
 
 for r in (auth.router, system.router, books.router, subjects.router, vouchers.router,
           ledger.router, reports.router, printing.router):
@@ -41,21 +122,43 @@ async def dbapi_error_handler(request, exc: DBAPIError):
 
     会计护栏全部落在 PostgreSQL 触发器里，psycopg 抛的是通用异常；
     这里取 diag.message_primary —— 那正是 RAISE EXCEPTION 里的原文。
+
+    分两种回法（P2-24）：
+
+    * **约束类 4xx**：把 message_primary 回给客户端。它是 ``db_init.sql`` 里
+      人工写的中文文案（"已记账的凭证不允许删除"之类），本来就是要给人看的；
+      400 不是「出事了」，是「你这次请求不合法」。
+    * **其它（500）**：**不回原文**。``str(orig)`` 里是表名、列名、约束名、
+      有时还有数据片段（唯一冲突会把重复键的值带出来）—— 把它回给调用方
+      等于把库结构抄送给未授权方。改成一句脱敏提示 + 请求号：
+      排查靠服务端日志（那里有完整异常栈），用户那边有可报障的凭据。
+
+    两条路都要**记日志**。护栏被绕过（有人绕过 API 直接改库、或有 bug
+    打到了不该打的地方）是最该留痕的路径之一，过去它一条日志都不产生 ——
+    唯一能看见的痕迹是用户截图里的那句报错。
     """
     orig = exc.orig
     sqlstate = getattr(orig, "sqlstate", None)
     diag = getattr(orig, "diag", None)
     message = (getattr(diag, "message_primary", None) or str(orig)).strip()
+    rid = getattr(request.state, "request_id", "-")
+    where = f"rid={rid} {request.method} {request.url.path}"
 
     if sqlstate in ("23514", "23505", "23503", "23502"):
         if sqlstate == "23505":
             message = f"数据已存在或被引用，违反唯一约束：{message}"
-        return JSONResponse(status_code=400, content={"detail": message})
+        # 护栏拒绝也要留痕：谁、在什么时候、想干什么被挡下来了。
+        # 日志里不记 message 全文（可能含重复键的值），只记状态码与截断摘要。
+        log.warning("数据库约束拒绝 %s sqlstate=%s %s", where, sqlstate, message[:200])
+        return JSONResponse(status_code=400,
+                            content={"detail": message[:500]},
+                            headers={"X-Request-ID": rid})
 
-    log.exception("数据库异常: %s %s", request.method, request.url.path)
+    log.exception("数据库异常 %s sqlstate=%s：%s", where, sqlstate, str(orig)[:500])
     return JSONResponse(
         status_code=500,
-        content={"detail": f"数据库错误 [{sqlstate}]：{message[:300]}"},
+        content={"detail": f"数据库内部错误（请求号 {rid}），请联系管理员并提供该请求号"},
+        headers={"X-Request-ID": rid},
     )
 
 

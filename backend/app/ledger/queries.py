@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session
 
 from app.ledger.engine import ZERO, Figures, LedgerEngine, display_side
 from app.models import Book, Entry, Period, Subject, Voucher
-from app.models.book import book_first_ord
 
 CATEGORY_ORDER = {"ASSET": 0, "LIABILITY": 1, "EQUITY": 2, "COST": 3, "PROFIT": 4}
 
@@ -90,7 +89,7 @@ def detail_ledger(
     if from_period.ord > to_period.ord:
         raise HTTPException(400, "起始期间不能晚于结束期间")
 
-    eng = LedgerEngine(db, book_id, include_unposted)
+    eng = LedgerEngine.for_ledger(db, book_id, include_unposted)
     periods = eng.periods()
     range_periods = [p for p in periods if from_period.ord <= p.ord <= to_period.ord]
     if not range_periods:
@@ -316,26 +315,30 @@ def general_ledger(
     include_unposted: bool = False,
 ) -> list[dict]:
     """总账：每个科目一行，含区间期初、本期发生、累计发生、期末。"""
-    eng = LedgerEngine(db, book_id, include_unposted)
+    eng = LedgerEngine.for_ledger(db, book_id, include_unposted)
     ids = [s.id for s in subjects]
-    fmap = eng.compute(ids, to_period.ord)
+    fmap = eng.batch_figures(ids, to_period.ord)
     # 区间发生额单独算，不能拿本年累计相减：区间跨年时两边的累计口径不同
     pmap = eng.range_movements(ids, from_period.ord, to_period.ord)
 
-    book = eng._book()
-    has_prev = from_period.ord > book_first_ord(book)
-    if has_prev:
-        prev_map = eng.compute(ids, from_period.ord - 1)
+    # 区间期初 = 起始期的上一期期末，两条路径用的是同一个语义：
+    # 起始期不是首期时是真实存在的上一期；起始期就是账套首期时，
+    # 引擎返回的「首期之前」那张图（期初=首期期初、零发生额），closing 相同。
+    #
+    # 2026-10-13 审计 P0-03：这里原来有一个 else 分支，起始期是首期时
+    # 退回取 fmap 的 opening —— 那是**结束期自己**的期初，于是
+    #   期初 600（5 月末）+ 本期借方 1200（1~6 月）= 期末 1800
+    # 而正确答案是 期初 0 + 1200 = 1200：[from, to-1] 的发生额被计入两次。
+    # 错误在行内自洽（期初 + 本期 = 期末 恒成立），只有与上月期末交叉核对
+    # 才看得出来，而总账 Excel 导出（api/printing）走的正是这一个函数，
+    # 错误数字直接落到交给客户的纸上。
+    prev_map = eng.compute(ids, from_period.ord - 1)
 
     out = []
     for s in subjects:
         f = fmap[s.id]
         p_dr, p_cr = pmap[s.id]
-        if has_prev:
-            opening = prev_map[s.id].closing
-        else:
-            opening = f.opening
-
+        opening = prev_map[s.id].closing
         closing = opening + p_dr - p_cr
         side, amount = display_side(s, closing)
         out.append(
@@ -375,8 +378,8 @@ def balance_sheet_of_accounts(
         Σ 借方发生额 == Σ 贷方发生额
         Σ 借方余额    == Σ 贷方余额
     """
-    eng = LedgerEngine(db, book_id, include_unposted)
-    fmap = eng.compute([s.id for s in subjects], period.ord)
+    eng = LedgerEngine.for_ledger(db, book_id, include_unposted)
+    fmap = eng.batch_figures([s.id for s in subjects], period.ord)
 
     rows = []
     total_open_dr = total_open_cr = total_dr = total_cr = total_close_dr = total_close_cr = ZERO
@@ -451,6 +454,7 @@ def voucher_subject_balances(
     上级科目一并算出来（引擎本来就上卷）：凭证只挂在末级上，但排凭证时
     「1002 银行存款」这种非末级也可能临时选上去看一眼余额。
     """
-    eng = LedgerEngine(db, book_id, include_unposted, exclude_voucher_id=exclude_voucher_id)
+    eng = LedgerEngine.for_ledger(db, book_id, include_unposted,
+                                   exclude_voucher_id=exclude_voucher_id)
     fmap = eng.compute(up_to_ord=period.ord)
     return {sid: str(f.closing) for sid, f in fmap.items()}

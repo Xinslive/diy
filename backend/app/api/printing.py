@@ -11,18 +11,19 @@
 """
 from __future__ import annotations
 
+import functools
 import html
 import urllib.parse
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.api.vouchers import _serialize
 from app.core.db import get_db
-from app.core.deps import get_current_user, get_my_book, require_book_write
+from app.core.deps import get_book_link, get_current_user, get_my_book, require_book_write
 from app.models import Book, Period, PrintTemplate, SysUser, UserBook, Voucher
 from app.printing import excel as xl
 from app.printing import preview as pv
@@ -66,16 +67,48 @@ def _period(db: Session, book_id: int, period_id: int | None) -> Period:
     return p
 
 
+def _visible_templates(book_id: int):
+    """这个账套**看得见**的模板：本账套的，加上全局兜底的。
+
+    ``print_template.book_id IS NULL`` 是「全局兜底」：迁移之前建的存量模板
+    没有任何一个账套真的拥有它们（见 ``models/printing.py``），把它们回填到
+    任意一个账套等于替人断言归属。算进可见范围是让老数据继续能打；它们
+    **不参与**「设为默认」的互相清除，是让新数据从一开始就有主。
+    """
+    # **不能用 ``book_id.in_([book_id, None])``** —— 这是本次实测踩到的坑：
+    # SQL 是三值逻辑，``NULL IN (6, NULL)`` 求值成 ``NULL``（不是 true），
+    # 于是全局兜底模板会被 WHERE **悄悄滤掉**，一条都不返回。
+    # 那个写法只在「没有 NULL 行」时与本式等价，而本式的全部意义恰恰是那几行。
+    return or_(PrintTemplate.book_id == book_id, PrintTemplate.book_id.is_(None))
+
+
+def _scoped_template(db: Session, book: Book, template_id: int) -> PrintTemplate:
+    """按 id 取模板，并且校验它属于当前账套（全局兜底模板也算可见）。
+
+    ``template_id`` 是前端传来的任意整数，**不是授权凭据**：没有这一层校验，
+    任何账套都能拿着别人的 id 进打印页。口径必须与 ``_template`` 的取用口径
+    一致（同一份 ``_visible_templates``），否则会出现「列表里看不见、却能
+    按 id 打出来」这种更糟的状态。
+    """
+    t = db.get(PrintTemplate, template_id)
+    if t is None or t.book_id not in (book.id, None):
+        # 跨账套与不存在返回同一个 404：不区分「没有」和「不是你的」，
+        # 否则这条接口本身就成了一个跨账套的存在性探测器。
+        raise HTTPException(404, "打印模板不存在")
+    return t
+
+
 def _template(db: Session, book: Book, scope: str, template_id: int | None) -> PrintTemplate:
     if template_id:
-        t = db.get(PrintTemplate, template_id)
-        if t is None:
-            raise HTTPException(404, "打印模板不存在")
-        return t
+        return _scoped_template(db, book, template_id)
     t = db.scalar(
         select(PrintTemplate)
-        .where(PrintTemplate.scope == scope, PrintTemplate.is_default.is_(True))
-        .order_by(PrintTemplate.id)          # 多个默认时取最早创建的，保证结果确定
+        .where(PrintTemplate.scope == scope, PrintTemplate.is_default.is_(True),
+               _visible_templates(book.id))
+        # 本账套模板优先、全局模板兜底。``book_id IS NULL`` 对 NULL 行算出
+        # true、对本账套行算出 false，ASC 排序下 false 在前 —— 「先本账套、
+        # 后全局」由排序保证，不依赖 id 大小这类偶然。
+        .order_by(PrintTemplate.book_id.is_(None), PrintTemplate.id)
         .limit(1)
     )
     if t is None:
@@ -128,35 +161,49 @@ def template_meta():
 
 @router.get("/templates")
 def templates(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    rows = db.scalars(select(PrintTemplate).order_by(PrintTemplate.scope, PrintTemplate.id)).all()
+    # 按账套过滤：设计器列的是「这个账套能改的模板」。跨账套可见既会让
+    # 别的账套看到本账套的版式，点下去也只能拿到 404（见 _scoped_template）。
+    rows = db.scalars(
+        select(PrintTemplate)
+        .where(_visible_templates(book.id))
+        .order_by(PrintTemplate.book_id.is_(None), PrintTemplate.scope, PrintTemplate.id)
+    ).all()
     return [{"id": t.id, "scope": t.scope, "name": t.name, "paper": t.paper,
-             "is_default": t.is_default, "remark": t.remark, "content": t.content}
+             "is_default": t.is_default, "remark": t.remark, "content": t.content,
+             "book_id": t.book_id}
             for t in rows]
 
 
 @router.get("/templates/{template_id}")
 def template_detail(template_id: int, book: Book = Depends(get_my_book),
                     db: Session = Depends(get_db)):
-    t = db.get(PrintTemplate, template_id)
-    if t is None:
-        raise HTTPException(404, "打印模板不存在")
+    t = _scoped_template(db, book, template_id)
     merged = _tpl_dict(t)
+    # book_id 与列表接口保持一致：设计器要能看出这张是本账套的模板还是
+    # 全局兜底的老数据（后者改动会影响所有账套）。
     return {"id": t.id, "scope": t.scope, "name": t.name, "paper": t.paper,
             "is_default": t.is_default, "remark": t.remark, "content": merged,
-            "raw": t.content}
+            "book_id": t.book_id, "raw": t.content}
 
 
 @router.post("/templates", status_code=201)
 def create_template(payload: TemplateIn, book: Book = Depends(get_my_book),
-                    db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
-                    user: SysUser = Depends(get_current_user)):
+                    db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
+                    user: SysUser = Depends(get_current_user),
+                    _link: UserBook = Depends(require_book_write)):
+    # 门禁按「模板是全局资源」收紧（见 _require_global_template_write）；模板本身
+    # 从这一版起归属本账套（book_id=book.id），门禁暂时不放宽。
+    # require_book_write 仍然挂着：它让「每个写接口都挂了写依赖」保持机械可查
+    # （tests/test_viewer_matrix.py 遍历路由表检查），与 books.py 的做法一致。
+    _require_global_template_write(link, user)
     if payload.scope not in SCOPES:
         raise HTTPException(400, f"未知打印范围：{payload.scope}，可选：{'、'.join(SCOPES)}")
     try:
         content = validate_template(payload.scope, payload.content)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    t = PrintTemplate(scope=payload.scope, name=payload.name, paper=content.get("paper", "A4"),
+    t = PrintTemplate(book_id=book.id, scope=payload.scope, name=payload.name,
+                      paper=content.get("paper", "A4"),
                       content=content, is_default=payload.is_default, remark=payload.remark)
     db.add(t)
     db.flush()
@@ -170,11 +217,11 @@ def create_template(payload: TemplateIn, book: Book = Depends(get_my_book),
 
 @router.put("/templates/{template_id}")
 def update_template(template_id: int, payload: TemplatePatch, book: Book = Depends(get_my_book),
-                    db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
-                    user: SysUser = Depends(get_current_user)):
-    t = db.get(PrintTemplate, template_id)
-    if t is None:
-        raise HTTPException(404, "打印模板不存在")
+                    db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
+                    user: SysUser = Depends(get_current_user),
+                    _link: UserBook = Depends(require_book_write)):
+    t = _scoped_template(db, book, template_id)
+    _require_global_template_write(link, user)
     before = t.content
     # 局部更新：先把补丁叠到「已保存的模板」上，再叠加内置默认值兜底。
     # 直接把补丁丢给 validate_template 会让默认值里的 paper/margins 盖掉用户已保存的值。
@@ -202,11 +249,11 @@ def update_template(template_id: int, payload: TemplatePatch, book: Book = Depen
 
 @router.delete("/templates/{template_id}")
 def delete_template(template_id: int, book: Book = Depends(get_my_book),
-                    db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
-                    user: SysUser = Depends(get_current_user)):
-    t = db.get(PrintTemplate, template_id)
-    if t is None:
-        raise HTTPException(404, "打印模板不存在")
+                    db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
+                    user: SysUser = Depends(get_current_user),
+                    _link: UserBook = Depends(require_book_write)):
+    t = _scoped_template(db, book, template_id)
+    _require_global_template_write(link, user)
     name = t.name
     db.delete(t)
     _log(db, user, book.id, "DELETE_PRINT_TEMPLATE", template_id, f"删除打印模板 {name}")
@@ -216,13 +263,15 @@ def delete_template(template_id: int, book: Book = Depends(get_my_book),
 
 @router.post("/templates/{template_id}/copy")
 def copy_template(template_id: int, book: Book = Depends(get_my_book),
-                  db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
-                  user: SysUser = Depends(get_current_user)):
+                  db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
+                  user: SysUser = Depends(get_current_user),
+                  _link: UserBook = Depends(require_book_write)):
     """复制一份再改 —— 改模板前先留个底，财务自己就能做。"""
-    src = db.get(PrintTemplate, template_id)
-    if src is None:
-        raise HTTPException(404, "打印模板不存在")
-    t = PrintTemplate(scope=src.scope, name=f"{src.name} 副本", paper=src.paper,
+    src = _scoped_template(db, book, template_id)
+    # 复制出来的仍是本账套的模板，同样按门禁收紧（否则「复制」就是个绕过点）。
+    _require_global_template_write(link, user)
+    t = PrintTemplate(book_id=book.id, scope=src.scope, name=f"{src.name} 副本",
+                      paper=src.paper,
                       content=dict(src.content or {}), is_default=False,
                       remark=src.remark)
     db.add(t)
@@ -232,9 +281,14 @@ def copy_template(template_id: int, book: Book = Depends(get_my_book),
 
 
 def _clear_other_defaults(db: Session, keep: PrintTemplate) -> None:
+    # 按 (book_id, scope) 分组：A 账套「设为默认」不该把 B 账套的默认模板
+    # 一起清掉 —— 那等于「在 A 账套点一下，B 账套的版式就变回旧的了」。
+    # book_id 为 NULL 的全局模板各自成组，跨账套互不影响。
     db.query(PrintTemplate).filter(
         PrintTemplate.scope == keep.scope, PrintTemplate.id != keep.id,
-        PrintTemplate.is_default.is_(True)
+        PrintTemplate.is_default.is_(True),
+        PrintTemplate.book_id == keep.book_id if keep.book_id is not None
+        else PrintTemplate.book_id.is_(None)
     ).update({PrintTemplate.is_default: False}, synchronize_session=False)
 
 
@@ -243,6 +297,40 @@ def _log(db, user, book_id, action, entity_id, detail, before=None, after=None) 
 
     log(db, action=action, entity="print_template", entity_id=entity_id, user=user,
         book_id=book_id, detail=detail, before=before, after=after)
+
+
+def _require_global_template_write(link: UserBook, user: SysUser) -> None:
+    """改打印模板需要本账套 OWNER（管理员放行）。
+
+    **为什么不能只看「当前账套能不能写」**：模板内容进 ``<style>``（P0-2），
+    改错一次，整批单据都要重打。``require_book_write`` 问的是「非 VIEWER 即可」，
+    而「能改别人的模板」从来不是一个人被授权去做的事。对齐
+    ``app/api/system.py`` 里 OWNER 的定义（「账套负责人，可改科目/模板/授权」）
+    与 ``app/api/books.py::update_book`` 的先例。
+
+    **``print_template.book_id`` 落地之后，这道门禁还不能放宽**，三个理由：
+
+    1. **仍有全局模板。** 迁移之前的存量模板 ``book_id IS NULL``，它们照样流进
+       每一个账套的打印页，而**任何一个**账套的 OWNER 都能改它们 —— 跨账套
+       窃取这条路还开着，只是从「改一张」变成「改一张还没有主的」。
+    2. **门禁本身不是这次新加的。** 它是上一批为了止血加的收紧；把它撤掉
+       属于「拿掉一道已经生效的防线」，而放宽的前提是「已经有更好的那道」，
+       不是「原来的问题看起来没那么严重」。
+    3. **没有回归网。** 模板是 JSON 自由文本，样式注入只有渲染层二次夹取
+       兜底；门禁是写入路径上唯一一道按**角色**判断的关卡。
+
+    真正该放宽的时机是「全局模板退役」之后：所有 ``book_id IS NULL`` 的行
+    都不再参与取用，写路径就真的只剩一个账套，可以回到「该账套 OWNER 以上」。
+
+    fail-closed：角色认不出来一律当拒绝，不做「不是 VIEWER 就放行」的黑名单判断
+    （见 ``frontend/src/stores/session.js::canWrite`` 里同一段推理）。
+    """
+    if user.is_admin:
+        return
+    if link.role != "OWNER":
+        raise HTTPException(
+            403, "打印模板是全局模板（所有账套的打印页都会用到），"
+                 "只有账套所有者或管理员可以修改")
 
 
 # ===================================================================== HTML 打印
@@ -254,8 +342,52 @@ def _log(db, user, book_id, action, entity_id, detail, before=None, after=None) 
 # 才看得到变化。
 
 
+#: 打印页的 CSP。
+#:
+#: 打印页是**纯样式文档**：一份内联 ``<style>`` + 静态表格，没有脚本、没有外链
+#: 资源、没有 ``<img>``/``<link>``/``<form>``。所以这里可以收得很紧：
+#:
+#: * ``default-src 'none'`` —— 除下面显式放行的，其余一律拒绝；
+#: * ``style-src 'unsafe-inline'`` —— 版式全靠内联 ``<style>``（``_page_css``），
+#:   ``'unsafe-inline'`` 是模板引擎的固有要求，不能去掉；
+#: * ``script-src 'none'`` —— **这条是 P0-2 的兜底**：即使模板内容绕过校验
+#:   （老数据、直接改库）注入进了 ``</style><script>…``，脚本也不会执行。
+#:   模板校验是第一道防线，这一条是第二道，两道独立成立。
+#:
+#: ``frame-ancestors 'self'`` 防止打印页被外站 iframe 套娃。
+#:
+#: 注意 nginx 那层也该有全局 CSP（由部署工作包负责）。这一条是**应用层**的：
+#: 即便反代没配、或有人直接用后端端口起服务，防护也仍然成立。
+PRINT_CSP = (
+    "default-src 'none'; "
+    "style-src 'unsafe-inline'; "
+    "script-src 'none'; "
+    "img-src 'none'; "
+    "font-src 'none'; "
+    "connect-src 'none'; "
+    "form-action 'none'; "
+    "base-uri 'none'; "
+    "frame-ancestors 'self'"
+)
+
+
 def _html_response(doc: str) -> Response:
-    return Response(content=doc, media_type="text/html; charset=utf-8")
+    """打印页响应。
+
+    带 CSP 头（见 ``PRINT_CSP``）和 ``nosniff``。``nosniff`` 是配套的：
+    没有 CSP 时它至少能挡住 MIME 嗅探这一条道，两者一起才是一道完整的门。
+    """
+    return Response(
+        content=doc,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "Content-Security-Policy": PRINT_CSP,
+            "X-Content-Type-Options": "nosniff",
+            # 打印页内容随模板变，但不能被任何一层缓存住：模板改完重新预览必须
+            # 立刻看到新版本，旧版式发出去才是账务事故。
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
@@ -558,7 +690,33 @@ def preview_draft(payload: PreviewIn, book: Book = Depends(get_my_book),
 # ===================================================================== Excel 导出
 
 
+def _xlsx(fn):
+    """把 Excel 导出层的领域异常翻译成 HTTP 语义。
+
+    * ``ExportTooLarge`` → 413 + 可操作提示（缩小范围再导出）。
+      导出侧是全内存构建的（见 ``excel.MAX_EXPORT_ROWS``），超限时**必须**
+      失败得明确：静默截断出来的账表缺行，交给审计方是错的。
+    * 其它 ValueError → 400。这类值在 API 层已经校验过，这里是兜底，
+      不该以 500 的形式漏给用户。
+
+    装饰器而不是每个接口写一遍 try/except：六个导出接口的这段逻辑完全相同，
+    复制六份迟早有一份漏掉。
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except xl.ExportTooLarge as exc:
+            raise HTTPException(413, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, f"导出失败：{exc}") from exc
+
+    return wrapper
+
+
 @router.get("/vouchers.xlsx")
+@_xlsx
 def export_vouchers(book_id: int, period_id: Optional[int] = None, book: Book = Depends(get_my_book),
                     db: Session = Depends(get_db), status: Optional[str] = None):
     from app.accounting.vouchers import query_vouchers
@@ -572,6 +730,7 @@ def export_vouchers(book_id: int, period_id: Optional[int] = None, book: Book = 
 
 
 @router.get("/balance.xlsx")
+@_xlsx
 def export_balance(book_id: int, period_id: Optional[int] = None, book: Book = Depends(get_my_book),
                    db: Session = Depends(get_db), include_unposted: bool = Query(False)):
     from app.ledger import queries
@@ -586,6 +745,7 @@ def export_balance(book_id: int, period_id: Optional[int] = None, book: Book = D
 
 
 @router.get("/general-ledger.xlsx")
+@_xlsx
 def export_general(book_id: int, period_id: Optional[int] = None,
                    from_period_id: Optional[int] = None,
                    book: Book = Depends(get_my_book), db: Session = Depends(get_db),
@@ -626,6 +786,7 @@ def export_general(book_id: int, period_id: Optional[int] = None,
 
 
 @router.get("/report.xlsx")
+@_xlsx
 def export_report(book_id: int, template_id: int, period_id: int, book: Book = Depends(get_my_book),
                   db: Session = Depends(get_db)):
     from app.models import ReportTemplate
@@ -643,6 +804,7 @@ def export_report(book_id: int, template_id: int, period_id: int, book: Book = D
 
 
 @router.get("/detail-ledger.xlsx")
+@_xlsx
 def export_detail_ledger(book_id: int, subject_id: int, period_id: Optional[int] = None,
                          from_period_id: Optional[int] = None,
                          from_subject_id: Optional[int] = None,

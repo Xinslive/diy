@@ -67,11 +67,12 @@
             <td class="amt">
               <el-input
                 v-if="s.is_leaf"
-                v-model="amounts[s.id]"
+                :model-value="shown(s.id)"
                 :disabled="!data.editable"
                 size="small"
                 class="money"
                 align="right"
+                @update:model-value="(v) => typeAmount(s, v)"
                 @blur="dirty = true"
               />
               <!-- 上级不能录（期初只能记在末级上），但也不能空着：
@@ -104,6 +105,7 @@ import { ElMessage } from 'element-plus'
 import * as api from '@/api/book'
 import { useSessionStore } from '@/stores/session'
 import { downloadFile } from '@/api/print'
+import { amountInputText, amountToNumber, sanitizeAmount, sanitizeAmountDetailed } from '@/utils/amountGrid'
 
 const store = useSessionStore()
 const router = useRouter()
@@ -112,6 +114,10 @@ const amounts = reactive({})
 /** 每行期初的「实际方位」。科目属性只是通常方向，允许逐行翻转 —— 应收账款出现
  *  贷方余额、应交税费为负都是真实业务，强按属性纠正会把余额方向洗掉。 */
 const sides = reactive({})
+/** 正在敲的那一格（原文）。跟 amounts 分开是因为净化会把刚敲下、还没跟数字的
+ *  小数点收掉 —— 那是**正在敲的半句话**，收掉的话「1234.5」会打成「12345」。
+ *  跟凭证页 AmountGrid 里 amountInputText 一个道理（同一套净化、同一套规矩）。 */
+const drafts = reactive({})
 const dirty = ref(false)
 const saving = ref(false)
 const parsing = ref(false)
@@ -126,13 +132,49 @@ const CATEGORIES = [
 
 const money = (v) => (Number(v || 0)).toLocaleString('zh-CN', { minimumFractionDigits: 2 })
 
+/* ── 金额净化（审计 P2-20）─────────────────────────────────────────
+ * 这一页以前直接 `Number(框里的字)`：脏输入（「abc」「1。5」「-」「１00」）
+ * 一律变 NaN，而 `NaN !== 0` 是**真** —— 于是这一行既进了合计（NaN 把整列
+ * 合计污染成 NaN）又进了保存名单，最后报「已保存 N 条」，
+ * 库里却存着 0。人以为存了 100，其实存了 0，期初表从此对不上总账。
+ *
+ * 现在净化走**凭证金额格那一份**（utils/amountGrid.js）：全角数字、
+ * 中文句点、各种减号都折回半角，只有「超出 亿…分 的位次」才截，
+ * 而且截了要说出来。别在这一页另写一套净化 —— 两页两套规矩，
+ * 迟早在某个角落各说各话。 */
+
+/** 框里该显示的：正在敲的那串原文（可能带着一个刚敲下的小数点），否则是净化后的值 */
+const shown = (id) => (drafts[id] !== undefined ? drafts[id] : (amounts[id] ?? ''))
+
+function typeAmount(s, typed) {
+  const { value, notices } = sanitizeAmountDetailed(typed)
+  amounts[s.id] = value
+  drafts[s.id] = amountInputText(typed, value)
+  for (const n of notices) {
+    ElMessage.warning(`${s.code} ${s.name}：${n.text}`, { grouping: true, duration: 2600 })
+  }
+}
+
+/**
+ * 一行期初的数额（不带符号）。
+ *
+ *  先净化、再解析 —— 而且「认不出来的串」一律当空格子，绝不产生 NaN：
+ *  NaN 有两个坏脾气，`NaN !== 0` 为真（会被「哪些行有余额」的过滤选中），
+ *  又能把整列合计污染掉 —— 脏输入那一行既进了保存名单、存进去的却是 0，
+ *  人还得到一句「已保存 N 条」（审计 P2-20）。
+ * amountToNumber 就是那份净化 + 「认不出当空格子」的解析，与凭证金额格同源。
+ */
+function amountOf(s) {
+  return amountToNumber(amounts[s.id])
+}
+
 const filledCount = computed(
-  () => data.value.subjects.filter((s) => s.is_leaf && Number(amounts[s.id] || 0) !== 0).length
+  () => data.value.subjects.filter((s) => s.is_leaf && amountOf(s) !== 0).length
 )
 
 /** 一行的带符号金额：借正贷负，与后端存储口径一致。 */
 function signedOf(s) {
-  const v = Math.abs(Number(amounts[s.id] || 0))
+  const v = Math.abs(amountOf(s))
   if (!v) return 0
   return sides[s.id] === '贷' ? -v : v
 }
@@ -198,17 +240,24 @@ async function load() {
   data.value = await api.getOpenings(store.bookId, store.periodId)
   for (const k of Object.keys(amounts)) delete amounts[k]
   for (const k of Object.keys(sides)) delete sides[k]
+  for (const k of Object.keys(drafts)) delete drafts[k]
   for (const s of data.value.subjects) {
     // side 来自库里实际存的方位；没录过时退回科目自然方向
     sides[s.id] = Number(s.signed) !== 0 ? s.side : s.natural_side
-    amounts[s.id] = s.is_leaf ? s.amount : ''
+    // 存回来的也过一遍净化：库里那份是别人（或上一次的手滑）写进去的，
+    // 页面不认脏串 —— 认了就等于把脏东西又带回来让人「照着改」。
+    amounts[s.id] = s.is_leaf ? sanitizeAmount(s.amount) : ''
   }
   dirty.value = false
 }
 
 async function save() {
   const rows = data.value.subjects
-    .filter((s) => s.is_leaf && Number(amounts[s.id] || 0) !== 0)
+    // 过滤条件跟合计用的是**同一个** amountOf：以前这里写的是
+    // `Number(框里的字) !== 0`，NaN 也算「有余额」，于是脏输入的行被算进
+    // 「已保存 N 条」，实际存进去的是 0。现在 amountOf 认不出的串一律当空格子，
+    // 报出来的条数与真正写进库的条数必然一致。
+    .filter((s) => s.is_leaf && amountOf(s) !== 0)
     .map((s) => ({ subject_id: s.id, amount: String(signedOf(s)) }))
   if (!balanced.value) {
     return ElMessage.error(`借贷不平：差额 ${money(dr.value - cr.value)}，不能保存`)
@@ -238,7 +287,10 @@ async function onFile(file) {
       // 不能只取绝对值 —— 那样反方向余额会被无声地洗成正的
       const signed = Number(r.signed ?? 0)
       sides[r.subject_id] = r.display_side || (signed < 0 ? '贷' : '借')
-      amounts[r.subject_id] = String(Math.abs(signed || Number(r.amount || 0)))
+      // 文件里的数字同样过一遍净化：Excel 里全角、带「元」字、带货币符号的
+      // 都不稀奇，照搬进来会让这一行变成算不出数的那一行
+      amounts[r.subject_id] = sanitizeAmount(String(Math.abs(signed || Number(r.amount || 0))))
+      delete drafts[r.subject_id]
     }
     dirty.value = true
     if (res.balanced) ElMessage.success(`已读入 ${ok.length} 条，借贷平衡`)

@@ -39,10 +39,14 @@
           <el-tag v-if="form.status === 'POSTED'" type="success" size="small">已记账</el-tag>
           <el-tag v-else type="warning" size="small">未记账</el-tag>
         </div>
-        <div v-if="locked" class="tag-bad">当前期间已结账，不可修改</div>
+        <!-- 说的是「这一张所在的期间」，不是顶栏那个月：两张凭证可以摊在两个期间里，
+             而能不能改由它们各自那期说了算。含糊成「当前期间」会让人以为说的是顶栏。 -->
+        <div v-if="locked" class="tag-bad">该凭证所在期间已结账，不可修改</div>
         <div v-else-if="posted" class="tag-bad">
           已记账凭证已锁定，不能修改。请在凭证列表点「反记账」后再改。
         </div>
+        <!-- 只读账套也得说一声：不然一屏全灰着，人只能猜是不是页面坏了 -->
+        <div v-else-if="!store.canWrite" class="tag-bad">这个账套是只读的，不能修改凭证</div>
       </div>
 
       <!-- 左边空出的 48px 是给每一行那对 ⊕ / ＋ 的：它们挂在各自那一行的左边，
@@ -218,12 +222,13 @@
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import * as api from '@/api/voucher'
 import * as subjectApi from '@/api/subject'
 import * as ledgerApi from '@/api/ledger'
 import { useSessionStore } from '@/stores/session'
+import { useTabsStore } from '@/stores/tabs'
 import { fmt } from '@/utils/format'
 import { displayBalance } from '@/utils/balanceSign'
 import AmountGrid from '@/components/AmountGrid.vue'
@@ -234,8 +239,14 @@ import AmountUnits from '@/components/AmountUnits.vue'
 import { Bottom, CircleCloseFilled, EditPen, Top } from '@element-plus/icons-vue'
 
 const store = useSessionStore()
+const tabs = useTabsStore()
 const route = useRoute()
 const router = useRouter()
+
+// 这张表单属于**哪个账套**。切账套时 store.bookId 先变成新的，
+// 此刻任何拿 store.bookId 发的请求，都是把上一个账套的凭证写进新账套 ——
+// 这个 ref 记下表单自己的归属，save() 认它，不认 store 上那个正在变的值。
+const formBookId = ref(0)
 
 // 这张凭证的 id：0 = 还没落库的空凭证。
 // 原来是 computed(route.params.id)，自动保存新建之后 URL 还没来得及换的那一瞬间
@@ -306,8 +317,24 @@ function rowProblemText(row, at = form.entries.indexOf(row) + 1) {
   }
   return ''
 }
-/** 页脚那一行提示用的：没有非末级科目就返回 null */
+/** 页脚那一行提示用的：所有挂在非末级科目上的分录（不管是谁挂上去的） */
 const nonLeafRows = computed(() => form.entries.filter((e) => badSubject(e) && num(e.amount)))
+/**
+ * **这一页新挂上去**的非末级科目分录。只有这些才当场拦下来。
+ *
+ *  原来拿 `is_leaf` 当硬闸，一视同仁地拦住所有非末级分录。而 `is_leaf` 是
+ *  服务端按「有没有下级」算出来的**派生值**（ARCHITECTURE §9.6），前端手里
+ *  那份科目树只是快照 —— 于是一张老凭证（当年挂 1002，后来 1002 底下加了子科目）
+ *  连**只改一下附单据数**都存不下去：页脚红着「第 1 行不是末级科目」，
+ *  而人根本没有碰那一条分录。
+ *
+ *  分界在这里：**账上原来就有的**（`form.legacySubjects` 是后端返回的这张凭证
+ *  已经用掉的科目 id）不归前端管 —— 它是服务端的事，服务端自己会拒，
+ *  而且它拒的话写得更准（点名是哪几个科目）。**这一页刚挂上去的**才是当场
+ *  的笔误，拦下来当场改比等一趟 400 回来强。
+ */
+const newNonLeafRows = computed(() =>
+  nonLeafRows.value.filter((e) => !form.legacySubjects.includes(e.subject_id)))
 
 /** 这张凭证还剩几行：四行是底线，出现第五行才说明「多写了」，那哪一行都删得掉 */
 const canDeleteRow = computed(() => form.entries.length > 4)
@@ -317,16 +344,47 @@ const voucherPeriod = ref(null)
 
 const form = reactive({
   voucher_no: '', voucher_date: '', status: 'UNPOSTED',
-  attachments: 0, remark: '', entries: []
+  attachments: 0, remark: '', entries: [],
+  // 这张凭证**从服务端带回来**时用过的科目 id：分录是新挂的还是账上原有的，
+  // 就靠它分家（见 newNonLeafRows）。它不进 entrySig —— 改它不算「这张凭证变了」。
+  legacySubjects: []
 })
 
-const locked = computed(() => !!store.currentPeriod?.locked)
+/** 顶栏那个期间结没结账 —— 只管「能不能**开新**凭证」。
+ *  新凭证落在哪一期由顶栏说了算，所以这道闸跟着顶栏走。 */
+const periodLocked = computed(() => !!store.currentPeriod?.locked)
+/**
+ * 这张凭证能不能改：**按它自己的期间判，不是顶栏那个**。
+ *
+ *  原来直接读 `store.currentPeriod?.locked`：顶栏停在未结账的 12 月，
+ *  翻到一张 11 月（已结账）的凭证，表单整张可编辑 —— 改一格就触发自动保存的 PUT，
+ *  后端那道 `fn_voucher_guard` 照单全收地拒掉，人每改一次弹一次错，
+ * 而界面上从头到尾没有一个字说这张不能改。
+ *
+ *  取的是**它自己的**那个期间（`voucherPeriodId` 直接来自接口，不从
+ * `store.periods` 反查 —— 那个数组是异步灌的，页面可能比它先到）。
+ * 新凭证还没落库，期间按保存时顶栏那一期走，这时退回顶栏。
+ * 认不出（自己的期间还没拿到）也退回顶栏，跟原来的行为一致 ——
+ * 宁可少锁一次（后端还会拒），也不能把能改的一张锁死在这儿。
+ */
+const locked = computed(() => {
+  if (!voucherId.value) return periodLocked.value
+  const own = store.periods.find((p) => p.id === voucherPeriodId.value) || voucherPeriod.value
+  return !!(own ? own.locked : store.currentPeriod?.locked)
+})
 const posted = computed(() => form.status === 'POSTED')
-// 只读：期间已结账，或凭证本身已记账
-const readonly = computed(() => locked.value || posted.value)
-
-// 能不能开新凭证：只读账套不行，期间已结账也不行
-const canAdd = computed(() => store.canWrite && !locked.value)
+/**
+ * 只读：**没这个账套的写权限**，或这张凭证所在的期间已结账，或它本身已记账。
+ *
+ *  原来只认后两条，漏了 `canWrite`：VIEWER 的操作列虽然在列表里藏了，
+ *  但双击任意一行就能进这一页，整张表可填 —— 改一格触发一次自动保存、
+ *  换回一个 403。页面上没有任何一处提示这里不该写。
+ *  `canWrite` 用的是 store 那份白名单（认不出的角色一律当不能写），
+ *  与后端的 ROLES 是同一份名单，不在前端另立一套标准。
+ */
+const readonly = computed(() => locked.value || posted.value || !store.canWrite)
+// 只读账套不行，**顶栏那个期间**已结账也不行（新凭证落在顶栏那一期）
+const canAdd = computed(() => store.canWrite && !periodLocked.value)
 
 const subjectOf = (id) => subjects.value.find((s) => s.id === id) || null
 /** 这一行挂的不是末级科目：科目格标红、保存拦下、回车不许往下走 */
@@ -342,6 +400,9 @@ const subjectCreateRow = ref(0)
  *  不用人把同一串号在两个地方各敲一遍。 */
 const subjectPreset = ref('')
 function openSubjectCreate(i, kw) {
+  // 科目格本身在只读时是关着的，这里再挡一道：新增科目是个**写**动作，
+  // VIEWER 走到这一步只会被服务端 403 拒一次，白等一趟。
+  if (readonly.value) return
   subjectCreateRow.value = i
   subjectPreset.value = String(kw || '').trim()
   subjectCreateOpen.value = true
@@ -519,19 +580,58 @@ const num = (v) => {
 /** 合计是算出来的数，落格前补上角分：分录行写的是「2180504.00」，
  *  合计格却只剩「2180504」，同一张纸上两种写法，看着像少了两位。 */
 const money2 = (v) => (num(v) ? num(v).toFixed(2) : '')
-/** 带符号的合计：哪一侧的数就加在哪一侧，负数照减。
- *  「=」补出来的差额必须用这一对算 —— 显示用的合计把负数搬去了对面，
- *  拿它当差额会把补出来的数翻一倍。 */
-const signedTotal = computed(() => {
-  let debit = 0, credit = 0
-  for (const e of form.entries) {
-    if (e.direction === 'DEBIT') debit += num(e.amount)
-    else credit += num(e.amount)
-  }
-  return { debit, credit }
-})
+// ---- 金额：一律整数分（判平、差额、补差三处共用这一份量化结果）----
+//
+//  原来是 JS number 累加 + 严格相等判平，而 `100.10 + 200.20 = 300.29999999999995`
+//  不等于 `300.3` —— 于是「借 100.10 + 借 200.20 / 贷 300.30」这种完全合法的凭证
+//  被判成不平，两道闸门（手动保存、自动保存）都只有 `balanced` 一个口子，
+//  于是它**永远存不进去**。枚举下来两借一贷约 22%、三借一贷约 27% 中招。
+//  更糟的是页脚那句 `fmt(Math.abs(借 − 贷))` 把残差抹成「贷方大 0.00」，
+//  人对着一个 0.00 差额根本看不出自己错在哪。
+//
+//  现在按**分**这个最小单位比：金额只在这里定点化一次，之后全是整数加减。
+//  后端是 Decimal 逐笔累加、一分不差，前端也一分不差，两边才是一套口径 ——
+//  不再是「前端拿容差凑合、后端用精确值」这种永远对不齐的双口径。
+
 /**
- * 凭证上印的合计：**负数算到对面去**。
+ * 一个金额折成**整数分**。全程字符串定点，不经过浮点累加。
+ *
+ *  · `''` / `'-'` / 认不出来的字符 → 0：只敲了一个负号时 `Number('-')` 是 NaN，
+ *    NaN 一进合计，整张凭证的差额就废了，连「不平」都说不出来。
+ *  · 小数只取到分：`sanitizeAmount` 敲进来时就截到两位，金额列也是两位小数，
+ *    再往后的位次从来不会到这里 —— 静默截断比悄悄四舍五入诚实。
+ *  · 负号认半角 `-` 和落格用的真正减号 `−`（U+2212）：两种都得是红字，
+ *    把其中一个当成正数，冲销就成了再记一遍，方向刚好反。
+ */
+function centsOf(v) {
+  if (v === '' || v === null || v === undefined) return 0
+  const raw = String(v).trim()
+  if (!raw) return 0
+  const neg = raw[0] === '-' || raw[0] === '\u2212'
+  const body = (neg ? raw.slice(1) : raw).replace(/[^0-9.]/g, '')
+  const dot = body.indexOf('.')
+  const int = (dot === -1 ? body : body.slice(0, dot)) || '0'
+  const dec = dot === -1 ? '' : body.slice(dot + 1)
+  const yuan = Number(int)
+  if (!Number.isFinite(yuan)) return 0
+  const fen = Number(dec.slice(0, 2).padEnd(2, '0'))
+  const cents = yuan * 100 + fen
+  // 整数分再大也越不过 2^53；越界说明这不是一笔金额，宁可当 0 也不能让它进合计
+  if (!Number.isSafeInteger(cents)) return 0
+  return neg ? -cents : cents
+}
+
+/** 整数分落成字符串（不带千分位）。补差写回格子、发给后端都走它 ——
+ *  所以页面上看见的数、判平用的数、后端收到的数，是同一个数。 */
+function centsText(c) {
+  const n = Number.isFinite(c) ? Math.trunc(c) : 0
+  const neg = n < 0
+  const a = Math.abs(n)
+  return `${neg ? '-' : ''}${Math.floor(a / 100)}.${String(a % 100).padStart(2, '0')}`
+}
+
+/**
+ * 凭证上印的合计：**负数算到对面去**，在整数分上做。
  *
  *  贷方红字（负数）本质上是借方，借方红字本质上是贷方 —— 这是红字的本意，
  *  不是「贷方减了 300」。所以两栏都只把正数加进来：
@@ -542,32 +642,79 @@ const signedTotal = computed(() => {
  *
  *  判平用它也准：借方合计 = 贷方合计 ⟺ 带符号借方 = 带符号贷方，两种口径完全等价。
  */
-const total = computed(() => {
+function voucherTotals(entries) {
   let debit = 0, credit = 0
-  for (const e of form.entries) {
-    const v = num(e.amount)
-    if (v > 0) {
-      if (e.direction === 'DEBIT') debit += v
-      else credit += v
-    } else if (v < 0) {
+  for (const e of entries || []) {
+    const c = centsOf(e.amount)
+    if (c > 0) {
+      if (e.direction === 'DEBIT') debit += c
+      else credit += c
+    } else if (c < 0) {
       // 红字：写到对面去
-      if (e.direction === 'DEBIT') credit += -v
-      else debit += -v
+      if (e.direction === 'DEBIT') credit += -c
+      else debit += -c
     }
   }
   return { debit, credit }
-})
+}
+
+/** 带符号的合计（借正贷负，负数照减），「=」补差用这一份。
+ *  显示用的合计把负数搬去了对面，拿它当差额会把补出来的数翻一倍。 */
+function voucherSignedTotals(entries) {
+  let debit = 0, credit = 0
+  for (const e of entries || []) {
+    const c = centsOf(e.amount)
+    if (e.direction === 'DEBIT') debit += c
+    else credit += c
+  }
+  return { debit, credit }
+}
+
+/** 「=」补差：在整数分上算「这一格填多少，整张才平」。 */
+function autoBalanceNeed({ opposite, same, mine, mineSide, side }) {
+  return opposite - same + (mineSide === side ? mine : -mine)
+}
+
+/** 判平、差额、合计三处共用的那一份量化结果（单位：分）。 */
+const totals = computed(() => voucherTotals(form.entries))
+/** 显示用的合计：格子里落的那两行。从整数分换算回来，不再自己累加一遍。 */
+const total = computed(() => ({ debit: totals.value.debit / 100, credit: totals.value.credit / 100 }))
+/** 补差用的带符号合计 */
+const signedTotals = computed(() => voucherSignedTotals(form.entries))
+/** 差额（分）。借方大就是正的 —— 方向和大小在同一个数上，不用分两处判断。 */
+const diffCents = computed(() => totals.value.debit - totals.value.credit)
 /**
- * 平不平：**借方合计 = 贷方合计，就是平的**。
+ * 平不平：**借方合计 = 贷方合计，就是平的**，在整数分上完全相等。
  *
- *  两种看着「不像平」的形状都是平的，别去替人把它们判成不平：
+ * 这里没有容差，也不该有：差一分就是不平（后端 Decimal 也是这么判的），
+ * 而 `5e-15` 那种浮点残差在 `centsOf` 那一步就已经不存在了 ——
+ * 加容差只会把「真差一分钱」也一起放过。
+ *
+ * 两种看着「不像平」的形状都是平的，别去替人把它们判成不平：
  *  红字凭证（借 −300 / 贷 −300）冲的是老账，照样该存；
  *  正负相抵（借 111 / 借 −111）记的是一次冲销 —— 红字把 −111 搬去了对面，
  *  两栏一样大，就该按平处理（2026-10-12 用户明确要求的）。
  *
  *  一条都还没录是另一回事：那走 `blank`，页脚说「还没录金额」，不是「平」。
  */
-const balanced = computed(() => total.value.debit === total.value.credit)
+const balanced = computed(() => diffCents.value === 0)
+/**
+ * 差额要说清是**哪一边大**。
+ *
+ *  只写「差额 90.00」，90 这个数看着像凭空冒出来的；其实两栏摆在那儿，
+ * 一眼比得出大小。不说方向，人还得自己回头数一遍是借多还是贷多，
+ * 才知道该往哪一格补 —— 而这恰恰是页脚这句话唯一该干的事。
+ *
+ *  金额从整数分直接落成字符串：不平的时候至少差一分，
+ * 所以这里**不可能再出现「贷方大 0.00」**那种看不懂的话。
+ */
+const diffTag = computed(() => `${diffCents.value > 0 ? '借方大' : '贷方大'} ${
+  fmt(centsText(Math.abs(diffCents.value)))}`)
+
+// 一分钱都还没录的时候别急着报红字，那是噪音不是提示
+const blank = computed(() => totals.value.debit === 0 && totals.value.credit === 0)
+// ---- 金额段结束（tests/voucher_balance.test.mjs 从这里头抠实现跑）----
+
 // 「这张凭证现在长什么样」：自动保存靠它判断有没有改动。没动过就不重存。
 const entrySig = computed(() => JSON.stringify([
   form.voucher_date, form.voucher_no, form.attachments, form.remark,
@@ -575,18 +722,12 @@ const entrySig = computed(() => JSON.stringify([
 ]))
 const lastSaved = ref('')      // 上一次落库的签名
 const savedAt = ref('')        // 上一次落库的时间，页脚上给个准信
-/**
- * 差额要说清是**哪一边大**。
+/** 存失败的那一版：同一版不再自动重试。
  *
- *  只写「差额 90.00」，90 这个数看着像凭空冒出来的；其实两栏摆在那儿，
- * 一眼比得出大小。不说方向，人还得自己回头数一遍是借多还是贷多，
- * 才知道该往哪一格补 —— 而这恰恰是页脚这句话唯一该干的事。
- */
-const diffTag = computed(() => `${total.value.debit > total.value.credit ? '借方大' : '贷方大'} ${
-  fmt(Math.abs(total.value.debit - total.value.credit))}`)
-
-// 一分钱都还没录的时候别急着报红字，那是噪音不是提示
-const blank = computed(() => total.value.debit === 0 && total.value.credit === 0)
+ *  不记的话，一次失败（老凭证挂着后来被加了子科目的分录、服务端 400）
+ *  会变成「每敲一下键弹一次同样的错」—— 报错反而把页面变成噪声，
+ *  人连自己在改什么都看不清了。 */
+const failedSig = ref('')
 
 
 function subjectText(id) {
@@ -775,13 +916,14 @@ function autoBalance(i, side) {
   const row = form.entries[i]
   if (!row) return
   // opposite = 写进去这一格的**对面**合计；same = 写进去这一格的**本侧**合计
-  const opposite = side === 'd' ? signedTotal.value.credit : signedTotal.value.debit
-  const same = side === 'd' ? signedTotal.value.debit : signedTotal.value.credit
-  const mine = num(row.amount)
+  // 全是整数分：补完这一格之后判平用的那份量化结果也必然是平的，
+  // 不会再出现「已按差额补上 300.30」却依然存不了的情况。
+  const opposite = side === 'd' ? signedTotals.value.credit : signedTotals.value.debit
+  const same = side === 'd' ? signedTotals.value.debit : signedTotals.value.credit
+  const mine = centsOf(row.amount)
   // 这一行现在的方向。空格也记着方向（默认借方），但金额是 0，翻不翻都一样
   const mineSide = row.direction === 'CREDIT' ? 'c' : 'd'
-  const gap = opposite - same + (mineSide === side ? mine : -mine)
-  const need = Number(gap.toFixed(2))
+  const need = autoBalanceNeed({ opposite, same, mine, mineSide, side })
 
   // 补出来是 0：这一格该空着。空着本来就没错，说一声已经平了；
   // 不空着（前面有一笔同方向的数）就得清掉 —— 留着它反而不平。
@@ -794,12 +936,14 @@ function autoBalance(i, side) {
   // 已经是这个数：什么都不用做，别再报一遍「已按差额补上 300」
   if (mineSide === side && mine === need) return
 
-  if (side === 'd') setDebit(row, String(need))
-  else setCredit(row, String(need))
+  // 负数原样写进去（红字冲销），别在这里被当成垃圾字符剔掉
+  const text = centsText(need)
+  if (side === 'd') setDebit(row, text)
+  else setCredit(row, text)
   activeRow.value = row
   ElMessage.success(need < 0
-    ? `已按差额补上 ${fmt(need)}（红字冲销）`
-    : `已按差额补上 ${fmt(need)}`)
+    ? `已按差额补上 ${fmt(text)}（红字冲销）`
+    : `已按差额补上 ${fmt(text)}`)
 }
 
 /**
@@ -1004,6 +1148,44 @@ let loadSeq = 0
 /** 响应回来后确认「我还是最新那一次」，不是就说明该丢弃了。 */
 function stale(seq) { return seq !== loadSeq }
 
+/**
+ * 把整张表单抹回「什么都没有」的样子。换账套时用。
+ *
+ * 原来换账套只是让 load() 重跑一遍，而 load() 开头无条件
+ * `voucherId.value = Number(route.params.id || 0)` —— 地址栏里的 id 是上一个
+ * 账套的凭证号，在新账套里要么不存在、要么是**另一张**凭证。表单、分录、
+ * 「已自动保存 09:49」这些上一张的痕迹全留在屏幕上，而 `voucherId` 已经
+ * 指着外账套的号了：接下来随便改一格，就是拿新账套的地址去更新旧账套的凭证。
+ *
+ * `loadSeq` 也得一起抬一代：还在路上的旧响应回来时必须自己认得出过期，
+ * 否则抹干净的表单又被它填回上一张的样子。
+ */
+function resetForm() {
+  ++loadSeq
+  voucherId.value = 0
+  voucherPeriod.value = null
+  voucherPeriodId.value = 0
+  insertCtx.value = null
+  savedAt.value = ''
+  failedSig.value = ''
+  prevId.value = null
+  nextId.value = null
+  neighbourScope.value = ''
+  subjectRefs.clear()
+  sumRefs.clear()
+  amtRefs.clear()
+  markingRows.value = new Set()
+  activeRow.value = null
+  hoverRow.value = null
+  Object.assign(form, {
+    voucher_no: '', voucher_date: '', status: 'UNPOSTED',
+    attachments: 0, remark: '', entries: [], legacySubjects: []
+  })
+  ensureRows(4)
+  // 抹干净之后不算「有没存上的改动」：这一页本来就不该替上一个账套存任何东西
+  lastSaved.value = entrySig.value
+}
+
 async function load() {
   const seq = ++loadSeq
   const myId = Number(route.params.id || 0)
@@ -1018,7 +1200,18 @@ async function load() {
   // 不清的话，上一张还在标记的行会留在集合里，白收着这张的余额
   markingRows.value = new Set()
   if (myId) {
-    const v = await api.getVoucher(store.bookId, myId)
+    let v = null
+    try {
+      v = await api.getVoucher(store.bookId, myId)
+    } catch (e) {
+      if (stale(seq)) return
+      // 这个 id 在**当前账套**里读不出来。多半是切了账套而地址栏还挂着
+      // 上一张的号（两个账套的凭证 id 是各自自增的，撞上号也不稀奇）。
+      // 停在一张空表上、还绑着那个 id，只会更让人以为凭证没了 —— 回列表去。
+      ElMessage.error('这张凭证在当前账套里不存在')
+      router.push({ name: 'vouchers' })
+      return
+    }
     if (stale(seq)) return
     // 双重确认：代次之外再核对 id，防的是「代次对上了但期间切换了」
     if (Number(route.params.id || 0) !== myId) return
@@ -1029,12 +1222,16 @@ async function load() {
       attachments: v.attachments, remark: v.remark,
       entries: v.entries.map((e) => ({
         subject_id: e.subject_id, direction: e.direction, amount: e.amount, summary: e.summary
-      }))
+      })),
+      // 这张凭证在**账上**用掉的科目：这些分录不是这一页新挂的，
+      // 非末级那道闸就不该拦它们（见 newNonLeafRows）
+      legacySubjects: v.entries.map((e) => e.subject_id)
     })
     ensureRows(4)
     lastSaved.value = entrySig.value      // 刚打开的这张就是「已保存」的样子，别一进来就重存一遍
     await loadNeighbour(seq)
   } else {
+    form.legacySubjects = []              // 新凭证：所有分录都是这一页新挂的
     // 新开一张：凭证号和日期都先替人填好。
     // 号码问后端要（`/vouchers/next`），因为它跟落库时用的是同一个发号函数 ——
     // 自己照着列表猜一个「最大号 +1」会跟真正发出来的号对不上，白填一次。
@@ -1094,30 +1291,39 @@ function defaultDate() {
  * 落库。`quiet` 是自动保存那条路：成功不弹提示、不跳页面 —— 人还在这一张凭证上接着录，
  * 一存完就把人踢回列表，等于逼着人每次都重新找回来。
  * 失败一定要说：自动保存失败而页面上一声不吭，人是会信的。
+ *
+ * 返回有没有存成。离开页面前那趟 flush 靠它决定「放不放人走」——
+ * 吞掉失败就又变成静默丢数据。
  */
 async function save({ quiet = false } = {}) {
   if (readonly.value) {
     if (!quiet) {
-      ElMessage.warning(posted.value ? '已记账凭证不能修改，请先反记账' : '当前期间已结账，不能修改凭证')
+      ElMessage.warning(posted.value ? '已记账凭证不能修改，请先反记账'
+        : !store.canWrite ? '这个账套是只读的，不能修改凭证'
+          : locked.value ? '该凭证所在期间已结账，不能修改'
+            : '当前期间已结账，不能修改凭证')
     }
-    return
+    return false
   }
   const entries = form.entries
     .filter((e) => e.subject_id && num(e.amount))
     .map((e) => ({
       subject_id: e.subject_id,
       direction: e.direction,
-      amount: String(num(e.amount)),
+      // 金额按同一套定点化落成字符串：页面上看见的、判平用的、后端收到的
+      // 是同一个数，不会出现「看着是 300.30、发出去是 300.29999999999995」
+      amount: centsText(centsOf(e.amount)),
       summary: e.summary || ''
     }))
-  if (!entries.length) return quiet || ElMessage.warning('请至少填写一条分录')
+  if (!entries.length) { if (!quiet) ElMessage.warning('请至少填写一条分录'); return false }
   // 非末级科目这一条不分 quiet：自动保存要是闷声不响，人只会以为存好了，
   // 而这笔分录其实根本没落库 —— 等发现时已经按它记了好几天的账。
-  if (nonLeafRows.value.length) {
-    ElMessage.error(rowProblemText(nonLeafRows.value[0]))
-    return
+  // 只拦**这一页新挂上去的**那些（见 newNonLeafRows）；账上原有的是服务端的事。
+  if (newNonLeafRows.value.length) {
+    ElMessage.error(rowProblemText(newNonLeafRows.value[0]))
+    return false
   }
-  if (!balanced.value) return quiet || ElMessage.error('借贷不平衡，无法保存')
+  if (!balanced.value) { if (!quiet) ElMessage.error('借贷不平衡，无法保存'); return false }
 
   const payload = {
     voucher_date: form.voucher_date, entries, remark: form.remark,
@@ -1129,34 +1335,55 @@ async function save({ quiet = false } = {}) {
   // 否则这几秒里敲的东西会被当成「已保存」丢掉
   const sentSig = entrySig.value
   const wasNew = !voucherId.value
+  // 请求打到**这张表单所属的账套**，不是当下的 store.bookId：切账套那一瞬间
+  // store.bookId 已经变成新的了，拿它发请求等于把上一个账套的凭证写进新账套。
+  const bookId = formBookId.value || store.bookId
   saving.value = true
-  try {
-    const saved = wasNew
-      ? await api.createVoucher(store.bookId, payload)
-      : await api.updateVoucher(store.bookId, voucherId.value, payload)
-    voucherId.value = saved.id
-    lastSaved.value = sentSig
-    savedAt.value = new Date().toTimeString().slice(0, 5)
-    if (wasNew) {
-      // 地址栏换成 /vouchers/{id}：这时候刷新页面不会变成另一张空凭证。
-      // 只动地址栏、**不走 router** —— voucher-new 和 voucher-edit 是两条路由记录，
-      // router.replace 会把组件整个重挂一遍：正在填的表单、光标、绿行全没了。
-      // replaceState 不触发 hashchange，router 内部状态原样保留。
-      history.replaceState(history.state, '', `#/vouchers/${saved.id}`)
-      voucherPeriod.value = store.periods.find((p) => p.id === saved.period_id) || null
-      voucherPeriodId.value = saved.period_id
-      // 顺位已经落库，这张从「待插入」变成普通凭证：说明条收起来，
-      // 再改内容走的是 update，不会把后面那叠号再顶一次
-      insertCtx.value = null
-      await loadNeighbour()
+  const p = (async () => {
+    try {
+      const saved = wasNew
+        ? await api.createVoucher(bookId, payload)
+        : await api.updateVoucher(bookId, voucherId.value, payload)
+      voucherId.value = saved.id
+      lastSaved.value = sentSig
+      failedSig.value = ''
+      savedAt.value = new Date().toTimeString().slice(0, 5)
+      formBookId.value = bookId
+      if (wasNew) {
+        // 地址栏换成 /vouchers/{id}：这时候刷新页面不会变成另一张空凭证。
+        // 只动地址栏、**不走 router** —— voucher-new 和 voucher-edit 是两条路由记录，
+        // router.replace 会把组件整个重挂一遍：正在填的表单、光标、绿行全没了。
+        // replaceState 不触发 hashchange，router 内部状态原样保留。
+        history.replaceState(history.state, '', `#/vouchers/${saved.id}`)
+        // 标签栏那条记的还是 /vouchers/new：只改地址栏不同步它的话，
+        // 关掉标签再点回来会跳到**另一张新的空凭证**，刚录好的那张像丢了。
+        // tabs.open 认的是 (name, path) —— 名字还是原来那个，path 换成存下来的地址。
+        tabs.open({ name: 'voucher-new', path: `/vouchers/${saved.id}` })
+        voucherPeriod.value = store.periods.find((p) => p.id === saved.period_id) || null
+        voucherPeriodId.value = saved.period_id
+        // 顺位已经落库，这张从「待插入」变成普通凭证：说明条收起来，
+        // 再改内容走的是 update，不会把后面那叠号再顶一次
+        insertCtx.value = null
+        await loadNeighbour()
+      }
+      if (!quiet) {
+        ElMessage.success('已保存')
+        router.push('/vouchers')
+      }
+      return true
+    } catch (e) {
+      // 这一版没存上，记下来：同一个签名不再自动重试（见 failedSig）。
+      // 错误本身已经由 http 拦截器弹过了，这里不重复报一遍。
+      failedSig.value = sentSig
+      return false
+    } finally {
+      saving.value = false
     }
-    if (!quiet) {
-      ElMessage.success('已保存')
-      router.push('/vouchers')
-    }
-  } finally {
-    saving.value = false
-  }
+  })()
+  savingPromise = p
+  const ok = await p
+  savingPromise = null
+  return ok
 }
 
 /**
@@ -1165,6 +1392,8 @@ async function save({ quiet = false } = {}) {
  */
 const AUTO_SAVE_DELAY = 700
 let autoSaveTimer = null
+/** 正在路上那趟保存。离开页面前要等它回来，不然同一张凭证会被 POST 两遍。 */
+let savingPromise = null
 async function autoSave() {
   // 上一趟还在路上：改完的东西还没发出去，等它回来再走一趟，别丢
   if (saving.value) {
@@ -1177,22 +1406,99 @@ watch([entrySig, balanced], () => {
   clearTimeout(autoSaveTimer)
   if (readonly.value || !balanced.value) return
   if (entrySig.value === lastSaved.value) return    // 跟刚落库的那一版一模一样，不用再存
+  if (entrySig.value === failedSig.value) return   // 这一版刚才存失败了，别反复弹同一个错
   autoSaveTimer = setTimeout(autoSave, AUTO_SAVE_DELAY)
 })
+
+/**
+ * 离开之前把没落库的改动补上。
+ *
+ * 这一页**没有保存按钮**（工具栏上只有返回/翻页/插入/增加/打印），
+ * 自动保存是唯一的落库路径 —— 于是「停手 700ms 之内点返回、关页签、
+ * 切账套、切期间」这一串动作，改动就永远丢了，而屏幕上没有任何提示。
+ *
+ * 只在「确实有能落库的改动」时才发请求：还没录平的不是没存上的改动，
+ * 是还没录完 —— 为这个拦住人不让人走是本末倒置。
+ *
+ * 返回 true = 没有待补的改动（或补上了）；false = 有改动但没存上。
+ */
+async function flushIfDirty() {
+  if (readonly.value) return true
+  if (savingPromise) await savingPromise        // 上一趟还在路上，先等它回来
+  if (entrySig.value === lastSaved.value) return true
+  if (!balanced.value) return true
+  if (!form.entries.some((e) => e.subject_id && num(e.amount))) return true
+  return save({ quiet: true }) === true
+}
+
+/** 真有东西没存上吗？浏览器的关页签/刷新提示问的是这一句。 */
+function hasUnsavedChanges() {
+  if (readonly.value) return false
+  if (entrySig.value === lastSaved.value) return false
+  if (!balanced.value) return false
+  return form.entries.some((e) => e.subject_id && num(e.amount))
+}
+
+/** 关页签 / 刷新：拦不住就至少让浏览器自己问一句「确定要走？」 */
+function onBeforeUnload(e) {
+  if (!hasUnsavedChanges()) return
+  e.preventDefault()
+  e.returnValue = ''
+}
+
+/** 组件被换掉（切账套 / 切期间时 MainLayout 的 viewKey 变化会直接重挂载）：
+ *  这一条路没有路由跳转，`onBeforeRouteLeave` 根本不触发，只能在这儿补一趟。
+ *  换账套时表单刚被 resetForm 抹平、什么都不脏，这里自然什么都不做。 */
 onBeforeUnmount(() => {
   clearTimeout(autoSaveTimer)
   window.removeEventListener('resize', reAutosizeSums)
+  window.removeEventListener('beforeunload', onBeforeUnload)
+  if (formBookId.value === store.bookId) flushIfDirty()
 })
+
 /** 摘要列宽跟着窗口变，折行位置跟着变，双行的框得重新量 */
 function reAutosizeSums() { sumRefs.forEach((el) => autosizeSum(el)) }
 
+/**
+ * 离开这一页前把改动补上；补不上就问一句，不让人无声无息地丢掉半张凭证。
+ *
+ * 取消确认框会 reject（「cancel」），不接住就是一个未处理的 rejection ——
+ * 控制台一片红，还可能连带吞掉后面真正的报错。
+ */
+onBeforeRouteLeave(async () => {
+  if (await flushIfDirty()) return true
+  return ElMessageBox.confirm('这一张还有改动没能存上，离开就会丢掉。仍然离开？',
+    '改动未保存', { type: 'warning', confirmButtonText: '仍然离开', cancelButtonText: '留下继续改' })
+    .then(() => true)
+    .catch(() => false)
+})
+
 onMounted(async () => {
   window.addEventListener('resize', reAutosizeSums)
+  window.addEventListener('beforeunload', onBeforeUnload)
   if (!store.periodId) return
+  formBookId.value = store.bookId   // 这张表单从这一刻起属于这个账套
   await load()
 })
-// 前一张/后一张只是换 route.params，组件不会重新挂载 —— 必须盯着 id
-watch(() => [store.bookId, store.periodId, route.params.id], load)
+/**
+ * 切账套 / 切期间 / 翻凭证都会重载表单。
+ *
+ *  换**账套**时先整张抹平：地址栏里的 id 是上一个账套的凭证号，留着它
+ *  就是拿新账套的地址去动旧账套的数据，而且上一张的表单还摊在屏幕上。
+ *  换**期间**或**翻凭证**属于同一个账套，先把这一张没落库的改动补上再重载。
+ *
+ *  前一张/后一张只是换 route.params，组件不会重新挂载 —— 必须盯着 id。
+ */
+watch(() => [store.bookId, store.periodId, route.params.id], async () => {
+  if (store.bookId !== formBookId.value) {
+    resetForm()
+    formBookId.value = store.bookId
+    await load()
+    return
+  }
+  await flushIfDirty()
+  await load()
+})
 </script>
 
 <style scoped>

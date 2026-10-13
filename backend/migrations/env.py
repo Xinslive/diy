@@ -30,6 +30,42 @@ if config.config_file_name is not None:
     # 迁移只该管自己那几行输出，不该改别人的日志。
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
+#: 每条 revision 各自一个事务，而不是把整条链包在**一个**事务里。
+#:
+#: **为什么开这个开关（实测过的结论，不是照抄 alembic 文档）。**
+#:
+#: 0001..0007 全程被 ``context.begin_transaction()`` 包在一个事务里，带来两个
+#: 具体后果：
+#:
+#: 1. **索引只能建在锁里。** ``0006`` 放弃 ``CREATE INDEX CONCURRENTLY`` 的
+#:    直接原因就在这里：跑 0006 时，0005 刚加的外键仍持着 ``entry`` /
+#:    ``period_opening`` 的 ACCESS EXCLUSIVE 锁，而同一次 upgrade 里的另一条
+#:    连接要等这把锁 —— 等锁的那个事务正是持锁的那个事务，必然自锁。
+#: 2. **一条失败要重放整条链。** 0005 / 0007 都是「重放整份 db_init.sql」，
+#:    里面有全表校验级的 ``ADD CONSTRAINT ... FOREIGN KEY``。整条链一个事务时，
+#:    中途失败 = 全部回滚 = 下次重来一遍。
+#:
+#: 每条 revision 自己一个事务之后：每条内部仍然是原子的（PostgreSQL 的 DDL 是
+#: 事务性的，``transactional_ddl`` 为真，这一点**没有变**），变的只是**失败时
+#: 已提交的部分会留下来**，而 ``alembic_version`` 正好记录了停在哪 —— 下次
+#: ``upgrade head`` 从那里接着跑。这与本项目「每条 revision 自包含且幂等」的
+#: 写法是一致的（见 0001 / 0003 / 0005 / 0007 的 docstring）。
+#:
+#: **它不能做什么（别把这两件事混为一谈）。**
+#:
+#: 开这个开关**只是**让 ``op.get_context().autocommit_block()`` 在**命令行**
+#: 路径上可用（实测：``alembic upgrade head`` 通过）。它**不**解决
+#: ``app/core.schema_version.upgrade_to_head`` 那条路径 ——
+#: 那里把连接交给 alembic 之前先开了 ``with conn.begin():``，alembic 据此判定
+#: ``_in_external_transaction`` 并**跳过**本开关的逐 revision 事务，于是
+#: ``autocommit_block()`` 里的 ``assert self._transaction is not None`` 照样
+#: 炸（实测 AssertionError，见 0006 docstring 的阻塞点 1）。
+#: 换句话说：**0006 想改用 CONCURRENTLY，前置条件还包括让 ``upgrade_to_head``
+#: 不再自带外层事务**，而那个文件不在本工作线的归属范围内。所以这里只开前置
+#: 条件，不动 0006（改它也不会有任何可观测的效果）。
+TRANSACTION_PER_MIGRATION = True
+
+
 target_metadata = Base.metadata
 
 
@@ -37,6 +73,7 @@ def run_migrations_offline() -> None:
     context.configure(
         url=settings.database_url,
         target_metadata=target_metadata,
+        transaction_per_migration=TRANSACTION_PER_MIGRATION,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
@@ -61,7 +98,9 @@ def run_migrations_online() -> None:
 
 
 def _run(connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
+    context.configure(connection=connection, target_metadata=target_metadata,
+                      transaction_per_migration=TRANSACTION_PER_MIGRATION,
+                      compare_type=True)
     with context.begin_transaction():
         context.run_migrations()
 

@@ -2,21 +2,71 @@
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, DecimalException, ROUND_HALF_UP
 
 TWO = Decimal("0.01")
 ZERO = Decimal("0")
 
+# 金额量级上限：与 ``Numeric(20, 2)`` 的上界对齐（20 位里 2 位给小数）。
+#
+# 这道闸不是洁癖。超出这个值的金额有**两条**撞墙路径，而且都不是我们想看到的：
+#   · 1e30 这类超大值在 ``quantize`` 就抛 InvalidOperation（Decimal 默认上下文
+#     只有 28 位有效数字）—— 而 InvalidOperation 的祖先是 ArithmeticError，
+#     **不是 ValueError**，于是全链路那些 ``except ValueError`` 一律接不住，
+#     一张凭证直接 500（审计 P1-21）。
+#   · 1e20 这类「quantize 能过、但列存不下」的值会一路走到 INSERT，
+#     PostgreSQL 抛 NumericValueOutOfRange（sqlstate 22003），
+#     而全局 DBAPIError 处理器只把 235xx 翻成 400，22003 一样落成 500。
+# 量化之前先按上界拒掉，两条路都不会走到。
+MONEY_LIMIT = Decimal("999999999999999999.99")
+
 
 def money(value) -> Decimal:
-    """统一金额精度：两位小数，四舍五入。"""
+    """统一金额精度：两位小数，四舍五入。**超量级、非法值一律抛 ValueError。**
+
+    异常类型是这里最要紧的约定：调用链上有十几处 ``except ValueError`` 把
+    金额问题翻成 400，而 Decimal 抛的 ``InvalidOperation`` 走的是
+    ``DecimalException → ArithmeticError`` 这条线，不进 ValueError。
+    所以这里**把 Decimal 异常翻译成 ValueError 再抛**（而不是让它逃出去），
+    让「金额非法」在全系统只有一种表现。
+    """
     if value is None:
         return ZERO
-    return Decimal(str(value)).quantize(TWO, rounding=ROUND_HALF_UP)
+    try:
+        d = Decimal(str(value))
+    except (DecimalException, ArithmeticError, TypeError) as exc:
+        raise ValueError(f"{value!r} 不是合法金额") from exc
+    # NaN / Infinity 必须单独挡：``Decimal('NaN').quantize(TWO)`` 不抛异常，
+    # 返回的还是 NaN。它会一路进 sum()，而 NaN 的比较恒为 False ——
+    # 借贷平衡那道 ``dr != cr`` 将永远为假，一张「NaN 凭证」就这么存进去了。
+    if not d.is_finite():
+        raise ValueError(f"{value!r} 不是合法金额（NaN / 无穷大）")
+    if d > MONEY_LIMIT or d < -MONEY_LIMIT:
+        raise ValueError(
+            f"金额 {value} 超出可表示范围（最大 ±{MONEY_LIMIT}，"
+            "与库里 Numeric(20,2) 的上界一致）")
+    try:
+        return d.quantize(TWO, rounding=ROUND_HALF_UP)
+    except (DecimalException, ArithmeticError) as exc:
+        # 到这里只剩「位数太多量化不动」这一种可能（上面已经挡掉量级）。
+        raise ValueError(f"金额 {value} 无法按两位小数量化") from exc
 
 
 def period_label(year: int, month: int) -> str:
     return f"{year}-{month:02d}"
+
+
+def constraint_name(exc: Exception) -> str:
+    """从数据库异常里取出**被违反的约束名**。
+
+    撞号要翻成人话，但翻之前必须先认得出是哪一条约束：
+    别的唯一约束（外键指向不存在、字段非空）撞上时报「凭证号重复」是**假话**，
+    用户会照着去改一个根本没问题的字段。所以「凡 IntegrityError 都当撞号」
+    这种写法在这里是错的。
+    """
+    orig = getattr(exc, "orig", None)
+    diag = getattr(orig, "diag", None)
+    return str(getattr(diag, "constraint_name", "") or "")
 
 
 def find_period(db, book_id: int, d: date):

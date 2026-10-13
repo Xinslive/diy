@@ -28,15 +28,19 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.accounting.audit_helper import log, voucher_snapshot
-from app.accounting.util import period_label
+from app.accounting.util import constraint_name, period_label
 from app.models import Period, SysUser, Voucher
 
 # 凭证号形如「记001」，前缀是 1~2 个汉字，序号是数字（补零到三位）
 NO_PATTERN = re.compile(r"^(?P<prefix>[^\d]{1,4})(?P<seq>\d+)$")
 PARK_PREFIX = "∥"  # ∥ 临时占位前缀，保证永不与真实凭证号冲突
+# 与 accounting/vouchers.py 同一份判据：撞号要认约束，不能「凡 IntegrityError
+# 都当撞号」（util.constraint_name 的注释里写了为什么）。
+_NO_UNIQUE = "uq_voucher_period_no"
 
 STRATEGIES = ("RENUM", "SORT_DATE")
 
@@ -347,6 +351,27 @@ def apply_organize(
     result: list[dict] = []
     total_changed = 0
 
+    # P3-11：改号全程无锁。计划是「读一遍算一遍」，落库是「写两遍」，
+    # 中间没有任何东西挡住并发的第二个整理 —— 两边会按**各自的**快照算出
+    # 同一套目标号，然后后提交的那个撞上 ``uq_voucher_period_no``。
+    #
+    # DB 侧有唯一约束兜底，所以不会产生脏数据（这是「翻成人话」而不是
+    # 「修数据错」的原因）；但撞出来的是一条裸的 IntegrityError，
+    # 走全局处理器只得到 500，用户看不出是自己刚点过整理。
+    #
+    # 这里锁**期间行**，与 periods.py 的 ``ensure_periods`` 同一套做法
+    # （它锁账套行）。锁粒度选期间而不是账套：整理是逐期发号的，
+    # 锁期间就够把「同一个期间的号段」串行化，不同期间可以并行。
+    # 锁顺序按 ``ord`` 升序 —— 全项目行锁只有这两处，顺序一致才不会成环。
+    lock_ids = [p.period_id for p in plans if any(c.changed for c in p.changes)]
+    if lock_ids:
+        db.execute(
+            select(Period.id)
+            .where(Period.id.in_(lock_ids))
+            .order_by(Period.ord)
+            .with_for_update()
+        )
+
     for plan in plans:
         before = {
             c.voucher_id: c.old_no
@@ -382,15 +407,33 @@ def _renumber(db: Session, plan: PeriodPlan) -> None:
         return
 
     # 阶段一：整体挪到 ∥<id>，这些值与任何真实凭证号都不冲突
-    for c in targets:
-        v = db.get(Voucher, c.voucher_id)
-        if v is None:
-            raise ValueError(f"凭证不存在（可能已被删除）：{c.voucher_id}")
-        v.voucher_no = f"{PARK_PREFIX}{v.id}"
-    db.flush()
-
     # 阶段二：写最终号，此时序列里已经没有旧号
-    for c in targets:
-        v = db.get(Voucher, c.voucher_id)
-        v.voucher_no = c.new_no
-    db.flush()
+    #
+    # 两段都包在 savepoint 里（P3-11）：IntegrityError 会把整个事务标记为失败，
+    # 而 ``apply_organize`` 逐期改号 —— 一个期间撞了不该把前面几期已经改好的
+    # 号一起废掉。撞号（唯一约束兜底生效）翻成 ValueError；不是撞号的
+    # 数据库错误原样抛出，不替它编理由。
+    try:
+        with db.begin_nested():
+            for c in targets:
+                v = db.get(Voucher, c.voucher_id)
+                if v is None:
+                    raise ValueError(f"凭证不存在（可能已被删除）：{c.voucher_id}")
+                v.voucher_no = f"{PARK_PREFIX}{v.id}"
+            db.flush()
+
+            for c in targets:
+                v = db.get(Voucher, c.voucher_id)
+                v.voucher_no = c.new_no
+            db.flush()
+    except IntegrityError as exc:
+        # savepoint 回滚了，数据库里的号没动，但会话里的对象还带着改过的值 ——
+        # expire 掉，否则调用方接着读到的就是一份「内存里已经改了、库里没改」的
+        # 凭证号，日志与返回值会互相打架。
+        db.expire_all()
+        if constraint_name(exc) != _NO_UNIQUE and _NO_UNIQUE not in str(
+                getattr(exc, "orig", exc)):
+            raise
+        raise ValueError(
+            f"改号失败：{plan.label} 的目标凭证号已被另一条记录占用"
+            f"（可能刚被别的操作改过）。请刷新后重试。") from exc

@@ -143,6 +143,132 @@ def test_登录后仍然能读模板设计(client, auth, db, tpl_id):
     assert any(c["formula"] for c in data["cells"]), "单元格公式读不到了"
 
 
+# -------------------------------------------- P2-13：零账套账号不得读取模板口径
+#
+# 上面那组钉的是「必须登录」。但**登录**不等于「有权看这家单位的账」：
+# 自助注册产生的空账号一个账套都没有，而报表模板是全局的、跨账套共用的，
+# 于是它照样能把资产负债表的科目排列和取数公式全枚举一遍。
+
+
+def test_零账套账号读不到模板列表(client, plain_auth, db, plain_user):
+    from app.models import UserBook
+
+    assert not db.scalars(select(UserBook).where(UserBook.user_id == plain_user.id)).all()
+    r = client.get("/api/reports/templates", headers=plain_auth)
+    assert r.status_code == 403, f"零账套账号拿到 {r.status_code}：{r.text[:200]}"
+
+
+def test_零账套账号读不到取数公式(client, plain_auth, db, tpl_id):
+    """这条就是审计里的复现：一个账套都没有，却能读到完整行列公式。"""
+    r = client.get(f"/api/reports/{tpl_id}/design", headers=plain_auth)
+    assert r.status_code == 403, (
+        f"零账套账号拿到 {r.status_code}：报表口径已泄漏，{r.text[:200]}")
+
+
+def test_只要有一个账套授权就能读(client, plain_auth, db, book, plain_user, tpl_id):
+    """VIEWER 也该能读 —— 只读不是不能用，把权限模型整体堵掉是另一种事故。"""
+    from app.models import UserBook
+
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="VIEWER"))
+    db.commit()
+    assert client.get("/api/reports/templates", headers=plain_auth).status_code == 200
+    assert client.get(f"/api/reports/{tpl_id}/design", headers=plain_auth).status_code == 200
+
+
+# ---------------------------------------------- P1-5：全局模板写入 fail-closed
+#
+# 审计场景：用户在账套 B 是会计、在账套 A 是**只读**。
+# 报表模板没有 book_id、却是所有账套共用的，而旧的 ``_can_write`` 在
+# **缺省 book_id** 时退化成「该用户在任意账套非 VIEWER」——
+# 于是不带 book_id 就能改写出账套 A 也在用的公式与打印模板。
+#
+# 现在两道闸都必须是 fail-closed 的：显式目标账套 + 该账套 OWNER。
+
+
+def _two_books(client, auth, db, plain_user):
+    """造两个账套：B 里普通用户是会计，A 里是只读。返回 (A, B)。
+
+    名字必须每例唯一：``client`` 跑在**另一个** Session 里并且已经提交，
+    ``db`` 夹具的 rollback 回滚不掉它 —— 下一个用例再建同名账套就会撞
+    「账套已存在」的唯一约束（第一批用例踩过同一个坑，所以都带 uuid 后缀）。
+    """
+    import uuid
+
+    from app.models import UserBook
+
+    tag = uuid.uuid4().hex[:8]
+    ids = []
+    for name in (f"甲方账套{tag}", f"乙方账套{tag}"):
+        r = client.post("/api/books", headers=auth,
+                        json={"company_name": f"{name}公司", "name": name,
+                              "start_year": 2026})
+        assert r.status_code == 201, r.text
+        ids.append(r.json()["id"])
+    a_id, b_id = ids
+    db.add(UserBook(user_id=plain_user.id, book_id=a_id, role="VIEWER"))
+    db.add(UserBook(user_id=plain_user.id, book_id=b_id, role="ACCOUNTANT"))
+    db.commit()
+    return a_id, b_id
+
+
+def test_不带账套不能建模板(client, plain_auth, db, plain_user, auth, tpl_id):
+    """审计的复现路径：不带 book_id 就该被挡下，而不是「任一可写账套」放行。"""
+    a_id, b_id = _two_books(client, auth, db, plain_user)
+    before = len(db.scalars(select(ReportTemplate)).all())
+
+    r = client.post("/api/reports/templates", headers=plain_auth,
+                    json={"name": "跨账套偷改", "base_code": "BALANCE_SHEET"})
+    assert r.status_code == 400, (
+        f"拿到 {r.status_code}：全局模板的门只看了一个无关账套的角色")
+    assert "book_id" in r.json()["detail"], r.json()
+    db.expire_all()
+    assert len(db.scalars(select(ReportTemplate)).all()) == before, "居然真的建出来了"
+
+
+def test_只读账套不能建模板(client, plain_auth, db, plain_user, auth, tpl_id):
+    """显式指向只读的那个账套 —— 必须 403，且理由说清是全局口径。"""
+    a_id, b_id = _two_books(client, auth, db, plain_user)
+    r = client.post(f"/api/reports/templates?book_id={a_id}", headers=plain_auth,
+                    json={"name": "改只读账套的表", "base_code": "BALANCE_SHEET"})
+    assert r.status_code == 403, f"拿到 {r.status_code}：{r.text[:200]}"
+    assert "全局口径" in r.json()["detail"], r.json()
+
+
+def test_会计在B也不能改全局模板(client, plain_auth, db, plain_user, auth, tpl_id):
+    """会计改全局公式也不行 —— 与打印侧（OWNER 才放行）对齐。"""
+    a_id, b_id = _two_books(client, auth, db, plain_user)
+    r = client.post(f"/api/reports/templates?book_id={b_id}", headers=plain_auth,
+                    json={"name": "会计改全局表", "base_code": "BALANCE_SHEET"})
+    assert r.status_code == 403, f"拿到 {r.status_code}：{r.text[:200]}"
+
+
+def test_所有者显式指定账套就能改(client, plain_auth, db, plain_user, auth, tpl_id):
+    """收紧只针对「全局且无主」：OWNER 显式指定账套必须照常能改，否则等于把账锁死。"""
+    r = client.post("/api/books", headers=plain_auth,
+                    json={"company_name": "自有公司", "name": "自有账套", "start_year": 2026})
+    assert r.status_code == 201, r.text   # 自己建的账套自动是 OWNER
+    own_book = r.json()["id"]
+
+    r = client.post(f"/api/reports/templates?book_id={own_book}", headers=plain_auth,
+                    json={"name": "所有者建表", "base_code": "BALANCE_SHEET"})
+    assert r.status_code == 201, f"OWNER 也被挡住了：{r.status_code} {r.text[:200]}"
+
+    # 改了公式同样放行
+    r = client.put(f"/api/reports/{tpl_id}/cells?book_id={own_book}", headers=plain_auth,
+                   json=[{"row_no": 2, "col_no": 2, "formula": "1+1"}])
+    assert r.status_code == 200, f"OWNER 改不了公式：{r.status_code} {r.text[:200]}"
+
+
+def test_改公式同样要求显式账套(client, plain_auth, db, plain_user, auth, tpl_id):
+    """门禁覆盖**每一个**写入口，不只是新建。"""
+    before = client.get(f"/api/reports/{tpl_id}/design", headers=auth).json()["cells"]
+    r = client.put(f"/api/reports/{tpl_id}/cells", headers=plain_auth,
+                   json=[{"row_no": 2, "col_no": 2, "formula": "1"}])
+    assert r.status_code == 400, f"拿到 {r.status_code}：{r.text[:200]}"
+    after = client.get(f"/api/reports/{tpl_id}/design", headers=auth).json()["cells"]
+    assert before == after, "公式居然被改了"
+
+
 # ------------------------------- 审计的另一条建议：无论结论如何，锁住「匿名不可写」
 
 def test_匿名改不了公式(client, db, tpl_id):

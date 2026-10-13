@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import io
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -12,11 +12,13 @@ from sqlalchemy.orm import Session
 
 from app.accounting import periods as svc
 from app.accounting.util import money
-from app.api.schemas import (BookEditIn, BookIn, CarryForwardIn, OpeningIn,
+from app.api.schemas import (BookEditIn, BookIn, CarryForwardIn, CloseIn, OpeningIn,
                            UncloseIn, YearEndIn)
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import (get_book_link, get_current_user, get_my_book, require_admin,
                         require_book_write)
+from app.core.uploads import RowBudget, UploadTooLarge, check_archive_size, read_upload
 from app.ledger.engine import LedgerEngine
 from app.models import Book, Period, PeriodOpening, Subject, SysUser, UserBook, Voucher
 
@@ -236,6 +238,9 @@ def list_periods(book: Book = Depends(get_my_book), db: Session = Depends(get_db
         {
             "id": p.id, "code": p.code, "year": p.year, "month": p.month, "ord": p.ord,
             "locked": p.locked, "closed_by": p.closed_by,
+            # P1-19：乐观锁的版本号必须随列表一起下发。不下发的话前端手里
+            # 永远没有可比对的数，结账/反结账就退化成「不带版本」= 不比对。
+            "version": p.version,
             "closed_at": p.closed_at.isoformat() if p.closed_at else None,
             "vouchers": counts.get(p.id, 0),
             "posted": posted.get(p.id, 0),
@@ -372,10 +377,16 @@ def export_openings(book_id: int, period_id: int | None = None,
     saved = _openings_amounts(db, book, first, subjects)
     data = xl.opening_balance_excel(
         # 导出用的是**实际**方位：反方向余额（应收账款贷方等）导出后再导入必须
-        # 原样回来，用科目自然方向导出会把方向洗成正的
+        # 原样回来，用科目自然方向导出会把方向洗成正的。
+        #
+        # 金额保持 Decimal（审计 P2-7）。这里原来写的是 ``float(abs(st))``：
+        # 库里是 Numeric(20,2)、链路里是 Decimal，到导出这一步退回 float
+        # 就等于在最末端把精度又丢了（大额只剩 15~17 位有效数字），
+        # 而导出表是要交给审计方逐格核对的。printing/excel.py 那一侧
+        # 已经是 Decimal 原样写进单元格，两边现在同一口径。
         [{"code": s_.code, "name": s_.name,
           "direction": ("借" if st > 0 else "贷") if st != 0 else ("借" if s_.direction == "DEBIT" else "贷"),
-          "amount": float(abs(st))} for s_ in subjects for st in [saved.get(s_.id, Decimal("0"))]],
+          "amount": abs(st)} for s_ in subjects for st in [saved.get(s_.id, Decimal("0"))]],
         company=book.company_name, book_name=book.name, year=first.year, month=first.month,
     )
     return Response(content=data, media_type=XLSX_MIME,
@@ -390,7 +401,16 @@ async def parse_openings(book_id: int, file: UploadFile = File(...),
     虽然是 POST，但它**不改任何数据**：只解析出一个 preview 返回给前端。
     真正落库的是 ``set_openings``（那里挂了 require_book_write）。
     所以这里不挂写依赖 —— 只读账号也该能预览自己账上的期初表。
-    
+
+    但「只读」只免的是**写权限**，不免**容量**（审计 P1-4）：这个入口曾经
+    一道闸都没有。``raw = await file.read()`` 无上限整体读进内存，
+    紧接着 ``grid = [list(r) for r in ws.iter_rows(...)]`` 把整个工作表
+    一次性物化成二维列表 —— 凭证导入那边有三道闸，这里一道都没有，
+    而只读账号就能打。它还被 ``tests/test_viewer_matrix.py`` 按
+    「不落库」列进写接口豁免清单，于是守卫测试也照不到它。
+    现在与凭证导入共用 ``app/core/uploads.py``：先看 ``file.size`` 预检、
+    再按上限 +1 读一次、读进来之后按 zip 目录声明的解压体积预检、
+    物化工作表时逐行计数。
 
     为什么不按「第 1 行是表头」写死：导出的模板自己就带两行大标题，而且用户
     从别处抄来的表几乎不可能是干净的四列。这里改成**认表头** —— 扫前若干行找到
@@ -402,7 +422,17 @@ async def parse_openings(book_id: int, file: UploadFile = File(...),
     """
     from openpyxl import load_workbook
 
-    raw = await file.read()
+    # 容量三道闸的前两道在共享工具里（与凭证导入同一把尺，见 app/core/uploads.py）。
+    # 413：文件太大是「换个更小的再来」，不是参数写错了。
+    try:
+        raw = await read_upload(file, label="期初余额文件",
+                                hint="请拆成多份分别导入，或先删除无关工作表")
+    except UploadTooLarge as e:
+        raise HTTPException(413, str(e))
+    try:
+        check_archive_size(raw, label="期初余额表")
+    except UploadTooLarge as e:
+        raise HTTPException(413, str(e))
     try:
         wb = load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
     except Exception as exc:  # noqa: BLE001
@@ -436,7 +466,16 @@ async def parse_openings(book_id: int, file: UploadFile = File(...),
                 return idx, roles
         return None, roles
 
-    grid = [list(r) for r in ws.iter_rows(values_only=True)]
+    # 第三道闸：物化工作表时逐行计数（审计 P1-4）。
+    # 这一行是这里唯一的容量兜底 —— 上面两道都能被伪造（zip 中央目录里的
+    # file_size 可以随便写），行数不会。而且**必须边读边数**：先 count 一遍
+    # 照样要把整个工作表读进内存，那正是要防的事。
+    try:
+        grid = RowBudget(settings.import_max_rows,
+                         hint="请拆成多份分别导入，或先删除无关工作表").guard_rows(
+            list(r) for r in ws.iter_rows(values_only=True))
+    except UploadTooLarge as e:
+        raise HTTPException(413, str(e))
     head_idx, cols = _find_header(grid)
     if head_idx is None:
         head_idx, cols = 0, {"code": 0, "name": 1, "direction": 2, "amount": 3}
@@ -573,7 +612,12 @@ def set_openings(book_id: int, payload: list[OpeningIn], period_id: int | None =
         # 就已经差了。
         try:
             amount = money(item.amount)
-        except (InvalidOperation, TypeError, ValueError):
+        except (ArithmeticError, TypeError, ValueError):
+            # ArithmeticError 是 Decimal 异常族的公共祖先。这里原来写的是
+            # ``InvalidOperation`` —— 它确实是 ArithmeticError 的子类，功能上等价，
+            # 但写成祖先才覆盖得住 ``money()`` 将来可能抛的别的 Decimal 异常
+            # （Overflow / DivisionByZero）。money() 自己也会把它们翻译成
+            # ValueError，这里是第二道。
             raise HTTPException(400, f"科目 {subject.code} 金额非法：{item.amount!r}")
         if amount != 0 and not subject.is_leaf:
             raise HTTPException(400, f"{subject.code} {subject.name} 不是明细科目，期初应录在明细级")
@@ -639,13 +683,30 @@ def carry_forward(book_id: int, period_id: int,
 
 
 @router.post("/{book_id}/periods/{period_id}/close")
-def close_period(book_id: int, period_id: int, book: Book = Depends(get_my_book),
-                 db: Session = Depends(get_db), user: SysUser = Depends(get_current_user),
+def close_period(book_id: int, period_id: int,
+                 payload: Optional[CloseIn] = None,
+                 book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                 user: SysUser = Depends(get_current_user),
                  _link: UserBook = Depends(require_book_write)):
     period = svc.get_period(db, book.id, period_id)
     try:
-        return svc.close_period(db, period, user)
-    except ValueError as e:
+        return svc.close_period(
+            db, period, user,
+            expected_version=payload.version if payload else None)
+    except svc.PeriodVersionConflict as e:
+        # **顺序很重要**：必须在 ``except ValueError`` 之前。
+        # PeriodVersionConflict 继承 ValueError（为了让不认识它的旧调用方
+        # 也能正常报错而不是 500），写在后面就会被 400 那条先接走 ——
+        # 而 400 的语义是「你参数写错了」，前端会让人去检查表单，
+        # 实际要做的却是「刷新页面看最新状态」。
+        db.rollback()
+        raise HTTPException(409, str(e))
+    except (ValueError, ArithmeticError) as e:
+        # 回滚不能省（审计 P2-2）。原来是直接 raise，靠 ``Session.close()``
+        # 的隐式回滚兜底 —— 那是**依赖**：同一个会话里后面还有别的事务动作
+        # （比如调用方的批量操作继续往下走），失败的事务就会一直挂着。
+        # 同文件的 carry_forward / year_end 一直都有这一行，这里是漏的。
+        db.rollback()
         raise HTTPException(400, str(e))
 
 
@@ -662,8 +723,17 @@ def unclose_period(book_id: int, period_id: int, payload: UncloseIn, book: Book 
                    _link: UserBook = Depends(require_book_write)):
     period = svc.get_period(db, book.id, period_id)
     try:
-        return svc.batch_unclose(db, book.id, period, user, payload.revert_posting)
-    except ValueError as e:
+        return svc.batch_unclose(
+            db, book.id, period, user, payload.revert_posting,
+            expected_version=payload.version)
+    except svc.PeriodVersionConflict as e:
+        # 同上：409 必须排在 400 前面。反结账尤其要这样 —— 它会把区间内的
+        # 凭证批量退回未记账，误报成「参数写错」会让人反复重试，
+        # 而真相是「别人刚结过账，你手里的状态已经过期」。
+        db.rollback()
+        raise HTTPException(409, str(e))
+    except (ValueError, ArithmeticError) as e:
+        db.rollback()
         raise HTTPException(400, str(e))
 
 

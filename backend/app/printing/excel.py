@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import io
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
 
 from openpyxl import Workbook
@@ -15,6 +15,50 @@ from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.utils import get_column_letter
 
 ZERO = Decimal("0")
+CENT = Decimal("0.01")
+
+#: 单次导出的最大数据行数。
+#:
+#: 明细账可以「跨全科目跨全年」，行数上界是**科目数 × 期间数 × 明细行数**，
+#: 实测能到十几万行。openpyxl 是全内存构建（``wb.save`` 把整张表序列化成
+#: 一个 zip 再进 BytesIO），没有上限时一个「导出全年明细账」能把进程内存吃光，
+#: 拖垮的不是一个请求而是整个后端。
+#:
+#: 这里选**明确报错**而不是静默截断：导出的账表少一段，交给审计方就是错的，
+#: 而报错只是让用户缩小查询范围。宁可失败得明确，也不能给一份缺行的账。
+MAX_EXPORT_ROWS = 50_000
+
+#: Excel 工作表名的非法字符（openpyxl 直接抛 ValueError）。
+#: 见 ``_safe_sheet_title``。
+_ILLEGAL_TITLE_CHARS = set(r"[]:*?/\\")
+
+
+class ExportTooLarge(ValueError):
+    """导出行数超限。由 API 层翻译成 413 并带上可操作的提示。"""
+
+
+def _check_size(kind: str, rows: int) -> None:
+    if rows > MAX_EXPORT_ROWS:
+        raise ExportTooLarge(
+            f"{kind}共 {rows:,} 行，超过单次导出上限 {MAX_EXPORT_ROWS:,} 行。"
+            "请缩小查询范围（按科目或按期间分段导出）后重试。")
+
+
+def _safe_sheet_title(name: str, fallback: str) -> str:
+    """把模板名变成一个 Excel 认的工作表名。
+
+    openpyxl 对 ``[]:*?/\\`` 直接抛 ValueError → HTTP 500。触发它很容易：
+    报表模板名是用户自己填的，「2026[Q1]」「1月/2月对比」这类名字完全正常，
+    却会让整个导出 500。
+
+    做法是**剔除非法字符 + 截断到 31 字（Excel 上限）**，而不是报错：
+    这些名字本身都是合法业务名，报错等于「你起名起得不合法」。
+    剔完为空（名字全是非法字符）才退回默认名。sheet 名只在标签页上显示，
+    不参与账务计算，清洗掉这几个字符不影响导出内容的正确性。
+    """
+    cleaned = "".join(ch for ch in str(name or "") if ch not in _ILLEGAL_TITLE_CHARS)
+    cleaned = cleaned.strip()[:31]
+    return cleaned or fallback
 
 THIN = Side(style="thin", color="000000")
 MEDIUM = Side(style="medium", color="000000")
@@ -26,9 +70,22 @@ RIGHT = Alignment(horizontal="right", vertical="center")
 
 
 def _num(v) -> Optional[float]:
+    """金额列写进单元格的形态。
+
+    **保持 Decimal，不收窄成 float**（P2-7 / P3-4）。
+
+    金额在库里是 ``Numeric(20,2)``、在计算链路里是 Decimal，到导出这一步
+    退回 float 就等于在最末端又把精度丢了：大额（千万级以上）float 只有
+    15~17 位有效数字，逐格累加还会漂。openpyxl 原生支持 Decimal 写单元格
+    （``data_type == 'n'``，写出的是十进制字面量），所以这里不需要理由退回 float。
+
+    另外注意合计曾经用 ``float`` 累加：10 × 0.1 会得到 0.9999999999999999，
+    再 ``round(2)`` 仍是 1.0 看着没事，但 0.1+0.2 这类组合在几十万行上会明显偏移，
+    而导出表是要交给审计方逐格核对的。改成 Decimal 累加后不存在这个问题。
+    """
     if v is None or v == "":
         return None
-    return float(Decimal(str(v)))
+    return Decimal(str(v))
 
 
 def _d(v) -> Decimal:
@@ -76,14 +133,14 @@ def vouchers_excel(rows: list[dict], *, title: str = "记账凭证", period: str
     ws = wb.active
     ws.title = "记账凭证"
 
-    ws["A1"] = title
+    ws["A1"] = _text(title)
     ws["A1"].font = Font(name="宋体", size=16, bold=True)
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=5)
     ws["A1"].alignment = CENTER
     ws.row_dimensions[1].height = 30
 
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=5)
-    ws["A2"] = f"会计期间：{period}"
+    ws["A2"] = _text(f"会计期间：{period}")
     ws["A2"].alignment = CENTER
 
     headers = ["日期", "凭证字号", "摘要", "会计科目", "借方金额", "贷方金额"]
@@ -153,6 +210,7 @@ def balance_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = "科目余额表"
+    _check_size("科目余额表", len(payload.get("rows") or []))
 
     ws["A1"] = "科目余额表"
     ws["A1"].font = Font(name="宋体", size=16, bold=True)
@@ -161,7 +219,10 @@ def balance_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     ws.row_dimensions[1].height = 28
 
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=10)
-    ws["A2"] = f"{company} · {book_name} · 期间 {payload['period']}"
+    # 单位名（book.company_name）是建账时填的自由文本，与摘要同一类输入。
+    # 以前这四处标题格绕过了 _text：openpyxl 见到以 = 开头就标成公式，
+    # 导出表里就多了一格可执行公式，而这份文件是要发给客户和审计方的。
+    ws["A2"] = _text(f"{company} · {book_name} · 期间 {payload['period']}")
     ws["A2"].alignment = CENTER
 
     headers = ["科目编码", "科目名称", "方向", "期初", "本期借方", "本期贷方",
@@ -177,7 +238,7 @@ def balance_excel(payload: dict, *, company: str, book_name: str) -> bytes:
         c.alignment = CENTER
         c.border = Border(left=THIN, right=THIN, top=MEDIUM, bottom=MEDIUM)
 
-    totals = [0.0] * 6
+    totals = [ZERO] * 6
     for row in payload["rows"]:
         r += 1
         values = [_text(row["code"]), _text(row["name"]), _text(row["opening_direction"]),
@@ -189,14 +250,16 @@ def balance_excel(payload: dict, *, company: str, book_name: str) -> bytes:
             c = ws.cell(row=r, column=i, value=v)
             c.border = BOX
             c.alignment = LEFT if i in (1, 2) else (CENTER if i in (3, 9) else RIGHT)
+        # Decimal 累加，不退回 float（见 _num 的说明）。逐格 round 也不能替代：
+        # round 是「四舍五入到分」，累加是「先加后舍」，两者在长表上不等价。
         for idx, key in enumerate(["opening", "period_debit", "period_credit",
                                    "ytd_debit", "ytd_credit", "closing"]):
-            totals[idx] += float(row[key] or 0)
+            totals[idx] += _d(row.get(key))
 
     r += 1
     ws.cell(row=r, column=2, value="合计").font = Font(bold=True)
     for i, t in enumerate(totals, start=4):
-        ws.cell(row=r, column=i, value=round(t, 2)).font = Font(bold=True)
+        ws.cell(row=r, column=i, value=t.quantize(CENT, rounding=ROUND_HALF_UP)).font = Font(bold=True)
     for c in range(1, 11):
         ws.cell(row=r, column=c).border = Border(left=THIN, right=THIN, top=MEDIUM, bottom=MEDIUM)
     _money_style(ws, r, range(4, 11))
@@ -221,6 +284,7 @@ def general_ledger_excel(payload: dict, *, company: str, book_name: str) -> byte
     wb = Workbook()
     ws = wb.active
     ws.title = "总账"
+    _check_size("总账", len(payload.get("rows") or []))
 
     ws["A1"] = "总账"
     ws["A1"].font = Font(name="宋体", size=16, bold=True)
@@ -229,7 +293,7 @@ def general_ledger_excel(payload: dict, *, company: str, book_name: str) -> byte
     ws.row_dimensions[1].height = 28
 
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=9)
-    ws["A2"] = f"{company} · {book_name} · {payload['from_period']} 至 {payload['to_period']}"
+    ws["A2"] = _text(f"{company} · {book_name} · {payload['from_period']} 至 {payload['to_period']}")
     ws["A2"].alignment = CENTER
 
     headers = ["科目编码", "科目名称", "期初方向", "期初余额", "本期借方", "本期贷方",
@@ -267,6 +331,9 @@ def detail_ledger_excel(payload: dict, *, book_name: str) -> bytes:
     ws = wb.active
     ws.title = "明细账"
     ws.sheet_view.showGridLines = False
+
+    # 明细账是「跨全科目跨全年」的那一张，行数上界最高，先卡上限（见 MAX_EXPORT_ROWS）。
+    _check_size("明细账", len(payload.get("rows") or []))
 
     subject = payload.get("subject", {})
     subject_range = payload.get("subject_range")
@@ -361,9 +428,16 @@ def detail_ledger_excel(payload: dict, *, book_name: str) -> bytes:
 def report_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     wb = Workbook()
     ws = wb.active
-    ws.title = payload.get("name", "报表")[:30]
+    name = payload.get("name", "报表")
+    # 报表模板名是用户可 PATCH 的自由文本，且是**全局**报表模板 ——
+    # 「2026[Q1]」这类名字完全正常，却会让 openpyxl 抛 ValueError 变成 500。
+    # 清洗见 _safe_sheet_title。
+    ws.title = _safe_sheet_title(name, "报表")
 
-    ws["A1"] = payload.get("name", "报表")
+    rows = payload.get("rows") or []
+    _check_size("报表", len(rows))
+
+    ws["A1"] = _text(name)
     ws["A1"].font = Font(name="宋体", size=16, bold=True)
     last_col = max(len(payload["cols"]), 1)
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
@@ -371,7 +445,7 @@ def report_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     ws.row_dimensions[1].height = 30
 
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
-    ws["A2"] = f"{company} · {book_name} · 期间 {payload['period']}"
+    ws["A2"] = _text(f"{company} · {book_name} · 期间 {payload['period']}")
     ws["A2"].alignment = CENTER
 
     r = 4
@@ -382,9 +456,11 @@ def report_excel(payload: dict, *, company: str, book_name: str) -> bytes:
         c.alignment = CENTER
         c.border = Border(left=THIN, right=THIN, top=MEDIUM, bottom=MEDIUM)
 
-    for row in payload["rows"]:
+    for row in rows:
         r += 1
-        c = ws.cell(row=r, column=1, value="　" * row["indent"] + row["label"])
+        # 行标签（项目名）来自报表公式的 label，同样是用户可控文本，
+        # 绕过了 _text 就能把报表名/项目名写成 Excel 公式。
+        c = ws.cell(row=r, column=1, value=_text("　" * row["indent"] + row["label"]))
         c.alignment = LEFT
         c.font = Font(bold=row["bold"])
         c.border = BOX
@@ -419,11 +495,11 @@ def opening_balance_excel(rows: list[dict], *, company: str, book_name: str, yea
     ws.title = "期初余额"
 
     ws.merge_cells("A1:D1")
-    ws["A1"] = f"{company}"
+    ws["A1"] = _text(company)
     ws["A1"].font = Font(size=13, bold=True)
     ws["A1"].alignment = Alignment(horizontal="center")
     ws.merge_cells("A2:D2")
-    ws["A2"] = f"{book_name}　期初余额表　{year}年{month}月"
+    ws["A2"] = _text(f"{book_name}　期初余额表　{year}年{month}月")
     ws["A2"].font = Font(size=11, bold=True)
     ws["A2"].alignment = Alignment(horizontal="center")
 

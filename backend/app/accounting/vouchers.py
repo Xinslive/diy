@@ -1,18 +1,40 @@
 """凭证服务：新增 / 修改 / 删除 / 记账 / 反记账 / 查询 / 批量。"""
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import Select, and_, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, selectinload
 
 from app.accounting import organize as svc_organize
 from app.accounting.organize import split_no
 from app.accounting.audit_helper import log, voucher_snapshot
-from app.accounting.util import find_period, money, period_label
+from app.accounting.util import constraint_name, find_period, money, period_label
 from app.models import Book, Entry, Period, Subject, SysUser, Voucher
+
+# 凭证号在期间内唯一。撞号时数据库只会说「违反唯一约束」，看到的人
+# 不知道该改哪个字段，所以把它翻成人话时要认得出**是哪一条**约束。
+_NO_UNIQUE = "uq_voucher_period_no"
+
+
+def _is_no_collision(exc: IntegrityError) -> bool:
+    """这个 IntegrityError 是凭证号撞车吗？
+
+    必须认约束而不是「凡 IntegrityError 都当撞号」：别的唯一约束
+    （外键指向不存在、字段非空）撞上时，报「凭证号重复」是**假话**，
+    用户会照着改一个根本没问题的字段。取约束名的工具在 util 里，
+    与 organize.py 那一侧共用同一份判据。
+    """
+    if constraint_name(exc) == _NO_UNIQUE:
+        return True
+    # 少数驱动/包装下拿不到 diag，退回原文匹配 —— 宁可漏认成
+    # 「别的错误」也不要误报成撞号（漏认的后果是 500，不是数据错）。
+    return not constraint_name(exc) and _NO_UNIQUE in str(getattr(exc, "orig", exc))
+
 
 
 # --------------------------------------------------------------------- 编号
@@ -152,7 +174,31 @@ SYSTEM_SOURCES = ("CARRY_FORWARD",)
 
 
 def _validate_entries(db: Session, book_id: int, entries: list[dict],
-                      allow_inactive: bool = False) -> None:
+                      allow_inactive: bool = False,
+                      legacy_non_leaf: Counter | None = None) -> int:
+    """校验分录。返回**本次被豁免的历史非末级分录条数**（审计 P2-21）。
+
+    末级科目这道关口是硬的：分录挂在上级科目上，明细账、科目余额表都按末级出账，
+    这笔分录会在账上凭空消失。前端不给选、导入会拦、服务端再拦一遍，
+    才轮得到「账上不可能出现挂在上级科目上的分录」这句话。
+
+    ``legacy_non_leaf`` 是唯一一条口子，而且它不是「校验放宽」，
+    是「**原样保留历史**」：会计早于末级校验就在凭证上挂了非末级科目，
+    后来那个科目被加了子节点 —— 从此这张凭证**一个格子都改不了**，
+    连只改附单据数都存不下去（400）。这不是校验太严，是校验把历史锁死了。
+
+    口子的边界必须 fail-closed：调用方交来的是「这张凭证原本有哪些分录」的
+    逐条计数（科目 + 方向 + 金额），本次提交里每一条非末级分录都要**逐条**
+    从这份计数里扣一条对得上的。也就是：
+
+      · 新增一条非末级分录   → 扣不掉 → 拒绝（**新错不许进**）
+      · 改金额/改科目        → 扣不掉 → 拒绝（历史不许被加工）
+      · 老分录原样提交        → 扣得掉 → 放行
+      · 删一条再加两条一样的 → 第二条扣不掉 → 拒绝（计数不是布尔开关）
+
+    所以放宽的只有「保持原样」这一种情形，而它甚至不会被写进库里
+    （写进去的还是原来那些分录）。
+    """
     if not entries:
         raise ValueError("凭证至少需要一条分录")
     dr = sum(money(e["amount"]) for e in entries if e["direction"] == "DEBIT")
@@ -186,9 +232,22 @@ def _validate_entries(db: Session, book_id: int, entries: list[dict],
     # 接口能被直接调、导入能绕、老的行早就挂上去了 —— 前端拦一遍，这里再拦一遍，
     # 才轮得到「账上不可能出现挂在上级科目上的分录」这句话。
     # 挂错了不是显示难看：明细账、科目余额表都按末级出账，这笔分录会在账上凭空消失。
-    non_leaf = sorted(f"{r.code} {r.name}" for r in rows if not r.is_leaf)
+    by_id = {r.id: r for r in rows}
+    non_leaf: list[str] = []
+    grandfathered = 0
+    for e in entries:
+        r = by_id.get(e["subject_id"])
+        if r is None or r.is_leaf:
+            continue
+        key = (e["subject_id"], e["direction"], money(e["amount"]))
+        if legacy_non_leaf is not None and legacy_non_leaf.get(key, 0) > 0:
+            legacy_non_leaf[key] -= 1     # 逐条一一对应，不是布尔开关
+            grandfathered += 1
+            continue
+        non_leaf.append(f"{r.code} {r.name}")
     if non_leaf:
-        raise ValueError(f"不是末级科目，请改到末级科目：{'、'.join(non_leaf)}")
+        raise ValueError(f"不是末级科目，请改到末级科目：{'、'.join(sorted(set(non_leaf)))}")
+    return grandfathered
 
 
 # --------------------------------------------------------------------- 写操作
@@ -278,8 +337,28 @@ def create_voucher(
         attachments=attachments,
         created_by=user.username,
     )
-    db.add(voucher)
-    db.flush()
+    # 撞号在数据库上是唯一约束，在这里是 ValueError。
+    #
+    # 上面那次「占用检查」和 ``next_voucher_no`` 的「取全表求 max」都没有锁，
+    # 两个人同时开一张必然双双查到「没被占」。DB 侧有 ``uq_voucher_period_no``
+    # 兜底，所以**不会产生脏数据**，问题只在于撞号抛的是 IntegrityError：
+    # 导入侧 ``except ValueError`` 接不住（``importer.commit``），
+    # 一整批导入就变成 HTTP 500，用户看到的是「服务器错误」而不是
+    # 「凭证号重复」—— 而后者只要换一个号就能解决。
+    #
+    # savepoint 而不是裸 flush：IntegrityError 会把整个事务标记为失败，
+    # 而这一段可能在调用方（批量导入）已经写了几张凭证之后才撞上，
+    # 一次并发不该把那几张一起废掉。
+    try:
+        with db.begin_nested():
+            db.add(voucher)
+            db.flush()
+    except IntegrityError as exc:
+        if not _is_no_collision(exc):
+            raise
+        raise ValueError(
+            f"凭证号 {no} 在 {period.code} 已经有一张了（可能刚被另一条记录占用），"
+            "请刷新后换一个号重试") from exc
 
     for i, e in enumerate(payload, start=1):
         db.add(Entry(voucher_id=voucher.id, line_no=i, **e))
@@ -344,7 +423,17 @@ def update_voucher(
             }
             for e in payload["entries"]
         ]
-        _validate_entries(db, voucher.book_id, entries)
+        # P2-21：这张凭证**原本**有哪些分录，必须在清空之前逐条记下来。
+        # 它是「历史非末级分录原样保留」那条口子的唯一凭据 ——
+        # 校验时每条非末级分录都要从这里扣一条对得上的，对不上的照样拒。
+        #
+        # 症状：科目被加了子节点之后，那些早于末级校验的老凭证**再也存不下去** ——
+        # 前端只改附单据数也一样 400，因为 ``update_voucher`` 无条件调用校验。
+        legacy = Counter(
+            (e.subject_id, e.direction, money(e.amount)) for e in voucher.entries
+        )
+        grandfathered = _validate_entries(db, voucher.book_id, entries,
+                                          legacy_non_leaf=legacy)
         voucher.entries.clear()
         db.flush()
         for i, e in enumerate(entries, start=1):
@@ -353,6 +442,8 @@ def update_voucher(
         voucher.status = "UNPOSTED"
         voucher.posted_at = None
         voucher.posted_by = None
+    else:
+        grandfathered = 0
 
     if "remark" in payload:
         voucher.remark = payload["remark"] or ""
@@ -367,7 +458,12 @@ def update_voucher(
         entity_id=voucher.id,
         user=user,
         book_id=voucher.book_id,
-        detail=f"修改凭证 {voucher.voucher_no}",
+        # 走了「历史非末级分录原样保留」那条口子时，日志里必须留一笔：
+        # 这张凭证上从此会长期挂着非末级分录，事后有人查「为什么它还能改」，
+        # 答案只能在这条日志里，不能靠翻代码重新推一遍。
+        detail=f"修改凭证 {voucher.voucher_no}"
+               + (f"（保留 {grandfathered} 条历史非末级分录，本次未改动）"
+                  if grandfathered else ""),
         before=before,
         after=voucher_snapshot(voucher),
     )
@@ -606,8 +702,15 @@ def query_vouchers(
         stmt.order_by(Voucher.voucher_date.desc(), Voucher.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
+        # 分录一次性捞出来（审计 P3-12）。这里原来是
+        # ``for v in rows: db.refresh(v)`` —— 一个 200 行的页就是 200 次往返，
+        # 而 ``refresh`` 刷的还是**凭证自己那一行**，分录仍然在序列化时逐条懒加载，
+        # 等于 200 次白跑 + 200 次懒加载。``selectinload`` 把它压成 2 条语句。
+        #
+        # 为什么当初要 refresh：怀疑 identity map 里是旧值。但这个路由是纯读的，
+        # 前面既没有 commit 也没有别的事务写入会话（``expire_on_commit`` 只在
+        # 提交时生效），refresh 保护不到任何真实场景。
+        .options(selectinload(Voucher.entries))
     )
-    rows = list(db.scalars(stmt).all())
-    for v in rows:
-        db.refresh(v)
+    rows = list(db.scalars(stmt).unique().all())
     return rows, total

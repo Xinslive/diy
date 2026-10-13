@@ -1,11 +1,53 @@
-fastapi>=0.115
-uvicorn[standard]>=0.30
-sqlalchemy>=2.0
-psycopg[binary]>=3.2
-alembic
-pydantic-settings
-pyjwt
-openpyxl
-python-multipart
-httpx
-pytest
+# 后端**运行时**依赖（生产服务真正 import 的东西）。
+#
+# **为什么要拆。** 原来这里是 11 行全 `>=`，其中还混着 pytest ——
+# 于是「装运行环境」和「装测试工具」变成同一件事，生产机器上躺着 pytest，
+# 而发布脚本 `deploy/deploy.sh` 每次 `pip install -r requirements.txt` 装到的
+# 版本又跟测试时跑的那套没有任何关系。测试全绿和生产能跑之间，缺一条版本等价的
+# 保证。拆开之后：
+#
+#   requirements.txt      运行时依赖，只有人工抬下界才会变
+#   requirements.lock      运行时**逐包定版**，发布/镜像/CI 都装它
+#   requirements-dev.txt   开发依赖（在运行时之上叠加）
+#   requirements-dev.lock  开发环境逐包定版，本地和 CI 用它
+#
+# **下界不是随手写的。** 这里的下界取的是 `backend/.venv` 里实测跑通全部测试的
+# 那个版本，不是「随便一个看起来合理的数」。理由有两层：
+#   1. 版本等价：下界低于实测版本，`>=` 就等于放行任意更新的版本，CI 和生产
+#      还是会漂 —— 那正是 lockfile 要解决的事；
+#   2. 少数几项另有硬约束，见各条注释。
+#
+# 想升级：改这里 → 重新生成 lock（见 lock 文件头）→ 跑全量测试 → 提交。
+# 不要只改 lock，否则下次谁按 .txt 重新生成，升级就被静默回滚了。
+
+# 下面这个不是「凑个下界」：models/ 全部用 SQLAlchemy 2.0 的声明式写法
+# （Mapped[] / mapped_column）。1.4 下这套写法不成立。
+SQLAlchemy>=2.1.4
+
+# 项目用 psycopg3 的驱动名（postgresql+psycopg://）。psycopg2 不认这个 URL，
+# 装成 psycopg2 会得到一个「连不上库」的错误，而不是一个明显的缺依赖错误。
+psycopg[binary]>=3.3.6
+
+# 生产 systemd 单元走 uvicorn（见 deploy/systemd/cwq-api.service），
+# Docker 镜像里的 gunicorn worker 也基于 uvicorn.workers。
+uvicorn[standard]>=0.54.0
+
+FastAPI>=0.143.0
+alembic>=1.20.0
+pydantic-settings>=2.15.0
+
+# app/core/security.py 的 jwt.decode 走 algorithms= 白名单校验，PyJWT 2.x 才对
+# 这条路径给出确定的校验行为。
+PyJWT>=2.15.1
+
+# 导入/导出凭证与模板都要读 xlsx。
+openpyxl>=3.1.5
+
+# FastAPI 的 File()/UploadFile() 靠它解析 multipart。缺了它不是启动报错，
+# 而是**收到上传请求时才 500** —— 这类「跑起来才发现」的缺依赖最贵。
+python-multipart>=0.0.32
+
+# 只有 backend/Dockerfile 的 CMD 用它（systemd 路径不走 gunicorn）。
+# 原来是 Dockerfile 里 `pip install gunicorn` 单独装、不受任何清单约束，
+# 镜像里跑的是哪一版完全看构建那天 PyPI 的脸色。收进清单是为了能被 lock 定版。
+gunicorn>=23.0.0

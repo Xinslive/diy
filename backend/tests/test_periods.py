@@ -844,3 +844,144 @@ def test_两个月都结转过就能一路结账(db, book, periods, subjects, ad
     assert r["period"] == "2026-02"
     db.refresh(periods[2])
     assert periods[2].locked is True
+
+
+# ===================================================================== 乐观锁的 HTTP 收尾
+# 审计 P1-19。服务层（``periods.assert_version``）由前一批做完，HTTP 层三件事：
+#   1. ``GET /periods`` 要下发 ``version`` —— 不下发前端手里就没有可比对的数；
+#   2. ``close`` / ``unclose`` 的入参要收 ``version``；
+#   3. 版本冲突要回 **409**，而且那条 except 必须排在 ``except ValueError`` 前面
+#      （``PeriodVersionConflict`` 继承 ValueError，写在后面会被 400 先接走）。
+#
+# 为什么必须是 409 而不是 400：400 的语义是「你参数写错了」，前端会让人去检查
+# 表单；而这里的事实是「别人已经动过这个期间，你手里的状态过期了」。
+# 答错状态码，用户就会反复重试一个永远错得一样的请求。
+
+
+def _periods(client, auth, book):
+    r = client.get(f"/api/books/{book.id}/periods", headers=auth)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_期间列表要下发version(client, auth, book):
+    """前端要靠这个数判断「我看到的还是不是现在的状态」。"""
+    for p in _periods(client, auth, book):
+        assert isinstance(p.get("version"), int), \
+            f"期间 {p['code']} 没有 version 字段：{p}"
+        assert p["version"] >= 0
+
+
+def test_带过期version结账得到409(client, auth, db, book, periods, subjects,
+                                 admin_user, make_voucher):
+    """陈旧的「结账」按钮不该把别人刚结过的账再结一遍。"""
+    make_voucher("2026-01-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    carry_forward_profit(db, book.id, periods[1], admin_user)
+    db.commit()
+
+    stale = [p for p in _periods(client, auth, book) if p["id"] == periods[1].id][0]
+    stale_version = stale["version"] - 1
+    # 期间本身也要能结（损益已结平），确保 409 的来源是版本而不是别的校验
+    r = client.post(f"/api/books/{book.id}/periods/{periods[1].id}/close",
+                    headers=auth, json={"version": stale_version})
+    assert r.status_code == 409, f"版本冲突得到了 {r.status_code}：{r.text}"
+    assert "已被他人操作" in r.json()["detail"], r.text
+
+    db.expire_all()
+    assert db.get(Period, periods[1].id).locked is False, "冲突之后数据库被改了"
+
+
+def test_带过期version反结账得到409(client, auth, db, book, periods, subjects,
+                                   admin_user, make_voucher):
+    """反结账尤其要挡：它会把区间内的凭证批量退回未记账。"""
+    make_voucher("2026-01-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    carry_forward_profit(db, book.id, periods[1], admin_user)
+    close_period(db, periods[1], admin_user)
+    db.commit()
+
+    cur = [p for p in _periods(client, auth, book) if p["id"] == periods[1].id][0]
+    r = client.post(f"/api/books/{book.id}/periods/{periods[1].id}/unclose",
+                    headers=auth,
+                    json={"revert_posting": True, "version": cur["version"] - 1})
+    assert r.status_code == 409, f"版本冲突得到了 {r.status_code}：{r.text}"
+
+    db.expire_all()
+    assert db.get(Period, periods[1].id).locked is True, "冲突之后数据库被改了"
+
+
+def test_带当前version可以正常结账(client, auth, db, book, periods, subjects,
+                                   admin_user, make_voucher):
+    """乐观锁不能变成「永远锁死」：版本对得上就该放行。"""
+    make_voucher("2026-01-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    carry_forward_profit(db, book.id, periods[1], admin_user)
+    db.commit()
+
+    cur = [p for p in _periods(client, auth, book) if p["id"] == periods[1].id][0]
+    r = client.post(f"/api/books/{book.id}/periods/{periods[1].id}/close",
+                    headers=auth, json={"version": cur["version"]})
+    assert r.status_code == 200, r.text
+
+
+def test_不传version的老调用方不被拦(client, auth, db, book, periods, subjects,
+                                     admin_user, make_voucher):
+    """上线期前端可能还没升级：body 可选，不带版本 = 不比对，与从前完全一致。"""
+    make_voucher("2026-01-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    carry_forward_profit(db, book.id, periods[1], admin_user)
+    db.commit()
+
+    r = client.post(f"/api/books/{book.id}/periods/{periods[1].id}/close", headers=auth)
+    assert r.status_code == 200, r.text
+
+
+# ===================================================================== 失败路径不许半提交
+# 审计 P2-2：``close`` / ``unclose`` 原来只 raise HTTPException，缺 ``db.rollback()``，
+# 靠 ``Session.close()`` 的隐式回滚兜底。同文件的 carry_forward / year_end 一直都有
+# 那一行，只有这两条漏了 —— 隐式依赖在冲突与异常交错的路径上尤其危险。
+#
+# 这里钉的是**可观测的后果**：失败之后库里的期间状态一个都不能变，
+# 而且下一次操作必须照常能跑（没有被毒死的会话）。原始的 400/409 文案
+# 由上面两条用例钉住。
+
+
+def test_结账被拒之后期间状态一个都没动(client, auth, db, book, periods, subjects,
+                                        admin_user, make_voucher):
+    """没结转损益时结账必然被拒（守门「损益没结平」）。这时不能有一期被锁上。"""
+    make_voucher("2026-01-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    db.commit()
+    before = {p.id: (p.locked, p.version) for p in
+              db.scalars(select(Period).where(Period.book_id == book.id)).all()}
+
+    r = client.post(f"/api/books/{book.id}/periods/{periods[1].id}/close", headers=auth)
+    assert r.status_code == 400, r.text
+
+    db.expire_all()
+    after = {p.id: (p.locked, p.version) for p in
+             db.scalars(select(Period).where(Period.book_id == book.id)).all()}
+    assert after == before, f"结账失败却改了库：{before} → {after}"
+
+
+def test_失败的结账之后还能正常结账(client, auth, db, book, periods, subjects,
+                                   admin_user, make_voucher):
+    """失败之后下一次操作必须照常 —— 会话被毒住的话这里就是 500。"""
+    make_voucher("2026-01-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    db.commit()
+    assert client.post(f"/api/books/{book.id}/periods/{periods[1].id}/close",
+                       headers=auth).status_code == 400
+
+    carry_forward_profit(db, book.id, periods[1], admin_user)
+    db.commit()
+    r = client.post(f"/api/books/{book.id}/periods/{periods[1].id}/close", headers=auth)
+    assert r.status_code == 200, f"上一次失败把会话毒住了：{r.status_code} {r.text}"
+
+
+def test_未结账时反结账被拒且状态不变(client, auth, db, book, periods):
+    before = {p.id: (p.locked, p.version) for p in
+              db.scalars(select(Period).where(Period.book_id == book.id)).all()}
+    r = client.post(f"/api/books/{book.id}/periods/{periods[1].id}/unclose",
+                    headers=auth, json={"revert_posting": True})
+    assert r.status_code == 400, r.text
+
+    db.expire_all()
+    after = {p.id: (p.locked, p.version) for p in
+             db.scalars(select(Period).where(Period.book_id == book.id)).all()}
+    assert after == before, f"反结账失败却改了库：{before} → {after}"

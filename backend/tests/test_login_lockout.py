@@ -150,3 +150,103 @@ def test_阈值可配置(monkeypatch):
     s = Settings(app_env="dev", jwt_secret="x" * 40, login_max_failures=2,
                  login_lock_minutes=1)
     assert s.login_max_failures == 2 and s.login_lock_minutes == 1
+
+
+# ------------------------------------------------------------------ 锁定留痕
+
+
+def test_锁定要单独留一条审计(client, db, admin_user, creds):
+    """锁定是「这个系统正在主动拒绝某个账号」的信号，事后第一眼要看的就是它。
+
+    与「又错了一次」分开记，是因为两者的处置完全不同：前者要看来源 IP
+    （是不是有人在扫），后者只是正常输错。
+    """
+    from app.core.config import settings
+    from app.models import AuditLog
+
+    for _ in range(settings.login_max_failures):
+        client.post("/api/auth/login", json={**creds, "password": "错的"})
+
+    # 查**这个账号**的锁定行，并按 id 倒序取最新的一条。
+    #
+    # 两个细节都不是洁癖，是这条用例曾经间歇性变红的原因：
+    #   · 不按 username 过滤 —— audit_log 是整场 session 累积的（admin_user 走
+    #     commit、db 夹具只 rollback，提交过的行不会被清掉），别的用例锁过别的
+    #     账号时，这里会捞到**别人的**锁定行；
+    #   · 不 order_by —— SELECT 不保证按插入顺序返回。表小时碰巧一致，
+    #     表大了（整场跑完几千行）物理顺序就和插入顺序分家，`rows[-1]`
+    #     拿到的是随机一条，于是 detail 里没有本用例的用户名。
+    entry = (db.query(AuditLog)
+             .filter(AuditLog.action == "ACCOUNT_LOCKED",
+                     AuditLog.username == admin_user.username)
+             .order_by(AuditLog.id.desc())
+             .first())
+    assert entry is not None, "账号被锁了却没有留痕 —— 事后查不到是谁在扫"
+    assert admin_user.username in entry.detail
+    assert entry.after.get("lock_minutes") == settings.login_lock_minutes
+    assert entry.after.get("locked_until")
+
+
+def test_锁定期内的登录尝试也要留痕(client, db, admin_user, creds):
+    """423 是攻击者唯一能拿到的「这个账号存在」信号，扫的人就在这条路径上。"""
+    from app.models import AuditLog
+
+    for _ in range(5):
+        client.post("/api/auth/login", json={**creds, "password": "错的"})
+    client.post("/api/auth/login", json=creds)
+
+    rows = db.query(AuditLog).filter(AuditLog.action == "LOGIN_FAILURE").all()
+    assert any("锁定" in (x.detail or "") for x in rows), "锁定期内的尝试没有留痕"
+
+
+# ------------------------------------------------------------------ 时序等价
+#
+# 审计 P2-11：未知用户名过去**跳过**口令校验，而 PBKDF2 是刻意做慢的
+# （24 万次迭代，约 20ms）—— 于是「扫用户名」几乎免费，「猜密码」一次要 20ms，
+# 响应时间差一个数量级，攻击者按快慢就能把有效用户名筛出来。
+
+
+def _median_ms(fn, n=5) -> float:
+    import statistics
+    import time
+
+    samples = []
+    for _ in range(n):
+        t = time.perf_counter()
+        fn()
+        samples.append((time.perf_counter() - t) * 1000)
+    return statistics.median(samples)
+
+
+def test_未知用户名与错误口令的耗时不再差一个数量级(client, db, admin_user, creds):
+    """两条失败路径必须做同样多的工作，否则响应时间就是用户名预言机。"""
+    unknown = _median_ms(lambda: client.post(
+        "/api/auth/login", json={"username": "查无此人", "password": "whatever"}))
+    wrong = _median_ms(lambda: client.post(
+        "/api/auth/login", json={**creds, "password": "错的"}))
+
+    ratio = max(unknown, wrong) / max(min(unknown, wrong), 0.001)
+    assert ratio < 2.0, (
+        f"未知用户名 {unknown:.1f}ms vs 错误口令 {wrong:.1f}ms，"
+        f"相差 {ratio:.1f} 倍 —— 仍是一个用户名枚举信道")
+
+
+def test_停用账号的登录尝试也要等量计算(client, db, admin_user, creds):
+    """停用是第二条「免费」路径：账号存在但被停，跳过校验同样是在报信道。"""
+    admin_user.active = False
+    db.commit()
+
+    disabled = _median_ms(lambda: client.post("/api/auth/login", json=creds))
+    unknown = _median_ms(lambda: client.post(
+        "/api/auth/login", json={"username": "查无此人", "password": "whatever"}))
+    ratio = max(disabled, unknown) / max(min(disabled, unknown), 0.001)
+    assert ratio < 2.0, (
+        f"停用账号 {disabled:.1f}ms vs 未知用户名 {unknown:.1f}ms，相差 {ratio:.1f} 倍")
+
+
+def test_未知用户名仍然拒绝登录(client, db, admin_user):
+    """等量计算**不能**变成放行：这是最容易被「优化」掉的一条断言。"""
+    r = client.post("/api/auth/login", json={"username": "查无此人", "password": "whatever"})
+    assert r.status_code == 401
+    assert "错误" in r.json()["detail"]
+

@@ -1,0 +1,222 @@
+# 工程基线 CI（P1-25）。
+#
+# **这份文件存在的理由。** 在它之前，仓库里没有任何机器执行的检查：没有
+# .github/，没有 .pre-commit-config.yaml，没有 Makefile，没有 ruff/flake8/mypy
+# 配置；46 个提交全绿**只源于作者自觉**。最直接的后果是
+# ``backend/tests/conftest.py`` 里那句 ``DROP SCHEMA public CASCADE`` 和
+# ``tests/test_test_db_guardrail.py`` 的整套测试库护栏 —— **删掉它们不会让任何
+# 流水线变红**。护栏写了等于没写。
+#
+# **所以这里有一条和「跑测试」同等重要的规则：护栏必须真的被执行。**
+# 下面有三道专门的闸在盯这件事：
+#   1. backend job 里 pytest 是**全量**跑的，没有任何 -k / -m / --ignore；
+#   2. 「护栏必须真的被执行」这一步显式断言护栏用例是 PASSED 而不是 SKIPPED；
+#   3. 「用例数下限」这一步断言收集到的用例数不低于 900 ——
+#      以后谁想用 -k 悄悄把范围收窄，这一步会先红。
+# 想改这三处，请连带在 PR 描述里说清楚理由。
+#
+# 三条 job：
+#   backend   —— 全量 pytest（PostgreSQL 服务 + 真实 pg_dump/psql）
+#   frontend  —— node --test 与 vite build
+#   docker    —— 镜像必须真的构建得出来，且 alembic.ini / migrations/ 在镜像里
+#   deploy    —— 发布脚本沙箱演练（deploy/tests/test_deploy.sh）
+
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# 取消同一个 ref 上上一轮的旧运行：提交越快越省算力，也不会让旧结果盖住新结果
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------ 后端
+  backend:
+    name: 后端全量测试
+    runs-on: ubuntu-latest
+
+    # 测试套件要一个真的 PostgreSQL：conftest 用迁移建库，
+    # 并且有一批用例直接写 SQL 验触发器/约束 —— 用 sqlite 跑等于没跑。
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # 用户名/库名沿用本地开发习惯，见 .env.example
+          POSTGRES_USER: cwq
+          POSTGRES_PASSWORD: cwq123
+          POSTGRES_DB: cwq
+        ports:
+          - '5432:5432'
+        options: >-
+          --health-cmd "pg_isready -U cwq"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # 库名带 _test —— conftest 的护栏**要求**这个名字，否则拒绝启动。
+      # 主机写 127.0.0.1：护栏对非本地主机还会要求 CWQ_ALLOW_REMOTE_TEST_DB=1，
+      # 那是给「测试库真的在远端」的场景准备的，CI 里用不着。
+      # **不要为了图省事把 _test 去掉或去削弱 conftest 里的护栏。**
+      CWQ_TEST_DATABASE_URL: postgresql+psycopg://cwq:cwq123@127.0.0.1:5432/cwq_test
+      # 要求 pg_dump/psql 必须存在（见 tests/test_db_backup_restore.py）：
+      # 备份/恢复是系统唯一的退路，这条路径不许在 CI 里悄悄被 skip 掉。
+      CWQ_REQUIRE_PG_CLIENT: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 与 backend/Dockerfile 和本地 .venv 一致（3.11）
+          python-version: '3.11'
+
+      - name: 装 PostgreSQL 客户端
+        # 备份/恢复测试要真的调 pg_dump 和 psql。GitHub runner 镜像里不保证有，
+        # 所以显式装 —— 靠「镜像里碰巧有」的话，某天 runner 换镜像就静默 skip 了。
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          pg_dump --version && psql --version
+
+      - name: 装锁定版本的依赖
+        working-directory: backend
+        # 装 requirements-dev.lock（逐包定版），不是 requirements-dev.txt。
+        # 这样「CI 跑测试的那套依赖」和「本地跑测试的那套依赖」逐包相同。
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.lock
+
+      - name: 全量 pytest（不加 -k，不加 -m，不跳过任何用例）
+        working-directory: backend
+        run: python -m pytest -rA
+
+      - name: 护栏测试必须真的被执行
+        working-directory: backend
+        # 这一步是整个 workflow 的重点。上面那次全量跑里如果有人加了
+        # `-k "not guardrail"` 或者给护栏打了 skip mark，pytest 依然会全绿 ——
+        # 而护栏恰恰是最容易被「静默绕过」的那部分。
+        run: |
+          set -euo pipefail
+          out=$(python -m pytest -rA --no-header \
+                  tests/test_test_db_guardrail.py \
+                  tests/test_migration_guardrails.py 2>&1) || {
+            echo "$out"; echo "❌ 护栏测试本身没过"; exit 1; }
+          echo "$out"
+          passed=$(grep -cE '^PASSED tests/' <<<"$out" || true)
+          if [ "${passed:-0}" -lt 3 ]; then
+            echo "❌ 护栏测试只跑出 ${passed:-0} 条 PASSED —— 护栏等于没上锁"
+            exit 1
+          fi
+          if grep -E '^SKIPPED tests/(test_test_db_guardrail|test_migration_guardrails)' <<<"$out"; then
+            echo "❌ 护栏测试被跳过了 —— 删掉或跳过护栏不该让流水线变绿"
+            exit 1
+          fi
+          echo "✅ ${passed} 条护栏用例真的执行了"
+
+      - name: 用例数下限（防止有人用 -k 把范围悄悄收窄）
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          n=$(python -m pytest --collect-only 2>&1 | sed -nE 's/^([0-9]+) tests collected.*/\1/p' | tail -1)
+          echo "收集到 ${n:-0} 条用例"
+          # 下限 900（当前约 960）。要往下调，先想清楚是不是在拿 CI 换绿灯。
+          if [ -z "${n:-}" ] || [ "$n" -lt 900 ]; then
+            echo "❌ 只收集到 ${n:-0} 条用例（下限 900）—— 测试范围被收窄了？"
+            exit 1
+          fi
+
+  # ------------------------------------------------------------------ 前端
+  frontend:
+    name: 前端测试与构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # CI 固定在 LTS 上，不追开发机的新版本 —— 流水线要的是可复现。
+          # 本地开发机跑的是 Node 26，两边都验证过（见 PR 里手工核对的结果）。
+          node-version: '22'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+
+      # 用 pnpm 装依赖、用 npm 跑脚本，是刻意的：
+      # 仓库提交的是 pnpm-lock.yaml，没有 package-lock.json，
+      # 所以 ``npm ci`` 必然失败、``npm install`` 会另生成一份锁（等于把锁作废）。
+      # 而「跑测试/构建」只是执行 scripts 里的命令行，与包管理器无关，
+      # 用 npm 跑正好对上 ``npm run test`` / ``npm run build`` 这两个约定。
+      - name: 装依赖（按 pnpm-lock.yaml）
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: 前端测试（node --test）
+        working-directory: frontend
+        run: npm run test
+
+      - name: 测试文件一个都不能少被发现
+        working-directory: frontend
+        # P1-27 的病根就是「有 5 个用例但没有任何 runner」。
+        # 现在 runner 接上了，但要防另一种形态：runner 在、却一个文件都没发现 ——
+        # 那还是一片绿。先看退出码（node --test 失败会非零退出），
+        # 再核对 runner 发现的测试文件数与磁盘上的文件数一致。
+        run: |
+          set -euo pipefail
+          expected=$(ls tests/*.test.mjs | wc -l | tr -d ' ')
+          out=$(npm run test 2>&1); rc=$?
+          echo "$out" | tail -20
+          [ "$rc" -eq 0 ] || { echo "❌ 前端测试失败（退出码 $rc）"; exit 1; }
+          got=$(sed -nE 's/.*tests ([0-9]+).*/\1/p' <<<"$out" | tail -1)
+          echo "磁盘上 ${expected} 个测试文件，runner 报告 ${got:-?} 个"
+          if [ -z "${got:-}" ] || [ "$got" -lt "$expected" ]; then
+            echo "❌ runner 发现的测试文件比磁盘上少 —— 有用例没被执行"
+            exit 1
+          fi
+
+      - name: 前端构建
+        working-directory: frontend
+        run: npm run build
+
+  # ------------------------------------------------------------------ 镜像
+  docker:
+    name: 镜像能构建且迁移文件在镜像里
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建镜像
+        # 这条路径以前**从来没被打通过**（P2-32）：镜像里没有 alembic.ini 和
+        # migrations/，启动闸门必然拒绝启动，而没人构建过所以没人发现。
+        # 光构建还不够 —— 下面还要断言这两个路径真的在镜像里。
+        run: docker build -t cwq-api:ci backend
+
+      - name: 镜像里必须有 alembic.ini 与 migrations/
+        run: |
+          set -euo pipefail
+          for p in /app/alembic.ini /app/migrations /app/migrations/versions; do
+            docker run --rm --entrypoint sh cwq-api:ci -c "test -e $p" \
+              || { echo "❌ 镜像里缺 $p —— 启动闸门会拒绝启动（P2-32）"; exit 1; }
+          done
+          # 闸门本身也要能算出 head
+          docker run --rm --entrypoint alembic cwq-api:ci heads \
+            || { echo "❌ 镜像里 alembic 算不出 head"; exit 1; }
+          echo "✅ 迁移文件在镜像里"
+
+  # ------------------------------------------------------------------ 发布脚本
+  deploy:
+    name: 发布脚本沙箱演练
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # deploy.sh 是 bash 脚本，用假的 git/pip/pytest/pnpm/systemctl/curl
+      # 在临时目录里真跑一遍再断言它做了什么。这条测试里有一条 assert_ran
+      # 守卫，专门防「脚本压根没跑起来却一片绿」。
+      - name: 跑沙箱演练
+        run: bash deploy/tests/test_deploy.sh

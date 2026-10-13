@@ -29,6 +29,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     SmallInteger,
@@ -72,7 +73,15 @@ class Book(Base, TimestampMixin):
 
 class Period(Base, TimestampMixin):
     __tablename__ = "period"
-    __table_args__ = (UniqueConstraint("book_id", "year", "month", name="uq_period"),)
+    __table_args__ = (
+        UniqueConstraint("book_id", "year", "month", name="uq_period"),
+        # (book_id, ord) 是「账套内连续期间序号」的自然主键：账簿聚合、
+        # 分录冗余列（entry.book_id + entry.period_ord 的组合外键）都指着它。
+        # 没有这条 UNIQUE，PG 不允许拿两列做外键目标，entry 的冗余列
+        # 也就无从被库层钉住。ord 本来就由 (year - start_year) * 12 + month
+        # 唯一决定，加约束不会与存量数据冲突。
+        UniqueConstraint("book_id", "ord", name="uq_period_book_ord"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     book_id: Mapped[int] = mapped_column(ForeignKey("book.id", ondelete="CASCADE"), nullable=False)
@@ -99,12 +108,28 @@ class PeriodOpening(Base, TimestampMixin):
     __tablename__ = "period_opening"
     __table_args__ = (
         UniqueConstraint("period_id", "subject_id", name="uq_period_opening"),
+        # 期初汇总查询（ledger/engine._roll_up_openings：WHERE book_id = ?）
+        # 原来**一个 book_id 索引都没有**，PG 只能扫全表再过滤。实测：见 0006。
+        Index("ix_period_opening_book", "book_id", "period_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     book_id: Mapped[int] = mapped_column(ForeignKey("book.id", ondelete="CASCADE"), nullable=False)
     period_id: Mapped[int] = mapped_column(ForeignKey("period.id", ondelete="CASCADE"), nullable=False)
-    subject_id: Mapped[int] = mapped_column(ForeignKey("subject.id", ondelete="CASCADE"), nullable=False)
+    # **RESTRICT，不是 CASCADE**（审计 P1-05 / P1-10）。
+    #
+    # 这条外键上分歧过：库里是 RESTRICT（db_init.sql 的 DO 块 + 0003 都写死
+    # 了它，0003 的 docstring 甚至说「这条外键正是本 revision 存在的理由」），
+    # 而模型这里写的是 CASCADE。谁照着模型跑一次
+    # ``alembic revision --autogenerate``，就会生成一条把 RESTRICT 改回
+    # CASCADE 的 revision —— 那正是 10-11 报告实测过的静默数据损失：
+    # 「只被期初引用、没有凭证引用」的科目一删，期初行跟着消失，
+    # 2 条删成 1 条，余额 0 → -100，没有任何报错或审计线索。
+    #
+    # 模型侧必须和库一致，否则 autogenerate 就是一台「把护栏改回缺陷」的机器。
+    # 防回归不靠自觉：tests/test_migration_guardrails.py 里有一条
+    # compare_metadata 用例，断言模型与库的外键集合零差异。
+    subject_id: Mapped[int] = mapped_column(ForeignKey("subject.id", ondelete="RESTRICT"), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=Decimal("0"), nullable=False)
 
 

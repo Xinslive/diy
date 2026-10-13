@@ -146,3 +146,35 @@ def test_校验会记入日志(caplog):
     with caplog.at_level(logging.INFO, logger="app.core.config"):
         _check(_prod())
     assert caplog.records, "配置校验结果没有写进日志"
+
+
+# --------------------------------------------------------------------- 日志级别
+
+
+def test_日志级别默认INFO且可配置():
+    """P3-14：级别以前完全取决于外部环境怎么配。"""
+    assert _prod().log_level == "INFO"
+    assert _prod(log_level="WARNING").log_level == "WARNING"
+    # 小写也要认 —— 部署脚本里手写 "debug" 的人比你想象的多
+    assert _prod(log_level="debug").log_level == "DEBUG"
+
+
+def test_生产环境开DEBUG拒绝启动():
+    """DEBUG + DB_ECHO 会把带绑定参数的 SQL 连同账套数据打进日志。"""
+    with pytest.raises(ValueError) as e:
+        _check(_prod(log_level="DEBUG"))
+    assert "LOG_LEVEL" in str(e.value)
+
+
+def test_dev环境允许DEBUG():
+    """开发机要能开调试，否则「本地能复现、日志里看不到」两件事会互相打架。"""
+    s = _prod(log_level="DEBUG")
+    validate_production_settings(s, env="dev")
+
+
+def test_非法日志级别直接拒绝构造():
+    """静默回退到 INFO 会把「我以为在打 DEBUG」藏起来：没人会去看少了什么。"""
+    with pytest.raises(Exception) as e:
+        Settings(jwt_secret=GOOD_SECRET, log_level="TRACE")
+    assert "LOG_LEVEL" in str(e.value)
+

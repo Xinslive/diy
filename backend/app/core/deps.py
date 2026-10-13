@@ -14,6 +14,14 @@ from app.models import Book, SysUser, UserBook
 
 bearer = HTTPBearer(auto_error=False)
 
+# 账套角色的**唯一**合法取值。
+#
+# 这三处必须一致，改一处就得改另外两处：
+#   core/deps.py（这里，判定）→ models/system.py（CHECK 约束）→ api/system.py::ROLES（入口校验）
+# 少一处的后果都是「值能进库但判不出来」，进而退化成放行。
+WRITE_ROLES = frozenset({"OWNER", "ACCOUNTANT"})
+READ_ONLY_ROLES = frozenset({"VIEWER"})
+
 
 def get_current_user(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
@@ -64,9 +72,47 @@ def require_admin(user: SysUser = Depends(get_current_user)) -> SysUser:
     return user
 
 
+def normalize_role(role: Optional[str]) -> str:
+    """把库里存的 role 归一化成判定用的形式。
+
+    大小写与首尾空白都吃掉。**权限判定不能因为「写库的人手滑打了个小写」
+    就换一个含义** —— 过去的写法是 ``if link.role == "VIEWER"``，
+    于是一个字面量比不中就放行。
+    """
+    return (role or "").strip().upper()
+
+
+def is_read_only(role: Optional[str]) -> bool:
+    """这个角色能不能写。**白名单语义**（审计 P2-12）。
+
+    黑名单（只挡 "VIEWER"）与白名单（只放行 OWNER/ACCOUNTANT）的差别，
+    全部落在「不认识的值」上：'viewer'、'read_only'、''、None、
+    'Owner'（没被归一化到的那层）—— 黑名单一律**放行**，于是绕过 API
+    直接改库的写入者（psql、脚本、误连的 ETL）拿到完整写权限，
+    这与项目通篇 fail-closed 的原则正好相反。
+
+    白名单一律**按只读处理**：配置写错的后果变成「这个人进不去」，
+    而不是「这个人拿到全部权限」，并且真出问题时管理员能在审计里
+    看到那个非法角色值，改回来即可。
+    """
+    return normalize_role(role) not in WRITE_ROLES
+
+
 def require_write(book: Book, user: SysUser, link: UserBook) -> None:
-    if link.role == "VIEWER":
+    """只读账号一律拒写，**含一切不认识的角色值**。
+
+    区分两种拒绝文案不是讲究：VIEWER 是正常业务状态（用户知道自己是只读），
+    而非法的角色值是**配置事故**，需要有人去修 —— 文案一样的话，
+    管理员看到满屏「当前账套为只读权限」会以为是自己配的只读。
+    """
+    role = (link.role or "")[:32]
+    if normalize_role(role) in READ_ONLY_ROLES:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "当前账套为只读权限")
+    if normalize_role(role) not in WRITE_ROLES:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"账套角色「{role}」不在系统允许的取值内（{'、'.join(sorted(WRITE_ROLES | READ_ONLY_ROLES))}），"
+            "已按只读处理，请联系管理员修正")
 
 
 def get_book_link(book_id: int, db: Session = Depends(get_db), user: SysUser = Depends(get_current_user)) -> UserBook:

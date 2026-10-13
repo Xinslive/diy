@@ -135,8 +135,22 @@ class CarryForwardIn(BaseModel):
     replace: bool = True
 
 
+class CloseIn(BaseModel):
+    """结账的入参。
+
+    整个 body 可选（``Optional[CloseIn]``）是为了兼容还没升级的前端：
+    不传 = 不带版本 = 不比对，与乐观锁上线前的行为完全一致。
+    """
+    # 乐观锁的期望版本（审计 P1-19）。值来自 ``GET /periods`` 返回的
+    # ``version``；留空表示「老调用方，不比对」。
+    version: Optional[int] = None
+
+
 class UncloseIn(BaseModel):
     revert_posting: bool = True
+    # 与 CloseIn 同一条约定，见那里的注释。反结账尤其需要：
+    # 它会把区间内的凭证批量退回未记账，陈旧屏幕上再点一次等于抹掉别人的操作。
+    version: Optional[int] = None
 
 
 class YearEndIn(BaseModel):

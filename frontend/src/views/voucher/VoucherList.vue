@@ -248,6 +248,13 @@ function open(row) {
   router.push({ name: 'voucher-edit', params: { id: row.id }, query: filterQuery() })
 }
 
+/**
+ * 确认框是会 reject 的：人一点「取消」就带着 'cancel' 抛出来。
+ *
+ *  原来直接 `await ElMessageBox.confirm(...)`，点取消 → 一个未处理的 rejection
+ *  冒到控制台，控制台一片红，还把后面真正的报错一起淹掉 —— 看着像页面崩了。
+ * 取消本来就是一个正常的决定，不该当异常。
+ */
 async function removeOne(row) {
   if (isLocked(row)) {
     return ElMessage.warning(
@@ -255,7 +262,10 @@ async function removeOne(row) {
         ? `凭证 ${row.voucher_no} 已记账，不能删除；请先「反记账」`
         : `${row.voucher_no} 所在期间已结账，不能删除`)
   }
-  await ElMessageBox.confirm(`确认删除凭证 ${row.voucher_no}？`, '删除凭证', { type: 'warning' })
+  const ok = await ElMessageBox.confirm(`确认删除凭证 ${row.voucher_no}？`, '删除凭证', { type: 'warning' })
+    .then(() => true)
+    .catch(() => false)
+  if (!ok) return
   await api.deleteVoucher(store.bookId, row.id)
   ElMessage.success('已删除')
   load()

@@ -293,6 +293,39 @@ def test_0003_能把_CASCADE_收敛成_RESTRICT(scratch, monkeypatch):
     assert typ == "integer", f"period.ord 没收敛到 integer，还是 {typ!r}"
 
 
+def test_0003_能把_同名不同动作_收敛成_RESTRICT(scratch, monkeypatch):
+    """P3-2：约束**名字对、删除动作错**，再跑一次必须收敛。
+
+    这是 0003 原先真正不幂等的地方。旧判据只比名字，于是遇到
+    ``fk_period_opening_subject`` 存在但动作是 CASCADE 的存量状态时，
+    它跳过 DROP，紧接着 ``ADD CONSTRAINT`` 用同一个名字再建一条 ——
+    upgrade 直接在重名上失败。「在」不等于「对」：这条外键在 create_all 时代
+    一直都在，只是名字和动作可能不对，判据必须把两者都算进去。
+
+    上一批只钉了 db_init.sql 里那段按**列**收敛的 DO 块，没钉 0003 本体
+    （文件不归那条工作线）。现在 0003 也改了，这里补上正向验证。
+    """
+    eng, _ = scratch
+    with eng.begin() as conn:
+        conn.exec_driver_sql("CREATE TABLE subject (id INTEGER PRIMARY KEY)")
+        conn.exec_driver_sql("CREATE TABLE period (id INTEGER PRIMARY KEY, ord INTEGER NOT NULL)")
+        conn.exec_driver_sql(
+            "CREATE TABLE period_opening (id INTEGER PRIMARY KEY, subject_id INTEGER NOT NULL, "
+            # 名字已经是目标名，**只有删除动作是错的** —— 旧写法在这里会崩
+            "CONSTRAINT fk_period_opening_subject FOREIGN KEY (subject_id) "
+            "REFERENCES subject(id) ON DELETE CASCADE)")
+    with eng.connect() as c:
+        rev = _load_0003()
+        monkeypatch.setattr(rev, "op", _OpShim(c))
+        rev.upgrade()
+        act = tuple(c.execute(text(
+            "SELECT conname || ':' || confdeltype::text FROM pg_constraint "
+            "WHERE conrelid = 'period_opening'::regclass AND contype = 'f'"
+        )).scalars().all())
+    assert act == ("fk_period_opening_subject:r",), (
+        f"同名不同动作的外键没有被收敛，现在是 {act}（CASCADE 会连带删掉期初余额）")
+
+
 class _OpShim:
     """``alembic.op`` 的替身，只提供 0003 用到的那一个方法。
 
@@ -457,12 +490,41 @@ def test_会计护栏触发器确实装上了(db):
 
     漏了不会让任何一条普通用例变红：借贷平衡、结账禁写这些护栏都是在
     **触犯**时才报错，没触犯时一切正常。所以这里单独数一遍。
+
+    **这份清单必须穷举，而且它曾经真的漏过一项**（审计 P1-9 / P2-33）：
+    ``trg_subject_leaf_guard`` 是 cd1cded 加进 db_init.sql 的，没有配套
+    revision，于是它在任何跑过 0001 的库上都不存在 —— 而这份清单当时
+    恰好没列它，所以 CI 全绿。清单漏项与护栏没上线是同一个问题的两面：
+    没有清单就没人知道漏了，清单不全就等于没有。
+
+    因此新增/修改任何数据库护栏时，**三件事一起做**：
+    改 ``app/core/db_init.sql``、新写一条 revision 把��交付给存量库、
+    在下面这个集合里登记。第三件漏了，前两件就等于没做。
     """
     rows = db.execute(text(
         "SELECT trigger_name FROM information_schema.triggers "
         "WHERE trigger_schema = current_schema()")).scalars().all()
     names = {n for r in rows for n in ([r] if isinstance(r, str) else r)}
-    required = {"trg_entry_balance", "trg_voucher_balance", "trg_entry_lock_guard",
-                "trg_posted_voucher_guard", "trg_entry_sync", "trg_voucher_resync"}
+    required = {
+        # 借贷平衡（延迟到提交时校验）
+        "trg_entry_balance", "trg_voucher_balance",
+        # 结账禁写：三处守卫必须齐全，缺一处就多一条绕过路径（P1-2）
+        "trg_entry_lock_guard", "trg_voucher_guard", "trg_voucher_delete_guard",
+        # 凭证状态与分录冗余列：两个方向都要有（P2-05）
+        "trg_posted_voucher_guard", "trg_entry_sync", "trg_voucher_resync",
+        # 科目：编码/类别不可变、is_leaf 自洽（被改行两个方向 + 父节点侧延迟校验，P2-04）
+        "trg_subject_guard", "trg_subject_leaf_guard",
+        "trg_subject_leaf_parent_guard",
+        # 期初只读
+        "trg_opening_guard",
+        # 触发器改写行时也刷新 updated_at（P2-09）
+        "trg_updated_at",
+    }
     missing = required - names
     assert not missing, f"护栏触发器缺失：{sorted(missing)}"
+
+    # 反过来也钉一下：**只**装了这几条就收工，等于有人把 db_init.sql 里的
+    # 触发器删了而没人发现。集合相等比「必需的都在」更难蒙混。
+    assert not (names - required), (
+        f"出现了清单之外的触发器：{sorted(names - required)} —— "
+        "要么是新加的护栏忘了登记（那正是 P2-33 的复发路径），要么是被删剩的残留")

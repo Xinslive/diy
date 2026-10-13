@@ -24,6 +24,7 @@ from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.accounting import organize as svc_organize
@@ -46,6 +47,71 @@ PROFIT_SUBJECT_CODE = "4103"     # 本年利润
 RETAINED_SUBJECT_CODE = "4104"   # 利润分配 — 未分配利润
 
 
+# --------------------------------------------------------------------- 乐观锁
+#
+# ``period.version`` 是 P2-04 留下的字段，过去**只有 ``p.version += 1``、没有任何
+# 比对**，全项目搜不到一处 ``if version ==`` —— 它是个装饰字段：写了、存了、
+# 读得到，唯独不产生任何行为。
+#
+# 这里把它接上（审计 P1-19）。先说清**它保护的是什么、不保护什么**，
+# 否则下一个人还会以为「有 version 就万事大吉」：
+#
+#   保护：期间**状态**的丢失更新。两个人同时开着 2026-11 的页面，
+#         甲把 11 月结账了（version 3→4），乙那边屏幕还停在 version 3，
+#         乙再点一次「结账/反结账」时带着 3 过来 → 409，而不是拿着
+#         一份过期的账况把状态又改一遍，或者（反结账）把甲刚记的新凭证
+#         批量退回未记账。
+#   不保护：**期间之内的业务数据**。凭证的增删改、期初的改动，version 一概不动
+#         （它们有各自的写保护：已结账期间由 fn_voucher_guard 触发器挡）。
+#         要给凭证编辑做乐观锁，得在 voucher 上另设 version 字段，
+#         由 ``api/vouchers.py`` 携带与比对 —— 不在本文件范围内。
+#
+# 为什么 ``expected_version`` 默认 None（不比对）：现有调用方（api/books.py）
+# 还没带这个参数，缺省放行是为了不把已有接口打成 400。
+# 路由层要真正闭环，需要在请求体里收下 version 并在调用时传进来 ——
+# 契约见 ``assert_version`` 的说明。
+
+
+class PeriodVersionConflict(ValueError):
+    """期间版本冲突。
+
+    继承 ValueError 是为了让不认识它的旧调用方也能正常报错而不是 500；
+    但**路由层必须在 ``except ValueError`` 之前**单独捕获它并返回 **409**
+    （而不是 400）：409 的语义就是「你手里的版本过期了，请刷新后重试」，
+    400 会让前端以为是自己参数写错了。
+    """
+
+
+def _fresh_period(db: Session, period_id: int) -> tuple[Period, bool, int]:
+    """取一行期间并锁住它，返回 (ORM 对象, 库里的 locked, 库里的 version)。
+
+    **必须用列查询拿 locked / version，不能直接读传入对象上的属性。**
+    SQLAlchemy 的 identity map 会把已经加载过的对象原样返回：调用方
+    （路由层）早先 ``get_period`` 读过这一行，本会话里它就是那份**旧值**。
+    原来 ``target.locked`` 读的就是这个旧值 —— 别人在这期间提交过一次结账，
+    本会话照样看到 ``locked=False``。用列查询绕开 identity map 才是真的
+    「读库」，``with_for_update()`` 同时把并发写者挡在外面。
+    """
+    row = db.execute(
+        select(Period.id, Period.locked, Period.version)
+        .where(Period.id == period_id).with_for_update()
+    ).one()
+    return db.get(Period, row[0]), bool(row[1]), int(row[2])
+
+
+def assert_version(expected: int | None, current: int, period_code: str) -> None:
+    """比对期间版本；不一致抛 :class:`PeriodVersionConflict`。
+
+    ``expected`` 是 None 表示调用方没有提供版本（例如老前端），此时不比对。
+    """
+    if expected is None or int(expected) == current:
+        return
+    raise PeriodVersionConflict(
+        f"{period_code} 已被他人操作（你手上的版本 {expected}，库里已是 {current}）。"
+        "本次操作没有执行，请刷新页面确认当前状态后再操作。"
+    )
+
+
 def get_period(db: Session, book_id: int, period_id: int) -> Period:
     p = db.get(Period, period_id)
     if p is None or p.book_id != book_id:
@@ -61,25 +127,30 @@ def _subject_by_code(db: Session, book_id: int, code: str) -> Optional[Subject]:
 
 
 def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = True,
-                 commit: bool = True) -> dict:
+                 commit: bool = True, expected_version: int | None = None) -> dict:
     """关闭指定期间，并顺带关闭其之前所有未结账期间。
 
     ``commit=False`` 让调用方把多步操作合成一个事务（年度结转用它）。
+
+    ``expected_version`` 是乐观锁（P1-19）：调用方把页面上看到的
+    ``period.version`` 传进来，不一致就抛 :class:`PeriodVersionConflict`。
     """
-    target = db.execute(
-        select(Period).where(Period.id == period.id).with_for_update()
-    ).scalar_one()
-    if target.locked:
+    # P1-19：locked 与 version 都从**库里**读，不读传入对象上的旧值。
+    target, locked_now, version_now = _fresh_period(db, period.id)
+    assert_version(expected_version, version_now, target.code)
+    if locked_now:
         raise ValueError(f"{target.code} 已经结账")
 
-    chain = list(
-        db.execute(
-            select(Period)
-            .where(Period.book_id == target.book_id, Period.ord <= target.ord)
-            .order_by(Period.ord)
-            .with_for_update()
-        ).scalars()
-    )
+    # 锁链上每一期。列查询拿 locked / version：identity map 里可能是别人读进来
+    # 的旧值，直接读属性会把「别人已经结过了」当成没结过。
+    chain_rows = db.execute(
+        select(Period.id, Period.locked, Period.version)
+        .where(Period.book_id == target.book_id, Period.ord <= target.ord)
+        .order_by(Period.ord)
+        .with_for_update()
+    ).all()
+    chain = [db.get(Period, r[0]) for r in chain_rows]
+    fresh = {r[0]: (bool(r[1]), int(r[2])) for r in chain_rows}
 
     # 整条链都要先过一遍「整理就绪」：断号、时序不对的月份一旦封进历史，
     # 纸质凭证按号装订就跟系统对不上，再想改只能作废重记。
@@ -88,7 +159,7 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
     auto_closed, auto_posted = [], 0
     pending = []
     for p in chain:
-        if p.locked:
+        if fresh[p.id][0]:
             continue
         posted = _auto_post(db, p, user) if auto_post else _check_unposted(db, p)
         auto_posted += posted
@@ -135,7 +206,7 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
         p.locked = True
         p.closed_at = func.now()
         p.closed_by = user.username
-        p.version += 1
+        p.version = fresh[p.id][1] + 1
 
     log(
         db, action="CLOSE", entity="period", entity_id=target.id, user=user,
@@ -209,7 +280,7 @@ def preview_unclose(db: Session, book_id: int, period: Period) -> dict:
 
 def batch_unclose(
     db: Session, book_id: int, period: Period, user: SysUser, revert_posting: bool = True,
-    commit: bool = True,
+    commit: bool = True, expected_version: int | None = None,
 ) -> dict:
     """批量反结账：从指定期间起，连续解锁到最后一个已锁期间。
 
@@ -217,19 +288,27 @@ def batch_unclose(
     账簿默认口径下余额会凭空消失，用户改完凭证重新记账时数字会跳变。
 
     ``commit=False`` 让调用方把多步操作合成一个事务（年度结转用它）。
-    """
-    locked = list(
-        db.execute(
-            select(Period)
-            .where(Period.book_id == book_id, Period.locked.is_(True), Period.ord >= period.ord)
-            .order_by(Period.ord)
-            .with_for_update()
-        ).scalars()
-    )
-    if not locked:
-        raise ValueError(f"{period.code} 及其之后的期间都未结账，无需反结账")
 
-    preview = preview_unclose(db, book_id, period)
+    ``expected_version`` 是乐观锁（P1-19）。反结账尤其需要它：它会把区间内
+    的凭证批量退回未记账，屏幕上的版本一变（别人刚反结过账、或刚记了新凭证），
+    再点一次就会把对方的工作抹掉。
+    """
+    # P1-19：与 close_period 同一把钥匙 —— locked / version 一律从库里读。
+    target, _locked, version_now = _fresh_period(db, period.id)
+    assert_version(expected_version, version_now, target.code)
+
+    locked_rows = db.execute(
+        select(Period.id, Period.version)
+        .where(Period.book_id == book_id, Period.locked.is_(True), Period.ord >= target.ord)
+        .order_by(Period.ord)
+        .with_for_update()
+    ).all()
+    locked = [db.get(Period, r[0]) for r in locked_rows]
+    chain_version = {r[0]: int(r[1]) for r in locked_rows}
+    if not locked:
+        raise ValueError(f"{target.code} 及其之后的期间都未结账，无需反结账")
+
+    preview = preview_unclose(db, book_id, target)
     period_ids = [p.id for p in locked]
 
     # 先解锁 —— 凭证的写保护触发器是按期间锁判断的，
@@ -238,7 +317,7 @@ def batch_unclose(
         p.locked = False
         p.closed_at = None
         p.closed_by = None
-        p.version += 1
+        p.version = chain_version[p.id] + 1
     db.flush()
 
     reverted = 0
@@ -428,8 +507,12 @@ def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUse
         from app.accounting.vouchers import post_vouchers
 
         post_vouchers(db, book_id, [v.id for v in created], user, commit=False)
-    db.commit()
 
+    # P1-20：这里原来先 ``db.commit()`` 把凭证落库、再写审计日志、再 commit。
+    # 两个事务之间任何失败（磁盘、连接中断、进程被杀）都留下「账已改、审计无记录」
+    # 的状态 —— 而本系统的凭证号可回收，审计快照是**唯一**的追溯手段
+    # （见 accounting/audit_helper 的自陈）。现在凭证与日志一起提交，
+    # 与同文件 ``year_end_carry`` 的单事务做法对齐。
     log(
         db, action="CARRY_FORWARD", entity="period", entity_id=period.id, user=user,
         book_id=book_id,
@@ -500,6 +583,12 @@ def _refresh_opening(db: Session, book_id: int, first: Period,
 
     但只要下一年已经记了账，就不能动它的期初：
     那时的期初已经被凭证引用，硬改会让已记账的凭证和新期初对不上。
+
+    ``subjects`` 必须覆盖**所有有余额的科目**，包括非末级的（审计 P1-1）。
+    金额直接取 ``fmap[sid].closing`` —— 那是**子树聚合后**的余额
+    （``ledger/engine`` 把分录上卷到各级父科目），不是「这个科目自己那一份」。
+    一个科目自己的快照是该科目的**基准总额**，下级只补增量，
+    引擎侧的去重口径见 ``LedgerEngine._roll_up_openings`` 的 subtree_total。
     """
     used = db.scalar(
         select(func.count(Voucher.id))
@@ -644,12 +733,26 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
 
     # 3. 下一年 1 月的期初 = 本年期末
     eng = LedgerEngine(db, book.id)
-    # **审计 P2-08 最严重的一条**：这里原来带 Subject.active 过滤，
-    # 于是停用科目的期末余额不会被写进次年期初 —— 「停用」这个本该
-    # 安全的操作变成了账务断层，次年账凭空少一笔且无任何提示。
-    # 期初快照必须覆盖**全部末级科目**，与是否停用无关。
-    subjects = db.scalars(
-        select(Subject).where(Subject.book_id == book.id, Subject.is_leaf.is_(True))).all()
+    # **审计 P2-08**：这里原来带 Subject.active 过滤，于是停用科目的期末余额
+    # 不会被写进次年期初 ——「停用」这个本该安全的操作变成了账务断层，
+    # 次年账凭空少一笔且无任何提示。**绝不能引入 active 过滤**：
+    # 停用 ≠ 删除，老凭证还指着它，账还得算得出来。
+    #
+    # **审计 P1-1**：这里原来还带 ``is_leaf.is_(True)``。同一个缺陷，
+    # 触发条件从 ``active`` 换成了 ``is_leaf`` —— 而 ``is_leaf`` 恰恰是
+    # 服务端派生的字段，派生化把「能不能升格」的判断从人工交给了系统。
+    #
+    # 失效场景：100201 银行存款-工行 1–5 月已记账借记 1000；6 月在它下面
+    # 建了子科目 10020101 并录期初 0 → 100201 因非末级被排除（期末 1000
+    # 不写进次年）、10020101 期末为 0 被跳过 → 次年 100201 期初归 0，
+    # 1000 元凭空消失、零提示，科目余额表还会试算不平。
+    #
+    # 现在按「**有余额的科目**」选取：一个都不漏，含非末级。金额取
+    # ``closing``，而它本身就是引擎上卷后的**子树合计**（分录已上卷到
+    # 各级父科目），父级自己那一份钱自然含在里面。
+    # 「父子各写一条同额快照会不会被算两遍」不会 —— 引擎读期初时以自身
+    # 快照为基准、下级只补增量，见 ``LedgerEngine._roll_up_openings``。
+    subjects = db.scalars(select(Subject).where(Subject.book_id == book.id)).all()
     fmap = eng.compute([s.id for s in subjects], last.ord)
 
     first = new_periods[0]
@@ -669,7 +772,25 @@ def ensure_periods(db: Session, book: Book, year: int) -> list[Period]:
 
     账套第一年从 start_month 开始（启用月之前不出现在账上），
     之后的年度都从 1 月起。已存在就原样返回，不改动任何期间状态。
+
+    **P3-11：check-then-act 必须有锁。** 原来这里是「查一遍、没有就插」，
+    两个并发的年度结转（同一个账套两个人同时点，或前端重试）
+    会双双查到空、都去插入，第二个撞上 ``period`` 上的唯一约束，
+    抛出一条裸的 ``IntegrityError`` 到 500 —— 账没建上，用户只看到一个
+    「Internal Server Error」，连哪一步失败都不知道。
+
+    两道处理，缺一不可：
+
+    1. **先锁账套行**（``book.id`` 上 ``FOR UPDATE``）。同一个账套的
+       建期间被串行化，后一个进来时前一个已经提交，重查就能看到结果。
+       锁顺序是「期间 → 账套」（``year_end_carry`` 先结账再 ``ensure_periods``），
+       全项目只有本文件用行锁，不会与别的路径构成死锁环。
+    2. **唯一约束兜底 + 友好报错**。锁不住的场景（锁之前就已经有人插进来，
+       或者别的入口绕过锁）由 savepoint 接住：回滚的只是这批 insert，
+       **不会把调用方（年度结转）已经做的工作一起回滚**。
     """
+    db.execute(select(Book.id).where(Book.id == book.id).with_for_update())
+
     rows = list(
         db.scalars(
             select(Period).where(Period.book_id == book.id, Period.year == year)
@@ -684,9 +805,30 @@ def ensure_periods(db: Session, book: Book, year: int) -> list[Period]:
                ord=period_ord(year, m, book.start_year), locked=False)
         for m in months
     ]
-    for p in out:
-        db.add(p)
-    db.flush()
+    try:
+        # savepoint 而不是裸 flush：IntegrityError 会把整个事务标记为失败，
+        # 而 ensure_periods 是被 year_end_carry 当中途步骤调用的，
+        # 一次并发撞车不该把前面解锁 12 月、结转损益的成果一起废掉。
+        with db.begin_nested():
+            for p in out:
+                db.add(p)
+            db.flush()
+    except IntegrityError:
+        # 并发的另一方已经铺好了：以库里的现状为准，不报错。
+        db.expire_all()
+        rows = list(
+            db.scalars(
+                select(Period).where(Period.book_id == book.id, Period.year == year)
+                .order_by(Period.ord)
+            ).all()
+        )
+        if rows:
+            return rows
+        raise ValueError(
+            f"{year} 年的会计期间创建失败：库里仍然没有这一年的期间，"
+            f"但插入时被数据库拒绝（账套 {book.id}）。"
+            "请检查该账套的期间数据是否有重复。"
+        )
     return out
 
 

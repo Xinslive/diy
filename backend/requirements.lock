@@ -1,0 +1,52 @@
+# 后端运行时依赖 —— 逐包定版（lockfile）。**装这个，不要装 requirements.txt。**
+#
+# 原来这里没有锁文件：requirements.txt 全是 `>=`，`deploy/deploy.sh` 每次发布
+# 都 `pip install -r requirements.txt`，装到哪一版看当天 PyPI 的脸色 ——
+# 于是「测试全绿」和「生产能跑」之间没有任何版本等价保证。这一份把它钉死。
+#
+# 版本从哪来：以 `backend/.venv` 实测跑通全部测试的那套为准，**不是**按最新解析。
+# 生成命令（uv 的 --exclude-newer 把它钉在实测环境的版本窗口内；去掉这个参数，
+# pydantic 会从 2.14.0 跳到 2.14.1，与实测环境不一致）：
+#
+#   uv pip compile requirements.txt --python-version 3.11 \
+#       --no-annotate --exclude-newer 2026-10-11T00:00:00Z
+#
+# 唯一不在 .venv 里的是 gunicorn：它只被 backend/Dockerfile 的 CMD 用
+# （systemd 生产路径走 uvicorn），原来是在 Dockerfile 里 `pip install gunicorn`
+# 单独装的、不受任何清单约束。收进 lock 后它才第一次有了确定版本。
+#
+# 升级步骤：改 requirements.txt 的下界 → 重新执行上面那条命令 → 跑全量测试
+# → 提交 requirements.txt 与本文件**一起**。只提交其中一个，下一个人按 .txt
+# 重新生成时升级就被静默回滚了。
+alembic==1.20.0
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+click==8.5.0
+et-xmlfile==2.0.0
+fastapi==0.143.0
+gunicorn==26.2.0
+h11==0.16.0
+httptools==0.9.0
+idna==3.20
+mako==1.4.3
+markupsafe==3.0.4
+openpyxl==3.1.5
+opentelemetry-api==1.45.1
+psycopg==3.3.6
+psycopg-binary==3.3.6
+pydantic==2.14.0
+pydantic-core==2.50.0
+pydantic-settings==2.15.0
+pyjwt==2.15.1
+python-dotenv==1.2.4
+python-multipart==0.0.32
+pyyaml==6.0.3
+sqlalchemy==2.1.4
+starlette==1.7.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+uvicorn==0.54.0
+uvloop==0.23.0
+watchfiles==1.3.0
+websockets==17.2

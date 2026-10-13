@@ -148,10 +148,6 @@ def update_user(user_id: int, payload: UserPatch, user: SysUser = Depends(get_cu
         target.real_name = payload.real_name
     if payload.active is not None:
         target.active = payload.active
-    password_changed = bool(payload.password)
-    if password_changed:
-        target.password_hash = hash_password(payload.password)
-
     # P2-01：改密和停用都必须让**已签发的**令牌立刻作废。
     #
     # 过去这里只改 password_hash，而 JWT 是自签名的、服务端不存会话，
@@ -159,7 +155,18 @@ def update_user(user_id: int, payload: UserPatch, user: SysUser = Depends(get_cu
     # 最常用的处置实际上没生效：攻击者手里的旧令牌照常读写，最长再活 12 小时。
     # 停用之所以能挡，是因为 active 每次都被查；改密没有对应的那个字段，
     # 这次给它补上（token_version）。
-    if password_changed or payload.active is not None:
+    #
+    # P1-8：**撤销与留痕必须成对出现**。原来的条件是
+    # ``payload.active is not None`` 就 token_version += 1，而审计只在
+    # 字段真的变了时才写 —— 于是 ``PATCH {"active": <当前值>}``（前端表单
+    # 原样回传、或脚本里把现值当默认值带上）会静默作废该用户**所有**在用令牌，
+    # 日志里一条没有。用户表现是「突然被踢下线」，运维查日志查不到任何东西。
+    # 现在只要发生撤销就必写一条，下面的 revoked 就是这个开关。
+    password_changed = bool(payload.password)
+    if password_changed:
+        target.password_hash = hash_password(payload.password)
+    revoked = password_changed or payload.active is not None
+    if revoked:
         target.token_version = (target.token_version or 0) + 1
 
     # P2-03：停用 / 启用 / 改密 / 改姓名过去全部直接提交，一条日志都没有。
@@ -170,14 +177,18 @@ def update_user(user_id: int, payload: UserPatch, user: SysUser = Depends(get_cu
     if payload.active is not None and payload.active != before["active"]:
         did.append("启用账号" if payload.active else "停用账号")
     if password_changed:
-        did.append("重置口令（已撤销该账号全部在用令牌）")
+        did.append("重置口令")
     if payload.real_name is not None and payload.real_name != before["real_name"]:
         did.append("修改姓名")
+    if revoked:
+        # 撤销无条件入账：哪怕这次提交一个字段都没变，**后果**也已经发生了。
+        did.append(f"撤销该账号全部在用令牌（token_version → {target.token_version}）")
     if did:
         log(db, action="UPDATE_USER", entity="user", entity_id=target.id, user=user,
             detail=f"{'、'.join(did)}：{target.username}",
             before=before,
-            after={**_user_snapshot(target), "password_changed": password_changed})
+            after={**_user_snapshot(target), "password_changed": password_changed,
+                   **({"token_version": target.token_version} if revoked else {})})
     db.commit()
     links = _links_by_user(db)
     return _serialize(target, links.get(target.id, {}))
@@ -269,7 +280,18 @@ def all_books(user: SysUser = Depends(get_current_user), db: Session = Depends(g
 @router.get("/audit-logs")
 def audit_logs(limit: int = 100, user: SysUser = Depends(get_current_user),
                db: Session = Depends(get_db)):
-    # 全局审计跨所有账套，普通用户只能看自己账套的（/books/{id}/audit-logs）
+    """**全局**审计流水，仅管理员。
+
+    原注释写的是「普通用户只能看自己账套的（/books/{id}/audit-logs）」，
+    读起来像是这个接口对普通用户是开放的、只是按范围过滤 —— 与实际行为不符：
+    本行下面就是 ``_require_admin(user)``，非管理员一律 403。
+    （``/books/{id}/audit-logs`` 那个接口同样挂着 ``require_admin``，
+    「普通用户能看自己账套的审计」这件事**从来没实现过**，别照着注释去承诺。）
+
+    这里坚持管理员而不是放宽给普通用户：审计快照是每次删除/修改的
+    **完整凭证副本**，跨账套的全局流水更不用说 —— 会计本来就能读自己账套的
+    数据，没道理再读走别人账套的操作痕迹。
+    """
     _require_admin(user)
     rows = db.scalars(select(AuditLog).order_by(AuditLog.id.desc())
                       .limit(min(max(limit, 1), 500))).all()

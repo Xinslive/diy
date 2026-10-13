@@ -62,13 +62,57 @@ export const useSessionStore = defineStore('session', {
         this.user = await authApi.me()
         localStorage.setItem('cwq_user', JSON.stringify(this.user))
       } catch {
-        this.logout()
+        // 令牌已经失效（或 /me 挂了）—— 这是**被清掉**，不是人点的登出。
+        // 所以只清本地、不去补一条 LOGOUT 留痕：那条请求注定 401，
+        // 就算通了也会把「被动失效」记成「本人登出」，审计上反而是假的。
+        this.logout({ remote: false })
       }
     },
-    logout() {
+
+    /**
+     * 登出：**先本地、后远端**。
+     *
+     *  语义（顺序是刻意的）：
+     *   1. 无条件先清本地。断网、服务没起、令牌早就过期 —— 这三种情况下
+     *      远端那条留痕请求必然失败，但人确实已经离开这台机器了，
+     *      把令牌留在浏览器里才是真事故（下一个用这台机器的人拿着它就是登进去）。
+     *      本地清理**同步**完成，不等任何 await，401 拦截器那条路也照样可靠。
+     *   2. 再调后端补一条 LOGOUT 审计。失败**不假装没发生**，也**不拦人**：
+     *      只在控制台记一句「这次没留上痕」，界面照常回登录页。
+     *      为什么这样取舍：本地登出是**人的意图**，一定会发生；留痕是**事后追查用的线索**，
+     *      缺一条只是线索断了一处，反过来把它当成登出的前置条件，
+     *      断网时就会把人锁在登录页之外、逼他反复重试。
+     *
+     *  @param {{remote?: boolean}} [opts] remote=false 只清本地（令牌已失效时用）
+     */
+    async logout(opts = {}) {
+      const token = this.token
+      this.clearLocal()
+      if (opts.remote === false || !token) return
+      try {
+        await authApi.logout(token)
+      } catch (e) {
+        console.warn('[session] 登出留痕未上报（本地已登出，不影响登出本身）', e)
+      }
+    },
+
+    /**
+     * 只清本地状态与 localStorage —— 登出的**全部实际语义**。
+     * 令牌是自签名的、服务端不存会话，所以「登出」在服务端做不了撤销动作，
+     * 丢掉本地的令牌就是全部（后端 logout 的 docstring 写的就是这件事）。
+     * 单独拆出来是为了让每一条「被迫清登录态」的路（401、令牌失效）
+     * 都能复用同一段清法，不必各写一遍。
+     */
+    clearLocal() {
       this.token = ''
       this.user = null
       this.books = []
+      // 期间跟账套是一对：书留着的账套 id（下次登录还能落回去），
+      // 但**期间必须清** —— 上一个用户停在哪一期跟下一个用户无关，
+      // 留着就可能让新用户一进来顶着一个不属于他的期间。periods 一并清掉，
+      // 免得登出后那半秒里顶栏还渲染着上一个人的月份（401 那条路是同步清的）。
+      this.periods = []
+      this.periodId = 0
       localStorage.removeItem('cwq_token')
       localStorage.removeItem('cwq_user')
       localStorage.removeItem('cwq_book')

@@ -29,6 +29,15 @@ from app.core.deps import require_book_write
 #     （见 tests/test_print_template.py::test_只读账套也能预览）
 #   .../openings/parse  只解析成 preview 返回，不落库；落库走 set_openings
 #   .../organize/preview  只算计划不执行，执行走 /organize
+#
+# **豁免的是「写权限」，不是「别的所有维度」。** 清单里的两条 parse/preview
+# 接口曾经只因为「不落库」就被整体放行 —— 于是它们的**容量**维度没人管：
+# ``openings/parse`` 是全项目唯一「一个请求能把进程内存吃光」的入口
+# （``raw = await file.read()`` 无上限 + 整个工作表一次性物化成二维列表），
+# 而只读账号就能打（审计 P1-4）。
+#
+# 所以上传入口的容量守卫**另立一条**，按容量维度覆盖全部 UploadFile 路由，
+# 与这份写权限清单互不代替：``tests/test_upload_capacity_matrix.py``。
 _EXEMPT_EXACT = {
     "/api/books",
     "/api/books/{book_id}/print/preview",

@@ -5,7 +5,7 @@ import { chromium } from 'playwright'
 import { fileURLToPath } from 'node:url'
 
 const BASE = 'http://127.0.0.1:5173'
-const OUT = fileURLToPath(new URL('./.shots/', import.meta.url))
+const OUT = fileURLToPath(new URL('../../.shots/', import.meta.url))
 const fails = []
 const browser = await chromium.launch()
 const page = await browser.newPage({ viewport: { width: 1560, height: 980 } })

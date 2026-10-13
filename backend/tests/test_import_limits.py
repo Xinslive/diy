@@ -126,7 +126,10 @@ def test_超过行数上限被拒(client, auth, book, monkeypatch):
     data = _xlsx(HEADER, _rows(30))   # 60 行数据 + 表头
 
     r = _upload(client, auth, book, data)
-    assert r.status_code == 400, f"超行数的表被放行了：{r.status_code} {r.text}"
+    # 413：三道容量闸统一用 413（审计 P1-4 把闸抽成共享工具之后）。
+    # 原来只有「读取字节数」那一道是 413，行数与凭证数是 400 —— 同一个含义
+    # （这份文件太大了，换个小的再来）却有两个状态码，前端只能按字节那道特判。
+    assert r.status_code == 413, f"超行数的表被放行了：{r.status_code} {r.text}"
     assert "行" in r.json()["detail"]
 
 
@@ -288,3 +291,81 @@ def test_清理不影响别的账套(client, db, auth, admin_user, book):
     assert r.status_code == 200, r.text
     db.expire_all()
     assert db.get(ImportBatch, b.id) is not None, "清理越权到了别的账套"
+
+
+# --------------------------------------------------------------------- 只读 GET 的副作用
+# 审计 P2-22：``GET /vouchers/import`` 是个**只读**接口，却会 DELETE + COMMIT
+# （``purge_stale_batches``）。原来清理排在响应构造之前：序列化批次一旦抛异常，
+# 用户拿到 500，而那一批过期批次**已经被删掉了** —— 一个失败的请求留下了
+# 它不该有的副作用，而且没有任何记录说明删了什么。
+
+
+def test_清理失败不能把导入历史这一页搞成500(client, auth, book, monkeypatch):
+    """清理失败不该让「看导入历史」整页报错。
+
+    过期批次留在库里，下次进来还会再清一次 —— 那是可重试的状态；
+    而 500 不可重试，用户只会以为系统坏了。
+
+    只接**数据库类**失败（``SQLAlchemyError``）：代码本身的 bug 仍然要 500，
+    不能因为「反正只是清理」就把真正的错误一起吞掉。
+    """
+    from sqlalchemy.exc import OperationalError
+
+    from app.accounting import importer
+
+    def boom(*a, **kw):
+        raise OperationalError("DELETE ...", {}, Exception("数据库正好在忙"))
+
+    monkeypatch.setattr(importer, "purge_stale_batches", boom)
+    r = client.get(f"/api/books/{book.id}/vouchers/import", headers=auth)
+    assert r.status_code == 200, r.text
+    assert isinstance(r.json(), list)
+
+
+def test_响应先算好_再清理():
+    """顺序就是这条要求的全部：序列化抛异常时，清理还没开始。
+
+    用桩会话把「序列化必然失败」这件事做成确定事件 ——
+    靠真实数据去撞一个偶发异常，测试就变成碰运气。
+    """
+    from app.api import vouchers as api
+    from app.models import ImportBatch
+
+    calls: list[str] = []
+
+    class _Rows:
+        def all(self):
+            # created_at 为 None → 序列化时 .isoformat() 抛 AttributeError
+            return [ImportBatch(id=1, filename="a.xlsx", status="PENDING", total=0,
+                                ok_count=0, error_count=0, committed_count=0,
+                                message="", created_by="admin", created_at=None)]
+
+    class _Boom:
+        def scalars(self, *a, **kw):
+            return _Rows()
+
+    original = api.svc_import.purge_stale_batches
+    api.svc_import.purge_stale_batches = lambda *a, **kw: calls.append("purge")
+    try:
+        with pytest.raises(AttributeError):
+            api.list_imports(book=object(), db=_Boom())
+    finally:
+        api.svc_import.purge_stale_batches = original
+
+    assert calls == [], f"序列化还没成功就先把批次删了：{calls}"
+
+
+def test_正常路径上清理仍然会被触发(client, auth, book, monkeypatch):
+    """把清理拿掉等于没人负责清过期批次 —— 顺序调整不能顺手把它删了。"""
+    from app.accounting import importer
+
+    calls: list[str] = []
+    original = importer.purge_stale_batches
+    importer.purge_stale_batches = lambda *a, **kw: calls.append("purge")
+    try:
+        r = client.get(f"/api/books/{book.id}/vouchers/import", headers=auth)
+    finally:
+        importer.purge_stale_batches = original
+
+    assert r.status_code == 200, r.text
+    assert calls == ["purge"], "导入历史页不再触发过期清理了"

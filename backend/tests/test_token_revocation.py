@@ -147,3 +147,35 @@ def test_停用与撤销都能追到审计(client, db, admin_user, staff):
     assert r.status_code == 200, r.text
     hits = [x for x in r.json() if x["action"] == "UPDATE_USER" and str(x["entity_id"]) == str(staff.id)]
     assert hits, "改密没有留审计记录"
+
+
+def test_提交与现值相同的active照样撤销且留痕(client, db, admin_user, staff, book):
+    """**P1-8**：静默撤销的闭环。
+
+    原来的条件是「``active`` 非空就 token_version += 1」，而日志只在字段
+    真的变了时才写 —— 前端表单原样回传 ``{"active": true}``、或脚本把现值
+    当默认值带上，都会**当场作废这个人的全部会话**而审计里一条不留。
+
+    这条把两半一起钉住：既撤销（不能为了补日志把撤销取消掉 —— 撤销是
+    P2-01 的安全语义），又留痕。
+    """
+    hdr = _login(client, admin_user.username, "admin123")
+    old = _login(client, staff.username, "staff123")
+    assert client.get(f"/api/books/{book.id}/subjects", headers=old).status_code == 200
+
+    r = client.patch(f"/api/system/users/{staff.id}", headers=hdr,
+                     json={"active": staff.active})
+    assert r.status_code == 200, r.text
+
+    # 一半：令牌确实被撤销了
+    assert client.get(f"/api/books/{book.id}/subjects", headers=old).status_code == 401, (
+        "提交同值 active 应当撤销该账号全部在用令牌")
+
+    # 另一半：并且留了痕
+    logs = client.get("/api/system/audit-logs?limit=50", headers=hdr).json()
+    entry = [x for x in logs if x["action"] == "UPDATE_USER"
+             and str(x["entity_id"]) == str(staff.id)][-1]
+    assert "撤销" in entry["detail"], (
+        f"同值提交撤销了会话却没有留痕：{entry['detail']}")
+    assert entry["after"].get("token_version"), f"撤销后的版本号没进 after：{entry['after']}"
+

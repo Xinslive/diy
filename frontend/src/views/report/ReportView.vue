@@ -33,6 +33,21 @@
         </div>
       </div>
 
+      <!-- 口径提示（后端 notices，唯一的数据契约见 reports/evaluate.py）：
+           本期真的结转过才可能出现。「这个数和总账为什么不一样」——
+           用户自己能看懂这句话，就不必来问「是不是算错了」。
+           README 开头「不存在某个报表和总账对不上」靠的就是**可对账**，不是靠它们相等。 -->
+      <el-alert v-for="(n, i) in data.notices || []" :key="i"
+                :type="noticeType(n)" :closable="false" class="mb no-print">
+        <div>{{ n.text }}</div>
+        <div v-if="n.amount" class="notice-sub">
+          本期结转凭证借方合计 <b class="money">{{ fmt(n.amount) }}</b>
+          <template v-if="n.cols?.length">
+            ；下列{{ colNameOf(n.cols) }}列按**排除结转凭证**的口径取数
+          </template>
+        </div>
+      </el-alert>
+
       <el-alert v-if="data.errors?.length" type="error" :closable="false" class="mb">
         <div v-for="(e, i) in data.errors" :key="i">{{ e }}</div>
       </el-alert>
@@ -45,7 +60,8 @@
               项目
               <span class="addr no-print">{{ staticLetter }}</span>
             </th>
-            <th v-for="c in valueCols" :key="c.col_no" class="c-head" :style="{ width: `${c.width}px` }">
+            <th v-for="c in valueCols" :key="c.col_no" class="c-head" :style="{ width: `${c.width}px` }"
+                :title="colTitle(c)">
               <div class="head-edit no-print">
                 <el-button link size="small" :title="`在 ${c.letter} 列左侧插入`" @click="insertCol(c.col_no)">⊕</el-button>
                 <el-button link size="small" :title="`删除 ${c.letter} 列`" @click="removeCol(c)">✕</el-button>
@@ -53,6 +69,11 @@
               <el-input v-if="designMode" v-model="c.label" size="small" class="col-label"
                         @change="renameCol(c, $event)" />
               <template v-else>{{ c.label }}</template>
+              <!-- 口径角标：这一列走的是**报表口径**（损益取数，排除结转凭证），
+                   与总账 / 科目余额表那个「含结转」的账簿口径差的就是结转凭证。
+                   不标出来，用户只会觉得这个数算错了。 -->
+              <span v-if="c.excludes_carry_forward" class="caliber no-print"
+                    :title="COL_CALIBER_HINT">不含结转</span>
               <div class="addr no-print">{{ c.letter }}</div>
               <div class="col-meta no-print">
                 <el-select v-if="designMode" :model-value="c.kind" size="small"
@@ -160,6 +181,26 @@ const editing = ref(null)
 const editingFormula = ref('')
 const dirty = reactive({})
 
+/* ── 口径标注（审计 P1-15 的前端一半）─────────────────────────────
+ * 账簿引擎有两个**刻意不同**的取数口径：for_ledger（含结转凭证，
+ * 总账 / 科目余额表 / 打印导出用它）与 for_report（损益取数排除结转凭证，
+ * 否则月度结转之后损益类本期净额恒为 0）。差额**恰好是结转凭证金额**。
+ *
+ * 这不是 bug，但必须让人看得见：后端已经把信号发过来了
+ * （cols[].excludes_carry_forward / notices / carry_forward_period_amount），
+ * 这一段只负责把它们**说出来**。没有它，README 开头那句
+ * 「不存在某个报表和总账对不上」在界面上是查证的 —— 用户只会得出
+ * 「这个报表算错了」的结论。 */
+const COL_CALIBER_HINT = '本期金额（不含结转损益）：这一列按损益口径取数，'
+  + '已排除本期结转凭证。与总账 / 科目余额表的差额 = 本期结转凭证金额，不是算错。'
+
+const noticeType = (n) => (n.level === 'error' ? 'error' : n.level === 'warning' ? 'warning' : 'info')
+/** 「本期金额 / 本年累计」这种列名，提示里好让人一眼对上号 */
+const colNameOf = (colNos = []) =>
+  valueCols.value.filter((c) => colNos.includes(c.col_no)).map((c) => `「${c.label}」`).join('、')
+/** 列头 title：带角标的那几列，说清楚它跟账簿差在哪 */
+const colTitle = (c) => (c.excludes_carry_forward ? `${c.label}｜${COL_CALIBER_HINT}` : '')
+
 const labelWidth = 260
 const lastRowNo = computed(() => Math.max(0, ...data.value.rows.map((r) => r.row_no)))
 
@@ -250,7 +291,22 @@ async function saveAll() {
     return { row_no, col_no, formula }
   })
   if (!cells.length) return ElMessage.info('没有改动')
-  await api.saveCells(templateId.value, cells, store.bookId)
+  try {
+    await api.saveCells(templateId.value, cells, store.bookId)
+  } catch (e) {
+    // **公式语法错现在后端当场 400**（以前是 200 存进去、等渲染时某一格蹦红字）。
+    // 这里必须把 detail 摆到人眼前：整批被拒了，一格都没存，
+    // 而「没存」只有一句话说不清 —— 到底是哪个格子、哪一处写法不对。
+    // 改动一律保留（不 reset），人改完再点一次保存即可。
+    const detail = e?.response?.data?.detail
+    const lines = Array.isArray(detail)
+      ? detail.map((d) => d.msg || String(d))
+      : [typeof detail === 'string' ? detail : '保存失败（未改动数据库）']
+    await ElMessageBox.alert(
+      lines.join('\n'), '公式没存进去', { type: 'error', confirmButtonText: '知道了' }
+    ).catch(() => {})
+    return
+  }
   ElMessage.success('公式已保存')
   dirtyKeysReset()
   load()
@@ -425,6 +481,25 @@ th.c-label .addr { margin-left: 4px; }
 .col-label { width: 100%; }
 .col-meta { margin-top: 4px; }
 .col-meta :deep(.el-select) { width: 100%; }
+
+/* 口径角标：小到不抢眼，但一眼能看见「这一列的数跟总账不是同一口径」。
+   打印/导出走的是后端那份模板，这里是屏幕上的说明，所以标 no-print。 */
+.caliber {
+  display: inline-block;
+  margin-top: 3px;
+  padding: 0 4px;
+  border: 1px solid #e6a23c;
+  border-radius: 3px;
+  background: #fdf6ec;
+  color: #b8823b;
+  font-size: 10px;
+  line-height: 15px;
+  font-weight: 400;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.notice-sub { margin-top: 4px; font-size: 12px; }
+.notice-sub .money { font-variant-numeric: tabular-nums; }
 
 th.c-gutter, td.c-gutter { background: #fbfbfc; width: 1%; white-space: nowrap; }
 .gutter { display: flex; align-items: center; gap: 0; }

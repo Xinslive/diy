@@ -13,6 +13,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
@@ -101,14 +102,42 @@ class Entry(Base, TimestampMixin):
 
     __tablename__ = "entry"
     __table_args__ = (
+        # 冗余列不许自己漂：组合外键把 (book_id, period_ord) 钉死在
+        # 「某个账套的某个真实期间」上。它同时**传递地**保证了 book_id
+        # 指向一个真实账套（period.book_id 本身就是 book 的外键），
+        # 所以不再单列 entry.book_id -> book 的外键 —— 两条外键各自挂一个
+        # 触发器，每次写分录都要多走一遍，白花开销换不来第二层保障。
+        #
+        # ON DELETE CASCADE 而不是 RESTRICT：period 本身是 book 的级联下级，
+        # 用 RESTRICT 的话「删账套」会被这条外键卡住（级联删除的中间态里
+        # period 已经没了而 entry 还在）。而 CASCADE 在一致库上是**不可达**的
+        # —— 有分录就必然有凭证，有凭证就必然被 voucher.period_id 那条
+        # NO ACTION 外键先挡住。所以它不会造成 P1-05 那种静默数据损失，
+        # 只会让账套删除能一路走通。
+        ForeignKeyConstraint(
+            ["book_id", "period_ord"], ["period.book_id", "period.ord"],
+            name="fk_entry_book_period", ondelete="CASCADE",
+        ),
+        # 明细账逐科目取数靠它；保留，不能被下面的宽索引取代。
         Index("ix_entry_subject_ord", "book_id", "subject_id", "period_ord"),
+        # 账簿最热的聚合（ledger/engine._query_movements：WHERE book_id = ?
+        # AND period_ord <= ? GROUP BY subject_id, period_ord）专用。
+        # INCLUDE 把聚合要的三列塞进索引里，让它变成 Index Only Scan ——
+        # 实测把 5.7 万行表上的这次聚合从「扫堆 + 读索引」变成纯索引遍历。
+        # 注意它是 CONCURRENTLY 建的（见 0006），所以这里的声明只是让
+        # autogenerate 认得它，别让它再生成一条 DROP INDEX。
+        Index("ix_entry_book_period", "book_id", "period_ord",
+              postgresql_include=["subject_id", "direction", "amount"]),
         Index("ix_entry_voucher", "voucher_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     voucher_id: Mapped[int] = mapped_column(ForeignKey("voucher.id", ondelete="CASCADE"), nullable=False)
     book_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    period_ord: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    # int 而不是 smallint（审计 P2-08）：来源 period.ord 早已是 integer，
+    # 这里再窄一档就等于在一份**派生**列上留了个永远走不到的溢出点。
+    # 派生列与来源列类型不一致，是「模型改了类型、库没跟上」那类化石的同款。
+    period_ord: Mapped[int] = mapped_column(Integer, nullable=False)
     line_no: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     subject_id: Mapped[int] = mapped_column(ForeignKey("subject.id"), nullable=False)
     # DEBIT 借 / CREDIT 贷

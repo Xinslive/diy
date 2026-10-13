@@ -8,7 +8,8 @@ from datetime import datetime
 
 from typing import Optional
 
-from sqlalchemy import (Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, func)
+from sqlalchemy import (Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String,
+                        UniqueConstraint, func)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
@@ -58,7 +59,29 @@ class UserBook(Base, TimestampMixin):
     """
 
     __tablename__ = "sys_user_book"
-    __table_args__ = (UniqueConstraint("user_id", "book_id", name="uq_user_book"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "book_id", name="uq_user_book"),
+        # 角色白名单下沉到数据库（审计 P2-12）。
+        #
+        # 应用层已经改成白名单语义（core/deps.py::is_read_only），但那只挡
+        # 「走 API 的写入者」。CHECK 约束挡的是另一条路：绕过 API 直接改库的
+        # 写入者 —— 那条路上根本没有应用层，原来 ``role == "VIEWER"`` 的
+        # 字面量比较在那里形同虚设，写个 'viewer' 就拿到完整写权限。
+        #
+        # 约束名与表达式必须与迁移 `0005_db_guardrails`（经 db_init.sql 交付）
+        # **逐字一致**：两边分成两套名字的话，Alembic 下次 autogenerate 会
+        # 同时报「库里有库里没有的」和「模型有库里没有的」，把一次改名
+        # 伪装成两条变更。存量脏数据由该迁移按 NOT VALID 挂上去，
+        # 这里只声明结构、不重复处理那批数据。
+        #
+        # 大小写归一化交给应用层（deps.normalize_role）做：库里若出现
+        # 'viewer' 这种值，判定侧一律按只读处理（fail-closed），
+        # 所以不必在库这一层再叠一条大小写约束。
+        CheckConstraint(
+            "role IN ('OWNER', 'ACCOUNTANT', 'VIEWER')",
+            name="ck_sys_user_book_role",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("sys_user.id", ondelete="CASCADE"), nullable=False)

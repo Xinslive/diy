@@ -1,10 +1,10 @@
 /**
  * 导航外壳的三块纯逻辑：路由归属映射（menuKeyOf）、菜单过滤（visibleNav）与
- * 模块落地页（landingOf），加上标签页开关（tabs store）。
+ * 模块落地页（landingOf），加上标签页开关与**持久化**（tabs store）。
  *
  * 关标签的「关完之后该去哪」是最容易写错的地方 —— 关的不是当前标签时不能乱跳，
  * 关的是当前标签时又必须有人接盘，否则页面停在一条已经不存在的标签上。
- * 这里把这几种情形都钉死。
+ * 持久化那一组盯的是另一件事：**只存标签结构，一个令牌都不许带出去**。
  *
  * 用 vite 的 ssrLoadModule 加载**线上那份源码**，不复制逻辑（零新依赖）。
  */
@@ -12,6 +12,16 @@ import { createServer } from 'vite'
 import assert from 'node:assert/strict'
 import { fileURLToPath } from 'node:url'
 import { createPinia, setActivePinia } from 'pinia'
+
+// tabs store 要读写 localStorage（持久化），必须先装好再加载
+globalThis.localStorage = {
+  _m: {},
+  getItem(k) { return this._m[k] ?? null },
+  setItem(k, v) { this._m[k] = String(v) },
+  removeItem(k) { delete this._m[k] }
+}
+const TABS_KEY = 'cwq_tabs'
+const setUser = (id) => localStorage.setItem('cwq_user', JSON.stringify({ id, username: `u${id}` }))
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url))
 const server = await createServer({
@@ -25,7 +35,15 @@ const t = (name, fn) => { try { fn(); console.log('  OK   ' + name); pass++ }
   catch (e) { console.log('  FAIL ' + name + '\n       ' + String(e.message).split('\n')[0]); fail++ } }
 
 const R = (name, path = '/x', title = name) => ({ name, path, meta: { title } })
-const fresh = () => { setActivePinia(createPinia()); return useTabsStore() }
+/** 重新载入页面：新建一个 pinia，store 才会真去读一次存储。
+ *  同一个 pinia 里再调 useTabsStore() 拿到的还是老实例（state 已初始化），
+ *  拿它去验「重开浏览器」会验成空欢喜 —— 那条要测的就是**重新读一次**。 */
+const reload = () => { setActivePinia(createPinia()); return useTabsStore() }
+/** 一个干净的 store：把持久化那份也一起清掉，否则上一条用例的标签会渗进来 */
+const fresh = () => {
+  localStorage.removeItem(TABS_KEY)
+  return reload()
+}
 const keys = (s) => s.opened.map((x) => x.key)
 
 // ---- 菜单结构 ----
@@ -203,6 +221,116 @@ t('只有一条标签时不算「有上一页可关」', () => {
   assert.equal(s.canClosePrev, false)
   s.open(R('subjects'))
   assert.equal(s.canClosePrev, true)
+})
+
+
+console.log('')
+console.log('== P3-10 标签 path 跟住最后一页 + 持久化 ==')
+
+t('自动保存把地址换了：标签记的必须是新地址（关掉再点回来才不是另一张空凭证）', () => {
+  const s = fresh()
+  s.open(R('voucher-new', '/vouchers/new'))
+  // VoucherEdit 保存完只改地址栏、不走 router，所以它显式调一次 open
+  s.open({ name: 'voucher-new', path: '/vouchers/1582' })
+  assert.equal(s.opened.length, 1, '不该多出一条标签')
+  assert.equal(s.opened[0].path, '/vouchers/1582')
+})
+t('path 不对的一律不认（拼错的、空的、协议外地址都不进标签栏）', () => {
+  const s = fresh()
+  s.open({ name: 'balance', path: '' })
+  s.open({ name: 'balance', path: 'http://evil.example/balance' })
+  s.open({ name: 'balance' })
+  assert.equal(s.opened.length, 0)
+})
+t('关掉浏览器再打开：标签原样回来', () => {
+  localStorage.removeItem(TABS_KEY)
+  setUser(7)
+  const s = fresh()
+  s.open(R('balance', '/balance'))
+  s.open(R('voucher-edit', '/vouchers/1582'))
+  const again = reload()                // 模拟重新载入页面：store 重新读一次存储
+  assert.deepEqual(again.opened.map((x) => [x.key, x.path]),
+    [['balance', '/balance'], ['vouchers', '/vouchers/1582']])
+})
+t('关标签 / 关闭其他 / 关闭全部 都同步到存储（不用等刷新才生效）', () => {
+  localStorage.removeItem(TABS_KEY)
+  setUser(7)
+  const s = fresh()
+  s.open(R('balance', '/balance'))
+  s.open(R('subjects', '/subjects'))
+  s.closeOthers('subjects')
+  assert.deepEqual(JSON.parse(localStorage.getItem(TABS_KEY)).opened.map((x) => x.key), ['subjects'])
+  s.closeAll()
+  assert.deepEqual(JSON.parse(localStorage.getItem(TABS_KEY)).opened, [])
+})
+t('登出 reset：存储里那份也一起清掉（下一个用户不该看见上一个开着的页面）', () => {
+  localStorage.removeItem(TABS_KEY)
+  setUser(7)
+  const s = fresh()
+  s.open(R('balance', '/balance'))
+  s.reset()
+  assert.equal(s.opened.length, 0)
+  assert.deepEqual(JSON.parse(localStorage.getItem(TABS_KEY)).opened, [], '存储里还留着上一个用户的标签')
+  assert.equal(reload().opened.length, 0, '重新载入时标签又回来了')
+})
+t('换了个人登录：上一位存下来的标签一份都不恢复', () => {
+  localStorage.removeItem(TABS_KEY)
+  setUser(7)
+  const s = fresh()
+  s.open(R('balance', '/balance'))
+  setUser(9)                              // 同一个浏览器，换了个人登录
+  assert.equal(reload().opened.length, 0)
+})
+t('**持久化里一个令牌都不能有**：只有 key/title/path 三个字段', () => {
+  localStorage.removeItem(TABS_KEY)
+  setUser(7)
+  localStorage.setItem('cwq_token', 'secret-token')
+  const s = fresh()
+  s.open(R('voucher-edit', '/vouchers/1582'))
+  const blob = localStorage.getItem(TABS_KEY)
+  assert.ok(!blob.includes('secret-token'), '令牌被带进标签结构了：' + blob)
+  const parsed = JSON.parse(blob)
+  for (const tab of parsed.opened) {
+    assert.deepEqual(Object.keys(tab).sort(), ['key', 'path', 'title'],
+      `一条标签里多带了字段：${Object.keys(tab).join(',')}`)
+  }
+})
+t('存的是路径，不含 query（query 里可能夹着期间之类的上下文）', () => {
+  localStorage.removeItem(TABS_KEY)
+  setUser(7)
+  const s = fresh()
+  s.open({ name: 'vouchers', path: '/vouchers?period_id=3', fullPath: '/vouchers?period_id=3&token=x' })
+  assert.equal(s.opened[0].path, '/vouchers?period_id=3')
+  assert.ok(!localStorage.getItem(TABS_KEY).includes('token=x'), 'query 被一起存下来了')
+})
+t('存了坏数据（不是 JSON / 版本不对 / 认不出的 key）：就地丢掉重开，不带崩界面', () => {
+  localStorage.removeItem(TABS_KEY)
+  setUser(7)
+  localStorage.setItem(TABS_KEY, '{ 这不是 json')
+  assert.equal(reload().opened.length, 0)
+  localStorage.setItem(TABS_KEY, JSON.stringify({ version: 99, opened: [{ key: 'balance', title: 'x', path: '/balance' }] }))
+  assert.equal(reload().opened.length, 0, '结构版本对不上就该重开，别去猜')
+  localStorage.setItem(TABS_KEY, JSON.stringify({ version: 1, user_id: 7, opened: [{ key: 'no-such-menu', title: 'x', path: '/x' }] }))
+  assert.equal(reload().opened.length, 0, '菜单里没有的 key 不该摆上标签栏')
+})
+t('存储整个不可用（隐私模式）：标签照常开，界面不带崩', () => {
+  setActivePinia(createPinia())
+  const real = globalThis.localStorage
+  globalThis.localStorage = {
+    getItem() { throw new Error('denied') },
+    setItem() { throw new Error('denied') },
+    removeItem() { throw new Error('denied') }
+  }
+  try {
+    const s = useTabsStore()
+    s.open(R('balance', '/balance'))
+    s.open(R('subjects', '/subjects'))
+    assert.deepEqual(keys(s), ['balance', 'subjects'])
+    s.close('balance', 'subjects')
+    assert.deepEqual(keys(s), ['subjects'])
+  } finally {
+    globalThis.localStorage = real
+  }
 })
 
 console.log(`\n通过 ${pass} / 失败 ${fail}`)

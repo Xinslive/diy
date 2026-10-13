@@ -200,3 +200,86 @@ def test_调整成员授权要留审计(client, auth, db, book, plain_user):
     assert plain_user.username in blob or str(plain_user.id) in blob, (
         f"授权审计没点名被改的人：{entry.detail} / {entry.after}")
     assert "VIEWER" in blob, f"新角色没进审计：{entry.detail} / {entry.after}"
+
+
+# --------------------------------------------------------------------- 金额精度
+# 审计 P1-23：审计快照用 float 存金额。
+#
+# 实测 float(Decimal('9999999999999999.99')) == 1e16 —— 而 Numeric(20,2) 的
+# 上界（20 位）远在 float 能无损表示的范围之外。也就是说金额一旦越过千万级，
+# 审计里记下来的**就不是那个数**了。
+#
+# 这张表的立论（models/audit.py 开篇）恰恰是「因为凭证号可复用，日志必须保存
+# 完整快照，否则同一个号码事后无法对应」—— 快照存的不是原数，这句话不成立。
+# 财务删掉一张凭证之后，要靠这条日志把那张凭证对回来；金额差一分就对不上。
+
+
+def _snapshot_of(client, auth, db, book, subjects, amount: str):
+    """建一张凭证再删掉它，返回留在审计里的那份快照。"""
+    r = client.post(f"/api/books/{book.id}/vouchers", headers=auth, json={
+        "voucher_date": "2026-01-15",
+        "entries": [
+            {"subject_id": subjects["100201"].id, "direction": "DEBIT",
+             "amount": amount, "summary": "精度"},
+            {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+             "amount": amount, "summary": "精度"},
+        ],
+    })
+    assert r.status_code == 201, r.text
+    vid = r.json()["id"]
+    assert client.delete(f"/api/books/{book.id}/vouchers/{vid}",
+                         headers=auth).status_code == 200
+    db.expire_all()
+    entry = _last(db, book, "DELETE")
+    assert entry.action == "DELETE"
+    return entry
+
+
+def test_大额凭证的删除快照不丢精度(client, auth, db, book, subjects):
+    """这个数必须**原样**留在审计里：不是 1e16，不是四舍五入过的近似值。"""
+    amount = "9999999999999.99"          # 13 位整数 + 2 位小数，float 已经不够用了
+    entry = _snapshot_of(client, auth, db, book, subjects, amount)
+
+    got = [str(e["amount"]) for e in entry.before["entries"]]
+    assert amount in got, f"快照里的金额不是原数：{got}（before={entry.before}）"
+    assert str(entry.before["debit"]) == amount, (
+        f"合计也丢了精度：{entry.before['debit']}")
+
+
+def test_快照里的金额是十进制文本而不是浮点(client, auth, db, book, subjects):
+    """JSON number 在前端同样会在 2^53 之后失真（审计日志页是前端渲染的）。
+
+    十进制文本是唯一无损载体，``set_openings`` 的期初快照早就是这么存的。
+    """
+    entry = _snapshot_of(client, auth, db, book, subjects, "1234.56")
+    assert isinstance(entry.before["entries"][0]["amount"], str), (
+        f"金额还是 JSON 数字：{entry.before['entries'][0]!r}")
+    assert isinstance(entry.before["debit"], str), (
+        f"合计还是 JSON 数字：{entry.before['debit']!r}")
+
+
+def test_百万级也原样留存(client, auth, db, book, subjects):
+    """顺手钉住「改动」这条路径：before / after 两份快照都不能收窄。"""
+    amount = "87654321.99"
+    r = client.post(f"/api/books/{book.id}/vouchers", headers=auth, json={
+        "voucher_date": "2026-01-15",
+        "entries": [
+            {"subject_id": subjects["100201"].id, "direction": "DEBIT",
+             "amount": amount, "summary": "精度"},
+            {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+             "amount": amount, "summary": "精度"},
+        ],
+    })
+    assert r.status_code == 201, r.text
+    vid = r.json()["id"]
+    assert client.put(f"/api/books/{book.id}/vouchers/{vid}", headers=auth, json={
+        "voucher_date": "2026-01-15", "attachments": 3,
+        "entries": r.json()["entries"],
+    }).status_code == 200
+
+    db.expire_all()
+    entry = _last(db, book, "UPDATE")
+    for side in ("before", "after"):
+        got = getattr(entry, side)["entries"][0]["amount"]
+        assert Decimal(str(got)) == Decimal(amount), \
+            f"{side} 快照的金额不是原数：{got!r}"

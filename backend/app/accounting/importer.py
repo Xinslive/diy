@@ -20,7 +20,9 @@ Excel 里一张凭证连着几行分录的常见排版。
 ---------------------
 导入是这套系统里唯一「一个请求能把整个进程的内存吃光」的入口：
 解析器把每一张凭证、每一条分录、每一条错误都累积进列表，
-最后整包写进 ``import_batch.payload``。因此设了三道闸：
+最后整包写进 ``import_batch.payload``。因此设了三道闸 —— 而闸本身住在
+``app/core/uploads.py``，**期初余额解析（openings/parse）共用同一套**
+（审计 P1-4：同一种入口曾在这里有三道、在那里一道都没有）：
 
     1. 接口层限制**读取字节数**（不把大文件读进内存）；
     2. 解析前按 zip 目录里的声明大小预检**解压后体量**（xlsx 就是 zip，
@@ -35,7 +37,6 @@ Excel 里一张凭证连着几行分录的常见排版。
 from __future__ import annotations
 
 import io
-import zipfile
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -46,6 +47,8 @@ from sqlalchemy.orm import Session
 from app.accounting.audit_helper import log
 from app.accounting.util import money
 from app.core.config import settings
+from app.core.uploads import (RowBudget, UploadTooLarge, check_archive_size,
+                              read_upload)
 from app.models import ImportBatch, Subject, SysUser
 
 # 字段别名：内部键 -> 可接受的表头（小写、已去空格）
@@ -161,37 +164,15 @@ def _subject_index(db: Session, book_id: int) -> tuple[dict[str, Subject], dict[
 # --------------------------------------------------------------------- 容量边界
 
 
-def _human(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n}B"
-
-
-def check_archive_size(data: bytes) -> None:
-    """按 zip 目录里**声明的**解压大小预检，不真正解压（审计 P2-02）。
-
-    xlsx 是 zip。一份几百 KB 的文件完全可以解压出几百 MB 的 XML ——
-    「上传大小没超限」在这条路上不构成任何保护。这里读 zip 的中央目录
-    （``ZipFile`` 只解析目录，不读文件内容）把各成员的 file_size 加起来，
-    超了就拒。
-
-    只能当**第一道**闸：中央目录里的 size 是可以随便写的。真正的兜底是
-    解析时逐行计数（:func:`parse_workbook` 里的行数与凭证数上限）。
-
-    不是 zip 就直接放行 —— 解析器稍后会自己报「无法读取 Excel 文件」。
-    """
-    limit = settings.import_max_unzipped_bytes
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            total = sum(info.file_size for info in zf.infolist())
-    except (zipfile.BadZipFile, OSError):
-        return  # 不是 zip（或已经坏到读不了目录）：交给解析器报错
-    if total > limit:
-        raise ValueError(
-            f"Excel 解压后约 {_human(total)}，超过上限 {_human(limit)}。"
-            "请拆成多份分别导入，或删除与本表无关的工作表后重试")
+# 容量闸本身在 app/core/uploads.py —— 期初余额解析共用同一套（审计 P1-4）。
+# 下面两个名字只为兼容既有用法与测试：``check_archive_size`` 曾是本模块的私有
+# 函数，现在是共享工具的转出（同一个对象，不是复制品 —— 两条上传入口共用一把尺，
+# 这一点必须靠「同一个函数」保证，而不是靠两处代码写得一样）。
+__all__ = [
+    "ALIASES", "UploadTooLarge", "check_archive_size", "commit", "discard",
+    "map_columns", "parse_workbook", "purge_stale_batches", "read_upload",
+    "stage",
+]
 
 
 # --------------------------------------------------------------------- 解析
@@ -243,6 +224,9 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
     errors: list[dict] = []
     current: dict | None = None
     line_no = 1
+    rows_budget = RowBudget(
+        settings.import_max_rows,
+        hint="请按期间或按凭证类别拆成多份分别导入")
 
     def close_current() -> None:
         nonlocal current
@@ -278,10 +262,7 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
         # 行数与凭证数的上限在**遍历过程中**判，而不是先 count 一遍：
         # 先 count 照样会把整个工作表读进内存，那正是要防的事。
         # 触发上限时立刻中止解析并抛错，调用方回滚，暂存表里不留残骸。
-        if line_no > settings.import_max_rows:
-            raise ValueError(
-                f"这份表超过 {settings.import_max_rows} 行，超过单次导入上限。"
-                "请按期间或按凭证类别拆成多份分别导入")
+        rows_budget.tick()
         if row is None or all(c in (None, "") for c in row):
             continue
 
@@ -528,7 +509,16 @@ def commit(db: Session, batch: ImportBatch, user: SysUser) -> dict:
                 commit=False,
             )
             created += 1
-        except ValueError as exc:
+        except (ValueError, ArithmeticError) as exc:
+            # ArithmeticError 是 Decimal 异常族的公共祖先（InvalidOperation /
+            # DivisionByZero / Overflow 都从它出），**不是 ValueError 的子类**。
+            # 这里原来只接 ValueError，于是金额侧的 Decimal 异常直接穿透到
+            # 500。服务层的 money() 已经把它们翻译成 ValueError 了，这一行是
+            # 第二道：将来有人绕过 money() 直接 Decimal(...)，也不会 500。
+            #
+            # 凭证号撞车也走这条路：``create_voucher`` 里那次占用检查没有锁，
+            # 并发时两个人会拿到同一个号，数据库抛 IntegrityError，
+            # 由服务层翻成「凭证号已经有一张了」的人话（审计 P1-3）。
             failed.append({"line": v["line"], "voucher_no": v.get("voucher_no"), "error": str(exc)})
 
     if failed:
@@ -542,7 +532,13 @@ def commit(db: Session, batch: ImportBatch, user: SysUser) -> dict:
 
     batch.status = "COMMITTED"
     batch.committed_count = created
-    batch.committed_at = datetime.now()
+    # 时间一律写 UTC（审计 P2-23）。原来是 ``datetime.now()`` —— 本地 naive 时间，
+    # 而列是 ``DateTime(timezone=True)``：psycopg 会按数据库会话的 TimeZone 把它
+    # 当成本地时间解释，同一份数据在不同部署的时区下会偏掉 8 小时。
+    # ``created_at`` 由 server_default now() 给（UTC），``purge_stale_batches``
+    # 的 TTL 清理也拿 UTC 的 cutoff 比 —— 两边必须同一个时区，否则过期批次
+    # 要么永远清不掉、要么刚上传就被清。
+    batch.committed_at = datetime.now(timezone.utc)
     batch.committed_by = user.username
     # P2-02：凭证已经入库，payload 里的分录正文没有存在理由了。
     # 先算摘要再清：下面的 log() 不用 payload，但将来有人想在这里加统计，

@@ -16,23 +16,51 @@ from app.core.deps import get_current_user, get_my_book, require_book_write
 from app.models import (Book, Period, ReportCell, ReportCol, ReportResult, ReportRow,
                      ReportTemplate, SysUser, UserBook)
 from app.reports.evaluate import COL_KINDS
-from app.reports.formula import no_to_col, rewrite_refs
+from app.reports.formula import FormulaError, Parser, no_to_col, rewrite_refs
 
 router = APIRouter(prefix="/api/reports", tags=["报表"])
 
 
+def require_report_reader(
+    db: Session = Depends(get_db),
+    user: SysUser = Depends(get_current_user),
+) -> SysUser:
+    """读报表模板：**登录 + 至少对一个账套有授权**（审计 P2-13）。
+
+    以前只要求登录，于是自助注册出来的空账号（一个账套都没有）能把
+    ``/templates`` 和 ``/{id}/design`` 全读一遍 —— 资产负债表的科目排列
+    和取数公式就等于把这家单位怎么算账公开了。
+
+    fail-closed：没有任何账套授权的账号对模板**没有正当需求**，一律拒绝，
+    不做「模板是全局的所以谁都能看」的放行。管理员放行（系统管理员本来就能
+    从 ``/api/system/*`` 看到全部账套）。
+
+    仍然挂 ``get_current_user``（作为依赖被它链进来），所以
+    ``tests/test_report_design_auth.py::test_报表接口全部要求登录``
+    那条静态守卫照旧成立。
+    """
+    if user.is_admin:
+        return user
+    if db.scalar(select(UserBook.id).where(UserBook.user_id == user.id).limit(1)) is None:
+        raise HTTPException(403, "还没有任何账套授权，无法查看报表模板")
+    return user
+
+
 @router.get("/templates")
-def templates(db: Session = Depends(get_db), user: SysUser = Depends(get_current_user)):
-    """报表模板列表：要求登录。
+def templates(db: Session = Depends(get_db),
+              user: SysUser = Depends(require_report_reader)):
+    """报表模板列表：要求登录**且至少有一个账套授权**（审计 P3-09 / P2-13）。
 
     审计 P3-09 原判 C 级「待产品确认」，理由是模板跨账套共享。
     这里的结论是「跨账套共享」≠「对外部公开」：
 
     * 共享指的是同一次部署内多个账套复用同一套模板，背后还是同一批会计；
     * 模板的行、列、单元格公式就是这套单位算账的口径，属于内部经营信息；
-    * 前端不存在合法的匿名消费方 —— 报表设计页在应用外壳内，必然已登录。
+    * 前端不存在合法的匿名消费方 —— 报表设计页在应用外壳内，必然已登录；
+    * 连**一个账套都没有**的账号也不该看：它不属于任何一家单位。
 
-    所以加登录校验对现有流程零影响，只挡掉设计意图之外的调用。
+    所以加「登录 + 至少一个账套授权」对现有流程零影响（前端每个用户至少
+    有一个账套），只挡掉设计意图之外的调用。
     静态守卫见 ``tests/test_report_design_auth.py::test_报表接口全部要求登录``。
     """
     _ = user
@@ -41,26 +69,55 @@ def templates(db: Session = Depends(get_db), user: SysUser = Depends(get_current
              "is_builtin": t.is_builtin, "remark": t.remark} for t in rows]
 
 
-def _can_write(db: Session, user: SysUser, book_id: int | None = None) -> bool:
-    """报表模板跨账套共享，因此只要用户对任一账套有**写**权限即可修改。
+def _require_template_write(db: Session, user: SysUser, book_id: int | None) -> None:
+    """改报表模板 = 改**全局**口径：要求「明确的账套 + 该账套的 OWNER」。
 
-    这里原来只查「有没有这条授权」，没查角色 —— 于是 VIEWER（只读）也能改公式、
-    增删行列。授权存在 ≠ 有权写，少了 role 这一层判断，整套只读模型在这条路径上
-    就形同虚设。补上 ``role != "VIEWER"``。
+    审计 P1-5：``book_id`` 以前是**可选**查询参数，缺省时条件退化成
+    「该用户在任意账套非 VIEWER」。于是「在账套 B 是会计、在账套 A 是只读」
+    的人不带 ``book_id`` 调 ``POST /api/reports/templates`` 就能过门禁，
+    改写出账套 A 也在用的全局公式 —— 模板是全局的，门却只看一个无关账套的角色。
+
+    两道 fail-closed 的闸：
+
+    1. **必须显式给 book_id**。没有目标账套就没有「以谁的身份改全局口径」
+       这件事，缺省放行等于把门重新打开。管理员也不例外：目标账套还要进
+       审计日志的 ``book_id`` 列。
+    2. **要求 OWNER**，不认「不是 VIEWER 就放行」这种黑名单判断。
+       角色认不出来一律当拒绝（与 ``printing._require_global_template_write``
+       同一套推理，也与 ``frontend/src/stores/session.js::canWrite`` 一致）。
+
+    **为什么必须与打印侧一致**：``report_template`` 和 ``print_template``
+    一样没有 ``book_id``、一样被所有账套共用、一样要全局生效。打印侧第一批
+    已经按「全局资源的全局门禁」收紧（``printing.py:261``），报表侧还停在
+    「任一可写账套」就是同一个漏洞在两个入口各留了一份。现在两边都是
+    「显式账套 + OWNER + 管理员放行」。
+
+    这是**应用层**的收紧，不是根治：根治同样是给模板加 ``book_id``，
+    那需要一条 Alembic revision，归迁移工作包。
     """
-    stmt = select(UserBook).where(UserBook.user_id == user.id, UserBook.role != "VIEWER")
-    if book_id:
-        stmt = stmt.where(UserBook.book_id == book_id)
-    return db.scalar(stmt.limit(1)) is not None
+    if book_id is None:
+        raise HTTPException(
+            400, "报表模板是全局模板（所有账套共用同一套公式），"
+                 "必须用 book_id 指明你以哪个账套的身份修改")
+    link = db.scalar(select(UserBook).where(
+        UserBook.user_id == user.id, UserBook.book_id == book_id))
+    if link is None:
+        raise HTTPException(403, "没有该账套的访问权限")
+    if user.is_admin:
+        return
+    if link.role != "OWNER":
+        raise HTTPException(
+            403, "报表公式是全局口径（所有账套都按这套公式出数），"
+                 "只有账套所有者或管理员可以修改")
 
 
 @router.get("/{template_id}/design")
 def design(template_id: int, db: Session = Depends(get_db),
-           user: SysUser = Depends(get_current_user)):
-    """模板的行 / 列 / 单元格公式结构：要求登录（审计 P3-09，理由同 ``templates``）。
+           user: SysUser = Depends(require_report_reader)):
+    """模板的行 / 列 / 单元格公式结构：要求登录且有账套授权（理由同 ``templates``）。
 
     这里返回的是取数公式本身 —— 比报表名和科目名更能说明一家单位怎么算账，
-    所以这条比 ``/templates`` 更不该匿名开放。
+    所以这条比 ``/templates`` 更不该对「不属于任何账套的人」开放。
     """
     _ = user
     tpl = db.get(ReportTemplate, template_id)
@@ -98,14 +155,41 @@ def render(template_id: int, book_id: int, period_id: int, db: Session = Depends
     return data
 
 
+def _check_formula(src: str, row_no: int, col_no: int) -> None:
+    """存之前先过一遍**语法**（只解析，不求值，所以不碰数据库）。
+
+    为什么不能只靠渲染期兜底：渲染是**逐格**的，一个语法错的格子只是那一格
+    显示一行红字，可它已经把整张表变成「有错」状态；而用户改完公式保存时
+    什么提示都没有，第二天才在报表页看到。存的时候拦一下，错误出现在
+    **输入的那一刻**，400 + 能照着改的文案。
+
+    只查语法是有意的：``科目("还没建的编码", ...)`` 语法没问题，只是现在
+    取不到数 —— 那是求值期的事，拦住它会让「先建公式再补科目」这种正常
+    做法没法保存。
+    """
+    if not (src or "").strip():
+        return
+    try:
+        Parser(src).parse()
+    except FormulaError as e:
+        raise HTTPException(
+            400, f"第 {row_no} 行 / {col_no} 列的公式语法错误：{e}") from None
+
+
 @router.put("/{template_id}/cells")
 def save_cells(template_id: int, payload: list[CellIn], db: Session = Depends(get_db),
                book_id: Optional[int] = None, user=Depends(get_current_user)):
-    """报表模板是跨账套的，改公式只需具备任一账套的写权限。"""
+    """改单元格公式。报表模板是**全局**的，所以门禁按全局资源收紧：
+    要求显式 ``book_id`` 且在该账套是 OWNER（``_require_template_write``）。
+
+    公式本身先过一遍语法（``_check_formula``）：语法错的公式存不进去，
+    而不是存进去、等报表渲染时才在某一格蹦出一行红字。
+    """
     if db.get(ReportTemplate, template_id) is None:
         raise HTTPException(404, "报表模板不存在")
-    if not _can_write(db, user, book_id):
-        raise HTTPException(403, "没有可写账套的权限")
+    _require_template_write(db, user, book_id)
+    for item in payload:
+        _check_formula(item.formula, item.row_no, item.col_no)
 
     # P3-10：改公式必须留 before。公式写错一个字符，报表就会悄无声息地
     # 少算一列，而页面照样渲染得出来 —— 没有原公式根本无从判断是哪改坏的。
@@ -274,18 +358,24 @@ def _shift_cols(db: Session, template_id: int, at: int, direction: int):
         raise
 
 
-def _rewrite_formulas(db: Session, template_id: int, *, row_shift=None, col_shift=None) -> int:
+def _rewrite_formulas(db: Session, template_id: int, *, row_shift=None, col_shift=None,
+                      drop_row: int | None = None, drop_col: int | None = None) -> int:
     """行列位移后，把整张表的公式引用同步改一遍。
 
     要改的是**全部**单元格，不只是被挪动的那些：第 5 行的公式完全可能引用
     第 20 行。只改被挪的格子，另一半引用会静默失准。
+
+    ``drop_row`` / ``drop_col`` 是被删掉的那一行/列 —— 指向它的引用按 0
+    处理而不是跟着上移（审计 P1-13：以前删第 35 行，引用 ``B35`` 的公式会
+    静默指向原第 34 行，报表照常渲染出一个错误的数字）。
 
     返回改写条数（公式为空或没被引用影响的不算）。
     """
     touched = 0
     for c in db.scalars(select(ReportCell)
                         .where(ReportCell.template_id == template_id)).all():
-        new = rewrite_refs(c.formula, row_shift=row_shift, col_shift=col_shift)
+        new = rewrite_refs(c.formula, row_shift=row_shift, col_shift=col_shift,
+                           drop_row=drop_row, drop_col=drop_col)
         if new != c.formula:
             c.formula = new
             touched += 1
@@ -308,8 +398,7 @@ def _clone_skeleton(db: Session, src_id: int, dst_id: int) -> None:
 def create_template(payload: ReportTemplateIn, book_id: Optional[int] = None,
                     user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
     """新建报表模板：复制一份内置表结构，财务在此基础上改公式。"""
-    if not _can_write(db, user, book_id):
-        raise HTTPException(403, "没有可写账套的权限")
+    _require_template_write(db, user, book_id)
     tpl = ReportTemplate(code=f"CUSTOM_{uuid.uuid4().hex[:10].upper()}",
                          name=payload.name, type="CUSTOM",
                          remark=payload.remark, is_builtin=False)
@@ -327,8 +416,7 @@ def create_template(payload: ReportTemplateIn, book_id: Optional[int] = None,
 def copy_template(template_id: int, name: Optional[str] = None, book_id: Optional[int] = None,
                   user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
     """复制模板（含全部公式）。改公式前先留底，财务自己就能做。"""
-    if not _can_write(db, user, book_id):
-        raise HTTPException(403, "没有可写账套的权限")
+    _require_template_write(db, user, book_id)
     src = db.get(ReportTemplate, template_id)
     if src is None:
         raise HTTPException(404, "报表模板不存在")
@@ -346,8 +434,7 @@ def copy_template(template_id: int, name: Optional[str] = None, book_id: Optiona
 def update_template(template_id: int, payload: ReportTemplatePatch,
                     book_id: Optional[int] = None, user: SysUser = Depends(get_current_user),
                     db: Session = Depends(get_db)):
-    if not _can_write(db, user, book_id):
-        raise HTTPException(403, "没有可写账套的权限")
+    _require_template_write(db, user, book_id)
     tpl = db.get(ReportTemplate, template_id)
     if tpl is None:
         raise HTTPException(404, "报表模板不存在")
@@ -362,8 +449,7 @@ def update_template(template_id: int, payload: ReportTemplatePatch,
 @router.delete("/templates/{template_id}")
 def delete_template(template_id: int, book_id: Optional[int] = None,
                     user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    if not _can_write(db, user, book_id):
-        raise HTTPException(403, "没有可写账套的权限")
+    _require_template_write(db, user, book_id)
     tpl = db.get(ReportTemplate, template_id)
     if tpl is None:
         raise HTTPException(404, "报表模板不存在")
@@ -381,8 +467,7 @@ def update_row(template_id: int, row_no: int, payload: ReportRowPatch, book_id: 
 
     只靠插删行拼不出想要的表 —— 「合计行加粗」「几行不打印」都得能单独调。
     """
-    if not _can_write(db, user, book_id):
-        raise HTTPException(403, "没有可写账套的权限")
+    _require_template_write(db, user, book_id)
     row = db.scalar(select(ReportRow).where(ReportRow.template_id == template_id,
                                              ReportRow.row_no == row_no))
     if row is None:
@@ -405,8 +490,7 @@ def update_row(template_id: int, row_no: int, payload: ReportRowPatch, book_id: 
 def add_row(template_id: int, payload: dict, book_id: Optional[int] = None,
             user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
     """在指定位置插入一行，下方行的公式单元格整体下移，公式内容不变。"""
-    if not _can_write(db, user, book_id):
-        raise HTTPException(403, "没有可写账套的权限")
+    _require_template_write(db, user, book_id)
     if db.get(ReportTemplate, template_id) is None:
         raise HTTPException(404, "报表模板不存在")
     rows = list(db.scalars(select(ReportRow).where(ReportRow.template_id == template_id)
@@ -430,8 +514,7 @@ def add_row(template_id: int, payload: dict, book_id: Optional[int] = None,
 @router.delete("/templates/{template_id}/rows/{row_no}")
 def delete_row(template_id: int, row_no: int, book_id: Optional[int] = None,
                user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    if not _can_write(db, user, book_id):
-        raise HTTPException(403, "没有可写账套的权限")
+    _require_template_write(db, user, book_id)
     row = db.scalar(select(ReportRow).where(ReportRow.template_id == template_id,
                                              ReportRow.row_no == row_no))
     if row is None:
@@ -443,8 +526,10 @@ def delete_row(template_id: int, row_no: int, book_id: Optional[int] = None,
         db.delete(row)
         for c in doomed:
             db.delete(c)
-    # 删除用 at+1：被删掉的行号本身不再参与映射
-    shifted = _rewrite_formulas(db, template_id, row_shift=(row_no + 1, -1))
+    # 删除用 at+1 做位移（被删掉的行号本身不参与映射），同时把 drop_row 交给
+    # 改写器：引用被删行的公式按 0 处理，绝不静默别名到相邻行（审计 P1-13）。
+    shifted = _rewrite_formulas(db, template_id, row_shift=(row_no + 1, -1),
+                                drop_row=row_no)
     db.commit()
     return {"ok": True, "deleted_cells": len(doomed), "formulas_shifted": shifted}
 
@@ -460,8 +545,7 @@ def delete_row(template_id: int, row_no: int, book_id: Optional[int] = None,
 def add_col(template_id: int, payload: dict, book_id: Optional[int] = None,
             user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
     """在指定位置插入一列。默认沿用左边那一列的取数口径。"""
-    if not _can_write(db, user, book_id):
-        raise HTTPException(403, "没有可写账套的权限")
+    _require_template_write(db, user, book_id)
     if db.get(ReportTemplate, template_id) is None:
         raise HTTPException(404, "报表模板不存在")
     cols = list(db.scalars(select(ReportCol).where(ReportCol.template_id == template_id)
@@ -495,8 +579,7 @@ def add_col(template_id: int, payload: dict, book_id: Optional[int] = None,
 @router.patch("/templates/{template_id}/cols/{col_no}")
 def update_col(template_id: int, col_no: int, payload: ReportColPatch, book_id: Optional[int] = None,
                user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    if not _can_write(db, user, book_id):
-        raise HTTPException(403, "没有可写账套的权限")
+    _require_template_write(db, user, book_id)
     col = db.scalar(select(ReportCol).where(ReportCol.template_id == template_id,
                                              ReportCol.col_no == col_no))
     if col is None:
@@ -518,8 +601,7 @@ def update_col(template_id: int, col_no: int, payload: ReportColPatch, book_id: 
 @router.delete("/templates/{template_id}/cols/{col_no}")
 def delete_col(template_id: int, col_no: int, book_id: Optional[int] = None,
                user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    if not _can_write(db, user, book_id):
-        raise HTTPException(403, "没有可写账套的权限")
+    _require_template_write(db, user, book_id)
     col = db.scalar(select(ReportCol).where(ReportCol.template_id == template_id,
                                              ReportCol.col_no == col_no))
     if col is None:
@@ -539,6 +621,9 @@ def delete_col(template_id: int, col_no: int, book_id: Optional[int] = None,
         db.delete(col)
         for c in doomed:
             db.delete(c)
-    shifted = _rewrite_formulas(db, template_id, col_shift=(col_no + 1, -1))
+    # 列与行是同一个 bug（审计 P1-13）：删列以前也只做了位移，
+    # 引用被删列的公式会静默指向左边挪过来的那一列。
+    shifted = _rewrite_formulas(db, template_id, col_shift=(col_no + 1, -1),
+                                drop_col=col_no)
     db.commit()
     return {"ok": True, "deleted_cells": len(doomed), "formulas_shifted": shifted}

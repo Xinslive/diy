@@ -871,3 +871,313 @@ def test_合计口径_正负相抵的凭证按平处理(db, book, admin_user, su
     # 存下来了，四条分录原样保留（红字的负号没被吃掉）
     assert [str(e.amount) for e in v.entries] == \
         ["100.00", "-100.00", "50.00", "-50.00"]
+
+
+# ===================================================================== 金额量级
+# 审计 P1-21：``amount: 1e30`` 曾把整张凭证打成 HTTP 500。
+#
+# ``decimal.InvalidOperation`` 的祖先链是 InvalidOperation → DecimalException →
+# **ArithmeticError** → Exception —— 它**不是 ValueError 的子类**。而这条链上
+# 全是 ``except ValueError``，于是用户填错一个数，服务端回他一个「服务器错误」，
+# 而且整张凭证的校验在半路中断。
+
+
+@pytest.mark.parametrize("bad", [1e30, "1e30"])
+def test_金额量级越界被拒_不是500(client, auth, book, subjects, bad):
+    """Decimal 异常必须落在 400 上 —— 500 的含义是「服务端坏了」，
+    而这里服务端好得很，是用户填了一个不可能的数。
+
+    ``1e30`` 原来得到的是 500：``money()`` 抛 InvalidOperation，
+    而路由只写 ``except ValueError``，InvalidOperation 不是它的子类。
+    """
+    entries = _entries(subjects, [("100201", bad, "x")], [("600101", 100, "x")])
+    r = client.post(f"/api/books/{book.id}/vouchers", headers=auth,
+                    json={"voucher_date": "2026-01-15", "entries": entries})
+    assert r.status_code == 400, f"金额 {bad!r} 得到了 {r.status_code}：{r.text}"
+    assert "金额" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+def test_NaN与无穷大被拒_不是500(client, auth, book, subjects, bad):
+    """这两种由 Pydantic 在请求体校验那一步就挡掉（422）。
+
+    特别值得钉的一条：``Decimal('NaN').quantize(...)`` **不抛异常**，
+    它返回的还是 NaN，而 NaN 的任何比较都为 False —— 也就是说
+    ``dr != cr`` 永远不成立，一张「NaN 凭证」本来能一路存进库里。
+    """
+    entries = _entries(subjects, [("100201", bad, "x")], [("600101", 100, "x")])
+    r = client.post(f"/api/books/{book.id}/vouchers", headers=auth,
+                    json={"voucher_date": "2026-01-15", "entries": entries})
+    assert r.status_code in (400, 422), f"金额 {bad!r} 得到了 {r.status_code}：{r.text}"
+
+
+def test_金额量级越界时凭证没有落库(client, db, auth, book, subjects):
+    """拒绝要干净：不能留下一张「半张凭证」。"""
+    before = db.scalar(select(func.count()).select_from(Voucher))
+    entries = _entries(subjects, [("100201", 1e30, "x")], [("600101", 1e30, "x")])
+    client.post(f"/api/books/{book.id}/vouchers", headers=auth,
+                json={"voucher_date": "2026-01-15", "entries": entries})
+    db.expire_all()
+    assert db.scalar(select(func.count()).select_from(Voucher)) == before
+
+
+def test_正常的大额仍然能存(client, db, auth, book, subjects):
+    """量级上限不能误伤：Numeric(20,2) 的上界之内照常落库。"""
+    big = "9999999999999.99"
+    entries = _entries(subjects, [("100201", big, "x")], [("600101", big, "x")])
+    r = client.post(f"/api/books/{book.id}/vouchers", headers=auth,
+                    json={"voucher_date": "2026-01-15", "entries": entries})
+    assert r.status_code == 201, f"千万级金额被拒了：{r.status_code} {r.text}"
+    assert r.json()["total_debit"] == big
+
+
+# ===================================================================== 历史非末级分录
+# 审计 P2-21。
+#
+# 报告原话是「is_leaf 服务端不读、是派生的」，**与实际不符**：服务端既算也强制
+# （``_validate_entries`` 拒非末级），而 ``update_voucher`` 无条件调用它。
+#
+# 真实症状：一张历史上合法、后来其科目被加了子科目的老凭证（含非末级分录），
+# 现在**连只改附单据数都存不下去** —— 400。前端松开硬拦没有用，症状在后端。
+
+
+def _legacy_voucher_with_non_leaf(db, book, subjects, admin_user):
+    """造一张「末级校验之前就存在」的老凭证：分录挂在非末级的 1002 上。
+
+    直接写库，而不是走 ``create_voucher`` —— 走服务层现在会被拒（这是对的）。
+    我们要的是「历史数据长这样」，不是「现在还能这么建」。
+    """
+    from app.accounting.util import find_period
+    from app.models import Entry, Voucher
+
+    p = find_period(db, book.id, date(2026, 1, 15))
+    v = Voucher(book_id=book.id, period_id=p.id, voucher_no="记001",
+                voucher_date=date(2026, 1, 15), status="UNPOSTED", source="MANUAL",
+                remark="老凭证", attachments=1, created_by=admin_user.username)
+    db.add(v)
+    db.flush()
+    db.add(Entry(voucher_id=v.id, line_no=1, subject_id=subjects["1002"].id,
+                 direction="DEBIT", amount=Decimal("100.00"), summary="历史"))
+    db.add(Entry(voucher_id=v.id, line_no=2, subject_id=subjects["600101"].id,
+                 direction="CREDIT", amount=Decimal("100.00"), summary="历史"))
+    db.commit()
+    db.expire_all()
+    return db.get(Voucher, v.id)
+
+
+def _put(client, auth, book, v, entries, **extra):
+    body = {"voucher_date": "2026-01-15", "entries": entries}
+    body.update(extra)
+    return client.put(f"/api/books/{book.id}/vouchers/{v.id}", headers=auth, json=body)
+
+
+def test_老凭证含非末级分录_只改附单据数能存下去(client, auth, db, book, subjects,
+                                               admin_user):
+    """症状本身：前端只改了「附单据数」，后端却因为另一条**没动的**分录拒了整张。"""
+    v = _legacy_voucher_with_non_leaf(db, book, subjects, admin_user)
+    entries = [
+        {"subject_id": subjects["1002"].id, "direction": "DEBIT",
+         "amount": "100.00", "summary": "历史"},
+        {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+         "amount": "100.00", "summary": "历史"},
+    ]
+    r = _put(client, auth, book, v, entries, attachments=7)
+    assert r.status_code == 200, (
+        f"只改附单据数却被拒 —— 这条分录根本没动：{r.status_code} {r.text}")
+    assert r.json()["attachments"] == 7
+    assert len(r.json()["entries"]) == 2, "分录不该被这条豁免顺手改掉"
+
+
+def test_豁免走过的凭证在审计里留痕(client, auth, db, book, subjects, admin_user):
+    """放行必须是**可追溯**的：事后有人问「这张怎么还能改」，答案在日志里。"""
+    from app.models import AuditLog
+
+    v = _legacy_voucher_with_non_leaf(db, book, subjects, admin_user)
+    entries = [
+        {"subject_id": subjects["1002"].id, "direction": "DEBIT",
+         "amount": "100.00", "summary": "历史"},
+        {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+         "amount": "100.00", "summary": "历史"},
+    ]
+    _put(client, auth, book, v, entries, attachments=7)
+
+    db.expire_all()
+    # 按 id 倒序取最新一条：`.all()[-1]` 没有 ORDER BY 时拿到的是物理顺序里的
+    # 最后一行，SELECT 不保证那是最新写入的那条（同 test_login_lockout 的坑）。
+    row = db.scalars(
+        select(AuditLog)
+        .where(AuditLog.entity_id == str(v.id), AuditLog.action == "UPDATE")
+        .order_by(AuditLog.id.desc())
+    ).first()
+    assert row is not None, "这次豁免修改没有留下审计"
+    assert "非末级" in row.detail, f"豁免没有留痕：{row.detail}"
+
+
+def test_新增一条非末级分录仍被拒(client, auth, db, book, subjects, admin_user):
+    """口子只对「原样保留」开。**新增**挂在非末级科目上的分录照样 400 ——
+    这是 fail-closed 的底线：历史不被锁死，新错也不许进。"""
+    v = _legacy_voucher_with_non_leaf(db, book, subjects, admin_user)
+    entries = [
+        {"subject_id": subjects["1002"].id, "direction": "DEBIT",
+         "amount": "100.00", "summary": "历史"},
+        {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+         "amount": "100.00", "summary": "历史"},
+        # 老凭证里并没有这一条：它新指向了非末级的 1002
+        {"subject_id": subjects["1002"].id, "direction": "DEBIT",
+         "amount": "50.00", "summary": "新加的"},
+        {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+         "amount": "50.00", "summary": "新加的"},
+    ]
+    r = _put(client, auth, book, v, entries, attachments=7)
+    assert r.status_code == 400, f"新增非末级分录竟然存下去了：{r.status_code} {r.text}"
+    assert "末级" in r.json()["detail"]
+
+
+def test_改动历史非末级分录的金额仍被拒(client, auth, db, book, subjects, admin_user):
+    """「原样保留」不是「随便改」：把老分录的金额从 100 改成 200 必须拒。
+
+    走这条路的金额会顺着账簿流下去，而明细账根本不出这条分录 ——
+    账面与账簿从这一刻起对不上，且没有任何提示。
+    """
+    v = _legacy_voucher_with_non_leaf(db, book, subjects, admin_user)
+    entries = [
+        {"subject_id": subjects["1002"].id, "direction": "DEBIT",
+         "amount": "200.00", "summary": "历史"},       # 原来是 100
+        {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+         "amount": "200.00", "summary": "历史"},
+    ]
+    r = _put(client, auth, book, v, entries)
+    assert r.status_code == 400, f"改金额竟然存下去了：{r.status_code} {r.text}"
+
+
+def test_复制一条历史非末级分录塞进去仍被拒(client, auth, db, book, subjects, admin_user):
+    """计数不是布尔开关：删掉一条、再加两条一模一样的，第二条扣不掉。"""
+    v = _legacy_voucher_with_non_leaf(db, book, subjects, admin_user)
+    entries = [
+        {"subject_id": subjects["1002"].id, "direction": "DEBIT",
+         "amount": "100.00", "summary": "历史"},
+        {"subject_id": subjects["1002"].id, "direction": "DEBIT",
+         "amount": "100.00", "summary": "历史"},      # 复制的一条
+        {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+         "amount": "200.00", "summary": "历史"},
+    ]
+    r = _put(client, auth, book, v, entries)
+    assert r.status_code == 400, f"复制非末级分录竟然存下去了：{r.status_code} {r.text}"
+
+
+def test_正常凭证仍然拒非末级(client, auth, db, book, subjects):
+    """回归：口子没有顺带把闸门本身关掉。"""
+    entries = [
+        {"subject_id": subjects["1002"].id, "direction": "DEBIT",
+         "amount": "100.00", "summary": "x"},
+        {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+         "amount": "100.00", "summary": "x"},
+    ]
+    r = client.post(f"/api/books/{book.id}/vouchers", headers=auth,
+                    json={"voucher_date": "2026-01-15", "entries": entries})
+    assert r.status_code == 400, f"新凭证竟然能挂非末级科目：{r.status_code} {r.text}"
+
+
+# ===================================================================== 列表页的往返次数
+# 审计 P3-12：``query_vouchers`` 原来对每行 ``db.refresh``，一个 200 行的页
+# 就是 200 次往返；而 ``refresh`` 刷的还是凭证自己那一行，分录仍在序列化时逐条
+# 懒加载 —— 等于 200 次白跑 + 200 次懒加载，外加每张凭证查一次科目表。
+
+
+def test_凭证列表一页只跑常数条SQL(client, auth, book, make_voucher, subjects):
+    """计数的是**真正发出去的语句**。结果对而慢，用户一样会骂。"""
+    import sqlalchemy
+
+    from app.core.db import engine as app_engine
+
+    for i in range(12):
+        make_voucher(f"2026-01-{i + 1:02d}",
+                     dr=[("100201", 100 + i, "x")], cr=[("600101", 100 + i, "x")])
+
+    stmts: list[str] = []
+    handler = lambda conn, cursor, statement, params, ctx, many: stmts.append(statement)
+    sqlalchemy.event.listen(app_engine, "before_cursor_execute", handler)
+    try:
+        r = client.get(f"/api/books/{book.id}/vouchers?page_size=200", headers=auth)
+    finally:
+        sqlalchemy.event.remove(app_engine, "before_cursor_execute", handler)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["total"] == 12
+    # 科目一次 + 计数一次 + 本页凭证一次 + 分录一次 = 4。
+    # 留一点余量是为了不把实现细节钉死（比如将来加一条无害的查询）。
+    assert len(stmts) <= 8, (
+        f"12 行的页发了 {len(stmts)} 条 SQL，逐行往返没去掉：{stmts}")
+
+
+# ===================================================================== 撞号的数据库兜底
+# 审计 P1-3。
+#
+# 上面那条「凭证号撞了报人话」走的是**应用层的占用检查**。但它和
+# ``next_voucher_no`` 的「取全表求 max」都没有锁：两个人同时开一张，
+# 两个事务会**双双查到「没被占」**。DB 侧有 ``uq_voucher_period_no`` 兜底，
+# 所以不产生脏数据 —— 但撞出来的是一条裸的 ``IntegrityError``，
+# 而 ``importer.commit`` 只 ``except ValueError``，于是批量导入变成 HTTP 500。
+#
+# 下面两条把「占用检查恰好没看见」这个窗口稳定复现出来：
+# 把那一句检查短路掉，让数据库去拒。
+
+
+def _blind_the_taken_check(db, monkeypatch):
+    """让 ``create_voucher`` 里那句占用检查查不到东西（模拟并发窗口）。
+
+    认的是语句本身（按 ``voucher_no`` 过滤的那句），不是「第几次调用」——
+    调用序会随代码改动漂移，按次数打补丁的测试迟早测错东西。
+    """
+    real_scalar = db.scalar
+
+    def fake_scalar(stmt, *a, **kw):
+        sql = str(stmt)
+        if "voucher_no" in sql:
+            return None
+        return real_scalar(stmt, *a, **kw)
+
+    monkeypatch.setattr(db, "scalar", fake_scalar)
+
+
+def test_并发撞号由数据库兜底_仍然报人话(db, book, admin_user, subjects,
+                                       make_voucher, monkeypatch):
+    """唯一约束兜底生效时，撞号必须落成 ValueError（人话），不是裸 IntegrityError。"""
+    v = make_voucher("2026-01-05", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    _blind_the_taken_check(db, monkeypatch)
+
+    with pytest.raises(ValueError) as exc:
+        create_voucher(
+            db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 6),
+            entries=_entries(subjects, [("100201", 1, "x")], [("600101", 1, "x")]),
+            voucher_no=v.voucher_no,
+        )
+    detail = str(exc.value)
+    assert v.voucher_no in detail, f"没说清撞的是哪个号：{detail}"
+    assert "唯一约束" not in detail, f"把数据库原话甩给了用户：{detail}"
+    db.rollback()
+
+
+def test_撞号之后同一个事务还能继续写(db, book, admin_user, subjects,
+                                      make_voucher, monkeypatch):
+    """撞号走 savepoint：回滚的只是这一条 insert，不是调用方整个事务。
+
+    这正是批量导入依赖的性质 —— 前面几张已经写进去的凭证不该被
+    「后面一张撞了号」一起废掉（``importer.commit`` 最后统一回滚）。
+    """
+    v = make_voucher("2026-01-05", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    _blind_the_taken_check(db, monkeypatch)
+
+    with pytest.raises(ValueError):
+        create_voucher(
+            db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 6),
+            entries=_entries(subjects, [("100201", 1, "x")], [("600101", 1, "x")]),
+            voucher_no=v.voucher_no,
+        )
+    # 同一个会话、同一个事务，接着写第二张：必须还能成功
+    ok = create_voucher(
+        db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 7),
+        entries=_entries(subjects, [("100201", 2, "y")], [("600101", 2, "y")]),
+    )
+    assert ok.id
+    db.commit()

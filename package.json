@@ -1,0 +1,13 @@
+{
+  "name": "cwq-accounting-root",
+  "private": true,
+  "version": "0.1.0",
+  "description": "仓库根的 Node 依赖：只为 tools/uitest/ 下的 Playwright 探测脚本服务。前端应用自身的依赖在 frontend/package.json，两份清单互不覆盖。",
+  "type": "module",
+  "scripts": {
+    "uitest": "node tools/uitest/shot.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.64.0"
+  }
+}

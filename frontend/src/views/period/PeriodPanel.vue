@@ -134,6 +134,7 @@
 import { computed, ref, watch, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import * as api from '@/api/book'
+import { http } from '@/api/client'
 import { voucherPeriodCheck } from '@/api/voucher'
 import { useSessionStore } from '@/stores/session'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
@@ -264,6 +265,10 @@ async function loadCarryInfo() {
 
 async function doClose() {
   const p = store.currentPeriod
+  // 没有当前期间时按钮是亮着的（`:disabled` 里 `currentPeriod?.locked` 在 null 时
+  // 是 undefined，falsy），这里补一道：宁可说一句「先选一个期间」，也别让
+  // 后面那句 `p.version` 抛出来变成一次白屏
+  if (!p) return ElMessage.warning('先在顶栏选一个会计期间')
   // 封账之前先体检一次：断号、时序不对的月份一旦锁进历史，纸质凭证按号装订
   // 就跟系统对不上了。与其等接口报错，不如在点确认之前就把差在哪儿说清楚。
   try {
@@ -282,20 +287,65 @@ async function doClose() {
     lead: '锁定后凭证不可再改。', confirmText: '结账'
   })) return
   try {
-    const r = await api.closePeriod(store.bookId, p.id)
+    const r = await closePeriodWithVersion(p)
     await store.loadPeriods()
     const extra = r.auto_closed_periods?.length ? `，顺带结账 ${r.auto_closed_periods.join('、')}` : ''
     const posted = r.auto_posted ? `，自动记账 ${r.auto_posted} 张` : ''
     ElMessage.success(`${p.code} 已结账${extra}${posted}`)
   } catch (e) {
-    // 结账失败的十有八九是「损益还没结平」，原文里有科目和金额，别吞掉
-    ElMessage.error(e?.response?.data?.detail || '结账失败')
-    await store.loadPeriods()
+    await handlePeriodError(e, '结账失败')
   }
+}
+
+/**
+ * 结账：**带上期间版本号**（乐观锁）。
+ *
+ *  两个账号各开着一个页面，A 先结了账，B 那边还拿着「未结账 + 版本 1」。
+ *  不带版本号时后端按 B 的陈旧状态照做（他那张屏幕上确实写着未结账），
+ *  带着版本号时后端比对库里那一份：不一致就 409 拒掉，两边都落到同一个事实上。
+ *
+ *  走共享 http 而不是 api/book.js 的 closePeriod：那条还没有 version 参数，
+ *  而它不在本工作包的改动范围里（挪进去只要给 closePeriod 加一个参数即可）。
+ *  http 是同一个实例，令牌头与 401 处理都还在，多的只是一个 body 字段。
+ */
+async function closePeriodWithVersion(p) {
+  const { data } = await http.post(`/books/${store.bookId}/periods/${p.id}/close`, { version: p.version })
+  return data
+}
+
+async function uncloseWithVersion(p) {
+  const { data } = await http.post(`/books/${store.bookId}/periods/${p.id}/unclose`, {
+    revert_posting: true, version: p.version
+  })
+  return data
+}
+
+/**
+ * 结账 / 反结账失败的两条路，**必须分开说**（审计 P1-06 的前端一半）。
+ *
+ *  400 = 「你参数写错了」—— 去看看你自己填的那些，界面上现有报错文案就是干这个的。
+ *  409 = 「别人先动了手，你手上的版本过期了」—— 该做的是**刷新**，
+ *        不是检查参数。按 400 那样弹一句「结账失败」，人会以为是自己哪里没填对，
+ *        反复重试、反复失败，而真相是「页面上这份状态已经是昨天的了」。
+ *
+ *  409 一律先把期间重新拉一遍：手里的 version 刷新了才能重试，
+ *  拿旧版本再点一次只会再撞一次 409。
+ */
+async function handlePeriodError(e, fallback) {
+  const status = e?.response?.status
+  const detail = e?.response?.data?.detail
+  if (status === 409) {
+    ElMessage.warning({ message: detail || `${fallback}：期间状态已被他人更新，请刷新后重试`, duration: 6000 })
+    await store.loadPeriods()
+    return
+  }
+  ElMessage.error(detail || fallback)
+  await store.loadPeriods()
 }
 
 async function previewUnclose() {
   const p = store.currentPeriod
+  if (!p) return ElMessage.warning('先在顶栏选一个会计期间')
   const r = await api.unclosePreview(store.bookId, p.id)
   if (!r.periods.length) return ElMessage.info('所选期间及其之后没有已结账的期间，无需反结账')
 
@@ -306,7 +356,13 @@ async function previewUnclose() {
   })
   if (!ok) return
 
-  const done = await api.unclose(store.bookId, p.id, true)
+  let done
+  try {
+    done = await uncloseWithVersion(p)
+  } catch (e) {
+    await handlePeriodError(e, '反结账失败')
+    return
+  }
   await store.loadPeriods()
   ElMessage.success(`已解锁 ${done.periods.length} 个期间，${done.unposted_vouchers} 张凭证转未记账`)
 }

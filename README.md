@@ -34,7 +34,9 @@ docker run -d --name cwq-pg -p 15432:5432 \
   -e POSTGRES_DB=cwq postgres:16
 ```
 
-首次启动会自动建表并装载标准科目表，无需手动执行 SQL。
+首次启动**不会**自动建表：数据库起好后要执行一次迁移（见下面第 2 步的
+`alembic upgrade head`）。标准科目表与演示账号由 `scripts/init_db.py` 装载，
+同样不是启动时自动做的。
 
 ### 2. 起后端
 
@@ -70,9 +72,20 @@ npm run dev        # http://localhost:5173
 
 演示账号：`admin / 123456`（管理员）、`zhangsan / 123456`（普通用户）
 
-登录页有**注册**页签，同事可以自助开号。注册只创建账号，**不授予任何账套** ——
-需要管理员在「用户与授权」里分配。用户名限 3-32 位字母/数字/下划线，密码至少 8 位。
-不想对外开放注册时，`.env` 里把 `REGISTRATION_ENABLED` 置 false 即可。
+> 连接串里的端口是 **15432**，与上面 `docker run -p 15432:5432` 一致；
+> `backend/.env.example` 里也是这个端口。
+
+登录页的**注册**页签存在，但**自助注册默认是关的**：
+`config.py` 里 `registration_enabled: bool = False`，`REGISTRATION_ENABLED` 没配或
+配成 false 时，调注册接口直接 **403**。公司内部要开，在 `backend/.env` 里显式
+`REGISTRATION_ENABLED=true` 并重启后端。
+
+> 三处必须一致，改任何一处都要同步另两处：`config.py` 的默认值、
+> `backend/.env.example`、`ARCHITECTURE.md` §9.5。默认值是 `False`（默认关闭），
+> **不要为了「让文档说得通」去改成 True** —— 那等于把刚收掉的口子重新打开。
+
+注册只创建账号，**不授予任何账套**，注册成功也不签发 token ——
+需要管理员在「用户与授权」里分配账套。用户名限 3-32 位字母/数字/下划线，密码至少 8 位。
 
 ### 4. 生成演示账套（推荐）
 
@@ -166,7 +179,7 @@ cd backend
 ```bash
 cd backend
 
-.venv/bin/python -m pytest                      # 201 个单元/接口测试
+.venv/bin/python -m pytest                      # 966 个单元/接口测试（52 个测试文件，实测 `--collect-only`）
 .venv/bin/python scripts/demo_e2e.py            # 69 项端到端流程
 .venv/bin/python scripts/demo_modules.py        # 53 项模块冒烟
 node onboard.mjs                                # 12 步浏览器开户全流程（需前后端都起着）
@@ -197,7 +210,7 @@ backend/
     reports/        # 报表公式引擎（自由配公式）
     printing/       # 打印模板引擎（HTML+CSS @page）
     api/            # HTTP 层，只做参数转换和错误翻译
-    models/         # 17 张表
+    models/         # 16 张表
     core/           # 配置、连接、鉴权、初始化 SQL
     seed/           # 标准科目表、内置报表模板
   scripts/          # seed_demo.py 演示数据 + demo_e2e/demo_modules 端到端脚本

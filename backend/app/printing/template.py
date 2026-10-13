@@ -29,7 +29,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 # --------------------------------------------------------------------- 纸型
 
@@ -47,6 +47,30 @@ DIRECTIONS = ("portrait", "landscape")
 LINE_STYLES = ("solid", "dashed", "dotted")
 ALIGN = ("left", "center", "right")
 ELEMENT_TYPES = ("text", "table", "line", "rectangle")
+
+#: 正文字体白名单。
+#:
+#: ``font.family`` 会被 ``_page_css`` 原样拼进 ``font-family: "…"``。
+#: 这里拼的是**带引号**的值，但引号本身不能防注入：给宋体后面接一个 ``"`` 就能
+#: 把字符串闭合掉，剩下的内容就成了 CSS 声明甚至 ``</style><script>``（模板内容
+#: 是全局的、只读账号也会渲染它，见 ``api/printing.py::_template``）。
+#:
+#: 字体名对排版而言是个**封闭集合** —— 打印环境里能用的中文字体就那么几种，
+#: 前端设计器也是让用户从下拉里选。认不出来的名字一律退回宋体，没有「让用户
+#: 自己敲字体名」这个需求，因此不必为了灵活开一个字符串注入的口子。
+FONT_FAMILIES = (
+    # 中文
+    "宋体", "SimSun", "黑体", "SimHei", "楷体", "KaiTi",
+    "仿宋", "FangSong", "微软雅黑", "Microsoft YaHei",
+    # 拉丁 / 通用
+    "Arial", "Times New Roman", "serif", "sans-serif", "monospace",
+)
+#: 正文字号区间（pt）。与前端设计器输入框的 min/max 一致。
+FONT_SIZE_RANGE = (6, 24)
+#: 标题 / 副标题字号区间（pt）。比正文宽一点，允许做大标题。
+TITLE_SIZE_RANGE = (8, 48)
+#: 页边距区间（mm）。负数在 CSS 里会被浏览器丢弃、过大则整页空白，这里夹住。
+MARGIN_RANGE = (0, 100)
 ELEMENT_BINDS = {
     "title", "subtitle", "company", "book", "period", "voucher_no", "date",
     "attachments", "accountant", "checker", "cashier", "remark", "capital",
@@ -217,6 +241,51 @@ def _correct_voucher_title(text: str) -> str:
     return re.sub(r"记\s*帐\s*凭\s*证", "记 账 凭 证", text)
 
 
+def _num(value: Any, default: float, low: float, high: float) -> float:
+    """把任意输入夹成 ``[low, high]`` 区间内的浮点数。
+
+    兜底 ``float(...)`` 抛异常时用默认值：模板里写坏了不该让整个预览 500。
+    返回值一律是 ``float``：这些数字直接拼进 CSS，统一类型免得调用方
+    拿到 int 时还要再判一次。
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = float(default)
+    if value != value or value in (float("inf"), float("-inf")):   # NaN / 无穷
+        value = float(default)
+    return max(low, min(high, value))
+
+
+def _safe_font(value: Any) -> str:
+    """正文字体名过白名单。认不出来退回宋体（见 ``FONT_FAMILIES`` 的说明）。"""
+    text = str(value or "").strip()
+    return text if text in FONT_FAMILIES else "宋体"
+
+
+def _safe_align(value: Any, default: str = "center") -> str:
+    """对齐方式过白名单 —— 会无引号拼进 ``text-align:{}``，必须过白名单。"""
+    return value if value in ALIGN else default
+
+
+def _clean_title_like(merged: dict, key: str, size_range: tuple[float, float],
+                      default_size: float) -> None:
+    """归一化 title / subtitle 这两组「会进 CSS 的标题字段」。
+
+    ``align`` 会无引号拼进 ``text-align:``、``size`` 会拼进 ``font-size:{}pt``，
+    两处都不像 ``font-family`` 那样自带引号兜底，是四组注入面里最好利用的
+    两个。任何进入 ``<style>`` 的字段都必须在这里过白名单或夹区间。
+    """
+    raw = merged.get(key)
+    if not isinstance(raw, dict):
+        merged[key] = {}
+        raw = merged[key]
+    raw["align"] = _safe_align(raw.get("align"))
+    raw["size"] = _num(raw.get("size"), default_size, *size_range)
+    raw["bold"] = bool(raw.get("bold", False))
+    raw["text"] = str(raw.get("text", ""))
+
+
 def validate_template(scope: str, content: dict | None) -> dict:
     """校验并归一化模板内容。返回合并默认值后的模板。"""
     merged = merge_defaults(scope, content)
@@ -240,12 +309,29 @@ def validate_template(scope: str, content: dict | None) -> dict:
     if merged.get("orientation") not in DIRECTIONS:
         merged["orientation"] = "portrait"
 
+    # font.family 会拼进 font-family，font.size 会拼进 font-size ——
+    # 与下面 title/subtitle 同理，会进 <style> 的字段一律过白名单或夹区间。
+    font = merged.get("font")
+    if not isinstance(font, dict):
+        font = {}
+    font["family"] = _safe_font(font.get("family"))
+    font["size"] = _num(font.get("size"), 10, *FONT_SIZE_RANGE)
+    merged["font"] = font
+
+    # title 与 subtitle 用各自的默认字号（16 / 11），别让写坏的值把副标题
+    # 悄悄变成大标题那种字号 —— 副标题比正文小是版式约定。
+    _clean_title_like(merged, "title", TITLE_SIZE_RANGE, 16)
+    _clean_title_like(merged, "subtitle", TITLE_SIZE_RANGE, 11)
+
+    # 页边距是原有 float 兜底，那一处已经足够：float() 对任何非数字串都抛
+    # ValueError，走 except 退回 10.0，因此不可能把非数字原样拼进 @page。
+    # 这里补的是**区间**——负数/超大值虽然注入不了，却能让整张纸空白或错位。
     margins = merged.setdefault("margins", {})
+    if not isinstance(margins, dict):
+        margins = {}
     for side in ("top", "right", "bottom", "left"):
-        try:
-            margins[side] = max(0.0, float(margins.get(side, 10)))
-        except (TypeError, ValueError):
-            margins[side] = 10.0
+        margins[side] = _num(margins.get(side), 10.0, *MARGIN_RANGE)
+    merged["margins"] = margins
 
     cols = merged.get("columns") or []
     if not isinstance(cols, list) or not cols:
@@ -300,11 +386,9 @@ def validate_template(scope: str, content: dict | None) -> dict:
                 text = _correct_voucher_title(text)
 
             def _number(key: str, default: float, low: float, high: float) -> float:
-                try:
-                    value = float(raw.get(key, default))
-                except (TypeError, ValueError):
-                    value = default
-                return max(low, min(high, value))
+                # 与页边距/字号共用 _num：元素坐标与 font_size 同样会被拼进
+                # style 属性（_element_style），NaN/Infinity 进去会让整张凭证塌掉。
+                return _num(raw.get(key, default), default, low, high)
 
             clean_elements.append(
                 {
@@ -346,9 +430,15 @@ def to_cn_capital(amount: Decimal | float | int | str) -> str:
 
     例：1234.56 -> 壹仟贰佰叁拾肆元伍角陆分；305.00 -> 叁佰零伍元整。
     整数部分按 4 位一节处理，节内补「零」、节间补「万/亿/兆」。
+
+    **舍入必须是 ROUND_HALF_UP**：中文大写金额是凭证的法定要素，必须和
+    ``accounting/util.py::money`` 的口径一致（银行/四舍五入习惯）。
+    ``Decimal.quantize`` 默认是 ROUND_HALF_EVEN（银行家舍入），二者会分叉：
+    ``0.125`` 在这里是「零元壹角叁分」，在账上却是 0.13；``1.005`` 同理。
+    同一张凭证，合计小写写 0.13、大写印「壹角贰分」，财务当场就能看出不对。
     """
     try:
-        value = Decimal(str(amount)).quantize(Decimal("0.01"))
+        value = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     except Exception:  # noqa: BLE001
         return ""
     neg = value < 0
@@ -431,16 +521,49 @@ def _esc(value: Any) -> str:
     return html.escape(str(value if value is not None else ""))
 
 
+#: 打印页内联的 CSP（``<meta http-equiv>`` 形式）。
+#:
+#: **为什么必须有 meta 而不是只靠响应头**：这份 HTML 不是被浏览器当「文档」直接
+#: 加载的。前端用 axios 取回源码，再交给 ``iframe.srcdoc`` 或
+#: ``window.open()`` + ``document.write()``（见 ``frontend/src/api/print.js``，
+#: 因为 token 在 localStorage、``iframe.src`` 带不上 Authorization）。
+#: 走这条链路时 **响应头全部丢失** —— CSP 头只在浏览器直接导航到该 URL 时生效。
+#: meta 标签是文档的一部分，跟着字符串走，因此三种加载方式都覆盖得到。
+#:
+#: ``style-src 'unsafe-inline'`` 不能去掉：版式全靠 ``_page_css`` 拼的内联
+#: ``<style>``。``script-src 'none'`` 才是重点 —— 模板校验是第一道防线，
+#: 这条是第二道，两道独立成立。
+PRINT_CSP_META = (
+    '<meta http-equiv="Content-Security-Policy" content="'
+    "default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; "
+    "img-src 'none'; font-src 'none'; connect-src 'none'; "
+    "form-action 'none'; base-uri 'none'"
+    '">'
+)
+
+
 # --------------------------------------------------------------------- 页面骨架
 
 
 def _page_css(tpl: dict) -> str:
+    """拼出整份页面的 CSS。
+
+    **这里的每一个模板取值都要在拼进 CSS 之前重新过一遍白名单/区间**，
+    不因为 ``validate_template`` 已经校验过就省掉。理由有两个：
+
+    1. 模板内容可能来自 ``validate_template`` 上线**之前**写入的老数据，
+       或者有人直接改库 —— 渲染层不能假设自己拿到的字典是干净的；
+    2. 渲染函数是公开入口，将来新增调用点时不必记得先校验。
+
+    拼装方式本身也遵循同一条规则：只有「白名单里的枚举字面量」和
+    「已经夹过区间的数字」才允许出现在本函数的返回值里。前者不可能包含
+    ``;``/``}``/``<``，后者经 ``_num`` 转换后只可能是有限小数，
+    因此 ``</style><script>`` 这类载荷在结构上就进不来。
+    """
     paper = str(tpl.get("paper", "A4"))
     spec = PAPERS.get(paper, PAPERS["A4"])
     landscape = tpl.get("orientation") == "landscape"
     w, h = (spec["h"], spec["w"]) if landscape else (spec["w"], spec["h"])
-    m = tpl.get("margins", {})
-    font = tpl.get("font", {})
 
     size_line = f"{w}mm {h}mm"
     if paper == "A4":
@@ -452,25 +575,53 @@ def _page_css(tpl: dict) -> str:
     # 屏幕预览必须用**同一套**纸型与页边距，否则「所见即所得」是假的：
     # 用户在左边把 A4 改成 A5、把页边距调小，右边预览纹丝不动，
     # 等真打印出来才发现版式不对 —— 那就失去了预览的意义。
-    mt, mr, mb, ml = (m.get(k, 10) for k in ("top", "right", "bottom", "left"))
+    # 边距同样重新夹区间：老数据里存过负数或超大值时不该整页空白。
+    m = tpl.get("margins", {})
+    if not isinstance(m, dict):
+        m = {}
+    mt, mr, mb, ml = (
+        _num(m.get(k), 10.0, *MARGIN_RANGE) for k in ("top", "right", "bottom", "left")
+    )
+
+    # font.family / font.size / title.align / title.size / subtitle.align /
+    # subtitle.size —— 六处会进 <style> 的字段，与 validate_template 里
+    # 「必须过白名单」的注释是同一套约束，只是执行点不同。
+    font = tpl.get("font")
+    if not isinstance(font, dict):
+        font = {}
+    family = _safe_font(font.get("family"))
+    fsize = _num(font.get("size"), 10, *FONT_SIZE_RANGE)
+
+    def _title_like(key: str, default_size: float) -> tuple[str, float]:
+        raw = tpl.get(key)
+        if not isinstance(raw, dict):
+            raw = {}
+        return (
+            _safe_align(raw.get("align")),
+            _num(raw.get("size"), default_size, *TITLE_SIZE_RANGE),
+        )
+
+    title_align, title_size = _title_like("title", 16)
+    subtitle_align, subtitle_size = _title_like("subtitle", 11)
+    title_bold = "700" if (tpl.get("title") or {}).get("bold", True) else "400"
 
     return f"""
 @page {{ size: {size_line}; margin: {mt}mm {mr}mm {mb}mm {ml}mm; }}
 * {{ box-sizing: border-box; }}
 html, body {{ margin:0; padding:0; }}
 body {{
-  font-family: "{font.get('family','宋体')}", "SimSun", "Songti SC", serif;
-  font-size: {font.get('size',10)}pt;
+  font-family: "{family}", "SimSun", "Songti SC", serif;
+  font-size: {fsize}pt;
   color:#000;
   -webkit-print-color-adjust: exact;
   print-color-adjust: exact;
 }}
-.doc-title {{ text-align:{tpl.get('title',{}).get('align','center')};
-  font-size:{tpl.get('title',{}).get('size',16)}pt;
-  font-weight:{'700' if tpl.get('title',{}).get('bold',True) else '400'};
+.doc-title {{ text-align:{title_align};
+  font-size:{title_size}pt;
+  font-weight:{title_bold};
   margin:0 0 4px; letter-spacing:2px; }}
-.doc-subtitle {{ text-align:{tpl.get('subtitle',{}).get('align','center')};
-  font-size:{tpl.get('subtitle',{}).get('size',11)}pt; margin:0 0 8px; }}
+.doc-subtitle {{ text-align:{subtitle_align};
+  font-size:{subtitle_size}pt; margin:0 0 8px; }}
 .doc-meta {{ display:flex; flex-wrap:wrap; gap:6px 18px; font-size:10pt; margin-bottom:6px; }}
 .doc-meta b {{ font-weight:600; }}
 table.grid {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
@@ -608,6 +759,7 @@ def render_table_page(tpl: dict, ctx: dict, rows: list[dict], page: int, total: 
         body_rows = ['<tr><td colspan="%d" class="ctr">（无数据）</td></tr>' % len(cols)]
 
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+{PRINT_CSP_META}
 <title>{_esc(ctx.get('doc_title') or tpl.get('title',{}).get('text','打印预览'))}</title>
 <style>{_page_css(tpl)}</style></head><body>
 <div class="page">
@@ -928,17 +1080,25 @@ def _voucher_table_html(tpl: dict, voucher: dict, el: dict | None = None) -> str
 
 
 def _element_style(el: dict) -> str:
+    """元素的行内样式。
+
+    与 ``_page_css`` 同一个道理：``x/y/w/h/font_size/align`` 会无引号拼进
+    ``style="…"``，渲染层再夹一次，不因为 ``validate_template`` 校验过就省掉。
+    """
     return (
-        f"left:{el['x']}%;top:{el['y']}%;width:{el['w']}%;height:{el['h']}%;"
-        f"font-size:{el['font_size']}pt;text-align:{el.get('align', 'left')};"
+        f"left:{_num(el.get('x'), 5, 0, 100)}%;top:{_num(el.get('y'), 5, 0, 100)}%;"
+        f"width:{_num(el.get('w'), 30, 1, 100)}%;height:{_num(el.get('h'), 6, 1, 100)}%;"
+        f"font-size:{_num(el.get('font_size'), 10, 6, 40)}pt;"
+        f"text-align:{_safe_align(el.get('align'), 'left')};"
         + ("font-weight:700;" if el.get("bold") else "")
     )
 
 
 def _element_border(el: dict) -> str:
     """线条/矩形的边框。线宽线型由模板控制，写死成 0.3mm 实线就没法改了。"""
-    width = el.get("line_width", 0.3)
-    style = el.get("line_style", "solid")
+    # 同样是无引号拼进 style 属性：线宽夹区间、线型过白名单。
+    width = _num(el.get("line_width", 0.3), 0.3, 0.1, 3)
+    style = el.get("line_style") if el.get("line_style") in LINE_STYLES else "solid"
     return f"{width}mm {style} #000"
 
 
@@ -985,6 +1145,7 @@ def render_voucher_sheet(tpl: dict, ctx: dict, vouchers: list[dict],
 
     doc_title = _esc((tpl.get("title") or {}).get("text", "") or "记 账 凭 证")
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+{PRINT_CSP_META}
 <title>{doc_title}</title>
 <style>{_page_css(tpl)}</style></head><body>
 <div class="page">

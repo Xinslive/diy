@@ -6,6 +6,8 @@ __pycache__/
 *.egg-info/
 
 # Node
+# 根目录的 node_modules/ 是 tools/uitest/ 那批 Playwright 探测脚本的依赖
+# （清单在根 package.json）；前端应用自己的依赖在 frontend/，node_modules 不入库。
 node_modules/
 dist/
 .vite/
