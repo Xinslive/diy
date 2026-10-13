@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from app.accounting.audit_helper import log
-from app.api.schemas import SubjectIn
+from app.api.schemas import SubjectEditIn, SubjectIn
 from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
-from app.models import Book, Entry, PeriodOpening, Subject, SysUser, UserBook
+from app.models import Book, Entry, Period, PeriodOpening, Subject, SysUser, UserBook
 
 router = APIRouter(prefix="/api/books/{book_id}/subjects", tags=["科目"])
 
@@ -24,7 +24,8 @@ def _subject_snapshot(s: Subject) -> dict:
     }
 
 
-def _tree(rows: list[Subject]) -> list[dict]:
+def _tree(rows: list[Subject], current_year_activity: set[int] | None = None) -> list[dict]:
+    current_year_activity = current_year_activity or set()
     by_parent: dict[int | None, list[Subject]] = {}
     for s in rows:
         by_parent.setdefault(s.parent_id, []).append(s)
@@ -38,6 +39,7 @@ def _tree(rows: list[Subject]) -> list[dict]:
                 "category": s.category, "direction": s.direction, "is_leaf": s.is_leaf,
                 "carry_forward": s.carry_forward, "active": s.active,
                 "qty_calc": s.qty_calc, "aux_calc": s.aux_calc, "fx_calc": s.fx_calc,
+                "has_current_year_activity": s.id in current_year_activity,
                 "children": build(s.id) if s.id in by_parent else [],
             }
             for s in by_parent.get(parent, [])
@@ -55,7 +57,15 @@ def list_subjects(book: Book = Depends(get_my_book), db: Session = Depends(get_d
     if not include_inactive:
         stmt = stmt.where(Subject.active.is_(True))
     rows = list(db.scalars(stmt.order_by(Subject.code)).all())
-    return _tree(rows)
+    current_year_activity = set(db.scalars(
+        select(Entry.subject_id)
+        .join(Period, and_(Period.book_id == Entry.book_id, Period.ord == Entry.period_ord))
+        .where(Entry.book_id == book.id,
+               Period.year == func.extract("year", func.current_date()),
+               Entry.amount != 0)
+        .distinct()
+    ).all())
+    return _tree(rows, current_year_activity)
 
 
 @router.get("/flat")
@@ -334,22 +344,70 @@ def _recompute_root_leaf_flags(db: Session, book_id: int) -> None:
 
 
 @router.patch("/{subject_id}")
-def update_subject(subject_id: int, payload: SubjectIn, book: Book = Depends(get_my_book),
+def update_subject(subject_id: int, payload: SubjectEditIn, book: Book = Depends(get_my_book),
                    db: Session = Depends(get_db), user: SysUser = Depends(get_current_user),
                    _link: UserBook = Depends(require_book_write)):
-    s = db.get(Subject, subject_id)
-    if s is None or s.book_id != book.id:
+    s = db.scalar(select(Subject).where(
+        Subject.id == subject_id, Subject.book_id == book.id).with_for_update())
+    if s is None:
         raise HTTPException(404, "科目不存在")
     before = _subject_snapshot(s)
     was_active = s.active
-    used = db.scalar(select(Entry).where(Entry.subject_id == subject_id).limit(1))
-    if used and (s.code != payload.code or s.direction != payload.direction or s.category != payload.category):
-        raise HTTPException(400, "科目已被凭证使用，不能修改编码 / 类别 / 余额方向")
+
+    changes = {
+        field: value for field, value in payload.model_dump(exclude_unset=True).items()
+        if value is not None or field == "parent_id"
+    }
+    if "code" in changes:
+        changes["code"] = changes["code"].strip()
+        if not changes["code"]:
+            raise HTTPException(400, "科目编码不能为空")
+    if "name" in changes:
+        changes["name"] = changes["name"].strip()
+        if not changes["name"]:
+            raise HTTPException(400, "科目名称不能为空")
+    changed = {
+        field: value for field, value in changes.items()
+        if field != "is_leaf" and getattr(s, field) != value
+    }
+    if not changed:
+        return {"id": s.id, "code": s.code, "name": s.name}
+
+    current_year_activity = db.scalar(
+        select(Entry.id)
+        .join(Period, and_(Period.book_id == Entry.book_id, Period.ord == Entry.period_ord))
+        .where(Entry.book_id == book.id, Entry.subject_id == subject_id,
+               Period.year == func.extract("year", func.current_date()), Entry.amount != 0)
+        .limit(1)
+    ) is not None
+    # 只挡 **code**，和 db_init.sql 的 fn_subject_guard 同口径。
+    #
+    # 别图省事写成「除 name 外一律拒绝」：那样连 parent_id / active 一起卡死，
+    # 而这两件事各自已经有更贴切的闸门，也各有非它不可的理由 ——
+    #   · parent_id 有 _assert_no_own_balance（余额会被升格带走的那条）；
+    #   · active 是「停用」，老凭证还指着它、账还得算得出来，
+    #     _assert_no_own_balance 的报错里明确把停用指为解法。把它一起挡掉，
+    #     等于当众收回那句话：有余额的科目就再也哪儿也去不了了。
+    # 当前唯一被这条挡住的字段是 code —— 账上已有的报告、明细账、导出都按
+    # 编码引用它，本年发生额还在就换不得，和触发器的意图完全一致。
+    if current_year_activity and "code" in changed:
+        raise HTTPException(400, f"科目 {s.code} 本年度已有发生额，只能修改科目名称")
+
+    used = db.scalar(select(Entry.id).where(Entry.subject_id == subject_id).limit(1)) is not None
+    if used and any(field in changed for field in ("direction", "category")):
+        raise HTTPException(400, "科目已被凭证使用，不能修改类别 / 余额方向")
+
+    if "code" in changed:
+        duplicate = db.scalar(select(Subject.id).where(
+            Subject.book_id == book.id, Subject.code == changes["code"],
+            Subject.id != subject_id).limit(1))
+        if duplicate is not None:
+            raise HTTPException(400, f"科目编码已存在: {changes['code']}")
 
     # P1-06：新建时有父科目校验，更新路径原来直接赋值。补上，
     # 连带环路检测与 level 跟随。
-    if payload.parent_id != s.parent_id:
-        parent = _check_parent(db, book, payload.parent_id, self_id=subject_id)
+    if "parent_id" in changed:
+        parent = _check_parent(db, book, changes["parent_id"], self_id=subject_id)
         # P1-1：改父级是「升格」的另一个入口，有两道：
         #   ① 新父节点因此有了下级，它自己那份余额会脱离明细口径；
         #   ② 被移动的这个科目若原本是末级，挂上去之后它也不再是末级，
@@ -358,15 +416,15 @@ def update_subject(subject_id: int, payload: SubjectIn, book: Book = Depends(get
         # 再挪一次位置并不会让它损失什么，不该借这条规则卡住正常的整理。
         if parent is not None:
             _assert_no_own_balance(db, parent, action=f"在它下面挂子科目 {s.code}")
-        if payload.parent_id is not None and s.is_leaf:
+        if changes["parent_id"] is not None and s.is_leaf:
             _assert_no_own_balance(
                 db, s, action=f"改挂到上级科目 {parent.code}" if parent else "改挂到上级科目")
         old_parent_id = s.parent_id
-        s.parent_id = payload.parent_id
+        s.parent_id = changes["parent_id"]
         s.level = (parent.level + 1) if parent else 1
         # P3-01：整棵子树的级次一起重算，不只是被移动的这一个节点。
         _recompute_subtree(db, book.id, subject_id)
-        _sync_leaf_flags(db, old_parent_id, payload.parent_id)
+        _sync_leaf_flags(db, old_parent_id, changes["parent_id"])
 
     # P1-01：is_leaf 从这个循环里拿掉了。
     #
@@ -379,13 +437,14 @@ def update_subject(subject_id: int, payload: SubjectIn, book: Book = Depends(get
     #
     # 现在 is_leaf 只由服务端从子级关系算：挂上父节点时父节点变汇总（P1-06），
     # 移走子节点时父节点恢复末级，删掉最后一个子节点时同样恢复。
-    for field in ("name", "category", "direction", "carry_forward", "sort_no",
+    for field in ("code", "name", "category", "direction", "carry_forward", "sort_no",
                   "qty_calc", "aux_calc", "fx_calc"):
-        setattr(s, field, getattr(payload, field))
+        if field in changed:
+            setattr(s, field, changes[field])
     # 停用是「不让再选它」，不是「删掉它」：老凭证还指着它，账还得算得出来。
     # 有分录的科目删不掉（下面 400），停用才是那条正路。
-    if payload.active is not None:
-        s.active = payload.active
+    if "active" in changed:
+        s.active = changes["active"]
     db.flush()
     # P3-10：停用尤其要留痕。老凭证还指着这个科目（停用不是删除），
     # 出问题时「它什么时候被停的、谁停的」是第一条要问的事。

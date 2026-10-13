@@ -310,12 +310,25 @@ CREATE TRIGGER trg_voucher_delete_guard BEFORE DELETE ON voucher
 -- ---------- 5. 科目不可变性 ----------
 CREATE OR REPLACE FUNCTION fn_subject_guard() RETURNS trigger AS $$
 BEGIN
+    IF TG_OP = 'UPDATE' AND NEW.code IS DISTINCT FROM OLD.code THEN
+        IF EXISTS (
+            SELECT 1
+            FROM entry e
+            JOIN period p ON p.book_id = e.book_id AND p.ord = e.period_ord
+            WHERE e.book_id = OLD.book_id
+              AND e.subject_id = OLD.id
+              AND e.amount <> 0
+              AND p.year = EXTRACT(YEAR FROM CURRENT_DATE)::int
+        ) THEN
+            RAISE EXCEPTION '科目 % 本年度已有发生额，不能修改编码', OLD.code
+                USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
     IF TG_OP = 'UPDATE'
-       AND (NEW.code IS DISTINCT FROM OLD.code
-         OR NEW.direction IS DISTINCT FROM OLD.direction
+       AND (NEW.direction IS DISTINCT FROM OLD.direction
          OR NEW.category IS DISTINCT FROM OLD.category) THEN
         IF EXISTS (SELECT 1 FROM entry WHERE subject_id = OLD.id) THEN
-            RAISE EXCEPTION '科目 % 已被凭证使用，不能修改编码/类别/余额方向', OLD.code
+            RAISE EXCEPTION '科目 % 已被凭证使用，不能修改类别/余额方向', OLD.code
                 USING ERRCODE = 'check_violation';
         END IF;
     END IF;

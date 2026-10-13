@@ -1,9 +1,10 @@
 <template>
   <div class="page">
     <div class="toolbar no-print">
-      <!-- 筛选一律按**全部期间**做：起止期间和「全部期间」那两个下拉撤了，
-           顶栏切到哪个月都不再把这一页锁死在那个月 —— 查账的人要的是「全年哪些凭证
-           超过十万」，不是「上个月里有哪些」。
+      <!-- 起止期间和「全部期间」那两个下拉撤了，期间由顶栏说了算：
+           **没填任何筛选条件**时只看顶栏那个月（空表格比跨年几百行好用）；
+           **填了任一条件**后放宽到全部期间 —— 查账的人要的是「全年哪些凭证
+           超过十万」，这时被顶栏那个月卡着反而是帮倒忙。判据见 hasFilter。
 
            「金额」筛的是**某一条分录**的金额，不是整张凭证的合计：
            只要凭证里有任意一行落在这个区间，整张就被捞出来。 -->
@@ -75,8 +76,19 @@
       >
         <el-table-column type="selection" width="42" />
         <!-- 日期不许折行：'2026-12-31' 断成两行，扫一列日期全靠猜 -->
-        <el-table-column prop="voucher_date" label="日期" width="124" class-name="nowrap" label-class-name="nowrap" />
-        <el-table-column prop="voucher_no" label="凭证号" width="95" />
+        <el-table-column prop="voucher_date" label="日期" width="124"
+                         class-name="nowrap" label-class-name="nowrap">
+          <template #header>
+            <span class="sort-head" :class="headClass('date_')"
+                  @click.stop="toggleSort('date')">日期</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="voucher_no" label="凭证号" width="95">
+          <template #header>
+            <span class="sort-head" :class="headClass('no_')"
+                  @click.stop="toggleSort('no')">凭证号</span>
+          </template>
+        </el-table-column>
         <el-table-column label="摘要" min-width="260" show-overflow-tooltip>
           <template #default="{ row }">{{ firstSummary(row) }}</template>
         </el-table-column>
@@ -94,7 +106,7 @@
         </el-table-column>
         <el-table-column v-if="store.canWrite" label="操作" width="168" fixed="right">
           <template #default="{ row }">
-            <!-- 已记账凭证锁定：只能看，改/删都要先反记账 -->
+            <!-- 已记账凭证锁定：只能看，改/删都要先退回复记账状态（入口在「期末结账 → 反结账」） -->
             <el-button link type="primary" @click="open(row)">
               {{ row.status === 'POSTED' ? '查看' : '查看/改' }}
             </el-button>
@@ -148,6 +160,38 @@ const query = reactive({
   page: 1, page_size: 50
 })
 
+// --------------------------------------------------------------------- 排序
+//
+// 四个档位（后端 SORTS 一一对应）：凭证号顺序 / 凭证号倒序 / 日期顺序 / 日期倒序。
+// **默认凭证号倒序** —— 刚录的那批排在最前面，一天里最后动过账的先看见。
+//
+// 「凭证号」排序是**先按期间、再按号段**：凭证号只在期间内唯一（记001 与 记012
+// 分属两个月），跨月比大小没有意义。这条口径由后端保证，前端只管把档位传下去。
+const SORT_LABEL = {
+  no_desc: '凭证号倒序', no_asc: '凭证号顺序',
+  date_desc: '日期倒序', date_asc: '日期顺序'
+}
+const sort = ref('no_desc')
+
+/** 切换排序列时从升序开始；连续点击当前列时切换升降序。 */
+function toggleSort(field) {
+  const isCurrentField = sort.value.startsWith(`${field}_`)
+  const direction = isCurrentField && sort.value.endsWith('_asc') ? 'desc' : 'asc'
+  sort.value = `${field}_${direction}`
+  query.page = 1        // 换排序回第一页，否则停在原来那页会看着像「少了几张」
+  load()
+}
+
+/** 表头高亮：正在按这一列排才点亮，并按升降挂 asc/desc 箭头。 */
+function headClass(prefix) {
+  if (!sort.value.startsWith(prefix)) return ''
+  return {
+    on: true,
+    asc: sort.value.endsWith('_asc'),
+    desc: sort.value.endsWith('_desc')
+  }
+}
+
 /**
  * 什么时候看全账套、什么时候只看顶栏那个月：
  *   **一个筛选条件都没填** → 就看顶栏定下的那个月（空表格比跨年 200 行好用）；
@@ -160,7 +204,7 @@ const hasFilter = computed(() =>
 
 /** 传给后端的查询参数：条件栏照旧，期间按 hasFilter 决定给不给。 */
 function queryParams() {
-  const p = { ...query }
+  const p = { ...query, sort: sort.value }
   if (!hasFilter.value) {
     p.from_period_id = store.periodId || undefined
     p.to_period_id = store.periodId || undefined
@@ -259,7 +303,7 @@ async function removeOne(row) {
   if (isLocked(row)) {
     return ElMessage.warning(
       row.status === 'POSTED'
-        ? `凭证 ${row.voucher_no} 已记账，不能删除；请先「反记账」`
+        ? `凭证 ${row.voucher_no} 已记账，不能删除；请到「期末结账」反结账后再删`
         : `${row.voucher_no} 所在期间已结账，不能删除`)
   }
   const ok = await ElMessageBox.confirm(`确认删除凭证 ${row.voucher_no}？`, '删除凭证', { type: 'warning' })
@@ -307,4 +351,26 @@ watch(() => store.periodId, () => {
 <style scoped>
 /* 日期不许折行：「2026-12-31」断成两行，扫一列日期全靠猜 */
 :deep(.el-table .nowrap .cell) { white-space: nowrap; }
+
+/* 可点的排序列：手型 + 悬停底色，让人看出这是个开关而不是纯标题。
+   当前正在按这一列排时给它主色小箭头 —— 四档循环光靠文字说不清自己在哪一档。 */
+.sort-head {
+  cursor: pointer;
+  user-select: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 4px;
+  margin: -1px -4px;
+  border-radius: 3px;
+}
+.sort-head:hover { background: var(--el-fill-color-light); }
+.sort-head.on { color: var(--el-color-primary); font-weight: 600; }
+.sort-head.on::after {
+  content: '';
+  border: 4px solid transparent;
+}
+.sort-head.on.asc::after { border-bottom-color: currentColor; margin-bottom: -3px; }
+.sort-head.on.desc::after { border-top-color: currentColor; margin-top: -3px; }
+
 </style>

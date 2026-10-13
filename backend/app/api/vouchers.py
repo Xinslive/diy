@@ -99,6 +99,7 @@ def query(book: Book = Depends(get_my_book), db: Session = Depends(get_db),
           status: Optional[str] = None, source: Optional[str] = None,
           keyword: Optional[str] = None, min_amount: Optional[Decimal] = None,
           max_amount: Optional[Decimal] = None, subject_id: Optional[int] = None,
+          sort: str = Query(svc.DEFAULT_SORT, pattern="^(no_asc|no_desc|date_asc|date_desc)$"),
           page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200)):
     fp = db.get(Period, from_period_id) if from_period_id else None
     tp = db.get(Period, to_period_id) if to_period_id else None
@@ -106,6 +107,7 @@ def query(book: Book = Depends(get_my_book), db: Session = Depends(get_db),
         db, book.id, from_period=fp, to_period=tp, date_from=date_from, date_to=date_to,
         status=status, source=source, keyword=keyword, min_amount=min_amount,
         max_amount=max_amount, subject_id=subject_id, page=page, page_size=page_size,
+        sort=sort,
     )
     # 科目一次取好，逐张序列化共用（审计 P3-12：200 行的页原来发 200 条同样的查询）
     subs = _book_subjects(db, book.id)
@@ -205,7 +207,7 @@ def batch_delete(payload: BatchIds, book: Book = Depends(get_my_book), db: Sessi
     posted = [v.voucher_no for v in rows if v.status == "POSTED"]
     if posted:
         raise HTTPException(
-            400, f"已记账的凭证不能删除，请先反记账：{'、'.join(posted[:10])}"
+            400, f"已记账的凭证不能删除，请到「期末结账」反结账后再删：{'、'.join(posted[:10])}"
                  + ("…" if len(posted) > 10 else ""))
     try:
         # 一批要么全删要么一张不删。逐张各自 commit 的话，删到第 5 张失败时

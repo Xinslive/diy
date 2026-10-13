@@ -29,11 +29,11 @@ from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.accounting.audit_helper import log, voucher_snapshot
 from app.accounting.util import constraint_name, period_label
-from app.models import Period, SysUser, Voucher
+from app.models import Entry, Period, SysUser, Voucher
 
 # 凭证号形如「记001」，前缀是 1~2 个汉字，序号是数字（补零到三位）
 NO_PATTERN = re.compile(r"^(?P<prefix>[^\d]{1,4})(?P<seq>\d+)$")
@@ -100,6 +100,62 @@ def split_no(voucher_no: str) -> tuple[str, int]:
     return m.group("prefix"), int(m.group("seq"))
 
 
+def _seq_of(voucher_no: str) -> int:
+    _prefix, seq = split_no(voucher_no)
+    return seq
+
+
+# --------------------------------------------------------------------- 收 / 付 / 转账
+
+# 「现金类」科目：1001 库存现金、1002 银行存款（含 1002xx 明细级）、
+# 1012 其他货币资金（第三方支付平台备付金等）。**按编码前缀判定**。
+#
+# 为什么不是给 Subject 加一个 is_cash 标志位：明细级（100201/100202）
+# 和父级（1002）是不同的行，前缀匹配一次命中整棵子树；标志位则要么每个
+# 账套逐个勾，要么靠「父级为现金 ⇒ 子级也为现金」的级联推导 —— 而后者
+# 在用户新建子科目时又得补一道回填。前缀是会计准则里已经定死的分类，
+# 拿来当判据既不用加列、也不会漏。
+CASH_SUBJECT_PREFIXES = ("1001", "1002", "1012")
+
+RECEIPT = 0   # 收：钱进账（现金/银行存款净增加）
+PAYMENT = 1   # 付：钱出账（现金/银行存款净减少）
+TRANSFER = 2  # 转账：不涉及现金/银行，或现金类借贷都有（提现、银行内部划转）
+
+
+def cash_flow_kind(entries) -> int:
+    """从分录判定这张凭证是收、付还是转账。
+
+    判据只看**现金类科目在哪个方向出现**，不引入凭证字、不落库、不改表：
+
+    * 现金类只出现在**借方**（资产增加 = 钱进账）→ 收 RECEIPT
+    * 现金类只出现在**贷方**（资产减少 = 钱出账）→ 付 PAYMENT
+    * **借贷两边都有**（提现 1001 借 / 100201 贷、银行手续费 收付各一条）
+      → 转账 TRANSFER。这两张在演示账里真实存在。
+    * **完全不涉及**现金/银行（计提工资、结转损益）→ 转账 TRANSFER。
+
+    「两边都有算转账」而不是「取主导方向」：一边一条、金额还不等的
+    混合凭证（如手续费 186 付 + 利息 980 收），主导方向会随金额大小翻面，
+    同一类业务在两个账套里可能排到不同段。收支两抵净额才是它真正的性质。
+    """
+    has_debit = has_credit = False
+    for e in entries:
+        code = getattr(getattr(e, "subject", None), "code", "") or ""
+        if not code.startswith(CASH_SUBJECT_PREFIXES):
+            continue
+        if e.direction == "DEBIT":
+            has_debit = True
+        elif e.direction == "CREDIT":
+            has_credit = True
+
+    if has_debit and has_credit:
+        return TRANSFER
+    if has_debit:
+        return RECEIPT
+    if has_credit:
+        return PAYMENT
+    return TRANSFER
+
+
 def _sort_key(voucher: Voucher, strategy: str):
     """排序键。最高一位永远是「是不是结转损益」：1 排最后。
 
@@ -108,8 +164,21 @@ def _sort_key(voucher: Voucher, strategy: str):
     """
     tail = 1 if voucher.source == "CARRY_FORWARD" else 0
     if strategy == "SORT_DATE":
-        return (tail, voucher.voucher_date.toordinal(), voucher.id)
-    return (tail, voucher.id)  # RENUM 保持当前存储顺序
+        # 同一天内按「先收后付再转账」排（用户 2026-10-13 定的口径）：
+        # 这一天钱先怎么进来、再怎么出去、最后才是内部划转 —— 这正是
+        # 银行流水对账时的阅读顺序。三类之内仍按录入顺序（id）兜底，
+        # 保证排序稳定、可复现。
+        kind = cash_flow_kind(voucher.entries)
+        return (tail, voucher.voucher_date.toordinal(), kind, voucher.id)
+    # RENUM 保持**当前号段**顺序，不是 id 顺序。
+    #
+    # 原来这里是 ``voucher.id``。正常录入时 id 与号同增，两者一致；但
+    # 「插入凭证」让老凭证保留 id、号却 +1，新凭证拿中间的号而 id 最大，
+    # 于是 id 顺序 ≠ 号段顺序。RENUM 再按 id 排，会把刚插到中间的那张
+    # 甩到末尾 —— 而 RENUM 的全部意义就是「不重排」。实测：插入后体检是
+    # 干净的（插入的凭证与参照凭证同一天，时序检查判它没错），RENUM 放行，
+    # 执行完当月从 clean 变成「时序不对 1 处」。按号排才等于「当前顺序」。
+    return (tail, _seq_of(voucher.voucher_no), voucher.id)
 
 
 # --------------------------------------------------------------------- 体检
@@ -247,8 +316,14 @@ def plan_organize(
                 "不能「按当前顺序重新编号」；请改用「按日期升序重排并编号」先排好时序"
             )
 
+        # entries + subject 一次取出来：_sort_key 的「先收后付再转账」要逐张看
+        # 分录里现金类科目在哪个方向。靠懒加载的话这里是 N+1（每张凭证一条
+        # entry 查询 + 每条 entry 一条 subject 查询），一个月几百张就是上千次
+        # 往返 —— 整理是个「点一次、等一会儿」的动作，这种延迟最容易被误读
+        # 成页面卡死。两级 selectinload 压成 2 条查询。
         rows = list(db.scalars(
             select(Voucher).where(Voucher.period_id == period.id)
+            .options(selectinload(Voucher.entries).selectinload(Entry.subject))
         ).all())
 
         # 已记账的凭证不动：它们占着的号原样留着，其余凭证只在空出来的号里发号。
@@ -285,11 +360,6 @@ def plan_organize(
         plans.append(plan)
 
     return plans
-
-
-def _seq_of(voucher_no: str) -> int:
-    _prefix, seq = split_no(voucher_no)
-    return seq
 
 
 def _dominant_prefix(rows: list[Voucher]) -> str:

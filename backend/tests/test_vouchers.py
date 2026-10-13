@@ -1181,3 +1181,105 @@ def test_撞号之后同一个事务还能继续写(db, book, admin_user, subjec
     )
     assert ok.id
     db.commit()
+
+
+# --------------------------------------------------------------------- 列表排序
+#
+# 四档：凭证号顺序 / 凭证号倒序 / 日期顺序 / 日期倒序，默认凭证号倒序
+# （用户 2026-10-13 定的）。两条最容易写错的地方，各有钉子：
+#   1. 凭证号**只在期间内唯一**，跨月必须先按期间排，否则记001 与 记012
+#      被拿去比大小；
+#   2. 号段要按**整数**比。直接排字符串时 "记100" < "记099"（字典序），
+#      与 next_voucher_no 当年踩过的 max() 是同一个坑。
+
+
+def _nos_in_order(rows):
+    return [(v.voucher_date.isoformat(), v.voucher_no) for v in rows]
+
+
+def test_排序_默认是凭证号倒序(db, book, periods, admin_user, subjects):
+    for i in range(1, 4):
+        create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, i),
+                       entries=_entries(subjects, [("100201", 100, "x")], [("600101", 100, "x")]))
+    db.commit()
+
+    rows, _total = query_vouchers(db, book.id)      # 不传 sort = 默认档
+    assert [v.voucher_no for v in rows] == ["记003", "记002", "记001"]
+
+
+def test_排序_凭证号跨期间先按期间再按号段(db, book, periods, admin_user, subjects):
+    """2 月一张记001、1 月三张记001..003。凭证号倒序该是「2月那张」在最前，
+    因为它的期间更晚 —— 而不是被 1 月那张同号的记001 顶掉。"""
+    for i in range(1, 4):
+        create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, i),
+                       entries=_entries(subjects, [("100201", 100, "x")], [("600101", 100, "x")]))
+    create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 2, 1),
+                   entries=_entries(subjects, [("100201", 100, "y")], [("600101", 100, "y")]))
+    db.commit()
+
+    rows, total = query_vouchers(db, book.id, sort="no_desc")
+    assert total == 4
+    assert rows[0].voucher_date == date(2026, 2, 1)
+    assert [(v.voucher_date.month, v.voucher_no) for v in rows] == [
+        (2, "记001"), (1, "记003"), (1, "记002"), (1, "记001"),
+    ]
+
+    rows_asc, _ = query_vouchers(db, book.id, sort="no_asc")
+    assert [(v.voucher_date.month, v.voucher_no) for v in rows_asc] == [
+        (1, "记001"), (1, "记002"), (1, "记003"), (2, "记001"),
+    ]
+
+
+def test_排序_凭证号按整数比不是按字典序(db, book, periods, admin_user, subjects):
+    """记099 与 记100：字典序下 "记100" < "记099"，整数序才是 099 < 100。"""
+    create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 1),
+                   voucher_no="记100",
+                   entries=_entries(subjects, [("100201", 100, "x")], [("600101", 100, "x")]))
+    create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 1),
+                   voucher_no="记099",
+                   entries=_entries(subjects, [("100201", 100, "y")], [("600101", 100, "y")]))
+    db.commit()
+
+    rows, _ = query_vouchers(db, book.id, sort="no_asc")
+    assert [v.voucher_no for v in rows] == ["记099", "记100"]
+
+
+def test_排序_日期两档与凭证号无关(db, book, periods, admin_user, subjects):
+    """同一天两张、号段与日期相反：日期两档必须都按日期给，不受号段影响。"""
+    create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 10),
+                   voucher_no="记001",
+                   entries=_entries(subjects, [("100201", 100, "x")], [("600101", 100, "x")]))
+    create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 5),
+                   voucher_no="记002",
+                   entries=_entries(subjects, [("100201", 100, "y")], [("600101", 100, "y")]))
+    db.commit()
+
+    asc, _ = query_vouchers(db, book.id, sort="date_asc")
+    assert [v.voucher_no for v in asc] == ["记002", "记001"]   # 01-05 在前
+
+    desc, _ = query_vouchers(db, book.id, sort="date_desc")
+    assert [v.voucher_no for v in desc] == ["记001", "记002"]  # 01-10 在前
+
+
+def test_排序_未知档位退回默认不报错(db, book, periods, admin_user, subjects):
+    """排序是显示偏好，不是数据错误：认不出的档位退回默认，而不是 400。"""
+    create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 1),
+                   entries=_entries(subjects, [("100201", 100, "x")], [("600101", 100, "x")]))
+    create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 2),
+                   entries=_entries(subjects, [("100201", 100, "y")], [("600101", 100, "y")]))
+    db.commit()
+
+    rows, _ = query_vouchers(db, book.id, sort="随便写的")
+    assert [v.voucher_no for v in rows] == ["记002", "记001"]
+
+
+def test_排序_筛选与分页在四个档位下总数一致(db, book, periods, admin_user, subjects):
+    """换排序只改顺序，不该改命中数 —— 排序若漏了 WHERE，总数就会变。"""
+    for i in range(1, 7):
+        create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, i),
+                       entries=_entries(subjects, [("100201", 100, "x")], [("600101", 100, "x")]))
+    db.commit()
+
+    counts = {s: query_vouchers(db, book.id, sort=s, page_size=200)[1]
+              for s in ("no_asc", "no_desc", "date_asc", "date_desc")}
+    assert set(counts.values()) == {6}

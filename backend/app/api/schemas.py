@@ -84,6 +84,22 @@ class SubjectIn(BaseModel):
     active: Optional[bool] = None
 
 
+class SubjectEditIn(BaseModel):
+    """科目更新使用部分字段，避免仅改名称/编码时覆盖其他属性。"""
+    code: Optional[str] = Field(default=None, min_length=1, max_length=32)
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    category: Optional[Literal["ASSET", "LIABILITY", "EQUITY", "COST", "PROFIT"]] = None
+    direction: Optional[Direction] = None
+    parent_id: Optional[int] = None
+    carry_forward: Optional[bool] = None
+    is_leaf: Optional[bool] = None
+    sort_no: Optional[int] = None
+    qty_calc: Optional[bool] = None
+    aux_calc: Optional[bool] = None
+    fx_calc: Optional[bool] = None
+    active: Optional[bool] = None
+
+
 # ---- 凭证 ----
 class EntryIn(BaseModel):
     subject_id: int

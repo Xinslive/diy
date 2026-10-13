@@ -7,7 +7,11 @@ import pytest
 from sqlalchemy import select
 
 from app.accounting.organize import (
+    PAYMENT,
+    RECEIPT,
+    TRANSFER,
     apply_organize,
+    cash_flow_kind,
     check_period,
     plan_organize,
     split_no,
@@ -349,3 +353,134 @@ def test_整理后编号连续无断号(db, book, periods, subjects, admin_user)
     r = check_period(db, periods[1])
     assert r["clean"] is True
     assert sorted(n for _i, n in _nos(db, book)) == ["记001", "记002"]
+
+
+# --------------------------------------------------------------------- 收 / 付 / 转账
+#
+# 下面这组钉的是「从分录自动判定 + 只用于同日排序」这条口径（用户 2026-10-13 定的）。
+# 关键约束三条：
+#   1. 判定**不新增凭证字** —— 号段仍是单一「记」段，check_period 的混用闸门不触发；
+#   2. 判定**按现金类科目的借贷方向**，不按金额大小；
+#   3. 借贷两边都有现金 → 转账（提现、银行手续费这类收支两抵的）。
+# 这三条任一被改写，同日顺序就会在真实账里翻车，所以都要有钉子。
+
+
+def _mk_cash(db, book, admin_user, subjects, date_, dr, cr, insert_after_id=None):
+    """dr / cr 是 (科目编码, 金额) 列表。"""
+    from datetime import date as _d
+
+    from app.accounting.vouchers import create_voucher
+    d = _d.fromisoformat(date_) if isinstance(date_, str) else date_
+    return create_voucher(
+        db, book_id=book.id, user=admin_user, voucher_date=d,
+        insert_after_id=insert_after_id,
+        entries=(
+            [{"subject_id": subjects[dc].id, "direction": "DEBIT",
+              "amount": str(da), "summary": "x"} for dc, da in dr]
+            + [{"subject_id": subjects[cc].id, "direction": "CREDIT",
+                "amount": str(ca), "summary": "x"} for cc, ca in cr]
+        ),
+    )
+
+
+def _kind_of(db, voucher):
+    from app.accounting.organize import cash_flow_kind
+    db.refresh(voucher)
+    return cash_flow_kind(voucher.entries)
+
+
+def test_判定_钱进账为收_钱出账为付_两边都是转账(db, book, periods, subjects, admin_user):
+    # 借 银行存款 = 资产增加 = 钱进账 → 收
+    receipt = _mk_cash(db, book, admin_user, subjects, "2026-01-05",
+                       dr=[("100201", 900)], cr=[("600101", 900)])
+    # 贷 银行存款 = 资产减少 = 钱出账 → 付
+    payment = _mk_cash(db, book, admin_user, subjects, "2026-01-05",
+                       dr=[("6602", 100)], cr=[("100201", 100)])
+    # 借 1001 库存现金 + 贷 100201 银行存款 = 提现，收支两抵 → 转账
+    transfer = _mk_cash(db, book, admin_user, subjects, "2026-01-05",
+                        dr=[("1001", 500)], cr=[("100201", 500)])
+
+    assert _kind_of(db, receipt) == RECEIPT
+    assert _kind_of(db, payment) == PAYMENT
+    assert _kind_of(db, transfer) == TRANSFER
+
+
+def test_判定_不涉及现金的凭证归转账(db, book, periods, subjects, admin_user):
+    # 计提工资：不碰现金/银行
+    accrue = _mk_cash(db, book, admin_user, subjects, "2026-01-05",
+                      dr=[("6602", 800)], cr=[("2211", 800)])
+    assert _kind_of(db, accrue) == TRANSFER
+
+
+def test_判定_混合收支按净额不按金额大小(db, book, periods, subjects, admin_user):
+    # 银行手续费(付 186) + 存款利息(收 980)：借贷都有现金 → 转账，
+    # 不能因为 980 > 186 就判成「收」。
+    mixed = _mk_cash(db, book, admin_user, subjects, "2026-01-05",
+                     dr=[("100201", 980), ("6603", 186)],
+                     cr=[("100201", 186), ("6111", 980)])
+    assert _kind_of(db, mixed) == TRANSFER
+
+
+def test_同日排序_先收后付再转账(db, book, periods, subjects, admin_user):
+    # 故意乱序录入：转账、付、收 —— 期望按日期整理后，收在前、转账在后
+    _mk_cash(db, book, admin_user, subjects, "2026-01-05",
+             dr=[("1001", 500)], cr=[("100201", 500)])           # 转账
+    pay = _mk_cash(db, book, admin_user, subjects, "2026-01-05",
+                   dr=[("6602", 300)], cr=[("100201", 300)])    # 付
+    rec = _mk_cash(db, book, admin_user, subjects, "2026-01-05",
+                   dr=[("100201", 700)], cr=[("600101", 700)])   # 收
+
+    apply_organize(db, book_id=book.id, user=admin_user,
+                   period_id=periods[1].id, strategy="SORT_DATE")
+
+    ordered = db.scalars(
+        select(Voucher).where(Voucher.book_id == book.id)
+        .order_by(Voucher.voucher_no)
+    ).all()
+    kinds = [cash_flow_kind(v.entries) for v in ordered]
+    # 三张同为 2026-01-05，应严格按 收→付→转账
+    assert kinds == [RECEIPT, PAYMENT, TRANSFER], f"实际顺序 {kinds}"
+    assert rec.id == ordered[0].id
+    assert pay.id == ordered[1].id
+
+
+def test_判定不新增凭证字_号段仍是单一段(db, book, periods, subjects, admin_user):
+    """判定只服务排序，绝不能把「记」拆成收/付/转三段。"""
+    _mk_cash(db, book, admin_user, subjects, "2026-01-05",
+             dr=[("100201", 700)], cr=[("600101", 700)])
+    _mk_cash(db, book, admin_user, subjects, "2026-01-06",
+             dr=[("6602", 100)], cr=[("100201", 100)])
+
+    r = check_period(db, periods[1])
+    assert r["clean"] is True
+    assert r["prefixes"] == ["记"]          # 仍然只有一个凭证字
+    assert not any("凭证字" in b for b in r["blocking"])
+
+
+# --------------------------------------------------------------------- RENUM 缺陷回归
+
+
+def test_RENUM_插入凭证后不破坏时序(db, book, periods, subjects, admin_user):
+    """回归：插入凭证把号顺延后，RENUM 必须按**当前号**排，不能按 id。
+
+    修复前 RENUM 用 ``voucher.id`` 排序，而插入让新凭证拿中间的号、id 却最大，
+    于是 RENUM 把它甩到末尾 —— 一个月从干净被整理成「时序不对」。
+    """
+    # 连记 5 张，号 记001..记005
+    stack = [_mk(db, book, admin_user, subjects, f"2026-01-0{i}") for i in range(1, 6)]
+    # 在 记002 后面插一张，日期与参照凭证**同一天**（体检判它没错，RENUM 会放行）
+    inserted = _mk_cash(db, book, admin_user, subjects, "2026-01-02",
+                        dr=[("100201", 50)], cr=[("600101", 50)],
+                        insert_after_id=stack[1].id)
+
+    assert check_period(db, periods[1])["clean"] is True, "前置：插入后应当体检干净"
+
+    apply_organize(db, book_id=book.id, user=admin_user,
+                   period_id=periods[1].id, strategy="RENUM")
+
+    r = check_period(db, periods[1])
+    assert r["clean"] is True, f"RENUM 不该制造时序错乱，实际 {r['blocking']}"
+    # 插入的那张仍待在号段中间（记002），没被甩到最后
+    final = {v.id: v.voucher_no for v in db.scalars(
+        select(Voucher).where(Voucher.book_id == book.id)).all()}
+    assert final[inserted.id] == "记002", f"插入的凭证应留在 记002，实际 {final[inserted.id]}"

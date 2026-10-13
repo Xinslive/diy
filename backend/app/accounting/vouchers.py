@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import Select, and_, func, or_, select
+from sqlalchemy import Integer, Select, and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -400,11 +400,17 @@ def update_voucher(
     period = db.get(Period, voucher.period_id)
     if period.locked:
         raise ValueError(f"{period.code} 已结账，不能修改凭证")
-    # 已记账 = 已进账簿，数字已经被总账/报表引用。改它必须先反记账，
+    # 已记账 = 已进账簿，数字已经被总账/报表引用。改它必须先退回复记账状态，
     # 否则「报表里的数和凭证里写的数」会对不上，且没人知道差在哪一步。
+    #
+    # 提示里**不能写「请在凭证列表里反记账」**：凭证列表工具栏上的
+    # 「记账 / 反记账」早就撤了（结算只在期末结账那一处，见 ARCHITECTURE §4），
+    # 按这句话去列表页翻的人只会找不到那个按钮。退回复记账的入口现在只有
+    # 「期末结账 → 反结账」—— 它会把区间内凭证一并退回未记账。
     if voucher.status == "POSTED":
         raise ValueError(
-            f"凭证 {voucher.voucher_no} 已记账，不能修改。请先在凭证列表里「反记账」再改。")
+            f"凭证 {voucher.voucher_no} 已记账，不能修改。"
+            f"请到「期末结账」对本期执行「反结账」后再改。")
 
     if "voucher_date" in payload and payload["voucher_date"]:
         new_date = payload["voucher_date"]
@@ -482,7 +488,8 @@ def delete_voucher(db: Session, voucher: Voucher, user: SysUser,
     """
     if voucher.status == "POSTED":
         raise ValueError(
-            f"凭证 {voucher.voucher_no} 已记账，不能删除。请先在凭证列表里「反记账」再删。")
+            f"凭证 {voucher.voucher_no} 已记账，不能删除。"
+            f"请到「期末结账」对本期执行「反结账」后再删。")
     snapshot = voucher_snapshot(voucher)
     log(
         db,
@@ -634,6 +641,38 @@ def unpost_vouchers(db: Session, book_id: int, voucher_ids: list[int], user: Sys
 # --------------------------------------------------------------------- 查询
 
 
+# 列表排序档位（用户 2026-10-13 定的）：默认「凭证号倒序」，
+# 表头可在「凭证号顺序 / 凭证号倒序 / 日期顺序 / 日期倒序」之间切换。
+#
+# 凭证号排序**必须先按期间**：``uq_voucher_period_no`` 是期间内唯一，
+# 记001 与 记012 分属两个月，跨月比大小没有意义。所以排序键是
+# (期间 ord, 号段数字)，日期排序则直接比 voucher_date。
+#
+# 号段数字要从字符串里抠出来再**按整数**比 —— 直接按 voucher_no 字符串排，
+# "记100" < "记099"（字典序），跟 next_voucher_no 踩过的 max() 同一个坑。
+# 用 PostgreSQL 的 regexp 抽出尾部数字再 cast 成 int。
+SORTS = ("no_asc", "no_desc", "date_asc", "date_desc")
+DEFAULT_SORT = "no_desc"
+
+
+def _no_seq():
+    """凭证号里的序号，按整数排序用。解析不出序号时给 -1，让它排最前。"""
+    digits = func.regexp_replace(Voucher.voucher_no, "^[^\d]*(\d+)$", r"\1")
+    return func.coalesce(func.cast(digits, Integer), -1)
+
+
+def _apply_sort(stmt: Select, sort: str) -> Select:
+    """按档位排序。未知档位退回默认，不给 400 —— 排序是显示偏好，不是数据错误。"""
+    if sort == "no_asc":
+        return stmt.order_by(Period.ord.asc(), _no_seq().asc(), Voucher.id.asc())
+    if sort == "no_desc":
+        return stmt.order_by(Period.ord.desc(), _no_seq().desc(), Voucher.id.desc())
+    if sort == "date_asc":
+        return stmt.order_by(Voucher.voucher_date.asc(), _no_seq().asc(), Voucher.id.asc())
+    # date_desc / 未知值
+    return stmt.order_by(Voucher.voucher_date.desc(), _no_seq().desc(), Voucher.id.desc())
+
+
 def query_vouchers(
     db: Session,
     book_id: int,
@@ -650,6 +689,7 @@ def query_vouchers(
     subject_id: int | None = None,
     page: int = 1,
     page_size: int = 50,
+    sort: str = "no_desc",
 ) -> tuple[list[Voucher], int]:
     stmt = select(Voucher).where(Voucher.book_id == book_id)
 
@@ -698,8 +738,13 @@ def query_vouchers(
         stmt = stmt.where(Voucher.id.in_(amt))
 
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    # 凭证号排序要按期间先后（记001 与 记012 分属不同月，跨月比大小无意义），
+    # 所以 join Period 拿到 ord。join 放在 count **之后**：count 只关心命中
+    # 多少行，join 一个 1:1 的 period 不会改变结果，却会让 count 的子查询
+    # 多带一张表 —— 没必要。
+    stmt = stmt.join(Period, Voucher.period_id == Period.id)
     stmt = (
-        stmt.order_by(Voucher.voucher_date.desc(), Voucher.id.desc())
+        _apply_sort(stmt, sort)
         .offset((page - 1) * page_size)
         .limit(page_size)
         # 分录一次性捞出来（审计 P3-12）。这里原来是

@@ -43,7 +43,7 @@
              而能不能改由它们各自那期说了算。含糊成「当前期间」会让人以为说的是顶栏。 -->
         <div v-if="locked" class="tag-bad">该凭证所在期间已结账，不可修改</div>
         <div v-else-if="posted" class="tag-bad">
-          已记账凭证已锁定，不能修改。请在凭证列表点「反记账」后再改。
+          已记账凭证已锁定，不能修改。请到「期末结账」对本期间执行「反结账」后再改。
         </div>
         <!-- 只读账套也得说一声：不然一屏全灰着，人只能猜是不是页面坏了 -->
         <div v-else-if="!store.canWrite" class="tag-bad">这个账套是只读的，不能修改凭证</div>
@@ -730,6 +730,17 @@ const savedAt = ref('')        // 上一次落库的时间，页脚上给个准�
  *  人连自己在改什么都看不清了。 */
 const failedSig = ref('')
 
+/** 这一页现在有没有「能落库的分录」：至少一条有科目、金额不为 0。
+ *
+ *  自动保存、离开前 flush、关页签拦问，问的都是同一句话，
+ *  判据也就只该有这一处。早先这三处各写一遍，其中 watch 那处漏了「有分录吗」，
+ *  只看 ``balanced`` —— 而空表时借贷都是 0、``diffCents === 0``，
+ *  ``balanced`` 就是 ``true``，于是新凭证页填好号码日期、停手 0.7 秒就
+ *  弹一句「请至少填写一条分录」。什么都没填的人被判成保存失败，
+ *  而且 ``failedSig`` 记不上它，每敲一下摘要就再弹一次。
+ */
+const hasCompleteEntry = computed(() =>
+  form.entries.some((e) => e.subject_id && num(e.amount)))
 
 function subjectText(id) {
   const s = subjects.value.find((x) => x.id === id)
@@ -1330,7 +1341,7 @@ function defaultDate() {
  */
 async function save() {
   if (readonly.value) {
-    ElMessage.warning(posted.value ? '已记账凭证不能修改，请先反记账'
+    ElMessage.warning(posted.value ? '已记账凭证不能修改，请到「期末结账」反结账后再改'
       : !store.canWrite ? '这个账套是只读的，不能修改凭证'
         : locked.value ? '该凭证所在期间已结账，不能修改'
           : '当前期间已结账，不能修改凭证')
@@ -1436,6 +1447,9 @@ async function autoSave() {
 watch([entrySig, balanced], () => {
   clearTimeout(autoSaveTimer)
   if (readonly.value || !balanced.value) return
+  // 一条能落库的分录都还没有 → 不是「有改动没存上」，是「还没录完」。
+  // 空表时 balanced 本来就是 true（借贷都是 0），光看它会把空表放进来去弹报错。
+  if (!hasCompleteEntry.value) return
   if (entrySig.value === lastSaved.value) return    // 跟刚落库的那一版一模一样，不用再存
   if (entrySig.value === failedSig.value) return   // 这一版刚才存失败了，别反复弹同一个错
   autoSaveTimer = setTimeout(autoSave, AUTO_SAVE_DELAY)
@@ -1458,7 +1472,7 @@ async function flushIfDirty() {
   if (savingPromise) await savingPromise        // 上一趟还在路上，先等它回来
   if (entrySig.value === lastSaved.value) return true
   if (!balanced.value) return true
-  if (!form.entries.some((e) => e.subject_id && num(e.amount))) return true
+  if (!hasCompleteEntry.value) return true
   return save() === true
 }
 
@@ -1467,7 +1481,7 @@ function hasUnsavedChanges() {
   if (readonly.value) return false
   if (entrySig.value === lastSaved.value) return false
   if (!balanced.value) return false
-  return form.entries.some((e) => e.subject_id && num(e.amount))
+  return hasCompleteEntry.value
 }
 
 /** 关页签 / 刷新：拦不住就至少让浏览器自己问一句「确定要走？」 */

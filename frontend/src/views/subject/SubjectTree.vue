@@ -18,12 +18,10 @@
         <el-table-column label="余额方向" width="80" align="center">
           <template #default="{ row }">{{ row.direction === 'DEBIT' ? '借' : '贷' }}</template>
         </el-table-column>
-        <el-table-column label="损益结转" width="80" align="center">
-          <template #default="{ row }">{{ row.carry_forward ? '是' : '' }}</template>
-        </el-table-column>
-        <el-table-column v-if="store.canWrite" label="操作" width="150" align="center">
+        <el-table-column v-if="store.canWrite" label="操作" width="190" align="center">
           <template #default="{ row }">
             <el-button link type="primary" @click="openCreate(row)">下级</el-button>
+            <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
             <el-button link type="danger" @click="remove(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -31,6 +29,7 @@
     </div>
 
     <SubjectFormDialog v-model="visible" :tree="tree" :parent-id="parentId" />
+    <SubjectEditDialog v-model="editVisible" :subject="editingSubject" @saved="load" />
   </div>
 </template>
 
@@ -39,6 +38,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as api from '@/api/subject'
 import SubjectFormDialog from '@/components/SubjectFormDialog.vue'
+import SubjectEditDialog from '@/components/SubjectEditDialog.vue'
 import { useSessionStore } from '@/stores/session'
 import { CATEGORY_LABEL } from '@/utils/subjectCode'
 
@@ -48,6 +48,8 @@ const loading = ref(false)
 const keyword = ref('')
 const visible = ref(false)
 const parentId = ref(null)
+const editVisible = ref(false)
+const editingSubject = ref(null)
 
 const rule = computed(() => store.currentBook?.subject_code_rule || '4-2-2-2')
 
@@ -60,6 +62,11 @@ async function load() {
 function openCreate(parent = null) {
   parentId.value = parent?.id || null
   visible.value = true
+}
+
+function openEdit(subject) {
+  editingSubject.value = subject
+  editVisible.value = true
 }
 
 async function remove(row) {

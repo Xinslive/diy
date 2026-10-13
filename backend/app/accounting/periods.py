@@ -173,9 +173,9 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
     # 的收入一并扫进本年利润，于是 11 月的钱出现在 12 月的凭证里，
     # 两边都「结账成功」，账面却已经错了，而且再也查不出来是谁动的手。
     eng = LedgerEngine(db, target.book_id)
-            # 不过滤 active：停用 ≠ 删除。结账校验漏掉停用科目的话，
-            # 一个挂着余额的停用损益科目能被直接结过去 —— 期间锁了、
-            # 损益却留在科目上跨年，而且没有任何报错。
+    # 结账校验只取「要结转的末级科目」，但**不过滤 active**：
+    # 停用 ≠ 删除。一个挂着余额的停用损益科目若被过滤掉，
+    # 就能被直接结过去 —— 期间锁了、损益却留在科目上跨年，而且没有任何报错。
     subjects = db.scalars(
         select(Subject).where(
             Subject.book_id == target.book_id,
