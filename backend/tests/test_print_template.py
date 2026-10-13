@@ -409,15 +409,56 @@ def test_最后一页合计等于整张凭证():
 
 
 def test_累计合计的金额大写跟着走():
-    """合计大写取的是这张分片的合计，最后一张要印整张凭证的大写。"""
+    """把「仅在尾页显示」关掉后，合计大写取的是这张分片的累计数。"""
     tpl = validate_template("VOUCHER", {"elements": [
         {"id": "cap", "type": "text", "bind": "capital",
-         "text": "合计大写：{capital}", "x": 3, "y": 82, "w": 64, "h": 5},
+         "text": "合计大写：{capital}", "x": 3, "y": 82, "w": 64, "h": 5,
+         "last_page_only": False},
     ]})
     pieces = split_voucher(_voucher(n=12), 5)
     html = render_voucher_sheet(tpl, {}, pieces, 1, 1)
-    assert "陆拾元整" in html
-    assert "叁拾元整" in html
+    assert "陆拾元整" in html      # 最后一张 = 整张凭证的合计
+    assert "叁拾元整" in html      # 第一张 = 前 5 行的累计
+
+
+def test_合计大写默认只在尾页显示():
+    """拆页后只有最后一张是完整的凭证。
+
+    每张都印一个累计合计，看起来会像每张都是整张凭证的合计 —— 默认只在尾页印。
+    """
+    tpl = validate_template("VOUCHER", {})
+    pieces = split_voucher(_voucher(n=12), 5)
+    pages = [render_voucher_sheet(tpl, {}, [p], 1, 1) for p in pieces]
+    assert [html.count("合计大写") for html in pages] == [0, 0, 1]
+    assert "陆拾元整" in pages[-1]        # 尾页印的是整张凭证的大写
+    assert "叁拾元整" not in pages[0]     # 续页上的分片合计不印
+
+
+def test_没拆过的凭证照常印合计大写():
+    """不拆页时整张凭证就是尾页，不能因为默认开关而把合计藏掉。"""
+    html = render_voucher_page(validate_template("VOUCHER", {}), {}, _voucher(n=3), 1, 1)
+    assert "合计大写" in html
+
+
+def test_只有合计大写默认仅尾页():
+    """凭证字号带着分页号，续页上不能没有，所以只有合计大写默认关到尾页。"""
+    tpl = validate_template("VOUCHER", {})
+    flags = {el["bind"]: el["last_page_only"]
+             for el in tpl["elements"] if el["type"] == "text"}
+    assert flags["capital"] is True
+    assert flags["voucher_no"] is False
+    assert flags["remark"] is False
+
+
+def test_仅尾页开关不影响表格():
+    """表格每页都要有，拆页只是把分录摊开，续页上没有表头表尾就没法核。"""
+    tpl = validate_template("VOUCHER", {"elements": [
+        {"id": "t", "type": "table", "bind": "entries", "x": 3, "y": 23,
+         "w": 94, "h": 57, "last_page_only": True},
+    ]})
+    pieces = split_voucher(_voucher(n=12), 5)
+    htmls = [render_voucher_sheet(tpl, {}, [p], 1, 1) for p in pieces]
+    assert all("class=\"grid\"" in html for html in htmls)
 
 
 def test_分片保留原始行号():
@@ -538,6 +579,18 @@ def test_十二行凭证打印时占满三张A4(client, auth, book, periods, mak
     assert "记001 - 003/003" in r.text
     assert r.text.count('class="voucher-slot"') == 3      # 3 个槽位
     assert r.text.count('<div class="page">') == 2         # A4 两槽位 → 2 张纸
+
+
+def test_拆页凭证整批只印一次合计大写(client, auth, book, periods, make_voucher):
+    """12 行 → 3 个分片，A4 一页 2 张；合计大写只在尾页那一张上出现。"""
+    make_voucher("2026-01-05",
+                 dr=[("100201", 10, f"借{i}") for i in range(6)],
+                 cr=[("600101", 10, f"贷{i}") for i in range(6)], posted=True)
+    r = client.get(f"/api/books/{book.id}/print/vouchers.html",
+                   params={"period_id": periods[1].id}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.text.count("合计大写") == 1
+    assert "陆拾元整" in r.text          # 尾页印的是整张凭证的合计
 
 
 def test_A5打印时每页一张(client, auth, book, periods, make_voucher):

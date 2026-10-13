@@ -311,12 +311,33 @@ CREATE TRIGGER trg_voucher_delete_guard BEFORE DELETE ON voucher
 CREATE OR REPLACE FUNCTION fn_subject_guard() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'UPDATE' AND NEW.code IS DISTINCT FROM OLD.code THEN
+        -- 判据是**整棵子树**的本年度发生额，不是这个科目自己身上的分录。
+        --
+        -- 账簿引擎把分录上卷到各级父科目（app/ledger/engine.py::_ancestor_map），
+        -- 所以父科目的本年发生额来自它的下级，对使用者来说「它有记账」是真的。
+        -- 只查 e.subject_id = OLD.id 的话，汇总级科目一律查不到分录，
+        -- 于是「末级改不了编码、汇总级随便改」——同一棵树上自相矛盾。
+        --
+        -- 与 app/api/subjects.py::update_subject 的 current_year_activity 同口径，
+        -- 两边都错才会被 test_subject_guardrails 的同源断言抓住。
+        -- 深度上限 32 与引擎的 guard < 32 对齐：科目树不该有环，万一有也不能把
+        -- 触发器挂死在这里。
         IF EXISTS (
+            WITH RECURSIVE sub AS (
+                SELECT s.id, 0 AS depth
+                FROM subject s
+                WHERE s.id = OLD.id
+                UNION ALL
+                SELECT c.id, sub.depth + 1
+                FROM subject c
+                JOIN sub ON c.parent_id = sub.id
+                WHERE c.book_id = OLD.book_id AND sub.depth < 32
+            )
             SELECT 1
             FROM entry e
             JOIN period p ON p.book_id = e.book_id AND p.ord = e.period_ord
             WHERE e.book_id = OLD.book_id
-              AND e.subject_id = OLD.id
+              AND e.subject_id IN (SELECT id FROM sub)
               AND e.amount <> 0
               AND p.year = EXTRACT(YEAR FROM CURRENT_DATE)::int
         ) THEN

@@ -99,6 +99,14 @@
             </el-select>
           </el-form-item>
 
+          <!-- 拆页后只在尾页出现的开关。合计大写默认开着：一张凭证拆成几张之后
+               只有最后一张是完整的，每张都印合计会让人以为是整张凭证的合计。 -->
+          <el-form-item v-if="cur.type === 'text'" label="尾页">
+            <el-checkbox :model-value="lastPageOnly(cur)" @change="setLastPageOnly">
+              仅在尾页显示
+            </el-checkbox>
+          </el-form-item>
+
           <template v-if="cur.type === 'table'">
             <div class="rail-head gap">表格</div>
             <div class="grid2">
@@ -413,6 +421,12 @@ function setHeaderMm(mm) {
 }
 
 function setShowHeader(v) { if (cur.value) { cur.value.show_header = !!v; changed() } }
+
+/** 老模板里没有这个字段，按绑定字段给默认值 —— 与后端 validate_template 同一套规则。 */
+function lastPageOnly(el) {
+  return el?.last_page_only ?? (el?.bind === 'capital')
+}
+function setLastPageOnly(v) { if (cur.value) { cur.value.last_page_only = !!v; changed() } }
 
 function setTotalLabel(v) { if (cur.value) { cur.value.total_label = String(v ?? ''); changed() } }
 

@@ -373,10 +373,27 @@ def update_subject(subject_id: int, payload: SubjectEditIn, book: Book = Depends
     if not changed:
         return {"id": s.id, "code": s.code, "name": s.name}
 
+    # **口径必须覆盖整棵子树，不能只看它自己身上的分录。**
+    #
+    # 账簿引擎把分录上卷到各级父科目（``ledger/engine.py::_ancestor_map``），
+    # 所以 1002 银行存款在总账 / 科目余额表 / 报表里看到的本年发生额，
+    # 全部来自它下面的 100201、100202。对使用者来说「1002 本年度有记账」
+    # 是板上钉钉的事实 —— 他看到的每一张报表都这么显示。
+    #
+    # 以前这里写的是 ``Entry.subject_id == subject_id``（只查直接分录），
+    # 于是同一棵树上：末级的 100201 有分录 → 被挡住不能改编码；
+    # 汇总级的 1002 一条直接分录都没有 → 放行。
+    # 结果就是「儿子改不了爹能改」，而两者在账上是同一笔钱。
+    # 改掉 1002 的编码会让资产负债表里按 1002 取数的公式指向一个空科目，
+    # 货币资金凭空归零，且没有任何报错 —— 这正是这道守卫要防的那类事故。
+    #
+    # 取子树而不是取祖先：判断的是「这个科目**当前**管着的钱」，
+    # 而 parent_id 的改动在下面才生效（改挂时不该用改挂后的子树来判）。
+    scope_ids = {subject_id} | _descendant_ids(db, subject_id)
     current_year_activity = db.scalar(
         select(Entry.id)
         .join(Period, and_(Period.book_id == Entry.book_id, Period.ord == Entry.period_ord))
-        .where(Entry.book_id == book.id, Entry.subject_id == subject_id,
+        .where(Entry.book_id == book.id, Entry.subject_id.in_(scope_ids),
                Period.year == func.extract("year", func.current_date()), Entry.amount != 0)
         .limit(1)
     ) is not None

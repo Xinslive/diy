@@ -890,6 +890,7 @@ def test_head_是本文件认识的那一版():
         "0007_subject_leaf_parent_guard",   # P2-04 的父节点护栏送达存量库
         "0008_login_ip_throttle",           # P2-11 的 IP 维度节流状态表
         "0009_subject_year_code_edit",      # 科目编码：本年度无发生额即可改
+        "0010_subject_year_code_subtree",   # 同上，但「发生额」按整棵子树判（汇总级也算有记账）
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")

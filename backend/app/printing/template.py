@@ -405,6 +405,10 @@ def validate_template(scope: str, content: dict | None) -> dict:
                     "align": raw.get("align") if raw.get("align") in ALIGN else "left",
                     "visible": bool(raw.get("visible", True)),
                     "border": bool(raw.get("border", True)),
+                    # 只在凭证的尾页出现。合计大写默认是开的：一张凭证拆成
+                    # 几张之后，只有最后一张是完整的凭证，每张都印一个合计
+                    # 会让人以为每张都是整张凭证的合计（见 _is_last_slice）。
+                    "last_page_only": bool(raw.get("last_page_only", bind == "capital")),
                     # 表格专用：表头可以不印，高度（占表格的百分比）也归模板管
                     "show_header": bool(raw.get("show_header", True)),
                     "header_height": _number("header_height", VOUCHER_HEAD_PCT, 0, 100),
@@ -1102,6 +1106,20 @@ def _element_border(el: dict) -> str:
     return f"{width}mm {style} #000"
 
 
+def _is_last_slice(voucher: dict) -> bool:
+    """这张分片是不是凭证的最后一张。
+
+    ``split_voucher`` 给每片打了 ``slice_index`` / ``slice_total``；没拆过的凭证
+    没有这两个标记，按尾页算 —— 不拆的时候整张凭证就是最后一张。
+    """
+    try:
+        index = int(voucher.get("slice_index") or 1)
+        total = int(voucher.get("slice_total") or 1)
+    except (TypeError, ValueError):
+        return True
+    return index >= total
+
+
 def _voucher_element_html(tpl: dict, ctx: dict, voucher: dict, el: dict,
                           page: int, total_pages: int) -> str:
     # 元素自己的显隐（画布上的「显示」开关 / 元素列表的隐藏按钮）
@@ -1122,6 +1140,8 @@ def _voucher_element_html(tpl: dict, ctx: dict, voucher: dict, el: dict,
     bind = el.get("bind", "custom")
     if not _element_enabled(tpl, bind):
         return ""
+    if el.get("last_page_only") and not _is_last_slice(voucher):
+        return ""      # 拆页后只在尾页印，续页上留着会被当成整张凭证的合计
     text = _fill(el.get("text") or ELEMENT_DEFAULT_TEXT.get(bind, ""),
                  _element_values(tpl, ctx, voucher, page, total_pages))
     if not text.strip():
