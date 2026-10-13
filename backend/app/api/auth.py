@@ -88,7 +88,8 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
     user.failed_logins = 0
     user.locked_until = None
     db.commit()
-    token, expires = create_access_token(user.id, user.username, is_admin=bool(user.is_admin))
+    token, expires = create_access_token(user.id, user.username, is_admin=bool(user.is_admin),
+                                         token_version=user.token_version or 0)
     books = db.scalars(select(UserBook).where(UserBook.user_id == user.id)).all()
     return TokenOut(
         access_token=token,

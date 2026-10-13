@@ -28,6 +28,18 @@ def get_current_user(
     user = db.get(SysUser, int(payload["sub"]))
     if user is None or not user.active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户不存在或已停用")
+    # 令牌版本核对（审计 P2-01）。JWT 自签名、服务端不存会话，所以「谁签发的、
+    # 什么时候签的」之外，服务端唯一能查到的状态就是库里这一列。
+    # 管理员重置口令或停用账号时把它加一，这个账号此前签发的所有令牌同时作废 ——
+    # 口令泄露后的标准处置就是「改口令」，过去改完旧令牌还能用满 12 小时，
+    # 等于没改。
+    #
+    # 载荷里没有 ``tv`` 的老令牌按 0 处理：升级前签发的令牌在存量库里
+    # 也是 tv=0，仍然可用（改口令/停用会立刻作废它们）。
+    if int(payload.get("tv", 0)) != (user.token_version or 0):
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "访问令牌已失效（口令或账号状态已变更），请重新登录")
     return user
 
 

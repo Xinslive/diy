@@ -47,9 +47,20 @@ def token_minutes_for(is_admin: bool) -> int:
     return min(settings.access_token_minutes, settings.admin_token_minutes)
 
 
-def create_access_token(user_id: int, username: str, is_admin: bool = False) -> tuple[str, int]:
+def create_access_token(user_id: int, username: str, is_admin: bool = False,
+                        token_version: int = 0) -> tuple[str, int]:
+    """签发访问令牌。
+
+    ``token_version`` 写进载荷（``tv``），由 :func:`app.core.deps.get_current_user`
+    与库里的当前值比对。这是「重置口令 / 停用账号之后旧令牌立刻失效」的全部机制
+    （审计 P2-01）—— 没有它，口令改了也已经发出去的令牌照样能用满有效期。
+
+    默认值 0 是为了让不关心这件事的调用方不用改签名；真正的签发入口
+    （``/api/auth/login``）一定会把库里的值传进来。
+    """
     expires = datetime.now(timezone.utc) + timedelta(minutes=token_minutes_for(is_admin))
-    payload = {"sub": str(user_id), "username": username, "exp": expires}
+    payload = {"sub": str(user_id), "username": username,
+               "exp": expires, "tv": int(token_version or 0)}
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm), int(
         expires.timestamp()
     )

@@ -34,6 +34,21 @@ class SysUser(Base, TimestampMixin):
     failed_logins: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
     locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
 
+    # 令牌版本号（审计 P2-01）。
+    #
+    # JWT 是自签名的，服务端不存会话，所以「重置口令」过去只能改
+    # ``password_hash`` —— 已经发出去的 bearer token 一律照常有效，直到自然过期
+    # （普通用户 720 分钟）。口令泄露之后管理员把口令重置了，攻击者手里的
+    # 旧令牌还能继续读写账套，最长还能用半天。
+    #
+    # 解法就这一个整数：签发时写进载荷，鉴权时与库里比一次，不一致就拒。
+    # 撤销 = ``token_version += 1``，于是该账号**所有**在用令牌一次性作废，
+    # 代价是这个人要重新登录一次 —— 这正是「改口令」该有的效果。
+    #
+    # 放在账号上而不是内存集合里：内存集合在多进程部署下每个进程各有一份，
+    # 撤销只撤销了其中一份；重启即清零，等于没实现。
+    token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+
 
 class UserBook(Base, TimestampMixin):
     """账套授权。role 决定该用户在此账套内的权限范围。

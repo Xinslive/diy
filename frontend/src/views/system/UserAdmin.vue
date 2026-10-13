@@ -116,6 +116,13 @@
           <el-input v-model="newPassword" type="password" show-password placeholder="至少 6 位" />
         </el-form-item>
       </el-form>
+      <!-- 重置口令 = 撤销该账号的全部在用令牌（审计 P2-01）。
+           这条以前不做，于是「口令泄露后重置口令」根本挡不住旧令牌。
+           代价是这个人要重新登录一次 —— 得让人看见，不然会以为是系统坏了。 -->
+      <el-alert
+        type="warning" :closable="false" show-icon
+        :title="resetHint" class="mb"
+      />
       <template #footer>
         <el-button @click="dlgReset = false">取消</el-button>
         <el-button type="primary" :loading="busy" @click="savePassword">重置</el-button>
@@ -126,12 +133,14 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import * as sysApi from '@/api/system'
 import { useSessionStore } from '@/stores/session'
 
 const store = useSessionStore()
+const router = useRouter()
 const users = ref([])
 const books = ref([])
 const busy = ref(false)
@@ -227,14 +236,31 @@ function openReset(row) {
   dlgReset.value = true
 }
 
+const resetHint = computed(() =>
+  target.value?.id === store.user?.id
+    ? '重置后你自己的登录状态也会失效，需要用新密码重新登录。'
+    : `重置后「${target.value?.real_name || target.value?.username || ''}」在所有设备上的登录状态会立即失效，需要用新密码重新登录。`
+)
+
 async function savePassword() {
   if (newPassword.value.length < 6) {
     ElMessage.warning('密码至少 6 位')
     return
   }
+  const isSelf = target.value?.id === store.user?.id
   await sysApi.updateUser(target.value.id, { password: newPassword.value })
-  ElMessage.success('密码已重置')
+  ElMessage.success(
+    isSelf
+      ? '密码已重置。你的登录状态已失效，正在跳转到登录页…'
+      : '密码已重置，该账号已登录的会话已全部失效'
+  )
   dlgReset.value = false
+  if (isSelf) {
+    // 自己重置自己的口令 = 自己的令牌也被撤销了。与其等下一次请求撞 401
+    // 再被全局拦截器踢出去，不如当场说清楚。
+    store.logout()
+    router.push({ name: 'login' })
+  }
 }
 
 async function remove(row) {

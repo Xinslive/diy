@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.accounting.audit_helper import log
 from app.core.db import get_db
 from app.core.deps import get_current_user
 from app.core.security import hash_password
@@ -35,6 +36,18 @@ def _is_admin(user: SysUser) -> bool:
 def _require_admin(user: SysUser) -> None:
     if not _is_admin(user):
         raise HTTPException(403, "只有系统管理员可以执行该操作")
+
+
+def _user_snapshot(u: SysUser) -> dict:
+    """账号快照：**只含身份属性**。
+
+    明文口令不会出现在这里（明文口令压根不落库），口令散列更不能 ——
+    ``/api/system/audit-logs`` 是全局可读的，日志里出现散列等于把离线爆破的
+    素材抄送给任何有管理员令牌的人。散列变了这件事本身记成
+    ``password_changed: true`` 就够了。
+    """
+    return {"id": u.id, "username": u.username, "real_name": u.real_name,
+            "active": u.active, "is_admin": u.is_admin}
 
 
 def _serialize(u: SysUser, links: dict[int, str]) -> dict:
@@ -108,6 +121,16 @@ def create_user(payload: UserIn, user: SysUser = Depends(get_current_user),
     db.add(u)
     db.flush()
     _apply_links(db, u, payload.books)
+    # P2-03：建号过去不留痕。这是整个身份体系的起点动作 ——
+    # 事后要能回答「这个人是谁、什么时候开的、一开始给了哪些账套」，
+    # 而 `set_books` 那条路由是逐账套记授权变更的，等于「改了权限有日志、
+    # 开号时给的初始权限没有」。这里把初始授权一并记进 after。
+    db.flush()
+    granted = {str(link.book_id): link.role for link in db.scalars(
+        select(UserBook).where(UserBook.user_id == u.id)).all()}
+    log(db, action="CREATE_USER", entity="user", entity_id=u.id, user=user,
+        detail=f"创建用户 {u.username}（{'启用' if u.active else '停用'}）",
+        after={**_user_snapshot(u), "books": granted})
     db.commit()
     db.refresh(u)
     return _serialize(u, {b["book_id"]: b["role"] for b in payload.books})
@@ -120,12 +143,41 @@ def update_user(user_id: int, payload: UserPatch, user: SysUser = Depends(get_cu
     target = db.get(SysUser, user_id)
     if target is None:
         raise HTTPException(404, "用户不存在")
+    before = _user_snapshot(target)
     if payload.real_name is not None:
         target.real_name = payload.real_name
     if payload.active is not None:
         target.active = payload.active
-    if payload.password:
+    password_changed = bool(payload.password)
+    if password_changed:
         target.password_hash = hash_password(payload.password)
+
+    # P2-01：改密和停用都必须让**已签发的**令牌立刻作废。
+    #
+    # 过去这里只改 password_hash，而 JWT 是自签名的、服务端不存会话，
+    # 鉴权只看签名 / 有效期 / active 三样 —— 于是「口令泄露后重置口令」这条
+    # 最常用的处置实际上没生效：攻击者手里的旧令牌照常读写，最长再活 12 小时。
+    # 停用之所以能挡，是因为 active 每次都被查；改密没有对应的那个字段，
+    # 这次给它补上（token_version）。
+    if password_changed or payload.active is not None:
+        target.token_version = (target.token_version or 0) + 1
+
+    # P2-03：停用 / 启用 / 改密 / 改姓名过去全部直接提交，一条日志都没有。
+    # 这类动作的影响面比授权还大（谁能进这个系统），却比授权更难追溯：
+    # 「这个人昨天还好好的，今天登不进去了」在日志里没有任何线索。
+    # 改密只记「变了」不记值 —— 见 _user_snapshot 的说明。
+    did: list[str] = []
+    if payload.active is not None and payload.active != before["active"]:
+        did.append("启用账号" if payload.active else "停用账号")
+    if password_changed:
+        did.append("重置口令（已撤销该账号全部在用令牌）")
+    if payload.real_name is not None and payload.real_name != before["real_name"]:
+        did.append("修改姓名")
+    if did:
+        log(db, action="UPDATE_USER", entity="user", entity_id=target.id, user=user,
+            detail=f"{'、'.join(did)}：{target.username}",
+            before=before,
+            after={**_user_snapshot(target), "password_changed": password_changed})
     db.commit()
     links = _links_by_user(db)
     return _serialize(target, links.get(target.id, {}))
@@ -135,7 +187,6 @@ def update_user(user_id: int, payload: UserPatch, user: SysUser = Depends(get_cu
 def set_books(user_id: int, books: list[dict], user: SysUser = Depends(get_current_user),
               db: Session = Depends(get_db)):
     """整份替换某用户的账套授权列表。"""
-    from app.accounting.audit_helper import log
 
     _require_admin(user)
     target = db.get(SysUser, user_id)
@@ -184,6 +235,13 @@ def delete_user(user_id: int, user: SysUser = Depends(get_current_user),
     target = db.get(SysUser, user_id)
     if target is None:
         raise HTTPException(404, "用户不存在")
+    # P2-03：删除过去不留痕。删完之后连「曾经有过这么一个账号」都没地方查 ——
+    # 而账号名册是要用来回答「这个账上的人都有谁」的。快照必须在 delete 之前取。
+    before = _user_snapshot(target)
+    before["books"] = {str(link.book_id): link.role for link in db.scalars(
+        select(UserBook).where(UserBook.user_id == user_id)).all()}
+    log(db, action="DELETE_USER", entity="user", entity_id=user_id, user=user,
+        detail=f"删除用户 {target.username}", before=before)
     db.delete(target)
     db.commit()
     return {"ok": True}
