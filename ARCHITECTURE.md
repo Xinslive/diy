@@ -942,6 +942,17 @@ token 在 localStorage 由 axios 拦截器注入，所以 `iframe.src` / `window
 `audit_helper.voucher_snapshot()` 在增删改时写入完整快照（分录逐条）。
 凭证创建、修改、删除、记账、反记账、结账、反结账、整理、导入、年度结转全部留痕。
 
+**身份操作同样留痕。** 建号、停用/启用、重置口令、删号四条路径过去全部直接提交，
+而隔壁的授权变更（`set_books`）却是逐账套写日志 —— 于是出现了「改了权限有日志、
+开号时给的初始权限没有」「停用账号一个字都没留下」这种不对称。现在这四条各自记一条
+`CREATE_USER` / `UPDATE_USER` / `DELETE_USER`，`book_id` 为空（跨账套事件），
+建号那条把**初始授权**一并记进 `after.books`。
+
+**日志里绝不出现口令或口令散列。** `/api/system/audit-logs` 是全局可读的，
+散列落进日志等于把离线爆破的素材抄送给每一个管理员。`_user_snapshot()` 只取身份属性，
+改密只记 `password_changed: true`。`tests/test_user_audit_log.py` 里有一条参数化用例
+专门钉这个。
+
 **只有管理员能看。** 快照等同于全量凭证副本（每一次删除/修改的完整内容），
 普通会计不该看到别人的操作痕迹。前端菜单对非管理员隐藏 + 路由 `adminOnly` 兜底，
 后端 `require_admin` 再兜一道 —— 三层都要有，前端两层只挡「手滑」，不挡手敲地址栏和直接打接口。
@@ -985,6 +996,66 @@ token 在 localStorage 由 axios 拦截器注入，所以 `iframe.src` / `window
 **注册只开账号，不发 token。** 没有账套的用户登录后是一片空白，
 自己点「新建账套」就能开工，也可以请管理员把已有账套授权过来。
 
+### 令牌撤销：`sys_user.token_version`
+
+JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的全部依据只有三样：
+签名对不对、有没有过期、用户还 `active` 吗。
+
+这三样里没有一项会因为**改口令**而变化，于是「口令泄露 → 管理员重置口令」这条
+最常用的处置实际上没生效：攻击者手里已经签发的 bearer token 照常读写账套，
+最长再活 720 分钟（普通用户 12 小时）。停用账号能挡住，因为 `active` 每次都被查；
+改密没有对应的字段。
+
+修法是一个整数（迁移 `0004_token_version`）：
+
+| 环节 | 做法 |
+|---|---|
+| 签发 | `create_access_token(..., token_version=…)` 把当前值写进载荷的 `tv` |
+| 鉴权 | `get_current_user` 比对 `payload["tv"]` 与 `user.token_version`，不等即 401 |
+| 撤销 | 改密或停用/启用时 `token_version += 1`，该账号全部在用令牌一次性作废 |
+| 代价 | 这个人要重新登录一次 —— 这正是「改口令」该有的效果 |
+
+三个取舍写在迁移的 docstring 里：为什么不存服务端会话（`get_current_user` 本来就要
+`db.get(SysUser)`，顺带比一个整数，**不增加任何查询**）、为什么不把口令哈希前缀塞进
+载荷（那是隐式绑定，谁把 `hash_password` 换成无盐实现，撤销路径就静默失效）、
+为什么放账号行而不是进程内存（多进程各有一份，重启即清零；与登录失败锁定同一个理由）。
+
+载荷里没有 `tv` 的旧令牌按 0 处理，与存量库的 `token_version = 0` 对得上，
+升级本身不会把人踢下线；一旦发生改密或停用，它们立即失效。
+
+---
+
+## 9.6 科目树的两个派生字段：`is_leaf` 与 `level`
+
+`subject.is_leaf`（是不是末级）和 `subject.level`（第几级）**都是派生值**，
+依据只有一个：**有没有下级**、**父级是谁**。
+
+这一点不是洁癖，它直接决定账面数字对不对：凭证校验
+（`accounting/vouchers._validate_entries`）和期初写入（`api/books.set_openings`）
+都拿 `is_leaf` 当权威判据 —— 分录挂到汇总科目上，明细账和科目余额表都按末级出账，
+这笔钱就在账上凭空消失。
+
+**曾经 `is_leaf` 是客户端可提交字段**，`update_subject` 的字段循环里无条件
+`s.is_leaf = payload.is_leaf`。于是普通账套写入者提交一次 PATCH，就能把有下级的
+汇总科目标成末级，凭证与期初两道关口同时放行。前端不给选不算防线，接口能被直接调。
+
+现在的规则：
+
+- **写入侧**：`is_leaf` 与 `level` 都由服务端算，客户端提交的值一律不读。
+  挂上父节点 → 父节点变汇总；移走子节点 / 删掉最后一个子节点 → 父节点恢复末级。
+- **移动侧**：`update_subject` 递归重算**整棵子树**的 `level`。
+  原来只把被移动的那一个节点改成「新父级次 + 1」，后代全留在旧级次上 ——
+  科目列表、明细账、前端缩进读的都是持久化的 `level`，所以那不是显示问题。
+  （原有测试搬的都是单个叶子科目，正好绕开了「搬整棵子树」。）
+- **数据库侧**：`fn_subject_leaf_guard` 触发器拒绝 `is_leaf` 从 false 翻成 true
+  而该科目**确实有下级**的自相矛盾状态。反方向不挡 ——
+  那只会让一个科目暂时录不了分录，表现为「不能选」，绝不产生错账；
+  而把它也挡掉的话，挂子节点时就必须在同一条 UPDATE 里把父节点改对。
+
+树根（`parent_id IS NULL`）单独说一句：它没有 id 可以更新，最后一个下级被删掉时
+要靠 `_recompute_root_leaf_flags()` 在所有根里重扫一遍。少了这一步，
+一级科目会永远停在 `is_leaf=False`，从此录不进分录，而界面上看不出任何原因。
+
 ## 10. 数据模型（16 张表）
 
 **账套与授权**
@@ -1001,13 +1072,27 @@ token 在 localStorage 由 axios 拦截器注入，所以 `iframe.src` / `window
 > 科目表、授权、期初录入都只跟账套走，与年度无关。
 
 **账套内数据**（全部带 `book_id`，每个账套独立）
-`subject`（树形 + `carry_forward` 标记损益类）`period`（含 `year`，跨年度连续 `ord`）`period_opening`
+`subject`（树形 + `carry_forward` 标记损益类；`is_leaf` / `level` 是派生值，见 §9.6）
+`period`（含 `year`，跨年度连续 `ord`）`period_opening`
 
 **凭证**
 `voucher`（含 `status`、`source`、`period_id`）`entry`
 
 **导入**
 `import_batch`（三段式暂存）
+
+> **`payload` 是暂存，不是归档。** 它装的是整份工作簿的解析结果：每张凭证的
+> 每条分录、科目编码、金额、摘要。确认入库或作废之后当场清空，只留摘要
+> （导了多少张、哪几行错了、错在什么科目）和批次元数据 ——
+> 凭证已经在 `voucher` / `entry` 表里，留着没有用途，只有「数据留在暂存表里没人察觉」
+> 这一个后果。「传完忘了点确认」的批次由 `purge_stale_batches()` 在导入历史页顺带清理
+> （挂读接口是因为它是唯一保证一定会被触发的地方）。
+>
+> **上传容量三道闸**（`app/core/config.py`）：接口层限制**读取字节数**（不把大文件
+> 读进内存）；解析前按 zip 中央目录**声明的**解压大小预检（xlsx 是 zip，几百 KB
+> 完全可以解压成几百 MB）；解析过程中限制**行数**与**单批凭证数**。
+> 前两道都可以被伪造 —— 中央目录里的 `file_size` 是可以随便写的 —— 行数不会，
+> 所以三道都要有。Nginx 那条 50m 限的是**请求体**，不是解压后体量，不能替代它们。
 
 **报表**
 `report_template` `report_row` `report_col` `report_cell` `report_result`
@@ -1065,6 +1150,10 @@ token 在 localStorage 由 axios 拦截器注入，所以 `iframe.src` / `window
 | `test_organize.py` | 断号、重排、两阶段改号 |
 | `test_voucher_no.py` | 补零只补零不改数字、**已结账期间不动**、触发器确实拦得住 |
 | `test_importer.py` | 三段式导入 |
+| `test_import_limits.py` | 上传字节/解压体积/行数/凭证数四道闸、确认与作废后清空 `payload`、过期批次清理不越账套 |
+| `test_subject_leaf_integrity.py` | `is_leaf` 不听客户端的（凭证与期初两条负向路径）、数据库触发器、移动整棵子树重算级次 |
+| `test_token_revocation.py` | 改密/停用后旧令牌立即失效、重登可用、牵连不到别人、升级前的老令牌不误杀 |
+| `test_user_audit_log.py` | 建号/停用/启用/改密/删号留痕、初始授权入档、**日志里没有口令与散列** |
 | `test_builtin_reports.py` | 内置模板的**数字勾稽**（资产=负债+权益、年初余额口径、结转排除） |
 | `test_openings.py` | 期初读写的往返保真、借贷必平、明细约束、跨账套隔离、Excel 往返 |
 | `test_report_design.py` | 报表结构增删改、**公式引用随行列位移同步改写**、隐藏行不进打印 |
