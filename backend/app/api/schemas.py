@@ -66,6 +66,14 @@ class SubjectIn(BaseModel):
     direction: Direction = "DEBIT"
     parent_id: Optional[int] = None
     carry_forward: bool = False
+    # **不接受客户端控制（审计 P1-01）。**
+    #
+    # 「是不是末级」完全由「有没有下级」决定。凭证校验和期初写入都拿
+    # ``Subject.is_leaf`` 当权威判据，一旦它能被 PATCH 改写，就等于普通写入者
+    # 可以把汇总科目标成末级、进而往汇总级上挂分录。
+    #
+    # 字段保留是因为前端已经在提交它（新增表单固定传 true），
+    # 删掉会让存量前端直接 422。服务端读都不读它。
     is_leaf: bool = True
     sort_no: int = 0
     qty_calc: bool = False

@@ -274,6 +274,35 @@ DROP TRIGGER IF EXISTS trg_subject_guard ON subject;
 CREATE TRIGGER trg_subject_guard BEFORE UPDATE ON subject
     FOR EACH ROW EXECUTE FUNCTION fn_subject_guard();
 
+-- ---------- 5b. is_leaf 必须与「有没有下级」一致（审计 P1-01）----------
+-- is_leaf 是派生字段，但它决定了分录能挂在哪里：
+-- 凭证校验和期初写入都拿它当权威判据。一旦它被写成与实际子级关系矛盾的值，
+-- 汇总科目就会被当成末级科目，分录挂上去之后明细账里这笔钱凭空消失。
+--
+-- 这里**只挡危险的那一个方向**：is_leaf = true 却真的有下级。
+-- 反方向（is_leaf = false 但没有下级）不挡 —— 那只会让这个科目暂时录不了
+-- 分录，界面上表现为「不能选」，绝不会产生错账；而把它也挡掉的话，
+-- 应用层每次挂子节点都必须同一条 UPDATE 里把父节点改对，少一个中间态就报错。
+-- 拦「错账方向」而不拦「不方便方向」，是这套护栏一贯的分寸。
+--
+-- 存量脏数据不追溯：已经错了的 is_leaf 需要应用层重算或人工修，
+-- 触发器只保证它不会再变错。
+CREATE OR REPLACE FUNCTION fn_subject_leaf_guard() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' AND NEW.is_leaf AND NOT OLD.is_leaf THEN
+        IF EXISTS (SELECT 1 FROM subject c WHERE c.parent_id = NEW.id) THEN
+            RAISE EXCEPTION
+                '科目 % 有下级科目，is_leaf 必须是 false（is_leaf 由服务端按子级关系维护）',
+                NEW.code USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
+    RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_subject_leaf_guard ON subject;
+CREATE TRIGGER trg_subject_leaf_guard BEFORE UPDATE ON subject
+    FOR EACH ROW EXECUTE FUNCTION fn_subject_leaf_guard();
+
 -- ---------- 6. 期初快照只读（除应用层显式写入外） ----------
 CREATE OR REPLACE FUNCTION fn_opening_guard() RETURNS trigger AS $$
 BEGIN

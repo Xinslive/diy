@@ -116,7 +116,10 @@ def create_subject(payload: SubjectIn, book: Book = Depends(get_my_book),
         book_id=book.id, code=payload.code, name=payload.name, category=payload.category,
         direction=payload.direction, parent_id=payload.parent_id,
         level=(parent.level + 1) if parent else 1,
-        is_leaf=payload.is_leaf, carry_forward=payload.carry_forward,
+        # P1-01：is_leaf 是服务端派生的，不接受客户端提交的值。
+        # 刚建出来的科目必然没有下级，所以这里一定是 True —— 写死而不是
+        # 读 payload，是为了让「客户端说了不算」这件事在代码里看得见。
+        is_leaf=True, carry_forward=payload.carry_forward,
         qty_calc=payload.qty_calc, aux_calc=payload.aux_calc, fx_calc=payload.fx_calc,
         sort_no=payload.sort_no, active=True, ext_attrs={},
     )
@@ -177,14 +180,73 @@ def _check_parent(db: Session, book: Book, parent_id: int | None, self_id: int |
     return parent
 
 
+def _children_map(db: Session, book_id: int) -> dict[int, list[int]]:
+    """账套内的父子关系：父 id -> 子 id 列表（一次查完，不发 N 次查询）。
+
+    科目树只有几百条，整棵树一次读进来比边走边查划算；而且递归重算时
+    每层都要问「谁的孩子是它」，逐层查会把一次改父放大成几十次查询。
+    """
+    rows = db.execute(
+        select(Subject.parent_id, Subject.id).where(Subject.book_id == book_id)
+    ).all()
+    out: dict[int, list[int]] = {}
+    for parent_id, child_id in rows:
+        if parent_id is not None:
+            out.setdefault(parent_id, []).append(child_id)
+    return out
+
+
+def _recompute_subtree(db: Session, book_id: int, root_id: int) -> None:
+    """从 root_id 起，递归重算整棵子树的 level 与 is_leaf（审计 P3-01 / P1-01）。
+
+    两个字段都是**派生值**，凡是它们的依据变了就得重算：
+
+    * ``level``：原来改父只把被移动的那个科目改成「新父级次 + 1」，它下面的
+      下级、更深的后代一律留在旧级次上。于是把一棵两级的子树从第 1 层搬到
+      第 3 层，根节点跟过去了，子孙还挂在原来的数上 —— 科目列表、明细账、
+      前端缩进全都按持久化的 level 显示，树画出来是错的。
+      测试里的改父用例搬的都是单个叶子科目，正好绕开了这个场景。
+
+    * ``is_leaf``：同样派生自「有没有下级」，一起算才不会两个字段互相打架。
+
+    之所以整棵重算而不是只改一层：级次是沿父链累加的，祖先动一位，
+    整条链都错。没有循环（``_check_parent`` 拦了自引用和挂到后代），
+    递归不会死循环；深度也受科目编码规则约束，是有限的几层。
+    """
+    children = _children_map(db, book_id)
+    root = db.get(Subject, root_id)
+    if root is None:
+        return
+    # 队列按层推进：同一层的节点 level 相同，算完再把子节点放进下一层，
+    # 这样子孙拿到的父级次一定是已经算好的。
+    queue: list[tuple[int, int]] = [(root_id, root.level)]
+    while queue:
+        subject_id, level = queue.pop(0)
+        kids = children.get(subject_id, [])
+        subject = db.get(Subject, subject_id)
+        if subject is None:
+            continue
+        if subject.level != level:
+            subject.level = level
+        is_leaf = not kids
+        if subject.is_leaf != is_leaf:
+            subject.is_leaf = is_leaf
+        queue.extend((kid, level + 1) for kid in kids)
+
+
 def _sync_leaf_flags(db: Session, old_parent_id: int | None, new_parent_id: int | None) -> None:
-    """改父之后，把新旧两个父节点的 is_leaf 重新算一遍。
+    """改父 / 删子之后，把新旧两个父节点的 is_leaf 重新算一遍。
 
     is_leaf 是「有没有下级」的冗余字段。它错了，期初录入会拒掉本该能录的科目，
     或者反过来允许在汇总级科目上录期初 —— 两头都是账面错误。
+
+    **None 不在这里处理**：它有两义 —— 「没有旧父节点」和「这个科目本来就是
+    树根」。新建一个顶级科目时 ``_sync_leaf_flags(db, None, None)`` 也会走到这里，
+    若把 None 当成「树根丢了孩子」把所有根都翻一遍，刚建出来的根节点立刻被标成
+    汇总级。树根那种情况由 :func:`_recompute_root_leaf_flags` 在删除路径上单独处理。
     """
     for pid in {old_parent_id, new_parent_id}:
-        if not pid:
+        if pid is None:
             continue
         # 会话是 autoflush=False（见 app/core/db.py），刚改的 parent_id 还没落库，
         # 下面的查询看不见它 —— 会把「有新下级」误判成 False，父节点就不更新。
@@ -195,6 +257,25 @@ def _sync_leaf_flags(db: Session, old_parent_id: int | None, new_parent_id: int 
         parent = db.get(Subject, pid)
         if parent is not None and parent.is_leaf != (not has_child):
             parent.is_leaf = not has_child
+
+
+def _recompute_root_leaf_flags(db: Session, book_id: int) -> None:
+    """重算树根的 is_leaf。
+
+    唯一的触发场景：**一个根的直接下级被删掉了**（或被改挂到别的根/别的层）。
+    没有 id 可以更新，只能在「parent_id IS NULL 的那一批」里逐个看有没有孩子。
+
+    原实现把 ``None`` 当成普通父节点跳过，于是根节点会永远停在 is_leaf=False：
+    最后一个明细被删掉之后，这个一级科目再也录不进分录，而界面上没有任何地方
+    提示它为什么不能记 —— 人只会以为系统坏了。
+    """
+    db.flush()
+    for root in db.scalars(select(Subject).where(Subject.parent_id.is_(None))).all():
+        has_child = db.scalar(
+            select(Subject.id).where(Subject.parent_id == root.id).limit(1)
+        ) is not None
+        if root.is_leaf != (not has_child):
+            root.is_leaf = not has_child
 
 
 @router.patch("/{subject_id}")
@@ -217,9 +298,22 @@ def update_subject(subject_id: int, payload: SubjectIn, book: Book = Depends(get
         old_parent_id = s.parent_id
         s.parent_id = payload.parent_id
         s.level = (parent.level + 1) if parent else 1
+        # P3-01：整棵子树的级次一起重算，不只是被移动的这一个节点。
+        _recompute_subtree(db, book.id, subject_id)
         _sync_leaf_flags(db, old_parent_id, payload.parent_id)
 
-    for field in ("name", "category", "direction", "carry_forward", "is_leaf", "sort_no",
+    # P1-01：is_leaf 从这个循环里拿掉了。
+    #
+    # 原来它在字段循环里被无条件赋值，等于把「是不是末级」交给了客户端：
+    # 而凭证校验（accounting/vouchers._validate_entries）和期初写入
+    # （api/books.set_openings）都拿 is_leaf 当权威判据。于是普通账套写入者
+    # 提交一次 PATCH，就能把一个有下级的汇总科目标成末级，接下来凭证校验放行、
+    # 期初录入也放行 —— 分录真的挂到了汇总科目上，明细账里这笔钱凭空消失。
+    # 前端不给选不算防线：接口能被直接调。
+    #
+    # 现在 is_leaf 只由服务端从子级关系算：挂上父节点时父节点变汇总（P1-06），
+    # 移走子节点时父节点恢复末级，删掉最后一个子节点时同样恢复。
+    for field in ("name", "category", "direction", "carry_forward", "sort_no",
                   "qty_calc", "aux_calc", "fx_calc"):
         setattr(s, field, getattr(payload, field))
     # 停用是「不让再选它」，不是「删掉它」：老凭证还指着它，账还得算得出来。
@@ -274,6 +368,14 @@ def delete_subject(subject_id: int, book: Book = Depends(get_my_book),
     # 的写路径 —— 没有快照的话，被删掉的科目长什么样只能靠人回忆。
     log(db, action="DELETE_SUBJECT", entity="subject", entity_id=subject_id, user=user,
         book_id=book.id, detail=f"删除科目 {s.code} {s.name}", before=before)
+    old_parent_id = s.parent_id
     db.delete(s)
+    db.flush()
+    # P1-01：删掉的可能正是父节点最后一个下级。不重算的话父节点会永远
+    # 停在 is_leaf=False —— 从那以后它再也录不进分录，界面上却看不出原因。
+    if old_parent_id is None:
+        _recompute_root_leaf_flags(db, book.id)
+    else:
+        _sync_leaf_flags(db, old_parent_id, None)
     db.commit()
     return {"ok": True}
