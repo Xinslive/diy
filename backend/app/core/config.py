@@ -53,6 +53,25 @@ class Settings(BaseSettings):
     login_max_failures: int = 5
     login_lock_minutes: int = 15
 
+    # Excel 导入的容量上限（审计 P2-02）。
+    #
+    # Nginx 把单请求限在 50MB，那只挡住了「一个特别大的请求」，挡不住
+    # 「很多个不算大但解压后很大」的请求 —— xlsx 本身就是个 zip，
+    # 1MB 的文件完全可能解压成几百 MB 的 XML。原实现是
+    # ``file.file.read()`` 无上限读进内存，解析器再把每一张凭证、每一条分录、
+    # 每一条错误都累积进列表，最后整包塞进 ``import_batch.payload``。
+    # 于是「上传」这一个动作就足以吃掉一个进程的内存，而暂存表会一直长。
+    import_max_bytes: int = 20 * 1024 * 1024            # 上传文件的字节数
+    # xlsx 是 zip：这两个上限防的是解压炸弹（几百 KB 的文件解压成几百 MB）。
+    # 1) 按 zip 目录里的声明大小累加，不真正解压就能判断；
+    # 2) 按实际解析出来的行数与凭证数兜底 —— 声明大小可以撒谎，行数不会。
+    import_max_unzipped_bytes: int = 200 * 1024 * 1024
+    import_max_rows: int = 20_000
+    import_max_vouchers: int = 5_000
+    # 未确认的暂存批次保留多久后自动清掉（确认/作废时 payload 当场清空，
+    # 但人上传完忘了点确认的批次会一直在）。见 importer.purge_stale_batches。
+    import_batch_ttl_days: int = 7
+
     default_timezone: str = "Asia/Shanghai"
 
     # 运行环境。**默认 prod** —— 也就是「按最坏情况处理」。

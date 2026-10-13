@@ -15,19 +15,37 @@
 --------
 日期或凭证号为空时视为「接上一张凭证」，这正好对应
 Excel 里一张凭证连着几行分录的常见排版。
+
+容量边界（审计 P2-02）
+---------------------
+导入是这套系统里唯一「一个请求能把整个进程的内存吃光」的入口：
+解析器把每一张凭证、每一条分录、每一条错误都累积进列表，
+最后整包写进 ``import_batch.payload``。因此设了三道闸：
+
+    1. 接口层限制**读取字节数**（不把大文件读进内存）；
+    2. 解析前按 zip 目录里的声明大小预检**解压后体量**（xlsx 就是 zip，
+       几百 KB 的文件解压成几百 MB 是常事，声明大小不真正解压就能看）；
+    3. 解析过程中限制**行数**与**单批凭证数** —— 前两道都可以被伪造
+       （zip 目录里的 file_size 是可以随便写的），行数不会。
+
+确认入库或作废之后，完整 payload 当场清空，只留批次元数据与校验摘要：
+已经处理完的工作簿内容没有继续留在暂存表里的理由，而那里面是
+整份凭证的科目、金额、摘要。
 """
 from __future__ import annotations
 
 import io
-from datetime import date, datetime
+import zipfile
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.accounting.audit_helper import log
 from app.accounting.util import money
+from app.core.config import settings
 from app.models import ImportBatch, Subject, SysUser
 
 # 字段别名：内部键 -> 可接受的表头（小写、已去空格）
@@ -140,6 +158,42 @@ def _subject_index(db: Session, book_id: int) -> tuple[dict[str, Subject], dict[
     return by_code, by_name
 
 
+# --------------------------------------------------------------------- 容量边界
+
+
+def _human(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n}B"
+
+
+def check_archive_size(data: bytes) -> None:
+    """按 zip 目录里**声明的**解压大小预检，不真正解压（审计 P2-02）。
+
+    xlsx 是 zip。一份几百 KB 的文件完全可以解压出几百 MB 的 XML ——
+    「上传大小没超限」在这条路上不构成任何保护。这里读 zip 的中央目录
+    （``ZipFile`` 只解析目录，不读文件内容）把各成员的 file_size 加起来，
+    超了就拒。
+
+    只能当**第一道**闸：中央目录里的 size 是可以随便写的。真正的兜底是
+    解析时逐行计数（:func:`parse_workbook` 里的行数与凭证数上限）。
+
+    不是 zip 就直接放行 —— 解析器稍后会自己报「无法读取 Excel 文件」。
+    """
+    limit = settings.import_max_unzipped_bytes
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            total = sum(info.file_size for info in zf.infolist())
+    except (zipfile.BadZipFile, OSError):
+        return  # 不是 zip（或已经坏到读不了目录）：交给解析器报错
+    if total > limit:
+        raise ValueError(
+            f"Excel 解压后约 {_human(total)}，超过上限 {_human(limit)}。"
+            "请拆成多份分别导入，或删除与本表无关的工作表后重试")
+
+
 # --------------------------------------------------------------------- 解析
 
 
@@ -147,6 +201,7 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
     """解析 xlsx 字节流，返回可 JSON 化的暂存包。不写库。"""
     from openpyxl import load_workbook
 
+    check_archive_size(data)
     try:
         wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
     except Exception as exc:  # noqa: BLE001
@@ -211,9 +266,22 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
         current["ok"] = not current["errors"]
         vouchers.append(current)
         current = None
+        # 凭证数上限：行数上限挡不住「一张凭证几十分录」的放大 ——
+        # 行数合规但凭证条数失控时，累积的列表依然能吃掉大量内存。
+        if len(vouchers) > settings.import_max_vouchers:
+            raise ValueError(
+                f"这份表解析出超过 {settings.import_max_vouchers} 张凭证，超过单次导入上限。"
+                "请拆成多份分别导入")
 
     for row in rows_iter:
         line_no += 1
+        # 行数与凭证数的上限在**遍历过程中**判，而不是先 count 一遍：
+        # 先 count 照样会把整个工作表读进内存，那正是要防的事。
+        # 触发上限时立刻中止解析并抛错，调用方回滚，暂存表里不留残骸。
+        if line_no > settings.import_max_rows:
+            raise ValueError(
+                f"这份表超过 {settings.import_max_rows} 行，超过单次导入上限。"
+                "请按期间或按凭证类别拆成多份分别导入")
         if row is None or all(c in (None, "") for c in row):
             continue
 
@@ -350,6 +418,37 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
 # --------------------------------------------------------------------- 暂存 / 入库
 
 
+# 摘要里最多留多少条错误：够人回源文件定位，又不至于把整份表又存一遍。
+_SUMMARY_ERROR_LIMIT = 200
+
+
+def _summarized_payload(payload: dict | None) -> dict:
+    """确认/作废之后替换 payload 用：只留摘要，不留凭证正文（审计 P2-02）。
+
+    ``payload`` 里装的是**整份工作簿解析结果**：每张凭证的每一条分录，
+    科目编码、名称、金额、原始字符串、摘要文字。批次已经入库或作废之后，
+    这些内容没有任何用途 —— 凭证在 ``voucher`` / ``entry`` 表里，错误在审计
+    日志与用户手上的源文件里。留着只有一个后果：一张几万行的导入表，
+    它的科目与金额会一直躺在暂存表里，而那张表本来该在上确认那一刻就消失。
+
+    保留的仍然够复盘用：失败在哪一行、错在什么科目、这次导了多少张。
+    """
+    payload = payload or {}
+    errors = list(payload.get("errors") or [])[:_SUMMARY_ERROR_LIMIT]
+    dropped = max(0, len(payload.get("errors") or []) - len(errors))
+    summary = {
+        "cleared": True,
+        "total": len(payload.get("vouchers") or []),
+        "ok": sum(1 for v in payload.get("vouchers") or [] if v.get("ok")),
+        "errors": errors,
+        "unknown_subjects": payload.get("unknown_subjects") or {},
+        "unknown_headers": payload.get("unknown_headers") or [],
+    }
+    if dropped:
+        summary["errors_truncated"] = dropped
+    return summary
+
+
 def stage(db: Session, book_id: int, user: SysUser, filename: str, data: bytes) -> ImportBatch:
     parsed = parse_workbook(data, book_id, db)
     ok = sum(1 for v in parsed["vouchers"] if v["ok"])
@@ -367,6 +466,33 @@ def stage(db: Session, book_id: int, user: SysUser, filename: str, data: bytes) 
     db.commit()
     db.refresh(batch)
     return batch
+
+
+def purge_stale_batches(db: Session, book_id: int | None = None,
+                        ttl_days: int | None = None) -> int:
+    """清掉久未确认的暂存批次，返回条数（审计 P2-02）。
+
+    确认/作废时 payload 已经当场清空，但这解决不了「传完就忘了点确认」的
+    那些批次：它们永远是 PENDING，payload 永远是完整的一份工作簿。
+    列表接口的 ``LIMIT 100`` 只限制返回条数，不会删除任何东西 ——
+    多次导入的批次会一直累积在表里。
+
+    只删 PENDING：COMMITTED / DISCARDED 的批次元数据（谁在什么时候导了多少张）
+    是有价值的追溯记录，而 payload 已经清空了，占不了什么空间。
+    """
+    ttl = settings.import_batch_ttl_days if ttl_days is None else ttl_days
+    if ttl <= 0:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(days=ttl)
+    stmt = delete(ImportBatch).where(
+        ImportBatch.status == "PENDING",
+        ImportBatch.created_at < cutoff,
+    )
+    if book_id is not None:
+        stmt = stmt.where(ImportBatch.book_id == book_id)
+    result = db.execute(stmt)
+    db.commit()
+    return int(result.rowcount or 0)
 
 
 def commit(db: Session, batch: ImportBatch, user: SysUser) -> dict:
@@ -418,6 +544,10 @@ def commit(db: Session, batch: ImportBatch, user: SysUser) -> dict:
     batch.committed_count = created
     batch.committed_at = datetime.now()
     batch.committed_by = user.username
+    # P2-02：凭证已经入库，payload 里的分录正文没有存在理由了。
+    # 先算摘要再清：下面的 log() 不用 payload，但将来有人想在这里加统计，
+    # 也不会发现数据已经没了 —— 这个顺序要写在注释里，否则早晚会有人调换。
+    batch.payload = _summarized_payload(batch.payload)
     log(
         db,
         action="IMPORT",
@@ -436,4 +566,7 @@ def discard(db: Session, batch: ImportBatch) -> None:
     if batch.status != "PENDING":
         raise ValueError(f"该导入批次已是「{batch.status}」状态")
     batch.status = "DISCARDED"
+    # P2-02：作废同样清空正文。这批数据没人要了，但「作废了却还留着一整份
+    # 凭证内容」是最坏的一种残留 —— 界面上看不见，库里一直在。
+    batch.payload = _summarized_payload(batch.payload)
     db.commit()

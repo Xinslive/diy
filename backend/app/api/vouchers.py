@@ -17,6 +17,7 @@ from app.accounting import organize as svc_organize
 from app.accounting import vouchers as svc
 from app.accounting.util import find_period
 from app.api.schemas import BatchIds, VoucherIn
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
 from app.models import (Book, Entry, ImportBatch, Period, Subject, SysUser,
@@ -279,7 +280,23 @@ def upload_import(file: UploadFile = File(...), book: Book = Depends(get_my_book
     """上传并解析，暂存待确认。不写任何凭证。"""
     if not (file.filename or "").lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(400, "只支持 .xlsx 格式（另存为 xlsx 后重试）")
-    data = file.file.read()
+    # 读取长度必须带上限（审计 P2-02）。原来是 `file.file.read()` —— 无参数
+    # 意味着「有多少读多少」，Nginx 那条 50m 只是最后一道闸，而它是**请求体**
+    # 限制：压缩过的上传、拆成多次的请求都能绕过，而且解析器拿到之后
+    # 会把每一行都累积进内存。
+    #
+    # 两道检查：file.size 是 Starlette 在收到请求时记下的字节数，
+    # 先用它拒掉明显超限的（连读都不读）；再按上限 +1 读一次，
+    # 处理 size 不可信的情况。
+    limit = settings.import_max_bytes
+    size = getattr(file, "size", None)
+    if size is not None and size > limit:
+        raise HTTPException(
+            413, f"文件 {size // 1024} KB 超过导入上限 {limit // 1024} KB，请拆成多份导入")
+    data = file.file.read(limit + 1)
+    if len(data) > limit:
+        raise HTTPException(
+            413, f"文件超过导入上限 {limit // 1024} KB，请拆成多份导入")
     try:
         batch = svc_import.stage(db, book.id, user, file.filename, data)
     except ValueError as e:
@@ -296,6 +313,10 @@ def upload_import(file: UploadFile = File(...), book: Book = Depends(get_my_book
 
 @router.get("/import")
 def list_imports(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
+    # P2-02：进列表页顺带清掉「传完没确认」的过期批次。
+    # 挂在读接口上是因为这是唯一保证它**一定会被触发**的地方 ——
+    # 没人会为了清理去跑一个定时任务，而导入历史是每次进来都要看的页面。
+    svc_import.purge_stale_batches(db, book.id)
     rows = db.scalars(
         select(ImportBatch).where(ImportBatch.book_id == book.id)
         .order_by(ImportBatch.id.desc()).limit(100)
