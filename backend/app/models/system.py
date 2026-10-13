@@ -8,8 +8,8 @@ from datetime import datetime
 
 from typing import Optional
 
-from sqlalchemy import (Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String,
-                        UniqueConstraint, func)
+from sqlalchemy import (Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer,
+                        String, UniqueConstraint, func)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
@@ -49,6 +49,58 @@ class SysUser(Base, TimestampMixin):
     # 放在账号上而不是内存集合里：内存集合在多进程部署下每个进程各有一份，
     # 撤销只撤销了其中一份；重启即清零，等于没实现。
     token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+
+
+class LoginIpThrottle(Base, TimestampMixin):
+    """登录失败的 **IP 维度** 聚合状态（审计 P2-11 的另一半）。
+
+    ``SysUser.failed_logins`` 只回答「这个账号被打了多少次」。而轮换用户名的
+    攻击源压根不碰同一个账号两次：它对上万个账号各试 5 次，每次只锁一个账号，
+    锁定机制几乎不生效，事后在审计里看到的也只是一堆互不相干的
+    ``LOGIN_FAILURE`` —— 没有任何一行能说清「这些来自同一个源」。
+
+    这张表就是那个「源」：每个来源 IP 一行，记滑动窗口内的失败总数。
+
+    放库里而不是内存里的理由与 ``SysUser.failed_logins`` 完全相同，且更要紧：
+    内存计数在多进程部署下每个进程各有一份（打满 N 个进程就有 N 次额度），
+    而重启即清零（「每秒试一次、攒够就停」的慢速爆破根本触发不了阈值）。
+
+    **它只是一张节流计分板，不是锁。** 超阈值不会写 ``locked_until``、
+    不会改任何账号 —— 原因见 ``app/api/auth.py`` 里「为什么不做 IP 锁死」
+    那一段：NAT 后面几百人共用一个出口 IP，按 IP 硬锁是把他们一起关在门外，
+    而且这个动作**攻击者可以主动触发**（从公司网络里打满阈值即可让整个公司
+    一段时间登不进来）。要开 IP 硬锁得显式置 ``LOGIN_IP_HARD_LOCK=true``。
+
+    时间口径：三个时间列都是 **naive UTC**，与 ``SysUser.locked_until`` 一致，
+    Python 侧一律走 ``auth.py::_utcnow()``。混用 aware/naive 会让窗口
+    在东八区部署时凭空差 8 小时。
+    """
+
+    __tablename__ = "login_ip_throttle"
+    __table_args__ = (
+        # 唯一约束是这张表的全部并发正确性基础：ON CONFLICT (ip) 靠它把
+        # 「读计数 + 加一」压成一条原子语句（auth.py::_bump_ip_failure）。
+        # 少了它就只能先 SELECT 再 UPDATE，两个并发请求会各读到同一个旧值，
+        # 于是失败数只涨 1 —— 攻击者并发打就把计数废掉了。
+        UniqueConstraint("ip", name="uq_login_ip_throttle_ip"),
+        # 清理入口（purge_expired_login_ip_state）按 last_failed_at 扫，
+        # 没有索引就是每次清理一次全表扫，而清理是在登录路径上顺带做的。
+        Index("ix_login_ip_throttle_last_failed", "last_failed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # 45 = IPv6 最长文本长度。刻意不存 inet 类型：那会让本项目其余部分
+    # （审计表里那个 String(45) 的 ip 字段）出现两种 IP 表达，比较时必踩坑。
+    ip: Mapped[str] = mapped_column(String(45), nullable=False)
+    # 窗口内的失败总数。
+    failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+    # 窗口起点（naive UTC）。窗口是**滑动**的：只有在连续 window 秒没有失败时
+    # 才整体清零（见 auth.py::_bump_ip_failure），所以攻击持续时计数只涨不落。
+    window_started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    last_failed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # 仅在显式开启 LOGIN_IP_HARD_LOCK 时才会被写。默认永远为 NULL ——
+    # 见本类 docstring 里「为什么不做 IP 锁死」。
+    blocked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
 
 
 class UserBook(Base, TimestampMixin):

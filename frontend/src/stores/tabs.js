@@ -115,6 +115,10 @@ export const useTabsStore = defineStore('tabs', {
       if (!key || typeof route?.path !== 'string' || !route.path.startsWith('/')) return
       const hit = this.opened.find((t) => t.key === key)
       if (hit) {
+        // 地址没变就**连存储都不写**：调用方是路由 watcher，翻页、筛选、后退
+        // 都会叫到这儿，每次都 JSON.stringify 一份再 setItem 纯属白刷。
+        // 写存储不是没有副作用的动作，调用频次一高就该先问一句「真的变了吗」。
+        if (hit.path === route.path) return
         hit.path = route.path
         saveTabs(this.opened)
         return

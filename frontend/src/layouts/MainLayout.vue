@@ -220,7 +220,25 @@ function onCommand(cmd) {
 }
 
 /* ── 标签栏 ─────────────────────────────────────────────────────── */
-watch(() => route.name, () => tabs.open(route), { immediate: true })
+/**
+ * 路由一变就把当前页登记进标签栏。
+ *
+ * **path 也要 watch，不能只看 name。** 凭证页的「上一张 / 下一张」走的是
+ * **同一个 route name、不同 path**（/vouchers/12 → /vouchers/13）——
+ * name 一个字没变，原来那条 `watch(() => route.name, ...)` 根本不触发，
+ * 标签记的 path 就永远停在第一张：关掉标签再点回来会跳到**另一张凭证**，
+ * 人只会以为凭证丢了。（自动保存那次是 VoucherEdit 自己显式调的，那是个例，
+ * 这条 watcher 的口子本身还在。）
+ *
+ * 拼成**一个字符串**再 watch，而不是 `[route.name, route.path]`：
+ * 数组每次求值都是新引用，watcher 按引用比，等于什么依赖一动就触发一次。
+ * 字符串按值比，name 和 path 都没真变时不会触发。
+ * route.path 不含 query，所以只改筛选条件不会惊动标签（标签存的也是 path）。
+ *
+ * 触发得再频也不怕：tabs.open 对已存在的标签**只改 path**，不改标题、不动脏状态，
+ * 而且地址没变时直接返回、连存储都不写（见 stores/tabs.js 的 open）。
+ */
+watch(() => `${route.name} ${route.path}`, () => tabs.open(route), { immediate: true })
 
 function closeTab(key) {
   const { next } = tabs.close(key, activeKey.value)

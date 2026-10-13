@@ -179,7 +179,7 @@ cd backend
 ```bash
 cd backend
 
-.venv/bin/python -m pytest                      # 966 个单元/接口测试（52 个测试文件，实测 `--collect-only`）
+.venv/bin/python -m pytest                      # 995 个单元/接口测试（53 个测试文件，实测 `--collect-only`）
 .venv/bin/python scripts/demo_e2e.py            # 69 项端到端流程
 .venv/bin/python scripts/demo_modules.py        # 53 项模块冒烟
 node onboard.mjs                                # 12 步浏览器开户全流程（需前后端都起着）
@@ -210,7 +210,7 @@ backend/
     reports/        # 报表公式引擎（自由配公式）
     printing/       # 打印模板引擎（HTML+CSS @page）
     api/            # HTTP 层，只做参数转换和错误翻译
-    models/         # 16 张表
+    models/         # 17 张表
     core/           # 配置、连接、鉴权、初始化 SQL
     seed/           # 标准科目表、内置报表模板
   scripts/          # seed_demo.py 演示数据 + demo_e2e/demo_modules 端到端脚本

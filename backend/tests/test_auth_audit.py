@@ -15,10 +15,35 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 import pytest
 
 from app.models import AuditLog
+
+
+@pytest.fixture
+def client(app_for_peer):
+    """覆盖 conftest 的 ``client``：每个用例一个独立的来源 IP。
+
+    理由同 ``test_login_lockout.py`` 开头那段 —— 本文件也要故意地多次登录失败，
+    而 conftest 的 client 是全suite共用的同一个对端。共用一个来源 IP 意味着
+    这些失败会堆进同一个节流桶，于是「测审计」的文件会把「测节流」的用例顶掉。
+    """
+    return app_for_peer
+
+
+@pytest.fixture
+def app_for_peer():
+    from fastapi.testclient import TestClient
+
+    from app.main import app as fastapi_app
+
+    ip = f"198.51.{uuid.uuid4().int % 254 + 1}.{uuid.uuid4().int % 254 + 1}"
+    with TestClient(fastapi_app, raise_server_exceptions=False,
+                    client=(ip, 50000)) as c:
+        yield c
+
 
 
 def _admin(client, admin_user) -> dict:
@@ -75,6 +100,53 @@ def test_登录失败要记下来源IP(client, db, admin_user):
     assert r.status_code == 401
     entry = _logs(db, "LOGIN_FAILURE")[-1]
     assert "203.0.113.7" in _flat(entry), f"审计里没有来源 IP：{_flat(entry)}"
+
+
+def test_审计口径与判定口径是两套(client, db, admin_user):
+    """**最容易顺手破坏的一条边界**：审计记 IP 与节流判定 IP 故意不是同一套。
+
+    审计这一侧取 ``X-Forwarded-For`` 的**最左**元素（``_client_ip``）：那是
+    客户端自己写的第一个值，可能是假的，但在取证这件事上「宁可记一个可能
+    被伪造的值，也别把真实来源弄丢」是对的 —— 多代理链下最左元素往往正是
+    真正的发起方。
+
+    节流判定那侧（``_throttle_ip``）只认 TCP 对端，除非对端在
+    ``TRUSTED_PROXIES`` 里 —— 因为**判定**会把值拿去当「谁在攻击」的判据，
+    采信一个能随便写的头等于把限流的钥匙交给攻击者。
+
+    两者都写在这里，是因为下一次有人「顺手统一一下」就会把其中一个弄坏，
+    而弄坏哪一个都不会让任何一条既有用例变红。
+    """
+    from app.api.auth import _client_ip, _throttle_ip
+
+    class _Req:
+        client = type("C", (), {"host": "198.51.100.5"})()
+
+        def __init__(self):
+            self.headers = {"x-forwarded-for": "1.2.3.4, 198.51.100.5"}
+
+    req = _Req()
+    assert _client_ip(req) == "1.2.3.4", "审计口径应当取 XFF 最左（取证视角）"
+    assert _throttle_ip(req) == "198.51.100.5", (
+        "判定口径必须只认 TCP 对端 —— 采信可伪造的头，这一层防护等于不存在")
+
+    # 端到端再确认一次：审计里记的是 XFF 最左，节流状态行记的是 TCP 对端
+    from fastapi.testclient import TestClient
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app, raise_server_exceptions=False,
+                    client=("198.51.100.5", 50000)) as c:
+        c.post("/api/auth/login",
+               json={"username": admin_user.username, "password": "错的"},
+               headers={"X-Forwarded-For": "1.2.3.4"})
+
+    assert "1.2.3.4" in _flat(_logs(db, "LOGIN_FAILURE")[-1])
+    db.expire_all()
+    from app.models.system import LoginIpThrottle
+
+    rows = [r for r in db.query(LoginIpThrottle).all() if r.ip == "198.51.100.5"]
+    assert rows, "伪造的 XFF 被拿去当节流判据了 —— 这一层防护等于不存在"
 
 
 def test_用户名不存在也要留审计(client, db, admin_user):

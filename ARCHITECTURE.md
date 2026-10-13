@@ -1147,11 +1147,18 @@ token 在 localStorage 由 axios 拦截器注入，所以 `iframe.src` / `window
 | `ACCOUNT_LOCKED` | 登录失败数达 `LOGIN_MAX_FAILURES` | 独立一类，别混进 `LOGIN_FAILURE` |
 | `LOGOUT` | `POST /api/auth/logout` | |
 | `REGISTER_USER` | `POST /api/auth/register` | 跨账套事件，`book_id` 为空 |
+| `LOGIN_IP_SCAN` | 同一来源在窗口内失败数**跨过阈值**那一次 | 「这个源开始扫了」，与「拒绝」分开记，处置不同 |
+| `LOGIN_IP_THROTTLED` | 被 IP 维度节流拒绝的每一次 | 「这台系统在主动拒绝某个来源」，事后第一眼要看的 |
 
-三个都在 `api/auth.py`（prefix `/api/auth`）；用户与授权那批接口才在 `/api/system` 下。
+登录那批全在 `api/auth.py`（prefix `/api/auth`）；用户与授权那批接口才在 `/api/system` 下。
 
 来源 IP 取 `X-Forwarded-For` 最左一节（直连部署时该头没有，落到 `request.client.host`），
 截到 45 字符后写进 `detail` 与 `after.ip`。**没有 IP 的登录日志在排查时几乎没有价值。**
+
+> **这是审计口径，不是判定口径，两者故意不同。** 审计求「信息尽量多」——
+> 最左元素即便被伪造，代价也只是那行日志写着别人的 IP，换不来任何权限。
+> 而节流判定求「一定可靠」，走的是 `auth.py::_throttle_ip` 那套（见 §9.7），
+> **无条件采信 XFF 等于把限流的钥匙交给攻击者**。
 
 **审计包走 SAVEPOINT。** 审计写失败绝不能把一次成功的登录变成 500 ——
 `_audit()` 在 SAVEPOINT 里执行，失败只打应用日志、不影响主流程。
@@ -1355,7 +1362,103 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
 > **容量**这一维度没人看。豁免的是**写权限**，不是**容量** —— 两件事必须分开
 > （`tests/test_upload_capacity_matrix.py`）。
 
-## 10. 数据模型（16 张表）
+## 9.7 登录的 IP 维度软节流（`LOGIN_IP_HARD_LOCK` 默认关）
+
+**打开 `LOGIN_IP_HARD_LOCK` 之前，先读完这一节。** 这是本项目最容易在下一轮被
+「顺手打开」的开关，而打开它的后果不是「多一道防护」，是**多一个可用性故障面**。
+
+### 为什么默认不做 IP 硬锁
+
+`sys_user.failed_logins` / `locked_until` 只认**账号**：一个源轮换用户名就能把
+「每个账号试 5 次」摊到上万个账号上，每次只锁一个，锁定机制几乎不生效
+（P2-11）。按来源聚起来看才是正解 —— `login_ip_throttle` 表，每来源一行。
+
+看上去「IP 锁死」比 429 强得多，但在这套系统的真实部署里它是个
+**DoS 放大器**，理由两条，缺一条都不成立：
+
+1. **共享出口 IP 是常态，不是例外。** 办公网、家庭宽带、大客户出口、运营商 NAT
+   后面可能是几百上千人共用一个 IP。按 IP 锁死等于把这几百人一起关在门外 ——
+   防护直接变成故障，而且**故障面比攻击面大得多**。
+2. **这个动作可以被攻击者主动触发。** 从公司网发请求打满阈值，这个 IP 在锁定期内
+   对全公司不可用。所以硬锁不是「防住攻击者」，而是把攻击者手里的工具
+   从爆破换成了拒人于门外。
+
+所以默认只有**软节流**：超阈值回 **429 + `Retry-After`** + 留痕 `LOGIN_IP_THROTTLED`，
+**不锁账号、不锁 IP**，窗口滑完自动恢复。跨线瞬间另留一条 `LOGIN_IP_SCAN`。
+`blocked_until` 这一列默认永远为 NULL，只有显式打开 `LOGIN_IP_HARD_LOCK` 才写。
+
+**服务端只睡一小段：递增延迟每档 `LOGIN_IP_DELAY_STEP_MS`（200ms）、封顶
+`LOGIN_IP_DELAY_MAX_MS`（1 秒）。** 更大的惩罚交给 `Retry-After` 响应头，
+由讲规矩的客户端自己去退避 —— 服务端 `time.sleep` 要占住一个 worker，
+而「占住 worker」正是上面刚否掉 DoS 放大器的同一种资源消耗。
+
+阈值 `LOGIN_IP_MAX_FAILURES` 默认 30 / 窗口 `LOGIN_IP_WINDOW_SECONDS` 默认 900 秒，
+比账号维度的 5 次高一个数量级：共享出口上一个月结期几十个人输错口令是**正常业务噪声**，
+而攻击者每次尝试都要付 PBKDF2 的 20ms。取舍方向是单边的 —— 宁可让他多试几次。
+
+`tests/test_ip_throttle.py` 把「默认不做 IP 硬锁」这条结论本身钉成断言
+（`test_超阈值也不锁任何账号`），并单独测了默认关闭的那条分支（`test_硬锁开关打开后行为完全不同`），
+免得它变成没人跑过的代码。
+
+### 两套 IP 口径：审计用 XFF 最左，判定用「对端优先」
+
+`auth.py` 里有**两个**取 IP 的函数，故意不合并：
+
+| 函数 | 用途 | 取值 |
+|---|---|---|
+| `_client_ip` | 只写审计 | `X-Forwarded-For` **最左**，兜底 `request.client.host` |
+| `_throttle_ip` | **唯一参与安全判定** | 见下 |
+
+`_throttle_ip` 的顺序（`is_trusted_proxy()` 判定对端是否在白名单内）：
+
+1. 对端**不在** `TRUSTED_PROXIES` 白名单里 → 只认 `request.client.host`。
+   这是 TCP 层的真实对端，**攻击者伪造不了**。
+2. 对端在白名单里 → 才读代理头，**先 `X-Real-IP`**（nginx 用
+   `proxy_set_header X-Real-IP $remote_addr`，是**覆盖**不是追加，客户端发的会被丢弃）。
+3. 没有 `X-Real-IP` 才退回 `X-Forwarded-For`，取**最右**一个 —— nginx 的
+   `$proxy_add_x_forwarded_for` 是**追加**语义，最右边才是代理亲眼见到的；
+   最左边（审计口径取的那个）是客户端自己写的。
+
+> ⚠️ **无条件信任 XFF 是最容易写出来、也最容易被当成安全的那份代码，而它恰好把这一层
+> 防护整个作废。** 每次请求换一个头就能换一个桶，IP 维度限流对攻击者等于不存在。
+> 默认「一个代理都不信」正是为了堵这条路：`tests/test_ip_throttle.py` 里
+> `test_伪造XForwardedFor换不了桶` 断言伪造的头**各自建不出一行计数**。
+
+**用 nginx 部署时必须设 `TRUSTED_PROXIES=127.0.0.1`**（`config.py` 的
+`trusted_proxies`，默认空串 = 一个都不信）。否则所有请求的 TCP 对端都是
+`127.0.0.1` —— **全站共用一个桶，节流等于没有**。`validate_production_settings`
+对这件事是**告警而不是拒绝启动**（`log.warning`）：默认配置已经在挡着一大批真实部署，
+把它们变成「升级之后起不来」是拿可用性换一个已经由 429 兜着的风险。
+
+**nginx 配置无需改动**：`deploy/nginx/cwq.conf` 已经透传 `X-Real-IP` 与
+`X-Forwarded-For` 两个头，只需要在本服务侧声明谁是自己人。白名单支持单个 IP 与 CIDR
+（`trusted_proxy_networks` 两者都认），解析不了的条目**跳过并告警**而不是抛异常 ——
+运维写错一个条目不该让服务起不来。
+
+### 状态会过期：`login_ip_throttle` 不是只增不减的
+
+这张表**每个来源一行、写入方是每一次登录失败**，没有人会手工清它。所以清理入口是
+必需品而不是优化：`purge_expired_login_ip_state()`，保留期取
+`LOGIN_IP_STATE_TTL_HOURS`（默认 24 小时 = 窗口的 9 倍）。
+
+- 取窗口**倍数**而不是「刚好等于窗口」是有意的：刚出窗口的那几行正是还要用来判定
+  「这个源是不是刚被放过」的状态，删早了等于让一次节流凭空消失。
+- 触发方式有两条：**登录失败路径顺带清理**（每进程最多 60 秒扫一次，
+  `_PURGE_INTERVAL_S`）与显式调用。挂在失败路径而不是成功路径，是因为这张表
+  **只由失败写入** —— 挂在成功路径会漏掉「被扫了一轮之后所有人都不再出错」这段尾巴。
+- 关掉节流是真的**不写库**（`LOGIN_IP_THROTTLE_ENABLED=false` 判在写之前），
+  否则表只增不减，正是 P2-23 点名的那种「定义了却没人回收」的状态。
+
+被节流的请求**不延长窗口** —— 否则一个照着 `Retry-After` 每隔一分钟重试的用户
+（或攻击者）会把窗口无限续上，手册上的「N 分钟后再试」变成一句空话。
+
+结构变更走迁移 `0008_login_ip_throttle`（`uq_login_ip_throttle_ip` 唯一约束是
+整张表并发正确性的全部基础：upsert 靠它把「读计数 + 加一」压成一条原子语句；
+`ix_login_ip_throttle_last_failed` 供清理扫描）。
+
+---
+
+## 10. 数据模型（17 张表）
 
 **账套与授权**
 `sys_user` `book` `sys_user_book`（OWNER / ACCOUNTANT / VIEWER）
@@ -1426,6 +1529,19 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
 **审计**
 `audit_log`
 
+**登录安全**
+`login_ip_throttle`（每来源一行的失败聚合；**跨账套、无 `book_id`**，
+它记的是「谁在扫」而不是「哪个账套的账」，见 §9.7）
+
+> **表数是 17，核实方法：模型里 17 个 `__tablename__`**
+> （`audit_log` `book` `entry` `import_batch` `login_ip_throttle` `period`
+> `period_opening` `print_template` `report_cell` `report_col` `report_result`
+> `report_row` `report_template` `subject` `sys_user` `sys_user_book` `voucher`）。
+> 迁移侧一致：`0001_baseline` 建 16 张，`0002`~`0007` 一张都不加（只加列、索引、
+> 约束与触发器），`0008_login_ip_throttle` 加第 17 张。
+> `db_init.sql` 里**没有** `CREATE TABLE` —— 建表只由 Alembic revision 负责。
+> README 里的同一处数字也要跟着改，两边不一致时以本节为准。
+
 ---
 
 ## 11. 加新功能的标准动作
@@ -1437,6 +1553,7 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
 
 ### 加一张新表
 1. `app/models/` 建模型，`book_id` 必带
+   （**例外**：跨账套的系统级表不带，如 `audit_log` / `login_ip_throttle`）
 2. **加一条 Alembic revision**（`alembic revision -m "..."`），把建表 DDL 写进去。
    不要指望 `create_all` 补：它只建缺失的表，对**已存在**的表一眼都不看，
    「给已有表加 NOT NULL 列」「改列类型」「加索引」都会静默不生效 ——
@@ -1445,6 +1562,13 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
    另有一条纪律：baseline 是**冻结的显式 DDL**，不是 `create_all`。
    如果写成 `create_all`，它会跟着模型走，于是后面每条 revision 都在
    和一个已经建好的表撞 DuplicateColumn。
+
+   没有改 `db_init.sql`（只是新增一张表，不是加护栏）就**不要**重放那份 SQL ——
+   重放会让存量库跑一遍全部幂等语句，而收益为零。参考 `0008_login_ip_throttle`。
+
+3. **`book_id` 之外还要想清楚状态会不会只增不减。** 凡是「由写入方持续写入、
+   没有人会手工清」的表（`login_ip_throttle` 是典型），清理入口必须是
+   **可测的独立函数**，不能只挂在某条读路径上 —— 见 §9.7 与 P2-23。
 
 ### 改 `app/core/db_init.sql`（触发器 / 约束）—— **强制清单，不是建议**
 
@@ -1463,6 +1587,12 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
    会发现护栏没上线（`fn_subject_leaf_guard` 的清单漏项就是这么漏的）。
    **`conftest.py` 每次在全新库上跑 `upgrade head`，护栏在测试库里天天齐全 ——
    所以「CI 全绿」不能证明这条护栏在生产库上存在。**
+
+   那份清单**只管触发器，不管表**。加一张新表不需要在这里登记；
+   `login_ip_throttle` 就没有触发器（只由应用写，且 upsert 在语句里显式写了
+   `updated_at = now()`），所以也不进 `db_init.sql` 第 7 段的 `trg_updated_at` 清单 ——
+   为一个已经被覆盖到的语义去改清单、再让存量库重放整份 SQL，是把收益为零的
+   分歧风险买了进来。
 
 3. **写清降级是有损的。** 触发器无法「撤销」（它们和 `0001` 装上去的同源），
    downgrade 通常只能回滚本条新增的约束。改动说明里要写明这一点。
@@ -1560,7 +1690,9 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
 | `test_openings.py` | 期初读写的往返保真、借贷必平、明细约束、跨账套隔离、Excel 往返 |
 | `test_report_design.py` | 报表结构增删改、**公式引用随行列位移同步改写**、隐藏行不进打印 |
 
-> 后端全量 **966 passed**（52 个测试文件；用 `--collect-only -q` 实测，不建表不碰库）。
+> 后端全量 **995 collected**（53 个测试文件；用 `--collect-only -q` 实测，不建表不碰库）。
+> 注意这里是**收集到**的用例数，不是 passed 数 —— `passed` 要真跑一遍才有，
+> 而写文档时未必有那个环境；两个数别混着引。
 > 上面这张表**不是完整清单** —— 新增测试文件时记得补进来，
 > 否则下一个人会按这张表判断「哪块还没测」。数量也在长，改文档时按当次实测写。
 
@@ -1571,6 +1703,7 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
 | `test_migration_guardrails.py` | `0005` 把 `db_init.sql` 重放到存量库；**触发器确实存在于库中**（不是只存在于源码） |
 | `test_schema_version.py` | schema 版本不符拒绝启动；**触发器清单** —— 改 `db_init.sql` 后必须在此登记，见 §11 |
 | `test_auth_audit.py` | 登录成败 / 登出 / 注册 / 锁定四类留痕、**失败记来源 IP**、审计走 SAVEPOINT 失败不影响主流程 |
+| `test_ip_throttle.py` | IP 维度软节流：轮换账号仍聚到同一个源、**伪造 XFF 换不了桶**、默认不锁账号、默认阈值站在共享 IP 安全的那一侧、清理入口删过期状态（见 §9.7） |
 | `test_role_guard.py` | 角色白名单三处一致（`deps.py` / `models` CHECK / `api/system.py::ROLES`）、认不出的角色 fail-closed |
 | `test_gateway_hardening.py` | 接口文档按环境开关、request id 回传、**500 响应脱敏**、`LOG_LEVEL` 生效 |
 | `test_nginx_gateway.py` | nginx 配置里的安全头与 CSP；**打印页 CSP 例外的前缀必须是真实的 `/print/`**（不是 `/printing/`） |

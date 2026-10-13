@@ -227,6 +227,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import * as api from '@/api/voucher'
 import * as subjectApi from '@/api/subject'
 import * as ledgerApi from '@/api/ledger'
+import { openPrint } from '@/api/print'
 import { useSessionStore } from '@/stores/session'
 import { useTabsStore } from '@/stores/tabs'
 import { fmt } from '@/utils/format'
@@ -1107,6 +1108,28 @@ function addVoucher() {
   router.push({ name: 'voucher-new' })
 }
 
+/** 打印这一张凭证。
+ *
+ *  模板里这个「打印预览」按钮挂的是 `printVoucher`，而这个函数曾经**根本不存在** ——
+ *  按钮点下去只会得到一句 `printVoucher is not a function`。列表页那边叫
+ *  `printVouchers`（复数，走勾选），这里是单张，所以另起一个名字而不是共用。
+ *
+ *  期间取**这张凭证自己的** `voucherPeriodId`，不是顶栏那个 —— 顶栏停在别的月时
+ *  打开一张旧凭证，打印出来的东西必须仍然是这张凭证所属期间的（P1-16 同一条理由）。
+ */
+function printVoucher() {
+  if (!voucherId.value) return
+  const periodId = voucherPeriodId.value || store.periodId
+  if (!store.bookId || !periodId) {
+    ElMessage.warning('账套或期间还没就绪，打印需要稍等一下')
+    return
+  }
+  openPrint(`/books/${store.bookId}/print/vouchers.html`, {
+    period_id: periodId,
+    voucher_ids: String(voucherId.value),
+  })
+}
+
 /** 拉上一张/下一张的导航信息。
  *
  *  seq 传进来是为了丢弃过期响应：load() 里那次必须传，而保存成功后的那次
@@ -1288,21 +1311,29 @@ function defaultDate() {
 }
 
 /**
- * 落库。`quiet` 是自动保存那条路：成功不弹提示、不跳页面 —— 人还在这一张凭证上接着录，
- * 一存完就把人踢回列表，等于逼着人每次都重新找回来。
- * 失败一定要说：自动保存失败而页面上一声不吭，人是会信的。
+ * 落库。
+ *
+ * 这里原来挂着个 `quiet` 形参，`quiet === false` 那条路是「存好了 + 弹成功 + 跳回列表」。
+ * **它已经删掉了**，因为走不到：
+ *  这一页**没有保存按钮**（工具栏上只有返回 / 前一张 / 后一张 / 插入 / 增加 / 打印，
+ *  见模板顶部），自动保存是唯一的落库路径；而两个调用方 `autoSave()` 与
+ *  `flushIfDirty()` 都传 `quiet: true`。形参没有默认调用方（`save()` 不经 defineExpose
+ *  暴露出去，模板里也没有保存控件），于是 `!quiet` 恒假 —— 留着一个永远不进的
+ *  分支，比没有更糟：它让人以为「手动保存」这条老路还在。
+ *
+ * 删掉之后 `quiet` 就没有存在意义了 —— 它原本只控制「成功那句提示 + 跳列表」，
+ * 失败的几句提示（只读 / 空表 / 不平）它同样一句都挡不住。所以形参一并去掉，
+ * 调用方写成 `save()`。**失败一定要说**：自动保存失败而页面上一声不吭，人是会信的。
  *
  * 返回有没有存成。离开页面前那趟 flush 靠它决定「放不放人走」——
  * 吞掉失败就又变成静默丢数据。
  */
-async function save({ quiet = false } = {}) {
+async function save() {
   if (readonly.value) {
-    if (!quiet) {
-      ElMessage.warning(posted.value ? '已记账凭证不能修改，请先反记账'
-        : !store.canWrite ? '这个账套是只读的，不能修改凭证'
-          : locked.value ? '该凭证所在期间已结账，不能修改'
-            : '当前期间已结账，不能修改凭证')
-    }
+    ElMessage.warning(posted.value ? '已记账凭证不能修改，请先反记账'
+      : !store.canWrite ? '这个账套是只读的，不能修改凭证'
+        : locked.value ? '该凭证所在期间已结账，不能修改'
+          : '当前期间已结账，不能修改凭证')
     return false
   }
   const entries = form.entries
@@ -1315,15 +1346,15 @@ async function save({ quiet = false } = {}) {
       amount: centsText(centsOf(e.amount)),
       summary: e.summary || ''
     }))
-  if (!entries.length) { if (!quiet) ElMessage.warning('请至少填写一条分录'); return false }
-  // 非末级科目这一条不分 quiet：自动保存要是闷声不响，人只会以为存好了，
+  if (!entries.length) { ElMessage.warning('请至少填写一条分录'); return false }
+  // 非末级科目拦下来一定要出声：闷声不响的话，人只会以为存好了，
   // 而这笔分录其实根本没落库 —— 等发现时已经按它记了好几天的账。
   // 只拦**这一页新挂上去的**那些（见 newNonLeafRows）；账上原有的是服务端的事。
   if (newNonLeafRows.value.length) {
     ElMessage.error(rowProblemText(newNonLeafRows.value[0]))
     return false
   }
-  if (!balanced.value) { if (!quiet) ElMessage.error('借贷不平衡，无法保存'); return false }
+  if (!balanced.value) { ElMessage.error('借贷不平衡，无法保存'); return false }
 
   const payload = {
     voucher_date: form.voucher_date, entries, remark: form.remark,
@@ -1366,10 +1397,10 @@ async function save({ quiet = false } = {}) {
         insertCtx.value = null
         await loadNeighbour()
       }
-      if (!quiet) {
-        ElMessage.success('已保存')
-        router.push('/vouchers')
-      }
+      // 原来这里有 `if (!quiet) { ElMessage.success('已保存'); router.push('/vouchers') }`，
+      // 那是「手动保存」的老路：存好了说一声、把人送回列表。走不到，已经删掉 ——
+      // 自动保存存完必须把人**留在这张凭证上**接着录，一存完就踢回列表，
+      // 等于逼着人每次都重新找回来。页脚那句「已自动保存 HH:MM」（savedAt）才是准信。
       return true
     } catch (e) {
       // 这一版没存上，记下来：同一个签名不再自动重试（见 failedSig）。
@@ -1400,7 +1431,7 @@ async function autoSave() {
     autoSaveTimer = setTimeout(autoSave, AUTO_SAVE_DELAY)
     return
   }
-  await save({ quiet: true })
+  await save()
 }
 watch([entrySig, balanced], () => {
   clearTimeout(autoSaveTimer)
@@ -1428,7 +1459,7 @@ async function flushIfDirty() {
   if (entrySig.value === lastSaved.value) return true
   if (!balanced.value) return true
   if (!form.entries.some((e) => e.subject_id && num(e.amount))) return true
-  return save({ quiet: true }) === true
+  return save() === true
 }
 
 /** 真有东西没存上吗？浏览器的关页签/刷新提示问的是这一句。 */

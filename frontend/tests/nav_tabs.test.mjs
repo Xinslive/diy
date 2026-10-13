@@ -10,8 +10,10 @@
  */
 import { createServer } from 'vite'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { createPinia, setActivePinia } from 'pinia'
+import { nextTick, reactive, watch } from 'vue'
 
 // tabs store 要读写 localStorage（持久化），必须先装好再加载
 globalThis.localStorage = {
@@ -33,6 +35,11 @@ const { useTabsStore } = await server.ssrLoadModule('/src/stores/tabs.js')
 let pass = 0, fail = 0
 const t = (name, fn) => { try { fn(); console.log('  OK   ' + name); pass++ }
   catch (e) { console.log('  FAIL ' + name + '\n       ' + String(e.message).split('\n')[0]); fail++ } }
+/** 异步版用例（watcher 那几条要等 nextTick）。用法与 t() 一样，直接 await。 */
+const ta = async (name, fn) => {
+  try { await fn(); console.log('  OK   ' + name); pass++ }
+  catch (e) { console.log('  FAIL ' + name + '\n       ' + String(e.message).split('\n')[0]); fail++ }
+}
 
 const R = (name, path = '/x', title = name) => ({ name, path, meta: { title } })
 /** 重新载入页面：新建一个 pinia，store 才会真去读一次存储。
@@ -334,4 +341,116 @@ t('存储整个不可用（隐私模式）：标签照常开，界面不带崩',
 })
 
 console.log(`\n通过 ${pass} / 失败 ${fail}`)
+console.log('')
+console.log('== P3-10b MainLayout 的 watcher：同 name 换 path 也要通知标签 ==')
+
+/**
+ * 这一段盯的不是 tabs.open（它本来就一直认 path），而是**谁去调它**。
+ *
+ * 原来 MainLayout 里只 watch 了 `route.name`：凭证页的「上一张/下一张」
+ * 走的是**同一个 route name、不同 path**（/vouchers/12 → /vouchers/13），
+ * name 一个字没变，watcher 根本不触发，标签记的 path 就停在第一张 ——
+ * 关掉标签再点回来会跳到**另一张凭证**，看着像丢数据。
+ *
+ * 照旧不写等价物：从**真实组件源码**里把「标签栏」那一节下面的那条 watch(...)
+ * 连括号配平一起原样抠出来，配真实的 vue watch 和真实的 tabs store 跑。
+ * 被测的就是源码里那条通知本身，所以这条用例红了只可能是真出问题了。
+ */
+const LAYOUT_SRC = fs.readFileSync(
+  new URL('../src/layouts/MainLayout.vue', import.meta.url), 'utf8')
+
+/**
+ * 抠出 MainLayout 里那条「切路由就通知标签」的 watch(...)，并自检。
+ *
+ * 故意**不靠章节注释定位**：文件里「标签栏」这三个字出现了三次（模板、脚本、样式），
+ * 按注释抠很容易抠到别处去，而抠错了下面那些断言照样会过 —— 空转比红更坏。
+ * 所以这里扫出所有 watch(...)，挑那条真的在调 tabs.open 的，
+ * 并且要求**有且只有一条**，多出来一条就说明通知的口子不止一处。
+ */
+function tabsWatcherFromSource() {
+  const found = []
+  for (let i = LAYOUT_SRC.indexOf('watch('); i !== -1; i = LAYOUT_SRC.indexOf('watch(', i + 1)) {
+    let depth = 0
+    let j = LAYOUT_SRC.indexOf('(', i)
+    for (; j < LAYOUT_SRC.length; j++) {
+      if (LAYOUT_SRC[j] === '(') depth++
+      else if (LAYOUT_SRC[j] === ')') { depth--; if (depth === 0) break }
+    }
+    const src = LAYOUT_SRC.slice(i, j + 1)
+    if (src.includes('tabs.open(')) found.push(src)
+  }
+  assert.equal(found.length, 1,
+    `期望正好一条通知标签的 watch(...)，实际 ${found.length} 条：\n${found.join('\n')}`)
+  return found[0]
+}
+const WATCHER_SRC = tabsWatcherFromSource()
+
+/** 让真实 watcher 挂到一个可变的 route 上，返回 { route, tabs }。 */
+function mountWatcher(initial) {
+  const s = fresh()
+  const route = reactive({ name: initial.name, path: initial.path, query: {} })
+  // 源码里那条 watch(...) 就是被测对象：route / tabs / watch 全由外面喂进去
+  new Function('watch', 'route', 'tabs', WATCHER_SRC)(watch, route, s)
+  return { route, tabs: s }
+}
+
+await ta('翻到下一张凭证：标签记的 path 跟着换（原来停在第一张）', async () => {
+  const { route, tabs } = mountWatcher({ name: 'voucher-edit', path: '/vouchers/12' })
+  // immediate：进页面就该记下这一张
+  assert.equal(tabs.opened.length, 1, '进凭证页没有开出标签')
+  assert.equal(tabs.opened[0].path, '/vouchers/12')
+  // 点「下一张」：route name 一个字没变，只有 path 变 —— 这正是原来漏掉的情形
+  route.path = '/vouchers/13'
+  await nextTick()
+  assert.equal(tabs.opened.length, 1, '翻页不该多开一条标签')
+  assert.equal(tabs.opened[0].path, '/vouchers/13',
+    `标签记的还是 ${tabs.opened[0].path}，关掉再点回来会跳到另一张凭证`)
+})
+
+await ta('连着翻好几张：标签 path 始终是最后打开的那一张', async () => {
+  const { route, tabs } = mountWatcher({ name: 'voucher-edit', path: '/vouchers/1581' })
+  for (const id of [1582, 1583, 1581]) {
+    route.path = `/vouchers/${id}`
+    await nextTick()
+    assert.equal(tabs.opened[0].path, `/vouchers/${id}`)
+  }
+  assert.equal(tabs.opened.length, 1)
+})
+
+await ta('换到别的页面：照旧新开一条标签（watcher 没被改瞎）', async () => {
+  const { route, tabs } = mountWatcher({ name: 'voucher-edit', path: '/vouchers/12' })
+  route.name = 'balance'; route.path = '/balance'
+  await nextTick()
+  assert.deepEqual(keys(tabs), ['vouchers', 'balance'])
+})
+
+await ta('只改 query 不动标签（标签存的是 path，query 不进存储）', async () => {
+  const { route, tabs } = mountWatcher({ name: 'voucher-edit', path: '/vouchers/12' })
+  const before = JSON.stringify(tabs.opened)
+  route.query = { period_id: '3' }        // query 变了，path 没变
+  await nextTick()
+  assert.equal(JSON.stringify(tabs.opened), before, 'query 变化不该惊动标签')
+  assert.equal(tabs.opened[0].path, '/vouchers/12')
+})
+
+await ta('重复通知同一个页面：不新增标签、也不重写存储', async () => {
+  localStorage.setItem('cwq_user', JSON.stringify({ id: 3, username: 'u3' }))
+  const { route, tabs } = mountWatcher({ name: 'voucher-edit', path: '/vouchers/12' })
+  let writes = 0
+  const real = localStorage.setItem.bind(localStorage)
+  localStorage.setItem = (k, v) => { writes++; return real(k, v) }
+  try {
+    route.name = 'voucher-edit'; route.path = '/vouchers/12'   // 同 name 同 path
+    await nextTick()
+    assert.equal(tabs.opened.length, 1, '不该多出一条标签')
+    assert.equal(writes, 0, `地址没变还写了 ${writes} 次存储 —— open() 不幂等，被高频调用会白刷`)
+    // 但换个同 name 的 path 就必须写：这条才是真正要记下的变化
+    route.path = '/vouchers/13'
+    await nextTick()
+    assert.equal(writes, 1, '地址真变了却没同步到存储')
+  } finally {
+    localStorage.setItem = real
+  }
+})
+
 process.exit(fail ? 1 : 0)

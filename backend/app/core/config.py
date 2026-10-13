@@ -63,6 +63,74 @@ class Settings(BaseSettings):
     login_max_failures: int = 5
     login_lock_minutes: int = 15
 
+    # ------------------------------------------------ IP 维度软节流（审计 P2-11 的另一半）
+    #
+    # 上面的账号锁定只防「盯死一个账号」。轮换用户名就能把同一个攻击源摊到
+    # 上万个账号上：每次只锁一个，锁定几乎不生效，而审计里留下的是成千上万条
+    # 互不相干的 LOGIN_FAILURE，事后看不出「这些来自同一个源」。
+    # 下面这一组补的是**按来源聚合**的判断。
+    #
+    # **为什么默认是软节流（429 + 递增延迟 + 留痕），而不是「IP 锁死」。**
+    # 办公网、家庭宽带、大客户出口、运营商 NAT 后面可能是几百上千人共用一个
+    # IP。按 IP 硬锁等于把这几百人一起关在门外 —— 把防护变成了故障。
+    # 更糟的是它**可被主动触发**：拿到一个属于己方公司的 IP，从公司网络里反复
+    # 失败几次，这个 IP 在锁定期内对全公司不可用。也就是说硬锁不是「防住攻击者」，
+    # 而是「把攻击者手里的武器换成 DoS 放大器」。
+    # 所以：超阈值只回 429，**不锁账号、不锁 IP**；账号锁定的原有语义一字未动。
+    #
+    # 阈值刻意取得比账号阈值（5）高一个数量级：账号锁定针对的是「有人在打这个
+    # 账号」，而共享出口 IP 上几十个人在月结时输错口令是**正常业务噪声**。
+    # 宁可让攻击者多试几次（每次仍要付 PBKDF2 的 20ms），也不能把一整个办公室
+    # 挡在门外 —— 这是这条参数唯一的取舍方向。
+    login_ip_throttle_enabled: bool = True
+    login_ip_max_failures: int = 30
+    # 滑动窗口长度（秒）。与 login_lock_minutes 的默认 15 分钟对齐，
+    # 两个旋钮读起来是同一件事。
+    login_ip_window_seconds: int = 900
+
+    # 递增延迟：超阈值后每多失败一次多睡 step，上限 max。
+    #
+    # **默认上限只给到 1 秒，这是有意的。** 服务端 sleep 会占住一个 worker
+    # 线程，而「占住 worker」正是上面刚否掉 DoS 放大器的同一种东西 ——
+    # 软节流之所以不伤共享 IP，正是因为它不把请求挡在门外。更大的惩罚交给
+    # **Retry-After 响应头**（随超阈值次数递增），由讲规矩的客户端自己去退避，
+    # 代价不落在服务端资源上。
+    login_ip_delay_step_ms: int = 200
+    login_ip_delay_max_ms: int = 1000
+    # Retry-After 的上限（秒）。与窗口同长：窗口一过就该重新给额度。
+    login_ip_retry_after_max_seconds: int = 900
+
+    # **默认关闭**，且下面两行注释比这个默认值更重要：
+    #
+    # 这是一个把「攻击者关在门外」和「无辜的人关在门外」绑成同一个动作的开关。
+    # 它适合的场景是**登录页完全对外暴露、且出口 IP 一人一户**的部署；
+    # 在 NAT 后面它是纯粹的可用性风险。仓库通篇的口径是 fail-closed，
+    # 但 fail-closed 不等于「用一个可用性风险换一个安全风险」——
+    # 这里两项都收益有限，所以默认站在不用它的那一侧，要用请显式开。
+    login_ip_hard_lock: bool = False
+    login_ip_hard_lock_minutes: int = 15
+
+    # 节流状态行留多久后可以被清理（小时）。
+    #
+    # **必须有 TTL**：这张表是按 IP 一行、只增不减的，写入方是每一次登录失败。
+    # 没有清理它就是一个只涨不落的表 —— 而 P2-23 批的正是那种「定义了却没人
+    # 回收」的状态。ttl 取窗口的 9 倍（24h / 15min），保证「窗口内不删、
+    # 窗口过后多久才回收」这两个语义都不会被清理动作抢跑。
+    # 见 auth.py::purge_expired_login_ip_state（运维入口 + 登录路径上的顺带清理）。
+    login_ip_state_ttl_hours: int = 24
+
+    # 可信反向代理（逗号分隔的 IP 或 CIDR）。**默认空 = 一个都不信。**
+    #
+    # 取真实客户端 IP 通常要读 X-Forwarded-For / X-Real-IP，但**无条件信任
+    # 这两个头等于把限流交给攻击者**：他每次请求换一个头就能换一个桶，
+    # 于是 IP 维度限流对他是完全不存在的。fail-closed 的做法是：默认只认
+    # TCP 对端（request.client.host），只有当对端落在这份白名单里才去读
+    # 代理头。deploy/nginx/cwq.conf 已经透传这两个头，所以配了
+    # TRUSTED_PROXIES=127.0.0.1 就能拿到真实 IP；**不配就退回到「按对端计」**，
+    # 此时 nginx 后面的所有请求会共用 127.0.0.1 一个桶（见 validate_production_settings
+    # 里的启动告警）。
+    trusted_proxies: str = ""
+
     # Excel 导入的容量上限（审计 P2-02）。
     #
     # Nginx 把单请求限在 50MB，那只挡住了「一个特别大的请求」，挡不住
@@ -157,6 +225,51 @@ def _db_password(url: str) -> str:
     return m.group(1) if m else ""
 
 
+def trusted_proxy_networks(raw: str | None = None) -> tuple:
+    """把 ``TRUSTED_PROXIES`` 解析成 ip_network 元组；解析不了的项**跳过并告警**。
+
+    返回空元组表示「一个代理都不信」，这是默认状态，也是刻意的：
+    信任来源判定错了会让人**低估**暴露面（「我配了代理所以 IP 是真的」），
+    而这条判断反过来用（拿它当限流的绕过手段）时，误信就是真的被绕过。
+
+    跳过而不是抛异常：运维写错一个条目不该让服务起不来，那会造成「改完配置
+    才发现系统登不进去」这种更糟的故障 —— 跳过只损失一条告警，且
+    ``validate_production_settings`` 会在启动时把没解析出来的条目打出来。
+    """
+    import ipaddress
+
+    if raw is None:
+        raw = settings.trusted_proxies
+    nets = []
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            log.warning("TRUSTED_PROXIES 里的 %r 不是合法 IP 或 CIDR，已忽略（不生效）", item)
+    return tuple(nets)
+
+
+def is_trusted_proxy(host: str | None, raw: str | None = None) -> bool:
+    """这个 TCP 对端是不是我们自己部署的反向代理。
+
+    **只拿它做一件事**：决定「能不能读 X-Forwarded-For / X-Real-IP」。
+    对端不在白名单里时一律读 socket 对端 —— 那才是攻击者唯一伪造不了的东西。
+    """
+    import ipaddress
+
+    nets = trusted_proxy_networks(raw)
+    if not nets or not host:
+        return False
+    try:
+        addr = ipaddress.ip_address(host.strip())
+    except ValueError:
+        return False
+    return any(addr in net for net in nets)
+
+
 def validate_production_settings(settings: "Settings", env: str | None = None) -> list[str]:
     """非 dev 环境下校验配置，不合格**拒绝启动**。
 
@@ -214,6 +327,28 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
         f"日志级别 {settings.log_level}（生产不允许 DEBUG）",
     ]
     log.info("生产配置校验通过：%s", "；".join(checks))
+
+    # **告警而不是拒绝启动。** 这条部署形态（nginx → 127.0.0.1:8000，见
+    # deploy/nginx/cwq.conf）下，TRUSTED_PROXIES 留空意味着所有请求的 TCP
+    # 对端都是 127.0.0.1 —— IP 维度节流于是退化成「全站一个桶」，任何人的
+    # 连续输错都可能把所有人一起挡一会儿。软节流不至于锁死谁，但这是运维
+    # 该知道的一件事。
+    #
+    # 为什么不当成 problem（拒绝启动）：默认配置已经在挡着一大批真实部署，
+    # 把它们全部变成「升级之后起不来」是拿可用性换一个已经由 429 兜着的风险。
+    # 宁可用一条启动告警把话说清楚。
+    if not trusted_proxy_networks(settings.trusted_proxies):
+        log.warning(
+            "TRUSTED_PROXIES 为空：IP 维度登录节流只按 TCP 对端计。"
+            "若本服务在反向代理后面（nginx → 127.0.0.1:8000），"
+            "所有用户会共用同一个来源地址，节流会误伤；"
+            "请设 TRUSTED_PROXIES=127.0.0.1（按实际对端）后重启。"
+            "不设也能工作 —— 节流是软节流，只回 429，不锁账号。")
+    elif not settings.login_ip_throttle_enabled:
+        log.warning(
+            "LOGIN_IP_THROTTLE_ENABLED=false：IP 维度登录节流已关闭，"
+            "轮换用户名的爆破将不受任何聚合限制（这是显式的 fail-open）。")
+
     return checks
 
 

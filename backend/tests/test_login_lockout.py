@@ -11,15 +11,50 @@
    攒够就停」的慢速爆破根本触发不了阈值。
 2. **锁定期间不校验口令。** 校验了等于告诉攻击者「密码猜对了，只是被锁着」，
    等于把口令空间又缩一层。
+
+**本文件为什么覆盖了 ``client`` 夹具。**
+P2-11 补上了 IP 维度的聚合节流，而 ``conftest`` 的 ``client`` 是全suite共用
+的：对端恒为 Starlette TestClient 的 ``("testclient", 50000)``。于是本文件这
+六十来次「故意的失败」会全部堆进**同一个来源 IP 的桶**里，把节流器自己触发 ——
+一份专门测「攻击者」的测试文件，反而因为「模拟得像攻击者」而把后面所有用例
+顶成 429。
+
+修法不是把阈值调到几百（那样就把生产的防护调没了），而是**给每个用例一个
+自己的来源 IP**：每条用例本来就在模拟一次独立的攻击，两个用例也不该是同一个
+攻击源。共享 IP 的那条边界由 ``test_ip_throttle.py`` 单独钉着。
 """
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from app.core.config import Settings
 from app.core.security import create_access_token, token_minutes_for
+
+
+@pytest.fixture
+def client(app_for_peer):
+    """覆盖 conftest 的 ``client``：每个用例一个**独立的来源 IP**。
+
+    只换对端地址，不换应用 —— 于是用例之间的隔离来自「不同的攻击源」，
+    而不是来自「不同的数据库」（它们本来就共用同一个库）。
+    """
+    return app_for_peer
+
+
+@pytest.fixture
+def app_for_peer():
+    """一个对端是随机 IP 的 TestClient。``docs`` 的特殊 IP 段不会被真路由到。"""
+    from fastapi.testclient import TestClient
+
+    from app.main import app as fastapi_app
+
+    ip = f"198.51.{uuid.uuid4().int % 254 + 1}.{uuid.uuid4().int % 254 + 1}"
+    with TestClient(fastapi_app, raise_server_exceptions=False,
+                    client=(ip, 50000)) as c:
+        yield c
 
 
 @pytest.fixture
