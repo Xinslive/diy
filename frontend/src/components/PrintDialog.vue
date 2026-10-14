@@ -84,6 +84,8 @@ import {
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
+  /** 从模板设计器打开时，优先预览正在编辑的已保存模板。 */
+  initialTemplateId: { type: Number, default: null },
   bookId: { type: [Number, String], default: null },
   /** 打印接口路径，如 /books/12/print/vouchers.html。范围参数由 params 带。 */
   path: { type: String, default: '' },
@@ -101,6 +103,7 @@ const visible = computed({
 })
 
 const templateId = ref(null)
+const defaultTemplates = ref({})
 const paper = ref('A4')
 const orientation = ref('portrait')
 const papers = ref([])
@@ -140,7 +143,7 @@ function orientationOf(t) {
 
 function buildParams() {
   const p = { ...props.params }
-  if (templateId.value) p[templateKey.value] = templateId.value
+  if (templateId.value !== null) p[templateKey.value] = templateId.value
   if (paper.value) p.paper = paper.value
   if (orientation.value) p.orientation = orientation.value
   return p
@@ -156,6 +159,7 @@ async function init() {
       const meta = await templateMeta(props.bookId)
       // 后端仍下发全部纸型，这里只留系统对外提供的两种。
       papers.value = pickPapers(meta?.papers || [])
+      defaultTemplates.value = meta?.defaults || {}
     }
     tplList.value = (await loadTemplates(props.bookId)) || []
   } catch (e) {
@@ -163,9 +167,11 @@ async function init() {
     return
   }
   const list = tplList.value.filter((t) => t.scope === props.scope)
-  tplList.value = list
-  // 默认模板优先；一个都没有就传 null，让后端回落到内置默认版式。
-  const def = list.find((t) => t.is_default) || list[0] || null
+  const builtin = { id: 0, name: '内置默认', content: defaultTemplates.value[props.scope] || {} }
+  tplList.value = [builtin, ...list]
+  // 设计器传入的 0 明确指内置版式；其它入口仍优先使用账套默认模板。
+  const def = tplList.value.find((t) => t.id === props.initialTemplateId) ||
+    list.find((t) => t.is_default) || list[0] || builtin
   if (def) {
     // **必须等选项先渲染出来再赋值**。el-select 是靠 modelValue 去已注册的
     // 选项里反查 label 的；选项还没挂上就赋值，收起框里只能显示空。

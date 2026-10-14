@@ -33,6 +33,7 @@ from app.printing.template import (
     PAPERS,
     SCOPES,
     render_table_page,
+    wrap_pages,
     render_voucher_sheet,
     split_voucher,
     validate_template,
@@ -100,9 +101,10 @@ def _scoped_template(db: Session, book: Book, template_id: int) -> PrintTemplate
 
 
 def _template(db: Session, book: Book, scope: str, template_id: int | None) -> PrintTemplate:
-    if template_id:
+    if template_id is not None and template_id != 0:
         return _scoped_template(db, book, template_id)
-    t = db.scalar(
+    # 0 是明确选择内置版式；未传 id 才沿用账套默认模板。
+    t = None if template_id == 0 else db.scalar(
         select(PrintTemplate)
         .where(PrintTemplate.scope == scope, PrintTemplate.is_default.is_(True),
                _visible_templates(book.id))
@@ -489,12 +491,7 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
     docs = [render_voucher_sheet(tpl, ctx, group, i, total_pages)
             for i, group in enumerate(sheets, start=1)]
 
-    if len(docs) == 1:
-        doc = docs[0]
-    else:
-        doc = docs[0].split("</head>")[0] + "</head><body>" + "".join(docs) + "</body></html>"
-
-    return _with_note(doc, note)
+    return _with_note(wrap_pages(docs), note)
 
 
 def _with_note(doc: str, note: str) -> str:

@@ -18,6 +18,7 @@ from app.printing.template import (
     validate_template,
     voucher_rows_per_page,
     voucher_slots_per_page,
+    wrap_pages,
 )
 
 
@@ -905,6 +906,22 @@ def test_打印页带CSP且禁脚本():
         assert "style-src 'unsafe-inline'" in html   # 内联样式是模板引擎的固有要求
 
 
+def test_多页打印只包含一个文档头且保留各页内容():
+    tpl = validate_template("VOUCHER", {})
+    pages = [render_voucher_sheet(tpl, {}, [_voucher()], page, 3) for page in range(1, 4)]
+    html = wrap_pages(pages, "预览 <3> 张")
+    head, body = html.split("</head>", 1)
+    assert html.count("<!DOCTYPE html>") == 1
+    assert html.count("<head>") == 1
+    assert html.count("<body>") == 1
+    assert head.count('http-equiv="Content-Security-Policy"') == 1
+    assert "Content-Security-Policy" not in body
+    assert body.count('<div class="page">') == 3
+    assert body.count('<p class="page-note">') == 1
+    assert "预览 &lt;3&gt; 张" in body
+    assert wrap_pages(pages[:1]) == pages[0]
+
+
 def test_CSP不破坏内联样式和打印():
     """CSP 不能把版式打掉：内联 <style> 必须仍被放行。"""
     tpl = validate_template("VOUCHER", {"font": {"family": "黑体", "size": 12}})
@@ -1034,6 +1051,16 @@ def _printed(client, headers, book_id) -> str:
     r = client.get(f"/api/books/{book_id}/print/balance.html", headers=headers)
     assert r.status_code == 200, r.text
     return r.text
+
+
+def test_明确选择内置版式不被账套默认模板替换(client, db, auth, book):
+    _mk_template(db, book_id=book.id, scope="BALANCE", name="自定义默认", title="CUSTOM-DEFAULT")
+    assert "CUSTOM-DEFAULT" in _printed(client, auth, book.id)
+    r = client.get(f"/api/books/{book.id}/print/balance.html", headers=auth,
+                   params={"template_id": 0})
+    assert r.status_code == 200, r.text
+    assert "CUSTOM-DEFAULT" not in r.text
+    assert DEFAULT_TEMPLATES["BALANCE"]["title"]["text"] in r.text
 
 
 def test_本账套模板优先_全局模板只做兜底(client, db, auth, book):

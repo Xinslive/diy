@@ -673,6 +673,8 @@ table.grid tfoot td {{ font-weight:700; }}
    tbody 里的各行，而是把余量塞给最后一行，于是合计行变成一条肥带、空行又比
    有字的分录行矮胖不一。--vrow 由 _voucher_table_html 按行数算好后内联给出。 */
 .voucher-element.table table.grid {{ height:100%; font-size:inherit; }}
+/* 单元格的百分比高度不会为 thead 分配高度，必须在表头行组上声明。 */
+.voucher-element.table table.grid thead {{ height:var(--vhead); }}
 .voucher-element.table table.grid th {{ height:var(--vhead); }}
 .voucher-element.table table.grid td {{ height:var(--vrow); }}
 .voucher-element.table table.grid th,
@@ -1199,7 +1201,9 @@ def wrap_pages(pages: list[str], note: str = "") -> str:
         return render_table_page(validate_template("LEDGER", {}), {}, [], 1, 1)
     if len(pages) == 1:
         return pages[0]
-    head = pages[0].split("</head>")[0] + "</head><body>"
-    body = head + "".join(pages) + "</body></html>"
+    head = pages[0].split("</head>", 1)[0] + "</head><body>"
+    # 各页只拼 body 内容，整份文档共用首个 head。重复嵌入完整 HTML 会让
+    # CSP meta 落在 body 里，也会破坏浏览器对页间距和文档高度的计算。
+    bodies = [page.partition("<body>")[2].rpartition("</body>")[0] for page in pages]
     note_html = f'<p class="page-note">{_esc(note)}</p>' if note else ""
-    return body.replace("<div class=\"page\">", note_html + "<div class=\"page\">", 1)
+    return head + note_html + "".join(bodies) + "</body></html>"

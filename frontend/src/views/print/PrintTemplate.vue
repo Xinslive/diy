@@ -1,311 +1,240 @@
 <template>
-  <div class="page page-plain">
-    <el-card shadow="never" class="mt">
-      <template #header>
-        <div class="card-head"><span class="title">打印模板</span></div>
-      </template>
-
-      <el-form :inline="true" class="toolbar">
-        <el-form-item label="打印内容">
-          <el-select v-model="scope" style="width: 180px" @change="onScopeChange">
-            <el-option v-for="(label, key) in SCOPES" :key="key" :label="label" :value="key" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="模板">
-          <el-select v-model="templateId" style="width: 200px" @change="loadTemplate">
-            <el-option label="（内置默认）" :value="0" />
-            <el-option v-for="t in listOfScope" :key="t.id" :label="t.name" :value="t.id" />
-          </el-select>
-        </el-form-item>
-        <el-form-item>
-          <el-button @click="doRename" :disabled="!templateId || !store.canWrite">
-            <el-icon><EditPen /></el-icon>&nbsp;重命名
-          </el-button>
-          <el-button @click="doCopy" :disabled="!templateId"><el-icon><CopyDocument /></el-icon>&nbsp;复制一份</el-button>
-          <el-button @click="doCreate"><el-icon><Plus /></el-icon>&nbsp;新建空白</el-button>
-          <el-button type="danger" plain :disabled="!templateId" @click="doDelete">
-            <el-icon><Delete /></el-icon>&nbsp;删除
-          </el-button>
-        </el-form-item>
-      </el-form>
-
-      <div v-if="!store.canWrite" class="warn">
-        <el-alert type="info" :closable="false" show-icon
-                  title="当前账套是只读权限，可以预览和打印，但不能保存模板。" />
+  <div class="pt">
+    <!-- ── 顶部工具条 ────────────────────────────────────────────
+         只有真正每天都要用的动作留在明面上（换范围、换模板、刷新、打印、保存），
+         重命名/复制/删除这类低频动作收进「更多」，工具条因此不会被一排按钮撑满。 -->
+    <header class="pt-bar">
+      <div class="bar-l">
+        <span class="pt-title">打印模板</span>
+        <el-select v-model="scope" class="sel" @change="onScopeChange">
+          <el-option v-for="(label, key) in SCOPES" :key="key" :label="label" :value="key" />
+        </el-select>
+        <el-select v-model="templateId" class="sel sel-tpl" @change="loadTemplate">
+          <el-option label="（内置默认）" :value="0" />
+          <el-option v-for="t in listOfScope" :key="t.id" :label="t.name" :value="t.id" />
+        </el-select>
+        <el-button :disabled="!store.canWrite" @click="doCreate"><el-icon><Plus /></el-icon>&nbsp;新建</el-button>
+        <el-dropdown trigger="click" @command="onMore">
+          <el-button title="更多操作"><el-icon><MoreFilled /></el-icon></el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="rename" :disabled="!templateId || !store.canWrite">
+                <el-icon><EditPen /></el-icon>重命名
+              </el-dropdown-item>
+              <el-dropdown-item command="copy" :disabled="!templateId || !store.canWrite">
+                <el-icon><CopyDocument /></el-icon>复制一份
+              </el-dropdown-item>
+              <el-dropdown-item command="delete" :disabled="!templateId || !store.canWrite" divided>
+                <el-icon><Delete /></el-icon>删除
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
       </div>
-    </el-card>
 
-    <div class="designer" :class="{ voucher: isVoucher }">
-      <el-card shadow="never" class="panel p-format">
-        <template #header><span class="title">版式</span></template>
+      <div class="bar-r">
+        <el-tag v-if="previewing" size="small" type="info" effect="plain">渲染中…</el-tag>
+        <el-tag v-else-if="dirty" size="small" type="warning" effect="plain">未保存</el-tag>
 
-        <el-form label-width="86px" label-position="left" size="default">
-          <el-divider content-position="left">纸张</el-divider>
-          <el-form-item label="纸型">
-            <el-select v-model="tpl.paper" style="width: 100%" @change="onPaperChange">
-              <el-option v-for="p in paperOptions" :key="p.key" :value="p.key"
-                         :label="paperLabel(p.key)" />
-            </el-select>
-          </el-form-item>
-          <el-form-item label="方向">
-            <el-radio-group v-model="tpl.orientation" @change="onOrientationChange">
-              <el-radio-button value="portrait">纵向</el-radio-button>
-              <el-radio-button value="landscape">横向</el-radio-button>
-            </el-radio-group>
-          </el-form-item>
-          <el-form-item label="页边距">
-            <div class="margins">
-              <div v-for="side in ['top', 'right', 'bottom', 'left']" :key="side">
-                <span class="mlabel">{{ SIDE_CN[side] }}边</span>
-                <el-input-number v-model="tpl.margins[side]" :min="0" :max="40" :step="1"
-                                 size="small" :controls="false" style="width: 100%"
-                                 @change="normalize" />
-              </div>
-            </div>
-          </el-form-item>
+        <el-tooltip
+          :content="guideMode
+            ? '正在调整页边距，再次点击退出'
+            : '打开后可在预览纸的四条边上直接拖动页边距'"
+          placement="bottom"
+        >
+          <el-button :type="guideMode ? 'primary' : ''" :disabled="!store.canWrite" @click="toggleGuides">
+            <el-icon><Crop /></el-icon>&nbsp;边距
+          </el-button>
+        </el-tooltip>
 
-          <!-- 凭证的标题/页眉/页脚/框线都在下方「版式编辑」画布里直接改
-               （文字、字号、粗细、显隐、框线），这里再放一份就是两套开关互相打架 -->
-          <template v-if="!isVoucher">
-            <el-divider content-position="left">标题</el-divider>
-            <el-form-item label="主标题"><el-input v-model="tpl.title.text" @input="schedulePreview" @change="normalize" /></el-form-item>
-            <el-form-item label="字号">
-              <el-input-number v-model="tpl.title.size" :min="8" :max="40" size="small" @change="normalize" />
-              <el-checkbox v-model="tpl.title.bold" class="ml" @change="normalize">加粗</el-checkbox>
-            </el-form-item>
-            <el-form-item label="副标题"><el-input v-model="tpl.subtitle.text" placeholder="留空则显示期间"
-                         @input="schedulePreview" @change="normalize" /></el-form-item>
-          </template>
+        <el-tooltip content="重新渲染预览" placement="bottom">
+          <el-button @click="refreshPreview"><el-icon><Refresh /></el-icon></el-button>
+        </el-tooltip>
+        <el-button @click="doPrint"><el-icon><Printer /></el-icon>&nbsp;打印</el-button>
+        <el-button type="primary" :loading="saving" :disabled="!store.canWrite || !templateId" @click="save">
+          保存
+        </el-button>
+      </div>
+    </header>
 
-          <el-divider content-position="left">字体</el-divider>
-          <el-form-item label="字体">
-            <el-input v-model="tpl.font.family" @input="schedulePreview" @change="normalize" />
-          </el-form-item>
-          <el-form-item v-if="!isVoucher" label="字号">
-            <el-input-number v-model="tpl.font.size" :min="6" :max="24" :step="0.5" size="small" @change="normalize" />
-            pt
-          </el-form-item>
-
-          <template v-if="!isVoucher">
-            <el-divider content-position="left">页眉字段</el-divider>
-            <el-form-item label="显示项">
-              <el-checkbox-group v-model="metaOn" @change="normalize">
-                <el-checkbox v-for="(label, key) in META_CN" :key="key" :value="key">{{ label }}</el-checkbox>
-              </el-checkbox-group>
-            </el-form-item>
-            <el-form-item label="页脚">
-              <el-input v-model="tpl.footer.text" placeholder="自定义页脚文字"
-                        @input="schedulePreview" @change="normalize" />
-            </el-form-item>
-            <el-form-item label="页码">
-              <el-checkbox v-model="tpl.footer.show_page_no" @change="normalize">显示页码</el-checkbox>
-              <el-input v-model="tpl.footer.format" size="small" class="ml" style="width: 200px"
-                        @change="normalize" />
-            </el-form-item>
-          </template>
-
-          <el-divider content-position="left">表格</el-divider>
-          <el-form-item v-if="!isVoucher" label="边框">
-            <el-switch v-model="tpl.body.border" @change="normalize" />
-          </el-form-item>
-          <el-form-item label="重复表头">
-            <el-switch v-model="tpl.body.repeat_header" @change="normalize" />
-          </el-form-item>
-
-          <template v-if="isVoucher">
-            <el-divider content-position="left">分页</el-divider>
-            <el-form-item label="分页编号">
-              <el-input v-model="tpl.voucher.split_format" @input="schedulePreview" @change="normalize" />
-            </el-form-item>
-            <div class="ph-tip">
-              凭证字号按这个格式加分页号：<b>{{ splitExample }}</b>；
-              超过 {{ rowCountTip }} 行拆成多张时页码跟着变（如 002/006），不拆的是 001/001。
-              占位符 {page} 本张页码、{pages} 总页数、{first} 起始行、{last} 结束行、{lines} 总行数，
-              数字自动补零到三位。
-            </div>
-          </template>
-        </el-form>
-      </el-card>
-
-      <el-card shadow="never" class="panel p-preview">
-        <template #header>
-          <div class="card-head">
-            <span class="title">预览</span>
-            <el-tag v-if="previewing" size="small" type="info" effect="plain">渲染中…</el-tag>
-            <el-tag v-else-if="dirty" size="small" type="warning" effect="plain">未保存</el-tag>
-            <el-button size="small" @click="refreshPreview"><el-icon><Refresh /></el-icon></el-button>
-            <el-button size="small" type="primary" @click="doPrint">
-              <el-icon><Printer /></el-icon>&nbsp;打印
-            </el-button>
-          </div>
-        </template>
-
-        <el-form v-if="scope === 'DETAIL_LEDGER' || scope === 'REPORT'" :inline="true" class="preview-opts">
-          <el-form-item v-if="scope === 'DETAIL_LEDGER'" label="科目">
-            <el-select v-model="previewSubjectId" size="small" style="width: 180px" @change="onPreviewSubjectChange">
-              <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
-            </el-select>
-          </el-form-item>
-          <template v-if="scope === 'DETAIL_LEDGER' && previewRangeSubjects.length">
-            <el-form-item label="科目起">
-              <el-select v-model="previewFromSubjectId" size="small" style="width: 180px" @change="onPreviewFromSubjectChange">
-                <el-option v-for="s in previewRangeSubjects" :key="s.id" :label="`${s.code} ${s.name}`" :value="s.id" />
-              </el-select>
-            </el-form-item>
-            <el-form-item label="止">
-              <el-select v-model="previewToSubjectId" size="small" style="width: 180px" @change="onPreviewToSubjectChange">
-                <el-option v-for="s in previewRangeSubjects" :key="s.id" :label="`${s.code} ${s.name}`" :value="s.id" />
-              </el-select>
-            </el-form-item>
-          </template>
-          <el-form-item v-if="scope === 'REPORT'" label="报表">
-            <el-select v-model="previewReportId" size="small" style="width: 150px" @change="refreshPreview">
-              <el-option v-for="r in reports" :key="r.id" :label="r.name" :value="r.id" />
-            </el-select>
-          </el-form-item>
-        </el-form>
-
-        <div v-if="previewError" class="preview-err">
-          <el-alert type="warning" :closable="false" show-icon :title="previewError" />
-        </div>
-        <div v-else ref="box" class="preview-box">
-          <div ref="stage" class="preview-stage" :style="stageStyle">
-            <!--
-              sandbox 是第三道防线（模板校验 + 文档内 CSP meta 已经在前两处）。
-
-              为什么是 allow-same-origin 而**不加** allow-scripts：
-              measurePreview() 要读 contentDocument、getComputedStyle、还要在里面
-              建 ResizeObserver 来量真实高度 —— 去掉 allow-same-origin 这些全部失效，
-              预览框会退回固定高度并被裁掉多页。
-              而不写 allow-scripts，iframe 里的脚本一律不执行：即使模板内容
-              （或更老的数据、或有人直接改库）里带着 </style><script>…，
-              也跑不起来。这正是存储型 XSS 需要的唯一能力。
-
-              注意别写成 sandbox="allow-scripts allow-same-origin" ——
-              两者同时给等于没 sandbox：脚本能跑 + 同源 = 可以读父页的
-              document.cookie 和 localStorage（token 就在里面）。
-            -->
-            <iframe ref="frame" class="preview" :srcdoc="previewHtml" title="打印预览"
-                    sandbox="allow-same-origin" :style="frameStyle" @load="measurePreview"></iframe>
-          </div>
-        </div>
-      </el-card>
-
-      <el-card shadow="never" class="panel p-cols">
-        <template #header>
-          <div class="card-head"><span class="title">列</span></div>
-        </template>
-
-        <el-table :data="tpl.columns" size="small" border>
-          <el-table-column label="字段" width="108">
-            <template #default="{ row }">
-              <el-select v-model="row.key" size="small" filterable style="width: 100%" @change="normalize">
-                <el-option v-for="k in COLUMN_KEYS" :key="k" :label="k" :value="k" />
-              </el-select>
-            </template>
-          </el-table-column>
-          <el-table-column label="表头" width="84">
-            <template #default="{ row }">
-              <el-input v-model="row.label" size="small" style="width: 100%"
-                        @input="schedulePreview" @change="normalize" />
-            </template>
-          </el-table-column>
-          <el-table-column label="宽度" width="94">
-            <template #default="{ row }">
-              <el-input-number v-model="row.width" :min="0.5" :step="0.5" size="small"
-                               style="width: 100%" :controls="false" @change="normalize" />
-            </template>
-          </el-table-column>
-          <el-table-column label="对齐" width="76">
-            <template #default="{ row }">
-              <el-select v-model="row.align" size="small" style="width: 100%" @change="normalize">
-                <el-option label="左" value="left" />
-                <el-option label="中" value="center" />
-                <el-option label="右" value="right" />
-              </el-select>
-            </template>
-          </el-table-column>
-          <el-table-column width="52" align="center">
-            <template #default="{ $index }">
-              <el-button link type="danger" :icon="Delete" :disabled="tpl.columns.length <= 1"
-                         @click="removeColumn($index)" />
-            </template>
-          </el-table-column>
-          <el-table-column width="74" align="center">
-            <template #default="{ $index }">
-              <el-button link :icon="Top" :disabled="$index === 0" @click="move($index, -1)" />
-              <el-button link :icon="Bottom" :disabled="$index === tpl.columns.length - 1" @click="move($index, 1)" />
-            </template>
-          </el-table-column>
-        </el-table>
-        <el-button class="mt" :icon="Plus" @click="addColumn">添加列</el-button>
-
-        <div class="fields">
-          <div class="fields-title">
-            可用字段
-            <span class="fields-count">{{ FIELD_DOC.length }}</span>
-          </div>
-          <el-collapse v-model="openFieldGroup" class="fields-body">
-            <el-collapse-item v-for="g in FIELD_DOC" :key="g.title" :name="g.title">
-              <template #title>
-                <span class="fields-group">{{ g.title }}</span>
-                <span class="fields-group-sub">{{ g.items.length }}</span>
-              </template>
-              <dl class="fields-list">
-                <template v-for="f in g.items" :key="f.key">
-                  <dt><code>{{ f.key }}</code></dt>
-                  <dd>{{ f.desc }}</dd>
-                </template>
-              </dl>
-            </el-collapse-item>
-          </el-collapse>
-        </div>
-      </el-card>
-
-      <el-card v-if="isVoucher" shadow="never" class="panel p-layout">
-        <template #header>
-          <div class="card-head"><span class="title">版式编辑</span></div>
-        </template>
-        <VoucherLayoutEditor :tpl="tpl" :slots="voucherSlots" :papers="meta.papers || []" @change="onLayoutChange" />
-      </el-card>
-
+    <!-- 只读提示：放在工具条下面一条，不占版面，也不挡着纸 -->
+    <div v-if="!store.canWrite" class="ro-note">
+      <el-icon><InfoFilled /></el-icon>
+      当前账套是只读权限，可以预览和打印，但不能保存模板。
     </div>
 
-    <div class="footer-bar">
-      <el-button type="primary" :loading="saving" :disabled="!store.canWrite || !templateId" @click="save">
-        保存模板
-      </el-button>
-      <el-button @click="loadTemplate(templateId)">放弃改动</el-button>
-      <span class="spacer"></span>
-      <el-tag v-if="dirty" size="small" type="warning" effect="plain">未保存</el-tag>
+    <div class="pt-body">
+      <!-- ── 左栏检查器 ──────────────────────────────────────────
+           默认展开；窗口窄到预览会被挤扁时自动收起。
+           这是「预览不被挤小」的兜底 —— 不是靠给预览一个更宽的栅格，
+           而是保证两侧永远不会同时占着宽度。 -->
+      <aside v-show="railOpen" ref="rail" class="rail">
+        <TemplateInspector
+          v-model:active-tab="tab"
+          :tpl="tpl"
+          :is-voucher="isVoucher"
+          :selected-id="selectedId"
+          :can-write="store.canWrite"
+          :paper-options="paperOptions"
+          @change="onEdit"
+          @select="selectedId = $event"
+          @add-element="addElement"
+        />
+      </aside>
+
+      <button class="rail-toggle" :class="{ closed: !railOpen }" :title="railOpen ? '收起检查器' : '展开检查器'"
+              :aria-label="railOpen ? '收起检查器' : '展开检查器'" @click="toggleRail">
+        <el-icon><DArrowLeft v-if="railOpen" /><DArrowRight v-else /></el-icon>
+      </button>
+
+      <!-- ── 预览台 ──────────────────────────────────────────────
+           这一栏是页面的主角，占掉除检查器外的全部宽度。 -->
+      <section class="stage-col">
+        <div class="stage-opts">
+          <template v-if="scope === 'DETAIL_LEDGER'">
+            <label>科目</label>
+            <el-select v-model="previewSubjectId" size="small" class="opt" @change="onPreviewSubjectChange">
+              <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
+            </el-select>
+            <template v-if="previewRangeSubjects.length">
+              <label>科目起</label>
+              <el-select v-model="previewFromSubjectId" size="small" class="opt" @change="onPreviewFromSubjectChange">
+                <el-option v-for="s in previewRangeSubjects" :key="s.id" :label="`${s.code} ${s.name}`" :value="s.id" />
+              </el-select>
+              <label>止</label>
+              <el-select v-model="previewToSubjectId" size="small" class="opt" @change="onPreviewToSubjectChange">
+                <el-option v-for="s in previewRangeSubjects" :key="s.id" :label="`${s.code} ${s.name}`" :value="s.id" />
+              </el-select>
+            </template>
+          </template>
+          <template v-else-if="scope === 'REPORT'">
+            <label>报表</label>
+            <el-select v-model="previewReportId" size="small" class="opt opt-w" @change="refreshPreview">
+              <el-option v-for="r in reports" :key="r.id" :label="r.name" :value="r.id" />
+            </el-select>
+          </template>
+
+          <span class="spacer" />
+          <span class="hint">
+            <template v-if="isVoucher && store.canWrite">
+              直接在纸上拖动控件即可改版式 · 双击文字就地编辑
+            </template>
+            <template v-else-if="isVoucher">当前模板预览</template>
+            <template v-else>
+              点纸上的标题、页眉、表、页脚可直接定位到对应设置
+            </template>
+          </span>
+        </div>
+
+        <div v-if="previewError" class="stage-err">
+          <el-alert type="warning" :closable="false" show-icon :title="previewError" />
+        </div>
+
+        <div class="stage-host-wrap">
+          <PrintStage
+            :key="scope + ':' + templateId"
+            ref="stage"
+            :html="previewHtml"
+            :paper="tpl.paper"
+            :orientation="tpl.orientation"
+            :papers="meta.papers || []"
+            :margins="tpl.margins"
+            :slots="isVoucher ? voucherSlots : 1"
+            :editing="store.canWrite || !isVoucher"
+            :error="previewError"
+          >
+            <template #tools>
+              <div v-if="isVoucher && voucherSlots > 1 && store.canWrite" class="slot-switch" aria-label="当前编辑的凭证槽位">
+                <button v-for="n in voucherSlots" :key="n" type="button"
+                        :class="{ on: activeSlot === n - 1 }" :aria-pressed="activeSlot === n - 1"
+                        @click="activeSlot = n - 1">第 {{ n }} 张</button>
+              </div>
+            </template>
+            <template #default="{ page, content, slots: slotRects, hotspots: spots, scale: stageScale }">
+              <!-- 凭证：元素框直接压在真预览上，能拖能缩 -->
+              <VoucherCanvasLayer
+                v-if="isVoucher && store.canWrite"
+                :elements="tpl.elements"
+                :columns="tpl.columns"
+                :slot-rects="slotRects"
+                :slots="voucherSlots"
+                :active-slot="activeSlot"
+                :selected-id="selectedId"
+                :can-write="store.canWrite"
+                :scale="stageScale"
+                @change="onEdit"
+                @select="selectElement"
+              />
+
+              <!-- 页边距：拖纸的四条边 -->
+              <PaperGuides v-if="guideMode" :page="page" :content="content"
+                           :margins="tpl.margins" :can-write="store.canWrite" :scale="stageScale"
+                           @change="onEdit" />
+
+              <!-- 非凭证：在真预览上量出来的可点区块 -->
+              <template v-else-if="!isVoucher && spots?.length">
+                <button v-for="h in spots" :key="h.key" type="button" class="hotspot"
+                        :class="[h.key, { on: hotKey === h.key }]"
+                        :style="{ left: h.x + 'px', top: h.y + 'px', width: h.w + 'px', height: h.h + 'px' }"
+                        :title="HOT_CN[h.key] || ''" @click="focusHotspot(h.key)" />
+              </template>
+            </template>
+          </PrintStage>
+        </div>
+
+        <div class="save-bar" :class="{ dirty }">
+          <el-button @click="loadTemplate(templateId)" :disabled="!dirty">放弃改动</el-button>
+          <span class="save-tip">{{ saveHint }}</span>
+          <span class="spacer" />
+          <el-button type="primary" :loading="saving" :disabled="!store.canWrite || !templateId || !dirty" @click="save">
+            保存模板
+          </el-button>
+        </div>
+      </section>
     </div>
 
     <PrintDialog v-model="printVisible" :book-id="store.bookId" :path="printPath"
-                 :scope="scope" :params="printParams" :title="printTitle" />
+                 :scope="scope" :params="printParams" :initial-template-id="templateId" :title="printTitle" />
   </div>
 </template>
 
 <script setup>
+/**
+ * 打印模板设计器。
+ *
+ * 这个页面重做过一次，方向只有一条：**预览是主角，编辑发生在预览上**。
+ *
+ * 上一版是「版式 | 预览 | 列」三栏并排，栅格写死 300px + 1fr + 520px。
+ * 实际测出来中栏只剩 154px —— A4 的纸被压成邮票，两侧各占着固定宽度，
+ * 谁也不肯让。用户要判断版式，版式却恰好是唯一看不清的那部分。
+ *
+ * 现在改成：预览吃掉除检查器外的全部宽度，检查器可以收起；
+ * 凭证的控件框、页边距，都直接画在**真实渲染出来的那张纸**上 ——
+ * 拖到哪里，打印出来就在哪里，不再有「示意图」和「实物」两套坐标。
+ */
 import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, EditPen, Top, Bottom, Plus, CopyDocument, Refresh, Printer } from '@element-plus/icons-vue'
-import VoucherLayoutEditor from '@/components/VoucherLayoutEditor.vue'
+import {
+  CopyDocument, Crop, DArrowLeft, DArrowRight, Delete, EditPen,
+  InfoFilled, MoreFilled, Plus, Printer, Refresh,
+} from '@element-plus/icons-vue'
+import PrintStage from '@/components/print/PrintStage.vue'
+import VoucherCanvasLayer from '@/components/print/VoucherCanvasLayer.vue'
+import PaperGuides from '@/components/print/PaperGuides.vue'
+import TemplateInspector from '@/components/print/TemplateInspector.vue'
 import PrintDialog from '@/components/PrintDialog.vue'
 import * as printApi from '@/api/print'
 import * as reportApi from '@/api/report'
 import * as subjectApi from '@/api/subject'
 import { useSessionStore } from '@/stores/session'
-import {
-  DEFAULT_ORIENTATION, TWO_UP_PAPERS, paperLabel as labelPaper, pickPapers,
-} from '@/utils/paper'
+import { TWO_UP_PAPERS, pickPapers } from '@/utils/paper'
 
-function clone(o) {
-  return JSON.parse(JSON.stringify(o))
-}
+const clone = (o) => JSON.parse(JSON.stringify(o))
 
 const store = useSessionStore()
-// 骨架：首屏渲染发生在模板数据回来之前，表单里到处是 tpl.margins[side] 这类深层访问，
-// 所以必须给一份完整默认值，否则 setup 阶段就会抛 "reading 'top'"。
+
+/** 骨架：首屏渲染发生在模板数据回来之前，模板里到处是 tpl.margins.top 这类深层访问，
+ *  必须给一份完整默认值，否则 setup 阶段就会抛 "reading 'top'"。 */
 const EMPTY_TPL = {
   paper: 'A4',
   orientation: 'portrait',
@@ -324,23 +253,31 @@ const EMPTY_TPL = {
   elements: [],
 }
 
-/** 纸型常量统一收在 utils/paper：整个系统只对外提供 A4 / A5。 */
 const meta = ref({ papers: [], defaults: {} })
 const scope = ref('VOUCHER')
 const templateId = ref(0)
 const list = ref([])
 const tpl = ref(clone(EMPTY_TPL))
-const frame = ref(null)
+
+/** 检查器栏是否展开。展开时才占宽度，所以预览永远拿得到主体。 */
+const railOpen = ref(true)
+/** 边距拖拽模式。非凭证范围它就是唯一的直接编辑手段。 */
+const guideMode = ref(false)
 const stage = ref(null)
-const box = ref(null)
+function toggleGuides() {
+  guideMode.value = !guideMode.value
+  if (guideMode.value) stage.value?.resetScroll()
+}
+/** 当前编辑第几个凭证槽位（一页两张时才分得出）。 */
+const activeSlot = ref(0)
+/** 画布上选中的凭证元素。 */
+const selectedId = ref(null)
+const inspectorTab = ref('page')
+
 const subjects = ref([])
 const reports = ref([])
 const saving = ref(false)
 
-/** 预览期间跟顶栏走。顶栏已经有一个期间选择器，面板里再放一个只会选出两份不一样的期间。 */
-const previewPeriodId = computed(() =>
-  store.periodId || store.currentPeriod?.id || store.periods[store.periods.length - 1]?.id || null)
-const fromPeriodId = ref(null)
 const previewSubjectId = ref(null)
 const previewFromSubjectId = ref(null)
 const previewToSubjectId = ref(null)
@@ -348,127 +285,149 @@ const previewReportId = ref(null)
 const previewHtml = ref('')
 const previewError = ref('')
 const previewing = ref(false)
+const printVisible = ref(false)
 let previewToken = 0
 
 const SCOPES = {
   VOUCHER: '记账凭证', LEDGER: '总账', DETAIL_LEDGER: '明细账',
   BALANCE: '科目余额表', REPORT: '报表',
 }
-const SIDE_CN = { top: '上', right: '右', bottom: '下', left: '左' }
-const META_CN = {
-  company: '单位', book: '账套', period: '期间', accountant: '制单',
-  checker: '审核', cashier: '出纳', voucher_no: '凭证号', date: '日期',
-  attachments: '附单据', remark: '备注',
+const HOT_CN = {
+  title: '主标题', subtitle: '副标题', meta: '页眉信息',
+  table: '数据表格', footer: '页脚',
 }
-/** 字段说明：key 必须和 COLUMN_KEYS / 后端渲染器认识的字段一致。 */
-const FIELD_DOC = [
-  {
-    title: '凭证分录',
-    items: [
-      { key: 'line_no', desc: '分录行号' },
-      { key: 'summary', desc: '摘要' },
-      { key: 'subject', desc: '会计科目（编码 + 名称）' },
-      { key: 'debit', desc: '借方金额' },
-      { key: 'credit', desc: '贷方金额' },
-    ],
-  },
-  {
-    title: '账簿通用',
-    items: [
-      { key: 'date', desc: '凭证日期' },
-      { key: 'month', desc: '月份' },
-      { key: 'day', desc: '日期' },
-      { key: 'voucher_no', desc: '凭证字号' },
-      { key: 'direction', desc: '借贷方向' },
-      { key: 'balance', desc: '该科目余额' },
-    ],
-  },
-  {
-    title: '科目余额表',
-    items: [
-      { key: 'code', desc: '科目编码' },
-      { key: 'name', desc: '科目名称' },
-      { key: 'level', desc: '科目级次' },
-      { key: 'opening_debit', desc: '期初借方' },
-      { key: 'opening_credit', desc: '期初贷方' },
-      { key: 'period_debit', desc: '本期借方发生额' },
-      { key: 'period_credit', desc: '本期贷方发生额' },
-      { key: 'closing_debit', desc: '期末借方' },
-      { key: 'closing_credit', desc: '期末贷方' },
-      { key: 'opening', desc: '期初余额' },
-      { key: 'closing', desc: '期末余额' },
-    ],
-  },
-  {
-    title: '报表',
-    items: [
-      { key: 'label', desc: '项目名称' },
-      { key: 'value0', desc: '本期金额（第 1 列）' },
-      { key: 'value1', desc: '本期金额（第 2 列）' },
-      { key: 'value2', desc: '本期金额（第 3 列）' },
-    ],
-  },
-]
-
-const COLUMN_KEYS = [
-  'line_no', 'summary', 'subject', 'debit', 'credit',
-  'date', 'month', 'day', 'voucher_no', 'direction', 'balance',
-  'code', 'name', 'level',
-  'opening_debit', 'opening_credit', 'period_debit', 'period_credit',
-  'closing_debit', 'closing_credit', 'opening', 'closing',
-  'label', 'value0', 'value1', 'value2',
-]
-
-const openFieldGroup = ref(['凭证分录'])
-
-function onOrientationChange() {
-  contentH.value = 0
-  normalize()
-}
-
-/** 换纸型就把方向带到该纸型的默认值，否则 A5 沿用 A4 的纵向，横向小册子排不出来。 */
-function onPaperChange() {
-  tpl.value.orientation = DEFAULT_ORIENTATION[tpl.value.paper] || 'portrait'
-  contentH.value = 0
-  normalize()
-}
+/** 纸型下拉只给系统对外提供的两种，与打印弹窗共用同一份口径。 */
+const paperOptions = computed(() => pickPapers(meta.value.papers || []))
 
 const listOfScope = computed(() => list.value.filter((t) => t.scope === scope.value))
 const isVoucher = computed(() => scope.value === 'VOUCHER')
-const selectedPreviewSubject = computed(() => subjects.value.find((s) => s.id === previewSubjectId.value))
-const previewRangeSubjects = computed(() => selectedPreviewSubject.value?.children || [])
-const rowCountTip = computed(() => tpl.value?.voucher?.rows_per_page || 5)
-/** 用一张 12 行的凭证当例子，把分页编号格式串渲染成看得懂的样子。 */
-const splitExample = computed(() => {
-  const fmt = tpl.value?.voucher?.split_format || '{voucher_no} - {page}/{pages}'
-  const pages = Math.ceil(12 / (rowCountTip.value || 5))
-  const width = Math.max(3, String(pages).length)
-  const z = (n) => String(n).padStart(width, '0')
-  return fmt.replace(/\{(\w+)\}/g, (_, k) =>
-    ({ voucher_no: '记001号', page: z(1), pages: z(pages),
-       first: z(1), last: z(rowCountTip.value), lines: z(12) }[k] ?? ''))
-})
 const voucherSlots = computed(() => (TWO_UP_PAPERS.includes(tpl.value.paper) ? 2 : 1))
-/** 纸型下拉只给系统对外提供的两种，与打印弹窗共用同一份口径。 */
-const paperOptions = computed(() => pickPapers(meta.value.papers || []))
-function paperLabel(key) {
-  return labelPaper(key, isVoucher.value)
-}
+watch(voucherSlots, (slots) => { activeSlot.value = Math.min(activeSlot.value, slots - 1) })
+const tab = computed({
+  get: () => inspectorTab.value,
+  set: (v) => { inspectorTab.value = v },
+})
 
-/** 拖拽过程每帧都在改坐标，只重排防抖刷新，不碰列宽归一化。 */
-function onLayoutChange() {
-  schedulePreview()
-}
+/** 预览期间跟顶栏走。顶栏已经有一个期间选择器，页面里再放一个只会选出两份不一样的期间。 */
+const previewPeriodId = computed(() =>
+  store.periodId || store.currentPeriod?.id || store.periods[store.periods.length - 1]?.id || null)
+const fromPeriodId = ref(null)
 
 /** 当前草稿是否与已保存内容不同 —— 用来提示「未保存」，免得以为已经存进去了。 */
 const savedSnapshot = ref('')
 const dirty = computed(() => !!templateId.value && JSON.stringify(tpl.value) !== savedSnapshot.value)
-const metaOn = computed({
-  get: () => Object.keys(tpl.value?.meta || {}).filter((k) => tpl.value.meta[k]),
-  set: (keys) => {
-    for (const k of Object.keys(tpl.value.meta || {})) tpl.value.meta[k] = keys.includes(k)
-  },
+
+const saveHint = computed(() => {
+  if (!templateId.value) return '内置默认版式，改动需要先新建模板才能保存'
+  if (!store.canWrite) return '只读账套，改动无法保存'
+  if (dirty.value) return '有未保存的改动'
+  return '已是最新'
 })
+
+// ------------------------------------------------------------------ 编辑动作
+/**
+ * 编辑器里任何改动都走这里：防抖刷一次预览。
+ *
+ * 拖拽是每帧都在改坐标的，不防抖的话一次拖动能打出去几十个请求；
+ * 完全不等又会让拖动看着发木。200ms 是这两者之间的平衡点。
+ */
+let previewTimer = null
+function onEdit() {
+  clearTimeout(previewTimer)
+  previewTimer = setTimeout(refreshPreview, 200)
+}
+
+/** 新增元素：id 必须唯一，且父组件持有数组，所以在这里生成。 */
+let seq = 0
+function addElement(kind) {
+  if (!store.canWrite) return
+  const id = 'el-' + Date.now().toString(36) + '-' + (seq++)
+  const base = { id, x: 10, y: 10, w: 40, h: 6, font_size: 9, bold: false,
+                 align: 'left', visible: true, border: true }
+  const el = { ...base, type: 'text', bind: 'custom', text: '新文本' }
+  if (kind === 'table') Object.assign(el, { type: 'table', bind: 'entries', text: '', x: 3, y: 24, w: 94, h: 55 })
+  if (kind === 'line') {
+    Object.assign(el, { type: 'line', bind: 'custom', text: '', x: 5, y: 50, w: 90, h: 1,
+                        line_width: 0.3, line_style: 'solid' })
+  }
+  if (kind === 'rectangle') {
+    Object.assign(el, { type: 'rectangle', bind: 'custom', text: '', x: 20, y: 30, w: 50, h: 25,
+                        line_width: 0.3, line_style: 'solid' })
+  }
+  if (!Array.isArray(tpl.value.elements)) tpl.value.elements = []
+  tpl.value.elements.push(el)
+  selectedId.value = id
+  inspectorTab.value = 'elements'
+  onEdit()
+}
+
+function selectElement(id) {
+  selectedId.value = id
+  if (id) inspectorTab.value = 'elements'
+}
+
+/** 在真预览上点了某个区块 → 切到对应页签并把那个控件滚到眼前。 */
+const hotKey = ref('')
+function focusHotspot(key) {
+  hotKey.value = key
+  railOpen.value = true
+  inspectorTab.value = 'page'
+  nextTick(() => {
+    const el = document.querySelector(`.ti [data-field="${key}"]`)
+    if (el) {
+      // 只滚动检查器；scrollIntoView 会把外层隐藏溢出的区域也滚走，连纸面都偏移。
+      const inspector = el.closest('.ti')
+      if (inspector) {
+        const target = el.getBoundingClientRect()
+        const viewport = inspector.getBoundingClientRect()
+        inspector.scrollTo({
+          top: inspector.scrollTop + target.top - viewport.top - (viewport.height - target.height) / 2,
+          behavior: 'smooth',
+        })
+      }
+      el.querySelector('input, textarea')?.focus({ preventScroll: true })
+    }
+  })
+}
+
+/** 删除控件后清掉悬空选中态，避免左栏显示旧属性而画布已经没有对应框。 */
+watch(
+  () => (tpl.value.elements || []).map((el) => el.id),
+  (ids) => {
+    if (selectedId.value && !ids.includes(selectedId.value)) selectedId.value = null
+  },
+)
+
+// ------------------------------------------------------------------ 数据
+async function loadTemplates() {
+  list.value = await printApi.templates(store.bookId)
+}
+
+async function onScopeChange() {
+  // 换范围等于换一套版式模型：凭证有元素层，账簿报表没有。
+  // 停在「元素」页签上只会看到一片空白，所以主动收回收面板页。
+  if (!isVoucher.value) inspectorTab.value = 'page'
+  selectedId.value = null
+  activeSlot.value = 0
+  guideMode.value = false
+  const hit = listOfScope.value.find((t) => t.is_default) || listOfScope.value[0]
+  templateId.value = hit?.id || 0
+  await loadTemplate(templateId.value)
+}
+
+async function loadTemplate(id) {
+  clearTimeout(previewTimer)
+  const base = id
+    ? (await printApi.templateDetail(store.bookId, id)).content
+    : clone(meta.value.defaults[scope.value] || EMPTY_TPL)
+  tpl.value = clone({ ...clone(EMPTY_TPL), ...base })
+  selectedId.value = null
+  activeSlot.value = 0
+  normalize()
+  migrateVoucherVisibility()
+  // 等列宽归一化完再取快照，否则「刚打开就显示未保存」是假警报
+  savedSnapshot.value = JSON.stringify(tpl.value)
+}
 
 /**
  * 凭证的显隐统一交给画布元素的 visible 开关（后端 _voucher_element_html 只认它）。
@@ -477,66 +436,36 @@ const metaOn = computed({
  */
 function migrateVoucherVisibility() {
   if (!isVoucher.value) return
+  if (!Array.isArray(tpl.value.elements)) tpl.value.elements = []
+  const meta = tpl.value.meta || {}
+  const show = tpl.value.show || {}
   for (const el of tpl.value.elements) {
-    if (el.visible === undefined) el.visible = true
-    if (META_CN[el.bind] && tpl.value.meta?.[el.bind] === false) el.visible = false
+    const bind = el.bind
+    const enabled = meta[bind] !== false &&
+      (!['period', 'voucher_no', 'date', 'attachments', 'remark'].includes(bind) || show[bind] !== false) &&
+      (bind !== 'footer' || show.page_no !== false)
+    el.visible = el.visible !== false && enabled
   }
-  Object.keys(tpl.value.meta || {}).forEach((k) => { tpl.value.meta[k] = true })
-  tpl.value.show.page_no = true
+  for (const key of Object.keys(meta)) meta[key] = true
+  for (const key of Object.keys(show)) show[key] = true
 }
 
 /** 把本地改动对齐到「可提交」的形态：列宽归一化、meta/show 补全 */
+const round = (n) => Math.round(n * 10000) / 10000
 function normalize() {
-  const total = (tpl.value.columns || []).reduce((s, c) => s + (Number(c.width) || 0), 0) || 1
-  tpl.value.columns.forEach((c) => { c.width = round((Number(c.width) || 0) / total * 100) })
+  const cols = tpl.value.columns || []
+  const total = cols.reduce((s, c) => s + (Number(c.width) || 0), 0) || 1
+  cols.forEach((c) => { c.width = round((Number(c.width) || 0) / total * 100) })
   if (!Array.isArray(tpl.value.elements)) tpl.value.elements = []
   if (!tpl.value.voucher) tpl.value.voucher = { rows_per_page: 5, split_number: true, fill_rows: true }
   if (!tpl.value.meta) tpl.value.meta = {}
-  Object.keys(META_CN).forEach((k) => { if (!(k in tpl.value.meta)) tpl.value.meta[k] = false })
   if (!tpl.value.show) tpl.value.show = {}
   schedulePreview()
 }
 
-const round = (n) => Math.round(n * 10000) / 10000
-
-function move(i, d) {
-  const arr = tpl.value.columns
-  const j = i + d
-  if (j < 0 || j >= arr.length) return
-  ;[arr[i], arr[j]] = [arr[j], arr[i]]
-  normalize()
-}
-
-function addColumn() {
-  tpl.value.columns.push({ key: 'summary', label: '新列', width: 10, align: 'left', indent: 0 })
-  normalize()
-}
-
-function removeColumn(i) {
-  if (tpl.value.columns.length <= 1) return   // 至少留一列，否则模板是非法的
-  tpl.value.columns.splice(i, 1)
-  normalize()
-}
-
-async function loadTemplates() {
-  list.value = await printApi.templates(store.bookId)
-}
-
-async function onScopeChange() {
-  const hit = listOfScope.value.find((t) => t.is_default) || listOfScope.value[0]
-  templateId.value = hit?.id || 0
-  await loadTemplate(templateId.value)
-}
-
-async function loadTemplate(id) {
-  const base = id
-    ? (await printApi.templateDetail(store.bookId, id)).content
-    : clone(meta.value.defaults[scope.value] || EMPTY_TPL)
-  tpl.value = clone({ ...clone(EMPTY_TPL), ...base })
-  normalize()
-  migrateVoucherVisibility()
-  // 等列宽归一化完再取快照，否则「刚打开就显示未保存」是假警报
-  savedSnapshot.value = JSON.stringify(tpl.value)
+function schedulePreview(delay = 250) {
+  clearTimeout(previewTimer)
+  previewTimer = setTimeout(refreshPreview, delay)
 }
 
 async function loadPreviewData() {
@@ -566,6 +495,9 @@ function resetPreviewSubjectRange() {
   previewToSubjectId.value = previewRangeSubjects.value.at(-1)?.id ?? null
 }
 
+const selectedPreviewSubject = computed(() => subjects.value.find((s) => s.id === previewSubjectId.value))
+const previewRangeSubjects = computed(() => selectedPreviewSubject.value?.children || [])
+
 function onPreviewSubjectChange() {
   resetPreviewSubjectRange()
   refreshPreview()
@@ -588,7 +520,7 @@ function onPreviewToSubjectChange() {
 /**
  * 预览请求体：带上**当前未保存的草稿**。
  *
- * 这是「改一下右边立刻变」的全部秘密 —— 预览不吃已保存的模板（那要先点保存，
+ * 这是「拖一下纸就变」的全部秘密 —— 预览不吃已保存的模板（那要先点保存，
  * 还得刷新），而是把编辑器里这份 JSON 直接发给后端渲染一遍。
  */
 function previewPayload() {
@@ -604,15 +536,32 @@ function previewPayload() {
   }
 }
 
+async function refreshPreview() {
+  if (!store.bookId) return
+  const token = ++previewToken
+  previewing.value = true
+  try {
+    const html = await printApi.previewHtml(store.bookId, previewPayload())
+    if (token !== previewToken) return              // 过期响应直接丢弃，避免旧结果盖掉新的
+    previewHtml.value = html
+    previewError.value = ''
+  } catch (e) {
+    if (token !== previewToken) return
+    const detail = e.response?.data?.detail
+    // 草稿处于半成品状态（列全删了、科目没选）是正常编辑过程，
+    // 就地显示原因即可，不该弹一个红色报错打断。
+    previewError.value = typeof detail === 'string' ? detail : '预览加载失败'
+  } finally {
+    if (token === previewToken) previewing.value = false
+  }
+}
+
 /**
  * 正式打印：与预览**同一个范围、同一个期间**，只是模板换成已保存的那份。
  *
  * 打印走已保存的版式而不是编辑器里的草稿，是因为打印窗口里的东西可能被人另存为 PDF
  * 发出去 —— 必须对应一条真正存了档的版式。所以这里**只交范围**，
  * print_template_id 交给弹窗：它选的也是模板表里已保存的那些行，草稿压根进不了这条路。
- *
- * report.html 的两个 id 是反的（版式走 print_template_id、报表走 template_id），
- * 和上面 PrintDialog 的约定一致：REPORT 分支只传报表模板 id，版式 id 留给弹窗补。
  */
 const printTarget = computed(() => {
   const pid = previewPeriodId.value
@@ -639,177 +588,15 @@ const printTarget = computed(() => {
 const printPath = computed(() => printTarget.value.path)
 const printParams = computed(() => printTarget.value.params)
 const printTitle = computed(() => `打印${SCOPES[scope.value]}`)
-const printVisible = ref(false)
-
-async function refreshPreview() {
-  if (!store.bookId) return
-  const token = ++previewToken
-  previewing.value = true
-  try {
-    const html = await printApi.previewHtml(store.bookId, previewPayload())
-    if (token !== previewToken) return              // 过期响应直接丢弃，避免旧结果盖掉新的
-    previewHtml.value = html
-    previewError.value = ''
-    nextTick(fitPreview)
-  } catch (e) {
-    if (token !== previewToken) return
-    const detail = e.response?.data?.detail
-    // 草稿处于半成品状态（列全删了、科目没选）是正常编辑过程，
-    // 就地显示原因即可，不该弹一个红色报错打断。
-    previewError.value = typeof detail === 'string' ? detail : '预览加载失败'
-  } finally {
-    if (token === previewToken) previewing.value = false
-  }
-}
-
-/**
- * 防抖刷新。
- *
- * 输入框每敲一个字就发一次请求的话，一个标题就能打出几十个请求；
- * 但完全不等又会让人觉得「不跟手」。250ms 是两者之间的平衡点。
- */
-let previewTimer = null
-function schedulePreview(delay = 250) {
-  clearTimeout(previewTimer)
-  previewTimer = setTimeout(refreshPreview, delay)
-}
-
-const MM2PX = 96 / 25.4
-
-/**
- * 当前纸张在 96dpi 下的像素尺寸；orientation 为横向时宽高互换。
- *
- * 尺寸取自后端 meta 下发的 papers（w/h 单位毫米），不在这里写死一份常量：
- * 后端 PAPERS 一改，这份表就会悄悄过期 —— 而且过期时没有任何报错，
- * 只是预览框按错误的宽度缩放，看着还挺正常。
- */
-const pagePx = computed(() => {
-  const spec = (meta.value.papers || []).find((p) => p.key === tpl.value.paper)
-  const w = spec?.w || 210
-  const h = spec?.h || 297
-  const landscape = tpl.value.orientation === 'landscape'
-  return {
-    w: Math.round((landscape ? h : w) * MM2PX),
-    h: Math.round((landscape ? w : h) * MM2PX),
-  }
-})
-
-const scale = ref(1)
-const contentH = ref(0)
-/** 量高留的兜底余量：一像素的取整误差就够顶出一条内部滚动条。 */
-const H_PAD = 2
-/** 文档内部的尺寸观察者：内容变高时自动把 iframe 补高。 */
-let innerRO = null
-function disconnectInnerRO() {
-  innerRO?.disconnect()
-  innerRO = null
-}
-
-const frameStyle = computed(() => {
-  const { w, h } = pagePx.value
-  return {
-    width: w + 'px',
-    // 多页预览时按内容高度撑开，至少一整页
-    height: Math.max(h, contentH.value || h) + 'px',
-    transform: `scale(${scale.value})`,
-  }
-})
-
-const stageStyle = computed(() => {
-  const { w, h } = pagePx.value
-  return {
-    width: Math.round(w * scale.value) + 'px',
-    height: Math.round(Math.max(h, contentH.value || h) * scale.value) + 'px',
-  }
-})
-
-/** 容器宽度变了（窗口缩放、面板重排）就重算缩放比。 */
-let ro = null
-function fitPreview() {
-  const host = box.value
-  if (!host) return
-  // clientWidth 是「内容 + padding」，真正能放版面的只有扣掉左右 padding 的内容宽。
-  // 之前直接用 clientWidth，右侧灰边会被撑没，页面还会溢出面板 8px。
-  const cs = getComputedStyle(host)
-  const availW = host.clientWidth
-    - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0)
-  if (availW <= 0) return
-  // 宽度不够就缩小；宽度富余则适度放大到 1.4 倍把版面填满，
-  // 不再拿高度卡一刀 —— 否则 A5 在宽面板里被压成灰底中间的一小块。
-  scale.value = Math.max(0.15, Math.min(1.4, availW / pagePx.value.w))
-}
-
-/**
- * 预览文档必须**永远不自己滚动**：外层 .preview-box 才是唯一的滚动容器。
- *
- * iframe 上那个 scrolling="no" 是 HTML5 早就废弃的属性，Chrome 根本不认 ——
- * 只要文档比 iframe 高出一丁点，iframe 内部就会自己冒出一条滚动条。滚轮悬在
- * 预览上时先被这条「几乎滚不动」的滚动条吃掉，表现就是预览滑不动；而外层同时
- * 也有滚动条，于是同时出现两条，滑哪条都别扭。
- * 真正管用的是往文档里插一条 overflow 规则。
- */
-function lockInnerScroll(d) {
-  const host = d.head || d.documentElement
-  if (!host || d.getElementById('__vle_lock')) return
-  const st = d.createElement('style')
-  st.id = '__vle_lock'
-  st.textContent = 'html,body{overflow:hidden!important;}'
-  host.appendChild(st)
-}
-
-/** 量「排版后内容真正占多高」的下沿，不受 iframe 视口高影响。 */
-function readContentBottom(d, w) {
-  const body = d.body
-  if (!body) return 0
-  // body 自身的下沿兜住「溢出 body 的内容」（绝对定位、超长子表格）。
-  let bottom = body.getBoundingClientRect().bottom
-  for (const node of body.children) {
-    const r = node.getBoundingClientRect()
-    const mb = parseFloat(w.getComputedStyle(node).marginBottom) || 0
-    bottom = Math.max(bottom, r.bottom + mb)
-  }
-  return bottom
-}
-
-/**
- * iframe 是 about:srcdoc，同源可读：量出真实内容高度，好让多页预览不被裁掉。
- *
- * 量的是**最后一个纸页的下边缘**，不是 documentElement.scrollHeight ——
- * scrollHeight 永远不小于视口高，而视口高又是我们设进去的，拿它定高会变成
- * 「越量越高」的死循环（实测一张 A5 横向被撑到 2795px，实际只有 1 页 559px）。
- */
-function measurePreview() {
-  try {
-    const d = frame.value?.contentDocument
-    if (!d) return
-    lockInnerScroll(d)
-    disconnectInnerRO()
-    const w = d.defaultView
-
-    const apply = () => {
-      const h = Math.max(pagePx.value.h, Math.ceil(readContentBottom(d, w)) + H_PAD)
-      if (h !== contentH.value) contentH.value = h
-    }
-    apply()
-
-    // srcdoc 一换就重新加载文档，而 contentH 还停在上一版的高度：新内容更高时，
-    // 在量到之前 iframe 是偏矮的，内部就会闪出一条滚动条（改版式时最容易撞上）。
-    // 盯住文档内容尺寸，任何原因导致变高都立刻补齐，滚轮就永远只有一个去处。
-    if (w.ResizeObserver) {
-      innerRO = new w.ResizeObserver(apply)
-      innerRO.observe(d.body)
-    }
-  } catch { /* 跨源或尚未就绪，保持一整页高度即可 */ }
-  nextTick(fitPreview)
-}
-
-onBeforeUnmount(() => { ro?.disconnect(); ro = null; disconnectInnerRO() })
 
 function doPrint() {
+  if (dirty.value) ElMessage.info('当前改动尚未保存，打印使用模板已保存的版本')
   printVisible.value = true
 }
 
+// ------------------------------------------------------------------ 模板增删改存
 async function save() {
+  if (!store.canWrite || !templateId.value) return
   saving.value = true
   try {
     await printApi.updateTemplate(store.bookId, templateId.value, { content: tpl.value })
@@ -826,6 +613,7 @@ async function save() {
  * 改名不该动版式，也不该把「未保存」这个提示点出来（它只比对 tpl）。
  */
 async function doRename() {
+  if (!store.canWrite || !templateId.value) return
   const cur = listOfScope.value.find((t) => t.id === templateId.value)
   if (!cur) return
   let name
@@ -845,6 +633,7 @@ async function doRename() {
 }
 
 async function doCopy() {
+  if (!store.canWrite || !templateId.value) return
   const t = await printApi.copyTemplate(store.bookId, templateId.value)
   ElMessage.success(`已复制为「${t.name}」`)
   await loadTemplates()
@@ -853,10 +642,16 @@ async function doCopy() {
 }
 
 async function doCreate() {
-  const { value: name } = await ElMessageBox.prompt('新模板名称', '新建打印模板', {
-    inputValue: `${SCOPES[scope.value]} 模板`,
-    inputValidator: (v) => (v && v.trim() ? true : '名称不能为空'),
-  })
+  if (!store.canWrite) return
+  let name
+  try {
+    ;({ value: name } = await ElMessageBox.prompt('新模板名称', '新建打印模板', {
+      inputValue: `${SCOPES[scope.value]} 模板`,
+      inputValidator: (v) => (v && v.trim() ? true : '名称不能为空'),
+    }))
+  } catch {
+    return
+  }
   const t = await printApi.createTemplate(store.bookId, {
     scope: scope.value,
     name: name.trim(),
@@ -866,9 +661,11 @@ async function doCreate() {
   await loadTemplates()
   templateId.value = t.id
   await loadTemplate(t.id)
+  ElMessage.success('已基于当前版式新建')
 }
 
 async function doDelete() {
+  if (!store.canWrite || !templateId.value) return
   try {
     await ElMessageBox.confirm('删除后无法恢复，确定删除该打印模板吗？', '删除模板', { type: 'warning' })
   } catch {
@@ -881,11 +678,14 @@ async function doDelete() {
   await loadTemplate(templateId.value)
 }
 
+function onMore(cmd) {
+  if (cmd === 'rename') doRename()
+  else if (cmd === 'copy') doCopy()
+  else if (cmd === 'delete') doDelete()
+}
+
+// ------------------------------------------------------------------ 生命周期
 onMounted(async () => {
-  if (box.value && window.ResizeObserver) {
-    ro = new ResizeObserver(() => fitPreview())
-    ro.observe(box.value)
-  }
   meta.value = await printApi.templateMeta(store.bookId)
   await loadTemplates()
   await loadPreviewData()
@@ -893,7 +693,7 @@ onMounted(async () => {
   await loadTemplate(templateId.value)
 })
 
-// 顶栏切期间，预览跟着走 —— 期间不再是面板里的独立控件了
+// 顶栏切期间，预览跟着走 —— 期间不再是页面里的独立控件了
 watch(() => previewPeriodId.value, () => schedulePreview(0))
 
 watch(() => store.bookId, async () => {
@@ -903,150 +703,127 @@ watch(() => store.bookId, async () => {
     await loadTemplate(templateId.value)
   }
 })
+
+/**
+ * 窗口窄了就自动收起检查器。
+ *
+ * 这不是「响应式小屏适配」那种锦上添花 —— 这个页面的判断依据只有一个：
+ * 预览必须看得清。两边同时展开而中间只剩一条缝的时候，
+ * 自动收起左栏比让用户自己发现「预览怎么这么小」要靠谱得多。
+ *
+ * 但用户**手动**收过之后就别再自动展开：每 resize 一次就弹回来一次，比不响应还烦。
+ */
+let userToggled = false
+function syncRail() {
+  if (window.innerWidth < 1120) railOpen.value = false
+  else if (!userToggled) railOpen.value = true
+}
+function toggleRail() {
+  userToggled = true
+  railOpen.value = !railOpen.value
+}
+onMounted(() => { syncRail(); window.addEventListener('resize', syncRail) })
+onBeforeUnmount(() => {
+  clearTimeout(previewTimer)
+  window.removeEventListener('resize', syncRail)
+})
 </script>
 
 <style scoped>
-/* ── 三栏设计器 ──────────────────────────────────────────────
-   版式 / 列 / 预览 三个面板同高同起，版式编辑在凭证范围下独占整行。
-   align-items:stretch 让卡片底部对齐，右侧不会参差成阶梯状。 */
-.designer {
-  --gap: 12px;
-  display: grid;
-  grid-template-columns: 300px minmax(0, 1fr) 520px;
-  gap: var(--gap);
-  align-items: stretch;
-}
-.designer.voucher { grid-template-columns: 300px minmax(0, 1fr) 520px; }
-.designer.voucher .p-format { grid-column: 1; grid-row: 1; }
-.designer.voucher .p-preview { grid-column: 2; grid-row: 1; }
-.designer.voucher .p-cols    { grid-column: 3; grid-row: 1; }
-.designer.voucher .p-layout  { grid-column: 1 / -1; grid-row: 2; }
-
-@media (max-width: 1400px) {
-  .designer, .designer.voucher { grid-template-columns: 300px minmax(0, 1fr); }
-  .designer .p-format, .designer.voucher .p-format { grid-column: 1; grid-row: 1; }
-  .designer .p-cols,    .designer.voucher .p-cols    { grid-column: 2; grid-row: 1; }
-  .designer .p-preview, .designer.voucher .p-preview { grid-column: 1 / -1; grid-row: 2; }
-  .designer.voucher .p-layout { grid-column: 1 / -1; grid-row: 3; }
-}
-@media (max-width: 1100px) {
-  .designer, .designer.voucher { grid-template-columns: 1fr; }
-  .designer .p-format, .designer .p-cols, .designer .p-preview,
-  .designer.voucher .p-format, .designer.voucher .p-cols,
-  .designer.voucher .p-layout, .designer.voucher .p-preview {
-    grid-column: 1; grid-row: auto;
-  }
+.pt {
+  --rail-w: 320px;
+  display: flex; flex-direction: column;
+  /* 撑满 .content（父级是 flex:1 + min-height:0，有确定高度，100% 才成立）。
+     这个页面不再随文档滚动：预览台自己滚，滚动条留在纸的四周。 */
+  height: 100%; min-height: 0;
+  background: #fff; overflow: hidden;
 }
 
-/* 面板：内部滚动，卡片外框始终等高 */
-.panel { display: flex; flex-direction: column; min-width: 0; }
-.p-cols { max-width: 520px; }
-.panel :deep(.el-card__header) {
-  background: #fff; padding: 10px 14px;
-  border-bottom: 1px solid var(--cwq-border);
+/* ── 顶部工具条 ───────────────────────────────────────────── */
+.pt-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+  padding: 10px 16px; border-bottom: 1px solid var(--cwq-hairline, #e8ebf0);
+  background: #fff; flex: none;
 }
-.panel :deep(.el-card__body) {
-  flex: 1; min-height: 0; max-height: 72vh;
-  overflow: auto; padding: 14px;
-}
-.card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.card-head .title { font-weight: 600; font-size: 14px; color: var(--cwq-text); }
-.ph-tip {
-  font-size: 12px; color: #909399; line-height: 1.7;
-  padding: 0 0 4px; word-break: break-word;
-}
-.ph-tip b { color: var(--cwq-text); }
-.panel :deep(.el-form-item) { margin-bottom: 12px; }
-.panel :deep(.el-form-item__content) { min-width: 0; }
-.panel :deep(.el-input), .panel :deep(.el-select) { min-width: 0; max-width: 100%; }
-.panel :deep(.el-table .cell) { padding: 0 4px; }
+.bar-l, .bar-r { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.bar-r { margin-left: auto; }
+.pt-title { font-size: 15px; font-weight: 600; color: var(--cwq-chrome-strong, #1f2733); }
+.sel { width: 132px; }
+.sel-tpl { width: 190px; }
 
-/* ── 预览 ─────────────────────────────────────────────────
-   iframe 按纸张真实像素宽度渲染，再整块 scale 缩放进容器，
-   右边缘不再被裁掉（A4 793px 塞进窄栏时尤其明显）。 */
-.p-preview :deep(.el-card__body) {
-  overflow: hidden; display: flex; flex-direction: column; min-height: 0;
-}
-.preview-box {
-  /* 不写 flex:1：那样无论内容多少都撑满整张卡片。
-     flex-shrink:1 保留，内容超过可用高度时照常收缩并滚动。 */
-  flex: 0 1 auto; min-height: 0; overflow: auto;
-  padding: 10px 8px;
-  background: #f5f6f8;
-  border-radius: 4px;
-}
-.preview-stage {
-  margin: 0 auto;
-  background: #fff;
-  box-shadow: 0 1px 6px rgba(0, 0, 0, .12);
-  transform-origin: top left;
-}
-.preview {
-  display: block;
-  border: 0;
-  transform-origin: top left;
-  background: #fff;
-}
-.preview-err {
-  flex: 1; min-height: 0; display: flex; align-items: flex-start; padding-top: 24px;
-}
-.preview-opts :deep(.el-form-item) { margin-bottom: 10px; }
-
-/* ── 底部保存条 ────────────────────────────────────────────
-   悬浮在内容之上：纯不透明白底 + 阴影，否则下层面板会透上来。 */
-.footer-bar {
-  position: sticky; bottom: 0; z-index: 30;
-  display: flex; gap: 10px; align-items: center;
-  background: #fff;                       /* 不透明 */
-  border: 1px solid var(--cwq-border);
-  border-radius: 6px;
-  box-shadow: 0 -2px 10px rgba(0, 0, 0, .10);
-  padding: 10px 14px;
-  margin-top: 12px;
-}
-.footer-bar .spacer { flex: 1; }
-
-/* ── 零散 ─────────────────────────────────────────────────── */
-.margins { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 8px; width: 100%; }
-.margins > div { display: flex; align-items: center; gap: 5px; }
-.margins .mlabel { font-size: 12px; color: #888; width: 28px; flex: none; }
-
-.fields {
-  margin-top: 12px; padding-top: 10px;
-  border-top: 1px dashed var(--cwq-border);
-}
-.fields-title {
+.ro-note {
   display: flex; align-items: center; gap: 6px;
-  font-size: 13px; font-weight: 600; color: var(--cwq-text);
-  padding-bottom: 8px;
-}
-.fields-count {
-  font-size: 11px; font-weight: 400; color: var(--cwq-muted);
-  background: #f0f2f5; border-radius: 10px; padding: 1px 7px;
-}
-.fields-body { border-top: none; }
-.fields-body :deep(.el-collapse-item__header) {
-  height: 34px; line-height: 34px; font-size: 13px; padding: 0 4px;
-  border-bottom-color: transparent;
-}
-.fields-body :deep(.el-collapse-item__wrap) { border-bottom: none; }
-.fields-body :deep(.el-collapse-item__content) { padding-bottom: 6px; }
-.fields-group { font-weight: 500; }
-.fields-group-sub { margin-left: 6px; font-size: 11px; color: var(--cwq-muted); }
-.fields-list {
-  display: grid; grid-template-columns: minmax(96px, auto) 1fr;
-  gap: 4px 10px; margin: 0; padding: 2px 4px 0;
-}
-.fields-list dt { margin: 0; }
-.fields-list dd { margin: 0; font-size: 12px; color: #606266; line-height: 20px; }
-.fields-list code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px; white-space: nowrap;
+  padding: 7px 16px; font-size: 13px; color: #92400e;
+  background: #fffbeb; border-bottom: 1px solid #fde68a; flex: none;
 }
 
-.page-plain { background: #fff; }
-.mt { margin-top: 12px; }
-.ml { margin-left: 10px; }
-.toolbar :deep(.el-form-item) { margin-bottom: 0; }
-code { background: #f5f5f5; padding: 1px 4px; border-radius: 3px; }
+/* ── 主体两栏 ─────────────────────────────────────────────── */
+.pt-body { flex: 1; min-height: 0; display: flex; position: relative; }
+
+.rail {
+  width: var(--rail-w); flex: none; min-width: 0;
+  border-right: 1px solid var(--cwq-hairline, #e8ebf0);
+  background: #fbfcfe; overflow: hidden;
+}
+
+.rail-toggle {
+  position: absolute; left: var(--rail-w); top: 50%; z-index: 20;
+  transform: translate(-1px, -50%);
+  width: 18px; height: 52px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--cwq-hairline, #e8ebf0); border-left: none;
+  border-radius: 0 8px 8px 0; background: #fff; color: var(--cwq-chrome-text, #5b6472);
+  cursor: pointer; box-shadow: 2px 0 8px rgba(15, 23, 42, .06);
+}
+.rail-toggle.closed { left: 0; }
+.rail-toggle:hover { color: var(--cwq-chrome-active, #2563eb); }
+
+/* ── 预览台 ───────────────────────────────────────────────── */
+.stage-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+.stage-opts {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px; flex: none;
+  padding: 8px 16px; border-bottom: 1px solid var(--cwq-hairline, #e8ebf0);
+  background: #fff;
+}
+.stage-opts label { font-size: 13px; color: var(--cwq-chrome-text, #5b6472); }
+.stage-opts .spacer, .save-bar .spacer { flex: 1; }
+.opt { width: 170px; }
+.opt-w { width: 190px; }
+.hint { font-size: 12px; color: var(--cwq-muted, #909399); }
+
+.stage-host-wrap { flex: 1; min-height: 0; }
+.stage-err { padding: 12px 16px 0; }
+
+/* ── 保存条 ───────────────────────────────────────────────── */
+.save-bar {
+  display: flex; align-items: center; gap: 12px; flex: none;
+  padding: 9px 16px; border-top: 1px solid var(--cwq-hairline, #e8ebf0);
+  background: #fff;
+}
+.save-tip { font-size: 12px; color: var(--cwq-muted, #909399); }
+.save-bar.dirty .save-tip { color: var(--cwq-warn, #d97706); font-weight: 500; }
+
+/* ── 画布上的零碎控件（VoucherCanvasLayer / PaperGuides 的兄弟样式） ── */
+.slot-switch { display: flex; gap: 4px; }
+.slot-switch button {
+  border: 1px solid var(--cwq-hairline, #e8ebf0); background: rgba(255, 255, 255, .95);
+  border-radius: 4px; padding: 2px 9px; font-size: 11px; cursor: pointer;
+  color: var(--cwq-chrome-text, #5b6472);
+}
+.slot-switch button.on { background: var(--cwq-chrome-active, #2563eb); color: #fff; border-color: transparent; }
+
+/* 预览上量出来的可点区块：平时隐形，悬停才浮出虚线 */
+.hotspot {
+  position: absolute; padding: 0; background: transparent;
+  border: 1px solid transparent; border-radius: 3px; cursor: pointer;
+}
+.hotspot:hover, .hotspot.on {
+  border-color: rgba(37, 99, 235, .55); background: rgba(37, 99, 235, .07);
+}
+.hotspot.on { border-style: dashed; }
+
+@media (max-width: 1120px) {
+  .pt { --rail-w: 300px; }
+}
 </style>
