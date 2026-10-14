@@ -14,7 +14,6 @@
         </el-button-group>
       </div>
       <slot name="tools" />
-      <span v-if="displayH > pageH + 2" class="long-page">长表，可滚动查看</span>
       <div class="tool-group">
         <el-button-group size="small">
           <el-button :disabled="scale <= 0.1" @click="zoomBy(-0.1)" title="缩小">
@@ -103,6 +102,8 @@ const props = defineProps({
   editing: { type: Boolean, default: false },
   /** 预览出错时的提示文案，由调用方给出（它是懂后端返回的那种）。 */
   error: { type: String, default: '' },
+  /** 模板里的页码格式串，切页时要按新页数重算「第 X 页 共 Y 页」。 */
+  footerFormat: { type: String, default: '第 {page} 页　共 {total} 页' },
 })
 const emit = defineEmits(['pages', 'hotspots'])
 
@@ -315,6 +316,119 @@ function readPages(d) {
   return { count: pages.length, tops, heights: pages.map((p) => p.getBoundingClientRect().height) }
 }
 
+/**
+ * 把一张被内容撑高的「纸」切成若干张**真实 A4**。
+ *
+ * 问题的来由：后端 render_table_page 对总账 / 明细账 / 余额表 / 报表是
+ * 「所有行进同一个 .page」（`render_table_page(tpl, ctx, rows, 1, 1)`），
+ * 而 .page 只有 min-height、没有高度上限 —— 一个科目一行，几十个科目就
+ * 把这张纸撑成好几倍 A4。屏幕上一看就是「纸怎么这么长」。
+ *
+ * 纸打出来其实是对的：@page 规则带 size 和 margin，浏览器打印时会自己断页。
+ * 错的只有屏幕预览 —— 而预览的全部价值就是所见即所得，不能拿一张
+ * 长得离谱的纸糊弄用户。所以在这里把长表按**真实行高**切开。
+ *
+ * 为什么不放后端分页：后端要估算「一行占多少毫米」，只能估；估出来的页数和
+ * 浏览器真正打印时的断页位置对不上，预览反而在说谎。这里是量出来的 ——
+ * 逐行试排，放不下就断在这里，和浏览器自己的分页规则基本一致。
+ *
+ * 切完之后交给既有的 readPages()，页码导航、分页高度、编辑层坐标全都自动对上了。
+ */
+function sliceSheets(d) {
+  if (!d.body || d.body.dataset.__sliced === '1') return
+  const pages = [...d.querySelectorAll('.page')]
+  if (pages.length !== 1) return                  // 后端自己分好页了
+  const page = pages[0]
+  const sheetH = pageH.value
+  if (page.getBoundingClientRect().height <= sheetH * 1.04) return   // 本来就是一页
+
+  const table = page.querySelector('table.grid')
+  const tbody = table?.querySelector('tbody')
+  if (!tbody || tbody.children.length < 2) return // 不是长表格，别乱切
+
+  const kids = [...page.children]
+  const ti = kids.indexOf(table)
+  const headHTML = kids.slice(0, ti).map((n) => n.outerHTML).join('')       // 标题/副标题/页眉
+  const footHTML = kids.slice(ti + 1).map((n) => n.outerHTML).join('')     // 页脚
+  const colHTML = table.querySelector('colgroup')?.outerHTML || ''
+  const theadHTML = table.querySelector('thead')?.outerHTML || ''
+  const rows = [...tbody.children].map((tr) => tr.outerHTML)
+
+  const cs = d.defaultView.getComputedStyle(page)
+  const padT = parseFloat(cs.paddingTop) || 0
+  const padB = parseFloat(cs.paddingBottom) || 0
+
+  // 量页脚有多高：每张纸都要给页脚留位置，否则最后一张会被顶出去。
+  const probe = d.createElement('div')
+  probe.style.cssText = 'position:absolute;left:-99999px;top:0;visibility:hidden;'
+  probe.innerHTML = `<div class="page" style="width:${pageW.value}px;min-height:0">${footHTML}</div>`
+  d.body.appendChild(probe)
+  const footH = probe.firstElementChild.getBoundingClientRect().height
+  probe.remove()
+
+  // 一张纸能放多少正文：纸高 - 上下边距 - 页脚 - 1px 量高余量
+  const room = sheetH - padT - padB - footH - 1
+
+  // 量高必须在文档里量（脱离文档的元素没有布局），所以挂一个隐藏的量具
+  const bench = d.createElement('div')
+  bench.style.cssText = 'position:absolute;left:-99999px;top:0;visibility:hidden;'
+  d.body.appendChild(bench)
+
+  const rowEl = (html) => {
+    const tb = d.createElement('tbody')
+    tb.innerHTML = html
+    return tb.firstElementChild
+  }
+
+  const sheets = []
+  let cur = null
+  let curBody = null
+
+  const startSheet = (isFirst) => {
+    cur = d.createElement('div')
+    cur.className = 'page'
+    cur.style.minHeight = '0'                   // 量高期间不能被 min-height 撑成一张整纸
+    cur.innerHTML = (isFirst ? headHTML : '')
+      + `<table class="grid">${colHTML}${theadHTML}<tbody></tbody></table>`
+    curBody = cur.querySelector('tbody')
+    bench.appendChild(cur)
+    sheets.push(cur)
+  }
+
+  startSheet(true)
+  for (const html of rows) {
+    curBody.appendChild(rowEl(html))
+    if (cur.getBoundingClientRect().height <= room) continue
+    curBody.lastElementChild.remove()           // 放不下，退回去
+    // 一行都放不下说明这行本身比一整张纸还高：硬塞会溢出，宁可停在这里，
+    // 也绝不能为了「看起来整齐」把数据丢掉。
+    if (!curBody.children.length) break
+    startSheet(false)
+    curBody.appendChild(rowEl(html))
+  }
+  bench.remove()
+
+  // 页脚每张纸一份，页码按切出来的张数重算 —— 否则每张都写着「第 1 页 共 1 页」
+  const total = sheets.length
+  sheets.forEach((el, i) => {
+    if (footHTML) {
+      const box = d.createElement('div')
+      box.innerHTML = footHTML
+      const spans = box.querySelectorAll('.doc-footer > span')
+      if (spans.length > 1) {
+        spans[spans.length - 1].textContent = props.footerFormat
+          .replace('{page}', String(i + 1))
+          .replace('{total}', String(total))
+      }
+      el.appendChild(box.firstElementChild)
+    }
+    el.style.minHeight = ''                     // 量完了，恢复成一张真实 A4
+  })
+
+  page.replaceWith(...sheets)
+  d.body.dataset.__sliced = '1'
+}
+
 let innerRO = null
 function disconnectInnerRO() {
   innerRO?.disconnect()
@@ -327,6 +441,8 @@ function measure() {
     if (!d) return
     lockInnerScroll(d)
     previewNote.value = d.querySelector('.page-note')?.textContent?.trim() || ''
+    // 先切页再量：readPages 量的是「有几张真实纸」，顺序反了量到的还是那张长纸
+    sliceSheets(d)
     disconnectInnerRO()
     const w = d.defaultView
 
@@ -419,7 +535,6 @@ defineExpose({ go, fit: fitToWindow, resetScroll, getScale: () => scale.value })
   box-shadow: 0 2px 10px rgba(15, 23, 42, .10);
 }
 .tool-group { display: flex; gap: 6px; align-items: center; }
-.long-page { font-size: 11px; color: var(--cwq-muted, #909399); white-space: nowrap; }
 .stage-tools :deep(.el-button-group .el-button) { padding: 6px 9px; }
 .page-no { font-variant-numeric: tabular-nums; pointer-events: none; }
 .zoom-label { min-width: 62px; font-variant-numeric: tabular-nums; }

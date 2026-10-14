@@ -142,6 +142,7 @@
             :slots="isVoucher ? voucherSlots : 1"
             :editing="store.canWrite || !isVoucher"
             :error="previewError"
+            :footer-format="tpl.footer?.format"
           >
             <template #tools>
               <div v-if="isVoucher && voucherSlots > 1 && store.canWrite" class="slot-switch" aria-label="当前编辑的凭证槽位">

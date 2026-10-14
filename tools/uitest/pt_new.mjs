@@ -294,18 +294,37 @@ try {
     await page.locator('.print-dialog button').filter({ hasText: '取消' }).click()
     page.off('request', capture)
   })
-  await step('总账长表完整显示，标题、副标题与页脚热点可定位', async () => {
+  await step('总账长表被切成真实 A4，热点仍可定位', async () => {
     await choose('.pt-bar .sel:not(.sel-tpl)', '总账')
     if (await page.locator('.slot > .el').count()) throw new Error('总账仍有凭证控件')
     for (const key of ['title', 'subtitle', 'meta', 'table', 'footer']) {
       await page.locator(`.hotspot.${key}`).click(); await page.waitForTimeout(250)
       if (key !== 'meta' && !(await page.evaluate((k) => document.querySelector(`.ti [data-field="${k}"]`)?.contains(document.activeElement), key))) throw new Error(key + ' 没有定位')
     }
-    const heights = await page.evaluate(() => ({
-      real: document.querySelector('iframe.frame').contentDocument.querySelector('.page').getBoundingClientRect().height,
-      paper: parseFloat(document.querySelector('.paper').style.height),
-    }))
-    if (heights.paper < heights.real - 1) throw new Error('长表底部被裁掉')
+    // 后端把总账所有行进同一个 .page，.page 只有 min-height 没有上限，
+    // 一行一个科目就能撑成好几倍 A4。预览必须把它切回一张张真纸。
+    const geo = await page.evaluate(() => {
+      const d = document.querySelector('iframe.frame').contentDocument
+      const pages = [...d.querySelectorAll('.page')]
+      const a4 = 297 * 96 / 25.4
+      return {
+        count: pages.length,
+        heights: pages.map((p) => p.getBoundingClientRect().height),
+        a4,
+        paper: parseFloat(document.querySelector('.paper').style.height),
+        rowsPerPage: pages.map((p) => p.querySelectorAll('tbody tr').length),
+      }
+    })
+    if (geo.count < 2) throw new Error(`总账长表没有被切页（只有 ${geo.count} 张）`)
+    const tall = geo.heights.filter((h) => h > geo.a4 * 1.04)
+    if (tall.length) throw new Error(`有 ${tall.length} 张纸超过 A4：${geo.heights.map(Math.round)}`)
+    if (geo.rowsPerPage.some((n) => n === 0)) throw new Error('切出了空白页')
+    console.log(`   ${geo.count} 张 A4，每张 ${geo.rowsPerPage.join('/')} 行，纸高 ${Math.round(geo.paper)}px（A4=${Math.round(geo.a4)}px）`)
+    // 页码按切出来的张数重算，不能每张都写「第 1 页 共 1 页」
+    const footers = await page.evaluate(() => [...document.querySelector('iframe.frame').contentDocument
+      .querySelectorAll('.page')].map((p) => p.querySelector('.doc-footer')?.innerText.trim() || ''))
+    if (footers.length && footers.some((f) => /共 1 页/.test(f))) throw new Error('页脚总页数没有重算：' + JSON.stringify(footers))
+    if (geo.paper > geo.a4 * 1.04) throw new Error(`纸还是太长：${Math.round(geo.paper)}px`)
     await page.locator('.pt-bar button').filter({ hasText: '边距' }).click()
     const edge = await page.locator('.guides .edge.top').boundingBox()
     if (edge.y < 150) throw new Error('进入边距模式时没有回到纸面顶部')
