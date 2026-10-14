@@ -313,13 +313,26 @@ try {
         a4,
         paper: parseFloat(document.querySelector('.paper').style.height),
         rowsPerPage: pages.map((p) => p.querySelectorAll('tbody tr').length),
+        // 每张纸的「底部余量」= 纸底 - 内容底（页脚）。尾页本来就该空着，不算。
+        gaps: pages.map((p) => {
+          const r = p.getBoundingClientRect()
+          const foot = p.querySelector('.doc-footer')?.getBoundingClientRect()
+          const bottom = foot ? foot.bottom : (p.lastElementChild?.getBoundingClientRect().bottom || r.top)
+          return Math.round(r.height - (bottom - r.top))
+        }),
       }
     })
     if (geo.count < 2) throw new Error(`总账长表没有被切页（只有 ${geo.count} 张）`)
     const tall = geo.heights.filter((h) => h > geo.a4 * 1.04)
     if (tall.length) throw new Error(`有 ${tall.length} 张纸超过 A4：${geo.heights.map(Math.round)}`)
     if (geo.rowsPerPage.some((n) => n === 0)) throw new Error('切出了空白页')
-    console.log(`   ${geo.count} 张 A4，每张 ${geo.rowsPerPage.join('/')} 行，纸高 ${Math.round(geo.paper)}px（A4=${Math.round(geo.a4)}px）`)
+    // 除尾页外，每张都要排满。回归过一次：量高时把 .page 的内边距扣了两次，
+    // 每页白扔 8~9 行，纸下半截永远空着（修复前首张底部余 302px / 27%）。
+    // 阈值取 15%：正常剩的是「下边距 + 不足一行的零头」，离阈值很远。
+    const loose = geo.gaps.slice(0, -1).map((g, i) => [i + 1, g, Math.round(g / geo.heights[i] * 100)])
+      .filter(([, g]) => g > geo.heights[0] * 0.15)
+    if (loose.length) throw new Error(`第 ${loose.map(([n, g, p]) => `${n}张余${g}px(${p}%)`).join('、')} 没排满`)
+    console.log(`   ${geo.count} 张 A4，每张 ${geo.rowsPerPage.join('/')} 行，底部余 ${geo.gaps.join('/')}px，纸高 ${Math.round(geo.paper)}px（A4=${Math.round(geo.a4)}px）`)
     // 页码按切出来的张数重算，不能每张都写「第 1 页 共 1 页」
     const footers = await page.evaluate(() => [...document.querySelector('iframe.frame').contentDocument
       .querySelectorAll('.page')].map((p) => p.querySelector('.doc-footer')?.innerText.trim() || ''))

@@ -354,20 +354,23 @@ function sliceSheets(d) {
   const theadHTML = table.querySelector('thead')?.outerHTML || ''
   const rows = [...tbody.children].map((tr) => tr.outerHTML)
 
-  const cs = d.defaultView.getComputedStyle(page)
-  const padT = parseFloat(cs.paddingTop) || 0
-  const padB = parseFloat(cs.paddingBottom) || 0
-
   // 量页脚有多高：每张纸都要给页脚留位置，否则最后一张会被顶出去。
+  //
+  // 这里**不能**套一层 .page 去量：.page 自带 padding，而 CSS 是 box-sizing:border-box，
+  // 量出来的是「页脚 + 上下内边距」，等于把内边距又算了一遍（实测 138px，页脚本身只有 25px）。
+  // 外层用 overflow:hidden 是为了让 .doc-footer 的 margin-top 不塌出容器 —— 塌出去就少量了 8px。
   const probe = d.createElement('div')
   probe.style.cssText = 'position:absolute;left:-99999px;top:0;visibility:hidden;'
-  probe.innerHTML = `<div class="page" style="width:${pageW.value}px;min-height:0">${footHTML}</div>`
+  probe.innerHTML = `<div style="overflow:hidden">${footHTML}</div>`
   d.body.appendChild(probe)
   const footH = probe.firstElementChild.getBoundingClientRect().height
   probe.remove()
 
-  // 一张纸能放多少正文：纸高 - 上下边距 - 页脚 - 1px 量高余量
-  const room = sheetH - padT - padB - footH - 1
+  // 一张纸能放多少：纸高 - 页脚 - 1px 量高余量。
+  // 上下内边距**不在这里扣** —— 量高用的是 .page 自己的 border-box，
+  // 里面已经含了内边距。这里再扣一次就是扣两遍，每页会白白少放 8~9 行，
+  // 纸下半截永远空着（这正是「下方还有大片区域」的成因）。
+  const room = sheetH - footH - 1
 
   // 量高必须在文档里量（脱离文档的元素没有布局），所以挂一个隐藏的量具
   const bench = d.createElement('div')
