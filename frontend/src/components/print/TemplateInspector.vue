@@ -25,7 +25,7 @@
               </div>
               <div class="fl">
                 <span class="lb">方向</span>
-                <el-radio-group v-model="tpl.orientation" size="small" :disabled="ro" @change="commit">
+                <el-radio-group v-model="tpl.orientation" class="orient" size="small" :disabled="ro" @change="commit">
                   <el-radio-button value="portrait">纵向</el-radio-button>
                   <el-radio-button value="landscape">横向</el-radio-button>
                 </el-radio-group>
@@ -857,6 +857,36 @@ function setColWidth(i, v) {
 }
 
 .f { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 10px; }
+/* ── 方向：整行分段控件 ──────────────────────────────────────
+   两个 46px 的小块缩在左边缘、右边空一大片，本身就像没画完。
+   更要紧的是 Element 默认边框 #dcdfe6 太浅，紧贴白底时左边那截线几乎看不见，
+   读起来就是「框线显示不全」。这里换成一个看得见外框的轨道：两格等分填满整行，
+   左边那道线由轨道自身的边框画出来，不再依赖那一格自己的 1px 边框。 */
+.orient {
+  display: flex !important;
+  width: 100%;
+  gap: 2px;
+  padding: 2px;
+  background: #f2f4f7;
+  border: 1px solid #d3d9e2;
+  border-radius: 7px;
+}
+.orient :deep(.el-radio-button) { flex: 1 1 0; min-width: 0; }
+.orient :deep(.el-radio-button__inner) {
+  width: 100%;
+  border: 0 !important;
+  border-radius: 5px !important;
+  box-shadow: none !important;
+  background: transparent;
+  transition: background .15s, color .15s;
+}
+.orient :deep(.el-radio-button.is-active .el-radio-button__inner) {
+  background: #fff;
+  color: var(--cwq-chrome-active, #2563eb);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, .10);
+}
+.orient :deep(.el-radio-button.is-disabled .el-radio-button__inner) { color: var(--cwq-muted); }
+
 .f1 { display: grid; gap: 8px; }
 .fl { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .lb { font-size: 12px; color: var(--cwq-muted); }
