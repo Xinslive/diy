@@ -11,9 +11,11 @@
 """
 from __future__ import annotations
 
+import calendar
 import functools
 import html
 import urllib.parse
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -528,6 +530,40 @@ def _check_print_rows(rows: list, kind: str) -> list:
     return rows
 
 
+def _report_print_col(col: dict) -> dict:
+    """报表的一列 -> 一个打印列。
+
+    ``key`` 必须是 ``c{col_no}``：``preview.report_rows`` 按列号摊行，
+    渲染器与 Excel 导出都靠这个 key 找值（双栏表里「资产」和「负债和所有者
+    权益」同名两列，靠列号才分得开）。
+
+    对齐按列的 kind 定，不看报表类型：STATIC 是项目名（左对齐）、
+    LINE_NO 是行次（居中）、其余是金额（右对齐 + 千分位）。
+
+    ``width`` 用 ReportCol 的像素值除 7 当权重 —— 与 ``excel.report_excel``
+    里的换算一致，两条通道看到的列宽比例才相同。真正定宽的是
+    ``validate_template``：它把权重归一化到 100%。
+    """
+    kind = col.get("kind")
+    if kind == "STATIC":
+        align = "left"
+    elif kind == "LINE_NO":
+        align = "center"
+    else:
+        align = "right"
+    try:
+        width = float(col.get("width") or 120) / 7
+    except (TypeError, ValueError):
+        width = 120 / 7
+    return {
+        "key": f"c{col.get('col_no')}",
+        "label": col.get("label", ""),
+        "width": max(0.5, width),
+        "align": align,
+        "indent": 0,
+    }
+
+
 def _print_too_large(fn):
     """把打印通道的行数超限翻译成 HTTP 语义。
 
@@ -634,21 +670,27 @@ def _render_scope(
 
         tpl = dict(tpl)
         tpl["title"] = {**tpl.get("title", {}), "text": rtpl.name}
+        # 表号只对法定双栏表有意义：DEFAULT_TEMPLATES["REPORT"] 是所有报表共用的
+        # 默认模板，资产负债表要印「会小企01表」，利润表挂上去就成了「会小企01表
+        # 利润表」。因此按报表类型清空 —— 空串不是 None，_deep_merge 里赢过默认值。
+        if getattr(rtpl, "type", "") != "BALANCE_SHEET":
+            tpl["header"] = {**(tpl.get("header") or {}), "form_no": ""}
 
-        # 报表的列随「报表模板」走：第一列固定项目名，其余按模板列数展开
+        # 打印列**直接来自报表模板的列**，一个报表列对一个打印列。
+        # 以前是硬拼「项　目」列 + 每个 payload 列一个 value 列：会小企01表有
+        # 8 列（第 1/5 列是项目名、第 2/6 列是行次），那样会印出 9 列，
+        # 还多出一列左右都不属于的 phantom「项　目」列。行次列与两侧项目名
+        # 都由 preview.report_rows 按 col_no 摊到了行上（c1…c8）。
         cols = payload.get("cols", [])
         if cols:
-            label_w = max(24.0, 46.0 - 4.0 * len(cols))
-            tpl["columns"] = [
-                {"key": "label", "label": "项　目", "width": label_w, "align": "left", "indent": 0},
-            ] + [
-                {"key": f"value{i}", "label": c.get("label", ""), "width": 10.0,
-                 "align": "right", "indent": 0}
-                for i, c in enumerate(cols)
-            ]
+            tpl["columns"] = [_report_print_col(c) for c in cols]
             tpl = validate_template("REPORT", tpl)      # 重新归一化列宽到 100%
 
-        ctx = pv.context(db, book, period)
+        # end_date 是给页眉中间那格用的（要「期末」而不是期间的第一天）；
+        # 没给时 render 会按期间码自己推当月最后一天。
+        ctx = pv.context(db, book, period,
+                         end_date=date(period.year, period.month,
+                                       calendar.monthrange(period.year, period.month)[1]).isoformat())
         doc = render_table_page(tpl, ctx, pv.report_rows(payload), 1, 1)
         return _with_note(doc, note)
 

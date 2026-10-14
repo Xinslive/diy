@@ -255,7 +255,7 @@ def test_所有者显式指定账套就能改(client, plain_auth, db, plain_user
 
     # 改了公式同样放行
     r = client.put(f"/api/reports/{tpl_id}/cells?book_id={own_book}", headers=plain_auth,
-                   json=[{"row_no": 2, "col_no": 2, "formula": "1+1"}])
+                   json=[{"row_no": 2, "col_no": 3, "formula": "1+1"}])
     assert r.status_code == 200, f"OWNER 改不了公式：{r.status_code} {r.text[:200]}"
 
 
@@ -263,7 +263,7 @@ def test_改公式同样要求显式账套(client, plain_auth, db, plain_user, a
     """门禁覆盖**每一个**写入口，不只是新建。"""
     before = client.get(f"/api/reports/{tpl_id}/design", headers=auth).json()["cells"]
     r = client.put(f"/api/reports/{tpl_id}/cells", headers=plain_auth,
-                   json=[{"row_no": 2, "col_no": 2, "formula": "1"}])
+                   json=[{"row_no": 2, "col_no": 3, "formula": "1"}])
     assert r.status_code == 400, f"拿到 {r.status_code}：{r.text[:200]}"
     after = client.get(f"/api/reports/{tpl_id}/design", headers=auth).json()["cells"]
     assert before == after, "公式居然被改了"
@@ -273,7 +273,7 @@ def test_改公式同样要求显式账套(client, plain_auth, db, plain_user, a
 
 def test_匿名改不了公式(client, db, tpl_id):
     r = client.put(f"/api/reports/{tpl_id}/cells",
-                   json=[{"row_no": 2, "col_no": 2, "formula": "=A1+1"}])
+                   json=[{"row_no": 2, "col_no": 3, "formula": "=A1+1"}])
     assert r.status_code == 401, f"匿名改公式拿到 {r.status_code}"
 
 

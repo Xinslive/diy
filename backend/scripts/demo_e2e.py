@@ -193,13 +193,30 @@ def main() -> int:
     bs = client.get(f"/api/reports/{tpl['BALANCE_SHEET']}/render", headers=H,
                     params={"book_id": BID, "period_id": P["2026-03"]}).json()
     check("资产负债表无公式错误", not bs["errors"], str(bs["errors"][:2]))
+    check("资产负债表是一行两栏的 8 列", len(bs["cols"]) == 8, f"{len(bs['cols'])} 列")
 
-    def row(label):
-        return next(r for r in bs["rows"] if r["label"] == label)
+    # 双栏表：左右两半共用同一行，所以**不能**按 label 找行 ——
+    # 「资产总计」在第 32 行的左半边，「负债和所有者权益总计」在第 29 行的右半边，
+    # 两者的数值分别在第 3 列（期末）和第 7 列（期末）。
+    def row_by_label(bs, label, side="left"):
+        def name(r):
+            if side == "left":
+                return r["label"]
+            return (r.get("style") or {}).get("label_right", "")
 
-    assets = row("资产总计")["cells"][1]["value"]
-    le = row("负债和所有者权益总计")["cells"][1]["value"]
-    chk = row("平衡校验（应为 0）")["cells"][1]["value"]
+        return next((r for r in bs["rows"] if name(r) == label), None)
+
+    def cell(row, col_no):
+        """按**列号**取格，不按下标：双栏表里列号与下标差一位，且左右两半会重名。"""
+        return next(c["value"] for c in row["cells"] if c["col_no"] == col_no)
+
+    assets = cell(row_by_label(bs, "资产总计"), 3)
+    le = cell(row_by_label(bs, "负债和所有者权益总计", "right"), 7)
+    # 平衡校验行不在表结构里，用 style 的分列 kind 认它
+    # （行级 kind 只是两半的默认值，真正生效的是 kind_left/right），
+    # 比匹配那串长得像提示语的 label 稳
+    chk_row = next(r for r in bs["rows"] if (r.get("style") or {}).get("kind_left") == "CHECK")
+    chk = cell(chk_row, 3)
     check("资产总计 == 负债和所有者权益总计", Decimal(assets) == Decimal(le),
           f"{assets} vs {le}")
     check("表内平衡校验行 = 0", Decimal(chk) == 0, str(chk))
@@ -207,19 +224,22 @@ def main() -> int:
     is_ = client.get(f"/api/reports/{tpl['INCOME_SHEET']}/render", headers=H,
                      params={"book_id": BID, "period_id": P["2026-03"]}).json()
     check("利润表无公式错误", not is_["errors"], str(is_["errors"][:2]))
-    net = next(r for r in is_["rows"] if r["label"] == "四、净利润")["cells"][1]["value"]
+    net = cell(next(r for r in is_["rows"] if r["label"] == "四、净利润"), 2)
     check("净利润 = 97000", Decimal(net) == Decimal("97000"), str(net))
 
-    # 自定义公式：把「资产总计」改成用 ROUND 和 IF 加工一遍，验证引擎可编辑
-    r = client.put(f"/api/reports/{tpl['BALANCE_SHEET']}/cells", headers=H,
-                   json=[{"row_no": 39, "col_no": 2, "formula": '=ROUND(B17-B38,2)'}])
+    # 自定义公式：把平衡校验行的期末余额改成用 ROUND 和 IF 加工一遍，验证引擎可编辑。
+    # 地址跟着会小企01表的坐标走：资产总计在第 32 行 C 列，负债和所有者权益总计在第 29 行 G 列。
+    # 报表模板是全局资源（P1-5），改公式必须显式带 book_id 说明「以哪个账套的身份改」。
+    r = client.put(f"/api/reports/{tpl['BALANCE_SHEET']}/cells?book_id={BID}", headers=H,
+                   json=[{"row_no": 33, "col_no": 3, "formula": "=ROUND(C32-G29,2)"}])
     check("可编辑单元格公式", r.status_code == 200, r.text[:80])
     bs2 = client.get(f"/api/reports/{tpl['BALANCE_SHEET']}/render", headers=H,
                      params={"book_id": BID, "period_id": P["2026-03"]}).json()
-    chk2 = next(r for r in bs2["rows"] if r["label"] == "平衡校验（应为 0）")["cells"][1]["value"]
+    chk2 = cell(next(r for r in bs2["rows"]
+                     if (r.get("style") or {}).get("kind_left") == "CHECK"), 3)
     check("改公式后重算结果不变", Decimal(chk2) == Decimal(chk), f"{chk} -> {chk2}")
-    client.put(f"/api/reports/{tpl['BALANCE_SHEET']}/cells", headers=H,
-               json=[{"row_no": 39, "col_no": 2, "formula": "B17-B38"}])
+    client.put(f"/api/reports/{tpl['BALANCE_SHEET']}/cells?book_id={BID}", headers=H,
+               json=[{"row_no": 33, "col_no": 3, "formula": "C32-G29"}])
 
     # ---------------------------------------------------------------- 8 账簿
     step(8, "账簿")

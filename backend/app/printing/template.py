@@ -24,6 +24,7 @@
 """
 from __future__ import annotations
 
+import calendar
 import html
 import re
 from datetime import datetime
@@ -216,6 +217,13 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
         "font": {"family": "宋体", "size": 10},
         "show": {"period": True, "page_no": True},
         "columns": [{"key": "label", "label": "项　目", "width": 34, "align": "left"}],
+        # 法定报表的页眉行：左「单位名称」、中「期末日期」（按期间自动算）、
+        # 右「表号 + 单位」。**可整块删掉**：没有这个键时页眉行不渲染。
+        #
+        # form_no 写在共用默认值里是有代价的 —— REPORT 是所有报表共用的一套
+        # 模板，利润表不该挂「会小企01表」。因此由 ``api/printing.py`` 的 REPORT
+        # 分支按报表类型把它清成空串（空串不是 None，_deep_merge 里会赢过默认值）。
+        "header": {"form_no": "会小企01表", "unit_label": "单位名称", "unit": "单位：元"},
         "meta": {"company": True, "book": True, "period": True},
         "footer": {"text": "", "show_page_no": True,
                    "format": "第 {page} 页　共 {total} 页"},
@@ -647,8 +655,24 @@ table.grid th, table.grid td {{ border:{border}; padding:3px 5px;
 table.grid thead {{ display:{'table-header-group' if tpl.get('body',{}).get('repeat_header',True) else 'table-row-group'}; }}
 table.grid td.num {{ text-align:right; white-space:nowrap; }}
 table.grid td.ctr {{ text-align:center; }}
+/* 会小企01表：官方模板里那 7 个灰格压一层浅灰。**不加粗** ——
+   官方表通篇没有粗体（大标题除外），把段标题加粗"增强可读性"反而
+   就不像那张纸了。td.total 是总账/明细账的老约定，保留。
+   平衡校验行加一道虚线分隔。 */
+table.grid td.shade {{ background:#f0f0f0; }}
+table.grid td.check {{ border-top:1px dashed #666; }}
+table.grid td.total {{ font-weight:700; }}
 table.grid tr.total td {{ font-weight:700; }}
+table.grid tr.group td {{ font-weight:700; }}
+table.grid tr.check td {{ border-top:1px dashed #666; }}
 table.grid tfoot td {{ font-weight:700; }}
+/* 报表页眉：左「单位名称」、中「期末日期」、右「表号 + 单位」。
+   用 flex 而不是三列 table：它要跟正文表格左对齐但不共用列宽，
+   换一张报表模板（列数不同）也不用跟着改。 */
+.doc-form-head {{ display:flex; justify-content:space-between; align-items:flex-end;
+  gap:12px; font-size:10pt; margin:0 0 6px; }}
+.doc-form-head .fh-mid {{ flex:1; text-align:center; }}
+.doc-form-head .fh-right {{ text-align:right; }}
 .doc-footer {{ margin-top:8px; font-size:9pt; color:#333;
   display:flex; justify-content:space-between; }}
 /* 凭证按「槽位」铺在纸上：A4 一页两个槽位，A5 一个。
@@ -735,6 +759,47 @@ def _footer_html(tpl: dict, page: int, total: int) -> str:
     return f'<div class="doc-footer"><span>{left}</span><span>{right}</span></div>'
 
 
+def _period_end_date(ctx: dict) -> str:
+    """报表页眉中间的「期末日期」，``2026年10月31日`` 这种写法。
+
+    优先用 ``ctx["end_date"]``（调用方手里有完整日期时直接给，别让它再猜）；
+    否则按会计期间 ``YYYY-MM`` 推当月最后一天 —— 资产负债表上印的是**期末**日，
+    写成期间的第一天会把整张表的时点说错一个月。
+
+    推不出来就返回空串：宁可这一格空着，也不要把 ``2026`` 之类的半截期间
+    掰成一段假日期（``cn_date`` 对非日期是原样返回的）。
+    """
+    raw = str(ctx.get("end_date") or "").strip()
+    if not raw:
+        m = re.match(r"^(\d{4})-(\d{1,2})$", str(ctx.get("period") or "").strip())
+        if m and 1 <= int(m.group(2)) <= 12:
+            year, month = int(m.group(1)), int(m.group(2))
+            raw = f"{year:04d}-{month:02d}-{calendar.monthrange(year, month)[1]:02d}"
+    return cn_date(raw)
+
+
+def _form_header_html(tpl: dict, ctx: dict) -> str:
+    """报表页眉那一行：左「单位名称」、中「期末日期」、右「表号 + 单位」。
+
+    **完全可选**：模板里没有 ``header`` 键就返回空串，页面与从前逐字节一致
+    —— 其余四种打印范围（总账/明细账/余额表/凭证）本来就没有这个键。
+
+    拼的是纯字符串并逐个值 ``_esc``：模板 content 是用户可 PATCH 的自由文本，
+    与 ``_meta_html`` 同一套理由（见 ``PRINT_CSP_META``）。这里不用 style 属性，
+    版式全交给 ``_page_css`` 里的 ``.doc-form-head``。
+    """
+    h = tpl.get("header")
+    if not isinstance(h, dict):
+        return ""
+    unit_label = str(h.get("unit_label") or "")
+    left = f"{_esc(unit_label)}：{_esc(ctx.get('company'))}" if unit_label else _esc(ctx.get("company"))
+    right = "<br>".join(_esc(x) for x in (h.get("form_no"), h.get("unit")) if x)
+    cells = [f'<span class="fh-left">{left}</span>',
+             f'<span class="fh-mid">{_esc(_period_end_date(ctx))}</span>',
+             f'<span class="fh-right">{right}</span>']
+    return f'<div class="doc-form-head">{"".join(cells)}</div>'
+
+
 def render_table_page(tpl: dict, ctx: dict, rows: list[dict], page: int, total: int) -> str:
     """通用表格页：总账 / 明细账 / 余额表 / 报表共用。"""
     cols = tpl["columns"]
@@ -745,7 +810,22 @@ def render_table_page(tpl: dict, ctx: dict, rows: list[dict], page: int, total: 
     body_rows: list[str] = []
     for r in rows:
         tds = []
-        is_total = str(r.get("__kind", "")) in ("TOTAL", "SUBTOTAL", "GROUP")
+        # 行性质只影响外观（加粗/底纹/虚线），不影响取数。其余四种打印范围的
+        # 行要么没有 __kind，要么只有 TOTAL/SUBTOTAL，走的还是原来那条分支。
+        kind = str(r.get("__kind", ""))
+        # 双栏报表两侧性质不同（第 16 行左边是「流动资产合计」、右边是「递延收益」），
+        # 所以 kind 可以**按列**给；没有这张表时逐列回落到行级值。
+        kinds = r.get("__kind_by_col") or {}
+        row_classes = []
+        if kind in ("TOTAL", "SUBTOTAL", "GROUP"):
+            row_classes.append("total")
+        if kind in ("GROUP", "SECTION"):
+            row_classes.append("section")
+        elif kind == "CHECK":
+            row_classes.append("check")
+        # 逐列的缩进/加粗（双栏报表左右两半不同）；没有这两张表时退还行级值。
+        col_indent = r.get("__indent") or {}
+        col_bold = r.get("__bold") or {}
         for c in cols:
             raw = r.get(c["key"], "")
             cls = ""
@@ -753,10 +833,25 @@ def render_table_page(tpl: dict, ctx: dict, rows: list[dict], page: int, total: 
                 cls = "num"
             elif c["align"] == "center":
                 cls = "ctr"
-            style = ""
+            cell_kind = str(kinds.get(c["key"], kind))
+            if cell_kind == "SHADE":
+                cls = f"{cls} shade".strip()
+            elif cell_kind == "CHECK":
+                cls = f"{cls} check".strip()
+            elif cell_kind in ("TOTAL", "SUBTOTAL", "GROUP"):
+                # 其余打印范围（总账/明细账/余额表）的老约定：行级 __kind
+                # 命中即加粗。会小企01表走的是上面的 SHADE/CHECK 分支。
+                cls = f"{cls} total".strip()
+            # 这里以前是把内联样式**当字符串**拼的：缩进先写成
+            # ` style="padding-left:19px"`，加粗再 `+= " font-weight:700;"`。
+            # 于是「不缩进但要加粗」的行（缩进 0 的合计行、段标题 —— 资产负债
+            # 表上一半的行都是）拼出来是 `<td class="" font-weight:700;>`：
+            # 字体加粗被当成一个**非法 HTML 属性**扔掉了，打印出来永远不加粗。
+            # 拼声明列表再一次性包进 style= 才是它本来的意思。
+            decls: list[str] = []
             if c["align"] == "left":
                 # 行级 indent（报表用）优先于列级 indent
-                depth = r.get("indent")
+                depth = col_indent.get(c["key"], r.get("indent"))
                 if depth is None or depth == "":
                     depth = c.get("indent", 0)
                 try:
@@ -764,17 +859,20 @@ def render_table_page(tpl: dict, ctx: dict, rows: list[dict], page: int, total: 
                 except (TypeError, ValueError):
                     depth = 0
                 if depth:
-                    style = f' style="padding-left:{5 + depth * 14}px"'
-                if r.get("bold"):
-                    style += " font-weight:700;"
-            # 只对右对齐（金额）列做千分位格式化；居中列放的是级次、日期这类
-            # 非金额字段，套 _fmt 会把 1 变成 "1.00"
+                    decls.append(f"padding-left:{5 + depth * 14}px")
+                if col_bold.get(c["key"], r.get("bold")):
+                    decls.append("font-weight:700")
+            style = f' style="{";".join(decls)}"' if decls else ""
+            # 只对右对齐（金额）列做千分位格式化；居中列放的是级次、日期、行次
+            # 这类非金额字段，套 _fmt 会把行次 1 变成 "1.00"
             txt = _esc(_fmt(raw) if c["align"] == "right" and raw not in (None, "") else raw)
             tds.append(f'<td class="{cls}"{style}>{txt}</td>')
-        tr_cls = ' class="total"' if is_total else ""
+        tr_cls = f' class="{" ".join(row_classes)}"' if row_classes else ""
         body_rows.append(f"<tr{tr_cls}>{''.join(tds)}</tr>")
 
     if not body_rows:
+        # colspan 取 len(cols)：报表的列数是**跟着报表模板走的**（会小企01表 8 列），
+        # 写死成一个数就会出现「表头 8 列、空态横跨 1 格」的破相。
         body_rows = ['<tr><td colspan="%d" class="ctr">（无数据）</td></tr>' % len(cols)]
 
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -785,6 +883,7 @@ def render_table_page(tpl: dict, ctx: dict, rows: list[dict], page: int, total: 
   <h1 class="doc-title">{_esc(tpl.get('title',{}).get('text',''))}</h1>
   <p class="doc-subtitle">{_esc(tpl.get('subtitle',{}).get('text','') or ctx.get('period',''))}</p>
   {_meta_html(tpl, ctx)}
+  {_form_header_html(tpl, ctx)}
   <table class="grid"><colgroup>{colgroup}</colgroup>
     <thead><tr>{head}</tr></thead>
     <tbody>{''.join(body_rows)}</tbody>

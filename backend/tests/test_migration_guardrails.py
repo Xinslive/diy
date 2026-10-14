@@ -892,6 +892,9 @@ def test_head_是本文件认识的那一版():
         "0009_subject_year_code_edit",      # 科目编码：本年度无发生额即可改
         "0010_subject_year_code_subtree",   # 同上，但「发生额」按整棵子树判（汇总级也算有记账）
         "0011_subject_and_batch_indexes",   # 性能审计：entry.subject_id 与 import_batch 的查询索引
+        "0012_balance_sheet_dual_sided",    # 资产负债表改成会小企01表的双栏 8 列版式
+        "0013_sme_chart_accounts",       # 补齐《小企业会计准则》科目，让会小企01表每行挂得上科目
+        "0014_official_template",            # 按官方空白模板纠正左右两半的行配对与底纹
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")

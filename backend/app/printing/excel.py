@@ -11,7 +11,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, Side
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 ZERO = Decimal("0")
@@ -445,11 +445,15 @@ def report_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     ws.title = _safe_sheet_title(name, "报表")
 
     rows = payload.get("rows") or []
+    cols = payload.get("cols") or []
     _check_size("报表", len(rows))
 
     ws["A1"] = _text(name)
     ws["A1"].font = Font(name="宋体", size=16, bold=True)
-    last_col = max(len(payload["cols"]), 1)
+    # 标题合并宽度 = **实际数据列数**。原来是 max(len(cols), 1)，那个 +1 是当初
+    # 「可能一列都没有」时的兜底，代价是列数为 8 的双栏表会把标题格多并一格，
+    # 标题跑出表体范围（Excel 里表现为标题盖住表头右侧）。
+    last_col = len(cols) or 1
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
     ws["A1"].alignment = CENTER
     ws.row_dimensions[1].height = 30
@@ -458,8 +462,33 @@ def report_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     ws["A2"] = _text(f"{company} · {book_name} · 期间 {payload['period']}")
     ws["A2"].alignment = CENTER
 
+    # 每个报表列落在**自己那一列**，不整体右移。原来是「第 1 列写行标签，
+    # 之后 enumerate(cells, start=2)」：会小企01表有 8 个报表列、其中 2 个是
+    # 标题列（无值），于是整张表从第 2 列起就错一列，最右一列直接写丢。
+    # STATIC/LINE_NO 的内容在行上（与 printing/preview.py 同一套取法）。
+    #
+    # 一个 STATIC 都没有时（老形状 / 调用方自己拼的精简 payload：cols 只有
+    # label 和 width，没有 kind），把**第 1 列**当标题列。否则行标签根本没
+    # 人写 —— 那不只是少一列：行标签是用户可控文本，漏掉它等于让
+    # test_excel_export 里那批「标签不注入公式」的用例失去被测对象。
+    has_static = any(c.get("kind") == "STATIC" for c in cols)
+    static_seen = line_seen = 0
+    col_plan: list[tuple[dict, str, int]] = []
+    for idx, col in enumerate(cols):
+        kind = col.get("kind")
+        if not kind and idx == 0 and not has_static:
+            kind = "STATIC"
+        side = 0
+        if kind == "STATIC":
+            side = static_seen
+            static_seen += 1
+        elif kind == "LINE_NO":
+            side = line_seen
+            line_seen += 1
+        col_plan.append((col, kind or "", side))
+
     r = 4
-    for idx, col in enumerate(payload["cols"], start=1):
+    for idx, col in enumerate(cols, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = col.get("width", 120) / 7
         c = ws.cell(row=r, column=idx, value=_text(col["label"]))
         c.font = Font(bold=True)
@@ -468,18 +497,63 @@ def report_excel(payload: dict, *, company: str, book_name: str) -> bytes:
 
     for row in rows:
         r += 1
-        # 行标签（项目名）来自报表公式的 label，同样是用户可控文本，
-        # 绕过了 _text 就能把报表名/项目名写成 Excel 公式。
-        c = ws.cell(row=r, column=1, value=_text("　" * row["indent"] + row["label"]))
-        c.alignment = LEFT
-        c.font = Font(bold=row["bold"])
-        c.border = BOX
-        for idx, cell in enumerate(row["cells"], start=2):
-            c = ws.cell(row=r, column=idx, value=_num(cell["value"]))
-            c.alignment = RIGHT
+        style = row.get("style") or {}
+        if not isinstance(style, dict):
+            style = {}
+        cells_by_no = {c.get("col_no"): c for c in row.get("cells") or []}
+        # 段标题与合计行加粗。**按半**判：资产负债表的同一行两侧性质不同
+        # （第 16 行左边「流动资产合计」要加粗、右边「递延收益」是普通项目），
+        # 只认行级 kind 会把右半也印成合计。
+        # 单栏模板（利润表）没有 kind_left/kind_right，回落到行级 kind。
+        def _side_kind(side: int) -> str:
+            k = style.get("kind_right" if side else "kind_left")
+            return str(k or style.get("kind") or "")
+
+        def _side_filled(side: int) -> bool:
+            return bool(style.get("label_right")) or style.get("line_right") is not None \
+                if side else bool(row.get("label")) or style.get("line_left") is not None
+
+        for idx, (col, kind, side) in enumerate(col_plan, start=1):
+            sk = _side_kind(side) if _side_filled(side) else ""
+            # 官方表通篇没有粗体（大标题除外），表体一律不加粗。
+            row_bold = bool(row.get("bold") if side == 0 else style.get("bold_right"))
+            if kind == "STATIC":
+                # 项目名是用户可控文本：绕过了 _text 就能把报表名/项目名写成公式
+                if side:
+                    label = style.get("label_right") or ""
+                    depth = style.get("indent_right", 0)
+                    bold = bool(style.get("bold_right"))
+                else:
+                    label = row.get("label") or ""
+                    depth = row.get("indent", 0)
+                    bold = bool(row.get("bold"))
+                # 会小企01表：段标题与最外层总计压灰，其余白底。
+                if sk == "SHADE":
+                    cell_fill = PatternFill("solid", fgColor="D9D9D9")
+                else:
+                    cell_fill = PatternFill()
+                try:
+                    depth = int(depth or 0)
+                except (TypeError, ValueError):
+                    depth = 0
+                c = ws.cell(row=r, column=idx, value=_text("　" * depth + str(label)))
+                c.alignment = LEFT
+                c.font = Font(bold=bold)
+                c.fill = cell_fill
+            elif kind == "LINE_NO":
+                # 行次是法定固定编号，写成字符串：openpyxl 见到纯数字字符串无所谓，
+                # 但它可能带 '-'（占位），转成 int 会在这种行上直接抛异常。
+                no = style.get("line_right" if side else "line_left")
+                c = ws.cell(row=r, column=idx, value="" if no is None else str(no))
+                c.alignment = CENTER
+                c.font = Font(bold=row_bold)
+            else:
+                value = (cells_by_no.get(col.get("col_no")) or {}).get("value")
+                c = ws.cell(row=r, column=idx, value=_num(value))
+                c.alignment = RIGHT
+                c.number_format = "#,##0.00"
+                c.font = Font(bold=row_bold or bool(row.get("bold")))
             c.border = BOX
-            c.font = Font(bold=row["bold"])
-            c.number_format = "#,##0.00"
 
     if payload.get("errors"):
         r += 2

@@ -52,6 +52,21 @@ from typing import Any, Callable, Iterator, Optional
 
 ZERO = Decimal("0")
 
+#: **不带取数口径**的列类型：内容不来自科目，也不写公式。
+#:
+#: * ``STATIC`` —— 项目标题列（资产负债表的「资产」「负债和所有者权益」，
+#:   利润表的「项目」）。内容是 ``ReportRow.label`` 或
+#:   ``ReportRow.style["label_right"]``。
+#: * ``LINE_NO`` —— 行次列（《小企业会计准则》规定的 1~53）。内容是
+#:   ``ReportRow.style["line_left" / "line_right"]``。
+#:
+#: 它们放在这里而不是各自的模块里，是因为**三处都要用同一个口径**：
+#: 播种时不写公式（``app/seed/builtin_reports.py``）、求值时不当数值列
+#: （``app/reports/evaluate.py``）、设计器里不继承取数口径
+#: （``app/api/reports.py``）。少一处，多一处就会把「行次」当成一个能取数的
+#: 列，于是新插的列继承到 LINE_NO 口径、报一个用户看不懂的错。
+NON_FORMULA_KINDS = frozenset({"STATIC", "LINE_NO"})
+
 # 标识符首字符与后续字符分开判断；用带锚点的整串正则会让 B2 只吃下 B
 IDENT_START = re.compile(r"[一-鿿A-Za-z_]")
 IDENT_PART = re.compile(r"[一-鿿A-Za-z0-9_]")

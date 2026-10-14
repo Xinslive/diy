@@ -16,7 +16,7 @@ from app.core.deps import get_current_user, get_my_book, require_book_write
 from app.models import (Book, Period, ReportCell, ReportCol, ReportResult, ReportRow,
                      ReportTemplate, SysUser, UserBook)
 from app.reports.evaluate import COL_KINDS
-from app.reports.formula import FormulaError, Parser, no_to_col, rewrite_refs
+from app.reports.formula import FormulaError, NON_FORMULA_KINDS, Parser, no_to_col, rewrite_refs
 
 router = APIRouter(prefix="/api/reports", tags=["报表"])
 
@@ -555,14 +555,16 @@ def add_col(template_id: int, payload: dict, book_id: Optional[int] = None,
         raise HTTPException(400, "列号从 2 开始，第 1 列是固定的「项目」列")
 
     # 口径默认「沿用左边最近的一个数值列」；左边一个都没有（插在标签列右边，
-    # 最常见的用法）就退回整张表的第一个数值列。绝不能继承 STATIC —— 第 1 列
-    # 是固定的「项目」标签列，继承它会造出一个既不显示、又没有任何取数口径的
-    # 幽灵列，看着像插成功了，导出却没有这一列。
-    value_cols = [c for c in cols if c.kind != "STATIC"]
+    # 最常见的用法）就退回整张表的第一个数值列。绝不能继承不带口径的列 ——
+    # STATIC 是固定的「项目」标签列，LINE_NO 是「行次」列（资产负债表的
+    # 8 列版式里各有一个）。继承它们会造出一个既不显示、也永远算不出数的
+    # 幽灵列：看着像插成功了，导出却没有这一列，或者更糟 —— 行次列里的
+    # 「1」「31」被当成金额显示出来。
+    value_cols = [c for c in cols if c.kind not in NON_FORMULA_KINDS]
     left = [c for c in value_cols if c.col_no < at]
     neighbour = left[-1] if left else (value_cols[0] if value_cols else None)
     kind = str(payload.get("kind") or (neighbour.kind if neighbour else "BALANCE_CLOSING"))
-    if kind == "STATIC" or kind not in COL_KINDS:
+    if kind in NON_FORMULA_KINDS or kind not in COL_KINDS:
         raise HTTPException(400, f"未知的取数口径 {kind}，可选：{', '.join(sorted(COL_KINDS))}")
 
     with _shift_cols(db, template_id, at, direction=+1):
@@ -585,7 +587,7 @@ def update_col(template_id: int, col_no: int, payload: ReportColPatch, book_id: 
     if col is None:
         raise HTTPException(404, "列不存在")
     if payload.kind is not None and payload.kind != col.kind:
-        if payload.kind != "STATIC" and payload.kind not in COL_KINDS:
+        if payload.kind not in COL_KINDS:
             raise HTTPException(400, f"未知的取数口径 {payload.kind}")
         col.kind = payload.kind
     if payload.label is not None:
@@ -606,12 +608,17 @@ def delete_col(template_id: int, col_no: int, book_id: Optional[int] = None,
                                              ReportCol.col_no == col_no))
     if col is None:
         raise HTTPException(404, "列不存在")
-    if col.kind == "STATIC":
-        raise HTTPException(400, "「项目」列是固定列，不能删")
+    if col.kind in NON_FORMULA_KINDS:
+        raise HTTPException(
+            400, "「项目」列与「行次」列是固定列，不能删"
+            if col.kind == "LINE_NO" else "「项目」列是固定列，不能删")
+    # 「至少留一个数值列」必须数**真正取数的**列：把 STATIC/LINE_NO 算进去，
+    # 会让一张只剩标签列和行次列的表也通过校验 —— 那种表一格数都算不出来，
+    # 却能在界面上看着像一张正常的表。
     remaining = db.scalar(
         select(func.count()).select_from(ReportCol).where(
             ReportCol.template_id == template_id, ReportCol.col_no != col_no,
-            ReportCol.kind != "STATIC"))
+            ReportCol.kind.not_in(tuple(NON_FORMULA_KINDS))))
     if not remaining:
         raise HTTPException(400, "至少要保留一个数值列")
 
