@@ -43,6 +43,12 @@ PyJWT>=2.15.1
 # 导入/导出凭证与模板都要读 xlsx。
 openpyxl>=3.1.5
 
+# 用友等旧系统导出的 .xls 是 OLE 复合文档，openpyxl 只支持 .xlsx。
+xlrd>=2.0.2
+
+# 用友 UFO 5.10 的 .rep/.rbk 报表模板是 OLE 复合文档。
+olefile>=0.47
+
 # openpyxl 的**可选**加速项：装了就走 libxml2，没装就走纯 Python 的
 # ElementTree，两条路都能跑，差别只在快慢 —— 所以它不装也能启动，不会变成
 # 新的缺依赖故障。

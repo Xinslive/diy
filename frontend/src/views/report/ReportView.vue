@@ -409,6 +409,7 @@ function letterOf(colNo) {
 }
 
 const COL_KINDS = {
+  FORMULA: '按单元格公式',
   BALANCE_CLOSING: '期末余额',
   BALANCE_OPENING: '年初余额',
   PERIOD_AMOUNT: '本期金额',

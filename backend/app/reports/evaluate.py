@@ -36,6 +36,7 @@ from app.reports.formula import D, Evaluator, FormulaError, formula_guard
 
 # 列类型 -> (取数口径, 期间占位符)
 COL_KINDS = {
+    "FORMULA": ("期末", "{{本期}}"),  # 迁移模板：每格显式公式决定取数口径
     "BALANCE_CLOSING": ("期末", "{{本期}}"),
     "BALANCE_OPENING": ("期初", "{{年初}}"),
     "PERIOD_AMOUNT": ("本期金额", "{{本期}}"),

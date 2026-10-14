@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import uuid
+import re
 from contextlib import contextmanager
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -13,10 +14,14 @@ from app.accounting.audit_helper import log
 from app.api.schemas import CellIn
 from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
+from app.core.uploads import UploadTooLarge, read_upload_sync as read_upload
 from app.models import (Book, Period, ReportCell, ReportCol, ReportResult, ReportRow,
-                     ReportTemplate, SysUser, UserBook)
+                     ReportTemplate, Subject, SysUser, UserBook)
 from app.reports.evaluate import COL_KINDS
 from app.reports.formula import FormulaError, NON_FORMULA_KINDS, Parser, no_to_col, rewrite_refs
+from app.reports.importer import (MAX_TEMPLATE_BYTES, TemplateImportError, parse_ufo_report,
+                                  subject_codes, validate_formula)
+from app.reports.import_schema import ImportTemplates
 
 router = APIRouter(prefix="/api/reports", tags=["报表"])
 
@@ -248,6 +253,105 @@ def persist(template_id: int, book_id: int, period_id: int, db: Session = Depend
             ))
     db.commit()
     return {"saved": True, "errors": data["errors"]}
+
+
+# ===================================================================== 外部模板迁移
+
+
+@router.post("/templates/import/preview")
+def preview_template_import(file: UploadFile = File(...), book_id: Optional[int] = None,
+                            user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    """只解析、检查当前账套科目，不创建模板。"""
+    _require_template_write(db, user, book_id)
+    try:
+        raw = read_upload(file, limit=MAX_TEMPLATE_BYTES, label="报表模板", hint="单个模板最大 5 MB")
+        parsed = parse_ufo_report(raw, file.filename or "")
+    except UploadTooLarge as exc:
+        raise HTTPException(413, str(exc)) from exc
+    except TemplateImportError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    book_subjects = list(db.scalars(select(Subject).where(Subject.book_id == book_id).order_by(Subject.code)))
+    by_code = {subject.code: subject for subject in book_subjects}
+    existing = db.scalar(select(ReportTemplate).where(
+        ReportTemplate.code == f"IMPORTED_{parsed['source']['fingerprint']}"))
+    document = {key: parsed[key] for key in ("name", "type", "source", "rows", "cols", "cells", "issues")}
+    return {
+        "document": document, "stats": parsed["stats"], "warnings": parsed["warnings"],
+        "subjects": [{"code": code, "name": by_code[code].name if code in by_code else "",
+                      "matched": code in by_code} for code in parsed["subject_codes"]],
+        "available_subjects": [{"code": subject.code, "name": subject.name} for subject in book_subjects],
+        "existing": {"id": existing.id, "name": existing.name} if existing else None,
+    }
+
+
+@router.post("/templates/import", status_code=201)
+def import_templates(payload: ImportTemplates, book_id: Optional[int] = None,
+                     user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    """先校验整批，再在一个事务内新建模板；不覆盖内置或已有报表。"""
+    _require_template_write(db, user, book_id)
+    book_codes = set(db.scalars(select(Subject.code).where(Subject.book_id == book_id)))
+    validated = []
+    seen_codes: set[str] = set()
+    for item in payload.templates:
+        code = f"IMPORTED_{item.source.fingerprint}"
+        if code in seen_codes:
+            raise HTTPException(409, "同一批次包含重复模板，请只选择 .rep / .rbk 中的一份")
+        seen_codes.add(code)
+        if db.scalar(select(ReportTemplate.id).where(ReportTemplate.code == code)):
+            raise HTTPException(409, f"「{item.name}」已经导入，请打开已有模板")
+        row_numbers = {row.row_no for row in item.rows}
+        col_numbers = {col.col_no for col in item.cols}
+        if row_numbers != set(range(1, len(item.rows) + 1)) or col_numbers != set(range(1, len(item.cols) + 1)):
+            raise HTTPException(400, "模板的行列编号必须连续且不能重复")
+        if item.cols[0].kind != "STATIC":
+            raise HTTPException(400, "模板第一列必须是项目列")
+        mapping = item.subject_mapping
+        for original, target in mapping.items():
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", original) or target not in book_codes:
+                raise HTTPException(400, f"科目映射 {original} → {target} 无效")
+        cells, seen_cells = [], set()
+        fixed_cols = {col.col_no for col in item.cols if col.kind in NON_FORMULA_KINDS}
+        for cell in item.cells:
+            coord = (cell.row_no, cell.col_no)
+            if coord in seen_cells or cell.row_no not in row_numbers or cell.col_no not in col_numbers or cell.col_no in fixed_cols:
+                raise HTTPException(400, "模板单元格重复、越界或位于固定列")
+            seen_cells.add(coord)
+            formula = re.sub(r'科目\("([^"\\]+)",',
+                             lambda match: f'科目("{mapping.get(match.group(1), match.group(1))}",', cell.formula)
+            try:
+                validate_formula(formula, row_numbers, col_numbers)
+            except FormulaError as exc:
+                raise HTTPException(400, f"「{item.name}」第 {cell.row_no} 行 / {cell.col_no} 列：{exc}") from exc
+            cells.append({"row_no": cell.row_no, "col_no": cell.col_no, "formula": formula})
+        missing = sorted(set(subject_codes(cells)) - book_codes)
+        if (item.issues or missing) and not payload.accept_warnings:
+            raise HTTPException(400, "模板仍有待配置公式或未匹配科目，请先核对并确认提示")
+        validated.append((item, code, cells, missing))
+
+    created = []
+    for item, code, cells, missing in validated:
+        notes = [f"导入自 {item.source.format}：{item.source.filename}"]
+        if item.issues:
+            notes.append(f"{len(item.issues)} 个金额格待配置公式")
+        if missing:
+            notes.append(f"{len(missing)} 个科目待匹配")
+        template = ReportTemplate(code=code, name=item.name, type=item.type,
+                                  remark="；".join(notes), is_builtin=False)
+        db.add(template)
+        db.flush()
+        db.add_all([ReportRow(template_id=template.id, **row.model_dump()) for row in item.rows])
+        db.add_all([ReportCol(template_id=template.id, **col.model_dump()) for col in item.cols])
+        db.add_all([ReportCell(template_id=template.id, **cell) for cell in cells])
+        db.flush()
+        log(db, action="IMPORT_REPORT_TEMPLATE", entity="report_template", entity_id=template.id,
+            user=user, book_id=book_id, detail=template.remark,
+            after={"name": item.name, "rows": len(item.rows), "cols": len(item.cols),
+                   "formulas": len(cells), "pending_formulas": len(item.issues),
+                   "missing_subjects": missing, "subject_mapping": item.subject_mapping})
+        created.append({"id": template.id, "name": template.name, "type": template.type,
+                        "pending_formulas": len(item.issues), "missing_subjects": len(missing)})
+    db.commit()
+    return {"created": created, "count": len(created)}
 
 
 # ===================================================================== 模板管理

@@ -1,15 +1,17 @@
 """科目表。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, func, select
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.orm import Session
 
 from app.accounting.audit_helper import log
+from app.accounting.subject_importer import parse_subject_workbook
 from app.api.schemas import SubjectEditIn, SubjectIn
 from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
-from app.models import Book, Entry, Period, PeriodOpening, Subject, SysUser, UserBook
+from app.core.uploads import UploadTooLarge, read_upload_sync as read_upload
+from app.models import Book, Entry, Period, PeriodOpening, Subject, SysUser, UserBook, Voucher
 
 router = APIRouter(prefix="/api/books/{book_id}/subjects", tags=["科目"])
 
@@ -110,6 +112,193 @@ def frequent_subjects(book: Book = Depends(get_my_book), db: Session = Depends(g
         out.append({"id": s.id, "code": s.code, "name": s.name, "category": s.category,
                     "direction": s.direction, "is_leaf": s.is_leaf, "used": r.n})
     return out
+
+
+def _subject_import_state(db: Session, book_id: int) -> dict:
+    subject_count = db.scalar(
+        select(func.count()).select_from(Subject).where(Subject.book_id == book_id)
+    ) or 0
+    voucher_count = db.scalar(
+        select(func.count()).select_from(Voucher).where(Voucher.book_id == book_id)
+    ) or 0
+    entry_count = db.scalar(
+        select(func.count()).select_from(Entry).where(Entry.book_id == book_id)
+    ) or 0
+    opening_count = db.scalar(
+        select(func.count()).select_from(PeriodOpening)
+        .join(Period, Period.id == PeriodOpening.period_id)
+        .where(Period.book_id == book_id)
+    ) or 0
+    return {
+        "subject_count": subject_count,
+        "voucher_count": voucher_count,
+        "entry_count": entry_count,
+        "opening_count": opening_count,
+        "can_overwrite": voucher_count == 0 and entry_count == 0 and opening_count == 0,
+    }
+
+
+def _parse_subject_upload(file: UploadFile, data: bytes | None = None) -> tuple[dict, str]:
+    filename = file.filename or "未命名科目表"
+    suffix = filename.lower()
+    if not (suffix.endswith(".xls") or suffix.endswith(".xlsx")):
+        raise HTTPException(400, "只支持 .xls 或 .xlsx 格式的科目表")
+    try:
+        if data is None:
+            data = read_upload(
+                file,
+                label="科目表",
+                hint="请拆成更小的文件或删除无关工作表后重试",
+            )
+        parsed = parse_subject_workbook(data, filename)
+    except UploadTooLarge as exc:
+        raise HTTPException(413, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return parsed, filename
+
+
+@router.post("/import/preview")
+def preview_subject_import(
+    file: UploadFile = File(...),
+    book: Book = Depends(get_my_book),
+    db: Session = Depends(get_db),
+    _link: UserBook = Depends(require_book_write),
+):
+    """解析外部科目表并返回预览，不修改账套。"""
+    try:
+        data = read_upload(
+            file,
+            label="科目表",
+            hint="请拆成更小的文件或删除无关工作表后重试",
+        )
+    except UploadTooLarge as exc:
+        raise HTTPException(413, str(exc)) from exc
+    parsed, filename = _parse_subject_upload(file, data)
+    state = _subject_import_state(db, book.id)
+    return {
+        "filename": filename,
+        "source": "用友科目表" if parsed["file_format"] == "xls" else "Excel 科目表",
+        **parsed,
+        "current": state,
+        "blocked_reason": (
+            "账套已有凭证或期初余额，不能覆盖科目表；请新建空账套或先完成业务数据迁移"
+            if not state["can_overwrite"] else ""
+        ),
+    }
+
+
+@router.post("/import")
+def import_subjects(
+    file: UploadFile = File(...),
+    book: Book = Depends(get_my_book),
+    db: Session = Depends(get_db),
+    user: SysUser = Depends(get_current_user),
+    _link: UserBook = Depends(require_book_write),
+):
+    """确认覆盖科目表：重新解析文件，并在一个事务内整表替换。"""
+    try:
+        data = read_upload(
+            file,
+            label="科目表",
+            hint="请拆成更小的文件或删除无关工作表后重试",
+        )
+    except UploadTooLarge as exc:
+        raise HTTPException(413, str(exc)) from exc
+    parsed, filename = _parse_subject_upload(file, data)
+    if not parsed["ok"]:
+        raise HTTPException(400, f"科目表有 {parsed['error_count']} 个问题，请修正后再导入")
+    if not parsed["subjects"]:
+        raise HTTPException(400, "科目表没有可导入的科目")
+
+    # 覆盖是破坏性操作。锁住账套后再次检查，避免预览与确认之间有人写入凭证。
+    locked_book = db.scalar(select(Book).where(Book.id == book.id).with_for_update())
+    if locked_book is None:
+        raise HTTPException(404, "账套不存在")
+    state = _subject_import_state(db, locked_book.id)
+    if not state["can_overwrite"]:
+        raise HTTPException(
+            409,
+            "账套已有业务数据，不能覆盖科目表"
+            f"（凭证 {state['voucher_count']} 张、分录 {state['entry_count']} 条、"
+            f"期初余额 {state['opening_count']} 条）。请新建空账套或先完成数据迁移",
+        )
+
+    old_count = state["subject_count"]
+    old_rule = locked_book.subject_code_rule
+    try:
+        max_level = db.scalar(
+            select(func.max(Subject.level)).where(Subject.book_id == locked_book.id)
+        ) or 0
+        # 自引用外键要求先删下级，再删上级；逐级删除也让这条路径不依赖数据库的
+        # 删除计划，PostgreSQL 和测试数据库的行为保持一致。
+        for level in range(max_level, 0, -1):
+            db.execute(delete(Subject).where(
+                Subject.book_id == locked_book.id,
+                Subject.level == level,
+            ))
+
+        by_code: dict[str, Subject] = {}
+        max_import_level = max(item["level"] for item in parsed["subjects"])
+        for level in range(1, max_import_level + 1):
+            created: list[tuple[dict, Subject]] = []
+            for item in parsed["subjects"]:
+                if item["level"] != level:
+                    continue
+                parent = by_code.get(item["parent_code"]) if item["parent_code"] else None
+                subject = Subject(
+                    book_id=locked_book.id,
+                    code=item["code"],
+                    name=item["name"],
+                    category=item["category"],
+                    direction=item["direction"],
+                    parent_id=parent.id if parent else None,
+                    level=level,
+                    is_leaf=item["is_leaf"],
+                    carry_forward=item["carry_forward"],
+                    qty_calc=item["qty_calc"],
+                    aux_calc=item["aux_calc"],
+                    fx_calc=item["fx_calc"],
+                    sort_no=item["sort_no"],
+                    active=True,
+                    ext_attrs=item["ext_attrs"],
+                )
+                db.add(subject)
+                created.append((item, subject))
+            db.flush()
+            for item, subject in created:
+                by_code[item["code"]] = subject
+
+        locked_book.subject_code_rule = parsed["code_rule"]
+        db.flush()
+        log(
+            db,
+            action="IMPORT_SUBJECTS",
+            entity="book",
+            entity_id=locked_book.id,
+            user=user,
+            book_id=locked_book.id,
+            detail=f"覆盖导入科目表 {filename}：{old_count} → {len(parsed['subjects'])} 个科目",
+            before={"subject_count": old_count, "subject_code_rule": old_rule},
+            after={
+                "subject_count": len(parsed["subjects"]),
+                "subject_code_rule": parsed["code_rule"],
+                "filename": filename,
+                "file_format": parsed["file_format"],
+            },
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "ok": True,
+        "deleted": old_count,
+        "created": len(parsed["subjects"]),
+        "code_rule": parsed["code_rule"],
+        "filename": filename,
+    }
 
 
 @router.post("", status_code=201)

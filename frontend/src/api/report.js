@@ -40,3 +40,12 @@ export const updateCol = (id, colNo, payload, bookId) =>
   http.patch(`/reports/templates/${id}/cols/${colNo}`, payload, { params: { book_id: bookId } }).then(r => r.data)
 export const deleteCol = (id, colNo, bookId) =>
   http.delete(`/reports/templates/${id}/cols/${colNo}`, { params: { book_id: bookId } }).then(r => r.data)
+
+export const previewTemplateImport = (file, bookId) => {
+  const form = new FormData()
+  form.append('file', file)
+  return http.post('/reports/templates/import/preview', form, { params: { book_id: bookId } }).then(r => r.data)
+}
+export const importTemplates = (templates, bookId, acceptWarnings = false) =>
+  http.post('/reports/templates/import', { templates, accept_warnings: acceptWarnings },
+    { params: { book_id: bookId } }).then(r => r.data)
