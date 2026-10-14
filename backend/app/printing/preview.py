@@ -45,9 +45,16 @@ def _d(v: Any) -> Decimal:
 
 
 def voucher_rows(db: Session, book: Book, vouchers: list) -> list[dict]:
-    from app.api.vouchers import _serialize
+    from app.api.vouchers import _book_subjects, _serialize
 
-    return [_serialize(db, v) for v in vouchers]
+    # 科目一次取好，逐张共用（审计 P3-12 的同一条理由，审计 2026-10-14 复发）。
+    # 以前这里每张凭证都走 `_serialize` 的兜底分支，各查一次全账套科目：
+    # 序列化一张凭证只显示科目编码与名称，而这个查询与凭证无关。
+    # SQLAlchemy 的 identity map 只省对象重建、**不省 SQL 发射**，
+    # N 张凭证就是 N 条一模一样的 SELECT —— 列表接口（vouchers.py:113）
+    # 早就修好了，这里还留着。
+    subs = _book_subjects(db, book.id)
+    return [_serialize(db, v, subs) for v in vouchers]
 
 
 def balance_rows(rows: list[dict]) -> list[dict]:

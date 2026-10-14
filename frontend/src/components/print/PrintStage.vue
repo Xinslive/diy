@@ -281,11 +281,24 @@ const HOTSPOT_SELECTORS = {
 }
 const hotspots = ref([])
 
+/** 同一批热点、同一批坐标就别换新数组（换引用 = 模板全量重渲染）。 */
+function sameHotspots(a, b) {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]
+    const y = b[i]
+    if (x === y) continue
+    if (!x || !y) return false
+    if (x.key !== y.key || x.x !== y.x || x.y !== y.y || x.w !== y.w || x.h !== y.h) return false
+  }
+  return true
+}
+
 function readHotspots(d) {
-  if (props.slots > 1) { hotspots.value = []; return }   // 凭证走元素层
+  if (props.slots > 1) { if (hotspots.value.length) hotspots.value = []; return }   // 凭证走元素层
   const pages = [...d.querySelectorAll('.page')]
   const pageEl = pages[activePage.value - 1]
-  if (!pageEl) { hotspots.value = []; return }
+  if (!pageEl) { if (hotspots.value.length) hotspots.value = []; return }
   const pr = pageEl.getBoundingClientRect()
   const out = []
   for (const [key, sel] of Object.entries(HOTSPOT_SELECTORS)) {
@@ -301,7 +314,7 @@ function readHotspots(d) {
       h: Math.round(r.height),
     })
   }
-  hotspots.value = out
+  if (!sameHotspots(hotspots.value, out)) hotspots.value = out
 }
 
 /**
@@ -311,9 +324,31 @@ function readHotspots(d) {
 function readPages(d) {
   const pages = [...d.querySelectorAll('.page')]
   if (!pages.length) return { count: 1, tops: [0], heights: [] }
-  const tops = pages.map((p) => Math.max(0, p.getBoundingClientRect().top
-    + (d.defaultView.scrollY || 0)))
-  return { count: pages.length, tops, heights: pages.map((p) => p.getBoundingClientRect().height) }
+  const scrollY = d.defaultView.scrollY || 0
+  const tops = []
+  const heights = []
+  // 每个 .page **量一次**，两趟 map 各调一次 getBoundingClientRect 的话，
+  // 同一批元素会被量两遍 —— 而 measure() 是被 iframe 内的 ResizeObserver
+  // 拖着跑的，文档一动就重跑一趟。
+  for (const p of pages) {
+    const r = p.getBoundingClientRect()
+    tops.push(Math.max(0, r.top + scrollY))
+    heights.push(r.height)
+  }
+  return { count: pages.length, tops, heights }
+}
+
+/**
+ * 内容没变就别换新数组。
+ *
+ * 这三个数组喂给的是模板里的 v-for / :style，换一个引用就是一次全量重渲染，
+ * 哪怕里面每个数都一模一样。measure() 由 ResizeObserver 拖着跑，
+ * 「量了但其实没变」是常态。
+ */
+function sameList(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+  return true
 }
 
 /**
@@ -458,8 +493,8 @@ function measure() {
         activePage.value = Math.min(activePage.value, count)
         emit('pages', count)
       }
-      if (tops.length) pageTops.value = tops
-      pageHeights.value = heights
+      if (tops.length && !sameList(pageTops.value, tops)) pageTops.value = tops
+      if (!sameList(pageHeights.value, heights)) pageHeights.value = heights
       readHotspots(d)
     }
     apply()

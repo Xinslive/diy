@@ -18,7 +18,10 @@ from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import (get_book_link, get_current_user, get_my_book, require_admin,
                         require_book_write)
-from app.core.uploads import RowBudget, UploadTooLarge, check_archive_size, read_upload
+from app.core.uploads import RowBudget, UploadTooLarge, check_archive_size
+# 本地别名保持函数名 ``read_upload`` 不变（守卫测试按这个名字认共享容量闸），
+# 指向的其实是同步版 —— 端点已改成同步 ``def``，不能再 await。
+from app.core.uploads import read_upload_sync as read_upload
 from app.ledger.engine import LedgerEngine
 from app.models import Book, Period, PeriodOpening, Subject, SysUser, UserBook, Voucher
 
@@ -394,13 +397,20 @@ def export_openings(book_id: int, period_id: int | None = None,
 
 
 @router.post("/{book_id}/openings/parse")
-async def parse_openings(book_id: int, file: UploadFile = File(...),
-                         book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
+def parse_openings(book_id: int, file: UploadFile = File(...),
+                   book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     """解析期初余额 Excel，**只解析不落库** —— 前端先给用户预览，确认后才写。
 
     虽然是 POST，但它**不改任何数据**：只解析出一个 preview 返回给前端。
     真正落库的是 ``set_openings``（那里挂了 require_book_write）。
     所以这里不挂写依赖 —— 只读账号也该能预览自己账上的期初表。
+
+    **同步端点，刻意如此**（审计严重 1）：它和 ``vouchers/import`` 是全仓仅有的两个
+    ``async def`` 端点，而 ``async def`` 端点直接跑在事件循环线程上 ——
+    这里的 ``load_workbook``（同步 openpyxl）与 ``get_db`` 给的同步 Session
+    会原地堵死整个 worker 的事件循环，连 ``/api/health`` 一起排队，
+    而 CPU 占用并不高。改成 ``def`` 后由 FastAPI 丢进 anyio 线程池，
+    与全仓其余端点一致。
 
     但「只读」只免的是**写权限**，不免**容量**（审计 P1-4）：这个入口曾经
     一道闸都没有。``raw = await file.read()`` 无上限整体读进内存，
@@ -425,8 +435,8 @@ async def parse_openings(book_id: int, file: UploadFile = File(...),
     # 容量三道闸的前两道在共享工具里（与凭证导入同一把尺，见 app/core/uploads.py）。
     # 413：文件太大是「换个更小的再来」，不是参数写错了。
     try:
-        raw = await read_upload(file, label="期初余额文件",
-                                hint="请拆成多份分别导入，或先删除无关工作表")
+        raw = read_upload(file, label="期初余额文件",
+                          hint="请拆成多份分别导入，或先删除无关工作表")
     except UploadTooLarge as e:
         raise HTTPException(413, str(e))
     try:

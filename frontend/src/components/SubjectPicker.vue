@@ -62,6 +62,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { CATEGORY_LABEL, ensurePinyin, matchSubject } from '@/utils/subjectCode'
+import { perFrame, rafThrottle } from '@/utils/frame'
 
 const props = defineProps({
   modelValue: { type: [Number, String], default: null },
@@ -397,7 +398,10 @@ function onFocus() {
 function autosize() {
   const el = inputEl.value
   if (!el) return
-  const lh = parseFloat(getComputedStyle(el).lineHeight) || 22
+  // 同一张凭证上挂着 8~20 个本组件，resize 时每个都被叫一遍 —— 但量的是
+  // 同一个 CSS 类定出来的 line-height。同帧内共用一份（perFrame），别量 20 遍。
+  const lh = perFrame('SubjectPicker.lineHeight',
+    () => parseFloat(getComputedStyle(el).lineHeight)) || 22
   const max = lh * 2
   el.style.height = 'auto'
   const need = el.scrollHeight
@@ -605,14 +609,19 @@ watch(visible, () => {
   setCursor(i >= 0 ? i : 0)
 })
 
-// 列宽跟着窗口走，窗口一改折行位置就变了，高度得跟着重量一遍
-function onResize() { autosize() }
+// 列宽跟着窗口走，窗口一改折行位置就变了，高度得跟着重量一遍。
+//
+// resize 一秒能来 60 次，而 autosize() 里是「写 height:auto → 读 scrollHeight」
+// 一写一读，中间要把布局同步刷一遍。按帧合并：两次绘制之间缩多少次，
+// 量一趟就够 —— 中间那些中间态没人看得见。
+const onResize = rafThrottle(() => autosize())
 onMounted(() => {
   document.addEventListener('mousedown', onDocClick)
   window.addEventListener('resize', onResize)
   autosize()
 })
 onBeforeUnmount(() => {
+  onResize.cancel()          // 还挂着的那一帧别再对着已卸载的 DOM 跑
   document.removeEventListener('mousedown', onDocClick)
   window.removeEventListener('resize', onResize)
 })

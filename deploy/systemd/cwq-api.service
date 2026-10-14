@@ -8,11 +8,32 @@ Type=simple
 User=cwq
 Group=cwq
 WorkingDirectory=/opt/cwq/backend
+# worker 进程数。**默认值 = 2**，与这里原来写死的 `--workers 2` 完全一致 ——
+# 这次只是让它可配，容量要不要动是另一件事（要拿 CPU 核数与并发数据说话）。
+#
+# 为什么写成变量而不是把它留在 ExecStart 里：同一个数在 deploy/systemd 和
+# backend/Dockerfile 里各写死一份，改一处忘一处就会出现「systemd 4 个、
+# Docker 2 个」，而两边连的是同一个 uvicorn 进程模型。
+#
+# **ExecStart 不走 shell**，所以 `${VAR:-2}` 那种「带兜底值」的写法不存在 ——
+# systemd 只认自己的变量展开，而**未定义的变量会展开成空字符串**（不是保留
+# 原样）。所以这里用 Environment= 给死默认值，再用 EnvironmentFile 让运维覆盖：
+#   * Environment= 必须写在 EnvironmentFile= **之前**。systemd >= 250 是
+#     「后写的覆盖先写的」，< 250 是「文件无条件覆盖 Environment=」——
+#     放在前面，两种版本下结论一致：都是 .env 说了算。
+#   * .env 里没有这一项时，用的仍然是这里的 2，不会展开成空。
+# 名字带 CWQ_ 前缀是为了和 .env 里其它应用侧配置区分开：这个变量是
+# **给 systemd 读的**，config.py 里没有、也不应该有对应字段（Python 那边
+# 读不到它，留一个读不到的配置项比没有更危险）。
+Environment=CWQ_API_WORKERS=2
 EnvironmentFile=/opt/cwq/backend/.env
 Environment=TZ=Asia/Shanghai
+# 只做一件事：把「.env 里把这一项清空了」这种手滑，从「uvicorn 收到空的
+# --workers 参数、Restart=always 无限重启刷日志」变成一条看得懂的启动失败。
+ExecStartPre=/bin/sh -c 'case "$CWQ_API_WORKERS" in ""|*[!0-9]*|0) echo "CWQ_API_WORKERS 必须是正整数（.env 里不能把它清空）" >&2; exit 1;; esac'
 ExecStart=/opt/cwq/backend/.venv/bin/uvicorn app.main:app \
     --host 127.0.0.1 --port 8000 \
-    --workers 2 --timeout-keep-alive 120
+    --workers ${CWQ_API_WORKERS} --timeout-keep-alive 120
 Restart=always
 RestartSec=3
 

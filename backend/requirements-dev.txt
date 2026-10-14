@@ -10,7 +10,12 @@
 # 测试套件的唯一 runner
 pytest>=9.1.1
 
-# 并行跑：pytest.ini 里默认 -n 6，全量 194s -> 33s。
+# 并行跑：pytest.ini 里默认 -n 6，全量 178s -> 26s。
+# 这个数字与 pytest.ini 的注释是**同一个**（原来这里写 194s -> 33s，两处矛盾，
+# 各自像是某次不同时间的测量；统一到 pytest.ini 那条，因为它带了三次连续
+# 实测 26/25/28s，是更可核对的那个）。
+# 注意：CI（4 vCPU）会显式覆盖成 -n 3，所以 CI 上的绝对耗时不等于这里的数，
+# 原因见 ci.yml 里的说明。
 # 每个 worker 用独立的库（conftest 按 PYTEST_XDIST_WORKER 加库名后缀），
 # 否则 session 级 DROP SCHEMA 会让 worker 之间互相删表。
 pytest-xdist>=3.8.0

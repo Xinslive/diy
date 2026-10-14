@@ -186,13 +186,62 @@ function signedOf(s) {
  *  「银行存款」到底装了多少钱就成了问不出来的事 —— 而这恰恰是翻这张表的目的。
  *  合计按带符号加，方向相反的余额会自己抵掉，不会两行都往上堆。
  */
-const subTotal = (s) => {
-  if (s.is_leaf) return signedOf(s)
-  let total = 0
-  for (const c of childrenOf(s.id)) total += subTotal(c)
-  return total
-}
-const childrenOf = (id) => data.value.subjects.filter((x) => x.parent_id === id)
+/**
+ * 科目表是**平的**（每行带 parent_id），树要自己搭 —— 一次搭好，按 parent_id 存。
+ *
+ * 以前 childrenOf() 每次都把全表 filter 一遍，而 subTotal() 在递归里逐个调它：
+ * 每算一个后代节点就扫一遍全表，一行渲染 O(N)，整张表 O(N²)。而 amounts/drafts
+ * 是 reactive 的，打字时这套东西一直在渲染路径上跑。
+ * 写法照抄 SubjectPicker.vue 里那份 byId：computed 里建一次 Map，之后都是 O(1) 取。
+ */
+const childrenByParent = computed(() => {
+  const m = new Map()
+  for (const s of data.value.subjects) {
+    const list = m.get(s.parent_id)
+    if (list) list.push(s)
+    else m.set(s.parent_id, [s])
+  }
+  return m
+})
+
+/**
+ * 全部合计：**一次自底向上遍历**算完，按 id 缓存。
+ *
+ * 用显式栈做后序遍历，而不是递归，也不靠「后端一定把父排在子前面」——
+ * 顺序一旦变了，父先落定就会把下级漏掉，算出来的上级合计是 0，而页面上看不出来。
+ * 依赖 amounts/sides，所以改一个格子只重算一趟 O(N)，不是每行各递归一次。
+ */
+const subTotals = computed(() => {
+  const subs = data.value.subjects
+  const kids = childrenByParent.value
+  const out = new Map()
+  // 全部科目都进栈，不预先分根：谁先算到全看顺序，而 out 本身保证
+  // 「非末级一定等所有子节点都落定才收自己」，所以后端把父子排成什么样都对。
+  const stack = [...subs]
+  while (stack.length) {
+    const s = stack[stack.length - 1]
+    if (out.has(s.id)) { stack.pop(); continue }
+    // is_leaf 先判，与老口径同序：末级只认自己的数，哪怕数据里它底下还挂着行
+    // （自相矛盾时以末级为准，别把上一版「先看有没有孩子」的顺序偷换成另一套口径）
+    const children = s.is_leaf ? [] : (kids.get(s.id) || [])
+    if (children.length) {
+      let pushed = false
+      for (const c of children) if (!out.has(c.id)) { stack.push(c); pushed = true }
+      if (pushed) continue                       // 回来时子节点都算完了，再收自己
+      let total = 0
+      for (const c of children) total += out.get(c.id) || 0
+      out.set(s.id, total)
+      stack.pop()
+      continue
+    }
+    // 末级记自己的数；**非末级却没有任何子节点**仍然是 0（与老口径一致）
+    out.set(s.id, s.is_leaf ? signedOf(s) : 0)
+    stack.pop()
+  }
+  return out
+})
+
+const subTotal = (s) => subTotals.value.get(s.id) ?? 0
 
 /** 上级的方位跟着这一支的合计走：正的在借方、负的在贷方；
  *  加起来正好 0 就没方位可言，退回科目本身的自然方向。 */

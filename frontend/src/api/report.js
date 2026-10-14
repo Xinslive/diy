@@ -1,7 +1,8 @@
-import { http, apiUrl } from './client'
+import { http, apiUrl, getLatest } from './client'
 export const templates = () => http.get('/reports/templates').then(r => r.data)
 export const design = (id) => http.get(`/reports/${id}/design`).then(r => r.data)
-export const render = (id, params) => http.get(`/reports/${id}/render`, { params }).then(r => r.data)
+// 跟着期间/账套/模板走，切换时同样会连点 —— 走 getLatest 让上一趟直接 abort。
+export const render = (id, params) => getLatest('report/render', `/reports/${id}/render`, params)
 // 公式语法错现在**当场 400**（以前是 200 存进去、等渲染时某一格蹦红字）。
 // 整批拒收、一格不存，所以调用方要把 detail 弹给人看，并保留未保存的改动。
 export const saveCells = (id, cells, bookId) => http.put(`/reports/${id}/cells`, cells, { params: { book_id: bookId } }).then(r => r.data)

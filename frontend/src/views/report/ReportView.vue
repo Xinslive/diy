@@ -172,6 +172,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import * as api from '@/api/report'
 import { downloadFile } from '@/api/print'
 import PrintDialog from '@/components/PrintDialog.vue'
+import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 
@@ -185,7 +186,8 @@ const templateId = ref(Number(route.params.templateId || 0))
 const bookId = ref(store.bookId || 0)
 const template = ref(null)
 const data = ref({ rows: [], cols: [], errors: [] })
-const loading = ref(false)
+/** 只认最新一趟：期间/模板切换时，旧响应不许覆盖新数据（见 composables/useLatestLoad）。 */
+const { loading, run, isStale } = useLatestLoad('report/render')
 const designMode = ref(false)
 const formulaVisible = ref(false)
 const editing = ref(null)
@@ -407,31 +409,29 @@ async function forkTemplate() {
 
 async function load(keepDirty = false) {
   if (!templateId.value || !store.bookId || !store.periodId) return
-  loading.value = true
-  try {
-    const tpl = allTemplates.value.find((t) => t.id === templateId.value)
-    template.value = tpl
-    const res = await api.render(templateId.value, {
-      book_id: store.bookId, period_id: store.periodId
-    })
-    // 列字母挂在列上，行编辑按钮要用
-    res.cols = res.cols.map((c) => ({ ...c, letter: letterOf(c.col_no) }))
-    data.value = res
-    if (designMode.value && keepDirty) {
-      for (const row of res.rows) {
-        // 键必须用 cell.col_no（1 基），跟 onCellClick 存进去的一致。
-        // 用数组下标 ci（0 基）会永远匹配不上，编辑中的公式就"丢了"
-        row.cells.forEach((cell) => {
-          const key = `${row.row_no}:${cell.col_no}`
-          if (dirty[key] !== undefined) {
-            cell.formula = dirty[key]
-            cell.value = '（待保存后重算）'
-          }
-        })
-      }
+  const tpl = allTemplates.value.find((t) => t.id === templateId.value)
+  template.value = tpl
+  // 只认最新一趟：期间/模板切换时，旧响应不许覆盖新数据。
+  const res = await run(() => api.render(templateId.value, {
+    book_id: store.bookId, period_id: store.periodId
+  }))
+  // 过期的那一趟：条件早就被改掉了，写进去就是「表里的数对不上顶栏的期间」。
+  if (isStale(res)) return
+  // 列字母挂在列上，行编辑按钮要用
+  res.cols = res.cols.map((c) => ({ ...c, letter: letterOf(c.col_no) }))
+  data.value = res
+  if (designMode.value && keepDirty) {
+    for (const row of res.rows) {
+      // 键必须用 cell.col_no（1 基），跟 onCellClick 存进去的一致。
+      // 用数组下标 ci（0 基）会永远匹配不上，编辑中的公式就"丢了"
+      row.cells.forEach((cell) => {
+        const key = `${row.row_no}:${cell.col_no}`
+        if (dirty[key] !== undefined) {
+          cell.formula = dirty[key]
+          cell.value = '（待保存后重算）'
+        }
+      })
     }
-  } finally {
-    loading.value = false
   }
 }
 

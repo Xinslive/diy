@@ -1,17 +1,17 @@
 """凭证服务：新增 / 修改 / 删除 / 记账 / 反记账 / 查询 / 批量。"""
 from __future__ import annotations
 
+import re
 from collections import Counter
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import Integer, Select, and_, func, or_, select
+from sqlalchemy import Integer, Numeric, Select, and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.accounting import organize as svc_organize
-from app.accounting.organize import split_no
 from app.accounting.audit_helper import log, voucher_snapshot
 from app.accounting.util import constraint_name, find_period, money, period_label
 from app.models import Book, Entry, Period, Subject, SysUser, Voucher
@@ -40,6 +40,29 @@ def _is_no_collision(exc: IntegrityError) -> bool:
 # --------------------------------------------------------------------- 编号
 
 
+# NO_PATTERN 的前缀组约束，逐字照抄（organize.py:39）。前缀不合这个形状时，
+# **任何**凭证号都拆不出这个前缀，于是答案与库里有哪些号无关，恒为 001。
+_PREFIX_SHAPE = re.compile(r"^[^\d]{1,4}$")
+
+
+def _prefix_seq_expr(prefix: str):
+    """「前缀 + 纯数字序号」整体的序号列；不匹配的行给 NULL。
+
+    等价于应用层 ``split_no(no)`` 在 ``prefix == 前缀`` 那一支的行为：
+    ``split_no`` 先 ``strip()`` 再要求整体匹配 ``^{prefix}(\\d+)$``，所以正则
+    两头留 ``\\s*``、中间**不留** ——「记 005」里那个空格在 Python 侧会被吃进
+    前缀组（前缀变成「记 」，不等于「记」）因而落选，这里同样落选。
+
+    用 ``substring(no, pattern)`` 而不是 ``substring(no, 固定偏移)``：偏移量
+    依赖「凭证字恰好几个汉字」这个假设，当年就是这么错的（见下面 docstring）。
+    PostgreSQL 的两参 ``substring(text, text)`` 在正则含括号子表达式时返回
+    **第一个括号子表达式**，于是这里拿到的就是纯数字那段，不需要在 Python
+    侧再抠一次。
+    """
+    pattern = rf"^\s*{re.escape(prefix)}(\d+)\s*$"
+    return func.cast(func.substring(Voucher.voucher_no, pattern), Numeric)
+
+
 def next_voucher_no(db: Session, period: Period, prefix: str = "记") -> str:
     """期间内顺序编号。凭证号允许回收复用，因此取「当前最大值 + 1」即可。
 
@@ -61,24 +84,40 @@ def next_voucher_no(db: Session, period: Period, prefix: str = "记") -> str:
 
     两个缺陷叠在一起，探针 13 组里 10 组结果是错的。
 
-    改成把该期间的号全取出来，用 ``organize.split_no`` 在**应用层**按
-    整数求最大值：前缀按传入的 prefix 走，序号按数值比。
+    第一版修复改对了方向（必须按**整数**比），但落成了「把该期间全部凭证号
+    拉回 Python 求 max」。单张创建是 4 次 SELECT，可批量导入在一个事务里
+    逐张 ``create_voucher``（``import_max_vouchers`` 允许 5000 张），
+    于是 N 张累计读回约 N(N-1)/2 行。
+
+    现在把「按前缀分组取该前缀最大序号」下推成 SQL 聚合：**正确性决策
+    （按整数比）原样保留，退回字典序 max 的路被正则 + cast 堵死**，
+    而回传的只有一行。
+
+    与原实现逐条等价的地方：
+
+    * 序号 0（如「记0」）仍可能进 ``max``，但原实现把 ``n <= 0`` 过滤掉后
+      缺省值就是 0，两边对「只存在记0」与「记0 + 记005」都给 0 / 5 ——
+      max 的候选里放不放 0 不改变结果。
+    * 前缀组只有 1~4 个非数字字符，且序号必须 ``\\d+``（至少一位），这两条
+      约束由正则承担，与 ``NO_PATTERN`` 同源；前缀本身不合这个形状时直接
+      短路成 001，省掉一次注定为空的查询。
+    * cast 用 Numeric 而不是 Integer：Python 的 ``int()`` 不溢出，
+      Integer 到 2147483647 就报错，用户自带「记99999999999999」不该让
+      发号整个炸掉。
+
+    剩下的代价：PG 侧仍要对本期每一行算一次正则（没有匹配表达式的索引），
+    单次发号是 O(本期凭证数)。真要把它也压成 O(1)，得在 ``period`` 上维护
+    一个发号计数器列 —— 那要动模型和迁移，不在本文件范围内。
     """
-    nos = db.scalars(
-        select(Voucher.voucher_no).where(Voucher.period_id == period.id)
-    ).all()
-    # 只看**与本次前缀相同**的号。这不是额外的洁癖，organize 里
-    # ``_check``/``_dominant_prefix`` 本来就是按前缀分组的：凭证字不同
-    # 就是不同的号段，跨前缀比序号没有意义。
-    #
-    # 否则「记-2」会被解析成 (前缀「记-」, 序号 2)，把「记」的下一个号
-    # 顶到 003 —— 用户看着 记001/记002 空着，发号却说 记003。
-    # 同理「记-年结」这类解析不出序号的返回 0，本来就不该参与递增。
-    seq = max((n for no in nos
-               if (n := split_no(no)[1]) > 0 and split_no(no)[0] == prefix),
-              default=0) + 1
+    if not _PREFIX_SHAPE.match(prefix):
+        return f"{prefix}001"
+    top = db.scalar(
+        select(func.coalesce(func.max(_prefix_seq_expr(prefix)), 0)).where(
+            Voucher.period_id == period.id
+        )
+    )
     # 三位数够一个月的凭证用。四位（记0022）看着像系统自动加的零，反而难扫。
-    return f"{prefix}{seq:03d}"
+    return f"{prefix}{int(top or 0) + 1:03d}"
 
 
 # --------------------------------------------------------------------- 插入位
@@ -385,7 +424,11 @@ def create_voucher(
         user=user,
         book_id=book_id,
         detail=f"新增凭证 {voucher.voucher_no}",
-        after=voucher_snapshot(voucher),
+        # 分录是拿外键建的，backref 不会回填 voucher.entries —— 不把
+        # payload 递进去，下面这行就会为了拿「刚写进去的这些分录」再查一次库。
+        after=voucher_snapshot(
+            voucher, entries=[dict(e, line_no=i) for i, e in enumerate(payload, start=1)]
+        ),
     )
     if commit:
         db.commit()
@@ -524,10 +567,19 @@ def _resolve_vouchers(db: Session, book_id: int, voucher_ids: list[int]) -> list
     另外顺带解决 P1-08：原来查不到就直接访问 ``vouchers[0]``，
     传不存在的 ID → IndexError → HTTP 500。500 会掩盖真实原因
     （是不存在？是无权？还是服务端坏了？），也不符合 API 契约。
+
+    ``selectinload(Voucher.entries)``：批量记账按 ``v.entries`` 逐张求借贷合计
+    （``post_vouchers``），裸 select 会让每张各发一条 ``SELECT ... WHERE
+    voucher_id=?`` —— 一次批量记账 = N 次往返。与凭证列表查询是同一个坑，
+    那边早就补过了（``query_vouchers`` 里的 selectinload，200 次往返的注释
+    还记着）。预载对不读分录的调用方（``unpost_vouchers``）只是多传一份
+    数据，语义不变：这里返回的还是同一批凭证对象，分录还是各自的那几条。
     """
     wanted = sorted(set(voucher_ids))
     rows = list(db.scalars(
-        select(Voucher).where(Voucher.id.in_(wanted), Voucher.book_id == book_id)
+        select(Voucher)
+        .options(selectinload(Voucher.entries))
+        .where(Voucher.id.in_(wanted), Voucher.book_id == book_id)
     ).all())
     found = {v.id for v in rows}
     missing = [i for i in wanted if i not in found]

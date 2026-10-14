@@ -266,6 +266,23 @@ class ReportContext:
         self._cells[key] = value
         return value
 
+    def memoized_cell(self, row: int, col: int) -> Optional[Decimal]:
+        """本轮求值里**已经算过**的这一格；没算过返回 ``None``。
+
+        报表里被别的格子引用过的格子很多（合计行、期初列、校验行），而顶层
+        循环走的是 ``evaluator.run(src)`` —— 于是这些格子在循环轮到它时
+        **又完整重算一遍**，哪怕 ``_cells`` 里已经躺着它的值。
+
+        这里只做「读」，不代算：没算过时返回 ``None``，由调用方照旧自己跑。
+        这一点是刻意的 —— 代算会把这一格塞进 ``_cells``，从而改变**报错归属**：
+        报错该出现在哪一格、说的是哪一对行列，是 ``_visiting`` 的栈决定的，
+        顺手改了会让「这一格报错了」变成「它引用的那一格报错了」。
+
+        值相同是构造上保证的：``_cells`` 里存的就是同一个 ctx、同一条公式串
+        跑出来的 ``Decimal``，而这次求值期间账是只读的。
+        """
+        return self._cells.get((row, col))
+
 
 class EvalContext(ReportContext):
     def __init__(self, db, book, period, formulas: dict[tuple[int, int], str], include_unposted=False):
@@ -316,7 +333,12 @@ def evaluate(
                 row_values.append({**base, "value": None, "formula": "", "error": ""})
                 continue
             try:
-                value = evaluator.run(src)
+                # 优先复用本轮求值里已经算过的这一格（见 ReportContext.memoized_cell）：
+                # 值必然相同，省掉的是整棵 AST 的重走。没算过就照旧自己跑，
+                # 报错归属保持原样。
+                value = ctx.memoized_cell(r.row_no, c.col_no)
+                if value is None:
+                    value = evaluator.run(src)
                 row_values.append({**base, "value": str(value), "formula": src, "error": ""})
             except FormulaError as e:
                 errors.append(f"{r.label}(第{r.row_no}行 第{c.label}列): {e}")

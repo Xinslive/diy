@@ -36,8 +36,43 @@ def _jsonable(v: Any) -> Any:
     return v
 
 
-def voucher_snapshot(voucher: Voucher) -> dict:
-    """凭证的完整快照。金额是十进制文本 —— 见 :func:`_jsonable` 的理由。"""
+def _entry_dict(e: Any) -> dict:
+    """一条分录的快照字段。``e`` 可以是 ``Entry``，也可以是等价的 dict。
+
+    创建路径上的分录只设了外键（``Entry(voucher_id=..., **e)``），backref
+    不会回填到 ``voucher.entries`` 上，于是取快照会触发一条 SELECT —— 而它
+    拿回来的正是这里手头已经有的 ``payload``。允许直接传 dict，省掉这次往返
+    （ORM 分录仍走同一条路径，两种形态产出完全一样的字段）。
+
+    **金额在这里保持原样**（Decimal），不做 :func:`_jsonable`：借贷合计要拿
+    它做加法，转成文本就再也加不动了。转文本只发生在最后落进快照的那一刻。
+    """
+    if isinstance(e, dict):
+        return {
+            "line_no": e["line_no"],
+            "subject_id": e["subject_id"],
+            "direction": e["direction"],
+            "amount": e["amount"],
+            "summary": e.get("summary", "") or "",
+        }
+    return {
+        "line_no": e.line_no,
+        "subject_id": e.subject_id,
+        "direction": e.direction,
+        "amount": e.amount,
+        "summary": e.summary,
+    }
+
+
+def voucher_snapshot(voucher: Voucher, entries: Any = None) -> dict:
+    """凭证的完整快照。金额是十进制文本 —— 见 :func:`_jsonable` 的理由。
+
+    ``entries`` 不给时读 ORM 关系（修改/删除路径就是靠关系里那份集合）。
+    给了就用它，且**不再碰 ``voucher.entries``**：新建凭证的分录是刚 ``db.add``
+    进去的、关系上还没有，不显式传就会白发一次懒加载。
+    """
+    rows = [_entry_dict(e) for e in (voucher.entries if entries is None else entries)]
+    rows.sort(key=lambda r: r["line_no"])
     return {
         "id": voucher.id,
         "voucher_no": voucher.voucher_no,
@@ -46,20 +81,9 @@ def voucher_snapshot(voucher: Voucher) -> dict:
         "source": voucher.source,
         "remark": voucher.remark,
         "attachments": voucher.attachments,
-        "debit": _jsonable(sum(e.amount for e in voucher.entries
-                               if e.direction == "DEBIT")),
-        "credit": _jsonable(sum(e.amount for e in voucher.entries
-                                if e.direction == "CREDIT")),
-        "entries": [
-            {
-                "line_no": e.line_no,
-                "subject_id": e.subject_id,
-                "direction": e.direction,
-                "amount": _jsonable(e.amount),
-                "summary": e.summary,
-            }
-            for e in sorted(voucher.entries, key=lambda x: x.line_no)
-        ],
+        "debit": _jsonable(sum(r["amount"] for r in rows if r["direction"] == "DEBIT")),
+        "credit": _jsonable(sum(r["amount"] for r in rows if r["direction"] == "CREDIT")),
+        "entries": [{**r, "amount": _jsonable(r["amount"])} for r in rows],
     }
 
 

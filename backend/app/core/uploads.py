@@ -19,8 +19,10 @@
 
 所以闸住在共享工具里，而不是各写一遍：
 
-1. :func:`read_upload` —— 接口层限**读取字节数**（先看 ``file.size`` 预检，
-   再按上限 +1 读一次，覆盖 size 不可信的情况）；
+1. :func:`read_upload` / :func:`read_upload_sync` —— 接口层限**读取字节数**
+   （先看 ``file.size`` 预检，再按上限 +1 读一次，覆盖 size 不可信的情况）。
+   两个入口共用同一份实现，区别只在 async 壳：同步端点（FastAPI 会丢进线程池）
+   调同步版；
 2. :func:`check_archive_size` —— 按 zip 中央目录**声明的**解压体积预检，
    不真正解压就能挡住「几百 KB 解压成几百 MB」；
 3. :class:`RowBudget` —— 解析过程中数**行数**。前两道都可以被伪造
@@ -72,10 +74,8 @@ def unzipped_limit() -> int:
     return settings.import_max_unzipped_bytes
 
 
-async def read_upload(file, *, limit: int | None = None,
-                      label: str = "文件",
-                      hint: str = "请拆成多份分别上传") -> bytes:
-    """把上传文件读进内存，**带上限**读。
+def _read_capped(file, *, limit: int | None, label: str, hint: str) -> bytes:
+    """带上限读上传文件。同步版与异步版共用这一份实现。
 
     两道检查，缺一不可：
 
@@ -101,6 +101,36 @@ async def read_upload(file, *, limit: int | None = None,
     if len(data) > cap:
         raise UploadTooLarge(f"{label} 超过上限 {human_bytes(cap)}，{hint}")
     return data
+
+
+async def read_upload(file, *, limit: int | None = None,
+                      label: str = "文件",
+                      hint: str = "请拆成多份分别上传") -> bytes:
+    """把上传文件读进内存，**带上限**读（异步入口，见 :func:`read_upload_sync`）。
+
+    保留这个 async 签名是为了不动公共工具的既有契约（``app.accounting.importer``
+    把它列进 ``__all__`` 转出）。读的实现从来就不依赖 await —— 它一直是
+    ``file.file.read(...)`` —— 所以两个上传端点改同步后走 :func:`read_upload_sync`。
+    """
+    return _read_capped(file, limit=limit, label=label, hint=hint)
+
+
+def read_upload_sync(file, *, limit: int | None = None,
+                     label: str = "文件",
+                     hint: str = "请拆成多份分别上传") -> bytes:
+    """:func:`read_upload` 的同步版，**语义逐条相同**（同一个 cap、同一个 +1 超限
+    检测、同一个 :class:`UploadTooLarge`），因为两者共用 :func:`_read_capped`。
+
+    为什么需要它：``vouchers/import`` 与 ``openings/parse`` 曾经是全仓仅有的两个
+    ``async def`` 端点（审计严重 1）。它们把**同步**的 openpyxl 与**同步** psycopg
+    Session 直接跑在事件循环线程上，一次 20MB 导入能把整个 worker 的事件循环堵死，
+    而 CPU 占用并不高 —— 表现是后端整体无响应。改成同步 ``def`` 端点后，
+    FastAPI 会把整个调用丢进 anyio 线程池，阻塞的是线程池线程，安全。
+
+    改成同步就不能 ``await``，而 ``UploadFile.file`` 本来就是
+    ``SpooledTemporaryFile``，读取不经过 await —— 所以这里只是去掉 async 壳。
+    """
+    return _read_capped(file, limit=limit, label=label, hint=hint)
 
 
 def check_archive_size(data: bytes, *, limit: int | None = None,

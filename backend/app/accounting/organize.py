@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
+from typing import NamedTuple
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -184,7 +186,20 @@ def _sort_key(voucher: Voucher, strategy: str):
 # --------------------------------------------------------------------- 体检
 
 
-def _time_order_issues(by_seq: list[tuple[Voucher, str, int]]) -> list[dict]:
+class _VoucherRow(NamedTuple):
+    """体检真正用到的三个字段。
+
+    以前这里跑的是 ``select(Voucher)``：结账时 ``assert_tidy`` 会对**整条
+    期间链**逐期调用，把每期的凭证全建成 ORM 对象并塞进 identity map，
+    而体检只用到凭证号、日期、状态这三个字段。十年账套结一次 12 月就是
+    几万张白建的 Voucher。
+    """
+    no: str
+    voucher_date: date
+    status: str
+
+
+def _time_order_issues(by_seq: list[tuple[_VoucherRow, str, int]]) -> list[dict]:
     """按凭证号排一遍，看日期是不是也一路往后走。
 
     记账是按时间顺序记的，凭证号就是时间顺序的编号。号大的那张日期反而更早，
@@ -192,13 +207,13 @@ def _time_order_issues(by_seq: list[tuple[Voucher, str, int]]) -> list[dict]:
     装订也对不上，月底不能就这么封账。
     """
     issues: list[dict] = []
-    prev: Voucher | None = None
+    prev: _VoucherRow | None = None
     for v, _prefix, _seq in by_seq:
         if prev is not None and v.voucher_date < prev.voucher_date:
             issues.append({
-                "voucher_no": v.voucher_no,
+                "voucher_no": v.no,
                 "voucher_date": v.voucher_date.isoformat(),
-                "prev_no": prev.voucher_no,
+                "prev_no": prev.no,
                 "prev_date": prev.voucher_date.isoformat(),
             })
         prev = v
@@ -213,11 +228,14 @@ def check_period(db: Session, period: Period) -> dict:
 
     结转损益算不算断号/时序？算。它照样占着号，缺了就是缺了。
     """
-    rows = list(db.scalars(
-        select(Voucher).where(Voucher.period_id == period.id).order_by(Voucher.id)
-    ).all())
+    rows = [
+        _VoucherRow(*r) for r in db.execute(
+            select(Voucher.voucher_no, Voucher.voucher_date, Voucher.status)
+            .where(Voucher.period_id == period.id).order_by(Voucher.id)
+        ).all()
+    ]
 
-    parsed = [(v, *split_no(v.voucher_no)) for v in rows]
+    parsed = [(v, *split_no(v.no)) for v in rows]
     with_seq = [(v, p, s) for v, p, s in parsed if s > 0]
 
     prefixes = {p for _, p, _ in with_seq}
@@ -227,7 +245,7 @@ def check_period(db: Session, period: Period) -> dict:
 
     for v, p, s in parsed:
         if s == 0:
-            unparsed.append(v.voucher_no)
+            unparsed.append(v.no)
 
     if prefixes:
         _, prefix, top_seq = max(with_seq, key=lambda t: t[2])
@@ -238,13 +256,13 @@ def check_period(db: Session, period: Period) -> dict:
         for v, p, s in with_seq:
             if p != prefix:
                 continue
-            if v.voucher_no in seen:
-                dup.append(v.voucher_no)
-            seen.add(v.voucher_no)
+            if v.no in seen:
+                dup.append(v.no)
+            seen.add(v.no)
 
     by_seq = sorted(with_seq, key=lambda t: t[2])
     out_of_order = _time_order_issues(by_seq)
-    posted = [v.voucher_no for v in rows if v.status == "POSTED"]
+    posted = [v.no for v in rows if v.status == "POSTED"]
 
     blocking: list[str] = []
     if gaps:

@@ -50,6 +50,13 @@ Figures，closing 即账套首期的期初，区间查询不再需要分叉。
 写路径现有用法都符合这一点（``accounting/periods.py`` 在写之前就把要用的
 数字全部取出来，写完另起一个引擎），不要为了「省一个对象」把实例跨写复用。
 刻意不做跨请求缓存：正确性优先。
+
+**记忆化留了什么、没留什么（2026-10-14 审计：峰值内存 O(科目数 × 期间数)）。**
+``_figures`` 每个科目只留**推算到的最后一期**，中间各期算完即弃 —— 期间游标
+（期初 / 本年累计）只活在 ``compute()`` 那个循环的局部变量里。对外行为一个字
+没变：``compute()`` 本来就只返回 ``top`` 那一期（``before_book`` 那一期除外），
+``figures(sid, ord)`` 传中间某期时会重推一次到那一期。**重推不发 SQL** ——
+期初快照、发生额聚合、科目树都已经在实例内了，走的是纯算术。
 """
 from __future__ import annotations
 
@@ -103,6 +110,9 @@ class LedgerEngine:
     # 边填边自动保存，它要是算进去，余额会跟着手上这张一起动 —— 看的是自己写进去的数。
     exclude_voucher_id: int | None = None
     _figures: dict[tuple[int, int], Figures] = field(default_factory=dict)
+    # 上面这个字典**每个科目只留推到的最后一期**（外加「账套首期之前」那一张，
+    # 见 compute() 的 before_book 分支），不是每期一张 —— 内存是 O(科目数)
+    # 而不是 O(科目数 × 期间数)。失效边界与读法见模块 docstring。
     # ---- 单次请求内的记忆化（2026-10-13 审计 P2-03 / P2-15）----
     # 全部是实例级缓存，失效边界见模块 docstring：实例只读，写后换实例。
     _book_cache: Book | None = None
@@ -418,14 +428,21 @@ class LedgerEngine:
                     dr_cum += dr
                     cr_cum += cr
 
-                    f = Figures(
-                        subject_id=sid, ord=o, opening=opening,
-                        dr_cum=dr_cum, cr_cum=cr_cum, period_dr=dr, period_cr=cr,
-                    )
-                    self._figures[(sid, o)] = f
+                    if o == top:
+                        # **只留最后这一期。** 期初由 opening 游标带着往下走，
+                        # 中间各期算完即弃 —— 旧写法每一期都写进 _figures，
+                        # 于是峰值内存是 O(科目数 × 期间数)（500 科目 × 120 期
+                        # = 6 万个 Figures），而对外只有 top 这一期被用得上。
+                        # 要中间某期时 figures() 会重推那一条路径，纯算术、
+                        # 不发 SQL（见 _cum_movements 的记忆化）。
+                        f = Figures(
+                            subject_id=sid, ord=o, opening=opening,
+                            dr_cum=dr_cum, cr_cum=cr_cum, period_dr=dr, period_cr=cr,
+                        )
 
                     opening = opening + dr - cr
 
+                self._figures[(sid, top)] = f
                 self._computed_through[sid] = top
 
             if before_book:

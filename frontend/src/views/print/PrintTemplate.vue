@@ -94,16 +94,16 @@
           <template v-if="scope === 'DETAIL_LEDGER'">
             <label>科目</label>
             <el-select v-model="previewSubjectId" size="small" class="opt" @change="onPreviewSubjectChange">
-              <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
+              <el-option v-for="o in subjectOptions" :key="o.id" :label="o.label" :value="o.id" />
             </el-select>
             <template v-if="previewRangeSubjects.length">
               <label>科目起</label>
               <el-select v-model="previewFromSubjectId" size="small" class="opt" @change="onPreviewFromSubjectChange">
-                <el-option v-for="s in previewRangeSubjects" :key="s.id" :label="`${s.code} ${s.name}`" :value="s.id" />
+                <el-option v-for="o in rangeSubjectOptions" :key="o.id" :label="o.label" :value="o.id" />
               </el-select>
               <label>止</label>
               <el-select v-model="previewToSubjectId" size="small" class="opt" @change="onPreviewToSubjectChange">
-                <el-option v-for="s in previewRangeSubjects" :key="s.id" :label="`${s.code} ${s.name}`" :value="s.id" />
+                <el-option v-for="o in rangeSubjectOptions" :key="o.id" :label="o.label" :value="o.id" />
               </el-select>
             </template>
           </template>
@@ -498,6 +498,21 @@ function resetPreviewSubjectRange() {
 
 const selectedPreviewSubject = computed(() => subjects.value.find((s) => s.id === previewSubjectId.value))
 const previewRangeSubjects = computed(() => selectedPreviewSubject.value?.children || [])
+
+/**
+ * 下拉选项的 label 提前算好，别留在模板里。
+ *
+ * 以前 `v-for="s in subjects" :label="subjectLabel(s)"` —— 每渲染一次，
+ * 每个选项就现拼一遍全角缩进（''.repeat）。这张页面渲染得并不少（拖一下纸
+ * 预览就重渲染一次），科目一多就是几百次字符串拼接 × 每帧。
+ *
+ * 起止两个下拉更该合：它们是**同一批**子科目，label 各写了一份一模一样的
+ * 模板串，算两遍。现在共用 rangeSubjectOptions 这一份。
+ */
+const subjectOptions = computed(() => subjects.value.map((s) => ({ id: s.id, label: subjectLabel(s) })))
+const rangeSubjectOptions = computed(
+  () => previewRangeSubjects.value.map((s) => ({ id: s.id, label: `${s.code} ${s.name}` }))
+)
 
 function onPreviewSubjectChange() {
   resetPreviewSubjectRange()

@@ -21,18 +21,21 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import func, select, tuple_
+from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.accounting import importer as svc_import
 from app.accounting import organize as svc_organize
 from app.accounting import vouchers as svc
-from app.accounting.util import find_period
+from app.accounting.util import find_period, money
 from app.api.schemas import BatchIds, VoucherIn
 from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
-from app.core.uploads import UploadTooLarge, read_upload
+# 本地别名保持函数名 ``read_upload`` 不变：``tests/test_upload_capacity_matrix.py``
+# 按这个名字守「每个上传入口都调了共享容量闸」，而这里要的其实是它的同步版
+# ``uploads.read_upload_sync``（端点已改成同步 ``def``，不能再 await）。
+from app.core.uploads import UploadTooLarge, read_upload_sync as read_upload
 from app.models import (Book, Entry, ImportBatch, Period, Subject, SysUser,
                      UserBook, Voucher)
 
@@ -303,10 +306,19 @@ def import_template(book: Book = Depends(get_my_book)):
 
 
 @router.post("/import")
-async def upload_import(file: UploadFile = File(...), book: Book = Depends(get_my_book),
-                        db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
-                        user: SysUser = Depends(get_current_user)):
-    """上传并解析，暂存待确认。不写任何凭证。"""
+def upload_import(file: UploadFile = File(...), book: Book = Depends(get_my_book),
+                  db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
+                  user: SysUser = Depends(get_current_user)):
+    """上传并解析，暂存待确认。不写任何凭证。
+
+    **同步端点，刻意如此**（审计严重 1）：全仓 100+ 个端点里只有它和
+    ``openings/parse`` 是 ``async def``。``async def`` 端点直接跑在事件循环线程上，
+    而这里是**同步**的 openpyxl（``svc_import.stage`` → ``load_workbook``）加
+    **同步**的 psycopg Session —— 一次 20MB / 2 万行的导入能把整个 worker 的
+    事件循环堵死数秒，期间该 worker 上所有请求（含所有同步端点的依赖解析）一起排队，
+    而 CPU 占用并不高。改成 ``def`` 之后 FastAPI 把它丢进 anyio 线程池，
+    阻塞的是线程池线程，全仓其余端点本来就是这么跑的。
+    """
     if not (file.filename or "").lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(400, "只支持 .xlsx 格式（另存为 xlsx 后重试）")
     # 容量闸住在共享工具里（审计 P1-4 / P2-02）。原来是 ``file.file.read()`` ——
@@ -317,7 +329,7 @@ async def upload_import(file: UploadFile = File(...), book: Book = Depends(get_m
     # 第二、三道闸（zip 中央目录声明的解压体积、遍历过程中的行数）在 service 层，
     # 与期初余额解析共用同一套 —— 两处曾是同一种入口的两种长法。
     try:
-        data = await read_upload(file)
+        data = read_upload(file)
         batch = svc_import.stage(db, book.id, user, file.filename, data)
     except UploadTooLarge as e:
         # 413 而不是 400：文件太大是「换个更小的再来」，不是参数写错了。
@@ -469,6 +481,38 @@ def period_check(period_id: Optional[int] = None, book: Book = Depends(get_my_bo
     return svc_organize.check_period(db, period)
 
 
+def _filtered_scope(db: Session, book_id: int, *, keyword: Optional[str] = None,
+                    min_amount: Optional[Decimal] = None,
+                    max_amount: Optional[Decimal] = None) -> tuple:
+    """``neighbour`` 的筛选条件，与 ``svc.query_vouchers`` 的同名参数**逐条对齐**。
+
+    对齐是硬要求：这里翻的是「列表筛出来的那个结果集」，两处口径一旦漂移，
+    用户在列表里看到的顺序和「前一张/后一张」跳过去的就不一样。
+    测试 ``tests/test_perf_api_layer.py`` 里有一条按 ``query_vouchers`` 的
+    count 对齐 ``total`` 的用例盯着这件事。
+
+    （口径相同不等于共用函数：``query_vouchers`` 还会拼排序与分页，
+    这里只需要 WHERE 条件。改动 ``query_vouchers`` 的筛选时两处要一起看。）
+    """
+    conds = [Voucher.book_id == book_id]
+    if keyword:
+        like = f"%{keyword}%"
+        conds.append(or_(
+            Voucher.voucher_no.ilike(like),
+            Voucher.remark.ilike(like),
+            Voucher.id.in_(select(Entry.voucher_id).where(Entry.summary.ilike(like))),
+        ))
+    if min_amount is not None or max_amount is not None:
+        # 「金额」筛的是**某一条分录**的金额，不是整张凭证的合计（与列表一致）。
+        amt = select(Entry.voucher_id).where(Entry.book_id == book_id)
+        if min_amount is not None:
+            amt = amt.where(Entry.amount >= money(min_amount))
+        if max_amount is not None:
+            amt = amt.where(Entry.amount <= money(max_amount))
+        conds.append(Voucher.id.in_(amt))
+    return tuple(conds)
+
+
 @router.get("/{voucher_id}/neighbour")
 def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
               _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user),
@@ -485,35 +529,45 @@ def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = 
     不带条件时同样按 (日期, id) 升序，只把范围收在同期间内，
     连续录一叠凭证时「后一张」该是接下来要填的那张。
 
-    结果集可能跨很多页，`page_size` 上限 200，所以要翻页收齐再定位。
+    带筛选的分支也走**单条 SQL**（审计严重 5）。原来为了「前后各一张」把整个
+    结果集按 200 一页翻到收齐再 ``ids.index(...)``：最多 100 轮 × (1 次 count
+    子查询 + 1 次分页查询) ≈ 200 条 SQL，并把最多两万张凭证实例化进 identity map。
+    现在前后各取一条、index 用一次条件聚合数出来 —— 返回体一个字没变。
     """
     v = db.get(Voucher, voucher_id)
     if v is None or v.book_id != book.id:
         raise HTTPException(404, "凭证不存在")
 
     if keyword or min_amount is not None or max_amount is not None:
-        ids: list[int] = []
-        total = 0
-        for page in range(1, 101):           # 封顶 20000 张，够用了，也防死循环
-            rows, total = svc.query_vouchers(
-                db, book.id, keyword=keyword, min_amount=min_amount, max_amount=max_amount,
-                page=page, page_size=200)
-            ids.extend(r.id for r in rows)
-            if len(ids) >= total or not rows:
-                break
-        # query_vouchers 是倒序（新的在前），这里翻过来成正序。
-        # 顺带把日期相同那批的先后也一起翻了：倒序是 id 降，翻过来正好是 id 升，
-        # 跟不带条件时 `tuple_(date, id)` 升序的那条路对得上。
-        ids.reverse()
-        try:
-            i = ids.index(voucher_id)
-        except ValueError:                   # 这张不在结果集里（比如筛选条件刚改过）
-            return {"prev_id": None, "next_id": None, "scope": "filtered", "index": -1, "total": len(ids)}
-        return {
-            "prev_id": ids[i - 1] if i > 0 else None,
-            "next_id": ids[i + 1] if i < len(ids) - 1 else None,
-            "scope": "filtered", "index": i, "total": len(ids),
-        }
+        scope = _filtered_scope(
+            db, book.id, keyword=keyword, min_amount=min_amount, max_amount=max_amount)
+        # 一次聚合问清三件事：结果集多大、这张在不在里面、它前面有几个。
+        # 「在不在里面」不能拿「前后都查不到」来代替 —— 结果集的第一张就是
+        # prev=None 却 index=0，靠「查不到邻票」判断会把它误判成不在结果集里。
+        total, hits, before = db.execute(
+            select(
+                func.count(),
+                func.count().filter(Voucher.id == voucher_id),
+                func.count().filter(
+                    tuple_(Voucher.voucher_date, Voucher.id) < (v.voucher_date, v.id)),
+            ).select_from(Voucher).where(*scope)).one()
+        if not hits:                          # 这张不在结果集里（比如筛选条件刚改过）
+            return {"prev_id": None, "next_id": None, "scope": "filtered",
+                    "index": -1, "total": total}
+        prev_id = db.scalar(
+            select(Voucher.id).where(
+                *scope, tuple_(Voucher.voucher_date, Voucher.id) < (v.voucher_date, v.id))
+            .order_by(Voucher.voucher_date.desc(), Voucher.id.desc()).limit(1)
+        )
+        next_id = db.scalar(
+            select(Voucher.id).where(
+                *scope, tuple_(Voucher.voucher_date, Voucher.id) > (v.voucher_date, v.id))
+            .order_by(Voucher.voucher_date, Voucher.id).limit(1)
+        )
+        # index 是「时间正序结果集里的位置」（0 基）—— 与不带条件时
+        # `tuple_(voucher_date, id)` 升序那一条是同一个口径。
+        return {"prev_id": prev_id, "next_id": next_id, "scope": "filtered",
+                "index": before, "total": total}
 
     scope = (Voucher.book_id == book.id, Voucher.period_id == v.period_id)
     prev_id = db.scalar(

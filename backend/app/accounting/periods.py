@@ -143,14 +143,34 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
 
     # 锁链上每一期。列查询拿 locked / version：identity map 里可能是别人读进来
     # 的旧值，直接读属性会把「别人已经结过了」当成没结过。
+    #
+    # 行锁就是这一句拿的 —— ``FOR UPDATE`` 按**本次查询命中的行**加锁，
+    # 锁一直持有到事务结束（不是到这条语句结束）。所以下面那条补 ORM 对象的
+    # 查询不需要（也不能）再加 ``with_for_update()``：同一事务里对同一批行
+    # 重复加锁只会自查自锁，那是另一种死锁。
     chain_rows = db.execute(
         select(Period.id, Period.locked, Period.version)
         .where(Period.book_id == target.book_id, Period.ord <= target.ord)
         .order_by(Period.ord)
         .with_for_update()
     ).all()
-    chain = [db.get(Period, r[0]) for r in chain_rows]
     fresh = {r[0]: (bool(r[1]), int(r[2])) for r in chain_rows}
+    # 一条查询补齐整条链的 ORM 对象，替代原来逐个 ``db.get`` 的 N 次往返
+    # （十年账套结一次 12 月就是 24 次）。
+    #
+    # ``populate_existing`` 不能省：``db.get`` 遇到 identity map 里已有的对象
+    # 直接原样返回、不发 SQL，而那个对象可能是路由层早先读进来的**旧值**。
+    # 列查询不填充 identity map 正是 ``_fresh_period`` 那段注释要绕开的坑，
+    # 这里补对象时得主动把它填上，否则绕一圈又踩回去。
+    #
+    # 也正因为 populate_existing 是「用库里的值盖掉会话里的」，这一句必须待在
+    # 任何期间写入之前 —— 放在上锁循环之后就变成拿自己刚写的值盖自己。
+    chain = list(db.scalars(
+        select(Period)
+        .where(Period.id.in_(list(fresh)))
+        .order_by(Period.ord)
+        .execution_options(populate_existing=True)
+    ).all())
 
     # 整条链都要先过一遍「整理就绪」：断号、时序不对的月份一旦封进历史，
     # 纸质凭证按号装订就跟系统对不上，再想改只能作废重记。
@@ -297,14 +317,23 @@ def batch_unclose(
     target, _locked, version_now = _fresh_period(db, period.id)
     assert_version(expected_version, version_now, target.code)
 
+    # 行锁在下面这条 ``FOR UPDATE`` 上就已拿住整批已锁期间，持有到事务结束，
+    # 所以补 ORM 对象时同样不需要再加锁（理由见 close_period 里的同一段注释）。
     locked_rows = db.execute(
         select(Period.id, Period.version)
         .where(Period.book_id == book_id, Period.locked.is_(True), Period.ord >= target.ord)
         .order_by(Period.ord)
         .with_for_update()
     ).all()
-    locked = [db.get(Period, r[0]) for r in locked_rows]
     chain_version = {r[0]: int(r[1]) for r in locked_rows}
+    # 一条查询补齐整批期间对象，替代逐个 ``db.get``（N 次往返）。
+    # populate_existing 同 close_period：identity map 里可能是旧值。
+    locked = list(db.scalars(
+        select(Period)
+        .where(Period.id.in_(list(chain_version)))
+        .order_by(Period.ord)
+        .execution_options(populate_existing=True)
+    ).all())
     if not locked:
         raise ValueError(f"{target.code} 及其之后的期间都未结账，无需反结账")
 

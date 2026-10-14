@@ -70,27 +70,28 @@ import { computed, onMounted, ref, watch } from 'vue'
 import * as api from '@/api/ledger'
 import { downloadFile } from '@/api/print'
 import PrintDialog from '@/components/PrintDialog.vue'
+import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 
 const store = useSessionStore()
 const data = ref({ rows: [], check: {} })
-const loading = ref(false)
 const includeUnposted = ref(true)
 const onlyLeaf = ref(true)
+
+/** 只认最新一趟：顶栏期间连点时，旧响应不许覆盖新数据（见 composables/useLatestLoad）。 */
+const { loading, run, isStale } = useLatestLoad('ledger/balance')
 
 const visibleRows = computed(() => (onlyLeaf.value ? data.value.rows.filter((r) => r.is_leaf) : data.value.rows))
 
 async function load() {
   if (!store.bookId || !store.periodId) return
-  loading.value = true
-  try {
-    data.value = await api.balance(store.bookId, {
-      period_id: store.periodId, include_unposted: includeUnposted.value
-    })
-  } finally {
-    loading.value = false
-  }
+  const d = await run(() => api.balance(store.bookId, {
+    period_id: store.periodId, include_unposted: includeUnposted.value
+  }))
+  // 过期的那一趟：条件早就被改掉了，写进去就是「表里的数对不上顶栏的期间」。
+  if (isStale(d)) return
+  data.value = d
 }
 
 function previewHtml() {

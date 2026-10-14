@@ -1126,14 +1126,20 @@ def test_凭证列表一页只跑常数条SQL(client, auth, book, make_voucher, 
 def _blind_the_taken_check(db, monkeypatch):
     """让 ``create_voucher`` 里那句占用检查查不到东西（模拟并发窗口）。
 
-    认的是语句本身（按 ``voucher_no`` 过滤的那句），不是「第几次调用」——
-    调用序会随代码改动漂移，按次数打补丁的测试迟早测错东西。
+    认的是语句本身（按 ``voucher_no`` **等值**过滤的那句），不是「第几次调用」
+    ——调用序会随代码改动漂移，按次数打补丁的测试迟早测错东西。
+
+    判据收紧到 ``"voucher_no = "``（带等号和空格）是有讲究的：发号那条语句里
+    同样出现 ``voucher_no``，但它是 ``substring(voucher_no, ...)`` 这种「抠序号」
+    的聚合，不是占用检查。认得太宽会把发号一起短路掉 —— 于是本该撞号的用例
+    拿到一个更小的号、顺利建出第二张凭证，验不到它本来要验的 savepoint 恢复，
+    反而变成一条永远绿着的假用例。
     """
     real_scalar = db.scalar
 
     def fake_scalar(stmt, *a, **kw):
         sql = str(stmt)
-        if "voucher_no" in sql:
+        if "voucher_no = " in sql:
             return None
         return real_scalar(stmt, *a, **kw)
 

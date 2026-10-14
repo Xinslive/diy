@@ -29,6 +29,10 @@ gunicorn==26.2.0
 h11==0.16.0
 httptools==0.9.0
 idna==3.20
+# openpyxl 的可选加速项：装了就用 libxml2 而不是纯 Python 的 ElementTree。
+# 版本来自实测安装（pip 解析结果 6.1.3，2026-09-02 发布，落在本文件头
+# --exclude-newer 2026-10-11 的窗口内）。实测：5000 行 × 12 列写 0.36s -> 0.24s。
+lxml==6.1.3
 mako==1.4.3
 markupsafe==3.0.4
 openpyxl==3.1.5

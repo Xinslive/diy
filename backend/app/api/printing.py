@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.api.vouchers import _serialize
+from app.api.vouchers import _book_subjects, _serialize
 from app.core.db import get_db
 from app.core.deps import get_book_link, get_current_user, get_my_book, require_book_write
 from app.models import Book, Period, PrintTemplate, SysUser, UserBook, Voucher
@@ -472,9 +472,14 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
     # 先分片再排版：一张 12 行的凭证会变成 记001 - 001/003 / 002/003 / 003/003，
     # 它们占三个槽位，可能跨物理页。分页编号的写法由模板的 split_format 决定。
     split_format = (tpl.get("voucher") or {}).get("split_format")
+    # 科目一次取好，下面逐张共用（审计严重 2）。这里原来只传两个参数，
+    # 于是走 `_serialize` 的兜底分支，每张凭证发一条「全账套科目」查询 ——
+    # 列表接口早已在 vouchers.py::query 修好同一个坑（一次取好复用，审计 P3-12），
+    # 打印层漏了：这里 page_size=5000，满月的账就是 5000 次同样的 SELECT。
+    subs = _book_subjects(db, book.id)
     pieces: list[dict] = []
     for v in shown:
-        voucher = _serialize(db, v)
+        voucher = _serialize(db, v, subs)
         voucher["period"] = period_codes.get(v.period_id, period.code)
         pieces.extend(split_voucher(voucher, rows_per_page, split_format))
 
@@ -501,6 +506,47 @@ def _with_note(doc: str, note: str) -> str:
                        f'<p class="page-note">{html.escape(note)}</p><div class="page">', 1)
 
 
+def _check_print_rows(rows: list, kind: str) -> list:
+    """HTML 打印通道的行数闸。
+
+    为什么 Excel 那边有、HTML 这边没有：``xl.MAX_EXPORT_ROWS`` 挡的是
+    openpyxl 全内存构建（``wb.save`` 把整张表序列化成一个 zip）。HTML 打印页同样
+    是**一次性在内存里拼完整份文档**（``render_table_page`` → ``wrap_pages``），
+    明细账跨全科目跨全年能到十几万行，而这三处页码硬编码 ``1, 1``
+    （不分页、一次全出）—— 没有上限就是一个请求把进程内存吃光。
+
+    上限**复用** Excel 通道那一个，不另立一份数字：两个通道面对的是同一份账、
+    同样的量级，写成两个常量迟早会被调成不一致。异常也复用
+    ``xl.ExportTooLarge``，由 :func:`_print_too_large` 翻译成 413 ——
+    与 ``_xlsx`` 装饰器的处理完全一致（明确失败，而不是静默截断出缺行的账）。
+    """
+    n = len(rows)
+    if n > xl.MAX_EXPORT_ROWS:
+        raise xl.ExportTooLarge(
+            f"{kind}共 {n:,} 行，超过单次打印上限 {xl.MAX_EXPORT_ROWS:,} 行。"
+            "请缩小查询范围（按科目或按期间分段打印）后重试。")
+    return rows
+
+
+def _print_too_large(fn):
+    """把打印通道的行数超限翻译成 HTTP 语义。
+
+    只翻译 ``ExportTooLarge``，不碰别的 ``ValueError`` —— ``_render_scope``
+    同时服务五个 ``.html`` 接口与设计器预览，各自有各的 HTTP 语义，
+    在这里统一改写会把它们原本的报错（缺科目 400、模板不合法 422）也搅浑。
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except xl.ExportTooLarge as exc:
+            raise HTTPException(413, str(exc)) from exc
+
+    return wrapper
+
+
+@_print_too_large
 def _render_scope(
     db: Session,
     book: Book,
@@ -534,7 +580,7 @@ def _render_scope(
         rows, _check = queries.balance_sheet_of_accounts(db, book.id, subjects, period,
                                                           include_unposted)
         doc = render_table_page(tpl, pv.context(db, book, period),
-                                pv.balance_rows(rows), 1, 1)
+                                _check_print_rows(pv.balance_rows(rows), "科目余额表"), 1, 1)
         return _with_note(doc, note)
 
     to_period = period
@@ -549,7 +595,8 @@ def _render_scope(
         ctx = pv.context(db, book, to_period,
                          period=f"{from_period.code} 至 {to_period.code}"
                          if from_period.id != to_period.id else to_period.code)
-        doc = render_table_page(tpl, ctx, pv.general_rows(rows), 1, 1)
+        doc = render_table_page(tpl, ctx,
+                                _check_print_rows(pv.general_rows(rows), "总账"), 1, 1)
         return _with_note(doc, note)
 
     if scope == "DETAIL_LEDGER":
@@ -570,7 +617,8 @@ def _render_scope(
                          subject=subject_caption,
                          period=f"{payload['from_period']} 至 {payload['to_period']}"
                          if payload["from_period"] != payload["to_period"] else payload["from_period"])
-        doc = render_table_page(tpl, ctx, pv.detail_rows(payload), 1, 1)
+        doc = render_table_page(tpl, ctx,
+                                _check_print_rows(pv.detail_rows(payload), "明细账"), 1, 1)
         return _with_note(doc, note)
 
     if scope == "REPORT":
@@ -734,6 +782,10 @@ def preview_draft(payload: PreviewIn, book: Book = Depends(get_my_book),
             note=note,
         )
     except HTTPException as e:
+        # 行数超限的 413 原样放行：它说的不是「模板草稿还没填完」，
+        # 而是「这份账太大，请缩小范围」，翻译成 422 会让用户一直改模板。
+        if e.status_code == 413:
+            raise
         # 缺期间 / 缺科目这类「参数没选全」不该让预览框变成红色报错
         raise HTTPException(422, e.detail)
     return _html_response(doc)
@@ -777,7 +829,9 @@ def export_vouchers(book_id: int, period_id: Optional[int] = None, book: Book = 
     period = _period(db, book.id, period_id)
     rows, _ = query_vouchers(db, book.id, from_period=period, to_period=period,
                              status=status, page_size=5000)
-    data = xl.vouchers_excel([_serialize(db, v) for v in rows], period=period.code)
+    # 科目一次取好逐张复用（审计严重 2）—— 与 `_voucher_html` 同一个坑的同一处修法。
+    subs = _book_subjects(db, book.id)
+    data = xl.vouchers_excel([_serialize(db, v, subs) for v in rows], period=period.code)
     return Response(content=data, media_type=XLSX_MIME,
                     headers={"Content-Disposition": _filename(f"记账凭证_{book.name}_{period.code}.xlsx")})
 

@@ -60,6 +60,20 @@ COPY scripts ./scripts
 COPY alembic.ini ./alembic.ini
 COPY migrations ./migrations
 
+# ------------------------------------------------------------------ 非 root
+#
+# 原来整个容器以 root 跑。应用只需要读自己的代码目录，而 CMD 里那条
+# ``alembic upgrade head`` 写的是**数据库**、不是文件系统 —— 所以降到非 root
+# 不会让任何一步跑不起来。systemd 那边本来就是 ``User=cwq``，这条让容器
+# 与之对齐：同一个应用在两条部署路径上的权限姿态不再是两回事。
+#
+# uid/gid 固定成 10001，是为了 bind mount 宿主机目录时对得上，而不是随构建
+# 漂移。nologin + 无 home：这个进程不登录、不需要家目录。
+RUN groupadd --gid 10001 cwq \
+ && useradd --uid 10001 --gid cwq --no-create-home \
+            --home-dir /nonexistent --shell /usr/sbin/nologin cwq
+USER cwq
+
 EXPOSE 8000
 
 # 启动前先迁移，是应用自己的硬性要求，不是顺手加的好习惯：
@@ -69,10 +83,17 @@ EXPOSE 8000
 # 继续起服务 —— 那等于带着旧 schema 跑起来，问题要到运行时才炸。
 # 并发边界（明说）：两个容器同时起会同时跑 upgrade。这里是开发/试验通道，
 # 不做迁移锁；要并发部署请走 deploy/，那里由 systemd 串行化。
+#
+# worker 数：默认 2，与 deploy/systemd/cwq-api.service 的默认值一致。
+# 这里**能**用 ${VAR:-默认} —— 因为 CMD 走的是 `sh -c`，有 shell 做展开。
+# （systemd 那边没有 shell，用的是另一套写法，见那个 unit 里的注释。）
+#
+# ``--threads`` 已删除：gunicorn 的 thread 开关只对**同步** worker 生效，而这里
+# 是 ``-k uvicorn.workers.UvicornWorker``（异步 worker），每个进程已经是事件循环，
+# 起线程没有作用。它此前在这里静默无效，容易让人以为「4 线程」真的存在。
 CMD ["sh", "-c", "alembic upgrade head && exec gunicorn app.main:app \
      -k uvicorn.workers.UvicornWorker \
-     --workers 2 \
-     --threads 4 \
+     --workers ${CWQ_API_WORKERS:-2} \
      --timeout 120 \
      --bind 0.0.0.0:8000 \
      --access-logfile -"]

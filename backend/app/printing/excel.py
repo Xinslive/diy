@@ -133,6 +133,16 @@ def vouchers_excel(rows: list[dict], *, title: str = "记账凭证", period: str
     ws = wb.active
     ws.title = "记账凭证"
 
+    # 口径是**分录数**不是凭证数：下面按 entry 逐行展开（`:172` 那段循环），
+    # 一张凭证有几条分录就占几行。拿凭证数去卡上限，等于把上限放大了一倍
+    # （每张凭证平均 8 行的情况下就是 8 倍）。
+    #
+    # 调用方 `/print/vouchers.xlsx` 一次取 5000 张凭证（`api/printing.py`），
+    # 也就是最坏情况 4 万行；而下面每一格都逐个 `ws.cell(...)` 再赋 `.border`，
+    # openpyxl 又是全内存构建 —— 没有上限时，一个请求就能把进程内存吃光。
+    # 其余四个导出函数都卡了 MAX_EXPORT_ROWS，只有这里没有，是漏了不是例外。
+    _check_size("记账凭证", sum(len(v.get("entries") or []) for v in rows))
+
     ws["A1"] = _text(title)
     ws["A1"].font = Font(name="宋体", size=16, bold=True)
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=5)

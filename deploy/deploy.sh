@@ -178,9 +178,46 @@ mv "$APP/frontend/dist" "$STAGE"
 mv "$STAGE" "$APP/frontend/dist"
 
 systemctl restart cwq-api
-sleep 3
-curl -fsS http://127.0.0.1:8000/api/health >/dev/null
 
+# 探活**轮询**而不是「睡 3 秒打一发」。
+#
+# 原来这里是 ``sleep 3`` + 单次 ``curl -fsS``，失败就非零退出。问题是走到这
+# 一行时，**该发生的都已经发生了**：迁移已执行、前端产物已切换、服务已重启。
+# 运维看到「发布失败」，而新版本其实已经在跑。于是这个失败信号指向了一个
+# 回滚不回去的状态 —— 照失败处理（回滚）等于把正在服务的版本撤掉，
+# 不处理又会以为线上还是旧版。真正的失败原因（新版本起不来）和真正的误报
+# （服务只是还没起来）在这个写法下长得一模一样。
+#
+# 探测口径沿用原来的那条命令（``curl -fsS``）—— ``-f`` 让 curl 在 HTTP >= 400
+# 时返回非零，所以「curl 退出码为 0」就等于「拿到 2xx/3xx」。
+# **刻意不改成解析 ``%{http_code}``**：那样只是把判定从 curl 挪到 shell，
+# 语义没变，还多一个失败面（比如代理/重定向场景下 curl 退出码与状态码
+# 的组合比想象中多）。这里要修的是「只试一次」，不是「换一套判定口径」。
+#
+# 唯一从 dev.sh 的 wait_http 借来的是**轮询**这个形状：最多 60 次 × 0.5 秒
+# = 30 秒。
+log "  等待 /api/health 应答（最多 30 秒）"
+health_ok=0
+for _ in $(seq 1 60); do
+  if curl -fsS -m 2 -o /dev/null http://127.0.0.1:8000/api/health 2>/dev/null; then
+    health_ok=1
+    break
+  fi
+  sleep 0.5
+done
+
+if [ "$health_ok" -ne 1 ]; then
+  log "❌ 发布后 30 秒内 /api/health 没有给出 2xx/3xx"
+  log "   ⚠️  此时**新版本已经上线**：迁移已执行、前端产物已切换、服务已重启。"
+  log "      这次发布不是「没发生」，不要直接当作「什么都没上线」。"
+  log "   先分清是新版本起不来，还是探活口径不对："
+  log "     journalctl -u cwq-api -n 200 --no-pager"
+  log "     tail -50 /opt/cwq/backend/logs/api.err.log"
+  log "   需要回滚时（人工确认后再做），备份在 ${RELEASES}/${STAMP}"
+  exit 1
+fi
+
+log "  /api/health 应答"
 log "✅ 发布完成"
 
 # 只保留最近 KEEP 个备份

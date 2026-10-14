@@ -218,6 +218,7 @@ import SubjectFormDialog from '@/components/SubjectFormDialog.vue'
 import AmountCells from '@/components/AmountCells.vue'
 import AmountUnits from '@/components/AmountUnits.vue'
 import PrintDialog from '@/components/PrintDialog.vue'
+import { rafThrottle } from '@/utils/frame'
 import { Bottom, CircleCloseFilled, EditPen, Top } from '@element-plus/icons-vue'
 
 const store = useSessionStore()
@@ -756,13 +757,16 @@ function setSumRef(el, idx) {
  * 先把 height 撤成 auto 量出内容真正要多少，再取 min(内容, 两行) ——
  * 少了 min，超长摘要会把框撑到五行、盖住下面那一行；少了 auto，量到的永远是当前高度。
  */
-function autosizeSum(el) {
+function autosizeSum(el, measured) {
   if (!el) return
   sumArmed = false        // 已经动手改了：整格选中到此为止，别等下一帧又划掉刚打的字
   const lh = parseFloat(getComputedStyle(el).lineHeight) || 21
   const max = lh * 2
-  el.style.height = 'auto'
-  const need = el.scrollHeight
+  let need = measured
+  if (need === undefined) {
+    el.style.height = 'auto'
+    need = el.scrollHeight
+  }
   el.style.height = Math.min(need, max) + 'px'
   el.style.overflowY = need > max ? 'auto' : 'hidden'
 }
@@ -1484,13 +1488,33 @@ function onBeforeUnload(e) {
  *  换账套时表单刚被 resetForm 抹平、什么都不脏，这里自然什么都不做。 */
 onBeforeUnmount(() => {
   clearTimeout(autoSaveTimer)
-  window.removeEventListener('resize', reAutosizeSums)
+  onWindowResize.cancel()          // 还挂着的那一帧别再对着已卸载的 DOM 跑
+  window.removeEventListener('resize', onWindowResize)
   window.removeEventListener('beforeunload', onBeforeUnload)
   if (formBookId.value === store.bookId) flushIfDirty()
 })
 
-/** 摘要列宽跟着窗口变，折行位置跟着变，双行的框得重新量 */
-function reAutosizeSums() { sumRefs.forEach((el) => autosizeSum(el)) }
+/**
+ * 摘要列宽跟着窗口变，折行位置跟着变，双行的框得重新量。
+ *
+ * resize 一秒能来 60 次，而每量一个框都是「写 height:auto → 读 scrollHeight →
+ * 再写 height」，中间要把布局**同步刷一遍**。一张凭证 8~20 个框，一次 resize
+ * 就是 8~20 遍强制重排 —— 拖个窗口整页跟着卡，跟这张凭证本身多重没关系。
+ * 两处一起治：
+ *   1. 按帧合并（rafThrottle）：两次绘制之间缩多少次，量一趟就够；
+ *   2. 同一帧里**先给所有框写 auto，再一起读 scrollHeight，最后一起写回** ——
+ *      布局只被逼刷一次，而不是每个框刷一遍。
+ */
+function reAutosizeSums() {
+  const els = []
+  for (const el of sumRefs.values()) if (el) els.push(el)
+  if (!els.length) return
+  sumArmed = false                       // 已经动手改了：整格选中到此为止
+  for (const el of els) el.style.height = 'auto'
+  const needs = els.map((el) => el.scrollHeight)
+  els.forEach((el, i) => autosizeSum(el, needs[i]))
+}
+const onWindowResize = rafThrottle(reAutosizeSums)
 
 /**
  * 离开这一页前把改动补上；补不上就问一句，不让人无声无息地丢掉半张凭证。
@@ -1507,7 +1531,7 @@ onBeforeRouteLeave(async () => {
 })
 
 onMounted(async () => {
-  window.addEventListener('resize', reAutosizeSums)
+  window.addEventListener('resize', onWindowResize)
   window.addEventListener('beforeunload', onBeforeUnload)
   if (!store.periodId) return
   formBookId.value = store.bookId   // 这张表单从这一刻起属于这个账套

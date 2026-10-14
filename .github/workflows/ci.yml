@@ -94,30 +94,114 @@ jobs:
 
       - name: 全量 pytest（不加 -k，不加 -m，不跳过任何用例）
         working-directory: backend
-        run: python -m pytest -rA
+        shell: bash
+        # -n 3 覆盖 pytest.ini 里的 -n 6。两个原因：
+        #   * pytest.ini 的 6 是按**本机 10 核**调出来的，它的注释里明写「8/10
+        #     实测反而更慢」—— 因为用例大量走磁盘和 PostgreSQL，瓶颈是 IO。
+        #     CI 跑在 ubuntu-latest（4 vCPU）上，照抄 6 只会让 6 个 worker 互相
+        #     抢那 4 个核。给 3 是**略低于核数**，留一个核给 PostgreSQL 服务容器。
+        #   * 刻意**不用 -n auto**：那条「IO 瓶颈」的结论是在 10 核机上测出来的，
+        #     4 核机上未必成立，而 auto 会让并行度跟着 runner 的规格漂 ——
+        #     同一个 commit 在不同 runner 上跑出不同的并行度，没法比较。
+        #     命令行参数优先级高于 pytest.ini 的 addopts，所以这里的 3 会生效。
+        run: |
+          set -euo pipefail
+          # tee 到文件：下一步的护栏校验解析这份报告，而不是重跑一遍护栏。
+          # set -o pipefail 保证 pytest 失败时这一步照样失败（tee 自己是 0）。
+          python -m pytest -rA -n 3 2>&1 | tee pytest-report.txt
 
-      - name: 护栏测试必须真的被执行
+      - name: 护栏测试必须真的被执行（读上面那次全量的报告，不重跑）
         working-directory: backend
+        shell: bash
         # 这一步是整个 workflow 的重点。上面那次全量跑里如果有人加了
         # `-k "not guardrail"` 或者给护栏打了 skip mark，pytest 依然会全绿 ——
         # 而护栏恰恰是最容易被「静默绕过」的那部分。
+        #
+        # **为什么不自己再跑一遍**（原来这里是另起一个 pytest 进程跑这两个文件）：
+        # tests/conftest.py 的 _test_database 是 session 级夹具，每个 pytest
+        # 进程启动都会做一次 CREATE DATABASE + DROP SCHEMA public CASCADE +
+        # 跑完整条迁移链。全量跑一次 = 6 套（-n 6，worker 各自建库），护栏再跑
+        # 一遍 = 第 7 套。护栏那两条已经在第 95 行那次全量里跑过了 —— 同一批
+        # 用例同一套迁移，白建一次库、白跑一遍迁移链。
+        #
+        # 现在改成解析上一步 `-rA` 已经打印出来的 short test summary。
+        # **全程 fail-closed**，五条退出条件逐条都验过：
+        #   1. 报告文件不存在（上一步没落盘）
+        #   2. 报告里找不到 short test summary 段（截断 / 格式变了）
+        #   3. 某个护栏文件一条 PASSED 都没有（被人用 -k 收窄了范围）
+        #   4. 某个护栏文件 PASSED 少于下限 3 条
+        #   5. 护栏出现任何非 PASSED 状态（FAILED/ERROR/SKIPPED/**XFAIL/XPASS**）
+        # 宁可误报红，也不放过「护栏其实没跑」。比原来更严的一处是第 5 条：
+        # 原来只挡 SKIPPED，现在把 xfail 也算失败 —— 给护栏打 xfail 正是不该
+        # 悄悄发生的那类改动，它必须留在一张被人看见的 PR 上。
         run: |
           set -euo pipefail
-          out=$(python -m pytest -rA --no-header \
-                  tests/test_test_db_guardrail.py \
-                  tests/test_migration_guardrails.py 2>&1) || {
-            echo "$out"; echo "❌ 护栏测试本身没过"; exit 1; }
-          echo "$out"
-          passed=$(grep -cE '^PASSED tests/' <<<"$out" || true)
-          if [ "${passed:-0}" -lt 3 ]; then
-            echo "❌ 护栏测试只跑出 ${passed:-0} 条 PASSED —— 护栏等于没上锁"
-            exit 1
-          fi
-          if grep -E '^SKIPPED tests/(test_test_db_guardrail|test_migration_guardrails)' <<<"$out"; then
-            echo "❌ 护栏测试被跳过了 —— 删掉或跳过护栏不该让流水线变绿"
-            exit 1
-          fi
-          echo "✅ ${passed} 条护栏用例真的执行了"
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          REPORT = pathlib.Path("pytest-report.txt")
+          GUARDRAILS = ("tests/test_test_db_guardrail.py", "tests/test_migration_guardrails.py")
+          MIN_PASSED = 3
+
+          def die(msg):
+              print("❌ " + msg)
+              sys.exit(1)
+
+          if not REPORT.is_file():
+              die(f"找不到 {REPORT} —— 上一步的全量报告没有落盘，"
+                  "护栏是否真的被执行无从确认。")
+
+          text = REPORT.read_text(encoding="utf-8", errors="replace")
+
+          # 只解析 short test summary 段。整份报告里还有 PASSES 段和被捕获的
+          # stderr，那些地方同样可能出现 PASSED/FAILED 字样 —— 全文件 grep 会误判。
+          idx = text.find("short test summary info")
+          if idx < 0:
+              die(f"{REPORT} 里找不到 short test summary 段 —— "
+                  "报告被截断或 pytest 输出格式变了，不能靠猜。")
+          summary = []
+          for line in text[idx:].splitlines():
+              if re.match(r"^=+ .* =+$", line):
+                  break                       # 进入下一段，停止收集
+              summary.append(line)
+
+          # 形如：PASSED tests/test_test_db_guardrail.py::test_开发库名被拦下
+          status_re = re.compile(
+              r"^(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\s+(\S+?\.py)(?:::|$)")
+
+          counts = {g: {} for g in GUARDRAILS}
+          for line in summary:
+              m = status_re.match(line.strip())
+              if not m:
+                  continue
+              status, path = m.group(1), m.group(2)
+              for g in GUARDRAILS:
+                  if path == g or path.endswith("/" + g):
+                      counts[g][status] = counts[g].get(status, 0) + 1
+
+          problems = []
+          for g in GUARDRAILS:
+              c = counts[g]
+              passed = c.get("PASSED", 0)
+              others = {k: v for k, v in c.items() if k != "PASSED"}
+              if passed == 0:
+                  problems.append(f"{g}：报告里一条 PASSED 都没有"
+                                  f"（该文件的状态统计：{c or '完全没出现'}）"
+                                  "—— 护栏等于没上锁")
+              elif passed < MIN_PASSED:
+                  problems.append(f"{g}：只跑出 {passed} 条 PASSED，"
+                                  f"下限是 {MIN_PASSED} 条")
+              for k, v in sorted(others.items()):
+                  problems.append(f"{g}：有 {v} 条 {k} —— 护栏必须真的 PASSED，"
+                                  "删掉或跳过护栏不该让流水线变绿")
+          if problems:
+              die("；".join(problems))
+
+          print("✅ 护栏用例真的执行了：" + "；".join(
+              f"{g} {counts[g]['PASSED']} 条 PASSED" for g in GUARDRAILS))
+          PY
 
       - name: 用例数下限（防止有人用 -k 把范围悄悄收窄）
         working-directory: backend

@@ -1,0 +1,65 @@
+# Docker 构建上下文排除清单。
+#
+# 为什么需要它：``docker build backend`` 会把整个 backend/ 当成上下文传给
+# docker daemon。Dockerfile 只 COPY 了 app/ scripts/ migrations/ alembic.ini
+# 和两个 requirements 文件，但**上下文是整个目录**，剩下的照样全部上传 ——
+# 没有 .dockerignore 时，每次构建都要把 .venv（113MB）、.pytest_cache、
+# __pycache__ 和 tests/ 传给 daemon。
+#
+# 代价不只是慢：传进去的东西一律进入构建缓存的计算范围，改一个 .pyc 的
+# 时间戳都可能让某层缓存失效。所以这份清单的作用是「别传用不上的东西」，
+# 不是「别 COPY 错东西」。
+#
+# 判定标准只有一条：**Dockerfile 里没有 COPY 到、运行时也不需要的**。
+# 宁可漏排（只是慢），不可错排（把运行要的文件排掉，镜像构建出来是残的）。
+
+# 虚拟环境：镜像里用 requirements.lock 重新装，宿主机这个是给本地开发用的。
+# 这一条是这里最大头的一项 —— 单独就 113MB。
+.venv/
+venv/
+env/
+
+# Python 字节码与构建产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 测试与缓存产物
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+
+# 测试代码与测试数据：镜像是跑 API 用的，不跑测试。
+# CI 的 docker job 只断言镜像里 alembic.ini / migrations/ 在（见 ci.yml），
+# 不需要 tests/。真要在容器里跑测试，另行 COPY。
+tests/
+
+# 版本控制与编辑器
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# 本地环境与密钥
+.env
+.env.*
+!.env.example
+
+# 文档与本地笔记：镜像运行时用不到
+*.md
+!README.md
+
+# 注意：requirements*.txt 与 requirements*.lock **不能**排除 ——
+# Dockerfile 第 53 行就是 COPY 它们。alembic.ini 与 migrations/ 同理
+# （启动闸门要读，见 schema_version.py）。
