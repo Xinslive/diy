@@ -82,6 +82,46 @@ await t('公式保存被 400 拒掉时把 detail 弹给人看，并保留未保�
   assert.ok(alertAt >= 0 && resetAt > alertAt, '报错弹窗之后仍清了改动 —— 改的东西就丢了')
 })
 
+console.log('== 报表设计：列名与项目名改得动 ==')
+
+await t('列标题用 v-model —— 退成只读绑定会把刚打的字还原掉', () => {
+  // el-input 每次 input 后都用 props.modelValue 回填 DOM（Element Plus
+  // handleInput 末尾的 setNativeInputValue）。只绑 :model-value 而不回写，
+  // 打字就等于没打 —— 这不是猜测，是浏览器实测：值会被还原并追加。
+  assert.ok(/<el-input[^>]*v-if="designMode"[^>]*v-model="c\.label"/s.test(SRC),
+    '列标题没用 v-model，打字会被 el-input 回填成旧值')
+})
+
+await t('落库层不得再拿入参与数据源比相等（v-model 已经先改过源值了）', () => {
+  // 这是「项目名列改不了」的真正成因：v-model 先把新值写回 c.label，@change
+  // 再触发时 `label === col.label` 恒成立，第一行就 return，请求一次也不发。
+  assert.ok(!/function renameCol\(col, label\)\s*\{\s*if \(label === col\.label\)/.test(SRC),
+    'renameCol 又加回了「值没变就不发请求」的短路，改动存不住')
+  assert.ok(!/function saveSideLabel\([\s\S]{0,200}?if \(label === /.test(SRC),
+    'saveSideLabel 又加回了「值没变就不发请求」的短路')
+})
+
+await t('表体行名左右栏写回各自的存储位置，且分「写本地 / 落库」两步', () => {
+  // 左右两栏的项目名存在两个地方（row.label / row.style.label_right），
+  // v-model 只能绑一条固定路径，所以拆成 update:model-value 写本地 +
+  // change 落库。少了写本地那一步，输入框里的字进不去。
+  assert.ok(/:model-value="labelText\(row, it\.side\)"/.test(SRC), '行名输入框没有读 labelText()')
+  assert.ok(/@update:model-value="draftSideLabel\(row, it\.side, \$event\)"/.test(SRC),
+    '行名输入框没有在打字时把新值写回本地')
+  assert.ok(/@change="saveSideLabel\(row, it\.side, \$event\)"/.test(SRC), '行名输入框失焦时没有落库')
+  assert.ok(/function draftSideLabel\(row, side, value\)[\s\S]{0,240}label_right: value/.test(SRC),
+    '右栏没有写进 row.style.label_right')
+  assert.ok(/async function saveSideLabel\(row, side, label\)[\s\S]{0,200}\{ style: row\.style \}/.test(SRC),
+    '右栏落库没有整份提交 style —— 行次/缩进/加粗会被抹掉')
+})
+
+await t('项目名列的口径下拉要说清「改不了的是口径，不是列名」', () => {
+  // 「项目名（固定）」这个措辞会被读成整列锁死，而用户想改的恰恰是列名。
+  assert.ok(/:title="colKindHint\(c\)"/.test(SRC), '口径下拉没有挂说明')
+  assert.ok(/function colKindHint\(col\)[\s\S]{0,900}列名在上面那个输入框/.test(SRC),
+    '说明里没告诉用户列名在哪里改')
+})
+
 console.log('')
 console.log(`通过 ${pass} / 失败 ${fail}`)
 http.post = realPost

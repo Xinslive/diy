@@ -1416,6 +1416,27 @@ B17 = B9+B16                      资产总计
   显示隐藏行，否则没法取消隐藏；查看模式才隐藏。过滤要按 `col_no` 对齐单元格，
   不能照抄下标，否则隐藏掉中间一列时其余列的数字会整列错位。
 
+### 名字输入框：`v-model` 与「值没变就别发请求」不能同时要
+
+表头列名和表体项目名都是失焦即存的输入框。这里有个反直觉的坑，两个方向都踩过：
+
+**去掉 `v-model` 会打不进字。** `el-input` 每次 `input` 之后都会用 `props.modelValue`
+回填输入框（`handleInput` 末尾的 `setNativeInputValue`）。只绑 `:model-value` 而不
+把新值写回去，`nextTick` 之后刚打进去的字就被还原成旧值 —— 表现是「打一个字没反应」。
+
+**留着 `v-model` 又会让保存函数误判。** `v-model` 先把新值写回数据源，`@change`
+再触发时 `label === col.label` 恒成立，`if (label === col.label) return` 这一行
+就把请求挡掉了 —— 看上去改了，一刷新又变回去。
+
+正确写法是**去掉相等判断**而不是去掉 `v-model`：原生 `change` 事件本身就是「用户
+确实改过」的判据，值没动时浏览器压根不触发，多一次幂等 PATCH 无所谓。
+
+左右两栏项目名存在**两个地方**（左栏 `row.label`、右栏 `row.style.label_right`，
+后端没有「右栏标题」这个独立字段），`v-model` 只能绑一条固定路径，所以表体那一处
+拆成两步：`update:model-value` 把新值写回本地（让 `modelValue` 跟得上手），
+`change` 再落库。右栏提交**整份** `style`，否则同行的行次、缩进、加粗会被抹掉。
+
+
 ### 求值上下文
 `ReportContext` 把账簿引擎和模板胶合起来，并向 `Evaluator` 暴露：
 `subject_id(code)` / `opening` / `debit_cum` / `credit_cum` / `closing` /
@@ -2143,6 +2164,7 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
 | `test_report_design.py` | 报表结构增删改、**公式引用随行列位移同步改写**、隐藏行不进打印 |
 | `report_template_visibility.test.mjs` | 模板列表可见性（**线上那份 `utils/reportTemplates.js`**）：按 type 让位、同类多张不误伤、删掉自有模板内置回归、`keepId` 只保自己；外加源码级断言守住两个页面都走这套判定、来源说明列已下线 |
 | `cell_selection.test.mjs` | 全局矩形选区（**线上那份 `utils/cellRange.js`**）：倒着拖结果一致、C3→C9 不多吃邻列、四边闭合、越界补空串、TSV 不带多余空白；外加接入点断言守住监听挂在 document、单击不抢剪贴板、输入框不被接管 |
+| `report_caliber.test.mjs` | 报表口径标注（角标 / notices / 400 detail）；以及**设计器的名字输入框**：列名必须用 `v-model`、落库层不得再比相等、左右栏项目名写回各自存储位置且整份提交 style |
 
 ### 跑得快一点（2026-10-13 加）
 

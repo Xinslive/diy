@@ -95,6 +95,12 @@
                 <el-button link size="small" :title="`在 ${c.letter} 列左侧插入`" @click="insertCol(c.col_no)">⊕</el-button>
                 <el-button link size="small" :title="`删除 ${c.letter} 列`" @click="removeCol(c)">✕</el-button>
               </div>
+              <!-- 必须是 v-model，不能退成 :model-value。el-input 每次 input
+                   之后都会用 props.modelValue 回填输入框（Element Plus
+                   handleInput 末尾的 setNativeInputValue），modelValue 不跟着
+                   手走的话，刚打进去的字会被立刻还原成旧值 —— 表现就是「打不进
+                   字」。而 v-model 会先把新值写回 c.label，所以 renameCol 那边
+                   不能再拿入参跟 c.label 比相等。 -->
               <el-input v-if="designMode" v-model="c.label" size="small" class="col-label"
                         @change="renameCol(c, $event)" />
               <template v-else>{{ c.label }}</template>
@@ -108,7 +114,7 @@
                    所以设计模式下留着。 -->
               <div v-if="designMode" class="addr no-print">{{ c.letter }}</div>
               <div v-if="designMode" class="col-meta no-print">
-                <el-select v-if="designMode" :model-value="c.kind" size="small"
+                <el-select v-if="designMode" :model-value="c.kind" size="small" :title="colKindHint(c)"
                            @change="changeColKind(c, $event)">
                   <el-option v-for="o in colKindOptions(c)" :key="o.k" :label="o.v" :value="o.k"
                              :disabled="o.disabled" />
@@ -144,8 +150,15 @@
               <td v-if="it.col.kind === 'STATIC'" class="c-label"
                   :class="[cellClass(row, it), { b: labelBold(row, it.side) }]"
                   :style="{ width: `${it.col.width}px`, paddingLeft: `${8 + labelIndent(row, it.side) * 16}px` }">
-                <el-input v-if="designMode" :model-value="labelText(row, it.side)" size="small" class="row-label"
-                          @change="renameSideLabel(row, it.side, $event)" />
+                <!-- 左右两栏的项目名存在两个地方：左栏是 row.label，右栏塞在
+                     row.style.label_right（后端没有「右栏标题」这个独立字段）。
+                     v-model 只能绑一条固定路径，而这里两栏共用同一个输入框，
+                     所以拆成「input 时写回本地、change 时落库」两步 —— 少了
+                     第一步，el-input 会用旧 modelValue 把新字还原掉。 -->
+                <el-input v-if="designMode" :model-value="labelText(row, it.side)"
+                          size="small" class="row-label"
+                          @update:model-value="draftSideLabel(row, it.side, $event)"
+                          @change="saveSideLabel(row, it.side, $event)" />
                 <!-- 右栏标题存在 row.style 里，保存时只更新 label_right，保留行次、缩进、加粗等配置。 -->
                 <template v-else>{{ labelText(row, it.side) }}</template>
               </td>
@@ -424,6 +437,24 @@ function colKindOptions(col) {
 const KIND_STATIC = 'STATIC'
 const KIND_LINE_NO = 'LINE_NO'
 
+/**
+ * 口径下拉旁边的说明。
+ *
+ *  「项目名（固定）」这个措辞会被读成「整列锁死」，而用户想改的恰恰是这一列
+ *  的名字 —— 于是去找哪里能改、没找到，就以为不能改。与其让人自己试出来，
+ *  不如把「哪部分能改」直接说清楚：列名在上面那个输入框、每一行的项目名在
+ *  表体里，两处都能改。
+ */
+function colKindHint(col) {
+  if (col.kind === KIND_STATIC) {
+    return '项目名列是报表的「形态」而不是取数口径，所以口径改不了它。列名在上面那个输入框、每一行的项目名在表体的输入框里，都能改。'
+  }
+  if (col.kind === KIND_LINE_NO) {
+    return '行次列是报表的「形态」，填法定行次，口径改不了。列名在上面那个输入框里能改。'
+  }
+  return '这一列取数用的口径。项目名与行次不在其中，它们是报表形态，填项目与法定行次。'
+}
+
 /** 表头和表体共用的列清单，顺序与 data.cols 完全一致。
  * side 表示「这是左栏还是右栏」：STATIC / LINE_NO 在双栏表里各出现两次，
  * 靠**出现次序**分左右而不是靠 col_no —— 设计模式里插删列会改 col_no，
@@ -689,22 +720,25 @@ async function removeRow(row) {
   ElMessage.success(`已删除，${r.formulas_shifted} 处引用已同步修正`)
 }
 
-async function renameRow(row, label) {
-  if (label === row.label) return
-  await api.updateRow(templateId.value, row.row_no, { label }, store.bookId)
-  row.label = label
+// 项目名输入框的两步：打字时先写回本地，失焦时再落库。
+//
+// 为什么不能合成一步（v-model + change 里直接存）：v-model 已经把新值写进了
+// row.label，change 里再拿入参跟 labelText(row, side) 比「变了没有」，两个值
+// 永远相等，请求就一次也发不出去 —— 看上去改了，一刷新又变回去。落库这一层
+// 因此不再做相等判断：原生 change 事件本身就是「用户确实改过」的判据，改了
+// 又改回来多发一次幂等 PATCH 无所谓。
+
+/** 打字途中：把新值写回 row 本体，让 el-input 的 modelValue 跟得上手。 */
+function draftSideLabel(row, side, value) {
+  if (side === 0) { row.label = value; return }
+  row.style = { ...(row.style || {}), label_right: value }
 }
 
-async function renameSideLabel(row, side, label) {
-  const current = labelText(row, side)
-  if (label === current) return
-  if (side === 0) {
-    await renameRow(row, label)
-    return
-  }
-  const style = { ...(row.style || {}), label_right: label }
-  await api.updateRow(templateId.value, row.row_no, { style }, store.bookId)
-  row.style = style
+/** 失焦：落库。右栏整份 style 一起提交（draftSideLabel 已经在它上面改好了
+ *  label_right），行次、缩进、加粗这些同行样式原样带回，不会被抹掉。 */
+async function saveSideLabel(row, side, label) {
+  if (side === 0) await api.updateRow(templateId.value, row.row_no, { label }, store.bookId)
+  else await api.updateRow(templateId.value, row.row_no, { style: row.style }, store.bookId)
 }
 
 async function toggleRow(row, field, delta = null) {
@@ -733,10 +767,11 @@ async function removeCol(col) {
   ElMessage.success(`已删除，${r.formulas_shifted} 处引用已同步修正`)
 }
 
+// 同 draftSideLabel 上方那段：v-model 已经把新值写进 c.label，这里再跟入参比
+// 相等就永远成立，所以直接存。列名是 STATIC 列唯一可改的东西，这一路堵住
+// 的话，用户在表头输入框里怎么打都存不下来。
 async function renameCol(col, label) {
-  if (label === col.label) return
   await api.updateCol(templateId.value, col.col_no, { label }, store.bookId)
-  col.label = label
 }
 
 async function changeColKind(col, kind) {
