@@ -1,5 +1,5 @@
 <template>
-  <el-dialog :model-value="modelValue" title="导入报表模板" width="min(1120px, calc(100vw - 40px))"
+  <el-dialog :model-value="modelValue" title="导入报表模板" :width="dialogWidth"
              class="report-import-dialog" :close-on-click-modal="false" :close-on-press-escape="!busy"
              :show-close="!busy" destroy-on-close @update:model-value="emit('update:modelValue', $event)" @closed="reset">
     <div class="import-stepper" aria-label="导入进度">
@@ -161,6 +161,14 @@ const onlyMissing = ref(false)
 const acceptedWarnings = ref(false)
 const parseProgress = ref(0)
 const created = ref([])
+/**
+ * 宽度跟着步骤走：选文件 / 导入完成这两步的内容本身就被限在 770 / 690，
+ * 撑到 1120 只会在两侧各空出一大片，看着不是「大气」而是不精致；预览那一步
+ * 是真的要用宽度（文件侧栏 + 科目匹配表 + 8 列结构预览），不缩。
+ */
+const dialogWidth = computed(() => (
+  step.value === 1 ? 'min(1120px, calc(100vw - 40px))' : 'min(760px, calc(100vw - 40px))'
+))
 const typeName = type => ({ BALANCE_SHEET: '资产负债表', INCOME_SHEET: '利润表' }[type] || '自定义报表')
 const formatSize = size => size < 1024 * 1024 ? `${(size / 1024).toFixed(1)} KB` : `${(size / (1024 * 1024)).toFixed(1)} MB`
 const parsedFiles = computed(() => files.value.filter(file => file.preview))

@@ -47,11 +47,6 @@
           <el-empty description="还没有报表模板" />
         </template>
       </el-table>
-
-      <div class="migration-tip">
-        <el-icon><InfoFilled /></el-icon>
-        <span>支持用友 UFO 5.10 / 8.00 的 <code>.rep</code>、<code>.rbk</code> 模板。导入前会先预览行列、公式和科目匹配情况。</span>
-      </div>
     </div>
 
     <ReportImportDialog v-model="showImport" @imported="load" />
@@ -62,7 +57,7 @@
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, EditPen, InfoFilled, Upload } from '@element-plus/icons-vue'
+import { Delete, EditPen, Upload } from '@element-plus/icons-vue'
 import * as api from '@/api/report'
 import { useSessionStore } from '@/stores/session'
 import ReportImportDialog from '@/components/ReportImportDialog.vue'
@@ -138,7 +133,4 @@ onMounted(load)
 .report-name:hover { text-decoration: underline; }
 .report-meta { display: flex; align-items: center; gap: 7px; margin-top: 7px; color: #9aa5b5; font-size: 11px; }
 .report-meta :deep(.el-tag) { height: 20px; line-height: 18px; }
-.migration-tip { display: flex; align-items: flex-start; gap: 7px; margin-top: 15px; padding: 11px 13px; border: 1px solid #e1eafb; border-radius: 7px; background: #f6f9ff; color: #7f90aa; font-size: 12px; line-height: 1.6; }
-.migration-tip .el-icon { margin-top: 3px; color: #7c9bd3; flex-shrink: 0; }
-.migration-tip code { padding: 1px 4px; border-radius: 3px; background: #e9f0fd; color: #617fae; font-family: inherit; }
 </style>
