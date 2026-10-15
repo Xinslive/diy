@@ -1,0 +1,46 @@
+[Unit]
+Description=云财务记账系统 数据库定时备份
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=cwq
+Group=cwq
+WorkingDirectory=/opt/cwq/backend
+
+EnvironmentFile=/opt/cwq/backend/.env
+
+# 保留最近 N 份。**不要去掉 --keep**：没有保留策略的每日备份会慢慢把
+# 磁盘写满，而磁盘写满之后下一个失败的就是备份本身 ——
+# 一个把自己搞挂的备份策略。14 份 ≈ 两周回溯窗口。
+Environment=CWQ_BACKUP_KEEP=14
+
+# 落盘目录与文件名里的日期都由 systemd 展开：systemd 的 ExecStart
+# **不走 shell**，所以 $(date ...) 不会执行 —— 必须写成 %% 或直接用
+# 时间戳规格。这里用 %F（YYYY-MM-DD）。
+#
+# 文件名用固定日期而不是内容哈希：出事了运维要一眼看出「这是哪天的」。
+# 同一天重复跑会覆盖同一个文件，这没问题 —— 同一天的两份备份没有区别。
+ExecStart=/opt/cwq/backend/.venv/bin/python scripts/db_backup.py \
+    --out /opt/cwq/backups/db-%F.sql \
+    --keep ${CWQ_BACKUP_KEEP}
+
+# ---------------------------------------------------------------------------
+# 加固项：**不能照抄 cwq-api.service**。
+#
+# 那个 unit 用 `ProtectSystem=strict` + `ReadWritePaths=/opt/cwq/backend/logs`，
+# 意思是「除了这一个白名单目录，整个文件系统只读」。
+# 这里要写 /opt/cwq/backups —— 一个**不同的**目录。照抄的话备份会写不进去，
+# 而 systemd 只会报一个含糊的失败码，不会在日志里说「因为没在 ReadWritePaths 里」。
+# 于是表现是「定时任务每天都跑、每天都失败、没人看 journal」——
+# 比没有定时备份更危险，因为它看起来是有的。
+# ---------------------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cwq/backups
+
+StandardOutput=append:/opt/cwq/backups/backup.log
+StandardError=append:/opt/cwq/backups/backup.log

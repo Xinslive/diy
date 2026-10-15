@@ -154,6 +154,73 @@ def restore(url: str, sql: bytes) -> int:
     return _run(restore_command(url), _env(u), stdin_bytes=sql)
 
 
+def dump_to_file(out: Path, keep: int | None = None) -> int:
+    """导出到文件，**并且**保证落盘的不是空文件。
+
+    为什么不能 `> file` 一把梭：shell 重定向会**先把文件建出来**，
+    pg_dump 随后才跑。pg_dump 失败（客户端没装、口令错、磁盘满）时，
+    那个文件**已经躺在那里了** —— 0 字节或半截，且文件名看着完全正常。
+    没有保留策略时它会一路留到被轮转掉，而某一天有人拿它恢复，
+    结果恢复「成功」了但库里是空的。
+    （这与 --restore 那侧的 RestoreRefused 是同一个担心，两头都得防。）
+
+    所以这里先写临时文件，**确认非空后再改名**。改名是原子的，
+    于是目录里出现的永远要么是上一份完整备份，要么就是这一份完整备份。
+
+    保留策略：只保留最近 ``keep`` 份，按修改时间倒序。
+    没有保留策略的定时备份会慢慢把磁盘写满 —— 而磁盘写满之后，
+    下一个失败的就是**备份本身**，一个把自己搞挂的备份策略。
+    """
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".part")
+
+    try:
+        with open(tmp, "wb") as fh:
+            rc = dump_to(fh)
+    except BaseException:
+        # **抛异常也要清。** dump_to 不只可能「返回非零」：
+        # 磁盘满时 fh.write 会抛 OSError，Popen 也可能抛别的错。
+        # 只在 rc != 0 那条路上清理的话，异常一抛，.part 就留在目录里了 ——
+        # 而它长得像备份，保留策略还只管 *.sql，于是它能一直躺着。
+        tmp.unlink(missing_ok=True)
+        raise
+    if rc != 0:
+        tmp.unlink(missing_ok=True)      # 别把半截文件留在目录里冒充备份
+        print(f"❌ 备份失败（退出码 {rc}），未生成 {out.name}", file=sys.stderr)
+        return rc
+    if tmp.stat().st_size == 0:
+        tmp.unlink(missing_ok=True)
+        print(f"❌ 备份产出是 0 字节，已丢弃：{out}", file=sys.stderr)
+        return 4
+    tmp.replace(out)                      # 原子改名：目录里不会出现半截备份
+
+    if keep:
+        prune(out.parent, keep)
+    return 0
+
+
+def dump_to(fh) -> int:
+    """把 dump 写进已打开的二进制流。"""
+    u = _parse(settings.database_url)
+    cmd = dump_command(settings.database_url)
+    try:
+        p = subprocess.Popen(cmd, env=_env(u), stdout=fh)
+    except FileNotFoundError:
+        print(f"找不到 {cmd[0]}。装 PostgreSQL 客户端，或用 "
+              f"{'CWQ_PG_DUMP' if cmd[0] == PG_DUMP_BIN else 'CWQ_PSQL'} 指向它的位置。",
+              file=sys.stderr)
+        return 127
+    return p.wait()
+
+
+def prune(directory: Path, keep: int) -> None:
+    """只留最近 keep 份 .sql（按 mtime 倒序）。"""
+    backups = sorted(directory.glob("*.sql"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in backups[keep:]:
+        old.unlink(missing_ok=True)
+        print(f"  已清理旧备份 {old.name}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="数据库备份/恢复")
     ap.add_argument("--restore", action="store_true",
@@ -161,10 +228,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--file", help="恢复用的 dump 文件；不给则读 stdin")
     ap.add_argument("--url", default=settings.database_url,
                     help="目标连接串，默认取配置里的 DATABASE_URL（恢复演练时指向测试库）")
+    ap.add_argument("--out", help="导出到这个文件（不给则写 stdout，与原行为一致）。"
+                                   "定时备份用它，省掉 shell 重定向的半截文件问题")
+    ap.add_argument("--keep", type=int, metavar="N",
+                    help="配合 --out：只保留最近 N 份备份，删掉更旧的")
     args = ap.parse_args(argv)
 
     try:
         if not args.restore:
+            if args.out:
+                return dump_to_file(Path(args.out), args.keep)
             return dump(args.url)
 
         if args.file:

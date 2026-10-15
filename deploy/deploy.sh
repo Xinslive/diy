@@ -265,6 +265,71 @@ if [ "$health_ok" -ne 1 ]; then
 fi
 
 log "  /api/health 应答"
+
+# ---------------------------------------------------------------------------
+# 7/7 发布后体检。三项都只提醒、不阻断 ——
+# 它们各自都有**故意不硬失败**的理由，硬失败会把「发布失败」指向一个
+# 其实不需要回滚的状态（与上面探活那段同一个顾虑）。
+# ---------------------------------------------------------------------------
+log "7/7 发布后体检"
+
+# (1) 启用定时备份。
+#
+# 原来的备份只在发布流程里跑（上面第 4/7 步），也就是说
+# **一个月不发布，那一个月就没有任何新备份** —— 而发布恰恰不是备份的理由。
+# 迁移是最需要退路的时候，可退路的存在与否却取决于「最近有没有人发版」。
+# 这里把启用动作放进发布脚本，是刻意的：**发布是运维唯一会来看日志的时刻**，
+# 借它把定时器点上，比写一份没人执行的文档有用。
+#
+# 产物是 CI 打的 tar，deploy/systemd/ 不在其中，所以先看这台机器上有没有：
+# 没有就把两条命令原样打出来（不猜路径、不静默跳过）。
+enable_backup_timer() {
+  local src=""
+  for d in "$APP/deploy/systemd" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/systemd"; do
+    if [ -f "$d/cwq-backup.timer" ]; then src="$d"; break; fi
+  done
+
+  if [ -n "$src" ]; then
+    mkdir -p /opt/cwq/backups
+    # daemon-reload 必须排在 enable 之前，否则 systemd 认的还是旧缓存 ——
+    # 首次安装时 unit 名不存在，enable 会报「unit not found」。
+    cp "$src/cwq-backup.service" "$src/cwq-backup.timer" /etc/systemd/system/ \
+      || return 1
+    systemctl daemon-reload || return 1
+  fi
+
+  systemctl enable --now cwq-backup.timer
+}
+
+if enable_backup_timer >/dev/null 2>&1; then
+  next_run=$(systemctl show cwq-backup.timer -p NextElapseUSecRealtime --value 2>/dev/null || echo "")
+  log "  定时备份已启用${next_run:+（下次：${next_run}）}，备份目录 /opt/cwq/backups"
+else
+  log "  ⚠️  定时备份启用失败 —— 当前备份仍然只发生在发版时"
+  log "     手动补一次（把 deploy/systemd/ 两个文件拷过去）："
+  log "       mkdir -p /opt/cwq/backups"
+  log "       cp deploy/systemd/cwq-backup.{service,timer} /etc/systemd/system/"
+  log "       systemctl daemon-reload && systemctl enable --now cwq-backup.timer"
+  log "     然后验证真的产出文件：systemctl start cwq-backup.service && ls -l /opt/cwq/backups/"
+fi
+
+# (2) TRUSTED_PROXIES 没配 → IP 维度的登录节流形同虚设
+#
+# 不配时后端按 fail-closed 处理：**忽略** X-Forwarded-For，
+# 于是全站共用 127.0.0.1 一个节流桶。后果不是「多一道防护」变弱，
+# 而是这个桶会被**全站所有人共用** —— 一个来源反复试错，
+# 会把整个公司（都经由同一个 nginx）一起拖进节流窗口。
+#
+# 它与 nginx 侧的 proxy_set_header X-Forwarded-For 是**一对**：
+# 只配一边等于没配（配了 app 侧而 nginx 不发头 → 全是直连 IP；
+# nginx 发了头而 app 不配 → 头被忽略）。
+if grep -qE '^[[:space:]]*TRUSTED_PROXIES[[:space:]]*=[[:space:]]*"?[[:space:]]*"?[[:space:]]*$' "$APP/backend/.env" 2>/dev/null; then
+  log "  ⚠️  TRUSTED_PROXIES 是空的 —— IP 维度登录节流当前形同虚设（全站共用一个桶）"
+  log "     配法见 deploy/tuning.md 第八节。改完要重启 cwq-api 才生效。"
+else
+  log "  TRUSTED_PROXIES 已配置"
+fi
+
 log "✅ 发布完成（${SHA}）"
 
 # 暂存目录：产物已经解压进 ${APP}，这里只是下载暂存
