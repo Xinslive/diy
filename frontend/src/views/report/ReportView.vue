@@ -317,6 +317,7 @@ import PrintDialog from '@/components/PrintDialog.vue'
 import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
+import { visibleTemplates } from '@/utils/reportTemplates'
 
 const store = useSessionStore()
 const route = useRoute()
@@ -773,13 +774,20 @@ async function deleteCurrentTemplate() {
   ).then(() => true).catch(() => false)
   if (!confirmed) return
   await api.deleteTemplate(templateId.value, store.bookId)
-  const remaining = await api.templates()
+  // 重新算可见性：删掉的若是该类型唯一一张自有模板，内置模板会重新露出来，
+  // 直接拿接口原样跳转就可能跳到一张已经被藏起来的表。
+  allTemplates.value = visibleTemplates(await api.templates())
   ElMessage.success('报表已删除')
-  if (remaining.length) {
-    router.replace(`/reports/${remaining[0].id}`)
-  } else {
+  if (!allTemplates.value.length) {
     router.replace('/reports')
+    return
   }
+  // 光换 URL 不够：/reports/:id 是同一个路由，router-view 不会重新挂载，
+  // templateId 会停在已删掉的那张上，页面一直显示一张后端已经删了的报表。
+  templateId.value = allTemplates.value[0].id
+  router.replace(`/reports/${templateId.value}`)
+  dirtyKeysReset()
+  load()
 }
 
 // ------------------------------------------------------------------ 数据
@@ -837,7 +845,9 @@ function exportXlsx() {
 }
 
 onMounted(async () => {
-  allTemplates.value = await api.templates()
+  // keepId：按 URL 直接打开一张已被隐藏的内置报表时，下拉里仍要留着它，
+  // 否则 load() 按 id 查模板会查不到，页面标题和「是否内置」全成空。
+  allTemplates.value = visibleTemplates(await api.templates(), templateId.value)
   if (store.bookId) {
     subjectOptions.value = await subjectApi.subjectFlat(store.bookId, { include_parents: true }).catch(() => [])
   }

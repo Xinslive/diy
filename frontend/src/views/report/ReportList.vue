@@ -31,11 +31,6 @@
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="来源说明" min-width="320">
-          <template #default="{ row }">
-            <span class="report-remark">{{ row.remark || '系统内置模板，可直接查看和设计。' }}</span>
-          </template>
-        </el-table-column>
         <el-table-column label="操作" width="280" align="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openReport(row)">打开</el-button>
@@ -71,6 +66,7 @@ import { Delete, EditPen, InfoFilled, Upload } from '@element-plus/icons-vue'
 import * as api from '@/api/report'
 import { useSessionStore } from '@/stores/session'
 import ReportImportDialog from '@/components/ReportImportDialog.vue'
+import { visibleTemplates } from '@/utils/reportTemplates'
 
 const templates = ref([])
 const loading = ref(false)
@@ -87,7 +83,8 @@ const typeName = type => ({
 async function load() {
   loading.value = true
   try {
-    templates.value = await api.templates()
+    // 导入了自家的模板后，同类的内置模板不再列出来（口径以导入的为准）
+    templates.value = visibleTemplates(await api.templates())
   } finally {
     loading.value = false
   }
@@ -141,7 +138,6 @@ onMounted(load)
 .report-name:hover { text-decoration: underline; }
 .report-meta { display: flex; align-items: center; gap: 7px; margin-top: 7px; color: #9aa5b5; font-size: 11px; }
 .report-meta :deep(.el-tag) { height: 20px; line-height: 18px; }
-.report-remark { color: #7e8da2; font-size: 12px; line-height: 1.5; }
 .migration-tip { display: flex; align-items: flex-start; gap: 7px; margin-top: 15px; padding: 11px 13px; border: 1px solid #e1eafb; border-radius: 7px; background: #f6f9ff; color: #7f90aa; font-size: 12px; line-height: 1.6; }
 .migration-tip .el-icon { margin-top: 3px; color: #7c9bd3; flex-shrink: 0; }
 .migration-tip code { padding: 1px 4px; border-radius: 3px; background: #e9f0fd; color: #617fae; font-family: inherit; }
