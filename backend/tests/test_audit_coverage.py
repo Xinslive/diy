@@ -163,23 +163,67 @@ def test_改报表公式要留审计(client, auth, db, book):
     公式写错一个字符，资产负债表就会悄无声息地少算一列 —— 而且报表照样
     渲染得出来。所以事后必须能查到「这个格子的公式原来是什么」。
     """
-    from app.models import ReportCell, ReportTemplate
+    from app.models import ReportCell, ReportCol, ReportTemplate
 
     tpl = db.scalar(select(ReportTemplate).where(ReportTemplate.code == "BALANCE_SHEET"))
-    cell = db.scalar(select(ReportCell).where(
-        ReportCell.template_id == tpl.id).limit(1))
+
+    # **只挑数值列，且排序确定。**
+    #
+    # 原来这里是 ``select(ReportCell).where(template_id == tpl.id).limit(1)`` ——
+    # 无排序，拿到哪一格取决于数据库返回顺序，而那个顺序取决于**别的测试
+    # 在这个库里留下了什么**。于是它有时抓到数值列、有时抓到 STATIC 固定列。
+    #
+    # 抓到 STATIC 列是要出事的：固定列放的是行标签/行次，不走取数，
+    # 往里写公式等于把「行次 31」当成金额渲染。而下面那条
+    # ``test_资产负债表的静态列与行次列没有公式`` 断言的正是「静态列没有
+    # 公式」—— 它一抓到固定列就红。
+    #
+    # 于是表现为一条**与本用例毫无关系的用例在并行下时红时绿**，
+    # 而真正的原因隔了两个文件、两百行。往 STATIC 列写公式本身也是错的做法，
+    # 所以这里从源头上就不该选它。
+    numeric_cols = db.scalars(
+        select(ReportCol.col_no).where(
+            ReportCol.template_id == tpl.id, ReportCol.kind != "STATIC")
+    ).all()
+    assert numeric_cols, "资产负债表里没有数值列，这条用例的前提不成立"
+    cell = db.scalar(
+        select(ReportCell)
+        .where(ReportCell.template_id == tpl.id,
+               ReportCell.col_no.in_(numeric_cols))
+        .order_by(ReportCell.row_no, ReportCell.col_no)   # 确定性
+    )
+    assert cell is not None, "资产负债表里没有数值列的单元格"
     old_formula = cell.formula
 
-    r = client.put(f"/api/reports/{tpl.id}/cells?book_id={book.id}", headers=auth,
-                   json=[{"row_no": cell.row_no, "col_no": cell.col_no,
-                          "formula": "科目(\"1001\",\"期末余额\",{{本期}})*999"}])
-    assert r.status_code == 200, r.text
+    # **改完必须还原。**
+    #
+    # 经 client 的写入走的是 API 自己的 Session 并且 commit，而 conftest 的
+    # ``db`` 夹具只 rollback **它自己那个** session —— 所以 API 写进去的东西
+    # 不会被夹具撤销（审计已记录的既有设计：「db 夹具的 rollback 被夹具内部
+    # 的 commit 架空」）。这条毒公式因此会活过本用例，去污染后面读同一张
+    # 模板的用例。放到 finally 里，是为了让**断言失败时也照样还原** ——
+    # 一次红掉的用例不该顺手再弄坏另外一条。
+    try:
+        r = client.put(f"/api/reports/{tpl.id}/cells?book_id={book.id}", headers=auth,
+                       json=[{"row_no": cell.row_no, "col_no": cell.col_no,
+                              "formula": "科目(\"1001\",\"期末余额\",{{本期}})*999"}])
+        assert r.status_code == 200, r.text
 
-    entry = _last(db, book, "UPDATE_REPORT_CELLS")
-    blob = str(entry.before) + str(entry.after)
-    assert old_formula[:20] in blob, (
-        f"公式审计里没有原公式（{old_formula[:40]}…）：{entry.before} / {entry.after}")
-    assert "999" in blob, f"新公式没进审计：{entry.before} / {entry.after}"
+        entry = _last(db, book, "UPDATE_REPORT_CELLS")
+        blob = str(entry.before) + str(entry.after)
+        assert old_formula[:20] in blob, (
+            f"公式审计里没有原公式（{old_formula[:40]}…）：{entry.before} / {entry.after}")
+        assert "999" in blob, f"新公式没进审计：{entry.before} / {entry.after}"
+    finally:
+        # 还原本身也要验：还原失败会让毒公式活过本用例，而**症状出现在别的
+        # 文件里**（读同一张模板的用例红）。这里不响亮地失败，那条毒就会
+        # 以「与本用例无关的用例随机变红」的形式回来 —— 也就是它现在的样子。
+        back = client.put(f"/api/reports/{tpl.id}/cells?book_id={book.id}", headers=auth,
+                          json=[{"row_no": cell.row_no, "col_no": cell.col_no,
+                                 "formula": old_formula}])
+        assert back.status_code == 200, (
+            f"还原单元格公式失败（HTTP {back.status_code}）：{back.text}\n"
+            f"毒公式会留在这个账套里，后面读同一张模板的用例会莫名其妙地红。")
 
 
 # --------------------------------------------------------------------- 授权
