@@ -155,6 +155,7 @@ import { computed, ref, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Upload, UploadFilled, Download } from '@element-plus/icons-vue'
 import * as voucherApi from '@/api/voucher'
+import { downloadFile } from '@/api/print'
 import { useSessionStore } from '@/stores/session'
 
 const store = useSessionStore()
