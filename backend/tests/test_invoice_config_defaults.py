@@ -79,3 +79,35 @@ def test_配置里没有进项税额科目(client, auth, book):
     r = client.get(f"/api/books/{book.id}/invoices/config", headers=auth)
     assert r.status_code == 200
     assert "input_tax_subject_id" not in r.json()
+
+
+def test_保存的内容真的落库了(client, auth, book, db):
+    """用**另一个会话**回读。
+
+    这是唯一能抓住「只 flush 没 commit」的那条。保存接口当场会用同一个会话把
+    值读回来回给你，所以界面上明明显示「已保存」—— 但事务从没提交，刷新一次
+    就没了。任何在同一会话里回读的断言都看不出问题，必须换连接。
+    """
+    from app.models import Subject
+
+    leaf = db.query(Subject).filter(
+        Subject.book_id == book.id, Subject.is_leaf.is_(True)).first()
+    r = client.put(f"/api/books/{book.id}/invoices/config", headers=auth, json={
+        "taxpayer_id": "91310000MA1FL0000X",
+        "output_tax_subject_id": leaf.id,
+        "input_credit_subject_id": leaf.id,
+        "output_debit_subject_id": leaf.id,
+    })
+    assert r.status_code == 200, r.text
+
+    # 关键：开新会话，绕开任何同一请求内的缓存
+    from app.core.db import SessionLocal
+
+    other = SessionLocal()
+    try:
+        saved = service.get_config(other, book.id)
+        assert saved["id"] is not None, "配置行根本没写进库"
+        assert saved["taxpayer_id"] == "91310000MA1FL0000X"
+        assert saved["output_tax_subject_id"] == leaf.id
+    finally:
+        other.close()

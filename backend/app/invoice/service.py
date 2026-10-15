@@ -135,7 +135,16 @@ def save_config(db: Session, book_id: int, payload: dict[str, Any]) -> dict[str,
     config.taxpayer_id = _text(payload.get("taxpayer_id"))
     for key, value in values.items():
         setattr(config, key, value)
-    db.flush()
+    # 必须 commit，不能只 flush。
+    #
+    # get_db() 只是 close 掉会话，不会替我们提交（app/core/db.py）。只 flush 的
+    # 后果是：保存接口当场回读，界面显示「已保存」，**但事务从未落库** ——
+    # 刷新一次（或换一个请求）就回到没配过的样子。get_config 在同一会话里读
+    # 得到自己刚 flush 的内容，所以当场看不出任何异常。
+    #
+    # 这个 bug 一直存在，只是被默认预填盖住了：以前每次打开界面都会补上
+    # 2221/1001，「像是有值」，没人发现那行数据其实从没写进去。
+    db.commit()
     return get_config(db, book_id)
 
 
