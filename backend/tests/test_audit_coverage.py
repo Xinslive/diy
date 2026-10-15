@@ -195,6 +195,24 @@ def test_改报表公式要留审计(client, auth, db, book):
     assert cell is not None, "资产负债表里没有数值列的单元格"
     old_formula = cell.formula
 
+    # 先 fork 一份归属 book 的副本再改：模板按账套隔离（迁移 0020）之后
+    # 内置基线是只读的，往它身上写只会拿到 404 —— 那条用例要验的是
+    # 「改公式留不留 before」，靶子必须是账套改得动的那一份。
+    baseline = db.scalar(select(ReportTemplate).where(
+        ReportTemplate.code == "BALANCE_SHEET", ReportTemplate.book_id.is_(None)))
+    forked = client.post(f"/api/reports/templates/{baseline.id}/fork?book_id={book.id}",
+                         headers=auth)
+    assert forked.status_code == 201, forked.text
+    tpl = db.get(ReportTemplate, forked.json()["id"])
+    cell = db.scalar(
+        select(ReportCell)
+        .where(ReportCell.template_id == tpl.id,
+               ReportCell.col_no.in_(numeric_cols))
+        .order_by(ReportCell.row_no, ReportCell.col_no)
+    )
+    assert cell is not None, "fork 出来的副本里没有数值列的单元格"
+    old_formula = cell.formula
+
     # **改完必须还原。**
     #
     # 经 client 的写入走的是 API 自己的 Session 并且 commit，而 conftest 的

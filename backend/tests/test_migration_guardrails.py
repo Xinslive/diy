@@ -846,14 +846,22 @@ def test_模型与库的外键零差异(db):
             Base.metadata)
 
     offenders: list[str] = []
-    for table, ops in diffs:
-        for outer in ops:
-            for item in getattr(outer, "ops", None) or [outer]:
-                if type(item).__name__ in CONSTRAINT_OPS:
-                    offenders.append(
-                        f"{table.name}: {type(item).__name__} "
-                        f"{getattr(item, 'constraint_name', '') or ''} "
-                        f"{getattr(item, 'constraint', '') or ''}")
+    # ``compare_metadata`` 返回的是 **DiffResult**：``[(op 代码, 对象), ...]``。
+    # ``add_table`` 给 Table、``add_index`` 给 Index、约束类改动给约束对象，
+    # 表级改动则装在 ModifyTableOps 容器里。
+    #
+    # 早年的写法按 ``[(表, ops 容器), ...]`` 解包。Table 恰好可迭代
+    # （迭代出的是列对象），于是它从没匹配上过 CONSTRAINT_OPS —— 这条
+    # 断言一直是**空转**的绿。0020 给 report_template 加上部分唯一索引之后，
+    # ``add_index`` 那条上的 Index 不可迭代，才把潜伏的形状错误翻成 TypeError。
+    # 形状修正之后它才真的在比较约束 —— 下面那句 assert 从此有意义。
+    for _code, obj in diffs:
+        for item in getattr(obj, "ops", None) or [obj]:
+            if type(item).__name__ in CONSTRAINT_OPS:
+                offenders.append(
+                    f"{getattr(obj, 'name', '') or ''}: {type(item).__name__} "
+                    f"{getattr(item, 'constraint_name', '') or ''} "
+                    f"{getattr(item, 'constraint', '') or ''}")
     assert not offenders, (
         "模型与库在约束上不一致 —— 照模型跑一次 autogenerate 就会把它们改回去：\n"
         + "\n".join(offenders)
@@ -900,6 +908,7 @@ def test_head_是本文件认识的那一版():
         "0017_system_settings",               # 系统级键值配置：第三方服务凭据从 .env 搬进库
         "0018_book_initialization",            # 账套初始化两步的状态（第 1 步科目、第 2 步期初余额）
         "0019_book_order",                     # 账套磁贴的**个人**排序：每个用户各一份磁贴顺序
+        "0020_report_template_book_scope",     # 报表模板按账套隔离（book_id 可空 = 官方内置基线）
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")

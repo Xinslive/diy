@@ -380,30 +380,49 @@ def install(db: Session, codes: tuple[str, ...] | None = None) -> None:
     ``codes`` 只装指定的几张模板（迁移里补装资产负债表时用，
     免得把用户在利润表上的改动一起冲掉）。模板已存在时是**先删后建**，
     所以重跑一次就是一次重新播种。
+
+    播出来的模板**不写 ``book_id``**，也就是数据库默认的 NULL = 官方内置
+    基线：所有账套共看同一份、只读。某个账套要改它时由 API 先 ``fork``
+    一份副本过去，改动不回到基线，也不会扩散到别的账套。
     """
     for spec in TEMPLATES:
         if codes is not None and spec["code"] not in codes:
             continue
-        tpl = db.scalar(select(ReportTemplate).where(ReportTemplate.code == spec["code"]))
-        if tpl is None:
-            tpl = ReportTemplate(
-                code=spec["code"], name=spec["name"], type=spec["type"], is_builtin=True
-            )
-            db.add(tpl)
-            db.flush()
+        # 查询只取主键，不能写 select(ReportTemplate)：整表查询会带上**模型
+        # 当前**的全部列，而 install() 是被迁移链里的 revision 调的
+        # （0001_baseline、0012、0013、0014），它们全排在 0020 给
+        # report_template 加 book_id **之前** —— 那时表里还没有这一列，
+        # 整表查询会 UndefinedColumn，整条链建不起库。
+        #
+        # 插入同样不能用 ORM 的 insert()：可空列未赋值时值是 None，SQLAlchemy
+        # **照样**把它列进 INSERT，于是 0001/0012/0013/0014 跑播种时又会在
+        # book_id 上炸一次。所以这里显式用 core insert，把列名写死 ——
+        # 播种要写哪几列是确定的，不该跟着模型长。
+        #
+        # book_id 有意不写：落库为 NULL，正是「官方内置基线」这个语义。
+        tpl_id = db.scalar(
+            select(ReportTemplate.id).where(ReportTemplate.code == spec["code"])
+        )
+        if tpl_id is None:
+            tpl_id = db.execute(
+                ReportTemplate.__table__.insert().values(
+                    code=spec["code"], name=spec["name"], type=spec["type"],
+                    remark="", is_builtin=True,
+                )
+            ).inserted_primary_key[0]
         else:
-            for c in list(db.scalars(select(ReportCol).where(ReportCol.template_id == tpl.id))):
+            for c in list(db.scalars(select(ReportCol).where(ReportCol.template_id == tpl_id))):
                 db.delete(c)
-            for r in list(db.scalars(select(ReportRow).where(ReportRow.template_id == tpl.id))):
+            for r in list(db.scalars(select(ReportRow).where(ReportRow.template_id == tpl_id))):
                 db.delete(r)
-            for c in list(db.scalars(select(ReportCell).where(ReportCell.template_id == tpl.id))):
+            for c in list(db.scalars(select(ReportCell).where(ReportCell.template_id == tpl_id))):
                 db.delete(c)
             db.flush()
 
         for col_no, label, kind, width in spec["cols"]:
             db.add(
                 ReportCol(
-                    template_id=tpl.id, col_no=col_no, label=label,
+                    template_id=tpl_id, col_no=col_no, label=label,
                     kind=kind, hidden=False, width=width,
                 )
             )
@@ -411,18 +430,18 @@ def install(db: Session, codes: tuple[str, ...] | None = None) -> None:
 
         cols = list(
             db.scalars(
-                select(ReportCol).where(ReportCol.template_id == tpl.id).order_by(ReportCol.col_no)
+                select(ReportCol).where(ReportCol.template_id == tpl_id).order_by(ReportCol.col_no)
             ).all()
         )
 
         if spec["type"] == "BALANCE_SHEET":
-            _install_balance(db, tpl, cols, spec["rows"])
+            _install_balance(db, tpl_id, cols, spec["rows"])
         else:
-            _install_vertical(db, tpl, cols, spec["rows"])
+            _install_vertical(db, tpl_id, cols, spec["rows"])
         db.commit()
 
 
-def _install_balance(db: Session, tpl: ReportTemplate,
+def _install_balance(db: Session, tpl_id: int,
                     cols: list[ReportCol], lines: list[Line]) -> None:
     """双栏（资产负债表）：一行同时落左半和右半。"""
     from app.reports.formula import no_to_col
@@ -453,7 +472,7 @@ def _install_balance(db: Session, tpl: ReportTemplate,
         }
         db.add(
             ReportRow(
-                template_id=tpl.id, row_no=row_no, label=line.left.label,
+                template_id=tpl_id, row_no=row_no, label=line.left.label,
                 indent=line.left.indent, bold=line.left.bold,
                 hidden=line.hidden, style=style,
             )
@@ -462,13 +481,13 @@ def _install_balance(db: Session, tpl: ReportTemplate,
                                       (line.right, right_cols, peer_for_right)):
             for col_no, formula in _side_formulas(side, side_cols, peer):
                 cells.append(ReportCell(
-                    template_id=tpl.id, row_no=row_no, col_no=col_no, formula=formula,
+                    template_id=tpl_id, row_no=row_no, col_no=col_no, formula=formula,
                 ))
     db.add_all(cells)
     db.flush()
 
 
-def _install_vertical(db: Session, tpl: ReportTemplate, cols: list[ReportCol],
+def _install_vertical(db: Session, tpl_id: int, cols: list[ReportCol],
                       rows: list[tuple]) -> None:
     """单栏（利润表）：一行一个项目，右侧若干数值列。"""
     from app.reports.formula import no_to_col
@@ -476,7 +495,7 @@ def _install_vertical(db: Session, tpl: ReportTemplate, cols: list[ReportCol],
     for row_no, label, indent, bold, codes, formula_tpl in rows:
         db.add(
             ReportRow(
-                template_id=tpl.id, row_no=row_no, label=label,
+                template_id=tpl_id, row_no=row_no, label=label,
                 indent=indent, bold=bold, hidden=False, style={},
             )
         )
@@ -492,7 +511,7 @@ def _install_vertical(db: Session, tpl: ReportTemplate, cols: list[ReportCol],
             else:
                 formula = _code_sum_formula(col.kind, codes)
             cells.append(ReportCell(
-                template_id=tpl.id, row_no=row_no, col_no=col.col_no, formula=formula,
+                template_id=tpl_id, row_no=row_no, col_no=col.col_no, formula=formula,
             ))
     db.add_all(cells)
     db.flush()

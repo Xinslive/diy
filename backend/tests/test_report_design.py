@@ -31,19 +31,25 @@ R_CLOSING = 7
 def tpl_id(db, book):
     """一张干净的资产负债表模板（每个用例一份，互不干扰）。
 
-    依赖 ``book`` 是为了写权限：报表模板是**全局**资源，改它要求显式给出
-    ``book_id`` 且在该账套是 OWNER（审计 P1-5 的 fail-closed 门禁）。
-    下面每个写接口都必须带 ``?book_id={book.id}`` —— 缺省会被 400 挡掉。
+    依赖 ``book`` 有两个用途，缺一不可：
+
+    1. **写权限**：改报表模板要求显式给出 ``book_id`` 且在该账套是 OWNER
+       （审计 P1-5 的 fail-closed 门禁）。下面每个写接口都必须带
+       ``?book_id={book.id}`` —— 缺省会被 400 挡掉。
+    2. **归属**：模板按账套隔离（迁移 0020）之后，写路径只接受
+       **归属当前账套**的模板。所以这份副本必须带上 ``book_id``；
+       不带的话它是「官方内置基线」，会被 404 挡掉 —— 那正是基线该有的
+       只读性，只是对这份夹具来说就变成「改不了了」。
     """
     import uuid
 
-    src = db.scalar(select(ReportTemplate).where(ReportTemplate.code == "BALANCE_SHEET"))
+    # 取基线那张（book_id IS NULL）。别只按 code 找：某个账套 fork 之后
+    # 会有同 code 的副本，按 code 找可能拿到副本，测的就不是基线版式了。
+    src = db.scalar(select(ReportTemplate).where(
+        ReportTemplate.code == "BALANCE_SHEET", ReportTemplate.book_id.is_(None)))
     tag = uuid.uuid4().hex[:8]
-
-    def cp(code):
-        return db.scalar(select(ReportTemplate).where(ReportTemplate.code == code))
-
-    t = ReportTemplate(code=f"TEST_{tag}", name=f"测试报表{tag}", type="CUSTOM", remark="")
+    t = ReportTemplate(code=f"TEST_{tag}", book_id=book.id, name=f"测试报表{tag}",
+                       type="CUSTOM", remark="")
     db.add(t)
     db.flush()
     for r in db.scalars(select(ReportRow).where(ReportRow.template_id == src.id)).all():
@@ -202,14 +208,14 @@ def test_can_rename_and_restyle_a_row(client, auth, tpl_id, db, book):
 
 def test_hidden_row_disappears_from_render(client, auth, tpl_id, book):
     """隐藏行不该出现在渲染结果里（打印时也少一行）。"""
-    before = client.get(f"/api/reports/{tpl_id}/design", headers=auth).json()
+    before = client.get(f"/api/reports/{tpl_id}/design?book_id={book.id}", headers=auth).json()
     assert any(r["row_no"] == 9 for r in before["rows"])
 
     assert client.patch(f"/api/reports/templates/{tpl_id}/rows/9?book_id={book.id}",
                         headers=auth, json={"hidden": True}).status_code == 200
-    assert not client.get(f"/api/reports/{tpl_id}/design", headers=auth).json()["rows"] \
+    assert not client.get(f"/api/reports/{tpl_id}/design?book_id={book.id}", headers=auth).json()["rows"] \
         or all(r["row_no"] != 9 or r["hidden"] for r in
-               client.get(f"/api/reports/{tpl_id}/design", headers=auth).json()["rows"])
+               client.get(f"/api/reports/{tpl_id}/design?book_id={book.id}", headers=auth).json()["rows"])
 
 
 # --------------------------------------------------------------------- 列
@@ -577,7 +583,7 @@ def test_hidden_row_still_editable_in_design_view(client, auth, tpl_id, db, book
     """界面要能取消隐藏，所以 render 里仍要带着 hidden 行 —— 过滤只发生在打印侧。"""
     client.patch(f"/api/reports/templates/{tpl_id}/rows/5?book_id={book.id}",
                  headers=auth, json={"hidden": True})
-    rows = client.get(f"/api/reports/{tpl_id}/design", headers=auth).json()["rows"]
+    rows = client.get(f"/api/reports/{tpl_id}/design?book_id={book.id}", headers=auth).json()["rows"]
     hidden = [r for r in rows if r["row_no"] == 5]
     assert hidden and hidden[0]["hidden"] is True, hidden
 

@@ -33,7 +33,7 @@
           <el-button v-else text circle :disabled="busy" :aria-label="`移除 ${file.raw.name}`" @click="removeFile(file.uid)"><el-icon><Close /></el-icon></el-button>
         </div>
       </div>
-      <div class="import-scope-note"><el-icon><InfoFilled /></el-icon>仅导入模板结构和公式。模板在系统内共享，金额按打开报表时的账套与期间重新计算。</div>
+      <div class="import-scope-note"><el-icon><InfoFilled /></el-icon>仅导入模板结构和公式。报表归属当前账套，不会出现在别的账套；金额按打开报表时的期间重新计算。</div>
     </div>
 
     <div v-else-if="step === 1" class="review-import">

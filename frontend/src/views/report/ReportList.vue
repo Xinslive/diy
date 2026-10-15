@@ -15,7 +15,6 @@
       <div class="section-heading">
         <div>
           <h3>报表模板</h3>
-          <p>模板结构和公式在系统内共享，打开时按当前账套与会计期间重新计算金额。</p>
         </div>
         <span class="template-count">{{ templates.length }} 张</span>
       </div>
@@ -79,7 +78,7 @@ async function load() {
   loading.value = true
   try {
     // 导入了自家的模板后，同类的内置模板不再列出来（口径以导入的为准）
-    templates.value = visibleTemplates(await api.templates())
+    templates.value = visibleTemplates(await api.templates(store.bookId))
   } finally {
     loading.value = false
   }
@@ -127,7 +126,6 @@ onMounted(load)
 .report-card { padding-top: 18px; }
 .section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
 .section-heading h3 { margin: 0; color: #33435a; font-size: 15px; font-weight: 600; }
-.section-heading p { margin: 6px 0 0; color: #8a97a9; font-size: 12px; }
 .template-count { color: #8c9aae; font-size: 12px; white-space: nowrap; }
 .report-name { color: var(--cwq-primary); text-decoration: none; font-weight: 500; }
 .report-name:hover { text-decoration: underline; }

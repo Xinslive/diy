@@ -22,6 +22,7 @@ const { visibleTemplates } = await createServer({
 
 const LIST = fs.readFileSync(new URL('../src/views/report/ReportList.vue', import.meta.url), 'utf8')
 const VIEW = fs.readFileSync(new URL('../src/views/report/ReportView.vue', import.meta.url), 'utf8')
+const API = fs.readFileSync(new URL('../src/api/report.js', import.meta.url), 'utf8')
 
 let pass = 0, fail = 0
 const t = (name, fn) => {
@@ -106,14 +107,31 @@ t('后端返回空列表 / 非数组时不炸（首屏还没加载完也是这�
 console.log('== 接入点：两个页面都走同一套判定 ==')
 
 t('列表页用 visibleTemplates 过滤，且不再渲染来源说明', () => {
-  assert.match(LIST, /visibleTemplates\(await api\.templates\(\)\)/)
+  assert.match(LIST, /visibleTemplates\(await api\.templates\(store\.bookId\)\)/)
   assert.ok(!LIST.includes('来源说明'), '来源说明列还在')
   assert.ok(!/row\.remark/.test(LIST), '还在读 remark 渲染那一列')
 })
 
 t('报表页下拉与删除后都重算可见性', () => {
-  assert.match(VIEW, /visibleTemplates\(await api\.templates\(\), templateId\.value\)/)
-  assert.match(VIEW, /allTemplates\.value = visibleTemplates\(await api\.templates\(\)\)/)
+  assert.match(VIEW, /visibleTemplates\(await api\.templates\(store\.bookId\), templateId\.value\)/)
+  assert.match(VIEW, /allTemplates\.value = visibleTemplates\(await api\.templates\(store\.bookId\)\)/)
+})
+
+t('列表必须带账套：服务端要靠 book_id 判可见性并按 code 去重', () => {
+  // 模板按账套隔离之后，/templates 不带 book_id 就不知道「哪些模板对当前
+  // 账套可见」，也没法做「基线 vs 本账套副本，同 code 取副本」的去重。
+  assert.match(API, /export const templates = \(bookId\) =>[\s\S]{0,160}book_id: bookId/)
+  assert.ok(!/api\.templates\(\)/.test(LIST + VIEW), '还有地方没带账套就拉模板列表')
+})
+
+t('进设计模式先 fork：内置原版不能直接改，且地址栏要跟着换', () => {
+  // 内置的资产负债表/利润表是所有账套共用的原版，直接改会扩散到别的账套。
+  // 所以点「设计报表」先复制一份到本账套再改。
+  assert.match(VIEW, /async function ensureOwnCopy\(\)/)
+  assert.match(VIEW, /api\.forkTemplate\(templateId\.value, store\.bookId\)/)
+  // URL 不换的话刷新会回到没改过的原版，看上去就是「改动没保存」。
+  assert.match(VIEW, /router\.replace\(`\/reports\/\$\{forked\.id\}`\)/)
+  assert.match(API, /export const forkTemplate/)
 })
 
 t('删掉当前报表后要改 templateId（同名路由不重新挂载，只换 URL 会停在已删的表上）', () => {

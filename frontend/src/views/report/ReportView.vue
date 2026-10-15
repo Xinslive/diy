@@ -602,9 +602,45 @@ function onDesignToggle() {
   if (designMode.value) load()
 }
 
-function toggleDesignMode() {
-  designMode.value = !designMode.value
-  if (!designMode.value) editing.value = null
+/**
+ * 进设计模式前，把「要改的那张表」变成本账套自己的一份。
+ *
+ * 系统内置的资产负债表/利润表是**所有账套共用的原版**（后端 `book_id` 为
+ * 空），直接改会立刻扩散到别的账套 —— 那正是「报表应该跟账套绑定」要避免的。
+ * 所以点「设计报表」时先调 fork：要改内置表就复制一份到本账套，改那份。
+ * 已经在本账套的报表后端原样返回同一个 id，不会重复复制。
+ *
+ * **URL 必须跟着换**。`/reports/:id` 是同一个路由，`router-view` 不会重新
+ * 挂载，只改 `templateId` 的话地址栏还指着原版；用户刷新一下就回到没改过
+ * 的原版上，看上去就是「改动没保存」。换掉地址栏，刷新才是同一个东西。
+ */
+async function ensureOwnCopy() {
+  if (!templateId.value) return
+  const forked = await api.forkTemplate(templateId.value, store.bookId)
+  if (forked.id === templateId.value) return
+  templateId.value = forked.id
+  router.replace(`/reports/${forked.id}`)
+  // 列表里那条也要换成副本：基线和副本同 code 并存时，列表按「副本优先」
+  // 去重，不重取的话下拉里那一项会变回基线。
+  allTemplates.value = visibleTemplates(await api.templates(store.bookId), forked.id)
+}
+
+async function toggleDesignMode() {
+  const entering = !designMode.value
+  designMode.value = entering
+  if (!entering) {
+    editing.value = null
+    onDesignToggle()
+    return
+  }
+  try {
+    await ensureOwnCopy()
+  } catch {
+    // fork 失败就不进设计模式：进去了改的每一格都会被后端拒（基线只读），
+    // 用户看到的是「打得进去、存不住」。不如一开始就不开。
+    designMode.value = false
+    return
+  }
   onDesignToggle()
 }
 
@@ -811,7 +847,7 @@ async function deleteCurrentTemplate() {
   await api.deleteTemplate(templateId.value, store.bookId)
   // 重新算可见性：删掉的若是该类型唯一一张自有模板，内置模板会重新露出来，
   // 直接拿接口原样跳转就可能跳到一张已经被藏起来的表。
-  allTemplates.value = visibleTemplates(await api.templates())
+  allTemplates.value = visibleTemplates(await api.templates(store.bookId))
   ElMessage.success('报表已删除')
   if (!allTemplates.value.length) {
     router.replace('/reports')
@@ -882,7 +918,7 @@ function exportXlsx() {
 onMounted(async () => {
   // keepId：按 URL 直接打开一张已被隐藏的内置报表时，下拉里仍要留着它，
   // 否则 load() 按 id 查模板会查不到，页面标题和「是否内置」全成空。
-  allTemplates.value = visibleTemplates(await api.templates(), templateId.value)
+  allTemplates.value = visibleTemplates(await api.templates(store.bookId), templateId.value)
   if (store.bookId) {
     subjectOptions.value = await subjectApi.subjectFlat(store.bookId, { include_parents: true }).catch(() => [])
   }

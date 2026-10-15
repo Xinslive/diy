@@ -55,58 +55,73 @@ def require_report_reader(
 
 
 @router.get("/templates")
-def templates(db: Session = Depends(get_db),
-              user: SysUser = Depends(require_report_reader)):
-    """报表模板列表：要求登录**且至少有一个账套授权**（审计 P3-09 / P2-13）。
+def templates(book_id: Optional[int] = None, db: Session = Depends(get_db),
+              user: SysUser = Depends(require_report_reader),
+              book: Book = Depends(get_my_book)):
+    """报表模板列表：**官方内置基线 + 当前账套自己的**，按 code 去重。
 
-    审计 P3-09 原判 C 级「待产品确认」，理由是模板跨账套共享。
-    这里的结论是「跨账套共享」≠「对外部公开」：
+    审计 P3-09 原判 C 级「待产品确认」，理由是模板跨账套共享。这里的结论
+    是「跨账套共享」≠「对外部公开」：
 
     * 共享指的是同一次部署内多个账套复用同一套模板，背后还是同一批会计；
-    * 模板的行、列、单元格公式就是这套单位算账的口径，属于内部经营信息；
-    * 前端不存在合法的匿名消费方 —— 报表设计页在应用外壳内，必然已登录；
-    * 连**一个账套都没有**的账号也不该看：它不属于任何一家单位。
+    * 模板的行、列、单元格公式就是这套单位怎么算账，属于内部经营信息；
+    * 前端不存在合法的匿名消费方 —— 报表设计页在应用外壳内，必然已登录。
 
-    所以加「登录 + 至少一个账套授权」对现有流程零影响（前端每个用户至少
-    有一个账套），只挡掉设计意图之外的调用。
-    静态守卫见 ``tests/test_report_design_auth.py::test_报表接口全部要求登录``。
+    所以仍然要求「登录 + 至少一个账套授权」（``require_report_reader``）。
+
+    **去重是这一条的核心。** 官方基线（``book_id IS NULL``）和本账套的副本
+    可能同 code 并存 —— 副本就是「这个账套改过这张内置表」的产物。按 code
+    去重时**本账套优先**：用户改过的永远是改过那份，没改过的账套看基线。
+    不去重的话，账套 A 改了内置利润表，列表里会同时冒出「利润表」和
+    「利润表」两张，用户点开哪张全凭上下顺序。
     """
     _ = user
-    rows = db.scalars(select(ReportTemplate).order_by(ReportTemplate.id)).all()
+    rows = db.scalars(select(ReportTemplate).where(
+        (ReportTemplate.book_id.is_(None)) | (ReportTemplate.book_id == book.id)
+    ).order_by(ReportTemplate.id)).all()
+    by_code: dict[str, ReportTemplate] = {}
+    for t in rows:
+        # 本账套的副本排在后面，覆盖同 code 的基线；基线先入，副本后入。
+        by_code[t.code] = t
     return [{"id": t.id, "code": t.code, "name": t.name, "type": t.type,
-             "is_builtin": t.is_builtin, "remark": t.remark} for t in rows]
+             "is_builtin": t.is_builtin, "remark": t.remark,
+             "book_id": t.book_id} for t in by_code.values()]
+
+
+def _visible_template(db: Session, template_id: int, book: Book) -> ReportTemplate:
+    """取出「当前账套看得见」的那份模板，否则 404。
+
+    看得见 = 官方基线（``book_id IS NULL``）**或**归属当前账套。别的账套的
+    模板一律当不存在 —— 不是 403，是 404：403 等于告诉对方「这个 id 确实
+    存在，只是你没权限」，那本身就是信息泄露（能拿它去枚举别的账套
+    建过几张报表、改过什么名字）。
+    """
+    tpl = db.get(ReportTemplate, template_id)
+    if tpl is None or (tpl.book_id is not None and tpl.book_id != book.id):
+        raise HTTPException(404, "报表模板不存在")
+    return tpl
 
 
 def _require_template_write(db: Session, user: SysUser, book_id: int | None) -> None:
-    """改报表模板 = 改**全局**口径：要求「明确的账套 + 该账套的 OWNER」。
+    """改报表模板 = 改**本账套**的口径：要求「明确的账套 + 该账套的 OWNER」。
 
     审计 P1-5：``book_id`` 以前是**可选**查询参数，缺省时条件退化成
     「该用户在任意账套非 VIEWER」。于是「在账套 B 是会计、在账套 A 是只读」
-    的人不带 ``book_id`` 调 ``POST /api/reports/templates`` 就能过门禁，
-    改写出账套 A 也在用的全局公式 —— 模板是全局的，门却只看一个无关账套的角色。
+    的人不带 ``book_id`` 调 ``POST /api/reports/templates`` 就能过门禁。
+    模板按账套隔离（迁移 0020）之后这条更要说清：**模板不再是全局口径**，
+    改的就是当前账套自己那份，所以门禁就该看当前账套的角色。
 
     两道 fail-closed 的闸：
 
-    1. **必须显式给 book_id**。没有目标账套就没有「以谁的身份改全局口径」
-       这件事，缺省放行等于把门重新打开。管理员也不例外：目标账套还要进
-       审计日志的 ``book_id`` 列。
-    2. **要求 OWNER**，不认「不是 VIEWER 就放行」这种黑名单判断。
-       角色认不出来一律当拒绝（与 ``printing._require_global_template_write``
-       同一套推理，也与 ``frontend/src/stores/session.js::canWrite`` 一致）。
-
-    **为什么必须与打印侧一致**：``report_template`` 和 ``print_template``
-    一样没有 ``book_id``、一样被所有账套共用、一样要全局生效。打印侧第一批
-    已经按「全局资源的全局门禁」收紧（``printing.py:261``），报表侧还停在
-    「任一可写账套」就是同一个漏洞在两个入口各留了一份。现在两边都是
-    「显式账套 + OWNER + 管理员放行」。
-
-    这是**应用层**的收紧，不是根治：根治同样是给模板加 ``book_id``，
-    那需要一条 Alembic revision，归迁移工作包。
+    1. **必须显式给 book_id**。没有目标账套就没有「以谁的身份改」这件事，
+       缺省放行等于把门重新打开。管理员也不例外：目标账套还要进审计
+       日志的 ``book_id`` 列。
+    2. **要求 OWNER**，不认「不是 VIEWER 就放行」这种黑名单判断。角色认不
+       出来一律当拒绝（与 ``frontend/src/stores/session.js::canWrite`` 一致）。
     """
     if book_id is None:
         raise HTTPException(
-            400, "报表模板是全局模板（所有账套共用同一套公式），"
-                 "必须用 book_id 指明你以哪个账套的身份修改")
+            400, "报表模板归属账套，必须用 book_id 指明你以哪个账套的身份修改")
     link = db.scalar(select(UserBook).where(
         UserBook.user_id == user.id, UserBook.book_id == book_id))
     if link is None:
@@ -114,28 +129,114 @@ def _require_template_write(db: Session, user: SysUser, book_id: int | None) -> 
     if user.is_admin:
         return
     if link.role != "OWNER":
-        raise HTTPException(
-            403, "报表公式是全局口径（所有账套都按这套公式出数），"
-                 "只有账套所有者或管理员可以修改")
+        raise HTTPException(403, "报表公式是本账套的口径，只有账套所有者或管理员可以修改")
 
 
-@router.get("/{template_id}/design")
-def design(template_id: int, db: Session = Depends(get_db),
-           user: SysUser = Depends(require_report_reader)):
-    """模板的行 / 列 / 单元格公式结构：要求登录且有账套授权（理由同 ``templates``）。
+def _require_owned_template(db: Session, template_id: int, book_id: int | None,
+                            user: SysUser) -> ReportTemplate:
+    """写路径的统一入口：门禁 + 归属。
 
-    这里返回的是取数公式本身 —— 比报表名和科目名更能说明一家单位怎么算账，
-    所以这条比 ``/templates`` 更不该对「不属于任何账套的人」开放。
+    与读路径最大的不同在这里 —— **官方内置基线（``book_id IS NULL``）
+    不接受任何直接写入**。它是所有账套共看的那一份，任何写都会立刻扩散到
+    别的账套去。真的要改它，走 ``fork``：先复制一份归属当前账套，改副本。
+    基线因此永远是干净的出厂状态。
+
+    **为什么基线回 400 而不是 404（顺序是刻意的，不是随手排的）。**
+
+    本函数原本先判 ``tpl.book_id != book_id`` 回 404，而 ``book_id`` 已被
+    ``_require_template_write`` 保证非 None，于是「基线」（``book_id IS NULL``）
+    必然先被 404 拦掉 —— 下面那句解释「怎么改基线」的 400 永远到不了用户
+    面前，只留下一句无从理解的「报表模板不存在」。
+
+    把基线提到 404 之前不会重新引入存在性泄露：404 那条要防的是**别的账套
+    的私有模板**，403 等于告诉对方「这个 id 确实存在」，能拿它去枚举别人
+    建过几张报表、改过什么名字。而基线是**公开的** —— 每个账套的报表列表里
+    都列着它们，id 集合根本不是秘密。对一个谁都能看见的东西回一句
+    「不能这么改，去设计模式」不泄露任何新信息。
     """
-    _ = user
+    _require_template_write(db, user, book_id)
     tpl = db.get(ReportTemplate, template_id)
     if tpl is None:
         raise HTTPException(404, "报表模板不存在")
+    # 基线在 404 之前，理由见 docstring。
+    if tpl.book_id is None:
+        raise HTTPException(
+            400, "系统内置报表是所有账套共用的原版，不能直接改；"
+                 "进入设计模式后会先复制一份到当前账套，改那份")
+    if tpl.book_id != book_id:
+        # 别人的模板与不存在的模板一样回 404，理由见 _visible_template。
+        raise HTTPException(404, "报表模板不存在")
+    return tpl
+
+
+@router.post("/templates/{template_id}/fork", status_code=201)
+def fork_template(template_id: int, book_id: Optional[int] = None,
+                  user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
+                  book: Book = Depends(get_my_book)):
+    """把一张模板复制一份归属当前账套 —— **写时复制的那一步**。
+
+    进入设计模式时前端先调这里，于是「改内置表」的实际动作落在副本上：
+
+    * 目标**已经不是**内置基线（``book_id`` 就是当前账套）→ 什么都不做，
+      直接返回它自己。反复进设计模式不会复制出一堆副本。
+    * 目标是内置基线，而本账套**已有**同 code 的副本 → 返回那个副本。
+      第二���改的还是同一份，不会越改越多。
+    * 目标是内置基线且本账套没有副本 → 真复制一份（行、列、单元格公式
+      整份带走，``_clone_skeleton``），归属当前账套。
+
+    副本的 ``code`` 沿用基线的，``is_builtin`` 为 false（它是账套自己维护的
+    表，可以删 —— 删了就回到看基线）。列表按 code 去重时副本优先，于是
+    用户改过的那份就是他看到的那份，而别的账套继续看干净的基线。
+
+    为什么不做成「保存时才发现要复制」：那样每个写端点都得在响应里回传
+    新 id，前端十几处都要跟着切。现在把复制收在**进入设计模式这一个
+    时刻**，写路径就完全不用知道写时复制这件事了。
+    """
+    _require_template_write(db, user, book_id)
+    src = _visible_template(db, template_id, book)
+    if src.book_id == book.id:
+        return {"id": src.id, "code": src.code, "name": src.name, "forked": False}
+    existing = db.scalar(select(ReportTemplate).where(
+        ReportTemplate.book_id == book.id, ReportTemplate.code == src.code))
+    if existing is not None:
+        return {"id": existing.id, "code": existing.code, "name": existing.name,
+                "forked": False}
+    tpl = ReportTemplate(code=src.code, book_id=book.id, name=src.name,
+                         type=src.type, remark=src.remark, is_builtin=False)
+    db.add(tpl)
+    db.flush()
+    _clone_skeleton(db, src.id, tpl.id)
+    log(db, action="FORK_REPORT_TEMPLATE", entity="report_template", entity_id=tpl.id,
+        user=user, book_id=book.id,
+        detail=f"复制内置报表 {src.name}（{src.code}）到当前账套",
+        before={"template_id": src.id, "code": src.code, "book_id": src.book_id},
+        after={"template_id": tpl.id, "code": tpl.code, "book_id": tpl.book_id})
+    db.commit()
+    return {"id": tpl.id, "code": tpl.code, "name": tpl.name, "forked": True}
+
+
+@router.get("/{template_id}/design")
+def design(template_id: int, db: Session = Depends(get_db), book_id: Optional[int] = None,
+           user: SysUser = Depends(require_report_reader), book: Book = Depends(get_my_book)):
+    """模板的行 / 列 / 单元格公式结构。
+
+    要求登录、至少一个账套授权（理由同 ``templates``），以及**这张模板对
+    当前账套可见**。这里返回的是取数公式本身 —— 比报表名和科目名更能说明
+    一家单位怎么算账，别的账套的模板不该流到这儿。
+    """
+    _ = user
+    tpl = _visible_template(db, template_id, book)
     rows = db.scalars(select(ReportRow).where(ReportRow.template_id == template_id)
                       .order_by(ReportRow.row_no)).all()
     cols = db.scalars(select(ReportCol).where(ReportCol.template_id == template_id)
                       .order_by(ReportCol.col_no)).all()
-    cells = db.scalars(select(ReportCell).where(ReportCell.template_id == template_id)).all()
+    # 单元格也必须排序。rows / cols 排了、cells 没排，于是同一个模板两次
+    # 打开可能给出不同顺序的公式列表 —— 堆顺序一变就变。设计页按地址渲染
+    # 不在乎顺序，但这份返回是给调用方的事实描述，顺序不定就没法比对、
+    # 没法缓存，写时复制那种「复制前后的结构必须逐条相等」的校验也会
+    # 变成随机红。
+    cells = db.scalars(select(ReportCell).where(ReportCell.template_id == template_id)
+                      .order_by(ReportCell.row_no, ReportCell.col_no)).all()
     return {
         "id": tpl.id, "code": tpl.code, "name": tpl.name, "type": tpl.type,
         "rows": [{"row_no": r.row_no, "label": r.label, "indent": r.indent,
@@ -151,6 +252,8 @@ def render(template_id: int, book_id: int, period_id: int, db: Session = Depends
            book: Book = Depends(get_my_book), include_unposted: bool = Query(False)):
     from app.reports.evaluate import evaluate
 
+    # 求值前先确认这张模板对当前账套可见：别的账套的公式不该在这里被算出来。
+    _visible_template(db, template_id, book)
     period = db.get(Period, period_id)
     if period is None or period.book_id != book.id:
         raise HTTPException(404, "会计期间不存在")
@@ -187,15 +290,14 @@ def _check_formula(src: str, row_no: int, col_no: int) -> None:
 @router.put("/{template_id}/cells")
 def save_cells(template_id: int, payload: list[CellIn], db: Session = Depends(get_db),
                book_id: Optional[int] = None, user=Depends(get_current_user)):
-    """改单元格公式。报表模板是**全局**的，所以门禁按全局资源收紧：
-    要求显式 ``book_id`` 且在该账套是 OWNER（``_require_template_write``）。
+    """改单元格公式。门禁与归属见 ``_require_owned_template``：
+    必须是**当前账套自己那份**模板，官方内置基线不接受直接写入
+    （前端在进入设计模式时已经先 ``fork`` 过一份，改的是副本）。
 
     公式本身先过一遍语法（``_check_formula``）：语法错的公式存不进去，
     而不是存进去、等报表渲染时才在某一格蹦出一行红字。
     """
-    if db.get(ReportTemplate, template_id) is None:
-        raise HTTPException(404, "报表模板不存在")
-    _require_template_write(db, user, book_id)
+    _require_owned_template(db, template_id, book_id, user)
     for item in payload:
         _check_formula(item.formula, item.row_no, item.col_no)
 
@@ -280,6 +382,7 @@ def preview_template_import(file: UploadFile = File(...), book_id: Optional[int]
     book_subjects = list(db.scalars(select(Subject).where(Subject.book_id == book_id).order_by(Subject.code)))
     by_code = {subject.code: subject for subject in book_subjects}
     existing = db.scalar(select(ReportTemplate).where(
+        ReportTemplate.book_id == book_id,
         ReportTemplate.code == f"IMPORTED_{parsed['source']['fingerprint']}"))
     document = {key: parsed[key] for key in ("name", "type", "source", "rows", "cols", "cells", "issues")}
     return {
@@ -305,7 +408,11 @@ def import_templates(payload: ImportTemplates, book_id: Optional[int] = None,
         if code in seen_codes:
             raise HTTPException(409, "同一批次包含重复模板，请只选择 .rep / .rbk 中的一份")
         seen_codes.add(code)
-        if db.scalar(select(ReportTemplate.id).where(ReportTemplate.code == code)):
+        # 判重按**账套**：code 是文件内容指纹，隔离之前整个系统只能导一次，
+        # 现在每个账套各导各的互不冲突（这正是部分唯一索引
+        # UNIQUE(book_id, code) 解开的那个老限制）。
+        if db.scalar(select(ReportTemplate.id).where(
+                ReportTemplate.book_id == book_id, ReportTemplate.code == code)):
             raise HTTPException(409, f"「{item.name}」已经导入，请打开已有模板")
         row_numbers = {row.row_no for row in item.rows}
         col_numbers = {col.col_no for col in item.cols}
@@ -343,7 +450,7 @@ def import_templates(payload: ImportTemplates, book_id: Optional[int] = None,
             notes.append(f"{len(item.issues)} 个金额格待配置公式")
         if missing:
             notes.append(f"{len(missing)} 个科目待匹配")
-        template = ReportTemplate(code=code, name=item.name, type=item.type,
+        template = ReportTemplate(code=code, book_id=book_id, name=item.name, type=item.type,
                                   remark="；".join(notes), is_builtin=False)
         db.add(template)
         db.flush()
@@ -508,16 +615,26 @@ def _clone_skeleton(db: Session, src_id: int, dst_id: int) -> None:
 
 @router.post("/templates", status_code=201)
 def create_template(payload: ReportTemplateIn, book_id: Optional[int] = None,
-                    user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    """新建报表模板：复制一份内置表结构，财务在此基础上改公式。"""
+                    user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
+                    book: Book = Depends(get_my_book)):
+    """新建报表模板：复制一份表结构，财务在此基础上改公式。
+
+    新模板**一出生就归属当前账套**（``book_id``），不是「先全局、再按需
+    隔离」。自建模板没有「先让所有人看到一份原版」的必要，留个归属更省心。
+    """
     _require_template_write(db, user, book_id)
     tpl = ReportTemplate(code=f"CUSTOM_{uuid.uuid4().hex[:10].upper()}",
-                         name=payload.name, type="CUSTOM",
+                         book_id=book.id, name=payload.name, type="CUSTOM",
                          remark=payload.remark, is_builtin=False)
     db.add(tpl)
     db.flush()
-    base = db.scalar(select(ReportTemplate).where(ReportTemplate.code == payload.base_code)) \
-        if payload.base_code else None
+    # base_code 按 code 找，且**只看当前账套看得见的**：本账套副本优先于
+    # 同 code 的官方基线（与列表去重同一个口径，否则「以利润表为基础新建」
+    # 可能复制到另一份去）。
+    base = db.scalar(select(ReportTemplate).where(
+        ReportTemplate.code == payload.base_code).where(
+        (ReportTemplate.book_id.is_(None)) | (ReportTemplate.book_id == book.id)
+    ).order_by(ReportTemplate.book_id.desc())) if payload.base_code else None
     if base is not None:
         _clone_skeleton(db, base.id, tpl.id)
     db.commit()
@@ -526,14 +643,18 @@ def create_template(payload: ReportTemplateIn, book_id: Optional[int] = None,
 
 @router.post("/templates/{template_id}/copy")
 def copy_template(template_id: int, name: Optional[str] = None, book_id: Optional[int] = None,
-                  user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    """复制模板（含全部公式）。改公式前先留底，财务自己就能做。"""
+                  user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
+                  book: Book = Depends(get_my_book)):
+    """复制模板（含全部公式）到当前账套。改公式前先留底，财务自己就能做。
+
+    源模板必须是当前账套看得见的（官方基线或本账套自己的）；副本一律归属
+    当前账套。code 用新的 UUID，所以同一个源可以在不同账套各复制一份而
+    不撞唯一索引。
+    """
     _require_template_write(db, user, book_id)
-    src = db.get(ReportTemplate, template_id)
-    if src is None:
-        raise HTTPException(404, "报表模板不存在")
+    src = _visible_template(db, template_id, book)
     tpl = ReportTemplate(code=f"CUSTOM_{uuid.uuid4().hex[:10].upper()}",
-                         name=name or f"{src.name} 副本", type="CUSTOM",
+                         book_id=book.id, name=name or f"{src.name} 副本", type="CUSTOM",
                          remark=src.remark, is_builtin=False)
     db.add(tpl)
     db.flush()
@@ -546,10 +667,7 @@ def copy_template(template_id: int, name: Optional[str] = None, book_id: Optiona
 def update_template(template_id: int, payload: ReportTemplatePatch,
                     book_id: Optional[int] = None, user: SysUser = Depends(get_current_user),
                     db: Session = Depends(get_db)):
-    _require_template_write(db, user, book_id)
-    tpl = db.get(ReportTemplate, template_id)
-    if tpl is None:
-        raise HTTPException(404, "报表模板不存在")
+    tpl = _require_owned_template(db, template_id, book_id, user)
     if payload.name is not None:
         tpl.name = payload.name
     if payload.remark is not None:
@@ -561,10 +679,16 @@ def update_template(template_id: int, payload: ReportTemplatePatch,
 @router.delete("/templates/{template_id}")
 def delete_template(template_id: int, book_id: Optional[int] = None,
                     user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_template_write(db, user, book_id)
-    tpl = db.get(ReportTemplate, template_id)
-    if tpl is None:
-        raise HTTPException(404, "报表模板不存在")
+    """删报表。删掉的只能是本账套自己那份；官方内置基线永远留着。
+
+    删掉的是内置表的**副本**时，那个账套就回到看基线的状态 —— 这正是
+    「我不想要我的改动」的那条退路，所以副本的 ``is_builtin`` 是 false。
+    """
+    tpl = _require_owned_template(db, template_id, book_id, user)
+    # 兜底，不再是主路径：基线（book_id IS NULL）已在 _require_owned_template
+    # 里以 400 挡下，走不到这里 —— 留给「book_id 非空却是内置模板」这种
+    # 说不清来路的存量/脏数据。留着是因为它便宜且 fail-closed，而删掉它
+    # 会让真出现这种数据时直接删掉一张所有账套共看的表。
     if tpl.is_builtin:
         raise HTTPException(400, "内置报表模板不允许删除，可以先复制一份再改")
     db.delete(tpl)
@@ -579,7 +703,7 @@ def update_row(template_id: int, row_no: int, payload: ReportRowPatch, book_id: 
 
     只靠插删行拼不出想要的表 —— 「合计行加粗」「几行不打印」都得能单独调。
     """
-    _require_template_write(db, user, book_id)
+    _require_owned_template(db, template_id, book_id, user)
     row = db.scalar(select(ReportRow).where(ReportRow.template_id == template_id,
                                              ReportRow.row_no == row_no))
     if row is None:
@@ -602,9 +726,7 @@ def update_row(template_id: int, row_no: int, payload: ReportRowPatch, book_id: 
 def add_row(template_id: int, payload: dict, book_id: Optional[int] = None,
             user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
     """在指定位置插入一行，下方行的公式单元格整体下移，公式内容不变。"""
-    _require_template_write(db, user, book_id)
-    if db.get(ReportTemplate, template_id) is None:
-        raise HTTPException(404, "报表模板不存在")
+    _require_owned_template(db, template_id, book_id, user)
     rows = list(db.scalars(select(ReportRow).where(ReportRow.template_id == template_id)
                            .order_by(ReportRow.row_no)).all())
     at = int(payload.get("row_no") or (rows[-1].row_no + 1 if rows else 1))
@@ -626,7 +748,7 @@ def add_row(template_id: int, payload: dict, book_id: Optional[int] = None,
 @router.delete("/templates/{template_id}/rows/{row_no}")
 def delete_row(template_id: int, row_no: int, book_id: Optional[int] = None,
                user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_template_write(db, user, book_id)
+    _require_owned_template(db, template_id, book_id, user)
     row = db.scalar(select(ReportRow).where(ReportRow.template_id == template_id,
                                              ReportRow.row_no == row_no))
     if row is None:
@@ -657,9 +779,7 @@ def delete_row(template_id: int, row_no: int, book_id: Optional[int] = None,
 def add_col(template_id: int, payload: dict, book_id: Optional[int] = None,
             user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
     """在指定位置插入一列。默认沿用左边那一列的取数口径。"""
-    _require_template_write(db, user, book_id)
-    if db.get(ReportTemplate, template_id) is None:
-        raise HTTPException(404, "报表模板不存在")
+    _require_owned_template(db, template_id, book_id, user)
     cols = list(db.scalars(select(ReportCol).where(ReportCol.template_id == template_id)
                            .order_by(ReportCol.col_no)).all())
     at = int(payload.get("col_no") or (cols[-1].col_no + 1 if cols else 1))
@@ -693,7 +813,7 @@ def add_col(template_id: int, payload: dict, book_id: Optional[int] = None,
 @router.patch("/templates/{template_id}/cols/{col_no}")
 def update_col(template_id: int, col_no: int, payload: ReportColPatch, book_id: Optional[int] = None,
                user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_template_write(db, user, book_id)
+    _require_owned_template(db, template_id, book_id, user)
     col = db.scalar(select(ReportCol).where(ReportCol.template_id == template_id,
                                              ReportCol.col_no == col_no))
     if col is None:
@@ -715,7 +835,7 @@ def update_col(template_id: int, col_no: int, payload: ReportColPatch, book_id: 
 @router.delete("/templates/{template_id}/cols/{col_no}")
 def delete_col(template_id: int, col_no: int, book_id: Optional[int] = None,
                user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    _require_template_write(db, user, book_id)
+    _require_owned_template(db, template_id, book_id, user)
     col = db.scalar(select(ReportCol).where(ReportCol.template_id == template_id,
                                              ReportCol.col_no == col_no))
     if col is None:

@@ -168,8 +168,19 @@ def test_会让渲染500的公式存不进去(client, auth, book, db, bad):
 
     写坏公式的格子选第 2 行 / 第 3 列：双栏版式里第 2 列是**行次**列
     （LINE_NO，本来就不该有公式），只有数值列才是这条护栏真正的对象。
+
+    先 fork 一份归属 ``book``：模板按账套隔离（迁移 0020）之后内置基线
+    是**只读**的，直接拿它当靶子会拿到 404 —— 那条用例要验的是「语法检查
+    拦不拦」，不是「基线能不能改」，靶子必须换成账套自己的副本。
     """
-    tpl = db.scalar(select(ReportTemplate).where(ReportTemplate.code == "BALANCE_SHEET"))
+    baseline = db.scalar(select(ReportTemplate).where(
+        ReportTemplate.code == "BALANCE_SHEET", ReportTemplate.book_id.is_(None)))
+    forked = client.post(f"/api/reports/templates/{baseline.id}/fork?book_id={book.id}",
+                         headers=auth)
+    assert forked.status_code == 201, forked.text
+    tpl_id = forked.json()["id"]
+
+    tpl = db.get(ReportTemplate, tpl_id)
     cell = db.scalar(select(ReportCell).where(
         ReportCell.template_id == tpl.id, ReportCell.row_no == 2, ReportCell.col_no == 3))
     old = cell.formula
