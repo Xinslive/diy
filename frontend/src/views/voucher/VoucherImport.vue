@@ -19,18 +19,20 @@
           <template #title>标准表头</template>
           <div class="mt-xs">
             日期、凭证号（可空）、摘要、科目编码、科目名称、借方金额、贷方金额、附单据数、备注。<br />
-            一张凭证占多行时，第二行起<b>日期与凭证号留空</b>即视为接上一张。
+            一张凭证占多行时，第二行起<b>日期与凭证号留空</b>即视为接上一张。<br />
+            用友导出的<b>序时账</b>（.xls）也能直接导：那种表每条分录都重复日期与凭证号数，
+            同样的日期与凭证号会自动并成同一张凭证。
           </div>
         </el-alert>
 
         <el-upload
-          drag :auto-upload="false" :show-file-list="false" accept=".xlsx,.xlsm"
+          drag :auto-upload="false" :show-file-list="false" accept=".xls,.xlsx,.xlsm"
           :on-change="onFile" class="mb"
         >
           <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
           <div class="el-upload__text">把 Excel 拖到此处，或<em>点击选择文件</em></div>
           <template #tip>
-            <div class="el-upload__tip">只支持 .xlsx；表头别名容错（日期/制单日期/voucher_date 均可）</div>
+            <div class="el-upload__tip">支持 .xls / .xlsx，用友导出的序时账可直接导入；表头别名容错（日期/制单日期/voucher_date 均可）</div>
           </template>
         </el-upload>
 
@@ -59,6 +61,15 @@
           v-if="(result.unknown_headers || []).length"
           type="info" :closable="false" show-icon class="mb"
           :title="`忽略了无法识别的列：${result.unknown_headers.join('、')}`"
+        />
+        <!-- 用友的序时账表尾固定带「合计」行（借贷两行、金额是全表发生额合计）。
+             它没有日期、没有凭证号也没有科目，不是分录，已经被跳过 ——
+             但必须说出来：不说的话用户会以为表里本来就没这行数据，
+             而那行合计往往就是全账最大的一笔数。 -->
+        <el-alert
+          v-if="result.footer_rows"
+          type="info" :closable="false" show-icon class="mb"
+          :title="`已跳过表尾 ${result.footer_rows} 行「合计」，它们不是分录，不会进入账上`"
         />
 
         <!-- 被丢弃的行必须显眼。原来只有表格里一个「有问题」标签，鼠标悬停
@@ -161,7 +172,7 @@ import { useSessionStore } from '@/stores/session'
 const store = useSessionStore()
 const step = ref(0)
 const file = ref(null)
-const result = ref({ vouchers: [], total: 0, ok_count: 0, error_count: 0 })
+const result = ref({ vouchers: [], total: 0, ok_count: 0, error_count: 0, footer_rows: 0 })
 const done = ref(0)
 const uploading = ref(false)
 const committing = ref(false)

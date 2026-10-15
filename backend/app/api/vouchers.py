@@ -319,8 +319,11 @@ def upload_import(file: UploadFile = File(...), book: Book = Depends(get_my_book
     而 CPU 占用并不高。改成 ``def`` 之后 FastAPI 把它丢进 anyio 线程池，
     阻塞的是线程池线程，全仓其余端点本来就是这么跑的。
     """
-    if not (file.filename or "").lower().endswith((".xlsx", ".xlsm")):
-        raise HTTPException(400, "只支持 .xlsx 格式（另存为 xlsx 后重试）")
+    # .xls 是用友等旧系统导出的 OLE 复合文档，openpyxl 读不了 —— service 层按
+    # 文件内容把它分流给 xlrd（和科目表、期初余额表共用同一个分流器）。这里只
+    # 挡明显不是表格的后缀，真正读不读得开由解析器说了算。
+    if not (file.filename or "").lower().endswith((".xls", ".xlsx", ".xlsm")):
+        raise HTTPException(400, "只支持 .xls 或 .xlsx 格式的凭证表（用友导出的 .xls 可直接导入）")
     # 容量闸住在共享工具里（审计 P1-4 / P2-02）。原来是 ``file.file.read()`` ——
     # 无参数意味着「有多少读多少」，Nginx 那条 50m 只是最后一道闸，而它是**请求体**
     # 限制：压缩过的上传、拆成多次的请求都能绕过，而且解析器拿到之后
@@ -343,6 +346,10 @@ def upload_import(file: UploadFile = File(...), book: Book = Depends(get_my_book
         "errors": batch.payload.get("errors", []),
         "unknown_subjects": batch.payload.get("unknown_subjects", {}),
         "unknown_headers": batch.payload.get("unknown_headers", []),
+        # 这份表是不是按用友序时账的排版读的、有没有跳过表尾的合计行。
+        # 「合计」行被跳过时用户该知道 —— 否则他会以为表里没这行数据。
+        "journal": bool(batch.payload.get("journal")),
+        "footer_rows": int(batch.payload.get("footer_rows") or 0),
     }
 
 

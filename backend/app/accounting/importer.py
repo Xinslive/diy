@@ -11,10 +11,32 @@
 不同财务导出的表头写法差别很大（日期 / 制单日期 / voucher_date …），
 因此每个字段都配了一组别名，全部小写去空格后匹配。
 
+文件格式
+--------
+``.xlsx`` 走 openpyxl，用友等旧系统导出的 ``.xls`` 走 xlrd。**按文件内容分流，
+文件名只作补充** —— 改了后缀的 .xls 必须照样读得开，反过来把 .xlsx 改名成 .xls
+也不能被 xlrd 接着而报一个看不懂的错。分流函数本身不在这里：
+:func:`app.accounting.subject_importer.iter_workbook_rows` 是全仓唯一的一份，
+期初余额表与科目表导入已经共用它（见那里的 docstring）。
+
 断行规则
 --------
 日期或凭证号为空时视为「接上一张凭证」，这正好对应
 Excel 里一张凭证连着几行分录的常见排版。
+
+用友序时账
+----------
+用友导出的**序时账**不是「一张凭证几行、后续行留空」，而是把每一条分录
+都平铺成一行，**每行都重复完整的日期与凭证号数**（实测
+``商管序时账.xls``：5579 行分录 = 556 张凭证，凭证号数逐行重复）。照上面
+那条「非空即新凭证」的规则去读，一张 112 条分录的凭证会被拆成 112 张
+每条都借贷不平衡的废凭证。
+
+所以这里多认一种排版：表头里有「上级科目」这类序时账独有的列时（见
+:func:`_looks_like_journal`），改成**日期与凭证号都和当前这张相同 = 接上一张**。
+判据只能落在表头上 —— 另一种同样存在的写法（每行都填日期、凭证号留空交给
+系统自动编号）在行内容上与序时账完全一样，靠行分不开，硬改规则会把那种表
+的两张小凭证并成一张。
 
 容量边界（审计 P2-02）
 ---------------------
@@ -36,7 +58,6 @@ Excel 里一张凭证连着几行分录的常见排版。
 """
 from __future__ import annotations
 
-import io
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -44,6 +65,7 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.accounting import subject_importer
 from app.accounting.audit_helper import log
 from app.accounting.util import money
 from app.core.config import settings
@@ -66,7 +88,53 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "direction": ("方向", "借贷", "借贷方向", "借或贷", "direction", "drcr"),
     "attachments": ("附单据数", "附件数", "单据数", "附单据", "attachments", "attach"),
     "remark": ("备注", "说明", "remark", "note"),
+    # 用友序时账多出来的三列。注册它们不是为了取值，而是为了**别再报成
+    # 「未识别的表头」**：那三列是正常业务列，用户看到自己的文件被列进
+    # 未识别清单只会怀疑是自己导出错了。
+    #   parent_subject —— 明细科目的完整路径（如「预收账款/星悦荟商业/1层/112」）。
+    #     它同时是 :func:`_looks_like_journal` 认序时账的主要判据，
+    #     且科目对不上时能拿它说清「这张凭证记的是哪个明细」。
+    #   quantity / foreign_amount —— 数量核算与外币核算两列，本表不取数
+    #     （Entry 上没有对应字段，辅助明细走 aux_ref）。
+    "parent_subject": ("上级科目", "科目全路径", "上级科目名称"),
+    "quantity": ("数量", "qty", "quantity"),
+    "foreign_amount": ("外币", "外币金额", "原币金额", "foreignamount", "fc"),
 }
+
+# 「方向」列认得的写法。用友序时账写「借 / 贷」，另一些系统写全的「借方 / 贷方」。
+DIRECTION_WORDS: dict[str, str] = {
+    "借": "DEBIT", "借方": "DEBIT", "d": "DEBIT", "debit": "DEBIT", "dr": "DEBIT",
+    "贷": "CREDIT", "贷方": "CREDIT", "c": "CREDIT", "credit": "CREDIT", "cr": "CREDIT",
+}
+
+# 序时账的表头判据。「上级科目」是它独有的列（明细科目的完整路径），
+# 普通凭证导入表不会有这一列。
+JOURNAL_HEADER_MARKERS = ("上级科目", "科目全路径", "上级科目名称")
+
+
+def _looks_like_journal(header: list[Any]) -> bool:
+    """这份表是用友的序时账吗（逐条分录平铺、每行重复日期与凭证号数）。
+
+    判据只能落在表头上，这一点值得说明白：序时账那种「每行都填日期与凭证号」
+    的排版，和「每行填日期、凭证号留空交给系统自动编号」的排版，
+    **在行内容上完全一样**，没有哪一列能把两者分开。区别只在整份表：
+
+    * 序时账逐条分录都带完整的日期与凭证号数，凭证号形如 ``记-0001``；
+    * 手工表是「一张凭证头一行、后续行留空」，凭证号常留空。
+
+    要是按行内容无差别地把「日期与凭证号相同」当成接上一张，那种自动编号的
+    写法就会被改掉 —— 每行都填日期的两张小凭证会被并成一张，而这种表
+    **今天是可以正常导入的**（两张各自平，凭证号留空由系统编号）。
+    宁可让序时账走一条单独的判据，也不改掉一条本来就对的规则。
+    """
+    names = {_norm(h) for h in header if h not in (None, "")}
+    if names & set(JOURNAL_HEADER_MARKERS):
+        return True
+    # 没有「上级科目」时退一步：序时账必带「数量 / 外币」两个核算列，
+    # 而普通凭证导入表只有借贷金额。要求两列同时出现，避免只勾了数量核算
+    # 的表被误判。
+    return "数量" in names and "外币" in names
+
 
 def _norm(value: Any) -> str:
     return "".join(str(value).split()).lower() if value is not None else ""
@@ -178,21 +246,50 @@ __all__ = [
 # --------------------------------------------------------------------- 解析
 
 
-def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
-    """解析 xlsx 字节流，返回可 JSON 化的暂存包。不写库。"""
-    from openpyxl import load_workbook
+def _read_error(exc: Exception) -> str:
+    """把底层 reader 的报错并回本模块对外的那一句。
 
+    分流用的是 ``subject_importer`` 里的两个 reader，它们各自报「无法读取 .xls
+    文件：…」/「无法读取 .xlsx 文件：…」。而本模块对外一直是一句「无法读取
+    Excel 文件：…」（``tests/test_import_limits.py`` 盯着这一句：不能因为多加了
+    一道容量检查，就把已经对用户说清楚的报错口径换掉）。所以摘掉重复的前缀、
+    把细节拼回去，一句话说完，不让人看到「无法读取 Excel 文件：无法读取
+    .xlsx 文件：…」这种叠罗汉。
+    """
+    text = str(exc).strip()
+    if text.startswith("Excel 里"):   # 「Excel 里没有工作表」本身就是完整报错
+        return text
+    for prefix in ("无法读取 .xls 文件：", "无法读取 .xlsx 文件："):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return f"无法读取 Excel 文件：{text}"
+
+
+def parse_workbook(data: bytes, book_id: int, db: Session,
+                   filename: str | None = None) -> dict:
+    """解析 Excel 字节流（``.xlsx`` 或用友的 ``.xls``），返回可 JSON 化的暂存包。
+
+    不写库。``filename`` 只在文件内容看不出格式时兜底，所以它是可选参数 ——
+    既有调用方（测试里成片的 ``parse_workbook(data, book.id, db)``）不用改。
+    """
     check_archive_size(data)
     try:
-        wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"无法读取 Excel 文件：{exc}") from exc
+        _sheet, rows_iter, _fmt = subject_importer.iter_workbook_rows(
+            data, filename or "")
+    except ValueError as exc:
+        raise ValueError(_read_error(exc)) from exc
 
-    ws = wb.active
-    if ws is None:
-        raise ValueError("Excel 里没有工作表")
+    try:
+        return _parse_rows(rows_iter, book_id, db)
+    finally:
+        # reader 把「关工作簿」放在行生成器的 finally 里（.xls 的
+        # release_resources / .xlsx 的 close）。正常路径会把生成器耗尽而触发它，
+        # 但异常路径（撞上限、金额非法）不会 —— 不显式关就是漏一个句柄。
+        rows_iter.close()
 
-    rows_iter = ws.iter_rows(values_only=True)
+
+def _parse_rows(rows_iter, book_id: int, db: Session) -> dict:
     try:
         header = [c for c in next(rows_iter)]
     except StopIteration as exc:
@@ -215,6 +312,8 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
 
     by_code, by_name = _subject_index(db, book_id)
     unknown_subjects: dict[str, str] = {}
+    journal = _looks_like_journal(header)
+    footer_rows = 0
 
     def col(key: str, row: list[Any]) -> Any:
         idx = mapping.get(key)
@@ -243,10 +342,18 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
             current["errors"].append("没有任何分录")
         elif dr != cr:
             current["errors"].append(f"借贷不平衡：借 {dr} / 贷 {cr}")
-        elif dr == 0 and cr == 0:
-            # 只挡「全零」，不挡负数：红字凭证（-300 / -300）是冲销，
-            # 照样是平的、照样该存 —— 冲掉一张记错的凭证正是记账的日常。
-            current["errors"].append("借贷金额相抵为 0，这张凭证什么也没记")
+        # 这里**不再**挡「借贷合计都是 0」。
+        #
+        # 原来挡的是 ``dr == 0 and cr == 0``，注释写着「只挡全零，不挡负数」，
+        # 可它拿**合计**代替了「有没有记东西」，于是把同侧相抵的凭证一起误杀：
+        # 用友导出的商管序时账 556 张里有 6 张是这种（结息、团体险分摊、
+        # 工会经费返还 —— 银行账户几笔正数 + 费用一笔等额负数，借方自己抵平），
+        # 报出来是「这张凭证什么也没记」，恰恰说反了。
+        #
+        # 而「一条都没填」这件事上面那句「没有任何分录」已经拦住了：两条取
+        # 金额的路（借贷双列、单金额列）都以「解析出来是不是非零」为准，
+        # 金额 0 的行根本不生成分录，所以**分录的金额永远不为 0** ——
+        # 再加一道「每条都是 0」的判断只能是走不到的死代码。
         current["ok"] = not current["errors"]
         vouchers.append(current)
         current = None
@@ -268,13 +375,51 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
 
         raw_date = col("voucher_date", row)
         raw_no = col("voucher_no", row)
-        if raw_date not in (None, "") or raw_no not in (None, ""):
+        row_date = str(raw_date).strip() if raw_date not in (None, "") else ""
+        row_no = str(raw_no).strip() if raw_no not in (None, "") else ""
+        row_subject = col("subject", row)
+        if row_subject in (None, ""):
+            row_subject = col("subject_name", row)
+
+        # 表尾的「合计」行：没有日期、没有凭证号、也没有科目，却带着金额。
+        # 用友序时账必带这种行（借贷两行合计全部发生额），而它本来会命中下面
+        # 的「接上一张」规则，被挂到上一张**真实**凭证头上 ——
+        # 实测那份商管序时账的合计是 14,538,288.54，够把一张凭证直接撑爆。
+        # 所以在这里挡掉，并且计数上报，不静默吞掉。
+        #
+        # 只认「三项全空」这一个形状：这种行在任何格式下都不可能是分录，
+        # 判据不含糊。曾经的处理是让它报「有金额但没填科目」并把上一张凭证
+        # 标成不通过 —— 那是把表尾的合计误算到别人的账上。
+        if not (row_date or row_no or (row_subject not in (None, ""))):
+            # 全空行在上一段已经 continue 过了，走到这里的必然有内容。
+            footer_rows += 1
+            continue
+
+        # 换一张凭证的判据。
+        #
+        #   * 普通表：日期或凭证号非空 = 新的一张（一张凭证几行，后续行留空）。
+        #   * 序时账：每行都重复完整的日期与凭证号数，所以**与当前这张相同
+        #     才算接上一张**。少了这个区分，一张 112 条分录的凭证会被拆成
+        #     112 张每条都借贷不平衡的废凭证 —— 而且它不是报错，是「成功导入
+        #     0 张可用凭证」，最容易把人骗过去。
+        #
+        # 顺带把凭证号原样留着（用友是「记-0001」这种），因为系统的唯一约束是
+        # (期间, 凭证号)：用友每个月都从 0001 重新编号，跨月重号是正常的，
+        # 落在不同期间里本来就不冲突；而按期间分组这件事 create_voucher
+        # 会用日期去找，不依赖这里。
+        same_as_current = (
+            current is not None and row_date and row_no
+            and current.get("voucher_date_raw") == row_date
+            and current.get("voucher_no") == row_no
+        )
+        starts_voucher = bool(row_date or row_no) and not same_as_current
+        if starts_voucher:
             close_current()
             current = {
                 "line": line_no,
                 "voucher_date": _as_date(raw_date).isoformat() if _as_date(raw_date) else None,
-                "voucher_date_raw": str(raw_date or ""),
-                "voucher_no": str(raw_no).strip() if raw_no not in (None, "") else None,
+                "voucher_date_raw": row_date,
+                "voucher_no": row_no or None,
                 "remark": str(col("remark", row) or ""),
                 "attachments": int(_as_decimal(col("attachments", row)) or 0),
                 "entries": [],
@@ -286,22 +431,27 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
         if current is None:
             continue  # 表头之后的空行 / 无日期无凭证号的散行
 
-        subject_raw = col("subject", row)
-        if subject_raw in (None, ""):
-            subject_raw = col("subject_name", row)
         subject = None
-        if subject_raw not in (None, ""):
-            key = str(subject_raw).strip()
+        if row_subject not in (None, ""):
+            key = str(row_subject).strip()
             subject = by_code.get(key) or by_name.get(key)
+            # 序时账的「上级科目」是明细科目的完整路径，科目对不上时它就是
+            # 最有用的那句线索：用户能据此判断是本账套缺了这个明细，还是
+            # 自己在别的模块录了同一件事。没有这一列时不提。
+            path_hint = ""
+            path = col("parent_subject", row)
+            if path not in (None, "") and journal:
+                path_hint = f"，该分录的上级科目路径是「{str(path).strip()}」"
             if subject is None:
                 unknown_subjects[key] = "科目编码或名称在本账套不存在"
-                current["errors"].append(f"第 {line_no} 行：找不到科目「{key}」")
+                current["errors"].append(
+                    f"第 {line_no} 行：找不到科目「{key}」{path_hint}")
             elif not subject.is_leaf:
                 # 表里写的是上级科目。它存在，只是不能往它身上记：
                 # 说清楚是哪一行、哪个科目，人改表还是改科目决定权都在自己手上
                 unknown_subjects[key] = "不是明细科目，凭证要记在明细级"
                 current["errors"].append(
-                    f"第 {line_no} 行：{subject.code} {subject.name} 不是明细科目，凭证要记在明细级")
+                    f"第 {line_no} 行：{subject.code} {subject.name} 不是明细科目，凭证要记在明细级{path_hint}")
                 subject = None
 
         # 借贷方向由「值填在哪一列」决定，**不能靠正负猜**。
@@ -339,22 +489,22 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
         elif cr_filled:
             direction, amount, amount_raw = "CREDIT", cr, str(raw_cr)
         elif "amount" in mapping and col("amount", row) not in (None, ""):
-            # 单金额 + 方向列的老表格式
+            # 单金额 + 方向列的老表格式。用友序时账走的正是这一路：
+            # 一列「金额」配一列「方向」（写「借」或「贷」）。
             raw_amt = col("amount", row)
             amt, amt_err = _parse_amount(raw_amt)
             if amt_err:
                 current["errors"].append(f"第 {line_no} 行：{amt_err}")
-            d = str(col("direction", row) or "").strip()
+            raw_dir = str(col("direction", row) or "").strip()
+            d = DIRECTION_WORDS.get(_norm(raw_dir))
             if amt == 0:
                 pass                      # 金额 0：不生成行（错误若已记过就够了）
-            elif d in ("借", "DEBIT", "D"):
-                direction, amount, amount_raw = "DEBIT", amt, str(raw_amt)
-            elif d in ("贷", "CREDIT", "C"):
-                direction, amount, amount_raw = "CREDIT", amt, str(raw_amt)
+            elif d is not None:
+                direction, amount, amount_raw = d, amt, str(raw_amt)
             else:
                 current["errors"].append(
                     f"第 {line_no} 行：金额 {raw_amt!r} 无法判断方向，"
-                    f"方向列填「{d or '空'}」，只认 借/贷 或 DEBIT/CREDIT")
+                    f"方向列填「{raw_dir or '空'}」，只认 借/贷 或 DEBIT/CREDIT")
 
         if direction is None:
             # 这一行没有金额：表头、空行、说明文字都走这条路，不该报错。
@@ -362,7 +512,7 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
             continue
         if subject is None:
             # 找不到科目 / 不是明细科目：原因上面已经记过，这里只补「压根没填科目」
-            if subject_raw in (None, ""):
+            if row_subject in (None, ""):
                 current["errors"].append(f"第 {line_no} 行：有金额但没填科目")
             continue
 
@@ -379,7 +529,6 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
         )
 
     close_current()
-    wb.close()
 
     if not vouchers:
         raise ValueError("没有解析出任何凭证行")
@@ -393,6 +542,8 @@ def parse_workbook(data: bytes, book_id: int, db: Session) -> dict:
         "errors": errors,
         "unknown_subjects": unknown_subjects,
         "unknown_headers": unknown,
+        "journal": journal,
+        "footer_rows": footer_rows,
     }
 
 
@@ -424,6 +575,10 @@ def _summarized_payload(payload: dict | None) -> dict:
         "errors": errors,
         "unknown_subjects": payload.get("unknown_subjects") or {},
         "unknown_headers": payload.get("unknown_headers") or [],
+        # 这两项是「这份表长什么样」的描述，不含凭证正文，留在摘要里正好
+        # 让事后复盘知道当初是不是走的序时账排版、跳过了几行合计。
+        "journal": bool(payload.get("journal")),
+        "footer_rows": int(payload.get("footer_rows") or 0),
     }
     if dropped:
         summary["errors_truncated"] = dropped
@@ -431,7 +586,7 @@ def _summarized_payload(payload: dict | None) -> dict:
 
 
 def stage(db: Session, book_id: int, user: SysUser, filename: str, data: bytes) -> ImportBatch:
-    parsed = parse_workbook(data, book_id, db)
+    parsed = parse_workbook(data, book_id, db, filename=filename)
     ok = sum(1 for v in parsed["vouchers"] if v["ok"])
     batch = ImportBatch(
         book_id=book_id,
