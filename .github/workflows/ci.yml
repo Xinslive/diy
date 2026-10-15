@@ -304,3 +304,120 @@ jobs:
       # 守卫，专门防「脚本压根没跑起来却一片绿」。
       - name: 跑沙箱演练
         run: bash deploy/tests/test_deploy.sh
+
+  # ------------------------------------------------------------------ 构建产物
+  #
+  # **这条 job 存在的理由：让生产机不必再当构建机。**
+  #
+  # 原来的 deploy.sh 在生产机上跑全量 pytest（-n 6，6 个并行 worker 各自
+  # 建独立 PG 库）加 pnpm install 加 vite build。那是生产机上最重的一步 ——
+  # 比运行时重得多，且要求生产机常驻 Node.js / pnpm / pytest 三套工具链，
+  # 只为了发一次版。
+  #
+  # 改成「CI 出产物、生产机只取产物重启」之后，生产机不再需要这三样，
+  # 发版尖峰也随之消失。
+  #
+  # **「测试闸门」没有被削弱，只是换了位置。** deploy.sh 原来的第一条铁律是
+  # 「先跑测试再切流量」。现在这个闸门由 `needs:` 承担：本 job 必须等
+  # backend 与 frontend 两条 job 都成功才会跑，所以**产物存在即代表后端全量
+  # pytest 与前端测试/构建都过了**。生产机「能不能取到产物」就是新的闸门 ——
+  # 取不到就不会重启服务。
+  #
+  # 护栏校验（护栏必须真的被执行、用例数下限，见 backend job 里的说明）
+  # **在 backend job 里生效**，而本 job `needs: backend`，所以它同样是上线
+  # 前置条件，不是在本地跑跑就算的那道闸。
+  build-artifacts:
+    name: 构建可部署产物
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'   # 与 Dockerfile / systemd / CI backend 一致
+
+      - name: 按锁定版本装运行时依赖（不是 requirements-dev.lock）
+        working-directory: backend
+        # **只装 requirements.lock**：生产机拿到这个产物后装的就是同一套。
+        # 这里若用了 dev 锁（带 pytest / httpx），产物里就会混入生产用不到的
+        # 东西，而「产物里跑的是哪一版」又变成看构建那天的心情。
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+
+      - name: 验证 schema 自洽（空库跑完整迁移链）
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+psycopg://cwq:cwq123@127.0.0.1:5432/cwq_artifacts
+        # 产物里带了 migrations/ 却不保证它能 upgrade，生产机上就是
+        # 「代码已切、schema 没升」—— 服务起不来，或者更糟：起得来但读的是旧表。
+        # 这里在 CI 里先跑一遍，失败就不该有产物。
+        services:
+          postgres:
+            image: postgres:16
+            env:
+              POSTGRES_USER: cwq
+              POSTGRES_PASSWORD: cwq123
+              POSTGRES_DB: cwq_artifacts
+            ports: ['5432:5432']
+            options: >-
+              --health-cmd "pg_isready -U cwq"
+              --health-interval 5s
+              --health-timeout 5s
+              --health-retries 10
+        run: |
+          set -euo pipefail
+          python -m alembic upgrade head
+          echo "schema 版本：$(python -m alembic current | tail -1)"
+
+      - name: 构建前端
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm install --frozen-lockfile --silent
+          pnpm run build
+
+      - name: 打包产物
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA::12}"
+          OUT="dist-artifacts"
+          mkdir -p "$OUT"
+
+          # 后端：源码 + 运行时锁 + 迁移文件。**不含** tests / .venv /
+          # requirements-dev.* —— 生产机不需要测试框架（那是「机器上装的
+          # 东西到底是给谁用的」说不清的老问题）。
+          tar -czf "$OUT/cwq-backend-${SHA}.tar.gz" \
+            -C backend \
+            --exclude='tests' --exclude='.venv' --exclude='__pycache__' \
+            --exclude='*.pyc' --exclude='logs' \
+            app scripts migrations alembic.ini requirements.lock pytest.ini
+
+          # 前端：只有产物目录，不含 src / node_modules
+          tar -czf "$OUT/cwq-frontend-${SHA}.tar.gz" -C frontend dist
+
+          # 清单：版本 + 构件名。生产机据此确认「拿到的是 CI 出品的那一份」。
+          {
+            echo "sha=${SHA}"
+            echo "commit=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF_NAME}"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "backend=cwq-backend-${SHA}.tar.gz"
+            echo "frontend=cwq-frontend-${SHA}.tar.gz"
+          } > "$OUT/manifest.txt"
+          ( cd "$OUT" && sha256sum ./*.tar.gz > SHA256SUMS )
+
+          cat "$OUT/manifest.txt"
+          ls -lh "$OUT"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: cwq-deploy-${{ github.sha }}
+          path: dist-artifacts/
+          retention-days: 30
+          if-no-files-found: error   # 产物没生成出来就不许「成功」

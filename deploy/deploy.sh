@@ -1,150 +1,194 @@
 #!/usr/bin/env bash
-# 发布脚本。三个铁律：
-#   1. 先跑测试再切流量 —— 测试不过就不重启
-#   2. 备份上一版代码，回滚是改回来而不是重新编译
-#   3. 表结构变更只由 Alembic 负责，发布流程会先备份数据库再执行
-#      ``alembic upgrade head``；迁移失败就不重启、不切前端产物
+# 发布脚本。四个铁律：
+#   1. 先验证再切流量 —— 产物取不到就不重启
+#   2. 备份上一版，回滚是改回来而不是重新编译
+#   3. 表结构变更只由 Alembic 负责，迁移前必须先备份数据库
+#   4. 备份失败就不迁移
 #
-# **第 3 条原来是反的（P3-13）。** 旧注释写的是「数据库不在这条链路里（无
-# migration），schema 由应用启动时自建」，而实现恰恰相反：第 6 步执行的就是
-# ``alembic upgrade head``。注释说没有、代码在做，后果是看脚本的人按注释理解
-# ——以为发版完全不碰数据库，于是在没有备份、没打算回滚的情况下发版。注释必须
-# 和实现一致，否则它比没有注释更危险。
+# ---------------------------------------------------------------------------
+# **第 1 条的铁律变了，闸门没变弱。**
+# ---------------------------------------------------------------------------
+# 原来这里是「git pull → pytest -q → pnpm build → 迁移 → 切产物 → 重启」，
+# 也就是**生产机自己就是构建机**。实测（压测基线报告 2026-10-15）那条路径是
+# 生产机上最重的一步：pytest.ini 默认 ``-n 6``，6 个并行 worker 各自要建一个
+# 独立 PG 库（conftest 按 PYTEST_XDIST_WORKER 加库名后缀），再叠 pnpm install
+# 与 vite build。它要求生产机常驻 Node.js / pnpm / pytest 三套只为发版存在的
+# 工具链，还让发版尖峰有机会把机器压垮。
+#
+# 现在改成：CI（.github/workflows/ci.yml 的 build-artifacts job）出产物，
+# 生产机只负责取产物 → 装运行时依赖 → 迁移 → 切产物 → 重启。
+#
+# **「先跑测试再切流量」并没有被削弱，只是闸门换了位置。** build-artifacts
+# job 的 ``needs: [backend, frontend]`` 意味着：产物存在 = 后端全量 pytest
+# 与前端测试/构建都已通过。所以这里的「取产物」就是新的闸门 ——
+# **取不到就 exit 1，什么都不动**。backend job 里那道「护栏必须真的被执行」
+# 和「用例数下限」的校验，同样因为这条 needs 而成为上线前置条件。
+#
+# **部署机不再需要** node / pnpm / pytest / postgresql-client 之外的构建工具：
+# 只有 pg_dump（备份用）与 git（可选，仅用于记录版本）还需要。
 set -euo pipefail
 
 APP=${APP_DIR:-/opt/cwq}
 KEEP=3
-# 分支不要写死。仓库默认分支改名（main/master 之争）时，写死的名字会在
-# ``set -e`` 下直接让发布失败 —— 而这恰恰是**最不该失败的时候**
-# （运维正在发布，脚本却因为分支名对不上而中断）。
-# 优先用显式指定，其次 remote HEAD，最后退回 main/master 挨个试。
+# 分支不写死（仓库默认分支改名时，写死的名字会让发布脚本在 ``set -e`` 下
+# 直接失败 —— 而那是最不该失败的时候）。发布模式不再 checkout 分支，
+# 这个变量保留是为了 ``--check-only`` 与运维排查时仍能回答「现在跑的是哪条线」。
 : "${DEPLOY_BRANCH:=}"
 BRANCH="$DEPLOY_BRANCH"
 RELEASES="$APP/.releases"
 
+# ---------------------------------------------------------------------------
+# 产物从哪来
+# ---------------------------------------------------------------------------
+# 默认用 GitHub CLI 从 Actions 拉本次 commit 的产物。装 gh 并登录一次
+# （GH_TOKEN 环境变量，或 ``gh auth login``）即可。
+#
+# **可以完全绕开 gh**：把三个文件（两个 tar.gz + manifest.txt + SHA256SUMS）
+# 下载到任意目录，然后用 ``ARTIFACT_DIR`` 指过去。这条路径让部署可以
+# 走内网镜像、对象存储、或人工上传 —— 脚本不关心来源，只校验产物本身。
+: "${ARTIFACT_DIR:=}"
+: "${REPO:=$(cd "$APP" 2>/dev/null && git config --get remote.origin.url || echo '')}"
+: "${ARTIFACT_REF:=main}"
+
 log() { echo "[$(date '+%F %T')] $*"; }
 
-resolve_branch() {
-  if [[ -n "$BRANCH" ]]; then echo "$BRANCH"; return; fi
-  # remote HEAD 是「远端默认分支」，跟着仓库走，不会过期
-  local head
-  if head=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null); then
-    echo "${head#origin/}"; return
+die() { echo "[$(date '+%F %T')] ❌ $*" >&2; exit 1; }
+
+# --------------------------------------------------------------------------
+# 产物的取得与校验
+# --------------------------------------------------------------------------
+
+fetch_artifacts() {
+  local dest="$1"
+
+  if [[ -n "$ARTIFACT_DIR" ]]; then
+    # 人工投放：只要四个文件在就算数，来源不追究
+    local missing=0
+    for f in manifest.txt SHA256SUMS; do
+      [[ -f "$ARTIFACT_DIR/$f" ]] || { echo "  缺 $f"; missing=1; }
+    done
+    compgen -G "$ARTIFACT_DIR/*.tar.gz" > /dev/null || { echo "  缺 *.tar.gz"; missing=1; }
+    [[ $missing -eq 0 ]] || die "ARTIFACT_DIR=${ARTIFACT_DIR} 里没有完整的一套产物。
+   内容应当是：cwq-backend-<sha>.tar.gz、cwq-frontend-<sha>.tar.gz、
+   manifest.txt、SHA256SUMS（build-artifacts job 产出）。"
+    cp "$ARTIFACT_DIR"/*.tar.gz "$ARTIFACT_DIR"/manifest.txt \
+       "$ARTIFACT_DIR"/SHA256SUMS "$dest"/
+    log "  从 ARTIFACT_DIR 取得产物"
+    return
   fi
-  for cand in main master; do
-    if git show-ref --verify --quiet "refs/remotes/origin/$cand"; then
-      echo "$cand"; return
-    fi
-  done
-  log "❌ 找不到可用的远端分支，请设置 DEPLOY_BRANCH"; exit 1
+
+  command -v gh > /dev/null 2>&1 || die "没装 gh，也没有指定 ARTIFACT_DIR。
+   二选一：
+     1) 装 gh 并设好 GH_TOKEN，然后重跑
+     2) 把 build-artifacts 的产物下载到任意目录，用 ARTIFACT_DIR=... 指定"
+
+  log "  从 GitHub Actions 拉取 ${ARTIFACT_REF} 的产物"
+  # ``--repo`` 显式给，不依赖当前目录是不是 git 仓库 —— 部署目录可能只是
+  # 一个被 rsync 过来的产物，没有 .git，那 gh 会因为认不出仓库而失败。
+  ( cd "$dest" && gh run download --repo "$REPO" --name "cwq-deploy-$(gh run view --repo "$REPO" --json headSha -q .headSha)" ) \
+    || die "取产物失败 —— 这一步取不到就意味着 CI 没全绿（build-artifacts 的 needs
+   是 [backend, frontend]）。**没有任何东西被改动，服务仍是上一版。**"
 }
 
-cd "$APP"
+verify_artifacts() {
+  local dir="$1"
+  # sha256 校验：确认拿到的是 CI 出品的那一份，而不是传输损坏或中途被换过。
+  ( cd "$dir" && sha256sum --check SHA256SUMS ) \
+    || die "产物校验和不匹配 —— 文件在传输中损坏或被替换过。**没有改动任何东西。**"
+  log "  产物校验和通过"
+  # 清单里的版本要跟 manifest 自洽：文件名带 sha，manifest 也记同一个 sha。
+  local sha
+  sha=$(sed -nE 's/^sha=//p' "$dir/manifest.txt")
+  [[ -n "$sha" ]] || die "manifest.txt 里没有 sha= 那一行，产物不是预期格式。"
+  ls "$dir"/*-"${sha}".tar.gz > /dev/null 2>&1 \
+    || die "产物文件名里的 sha 与 manifest 不一致（manifest: ${sha}）。**没有改动任何东西。**"
+  log "  产物版本 ${sha}（commit $(sed -nE 's/^commit=//p' "$dir/manifest.txt")）"
+}
 
-# --check-only 必须**真的只检查**。原来这里只 log 了一句就往下走，
-# 于是运维以为在做发布前预检，实际执行了完整发布流程 ——
-# 备份、装依赖、跑测试、构建、重启服务，一样没少。
+# --------------------------------------------------------------------------
+# --check-only 必须**真的只检查**（原来就有的语义，不许悄悄改成真发布）
+# --------------------------------------------------------------------------
 if [[ "${1:-}" == "--check-only" ]]; then
   log "只做检查，不发布"
-  log "  当前分支: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 未知)"
-  log "  待发布分支: $(resolve_branch)"
-  log "  后端依赖: $([[ -x ./.venv/bin/python ]] && echo 已就绪 || echo '缺失 .venv')"
-  log "  后端锁文件: $([[ -f backend/requirements-dev.lock ]] && echo requirements-dev.lock || echo '缺失 —— 将退回未锁定的 requirements.txt')"
-  log "  前端锁文件: $([[ -f frontend/pnpm-lock.yaml ]] && echo pnpm-lock.yaml || echo '缺失')"
+  log "  当前分支: $(git rev-parse --abbrev-current HEAD 2>/dev/null || echo 未知)"
+  log "  产物来源: ${ARTIFACT_DIR:-（未指定，将从 GitHub Actions 拉取）}"
+  log "  后端依赖: $([[ -x "$APP/backend/.venv/bin/python" ]] && echo 已就绪 || echo '缺失 .venv')"
+  log "  后端锁文件: $([[ -f "$APP/backend/requirements.lock" ]] && echo requirements.lock || echo '缺失')"
+  log "  Node 工具链: $(command -v pnpm >/dev/null && echo '⚠️ 仍装着（发版已不再需要，可以卸）' || echo '未安装（符合预期）')"
+  log "  pytest: $(command -v pytest >/dev/null && echo '⚠️ 仍装着（发版已不再需要，可以卸）' || echo '未安装（符合预期）')"
   log "  磁盘可用: $(df -h "$APP" | awk 'NR==2{print $4}')"
   exit 0
 fi
 
-BRANCH=$(resolve_branch)
+cd "$APP"
 
-log "1/7 拉代码（分支 ${BRANCH}）"
-git fetch --all
-git checkout "$BRANCH"
-git pull --ff-only
+STAGE="$APP/.artifact.$$"
+mkdir -p "$STAGE"
 
 # 每次发布都备份。原来是「目录不存在才备份」，父目录又从没被创建过 ——
 # 于是 ``cp -a backend "$APP/.releases/<时间戳>"`` 在首次部署时因父目录
 # 缺失而失败（有 set -e，直接中断）；而就算侥幸建成了，也只有第一次
 # 发布会备份，之后每次发布都在**没有备份**的情况下覆盖代码。
-log "2/7 备份当前版本"
-mkdir -p "$RELEASES"
-# 时间戳只到秒：同一秒里连发两次（比如上一��失败后立刻重试）会撞成
-# 同一个目录，第二次把第一次的备份覆盖掉 —— 于是「有备份」这件事
-# 看着成立，真要回滚时拿到的却是新版本。加个序号后缀躲开。
+log "1/7 取 CI 产物（测试闸门：取不到就是 CI 没全绿）"
 STAMP=$(date '+%Y%m%d-%H%M%S')
 n=1
 while [[ -e "$RELEASES/$STAMP" ]]; do
   STAMP="$(date '+%Y%m%d-%H%M%S')-$n"
   n=$((n + 1))
-  [[ "$n" -gt 100 ]] && { log "❌ 备份目录名反复冲突，中止"; exit 1; }
+  [[ "$n" -gt 100 ]] && { die "备份目录名反复冲突，中止"; }
 done
+
+fetch_artifacts "$STAGE"
+verify_artifacts "$STAGE"
+SHA=$(sed -nE 's/^sha=//p' "$STAGE/manifest.txt")
+log "  取到产物 ${SHA}"
+
+log "2/7 备份当前版本"
+# 备份目录在**产物取到之后**才建。建早了的后果很小（多一个空目录），
+# 但它意味着「取不到产物」这件事在磁盘上留了痕迹 —— 而取不到产物正是
+# 「CI 没全绿」这条闸门触发的场合，那一刻应该**一个字节都没动**。
+mkdir -p "$RELEASES"
 mkdir -p "$RELEASES/$STAMP"
 for d in backend frontend/dist; do
   if [[ -e "$APP/$d" ]]; then
     cp -a "$APP/$d" "$RELEASES/$STAMP/$(basename "$d")"
   fi
 done
-log "  已备份到 ${RELEASES}/${STAMP}"
+# 产物本身也存一份：回滚时不必重新下载，产物被清理掉也还能退回去
+cp -a "$STAGE" "$RELEASES/$STAMP/artifact"
+echo "  已备份到 ${RELEASES}/${STAMP}"
 
-log "3/7 装依赖"
+# --------------------------------------------------------------------------
+# 装依赖：只装 requirements.lock
+# --------------------------------------------------------------------------
+# 原来装的是 requirements-dev.lock —— 因为第 4 步的测试闸要用 pytest。
+# 测试闸移到 CI 之后，生产机就不需要测试框架了，于是这里也换成运行时锁。
+# 这条改动不是顺手：dev 锁里带 pytest / httpx，生产机上装不装测试框架
+# 曾经是「说不清这台机器装的东西是给谁用的」。
+log "3/7 装运行时依赖"
 cd "$APP/backend"
-# 装**开发锁**（requirements-dev.lock = 运行时锁 + pytest + httpx），不是
-# requirements-dev.txt。原因有二：
-#   * 逐包定版 —— requirements*.txt 全是「>=」，装它等于每次发布都换一套版本。
-#     那次测试跑通的依赖，和这次要发布的依赖，可能根本不是同一套东西；
-#   * 必须含 pytest —— 第 4 步的测试闸要用它。只装 requirements.lock（纯运行时）
-#     会让这台机器上 pytest 消失，测试闸直接跑不起来。这台发布机因此装着
-#     pytest，是「它要先考试才能上岗」的代价，不是把测试框架塞进了生产镜像。
-if [[ -f requirements-dev.lock ]]; then
-  ./.venv/bin/pip install -q -r requirements-dev.lock
-elif [[ -f requirements.lock ]]; then
-  log "⚠️  缺 requirements-dev.lock，只装运行时依赖 —— 第 4 步的测试闸可能跑不起来"
+if [[ -f requirements.lock ]]; then
   ./.venv/bin/pip install -q -r requirements.lock
-elif [[ -f requirements.txt ]]; then
-  log "⚠️  缺锁文件，本次退回未锁定的 requirements.txt —— 版本可能与测试时不同"
-  ./.venv/bin/pip install -q -r requirements.txt
 else
-  # 既没有锁也没有清单：这不是 git 拉下来的仓库，是个手工搭的目录
-  # （deploy/tests/test_deploy.sh 的沙箱就是这种形状，.venv 里全是桩）。
-  # 这里不中止 —— 中止只会让沙箱在第 3 步就死掉，后面所有断言又会变成
-  # 「脚本压根没跑起来所以什么都没发生」的假绿。但要喊出来。
-  log "⚠️  这个发布目录里既没有锁文件也没有 requirements.txt，跳过装依赖"
+  die "缺 requirements.lock —— 没有锁文件就无法保证「装出来的就是测试时那一版」。
+   **当前版本仍在服务，未做任何改动。**"
 fi
 
-log "4/7 跑测试（不通过就中止，不重启）"
-if ! ./.venv/bin/python -m pytest -q; then
-  log "❌ 测试未通过，保持现状不变"
-  exit 1
-fi
-
-# 项目提交的是 pnpm-lock.yaml，仓库里没有 package-lock.json，
-# 所以 ``npm ci`` **必然失败**（npm ci 要求有 package-lock.json）。
-log "5/7 构建前端"
-cd "$APP/frontend"
-if ! command -v pnpm >/dev/null 2>&1; then
-  log "❌ 没装 pnpm，但仓库的锁文件是 pnpm-lock.yaml"; exit 1
-fi
-pnpm install --frozen-lockfile --silent
-pnpm run build
-
-# 表结构变更只由 Alembic 负责（P3-01）。原来「应用启动时 create_all」，
-# 而 create_all 只建缺失的表、不改已存在的表 —— 生产上加一列 NOT NULL
-# 会静默不生效，服务照常启动，问题到运行时才炸。
+# --------------------------------------------------------------------------
+# 表结构变更只由 Alembic 负责（P3-01）
+# --------------------------------------------------------------------------
+# 原来这里跑的是「应用启动时 create_all」，而 create_all 只建缺失的表、
+# 不改已存在的表 —— 生产上加一列 NOT NULL 会静默不生效，服务照常启动，
+# 问题到运行时才炸。现在由 CI 产出的迁移 + 这里的 upgrade head 负责。
 #
-# 放在**测试之后、前端构建之后**：测试用的是测试库，不碰生产库，
-# 所以测试挂掉时生产库的 schema 一个字节都没动。
-log "6/7 备份数据库并执行迁移"
-# 上一步构建前端时 cwd 已经被带到 frontend 了。忘了切回来，
-# ``./.venv/bin/alembic`` 就会去 frontend/.venv 里找 —— 找不到，
-# 迁移这步直接失败退出，连带后面「保留 KEEP 份备份」也一起不执行。
-cd "$APP/backend"
+# 顺序仍然是「备份数据库 → 迁移 → 切产物 → 重启」，且任何一步失败都不切产物。
+log "4/7 备份数据库并执行迁移"
 DUMP="$RELEASES/$STAMP/database-before-migration.sql"
-# 备份失败**必须**中止（P2-25）。
-#
+# 备份失败**必须中止**（P2-25）。
 # 原来这里是「备份失败只喊一句，迁移照跑」。但备份是这个系统唯一的退路 ——
 # 凭证号可回收、审计快照不可再生，迁移把表结构改坏之后能救命的只有这份 dump。
 # 退路失败还继续往前走，等于「以为有退路」和「没有退路」两种状态跑在同一段
-# 代码里，而且分不出来。真要豁免，就在 pg_dump 装不上的时候把备份步骤整个
+# 代码上，而且分不出来。真要豁免，就把 pg_dump 装不上的时候把备份步骤整个
 # 去掉并让发布失败，不要留一个「记得看一眼日志」的分支 —— 没人会看。
 if ./.venv/bin/python scripts/db_backup.py > "$DUMP" 2>"$RELEASES/$STAMP/db_backup.err"; then
   log "  数据库已备份到 ${DUMP}（$(wc -l < "$DUMP") 行）"
@@ -155,7 +199,7 @@ else
   exit 1
 fi
 # 恢复命令一并打出来：出事时要靠它，而临场想起来的命令一定是错的
-log "  万一要回退：cd $APP/backend && .venv/bin/python scripts/db_backup.py --restore --file ${DUMP}"
+log "  万一要退：cd $APP/backend && .venv/bin/python scripts/db_backup.py --restore --file ${DUMP}"
 if ! ./.venv/bin/alembic upgrade head; then
   log "❌ 数据库迁移失败，保持现状不变（前端产物没切、没重启）"
   log "   库已回滚到迁移前状态；修好 revision 后重新发布即可"
@@ -163,62 +207,68 @@ if ! ./.venv/bin/alembic upgrade head; then
 fi
 log "  schema 版本：$(./.venv/bin/alembic current 2>/dev/null | tail -1)"
 
-# 换名落位，而不是删了再移。原来是 ``rm -rf dist`` 紧跟 ``mv dist dist`` ——
-# 在同一个目录里自删自移：dist 先被自己删掉，后面那条 mv 必然失败
-# （而且是在构建花掉几分钟之后才失败）。这里先把新产物换到暂存名，
-# 再换上，窗口从「必然失败」缩到两次 rename 之间。
-#
-# 说清楚：这不是严格原子替换。真正原子要用符号链接切换，那要改
-# vite 的 outDir 与 systemd 的工作目录，超出这次修复的范围。
-# 旧产物已在第 2 步备份进 .releases，回滚路径不受这个窗口影响。
-log "7/7 切换前端产物"
-STAGE="$APP/frontend/.dist.new"
-rm -rf "$STAGE"
-mv "$APP/frontend/dist" "$STAGE"
-mv "$STAGE" "$APP/frontend/dist"
+log "5/7 切换代码与前端产物"
+# 代码换名落位而不是就地覆盖：就地 mv 会在解压与替换之间留一个「代码在、
+# 依赖不在」的窗口。替换本身用 tar 直接落到目标目录，失败时旧版本还在
+# .releases 里可退。
+tar -xzf "$STAGE/cwq-backend-${SHA}.tar.gz" -C "$APP/backend"
+log "  代码已切到 ${SHA}"
 
+# 前端：解压到暂存名，再**换名**换上。
+#
+# **这里踩过一个坑，值得写下来。** 直觉写法是
+# ``mv "$STAGE/dist" "$APP/frontend/dist"`` —— 但目标 dist **已经存在**，
+# ``mv`` 对已存在的目录是「移进去」而不是「替换掉」，于是产物落成
+# ``dist/dist/index.html``，而根目录那份旧 index.html 还在原地。
+# 脚本一路绿灯、服务照常起来、探活照常通过 —— 前端却还是旧的。
+# 沙箱演练（deploy/tests/test_deploy.sh 第 7 组）就是为这条加的断言。
+#
+# 所以顺序必须是：旧的让开 → 新的顶上 → 再删旧的。
+FRONT_IN="$APP/frontend/.dist.incoming"
+FRONT_OLD="$APP/frontend/.dist.old"
+rm -rf "$FRONT_IN" "$FRONT_OLD"
+mkdir -p "$FRONT_IN"
+tar -xzf "$STAGE/cwq-frontend-${SHA}.tar.gz" -C "$FRONT_IN"
+if [[ ! -d "$FRONT_IN/dist" ]]; then
+  die "前端产物里没有 dist/ —— 解压出来的东西不对。**前端产物没切、代码没重启。**"
+fi
+mv "$APP/frontend/dist" "$FRONT_OLD"
+mv "$FRONT_IN/dist" "$APP/frontend/dist"
+rm -rf "$FRONT_OLD" "$FRONT_IN"
+
+log "6/7 重启服务"
 systemctl restart cwq-api
 
 # 探活**轮询**而不是「睡 3 秒打一发」。
-#
 # 原来这里是 ``sleep 3`` + 单次 ``curl -fsS``，失败就非零退出。问题是走到这
-# 一行时，**该发生的都已经发生了**：迁移已执行、前端产物已切换、服务已重启。
-# 运维看到「发布失败」，而新版本其实已经在跑。于是这个失败信号指向了一个
-# 回滚不回去的状态 —— 照失败处理（回滚）等于把正在服务的版本撤掉，
-# 不处理又会以为线上还是旧版。真正的失败原因（新版本起不来）和真正的误报
-# （服务只是还没起来）在这个写法下长得一模一样。
-#
-# 探测口径沿用原来的那条命令（``curl -fsS``）—— ``-f`` 让 curl 在 HTTP >= 400
-# 时返回非零，所以「curl 退出码为 0」就等于「拿到 2xx/3xx」。
-# **刻意不改成解析 ``%{http_code}``**：那样只是把判定从 curl 挪到 shell，
-# 语义没变，还多一个失败面（比如代理/重定向场景下 curl 退出码与状态码
-# 的组合比想象中多）。这里要修的是「只试一次」，不是「换一套判定口径」。
-#
-# 唯一从 dev.sh 的 wait_http 借来的是**轮询**这个形状：最多 60 次 × 0.5 秒
-# = 30 秒。
+# 一行时「该发生的都已经发生了」：迁移已执行、产物已切换、服务已重启。
+# 运维看到「发布失败」，而新版本其实已经在跑 —— 于是这个失败信号指向了一个
+# 回滚不回去的状态。按失败处理（回滚）等于把正在服务的版本撤掉，不处理又
+# 会以为线上还是旧版。所以这里轮询，把「是不是真失败」和「只是没起来」分开。
 log "  等待 /api/health 应答（最多 30 秒）"
 health_ok=0
 for _ in $(seq 1 60); do
-  if curl -fsS -m 2 -o /dev/null http://127.0.0.1:8000/api/health 2>/dev/null; then
-    health_ok=1
-    break
-  fi
+  curl -fsS -m 2 -o /dev/null http://127.0.0.1:8000/api/health 2>/dev/null && { health_ok=1; break; }
   sleep 0.5
 done
 
 if [ "$health_ok" -ne 1 ]; then
   log "❌ 发布后 30 秒内 /api/health 没有给出 2xx/3xx"
-  log "   ⚠️  此时**新版本已经上线**：迁移已执行、前端产物已切换、服务已重启。"
+  log "   ⚠️  此时**新版本已经上线**：迁移已执行、产物已切换、服务已重启。"
   log "      这次发布不是「没发生」，不要直接当作「什么都没上线」。"
   log "   先分清是新版本起不来，还是探活口径不对："
   log "     journalctl -u cwq-api -n 200 --no-pager"
   log "     tail -50 /opt/cwq/backend/logs/api.err.log"
-  log "   需要回滚时（人工确认后再做），备份在 ${RELEASES}/${STAMP}"
+  log "   需要回滚时（人工确认后再做）：备份在 ${RELEASES}/${STAMP}"
+  log "     产物也在 ${RELEASES}/${STAMP}/artifact（回滚不必重新下载）"
   exit 1
 fi
 
 log "  /api/health 应答"
-log "✅ 发布完成"
+log "✅ 发布完成（${SHA}）"
 
-# 只保留最近 KEEP 个备份
+# 暂存目录：产物已经解压进 ${APP}，这里只是下载暂存
+rm -rf "$STAGE"
+
+# 只保留最近 KEEP 份备份
 ls -dt "$RELEASES"/*/ 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -rf

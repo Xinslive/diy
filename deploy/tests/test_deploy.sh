@@ -4,14 +4,19 @@
 # deploy.sh 没有测试框架，但「它到底能不能跑通」恰恰是这次要钉的东西 ——
 # 审计说这份脚本当前状态下无法成功完成一次发布，修完就该证明它能。
 #
-# 做法：用假的 git / pip / pytest / pnpm / systemctl / curl 顶替真命令，
-# 在临时目录里**真的把 deploy.sh 跑一遍**，然后断言它做了什么。
+# 做法：在临时目录里造出**真实的产物 tarball**（不是桩），
+# 用假的 pip / alembic / systemctl / curl 顶替真命令，
+# **真的把 deploy.sh 跑一遍**，然后断言它做了什么。
 #
 # 最重要的一条是 assert_ran：脚本必须真的跑起来了，后面所有断言才有意义。
 # 这个守卫是被「恒绿测试」坑出来的 —— 旧版 deploy.sh 把 APP 写死成
 # /opt/cwq（不支持覆盖），在沙箱里第一行 ``cd "$APP"`` 就失败退出，
 # 于是「没重启服务」「没跑测试」这些断言全都成立，一片绿。
 # 但那不是脚本修好了，是脚本**根本没执行**。
+#
+# **活着的判据随发布流程一起改了。** 旧流程第一步是 ``git fetch``，
+# 现在第一步是「取 CI 产物」—— 所以 assert_ran 盯的是产物有没有被取走，
+# 不是 git 有没有被调。改判据不是放水，是让守卫跟真实的第一步对齐。
 #
 # 运行：bash deploy/tests/test_deploy.sh
 set -uo pipefail
@@ -22,59 +27,76 @@ ok(){ echo "  OK   $1"; PASS=$((PASS+1)); }
 no(){ echo "  FAIL $1"; FAIL=$((FAIL+1)); }
 
 DEP_N=0
+FAKE_SHA="abc123def456"
+
+# --------------------------------------------------------------------------
+# 造一套真实产物（结构必须与 build-artifacts job 产出的一致）
+# --------------------------------------------------------------------------
+make_artifacts(){
+  local out="$1"
+  mkdir -p "$out"
+  local be="$DEPDIR/stage-backend" fe="$DEPDIR/stage-frontend"
+  mkdir -p "$be/app" "$be/scripts" "$be/migrations/versions" "$fe/dist"
+  echo "NEW backend code" > "$be/app/main.py"
+  echo "# new" > "$be/app/__init__.py"
+  echo "print('backup')" > "$be/scripts/db_backup.py"
+  echo "print('pass')" > "$be/migrations/env.py"
+  echo "[alembic]" > "$be/alembic.ini"
+  echo "SQLAlchemy==2.1.4" > "$be/requirements.lock"
+  echo "[pytest]" > "$be/pytest.ini"
+  echo "<html>new frontend</html>" > "$fe/dist/index.html"
+  tar -czf "$out/cwq-backend-${FAKE_SHA}.tar.gz" -C "$be" .
+  tar -czf "$out/cwq-frontend-${FAKE_SHA}.tar.gz" -C "$fe" dist
+  {
+    echo "sha=${FAKE_SHA}"
+    echo "commit=${FAKE_SHA}fullsha"
+    echo "ref=main"
+    echo "built_at=2026-10-15T00:00:00Z"
+    echo "backend=cwq-backend-${FAKE_SHA}.tar.gz"
+    echo "frontend=cwq-frontend-${FAKE_SHA}.tar.gz"
+  } > "$out/manifest.txt"
+  ( cd "$out" && sha256sum ./cwq-backend-${FAKE_SHA}.tar.gz \
+                        ./cwq-frontend-${FAKE_SHA}.tar.gz > SHA256SUMS )
+}
+
 setup_sandbox(){
   DEP_N=$((DEP_N+1))
   export DEPDIR="/tmp/cwq-dep-$DEP_N-$$"
+  rm -rf "$DEPDIR"
   mkdir -p "$DEPDIR/bin"
   APP="$DEPDIR/app"
   mkdir -p "$APP/backend/.venv/bin" "$APP/frontend/dist" "$APP/.git"
-  echo "backend content" > "$APP/backend/app.py"
-  echo "old frontend" > "$APP/frontend/dist/index.html"
-  touch "$APP/frontend/pnpm-lock.yaml"
+  echo "OLD backend content" > "$APP/backend/app.py"
+  echo "<html>old frontend</html>" > "$APP/frontend/dist/index.html"
+  echo "SQLAlchemy==2.1.4" > "$APP/backend/requirements.lock"
+  make_artifacts "$DEPDIR/artifacts"
 
-  # 假的 git：symbolic-ref 回答默认分支，其余调用只记账
-  cat > "$DEPDIR/bin/git" <<'EOF'
-#!/bin/sh
-echo "git $*" >> "$DEPDIR/calls"
-if [ "$1" = "symbolic-ref" ]; then echo "origin/master"; exit 0; fi
-if [ "$1" = "rev-parse" ]; then echo "master"; exit 0; fi
-if [ "$1" = "show-ref" ]; then exit 0; fi
-exit 0
-EOF
-  cat > "$DEPDIR/bin/pnpm" <<'EOF'
-#!/bin/sh
-echo "pnpm $*" >> "$DEPDIR/calls"
-if [ "$1" = "run" ]; then D=$(pwd)/dist; mkdir -p "$D"; echo "new frontend" > "$D/index.html"; fi
-exit 0
-EOF
-  for c in systemctl curl pip; do
+  for c in systemctl curl; do
     printf '#!/bin/sh\necho "%s $*" >> "$DEPDIR/calls"\nexit 0\n' "$c" > "$DEPDIR/bin/$c"
   done
-  # 后端 venv 里的 python 才是真正被调用的那个
-  printf '#!/bin/sh\necho "pytest $*" >> "$DEPDIR/calls"\nexit ${STUB_PYTEST_RC:-0}\n' \
-    > "$APP/backend/.venv/bin/python"
   printf '#!/bin/sh\necho "pip $*" >> "$DEPDIR/calls"\nexit 0\n' > "$APP/backend/.venv/bin/pip"
-  # deploy.sh 现在会跑 ``alembic upgrade head``。没有这个桩，set -e 会在
-  # 迁移那一步直接中断 —— 断言「没重启服务」之类又全部成立，一片绿，
-  # 但那只是因为脚本中途死了。
   printf '#!/bin/sh\necho "alembic $*" >> "$DEPDIR/calls"\nexit ${STUB_ALEMBIC_RC:-0}\n' \
     > "$APP/backend/.venv/bin/alembic"
-  # 数据库备份也走 venv 里的 python（脚本是 python 写的），桩要认它
-  printf '#!/bin/sh\nif [ "$1" = "scripts/db_backup.py" ]; then echo "SELECT 1;"; exit 0; fi\necho "pytest $*" >> "$DEPDIR/calls"\nexit ${STUB_PYTEST_RC:-0}\n' \
+  # db_backup.py 走 venv 里的 python，要真的吐点东西当备份
+  printf '#!/bin/sh\nif [ "$1" = "scripts/db_backup.py" ]; then echo "SELECT 1;"; exit ${STUB_BACKUP_RC:-0}; fi\necho "python $*" >> "$DEPDIR/calls"\nexit 0\n' \
     > "$APP/backend/.venv/bin/python"
   chmod +x "$DEPDIR/bin"/* "$APP/backend/.venv/bin"/*
   : > "$DEPDIR/calls"
 }
 
 run_script(){
-  ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" \
+  ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+    LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
+}
+run_script_no_artifacts(){
+  ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/empty-artifacts" \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 calls(){ cat "$DEPDIR/calls" 2>/dev/null; }
 
-# 脚本必须真的跑起来了（走到了 git fetch），否则下面全是空断言
+# 脚本必须真的跑起来了（取到了产物），否则下面全是空断言
 assert_ran(){
-  if calls | grep -q "git fetch"; then return 0; fi
+  if calls | grep -q "alembic upgrade head"; then return 0; fi
   no "$1 —— 脚本在沙箱里没跑起来，下面的断言全部无意义"
   return 1
 }
@@ -82,48 +104,105 @@ assert_ran(){
 echo "== 1. --check-only 必须真的只检查 =="
 setup_sandbox
 OUT=$(run_script --check-only); RC=$?
-# 注意：--check-only 本来就不该 git fetch（那正是「不发布」的一部分），
-# 所以这里的活着性判据是「有没有输出检查结果」，不是「有没有 fetch」。
 if grep -q "只做检查" <<<"$OUT"; then
   ok "--check-only 确实执行了（不是空跑，也不是跑崩了）"
 else
   no "--check-only 分支没被执行 —— 后续断言无意义"
 fi
-# 「只检查」必须**正常退出**。旧脚本没有 exit 0，会一路往下走；
-# 它最终非零退出不是因为检查失败，而是因为后面的某一步崩了 ——
-# 所以光断言「没重启」会被这个崩溃掩盖过去（空断言）。
 if [[ "$RC" == "0" ]]; then
   ok "--check-only 以 0 正常退出（是主动结束的，不是崩的）"
 else
-  no "--check-only 退出码 $RC —— 它并没有在检查完就停下来，而是继续往下走了"
+  no "--check-only 退出码 $RC —— 它并没有在检查完就停下来"
 fi
-# 同理，直接查副作用：只检查不该动文件系统
 if [[ -d "$APP/.releases" ]]; then
   no "--check-only 仍然创建了备份目录 —— 它继续往下走了"
 else
   ok "--check-only 没有产生任何发布副作用"
 fi
-for pair in "pytest:跑测试" "systemctl:重启服务" "pnpm:构建前端" "pip:装依赖"; do
-  tool="${pair%%:*}"; what="${pair##*:}"
-  if calls | grep -q "$tool"; then no "--check-only 仍然$what"; else ok "--check-only 没$what"; fi
+for tool in systemctl curl; do
+  if calls | grep -q "$tool"; then no "--check-only 仍然调了 $tool"; else ok "--check-only 没调 $tool"; fi
 done
 
-echo "== 2. 分支名不写死 =="
+echo "== 2. 生产机不再跑测试、不再构建前端 =="
 setup_sandbox
-run_script >/dev/null
+OUT=$(run_script)
 assert_ran "全量发布" || exit 1
-if calls | grep -q "git checkout main"; then
-  no "仍然写死 checkout main"
+# 这两条是本次改造的核心目的：把生产机从构建机上摘下来。
+for pair in "pytest:跑测试" "pnpm:构建前端" "node:跑前端"; do
+  tool="${pair%%:*}"; what="${pair##*:}"
+  if calls | grep -q "$tool"; then no "生产机仍然${what}（${tool}）"; else ok "生产机不再${what}"; fi
+done
+if calls | grep -q "pip install -q -r requirements.lock"; then
+  ok "装的是运行时锁 requirements.lock（不是 dev 锁）"
 else
-  ok "没有写死 main"
+  no "没有装 requirements.lock"
 fi
 
-echo "== 3. .releases 必须 mkdir，且每次都备份 =="
+echo "== 3. 产物被取走并校验通过 =="
+setup_sandbox
+OUT=$(run_script)
+assert_ran "全量发布" || exit 1
+if grep -q "产物校验和通过" <<<"$OUT"; then
+  ok "产物 sha256 校验通过"
+else
+  no "没有做产物校验（或校验没过）"
+fi
+if grep -q "取到产物" <<<"$OUT"; then
+  ok "取到产物 ${FAKE_SHA}"
+else
+  no "没有取到产物"
+fi
+
+echo "== 4. 取不到产物 = 测试闸门拦住，绝不重启 =="
+setup_sandbox
+mkdir -p "$DEPDIR/empty-artifacts"
+OUT=$(run_script_no_artifacts); RC=$?
+if calls | grep -q "systemctl restart"; then
+  no "取不到产物却重启了服务 —— 测试闸门失效"
+else
+  ok "取不到产物没有重启"
+fi
+if [[ "$RC" != "0" ]]; then
+  ok "取不到产物以非零退出（${RC}）"
+else
+  no "取不到产物却返回成功"
+fi
+if grep -q "没有完整的一套产物" <<<"$OUT"; then
+  ok "明确报出产物缺失"
+else
+  no "没有明确报错"
+fi
+if [[ -d "$APP/.releases" ]]; then
+  no "产物缺失却仍创建了备份目录"
+else
+  ok "产物缺失时连备份都没动"
+fi
+
+echo "== 5. 校验和不匹配必须拒绝发布 =="
+setup_sandbox
+echo "corrupted" >> "$DEPDIR/artifacts/cwq-backend-${FAKE_SHA}.tar.gz"
+OUT=$(run_script)
+if calls | grep -q "systemctl restart"; then
+  no "产物损坏却重启了服务"
+else
+  ok "产物损坏没有重启"
+fi
+if grep -q "校验和不匹配" <<<"$OUT"; then
+  ok "明确报出校验和不匹配"
+else
+  no "没有报出校验和不匹配"
+fi
+if grep -q "没有改动任何东西" <<<"$OUT"; then
+  ok "明确说明没有改动任何东西"
+else
+  no "没说清楚「什么都没改」"
+fi
+
+echo "== 6. .releases 必须 mkdir，且每次都备份 =="
 setup_sandbox
 run_script >/dev/null
 assert_ran "首次发布" || exit 1
 if [[ -d "$APP/.releases" ]]; then ok "备份目录已创建"; else no "备份目录没创建"; fi
-# 连续两次发布（不 sleep，逼出同一秒内两次发布）
 run_script >/dev/null
 N=$(find "$APP/.releases" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
 if [[ "${N:-0}" -ge 2 ]]; then
@@ -136,58 +215,40 @@ if [[ -n "$(find "$APP/.releases" -name app.py 2>/dev/null)" ]]; then
 else
   no "备份内容为空"
 fi
+if [[ -d "$(find "$APP/.releases" -maxdepth 3 -type d -name artifact 2>/dev/null | head -1)" ]]; then
+  ok "产物也存进备份（回滚不必重新下载）"
+else
+  no "产物没存进备份 —— 产物被 CI 清理后就退不回去了"
+fi
 
-echo "== 4. 包管理器与锁文件一致 =="
+echo "== 7. 前后端产物都真的切过去了 =="
 setup_sandbox
 run_script >/dev/null
 assert_ran "全量发布" || exit 1
-if calls | grep -q "npm ci"; then
-  no "仍然用 npm ci（仓库没有 package-lock.json，必然失败）"
+if grep -q "NEW backend code" "$APP/backend/app/main.py" 2>/dev/null; then
+  ok "后端代码换成了新产物"
 else
-  ok "没用 npm ci"
+  no "后端代码没换过去"
 fi
-if calls | grep -q "pnpm install --frozen-lockfile"; then
-  ok "用了 pnpm install --frozen-lockfile"
+if grep -q "new frontend" "$APP/frontend/dist/index.html" 2>/dev/null; then
+  ok "前端 dist 里是新产物（不是旧的）"
 else
-  no "没用 pnpm --frozen-lockfile"
+  no "前端 dist 里不是新产物"
 fi
-
-echo "== 5. dist 换名而不是自删自移 =="
-setup_sandbox
-run_script >/dev/null
-assert_ran "全量发布" || exit 1
 if [[ -f "$APP/frontend/dist/index.html" ]]; then
   ok "dist 换名后仍在"
 else
   no "dist 换名后丢了"
 fi
-if grep -q "new frontend" "$APP/frontend/dist/index.html" 2>/dev/null; then
-  ok "dist 里是新构建的产物（不是旧的）"
-else
-  no "dist 里不是新产物，换名逻辑可能反了"
-fi
 
-echo "== 6. 测试不过就不重启 =="
-setup_sandbox
-export STUB_PYTEST_RC=1
-OUT=$(run_script)
-unset STUB_PYTEST_RC
-assert_ran "测试失败的发布流程" || exit 1
-if calls | grep -q "systemctl restart"; then
-  no "测试失败却重启了服务"
-else
-  ok "测试失败没有重启"
-fi
-if grep -q "测试未通过" <<<"$OUT"; then ok "明确报出测试未通过"; else no "没有明确报错"; fi
-
-echo "== 7. 备份保留 KEEP 份 =="
+echo "== 8. 备份保留 KEEP 份 =="
 setup_sandbox
 for i in 1 2 3 4 5; do mkdir -p "$APP/.releases/2020010$i-000000"; done
 run_script >/dev/null
 N=$(find "$APP/.releases" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
 if [[ "${N:-99}" -le 3 ]]; then ok "旧备份已清理（剩 $N 份）"; else no "备份没清理（剩 ${N:-?} 份）"; fi
 
-echo "== 8. 迁移由发布流程执行（P3-01）=="
+echo "== 9. 迁移由发布流程执行（P3-01）=="
 setup_sandbox
 run_script >/dev/null
 assert_ran "全量发布" || exit 1
@@ -195,17 +256,6 @@ if calls | grep -q "alembic upgrade head"; then
   ok "发布流程执行了 alembic upgrade head"
 else
   no "没有执行迁移 —— 表结构变更只能靠人工，迟早会漏"
-fi
-# 顺序比有没有跑更重要：测试不过就中止，生产库不该已经被迁移过
-setup_sandbox
-export STUB_PYTEST_RC=1
-run_script >/dev/null
-unset STUB_PYTEST_RC
-assert_ran "测试失败的发布流程" || exit 1
-if calls | grep -q "alembic upgrade head"; then
-  no "测试没过却先迁移了生产库"
-else
-  ok "测试没过就不迁移（schema 保持在迁移前的状态）"
 fi
 
 # 迁移失败必须拦住发布：库迁移了一半而代码没换，状态最糟
@@ -219,12 +269,29 @@ if calls | grep -q "systemctl restart"; then
 else
   ok "迁移失败没有重启"
 fi
-if calls | grep -q "mv "; then
-  no "迁移失败却切换了前端产物"
+if grep -q "NEW backend code" "$APP/backend/app/main.py" 2>/dev/null; then
+  no "迁移失败却切换了后端代码"
 else
-  ok "迁移失败没有切换前端产物"
+  ok "迁移失败没有切换代码"
 fi
 if grep -q "迁移失败" <<<"$OUT"; then ok "明确报出迁移失败"; else no "没有明确报错"; fi
+
+# 备份失败必须拦住迁移（P2-25）：备份是这个系统唯一的退路
+setup_sandbox
+export STUB_BACKUP_RC=1
+OUT=$(run_script)
+unset STUB_BACKUP_RC
+if calls | grep -q "alembic upgrade head"; then
+  no "备份失败却先迁移了生产库 —— 没有退路就不该动 schema"
+else
+  ok "备份失败就不迁移（schema 保持在迁移前的状态）"
+fi
+if calls | grep -q "systemctl restart"; then
+  no "备份失败却重启了服务"
+else
+  ok "备份失败没有重启"
+fi
+if grep -q "数据库备份失败" <<<"$OUT"; then ok "明确报出备份失败"; else no "没有明确报错"; fi
 
 echo
 echo "通过 $PASS / 失败 $FAIL"

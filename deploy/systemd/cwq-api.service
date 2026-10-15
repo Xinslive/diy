@@ -37,6 +37,33 @@ ExecStart=/opt/cwq/backend/.venv/bin/uvicorn app.main:app \
 Restart=always
 RestartSec=3
 
+# ---------------------------------------------------------------------------
+# 文件描述符上限（2026-10-15 压测基线后补）
+# ---------------------------------------------------------------------------
+# 这个数**不是随手写的**，它要同时盖住三样东西，取它们的最大值再加余量：
+#   * nginx upstream keepalive 32（cwq.conf 里每个 worker 进程持有）
+#   * 数据库连接 2 ×(pool_size 5 + max_overflow 10) = 30
+#   * 每个入站 HTTP 连接本身也要占一个 fd
+# systemd 的默认值是 1024，而 **LimitNOFILE 是硬上限，不是软限**：
+# 超了进程报 EMFILE，日志里表现为
+# ``OSError: [Errno 24] Too many open files`` 或 uvicorn 直接退出重启，
+# 很容易被误判成「服务不稳定」而查不到根因。软限制在 systemd 上没有意义
+# （要调软限得在 Limits 里一起给 LimitNOFILE= 与 LimitNOFILESoft=）。
+LimitNOFILE=8192
+LimitNOFILESoft=8192
+
+# 内存软上限：让 cgroup 的内存压力先在 API 上表现出来（内核回收、
+# 分配失败），而不是整机耗尽后由 OOM killer 在**几个进程里随机挑一个**杀。
+# 挑到 postgresql 后果更糟：数据库被杀会让未提交事务回滚、连接被断开，
+# 而挑到 API 只是 503。设一个明显高于实测（API 稳态约 220 MB）的上限，
+# 目的不是限流，而是让「要出事时先出谁」这件事是确定的。
+#
+# 注意：OOM 优先杀的是 cgroup 内 **占用最多的**进程，所以这个值必须留够
+# 余量，否则它挡不住 OOM killer 去动 PG —— 真要保护 PG，正确的做法是
+# 给 postgres 单独的 systemd 单元加 MemoryMax，而不是给 API 加。
+# 见 deploy/tuning.md。
+# MemoryMax=768M
+
 # 财务系统只读自己的代码目录，能写的地方只有日志
 NoNewPrivileges=true
 PrivateTmp=true
