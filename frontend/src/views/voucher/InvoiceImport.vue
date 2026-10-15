@@ -22,25 +22,41 @@
               <span class="muted">本单位税号用于自动判断进项/销项；默认结算科目为 1001 库存现金。进项发票不单列税额，价税合计直接计入成本费用</span>
             </div>
           </template>
-          <el-form :model="config" inline class="invoice-config-form">
-            <el-form-item label="本单位税号">
-              <el-input v-model="config.taxpayer_id" :disabled="!store.canWrite" placeholder="用于判断发票类型" style="width: 230px" />
-            </el-form-item>
-            <el-form-item label="销项税额">
-              <el-select v-model="config.output_tax_subject_id" :disabled="!store.canWrite" filterable style="width: 220px">
-                <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
-              </el-select>
-            </el-form-item>
-            <el-form-item label="进项贷方">
-              <el-select v-model="config.input_credit_subject_id" :disabled="!store.canWrite" filterable style="width: 220px">
-                <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
-              </el-select>
-            </el-form-item>
-            <el-form-item label="销项借方">
-              <el-select v-model="config.output_debit_subject_id" :disabled="!store.canWrite" filterable style="width: 220px">
-                <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
-              </el-select>
-            </el-form-item>
+          <!--
+            两列栅格，不是 inline 表单。inline 下标签宽度跟着文字走 ——
+            「本单位税号」五个字、「销项税额」四个字，两行的输入框起点就对不齐；
+            换行之后按钮又落在第二行飘着，整块看着是散的。固定 label-width 加
+            两列，输入框自然成一条线。
+          -->
+          <el-form :model="config" label-width="92px" class="invoice-config-form">
+            <el-row :gutter="'0 28'">
+              <el-col :xs="24" :sm="12">
+                <el-form-item label="本单位税号">
+                  <el-input v-model="config.taxpayer_id" :disabled="!store.canWrite" placeholder="用于判断发票类型" />
+                </el-form-item>
+              </el-col>
+              <el-col :xs="24" :sm="12">
+                <el-form-item label="销项税额">
+                  <el-select v-model="config.output_tax_subject_id" :disabled="!store.canWrite" filterable>
+                    <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
+                  </el-select>
+                </el-form-item>
+              </el-col>
+              <el-col :xs="24" :sm="12">
+                <el-form-item label="进项贷方">
+                  <el-select v-model="config.input_credit_subject_id" :disabled="!store.canWrite" filterable>
+                    <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
+                  </el-select>
+                </el-form-item>
+              </el-col>
+              <el-col :xs="24" :sm="12">
+                <el-form-item label="销项借方">
+                  <el-select v-model="config.output_debit_subject_id" :disabled="!store.canWrite" filterable>
+                    <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
+                  </el-select>
+                </el-form-item>
+              </el-col>
+            </el-row>
             <el-form-item>
               <el-button type="primary" :disabled="!store.canWrite" :loading="savingConfig" @click="saveConfig">
                 <el-icon><Check /></el-icon>保存配置
@@ -345,7 +361,12 @@ onMounted(loadAll)
 .invoice-config-card, .invoice-upload-card, .invoice-history-card, .invoice-result-card { margin-bottom: 14px; }
 .section-head { justify-content: space-between; gap: 14px; font-weight: 600; }
 .section-head .muted { font-size: 12px; font-weight: 400; }
-.invoice-config-form { margin-bottom: -18px; }
+/* 控件铺满各自列宽，两列的输入框左边缘才对得齐。inline + 固定 width 是靠像素
+   凑的，改一处宽度就散；交给栅格之后不再依赖字面标签有几个字。 */
+.invoice-config-form { max-width: 900px; margin-bottom: 0; }
+.invoice-config-form :deep(.el-form-item) { margin-bottom: 16px; }
+.invoice-config-form :deep(.el-select),
+.invoice-config-form :deep(.el-input) { width: 100%; }
 .invoice-upload-card :deep(.el-upload-dragger) { padding: 26px 0; }
 .upload-footer { justify-content: space-between; margin-top: 14px; }
 .result-title { gap: 10px; }
