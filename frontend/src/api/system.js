@@ -7,4 +7,8 @@ export const setUserBooks = (id, books) => http.put(`/system/users/${id}/books`,
 export const deleteUser = (id) => http.delete(`/system/users/${id}`).then(r => r.data)
 
 export const allBooks = () => http.get('/system/books').then(r => r.data)
-export const auditLogs = (limit = 200) => http.get('/system/audit-logs', { params: { limit } }).then(r => r.data)
+
+// 审计日志走 `@/api/book` 的 `auditLogs(bookId, limit)` —— 审计是**按账套**的，
+// 而这里原来包的是 `/system/audit-logs`（不带 book_id），两个函数**同名不同义**。
+// `AuditLog.vue` 实际 import 的是 `@/api/book`，这个从未被调用，留着只会让
+// 下一个人 import 错的那个。已删。

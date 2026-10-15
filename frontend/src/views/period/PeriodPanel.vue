@@ -134,7 +134,6 @@
 import { computed, ref, watch, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import * as api from '@/api/book'
-import { http } from '@/api/client'
 import { voucherPeriodCheck } from '@/api/voucher'
 import { useSessionStore } from '@/stores/session'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
@@ -298,26 +297,22 @@ async function doClose() {
 }
 
 /**
- * 结账：**带上期间版本号**（乐观锁）。
+ * 结账 / 反结账都走 `api/book.js`，并**带上期间版本号**（乐观锁）。
  *
- *  两个账号各开着一个页面，A 先结了账，B 那边还拿着「未结账 + 版本 1」。
- *  不带版本号时后端按 B 的陈旧状态照做（他那张屏幕上确实写着未结账），
- *  带着版本号时后端比对库里那一份：不一致就 409 拒掉，两边都落到同一个事实上。
+ *  版本号的理由写在 `api/book.js::closePeriod` 的注释里：两个账号各开着
+ *  一个页面时，后提交的那个必须被 409 拒掉，而不是按他屏幕上那份陈旧的
+ *  「未结账」状态照做。
  *
- *  走共享 http 而不是 api/book.js 的 closePeriod：那条还没有 version 参数，
- *  而它不在本工作包的改动范围里（挪进去只要给 closePeriod 加一个参数即可）。
- *  http 是同一个实例，令牌头与 401 处理都还在，多的只是一个 body 字段。
+ *  这里原来绕过 api 层、直接 import 共享 http 手写路径字符串，理由是
+ *  「closePeriod 还没有 version 参数」。现在有了，路径回到单一来源 ——
+ *  写在两个文件里意味着改后端路由时必然漏改一处。
  */
 async function closePeriodWithVersion(p) {
-  const { data } = await http.post(`/books/${store.bookId}/periods/${p.id}/close`, { version: p.version })
-  return data
+  return api.closePeriod(store.bookId, p.id, p.version)
 }
 
 async function uncloseWithVersion(p) {
-  const { data } = await http.post(`/books/${store.bookId}/periods/${p.id}/unclose`, {
-    revert_posting: true, version: p.version
-  })
-  return data
+  return api.unclose(store.bookId, p.id, p.version, true)
 }
 
 /**

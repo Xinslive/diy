@@ -84,9 +84,20 @@ export function matchSubject(s, kw) {
     || initials(s.name).includes(k)
 }
 
+/**
+ * 科目类别的**唯一**中文名。
+ *
+ * EQUITY 用「所有者权益」而不是「权益」：报表模板里写的是
+ * 「负债和所有者权益」（小企业会计准则的正式表述），科目页这里要是
+ * 显示成「权益」，同一份账上同一个东西就有了两个名字。
+ * 以前 OpeningBalance.vue 自己另存了一份 { EQUITY: '所有者权益' }，
+ * 于是同一个类别在不同页面显示不同 —— 现在统一到这一份。
+ */
 export const CATEGORY_LABEL = {
-  ASSET: '资产', LIABILITY: '负债', EQUITY: '权益', COST: '成本', PROFIT: '损益'
+  ASSET: '资产', LIABILITY: '负债', EQUITY: '所有者权益', COST: '成本', PROFIT: '损益'
 }
+/** 类别在页面上出现的顺序（会计恒等式：资产 = 负债 + 所有者权益 + 损益） */
+export const CATEGORY_ORDER = ['ASSET', 'LIABILITY', 'EQUITY', 'COST', 'PROFIT']
 /** 类别 → 该类科目的常规余额方向，顶层新增科目时给个默认值 */
 export const CATEGORY_DEFAULT_DIRECTION = {
   ASSET: 'DEBIT', COST: 'DEBIT', LIABILITY: 'CREDIT', EQUITY: 'CREDIT', PROFIT: 'CREDIT'

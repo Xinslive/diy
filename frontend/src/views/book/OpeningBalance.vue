@@ -106,6 +106,7 @@ import * as api from '@/api/book'
 import { useSessionStore } from '@/stores/session'
 import { downloadFile } from '@/api/print'
 import { amountInputText, amountToNumber, sanitizeAmount, sanitizeAmountDetailed } from '@/utils/amountGrid'
+import { CATEGORY_LABEL } from '@/utils/subjectCode'
 
 const store = useSessionStore()
 const router = useRouter()
@@ -123,12 +124,19 @@ const saving = ref(false)
 const parsing = ref(false)
 const keyword = ref('')
 
-const CATEGORIES = [
-  { key: 'ASSET', label: '资产' },
-  { key: 'LIABILITY', label: '负债' },
-  { key: 'EQUITY', label: '所有者权益' },
-  { key: 'PROFIT', label: '损益' }
-]
+/**
+ * 分组渲染的类别，顺序即会计恒等式的顺序。
+ *
+ * 文案一律取自 `@/utils/subjectCode` 的 CATEGORY_LABEL —— 原来这里另存了
+ * 一份 { EQUITY: '所有者权益' }，而科目页那份写的是「权益」，同一个类别
+ * 两个页面两个名字。现在只有一份来源。
+ *
+ * COST 不在这张表里：期初录入按四类分组，成本类目前走不到这里
+ * （`v-show` 会把空的分组藏掉，所以留着也无妨，但那样会让人以为
+ * 成本类期初是被支持的 —— 与其含糊，不如明确排除）。
+ */
+const CATEGORIES = ['ASSET', 'LIABILITY', 'EQUITY', 'PROFIT']
+  .map((key) => ({ key, label: CATEGORY_LABEL[key] }))
 
 const money = (v) => (Number(v || 0)).toLocaleString('zh-CN', { minimumFractionDigits: 2 })
 

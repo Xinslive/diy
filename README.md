@@ -179,11 +179,13 @@ cd backend
 ```bash
 cd backend
 
-.venv/bin/python -m pytest                      # 995 个单元/接口测试（53 个测试文件，实测 `--collect-only`）
+.venv/bin/python -m pytest                      # 1259 个单元/接口测试（60 个测试文件，实测 `--collect-only`）
 .venv/bin/python scripts/demo_e2e.py            # 69 项端到端流程
 .venv/bin/python scripts/demo_modules.py        # 53 项模块冒烟
 node onboard.mjs                                # 12 步浏览器开户全流程（需前后端都起着）
 node report_design.mjs                          # 7 步浏览器报表设计器（需前后端都起着）
+
+cd ../frontend && npm run test                  # 12 个前端测试文件（node --test）
 ```
 
 - pytest 用**独立测试库** `cwq_test`，每个用例一个全新账套，绝不碰开发库
