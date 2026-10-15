@@ -22,6 +22,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import * as api from '@/api/subject'
 import { useSessionStore } from '@/stores/session'
+import { validateSubjectForm } from '@/composables/useSubjectForm'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
@@ -44,9 +45,8 @@ watch(() => props.modelValue, (open) => {
 })
 
 async function submit() {
-  if (!store.canWrite) return ElMessage.warning('这个账套是只读的，不能编辑科目')
-  if (!form.code.trim()) return ElMessage.warning('科目编码不能为空')
-  if (!form.name.trim()) return ElMessage.warning('科目名称不能为空')
+  const bad = validateSubjectForm(store, form, '这个账套是只读的，不能编辑科目')
+  if (bad !== true) return ElMessage.warning(bad)
   saving.value = true
   try {
     const updated = await api.updateSubject(store.bookId, props.subject.id, {
