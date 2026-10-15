@@ -897,6 +897,7 @@ def test_head_是本文件认识的那一版():
         "0014_official_template",            # 按官方空白模板纠正左右两半的行配对与底纹
         "0015_book_data_version",            # 账套数据版本号：跨请求聚合缓存的失效依据
         "0016_invoice_import",               # 发票导入、OCR 结果留存与自动凭证生成
+        "0017_system_settings",               # 系统级键值配置：第三方服务凭据从 .env 搬进库
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")

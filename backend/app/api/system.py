@@ -1,4 +1,4 @@
-"""系统管理：用户、账套授权。
+"""系统管理：用户、账套授权、外部服务配置。
 
 内部系统只有几十个人，但「谁能看哪个账套」这件事必须落在数据库里，
 不能靠前端藏按钮。因此权限模型只有三个角色：
@@ -19,6 +19,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.accounting.audit_helper import log
+from app.core import system_settings
 from app.core.db import get_db
 from app.core.deps import get_current_user
 from app.core.security import hash_password
@@ -299,3 +300,79 @@ def audit_logs(limit: int = 100, user: SysUser = Depends(get_current_user),
              "entity_id": r.entity_id, "detail": r.detail,
              "created_at": r.created_at.isoformat() if r.created_at else None,
              "before": r.before, "after": r.after} for r in rows]
+
+
+# ------------------------------------------------------------ 外部服务（OCR）
+
+
+class OcrConfigPatch(BaseModel):
+    """OCR 服务配置。
+
+    ``api_token`` 是**只写**字段：读接口永远不回明文。这里也不允许「传空串 =
+    清空」—— 想清空要走 ``clear_token=True``，否则界面上一个没填内容的输入框
+    一次普通保存就把别人的 token 悄悄抹掉了，而界面上看不出任何区别。
+    """
+
+    api_url: Optional[str] = Field(default=None, max_length=512)
+    model: Optional[str] = Field(default=None, max_length=64)
+    api_token: Optional[str] = Field(default=None, max_length=512)
+    timeout_seconds: Optional[int] = Field(default=None, ge=10, le=3600)
+    poll_seconds: Optional[float] = Field(default=None, ge=0.5, le=60)
+    optional_payload: Optional[str] = Field(default=None, max_length=1024)
+    clear_token: bool = False
+
+
+@router.get("/ocr")
+def get_ocr_config(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    """返回 OCR 配置，**但没有 token 明文** —— 只有 ``token_set`` 与末 4 位。
+
+    管理员要能回答「到底配没配上」，但不需要把 token 再读出来贴到别处；
+    能读出来就意味着它会出现在浏览器历史、网络面板和一次误开的调试窗口里。
+    """
+    _require_admin(user)
+    return system_settings.ocr_config_public(db)
+
+
+@router.put("/ocr")
+def put_ocr_config(payload: OcrConfigPatch, user: SysUser = Depends(get_current_user),
+                   db: Session = Depends(get_db)):
+    _require_admin(user)
+    before = system_settings.ocr_config(db)
+    updates: dict[str, object] = {}
+    for field, key in (("api_url", "ocr_api_url"), ("model", "ocr_model"),
+                       ("timeout_seconds", "ocr_timeout_seconds"),
+                       ("poll_seconds", "ocr_poll_seconds"),
+                       ("optional_payload", "ocr_optional_payload")):
+        value = getattr(payload, field)
+        if value is not None:
+            updates[key] = value
+
+    if payload.clear_token:
+        system_settings.set_value(db, "ocr_api_token", "", updated_by=user.username)
+    elif payload.api_token:
+        system_settings.set_value(db, "ocr_api_token", payload.api_token, updated_by=user.username)
+
+    for key, value in updates.items():
+        system_settings.set_value(db, key, str(value), updated_by=user.username)
+
+    # 必须 flush 之后才能取 after 快照。本工程的 session 是 autoflush=False
+    # （见 app/core/db.py），而 Session.get() 找不到还没 flush 的 pending 行 ——
+    # 于是这里读到的是「改之前」的值，审计日志会记一条 before == after 的假变更，
+    # 恰好毁掉「谁把 token 换成什么」这条唯一可查的线索。
+    db.flush()
+    after = system_settings.ocr_config(db)
+    # 留痕，但不记值：审计日志页所有管理员都能翻，明文进日志等于二次泄露。
+    log(
+        db,
+        action="SYSTEM_OCR_CONFIG_UPDATE",
+        entity="system_setting",
+        entity_id="ocr",
+        user=user,
+        detail="更新外部识别服务配置" + ("（含 token）" if (payload.api_token or payload.clear_token) else ""),
+        before={"token": system_settings.mask_secret(before["token"]),
+                "api_url": before["api_url"], "model": before["model"]},
+        after={"token": system_settings.mask_secret(after["token"]),
+               "api_url": after["api_url"], "model": after["model"]},
+    )
+    db.commit()
+    return system_settings.ocr_config_public(db)

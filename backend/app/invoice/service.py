@@ -15,6 +15,7 @@ from app.accounting import vouchers as voucher_service
 from app.accounting.audit_helper import log
 from app.accounting.util import money
 from app.core.config import settings
+from app.core.system_settings import ocr_config
 from app.invoice import storage
 from app.invoice.parser import invoice_dict, parse_pdf_with_fallback
 from app.models import (
@@ -507,7 +508,9 @@ def create_batch(db: Session, book_id: int, user: SysUser, filename: str, data: 
     try:
         saved_path = storage.save_pdf(batch.id, data)
         batch.file_path = saved_path
-        invoices, ocr_used = parse_pdf_with_fallback(str(storage.path_for(saved_path)))
+        # 凭据从系统配置解析（库里优先、.env 兜底），解析层只负责执行。
+        ocr = ocr_config(db)
+        invoices, ocr_used = parse_pdf_with_fallback(str(storage.path_for(saved_path)), ocr)
         config = get_config(db, book_id)
         rules = db.scalars(select(InvoiceRule).where(InvoiceRule.book_id == book_id, InvoiceRule.active.is_(True))).all()
 

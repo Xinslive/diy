@@ -1,5 +1,5 @@
 from app.models.base import Base
-from app.models.system import SysUser, UserBook
+from app.models.system import SysUser, SystemSetting, UserBook
 from app.models.book import (Book, Period, PeriodOpening, book_first_ord,
                            ord_to_month, period_ord, year_start_ord)
 from app.models.accounting import Entry, Subject, Voucher
@@ -10,7 +10,7 @@ from app.models.invoice import InvoiceBatch, InvoiceConfig, InvoiceRecord, Invoi
 from app.models.audit import AuditLog
 
 __all__ = [
-    "Base", "SysUser", "UserBook",
+    "Base", "SysUser", "UserBook", "SystemSetting",
     "Book", "Period", "PeriodOpening",
     "period_ord", "year_start_ord", "ord_to_month", "book_first_ord",
     "Subject", "Voucher", "Entry",

@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer,
-                        String, UniqueConstraint, func)
+                        String, Text, UniqueConstraint, func)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
@@ -101,6 +101,37 @@ class LoginIpThrottle(Base, TimestampMixin):
     # 仅在显式开启 LOGIN_IP_HARD_LOCK 时才会被写。默认永远为 NULL ——
     # 见本类 docstring 里「为什么不做 IP 锁死」。
     blocked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+
+
+class SystemSetting(Base, TimestampMixin):
+    """系统级键值配置 —— 目前只放第三方服务的凭据与端点。
+
+    与 ``InvoiceConfig`` 那类账套配置分开：这里的东西**全系统一份**。PaddleOCR
+    的服务账号不是按账套分的，换一本账也不该换一套 token。
+
+    为什么要从 .env 搬进库：改一个 token 要重启后端、要改部署机上的文件、
+    还要有人会 ssh 上去。凭据是会过期、要轮换的东西，让它只能靠重启来改，
+    结果就是没人改 —— 于是扫描件这条路在某天悄悄失效，而配置「明明配过」。
+    搬进库之后，管理员在界面上改完即生效，且留下一条「谁改的」。
+
+    **关于明文存储。** token 必须能还原成原文才能去调对方接口，所以哈希掉没有
+    用（对比 ``SysUser.password_hash``：那个只需要比对，不需要还原）。这里等价于
+    .env 文件本身 —— 能读到这个数据库的人，本来也能读到那个文件。真正的防线是
+    **不往外发**：接口只回 ``token_set`` 与末 4 位，明文一律不出现在任何响应里
+    （见 ``app/api/system.py``）。
+
+    没有引入加密库是刻意的：为一个 token 拉进 ``cryptography`` 这种重量级依赖，
+    加密密钥最终仍得存在某处，威胁面没变小，复杂度却实打实涨了。真要多一层，
+    正确做法是 KMS / secret manager，那是部署形态的决定，不是加个依赖。
+    """
+
+    __tablename__ = "sys_setting"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # 谁最后改的。凭据类配置必须能追溯到人：token 外泄时要查的不只是
+    # 「现在配的是谁的」，还有「谁把它换掉的、什么时候换的」。
+    updated_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
 
 class UserBook(Base, TimestampMixin):

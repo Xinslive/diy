@@ -53,7 +53,6 @@
           <template #header>
             <div class="section-head">
               <span>上传电子发票</span>
-              <span class="muted">支持多页 PDF；文本层优先，识别不足时自动调用 PaddleOCR API</span>
             </div>
           </template>
           <el-upload
@@ -62,7 +61,6 @@
           >
             <el-icon class="el-icon--upload"><Upload /></el-icon>
             <div class="el-upload__text">把 PDF 拖到此处，或<em>点击选择文件</em></div>
-            <template #tip><div class="el-upload__tip">扫描件需要后端配置 INVOICE_OCR_API_TOKEN；原 PDF 会随批次留存</div></template>
           </el-upload>
           <div class="upload-footer">
             <span class="muted">{{ file?.name || '尚未选择文件' }}</span>
