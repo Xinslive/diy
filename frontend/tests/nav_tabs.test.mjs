@@ -111,6 +111,31 @@ t('没写 landing 的模块取第一项（系统管理 → 操作日志）', () 
   assert.equal(landingOf(sys), 'audit')
 })
 
+// ---- 落地页在侧栏里的位置 ----
+t('每个模块的落地页就是它侧栏的第一项', () => {
+  // 点顶部模块落到的那一页，必须一眼能在侧栏里找到 —— 排第三就得先扫一遍。
+  // 顺序由 visibleNav 保证，不靠手工把 NAV 的数组重排一次：以后再往落地页
+  // 前面插一项，顺序会漂回去，而这里会红。
+  for (const m of visibleNav(true)) {
+    assert.equal(m.items[0].name, landingOf(m),
+      `${m.key}（${m.title}）的落地页 ${landingOf(m)} 排在第 ${m.items.findIndex(i => i.name === landingOf(m)) + 1} 位，侧栏顺序：${m.items.map(i => i.title).join(' / ')}`)
+  }
+})
+t('顶到前面只动落地页，其余项的相对顺序不变', () => {
+  const raw = NAV.find(m => m.key === 'ledger')
+  const shown = visibleNav(true).find(m => m.key === 'ledger')
+  const rest = shown.items.slice(1).map(i => i.name)
+  assert.equal(shown.items[0].name, 'detail-ledger', '明细账是账簿报表的落地页')
+  assert.deepEqual(rest, raw.items.filter(i => i.name !== 'detail-ledger').map(i => i.name),
+    '科目余额表 / 总账 / 报表 的先后不该被顶栏调整打乱')
+})
+t('落地页被过滤掉时退到第一项，且那一项就在第一位', () => {
+  // landing 指向的项若因权限/隐藏不在菜单里，不能顶起一个不存在的东西
+  const shown = visibleNav(true).find(m => m.key === 'master')
+  assert.equal(shown.items[0].name, 'books', '账套管理是基础资料的落地页')
+  assert.ok(shown.items.some(i => i.name === landingOf(shown)))
+})
+
 // ---- 路由归属 ----
 t('凭证列表 / 新增 / 详情共用「凭证」这一个入口', () => {
   assert.equal(menuKeyOf('vouchers'), 'vouchers')
