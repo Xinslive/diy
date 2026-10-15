@@ -314,52 +314,16 @@ def general_ledger(
     to_period: Period,
     include_unposted: bool = False,
 ) -> list[dict]:
-    """总账：每个科目一行，含区间期初、本期发生、累计发生、期末。"""
-    eng = LedgerEngine.for_ledger(db, book_id, include_unposted)
-    ids = [s.id for s in subjects]
-    fmap = eng.batch_figures(ids, to_period.ord)
-    # 区间发生额单独算，不能拿本年累计相减：区间跨年时两边的累计口径不同
-    pmap = eng.range_movements(ids, from_period.ord, to_period.ord)
+    """总账：每个科目一行，含区间期初、区间发生、累计发生、期末。
 
-    # 区间期初 = 起始期的上一期期末，两条路径用的是同一个语义：
-    # 起始期不是首期时是真实存在的上一期；起始期就是账套首期时，
-    # 引擎返回的「首期之前」那张图（期初=首期期初、零发生额），closing 相同。
-    #
-    # 2026-10-13 审计 P0-03：这里原来有一个 else 分支，起始期是首期时
-    # 退回取 fmap 的 opening —— 那是**结束期自己**的期初，于是
-    #   期初 600（5 月末）+ 本期借方 1200（1~6 月）= 期末 1800
-    # 而正确答案是 期初 0 + 1200 = 1200：[from, to-1] 的发生额被计入两次。
-    # 错误在行内自洽（期初 + 本期 = 期末 恒成立），只有与上月期末交叉核对
-    # 才看得出来，而总账 Excel 导出（api/printing）走的正是这一个函数，
-    # 错误数字直接落到交给客户的纸上。
-    prev_map = eng.compute(ids, from_period.ord - 1)
-
-    out = []
-    for s in subjects:
-        f = fmap[s.id]
-        p_dr, p_cr = pmap[s.id]
-        opening = prev_map[s.id].closing
-        closing = opening + p_dr - p_cr
-        side, amount = display_side(s, closing)
-        out.append(
-            {
-                "subject_id": s.id,
-                "code": s.code,
-                "name": s.name,
-                "level": s.level,
-                "category": s.category,
-                "is_leaf": s.is_leaf,
-                "opening_direction": display_side(s, opening)[0],
-                "opening": display_side(s, opening)[1],
-                "period_debit": p_dr,
-                "period_credit": p_cr,
-                "ytd_debit": f.dr_cum,
-                "ytd_credit": f.cr_cum,
-                "direction": side,
-                "closing": amount,
-            }
-        )
-    return out
+    **行结构与试算合计都委托给 balance_sheet_of_accounts** —— 两张表在区间
+    口径下问的是同一个问题（「这一段里每个科目怎么动的」）。以前这里是各自
+    写一遍的，而审计第 7.3 节记过一次「总账导出与页面显示对不上」，
+    根子就是同一个口径有了两份实现。给余额表加区间时没有理由再添一份。
+    """
+    rows, _check = balance_sheet_of_accounts(
+        db, book_id, subjects, to_period, include_unposted, from_period=from_period)
+    return rows
 
 
 # --------------------------------------------------------------------- 科目余额表 / 试算平衡
@@ -371,23 +335,57 @@ def balance_sheet_of_accounts(
     subjects: list[Subject],
     period: Period,
     include_unposted: bool = False,
+    from_period: Period | None = None,
 ) -> tuple[list[dict], dict]:
     """科目余额表。返回 (行, 试算平衡校验结果)。
 
     试算平衡：
         Σ 借方发生额 == Σ 贷方发生额
         Σ 借方余额    == Σ 贷方余额
+
+    **给 from_period 就是查一段连续区间**（止期仍是 ``period``）：
+
+        期初余额 = 起始期的**上一期期末**
+        发生额   = [起始期, 止期] 区间合计
+        期末余额 = 期初 + 区间借方 − 区间贷方
+
+    两处细节都不能省，否则区间账一查就错：
+
+    * 区间发生额**不能用「本年累计相减」**。``dr_cum/cr_cum`` 是本年累计，
+      区间跨过年界（2026-12 → 2027-02）时相减会得到乱七八糟的数，
+      所以直接用 ``range_movements`` 逐期累加。
+    * 区间期初**不能退回取止期自己的期初**。2026-10-13 审计 P0-03 记过这个
+      缺陷：期初 + 区间发生额 = 期末 在行内恒成立，看起来永远自洽，
+      只有与起始期上月的期末交叉核对才看得出来，而导出的 Excel 正是
+      交给客户的纸面数。起始期是账套首期时引擎返回「首期之前」那张图
+      （期初=首期期初、零发生额），closing 相同，两条路径语义一致。
+
+    行结构与总账完全一致，``general_ledger`` 直接委托到这里 ——
+    同一个口径只允许有一份实现。
     """
     eng = LedgerEngine.for_ledger(db, book_id, include_unposted)
-    fmap = eng.batch_figures([s.id for s in subjects], period.ord)
+    ids = [s.id for s in subjects]
+    fmap = eng.batch_figures(ids, period.ord)
+
+    is_range = from_period is not None and from_period.id != period.id
+    if is_range:
+        moves = eng.range_movements(ids, from_period.ord, period.ord)
+        # 区间期初 = 起始期的上一期期末（不是止期自己的期初，理由见 docstring）
+        prev_map = eng.compute(ids, from_period.ord - 1)
+    else:
+        moves = {s.id: (fmap[s.id].period_dr, fmap[s.id].period_cr) for s in subjects}
+        prev_map = None
 
     rows = []
     total_open_dr = total_open_cr = total_dr = total_cr = total_close_dr = total_close_cr = ZERO
 
     for s in subjects:
         f = fmap[s.id]
-        o_side, o_amt = display_side(s, f.opening)
-        c_side, c_amt = display_side(s, f.closing)
+        o_signed = prev_map[s.id].closing if is_range else f.opening
+        m_dr, m_cr = moves[s.id]
+        c_signed = o_signed + m_dr - m_cr
+        o_side, o_amt = display_side(s, o_signed)
+        c_side, c_amt = display_side(s, c_signed)
         rows.append(
             {
                 "subject_id": s.id,
@@ -398,8 +396,11 @@ def balance_sheet_of_accounts(
                 "is_leaf": s.is_leaf,
                 "opening_direction": o_side,
                 "opening": o_amt,
-                "period_debit": f.period_dr,
-                "period_credit": f.period_cr,
+                # 字段名沿用「本期」，区间口径下它装的是**区间**发生额。
+                # 界面按当前口径改列名（本期发生额 / 区间借方），
+                # 字段名不动是为了让总账、余额表共用同一份行结构。
+                "period_debit": m_dr,
+                "period_credit": m_cr,
                 "ytd_debit": f.dr_cum,
                 "ytd_credit": f.cr_cum,
                 "direction": c_side,
@@ -408,12 +409,12 @@ def balance_sheet_of_accounts(
         )
         # 只累计明细级科目，否则父级汇总行会重复计数
         if s.is_leaf:
-            total_open_dr += f.opening if f.opening > 0 else ZERO
-            total_open_cr += -f.opening if f.opening < 0 else ZERO
-            total_dr += f.period_dr
-            total_cr += f.period_cr
-            total_close_dr += f.closing if f.closing > 0 else ZERO
-            total_close_cr += -f.closing if f.closing < 0 else ZERO
+            total_open_dr += o_signed if o_signed > 0 else ZERO
+            total_open_cr += -o_signed if o_signed < 0 else ZERO
+            total_dr += m_dr
+            total_cr += m_cr
+            total_close_dr += c_signed if c_signed > 0 else ZERO
+            total_close_cr += -c_signed if c_signed < 0 else ZERO
 
     check = {
         "period_balanced": total_dr == total_cr,

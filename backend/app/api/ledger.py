@@ -27,13 +27,37 @@ def _period(db: Session, book_id: int, period_id: int | None) -> Period:
 
 
 @router.get("/balance")
-def balance(book_id: int, period_id: Optional[int] = None, book: Book = Depends(get_my_book),
+def balance(book_id: int, period_id: Optional[int] = None,
+            from_period_id: Optional[int] = None,
+            book: Book = Depends(get_my_book),
             db: Session = Depends(get_db), include_unposted: bool = Query(False)):
+    """科目余额表。带 ``from_period_id`` 就是查**一段连续区间**（止期仍是 period_id）。
+
+    两张表（余额表 / 总账）共用同一份区间实现（queries.balance_sheet_of_accounts），
+    所以同一段区间在两边问出来的数必然一致 —— 审计第 7.3 节记过的
+    「导出与页面显示对不上」，根子就是同一个口径有两份实现。
+    """
     period = _period(db, book.id, period_id)
+    from_period = None
+    if from_period_id:
+        from_period = db.get(Period, from_period_id)
+        if from_period is None or from_period.book_id != book.id:
+            raise HTTPException(404, "起始期间不存在")
+        # 起始晚于止期：界面把它归位了，直接调接口也照样挡住 ——
+        # 否则算出来的是一段「倒着走」的区间，期初比期末还晚，数字能看不能信
+        if from_period.ord > period.ord:
+            raise HTTPException(400, "起始期间不能晚于结束期间")
     subjects = queries.subject_tree(db, book.id)
-    rows, check = queries.balance_sheet_of_accounts(db, book.id, subjects, period, include_unposted)
-    return {"period": period.code, "period_id": period.id, "rows": rows, "check": check,
-            "include_unposted": include_unposted}
+    rows, check = queries.balance_sheet_of_accounts(
+        db, book.id, subjects, period, include_unposted, from_period=from_period)
+    is_range = from_period is not None and from_period.id != period.id
+    return {
+        "period": period.code, "period_id": period.id,
+        "from_period": from_period.code if is_range else None,
+        "from_period_id": from_period.id if is_range else None,
+        "range": is_range,
+        "rows": rows, "check": check, "include_unposted": include_unposted,
+    }
 
 
 @router.get("/general")

@@ -626,8 +626,15 @@ def _render_scope(
 
     if scope == "BALANCE":
         subjects = queries.subject_tree(db, book.id)
-        rows, _check = queries.balance_sheet_of_accounts(db, book.id, subjects, period,
-                                                          include_unposted)
+        # 区间口径：与页面、Excel 导出走**同一个** from_period，
+        # 否则屏幕上一段区间、纸上却是单期，数字对不上（审计 7.3 同款毛病）
+        bal_from = None
+        if from_period_id:
+            bal_from = _period(db, book.id, from_period_id)
+            if bal_from.ord > period.ord:
+                raise HTTPException(400, "起始期间不能晚于结束期间")
+        rows, _check = queries.balance_sheet_of_accounts(
+            db, book.id, subjects, period, include_unposted, from_period=bal_from)
         doc = render_table_page(tpl, pv.context(db, book, period),
                                 _check_print_rows(pv.balance_rows(rows), "科目余额表"), 1, 1)
         return _with_note(doc, note)
@@ -739,13 +746,15 @@ def print_vouchers(book_id: int, period_id: Optional[int] = None,
 
 @router.get("/balance.html")
 def print_balance(book_id: int, period_id: Optional[int] = None,
+                  from_period_id: Optional[int] = None,
                   template_id: Optional[int] = None, include_unposted: bool = Query(False),
                   paper: Optional[str] = None, orientation: Optional[str] = None,
                   book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     tpl = _with_paper(_tpl_dict(_template(db, book, "BALANCE", template_id)),
                       paper, orientation)
     return _html_response(_render_scope(db, book, "BALANCE", tpl,
-                                        period_id=period_id, include_unposted=include_unposted))
+                                        period_id=period_id, from_period_id=from_period_id,
+                                        include_unposted=include_unposted))
 
 
 @router.get("/general-ledger.html")
@@ -896,18 +905,35 @@ def export_vouchers(book_id: int, period_id: Optional[int] = None, book: Book = 
 
 @router.get("/balance.xlsx")
 @_xlsx
-def export_balance(book_id: int, period_id: Optional[int] = None, book: Book = Depends(get_my_book),
+def export_balance(book_id: int, period_id: Optional[int] = None,
+                   from_period_id: Optional[int] = None,
+                   book: Book = Depends(get_my_book),
                    db: Session = Depends(get_db), include_unposted: bool = Query(False)):
+    """科目余额表导出。带 from_period_id 导出的是那一段区间。
+
+    **区间必须一路带到文件里。** 屏幕上一段区间、下载下来是单期，
+    用户不会以为导出坏了，只会把纸上那一份当成对的（总账导出栽过一次，
+    见 ``export_general`` 的 docstring）。
+    """
     from app.ledger import queries
     from app.printing import excel as xl
 
     period = _period(db, book.id, period_id)
+    from_period = None
+    if from_period_id:
+        from_period = _period(db, book.id, from_period_id)
+        if from_period.ord > period.ord:
+            raise HTTPException(400, "起始期间不能晚于结束期间")
     subjects = queries.subject_tree(db, book.id)
-    rows, check = queries.balance_sheet_of_accounts(db, book.id, subjects, period, include_unposted)
-    data = xl.balance_excel({"rows": rows, "check": check, "period": period.code},
+    rows, check = queries.balance_sheet_of_accounts(
+        db, book.id, subjects, period, include_unposted, from_period=from_period)
+    is_range = from_period is not None and from_period.id != period.id
+    # 文件名把区间说清楚，避免一个月一份的命名习惯盖住「这是跨三个月的」
+    label = f"{from_period.code}~{period.code}" if is_range else period.code
+    data = xl.balance_excel({"rows": rows, "check": check, "period": label},
                             company=book.company_name, book_name=book.name)
     return Response(content=data, media_type=XLSX_MIME,
-                    headers={"Content-Disposition": _filename(f"科目余额表_{period.code}.xlsx")})
+                    headers={"Content-Disposition": _filename(f"科目余额表_{label}.xlsx")})
 
 
 @router.get("/general-ledger.xlsx")

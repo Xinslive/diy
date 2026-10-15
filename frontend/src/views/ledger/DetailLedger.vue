@@ -32,9 +32,8 @@
         </div>
         <el-checkbox v-model="includeUnposted" label="包含未记账凭证" @change="onFilterChange" />
         <div class="ledger-toolbar__actions">
-          <el-button @click="previewHtml">模板预览/打印</el-button>
-          <el-button @click="window.print()">打印本页</el-button>
-          <el-button type="primary" @click="exportXlsx">导出 Excel</el-button>
+          <el-button @click="previewHtml">打印预览</el-button>
+              <el-button type="primary" @click="exportXlsx">导出 Excel</el-button>
         </div>
       </div>
     </div>

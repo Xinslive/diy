@@ -179,10 +179,10 @@ cd backend
 ```bash
 cd backend
 
-.venv/bin/python -m pytest                      # 1410 个单元/接口测试（68 个测试文件，实测 `--collect-only`）
+.venv/bin/python -m pytest                      # 1422 个单元/接口测试（69 个测试文件，实测 `--collect-only`）
 .venv/bin/python scripts/demo_e2e.py            # 69 项端到端流程
 .venv/bin/python scripts/demo_modules.py        # 53 项模块冒烟
-node onboard.mjs                                # 18 步浏览器开户全流程（需前后端都起着）
+node onboard.mjs                                # 19 步浏览器开户全流程（需前后端都起着）
 node report_design.mjs                          # 7 步浏览器报表设计器（需前后端都起着）
 
 cd ../frontend && npm run test                  # 14 个前端测试文件（node --test）
