@@ -372,6 +372,21 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
             "调试级内容（若同时 DB_ECHO=true，还包括全量 SQL 与账套数据）"
             "不该进生产日志。排查请临时开，看完就改回来。")
 
+    # 上面那条只挡住了「DEBUG + DB_ECHO」这一个组合。**DB_ECHO 自己就该拦。**
+    # 它不需要 DEBUG 级别照样生效：echo 是交给 SQLAlchemy engine 的，
+    # 与 Python 的日志级别是两套机制。所以 LOG_LEVEL=INFO + DB_ECHO=true
+    # 能从上一条下面完整走过去 —— 校验通过、正常启动，然后安静地把
+    # 全公司每一张凭证的金额写进日志文件，而没有任何一行警告。
+    #
+    # 这正是「级别配对了不代表内容安全」的另一半：上一条管的是日志级别，
+    # 这一条管的是引擎开关，两个都得单独看。
+    if settings.db_echo:
+        problems.append(
+            "DB_ECHO=true 不允许用于生产环境 —— 它会把带绑定参数的 SQL 全量"
+            "写进日志，也就是把全公司的凭证金额复制进日志系统"
+            "（日志通常比数据库备份还多人能读）。"
+            "排查请临时开，看完就改回来。")
+
     if problems:
         raise ValueError(
             "生产配置校验不通过，拒绝启动：\n  - "

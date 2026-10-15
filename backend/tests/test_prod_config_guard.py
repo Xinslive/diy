@@ -178,3 +178,55 @@ def test_非法日志级别直接拒绝构造():
         Settings(jwt_secret=GOOD_SECRET, log_level="TRACE")
     assert "LOG_LEVEL" in str(e.value)
 
+
+# --------------------------------------------------------------------- DB_ECHO
+
+
+def test_生产环境开DB_ECHO拒绝启动():
+    """**DB_ECHO 自己就该拦，而不是靠 LOG_LEVEL 顺便拦。**
+
+    `test_生产环境开DEBUG拒绝启动` 看着像已经覆盖了这件事，其实没有：
+    那条拦的是「LOG_LEVEL=DEBUG」，而 `echo` 是交给 SQLAlchemy engine 的，
+    与 Python 的日志级别是**两套机制**。所以 `LOG_LEVEL=INFO + DB_ECHO=true`
+    能从那条校验下面完整走过去。
+
+    走下去之后会发生什么：正常启动、没有任何警告，然后安静地把带绑定参数的
+    SQL —— 也就是全公司每一张凭证的金额 —— 一行行写进日志文件。
+    这种失效没有任何症状可观察，所以必须在启动前挡住。
+    """
+    with pytest.raises(ValueError) as e:
+        _check(_prod(db_echo=True))
+    assert "DB_ECHO" in str(e.value)
+
+
+def test_DB_ECHO不是靠DEBUG那条顺带拦住的():
+    """把这条钉住，是因为「看着已经拦了」正是当初漏掉它的原因。
+
+    上面的 `test_生产环境开DEBUG拒绝启动` 会让人以为 DB_ECHO 已经管住了。
+    真正要守住的是：**即便日志级别是正常的 INFO**，开 DB_ECHO 也必须被拒。
+    """
+    s = _prod(db_echo=True, log_level="INFO")
+    assert s.log_level == "INFO", "前提写错了：这条用的就是 INFO"
+    with pytest.raises(ValueError):
+        _check(s)
+
+
+def test_dev环境允许DB_ECHO():
+    """开发机要能看 SQL，否则「本地复现不了」和「库里明明是这样」会打架。"""
+    validate_production_settings(_prod(db_echo=True), env="dev")
+
+
+def test_DB_ECHO默认关闭且可配置():
+    assert _prod().db_echo is False
+    assert _prod(db_echo=True).db_echo is True
+
+
+def test_DB_ECHO与DEBUG是两个独立问题():
+    """两个都开时，错误里**两条**都要出现 —— 少说一条，运维就只改一条，
+    改完再发一次还是起不来，然后开始怀疑这个校验是不是坏了。"""
+    with pytest.raises(ValueError) as e:
+        _check(_prod(db_echo=True, log_level="DEBUG"))
+    msg = str(e.value)
+    assert "DB_ECHO" in msg
+    assert "LOG_LEVEL" in msg
+
