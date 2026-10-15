@@ -2,7 +2,7 @@
   <el-dialog
     v-model="visible"
     title="导入科目表（覆盖当前科目）"
-    width="min(1080px, calc(100vw - 32px))"
+    :width="dialogWidth"
     :close-on-click-modal="false"
     @closed="reset"
   >
@@ -141,6 +141,19 @@ const visibleErrors = computed(() => (result.value.errors || []).slice(0, 12))
 const previewRows = computed(() => (result.value.subjects || []).slice(0, 250))
 const canCommit = computed(() => !!file.value && result.value.ok && result.value.current?.can_overwrite)
 
+/**
+ * 宽度跟着步骤走，不是一个宽度用到底。
+ *
+ * 上传步只有一句警告、一个拖拽框和一个文件名，铺开 1080px 的话中间全是空白，
+ * 框越宽越像没做完 —— 收到 560px，和本项目其它表单弹窗（420/520px）一个体量。
+ *
+ * 预览步反过来必须宽：那 7 列里除「科目名称」外都是定宽，64+118+64+84+64+118
+ * 已经占掉 512px，「科目名称」最少还要 250px，再加弹窗两侧各 16px 内边距，
+ * 低于 800px 就得横向滚动。所以这一步给到 880px，余量全给科目名称。
+ */
+const dialogWidth = computed(() =>
+  step.value === 'preview' ? 'min(880px, calc(100vw - 32px))' : 'min(560px, calc(100vw - 32px))')
+
 function onFile(uploadFile) {
   const name = uploadFile.raw?.name || uploadFile.name || ''
   if (!/\.xlsx?$/i.test(name)) {
@@ -192,7 +205,12 @@ function reset() {
 <style scoped>
 .mb { margin-bottom: 14px; }
 .upload-box { width: 100%; }
-.selected-file { display: flex; align-items: center; gap: 8px; padding: 10px 12px; color: #334155; background: #f8fafc; border: 1px solid #e2e8f0; }
+/* 拖拽框：Element Plus 默认上下各留 40px、图标 67px，一块空地就有近 200px 高。
+   弹窗收窄之后这块空白更扎眼 —— 收到 26px、图标缩到 44px，
+   够放一句「拖到这里」就行，不必摆一个可以站人的广场。 */
+.upload-box :deep(.el-upload-dragger) { padding: 26px 16px; border-radius: 8px; }
+.upload-box :deep(.el-upload-dragger .el-icon--upload) { margin-bottom: 10px; font-size: 44px; line-height: 40px; }
+.selected-file { display: flex; align-items: center; gap: 8px; padding: 10px 12px; color: #334155; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; }
 .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
 .summary-grid > div { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: 10px 12px; border: 1px solid #e5e7eb; background: #fff; }
 .summary-grid b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

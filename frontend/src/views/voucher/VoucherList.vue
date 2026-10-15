@@ -7,8 +7,16 @@
            超过十万」，这时被顶栏那个月卡着反而是帮倒忙。判据见 hasFilter。
 
            「金额」筛的是**某一条分录**的金额，不是整张凭证的合计：
-           只要凭证里有任意一行落在这个区间，整张就被捞出来。 -->
-      <el-input v-model="query.keyword" placeholder="凭证号 / 摘要" clearable style="width: 108px" @keyup.enter="load" />
+           只要凭证里有任意一行落在这个区间，整张就被捞出来。
+
+           「查询」按钮和输入框里的清空「×」都撤了：三个输入框各自绑了回车，
+           条件填完按回车就跑。多摆一个按钮，等于把「条件什么时候算改了」摊成
+           两个入口 —— 改完点按钮是一种，改完直接回车是另一种，人很容易只记住
+           一种，然后对着没反应的列表以为坏了；「×」则只在有内容时冒出来，
+           工具栏宽度跟着输入内容变来变去，整排控件左右跳。
+           要清空就全选退格。 -->
+      <el-input v-model="query.keyword" placeholder="凭证号 / 摘要" title="填完按回车查询"
+                style="width: 108px" @keyup.enter="load" />
       <el-tooltip content="按分录金额筛选：凭证里有任意一行落在这个区间，整张都会被列出来" placement="top">
         <span class="muted">分录金额</span>
       </el-tooltip>
@@ -17,7 +25,6 @@
       <span class="muted">—</span>
       <el-input-number v-model="query.max_amount" :controls="false" :min="0" :precision="2"
                        :value-on-clear="null" placeholder="到" style="width: 78px" @keyup.enter="load" />
-      <el-button @click="load">查询</el-button>
 
       <span class="spacer" />
 
