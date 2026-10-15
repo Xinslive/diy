@@ -320,6 +320,15 @@ table { user-select: none; -webkit-user-select: none; }
    放在这里单独放行，而不是给表格逐个加例外开关 —— 例外越少越不容易忘。 */
 .cwq-select-text { user-select: text; -webkit-user-select: text; }
 
+/* 表格里的**输入框**必须把原生文本选区还回来。上面那条 user-select: none
+   会一路继承进 input，于是框里的字选不中、Ctrl+A 也选不全 —— 而「全选后
+   重打」恰恰是改报表名字最顺手的动作，等于把最常用的改法堵死了。
+   el-input 自己没声明 user-select（Element Plus 的 input 样式里没有这条），
+   所以必须在这里显式放行。 */
+table input, table textarea, table [contenteditable="true"] {
+  user-select: text; -webkit-user-select: text;
+}
+
 /* 选中态用内阴影而不是外描边：外描边会被相邻格子的边框盖掉，看上去像
    「有些格子描了边、有些没有」，而内阴影四边都在，选中范围一眼到底。 */
 .cwq-cell-picked {

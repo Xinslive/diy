@@ -96,8 +96,14 @@ function legacyCopy(text) {
 
 function onMouseDown(event) {
   if (event.button !== 0) return
+  // 先问「按在哪儿了」，再问「是不是在格子里」。顺序不能反：判断输入框必须
+  // 从 event.target 往上找，而格子要从 target 往上找到 td 再判断。写成
+  // cell.closest(SKIP) 就等于从 td 往上找祖先 —— 输入框是 td 的**后代**，
+  // 永远匹配不上，于是下面那句 preventDefault() 会照常落在每个输入框上，
+  // 鼠标一点就聚焦不了，看起来就是「框里的字改不动」。
+  if (event.target.closest?.(SKIP)) { clear(); return }
   const cell = event.target.closest?.('td')
-  if (!cell || cell.closest(SKIP)) { clear(); return }
+  if (!cell) { clear(); return }
   const table = cell.closest('table')
   const rows = table && rowsOf(table)
   if (!rows?.length) { clear(); return }
