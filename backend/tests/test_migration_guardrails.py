@@ -895,6 +895,7 @@ def test_head_是本文件认识的那一版():
         "0012_balance_sheet_dual_sided",    # 资产负债表改成会小企01表的双栏 8 列版式
         "0013_sme_chart_accounts",       # 补齐《小企业会计准则》科目，让会小企01表每行挂得上科目
         "0014_official_template",            # 按官方空白模板纠正左右两半的行配对与底纹
+        "0015_book_data_version",            # 账套数据版本号：跨请求聚合缓存的失效依据
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")

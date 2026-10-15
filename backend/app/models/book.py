@@ -25,6 +25,7 @@ from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Date,
     DateTime,
@@ -65,6 +66,18 @@ class Book(Base, TimestampMixin):
     # 保留字段：ACTIVE / CLOSED。年度结转不再新建账套，这里不再由结转改写，
     # 只留给「停用账套」这类运营语义使用。
     status: Mapped[str] = mapped_column(String(16), default="ACTIVE", nullable=False)
+
+    # 数据版本号：**由触发器维护**，应用层只读不写（迁移 0015）。
+    #
+    # 任何影响聚合的写（凭证/分录/科目/期初/期间）都在同一个事务里把它 +1。
+    # `LedgerEngine` 构造时先读它、再用它当跨请求缓存的键的一部分，
+    # 于是「写提交之后开始的请求一定读到新数」成立，且多 worker 天然一致
+    # （版本号在库里，不在各进程手里）。
+    #
+    # **不要在应用代码里写这个字段** —— 手写的赋值不会可靠地与写入同一事务，
+    # 而漏 bump 一次的后果是「用户改完账看到的还是旧余额」。规则见
+    # migrations/versions/0015_book_data_version.py。
+    data_version: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
 
     periods: Mapped[list["Period"]] = relationship(
         back_populates="book", cascade="all, delete-orphan", order_by="Period.ord"

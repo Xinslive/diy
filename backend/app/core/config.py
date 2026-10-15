@@ -110,6 +110,19 @@ class Settings(BaseSettings):
     # 等于把这一项关掉，也就回到原来那个问题了。
     db_pool_recycle: int = 300
 
+    # ---- 账簿聚合的跨请求缓存（2026-10 性能收尾 P0）----
+    #
+    # **这两个值都不是「多久算过期」。** 正确性由数据库里的
+    # ``book.data_version`` 保证（任何写都 +1，缓存键里带它），
+    # 所以这里调大调小都**不影响对错**，只影响命中率与内存。
+    #
+    # ledger_cache_maxsize 是**硬上界**：每个 worker 各自一份缓存，
+    # 而 worker 不重启、账却越记越多，没有上界的话内存会一路涨。
+    # 一次全账套聚合在压测规模下是 7,608 组，所以上界不能给大。
+    ledger_cache_maxsize: int = 16
+    # TTL 只是让长期没人访问的键早点让位。它**不承担**过期语义。
+    ledger_cache_ttl_seconds: float = 60.0
+
     jwt_secret: str = DEFAULT_JWT_SECRET
     jwt_algorithm: str = "HS256"
     access_token_minutes: int = 720

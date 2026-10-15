@@ -49,7 +49,25 @@ Figures，closing 即账套首期的期初，区间查询不再需要分叉。
 年度结转、改科目树）之后必须换一个实例，否则拿到的是写入前的数。
 写路径现有用法都符合这一点（``accounting/periods.py`` 在写之前就把要用的
 数字全部取出来，写完另起一个引擎），不要为了「省一个对象」把实例跨写复用。
-刻意不做跨请求缓存：正确性优先。
+
+------------------------- 跨请求缓存（2026-10 改）-------------------------
+**以前这里是「刻意不做跨请求缓存：正确性优先」。现在做了，但用版本号换回
+了正确性** —— 那句结论没有被推翻，只是被实现得比「不做」更好。
+
+压测（``压测基线报告_2026-10-15.md``）量出来多人同时看同一账套时，
+每次请求都把同一份聚合重算一遍，77.7ms 就在这里。判据是数据库里的
+``book.data_version``：任何影响聚合的写都在同一事务里 +1（迁移 0015，
+PostgreSQL 语句级触发器做的），引擎构造时**第一条 SQL** 就是读它。
+
+保证的是：写提交之后，**任何在此之后开始的请求**一定读到新数；
+多 worker 之间天然一致（版本号在库里，缓存只是各自一份副本）。
+
+**为什么不用 TTL**：TTL 会让「用户刚记完账、刷新总账看到旧数」成为可能，
+而 README 的核心承诺就是不存在「某个报表和总账对不上」。完整论证见
+``app/ledger/cache.py`` 的模块 docstring。
+
+**「先读版本号」是硬顺序**，不要为了省一次主键查询把它换到后面 ——
+反序会把旧数据缓存进新版本的键，那是最难查的一类 bug。
 
 **记忆化留了什么、没留什么（2026-10-14 审计：峰值内存 O(科目数 × 期间数)）。**
 ``_figures`` 每个科目只留**推算到的最后一期**，中间各期算完即弃 —— 期间游标
@@ -67,10 +85,26 @@ from typing import Any
 from sqlalchemy import Select, and_, func, select
 from sqlalchemy.orm import Session
 
+from app.ledger.cache import cache_for
 from app.models import Book, Entry, Period, PeriodOpening, Subject, Voucher
 from app.models.book import book_first_ord
 
 ZERO = Decimal("0")
+
+
+def shared(kind: str, key: Any):
+    """取某个跨请求缓存。
+
+    「某种东西缓存多大、留多久」在 config.py 里，不是每个调用点各写一遍 ——
+    写在调用点的话，改一次要翻半个目录。
+    """
+    from app.core.config import settings
+
+    return cache_for(
+        kind,
+        maxsize=settings.ledger_cache_maxsize,
+        ttl_seconds=settings.ledger_cache_ttl_seconds,
+    )
 
 
 @dataclass
@@ -141,6 +175,42 @@ class LedgerEngine:
     # 每个科目已经算到哪一期：重复请求同一科目不再重推一遍
     _computed_through: dict[int, int] = field(default_factory=dict)
 
+    # ---- 跨请求缓存（2026-10 性能收尾 P0）----
+    # 下面是实例级字典的**对面**：那些只活一次请求，这两个跨请求活到被 LRU 挤掉。
+    # 键里必须带 data_version —— 正确性全靠它，理由与「为什么不用 TTL」见
+    # app/ledger/cache.py 的模块 docstring。
+    _shared_periods: dict[Any, Any] | None = None
+    _shared_ancestors: dict[Any, dict[int, list[int]]] | None = None
+    _shared_openings: dict[Any, dict[tuple[int, int], Decimal]] | None = None
+    _shared_moves: dict[Any, dict[tuple[int, int], tuple[Decimal, Decimal]]] | None = None
+    # 本实例读到的账套数据版本。**在 __post_init__ 里读，且必须是第一条 SQL** ——
+    # 顺序是硬约束，反序会把旧数据缓存进新版本的键（见 cache.py 的说明）。
+    _data_version: int | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # 先读版本号，之后才允许有任何别的查询。
+        # 这一行是整个跨请求缓存的地基：它决定了后面所有缓存键的形状。
+        # 代价是一次主键查询；收益是「写完立刻刷新总账看到的一定是新数」。
+        self._data_version = self.db.scalar(
+            select(Book.data_version).where(Book.id == self.book_id)
+        ) or 0
+
+    # 口径相关的键片段。两个口径必须分开 —— 它们的差额恰好是结转凭证金额，
+    # 混在一起会让利润表在月度结转之后显示「本期净额恒为 0」。
+    @property
+    def _caliber(self) -> str:
+        return "REPORT" if self.exclude_carry_forward else "LEDGER"
+
+    @property
+    def _key_salt(self) -> tuple:
+        """凡是会改变结果的过滤条件，都必须进这个盐里。
+
+        漏一个的后果不是「慢」，是**算错**：比如漏了 include_unposted，
+        未记账凭证的余额就不会出现在账簿上，而缓存照样命中。
+        """
+        return (self.book_id, self._data_version, self._caliber,
+                self.include_unposted, self.exclude_voucher_id)
+
     # ---------------- 构造入口（口径契约） ----------------
 
     @classmethod
@@ -173,11 +243,17 @@ class LedgerEngine:
 
     def _period_map(self) -> dict[int, Period]:
         if self._period_map_cache is None:
-            self._period_map_cache = {
-                p.ord: p for p in self.db.scalars(
-                    select(Period).where(Period.book_id == self.book_id).order_by(Period.ord)
-                ).all()
-            }
+            key = ("periods",) + self._key_salt
+
+            def produce() -> dict[int, Period]:
+                return {
+                    p.ord: p for p in self.db.scalars(
+                        select(Period).where(Period.book_id == self.book_id)
+                        .order_by(Period.ord)
+                    ).all()
+                }
+
+            self._period_map_cache = shared("periods", key).get_or_set(key, produce)
         return self._period_map_cache
 
     def _book(self) -> Book:
@@ -191,33 +267,40 @@ class LedgerEngine:
         """科目 -> [自己, 上级, 上上级...]，用于把发生额上卷到各级父科目。"""
         if self._ancestor_cache is not None:
             return self._ancestor_cache
-        rows = list(
-            self.db.execute(
-                select(Subject.id, Subject.parent_id).where(Subject.book_id == self.book_id)
-            ).all()
-        )
-        parent = {sid: pid for sid, pid in rows}
-        cache: dict[int, list[int]] = {}
 
-        def chain(sid: int) -> list[int]:
-            if sid in cache:
-                return cache[sid]
-            out, cur, guard = [sid], parent.get(sid), 0
-            while cur and cur not in out and guard < 32:
-                out.append(cur)
-                cur = parent.get(cur)
-                guard += 1
-            cache[sid] = out
-            return out
+        key = ("ancestors",) + self._key_salt
 
-        self._ancestor_cache = {sid: chain(sid) for sid in parent}
+        def produce() -> dict[int, list[int]]:
+            rows = list(
+                self.db.execute(
+                    select(Subject.id, Subject.parent_id)
+                    .where(Subject.book_id == self.book_id)
+                ).all()
+            )
+            parent = {sid: pid for sid, pid in rows}
+            cache: dict[int, list[int]] = {}
+
+            def chain(sid: int) -> list[int]:
+                if sid in cache:
+                    return cache[sid]
+                out, cur, guard = [sid], parent.get(sid), 0
+                while cur and cur not in out and guard < 32:
+                    out.append(cur)
+                    cur = parent.get(cur)
+                    guard += 1
+                cache[sid] = out
+                return out
+
+            return {sid: chain(sid) for sid in parent}
+
+        self._ancestor_cache = shared("ancestors", key).get_or_set(key, produce)
         return self._ancestor_cache
 
     def _cum_movements(self, up_to_ord: int,
                        subject_ids: list[int] | None = None, *,
                        widen_on_miss: bool = False
                        ) -> dict[tuple[int, int], tuple[Decimal, Decimal]]:
-        """(subject_id, period_ord) -> (当期借方, 当���贷方)。
+        """(subject_id, period_ord) -> (当期借方, 当期贷方)。
 
         结果已经上卷到所有父科目：凭证只挂在明细级科目上，
         但账簿/报表需要每一级父科目的发生额，所以在这里一次算完。
@@ -336,7 +419,19 @@ class LedgerEngine:
         传进来的 ``subject_ids`` 必须是**已经展开到末级**的集合
         （:meth:`_cum_movements` 负责展开）—— 直接传父科目 id 会匹配不到
         任何分录，且不报错。
+
+        **结果跨请求复用。** 这是压测里那条 77.7ms 的聚合，缓存键带
+        ``data_version`` 与全部口径过滤条件（见 :attr:`_key_salt`）。
+        返回的是**共享的字典**，调用方只读不改 —— 真去改它就是在改别人的缓存。
         """
+        scope = tuple(subject_ids) if subject_ids else None
+        key = ("moves",) + self._key_salt + (scope, up_to_ord)
+        return shared("moves", key).get_or_set(
+            key, lambda: self._query_movements_uncached(up_to_ord, subject_ids))
+
+    def _query_movements_uncached(self, up_to_ord: int, subject_ids: list[int] | None
+                                  ) -> dict[tuple[int, int], tuple[Decimal, Decimal]]:
+        """真正发 SQL 的那一半。与 :meth:`_query_movements` 只差「有没有走缓存」。"""
         stmt = (
             select(
                 Entry.subject_id,
@@ -375,9 +470,11 @@ class LedgerEngine:
         return {k: (v[0], v[1]) for k, v in rolled.items()}
 
     def _openings(self) -> dict[tuple[int, int], Decimal]:
-        """期初快照 -> 每个科目的期初。单次请求内只算一次（结果与写无关）。"""
+        """期初快照上卷后的结果。跨请求复用（键里带 data_version）。"""
         if self._openings_cache is None:
-            self._openings_cache = self._roll_up_openings()
+            key = ("openings",) + self._key_salt
+            self._openings_cache = shared("openings", key).get_or_set(
+                key, self._roll_up_openings)
         return self._openings_cache
 
     def _roll_up_openings(self) -> dict[tuple[int, int], Decimal]:
