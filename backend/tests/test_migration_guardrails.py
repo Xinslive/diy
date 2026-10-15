@@ -898,6 +898,8 @@ def test_head_是本文件认识的那一版():
         "0015_book_data_version",            # 账套数据版本号：跨请求聚合缓存的失效依据
         "0016_invoice_import",               # 发票导入、OCR 结果留存与自动凭证生成
         "0017_system_settings",               # 系统级键值配置：第三方服务凭据从 .env 搬进库
+        "0018_book_initialization",            # 账套初始化两步的状态（第 1 步科目、第 2 步期初余额）
+        "0019_book_order",                     # 账套磁贴的**个人**排序：每个用户各一份磁贴顺序
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")

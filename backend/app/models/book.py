@@ -67,6 +67,41 @@ class Book(Base, TimestampMixin):
     # 只留给「停用账套」这类运营语义使用。
     status: Mapped[str] = mapped_column(String(16), default="ACTIVE", nullable=False)
 
+    # ---- 初始化状态（迁移 0018）------------------------------------------
+    #
+    # 初始化被显式拆成**有先后的两步**：先定科目，再录期初余额。
+    # 期初是挂在科目上的，所以顺序不是流程偏好而是数据依赖 —— 账上还没有
+    # 科目时录进来的期初挂不到任何科目上，只能整批丢掉。用户看不出这个
+    # 先后关系（科目表和期初余额是两个页面），所以状态记在账套上，由接口层拦。
+    #
+    # 两个时间戳而不是一张初始化表：两步天然有序、且与 book 1:1，
+    # 多一张表只是多一次 JOIN 和一套级联。
+    #
+    # **存量为空 = 还没做第 1 步。** 迁移把升级那一刻已存在的账套回填成
+    # CHART，否则新闸门会把正在用的老账套一起拦住（理由见迁移 docstring）。
+    #
+    # 「完成第 1 步」有两条路：从用友等外部系统导入科目表（IMPORT），
+    # 或确认沿用建账时系统装好的标准科目表（CHART）。两条路都算数 ——
+    # 强按第一条卡人，会把「就用标准科目表从零开始记账」的用户挡在门外。
+    init_subjects_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    init_subjects_source: Mapped[Optional[str]] = mapped_column(
+        String(16), nullable=True
+    )
+    # 第一次真正写入期初余额的时间。第一步录了一堆期初不等于初始化做完了 ——
+    # 还要等它存进库，才算第 2 步走完。
+    init_openings_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 第 2 步的来源：IMPORT = 导入过余额表；NONE = 本期本来就没有期初余额
+    # （新公司第一年、上一年度是空账）。**没存来源的话，「已导入 213 条」与
+    # 「确认过没有期初」在库里长得一模一样**，而后者恰恰最需要留痕 ——
+    # 出事要查「当时是不是本来就没有」，而界面上一个数字都没有。
+    init_openings_source: Mapped[Optional[str]] = mapped_column(
+        String(16), nullable=True
+    )
+
     # 数据版本号：**由触发器维护**，应用层只读不写（迁移 0015）。
     #
     # 任何影响聚合的写（凭证/分录/科目/期初/期间）都在同一个事务里把它 +1。

@@ -20,7 +20,7 @@ from app.models import SystemSetting
 #
 # 写成一张表而不是三份散开的列表：这几个名字过去在「库里存什么」「函数返回什么」
 # 「env 里叫什么」之间各用各的，于是 ocr_config_public 按错的一套取值，直接
-# KeyError。少一个「��」的映射，就少一处能对不上的地方。
+# KeyError。少一个「键」的映射，就少一处能对不上的地方。
 #
 # 返回名去掉了 ``ocr_`` 前缀 —— 既然它已经是「一份 OCR 配置」，调用方拿到
 # ``api_url`` 就够，不必每次都写 ``ocr_api_url``。

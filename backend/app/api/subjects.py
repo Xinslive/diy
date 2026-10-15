@@ -6,6 +6,7 @@ from sqlalchemy import and_, delete, func, select
 from sqlalchemy.orm import Session
 
 from app.accounting.audit_helper import log
+from app.accounting.initialization import init_state, mark_subjects_ready
 from app.accounting.subject_importer import parse_subject_workbook
 from app.api.schemas import SubjectEditIn, SubjectIn
 from app.core.db import get_db
@@ -115,27 +116,15 @@ def frequent_subjects(book: Book = Depends(get_my_book), db: Session = Depends(g
 
 
 def _subject_import_state(db: Session, book_id: int) -> dict:
-    subject_count = db.scalar(
-        select(func.count()).select_from(Subject).where(Subject.book_id == book_id)
-    ) or 0
-    voucher_count = db.scalar(
-        select(func.count()).select_from(Voucher).where(Voucher.book_id == book_id)
-    ) or 0
-    entry_count = db.scalar(
-        select(func.count()).select_from(Entry).where(Entry.book_id == book_id)
-    ) or 0
-    opening_count = db.scalar(
-        select(func.count()).select_from(PeriodOpening)
-        .join(Period, Period.id == PeriodOpening.period_id)
-        .where(Period.book_id == book_id)
-    ) or 0
-    return {
-        "subject_count": subject_count,
-        "voucher_count": voucher_count,
-        "entry_count": entry_count,
-        "opening_count": opening_count,
-        "can_overwrite": voucher_count == 0 and entry_count == 0 and opening_count == 0,
-    }
+    """能不能覆盖导入科目表。
+
+    实现搬到了 ``app.accounting.initialization`` —— 初始化状态要用同一份计数，
+    两边各查一遍的话，「账套列表说能导入、点进去说不能」这种不一致迟早出现。
+    这里保留原名：本文件的调用点与既有测试都按这个名字认它。
+    """
+    from app.accounting.initialization import subject_import_state
+
+    return subject_import_state(db, book_id)
 
 
 def _parse_subject_upload(file: UploadFile, data: bytes | None = None) -> tuple[dict, str]:
@@ -271,6 +260,10 @@ def import_subjects(
 
         locked_book.subject_code_rule = parsed["code_rule"]
         db.flush()
+        # 导入科目表就是初始化第 1 步的完成动作 —— 无论这个动作是从初始化
+        # 向导里点的，还是从「科目表」页面上点的。与 SET_OPENINGS 的标记
+        # 一样放在同一个事务里：状态与数据要么一起成立，要么一起回滚。
+        mark_subjects_ready(db, locked_book, "IMPORT")
         log(
             db,
             action="IMPORT_SUBJECTS",
@@ -298,6 +291,9 @@ def import_subjects(
         "created": len(parsed["subjects"]),
         "code_rule": parsed["code_rule"],
         "filename": filename,
+        # 初始化向导等的就是这份「第 1 步已完成」，随响应一起回去，
+        # 前端不用再发一次 /init 才把下一步解锁
+        "init": init_state(db, locked_book),
     }
 
 

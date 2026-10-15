@@ -326,12 +326,21 @@ def book(db, admin_user):
     """一个全新的空账套：12 个期间 + 标准科目表。
 
     每个测试拿一个干净的账套，测试之间不会因为上一条用例留下的凭证而互相干扰。
+
+    ``init_subjects_at`` 直接给上：这个夹具造的是「已经装好标准科目表」的账套，
+    等价于初始化第 1 步已经完成。生产上新账套这一列是空的（要走初始化向导），
+    而期初余额的导入与保存都挂在这道闸门上 —— 夹具不给的话，下面每一条
+    写期初的用例都会被 409 拒掉，测的就不再是它本来的意思。
+    需要「未初始化」账套的用例自己建，不要改这里。
     """
+    from datetime import datetime, timezone
+
     from app.accounting.periods import create_periods
     from app.seed.chart_of_accounts import install_chart
 
     tag = uuid.uuid4().hex[:8]
-    b = Book(company_name=f"测试公司{tag}", name=f"账套{tag}", start_year=2026, start_month=1)
+    b = Book(company_name=f"测试公司{tag}", name=f"账套{tag}", start_year=2026, start_month=1,
+             init_subjects_at=datetime.now(timezone.utc), init_subjects_source="CHART")
     db.add(b)
     db.flush()
     create_periods(db, b)

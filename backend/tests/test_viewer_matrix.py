@@ -43,6 +43,12 @@ _EXEMPT_EXACT = {
     "/api/books/{book_id}/print/preview",
     "/api/books/{book_id}/openings/parse",
     "/api/books/{book_id}/vouchers/organize/preview",
+    # 账套磁贴的**个人**排序。写的是「我这个人的磁贴怎么排」，
+    # 不碰凭证、科目、期初，也影响不到别的用户 —— 只读同事打开自己的
+    # 账套列表，同样有权把它排顺眼。挂 require_book_write 反而是错的。
+    # 边界由 tests/test_book_order.py 单独钉：它只能排自己的账套，
+    # 别人的 id 一律 400。
+    "/api/books/order",
 }
 _EXEMPT_PREFIXES = ("/api/auth/", "/api/system/")
 _REPORTS_PREFIX = "/api/reports/"   # 报表走 reports._can_write，另有用例

@@ -16,13 +16,29 @@ export const useSessionStore = defineStore('session', {
     // 刚建好的账套。放在 store 而不是组件里，是因为建完第一个账套时
     // bookId 会从 0 变成新账套，MainLayout 的 viewKey 一变整个页面就重新挂载，
     // 组件内的 newBookId 会被丢掉，「下一步录期初余额」的提示就没了。
-    lastCreatedBookId: 0
+    lastCreatedBookId: 0,
+    // 每个账套的初始化状态（两步向导要的那份 init）。账套列表行里已经自带 init，
+    // 这里存的是**比列表更新的那份**：向导里刚做完一步时，列表还没重新拉过。
+    initByBook: {}
   }),
   getters: {
     isAuthed: (s) => !!s.token,
     // 直接用后端下发的字段，别在前端拿用户名另立一套标准
     isAdmin: (s) => !!s.user?.is_admin,
     currentBook: (s) => s.books.find((b) => b.id === s.bookId) || null,
+    /**
+     * 某账套的初始化状态。拿不到时返回 **null 而不是一份全 false 的假状态** ——
+     * 「不知道」和「知道了，还没做」在界面上是两回事：前者不该弹出
+     * 「第 1 步还没做」的拦截条（那是在替后端下结论），后者要弹。
+     * 判定动作能不能做时再用 utils/bookInit 的 fail-closed 那套 —— 显示等知情，动作不等。
+     *
+     *  两份都留着、initByBook 优先：它装的是**单个账套**的精确刷新
+     * （loadInit / markInit），而 books 那份是列表接口顺带捎回来的。
+     * 代价是 initByBook 一旦陈旧就会盖住更新的列表数据 —— 所以 loadBooks
+     * 每次都要用新列表把它冲一遍，那条纪律就写在那里。
+     */
+    initOf: (s) => (bookId) =>
+      s.initByBook[bookId] ?? s.books.find((b) => b.id === bookId)?.init ?? null,
     currentPeriod: (s) => s.periods.find((p) => p.id === s.periodId) || null,
     /** 当前账套能不能写。**失败时关闭（fail-closed）**。
      *
@@ -113,6 +129,10 @@ export const useSessionStore = defineStore('session', {
       // 免得登出后那半秒里顶栏还渲染着上一个人的月份（401 那条路是同步清的）。
       this.periods = []
       this.periodId = 0
+      // 初始化状态跟账套列表一样是**这个人的账**：上一个用户停在哪一步，
+      // 跟下一个用户无关。留着就可能让新用户一进来就看见一张「待初始化」的卡片，
+      // 而那本账根本不是他的。books 同理（上面已清）。
+      this.initByBook = {}
       localStorage.removeItem('cwq_token')
       localStorage.removeItem('cwq_user')
       localStorage.removeItem('cwq_book')
@@ -126,6 +146,19 @@ export const useSessionStore = defineStore('session', {
      *  没人收拾 —— 表现就是顶栏期间下拉点开只有「无数据」。 */
     async loadBooks() {
       this.books = await bookApi.listBooks()
+      // 列表里的 init 是**刚取回来的**，比 initByBook 里的任何一份都新，
+      // 所以要顺手覆盖掉那份缓存。
+      //
+      // 不覆盖的话会出现一个很难查的现象：卡片是对的、弹窗是错的。
+      // 起因是 initOf 让 initByBook 优先于 books[].init —— 第 2 步在
+      // **期初余额页**上做完，回账套管理时列表已经刷新（卡片因此摘掉了
+      // 「待初始化」），但 initByBook 还停在这个会话早些时候 loadInit 拉到的
+      // 那份，点开向导仍然写着「第 2 步还没做」。而 markInit 之所以能被
+      // 信任，是因为它写的本来就是服务端刚返回的值，覆盖不会丢信息。
+      this.initByBook = this.books.reduce((acc, b) => {
+        if (b.init) acc[b.id] = b.init
+        return acc
+      }, {})
       if (!this.books.find((b) => b.id === this.bookId)) {
         this.bookId = 0
         this.periodId = 0
@@ -205,6 +238,43 @@ export const useSessionStore = defineStore('session', {
     /** 记下刚建好的账套：页面会因 viewKey 变化重新挂载，提示得跨过这一次挂载。 */
     setLastCreatedBook(id) {
       this.lastCreatedBookId = id || 0
+    },
+
+    /**
+     * 拉某个账套的初始化状态。
+     *
+     *  失败**不抛**：拿不到就继续用账套列表行里那份（可能旧一点，但也不是没有）。
+     *  向导此时的取值动作一律 fail-closed（见 utils/bookInit），所以一次网络抖动
+     *  不会变成「按钮亮着、点了被 409」。返回 null 表示这次没拿到新的。
+     */
+    async loadInit(bookId) {
+      if (!bookId) return null
+      try {
+        const init = await bookApi.getInit(bookId)
+        if (init) this.markInit(bookId, init)
+        return init || null
+      } catch (e) {
+        console.warn('[session] 初始化状态拉取失败，沿用账套列表里的那份', e)
+        return null
+      }
+    },
+
+    /**
+     * 就地更新某个账套的初始化状态 —— 账套列表里那一行也一起换掉。
+     *
+     *  必须连 books 那一行一起更新，否则卡片上的「待初始化」标记要等下一次
+     *  loadBooks 才消失，用户明明刚做完第 1 步、眼前那张卡片还在催他。
+     *  整份替换而不是就地改：books 是 computed 的输入，原地改字段它不会重算。
+     *
+     *  loadBooks() 不清 initByBook：向导刚刷新的状态比列表新，
+     *  一次改名/新建触发的列表刷新不该把「第 1 步已完成」又打回未完成。
+     */
+    markInit(bookId, init) {
+      if (!bookId || !init) return
+      this.initByBook = { ...this.initByBook, [bookId]: init }
+      if (this.books.some((b) => b.id === bookId)) {
+        this.books = this.books.map((b) => (b.id === bookId ? { ...b, init } : b))
+      }
     },
 
     setPeriod(id) {

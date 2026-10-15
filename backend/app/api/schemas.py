@@ -44,6 +44,7 @@ class BookIn(BaseModel):
 
 class BookEditIn(BaseModel):
     """改账套的属性：只允许动名字和科目编码规则，不动账上的任何数字。"""
+
     company_name: Optional[str] = Field(default=None, min_length=1, max_length=128)
     name: Optional[str] = Field(default=None, min_length=1, max_length=128)
     # 改了规则只影响**今后**新增科目的自动接号，已有科目的编码一律不动
@@ -51,6 +52,19 @@ class BookEditIn(BaseModel):
 
     def changes(self) -> dict:
         return {k: v for k, v in self.model_dump().items() if v is not None}
+
+
+class BookOrderIn(BaseModel):
+    """账套磁贴的**个人**排序：按用户想要的先后给一份账套 id。
+
+    传的是**相对顺序**，不是「第 2 本写在第 1 位」这样的绝对序号 ——
+    拖动只改变谁在谁前面，写死序号的话每次拖动都要重算全部，
+    而且中间新建的账套会把后面的序号全顶掉。
+    """
+
+    # 上限不是业务规则，是防御：真有人一次几千个账套时，
+    # 那不是「排个序」而是别的东西，不该由这个接口默默接下
+    book_ids: list[int] = Field(min_length=0, max_length=500)
 
 
 class OpeningIn(BaseModel):

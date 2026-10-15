@@ -33,7 +33,7 @@ Create Date: 2026-10-14
 
 **为什么顺带重播资产负债表模板。** 新科目要挂到具体的行上（公式里出现
 ``科目("1131",…)``），而模板是数据不是 schema。``install_chart`` 对已存在的编码
-是跳过的，所以这是纯增���；``install(db, codes=…)`` 只重播资产负债表，不动利润表。
+是跳过的，所以这是纯增项；``install(db, codes=…)`` 只重播资产负债表，不动利润表。
 """
 from __future__ import annotations
 

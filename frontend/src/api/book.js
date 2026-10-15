@@ -2,6 +2,14 @@ import { http, apiUrl } from './client'
 
 export const listBooks = () => http.get('/books').then(r => r.data)
 export const createBook = (payload) => http.post('/books', payload).then(r => r.data)
+/**
+ * 保存账套磁贴的**个人**排序。
+ *
+ *  传的是相对先后（一串有序的账套 id），不是「第 2 本写在第 1 位」——
+ *  绝对序号每拖一次都要重算全部，中途新建的账套还会把后面全顶掉。
+ *  没出现在这串里的账套由后端接在末尾并补齐序号。
+ */
+export const saveBookOrder = (ids) => http.put('/books/order', { book_ids: ids }).then(r => r.data)
 export const getBook = (id) => http.get(`/books/${id}`).then(r => r.data)
 export const updateBook = (id, payload) => http.put(`/books/${id}`, payload).then(r => r.data)
 export const listPeriods = (id) => http.get(`/books/${id}/periods`).then(r => r.data)
@@ -36,7 +44,37 @@ export const auditLogs = (id, limit = 100) => http.get(`/books/${id}/audit-logs`
 
 export const getOpenings = (id, periodId) =>
   http.get(`/books/${id}/openings`, { params: periodId ? { period_id: periodId } : {} }).then(r => r.data)
-export const parseOpenings = (id, fd) => {
+/**
+ * 解析期初余额文件，**只解析不落库** —— 返回行、匹配情况、借贷是否平衡，
+ *  让人先看清读进来什么再决定要不要填进表（落库仍是 setOpenings 那一步）。
+ *
+ *  basis 选「期初」还是「期末」那一份数：用友余额表两种数都在同一张表里，
+ *  以前前端写死期初，用户拿期末数来对就对不上了。basis 变就得重新解析同一个文件 ——
+ *  两份数在文件里是不同的列，不是同一份结果的两种显示。
+ */
+export const parseOpenings = (id, fd, basis = 'opening') => {
   const h = { 'Content-Type': 'multipart/form-data' }
-  return http.post(`/books/${id}/openings/parse`, fd, { headers: h }).then(r => r.data)
+  return http.post(`/books/${id}/openings/parse`, fd, {
+    params: { basis }, headers: h
+  }).then(r => r.data)
 }
+
+/**
+ * 账套初始化状态（两步向导唯一的数据来源）。
+ * GET /books 的每一行已经带 init，**列表页不必为每张卡片再请求一次**；
+ *  这条是给向导自己用的 —— 打开时拿一份最新的，任一步做完再刷新。
+ */
+export const getInit = (id) => http.get(`/books/${id}/init`).then(r => r.data)
+
+/** 第 1 步的第二条路：账上确实有科目时，直接沿用系统标准科目表（不覆盖导入）。 */
+export const keepChartSubjects = (id) => http.post(`/books/${id}/init/subjects/keep`).then(r => r.data)
+
+/**
+ * 第 2 步的第二条路：声明「本期本来就没有期初余额」。
+ *
+ *  新公司第一年、上一年度本来就是空账，期初该是 0 —— 界面上只有「导入」一个
+ *  出口时，这类账套的初始化永远停在第 2 步，卡片上的「待初始化」摘不掉。
+ *  后端只接受**账上确实一条期初都没有**的账套（有的话就是「把期初清空」，
+ *  与「本来就没有」不是一回事）。
+ */
+export const skipOpenings = (id) => http.post(`/books/${id}/init/openings/skip`).then(r => r.data)

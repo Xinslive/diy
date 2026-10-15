@@ -121,6 +121,11 @@ def main() -> int:
     check("新建专用账套（脚本可重复运行）", st == 201,
           f"{made['name']} / 科目 {made['subjects_installed']} 个")
 
+    # 初始化第 1 步：沿用系统标准科目表。没有这一步，这个新账套写不了期初
+    # （期初挂在科目上，接口层按初始化顺序 409 挡下，见 accounting/initialization.py）
+    st, kept = call("POST", f"/api/books/{bid}/init/subjects/keep")
+    check("初始化第 1 步（沿用标准科目表）", st == 200, str(kept)[:120])
+
     st, periods = call("GET", f"/api/books/{bid}/periods")
     p12 = next(p for p in periods if p["month"] == 12)
     p11 = next(p for p in periods if p["month"] == 11)

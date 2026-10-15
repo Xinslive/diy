@@ -171,6 +171,16 @@ class UserBook(Base, TimestampMixin):
     book_id: Mapped[int] = mapped_column(ForeignKey("book.id", ondelete="CASCADE"), nullable=False)
     # OWNER / ACCOUNTANT(可制单记账) / VIEWER(只读)
     role: Mapped[str] = mapped_column(String(16), default="ACCOUNTANT", nullable=False)
+    # 这个**用户**把账套磁贴排在第几位（迁移 0019）。
+    #
+    # 放在授权行上而不是 book 上：磁贴先后是每个人的工作台布局，
+    # 同一个账套甲排第一、乙排最后都很正常。写进 book 就成了
+    # 「甲拖一下，乙的页面跟着变」。
+    #
+    # NULL = 没排过，列表回落到 company_name/name —— 对从不拖动的用户
+    # 完全不可见。建新账套不写这一列，新账套因此落在已排序的末尾，
+    # 而不是把用户排好的布局顶开。
+    sort_order: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     user: Mapped["SysUser"] = relationship()
     book: Mapped["Book"] = relationship()

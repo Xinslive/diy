@@ -122,9 +122,23 @@ import * as api from '@/api/subject'
 import { useSessionStore } from '@/stores/session'
 import { CATEGORY_LABEL } from '@/utils/subjectCode'
 
-const props = defineProps({ modelValue: { type: Boolean, default: false } })
+const props = defineProps({
+  modelValue: { type: Boolean, default: false },
+  /**
+   * 导入到哪个账套。**不传就用当前账套**（科目表页的用法）。
+   *
+   * 为什么必须有这个口子：初始化向导可以对**任意一本**账套打开
+   * （账套卡片上的「继续初始化」），而向导自己并不切换当前账套 ——
+   * 以前这里直接读 `store.bookId`，于是从卡片打开向导给 B 账套做初始化时，
+   * 传进去的科目表**覆盖的是当前那本账套 A**。
+   * 后果不是「报错」，是 A 的科目表被无声地换掉、B 的初始化永远做不完。
+   */
+  bookId: { type: [Number, String], default: 0 }
+})
 const emit = defineEmits(['update:modelValue', 'imported'])
 const store = useSessionStore()
+
+const targetBookId = computed(() => Number(props.bookId) || store.bookId)
 
 const visible = computed({
   get: () => props.modelValue,
@@ -167,7 +181,7 @@ async function preview() {
   if (!file.value) return
   previewing.value = true
   try {
-    result.value = await api.previewSubjectImport(store.bookId, file.value)
+    result.value = await api.previewSubjectImport(targetBookId.value, file.value)
     step.value = 'preview'
   } finally {
     previewing.value = false
@@ -186,7 +200,7 @@ async function commit() {
   }
   committing.value = true
   try {
-    committed.value = await api.importSubjects(store.bookId, file.value)
+    committed.value = await api.importSubjects(targetBookId.value, file.value)
     step.value = 'done'
     emit('imported')
   } finally {

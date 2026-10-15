@@ -58,6 +58,12 @@ def main() -> int:
     check("新建账套", r.status_code == 201, r.text[:120])
     BID = r.json()["id"]
 
+    # 初始化第 1 步：确认沿用系统标准科目表。
+    # 新账套的初始化是**空**的，期初余额写不进去（409）——
+    # 演示脚本不导入外部科目表，所以走「沿用标准表」这条同样是完成的路。
+    r = client.post(f"/api/books/{BID}/init/subjects/keep", headers=H)
+    check("初始化第 1 步（沿用标准科目表）", r.status_code == 200, r.text[:120])
+
     periods = client.get(f"/api/books/{BID}/periods", headers=H).json()
     check("账套含 2026 全年 12 期", len(periods) == 12)
     P = {p["code"]: p["id"] for p in periods}

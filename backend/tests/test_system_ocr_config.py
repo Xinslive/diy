@@ -111,7 +111,7 @@ def test_没配时回退到env(db):
     from app.core.config import settings
 
     # 前面的用例往库里写过同一个键，而且用例之间是**提交**过的（不隔离库）。
-    # 不先清掉，这一��测的其实是「库优先」，跟这里要验的两件事混在一起。
+    # 不先清掉，这一条测的其实是「库优先」，跟这里要验的两件事混在一起。
     system_settings.set_value(db, "ocr_api_url", "")
     db.commit()
     monkey = settings.invoice_ocr_api_url

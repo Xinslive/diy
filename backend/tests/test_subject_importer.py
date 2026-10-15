@@ -83,3 +83,25 @@ def test_已有凭证的账套拒绝覆盖且不改动科目(client, auth, book,
     assert response.status_code == 409, response.text
     assert db.scalar(select(Subject).where(Subject.book_id == book.id, Subject.code == "1001")) is not None
     assert db.scalar(select(Subject).where(Subject.book_id == book.id, Subject.code == "100101")) is None
+
+
+def test_级次不全的科目表要报出清单而不是崩掉():
+    """级次缺一级时，这里原来直接 ``widths[level]`` → KeyError → 500。
+
+    最需要说清楚的恰恰是这种表（用户照着改就行），却只能看到一句
+    「数据库内部错误」—— 一句完全指不出该改哪里的提示。
+    """
+    from app.accounting.subject_importer import parse_subject_workbook
+
+    body = _xlsx([
+        ["类型", "级次", "科目编码", "科目名称", "余额方向"],
+        ["资产", 1, "1001", "现金", "借"],
+        # 第 2 级一个都没有，第 3 级直接出现 —— widths 里就没有 2 这一档
+        ["资产", 3, "10010101", "备用金-某行", "借"],
+    ])
+    result = parse_subject_workbook(body, "会计科目.xlsx")
+    assert result["ok"] is False
+    assert any("级次为 2" in e["message"] for e in result["errors"]), result["errors"]
+    assert any("第 3 级" in e["message"] for e in result["errors"]), result["errors"]
+    # 规则字符串给不全没关系：这份表压根导入不了
+    assert isinstance(result["code_rule"], str)

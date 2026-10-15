@@ -179,19 +179,19 @@ cd backend
 ```bash
 cd backend
 
-.venv/bin/python -m pytest                      # 1259 个单元/接口测试（60 个测试文件，实测 `--collect-only`）
+.venv/bin/python -m pytest                      # 1410 个单元/接口测试（68 个测试文件，实测 `--collect-only`）
 .venv/bin/python scripts/demo_e2e.py            # 69 项端到端流程
 .venv/bin/python scripts/demo_modules.py        # 53 项模块冒烟
-node onboard.mjs                                # 12 步浏览器开户全流程（需前后端都起着）
+node onboard.mjs                                # 18 步浏览器开户全流程（需前后端都起着）
 node report_design.mjs                          # 7 步浏览器报表设计器（需前后端都起着）
 
-cd ../frontend && npm run test                  # 12 个前端测试文件（node --test）
+cd ../frontend && npm run test                  # 14 个前端测试文件（node --test）
 ```
 
 - pytest 用**独立测试库** `cwq_test`，每个用例一个全新账套，绝不碰开发库
 - 两个 demo 脚本每次运行自建 uuid 账套，可以反复跑
-- `onboard.mjs` 跑真实浏览器：新建账套 → 录期初（含反方向余额）→ 试算平衡 →
-  保存回读 → 导出再导入 → 下载文件鉴权
+- `onboard.mjs` 跑真实浏览器：新建账套 → 初始化两步向导 → 录期初（含反方向余额）
+  → 试算平衡 → 保存回读 → 导出再导入 → 下载文件鉴权 → 拖拽磁贴排序并验证刷新后仍在
 - 跑完用 `seed_demo.py --clean` 收掉测试账套
 
 ---

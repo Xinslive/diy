@@ -282,7 +282,10 @@ def test_export_then_parse_round_trip_preserves_reverse_balance(
     assert res["balanced"] is True, res
     assert res["errors"] == [], res["errors"]
     row = next(x for x in res["rows"] if x["code"] == "1122")
-    assert row["signed"] == "-30000", row
+    # 用 Decimal 比而不是比字符串：解析侧现在按库的 Numeric(20,2) 口径量化，
+    # 「-30000」与「-30000.00」是同一个数，而断言字符串会把「量化了没」写成
+    # 一条与本用例真正要验的东西（反向余额往返不丢方向）无关的契约
+    assert Decimal(row["signed"]) == Decimal("-30000"), row
     assert row["display_side"] == "贷", row
 
 
@@ -326,7 +329,7 @@ def test_parse_matches_by_name_when_code_blank(client, auth, book_id):
     assert r.status_code == 200, r.text
     row = r.json()["rows"][0]
     assert row["subject_id"] is not None, row
-    assert row["signed"] == "4321", row
+    assert Decimal(row["signed"]) == Decimal("4321"), row
 
 
 def test_parse_default_side_follows_subject_when_column_blank(client, auth, book_id):
@@ -338,8 +341,8 @@ def test_parse_default_side_follows_subject_when_column_blank(client, auth, book
         ]), XLSX_MIME)})
     rows = r.json()["rows"]
     by_side = {x["natural"]: x for x in rows}
-    assert by_side[""]["signed"] == "500", rows
-    assert by_side["贷"]["signed"] == "-500", rows
+    assert Decimal(by_side[""]["signed"]) == Decimal("500"), rows
+    assert Decimal(by_side["贷"]["signed"]) == Decimal("-500"), rows
 
 
 def test_parse_rejects_garbage_and_empty(client, auth, book_id):

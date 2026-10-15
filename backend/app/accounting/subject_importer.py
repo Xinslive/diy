@@ -145,12 +145,22 @@ def _iter_xlsx(data: bytes):
     return sheet.title, rows(), "xlsx"
 
 
-def _workbook_rows(data: bytes, filename: str):
-    """按文件内容选择解析器，文件名只作为兼容补充。"""
+def iter_workbook_rows(data: bytes, filename: str):
+    """按文件内容选择解析器，文件名只作为兼容补充。
+
+    对外公开：期初余额表解析（``opening_importer``）要读同一批文件，而 .xls 的
+    OLE 与 .xlsx 的 zip 分流、以及 xlrd 缺失时那句中文提示都只应该存在一份 ——
+    以前这里是私有的 ``_workbook_rows``，期初表那条路于是自己 openpyxl 硬读，
+    用友导出的 .xls 到那里必然读不开（审计发现的老坑）。
+    """
     lower_name = (filename or "").lower()
     if data.startswith(_OLE_MAGIC) or (lower_name.endswith(".xls") and not data.startswith(_ZIP_MAGIC)):
         return _iter_xls(data)
     return _iter_xlsx(data)
+
+
+# 旧名保留成别名：既有测试按私有名调用，改名会让它们静默变成「测不到任何东西」。
+_workbook_rows = iter_workbook_rows
 
 
 def _as_level(raw: str) -> int | None:
@@ -186,7 +196,7 @@ def parse_subject_workbook(data: bytes, filename: str = "") -> dict:
 
     # .xls 是 OLE 文件，不会被 zip 检查读取；.xlsx 则复用上传入口的解压体积闸。
     check_archive_size(data, label="科目表")
-    sheet_name, rows_iter, file_format = _workbook_rows(data, filename)
+    sheet_name, rows_iter, file_format = iter_workbook_rows(data, filename)
     budget = RowBudget(
         settings.import_max_rows,
         what="行",
@@ -357,7 +367,15 @@ def parse_subject_workbook(data: bytes, filename: str = "") -> dict:
     for item in subjects:
         # 错误详情是预览用的；不把内部错误列表写入确认 payload。
         item.pop("errors", None)
-    code_rule = "-".join(str(widths[level]) for level in range(1, max_level + 1)) if widths else ""
+    # ``widths`` 可能缺某一级（上一段刚为它记过「缺少第 N 级的有效编码段」）。
+    # 这里原来直接 ``widths[level]``：一张级次不全的表走到这里就是 KeyError，
+    # 于是本该给用户看的那份校验清单变成一句「数据库内部错误」——
+    # 恰恰是最需要说清楚的时候说不清楚。缺的那级跳过即可：这份表本来
+    # 就 ok=False，压根导入不了，编码规则给不给全都不影响结论。
+    code_rule = (
+        "-".join(str(widths[level]) for level in range(1, max_level + 1) if level in widths)
+        if widths else ""
+    )
     return {
         "ok": not errors,
         "file_format": file_format,
@@ -373,4 +391,4 @@ def parse_subject_workbook(data: bytes, filename: str = "") -> dict:
     }
 
 
-__all__ = ["parse_subject_workbook"]
+__all__ = ["parse_subject_workbook", "iter_workbook_rows"]
