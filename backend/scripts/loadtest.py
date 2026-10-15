@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import math
 import os
@@ -37,6 +38,7 @@ import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -88,7 +90,7 @@ class Sampler:
     """采样被测进程的 RSS 与 CPU。
 
     Linux 读 /proc，macOS 退回 ``ps``。**两条路都只在采样点取瞬时值**，
-    所以结果是量级参考而不是精确计量 —— 这在压测里够用了，���不要拿它
+    所以结果是量级参考而不是精确计量 —— 这在压测里够用了，但不要拿它
     去对比两个相差 5% 的配置。
     """
 
@@ -220,6 +222,21 @@ def find_server_pids(pattern: str) -> list[int]:
 # --------------------------------------------------------------------- 场景
 
 
+def _walk_tree(nodes: list[dict]) -> tuple[list[dict], list[dict]]:
+    """返回 (全部叶子, 有下级的父)。顺序与接口一致（按 code）。
+
+    模块级而不是 discover 里的闭包：写场景也要用它选科目。
+    """
+    leaves, parents = [], []
+    for n in nodes:
+        kids = n.get("children") or []
+        (parents if kids else leaves).append(n)
+        l2, p2 = _walk_tree(kids)
+        leaves += l2
+        parents += p2
+    return leaves, parents
+
+
 @dataclass
 class Scenario:
     name: str
@@ -266,18 +283,7 @@ class Bench:
         if not period_id:
             raise RuntimeError("取不到任何会计期间，先用 seed_perf.py 造数")
 
-        def walk(nodes: list[dict]) -> tuple[list[dict], list[dict]]:
-            """返回 (全部叶子, 有下级的父)。顺序与接口一致（按 code）。"""
-            leaves, parents = [], []
-            for n in nodes:
-                kids = n.get("children") or []
-                (parents if kids else leaves).append(n)
-                l2, p2 = walk(kids)
-                leaves += l2
-                parents += p2
-            return leaves, parents
-
-        leaves, parents = walk(subs)
+        leaves, parents = _walk_tree(subs)
         if not leaves:
             raise RuntimeError("账套里没有末级科目")
         # 选子科目最多的那个父科目：只有它才够格切出 3/8 档
@@ -319,6 +325,116 @@ class Bench:
         """占位：账套的 ``years`` 只有年度汇总（year/total/closed/vouchers），
         **没有期间列表**，所以期间一律走 ``/api/books/{id}/periods`` 取。"""
         raise NotImplementedError
+
+    # ----------------------------------------------------------------- 写场景
+
+    async def make_write_scenarios(self, base: str, entries: int) -> list[Scenario]:
+        """造**写**场景，打在一个自建的临时账套上。
+
+        **为什么不直接打演示账套。** 写场景会真的落数据。打别人的账套意味着
+        压测把数据搞脏了、跑完还得手工收拾 —— 而「忘了收拾」这种情况一定会发生。
+        所以：新建一个专用账套，压完删掉。
+
+        **为什么每次都新建而不是复用。** 版本号触发器会让并发写串行，
+        而复用的账套里上一轮的数据会让缓存命中率、索引体积都随轮次漂移 ——
+        第二轮的数不能和第一轮比。**同一个账号下同名账套只能有一个**，
+        所以用时间戳命名。
+        """
+        h = {"Authorization": f"Bearer {self.token}"}
+        name = f"压测写入-{int(time.time())}"
+        r = await self.client.post(f"{base}/api/books", headers=h, json={
+            "company_name": f"压测写入公司-{int(time.time())}", "name": name,
+            "start_year": 2026, "start_month": 1})
+        if r.status_code >= 400:
+            raise RuntimeError(f"建压测写入账套失败：{r.status_code} {r.text[:200]}")
+        book_id = r.json()["id"]
+
+        pls = (await self.client.get(f"{base}/api/books/{book_id}/periods",
+                                     headers=h)).json()
+        rows = pls if isinstance(pls, list) else (pls.get("periods") or [])
+        if not rows:
+            raise RuntimeError("新建账套没有期间")
+        period = rows[0]
+
+        subs = (await self.client.get(f"{base}/api/books/{book_id}/subjects",
+                                      headers=h)).json()
+        leaves, _ = _walk_tree(subs)
+        if len(leaves) < 2:
+            raise RuntimeError("新账套里没有末级科目可用")
+
+        dr, cr = leaves[0]["id"], leaves[1]["id"]
+
+        def voucher_body(n_lines: int) -> dict:
+            """n_lines 条分录的借贷各半，借贷必须相等否则护栏会拒。"""
+            per = Decimal("100.00")
+            half = n_lines // 2
+            entries = [{"subject_id": dr, "amount": str(per), "summary": "压测",
+                        "direction": "DEBIT"} for _ in range(half)]
+            entries += [{"subject_id": cr, "amount": str(per), "summary": "压测",
+                         "direction": "CREDIT"} for _ in range(n_lines - half)]
+            return {
+                # **不能用 period["code"]**：它是 "2026-01" 这样的期间编码，
+                # 不是日期（后端 Pydantic 直接 422，报「input is too short」）。
+                # 真实日期要从 year / month 拼。
+                "voucher_date": f"{period.get('year')}-{int(period.get('month')):02d}-01",
+                "entries": entries, "remark": "压测写入",
+                # **刻意不指定 voucher_no**：写死一个编号，并发下必然撞
+                # uq_voucher_period_no，几十个请求全部 400 —— 测出来的
+                # 「写很慢」其实是唯一约束在挡路，不是写路径慢。
+                # 不给编号由服务端发号，那才是真实用户路径，
+                # 而且取号本身就是这条路径的一部分。
+            }
+
+        self._write_book_id = book_id
+        self._write_period_id = period["id"]
+
+        return [
+            Scenario("write-voucher", "POST",
+                     f"/api/books/{book_id}/vouchers",
+                     json_body=voucher_body(entries), weight=1),
+            Scenario("write-voucher-bulk", "POST",
+                     f"/api/books/{book_id}/vouchers",
+                     json_body=voucher_body(500), weight=1),
+        ]
+
+    async def cleanup_write_book(self, base: str) -> None:
+        """删掉临时账套。
+
+        **复用 `seed_demo.wipe_book` 而不是自己写。** 它按正确的依赖顺序删，
+        而且是**按规矩过护栏**的：先解锁期间、再把已记账凭证退回未记账，
+        然后才删 —— 触发器明确放行的状态跳转只有这一个。
+        自己写一份「直接 DELETE」会在压测账套没结账时就撞
+        ``trg_posted_voucher_guard``，而绕过触发器去删是这个项目明令禁止的
+        （见 ``wipe_book`` 自己的注释）。
+
+        也没有走 HTTP：这个系统**没有** `DELETE /api/books/{id}`，账套在产品上
+        能不能删本身是有争议的，不该为了压测临时加一个。
+        """
+        bid = getattr(self, "_write_book_id", None)
+        if not bid:
+            return
+        try:
+            from app.core.db import SessionLocal
+
+            # 按**路径**加载而不是 ``from seed_demo import wipe_book``：
+            # 后者只在「把本文件当脚本直接跑」时才成立（那时脚本所在目录
+            # 自动在 sys.path 上）。被当成模块导入时就 ModuleNotFoundError，
+            # 而那正好是清理会失败、却没人看见的时刻。
+            spec = importlib.util.spec_from_file_location(
+                "cwq_seed_demo", Path(__file__).with_name("seed_demo.py"))
+            seed_demo = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(seed_demo)
+
+            db = SessionLocal()
+            try:
+                seed_demo.wipe_book(db, bid)
+            finally:
+                db.close()
+            print(f"临时写入账套已删除（book_id={bid}）")
+        except Exception as e:                     # noqa: BLE001
+            # 清理失败**不许**把压测结果一起废掉：数字已经量到了，
+            # 报出来让人手工收一下就行。
+            print(f"⚠️  临时账套 {bid} 自动清理失败（{e}），请手工清理")
 
     async def run(self, scenarios: list[Scenario], duration: float) -> None:
         weighted: list[Scenario] = []
@@ -399,6 +515,61 @@ async def amain(args: argparse.Namespace) -> int:
 
         bench = Bench(client, token, args.concurrency)
         bench._user, bench._pass = args.username, args.password
+
+        # 写场景**单独一档**：它们真的落数据，混进读场景的循环里会
+        # 把两边都测坏（读场景的命中率被写搅掉，写场景又被读的耗时掩盖）。
+        # 而且要一个专属账套。
+        if args.write:
+            write_scenarios = await bench.make_write_scenarios(base, args.write_entries)
+            print("写场景（自建临时账套，跑完删除）: "
+                  + ", ".join(s.name for s in write_scenarios))
+            if args.scenario:
+                write_scenarios = [s for s in write_scenarios
+                                   if s.name in args.scenario] or write_scenarios
+            try:
+                if args.warmup > 0:
+                    print("写场景热身中（不计入）…")
+                    await bench.run(write_scenarios, args.warmup)
+                    bench.results.clear()
+                pids_w = ([int(p) for p in args.server_pid.split(",") if p.strip()]
+                          or find_server_pids(args.server_pattern))
+                sampler_w = Sampler(pids_w)
+                sampler_w.start()
+                cpu_before_w = self_cpu_seconds()
+                t1 = time.monotonic()
+                await bench.run(write_scenarios, args.duration)
+                wall_w = time.monotonic() - t1
+                # **必须 stop 之后才 summary** —— 采样线程还在跑的时候取，
+                # 拿到的是半截数据，而且线程会一直活着到进程退出。
+                await sampler_w.stop()
+                sysm_w = sampler_w.summary()
+            finally:
+                await bench.cleanup_write_book(base)
+
+            print(f"\n{report(bench.results, wall_w, sysm_w, os.cpu_count() or 1)}")
+            if any(r.errors for r in bench.results.values()):
+                print(f"\n失败明细: " + ", ".join(
+                    f"{n}={dict(r.statuses)}" for n, r in bench.results.items() if r.errors))
+            print(
+                "\n口径提醒：写吞吐受磁盘与 PG 落盘影响远大于读，"
+                "不可与读场景横向比。这组数字的用途是**看版本号触发器的锁代价**："
+                "同一账套的并发写会在 book 行上串行，语句级触发器让它是"
+                "「每条语句一次」而不是「每行一次」。\n"
+                "  write-voucher       每张 2 行 —— 锁开销的基线\n"
+                "  write-voucher-bulk  每张 500 行 —— 批量写形态，与导入同一量级")
+            if args.json:
+                Path(args.json).write_text(json.dumps(
+                    {"mode": "write", "concurrency": args.concurrency,
+                     "wall": wall_w, "scenarios": {
+                         n: {"n_ok": r.n_ok, "errors": r.errors,
+                             "p50": round(pct(sorted(r.latencies), .50), 1),
+                             "p95": round(pct(sorted(r.latencies), .95), 1),
+                             "p99": round(pct(sorted(r.latencies), .99), 1)}
+                         for n, r in bench.results.items()}},
+                    ensure_ascii=False, indent=2), encoding="utf-8")
+                print(f"JSON 已写入 {args.json}")
+            return 0
+
         scenarios = await bench.discover(base, args.book_name, args.period_id)
         if args.scenario:
             scenarios = [s for s in scenarios if s.name in args.scenario]
@@ -474,6 +645,11 @@ def main() -> int:
     p.add_argument("--timeout", type=float, default=60.0)
     p.add_argument("--scenario", action="append", default=None,
                    help="只跑指定场景（可重复）。默认全跑")
+    p.add_argument("--write", action="store_true",
+                   help="跑**写**场景（自建临时账套，跑完删除）。"
+                        "与读场景互斥：写会真的落数据，混在一起两边都测不准")
+    p.add_argument("--write-entries", type=int, default=2, metavar="N",
+                   help="write-voucher 场景每张凭证的分录数（默认 2）")
     p.add_argument("--server-pid", default="", help="逗号分隔的被测进程 pid")
     p.add_argument("--server-pattern", default="uvicorn app.main:app")
     p.add_argument("--json", default="", help="把结果写成 JSON")
