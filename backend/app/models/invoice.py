@@ -22,9 +22,10 @@ class InvoiceConfig(Base, TimestampMixin):
     # 只有销项需要税额科目：进项税额按用户约定不单独列示（并入第一条明细行），
     # 所以这里没有 input_tax_subject_id。
     output_tax_subject_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subject.id", ondelete="RESTRICT"))
-    # 进项发票贷方，按用户约定默认在界面预选 1001 库存现金。
+    # 进项发票贷方（付款账户）与销项发票借方（收款账户）。**一律不预填** ——
+    # 预填的已选项不会提醒任何人去核对，而生成出来的凭证科目错了要等总账
+    # 对不上才发现。留空就是「还没配」，预览时明确报「未配置结算科目」。
     input_credit_subject_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subject.id", ondelete="RESTRICT"))
-    # 销项发票借方，默认同样预选 1001，用户可在批次或配置中切换。
     output_debit_subject_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subject.id", ondelete="RESTRICT"))
 
 

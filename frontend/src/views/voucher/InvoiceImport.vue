@@ -19,7 +19,7 @@
           <template #header>
             <div class="section-head">
               <span>自动制证配置</span>
-              <span class="muted">本单位税号用于自动判断进项/销项；默认结算科目为 1001 库存现金。进项发票不单列税额，价税合计直接计入成本费用</span>
+              <span class="muted">本单位税号用于自动判断进项/销项；科目需自行选择，不预填。进项发票不单列税额，价税合计直接计入成本费用</span>
             </div>
           </template>
           <!--
@@ -37,21 +37,21 @@
               </el-col>
               <el-col :xs="24" :sm="12">
                 <el-form-item label="销项税额">
-                  <el-select v-model="config.output_tax_subject_id" :disabled="!store.canWrite" filterable>
+                  <el-select v-model="config.output_tax_subject_id" :disabled="!store.canWrite" filterable clearable>
                     <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                   </el-select>
                 </el-form-item>
               </el-col>
               <el-col :xs="24" :sm="12">
                 <el-form-item label="进项贷方">
-                  <el-select v-model="config.input_credit_subject_id" :disabled="!store.canWrite" filterable>
+                  <el-select v-model="config.input_credit_subject_id" :disabled="!store.canWrite" filterable clearable>
                     <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                   </el-select>
                 </el-form-item>
               </el-col>
               <el-col :xs="24" :sm="12">
                 <el-form-item label="销项借方">
-                  <el-select v-model="config.output_debit_subject_id" :disabled="!store.canWrite" filterable>
+                  <el-select v-model="config.output_debit_subject_id" :disabled="!store.canWrite" filterable clearable>
                     <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                   </el-select>
                 </el-form-item>

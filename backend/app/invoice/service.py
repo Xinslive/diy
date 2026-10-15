@@ -28,11 +28,18 @@ from app.models import (
 )
 
 
-DEFAULT_SUBJECT_CODES = {
-    "output_tax_subject_id": "2221",
-    "input_credit_subject_id": "1001",
-    "output_debit_subject_id": "1001",
-}
+# 账套配置里可指定科目的那几个字段。**刻意不带默认值。**
+#
+# 原来这里按科目编码预填 2221 / 1001，省掉一次选择。但预填意味着「用户没想过，
+# 系统替他想了」：一家公司可能把预付款挂在别的科目、把税额记在 2221 的另一个
+# 明细上，而界面上一个绿框似的已选项不会提醒任何人去核对 —— 生成出来的凭证
+# 科目错了，得等总账对不上才发现。空着就是「还没配」，预览时明确报
+# 「未配置税额科目」，比猜一个像样的强。
+CONFIG_SUBJECT_KEYS = (
+    "output_tax_subject_id",
+    "input_credit_subject_id",
+    "output_debit_subject_id",
+)
 
 
 def _money(value: Any) -> Decimal:
@@ -89,13 +96,16 @@ def _ensure_leaf_subjects(db: Session, book_id: int, ids: list[int | None], labe
 
 
 def _default_config(db: Session, book_id: int) -> dict[str, Any]:
-    rows = db.scalars(select(Subject).where(Subject.book_id == book_id, Subject.code.in_(DEFAULT_SUBJECT_CODES.values()))).all()
-    by_code = {row.code: row for row in rows}
+    """尚未配置时的形态：**科目一律为空**，只带上身份信息。
+
+    以前会按科目编码去查 2221 / 1001 并预填。现在不预填（见 CONFIG_SUBJECT_KEYS），
+    这里也就不必再查库。
+    """
     return {
         "id": None,
         "book_id": book_id,
         "taxpayer_id": "",
-        **{key: (by_code.get(code).id if by_code.get(code) else None) for key, code in DEFAULT_SUBJECT_CODES.items()},
+        **{key: None for key in CONFIG_SUBJECT_KEYS},
     }
 
 
@@ -114,9 +124,9 @@ def get_config(db: Session, book_id: int) -> dict[str, Any]:
 
 
 def save_config(db: Session, book_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    defaults = _default_config(db, book_id)
-    values = {key: payload.get(key) if payload.get(key) is not None else defaults.get(key)
-              for key in DEFAULT_SUBJECT_CODES}
+    # 存的就是界面上选的，**不回填任何默认值**。留空就是留空 —— 回填会让
+    # 「我把这一项清掉了」变成「怎么又变回 1001 了」。
+    values = {key: payload.get(key) for key in CONFIG_SUBJECT_KEYS}
     _ensure_leaf_subjects(db, book_id, list(values.values()), "发票默认科目")
     config = db.scalar(select(InvoiceConfig).where(InvoiceConfig.book_id == book_id))
     if config is None:
@@ -257,7 +267,7 @@ def _build_preview(
     overrides: dict[str, dict],
 ) -> tuple[list[dict[str, Any]], int, int]:
     record_rows = sorted(batch.invoices, key=lambda row: row.page_index)
-    default_ids = [config.get(key) for key in DEFAULT_SUBJECT_CODES]
+    default_ids = [config.get(key) for key in CONFIG_SUBJECT_KEYS]
     subjects = _ensure_leaf_subjects(db, batch.book_id, default_ids, "发票默认科目")
     for rule in rules:
         subjects.update(_ensure_leaf_subjects(db, batch.book_id, [rule.subject_id], "发票规则科目"))
