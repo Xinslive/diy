@@ -53,9 +53,7 @@
       <div class="report-head">
         <h2 class="report-title">科目余额表</h2>
         <div class="report-sub">
-          {{ store.currentBook?.company_name }} · {{ store.currentBook?.name }}
-          · <template v-if="isRange">区间 {{ data.from_period || fromCode }} ~ {{ data.period || periodCode }}</template>
-          <template v-else>期间 {{ data.period || periodCode }}</template>
+          {{ store.currentBook?.name }} · {{ periodText }}
         </div>
       </div>
 
@@ -142,6 +140,14 @@ const periodCode = computed(
 const fromCode = computed(
   () => yearPeriods.value.find((p) => p.id === fromId.value)?.code || ''
 )
+/** 表头那一句期间。区间缩到单期时按「期间 X」写，不要写成「区间 X ~ X」——
+ *  那种写法把同一个期间在页内说了两遍，而顶栏已经选过它了。 */
+const periodText = computed(() => {
+  const to = data.value.period || periodCode.value
+  const from = data.value.from_period || fromCode.value
+  if (isRange.value && from && to && from !== to) return `区间 ${from} ~ ${to}`
+  return `期间 ${to}`
+})
 
 /** 账套、年度或顶栏期间变了以后，原来那一期可能已经不在当前口径里 —— 归位。 */
 function alignPeriod() {

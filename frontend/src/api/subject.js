@@ -1,6 +1,6 @@
 import { http } from './client'
 export const subjectTree = (bookId, params) => http.get(`/books/${bookId}/subjects`, { params }).then(r => r.data)
-export const subjectFlat = (bookId) => http.get(`/books/${bookId}/subjects/flat`).then(r => r.data)
+export const subjectFlat = (bookId, params) => http.get(`/books/${bookId}/subjects/flat`, { params }).then(r => r.data)
 /** 常用科目：按这套账里已录入的分录数排 */
 export const createSubject = (bookId, payload) => http.post(`/books/${bookId}/subjects`, payload).then(r => r.data)
 export const updateSubject = (bookId, id, payload) => http.patch(`/books/${bookId}/subjects/${id}`, payload).then(r => r.data)

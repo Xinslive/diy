@@ -116,6 +116,13 @@ class StubCtx:
     period_amt = period_amount
     ytd_amt = ytd_amount
 
+    def measure(self, sid, kind_key, period):
+        """桩里没有科目树（每个编码都当成末级），所以汇总退化成直接取数。
+
+        真实上下文是 ``ReportContext.measure``：引用上级科目时取整棵子树之和。
+        """
+        return getattr(self, kind_key)(sid, period)
+
     def cell(self, row, col):
         return GRID.get((row, col), ZERO)
 

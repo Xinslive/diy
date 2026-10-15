@@ -43,8 +43,7 @@
       <div class="report-head">
         <h2 class="report-title">{{ template?.name }}</h2>
         <div class="report-sub">
-          {{ store.currentBook?.company_name }} · {{ store.currentBook?.name }} {{ store.currentPeriod?.code }}
-          · 期间 {{ data.period }}
+          {{ store.currentBook?.name }} · 期间 {{ data.period }}
           <span v-if="hiddenRowCount" class="muted">（{{ hiddenRowCount }} 行已隐藏，仅设计模式可见）</span>
         </div>
       </div>
@@ -198,18 +197,14 @@
 
             <div class="builder-body">
               <div v-if="builderType === 'subject'" class="builder-form">
-                <div class="builder-intro">从一个末级科目读取金额</div>
+                <div class="builder-intro">读取一个科目的金额；选上级科目会把它下面所有末级一起加总</div>
                 <label class="builder-label">科目</label>
                 <el-select v-model="builder.subjectCode" filterable clearable class="builder-input" placeholder="搜索科目编码或名称">
-                  <el-option v-for="s in subjectOptions" :key="s.code" :label="`${s.code} · ${s.name}`" :value="s.code" />
+                  <el-option v-for="s in subjectOptions" :key="s.code" :label="subjectLabel(s)" :value="s.code" />
                 </el-select>
                 <label class="builder-label">取数项目</label>
                 <el-select v-model="builder.measure" class="builder-input">
                   <el-option v-for="m in MEASURE_OPTIONS" :key="m.value" :label="m.label" :value="m.value" />
-                </el-select>
-                <label class="builder-label">期间</label>
-                <el-select v-model="builder.period" class="builder-input">
-                  <el-option v-for="p in PERIOD_OPTIONS" :key="p.value" :label="p.label" :value="p.value" />
                 </el-select>
               </div>
 
@@ -337,6 +332,8 @@ const designMode = ref(false)
 const editing = ref(null)
 const dirty = reactive({})
 const subjectOptions = ref([])
+/** 上级科目取的是它下面所有末级的和，和末级不是一回事，标出来免得选错。 */
+const subjectLabel = (s) => (s.is_leaf === false ? `${s.code} · ${s.name} · 上级` : `${s.code} · ${s.name}`)
 
 const MEASURE_OPTIONS = [
   { value: '期末余额', label: '期末余额' },
@@ -347,11 +344,6 @@ const MEASURE_OPTIONS = [
   { value: '本期贷方', label: '本期贷方' },
   { value: '借方累计', label: '借方累计' },
   { value: '贷方累计', label: '贷方累计' },
-]
-const PERIOD_OPTIONS = [
-  { value: '{{本期}}', label: '当前期间' },
-  { value: '{{上期}}', label: '上一期间' },
-  { value: '{{年初}}', label: '本年年初' },
 ]
 const OPERATOR_OPTIONS = [
   { value: '+', label: '+' }, { value: '-', label: '−' },
@@ -372,7 +364,7 @@ const BUILDER_TYPES = [
 ]
 const builderType = ref('subject')
 const builder = reactive({
-  subjectCode: '', measure: '期末余额', period: '{{本期}}',
+  subjectCode: '', measure: '期末余额',
   rangeStart: '', rangeEnd: '', reference: '',
   leftRef: '', operator: '+', rightRef: '',
   conditionRef: '', conditionOp: '>', conditionValue: '0', whenTrue: '', whenFalse: '',
@@ -509,13 +501,11 @@ const isDirty = (rowNo, colNo) => dirty[`${rowNo}:${colNo}`] !== undefined
 const dirtyCount = computed(() => Object.keys(dirty).length)
 
 const FN_HELP = [
-  { sig: '科目("1001","期末余额",{{本期}})', desc: '取科目余额/发生额；口径：期初、期末余额、借方累计、贷方累计、本期借方、本期贷方、本期金额、本年累计' },
+  { sig: '("1001","期末余额")', desc: '取科目余额/发生额，上级科目会加总它下面所有末级；口径：期初、期末余额、借方累计、贷方累计、本期借方、本期贷方、本期金额、本年累计' },
   { sig: '合计(B2:B8)', desc: '单元格区域求和' },
-  { sig: '上期(B10)', desc: '同一行的上一列' },
   { sig: 'IF(B10>0,B10,0)', desc: '条件判断' },
   { sig: '四舍五入(B10,2)', desc: '四舍五入到指定位数' },
   { sig: 'B9+B16', desc: '单元格加减；支持 + - * / 与比较运算' },
-  { sig: '{{本期}} {{上期}} {{年初}}', desc: '期间占位符' }
 ]
 
 /** 当前各格的取值，做成可点击的速查表，省得靠猜。
@@ -554,7 +544,7 @@ const builderValue = (value) => {
 const builtFormula = computed(() => {
   if (builderType.value === 'subject') {
     if (!builder.subjectCode) return ''
-    return `科目("${builder.subjectCode}","${builder.measure}",${builder.period})`
+    return `("${builder.subjectCode}","${builder.measure}")`
   }
   if (builderType.value === 'sum') {
     if (!builder.rangeStart || !builder.rangeEnd) return ''
@@ -617,7 +607,7 @@ function isEditingCell(row, cell) {
 
 function resetBuilder() {
   Object.assign(builder, {
-    subjectCode: '', measure: '期末余额', period: '{{本期}}', rangeStart: '', rangeEnd: '', reference: '',
+    subjectCode: '', measure: '期末余额', rangeStart: '', rangeEnd: '', reference: '',
     leftRef: '', operator: '+', rightRef: '', conditionRef: '', conditionOp: '>', conditionValue: '0',
     whenTrue: '', whenFalse: '', advancedFormula: '',
   })
@@ -628,13 +618,14 @@ function loadBuilderFromFormula(formula) {
   const src = String(formula || '').trim()
   if (!src) { builderType.value = 'subject'; return }
   // 只把「单个科目」识别为取科目；含有多个科目相加的复杂公式要留在高级模式，
-  // 避免贪婪匹配把后半段误塞进“期间”输入框。
-  const subject = src.match(/^科目\("([^"]+)","([^"]+)",([^()]+)\)$/)
+  // 避免贪婪匹配把后半段当成取数参数。期间参数只有 {{本期}} 等价于留空，
+  // 其它期间留给高级公式原样编辑，免得存回去时被悄悄改成本期。
+  const subject = src.match(/^(?:科目)?\("([^"]+)","([^"]+)"(?:,([^()]+))?\)$/)
   const sum = src.match(/^(?:合计|SUM)\(([A-Z]+\d+):([A-Z]+\d+)\)$/i)
   const condition = src.match(/^IF\(([A-Z]+\d+)([<>=!]+)(-?(?:\d+(?:\.\d+)?|\.\d+)),(.+),(.+)\)$/i)
   const math = src.match(/^([A-Z]+\d+)([+\-*/])([A-Z]+\d+)$/i)
-  if (subject) {
-    builderType.value = 'subject'; builder.subjectCode = subject[1]; builder.measure = subject[2]; builder.period = subject[3]; return
+  if (subject && (!subject[3] || subject[3] === '{{本期}}')) {
+    builderType.value = 'subject'; builder.subjectCode = subject[1]; builder.measure = subject[2]; return
   }
   if (sum) { builderType.value = 'sum'; builder.rangeStart = sum[1]; builder.rangeEnd = sum[2]; return }
   if (/^[A-Z]+\d+$/i.test(src)) { builderType.value = 'reference'; builder.reference = src.toUpperCase(); return }
@@ -848,13 +839,13 @@ function exportXlsx() {
 onMounted(async () => {
   allTemplates.value = await api.templates()
   if (store.bookId) {
-    subjectOptions.value = await subjectApi.subjectFlat(store.bookId).catch(() => [])
+    subjectOptions.value = await subjectApi.subjectFlat(store.bookId, { include_parents: true }).catch(() => [])
   }
   if (!templateId.value && allTemplates.value.length) templateId.value = allTemplates.value[0].id
   load()
 })
 watch(() => store.bookId, async (bookId) => {
-  if (bookId) subjectOptions.value = await subjectApi.subjectFlat(bookId).catch(() => [])
+  if (bookId) subjectOptions.value = await subjectApi.subjectFlat(bookId, { include_parents: true }).catch(() => [])
   load()
 })
 watch(() => store.periodId, () => load())

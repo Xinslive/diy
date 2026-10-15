@@ -87,10 +87,59 @@ class ReportContext:
         # 一次性建好 id -> Subject 的索引：以前每格都 db.get() 一次，
         # 一张几十行的报表就是几十次多余的往返。
         self._subjects_by_id = {s.id: s for s in self.subjects.values()}
+        # 父 -> 子。公式可以引用**上级科目**（见 subject_scope），而账簿引擎
+        # 只认单个 subject_id —— 上级科目自己身上没有分录（凭证只记到末级），
+        # 直接取数会得到一串 0。所以这里先建好树，取数时自己往下卷。
+        self._subject_children: dict[int, list[int]] = {}
+        for s in self.subjects.values():
+            if s.parent_id is not None:
+                self._subject_children.setdefault(s.parent_id, []).append(s.id)
         self.formulas: dict[tuple[int, int], str] = {}
         self._cells: dict[tuple[int, int], Decimal] = {}
         self._visiting: set[tuple[int, int]] = set()
         self._load_formulas()
+
+    # -- 科目范围（末级 / 整棵子树）--
+
+    #: 这些口径走 ``eng_pf``（for_report，排除结转凭证）。
+    _PF_KINDS = frozenset({"period_amount", "period_amt", "ytd_amount", "ytd_amt"})
+
+    def subject_scope(self, sid: int) -> list[int]:
+        """sid 自己 + 它下面**全部末级后代**；sid 是末级时就是 ``[sid]``。
+
+        凭证只允许记到末级（``vouchers._validate_entries`` 的硬闸），所以上级
+        科目自己身上永远是 0 —— 取它的数必须等于把整棵子树加总，否则报表上
+        就会出现一行恒为 0 的「银行存款」，而且不报任何错。
+        """
+        if sid not in self._subject_children:
+            return [sid]
+        out: list[int] = []
+        stack = [sid]
+        seen: set[int] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:      # 科目树理论上无环，脏数据下别死循环
+                continue
+            seen.add(cur)
+            kids = self._subject_children.get(cur)
+            if kids:
+                stack.extend(kids)
+            else:
+                out.append(cur)
+        return sorted(out)
+
+    def measure(self, sid: int, kind_key: str, period) -> Decimal:
+        """按某个口径取数；引用上级科目时取整棵子树之和。"""
+        fn = getattr(self, kind_key)
+        ids = self.subject_scope(sid)
+        if len(ids) == 1:
+            return fn(sid, period)
+        # 整棵子树**一次**算完。逐条取数会各自触发一次聚合（figures() 在缓存
+        # 未命中时退化成全账套扫描），一个 30 个明细的上级科目就是 30 次。
+        self.eng.compute(ids, period.ord)
+        if kind_key in self._PF_KINDS:
+            self.eng_pf.compute(ids, period.ord)
+        return sum((fn(s, period) for s in ids), ZERO)
 
     # -- 模板 --
     def _load_formulas(self) -> None:

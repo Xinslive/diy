@@ -72,11 +72,15 @@ def list_subjects(book: Book = Depends(get_my_book), db: Session = Depends(get_d
 
 
 @router.get("/flat")
-def flat_subjects(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    rows = db.scalars(
-        select(Subject).where(Subject.book_id == book.id, Subject.active.is_(True),
-                               Subject.is_leaf.is_(True)).order_by(Subject.code)
-    ).all()
+def flat_subjects(book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                  include_parents: bool = Query(
+                      False, description="是否连上级科目一起返回。报表公式可以引用"
+                                         "上级科目并自动汇总其下所有末级；凭证录入、"
+                                         "发票制证这些地方仍然只要末级。")):
+    stmt = select(Subject).where(Subject.book_id == book.id, Subject.active.is_(True))
+    if not include_parents:
+        stmt = stmt.where(Subject.is_leaf.is_(True))
+    rows = db.scalars(stmt.order_by(Subject.code)).all()
     return [{"id": s.id, "code": s.code, "name": s.name, "direction": s.direction,
              "level": s.level, "category": s.category, "is_leaf": s.is_leaf,
              "carry_forward": s.carry_forward,

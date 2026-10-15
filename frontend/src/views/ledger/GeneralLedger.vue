@@ -20,8 +20,8 @@
       <div class="report-head">
         <h2 class="report-title">总 账</h2>
         <div class="report-sub">
-          {{ store.currentBook?.company_name }} · {{ store.currentBook?.name }} {{ store.currentPeriod?.code }}
-          · {{ data.from_period }} 至 {{ data.to_period }}
+          {{ store.currentBook?.name }}
+          <template v-if="periodRangeText"> · {{ periodRangeText }}</template>
         </div>
       </div>
       <el-table :data="pageRows" border size="small" v-loading="loading">
@@ -65,6 +65,16 @@ import { fmt } from '@/utils/format'
 
 const store = useSessionStore()
 const data = ref({ rows: [] })
+
+/** 表头那一句期间。起止是同一期时按「期间 X」写 —— 写成「X 至 X」就是把
+ *  同一个期间在页内说了两遍，而顶栏已经选过它了。 */
+const periodRangeText = computed(() => {
+  const from = data.value.from_period
+  const to = data.value.to_period
+  if (!from && !to) return ''
+  if (!to || from === to) return `期间 ${from || to}`
+  return `${from} 至 ${to}`
+})
 const fromId = ref(store.periodId)
 const toId = ref(store.periodId)
 const leafOnly = ref(true)

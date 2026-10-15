@@ -19,11 +19,27 @@
 ----
     科目(编码, 取数口径[, 期间])   取数口径 ∈ 期初 / 借方累计 / 贷方累计 / 期末
                                           / 本期借方 / 本期贷方
+    ("编码", 取数口径)            同上，**省掉函数名**的简写（见下）
     合计(区域) / SUM(区域)         区域求和
     上期(单元格)                   同一行的上一列
     IF(条件, 真值, 假值)
     四舍五入(值, 位数) / ROUND(值, 位数)
     ABS(x) / MAX(...) / MIN(...)
+
+编码
+----
+    **可以写上级科目**（如 ``1002 银行存款``），取的是它下面所有末级科目的合计。
+    凭证只记到末级，上级科目自己身上永远是 0，所以这一步的汇总由求值上下文做
+    （``ReportContext.subject_scope``），不是账簿引擎的现成能力。
+
+省掉函数名
+----------
+    ``("1001","期末余额")`` 与 ``科目("1001","期末余额")`` 完全等价。第三个
+    参数照旧可写，``("1001","期末余额","{{上期}}")`` 也认。
+
+    判据是「``(`` 后紧跟字符串，且括号里有**顶层逗号**」—— 分组表达式里出现
+    逗号本来就是语法错误，所以这条分支不改变任何一条现有公式的含义。
+    ``("1001")`` 没有逗号，仍按分组处理，仍报「公式结果是文本」。
 
 期间写法
 --------
@@ -394,24 +410,61 @@ class Parser:
             return ("cell", tok.value)
         if tok.kind == "IDENT":
             self.pos += 1
-            self.eat("PUNCT", "(")
-            args = []
-            # 实参同样从最松的规则起步：IF(1+2>5,100,200) 里那个
-            # 比较号必须能在实参内部被吃掉，否则会一路冒泡成
-            # 「公式尾部有多余内容」。
-            if not (self.cur.kind == "PUNCT" and self.cur.value == ")"):
-                args.append(self.compare())
-                while self.cur.kind == "PUNCT" and self.cur.value == ",":
-                    self.pos += 1
-                    args.append(self.compare())
-            self.eat("PUNCT", ")")
-            return ("call", tok.value, args)
+            return ("call", tok.value, self._args())
         if tok.kind == "PUNCT" and tok.value == "(":
+            # 裸括号两种读法：分组 ``(1+2)``，或者省掉函数名的科目取数
+            # ``("1001","期末余额")``。
+            #
+            # 判据是「``(`` 后面紧跟字符串，**且**括号里有顶层逗号」。分组里
+            # 出现逗号本来就是语法错误，所以这条分支不会改变任何一条现有公式
+            # 的含义 —— 它只把今天解析不过去的写法接住。
+            if self._is_subject_args():
+                return ("call", "科目", self._args())
             self.pos += 1
             node = self.compare()
             self.eat("PUNCT", ")")
             return node
         raise FormulaError(f"无法解析的记号: {tok.value}")
+
+    def _is_subject_args(self) -> bool:
+        """当前位置是 ``(``，且它包住的是「字符串, 字符串, …」这种实参表。
+
+        必须先看清**有没有顶层逗号**才能决定读法：``("1001")`` 只有一层括号、
+        没有逗号，那是分组，走老路仍然报「公式结果是文本」；真当成科目取数会
+        把一句写错的话默默算成一个数。
+        """
+        i = self.pos + 1
+        if i >= len(self.tokens) or self.tokens[i].kind != "STRING":
+            return False
+        depth = 0
+        while i < len(self.tokens):
+            t = self.tokens[i]
+            if t.kind == "PUNCT":
+                if t.value == "(":
+                    depth += 1
+                elif t.value == ")":
+                    if depth == 0:
+                        return False      # 括号在逗号之前就闭合了
+                    depth -= 1
+                elif t.value == "," and depth == 0:
+                    return True
+            i += 1
+        return False
+
+    def _args(self) -> list:
+        """吃掉 ``实参, 实参, …)``。调用方已经站在 ``(`` 上。"""
+        self.eat("PUNCT", "(")
+        args = []
+        # 实参同样从最松的规则起步：IF(1+2>5,100,200) 里那个
+        # 比较号必须能在实参内部被吃掉，否则会一路冒泡成
+        # 「公式尾部有多余内容」。
+        if not (self.cur.kind == "PUNCT" and self.cur.value == ")"):
+            args.append(self.compare())
+            while self.cur.kind == "PUNCT" and self.cur.value == ",":
+                self.pos += 1
+                args.append(self.compare())
+        self.eat("PUNCT", ")")
+        return args
 
 
 # --------------------------------------------------------------------- 解析缓存
@@ -613,7 +666,8 @@ class Evaluator:
         }
         if kind not in m:
             raise FormulaError(f"未知取数口径: {kind}（可用：{'、'.join(m)}）")
-        return getattr(self.ctx, m[kind])(sid, period)
+        # 引用上级科目时由 ctx 取整棵子树（见 ReportContext.subject_scope）
+        return self.ctx.measure(sid, m[kind], period)
 
     def _f_sum(self, args: list) -> Decimal:
         return sum((D(self._eval(a)) for a in args), ZERO)

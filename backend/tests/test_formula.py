@@ -35,6 +35,11 @@ class FakeCtx:
     def _fig(self, code, kind):
         return Decimal(str(self.figures.get(code, {}).get(kind, 0)))
 
+    def measure(self, sid, kind_key, period):
+        """真实实现（ReportContext.measure）引用上级科目时会取整棵子树之和；
+        桩里没有科目树，每个编码都当末级，所以汇总退化成直接取数。"""
+        return getattr(self, kind_key)(sid, period)
+
     def opening(self, sid, p):
         return self._fig(self._code(sid), "opening")
 
