@@ -31,3 +31,6 @@ dl.mjs
 
 # 本地开发环境（dev.sh 生成的 pid/日志）
 .run/
+
+# 运行时数据。发票原件与解析结果（data/invoices）含购销方税号等敏感信息，只留本机。
+data/

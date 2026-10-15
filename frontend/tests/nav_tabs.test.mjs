@@ -80,9 +80,9 @@ t('非管理员看不到「操作日志 / 用户与授权」', () => {
   const names = n.flatMap(m => m.items.map(i => i.name))
   assert.ok(!names.includes('audit') && !names.includes('users'))
 })
-t('管理员侧栏是 12 项（整理凭证 / 凭证导入 标了 hidden 不进侧栏）', () => {
+t('管理员侧栏是 13 项（整理凭证 / 凭证导入 标了 hidden 不进侧栏）', () => {
   const names = visibleNav(true).flatMap(m => m.items.map(i => i.name))
-  assert.equal(names.length, 12, `实际 ${names.length}`)
+  assert.equal(names.length, 13, `实际 ${names.length}`)
   assert.ok(!names.includes('voucher-organize'), '整理凭证又冒进侧栏了')
   assert.ok(!names.includes('voucher-import'), '凭证导入又冒进侧栏了')
 })

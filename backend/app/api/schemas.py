@@ -115,7 +115,7 @@ class VoucherIn(BaseModel):
     remark: str = ""
     attachments: int = 0
     voucher_no: Optional[str] = None
-    source: Literal["MANUAL", "IMPORT", "CARRY_FORWARD"] = "MANUAL"
+    source: Literal["MANUAL", "IMPORT", "INVOICE", "CARRY_FORWARD"] = "MANUAL"
     # 「插入凭证」告诉后端插在谁的后面：新凭证拿这个号，后面的号整体顺位。
     # 留空就是普通的新增凭证（取期间内最大号 +1）。
     insert_after: Optional[int] = None
@@ -139,6 +139,46 @@ class VoucherOut(BaseModel):
 
 class BatchIds(BaseModel):
     ids: list[int]
+
+
+# ---- 发票导入 ----
+class InvoiceConfigIn(BaseModel):
+    """发票自动制证的账套级配置。"""
+
+    taxpayer_id: str = Field(default="", max_length=32)
+    input_tax_subject_id: Optional[int] = None
+    output_tax_subject_id: Optional[int] = None
+    input_credit_subject_id: Optional[int] = None
+    output_debit_subject_id: Optional[int] = None
+
+
+class InvoiceRuleIn(BaseModel):
+    match_type: Literal["SELLER", "ITEM"]
+    invoice_type: Literal["INPUT", "OUTPUT", "BOTH"] = "BOTH"
+    keyword: str = Field(min_length=1, max_length=128)
+    subject_id: int
+    priority: int = Field(default=0, ge=-1000, le=1000)
+    active: bool = True
+
+
+class InvoiceRulePatch(BaseModel):
+    match_type: Optional[Literal["SELLER", "ITEM"]] = None
+    invoice_type: Optional[Literal["INPUT", "OUTPUT", "BOTH"]] = None
+    keyword: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    subject_id: Optional[int] = None
+    priority: Optional[int] = Field(default=None, ge=-1000, le=1000)
+    active: Optional[bool] = None
+
+
+class InvoicePreviewIn(BaseModel):
+    """批次预览的人工覆盖项。
+
+    动态字典保持前端可逐张修正，不把发票明细硬编码成固定列数。
+    key 为 InvoiceRecord.id，value 允许包含 invoice_type、line_subjects、
+    tax_subject_id、settlement_subject_id。
+    """
+
+    overrides: dict[str, dict] = Field(default_factory=dict)
 
 
 # ---- 期间 ----

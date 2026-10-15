@@ -43,6 +43,10 @@ PyJWT>=2.15.1
 # 导入/导出凭证与模板都要读 xlsx。
 openpyxl>=3.1.5
 
+# 发票 PDF 文本层提取与 PaddleOCR API 调用。
+pypdfium2>=4.30.0
+requests>=2.32.0
+
 # 用友等旧系统导出的 .xls 是 OLE 复合文档，openpyxl 只支持 .xlsx。
 xlrd>=2.0.2
 

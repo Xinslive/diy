@@ -25,6 +25,7 @@ export const NAV = [
       // 菜单里拿 hidden 过滤掉；title 仍留在 NAV 里，标签页标题才认得出。
       { name: 'voucher-organize', title: '整理凭证', icon: Sort, hidden: true },
       { name: 'voucher-import', title: '凭证导入', icon: Upload, hidden: true },
+      { name: 'invoice-import', title: '发票导入', icon: Tickets },
       // 结账是录完凭证之后的下一步，跟着「凭证」这一条线走最顺；
       // 原来它跟打印模板混在一个「期末与输出」模块里，两件事互不相干。
       { name: 'periods', title: '期末结账', icon: CircleCheck },

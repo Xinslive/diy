@@ -20,7 +20,7 @@ ALTER TABLE entry   ADD  CONSTRAINT ck_entry_direction CHECK (direction IN ('DEB
 ALTER TABLE voucher DROP CONSTRAINT IF EXISTS ck_voucher_status;
 ALTER TABLE voucher ADD  CONSTRAINT ck_voucher_status CHECK (status IN ('UNPOSTED','POSTED'));
 ALTER TABLE voucher DROP CONSTRAINT IF EXISTS ck_voucher_source;
-ALTER TABLE voucher ADD  CONSTRAINT ck_voucher_source CHECK (source IN ('MANUAL','IMPORT','CARRY_FORWARD'));
+ALTER TABLE voucher ADD  CONSTRAINT ck_voucher_source CHECK (source IN ('MANUAL','IMPORT','INVOICE','CARRY_FORWARD'));
 
 -- ---------- 1. 分录冗余列同步 ----------
 -- entry.book_id / entry.period_ord 由凭证派生，保证账簿聚合只需扫单表

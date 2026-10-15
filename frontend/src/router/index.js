@@ -23,6 +23,7 @@ const routes = [
       { path: 'audit', name: 'audit', component: () => import('@/views/system/AuditLog.vue'), meta: { title: '操作日志', adminOnly: true } },
       { path: 'vouchers/organize', name: 'voucher-organize', component: () => import('@/views/voucher/VoucherOrganize.vue'), meta: { title: '整理凭证' } },
       { path: 'vouchers/import', name: 'voucher-import', component: () => import('@/views/voucher/VoucherImport.vue'), meta: { title: '凭证导入' } },
+      { path: 'vouchers/invoices', name: 'invoice-import', component: () => import('@/views/voucher/InvoiceImport.vue'), meta: { title: '发票导入' } },
       { path: 'print-templates', name: 'print-templates', component: () => import('@/views/print/PrintTemplate.vue'), meta: { title: '打印模板' } },
       { path: 'users', name: 'users', component: () => import('@/views/system/UserAdmin.vue'), meta: { title: '用户与授权', adminOnly: true } }
     ]

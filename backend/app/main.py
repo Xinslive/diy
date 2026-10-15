@@ -13,7 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
-from app.api import auth, books, ledger, printing, reports, subjects, system, vouchers
+from app.api import auth, books, invoices, ledger, printing, reports, subjects, system, vouchers
 from app.core.config import detect_env, settings
 from app.core.db import get_db
 from app.core.schema_version import assert_schema_ready
@@ -115,7 +115,7 @@ async def request_id_middleware(request: Request, call_next):
     response.headers["X-Request-ID"] = rid
     return response
 
-for r in (auth.router, system.router, books.router, subjects.router, vouchers.router,
+for r in (auth.router, system.router, books.router, subjects.router, vouchers.router, invoices.router,
           ledger.router, reports.router, printing.router):
     app.include_router(r)
 

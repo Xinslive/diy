@@ -222,6 +222,21 @@ class Settings(BaseSettings):
     # 但人上传完忘了点确认的批次会一直在）。见 importer.purge_stale_batches。
     import_batch_ttl_days: int = 7
 
+    # 发票原件与解析结果的本地留存目录。数据库只保存相对文件名，便于迁移部署。
+    invoice_storage_dir: str = "data/invoices"
+    invoice_max_bytes: int = 100 * 1024 * 1024
+    # 外部 PaddleOCR API。未同时配置 URL 和 token 时，发票功能仍可处理文本型 PDF，
+    # 但不会尝试 OCR 兜底。
+    invoice_ocr_api_url: str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+    invoice_ocr_api_token: str = ""
+    invoice_ocr_model: str = "PaddleOCR-VL-1.6"
+    invoice_ocr_timeout_seconds: int = 600
+    invoice_ocr_poll_seconds: float = 5.0
+    invoice_ocr_optional_payload: str = (
+        '{"useDocOrientationClassify":false,"useDocUnwarping":false,'
+        '"useChartRecognition":false}'
+    )
+
     # 这里曾经有一个 ``default_timezone: str = "Asia/Shanghai"``，现在**没有**了
     # （审计 P2-23）。它定义了但全仓零引用，而三个真正需要时区的时源已经各自
     # 收敛到唯一的正确写法：
