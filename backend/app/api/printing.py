@@ -27,7 +27,15 @@ from app.api.vouchers import _book_subjects, _serialize
 from app.core.db import get_db
 from app.core.deps import get_book_link, get_current_user, get_my_book, require_book_write
 from app.models import Book, Period, PrintTemplate, SysUser, UserBook, Voucher
-from app.printing import excel as xl
+# ``preview`` 是轻量的（只依赖 sqlalchemy），留在模块级。
+#
+# ``excel`` 则是**故意延迟导入**的：它在模块级 import openpyxl，而 openpyxl
+# 会连带把 lxml 拖进来 —— 实测 openpyxl + lxml + olefile + xlrd 合计
+# **18.7 MB / worker**。这份重量只为「用户偶尔导一次 Excel」而常驻，
+# 而导出是一个请求的事，不是进程启动时必须具备的能力。
+#
+# 写法沿用仓库里已有的先例（app/api/books.py 的期初余额导入入口就是
+# 函数内 ``from app.printing import excel as xl``），不是引入新约定。
 from app.printing import preview as pv
 from app.printing.template import (
     DEFAULT_TEMPLATES,
@@ -523,6 +531,7 @@ def _check_print_rows(rows: list, kind: str) -> list:
     与 ``_xlsx`` 装饰器的处理完全一致（明确失败，而不是静默截断出缺行的账）。
     """
     n = len(rows)
+    from app.printing import excel as xl
     if n > xl.MAX_EXPORT_ROWS:
         raise xl.ExportTooLarge(
             f"{kind}共 {n:,} 行，超过单次打印上限 {xl.MAX_EXPORT_ROWS:,} 行。"
@@ -574,6 +583,10 @@ def _print_too_large(fn):
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        # 延迟导入：``except`` 子句里的名字**必须在 try 之前就已在作用域内**，
+        # 否则 openpyxl 抛的异常还没进到这里就先撞一个 NameError ——
+        # 而这条路径恰恰只在「行数超限」这种异常场景下才会走到。
+        from app.printing import excel as xl
         try:
             return fn(*args, **kwargs)
         except xl.ExportTooLarge as exc:
@@ -852,6 +865,8 @@ def _xlsx(fn):
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        # 同 _print_too_large：except 子句的名字必须先于 try 就位。
+        from app.printing import excel as xl
         try:
             return fn(*args, **kwargs)
         except xl.ExportTooLarge as exc:
@@ -867,6 +882,7 @@ def _xlsx(fn):
 def export_vouchers(book_id: int, period_id: Optional[int] = None, book: Book = Depends(get_my_book),
                     db: Session = Depends(get_db), status: Optional[str] = None):
     from app.accounting.vouchers import query_vouchers
+    from app.printing import excel as xl
 
     period = _period(db, book.id, period_id)
     rows, _ = query_vouchers(db, book.id, from_period=period, to_period=period,
@@ -883,6 +899,7 @@ def export_vouchers(book_id: int, period_id: Optional[int] = None, book: Book = 
 def export_balance(book_id: int, period_id: Optional[int] = None, book: Book = Depends(get_my_book),
                    db: Session = Depends(get_db), include_unposted: bool = Query(False)):
     from app.ledger import queries
+    from app.printing import excel as xl
 
     period = _period(db, book.id, period_id)
     subjects = queries.subject_tree(db, book.id)
@@ -899,6 +916,7 @@ def export_general(book_id: int, period_id: Optional[int] = None,
                    from_period_id: Optional[int] = None,
                    book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                    include_unposted: bool = Query(False), leaf_only: bool = Query(False)):
+    from app.printing import excel as xl
     """总账导出。
 
     原来这个接口**只认 period_id**，把 from/to 都当成同一期：前端页面显示的
@@ -939,6 +957,7 @@ def export_general(book_id: int, period_id: Optional[int] = None,
 def export_report(book_id: int, template_id: int, period_id: int, book: Book = Depends(get_my_book),
                   db: Session = Depends(get_db)):
     from app.models import ReportTemplate
+    from app.printing import excel as xl
     from app.reports.evaluate import evaluate
 
     period = _period(db, book.id, period_id)
@@ -961,6 +980,7 @@ def export_detail_ledger(book_id: int, subject_id: int, period_id: Optional[int]
                          include_unposted: bool = Query(False),
                          book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     from app.ledger import queries
+    from app.printing import excel as xl
 
     to_period = _period(db, book.id, period_id)
     if to_period.book_id != book.id:

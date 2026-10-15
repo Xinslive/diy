@@ -19,8 +19,11 @@ from app.models import (Book, Period, ReportCell, ReportCol, ReportResult, Repor
                      ReportTemplate, Subject, SysUser, UserBook)
 from app.reports.evaluate import COL_KINDS
 from app.reports.formula import FormulaError, NON_FORMULA_KINDS, Parser, no_to_col, rewrite_refs
-from app.reports.importer import (MAX_TEMPLATE_BYTES, TemplateImportError, parse_ufo_report,
-                                  subject_codes, validate_formula)
+# ``app.reports.importer`` 在模块级 ``import olefile``，而实测
+# olefile + openpyxl + lxml + xlrd 合计 18.7 MB / worker。报表模板导入是
+# 偶发操作，不该让每个常驻 worker 为它付这份常驻内存，所以整行搬进用到它的
+# 两个函数（``preview_template_import`` / ``import_templates``）。
+# 写法沿用 app/api/books.py 里已有的先例。
 from app.reports.import_schema import ImportTemplates
 
 router = APIRouter(prefix="/api/reports", tags=["报表"])
@@ -263,6 +266,10 @@ def preview_template_import(file: UploadFile = File(...), book_id: Optional[int]
                             user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
     """只解析、检查当前账套科目，不创建模板。"""
     _require_template_write(db, user, book_id)
+    # 必须在 try **之前**导入：``except TemplateImportError`` 子句要用的名字
+    # 得先在作用域内就位，否则真正走到这条异常路径时会先撞 NameError。
+    from app.reports.importer import (MAX_TEMPLATE_BYTES, TemplateImportError,
+                                      parse_ufo_report)
     try:
         raw = read_upload(file, limit=MAX_TEMPLATE_BYTES, label="报表模板", hint="单个模板最大 5 MB")
         parsed = parse_ufo_report(raw, file.filename or "")
@@ -289,6 +296,7 @@ def import_templates(payload: ImportTemplates, book_id: Optional[int] = None,
                      user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
     """先校验整批，再在一个事务内新建模板；不覆盖内置或已有报表。"""
     _require_template_write(db, user, book_id)
+    from app.reports.importer import subject_codes, validate_formula
     book_codes = set(db.scalars(select(Subject.code).where(Subject.book_id == book_id)))
     validated = []
     seen_codes: set[str] = set()

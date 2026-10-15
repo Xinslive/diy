@@ -777,6 +777,21 @@ def query_vouchers(
             )
         )
     if subject_id:
+        # **这里刻意只按 subject_id 过滤，不补 book_id。**
+        #
+        # 迁移 0011 的 docstring 建议补上 ``Entry.book_id == book_id``，
+        # 好让这条查询复用 ``ix_entry_subject_ord``（book_id, subject_id,
+        # period_ord）的前导列、从而不再需要 ``ix_entry_subject_voucher``。
+        # 那个建议**实测是错的**（见 0011 docstring 里补记的对照数据）：
+        # 外层是「账套下全部凭证」，内层这个子查询被当半连接探测 15,000 次。
+        #   * ``ix_entry_subject_voucher``（subject_id, voucher_id）
+        #     是 **Index Only Scan**，探测一次命中一条记录页，且能整体
+        #     物化成哈希半连接 → 17.3 ms
+        #   * ``ix_entry_subject_ord`` 是普通 **Index Scan**，每次探测都要
+        #     多走一次索引项比较（loops=15000） → **395.4 ms（慢 23 倍）**
+        #
+        # 「能复用别的索引」不等于「用那个索引更快」—— 半连接探测次数
+        # 才是这里的主导成本。
         stmt = stmt.where(Voucher.id.in_(select(Entry.voucher_id).where(Entry.subject_id == subject_id)))
     if min_amount is not None or max_amount is not None:
         # 「金额」筛的是**某一条分录**的金额，不是整张凭证的合计 ——

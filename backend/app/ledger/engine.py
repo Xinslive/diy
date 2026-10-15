@@ -62,6 +62,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import Select, and_, func, select
 from sqlalchemy.orm import Session
@@ -118,13 +119,24 @@ class LedgerEngine:
     _book_cache: Book | None = None
     _period_map_cache: dict[int, Period] | None = None
     _ancestor_cache: dict[int, list[int]] | None = None
-    # 发生额：已算过的最大上界 + 那个上界下的完整结果 + 各上界下的过滤视图。
-    # 上界变小不需要重查（结果本来就是按 (subject_id, period_ord) 分好组的，
+    # 发生额：按「科目范围」分桶缓存，每桶记已算过的最大上界 + 那个上界下的
+    # 完整结果 + 各上界下的过滤视图。
+    #
+    # **为什么多了一个「科目范围」维度。** 压测实测（压测基线报告 2026-10-15）：
+    # 一次明细账请求的 85.9ms 里有 77.7ms 花在这条聚合上，而聚合扫的是
+    # **整个账套**（317 末级 × 24 期间 = 7,608 组，EXPLAIN 显示 24ms /
+    # 60,121 buffers）。明细账只要 1 个科目 × 24 期间 = 24 组 ——
+    # **97% 的聚合结果是白算的**。范围必须进缓存键，否则「查得全的」
+    # 和「只查了一个科目的」会互相串。
+    #
+    # 上界变小仍然不需要重查（结果本来就按 (subject_id, period_ord) 分好组，
     # 过滤一下就是更小上界的结果），所以总账「算到 to」+「算到 from-1」
     # 只产生**一次**聚合查询。
-    _moves_top: int | None = None
-    _moves_full: dict[tuple[int, int], tuple[Decimal, Decimal]] = field(default_factory=dict)
-    _moves_views: dict[int, dict[tuple[int, int], tuple[Decimal, Decimal]]] = field(default_factory=dict)
+    #
+    # 键：scope=None 表示全账套；否则是排好序的科目 id 元组。
+    _moves_top: dict[Any, int] = field(default_factory=dict)
+    _moves_full: dict[Any, dict[tuple[int, int], tuple[Decimal, Decimal]]] = field(default_factory=dict)
+    _moves_views: dict[tuple[Any, int], dict[tuple[int, int], tuple[Decimal, Decimal]]] = field(default_factory=dict)
     _openings_cache: dict[tuple[int, int], Decimal] | None = None
     # 每个科目已经算到哪一期：重复请求同一科目不再重推一遍
     _computed_through: dict[int, int] = field(default_factory=dict)
@@ -201,32 +213,130 @@ class LedgerEngine:
         self._ancestor_cache = {sid: chain(sid) for sid in parent}
         return self._ancestor_cache
 
-    def _cum_movements(self, up_to_ord: int) -> dict[tuple[int, int], tuple[Decimal, Decimal]]:
-        """(subject_id, period_ord) -> (当期借方, 当期贷方)。
+    def _cum_movements(self, up_to_ord: int,
+                       subject_ids: list[int] | None = None, *,
+                       widen_on_miss: bool = False
+                       ) -> dict[tuple[int, int], tuple[Decimal, Decimal]]:
+        """(subject_id, period_ord) -> (当期借方, 当���贷方)。
 
         结果已经上卷到所有父科目：凭证只挂在明细级科目上，
         但账簿/报表需要每一级父科目的发生额，所以在这里一次算完。
 
-        **单次请求内记忆化**：上界变大才重查（以前的 2 次/3 次全量聚合成 1 次），
-        上界变小只过滤 —— 因为结果本来就按 (subject_id, period_ord) 分好组，
-        「<= 更小的上界」就是丢掉更晚的期。失效边界见模块 docstring（实例只读）。
+        ``subject_ids`` 是**范围收窄**：只聚合这些科目（及其父科目）。
+        传 None 表示全账套。
+
+        **为什么要收窄。** 明细账一次只要一个（或几个）科目，而原实现每次都把
+        整个账套聚合一遍。实测 317 科目 / 6 万分录的账套上，单次请求的聚合是
+        77.7ms（占该请求 85.9ms 的 90%），而明细账真正用到的组数不到总量的 4%。
+
+        **收窄不能引入「每个科目查一次」。** ``figures(sid, ord)`` 会逐科目调
+        ``compute([sid], ord)``，若范围直接进 SQL，明细账就会从 1 次查询变成
+        N 次。所以先走 :meth:`_pick_donor`：凡是「已缓存的范围 ⊇ 本次范围」
+        且「已查到的上界 ≥ 本次上界」，直接从那份结果切片，**不发 SQL**。
+
+        切片只多不少（宁可多给几个科目，也绝不漏掉要的），而调用方一律用
+        ``moves.get((sid, o))`` 按自己要的科目取，多出来的键无人读 ——
+        这是刻意的：宁可在内存里多留几条，也不能让某次请求查不到本该有的数。
+
+        失效边界见模块 docstring（实例只读）。
+
+        ``widen_on_miss`` 区分两种调用形状，它们要的东西相反：
+
+        * ``compute(subject_ids=[...])`` —— 调用方**知道自己要哪些科目**
+          （明细账就是）。收窄到它，一次只算这几棵子树。
+        * ``figures(sid)`` → ``compute([sid])`` —— 调用方**逐个**来，
+          后面可能还有十几个科目。收窄会让它变成「每个科目查一次」，
+          那正是审计 P2-15 的 N+1 被修掉的原因。所以这种形状
+          在缓存盖不住时**退化为全账套**，之后每个 ``figures()`` 都命中
+          —— 整份报表仍然只跑一次聚合。
         """
-        cached = self._moves_views.get(up_to_ord)
-        if cached is not None:
-            return cached
-        if self._moves_top is None or up_to_ord > self._moves_top:
-            self._moves_full = self._query_movements(up_to_ord)
-            self._moves_top = up_to_ord
-            self._moves_views.clear()
-        if up_to_ord == self._moves_top:
-            view = self._moves_full
+        if subject_ids:
+            scope: Any = tuple(self._expand_scope(subject_ids))
+            key = (scope, up_to_ord)
+            cached = self._moves_views.get(key)
+            if cached is not None:
+                return cached
+            donor = self._pick_donor(scope, up_to_ord)
+            if donor is None and widen_on_miss:
+                # 没有任何缓存盖住这个科目 —— 说明外面还有别的科目要来，
+                # 按全账套查一次，后面就都命中了。
+                return self._cum_movements(up_to_ord, None)
+            return self._materialize(scope, up_to_ord, donor)
+        return self._materialize(None, up_to_ord, self._pick_donor(None, up_to_ord))
+
+    def _materialize(self, scope: Any, up_to_ord: int,
+                     donor: tuple[dict[tuple[int, int], tuple[Decimal, Decimal]], int] | None
+                     ) -> dict[tuple[int, int], tuple[Decimal, Decimal]]:
+        """把（缓存切片的）结果落到 ``_moves_views`` 并返回。"""
+        key = (scope, up_to_ord)
+        if donor is not None:
+            full, top = donor
+            view = full if up_to_ord == top else {
+                k: v for k, v in full.items() if k[1] <= up_to_ord}
         else:
-            view = {k: v for k, v in self._moves_full.items() if k[1] <= up_to_ord}
-        self._moves_views[up_to_ord] = view
+            view = self._query_movements(
+                up_to_ord, None if scope is None else list(scope))
+            self._moves_full[scope] = view
+            self._moves_top[scope] = up_to_ord
+        self._moves_views[key] = view
         return view
 
-    def _query_movements(self, up_to_ord: int) -> dict[tuple[int, int], tuple[Decimal, Decimal]]:
-        """账簿最热的聚合查询（唯一的全账扫描，见 P2-06 的索引建议）。"""
+    def _expand_scope(self, subject_ids: list[int]) -> list[int]:
+        """把请求的科目集合展开成「它自己和它的所有后代」。
+
+        **为什么必须展开。** 凭证分录只挂在**末级**科目上，父科目身上一条
+        直接分录都没有 —— 这是整套账的硬约束（写入侧 ``fn_subject_leaf_guard``）。
+        所以把父科目 id 直接塞进 ``IN`` 会一条都匹配不到：实测
+        ``_moves_full={(2,): {}}``，父科目的发生额直接变成 0，
+        而这种错误**不报错**，只是算出一个偏小的余额。
+
+        展开成后代之后，SQL 过滤的是叶子，上卷仍然交给
+        :meth:`_query_movements` 的 Python 那一步 —— 那里本来就要算祖先链。
+        """
+        want = set(subject_ids)
+        out = set(want)
+        for sid, chain in (self._ancestor_map() or {}).items():
+            if sid in want or any(a in want for a in chain):
+                out.add(sid)
+        return sorted(out)
+
+    def _pick_donor(self, scope: Any, up_to_ord: int
+                    ) -> tuple[dict[tuple[int, int], tuple[Decimal, Decimal]], int] | None:
+        """找一份能覆盖本次请求的已缓存结果，找得到就不必再查库。
+
+        「覆盖」= **科目范围 ⊇ 本次范围** 且 **已查到的上界 ≥ 本次上界**。
+        两个条件缺一不可：范围不够会漏科目，上界不够会少算期间 ——
+        而少算期间的数不会报错，只会算出一个偏小的余额。
+
+        宁可多留也不放过的取舍见 :meth:`_cum_movements` 的 docstring。
+        """
+        want = None if scope is None else set(scope)
+        best: tuple[dict[tuple[int, int], tuple[Decimal, Decimal]], int] | None = None
+        for sc, full in self._moves_full.items():
+            top = self._moves_top.get(sc)
+            if top is None or top < up_to_ord:
+                continue
+            if sc is None:                       # 全账套覆盖任何范围
+                return full, top
+            if want is not None and want <= set(sc):
+                # 上界更小的那个优先：切片结果更贴近本次范围，浪费更少
+                if best is None or top < best[1]:
+                    best = (full, top)
+        return best
+
+    def _query_movements(self, up_to_ord: int, subject_ids: list[int] | None = None
+                         ) -> dict[tuple[int, int], tuple[Decimal, Decimal]]:
+        """账簿最热的聚合查询（唯一的全账扫描，见 P2-06 的索引建议）。
+
+        ``subject_ids`` 不为空时把科目条件下推到 SQL：这是本次优化里
+        真正省掉 97% 聚合工作的一步 —— **过滤在聚合之前，不是之后**。
+        上卷到父科目仍然在 Python 里做（父科目本身没有分录可过滤，
+        它是从叶子累加上来的）。
+
+        传进来的 ``subject_ids`` 必须是**已经展开到末级**的集合
+        （:meth:`_cum_movements` 负责展开）—— 直接传父科目 id 会匹配不到
+        任何分录，且不报错。
+        """
         stmt = (
             select(
                 Entry.subject_id,
@@ -242,6 +352,11 @@ class LedgerEngine:
             .where(Entry.book_id == self.book_id, Entry.period_ord <= up_to_ord)
             .group_by(Entry.subject_id, Entry.period_ord)
         )
+        if subject_ids:
+            # 空列表**不**过滤（那等于「什么都不要」，不是「全都要」）。
+            # 调用方传 None 表示全账套，传非空列表表示收窄，两者语义不同，
+            # 所以这里判的是 truthy 而不是 `is not None`。
+            stmt = stmt.where(Entry.subject_id.in_(subject_ids))
         if not self.include_unposted:
             stmt = stmt.where(Voucher.status == "POSTED")
         if self.exclude_carry_forward:
@@ -353,7 +468,9 @@ class LedgerEngine:
         区间跨过年界（比如 2026-12 到 2027-02）时相减会得到乱七八糟的数。
         这里直接把区间内各期的发生额加起来，跨多少年都对。
         """
-        moves = self._cum_movements(to_ord)
+        # 只聚合调用方点名的那几个科目（下面 acc 也只读这几个），
+        # 全账套口径的聚合在报表总额那种场景才需要。
+        moves = self._cum_movements(to_ord, subject_ids)
         acc = {sid: [ZERO, ZERO] for sid in subject_ids}
         for (sid, o), (dr, cr) in moves.items():
             cell = acc.get(sid)
@@ -364,7 +481,8 @@ class LedgerEngine:
 
     # ---------------- 批量计算 ----------------
 
-    def compute(self, subject_ids: list[int] | None = None, up_to_ord: int | None = None) -> dict[int, Figures]:
+    def compute(self, subject_ids: list[int] | None = None, up_to_ord: int | None = None,
+                *, widen_on_miss: bool = False) -> dict[int, Figures]:
         """批量计算一批科目在 up_to_ord 期间的派生量。
 
         报表模板会同时引用几十个科目，批量接口保证每个科目只扫一次索引；
@@ -385,9 +503,10 @@ class LedgerEngine:
         if top < start:
             top = start
 
-        moves = self._cum_movements(top)
-        snapshots = self._openings()
-
+        # **科目范围要在聚合之前定下来**（下面的 subject_ids is None 分支
+        # 会把它补成全科目集）。顺序反了就只能按全账套聚合 —— 那正是这次
+        # 优化要消掉的那笔开销。
+        narrowed = subject_ids
         if subject_ids is None:
             # 不过滤 active：这是**默认的全科目集**，报表总额、账簿汇总都走它。
             # 停用科目被排除的话，上级科目合计会偏小、报表总额会缺一块，
@@ -397,6 +516,13 @@ class LedgerEngine:
                     select(Subject.id).where(Subject.book_id == self.book_id)
                 ).all()
             )
+            # narrowed 保持 None：全科目集不等于「把 317 个 id 塞进 IN」。
+            # 两者结果相同，但 IN 列表越长规划器越难选计划，而「不带科目
+            # 条件」正是 ``ix_entry_subject_ord`` 首列 book_id 最擅长的形态。
+            narrowed = None
+
+        moves = self._cum_movements(top, narrowed, widen_on_miss=widen_on_miss)
+        snapshots = self._openings()
 
         # 逐期推进：
         #   期初(P)     = 期初(P-1) + 本期借方(P-1) - 本期贷方(P-1)
@@ -471,7 +597,9 @@ class LedgerEngine:
     def figures(self, subject_id: int, ord_: int) -> Figures:
         key = (subject_id, ord_)
         if key not in self._figures:
-            self.compute([subject_id], ord_)
+            # widen_on_miss=True：这是「逐个来」的形状，缓存盖不住时退化为
+            # 全账套聚合 —— 见 _cum_movements 的 docstring why。
+            self.compute([subject_id], ord_, widen_on_miss=True)
         return self._figures[key]
 
     def one(self, subject_id: int, ord_: int | None = None) -> Figures:
