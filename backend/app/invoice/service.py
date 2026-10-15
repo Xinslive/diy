@@ -28,7 +28,6 @@ from app.models import (
 
 
 DEFAULT_SUBJECT_CODES = {
-    "input_tax_subject_id": "2221",
     "output_tax_subject_id": "2221",
     "input_credit_subject_id": "1001",
     "output_debit_subject_id": "1001",
@@ -107,7 +106,6 @@ def get_config(db: Session, book_id: int) -> dict[str, Any]:
         "id": config.id,
         "book_id": config.book_id,
         "taxpayer_id": config.taxpayer_id,
-        "input_tax_subject_id": config.input_tax_subject_id,
         "output_tax_subject_id": config.output_tax_subject_id,
         "input_credit_subject_id": config.input_credit_subject_id,
         "output_debit_subject_id": config.output_debit_subject_id,
@@ -334,14 +332,16 @@ def _build_preview(
             total = base + tax
         if total != base + tax:
             problems.append(f"金额校验不一致：不含税 {base} + 税额 {tax} != 价税合计 {total}")
-        tax_subject_id = override.get("tax_subject_id") or config.get(
-            "input_tax_subject_id" if invoice_type == "INPUT" else "output_tax_subject_id"
-        )
         settlement_subject_id = override.get("settlement_subject_id") or config.get(
             "input_credit_subject_id" if invoice_type == "INPUT" else "output_debit_subject_id"
         )
-        if not tax_subject_id:
-            problems.append("未配置税额科目")
+        # 只有销项需要税额科目。小微企业不做进项抵扣（用户约定），进项的税额
+        # 直接计入成本费用，不落到任何应交税费明细科目上。
+        tax_subject_id = None
+        if invoice_type == "OUTPUT":
+            tax_subject_id = override.get("tax_subject_id") or config.get("output_tax_subject_id")
+            if not tax_subject_id:
+                problems.append("未配置税额科目")
         if not settlement_subject_id:
             problems.append("未配置结算科目")
         if tax_subject_id and int(tax_subject_id) not in subjects:
@@ -355,17 +355,11 @@ def _build_preview(
         entries: list[dict[str, Any]] = []
         summary = f"发票 {invoice_no or '未识别'}"
         if invoice_type == "INPUT":
-            for subject_id, amount in by_subject.items():
-                entries.append({"subject_id": subject_id, "direction": "DEBIT", "amount": _decimal_string(amount), "summary": summary})
-            if tax:
-                entries.append({"subject_id": int(tax_subject_id), "direction": "DEBIT", "amount": _decimal_string(tax), "summary": summary + "（进项税额）"})
-            entries.append({"subject_id": int(settlement_subject_id), "direction": "CREDIT", "amount": _decimal_string(total), "summary": summary})
+            entries = _input_entries(by_subject, line_subjects, tax,
+                                     int(settlement_subject_id), total, summary)
         elif invoice_type == "OUTPUT":
-            entries.append({"subject_id": int(settlement_subject_id), "direction": "DEBIT", "amount": _decimal_string(total), "summary": summary})
-            for subject_id, amount in by_subject.items():
-                entries.append({"subject_id": subject_id, "direction": "CREDIT", "amount": _decimal_string(amount), "summary": summary})
-            if tax:
-                entries.append({"subject_id": int(tax_subject_id), "direction": "CREDIT", "amount": _decimal_string(tax), "summary": summary + "（销项税额）"})
+            entries = _output_entries(by_subject, tax, int(tax_subject_id),
+                                      int(settlement_subject_id), total, summary)
 
         if not by_subject:
             problems.append("没有可入账的发票明细")
@@ -396,6 +390,87 @@ def _build_preview(
     batch.ready_count = ready
     batch.error_count = errors
     return previews, ready, errors
+
+
+def _input_entries(
+    by_subject: dict[int, Decimal],
+    line_subjects: dict[int, int],
+    tax: Decimal,
+    settlement_subject_id: int,
+    total: Decimal,
+    summary: str,
+) -> list[dict[str, Any]]:
+    """进项发票的分录：明细借记不含税额，结算贷记价税合计。
+
+    **进项税额不单列。** 用户是小微企业，不做进项抵扣，所以发票上的税额没有
+    对应的资产 —— 按用户约定整笔并入**第一条明细行**，即价税合计直接进成本费用。
+    落在哪一行是要看出来的，所以摘要标「含税」：复核时一眼能看出这笔费用为什么
+    比发票明细那行大，而不是以为录错了。
+
+    两条容易写错的：
+
+    1. 「第一条」按 ``line_subjects`` 的最小行号取，不按 ``by_subject`` 的第一个
+       键。多行撞到同一个科目时 ``by_subject`` 会把它们合并，键的插入顺序就与
+       原始行序脱钩了 —— 那样税额会落错行，而且只在「恰好同科目」时才错。
+    2. 税额只加一次。上面按科目聚合后，同科目只留一行，所以「第一条的科目」在
+       ``by_subject`` 里唯一，``==`` 判断不会重复计。
+
+    借贷恒等：借方合计 = Σ明细 + 税额 = 价税合计 = 贷方，全程 Decimal 不经过
+    float，不会出现差一分。
+    """
+    first_subject_id = line_subjects[min(line_subjects)] if line_subjects else None
+    entries: list[dict[str, Any]] = []
+    for subject_id, amount in by_subject.items():
+        takes_tax = bool(tax) and subject_id == first_subject_id
+        entries.append({
+            "subject_id": subject_id,
+            "direction": "DEBIT",
+            "amount": _decimal_string(amount + tax if takes_tax else amount),
+            "summary": summary + ("（含税）" if takes_tax else ""),
+        })
+    entries.append({
+        "subject_id": settlement_subject_id,
+        "direction": "CREDIT",
+        "amount": _decimal_string(total),
+        "summary": summary,
+    })
+    return entries
+
+
+def _output_entries(
+    by_subject: dict[int, Decimal],
+    tax: Decimal,
+    tax_subject_id: int,
+    settlement_subject_id: int,
+    total: Decimal,
+    summary: str,
+) -> list[dict[str, Any]]:
+    """销项发票的分录：结算借记价税合计，明细与税额贷记。
+
+    销项税额**照旧单列** —— 那是向对方收的钱，要交出去，和进项不是一回事，
+    不能跟着一起并进收入。
+    """
+    entries: list[dict[str, Any]] = [{
+        "subject_id": settlement_subject_id,
+        "direction": "DEBIT",
+        "amount": _decimal_string(total),
+        "summary": summary,
+    }]
+    for subject_id, amount in by_subject.items():
+        entries.append({
+            "subject_id": subject_id,
+            "direction": "CREDIT",
+            "amount": _decimal_string(amount),
+            "summary": summary,
+        })
+    if tax:
+        entries.append({
+            "subject_id": tax_subject_id,
+            "direction": "CREDIT",
+            "amount": _decimal_string(tax),
+            "summary": summary + "（销项税额）",
+        })
+    return entries
 
 
 def serialize_record(record: InvoiceRecord, subjects: dict[int, Subject] | None = None) -> dict[str, Any]:

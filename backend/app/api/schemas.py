@@ -143,10 +143,13 @@ class BatchIds(BaseModel):
 
 # ---- 发票导入 ----
 class InvoiceConfigIn(BaseModel):
-    """发票自动制证的账套级配置。"""
+    """发票自动制证的账套级配置。
+
+    没有「进项税额」科目：小微企业不做进项抵扣，进项发票的税额直接计入成本
+    费用（并入第一条明细行），不需要单独一个应交税费明细科目。
+    """
 
     taxpayer_id: str = Field(default="", max_length=32)
-    input_tax_subject_id: Optional[int] = None
     output_tax_subject_id: Optional[int] = None
     input_credit_subject_id: Optional[int] = None
     output_debit_subject_id: Optional[int] = None

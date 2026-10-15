@@ -19,7 +19,8 @@ class InvoiceConfig(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     book_id: Mapped[int] = mapped_column(ForeignKey("book.id", ondelete="CASCADE"), nullable=False, unique=True)
     taxpayer_id: Mapped[str] = mapped_column(String(32), default="", nullable=False)
-    input_tax_subject_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subject.id", ondelete="RESTRICT"))
+    # 只有销项需要税额科目：进项税额按用户约定不单独列示（并入第一条明细行），
+    # 所以这里没有 input_tax_subject_id。
     output_tax_subject_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subject.id", ondelete="RESTRICT"))
     # 进项发票贷方，按用户约定默认在界面预选 1001 库存现金。
     input_credit_subject_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subject.id", ondelete="RESTRICT"))

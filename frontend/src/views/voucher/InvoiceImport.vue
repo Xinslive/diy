@@ -19,17 +19,12 @@
           <template #header>
             <div class="section-head">
               <span>自动制证配置</span>
-              <span class="muted">本单位税号用于自动判断进项/销项；默认结算科目为 1001 库存现金</span>
+              <span class="muted">本单位税号用于自动判断进项/销项；默认结算科目为 1001 库存现金。进项发票不单列税额，价税合计直接计入成本费用</span>
             </div>
           </template>
           <el-form :model="config" inline class="invoice-config-form">
             <el-form-item label="本单位税号">
               <el-input v-model="config.taxpayer_id" :disabled="!store.canWrite" placeholder="用于判断发票类型" style="width: 230px" />
-            </el-form-item>
-            <el-form-item label="进项税额">
-              <el-select v-model="config.input_tax_subject_id" :disabled="!store.canWrite" filterable style="width: 220px">
-                <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
-              </el-select>
             </el-form-item>
             <el-form-item label="销项税额">
               <el-select v-model="config.output_tax_subject_id" :disabled="!store.canWrite" filterable style="width: 220px">
@@ -166,10 +161,13 @@
                         <el-option label="进项" value="INPUT" /><el-option label="销项" value="OUTPUT" />
                       </el-select>
                     </el-form-item>
-                    <el-form-item label="税额科目">
+                    <el-form-item label="税额科目" v-if="invoiceTypeFor(row) === 'OUTPUT'">
                       <el-select :model-value="taxSubjectFor(row)" :disabled="!store.canWrite" filterable style="width: 210px" @update:model-value="(v) => setTaxSubject(row, v)">
                         <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                       </el-select>
+                    </el-form-item>
+                    <el-form-item v-else label="税额">
+                      <span class="muted">不单列，并入第一条明细行</span>
                     </el-form-item>
                     <el-form-item label="结算科目">
                       <el-select :model-value="settlementSubjectFor(row)" :disabled="!store.canWrite" filterable style="width: 210px" @update:model-value="(v) => setSettlementSubject(row, v)">
@@ -249,7 +247,7 @@ const committing = ref(false)
 const previewing = ref(false)
 const savingConfig = ref(false)
 const savingRule = ref(false)
-const config = reactive({ taxpayer_id: '', input_tax_subject_id: null, output_tax_subject_id: null, input_credit_subject_id: null, output_debit_subject_id: null })
+const config = reactive({ taxpayer_id: '', output_tax_subject_id: null, input_credit_subject_id: null, output_debit_subject_id: null })
 const overrides = reactive({})
 const ruleVisible = ref(false)
 const ruleForm = reactive({ match_type: 'SELLER', invoice_type: 'BOTH', keyword: '', subject_id: null, priority: 0, active: true })
@@ -272,8 +270,9 @@ function lineSubjectFor(row, index) {
   return overrides[row.id]?.line_subjects?.[String(index)] ?? row.resolution?.line_resolution?.[index]?.subject_id ?? null
 }
 function taxSubjectFor(row) {
-  const input = invoiceTypeFor(row) === 'INPUT'
-  return overrides[row.id]?.tax_subject_id || (input ? config.input_tax_subject_id : config.output_tax_subject_id)
+  // 进项不单列税额（小微企业不做进项抵扣），只有销项才需要税额科目。
+  if (invoiceTypeFor(row) !== 'OUTPUT') return null
+  return overrides[row.id]?.tax_subject_id || config.output_tax_subject_id
 }
 function settlementSubjectFor(row) {
   const input = invoiceTypeFor(row) === 'INPUT'
