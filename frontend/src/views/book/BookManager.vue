@@ -30,9 +30,8 @@
               <el-tag v-if="row.id === store.bookId" size="small" type="success">当前</el-tag>
             </div>
           </div>
-          <el-tag :type="yearOf(row).carried ? 'info' : 'success'" size="small">
-            {{ yearOf(row).carried ? '已结转' : '使用中' }}
-          </el-tag>
+          <!-- 只在已结转时提示；未结转是常态，不必挂标签占版面 -->
+          <el-tag v-if="yearOf(row).carried" type="info" size="small">已结转</el-tag>
         </div>
 
         <div class="book-tile-meta">
