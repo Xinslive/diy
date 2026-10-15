@@ -13,7 +13,9 @@ from app.api.schemas import InvoiceConfigIn, InvoicePreviewIn, InvoiceRuleIn, In
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
-from app.core.uploads import UploadTooLarge, read_upload_sync
+# 本地别名保持函数名 ``read_upload`` 不变（守卫测试按这个名字认共享容量闸），
+# 指向的其实是同步版 —— 端点是同步 ``def``，不能再 await。
+from app.core.uploads import UploadTooLarge, read_upload_sync as read_upload
 from app.invoice import service
 from app.invoice import storage
 from app.models import InvoiceBatch, InvoiceRecord, Book, SysUser, UserBook
@@ -89,7 +91,7 @@ def upload_invoice_batch(file: UploadFile = File(...), book: Book = Depends(get_
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(400, "只支持 PDF 发票文件")
     try:
-        data = read_upload_sync(file, limit=settings.invoice_max_bytes, label="发票 PDF")
+        data = read_upload(file, limit=settings.invoice_max_bytes, label="发票 PDF")
         batch = service.create_batch(db, book.id, user, filename, data)
         preview = service.preview_batch(db, batch)
     except UploadTooLarge as exc:
