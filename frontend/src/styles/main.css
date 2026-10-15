@@ -308,3 +308,21 @@ body {
 .period-popper.el-popper { min-width: 104px !important; width: 104px; }
 .period-popper .el-select-dropdown__item { padding: 0 8px; }
 .period-popper .el-tag { height: 18px; padding: 0 5px; font-size: 11px; }
+
+/* ── 表格里的矩形选区（composables/useCellSelection.js）────────────────────
+   浏览器的原生选区在表格里是**按文档顺序线性**扩的：从 C3 拖到 C9 会把中间
+   几整行连同左右各列一起框进去，而人在这类数字表格里的意图永远是「这一列
+   从这行到那行」。选区形状不是 CSS 能改的（user-select 只能开关），所以
+   这里先把原生选区关掉，形状交给脚本算，脚本把选中的格子打上这个 class。 */
+table { user-select: none; -webkit-user-select: none; }
+
+/* 极少数地方要的就是「挑着复制文字」而不是矩形选区（打印台预览的纸面）。
+   放在这里单独放行，而不是给表格逐个加例外开关 —— 例外越少越不容易忘。 */
+.cwq-select-text { user-select: text; -webkit-user-select: text; }
+
+/* 选中态用内阴影而不是外描边：外描边会被相邻格子的边框盖掉，看上去像
+   「有些格子描了边、有些没有」，而内阴影四边都在，选中范围一眼到底。 */
+.cwq-cell-picked {
+  background: #e7f0ff !important;
+  box-shadow: inset 0 0 0 1px #93bdf0;
+}
