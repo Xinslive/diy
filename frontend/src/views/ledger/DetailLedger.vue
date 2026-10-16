@@ -246,8 +246,15 @@ async function loadSubjects() {
     return [item, ...flatten(node.children || [], node.id)]
   })
   subjects.value = flatten(tree)
-  const preferred = subjects.value.find((s) => s.is_leaf && s.active)
-  subjectId.value = preferred?.id ?? subjects.value[0]?.id ?? null
+  /** 默认落在 **1001 库存现金**。
+   *
+   *  翻明细账十有八九是先看「钱搁在哪儿」，1001 是这张表的头一条。
+   *  以前取的是「第一个启用末级」—— 那取决于科目表怎么排，翻开就看到一个
+   *  莫名其妙的末级科目（截图里是 1007），还得先换一趟才看得到账。 */
+  const preferred = subjects.value.find((s) => s.code === '1001' && s.active)
+    ?? subjects.value.find((s) => s.is_leaf && s.active)
+    ?? subjects.value[0]
+  subjectId.value = preferred?.id ?? null
   resetSubjectRange()
 }
 

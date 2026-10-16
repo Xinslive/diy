@@ -67,6 +67,35 @@ def test_结转损益生成凭证并把损益科目清零(db, book, periods, sub
     assert bal(db, book, periods, subjects, "3103") == Decimal("-4200")
 
 
+def test_结转分录的摘要是写死的期间损益结转(db, book, periods, subjects, admin_user, make_voucher):
+    """摘要里**不写期间**（用户 2026-10-16 点名改的）。
+
+    早先每条分录的摘要都是「结转 2026-01 损益」：期间在凭证头上已经摆着，
+    摘要再抄一遍只是把同一句话说两遍，而这张凭证是要打印出来给人核对的。
+    写死成「期间损益结转」还有一个实际好处 —— 一眼看得出这张是系统结转出来的，
+    不用先去凭证头确认它是哪一期结的。
+
+    断言的是**每一条**分录：两张结转凭证（收入一张、费用一张）里，
+    挂到损益明细科目上的和挂到本年利润上的都该是同一句，
+    少一条改回去照样看得见。
+    """
+    make_voucher("2026-01-10", dr=[("1002", 5000, "租金")], cr=[("5001", 5000, "租金")], posted=True)
+    make_voucher("2026-01-15", dr=[("560206", 800, "水电")],
+                 cr=[("1002", 800, "水电")], posted=True)
+
+    carry_forward_profit(db, book.id, periods[1], admin_user)
+
+    rows = db.execute(
+        select(Entry.summary).join(Voucher, Voucher.id == Entry.voucher_id)
+        .where(Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD")
+    ).all()
+    assert rows, "结转凭证一条分录都没有，测的不是摘要"
+    assert {r[0] for r in rows} == {"期间损益结转"}, (
+        f"摘要不止这一种：{sorted({r[0] for r in rows})}")
+    # 手工凭证的摘要不许被传染：那是人自己写的字
+    assert db.scalar(select(Entry.summary).where(Entry.summary == "租金")) == "租金"
+
+
 def test_结转凭证记在期末最后一天(db, book, periods, subjects, admin_user, make_voucher):
     """结转凭证的日期必须是当月最后一天，否则会漏进下个月的明细账。"""
     make_voucher("2026-02-10", dr=[("1002", 100, "x")], cr=[("5001", 100, "x")], posted=True)
@@ -712,6 +741,30 @@ def test_重新结转走HTTP接口(client, auth, book, periods, make_voucher):
     body = rebuilt.json()
     assert body["replaced"] is True and body["removed"] == old
     assert body["vouchers"]                              # 生成了新的
+
+
+def test_HTTP结转回来的分录摘要就是那句(client, db, book, periods, auth, make_voucher):
+    """上面那条钉的是「重新结转不报错」，这里钉**页面看得见的那一列**。
+
+    走一次真实 HTTP：前端点「结转损益」拿到的就是这些凭证，
+    所以摘要得在这一层就能验 —— 只在 service 层验，接口哪天换了实现就漏了。
+    """
+    make_voucher("2026-01-10", dr=[("1002", 300, "x")], cr=[("5001", 300, "x")], posted=True)
+    r = client.post(f"/api/books/{book.id}/periods/{periods[1].id}/carry-forward",
+                    json={}, headers=auth)
+    assert r.status_code == 200, r.text
+
+    # carry-forward 返回的是**凭证号**（前端只拿它拼「已生成 记0002、记0003」这句提示），
+    # 而凭证详情接口收的是 int id —— 号喂进去只会得到 422，`got["entries"]`
+    # 报的是 KeyError，看不出真正的原因。所以先按号取回 id 再走 HTTP 查详情，
+    # 断言仍然落在接口返回的那份数据上，这一层的意思没变。
+    no = r.json()["vouchers"][0]
+    vid = db.scalar(select(Voucher.id).where(
+        Voucher.book_id == book.id, Voucher.voucher_no == no))
+    assert vid is not None, f"结转说生成了 {no}，库里却找不到这张凭证"
+
+    got = client.get(f"/api/books/{book.id}/vouchers/{vid}", headers=auth).json()
+    assert {e["summary"] for e in got["entries"]} == {"期间损益结转"}, got["entries"]
 
 
 def test_只读账套不能结转(client, db, book, periods, plain_user, plain_auth):

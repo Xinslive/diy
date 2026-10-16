@@ -572,7 +572,7 @@ const splitExample = computed(() => {
   const width = Math.max(3, String(total).length)
   const z = (n) => String(n).padStart(width, '0')
   return fmt.replace(/\{(\w+)\}/g, (_, k) =>
-    ({ voucher_no: '记001号', page: z(1), pages: z(total),
+    ({ voucher_no: '记0001号', page: z(1), pages: z(total),
        first: z(1), last: z(rowCount.value), lines: z(12) }[k] ?? ''))
 })
 

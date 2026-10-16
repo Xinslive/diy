@@ -140,37 +140,37 @@ def test_日期落在账套外报错(db, book, admin_user, subjects):
 def test_凭证号期间内顺序编号(db, book, periods, admin_user, subjects, make_voucher):
     a = make_voucher("2026-01-05", dr=[("1001", 1, "x")], cr=[("5001", 1, "x")])
     b = make_voucher("2026-01-06", dr=[("1001", 1, "x")], cr=[("5001", 1, "x")])
-    assert (a.voucher_no, b.voucher_no) == ("记001", "记002")
+    assert (a.voucher_no, b.voucher_no) == ("记0001", "记0002")
 
 
 def test_不同期间各自从0001开始(db, book, periods, admin_user, subjects, make_voucher):
     a = make_voucher("2026-01-05", dr=[("1001", 1, "x")], cr=[("5001", 1, "x")])
     b = make_voucher("2026-02-05", dr=[("1001", 1, "x")], cr=[("5001", 1, "x")])
-    assert a.voucher_no == "记001" and b.voucher_no == "记001"
+    assert a.voucher_no == "记0001" and b.voucher_no == "记0001"
 
 
 def test_作废不留号_删除后序号复用(db, book, periods, admin_user, subjects, make_voucher):
-    """用户明确要求：删掉 记001 之后，新凭证就应该是 记001。"""
+    """用户明确要求：删掉 记0001 之后，新凭证就应该是 记0001。"""
     a = make_voucher("2026-01-05", dr=[("1001", 1, "x")], cr=[("5001", 1, "x")])
     b = make_voucher("2026-01-06", dr=[("1001", 1, "x")], cr=[("5001", 1, "x")])
-    assert b.voucher_no == "记002"
+    assert b.voucher_no == "记0002"
 
     delete_voucher(db, a, admin_user)
     c = make_voucher("2026-01-07", dr=[("1001", 1, "x")], cr=[("5001", 1, "x")])
 
     # 下一个号取「当前最大值 + 1」，所以删中间那张不会让后续号前移，
     # 但删掉最后一张后号一定会被复用。
-    assert c.voucher_no == "记003"
+    assert c.voucher_no == "记0003"
     delete_voucher(db, b, admin_user)
     delete_voucher(db, c, admin_user)
     d = make_voucher("2026-01-08", dr=[("1001", 1, "x")], cr=[("5001", 1, "x")])
-    assert d.voucher_no == "记001"
+    assert d.voucher_no == "记0001"
 
 
 def test_凭证号预览(db, book, periods, admin_user, subjects, make_voucher):
     make_voucher("2026-03-05", dr=[("1001", 1, "x")], cr=[("5001", 1, "x")])
     make_voucher("2026-03-06", dr=[("1001", 1, "x")], cr=[("5001", 1, "x")])
-    assert next_voucher_no(db, periods[3]) == "记003"
+    assert next_voucher_no(db, periods[3]) == "记0003"
 
 
 # --------------------------------------------------------------------- 两态
@@ -648,7 +648,7 @@ def test_别的账套的凭证查不到前后张(client, auth, db, book, make_vo
 
 
 def _stack(make_voucher, n=10, month=3):
-    """连着造 n 张 2026-0X 的凭证，号自然是 记001..记010。"""
+    """连着造 n 张 2026-0X 的凭证，号自然是 记0001..记0010。"""
     out = []
     for i in range(n):
         v = make_voucher(f"2026-{month:02d}-{(i % 28) + 1:02d}",
@@ -658,9 +658,9 @@ def _stack(make_voucher, n=10, month=3):
 
 
 def test_插入凭证拿到参照的号_后面的整体顺位(db, book, periods, admin_user, subjects, make_voucher):
-    """记001..记010，打开记006插入 → 新凭证拿记006，原记006..记010 变记007..记011。"""
+    """记0001..记0010，打开记0006插入 → 新凭证拿记0006，原记0006..记0010 变记0007..记0011。"""
     stack = _stack(make_voucher)
-    anchor = stack[5]                      # 记006
+    anchor = stack[5]                      # 记0006
 
     new = create_voucher(
         db, book_id=book.id, user=admin_user,
@@ -669,12 +669,12 @@ def test_插入凭证拿到参照的号_后面的整体顺位(db, book, periods,
         insert_after_id=anchor.id,
     )
 
-    assert new.voucher_no == "记006"
+    assert new.voucher_no == "记0006"
     db.refresh(anchor)
-    assert anchor.voucher_no == "记007"
+    assert anchor.voucher_no == "记0007"
     assert [db.get(Voucher, v.id).voucher_no for v in stack] == [
-        "记001", "记002", "记003", "记004", "记005",
-        "记007", "记008", "记009", "记010", "记011",
+        "记0001", "记0002", "记0003", "记0004", "记0005",
+        "记0007", "记0008", "记0009", "记0010", "记0011",
     ]
     # 内容一条没动：顺位只改号，不碰分录
     assert db.get(Voucher, stack[0].id).entries[0].amount == Decimal("100.00")
@@ -695,8 +695,8 @@ def test_插入凭证顺延已经记账的号(db, book, admin_user, subjects, ma
         entries=_entries(subjects, [("1001", 50, "插入")], [("5001", 50, "插入")]),
         insert_after_id=stack[1].id,
     )
-    assert db.get(Voucher, stack[1].id).voucher_no == "记003"
-    assert db.get(Voucher, stack[2].id).voucher_no == "记004"
+    assert db.get(Voucher, stack[1].id).voucher_no == "记0003"
+    assert db.get(Voucher, stack[2].id).voucher_no == "记0004"
 
 
 def test_插入位是最后一张就只是接在末尾(db, book, admin_user, subjects, make_voucher):
@@ -707,8 +707,8 @@ def test_插入位是最后一张就只是接在末尾(db, book, admin_user, sub
         entries=_entries(subjects, [("1001", 50, "尾")], [("5001", 50, "尾")]),
         insert_after_id=stack[2].id,
     )
-    assert new.voucher_no == "记003"
-    assert db.get(Voucher, stack[2].id).voucher_no == "记004"
+    assert new.voucher_no == "记0003"
+    assert db.get(Voucher, stack[2].id).voucher_no == "记0004"
 
 
 def test_插入凭证不建就不顺位(db, book, admin_user, subjects, make_voucher):
@@ -720,7 +720,7 @@ def test_插入凭证不建就不顺位(db, book, admin_user, subjects, make_vou
     stack = _stack(make_voucher, n=4)
     before = [db.get(Voucher, v.id).voucher_no for v in stack]
     slot = insert_slot(db, stack[1])
-    assert slot["no"] == "记002"           # 只算不改
+    assert slot["no"] == "记0002"           # 只算不改
     assert [db.get(Voucher, v.id).voucher_no for v in stack] == before
 
 
@@ -734,7 +734,7 @@ def test_插入位不能跨会计期间(db, book, admin_user, subjects, make_vou
             entries=_entries(subjects, [("1001", 10, "b")], [("5001", 10, "b")]),
             insert_after_id=jan.id,
         )
-    assert db.get(Voucher, mar.id).voucher_no == "记001"
+    assert db.get(Voucher, mar.id).voucher_no == "记0001"
 
 
 def test_手改了号就照人的号来_顺位照做(db, book, admin_user, subjects, make_voucher):
@@ -744,24 +744,24 @@ def test_手改了号就照人的号来_顺位照做(db, book, admin_user, subje
         db, book_id=book.id, user=admin_user,
         voucher_date=date(2026, 3, 2),
         entries=_entries(subjects, [("1001", 50, "改号")], [("5001", 50, "改号")]),
-        voucher_no="记099", insert_after_id=stack[1].id,
+        voucher_no="记0099", insert_after_id=stack[1].id,
     )
-    assert new.voucher_no == "记099"
-    assert [db.get(Voucher, v.id).voucher_no for v in stack] == ["记001", "记003", "记004"]
+    assert new.voucher_no == "记0099"
+    assert [db.get(Voucher, v.id).voucher_no for v in stack] == ["记0001", "记0003", "记0004"]
 
 
 def test_插入位撞上别人已占的号要报人话(db, book, admin_user, subjects, make_voucher):
     """顺位只顶开 anchor 之后的号；手填一个还在别人手上的号，照样要拦下来。"""
     stack = _stack(make_voucher, n=3)
-    with pytest.raises(ValueError, match="记001 在 2026-03 已经有一张了"):
+    with pytest.raises(ValueError, match="记0001 在 2026-03 已经有一张了"):
         create_voucher(
             db, book_id=book.id, user=admin_user,
             voucher_date=date(2026, 3, 3),
             entries=_entries(subjects, [("1001", 50, "插")], [("5001", 50, "插")]),
-            voucher_no="记001", insert_after_id=stack[1].id,
+            voucher_no="记0001", insert_after_id=stack[1].id,
         )
     # 撞了就整笔回滚：顺位也不能留下半个
-    assert [db.get(Voucher, v.id).voucher_no for v in stack] == ["记001", "记002", "记003"]
+    assert [db.get(Voucher, v.id).voucher_no for v in stack] == ["记0001", "记0002", "记0003"]
 
 
 def test_插入预览只算不改(client, auth, book_id, admin_user, subjects, make_voucher):
@@ -770,12 +770,12 @@ def test_插入预览只算不改(client, auth, book_id, admin_user, subjects, m
                    params={"after_id": stack[3].id}, headers=auth)
     assert r.status_code == 200, r.text
     data = r.json()
-    assert data["anchor_no"] == "记004"
-    assert data["voucher_no"] == "记004"
+    assert data["anchor_no"] == "记0004"
+    assert data["voucher_no"] == "记0004"
     assert data["voucher_date"] == "2026-03-04"
-    assert [m["from"] for m in data["moved"]] == ["记004", "记005", "记006"]
-    assert [m["to"] for m in data["moved"]] == ["记005", "记006", "记007"]
-    assert db_get_no(client, auth, book_id, stack[3].id) == "记004"   # 没被改
+    assert [m["from"] for m in data["moved"]] == ["记0004", "记0005", "记0006"]
+    assert [m["to"] for m in data["moved"]] == ["记0005", "记0006", "记0007"]
+    assert db_get_no(client, auth, book_id, stack[3].id) == "记0004"   # 没被改
 
 
 def db_get_no(client, auth, book_id, voucher_id):
@@ -801,8 +801,8 @@ def test_走接口插入凭证号也是顺位的(client, auth, book_id, admin_us
         ],
     })
     assert r.status_code == 201, r.text
-    assert r.json()["voucher_no"] == "记002"
-    assert db_get_no(client, auth, book_id, stack[1].id) == "记003"
+    assert r.json()["voucher_no"] == "记0002"
+    assert db_get_no(client, auth, book_id, stack[1].id) == "记0003"
 
 
 # ===================================================================== 红字冲销
@@ -951,7 +951,7 @@ def _legacy_voucher_with_non_leaf(db, book, subjects, admin_user):
     from app.models import Entry, Voucher
 
     p = find_period(db, book.id, date(2026, 1, 15))
-    v = Voucher(book_id=book.id, period_id=p.id, voucher_no="记001",
+    v = Voucher(book_id=book.id, period_id=p.id, voucher_no="记0001",
                 voucher_date=date(2026, 1, 15), status="UNPOSTED", source="MANUAL",
                 remark="老凭证", attachments=1, created_by=admin_user.username)
     db.add(v)
@@ -1193,9 +1193,9 @@ def test_撞号之后同一个事务还能继续写(db, book, admin_user, subjec
 #
 # 四档：凭证号顺序 / 凭证号倒序 / 日期顺序 / 日期倒序，默认凭证号倒序
 # （用户 2026-10-13 定的）。两条最容易写错的地方，各有钉子：
-#   1. 凭证号**只在期间内唯一**，跨月必须先按期间排，否则记001 与 记012
+#   1. 凭证号**只在期间内唯一**，跨月必须先按期间排，否则记0001 与 记0012
 #      被拿去比大小；
-#   2. 号段要按**整数**比。直接排字符串时 "记100" < "记099"（字典序），
+#   2. 号段要按**整数**比。直接排字符串时 "记0100" < "记0099"（字典序），
 #      与 next_voucher_no 当年踩过的 max() 是同一个坑。
 
 
@@ -1210,12 +1210,12 @@ def test_排序_默认是凭证号倒序(db, book, periods, admin_user, subjects
     db.commit()
 
     rows, _total = query_vouchers(db, book.id)      # 不传 sort = 默认档
-    assert [v.voucher_no for v in rows] == ["记003", "记002", "记001"]
+    assert [v.voucher_no for v in rows] == ["记0003", "记0002", "记0001"]
 
 
 def test_排序_凭证号跨期间先按期间再按号段(db, book, periods, admin_user, subjects):
-    """2 月一张记001、1 月三张记001..003。凭证号倒序该是「2月那张」在最前，
-    因为它的期间更晚 —— 而不是被 1 月那张同号的记001 顶掉。"""
+    """2 月一张记0001、1 月三张记0001..003。凭证号倒序该是「2月那张」在最前，
+    因为它的期间更晚 —— 而不是被 1 月那张同号的记0001 顶掉。"""
     for i in range(1, 4):
         create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, i),
                        entries=_entries(subjects, [("1001", 100, "x")], [("5001", 100, "x")]))
@@ -1227,12 +1227,12 @@ def test_排序_凭证号跨期间先按期间再按号段(db, book, periods, ad
     assert total == 4
     assert rows[0].voucher_date == date(2026, 2, 1)
     assert [(v.voucher_date.month, v.voucher_no) for v in rows] == [
-        (2, "记001"), (1, "记003"), (1, "记002"), (1, "记001"),
+        (2, "记0001"), (1, "记0003"), (1, "记0002"), (1, "记0001"),
     ]
 
     rows_asc, _ = query_vouchers(db, book.id, sort="no_asc")
     assert [(v.voucher_date.month, v.voucher_no) for v in rows_asc] == [
-        (1, "记001"), (1, "记002"), (1, "记003"), (2, "记001"),
+        (1, "记0001"), (1, "记0002"), (1, "记0003"), (2, "记0001"),
     ]
 
 
@@ -1253,18 +1253,18 @@ def test_排序_凭证号按整数比不是按字典序(db, book, periods, admin
 def test_排序_日期两档与凭证号无关(db, book, periods, admin_user, subjects):
     """同一天两张、号段与日期相反：日期两档必须都按日期给，不受号段影响。"""
     create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 10),
-                   voucher_no="记001",
+                   voucher_no="记0001",
                    entries=_entries(subjects, [("1001", 100, "x")], [("5001", 100, "x")]))
     create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 5),
-                   voucher_no="记002",
+                   voucher_no="记0002",
                    entries=_entries(subjects, [("1001", 100, "y")], [("5001", 100, "y")]))
     db.commit()
 
     asc, _ = query_vouchers(db, book.id, sort="date_asc")
-    assert [v.voucher_no for v in asc] == ["记002", "记001"]   # 01-05 在前
+    assert [v.voucher_no for v in asc] == ["记0002", "记0001"]   # 01-05 在前
 
     desc, _ = query_vouchers(db, book.id, sort="date_desc")
-    assert [v.voucher_no for v in desc] == ["记001", "记002"]  # 01-10 在前
+    assert [v.voucher_no for v in desc] == ["记0001", "记0002"]  # 01-10 在前
 
 
 def test_排序_未知档位退回默认不报错(db, book, periods, admin_user, subjects):
@@ -1276,7 +1276,7 @@ def test_排序_未知档位退回默认不报错(db, book, periods, admin_user,
     db.commit()
 
     rows, _ = query_vouchers(db, book.id, sort="随便写的")
-    assert [v.voucher_no for v in rows] == ["记002", "记001"]
+    assert [v.voucher_no for v in rows] == ["记0002", "记0001"]
 
 
 def test_排序_筛选与分页在四个档位下总数一致(db, book, periods, admin_user, subjects):

@@ -534,22 +534,29 @@ def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUse
     last_day = date(period.year, period.month, _days_in_month(period.year, period.month))
     created = []
 
+    # 摘要**不写期间**：这些分录是一个月一笔的动作，凭证日期已经落在月末那天，
+    # 期间在凭证头上摆着，摘要再抄一遍「结转 2026-09 损益」只是把同一句话说两遍
+    # —— 而且那张凭证日后是要打印出来给人核对的，一行摘要挤掉半个字都不值当。
+    # 写死成「期间损益结转」：全仓凡是这一类分录都长这样，肉眼一眼分得出
+    # 「这张是系统结转出来的」，不用先去凭证头确认它是哪一期结的。
+    SUMMARY = "期间损益结转"
+
     # 两张凭证一起提交，不各自 commit：replace 模式下旧凭证已经删掉了，
     # 中途失败若留下「删了旧的、只生成一半新的」，比直接报错糟糕得多。
     if income:
         entries = [{"subject_id": s.id, "direction": "DEBIT", "amount": amt,
-                    "summary": f"结转{period.code}损益"} for s, amt in income]
+                    "summary": SUMMARY} for s, amt in income]
         entries.append({"subject_id": profit.id, "direction": "CREDIT",
-                        "amount": sum(a for _, a in income), "summary": f"结转{period.code}损益"})
+                        "amount": sum(a for _, a in income), "summary": SUMMARY})
         created.append(create_voucher(
             db, book_id=book_id, user=user, voucher_date=last_day, entries=entries,
             source="CARRY_FORWARD", remark=f"{period.code} 结转损益（收入类）", commit=False))
 
     if expense:
         entries = [{"subject_id": profit.id, "direction": "DEBIT",
-                    "amount": sum(a for _, a in expense), "summary": f"结转{period.code}损益"}]
+                    "amount": sum(a for _, a in expense), "summary": SUMMARY}]
         entries += [{"subject_id": s.id, "direction": "CREDIT", "amount": amt,
-                     "summary": f"结转{period.code}损益"} for s, amt in expense]
+                     "summary": SUMMARY} for s, amt in expense]
         created.append(create_voucher(
             db, book_id=book_id, user=user, voucher_date=last_day, entries=entries,
             source="CARRY_FORWARD", remark=f"{period.code} 结转损益（成本费用类）", commit=False))

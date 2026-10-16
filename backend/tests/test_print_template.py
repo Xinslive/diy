@@ -586,8 +586,8 @@ def test_十二行凭证打印时占满三张A4(client, auth, book, periods, mak
     r = client.get(f"/api/books/{book.id}/print/vouchers.html",
                    params={"period_id": periods[1].id}, headers=auth)
     assert r.status_code == 200, r.text
-    assert "记001 - 001/003" in r.text and "记001 - 002/003" in r.text
-    assert "记001 - 003/003" in r.text
+    assert "记0001 - 001/003" in r.text and "记0001 - 002/003" in r.text
+    assert "记0001 - 003/003" in r.text
     assert r.text.count('class="voucher-slot"') == 3      # 3 个槽位
     assert r.text.count('<div class="page">') == 2         # A4 两槽位 → 2 张纸
 
@@ -640,7 +640,7 @@ def test_预览的分片与正式打印一致(client, auth, book, periods, make_
         return h.split("<body>")[1].replace(
             '<p class="page-note">预览只显示前 3 张凭证，打印时输出该期间全部凭证。</p>', "")
 
-    assert "记001 - 002/002" in prev.text
+    assert "记0001 - 002/002" in prev.text
     assert body(prev.text) == body(printed.text)
 
 

@@ -412,13 +412,54 @@ def test_判定_不涉及现金的凭证归转账(db, book, periods, subjects, a
     assert _kind_of(db, accrue) == TRANSFER
 
 
-def test_判定_混合收支按净额不按金额大小(db, book, periods, subjects, admin_user):
-    # 银行手续费(付 186) + 存款利息(收 980)：借贷都有现金 → 转账，
-    # 不能因为 980 > 186 就判成「收」。
+def test_判定_收付混合按净额_净流入判收(db, book, periods, subjects, admin_user):
+    """手续费(付 186) + 利息(收 980) → 净 +794 → **收**。
+
+    真实账里这个形态反复出现（启明物业 13 张、星悦荟商管 39 张）：一张凭证
+    里既有一笔现金类对外支付（手续费），又有一笔现金类收入（利息），现金类
+    借贷都有。旧规则「借贷都有就算转账」把它整张打成转账，业务上却明明是
+    收到利息 —— 用户 2026-10-16 定的口径是「同属收和转的，认定为收」。
+    """
     mixed = _mk_cash(db, book, admin_user, subjects, "2026-01-05",
                      dr=[("1002", 980), ("560302", 186)],
                      cr=[("1002", 186), ("5111", 980)])
-    assert _kind_of(db, mixed) == TRANSFER
+    assert _kind_of(db, mixed) == RECEIPT
+
+
+def test_判定_收付混合按净额_净流出判付(db, book, periods, subjects, admin_user):
+    """同一形态的另一面：净额为负就判付。
+
+    这一条和上面那条是同一个判据的两半。少写一半的话，「一律判收」会把
+    真实账里净流出的那 16 张付款凭证错塞进收段（星悦荟商管 39 张混合凭证里
+    有 15 张净流出）。
+    """
+    mixed = _mk_cash(db, book, admin_user, subjects, "2026-01-05",
+                     dr=[("1002", 800), ("560302", 200)],
+                     cr=[("1002", 1000)])
+    assert _kind_of(db, mixed) == PAYMENT
+
+
+def test_判定_打包了一笔内部划转的凭证看净额(db, book, periods, subjects, admin_user):
+    """「折旧 + 收入 + 微信↔银行对倒」这种打包凭证，现金净额为 0 → 转账。
+
+    对倒那一对现金分录在净额里自己抵掉了，留在净额里的只有真正的钱进出；
+    这里进出相抵，所以它是转账，不是收也不是付。
+    """
+    packed = _mk_cash(db, book, admin_user, subjects, "2026-01-05",
+                      dr=[("1002", 4967), ("1002", 4728)],
+                      cr=[("1002", 4728), ("1002", 4967)])
+    assert _kind_of(db, packed) == TRANSFER
+
+
+def test_判定_混合收款里夹一笔内部划转仍判收(db, book, periods, subjects, admin_user):
+    """真实形态：收电费，微信收到一笔，其中一部分当场转到银行。
+
+    划转部分自己抵掉，净额只剩真正的收款 → 收。
+    """
+    with_move = _mk_cash(db, book, admin_user, subjects, "2026-01-05",
+                         dr=[("1002", 77735), ("1002", 100)],
+                         cr=[("1002", 100), ("1122", 77735)])
+    assert _kind_of(db, with_move) == RECEIPT
 
 
 def test_同日排序_先收后付再转账(db, book, periods, subjects, admin_user):

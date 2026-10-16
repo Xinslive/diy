@@ -117,10 +117,10 @@ def _whole_period_readback(stmts) -> list[str]:
 def test_发号只发一条聚合查询(db, period, seed_nos):
     """原来是一条 ``SELECT voucher_no FROM voucher WHERE period_id=…``，
     整期的号原样回传、在 Python 里求 max；现在是一次聚合、一行。"""
-    seed_nos(["记001", "记002", "记010"])
+    seed_nos(["记0001", "记0002", "记0010"])
     with _statements() as stmts:
         no = svc.next_voucher_no(db, period)
-    assert no == "记011"
+    assert no == "记0011"
     assert len(stmts) == 1, f"发号应当只有一条语句，实际 {len(stmts)} 条：{stmts}"
     assert len(_no_aggregates(stmts)) == 1
     assert not _whole_period_readback(stmts), "仍然在把整期凭证号拉回 Python"
@@ -130,10 +130,10 @@ def test_发号只发一条聚合查询(db, period, seed_nos):
 def test_发号查询数不随本期凭证数增长(db, period, seed_nos, size):
     """N 张累计读回 N(N−1)/2 行的问题。只钉语句数不够 —— 整表拉回本来
     就是**一条**语句，真正变掉的是「这条语句回传多少行」，所以同时要求它是聚合。"""
-    seed_nos([f"记{i:03d}" for i in range(1, size + 1)])
+    seed_nos([f"记{i:0{svc_organize.NO_WIDTH}d}" for i in range(1, size + 1)])
     with _statements() as stmts:
         no = svc.next_voucher_no(db, period)
-    assert no == f"记{size + 1:03d}"
+    assert no == f"记{size + 1:0{svc_organize.NO_WIDTH}d}"
     assert len(stmts) == 1, f"size={size} 时发号发了 {len(stmts)} 条：{stmts}"
     assert "max(" in stmts[0].lower() and "substring(" in stmts[0].lower()
 
@@ -148,23 +148,27 @@ def test_建凭证时的取号不再整表拉回(db, book, period, subjects, adm
     assert len(_no_aggregates(stmts)) == 1
 
 
-def test_记9记10与手工号混存时下一个号仍是记011(db, period, seed_nos):
+def test_记9记10与手工号混存时下一个号仍是记0011(db, period, seed_nos):
     """字典序在这里必翻车：``记-年结`` > ``记9`` > ``记10``。
 
     手工号「记-年结」「2026年终」解析不出序号，本来就不该参与递增。
     """
     seed_nos(["记9", "记10", "记-年结", "2026年终"])
-    assert svc.next_voucher_no(db, period) == "记011"
+    assert svc.next_voucher_no(db, period) == "记0011"
 
 
 def _reference_next_no(nos, prefix="记") -> str:
-    """修复前的应用层实现，逐字照抄 —— 用来证明两条路径结果一致。"""
-    from app.accounting.organize import split_no
+    """修复前的应用层实现，逐字照抄 —— 用来证明两条路径结果一致。
+
+    补零位数跟着 ``organize.NO_WIDTH`` 走（2026-10-16 由三位改回四位）：
+    这份参照实现要跟发号口径一致，否则比的是宽度而不是「谁算出来的号对」。
+    """
+    from app.accounting.organize import NO_WIDTH, split_no
 
     seq = max((n for no in nos
                if (n := split_no(no)[1]) > 0 and split_no(no)[0] == prefix),
               default=0) + 1
-    return f"{prefix}{seq:03d}"
+    return f"{prefix}{seq:0{NO_WIDTH}d}"
 
 
 @pytest.mark.parametrize("nos,prefix", [
@@ -189,26 +193,27 @@ def test_与修复前的应用层取号逐例一致(db, period, seed_nos, nos, p
 
 
 @pytest.mark.parametrize("prefix", ["", "9记", "记账凭证长"])
-def test_前缀拆不出来时直接发001(db, period, seed_nos, prefix):
+def test_前缀拆不出来时直接发头一个号(db, period, seed_nos, prefix):
     """NO_PATTERN 的前缀组是 ``[^\\d]{1,4}``：含数字、超 4 字、空前缀的
     ``prefix`` 永远匹配不到任何凭证号，答案与库里有什么无关。"""
-    seed_nos([f"{prefix}001" if prefix else "记001"])
-    assert svc.next_voucher_no(db, period, prefix) == f"{prefix}001"
+    seed_nos([f"{prefix}0001" if prefix else "记0001"])
+    assert svc.next_voucher_no(db, period, prefix) == (
+        f"{prefix}{1:0{svc_organize.NO_WIDTH}d}")
 
 
 def test_带符号的前缀仍按前缀发号(db, period, seed_nos):
     """「记-」是 ``[^\\d]{1,4}`` 能拆出来的前缀，就不是「拆不出来」那一类，
     它有自己独立的号段（别与「记」混算）。"""
-    seed_nos(["记001", "记-001"])
-    assert svc.next_voucher_no(db, period, "记-") == "记-002"
-    assert svc.next_voucher_no(db, period, "记") == "记002"
+    seed_nos(["记0001", "记-0001"])
+    assert svc.next_voucher_no(db, period, "记-") == "记-0002"
+    assert svc.next_voucher_no(db, period, "记") == "记0002"
 
 
 def test_各前缀发号互不干扰(db, period, seed_nos):
-    seed_nos(["记001", "银005", "银存001"])
-    assert svc.next_voucher_no(db, period, "记") == "记002"
-    assert svc.next_voucher_no(db, period, "银") == "银006"
-    assert svc.next_voucher_no(db, period, "银存") == "银存002"
+    seed_nos(["记0001", "银0005", "银存0001"])
+    assert svc.next_voucher_no(db, period, "记") == "记0002"
+    assert svc.next_voucher_no(db, period, "银") == "银0006"
+    assert svc.next_voucher_no(db, period, "银存") == "银存0002"
 
 
 # ----------------------------------------------------------------- 中等 3：分录预载
@@ -411,9 +416,9 @@ def test_体检只查三列不再实例化凭证对象(db, period, seed_nos):
 
 
 def test_体检仍然拦下断号与手工号(db, period, seed_nos):
-    seed_nos(["记001", "记003", "记-年结"])
+    seed_nos(["记0001", "记0003", "记-年结"])
     rep = svc_organize.check_period(db, period)
-    assert rep["gaps"] == ["记002"]
+    assert rep["gaps"] == ["记0002"]
     assert rep["unparsed"] == ["记-年结"]
     assert rep["clean"] is False
     assert any("断号" in b for b in rep["blocking"])

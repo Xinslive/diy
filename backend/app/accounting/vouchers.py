@@ -110,14 +110,14 @@ def next_voucher_no(db: Session, period: Period, prefix: str = "记") -> str:
     一个发号计数器列 —— 那要动模型和迁移，不在本文件范围内。
     """
     if not _PREFIX_SHAPE.match(prefix):
-        return f"{prefix}001"
+        return f"{prefix}{1:0{svc_organize.NO_WIDTH}d}"
     top = db.scalar(
         select(func.coalesce(func.max(_prefix_seq_expr(prefix)), 0)).where(
             Voucher.period_id == period.id
         )
     )
-    # 三位数够一个月的凭证用。四位（记0022）看着像系统自动加的零，反而难扫。
-    return f"{prefix}{int(top or 0) + 1:03d}"
+    # 补零位数只有 organize.NO_WIDTH 一个数说了算，别在这儿另写一份。
+    return f"{prefix}{int(top or 0) + 1:0{svc_organize.NO_WIDTH}d}"
 
 
 # --------------------------------------------------------------------- 插入位
@@ -126,8 +126,8 @@ def next_voucher_no(db: Session, period: Period, prefix: str = "记") -> str:
 def insert_slot(db: Session, anchor: Voucher) -> dict:
     """插入凭证要占的那个号：参照凭证自己的号，参照及以后的号整体顺延 +1。
 
-    记001..记010，打开记006 插入 —— 存下去之后新凭证拿记006，
-    原记006..记010 变成记007..记011。顺延按**号**算，不按日期：
+    记0001..记0010，打开记0006 插入 —— 存下去之后新凭证拿记0006，
+    原记0006..记0010 变成记0007..记0011。顺延按**号**算，不按日期：
     凭证号才是这个期间里的顺序，日期排出来的次序交给「整理凭证」管。
 
     这里只算不改。改号和建凭证必须落在同一个事务里：中途放弃一张空凭证，
@@ -145,7 +145,8 @@ def insert_slot(db: Session, anchor: Voucher) -> dict:
     for v in rows:
         p, s = svc_organize.split_no(v.voucher_no)
         if p == prefix and s >= seq:
-            moved.append({"id": v.id, "from": v.voucher_no, "to": f"{prefix}{s + 1:03d}"})
+            moved.append({"id": v.id, "from": v.voucher_no,
+                          "to": f"{prefix}{s + 1:0{svc_organize.NO_WIDTH}d}"})
     moved.sort(key=lambda m: m["from"])
     return {"prefix": prefix, "seq": seq, "no": anchor.voucher_no, "moved": moved}
 

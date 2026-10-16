@@ -112,6 +112,7 @@
                 :ref="(el) => setSubjectRef(el, i)"
                 :options="subjects"
                 :disabled="readonly || blocked(i)"
+                :has-bottom-hint="!!balanceText(row)"
                 @focusin="activeRow = row"
                 @change="onSubject(row)"
                 @add="(kw) => openSubjectCreate(i, kw)"
@@ -212,6 +213,7 @@ import { useSessionStore } from '@/stores/session'
 import { useTabsStore } from '@/stores/tabs'
 import { fmt } from '@/utils/format'
 import { displayBalance } from '@/utils/balanceSign'
+import { findFirstProblem } from '@/utils/voucherRows'
 import AmountGrid from '@/components/AmountGrid.vue'
 import SubjectPicker from '@/components/SubjectPicker.vue'
 import SubjectFormDialog from '@/components/SubjectFormDialog.vue'
@@ -263,13 +265,16 @@ const isOn = (row) => row === greenRow.value
  * 返回挡着的那一条（用来把话说清楚：第几行还差什么），没有就返回 null。
  */
 function blocker(i) {
-  for (let j = 0; j < i; j++) {
-    const e = form.entries[j]
-    if (e && rowProblem(e)) return e
-  }
-  return null
+  const at = firstProblemAt.value
+  return at < i ? form.entries[at] : null
 }
-const blocked = (i) => !!blocker(i)
+/**
+ * 第一条「没写完」的分录在第几行（没有就等于行数）—— 判定在 utils/voucherRows.js。
+ * `blocked(i)` 挂在每一行上问，靠的是这一个下标，不再每行从头扫一遍
+ * （以前每行扫到 i，一屏 154 行就是 1.2 万次判断，套上科目表里的线性查找
+ * 就是 O(行数² × 科目数)：那张凭证打开一次 41s，主线程整个占住）。 */
+const firstProblemAt = computed(() => findFirstProblem(form.entries, rowProblem))
+const blocked = (i) => firstProblemAt.value < i
 function warnBlocked(i) {
   const e = blocked(i) ? blocker(i) : null
   if (!e || readonly.value) return
@@ -368,7 +373,12 @@ const readonly = computed(() => locked.value || posted.value || !store.canWrite)
 // 只读账套不行，**顶栏那个期间**已结账也不行（新凭证落在顶栏那一期）
 const canAdd = computed(() => store.canWrite && !periodLocked.value)
 
-const subjectOf = (id) => subjects.value.find((s) => s.id === id) || null
+/** 科目按 id 建的索引：`subjectOf` 是**每一行都要问好几次**的（标红、余额、
+ *  页脚的提示各一次），拿 find 在两千条里线性翻，一屏几百行就是几百万次
+ *  响应式代理读取 —— 这条跟上面的 firstProblemAt 是同一个病的两处。
+ *  索引只在科目表换掉时重算一次。 */
+const subjectById = computed(() => new Map(subjects.value.map((s) => [s.id, s])))
+const subjectOf = (id) => subjectById.value.get(id) || null
 /** 这一行挂的不是末级科目：科目格标红、保存拦下、回车不许往下走 */
 const badSubject = (row) => {
   const sub = subjectOf(row?.subject_id)
@@ -724,7 +734,7 @@ const hasCompleteEntry = computed(() =>
   form.entries.some((e) => e.subject_id && num(e.amount)))
 
 function subjectText(id) {
-  const s = subjects.value.find((x) => x.id === id)
+  const s = subjectById.value.get(id)
   return s ? `${s.code} ${s.name}` : ''
 }
 function onSubject(row) {
