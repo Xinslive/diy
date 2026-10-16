@@ -120,11 +120,11 @@ def test_按科目筛选凭证不再全表扫(db, book, subjects, make_voucher):
     这是本条迁移要修的那一处：改动前 entry 上没有任何以 subject_id 打头的
     索引，这条子查询只能 Seq Scan（开发库实测：读 580 行、丢 438 行）。
     """
-    make_voucher("2026-01-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")],
+    make_voucher("2026-01-10", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")],
                  posted=True)
 
     plan = "\n".join(_plan(db, SUBJECT_FILTER_SQL,
-                           {"sid": subjects["100201"].id}, force_index=True))
+                           {"sid": subjects["1001"].id}, force_index=True))
     assert "ix_entry_subject_voucher" in plan, (
         "以 subject_id 打头的索引没有被选中：\n" + plan)
     assert "Seq Scan" not in plan, plan
@@ -142,7 +142,7 @@ def test_凭证按科目筛选不再需要回堆(db, book, subjects, make_vouche
     """
     import sqlalchemy as sa
 
-    make_voucher("2026-01-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")],
+    make_voucher("2026-01-10", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")],
                  posted=True)
 
     vacuum = sa.create_engine(app_engine.url, isolation_level="AUTOCOMMIT")
@@ -153,7 +153,7 @@ def test_凭证按科目筛选不再需要回堆(db, book, subjects, make_vouche
         vacuum.dispose()
 
     plan = "\n".join(_plan(db, SUBJECT_FILTER_SQL,
-                           {"sid": subjects["100201"].id}, force_index=True))
+                           {"sid": subjects["1001"].id}, force_index=True))
     assert "Index Only Scan" in plan, (
         "子查询没能 Index Only，说明白带了 voucher_id 的收益没拿到：\n" + plan)
 
@@ -218,13 +218,13 @@ def _same(a: Figures, b: Figures, what: str) -> None:
 def test_逐期数值与改动前完全一致(db, book, periods, subjects, make_voucher):
     """同一批数据下，新引擎每一期的五个量都与旧算法逐位相等。"""
     db.add(PeriodOpening(book_id=book.id, period_id=periods[1].id,
-                         subject_id=subjects["100201"].id, amount=Decimal("1000")))
+                         subject_id=subjects["1001"].id, amount=Decimal("1000")))
     db.commit()
     for m, amt in ((1, 500), (3, 300), (3, 200), (7, 900), (12, 50)):
         make_voucher(f"2026-{m:02d}-10",
-                     dr=[("100201", amt, "收")], cr=[("600101", amt, "收")], posted=True)
+                     dr=[("1001", amt, "收")], cr=[("5001", amt, "收")], posted=True)
 
-    ids = [subjects[c].id for c in ("100201", "1002", "600101", "6602", "1122")]
+    ids = [subjects[c].id for c in ("1001", "1002", "5001", "5602", "1122")]
     top = periods[12].ord
 
     ref = _reference_all_periods(LedgerEngine(db, book.id), ids, top)
@@ -251,16 +251,16 @@ def test_跨年时本年累计归零且数值不变(db, book, subjects, make_vou
     # 2026 年有发生额，2027 年也有：归零分支一旦失效，2027 年的
     # dr_cum 会把 2026 全年算进去，而这种错在「列与列之间」是自洽的。
     # 两个年份都用**借方**，这样归零有没有生效直接看 dr_cum 的数值。
-    make_voucher("2026-11-10", dr=[("600101", 700, "2026收入")],
-                 cr=[("100201", 700, "2026收入")], posted=True)
-    make_voucher("2027-02-10", dr=[("600101", 300, "2027收入")],
-                 cr=[("100201", 300, "2027收入")], posted=True)
+    make_voucher("2026-11-10", dr=[("5001", 700, "2026收入")],
+                 cr=[("1001", 700, "2026收入")], posted=True)
+    make_voucher("2027-02-10", dr=[("5001", 300, "2027收入")],
+                 cr=[("1001", 300, "2027收入")], posted=True)
 
-    sid = subjects["600101"].id
+    sid = subjects["5001"].id
     dec26 = per[12].ord          # 2026-12
     jan27 = per[13].ord          # 2027-01 —— 归零就发生在这里
     feb27 = per[14].ord          # 2027-02
-    ids = [subjects[c].id for c in ("600101", "100201")]
+    ids = [subjects[c].id for c in ("5001", "1001")]
 
     ref = _reference_all_periods(LedgerEngine(db, book.id), ids, feb27)
     eng = LedgerEngine(db, book.id)
@@ -284,12 +284,12 @@ def test_账套首期之前那张零发生额图不变(db, book, subjects, make_
         select(Period).where(Period.book_id == book.id).order_by(Period.ord).limit(1)
     ).one()
     db.add(PeriodOpening(book_id=book.id, period_id=first.id,
-                         subject_id=subjects["100201"].id, amount=Decimal("8888")))
+                         subject_id=subjects["1001"].id, amount=Decimal("8888")))
     db.commit()
-    make_voucher("2026-02-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")],
+    make_voucher("2026-02-10", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")],
                  posted=True)
 
-    sid = subjects["100201"].id
+    sid = subjects["1001"].id
     start = book_first_ord(db.get(Book, book.id))
     eng = LedgerEngine(db, book.id)
 
@@ -311,7 +311,7 @@ def test_只留最后一期后内存是O科目数(db, book, periods, subjects, m
 
     12 个期间 × 5 个科目：改动前是 60 个 Figures，现在是 5 个。
     """
-    ids = [subjects[c].id for c in ("100201", "1002", "600101", "6602", "1122")]
+    ids = [subjects[c].id for c in ("1001", "1002", "5001", "5602", "1122")]
     eng = LedgerEngine(db, book.id)
     eng.batch_figures(ids, periods[12].ord)
     assert len(eng._figures) == len(ids), (
@@ -321,7 +321,7 @@ def test_只留最后一期后内存是O科目数(db, book, periods, subjects, m
 
 def test_重复请求同一科目不重推(db, book, periods, subjects, make_voucher):
     """``_computed_through`` 的幂等语义不能因为收紧记忆化而失效。"""
-    ids = [subjects[c].id for c in ("100201", "600101")]
+    ids = [subjects[c].id for c in ("1001", "5001")]
     eng = LedgerEngine(db, book.id)
     top = periods[12].ord
     first = eng.compute(ids, top)
@@ -350,7 +350,7 @@ def test_取中间期重推不发SQL(db, book, periods, subjects, make_voucher):
     期初快照、发生额聚合、科目树都已在实例内；``_cum_movements`` 对更小的
     上界只过滤不重查（engine.py 里那条记忆化的原话）。
     """
-    ids = [subjects[c].id for c in ("100201", "600101")]
+    ids = [subjects[c].id for c in ("1001", "5001")]
     eng = LedgerEngine(db, book.id)
     with _statements() as stmts:
         eng.batch_figures(ids, periods[12].ord)

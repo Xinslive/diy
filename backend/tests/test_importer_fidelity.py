@@ -47,8 +47,8 @@ HEAD = ["日期", "凭证号", "摘要", "科目编码", "借方", "贷方"]
 def test_非法金额不再被吞成0(db, book):
     """金额列写「金额待定」这种值，必须出现在错误列表里。"""
     data = _xlsx(HEAD, [
-        ["2026-01-05", "记-1", "x", "100201", "金额待定", 0],
-        [None, None, "x", "600101", 0, 1000],
+        ["2026-01-05", "记-1", "x", "1002", "金额待定", 0],
+        [None, None, "x", "5001", 0, 1000],
     ])
     r = parse_workbook(data, book.id, db)
 
@@ -60,8 +60,8 @@ def test_非法金额不再被吞成0(db, book):
 def test_非法金额时批次ok标志与实际入库一致(db, book):
     """审计的核心指标：批次不能一边丢数据一边报 ok=true。"""
     data = _xlsx(HEAD, [
-        ["2026-01-05", "记-1", "x", "100201", "金额待定", 0],
-        [None, None, "x", "600101", 0, 1000],
+        ["2026-01-05", "记-1", "x", "1002", "金额待定", 0],
+        [None, None, "x", "5001", 0, 1000],
     ])
     b = stage(db, book.id, _admin(db), "脏数据.xlsx", data)
 
@@ -75,8 +75,8 @@ def test_非法金额时批次ok标志与实际入库一致(db, book):
 def test_百分比金额被报告(db, book):
     """整列从别处粘串了，99% 的单元格都带百分号 —— 原来全部静默变 0。"""
     data = _xlsx(HEAD, [
-        ["2026-01-05", "记-1", "x", "100201", "50%", 0],
-        [None, None, "x", "600101", 0, 500],
+        ["2026-01-05", "记-1", "x", "1002", "50%", 0],
+        [None, None, "x", "5001", 0, 500],
     ])
     r = parse_workbook(data, book.id, db)
     v = r["vouchers"][0]
@@ -87,8 +87,8 @@ def test_百分比金额被报告(db, book):
 def test_红字分录不再被丢弃(db, book):
     """冲销一张记错的凭证是记账的日常 —— 恰恰是最该保真的场景。"""
     data = _xlsx(HEAD, [
-        ["2026-01-05", "记-1", "冲上月的错账", "100201", -500, 0],
-        [None, None, "冲上月的错账", "600101", 0, -500],
+        ["2026-01-05", "记-1", "冲上月的错账", "1002", -500, 0],
+        [None, None, "冲上月的错账", "5001", 0, -500],
     ])
     r = parse_workbook(data, book.id, db)
 
@@ -103,23 +103,23 @@ def test_红字分录不再被丢弃(db, book):
 def test_红字凭证方向靠列位置不靠正负(db, book):
     """负数在贷方列就该是贷方，不能因为「不是正数」就当成借方。"""
     data = _xlsx(HEAD, [
-        ["2026-01-05", "记-1", "红字", "100201", 0, -300],
-        [None, None, "红字", "6602", -300, 0],
+        ["2026-01-05", "记-1", "红字", "1002", 0, -300],
+        [None, None, "红字", "560206", -300, 0],
     ])
     r = parse_workbook(data, book.id, db)
     entries = r["vouchers"][0]["entries"]
     by_code = {e["subject_code"]: e for e in entries}
 
-    assert by_code["100201"]["direction"] == "CREDIT"
-    assert Decimal(by_code["100201"]["amount"]) == Decimal("-300")
-    assert by_code["6602"]["direction"] == "DEBIT"
-    assert Decimal(by_code["6602"]["amount"]) == Decimal("-300")
+    assert by_code["1002"]["direction"] == "CREDIT"
+    assert Decimal(by_code["1002"]["amount"]) == Decimal("-300")
+    assert by_code["560206"]["direction"] == "DEBIT"
+    assert Decimal(by_code["560206"]["amount"]) == Decimal("-300")
 
 
 def test_同一行借贷都填了金额必须报错(db, book):
     """一行只能有一条分录。原来的代码只按借方算，贷方那栏凭空消失。"""
     data = _xlsx(HEAD, [
-        ["2026-01-05", "记-1", "x", "100201", 500, 500],
+        ["2026-01-05", "记-1", "x", "1002", 500, 500],
     ])
     r = parse_workbook(data, book.id, db)
     v = r["vouchers"][0]
@@ -130,11 +130,11 @@ def test_同一行借贷都填了金额必须报错(db, book):
 def test_审计场景_5条分录只入2条且报成功(db, book):
     """复刻审计报告里的那张表：5 条来源分录 → 只解析出 2 条 → 却报成功。"""
     data = _xlsx(HEAD, [
-        ["2026-01-05", "记-1", "正常行", "100201", 1000, 0],      # 1 正常
-        [None, None, "正常行", "600101", 0, 1000],                 # 2 正常
-        [None, None, "金额错", "100201", "错误金额", 0],            # 3 非法金额
-        [None, None, "红字行", "100201", -300, 0],                 # 4 红字
-        [None, None, "红字行", "600101", 0, -300],                 # 5 红字
+        ["2026-01-05", "记-1", "正常行", "1002", 1000, 0],      # 1 正常
+        [None, None, "正常行", "5001", 0, 1000],                 # 2 正常
+        [None, None, "金额错", "1002", "错误金额", 0],            # 3 非法金额
+        [None, None, "红字行", "1002", -300, 0],                 # 4 红字
+        [None, None, "红字行", "5001", 0, -300],                 # 5 红字
     ])
     r = parse_workbook(data, book.id, db)
     v = r["vouchers"][0]
@@ -150,8 +150,8 @@ def test_审计场景_5条分录只入2条且报成功(db, book):
 def test_原始金额被保留下来(db, book):
     """出错时要能对回源文件 —— 光看解析后的数字认不出是哪一格。"""
     data = _xlsx(HEAD, [
-        ["2026-01-05", "记-1", "x", "100201", "1,234.50", 0],
-        [None, None, "x", "600101", 0, 1234.50],
+        ["2026-01-05", "记-1", "x", "1002", "1,234.50", 0],
+        [None, None, "x", "5001", 0, 1234.50],
     ])
     r = parse_workbook(data, book.id, db)
     e = r["vouchers"][0]["entries"][0]
@@ -173,8 +173,8 @@ def test_同侧相抵的凭证被拒(db, book):
     金额 0 的行根本不生成分录，所以「一行都没填」必然落在这里。
     """
     data = _xlsx(HEAD, [
-        ["2026-01-05", "记-1", "x", "100201", 0, 0],
-        [None, None, "x", "100201", 0, 0],
+        ["2026-01-05", "记-1", "x", "1002", 0, 0],
+        [None, None, "x", "1002", 0, 0],
     ])
     r = parse_workbook(data, book.id, db)
     assert r["vouchers"][0]["ok"] is False
@@ -187,8 +187,8 @@ def test_同侧相抵但记了东西的凭证放行(db, book):
     用来友的序时账时，这是绕不开的一类凭证。
     """
     data = _xlsx(HEAD, [
-        ["2026-01-05", "记-1", "x", "100201", 500, 0],
-        [None, None, "x", "100201", -500, 0],
+        ["2026-01-05", "记-1", "x", "1002", 500, 0],
+        [None, None, "x", "1002", -500, 0],
     ])
     r = parse_workbook(data, book.id, db)
     v = r["vouchers"][0]
@@ -199,8 +199,8 @@ def test_同侧相抵但记了东西的凭证放行(db, book):
 def test_说明文字行不会被当成错误(db, book):
     """导出模板底部有说明文字，收紧不能把这些行也报错。"""
     data = _xlsx(HEAD, [
-        ["2026-01-05", "记-1", "x", "100201", 1000, 0],
-        [None, None, "x", "600101", 0, 1000],
+        ["2026-01-05", "记-1", "x", "1002", 1000, 0],
+        [None, None, "x", "5001", 0, 1000],
         [],
         ["说明：", None, "一张凭证占多行，第二行起日期与凭证号留空", None, None, None],
     ])
@@ -220,8 +220,8 @@ def _admin(db):
 def test_红字凭证能真正入库并保留符号(db, book):
     """不只是解析对，写进库里也得是红字。"""
     data = _xlsx(HEAD, [
-        ["2026-01-05", "记-1", "红字冲销", "100201", -500, 0],
-        [None, None, "红字冲销", "600101", 0, -500],
+        ["2026-01-05", "记-1", "红字冲销", "1002", -500, 0],
+        [None, None, "红字冲销", "5001", 0, -500],
     ])
     b = stage(db, book.id, _admin(db), "红字.xlsx", data)
     r = commit(db, b, _admin(db))

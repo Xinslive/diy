@@ -55,8 +55,8 @@ def _carry_forward_january(db, book, periods, subjects, admin_user, make_voucher
     from app.accounting.vouchers import post_vouchers
     from app.models import Voucher
 
-    make_voucher("2026-01-10", dr=[("100201", 10000, "收租")],
-                 cr=[("600101", 10000, "收租")], posted=True)
+    make_voucher("2026-01-10", dr=[("1002", 10000, "收租")],
+                 cr=[("5001", 10000, "收租")], posted=True)
     carry_forward_profit(db, book.id, periods[1], admin_user)
     ids = [x.id for x in db.scalars(select(Voucher).where(
         Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD",
@@ -82,7 +82,7 @@ def test_利润表本期金额与总账本期贷方差一个结转全额(
 
     _carry_forward_january(db, book, periods, subjects, admin_user, make_voucher)
     sid = db.scalar(select(Subject.id).where(
-        Subject.book_id == book.id, Subject.code == "600101"))
+        Subject.book_id == book.id, Subject.code == "5001"))
 
     ledger = LedgerEngine.for_ledger(db, book.id, False).figures(sid, periods[1].ord)
     report = LedgerEngine.for_report(db, book.id, False).figures(sid, periods[1].ord)
@@ -104,7 +104,7 @@ def test_利润表本期金额与总账本期贷方差一个结转全额(
 
 def test_结转之前两个口径完全相等(db, book, periods, subjects, admin_user, make_voucher):
     """没结转就没有差额 —— 标注必须只在真有差额时出现，否则是噪音。"""
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")],
+    make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")],
                  posted=True)
     data = evaluate(db, _tpl_id(db, "INCOME_SHEET"), book, periods[1], False)
     assert data["carry_forward_period_amount"] is None
@@ -141,7 +141,7 @@ def test_未记账的结转凭证不计入损益(db, book, periods, subjects, ad
     """已结转但**没记账**的结转凭证仍然不进报表 —— 与总账口径保持一致。"""
     from app.accounting.periods import carry_forward_profit
 
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")],
+    make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")],
                  posted=True)
     carry_forward_profit(db, book.id, periods[1], admin_user)   # 故意不记账
     db.commit()
@@ -297,9 +297,9 @@ def test_非首期的上期照常取上一期(db, book, periods, subjects, make_
     """第二期起 {{上期}} 指向第一期 —— 修首期不能把正常的上期也修坏。"""
     from app.reports.evaluate import EvalContext
 
-    make_voucher("2026-01-10", dr=[("1001", 500, "x")], cr=[("600101", 500, "x")],
+    make_voucher("2026-01-10", dr=[("1001", 500, "x")], cr=[("5001", 500, "x")],
                  posted=True)
-    make_voucher("2026-02-10", dr=[("1001", 700, "x")], cr=[("600101", 700, "x")],
+    make_voucher("2026-02-10", dr=[("1001", 700, "x")], cr=[("5001", 700, "x")],
                  posted=True)
 
     ctx = EvalContext(db, book, periods[2], {})

@@ -408,7 +408,7 @@ def test_叶子护栏_挡住了_true到true_这个漏网方向(db, book):
     from sqlalchemy.exc import DBAPIError
 
     parent = _subject(db, book.id, "1900", is_leaf=False)
-    child = _subject(db, book.id, "1901", parent=parent)
+    child = _subject(db, book.id, "1905", parent=parent)
     db.commit()
 
     # 造出「is_leaf=true 却有下级」的存量脏状态（这正是 P1-01 之前的老库会有的）。
@@ -446,13 +446,13 @@ def test_插子科目不动父节点_提交时被拒(db, book):
     db.commit()
     db.execute(text("INSERT INTO subject (book_id, code, name, parent_id, level, "
                     "category, direction, is_leaf, ext_attrs, created_at, updated_at) "
-                    "VALUES (:b, '1901', '1901', :p, 2, 'ASSET', 'DEBIT', true, "
+                    "VALUES (:b, '1905', '1905', :p, 2, 'ASSET', 'DEBIT', true, "
                     "'{}'::jsonb, now(), now())"),
                {"b": book.id, "p": parent})
     with pytest.raises(DBAPIError, match="末级"):
         db.commit()
     db.rollback()
-    assert db.execute(text("SELECT count(*) FROM subject WHERE book_id = :b AND code = '1901'"),
+    assert db.execute(text("SELECT count(*) FROM subject WHERE book_id = :b AND code = '1905'"),
                       {"b": book.id}).scalar() == 0, "被拒之后子科目不该留在库里"
 
 
@@ -467,21 +467,21 @@ def test_同一事务里改父节点_不挡(db, book):
     db.commit()
     db.execute(text("INSERT INTO subject (book_id, code, name, parent_id, level, "
                     "category, direction, is_leaf, ext_attrs, created_at, updated_at) "
-                    "VALUES (:b, '1901', '1901', :p, 2, 'ASSET', 'DEBIT', true, "
+                    "VALUES (:b, '1905', '1905', :p, 2, 'ASSET', 'DEBIT', true, "
                     "'{}'::jsonb, now(), now())"),
                {"b": book.id, "p": parent})
     db.execute(text("UPDATE subject SET is_leaf = false WHERE id = :p"), {"p": parent})
     db.commit()
     rows = db.execute(text("SELECT code, is_leaf FROM subject WHERE book_id = :b "
-                           "AND code IN ('1900', '1901') ORDER BY code"),
+                           "AND code IN ('1900', '1905') ORDER BY code"),
                       {"b": book.id}).all()
-    assert rows == [("1900", False), ("1901", True)], rows
+    assert rows == [("1900", False), ("1905", True)], rows
 
 
 def test_父节点护栏不挡_挂到本来就非末级的父级(db, book):
     parent = _subject(db, book.id, "1900", is_leaf=False)
     db.commit()
-    _subject(db, book.id, "1901", parent=parent)
+    _subject(db, book.id, "1905", parent=parent)
     db.commit()
     assert db.execute(text("SELECT count(*) FROM subject WHERE book_id = :b"),
                       {"b": book.id}).scalar() >= 1
@@ -909,6 +909,7 @@ def test_head_是本文件认识的那一版():
         "0018_book_initialization",            # 账套初始化两步的状态（第 1 步科目、第 2 步期初余额）
         "0019_book_order",                     # 账套磁贴的**个人**排序：每个用户各一份磁贴顺序
         "0020_report_template_book_scope",     # 报表模板按账套隔离（book_id 可空 = 官方内置基线）
+        "0021_youyou_chart_of_accounts",       # 内置科目表换成用友 4-2-2 的 140 个科目
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")

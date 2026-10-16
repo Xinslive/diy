@@ -42,7 +42,7 @@ ZERO = Decimal("0")
 # --------------------------------------------------------------------- 取数桩
 
 
-SUBJECTS = {"1001": 11, "6001": 12, "1002": 13}
+SUBJECTS = {"1001": 11, "5001": 12, "1002": 13}
 FIG = {
     11: dict(opening=Decimal("100.00"), debit_cum=Decimal("300.00"),
              credit_cum=Decimal("50.00"), closing=Decimal("350.00"),
@@ -191,10 +191,10 @@ GOLDEN: dict[str, dict[str, str]] = {
     '科目("1001","期末")': {"ok": "350.00"},
     '科目("1001","本期借方")': {"ok": "200.00"},
     '科目("1001","本期贷方")': {"ok": "50.00"},
-    '科目("6001","期末余额")': {"ok": "-900.00"},
+    '科目("5001","期末余额")': {"ok": "-900.00"},
     '科目("1002","期初余额")': {"ok": "-20.00"},
-    '科目("6001","本期金额")': {"ok": "400.00"},
-    '科目("6001","本年累计")': {"ok": "900.00"},
+    '科目("5001","本期金额")': {"ok": "400.00"},
+    '科目("5001","本年累计")': {"ok": "900.00"},
     '科目("1001","期末",{{本期}})': {"ok": "350.00"},
     '科目("1001","期末","2026-09")': {"ok": "350.00"},
     '科目("1001","期末",2026)': {"ok": "350.00"},
@@ -532,7 +532,7 @@ def test_预览凭证行只查一次科目(db, book, periods, subjects):
     这段代码目前**没有调用方**（全仓检索确认，见交付说明），但它是潜伏的坑：
     一旦有人把打印预览接回来就立刻复现，所以顺手修好并钉住。
     """
-    vs = _make_vouchers(db, book, periods[1], ["1001", "6001"], count=8)
+    vs = _make_vouchers(db, book, periods[1], ["1001", "5001"], count=8)
     with _statements() as stmts:
         rows = voucher_rows(db, book, vs)
     assert len([s for s in stmts if "FROM subject" in s]) == 1, (
@@ -543,7 +543,7 @@ def test_预览凭证行只查一次科目(db, book, periods, subjects):
 def test_预览凭证行的内容与一次取好科目后逐张序列化一致(db, book, periods, subjects):
     from app.api.vouchers import _book_subjects, _serialize
 
-    vs = _make_vouchers(db, book, periods[1], ["1001", "6001"], count=3)
+    vs = _make_vouchers(db, book, periods[1], ["1001", "5001"], count=3)
     assert voucher_rows(db, book, vs) == [
         _serialize(db, v, _book_subjects(db, book.id)) for v in vs]
 

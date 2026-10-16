@@ -82,7 +82,7 @@ def _find(nodes, code):
 def test_有下级的科目不许被客户端标成末级(client, auth, db, book):
     """审计的原始场景：PATCH is_leaf=true，HTTP 200，之后分录就挂得上汇总级。"""
     parent = _mk(client, auth, book, "1900", "被伪装的汇总科目")
-    _mk(client, auth, book, "1901", "它的明细", parent_id=parent)
+    _mk(client, auth, book, "1905", "它的明细", parent_id=parent)
     db.expire_all()
     assert _is_leaf(db, book.id, parent) is False, "前置：父科目确实有下级"
 
@@ -100,19 +100,19 @@ def test_伪装成末级之后凭证接口仍然拒绝(client, auth, db, book, s
     只挂一边的话报出来的是「借贷不平衡」，那道断言就名不副实了。
     """
     parent = _mk(client, auth, book, "1900", "汇总科目")
-    _mk(client, auth, book, "1901", "明细", parent_id=parent)
+    _mk(client, auth, book, "1905", "明细", parent_id=parent)
     _patch(client, auth, db, book, parent, is_leaf=True)
     db.expire_all()
 
     with pytest.raises(ValueError, match="不是末级科目"):
         make_voucher("2026-01-05",
-                     dr=[(subjects["100201"].id, Decimal("100.00"), "真明细")],
+                     dr=[(subjects["1002"].id, Decimal("100.00"), "真明细")],
                      cr=[(parent, Decimal("100.00"), "往汇总级记账")])
 
 
 def test_伪装成末级之后期初接口仍然拒绝(client, auth, db, book, subjects):
     parent = _mk(client, auth, book, "1900", "汇总科目")
-    _mk(client, auth, book, "1901", "明细", parent_id=parent)
+    _mk(client, auth, book, "1905", "明细", parent_id=parent)
     _patch(client, auth, db, book, parent, is_leaf=True)
     db.expire_all()
 
@@ -175,7 +175,7 @@ def test_数据库层也拦一道(db, book):
 def test_删除最后一个子节点后父节点恢复末级(client, auth, db, book):
     """删掉之后父节点必须能重新记进账 —— 否则它会永远停在「不能选」的状态。"""
     parent = _mk(client, auth, book, "1900", "容器")
-    child = _mk(client, auth, book, "1901", "唯一明细", parent_id=parent)
+    child = _mk(client, auth, book, "1905", "唯一明细", parent_id=parent)
     db.expire_all()
     assert _is_leaf(db, book.id, parent) is False
 
@@ -188,7 +188,7 @@ def test_删除最后一个子节点后父节点恢复末级(client, auth, db, b
 def test_删掉根科目的最后一个下级后根恢复末级(client, auth, db, book):
     """树根没有 id 可以更新，只能整体重算 —— 这是最容易被漏掉的一种。"""
     root = _mk(client, auth, book, "1900", "顶级科目")
-    child = _mk(client, auth, book, "1901", "它的明细", parent_id=root)
+    child = _mk(client, auth, book, "1905", "它的明细", parent_id=root)
     db.expire_all()
     assert _is_leaf(db, book.id, root) is False
 
@@ -208,7 +208,7 @@ def test_移动整棵子树要重算所有后代的级次(client, auth, db, book
     前端据此缩进，所以错的不只是显示。
     """
     deep_parent = _mk(client, auth, book, "1900", "一级容器")
-    mid = _mk(client, auth, book, "1901", "二级容器", parent_id=deep_parent)
+    mid = _mk(client, auth, book, "1905", "二级容器", parent_id=deep_parent)
     leaf = _mk(client, auth, book, "1902", "三级明细", parent_id=mid)
     db.expire_all()
     assert [_level(db, book.id, sid)
@@ -226,7 +226,7 @@ def test_移动整棵子树要重算所有后代的级次(client, auth, db, book
 
 def test_往上移回根层后代级次也要回落(client, auth, db, book):
     """反方向同样要算：只看「变深了」会漏掉「变浅了」。"""
-    mid = _mk(client, auth, book, "1901", "二级容器")
+    mid = _mk(client, auth, book, "1905", "二级容器")
     leaf = _mk(client, auth, book, "1902", "三级明细", parent_id=mid)
     db.expire_all()
     assert [_level(db, book.id, sid) for sid in (mid, leaf)] == [1, 2]
@@ -241,7 +241,7 @@ def test_往上移回根层后代级次也要回落(client, auth, db, book):
 def test_移动后is_leaf与实际子级关系一致(client, auth, db, book):
     """level 修了，is_leaf 不能同时被弄坏 —— 两者是同一次派生。"""
     parent = _mk(client, auth, book, "1900", "容器")
-    child = _mk(client, auth, book, "1901", "明细", parent_id=parent)
+    child = _mk(client, auth, book, "1905", "明细", parent_id=parent)
     other = _mk(client, auth, book, "1902", "另一个容器")
     db.expire_all()
 
@@ -257,7 +257,7 @@ def test_移动后科目树返回的级次正确(client, auth, db, book):
     """从接口返回的树上核对，而不是只看库里的列 ——
     前端缩进、明细账行、导出读的都是这份 level。"""
     a = _mk(client, auth, book, "1900", "A")
-    b = _mk(client, auth, book, "1901", "B", parent_id=a)
+    b = _mk(client, auth, book, "1905", "B", parent_id=a)
     _mk(client, auth, book, "1902", "C", parent_id=b)
     deep = _mk(client, auth, book, "1903", "D")
     db.expire_all()
@@ -269,6 +269,6 @@ def test_移动后科目树返回的级次正确(client, auth, db, book):
     tree = client.get(f"/api/books/{book.id}/subjects", headers=auth).json()
     d = _find(tree, "1903")
     a_node = _find(d["children"], "1900")
-    b_node = _find(a_node["children"], "1901")
+    b_node = _find(a_node["children"], "1905")
     assert (d["level"], a_node["level"], b_node["level"],
             b_node["children"][0]["level"]) == (1, 2, 3, 4)

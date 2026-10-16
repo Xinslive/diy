@@ -79,9 +79,9 @@ def _day(period: Period, day: int) -> date:
 
 def _pairs(subjects, amount="10"):
     return [
-        {"subject_id": subjects["100201"].id, "direction": "DEBIT",
+        {"subject_id": subjects["1002"].id, "direction": "DEBIT",
          "amount": amount, "summary": "x"},
-        {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+        {"subject_id": subjects["5001"].id, "direction": "CREDIT",
          "amount": amount, "summary": "x"},
     ]
 
@@ -302,7 +302,7 @@ def test_审计快照金额是文本且科目齐全(db, book, period, subjects, 
     ).one()
     assert [e["amount"] for e in logged.after["entries"]] == ["3.00", "3.00"]
     assert [e["summary"] for e in logged.after["entries"]] == ["x", "x"]
-    assert logged.after["entries"][0]["subject_id"] == subjects["100201"].id
+    assert logged.after["entries"][0]["subject_id"] == subjects["1002"].id
     assert logged.after["entries"][1]["direction"] == "CREDIT"
 
 
@@ -375,7 +375,7 @@ def test_批量反结账结果不变(db, book, periods, admin_user, make_voucher
     # 走资产科目而不是损益科目：结账要求链上每一期损益都结平，
     # 而这条用例要验的是反结账，不是结转损益。
     vs = [make_voucher(f"2026-0{m}-10", dr=[("1122", 100, "挂应收")],
-                       cr=[("100201", 100, "收款")])
+                       cr=[("1002", 100, "收款")])
           for m in (1, 2)]
     for m in (1, 2, 3):
         svc_periods.close_period(db, db.get(Period, periods[m].id), admin_user,

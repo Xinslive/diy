@@ -40,7 +40,7 @@ def test_期初余额写入要留审计(client, auth, db, book, subjects):
         book_id=book.id, month=1).one()
 
     r = client.post(f"/api/books/{book.id}/periods?period_id={p1.id}", headers=auth, json=[
-        {"subject_id": subjects["100201"].id, "amount": "1000"},
+        {"subject_id": subjects["1002"].id, "amount": "1000"},
         {"subject_id": subjects["4001"].id, "amount": "-1000"},
     ])
     assert r.status_code == 200, r.text
@@ -57,12 +57,12 @@ def test_期初改写要留改前值(client, auth, db, book, subjects):
     from app.models import Period
 
     p1 = db.query(Period).filter_by(book_id=book.id, month=1).one()
-    payload = [{"subject_id": subjects["100201"].id, "amount": "1000"},
+    payload = [{"subject_id": subjects["1002"].id, "amount": "1000"},
                {"subject_id": subjects["4001"].id, "amount": "-1000"}]
     assert client.post(f"/api/books/{book.id}/periods?period_id={p1.id}",
                        headers=auth, json=payload).status_code == 200
 
-    payload2 = [{"subject_id": subjects["100201"].id, "amount": "500"},
+    payload2 = [{"subject_id": subjects["1002"].id, "amount": "500"},
                 {"subject_id": subjects["4001"].id, "amount": "-500"}]
     assert client.post(f"/api/books/{book.id}/periods?period_id={p1.id}",
                        headers=auth, json=payload2).status_code == 200
@@ -84,7 +84,7 @@ def test_试算不平被拒时不留审计(client, auth, db, book, subjects):
     before = len(_logs(db, book, "SET_OPENINGS"))
 
     r = client.post(f"/api/books/{book.id}/periods?period_id={p1.id}", headers=auth, json=[
-        {"subject_id": subjects["100201"].id, "amount": "1000"},
+        {"subject_id": subjects["1002"].id, "amount": "1000"},
     ])
     assert r.status_code == 400
     assert len(_logs(db, book, "SET_OPENINGS")) == before, "被拒绝的期初写入留下了审计"
@@ -95,20 +95,20 @@ def test_试算不平被拒时不留审计(client, auth, db, book, subjects):
 
 def test_新建科目要留审计(client, auth, db, book):
     r = client.post(f"/api/books/{book.id}/subjects", headers=auth, json={
-        "code": "1901", "name": "测试用科目", "category": "ASSET",
+        "code": "1905", "name": "测试用科目", "category": "ASSET",
         "direction": "DEBIT", "is_leaf": True, "carry_forward": True,
         "qty_calc": False, "aux_calc": False, "fx_calc": False, "sort_no": 99,
     })
     assert r.status_code == 201, r.text
 
     entry = _last(db, book, "CREATE_SUBJECT")
-    assert "1901" in entry.detail
+    assert "1905" in entry.detail
 
 
 def test_改科目要留改前改后(client, auth, db, book, subjects):
-    sid_ = subjects["100201"].id
+    sid_ = subjects["1002"].id
     payload = {
-        "code": "100201", "name": "改过的名字", "category": "ASSET",
+        "code": "1002", "name": "改过的名字", "category": "ASSET",
         "direction": "DEBIT", "is_leaf": True, "carry_forward": True,
         "qty_calc": False, "aux_calc": False, "fx_calc": False, "sort_no": 0,
     }
@@ -123,9 +123,9 @@ def test_改科目要留改前改后(client, auth, db, book, subjects):
 
 def test_停用科目要留审计(client, auth, db, book, subjects):
     """停用是个安全动作但影响面很大（老凭证还在用它），必须留痕。"""
-    sid_ = subjects["100201"].id
+    sid_ = subjects["1002"].id
     payload = {
-        "code": "100201", "name": "银行存款", "category": "ASSET",
+        "code": "1002", "name": "银行存款", "category": "ASSET",
         "direction": "DEBIT", "is_leaf": True, "carry_forward": True,
         "qty_calc": False, "aux_calc": False, "fx_calc": False, "sort_no": 0,
         "active": False,
@@ -281,9 +281,9 @@ def _snapshot_of(client, auth, db, book, subjects, amount: str):
     r = client.post(f"/api/books/{book.id}/vouchers", headers=auth, json={
         "voucher_date": "2026-01-15",
         "entries": [
-            {"subject_id": subjects["100201"].id, "direction": "DEBIT",
+            {"subject_id": subjects["1002"].id, "direction": "DEBIT",
              "amount": amount, "summary": "精度"},
-            {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+            {"subject_id": subjects["5001"].id, "direction": "CREDIT",
              "amount": amount, "summary": "精度"},
         ],
     })
@@ -326,9 +326,9 @@ def test_百万级也原样留存(client, auth, db, book, subjects):
     r = client.post(f"/api/books/{book.id}/vouchers", headers=auth, json={
         "voucher_date": "2026-01-15",
         "entries": [
-            {"subject_id": subjects["100201"].id, "direction": "DEBIT",
+            {"subject_id": subjects["1002"].id, "direction": "DEBIT",
              "amount": amount, "summary": "精度"},
-            {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+            {"subject_id": subjects["5001"].id, "direction": "CREDIT",
              "amount": amount, "summary": "精度"},
         ],
     })

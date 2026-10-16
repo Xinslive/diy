@@ -104,7 +104,7 @@ def test_操作日志只有管理员能看(client, db, plain_auth, plain_user, b
 
 
 def test_管理员仍然看得到操作日志(client, auth, book, make_voucher):
-    make_voucher("2026-01-05", dr=[("100201", 10, "x")], cr=[("600101", 10, "x")])
+    make_voucher("2026-01-05", dr=[("1002", 10, "x")], cr=[("5001", 10, "x")])
     r = client.get(f"/api/books/{book.id}/audit-logs", headers=auth)
     assert r.status_code == 200
     assert any(x["action"] == "CREATE" for x in r.json())

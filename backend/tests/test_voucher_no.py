@@ -7,7 +7,7 @@ from app.seed.voucher_no import repad_voucher_numbers
 
 
 def _mk(db, book, make_voucher, no):
-    v = make_voucher("2026-01-05", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
+    v = make_voucher("2026-01-05", dr=[("1002", 100, "x")], cr=[("5001", 100, "x")])
     v.voucher_no = no
     db.flush()
     return v
@@ -132,9 +132,9 @@ def test_别处有脏数据也不改变本账套的计数(db, book, make_voucher
             attachments=0, created_by="脏数据", posted_by=None,
         )
         v.entries = [
-            Entry(subject_id=subs["100201"], line_no=1,
+            Entry(subject_id=subs["1002"], line_no=1,
                   direction="DEBIT", amount=Decimal("1"), summary="脏"),
-            Entry(subject_id=subs["600101"], line_no=2,
+            Entry(subject_id=subs["5001"], line_no=2,
                   direction="CREDIT", amount=Decimal("1"), summary="脏"),
         ]
         db.add(v)

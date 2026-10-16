@@ -47,11 +47,11 @@ def test_首年首月起算的区间期初必须是零(db, book, periods, subjec
     """
     for month, amt in ((1, 100), (2, 200), (3, 300), (6, 600)):
         make_voucher(f"2026-{month:02d}-10",
-                     dr=[("100201", amt, "收款")], cr=[("600101", amt, "收款")],
+                     dr=[("1001", amt, "收款")], cr=[("5001", amt, "收款")],
                      posted=True)
 
     rows = _ledger(db, book, periods, subjects, 1, 6)
-    row = _row(rows, subjects["100201"].id)
+    row = _row(rows, subjects["1001"].id)
 
     assert row["opening"] == Decimal("0"), (
         f"区间期初应为账套首期的期初 0，实际 {row['opening']}"
@@ -63,18 +63,21 @@ def test_首年首月起算的区间期初必须是零(db, book, periods, subjec
     # 行内自洽不是正确性的证据，所以再钉一条：区间期初必须等于「上一期期末」，
     # 而起始期是首期时不存在上一期 —— 它必须等于账套首期的期初快照。
     eng = LedgerEngine.for_ledger(db, book.id)
-    assert eng.opening(subjects["100201"].id, periods[1].ord) == Decimal("0")
+    assert eng.opening(subjects["1001"].id, periods[1].ord) == Decimal("0")
 
 
 def test_首年起算时父级科目也不重复计入(db, book, periods, subjects, make_voucher):
-    """父级 1002 银行存款同样受这条分支影响（上卷后的期初也是错的）。"""
+    """父级 1101 短期投资同样受这条分支影响（上卷后的期初也是错的）。
+
+    父级取 1101 而不是 1002：4-2-2 表里 1002 已是末级，压根没有下级可卷。
+    """
     for month, amt in ((1, 100), (2, 200), (3, 300), (6, 600)):
         make_voucher(f"2026-{month:02d}-10",
-                     dr=[("100201", amt, "收款")], cr=[("600101", amt, "收款")],
+                     dr=[("110101", amt, "收款")], cr=[("5001", amt, "收款")],
                      posted=True)
 
     rows = _ledger(db, book, periods, subjects, 1, 6)
-    row = _row(rows, subjects["1002"].id)
+    row = _row(rows, subjects["1101"].id)
     assert (row["opening"], row["period_debit"], row["closing"]) == (
         Decimal("0"), Decimal("1200"), Decimal("1200"))
 
@@ -87,11 +90,11 @@ def test_区间期初等于上一期期末(db, book, periods, subjects, make_vou
     """
     for month, amt in ((1, 100), (2, 200), (3, 300), (5, 400), (6, 600)):
         make_voucher(f"2026-{month:02d}-10",
-                     dr=[("100201", amt, "收款")], cr=[("600101", amt, "收款")],
+                     dr=[("1001", amt, "收款")], cr=[("5001", amt, "收款")],
                      posted=True)
 
     eng = LedgerEngine.for_ledger(db, book.id)
-    bank = subjects["100201"].id
+    bank = subjects["1001"].id
     may_closing = eng.closing(bank, periods[5].ord)
     assert may_closing == Decimal("1000")
 
@@ -103,11 +106,11 @@ def test_非首期的区间期初行为不变(db, book, periods, subjects, make_
     """从 3 月起算：期初 = 2 月末，走的是本来就走对的那条路径，别被改坏。"""
     for month, amt in ((1, 100), (2, 200), (3, 300), (6, 600)):
         make_voucher(f"2026-{month:02d}-10",
-                     dr=[("100201", amt, "收款")], cr=[("600101", amt, "收款")],
+                     dr=[("1001", amt, "收款")], cr=[("5001", amt, "收款")],
                      posted=True)
 
     rows = _ledger(db, book, periods, subjects, 3, 6)
-    row = _row(rows, subjects["100201"].id)
+    row = _row(rows, subjects["1001"].id)
     assert (row["opening"], row["period_debit"], row["closing"]) == (
         Decimal("300"), Decimal("900"), Decimal("1200"))
 
@@ -115,13 +118,13 @@ def test_非首期的区间期初行为不变(db, book, periods, subjects, make_
 def test_首期有期初余额时区间期初等于那张快照(db, book, periods, subjects, make_voucher):
     """启用月录了期初：区间期初必须等于**首期的期初快照**，不是 0、也不是末了的期初。"""
     db.add(PeriodOpening(book_id=book.id, period_id=periods[1].id,
-                         subject_id=subjects["100201"].id, amount=Decimal("5000")))
+                         subject_id=subjects["1001"].id, amount=Decimal("5000")))
     db.commit()
-    make_voucher("2026-03-10", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")],
+    make_voucher("2026-03-10", dr=[("1001", 300, "x")], cr=[("5001", 300, "x")],
                  posted=True)
 
     rows = _ledger(db, book, periods, subjects, 1, 6)
-    row = _row(rows, subjects["100201"].id)
+    row = _row(rows, subjects["1001"].id)
     assert (row["opening"], row["period_debit"], row["closing"]) == (
         Decimal("5000"), Decimal("300"), Decimal("5300"))
 
@@ -135,17 +138,17 @@ def test_区间期末等于结束期本身的期末(db, book, periods, subjects,
     凭证必须按期间顺序建：夹具在记账时会把之前的期间标成已结账，
     往已结账的月份补凭证会被数据库闸门挡下。
     """
-    make_voucher("2026-01-10", dr=[("100201", 100, "收款")],
-                 cr=[("600101", 100, "收款")], posted=True)
-    make_voucher("2026-02-10", dr=[("100201", 200, "收款")],
-                 cr=[("600101", 200, "收款")], posted=True)
-    make_voucher("2026-03-10", dr=[("100201", 300, "收款")],
-                 cr=[("600101", 300, "收款")], posted=True)
+    make_voucher("2026-01-10", dr=[("1001", 100, "收款")],
+                 cr=[("5001", 100, "收款")], posted=True)
+    make_voucher("2026-02-10", dr=[("1001", 200, "收款")],
+                 cr=[("5001", 200, "收款")], posted=True)
+    make_voucher("2026-03-10", dr=[("1001", 300, "收款")],
+                 cr=[("5001", 300, "收款")], posted=True)
     # 4 月：银行存款被**贷方**记一笔，借贷两侧都有发生额，期末 950
-    make_voucher("2026-04-10", dr=[("2001", 250, "借入")], cr=[("100201", 250, "还")],
+    make_voucher("2026-04-10", dr=[("2001", 250, "借入")], cr=[("1001", 250, "还")],
                  posted=True)
-    make_voucher("2026-06-10", dr=[("100201", 600, "收款")],
-                 cr=[("600101", 600, "收款")], posted=True)
+    make_voucher("2026-06-10", dr=[("1001", 600, "收款")],
+                 cr=[("5001", 600, "收款")], posted=True)
 
     eng = LedgerEngine.for_ledger(db, book.id)
     for from_month in (1, 3, 6):
@@ -191,9 +194,9 @@ def test_首期启用月不是一月时同样成立(db, admin_user):
             db, book_id=book.id, user=admin_user,
             voucher_date=date.fromisoformat(day),
             entries=[
-                {"subject_id": subs["100201"], "direction": "DEBIT",
+                {"subject_id": subs["1001"], "direction": "DEBIT",
                  "amount": str(amt), "summary": "收款"},
-                {"subject_id": subs["600101"], "direction": "CREDIT",
+                {"subject_id": subs["5001"], "direction": "CREDIT",
                  "amount": str(amt), "summary": "收款"},
             ],
             source="MANUAL", commit=True,
@@ -215,27 +218,27 @@ def test_首期启用月不是一月时同样成立(db, admin_user):
 
     rows = queries.subject_tree(db, book.id)
     row = _row(queries.general_ledger(
-        db, book.id, rows, by_month[4], by_month[6], False), subs["100201"])
+        db, book.id, rows, by_month[4], by_month[6], False), subs["1001"])
     assert (row["opening"], row["period_debit"], row["closing"]) == (
         Decimal("0"), Decimal("300"), Decimal("300"))
 
     # 引擎侧：显式的「首期之前」时点
     eng = LedgerEngine.for_ledger(db, book.id)
-    before = eng.compute([subs["100201"]], by_month[4].ord - 1)[subs["100201"]]
+    before = eng.compute([subs["1001"]], by_month[4].ord - 1)[subs["1001"]]
     assert before.opening == Decimal("0")
     assert (before.period_dr, before.period_cr, before.dr_cum, before.cr_cum) == (
         Decimal("0"), Decimal("0"), Decimal("0"), Decimal("0"))
-    assert before.closing == eng.opening(subs["100201"], 4)
+    assert before.closing == eng.opening(subs["1001"], 4)
 
 
 def test_首期之前这张图带着首期的期初余额(db, book, periods, subjects):
     """首期之前不是「全零」：首期的期初快照必须出现在那一张图的 opening/closing 上。"""
     db.add(PeriodOpening(book_id=book.id, period_id=periods[1].id,
-                         subject_id=subjects["100201"].id, amount=Decimal("8800")))
+                         subject_id=subjects["1001"].id, amount=Decimal("8800")))
     db.commit()
 
     eng = LedgerEngine.for_ledger(db, book.id)
-    sid = subjects["100201"].id
+    sid = subjects["1001"].id
     before = eng.compute([sid], 0)[sid]
     assert before.opening == Decimal("8800")
     assert before.closing == Decimal("8800")     # 首期之前没有任何发生额

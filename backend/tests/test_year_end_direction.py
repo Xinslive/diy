@@ -63,13 +63,13 @@ def _retained_opening_2027(db, book, subject_id):
 
 def test_盈利年度结转后本年利润归零(db, book, periods, subjects, admin_user, make_voucher):
     """收入 > 费用：留存收益增加。"""
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")],
-                 cr=[("600101", 1000, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("1002", 1000, "x")],
+                 cr=[("5001", 1000, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
 
     year_end_carry(db, book, admin_user)
 
-    profit, retained = sid(subjects, "4103"), sid(subjects, "4104")
+    profit, retained = sid(subjects, "3103"), sid(subjects, "3104")
     assert _closing(db, book, profit, _dec26_ord(db, book)) == Decimal("0"), "盈利年度本年利润没冲平"
     assert _retained_opening_2027(db, book, retained) == Decimal("-1000")   # 贷方，留存增加
 
@@ -77,16 +77,16 @@ def test_盈利年度结转后本年利润归零(db, book, periods, subjects, ad
 def test_亏损年度结转后本年利润归零(db, book, periods, subjects, admin_user, make_voucher):
     """审计 P1-03 的核心场景：费用 > 收入，留存收益应当**减少**。"""
     # 只有费用没有收入 → 本年利润落在借方
-    make_voucher("2026-01-10", dr=[("6602", 500, "x")],
-                 cr=[("100201", 500, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("560206", 500, "x")],
+                 cr=[("1002", 500, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
 
-    before = _closing(db, book, sid(subjects, "4103"), _dec26_ord(db, book))
+    before = _closing(db, book, sid(subjects, "3103"), _dec26_ord(db, book))
     assert before > 0, f"前置条件不成立：本年利润应当在借方（借正贷负），实际 {before}"
 
     year_end_carry(db, book, admin_user)
 
-    profit, retained = sid(subjects, "4103"), sid(subjects, "4104")
+    profit, retained = sid(subjects, "3103"), sid(subjects, "3104")
     after = _closing(db, book, profit, _dec26_ord(db, book))
     assert after == Decimal("0"), (
         f"亏损年度本年利润应冲平为 0，实际 {after}（结转前 {before}）")
@@ -96,12 +96,12 @@ def test_亏损年度结转后本年利润归零(db, book, periods, subjects, ad
 
 def test_亏损不是翻倍(db, book, periods, subjects, admin_user, make_voucher):
     """回归老 bug 的具体形态：100 的亏损被结成 200。"""
-    make_voucher("2026-01-10", dr=[("6602", 100, "x")],
-                 cr=[("100201", 100, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("560206", 100, "x")],
+                 cr=[("1002", 100, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
     year_end_carry(db, book, admin_user)
 
-    assert _closing(db, book, sid(subjects, "4103"),
+    assert _closing(db, book, sid(subjects, "3103"),
                     _dec26_ord(db, book)) == Decimal("0")
 
 
@@ -126,19 +126,19 @@ def test_重复年度结转是幂等的(db, book, periods, subjects, admin_user,
     那时已经是 2027 了，会去结转 2027（还没结账，直接报错），
     测的就不是幂等而是年度选择了。
     """
-    make_voucher("2026-01-10", dr=[("6602", 100, "x")],
-                 cr=[("100201", 100, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("560206", 100, "x")],
+                 cr=[("1002", 100, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
 
     year_end_carry(db, book, admin_user, 2026, 2027)
-    first = _retained_opening_2027(db, book, sid(subjects, "4104"))
+    first = _retained_opening_2027(db, book, sid(subjects, "3104"))
 
     year_end_carry(db, book, admin_user, 2026, 2027)
-    second = _retained_opening_2027(db, book, sid(subjects, "4104"))
+    second = _retained_opening_2027(db, book, sid(subjects, "3104"))
 
     assert second == first, f"重复结转后留存收益变了：{first} → {second}"
     # 本年利润也不能被结第二次结出新的差额
-    assert _closing(db, book, sid(subjects, "4103"), _dec26_ord(db, book)) == Decimal("0")
+    assert _closing(db, book, sid(subjects, "3103"), _dec26_ord(db, book)) == Decimal("0")
 
 
 def _carry_entry_directions(db, book, subjects):
@@ -149,7 +149,9 @@ def _carry_entry_directions(db, book, subjects):
         Voucher.book_id == book.id,
         Voucher.remark == "2026年 结转本年利润").order_by(Voucher.id.desc())).first()
     assert v is not None, "没找到年度结转凭证"
-    profit, retained = sid(subjects, "4103"), sid(subjects, "4104")
+    # 留存那条要取 310415 未分配利润（末级，记账接口只认末级），
+    # 不是它的上级 3104 —— 分录挂不到非末级上。
+    profit, retained = sid(subjects, "3103"), sid(subjects, "310415")
     out = {}
     for e in db.scalars(select(Entry).where(Entry.voucher_id == v.id)).all():
         if e.subject_id in (profit, retained):
@@ -159,8 +161,8 @@ def _carry_entry_directions(db, book, subjects):
 
 def test_亏损的结转凭证贷记本年利润(db, book, periods, subjects, admin_user, make_voucher):
     """直接看分录方向：亏损要在**贷方**冲平本年利润，借方冲减留存。"""
-    make_voucher("2026-01-10", dr=[("6602", 300, "x")],
-                 cr=[("100201", 300, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("560206", 300, "x")],
+                 cr=[("1002", 300, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
     year_end_carry(db, book, admin_user)
 
@@ -171,8 +173,8 @@ def test_亏损的结转凭证贷记本年利润(db, book, periods, subjects, ad
 
 def test_盈利的结转凭证借记本年利润(db, book, periods, subjects, admin_user, make_voucher):
     """盈利反过来：借方冲平本年利润，贷方增加留存。"""
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")],
-                 cr=[("600101", 1000, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("1002", 1000, "x")],
+                 cr=[("5001", 1000, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
     year_end_carry(db, book, admin_user)
 

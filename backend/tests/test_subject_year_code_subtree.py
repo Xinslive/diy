@@ -5,13 +5,16 @@
 ``Entry.subject_id = 该科目自己``。可是账簿引擎
 ``ledger/engine.py::_ancestor_map`` 把分录**上卷**到各级父科目，于是同一棵树上：
 
-    100201 银行存款-工行（末级）    本年 141 条分录  → 改编码被挡住
-    1002  银行存款（汇总级）        本年   0 条分录  → 放行
+    22210101 进项税额（末级）      本年 141 条分录  → 改编码被挡住
+    2221   应交税费（汇总级）      本年   0 条分录  → 放行
 
-「儿子改不了、爹能改」，而两者在账上是同一笔钱 —— 1002 的本年发生额全部来自
-100201，用户在科目余额表、总账、报表里看到的就是这 141 条。改掉 1002 的编码，
-按 1002 取数的报表公式会指向一个空科目，货币资金凭空归零，全程零报错。
+「儿子改不了、爹能改」，而两者在账上是同一笔钱 —— 2221 的本年发生额全部来自
+22210101，用户在科目余额表、总账、报表里看到的就是这 141 条。改掉 2221 的编码，
+按 2221 取数的报表公式会指向一个空科目，应交税费凭空归零，全程零报错。
 这正是这道守卫存在的意义（账上已有的报告、明细账、导出都按编码引用科目）。
+
+下面一律用 2221 → 222101 → 22210199 这条链：全表唯一的三层结构，
+4-2-2 表里 1001/1002 已经是末级，撑不起「汇总级父科目」这个角色。
 
 **为什么这样断言。** 判据必须是「这个科目**当前**管着的钱」，即自身 ∪ 全部后代。
 所以父 / 子 / 孙三个深度各钉一条：只测子级的话，把实现写成「查直接下级」照样能过，
@@ -66,7 +69,7 @@ def _post_year_activity(db, book, periods, make_voucher, debit_subject_id,
     p = _current_year_period(db, book, periods)
     make_voucher(dt.date(p.year, p.month, 10),
                  dr=[(debit_subject_id, Decimal(amount), "本年发生额")],
-                 cr=[("600101", Decimal(amount), "本年发生额")], posted=True)
+                 cr=[("5001", Decimal(amount), "本年发生额")], posted=True)
 
 
 def _direct_entries(db, subject_id) -> int:
@@ -107,21 +110,21 @@ def test_父科目有上卷发生额时不能改编码(
     """本次修复的核心断言：修复前这里是 HTTP 200。
 
     前置刻意写成「父科目自己身上 0 条分录」—— 旧守卫查的就是这个数字，
-    它为 0 才解释得通为什么 1002 曾经能被放行。
+    它为 0 才解释得通为什么 2221 曾经能被放行。
     """
-    bank = subjects["1002"]
-    _post_year_activity(db, book, periods, make_voucher, subjects["100201"].id)
+    parent = subjects["2221"]
+    _post_year_activity(db, book, periods, make_voucher, subjects["22210101"].id)
     db.expire_all()
-    assert _direct_entries(db, bank.id) == 0, (
+    assert _direct_entries(db, parent.id) == 0, (
         "前置：父科目自己没有直接分录，正是这个 0 让旧守卫漏判")
 
-    r = _patch(client, auth, book, bank.id, code="1002X")
+    r = _patch(client, auth, book, parent.id, code="2221X")
     assert r.status_code == 400, (
         f"汇总级父科目改编码被放行了：HTTP {r.status_code} {r.text} —— "
-        "它的本年发生额全部来自下级，改掉编码会让按 1002 取数的报表归零")
+        "它的本年发生额全部来自下级，改掉编码会让按 2221 取数的报表归零")
     assert "本年度已有发生额" in r.json()["detail"], r.json()
     db.expire_all()
-    assert db.get(Subject, bank.id).code == "1002", "被拒之后编码不该变"
+    assert db.get(Subject, parent.id).code == "2221", "被拒之后编码不该变"
 
 
 def test_子级有本年发生额时父科目仍然能改名(
@@ -132,16 +135,16 @@ def test_子级有本年发生额时父科目仍然能改名(
     报错文案自己写着「只能修改科目名称」—— 如果它也做不到了，
     用户就被逼着去改子科目编码，而下级同样是改不动的，死路。
     """
-    bank = subjects["1002"]
-    _post_year_activity(db, book, periods, make_voucher, subjects["100201"].id)
+    parent = subjects["2221"]
+    _post_year_activity(db, book, periods, make_voucher, subjects["22210101"].id)
     db.expire_all()
-    new_name = "银行存款（本年有发生额）"
+    new_name = "应交税费（本年有发生额）"
 
-    r = _patch(client, auth, book, bank.id, name=new_name)
+    r = _patch(client, auth, book, parent.id, name=new_name)
     assert r.status_code == 200, f"改名被守卫连坐挡住了：HTTP {r.status_code} {r.text}"
     db.expire_all()
-    assert db.get(Subject, bank.id).name == new_name
-    assert db.get(Subject, bank.id).code == "1002", "改名不该顺带动编码"
+    assert db.get(Subject, parent.id).name == new_name
+    assert db.get(Subject, parent.id).code == "2221", "改名不该顺带动编码"
 
 
 def test_子树没有本年发生额时父科目仍然能改编码(
@@ -149,20 +152,20 @@ def test_子树没有本年发生额时父科目仍然能改编码(
 ):
     """防过度拦截：守卫不能退化成「凡是父级都不许改编码」。
 
-    没有下级发生额时 1002 的本年发生额就是 0，改编码是安全的 ——
-    它和 1012、1001 这些干净科目没有任何区别。
+    没有下级发生额时 2221 的本年发生额就是 0，改编码是安全的 ——
+    它和 1001 库存现金这些干净科目没有任何区别。
     """
-    bank = subjects["1002"]
-    assert _direct_entries(db, bank.id) == 0, "前置：父科目自己没记账"
+    parent = subjects["2221"]
+    assert _direct_entries(db, parent.id) == 0, "前置：父科目自己没记账"
     for child in db.scalars(
-        select(Subject).where(Subject.parent_id == bank.id)
+        select(Subject).where(Subject.parent_id == parent.id)
     ).all():
         assert _direct_entries(db, child.id) == 0, f"前置：下级 {child.code} 有分录"
 
-    r = _patch(client, auth, book, bank.id, code="1002X")
+    r = _patch(client, auth, book, parent.id, code="2221X")
     assert r.status_code == 200, f"干净的父科目被无端拦住：HTTP {r.status_code} {r.text}"
     db.expire_all()
-    assert db.get(Subject, bank.id).code == "1002X", "编码没真的改掉"
+    assert db.get(Subject, parent.id).code == "2221X", "编码没真的改掉"
 
 
 def test_孙级有本年发生额时祖父级也不能改编码(
@@ -170,20 +173,20 @@ def test_孙级有本年发生额时祖父级也不能改编码(
 ):
     """递归深度 > 1：只看「直接下级」的实现过不了这条。
 
-    账套里本来只有 1002 → 100201 两层，孙级是现挂的。
+    账套里本来只有 2221 → 222101 两层，孙级 22210199 是现挂的。
     顺序要紧：必须**先**挂孙科目再记账 —— 反过来的话，
     建子科目会被 _assert_no_own_balance 以「父科目已有分录」挡掉，
     测到的就不是这道守卫了。
     """
-    bank = subjects["1002"]
-    grandchild = _create_child(client, auth, book, subjects["100201"].id,
-                               "10020101", "工行-基本户")
+    parent = subjects["2221"]
+    grandchild = _create_child(client, auth, book, subjects["222101"].id,
+                               "22210199", "工行-基本户")
     _post_year_activity(db, book, periods, make_voucher, grandchild)
     db.expire_all()
-    assert _direct_entries(db, bank.id) == 0, "前置：父科目自己没有直接分录"
-    assert _direct_entries(db, subjects["100201"].id) == 0, "前置：中间层也没有直接分录"
+    assert _direct_entries(db, parent.id) == 0, "前置：父科目自己没有直接分录"
+    assert _direct_entries(db, subjects["222101"].id) == 0, "前置：中间层也没有直接分录"
 
-    r = _patch(client, auth, book, bank.id, code="1002X")
+    r = _patch(client, auth, book, parent.id, code="2221X")
     assert r.status_code == 400, (
         f"隔一层的发生额没被算进来：HTTP {r.status_code} {r.text} —— "
         "判据必须是整棵子树，不是直接下级")
@@ -201,47 +204,47 @@ def test_裸UPDATE时触发器同样拦住有发生额的父科目(
     报错码也要钉：``check_violation``（SQLSTATE 23514）是这套守卫统一的
     fail-closed 口径，裸 PG 异常会被接口兜底成 500，分类错了排查会跑偏。
     """
-    bank = subjects["1002"]
-    _post_year_activity(db, book, periods, make_voucher, subjects["100201"].id)
+    parent = subjects["2221"]
+    _post_year_activity(db, book, periods, make_voucher, subjects["22210101"].id)
     db.expire_all()
 
     with pytest.raises(DBAPIError) as ei:
-        _raw_update_code(db, bank.id, "1002X")
+        _raw_update_code(db, parent.id, "2221X")
     err = ei.value.orig
     assert getattr(err, "sqlstate", None) == "23514", (
         f"期望 check_violation(23514)，实际 {getattr(err, 'sqlstate', None)}：{err}")
     assert "本年度已有发生额" in str(err), str(err)
     db.rollback()
     db.expire_all()
-    assert db.get(Subject, bank.id).code == "1002", "触发器抛错后编码不该变"
+    assert db.get(Subject, parent.id).code == "2221", "触发器抛错后编码不该变"
 
 
 def test_裸UPDATE时触发器同样认孙级发生额(
     db, book, subjects, periods, make_voucher
 ):
     """库层的递归也必须到孙级 —— 两层各写各的，一层写浅了就漏。"""
-    bank = subjects["1002"]
-    grandchild = _make_child_directly(db, book, subjects["100201"].id,
-                                      code="10020101", name="工行-基本户")
+    parent = subjects["2221"]
+    grandchild = _make_child_directly(db, book, subjects["222101"].id,
+                                      code="22210199", name="工行-基本户")
     _post_year_activity(db, book, periods, make_voucher, grandchild)
     db.expire_all()
 
     with pytest.raises(DBAPIError, match="本年度已有发生额"):
-        _raw_update_code(db, bank.id, "1002X")
+        _raw_update_code(db, parent.id, "2221X")
     db.rollback()
     db.expire_all()
-    assert db.get(Subject, bank.id).code == "1002"
+    assert db.get(Subject, parent.id).code == "2221"
 
 
 def test_裸UPDATE在子树干净时允许改编码(
     db, book, subjects, periods
 ):
     """库层也不能过度拦截，否则所有报表导出脚本都会开始报错。"""
-    bank = subjects["1002"]
+    parent = subjects["2221"]
 
-    _raw_update_code(db, bank.id, "1002X")   # 不抛异常即为通过
+    _raw_update_code(db, parent.id, "2221X")   # 不抛异常即为通过
     db.expire_all()
-    assert db.get(Subject, bank.id).code == "1002X"
+    assert db.get(Subject, parent.id).code == "2221X"
 
 
 def _make_child_directly(db, book, parent_id, code, name) -> int:
@@ -278,22 +281,22 @@ def test_两层同源_接口挡住的场景裸UPDATE也挡得住(
     于是又回到「儿子改不了爹能改」，而且**没有任何症状**。
     这条用例把两层放在同一个场景上跑，一次性比较两侧的判断。
     """
-    bank = subjects["1002"]
-    grandchild = _make_child_directly(db, book, subjects["100201"].id,
-                                      code="10020101", name="工行-基本户")
+    parent = subjects["2221"]
+    grandchild = _make_child_directly(db, book, subjects["222101"].id,
+                                      code="22210199", name="工行-基本户")
     _post_year_activity(db, book, periods, make_voucher, grandchild)
     db.expire_all()
 
-    r = _patch(client, auth, book, bank.id, code="1002X")
+    r = _patch(client, auth, book, parent.id, code="2221X")
     assert r.status_code == 400, f"应用层没挡住：HTTP {r.status_code} {r.text}"
 
     with pytest.raises(DBAPIError, match="本年度已有发生额"):
-        _raw_update_code(db, bank.id, "1002X")
+        _raw_update_code(db, parent.id, "2221X")
     db.rollback()
     db.expire_all()
 
     db.expire_all()
-    assert db.get(Subject, bank.id).code == "1002", "两层都拦住了，编码却还是变了"
+    assert db.get(Subject, parent.id).code == "2221", "两层都拦住了，编码却还是变了"
 
 
 def test_两层同源_接口放行的场景裸UPDATE也放行(
@@ -304,10 +307,10 @@ def test_两层同源_接口放行的场景裸UPDATE也放行(
     只测「都挡住」的话，触发器哪天被写成「凡是父级都不许改编码」也照样绿，
     而那会让所有按编码更新科目的脚本（期初导入、报表重导）集体失败。
     """
-    bank = subjects["1002"]
+    parent = subjects["2221"]
 
-    r = _patch(client, auth, book, bank.id, code="1002X")
+    r = _patch(client, auth, book, parent.id, code="2221X")
     assert r.status_code == 200, f"应用层误拦：HTTP {r.status_code} {r.text}"
 
     db.expire_all()
-    assert db.get(Subject, bank.id).code == "1002X", "接口返回 200 却没真的改掉"
+    assert db.get(Subject, parent.id).code == "2221X", "接口返回 200 却没真的改掉"

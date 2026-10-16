@@ -52,12 +52,12 @@ def _periods(db, book):
 def test_区间_期初加发生额等于期末(db, book, make_voucher):
     periods = _periods(db, book)
     p3, p4, p5 = periods[2], periods[3], periods[4]
-    _mv(make_voucher, p3, [("100201", 1000, 0), ("4001", 0, 1000)])
-    _mv(make_voucher, p4, [("100201", 2000, 0), ("4001", 0, 2000)])
-    _mv(make_voucher, p5, [("100201", 500, 0), ("4001", 0, 500)])
+    _mv(make_voucher, p3, [("1002", 1000, 0), ("4001", 0, 1000)])
+    _mv(make_voucher, p4, [("1002", 2000, 0), ("4001", 0, 2000)])
+    _mv(make_voucher, p5, [("1002", 500, 0), ("4001", 0, 500)])
 
     rows, _ = _rows(db, book, p5, from_period=p3)
-    r = rows["100201"]
+    r = rows["1002"]
     assert r["opening"] == 0, "区间从首期开始时，期初就该是 0"
     assert r["period_debit"] == 3500, "区间发生额要把三段都算进去"
     assert r["closing"] == 3500
@@ -68,27 +68,27 @@ def test_区间期初等于上一期期末_不是止期期初(db, book, make_vou
     行内看着永远自洽，只有与上一期的期末交叉核对才看得出来。"""
     periods = _periods(db, book)
     p3, p5 = periods[2], periods[4]
-    _mv(make_voucher, p3, [("100201", 1000, 0), ("4001", 0, 1000)])
-    _mv(make_voucher, periods[3], [("100201", 2000, 0), ("4001", 0, 2000)])
-    _mv(make_voucher, p4_ := periods[4], [("100201", 500, 0), ("4001", 0, 500)])
+    _mv(make_voucher, p3, [("1002", 1000, 0), ("4001", 0, 1000)])
+    _mv(make_voucher, periods[3], [("1002", 2000, 0), ("4001", 0, 2000)])
+    _mv(make_voucher, p4_ := periods[4], [("1002", 500, 0), ("4001", 0, 500)])
 
     single, _ = _rows(db, book, p4_)
     ranged, _ = _rows(db, book, p5, from_period=p3)
 
     # 区间期初必须正好等于起始期的上一期（p2）期末
-    assert ranged["100201"]["opening"] == 0
+    assert ranged["1002"]["opening"] == 0
     # 关键对照：止期自己的期初 = 上一期期末 = 3000（p3+p4 的 1000+2000），
     # 拿它当区间期初的话「3000 + 3500 = 6500」看着自洽，但 3000 那部分
     # 已经被区间发生额里又算了一遍 —— 正是 P0-03 那个错
-    assert single["100201"]["opening"] == 3000
-    assert ranged["100201"]["opening"] == 0
-    assert ranged["100201"]["opening"] != single["100201"]["opening"]
+    assert single["1002"]["opening"] == 3000
+    assert ranged["1002"]["opening"] == 0
+    assert ranged["1002"]["opening"] != single["1002"]["opening"]
 
 
 def test_单月区间等于单期口径(db, book, make_voucher):
     """起止同一个月 = 就是那一期，不该因为多传了个 from 就变出两套数。"""
     periods = _periods(db, book)
-    _mv(make_voucher, periods[2], [("100201", 700, 0), ("4001", 0, 700)])
+    _mv(make_voucher, periods[2], [("1002", 700, 0), ("4001", 0, 700)])
     single, check1 = _rows(db, book, periods[2])
     ranged, check2 = _rows(db, book, periods[2], from_period=periods[2])
     assert single == ranged, "同起止的区间与单期结果不一致"
@@ -101,7 +101,7 @@ def test_跨年区间不能用本年累计相减(db, book, admin_user, make_vouc
 
     periods = _periods(db, book)
     last = periods[-1]
-    _mv(make_voucher, last, [("100201", 400, 0), ("4001", 0, 400)])
+    _mv(make_voucher, last, [("1002", 400, 0), ("4001", 0, 400)])
 
     # 造下一年（走真实的年度结转，别手工插期间 —— 结转会重刷期初）
     # 结转要求本年**全部结账**，这里直接标 locked：走 close_period 会顺带
@@ -115,10 +115,10 @@ def test_跨年区间不能用本年累计相减(db, book, admin_user, make_vouc
     periods = _periods(db, book)
     nxt = periods[-1]
     assert nxt.year == last.year + 1
-    _mv(make_voucher, nxt, [("100201", 600, 0), ("4001", 0, 600)])
+    _mv(make_voucher, nxt, [("1002", 600, 0), ("4001", 0, 600)])
 
     rows, _ = _rows(db, book, nxt, from_period=last)
-    r = rows["100201"]
+    r = rows["1002"]
     assert r["period_debit"] == 1000, (
         f"跨年区间发生额应是 400+600=1000，实际 {r['period_debit']} —— "
         "多半是拿本年累计相减了")
@@ -127,8 +127,8 @@ def test_跨年区间不能用本年累计相减(db, book, admin_user, make_vouc
 
 def test_区间也要试算平衡(db, book, make_voucher):
     periods = _periods(db, book)
-    _mv(make_voucher, periods[1], [("100201", 300, 0), ("4001", 0, 300)])
-    _mv(make_voucher, periods[2], [("100201", 900, 0), ("4001", 0, 900)])
+    _mv(make_voucher, periods[1], [("1002", 300, 0), ("4001", 0, 300)])
+    _mv(make_voucher, periods[2], [("1002", 900, 0), ("4001", 0, 900)])
     _, check = _rows(db, book, periods[3], from_period=periods[1])
     assert check["period_balanced"] is True, "区间发生额借贷不平"
     assert check["closing_balanced"] is True, "区间期末借贷不平"
@@ -145,8 +145,8 @@ def test_余额表与总账问同一段区间_答案一样(db, book, make_vouche
     直接委托 balance_sheet_of_accounts，这条用例就是防止它又被拆开。
     """
     periods = _periods(db, book)
-    _mv(make_voucher, periods[1], [("100201", 111, 0), ("4001", 0, 111)])
-    _mv(make_voucher, periods[2], [("100201", 222, 0), ("4001", 0, 222)])
+    _mv(make_voucher, periods[1], [("1002", 111, 0), ("4001", 0, 111)])
+    _mv(make_voucher, periods[2], [("1002", 222, 0), ("4001", 0, 222)])
 
     subjects = queries.subject_tree(db, book.id)
     bal, _ = queries.balance_sheet_of_accounts(
@@ -161,8 +161,8 @@ def test_余额表与总账问同一段区间_答案一样(db, book, make_vouche
 
 def test_接口带区间与不带区间都对(client, auth, db, book, make_voucher):
     periods = _periods(db, book)
-    _mv(make_voucher, periods[1], [("100201", 150, 0), ("4001", 0, 150)])
-    _mv(make_voucher, periods[2], [("100201", 250, 0), ("4001", 0, 250)])
+    _mv(make_voucher, periods[1], [("1002", 150, 0), ("4001", 0, 150)])
+    _mv(make_voucher, periods[2], [("1002", 250, 0), ("4001", 0, 250)])
 
     single = client.get(f"/api/books/{book.id}/ledger/balance",
                         params={"period_id": periods[2].id, "include_unposted": True},
@@ -178,8 +178,8 @@ def test_接口带区间与不带区间都对(client, auth, db, book, make_vouch
     assert ranged["range"] is True
     assert ranged["from_period"] == periods[1].code
     assert ranged["period"] == periods[2].code
-    one = {r["code"]: r for r in single["rows"]}["100201"]
-    two = {r["code"]: r for r in ranged["rows"]}["100201"]
+    one = {r["code"]: r for r in single["rows"]}["1002"]
+    two = {r["code"]: r for r in ranged["rows"]}["1002"]
     assert two["period_debit"] == one["period_debit"] + 150, "区间发生额没把上一期算进去"
 
 
@@ -217,14 +217,14 @@ def test_别人的期间_id_404(client, auth, book, db, admin_user, plain_user, 
 def test_导出与页面是同一段区间(client, auth, db, book, make_voucher):
     """屏幕上一段区间、纸上单期 —— 总账栽过一次，用户只会以为纸上那份是对的。"""
     periods = _periods(db, book)
-    _mv(make_voucher, periods[1], [("100201", 640, 0), ("4001", 0, 640)])
-    _mv(make_voucher, periods[2], [("100201", 360, 0), ("4001", 0, 360)])
+    _mv(make_voucher, periods[1], [("1002", 640, 0), ("4001", 0, 640)])
+    _mv(make_voucher, periods[2], [("1002", 360, 0), ("4001", 0, 360)])
 
     ranged = client.get(f"/api/books/{book.id}/ledger/balance",
                         params={"period_id": periods[2].id,
                                 "from_period_id": periods[1].id,
                                 "include_unposted": True}, headers=auth).json()
-    total = next(r for r in ranged["rows"] if r["code"] == "100201")["period_debit"]
+    total = next(r for r in ranged["rows"] if r["code"] == "1002")["period_debit"]
     assert total == 1000
 
     r = client.get(f"/api/books/{book.id}/print/balance.xlsx",
@@ -238,8 +238,8 @@ def test_导出与页面是同一段区间(client, auth, db, book, make_voucher)
 
 def test_打印预览也吃区间(client, auth, db, book, make_voucher):
     periods = _periods(db, book)
-    _mv(make_voucher, periods[1], [("100201", 800, 0), ("4001", 0, 800)])
-    _mv(make_voucher, periods[2], [("100201", 200, 0), ("4001", 0, 200)])
+    _mv(make_voucher, periods[1], [("1002", 800, 0), ("4001", 0, 800)])
+    _mv(make_voucher, periods[2], [("1002", 200, 0), ("4001", 0, 200)])
 
     r = client.get(f"/api/books/{book.id}/print/balance.html",
                    params={"period_id": periods[2].id, "from_period_id": periods[1].id,

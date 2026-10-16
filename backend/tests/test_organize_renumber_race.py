@@ -36,9 +36,9 @@ def _mk(db, book, admin_user, subjects, no: str, day: int = 5):
     return create_voucher(
         db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, day),
         entries=[
-            {"subject_id": subjects["100201"].id, "direction": "DEBIT",
+            {"subject_id": subjects["1002"].id, "direction": "DEBIT",
              "amount": "100.00", "summary": "x"},
-            {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+            {"subject_id": subjects["5001"].id, "direction": "CREDIT",
              "amount": "100.00", "summary": "x"},
         ],
         voucher_no=no,

@@ -79,8 +79,8 @@ def _line(day: str, no: str, code: str, name: str, summary: str,
 
 
 # 一张凭证 = 两条分录，用本账套里真实存在的两个明细科目
-_DR = ("100201", "银行存款-工商银行")
-_CR = ("600101", "主营业务收入-租金")
+_DR = ("1002", "银行存款-工商银行")
+_CR = ("5001", "主营业务收入-租金")
 
 
 def _voucher_rows(day: str, no: str, amount: float, *, summary: str = "收租") -> list[list]:
@@ -120,8 +120,8 @@ def test_序时账的表头全部识别(db, book):
 
 def test_普通模板不被当成序时账(db, book):
     data = _xlsx(TEMPLATE_HEADER, [
-        ["2026-01-15", "记-1", "收租", "100201", 1000, None],
-        [None, None, "收租", "600101", None, 1000],
+        ["2026-01-15", "记-1", "收租", "1002", 1000, None],
+        [None, None, "收租", "5001", None, 1000],
     ])
     assert parse_workbook(data, book.id, db)["journal"] is False
 
@@ -223,9 +223,9 @@ def test_同侧相抵的凭证照样该存(db, book):
     「同侧相抵放行」这个结构行为，与科目经济含义无关。）
     """
     rows = [
-        _line("2026.03.21", "记-0029", "100201", "银行存款-工商银行", "结息", "借", 1000),
-        _line("2026.03.21", "记-0029", "100202", "银行存款-建设银行", "结息", "借", 500),
-        _line("2026.03.21", "记-0029", "100203", "银行存款-微信支付", "结息", "借", -1500),
+        _line("2026.03.21", "记-0029", "1002", "银行存款-工商银行", "结息", "借", 1000),
+        _line("2026.03.21", "记-0029", "1012", "银行存款-建设银行", "结息", "借", 500),
+        _line("2026.03.21", "记-0029", "1001", "银行存款-微信支付", "结息", "借", -1500),
     ]
     v = parse_workbook(_xls(JOURNAL_HEADER, rows), book.id, db)["vouchers"][0]
     assert len(v["entries"]) == 3
@@ -268,10 +268,10 @@ def test_科目对不上时报出上级科目路径(db, book):
 def test_普通模板的断行规则没被改(db, book):
     """一张凭证几行、后续行留空 —— 这条规则本来就对，不许被序时账带歪。"""
     data = _xlsx(TEMPLATE_HEADER, [
-        ["2026-01-15", "记-1", "收租", "100201", 1000, None],
-        [None, None, "收租", "600101", None, 1000],
-        ["2026-01-16", "记-2", "收租", "100201", 2000, None],
-        [None, None, "收租", "600101", None, 2000],
+        ["2026-01-15", "记-1", "收租", "1002", 1000, None],
+        [None, None, "收租", "5001", None, 1000],
+        ["2026-01-16", "记-2", "收租", "1002", 2000, None],
+        [None, None, "收租", "5001", None, 2000],
     ])
     r = parse_workbook(data, book.id, db)
     assert len(r["vouchers"]) == 2
@@ -287,10 +287,10 @@ def test_没有凭证号时不会把同日期的行并起来(db, book):
     会被并成一张 3000 块的大凭证。
     """
     data = _xlsx(TEMPLATE_HEADER, [
-        ["2026-01-15", None, "收租", "100201", 1000, None],
-        ["2026-01-15", None, "收租", "600101", None, 1000],
-        ["2026-01-15", None, "收租", "100201", 2000, None],
-        ["2026-01-15", None, "收租", "600101", None, 2000],
+        ["2026-01-15", None, "收租", "1002", 1000, None],
+        ["2026-01-15", None, "收租", "5001", None, 1000],
+        ["2026-01-15", None, "收租", "1002", 2000, None],
+        ["2026-01-15", None, "收租", "5001", None, 2000],
     ])
     r = parse_workbook(data, book.id, db)
     # 4 行各自成张（每张只有一条分录、借贷不平衡）—— 这就是改动前的行为，
@@ -312,8 +312,8 @@ def test_改后缀的xls照样读得开(db, book):
 def test_xlsx改名成xls不会喂给xlrd(db, book):
     """反向也一样：zip 就按 zip 读，不能让 xlrd 接着而报一句看不懂的错。"""
     data = _xlsx(TEMPLATE_HEADER, [
-        ["2026-01-15", "记-1", "收租", "100201", 1000, None],
-        [None, None, "收租", "600101", None, 1000],
+        ["2026-01-15", "记-1", "收租", "1002", 1000, None],
+        [None, None, "收租", "5001", None, 1000],
     ])
     r = parse_workbook(data, book.id, db, filename="其实是xls.xls")
     assert len(r["vouchers"]) == 1 and r["vouchers"][0]["ok"] is True

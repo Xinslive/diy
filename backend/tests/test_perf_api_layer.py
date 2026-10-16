@@ -114,8 +114,8 @@ def _voucher_xlsx(n: int) -> bytes:
     """n 张配平凭证，每张两行。"""
     rows = []
     for i in range(n):
-        rows.append([f"2026-01-{i + 1:02d}", f"记-{i}", f"收租金 {i}", "100201", 100, None])
-        rows.append([None, None, f"收租金 {i}", "600101", None, 100])
+        rows.append([f"2026-01-{i + 1:02d}", f"记-{i}", f"收租金 {i}", "1002", 100, None])
+        rows.append([None, None, f"收租金 {i}", "5001", None, 100])
     return _xlsx(["日期", "凭证号", "摘要", "科目编码", "借方", "贷方"], rows)
 
 
@@ -137,7 +137,7 @@ def mk_voucher(db, book):
     from app.models import Entry, Period, Subject, Voucher
 
     def _mk(day: str, *, summary: str = "x", amount=100,
-            dr: str = "100201", cr: str = "600101", remark: str = ""):
+            dr: str = "1002", cr: str = "5001", remark: str = ""):
         d = date.fromisoformat(day)
         period = db.scalar(select(Period).where(
             Period.book_id == book.id, Period.year == d.year, Period.month == d.month))
@@ -208,8 +208,8 @@ def test_凭证导入暂存批次进得了历史列表(client, auth, book):
 
 def test_期初解析改同步后仍然能解析(client, auth, book):
     data = _xlsx(["科目编码", "科目名称", "方向", "期初余额"],
-                 [["100201", "银行存款", "借", 100],
-                  ["600101", "主营业务收入", "贷", 100]])
+                 [["1002", "银行存款", "借", 100],
+                  ["5001", "主营业务收入", "贷", 100]])
     r = _upload_openings(client, auth, book, data)
     assert r.status_code == 200, r.text
     body = r.json()
@@ -235,7 +235,7 @@ def test_同步版容量闸没松_期初解析超限仍413(client, auth, book, m
 
     monkeypatch.setattr(settings, "import_max_bytes", 2048, raising=False)
     data = _xlsx(["科目编码", "科目名称", "方向", "期初余额"],
-                 [["100201", "银行存款", "借", 100]] * 40)
+                 [["1002", "银行存款", "借", 100]] * 40)
     assert len(data) > 2048, "前置：这份表要超过上限"
 
     r = _upload_openings(client, auth, book, data)
@@ -249,7 +249,7 @@ def test_期初解析超行数上限仍413(client, auth, book, monkeypatch):
     monkeypatch.setattr(settings, "import_max_rows", 10, raising=False)
     r = _upload_openings(client, auth, book,
                          _xlsx(["科目编码", "科目名称", "方向", "期初余额"],
-                               [["100201", "银行存款", "借", 100]] * 40))
+                               [["1002", "银行存款", "借", 100]] * 40))
     assert r.status_code == 413, f"超行数的表被放行了：{r.status_code} {r.text}"
     assert "行" in r.json()["detail"]
 
@@ -309,7 +309,7 @@ def test_打印页的科目编码名称仍然填得上(client, auth, book, perio
     r = client.get(f"/api/books/{book.id}/print/vouchers.html",
                    params={"period_id": periods[1].id}, headers=auth)
     assert r.status_code == 200, r.text
-    assert "100201" in r.text, r.text[:2000]
+    assert "1002" in r.text, r.text[:2000]
 
 
 # ===================================================================== 严重 5
@@ -587,7 +587,7 @@ def test_明细账打印超上限返回413(client, auth, book, periods, subjects
     monkeypatch.setattr(xl, "MAX_EXPORT_ROWS", 1)
     r = client.get(f"/api/books/{book.id}/print/detail-ledger.html",
                    params={"period_id": periods[1].id,
-                           "subject_id": subjects["100201"].id}, headers=auth)
+                           "subject_id": subjects["1002"].id}, headers=auth)
     assert r.status_code == 413, f"超行数的打印页被放行了：{r.status_code} {r.text}"
 
 

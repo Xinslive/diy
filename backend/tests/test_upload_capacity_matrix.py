@@ -122,7 +122,7 @@ def _opening_xlsx(rows: int) -> bytes:
     ws = wb.active
     ws.append(["科目编码", "科目名称", "方向", "期初余额"])
     for i in range(rows):
-        ws.append(["100201", "银行存款", "借", 100])
+        ws.append(["1002", "银行存款", "借", 100])
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

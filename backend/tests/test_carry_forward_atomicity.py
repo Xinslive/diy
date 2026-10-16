@@ -86,8 +86,8 @@ def test_审计写入失败时不留半截账(db, book, periods, subjects, admin
     这是 P1-20 的核心场景：老代码在这里已经 commit 过凭证了，
     于是库里留下一张没有审计快照的结转凭证，而接口还返回了错误。
     """
-    make_voucher("2026-01-10", dr=[("600101", 1000, "收入")],
-                 cr=[("100201", 1000, "收款")], posted=True)
+    make_voucher("2026-01-10", dr=[("5001", 1000, "收入")],
+                 cr=[("1002", 1000, "收款")], posted=True)
     p = db.get(Period, _p1(book, periods).id)
     before = _snapshot(db, book, p)
 
@@ -107,8 +107,8 @@ def test_审计写入失败时不留半截账(db, book, periods, subjects, admin
 def test_HTTP层审计失败也是原子的(client, db, book, periods, subjects, admin_user,
                                   make_voucher, auth, monkeypatch):
     """接口层同样：返回 5xx 之后，库里必须什么都没变。"""
-    make_voucher("2026-01-10", dr=[("600101", 1000, "收入")],
-                 cr=[("100201", 1000, "收款")], posted=True)
+    make_voucher("2026-01-10", dr=[("5001", 1000, "收入")],
+                 cr=[("1002", 1000, "收款")], posted=True)
     p = _p1(book, periods)
     before = _snapshot(db, book, p)
 
@@ -127,8 +127,8 @@ def test_重新结转中途失败不留下删了旧的只生成一半新的(
 
     用户会以为凭证还在，去别处重记一遍，下个月就多出一张。
     """
-    make_voucher("2026-01-10", dr=[("600101", 1000, "收入")],
-                 cr=[("100201", 1000, "收款")], posted=True)
+    make_voucher("2026-01-10", dr=[("5001", 1000, "收入")],
+                 cr=[("1002", 1000, "收款")], posted=True)
     p = db.get(Period, _p1(book, periods).id)
     first = carry_forward_profit(db, book.id, p, admin_user)
     assert first["vouchers"], "前置：第一次结转应当生成凭证"
@@ -154,8 +154,8 @@ def test_结转损益只提交一次事务(db, book, periods, subjects, admin_us
     数 commit 次数比看结果更直接：结果对了也可能是因为第二次提交补上了，
     而两次提交之间的那个窗口正是 P1-19 事故发生的地方。
     """
-    make_voucher("2026-01-10", dr=[("600101", 1000, "收入")],
-                 cr=[("100201", 1000, "收款")], posted=True)
+    make_voucher("2026-01-10", dr=[("5001", 1000, "收入")],
+                 cr=[("1002", 1000, "收款")], posted=True)
     p = db.get(Period, _p1(book, periods).id)
     calls = _count_commits(db, monkeypatch)
 
@@ -168,8 +168,8 @@ def test_结转损益只提交一次事务(db, book, periods, subjects, admin_us
 def test_年度结转仍然是单次提交(db, book, periods, subjects, admin_user,
                                make_voucher, monkeypatch):
     """回归护栏：年度结转本来就是单事务，别被改成多事务。"""
-    make_voucher("2026-01-10", dr=[("600101", 1000, "收入")],
-                 cr=[("100201", 1000, "收款")], posted=True)
+    make_voucher("2026-01-10", dr=[("5001", 1000, "收入")],
+                 cr=[("1002", 1000, "收款")], posted=True)
     for m in range(1, 13):
         p = db.get(Period, periods[m].id)
         try:
@@ -186,8 +186,8 @@ def test_年度结转仍然是单次提交(db, book, periods, subjects, admin_us
 def test_结转成功时凭证与审计一起可见(db, book, periods, subjects, admin_user,
                                       make_voucher):
     """正面路径不能被改坏：凭证、记账状态、审计日志一个都不能少。"""
-    make_voucher("2026-01-10", dr=[("600101", 1000, "收入")],
-                 cr=[("100201", 1000, "收款")], posted=True)
+    make_voucher("2026-01-10", dr=[("5001", 1000, "收入")],
+                 cr=[("1002", 1000, "收款")], posted=True)
     p = db.get(Period, _p1(book, periods).id)
     r = carry_forward_profit(db, book.id, p, admin_user)
     db.expire_all()

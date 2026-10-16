@@ -141,9 +141,9 @@ def test_连续发号不撞号(db, book, period, admin_user):
         used.append(no)
         v = create_voucher(db, book_id=book.id, user=admin_user,
                            voucher_date=date(2026, 2, 10), entries=[
-                               {"subject_id": _sid(db, book, "100201"),
+                               {"subject_id": _sid(db, book, "1002"),
                                 "direction": "DEBIT", "amount": "10", "summary": "x"},
-                               {"subject_id": _sid(db, book, "600101"),
+                               {"subject_id": _sid(db, book, "5001"),
                                 "direction": "CREDIT", "amount": "10", "summary": "x"},
                            ], voucher_no=no, commit=True)
         assert v.voucher_no == no

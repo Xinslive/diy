@@ -60,17 +60,17 @@ def test_用友表方向由借贷分列决定():
     1122 应收账款是借方属性，这里挂着贷方余额（客户预付），强推属性就洗掉了。
     """
     by_code, by_name = _index(
-        _subject(1, "100201", "银行存款-工商"),
+        _subject(1, "1121", "银行存款-工商"),
         _subject(2, "112201", "应收账款-甲", "DEBIT"),
     )
     out = parse_opening_rows(_yonyou([
-        _yonyou_row("100201", "  银行存款-工商", od=3056.43),
+        _yonyou_row("1121", "  银行存款-工商", od=3056.43),
         _yonyou_row("112201", "  应收账款-甲", oc=4148.43),
     ]), subjects_by_code=by_code, subjects_by_name=by_name)
 
     rows = {r["code"]: r for r in out["rows"]}
-    assert rows["100201"]["signed"] == "3056.43"
-    assert rows["100201"]["display_side"] == "借"
+    assert rows["1121"]["signed"] == "3056.43"
+    assert rows["1121"]["display_side"] == "借"
     assert rows["112201"]["signed"] == "-4148.43"
     assert rows["112201"]["display_side"] == "贷"
     assert out["source"] == "用友余额表"
@@ -83,11 +83,11 @@ def test_用友表方向由借贷分列决定():
 def test_用友表期末与期初是两套数():
     """同一张表里期初与期末分列。取错了不会报错，只会让用户对着一堆差额发呆。"""
     by_code, by_name = _index(
-        _subject(1, "100201", "银行存款-工商"),
+        _subject(1, "1121", "银行存款-工商"),
         _subject(2, "4001", "实收资本", "CREDIT"),
     )
     rows = [
-        _yonyou_row("100201", "银行存款-工商", od=1000, ed=1500),
+        _yonyou_row("1121", "银行存款-工商", od=1000, ed=1500),
         _yonyou_row("4001", "实收资本", oc=1000, ec=1500),
     ]
     opening = parse_opening_rows(_yonyou(rows), subjects_by_code=by_code,
@@ -102,9 +102,9 @@ def test_用友表期末与期初是两套数():
 
 
 def test_用友表借贷同列都有值要报错():
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(
-        _yonyou([_yonyou_row("100201", "银行存款-工商", od=100, oc=50)]),
+        _yonyou([_yonyou_row("1121", "银行存款-工商", od=100, oc=50)]),
         subjects_by_code=by_code, subjects_by_name=by_name)
     assert "借方和贷方" in out["rows"][0]["error"]
     assert out["rows"][0]["subject_id"] == 1
@@ -123,9 +123,9 @@ def test_合计行静默剔除而不是报错():
 
     当成科目会刷出一堆「科目在本账套不存在」，当成错误更糟。
     """
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(_yonyou([
-        _yonyou_row("100201", "银行存款-工商", od=100),
+        _yonyou_row("1121", "银行存款-工商", od=100),
         ["2026", "月份：2026.10-2026.10", "资产小计", "", "", 100.0, 0.0, 0.0, 0.0, 100.0, 0.0],
         ["2026", "月份：2026.10-2026.10", "损益小计", "", "", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         ["2026", "月份：2026.10-2026.10", "合计", "", "", 100.0, 0.0, 0.0, 0.0, 100.0, 0.0],
@@ -153,11 +153,11 @@ def test_名字里带合计的正经科目不能被剔掉():
 
 def test_全零行跳过且计入skipped():
     """用友余额表几百行里绝大多数是 0.0，全塞进预览框没法看。"""
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(_yonyou([
-        _yonyou_row("100201", "银行存款-工商"),
-        _yonyou_row("100202", "银行存款-建行"),
-        _yonyou_row("100203", "银行存款-农商"),
+        _yonyou_row("1121", "银行存款-工商"),
+        _yonyou_row("1012", "银行存款-建行"),
+        _yonyou_row("1001", "银行存款-农商"),
     ]), subjects_by_code=by_code, subjects_by_name=by_name)
     assert out["rows"] == []
     assert out["skipped"] == 3
@@ -165,15 +165,15 @@ def test_全零行跳过且计入skipped():
     # 「这份文件里一行余额都没有」是用户必须知道的，不能只给一个空列表
     with pytest.raises(ValueError, match="没有解析出任何数据行"):
         parse_opening_workbook(
-            _xlsx_with(YONYOU_HEADER, [_yonyou_row("100201", "银行存款-工商")]),
+            _xlsx_with(YONYOU_HEADER, [_yonyou_row("1121", "银行存款-工商")]),
             "全零.xlsx", subjects_by_code=by_code, subjects_by_name=by_name)
 
 
 def test_表头前有大标题行仍能认出表头():
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(
         [["科目余额表"], ["单位：某某公司    2026年10月"]] + _yonyou([
-            _yonyou_row("100201", "银行存款-工商", od=100)]),
+            _yonyou_row("1121", "银行存款-工商", od=100)]),
         subjects_by_code=by_code, subjects_by_name=by_name)
     assert len(out["rows"]) == 1
     assert out["header_row"] == 3
@@ -185,11 +185,11 @@ def test_两行表头也能认出来():
     拼起来是「期初借方」「贷方」「期末借方」「贷方」这种半空的串 ——
     认表头的代码必须按**位置**认，不能因为某一格缺字就整体认不出。
     """
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     rows = [
         ["会计年度", "会计期间", "科目编码", "科目名称", "期初", "", "期末", ""],
         ["", "", "", "", "借方", "贷方", "借方", "贷方"],
-        ["2026", "月份：2026.10-2026.10", "100201", "银行存款-工商", 100, 0, 0, 0],
+        ["2026", "月份：2026.10-2026.10", "1121", "银行存款-工商", 100, 0, 0, 0],
     ]
     out = parse_opening_rows(rows, subjects_by_code=by_code, subjects_by_name=by_name)
     assert len(out["rows"]) == 1, out
@@ -211,7 +211,7 @@ def test_科目名称前导空格要strip后才匹配得上():
 
 def test_编码匹配不到时按名称兜住():
     """很多人拿到的表只有名称对得上（编码体系不一样）。"""
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(
         _yonyou([_yonyou_row("9-9-9", "银行存款-工商", od=888)]),
         subjects_by_code=by_code, subjects_by_name=by_name)
@@ -220,9 +220,9 @@ def test_编码匹配不到时按名称兜住():
 
 
 def test_本账套没有的科目要报出来并计入unmatched():
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(_yonyou([
-        _yonyou_row("100201", "银行存款-工商", od=100),
+        _yonyou_row("1121", "银行存款-工商", od=100),
         _yonyou_row("999999", "不存在", od=50),
     ]), subjects_by_code=by_code, subjects_by_name=by_name)
     assert out["unmatched"] == 1
@@ -240,19 +240,19 @@ def test_非明细科目要挡住():
 
 
 def test_期间标签被带回来():
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(_yonyou([
-        _yonyou_row("100201", "全零行"),
-        _yonyou_row("100201", "银行存款-工商", od=100, period="月份：2026.10-2026.10"),
+        _yonyou_row("1121", "全零行"),
+        _yonyou_row("1121", "银行存款-工商", od=100, period="月份：2026.10-2026.10"),
     ]), subjects_by_code=by_code, subjects_by_name=by_name)
     assert out["period_label"] == "月份：2026.10-2026.10"
 
 
 def test_行号是Excel真实行号():
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(_yonyou([
-        _yonyou_row("100201", "A", od=1),
-        _yonyou_row("100201", "B", od=2),
+        _yonyou_row("1121", "A", od=1),
+        _yonyou_row("1121", "B", od=2),
     ]), subjects_by_code=by_code, subjects_by_name=by_name)
     # 表头是第 1 行，第一条数据是第 2 行 —— 报错行号要能对上源文件
     assert [r["line"] for r in out["rows"]] == [2, 3]
@@ -269,9 +269,9 @@ def test_行号是Excel真实行号():
     ("１２３４．５", "1234.50"),      # 全角数字：NFKC 折回半角再解析
 ])
 def test_金额各种写法都吃得下(raw, expected):
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(
-        _yonyou([_yonyou_row("100201", "银行存款-工商", od=raw, oc=0)]),
+        _yonyou([_yonyou_row("1121", "银行存款-工商", od=raw, oc=0)]),
         subjects_by_code=by_code, subjects_by_name=by_name)
     row = out["rows"][0]
     assert Decimal(row["signed"] or "0") == Decimal(expected), row
@@ -280,9 +280,9 @@ def test_金额各种写法都吃得下(raw, expected):
 @pytest.mark.parametrize("raw", ["", None, 0, 0.0])
 def test_空值与零就是零_不算错也不进预览(raw):
     """用友表里几百行是 0.0。全零行不是错，但也不该占着预览框。"""
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(
-        _yonyou([_yonyou_row("100201", "银行存款-工商", od=raw, oc=0)]),
+        _yonyou([_yonyou_row("1121", "银行存款-工商", od=raw, oc=0)]),
         subjects_by_code=by_code, subjects_by_name=by_name)
     assert out["errors"] == []
     assert out["rows"] == []
@@ -291,9 +291,9 @@ def test_空值与零就是零_不算错也不进预览(raw):
 
 def test_金额解析不出来必须报错而不是当0():
     """期初差一笔的代价是之后每个月都跟着歪，而用户看到的仍是「已读入 N 条」。"""
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(
-        _yonyou([_yonyou_row("100201", "银行存款-工商", od="abc", oc=0)]),
+        _yonyou([_yonyou_row("1121", "银行存款-工商", od="abc", oc=0)]),
         subjects_by_code=by_code, subjects_by_name=by_name)
     assert "金额无法识别" in out["rows"][0]["error"]
     assert Decimal(out["total_debit"]) == Decimal("0")
@@ -340,10 +340,10 @@ def test_四列表行为不变_方向以文件为准():
 
 def test_四列表的零值行照旧返回():
     """与用友表相反：四列表保留 0 值行，前端与既有用例都按这个行为走。"""
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(
         [["科目编码", "科目名称", "方向", "期初余额"],
-         ["100201", "银行存款-工商", "借", 0]],
+         ["1121", "银行存款-工商", "借", 0]],
         subjects_by_code=by_code, subjects_by_name=by_name)
     assert len(out["rows"]) == 1
     assert out["rows"][0]["amount"] == "0"
@@ -351,9 +351,9 @@ def test_四列表的零值行照旧返回():
 
 
 def test_认不出表头就按位置取ABCD():
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(
-        [["100201", "银行存款-工商", "借", 100]],
+        [["1121", "银行存款-工商", "借", 100]],
         subjects_by_code=by_code, subjects_by_name=by_name)
     assert len(out["rows"]) == 1
     assert Decimal(out["rows"][0]["signed"]) == Decimal("100")
@@ -361,9 +361,9 @@ def test_认不出表头就按位置取ABCD():
 
 
 def test_xlsx走openpyxl也能解析():
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_workbook(
-        _legacy_xlsx([("100201", "银行存款-工商", "借", 100)]),
+        _legacy_xlsx([("1121", "银行存款-工商", "借", 100)]),
         "期初余额.xlsx",
         subjects_by_code=by_code, subjects_by_name=by_name)
     assert out["file_format"] == "xlsx"
@@ -383,15 +383,15 @@ def test_xls文件走xlrd那条路():
 
 
 def test_空文件报错():
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     with pytest.raises(ValueError, match="空文件"):
         parse_opening_rows([], subjects_by_code=by_code, subjects_by_name=by_name)
 
 
 def test_取数口径只认期初和期末():
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     with pytest.raises(ValueError, match="取数口径"):
-        parse_opening_rows(_yonyou([_yonyou_row("100201", "银行存款-工商", od=1)]),
+        parse_opening_rows(_yonyou([_yonyou_row("1121", "银行存款-工商", od=1)]),
                            subjects_by_code=by_code, subjects_by_name=by_name,
                            basis="average")
 
@@ -400,9 +400,9 @@ def test_行数超限要挡住():
     """容量闸的第三道：前两道都能被伪造，行数不会。"""
     from app.core.config import settings
 
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     head = [["科目编码", "科目名称", "方向", "期初余额"]]
-    rows = head + [["100201", "银行存款-工商", "借", i + 1] for i in range(10)]
+    rows = head + [["1121", "银行存款-工商", "借", i + 1] for i in range(10)]
     original = settings.import_max_rows
     try:
         object.__setattr__(settings, "import_max_rows", 5)
@@ -426,12 +426,12 @@ def test_行数超限要挡住():
     "合计", "总计", "本页合计", "累计", "本年累计",
 ])
 def test_每一种汇总标签都被剔掉(label):
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     summary = ["2026", "月份：2026.10-2026.10", label, "", "", 100.0, 0.0, 0.0, 0.0, 100.0, 0.0]
-    out = parse_opening_rows(_yonyou([_yonyou_row("100201", "银行存款-工商", od=100), summary]),
+    out = parse_opening_rows(_yonyou([_yonyou_row("1121", "银行存款-工商", od=100), summary]),
                              subjects_by_code=by_code, subjects_by_name=by_name)
     assert out["errors"] == [], out["errors"]
-    assert [r["code"] for r in out["rows"]] == ["100201"]
+    assert [r["code"] for r in out["rows"]] == ["1121"]
     assert out["skipped"] == 1
     # 剔掉了才有意义：汇总行那个 100 若进来，这笔银行存款就被数了两遍
     assert Decimal(out["total_debit"]) == Decimal("100")
@@ -440,7 +440,7 @@ def test_每一种汇总标签都被剔掉(label):
 @pytest.mark.parametrize("label", ["资产小计", "合计", "本年累计"])
 def test_汇总标签写在名称列里也一样剔掉(label):
     """有的版本把标签写进「科目名称」列而不是编码列。"""
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
     out = parse_opening_rows(
         _yonyou([["2026", "月份：2026.10-2026.10", "", label, "", 100.0, 0.0, 0.0, 0.0, 100.0, 0.0]]),
         subjects_by_code=by_code, subjects_by_name=by_name)
@@ -504,8 +504,8 @@ def test_期初解析走的是同一份公开读取器(monkeypatch):
     """.xls 的分流逻辑只能有一份：这里与科目表共用 iter_workbook_rows。"""
     import app.accounting.opening_importer as oi
 
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
-    rows = _yonyou([_yonyou_row("100201", "银行存款-工商", od=100)])
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
+    rows = _yonyou([_yonyou_row("1121", "银行存款-工商", od=100)])
     seen = {}
 
     def fake_rows(data, filename):
@@ -537,11 +537,11 @@ def test_科目表读取器的旧名别名还在():
 
 def test_两个入口返回同一个结构():
     """路由与前端只认一套 payload：多一个键就等着有人按不存在的字段写代码。"""
-    by_code, by_name = _index(_subject(1, "100201", "银行存款-工商"))
-    row_level = parse_opening_rows(_yonyou([_yonyou_row("100201", "银行存款-工商", od=100)]),
+    by_code, by_name = _index(_subject(1, "1121", "银行存款-工商"))
+    row_level = parse_opening_rows(_yonyou([_yonyou_row("1121", "银行存款-工商", od=100)]),
                                    subjects_by_code=by_code, subjects_by_name=by_name)
     byte_level = parse_opening_workbook(
-        _xlsx_with(YONYOU_HEADER, [_yonyou_row("100201", "银行存款-工商", od=100)]),
+        _xlsx_with(YONYOU_HEADER, [_yonyou_row("1121", "银行存款-工商", od=100)]),
         "科目余额表.xlsx", subjects_by_code=by_code, subjects_by_name=by_name)
     assert set(row_level) == set(byte_level), (
         set(row_level) ^ set(byte_level))

@@ -43,8 +43,20 @@ from app.models import (
 )
 from app.models.book import period_ord
 
-PROFIT_SUBJECT_CODE = "4103"     # 本年利润
-RETAINED_SUBJECT_CODE = "4104"   # 利润分配 — 未分配利润
+#: 本年利润 / 未分配利润的候选编码，按优先级排。
+#:
+#: **为什么是「候选」而不是一个码。** 内置科目表换过一套编号：现在默认的是
+#: 用友 4-2-2（3103 / 3104 利润分配 → 310415 未分配利润），而存量账套里仍是
+#: 上一版《企业会计准则》编号（4103 / 4104 利润分配-未分配利润）。两边的
+#: **科目名一样**、**编码不一样**，而这份表已经切换过一次了。
+#:
+#: 写死一个码的代价是另一套账套直接结不了：年度结转里 ``if profit and retained``
+#: 找不到就整段跳过 —— **不报错，本年利润就是不冲平**，比报错难查得多。
+#: 所以按顺序试，第一个存在的为准。
+PROFIT_SUBJECT_CODES = ("3103", "4103")            # 本年利润
+#: 310415 未分配利润是**末级**，能直接记账；3104 利润分配是它的上级，
+#: 往非末级科目记账会被凭证接口拒掉，所以顺序不能反。
+RETAINED_SUBJECT_CODES = ("310415", "3104", "4104")  # 未分配利润
 
 
 # --------------------------------------------------------------------- 乐观锁
@@ -121,6 +133,15 @@ def get_period(db: Session, book_id: int, period_id: int) -> Period:
 
 def _subject_by_code(db: Session, book_id: int, code: str) -> Optional[Subject]:
     return db.scalar(select(Subject).where(Subject.book_id == book_id, Subject.code == code))
+
+
+def _subject_by_any_code(db: Session, book_id: int, codes: tuple[str, ...]) -> Optional[Subject]:
+    """按候选编码依次查找，取第一个存在的。"""
+    for code in codes:
+        found = _subject_by_code(db, book_id, code)
+        if found is not None:
+            return found
+    return None
 
 
 # --------------------------------------------------------------------- 结账
@@ -468,9 +489,11 @@ def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUse
         # 旧凭证已经 flush 掉，下面重算余额时看到的才是「未结转」的真实损益
         db.flush()
 
-    profit = _subject_by_code(db, book_id, PROFIT_SUBJECT_CODE)
+    profit = _subject_by_any_code(db, book_id, PROFIT_SUBJECT_CODES)
     if profit is None:
-        raise ValueError(f"账套缺少「本年利润」科目（编码 {PROFIT_SUBJECT_CODE}）")
+        raise ValueError(
+            f"账套缺少「本年利润」科目（编码 {'、'.join(PROFIT_SUBJECT_CODES)} 都不是）"
+        )
 
     # 结转损益的科目集合同样不过滤 active：停用的收入/费用科目如果被排除，
     # 它的本年累计就不会被结走，损益永远留在科目上，本年利润也算不对。
@@ -707,8 +730,8 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
     #    这张凭证必须落在本年最后一个月，若该期已结账则先解锁再补做 ——
     #    年度结转是一键动作，不该要求用户手动反结账一次。
     unlocked_for_carry = False
-    profit = _subject_by_code(db, book.id, PROFIT_SUBJECT_CODE)
-    retained = _subject_by_code(db, book.id, RETAINED_SUBJECT_CODE)
+    profit = _subject_by_any_code(db, book.id, PROFIT_SUBJECT_CODES)
+    retained = _subject_by_any_code(db, book.id, RETAINED_SUBJECT_CODES)
     if profit and retained:
         eng = LedgerEngine(db, book.id)
         bal = eng.figures(profit.id, last.ord).closing

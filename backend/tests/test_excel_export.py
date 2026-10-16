@@ -29,7 +29,7 @@ def _voucher(no: str, amount: str, summary: str = "测试") -> dict:
         "entries": [
             {"summary": summary, "subject_code": "1001", "subject_name": "库存现金",
              "direction": "DEBIT", "amount": amount},
-            {"summary": summary, "subject_code": "6001", "subject_name": "主营业务收入",
+            {"summary": summary, "subject_code": "5001", "subject_name": "主营业务收入",
              "direction": "CREDIT", "amount": amount},
         ],
         "total_debit": amount, "total_credit": amount,

@@ -73,8 +73,8 @@ def test_版本不匹配时反结账被拒且凭证不回退(db, book, periods, 
     """
     # 只用资产负债表科目（银行存款内部转账），不产生损益余额 ——
     # 否则结账会先被「还没结转损益」挡掉，测的就不是乐观锁了。
-    make_voucher("2026-03-10", dr=[("100201", 100, "x")],
-                 cr=[("100202", 100, "x")], posted=True)
+    make_voucher("2026-03-10", dr=[("1002", 100, "x")],
+                 cr=[("1012", 100, "x")], posted=True)
     close_period(db, _period(db, book, 3), admin_user)
     db.commit()
     p = _period(db, book, 3)

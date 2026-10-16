@@ -214,10 +214,10 @@ def test_两个口径不能互相串(db, book, make_voucher):
     ``source=CARRY_FORWARD`` 的凭证：口径差异的唯一来源就是那个字段。
     """
     bid = book.id
-    make_voucher("2026-01-10", dr=[("1001", 300, "收款")], cr=[("600101", 300, "收入")],
+    make_voucher("2026-01-10", dr=[("1001", 300, "收款")], cr=[("5001", 300, "收入")],
                  posted=True, source="MANUAL")
     # 同科目、同金额，只是 source 不同 —— 于是只有口径能把它们分开
-    make_voucher("2026-01-31", dr=[("1001", 300, "结转收款")], cr=[("600101", 300, "结转收入")],
+    make_voucher("2026-01-31", dr=[("1001", 300, "结转收款")], cr=[("5001", 300, "结转收入")],
                  posted=True, source="CARRY_FORWARD")
     db.expire_all()
 

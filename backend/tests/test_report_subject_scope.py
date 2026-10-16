@@ -4,7 +4,7 @@
 
 **上级科目可以直接取数。** 凭证只允许记到末级（``vouchers._validate_entries``
 的硬闸），所以上级科目自己身上永远是 0。以前设计器因此只给末级科目，
-``科目("1002","期末余额")`` 这种写法能解析、也能存，**取出来却是一串 0**，
+``科目("1101","期末余额")`` 这种写法能解析、也能存，**取出来却是一串 0**，
 而报表上不会报任何错 —— 银行账户那一行恒为 0，资产合计跟着少一大块，
 看报表的人完全看不出少了什么。现在 ``ReportContext.subject_scope`` 把整棵
 子树加总，取上级科目才有意义。
@@ -38,44 +38,52 @@ def _run(db, book, periods, src: str) -> Decimal:
 
 
 def test_上级科目的余额等于其末级之和(db, book, periods, subjects, make_voucher):
-    """1002 银行存款 自己身上永远是 0，取数必须等于 100201+100202+100203。"""
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")],
+    """1101 短期投资 自己身上永远是 0，取数必须等于 110101+110102+110103。
+
+    上级取 1101、末级取它真实的下级：4-2-2 表里 1002 已是末级，
+    拿 1121/1012 这些平级科目去加它，验的就不是「子树汇总」了。
+    """
+    make_voucher("2026-01-10", dr=[("110101", 1000, "x")], cr=[("1123", 1000, "x")],
                  posted=True)
-    make_voucher("2026-01-11", dr=[("100202", 500, "x")], cr=[("600101", 500, "x")],
+    make_voucher("2026-01-11", dr=[("110102", 500, "x")], cr=[("1123", 500, "x")],
                  posted=True)
 
-    assert _run(db, book, periods, '科目("100201","期末余额")') == Decimal("1000.00")
-    assert _run(db, book, periods, '科目("1002","期末余额")') == Decimal("1500.00")
+    assert _run(db, book, periods, '科目("110101","期末余额")') == Decimal("1000.00")
+    assert _run(db, book, periods, '科目("1101","期末余额")') == Decimal("1500.00")
 
 
 def test_上级科目按各自方向取正数后相加(db, book, periods, subjects, make_voucher):
-    """贷方科目汇总后仍是正数：每一笔先按自己的方向摆正，再相加。"""
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")],
+    """贷方科目汇总后仍是正数：每一笔先按自己的方向摆正，再相加。
+
+    贷方属性的上级用 5301 营业外收入（5001 主营业务收入已经是末级了）。
+    """
+    make_voucher("2026-01-10", dr=[("1123", 1000, "x")], cr=[("530101", 1000, "x")],
                  posted=True)
-    # 6001 是上级（600101/600102 之上的父），本身不记分录
-    assert _run(db, book, periods, '科目("6001","期末余额")') == Decimal("1000.00")
+    # 5301 是上级（530101 等之上的父），本身不记分录
+    assert _run(db, book, periods, '科目("5301","期末余额")') == Decimal("1000.00")
 
 
 def test_各级取数口径都按子树汇总(db, book, periods, subjects, make_voucher):
     """不只是期末余额：本期金额、借方累计等口径同样走子树。"""
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")],
+    make_voucher("2026-01-10", dr=[("110101", 1000, "x")], cr=[("1123", 1000, "x")],
                  posted=True)
 
-    assert _run(db, book, periods, '科目("1002","本期借方")') == Decimal("1000.00")
-    assert _run(db, book, periods, '科目("1002","借方累计")') == Decimal("1000.00")
-    assert _run(db, book, periods, '科目("1002","期初余额")') == Decimal("0.00")
+    assert _run(db, book, periods, '科目("1101","本期借方")') == Decimal("1000.00")
+    assert _run(db, book, periods, '科目("1101","借方累计")') == Decimal("1000.00")
+    assert _run(db, book, periods, '科目("1101","期初余额")') == Decimal("0.00")
 
 
 def test_上级科目取数与逐个末级相加一致(db, book, periods, subjects, make_voucher):
     """这是「汇总」这件事的定义本身，两条路必须给出同一个数。"""
-    make_voucher("2026-01-10", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")],
+    make_voucher("2026-01-10", dr=[("110101", 300, "x")], cr=[("1123", 300, "x")],
                  posted=True)
-    make_voucher("2026-01-12", dr=[("100203", 200, "x")], cr=[("600101", 200, "x")],
+    make_voucher("2026-01-12", dr=[("110102", 200, "x")], cr=[("1123", 200, "x")],
                  posted=True)
 
+    # 110103 基金一个数都没录，必须以 0 参与相加而不是被跳过
     leaves = sum((_run(db, book, periods, f'科目("{c}","期末余额")')
-                  for c in ("100201", "100202", "100203")), Decimal("0"))
-    assert _run(db, book, periods, '科目("1002","期末余额")') == leaves
+                  for c in ("110101", "110102", "110103")), Decimal("0"))
+    assert _run(db, book, periods, '科目("1101","期末余额")') == leaves
 
 
 def test_科目不存在仍然报错(db, book, periods):
@@ -93,40 +101,40 @@ def test_停用的末级仍然计入上级汇总(db, book, periods, subjects, ma
 
     停用只影响**选择**：``subjects/flat`` 不再把它列进下拉框。
     """
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")],
+    make_voucher("2026-01-10", dr=[("110101", 1000, "x")], cr=[("1123", 1000, "x")],
                  posted=True)
 
-    subjects["100201"].active = False
+    subjects["110101"].active = False
     db.commit()
     db.expire_all()
 
-    assert _run(db, book, periods, '科目("1002","期末余额")') == Decimal("1000.00")
+    assert _run(db, book, periods, '科目("1101","期末余额")') == Decimal("1000.00")
 
 
 # --------------------------------------------------------------------- 简写
 
 
 def test_简写与全写等价(db, book, periods, subjects, make_voucher):
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")],
+    make_voucher("2026-01-10", dr=[("110101", 1000, "x")], cr=[("1123", 1000, "x")],
                  posted=True)
-    long_form = _run(db, book, periods, '科目("1002","期末余额")')
-    short_form = _run(db, book, periods, '("1002","期末余额")')
+    long_form = _run(db, book, periods, '科目("1101","期末余额")')
+    short_form = _run(db, book, periods, '("1101","期末余额")')
     assert short_form == long_form == Decimal("1000.00")
 
 
 def test_简写可以出现在表达式里(db, book, periods, subjects, make_voucher):
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")],
+    make_voucher("2026-01-10", dr=[("110101", 1000, "x")], cr=[("1123", 1000, "x")],
                  posted=True)
-    assert _run(db, book, periods, '("1002","期末余额")+100') == Decimal("1100.00")
+    assert _run(db, book, periods, '("1101","期末余额")+100') == Decimal("1100.00")
 
 
 def test_简写的第三个参数仍然可用(db, book, periods, subjects, make_voucher):
     """期间没被删掉，只是变成了可选 —— 首期/非首期都要能取。"""
     from app.reports.evaluate import EvalContext
 
-    make_voucher("2026-01-10", dr=[("100201", 500, "x")], cr=[("600101", 500, "x")],
+    make_voucher("2026-01-10", dr=[("110101", 500, "x")], cr=[("1123", 500, "x")],
                  posted=True)
-    make_voucher("2026-02-10", dr=[("100201", 700, "x")], cr=[("600101", 700, "x")],
+    make_voucher("2026-02-10", dr=[("110101", 700, "x")], cr=[("1123", 700, "x")],
                  posted=True)
 
     ctx = EvalContext(db, book, periods[2], {})
@@ -134,8 +142,8 @@ def test_简写的第三个参数仍然可用(db, book, periods, subjects, make_
 
     from app.reports.formula import Evaluator
 
-    assert Evaluator(ctx).run('("1002","期末余额")') == Decimal("1200.00")
-    assert Evaluator(ctx).run('("1002","期末余额","{{上期}}")') == Decimal("500.00")
+    assert Evaluator(ctx).run('("1101","期末余额")') == Decimal("1200.00")
+    assert Evaluator(ctx).run('("1101","期末余额","{{上期}}")') == Decimal("500.00")
 
 
 def test_只有一个参数的括号仍是分组(db, book, periods):
@@ -161,8 +169,8 @@ def test_科目平铺默认只给末级(db, book, client, auth):
     r = client.get(f"/api/books/{book.id}/subjects/flat", headers=auth)
     assert r.status_code == 200
     codes = {s["code"] for s in r.json()}
-    assert "100201" in codes
-    assert "1002" not in codes
+    assert "1121" in codes
+    assert "1101" not in codes
 
 
 def test_科目平铺可以带上上级(db, book, client, auth):
@@ -170,5 +178,5 @@ def test_科目平铺可以带上上级(db, book, client, auth):
     assert r.status_code == 200
     rows = r.json()
     codes = {s["code"] for s in rows}
-    assert {"1002", "100201", "100202", "100203"} <= codes
-    assert next(s for s in rows if s["code"] == "1002")["is_leaf"] is False
+    assert {"1101", "1121", "1012", "1122"} <= codes
+    assert next(s for s in rows if s["code"] == "1101")["is_leaf"] is False

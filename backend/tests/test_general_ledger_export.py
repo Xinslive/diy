@@ -38,8 +38,8 @@ def _num_total(ws):
 
 def test_指定区间时只导区间内的月份(db, client, auth, book, periods, subjects, make_voucher):
     """1 月与 7 月都有凭证，导出 3~5 月不该看到这两个月。"""
-    make_voucher("2026-01-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")], posted=True)
-    make_voucher("2026-07-10", dr=[("100201", 500, "x")], cr=[("600101", 500, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("1002", 100, "x")], cr=[("5001", 100, "x")], posted=True)
+    make_voucher("2026-07-10", dr=[("1002", 500, "x")], cr=[("5001", 500, "x")], posted=True)
     db.expire_all()
 
     ws = _export(client, auth, book,
@@ -77,14 +77,14 @@ def test_区间外的凭证不计入本期发生额(db, client, auth, book, peri
     这才是「导出的数字对不对」——总账的「本期」列按区间内的分录汇总，
     区间被忽略时 1 月的钱会被算进 5 月。
     """
-    make_voucher("2026-01-10", dr=[("100201", 11111, "x")], cr=[("600101", 11111, "x")], posted=True)
-    make_voucher("2026-05-10", dr=[("100201", 22222, "x")], cr=[("600101", 22222, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("1002", 11111, "x")], cr=[("5001", 11111, "x")], posted=True)
+    make_voucher("2026-05-10", dr=[("1002", 22222, "x")], cr=[("5001", 22222, "x")], posted=True)
     db.expire_all()
 
     ws = _export(client, auth, book,
                  period_id=periods[5].id, from_period_id=periods[5].id)
     rows = list(ws.iter_rows(min_row=5))
-    row = next((r for r in rows if r[0].value == "100201"), None)
+    row = next((r for r in rows if r[0].value == "1002"), None)
     assert row is not None, "总账里没有 100201 这一行"
 
     period_debit = float(row[4].value or 0)     # 本期借方

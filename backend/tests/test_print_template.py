@@ -215,8 +215,8 @@ def test_横版纸型打出来确实是横向():
 
 def test_预览用草稿模板渲染(client, auth, book, periods, make_voucher):
     """改标题后预览应立刻出现新标题，不必先保存。"""
-    make_voucher("2026-01-05", dr=[("100201", 300, "首月租金")],
-                 cr=[("600101", 300, "首月租金")], posted=True)
+    make_voucher("2026-01-05", dr=[("1001", 300, "首月租金")],
+                 cr=[("5001", 300, "首月租金")], posted=True)
     r = client.post(
         f"/api/books/{book.id}/print/preview",
         json={"scope": "VOUCHER", "content": {"title": {"text": "草稿专用抬头"}},
@@ -229,7 +229,7 @@ def test_预览用草稿模板渲染(client, auth, book, periods, make_voucher):
 
 def test_预览不写库(client, auth, book, periods, make_voucher):
     """预览只渲染不落库 —— 否则调一次版式就凭空多出一个模板。"""
-    make_voucher("2026-01-05", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
+    make_voucher("2026-01-05", dr=[("1001", 300, "x")], cr=[("5001", 300, "x")], posted=True)
     before = len(client.get(f"/api/books/{book.id}/print/templates", headers=auth).json())
 
     client.post(
@@ -248,8 +248,8 @@ def test_预览与正式打印排版一致(client, auth, book, periods, make_vou
 
     这是「所见即所得」的全部含义 —— 两边一旦分叉，预览就失去意义了。
     """
-    make_voucher("2026-01-05", dr=[("100201", 300, "首月租金")],
-                 cr=[("600101", 300, "首月租金")], posted=True)
+    make_voucher("2026-01-05", dr=[("1001", 300, "首月租金")],
+                 cr=[("5001", 300, "首月租金")], posted=True)
     content = {"title": {"text": "记 账 凭 证"}, "font": {"size": 9}}
 
     prev = client.post(
@@ -293,7 +293,7 @@ def test_草稿半成品时预览给出可读提示(client, auth, book, periods)
 
 def test_预览不传期间时与打印一致地回落到最后一期(client, auth, book, make_voucher):
     """_period() 一直有「不传就取最后一期」的兜底，预览不能自己另立一套规则。"""
-    make_voucher("2026-01-05", dr=[("100201", 300, "x")], cr=[("600101", 300, "x")], posted=True)
+    make_voucher("2026-01-05", dr=[("1001", 300, "x")], cr=[("5001", 300, "x")], posted=True)
     r = client.post(f"/api/books/{book.id}/print/preview",
                     json={"scope": "BALANCE", "content": {}}, headers=auth)
     assert r.status_code == 200, r.text
@@ -303,8 +303,8 @@ def test_预览不传期间时与打印一致地回落到最后一期(client, au
 def test_预览凭证只取前三张(client, auth, book, periods, make_voucher):
     """预览限定张数，否则一个大期间的凭证能把改版式卡死。"""
     for i in range(1, 7):
-        make_voucher(f"2026-01-0{i}", dr=[("100201", 100 + i, f"第{i}笔")],
-                     cr=[("600101", 100 + i, f"第{i}笔")], posted=True)
+        make_voucher(f"2026-01-0{i}", dr=[("1001", 100 + i, f"第{i}笔")],
+                     cr=[("5001", 100 + i, f"第{i}笔")], posted=True)
     r = client.post(
         f"/api/books/{book.id}/print/preview",
         json={"scope": "VOUCHER", "content": {}, "period_id": periods[1].id},
@@ -581,8 +581,8 @@ def test_开关关掉后元素不输出():
 def test_十二行凭证打印时占满三张A4(client, auth, book, periods, make_voucher):
     """12 行 → 3 个槽位；A4 一页 2 张，所以是 2 张纸。"""
     make_voucher("2026-01-05",
-                 dr=[("100201", 10, f"借{i}") for i in range(6)],
-                 cr=[("600101", 10, f"贷{i}") for i in range(6)], posted=True)
+                 dr=[("1001", 10, f"借{i}") for i in range(6)],
+                 cr=[("5001", 10, f"贷{i}") for i in range(6)], posted=True)
     r = client.get(f"/api/books/{book.id}/print/vouchers.html",
                    params={"period_id": periods[1].id}, headers=auth)
     assert r.status_code == 200, r.text
@@ -595,8 +595,8 @@ def test_十二行凭证打印时占满三张A4(client, auth, book, periods, mak
 def test_拆页凭证整批只印一次合计大写(client, auth, book, periods, make_voucher):
     """12 行 → 3 个分片，A4 一页 2 张；合计大写只在尾页那一张上出现。"""
     make_voucher("2026-01-05",
-                 dr=[("100201", 10, f"借{i}") for i in range(6)],
-                 cr=[("600101", 10, f"贷{i}") for i in range(6)], posted=True)
+                 dr=[("1001", 10, f"借{i}") for i in range(6)],
+                 cr=[("5001", 10, f"贷{i}") for i in range(6)], posted=True)
     r = client.get(f"/api/books/{book.id}/print/vouchers.html",
                    params={"period_id": periods[1].id}, headers=auth)
     assert r.status_code == 200, r.text
@@ -605,9 +605,9 @@ def test_拆页凭证整批只印一次合计大写(client, auth, book, periods,
 
 
 def test_A5打印时每页一张(client, auth, book, periods, make_voucher):
-    make_voucher("2026-01-05", dr=[("100201", 10, "x")], cr=[("600101", 10, "x")],
+    make_voucher("2026-01-05", dr=[("1001", 10, "x")], cr=[("5001", 10, "x")],
                  posted=True)
-    make_voucher("2026-01-06", dr=[("100201", 20, "y")], cr=[("600101", 20, "y")],
+    make_voucher("2026-01-06", dr=[("1001", 20, "y")], cr=[("5001", 20, "y")],
                  posted=True)
     tpl_id = client.post(
         f"/api/books/{book.id}/print/templates",
@@ -623,8 +623,8 @@ def test_A5打印时每页一张(client, auth, book, periods, make_voucher):
 def test_预览的分片与正式打印一致(client, auth, book, periods, make_voucher):
     """拆页最容易在预览里跑偏：同一份内容，两边必须拆成一样的槽位。"""
     make_voucher("2026-01-05",
-                 dr=[("100201", 10, f"借{i}") for i in range(4)],
-                 cr=[("600101", 10, f"贷{i}") for i in range(4)], posted=True)
+                 dr=[("1001", 10, f"借{i}") for i in range(4)],
+                 cr=[("5001", 10, f"贷{i}") for i in range(4)], posted=True)
     content = {"paper": "A4"}
     prev = client.post(f"/api/books/{book.id}/print/preview",
                        json={"scope": "VOUCHER", "content": content,
@@ -1256,9 +1256,9 @@ def test_凭证改纸型会连每页张数一起改(client, auth, book, periods,
     这不是顺带发生的副作用，是这张纸本来就能放几张 —— 换成 A5 还硬塞两张，
     打出来就是两张叠在一起，谁也读不了。
     """
-    make_voucher("2026-01-05", dr=[("100201", 10, "x")], cr=[("600101", 10, "x")],
+    make_voucher("2026-01-05", dr=[("1001", 10, "x")], cr=[("5001", 10, "x")],
                  posted=True)
-    make_voucher("2026-01-06", dr=[("100201", 20, "y")], cr=[("600101", 20, "y")],
+    make_voucher("2026-01-06", dr=[("1001", 20, "y")], cr=[("5001", 20, "y")],
                  posted=True)
     url = f"/api/books/{book.id}/print/vouchers.html"
 

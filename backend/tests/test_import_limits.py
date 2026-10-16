@@ -47,8 +47,8 @@ def _rows(n_vouchers: int) -> list[list]:
     rows = []
     for i in range(n_vouchers):
         day = 1 + (i % 28)
-        rows.append([f"2026-01-{day:02d}", f"记-{i}", "收租金", "100201", 100, None])
-        rows.append([None, None, "收租金", "600101", None, 100])
+        rows.append([f"2026-01-{day:02d}", f"记-{i}", "收租金", "1002", 100, None])
+        rows.append([None, None, "收租金", "5001", None, 100])
     return rows
 
 
@@ -203,8 +203,8 @@ def test_作废后payload正文也被清空(client, db, auth, book):
 def test_摘要里保留校验错误(client, db, auth, book):
     """错误摘要要留着 —— 「哪一行错了」比「原始行内容」重要得多。"""
     data = _xlsx(HEADER, [
-        ["2026-01-05", "记-1", "借不平", "100201", 100, None],
-        [None, None, "借不平", "600101", None, 90],
+        ["2026-01-05", "记-1", "借不平", "1002", 100, None],
+        [None, None, "借不平", "5001", None, 90],
     ])
     r = _upload(client, auth, book, data)
     batch_id = r.json()["batch_id"]

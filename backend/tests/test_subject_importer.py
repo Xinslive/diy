@@ -62,7 +62,7 @@ def test_确认导入会完整覆盖自带科目并更新编码规则(client, au
         ("100101", "备用金", 2, True),
         ("2001", "短期借款", 1, True),
     ]
-    assert db.scalar(select(Subject).where(Subject.book_id == book.id, Subject.code == "600101")) is None
+    assert db.scalar(select(Subject).where(Subject.book_id == book.id, Subject.code == "5001")) is None
     audit = db.scalar(select(AuditLog).where(
         AuditLog.book_id == book.id, AuditLog.action == "IMPORT_SUBJECTS"
     ).order_by(AuditLog.id.desc()))
@@ -70,7 +70,7 @@ def test_确认导入会完整覆盖自带科目并更新编码规则(client, au
 
 
 def test_已有凭证的账套拒绝覆盖且不改动科目(client, auth, book, make_voucher, db):
-    make_voucher("2026-01-05", dr=[("1001", 10, "迁移保护")], cr=[("600101", 10, "迁移保护")])
+    make_voucher("2026-01-05", dr=[("1001", 10, "迁移保护")], cr=[("5001", 10, "迁移保护")])
     body = _subjects_file()
     upload = {"file": ("会计科目.xlsx", body, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
 

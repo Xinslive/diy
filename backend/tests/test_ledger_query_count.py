@@ -47,8 +47,8 @@ def _tree_scans(stmts) -> list[str]:
 def _seed(make_voucher, months=(1, 2, 3, 5, 6, 8)):
     for month in months:
         make_voucher(f"2026-{month:02d}-10",
-                     dr=[("100201", 100 * month, "收款")],
-                     cr=[("600101", 100 * month, "收款")], posted=True)
+                     dr=[("1002", 100 * month, "收款")],
+                     cr=[("5001", 100 * month, "收款")], posted=True)
 
 
 def test_总账一页只跑一次全账聚合(db, book, periods, subjects, make_voucher):
@@ -89,7 +89,7 @@ def test_报表逐科目取数不再每个科目一次全账聚合(db, book, per
     这里**没有**改 evaluate.py —— 记忆化放在引擎实例内，调用形状不变也受益。
     """
     _seed(make_voucher)
-    codes = ["100201", "100202", "100203", "600101", "6602", "1122"]
+    codes = ["1002", "1012", "1001", "5001", "5602", "1122"]
     eng = LedgerEngine.for_report(db, book.id)
 
     with _statements() as stmts:
@@ -107,7 +107,7 @@ def test_报表逐科目取数不再每个科目一次全账聚合(db, book, per
 def test_批量预热接口一次算完(db, book, periods, subjects, make_voucher):
     """batch_figures：报表可以先批量预热，结果与逐个取数完全一致。"""
     _seed(make_voucher)
-    ids = [subjects[c].id for c in ("100201", "600101", "1122")]
+    ids = [subjects[c].id for c in ("1002", "5001", "1122")]
 
     eng = LedgerEngine.for_report(db, book.id)
     with _statements() as stmts:
@@ -125,12 +125,12 @@ def test_账簿口径与报表口径是两个明确的引擎(db, book, periods, 
 
     差额恰好是结转凭证的金额 —— 这不是 bug，界面必须标注（由报表/前端负责）。
     """
-    make_voucher("2026-01-10", dr=[("100201", 900, "租金")], cr=[("600101", 900, "租金")],
+    make_voucher("2026-01-10", dr=[("1002", 900, "租金")], cr=[("5001", 900, "租金")],
                  posted=True)
-    make_voucher("2026-01-31", dr=[("600101", 900, "结转")], cr=[("4103", 900, "结转")],
+    make_voucher("2026-01-31", dr=[("5001", 900, "结转")], cr=[("3103", 900, "结转")],
                  posted=True, source="CARRY_FORWARD")
 
-    revenue = subjects["600101"].id
+    revenue = subjects["5001"].id
     ledger = LedgerEngine.for_ledger(db, book.id).figures(revenue, periods[1].ord)
     report = LedgerEngine.for_report(db, book.id).figures(revenue, periods[1].ord)
 

@@ -151,7 +151,7 @@ def test_年初余额不随月份变化(db, book, periods, subjects, make_vouche
     db.add(PeriodOpening(book_id=book.id, period_id=periods[1].id,
                          subject_id=subjects["1001"].id, amount=Decimal("20000")))
     db.commit()
-    make_voucher("2026-05-10", dr=[("1001", 500, "x")], cr=[("600101", 500, "x")], posted=True)
+    make_voucher("2026-05-10", dr=[("1001", 500, "x")], cr=[("5001", 500, "x")], posted=True)
 
     mar = render(db, book, periods[3], "BALANCE_SHEET")
     dec = render(db, book, periods[12], "BALANCE_SHEET")
@@ -191,9 +191,9 @@ def _mk(db, book, admin_user, subjects, m):
     return create_voucher(db, book_id=book.id, user=admin_user,
                           voucher_date=date(2026, m, 10),
                           entries=[
-                              {"subject_id": subjects["100201"].id, "direction": "DEBIT",
+                              {"subject_id": subjects["1002"].id, "direction": "DEBIT",
                                "amount": "10000", "summary": "收租"},
-                              {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+                              {"subject_id": subjects["5001"].id, "direction": "CREDIT",
                                "amount": "10000", "summary": "收租"},
                           ])
 
@@ -232,7 +232,7 @@ def test_年初余额列的合计必须取年初(db, book, periods, subjects, ma
     db.add(PeriodOpening(book_id=book.id, period_id=periods[1].id,
                          subject_id=subjects["1001"].id, amount=Decimal("20000")))
     db.commit()
-    make_voucher("2026-03-10", dr=[("1001", 30000, "x")], cr=[("600101", 30000, "x")],
+    make_voucher("2026-03-10", dr=[("1001", 30000, "x")], cr=[("5001", 30000, "x")],
                  posted=True)
 
     data = render(db, book, periods[3], "BALANCE_SHEET")
@@ -289,26 +289,29 @@ def test_利润表排除结转凭证(db, book, periods, subjects, admin_user, tp
     from app.ledger.engine import LedgerEngine
 
     sid = db.scalar(select(Subject.id).where(
-        Subject.book_id == book.id, Subject.code == "600101"))
+        Subject.book_id == book.id, Subject.code == "5001"))
     incl = LedgerEngine(db, book.id, exclude_carry_forward=False).figures(sid, periods[12].ord)
     assert incl.dr_cum - incl.cr_cum == Decimal("0"), "含结转凭证时收入应被冲平"
 
 
 def test_存货扣减跌价准备(db, book, periods, subjects, admin_user, tpl, make_voucher):
-    """模板里 1405 和 -1471 同在一个 sum 里，减项必须真的被减掉。
+    """存货 = 材料采购 + 在途物资 + 原材料 + 库存商品 + 委托加工物资。
 
-    双栏版式里「存货」还在第 10 行，减号仍在科目编码上 ——
-    改成双栏只改了版式，没改取数。
+    减项的机制本身没变（还在科目编码上打减号，见固定资产的累计折旧、
+    生产性生物资产的累计折旧），但**存货这一行不再减 1471 跌价准备** ——
+    换成用友 4-2-2 科目表之后表里就没有这个科目了。科目都不存在就谈不上
+    减值准备，挂一个不存在的编码只会让这一行永远取不到数。
     """
     from app.models import PeriodOpening
 
-    for code, amt in (("1405", "100000"), ("1471", "-12000")):
+    for code, amt in (("1401", "10000"), ("1402", "20000"), ("1403", "30000"),
+                      ("1405", "100000"), ("1408", "40000")):
         db.add(PeriodOpening(book_id=book.id, period_id=periods[1].id,
                              subject_id=subjects[code].id, amount=Decimal(amt)))
     db.commit()
 
     data = render(db, book, periods[12], "BALANCE_SHEET")
-    assert num(at(data, L_OPENING, "存货")) == Decimal("88000")
+    assert num(at(data, L_OPENING, "存货")) == Decimal("200000")
 
 
 def test_固定资产扣累计折旧(db, book, periods, subjects, admin_user, tpl):
@@ -338,7 +341,7 @@ def test_报表求值不报错(db, book, periods, subjects, make_voucher, tpl):
     利润表 3 列（一行一个项目）。形状变了却不出错，正是这套模板最危险的
     那种「悄无声息」—— 财务看到的是一张少了一栏的表，而不是一条报错。
     """
-    make_voucher("2026-01-10", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("1002", 100, "x")], cr=[("5001", 100, "x")], posted=True)
     expect_cols = {"BALANCE_SHEET": 8, "INCOME_SHEET": 3}
     expect_rows = {"BALANCE_SHEET": 33, "INCOME_SHEET": 13}
     for code in ("BALANCE_SHEET", "INCOME_SHEET"):
@@ -395,7 +398,7 @@ def test_跨年后年初余额等于上年期末(db, book, periods, subjects, ad
     from app.accounting.periods import carry_forward_profit, close_period, year_end_carry
     from app.models import Period
 
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
     for m in range(1, 13):
         has = db.scalar(select(Voucher.id).where(
             Voucher.book_id == book.id, Voucher.period_id == periods[m].id))
@@ -426,7 +429,7 @@ def test_跨年后本年累计不带上一年(db, book, periods, subjects, admin
     from app.accounting.periods import carry_forward_profit, close_period, year_end_carry
     from app.models import Period, Voucher
 
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
     for m in range(1, 13):
         if db.scalar(select(Voucher.id).where(
                 Voucher.book_id == book.id, Voucher.period_id == periods[m].id)):
