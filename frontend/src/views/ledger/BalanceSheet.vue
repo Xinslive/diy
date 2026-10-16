@@ -31,9 +31,15 @@
         <el-option label="包含未记账凭证" :value="true" />
         <el-option label="仅已记账凭证" :value="false" />
       </el-select>
-      <!-- 措辞跟总账一致（「仅明细科目」）：工具栏宽度就差这几个字换行，
-           而且两页叫同一个名字，用户不用记两种说法 -->
-      <el-checkbox v-model="onlyLeaf" label="仅明细科目" @change="load" />
+      <!-- 「看哪些科目」是同一根轴上的三档，不是两个独立的开关。一级科目和
+           明细科目本来就互斥（顶层科目要是同时没有下级，两头都算），摆两个
+           复选框就会勾出一个两边都不是的结果，还得让人猜现在是哪个口径。
+           三档互斥就用单选，用户永远只需要回答一个问题。 -->
+      <el-radio-group v-model="scope" size="default">
+        <el-radio-button value="top">仅一级科目</el-radio-button>
+        <el-radio-button value="leaf">仅明细科目</el-radio-button>
+        <el-radio-button value="all">全部科目</el-radio-button>
+      </el-radio-group>
       <span class="spacer" />
       <!-- 三颗动作按钮**整体**换行。工具栏宽度不够时 flex-wrap 会把最后一颗
            甩到第二行，孤零零一个「导出 Excel」看着像是排版坏了。
@@ -119,7 +125,12 @@ import { fmt } from '@/utils/format'
 const store = useSessionStore()
 const data = ref({ rows: [], check: {} })
 const includeUnposted = ref(true)
-const onlyLeaf = ref(true)
+/** 看哪些科目：三档互斥，默认只看一级。
+ *
+ *  默认这一档而不是沿用原来的「仅明细科目」，是因为明细级在真实账里是两三千行
+ *  （星悦荟商管光一张余额表就是 1300 多行），默认铺满屏谁都看不动；一级科目
+ *  六七十行，一眼扫完就知道钱在哪。要下钻的用户自己切「仅明细科目」或「全部科目」。 */
+const scope = ref('top')
 
 /** 本页自选的期间。跟明细账 / 总账一个口径：页内自选，不改顶栏的全局期间。
  *  余额表既有单期（默认）也有区间，所以「止期」两种模式共用同一个 ref。 */
@@ -179,7 +190,14 @@ function onFromChange() {
 /** 只认最新一趟：顶栏期间连点时，旧响应不许覆盖新数据（见 composables/useLatestLoad）。 */
 const { loading, run, isStale } = useLatestLoad('ledger/balance')
 
-const visibleRows = computed(() => (onlyLeaf.value ? data.value.rows.filter((r) => r.is_leaf) : data.value.rows))
+/** 过滤是纯前端的事：接口一次就把整棵树都给了，切档位不必重新取数。
+ *  （原来那个复选框绑的是 @change="load"，每拨一次都白跑一趟全表。） */
+const visibleRows = computed(() => {
+  const rows = data.value.rows
+  if (scope.value === 'top') return rows.filter((r) => r.level === 1)
+  if (scope.value === 'leaf') return rows.filter((r) => r.is_leaf)
+  return rows
+})
 
 async function load() {
   if (!store.bookId || !periodId.value) return
@@ -216,8 +234,14 @@ function exportXlsx() {
 }
 
 onMounted(async () => { alignPeriod(); await load() })
-// 顶栏换账套 / 换年度：先归位再取数，否则会用新账套的 id 去查旧期间
-watch(() => [store.bookId, store.currentYear], async () => {
+// 顶栏换账套 / 换年度：先归位再取数，否则会用新账套的 id 去查旧期间。
+//
+//  **还得盯住 periods 的长度**，不能只盯年份 —— 总账和明细账早就踩过这个坑：
+//  store.loadBooks() 先灌 books、再灌 periods，currentYear 会先从 books 的
+//  latest_year 变成真值，而那一刻 periods 还是空的；alignPeriod 于是把 periodId
+//  归成 null，之后 periods 到位也不再有人叫它归位。直接打开本页（刷新、按地址
+//  进）就正好落在这个中间态上：期间显示「请选择」、表里空无一物、试算不平。
+watch(() => [store.bookId, store.currentYear, store.periods.length], async () => {
   alignPeriod()
   await load()
 })

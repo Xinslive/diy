@@ -86,6 +86,8 @@ const BALANCE = fs.readFileSync(
   new URL('../src/views/ledger/BalanceSheet.vue', import.meta.url), 'utf8')
 const GENERAL = fs.readFileSync(
   new URL('../src/views/ledger/GeneralLedger.vue', import.meta.url), 'utf8')
+const DETAIL = fs.readFileSync(
+  new URL('../src/views/ledger/DetailLedger.vue', import.meta.url), 'utf8')
 
 t('余额表工具栏有期间下拉', () => {
   assert.match(BALANCE, /v-model="periodId"/, '没有页内期间控件')
@@ -111,8 +113,15 @@ t('页内控件不去改顶栏的全局期间', () => {
 t('换账套/换年度后，期间要归位到当前口径里', () => {
   // 不归位就会用新账套的 bookId 去查旧期间 id
   assert.match(BALANCE, /alignPeriod\(\)/, '没有归位逻辑')
-  assert.match(BALANCE, /watch\(\(\) => \[store\.bookId, store\.currentYear\]/,
-    '换账套/换年度后没有重新归位')
+  // **必须连 periods.length 一起盯**（总账、明细账当年就是这么补的）。
+  // store.loadBooks() 先灌 books 再灌 periods：currentYear 会先从 books 的
+  // latest_year 变成真值，那一刻 periods 还是空的，alignPeriod 把 periodId 归成
+  // null；只盯年份的话 watcher 不会再响一次，periods 到位后也没人叫它归位 ——
+  // 直接打开本页就会停在「请选择 + 空表 + 试算不平」。
+  for (const [name, src] of [['科目余额表', BALANCE], ['总账', GENERAL], ['明细账', DETAIL]]) {
+    assert.match(src, /watch\(\(\) => \[store\.bookId, store\.currentYear, store\.periods\.length\]/,
+      `${name}：watcher 没盯住 periods.length，刷新直接进本页时会停在空表上`)
+  }
 })
 
 console.log('')
