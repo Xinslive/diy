@@ -37,6 +37,13 @@
         <span>点击金额单元格，在右侧用选择框配置取数、合计和计算关系</span>
       </div>
       <el-tag v-if="hiddenRowCount" type="info" effect="plain">{{ hiddenRowCount }} 行已隐藏</el-tag>
+      <!-- 公式面板固定占 330px，是设计模式「挤压」的最大来源。收起它画布就能
+           铺满整行；而收起之后点任意金额单元格会自动展开，所以收起来不会把
+           人堵在「想改公式却找不到面板」的处境里。 -->
+      <el-button size="small" class="inspector-toggle" @click="inspectorOpen = !inspectorOpen">
+        <el-icon><component :is="inspectorOpen ? ArrowRight : ArrowLeft" /></el-icon>
+        {{ inspectorOpen ? '收起公式面板' : '展开公式面板' }}
+      </el-button>
     </div>
 
     <div class="card">
@@ -67,15 +74,42 @@
         <div v-for="(e, i) in data.errors" :key="i">{{ e }}</div>
       </el-alert>
 
-      <div class="report-workspace" :class="{ 'has-inspector': designMode }">
+      <div class="report-workspace" :class="{ 'has-inspector': designMode && inspectorOpen }">
         <div class="report-canvas">
           <div class="canvas-toolbar no-print">
             <span class="canvas-title"><el-icon><TrendCharts /></el-icon>报表数据</span>
             <span v-if="designMode" class="canvas-hint">点击金额单元格配置取数</span>
             <span v-else class="canvas-hint">{{ visibleRows.length }} 行 · {{ data.cols.length }} 列</span>
+            <!-- 缩放：报表动辄几十列几百行，设计模式还要在表头塞列名输入框和口径
+                 下拉，挤在卡片里只能横着拖着看。做法与「打印模板」的舞台一致 ——
+                 表格按自然尺寸排版，外层整体缩放：想看全就缩到适应宽度，
+                 想读数字就放大。 -->
+            <div class="zoom-tools">
+              <el-button-group size="small">
+                <el-button :disabled="scale <= MIN_SCALE" title="缩小" @click="zoomBy(-0.1)">
+                  <el-icon><ZoomOut /></el-icon>
+                </el-button>
+                <el-button class="zoom-label"
+                           :title="fitMode ? '适应宽度中，点一下回到 100%' : '点一下回到 100%'"
+                           @click="resetZoom">{{ Math.round(scale * 100) }}%</el-button>
+                <el-button :disabled="scale >= MAX_SCALE" title="放大" @click="zoomBy(0.1)">
+                  <el-icon><ZoomIn /></el-icon>
+                </el-button>
+              </el-button-group>
+              <el-tooltip content="适应宽度：整张表缩到一屏看全" placement="bottom">
+                <el-button size="small" :type="fitMode ? 'primary' : ''" @click="fitToWidth">
+                  <el-icon><FullScreen /></el-icon>&nbsp;适应宽度
+                </el-button>
+              </el-tooltip>
+            </div>
           </div>
-          <div class="table-scroll">
-          <table class="report-table" v-loading="loading">
+          <!-- 唯一的滚动容器。内层为什么还要再套两层，见脚本里的注释：
+               transform 不改变布局盒，只缩放的话滚动范围会按未缩放的尺寸算 ——
+               缩到 50% 右边空一大片，放到 200% 底部被截断。 -->
+          <div ref="scrollHost" class="table-scroll" @wheel="onWheel">
+            <div class="canvas-box" :style="canvasBoxStyle">
+              <div ref="zoomLayer" class="canvas-zoom" :style="zoomLayerStyle">
+                <table ref="tableEl" class="report-table" v-loading="loading">
         <thead>
           <tr>
             <th class="c-gutter no-print" v-if="designMode">行</th>
@@ -185,11 +219,13 @@
             </template>
           </tr>
         </tbody>
-          </table>
+                </table>
+              </div>
+            </div>
           </div>
         </div>
 
-        <aside v-if="designMode" class="formula-inspector no-print">
+        <aside v-if="designMode && inspectorOpen" class="formula-inspector no-print">
           <div v-if="editing" class="inspector-content">
             <div class="inspector-head">
               <div>
@@ -316,12 +352,13 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  CircleCheckFilled, DataAnalysis, Delete, Download, EditPen, Link,
-  MagicStick, Operation, Reading, Tools, TrendCharts,
+  ArrowLeft, ArrowRight, CircleCheckFilled, DataAnalysis, Delete, Download,
+  EditPen, FullScreen, Link, MagicStick, Operation, Reading, Tools,
+  TrendCharts, ZoomIn, ZoomOut,
 } from '@element-plus/icons-vue'
 import * as api from '@/api/report'
 import * as subjectApi from '@/api/subject'
@@ -331,6 +368,7 @@ import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 import { visibleTemplates } from '@/utils/reportTemplates'
+import { MAX_SCALE, MIN_SCALE, clampScale, fitScale } from '@/utils/canvasZoom'
 
 const store = useSessionStore()
 const route = useRoute()
@@ -343,6 +381,8 @@ const data = ref({ rows: [], cols: [], errors: [] })
 /** 只认最新一趟：期间/模板切换时，旧响应不许覆盖新数据（见 composables/useLatestLoad）。 */
 const { loading, run, isStale } = useLatestLoad('report/render')
 const designMode = ref(false)
+/** 公式面板默认展开（收起是为了给画布让宽度），点金额单元格会自动展开回来。 */
+const inspectorOpen = ref(true)
 const editing = ref(null)
 const dirty = reactive({})
 const subjectOptions = ref([])
@@ -644,9 +684,139 @@ async function toggleDesignMode() {
   onDesignToggle()
 }
 
+// ------------------------------------------------------------------ 画布缩放
+
+/* 报表能到几十列几百行，设计模式还要在表头塞列名输入框和口径下拉。塞在卡片
+ * 里就只能横着拖着看，一半内容在屏幕外 —— 也就是用户说的「挤压」。
+ *
+ * 做法照搬「打印模板」的舞台：表格按**自然尺寸**排版，外层整体缩放。
+ *
+ * 关键在两层结构。transform 不改变布局盒 —— 只给表格加 transform 的话，
+ * 滚动容器仍按**未缩放**的尺寸算可滚范围，缩到 50% 时右边空出一大片，
+ * 放大到 200% 时底部会被截断。所以：
+ *
+ *   .table-scroll   唯一的滚动容器
+ *     .canvas-box   按「缩放后」的尺寸占位（宽度和高度都乘 scale）
+ *       .canvas-zoom  绝对定位，固定按自然宽度排版，transform 在这里
+ *         table.report-table
+ *
+ * .canvas-zoom 的宽度必须是**未缩放的可用宽度**，表格才能维持今天的排版
+ * 结果 —— 不然缩放一次表格就重排一次，字会跟着折行，量出来的高度也跟着跳。
+ *
+ * 而 .canvas-box 的宽高取自 table 自己的 offsetWidth/offsetHeight：表格
+ * 内容比容器宽时（设计模式就是如此）offsetWidth 才是真实的内容宽度，用容器
+ * 宽度占位会把溢出部分裁掉，横向滚动就没了。offsetWidth 不受 transform
+ * 影响，所以缩放中读到的一直是自然尺寸。 */
+const scrollHost = ref(null)
+const zoomLayer = ref(null)
+const tableEl = ref(null)
+const scale = ref(1)
+/** 适应宽度：跟着容器尺寸走，窗口或面板一变就重新铺满 */
+const fitMode = ref(false)
+/** 滚动容器的可用宽度（扣掉内边距），也就是表格按 100% 排版时的宽度 */
+const availW = ref(0)
+/** 表格未缩放时的真实尺寸，用来做缩放后的占位 */
+const tableBox = reactive({ w: 0, h: 0 })
+
+const canvasBoxStyle = computed(() => {
+  // 还没量到就交回给常规流：宁可一帧没缩放，也不要先塌成 0 高度
+  if (!tableBox.w) return {}
+  // 宽度和高度都向上取整并留 1px 余量：canvas-box 是 overflow:hidden，
+  // 而缩放后的边界常常落在半个像素上，四舍五入到下界会啃掉表格最后一根线。
+  return {
+    width: `${Math.ceil(tableBox.w * scale.value)}px`,
+    height: `${Math.ceil(tableBox.h * scale.value) + 1}px`,
+  }
+})
+const zoomLayerStyle = computed(() => ({
+  width: `${availW.value}px`,
+  transform: `scale(${scale.value})`,
+}))
+
+/** 滚动容器扣掉自身内边距后的可用宽度。 */
+function hostAvailWidth() {
+  const h = scrollHost.value
+  if (!h) return 0
+  const cs = getComputedStyle(h)
+  return Math.max(0, h.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0))
+}
+
+/**
+ * 量一次画布。
+ *
+ * 宽度变了要**等 DOM 真的更新完再量第二遍**。层宽是由 availW 决定的，而 Vue
+ * 更新 DOM 是异步的：改完 availW 就直接量表，量到的还是上一版布局 —— 收起
+ * 公式面板后画布变宽，按旧宽度算出的缩放比会大到 130% 还不止，而且因为
+ * availW 之后不再变化，永远不会再被纠正回来。
+ */
+function measure() {
+  const table = tableEl.value
+  if (!table) return
+  const w = hostAvailWidth()
+  if (w !== availW.value) {
+    availW.value = w
+    nextTick(measure)
+    return
+  }
+  if (table.offsetWidth !== tableBox.w) tableBox.w = table.offsetWidth
+  if (table.offsetHeight !== tableBox.h) tableBox.h = table.offsetHeight
+  // 适应宽度是「一直铺满」而不是「量一次就定死」：窗口缩放、面板收起、
+  // 甚至某一列内容变长导致自然宽度变了，都得跟着重算。
+  if (fitMode.value) fitToWidth()
+}
+
+function fitToWidth() {
+  // 分母是表格自己的内容宽。用容器宽当分母的话，表格一铺满比值就是 1，
+  // 这个按钮点了永远停在 100%，看着「能用」其实什么也没做。
+  const next = fitScale(hostAvailWidth(), tableEl.value?.offsetWidth || 0)
+  if (next === null) return          // 量不出来就保持原档，别写个 1 进去
+  fitMode.value = true
+  scale.value = next
+}
+
+function zoomBy(d) {
+  fitMode.value = false
+  scale.value = clampScale(scale.value + d)
+}
+
+function resetZoom() {
+  fitMode.value = false
+  scale.value = 1
+}
+
+/** Ctrl/⌘ + 滚轮：和打印预览一个手势习惯，捏着滚轮直接缩放画布。 */
+function onWheel(e) {
+  if (!e.ctrlKey && !e.metaKey) return
+  e.preventDefault()
+  fitMode.value = false
+  scale.value = clampScale(scale.value + (e.deltaY < 0 ? 0.1 : -0.1))
+}
+
+let canvasRO = null
+onMounted(() => {
+  measure()
+  if (typeof ResizeObserver === 'undefined') return
+  canvasRO = new ResizeObserver(() => measure())
+  // 容器宽度变了要重算；表格高度变了要重算占位。少观察一个都会留下
+  // 「窗口拉大了表还是那么宽」「加了行下面被截掉」这种半截状态。
+  if (scrollHost.value) canvasRO.observe(scrollHost.value)
+  if (zoomLayer.value) canvasRO.observe(zoomLayer.value)
+})
+onBeforeUnmount(() => {
+  canvasRO?.disconnect()
+  canvasRO = null
+})
+
+/** 换模板、切设计模式、行高变化都会改表格尺寸，量一次。
+ *  flush:'post' 保证量的时候 DOM 已经更新完 —— 否则量到的还是上一版的表。 */
+watch([data, designMode], () => measure(), { flush: 'post' })
+
 // ------------------------------------------------------------------ 单元格
 
 function onCellClick(row, cell, item) {
+  // 面板收着的时候点单元格，等于明确表示「我要改这一格」，顺手把它带出来 ——
+  // 不然用户会以为点不动。
+  inspectorOpen.value = true
   editing.value = {
     row, rowNo: row.row_no, colNo: cell.col_no, rowLabel: labelText(row, item.side),
     colLabel: item.col.label, label: cell.label, addr: cell.addr,
@@ -948,6 +1118,8 @@ watch(() => store.periodId, () => load())
 .design-strip-copy strong { font-size: 13px; }
 .design-strip-copy span { font-size: 12px; color: #607594; }
 .design-strip .el-tag { margin-left: auto; }
+.inspector-toggle { flex: none; margin-left: 8px; }
+.inspector-toggle .el-icon { margin-right: 4px; }
 
 .report-card { padding: 18px; border-color: #dfe5ee; box-shadow: 0 6px 20px rgba(27, 44, 72, .04); }
 .report-head { text-align: center; margin: 0 0 18px; }
@@ -965,7 +1137,16 @@ watch(() => store.periodId, () => load())
 .canvas-title .el-icon { color: var(--report-blue); }
 .canvas-hint { color: var(--report-muted); font-size: 11px; }
 .canvas-hint::before { content: '·'; margin-right: 7px; color: #b4bdc9; }
-.table-scroll { overflow-x: auto; }
+/* 缩放控件靠右，和「打印模板」舞台上的那组是同一套图标与手感 */
+.zoom-tools { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.zoom-tools :deep(.el-button-group .el-button) { padding: 6px 9px; }
+.zoom-label { min-width: 62px; font-variant-numeric: tabular-nums; }
+
+/* 唯一的滚动容器：整张表按自然尺寸排版，外层 canvas-box 按缩放后的尺寸占位，
+   内层 canvas-zoom 负责 transform。脚本里的注释讲了为什么必须分这两层。 */
+.table-scroll { overflow: auto; }
+.canvas-box { position: relative; overflow: hidden; min-height: 120px; }
+.canvas-zoom { position: absolute; top: 0; left: 0; transform-origin: top left; }
 
 .report-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .report-table th, .report-table td { border: 1px solid var(--report-line); padding: 7px 8px; }
@@ -1096,5 +1277,16 @@ code.ref { display: inline-block; margin: 2px 4px; background: #f3f4f6; padding:
   .formula-inspector { position: static; max-height: none; }
   .report-toolbar-copy { width: 100%; margin-right: 0; }
   .template-select { flex: 1; min-width: 140px; }
+  .canvas-toolbar { flex-wrap: wrap; padding: 6px 12px; }
+  .zoom-tools { margin-left: auto; }
+}
+
+/* 缩放只服务于屏幕。真出纸走的是后端那份打印模板（点「预览打印」），
+   但万一路人直接对这个页面按 Ctrl+P，也不能把当前档位的缩放带进纸里 ——
+   缩到 60% 的一整版资产负债表，打出来是看不清的。 */
+@media print {
+  .canvas-zoom { transform: none !important; width: auto !important; }
+  .canvas-box { width: auto !important; height: auto !important; min-height: 0; overflow: visible; }
+  .table-scroll { overflow: visible !important; }
 }
 </style>
