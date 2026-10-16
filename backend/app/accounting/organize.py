@@ -37,8 +37,18 @@ from app.accounting.audit_helper import log, voucher_snapshot
 from app.accounting.util import constraint_name, period_label
 from app.models import Entry, Period, SysUser, Voucher
 
-# 凭证号形如「记001」，前缀是 1~2 个汉字，序号是数字（补零到三位）
+# 凭证号形如「记0001」，前缀是 1~2 个汉字，序号是数字（补零到 NO_WIDTH 位）
 NO_PATTERN = re.compile(r"^(?P<prefix>[^\d]{1,4})(?P<seq>\d+)$")
+# **序号补零到几位，全仓只有这一个数说了算**（2026-10-16 由三位改回四位）。
+#
+#   发号 / 插入顺延 / 整理重编 / 体检的断号清单 / 一次性补零脚本，
+#   五处各自写死过三位的格式串，改一处就留下两三种宽度的号混在同一个列表里。
+#   位数是**排版**，不是账：发号、断号体检、整理全都只按整数序号比
+#   （split_no），所以改宽窄不影响大小关系，也就不会撞上唯一约束。
+#
+#   三位（记008）和四位（记0008）在列表里并排时，序号那几列没法上下对齐，
+#   扫一眼数不出号断在哪 —— 四位给「一个月要记几百张」留出余量。
+NO_WIDTH = 4
 PARK_PREFIX = "∥"  # ∥ 临时占位前缀，保证永不与真实凭证号冲突
 # 与 accounting/vouchers.py 同一份判据：撞号要认约束，不能「凡 IntegrityError
 # 都当撞号」（util.constraint_name 的注释里写了为什么）。
@@ -251,7 +261,7 @@ def check_period(db: Session, period: Period) -> dict:
         _, prefix, top_seq = max(with_seq, key=lambda t: t[2])
         used = {s for _v, p, s in with_seq if p == prefix}
         missing = [n for n in range(1, top_seq + 1) if n not in used]
-        gaps = [f"{prefix}{n:03d}" for n in missing]
+        gaps = [f"{prefix}{n:0{NO_WIDTH}d}" for n in missing]
         seen: set[str] = set()
         for v, p, s in with_seq:
             if p != prefix:
@@ -357,7 +367,7 @@ def plan_organize(
             while n in reserved:
                 n += 1
             plan.changes.append(
-                Change(v.id, v.voucher_no, f"{prefix}{n:03d}",
+                Change(v.id, v.voucher_no, f"{prefix}{n:0{NO_WIDTH}d}",
                        v.voucher_date.isoformat(), v.status, v.source)
             )
         for v in rows:

@@ -72,7 +72,7 @@ def test_删除中间一张会断号(db, book, periods, subjects, admin_user):
     delete_voucher(db, vs[1], admin_user)
 
     r = check_period(db, periods[1])
-    assert r["gaps"] == ["记002"]
+    assert r["gaps"] == ["记0002"]
     assert r["clean"] is False
 
 
@@ -93,7 +93,7 @@ def test_体检只是查断号_不排号也不改号(db, book, periods, subjects
     delete_voucher(db, vs[1], admin_user)
     before = _nos(db, book)
 
-    assert check_period(db, periods[1])["gaps"] == ["记002"]
+    assert check_period(db, periods[1])["gaps"] == ["记0002"]
     assert _nos(db, book) == before
 
 
@@ -104,7 +104,7 @@ def test_计划阶段绝对不碰数据(db, book, periods, subjects, admin_user)
 
     plans = plan_organize(db, book_id=book.id, period_id=periods[1].id, strategy="RENUM")
     plan = plans[0]
-    assert plan.gaps == ["记002"]
+    assert plan.gaps == ["记0002"]
     assert any(c.changed for c in plan.changes)
     assert _nos(db, book) == before, "计划阶段绝对不能碰数据"
 
@@ -115,25 +115,25 @@ def test_RENUM补断号(db, book, periods, subjects, admin_user):
 
     plans = plan_organize(db, book_id=book.id, period_id=periods[1].id, strategy="RENUM")
     changes = {c.old_no: c.new_no for c in plans[0].changes if c.changed}
-    assert changes == {"记003": "记002"}      # 记001 原地不动，不算改动
+    assert changes == {"记0003": "记0002"}      # 记0001 原地不动，不算改动
 
 
 def test_重排会交换号_两阶段必须生效(db, book, periods, subjects, admin_user):
-    """记001 与 记002 互换编号，直接改会撞唯一约束。"""
-    a = _mk(db, book, admin_user, subjects, "2026-01-20", no="记001")
-    b = _mk(db, book, admin_user, subjects, "2026-01-10", no="记002")
+    """记0001 与 记0002 互换编号，直接改会撞唯一约束。"""
+    a = _mk(db, book, admin_user, subjects, "2026-01-20", no="记0001")
+    b = _mk(db, book, admin_user, subjects, "2026-01-10", no="记0002")
 
     plans = plan_organize(db, book_id=book.id, period_id=periods[1].id, strategy="SORT_DATE")
     changes = {c.voucher_id: (c.old_no, c.new_no) for c in plans[0].changes}
-    assert changes[a.id] == ("记001", "记002")
-    assert changes[b.id] == ("记002", "记001")
+    assert changes[a.id] == ("记0001", "记0002")
+    assert changes[b.id] == ("记0002", "记0001")
 
     apply_organize(db, book_id=book.id, user=admin_user,
                    period_id=periods[1].id, strategy="SORT_DATE")
 
     db.expire_all()
-    assert db.get(Voucher, a.id).voucher_no == "记002"
-    assert db.get(Voucher, b.id).voucher_no == "记001"
+    assert db.get(Voucher, a.id).voucher_no == "记0002"
+    assert db.get(Voucher, b.id).voucher_no == "记0001"
 
 
 def test_只有升序没有倒序(db, book, periods, subjects, admin_user):
@@ -144,34 +144,34 @@ def test_只有升序没有倒序(db, book, periods, subjects, admin_user):
 
 
 def test_结转损益排在最后(db, book, periods, subjects, admin_user):
-    a = _mk(db, book, admin_user, subjects, "2026-01-05", no="记001")
-    cf1 = _mk(db, book, admin_user, subjects, "2026-01-31", no="记002")
-    cf2 = _mk(db, book, admin_user, subjects, "2026-01-31", no="记003")
+    a = _mk(db, book, admin_user, subjects, "2026-01-05", no="记0001")
+    cf1 = _mk(db, book, admin_user, subjects, "2026-01-31", no="记0002")
+    cf2 = _mk(db, book, admin_user, subjects, "2026-01-31", no="记0003")
     for v in (cf1, cf2):
         v.source = "CARRY_FORWARD"
     db.commit()
 
     plans = plan_organize(db, book_id=book.id, period_id=periods[1].id, strategy="SORT_DATE")
     new_no = {c.voucher_id: c.new_no for c in plans[0].changes}
-    assert new_no[a.id] == "记001"
-    assert {new_no[cf1.id], new_no[cf2.id]} == {"记002", "记003"}
+    assert new_no[a.id] == "记0001"
+    assert {new_no[cf1.id], new_no[cf2.id]} == {"记0002", "记0003"}
 
     apply_organize(db, book_id=book.id, user=admin_user,
                    period_id=periods[1].id, strategy="SORT_DATE")
     db.expire_all()
-    assert db.get(Voucher, cf1.id).voucher_no in ("记002", "记003")
-    assert db.get(Voucher, cf2.id).voucher_no in ("记002", "记003")
-    assert db.get(Voucher, a.id).voucher_no == "记001"
+    assert db.get(Voucher, cf1.id).voucher_no in ("记0002", "记0003")
+    assert db.get(Voucher, cf2.id).voucher_no in ("记0002", "记0003")
+    assert db.get(Voucher, a.id).voucher_no == "记0001"
 
 
 def test_保留原来的凭证字(db, book, periods, subjects, admin_user):
     """多数凭证用「银」字，重排后不能全变成「记」。"""
-    _mk(db, book, admin_user, subjects, "2026-01-05", no="银001")
-    _mk(db, book, admin_user, subjects, "2026-01-06", no="银002")
+    _mk(db, book, admin_user, subjects, "2026-01-05", no="银0001")
+    _mk(db, book, admin_user, subjects, "2026-01-06", no="银0002")
 
     apply_organize(db, book_id=book.id, user=admin_user,
                    period_id=periods[1].id, strategy="SORT_DATE")
-    assert [n for _i, n in _nos(db, book)] == ["银001", "银002"]
+    assert [n for _i, n in _nos(db, book)] == ["银0001", "银0002"]
 
 
 # --------------------------------------------------------------------- 时序 / 闸门
@@ -179,34 +179,34 @@ def test_保留原来的凭证字(db, book, periods, subjects, admin_user):
 
 def test_时序不对查得出来(db, book, periods, subjects, admin_user):
     """号大的那张日期反而更早 = 这个月是回头补记的，号段已经乱了。"""
-    _mk(db, book, admin_user, subjects, "2026-01-25", no="记001")
-    _mk(db, book, admin_user, subjects, "2026-01-05", no="记002")
+    _mk(db, book, admin_user, subjects, "2026-01-25", no="记0001")
+    _mk(db, book, admin_user, subjects, "2026-01-05", no="记0002")
 
     rep = check_period(db, periods[1])
     assert len(rep["time_out_of_order"]) == 1
-    assert rep["time_out_of_order"][0]["prev_no"] == "记001"
-    assert rep["time_out_of_order"][0]["voucher_no"] == "记002"
+    assert rep["time_out_of_order"][0]["prev_no"] == "记0001"
+    assert rep["time_out_of_order"][0]["voucher_no"] == "记0002"
     assert rep["clean"] is False
     assert any("时序不对" in b for b in rep["blocking"])
 
 
 def test_同日多张不算时序不对(db, book, periods, subjects, admin_user):
     """同一天的两张凭证谁先谁后不算错 —— 日期相同，比不出先后。"""
-    _mk(db, book, admin_user, subjects, "2026-01-05", no="记001")
-    _mk(db, book, admin_user, subjects, "2026-01-05", no="记002")
+    _mk(db, book, admin_user, subjects, "2026-01-05", no="记0001")
+    _mk(db, book, admin_user, subjects, "2026-01-05", no="记0002")
     assert check_period(db, periods[1])["clean"] is True
 
 
 def test_时序不对时不能用当前顺序编号(db, book, periods, subjects, admin_user):
-    _mk(db, book, admin_user, subjects, "2026-01-25", no="记001")
-    _mk(db, book, admin_user, subjects, "2026-01-05", no="记002")
+    _mk(db, book, admin_user, subjects, "2026-01-25", no="记0001")
+    _mk(db, book, admin_user, subjects, "2026-01-05", no="记0002")
 
     with pytest.raises(ValueError, match="时序"):
         plan_organize(db, book_id=book.id, period_id=periods[1].id, strategy="RENUM")
     db.rollback()
     # 换个方式就好：先按日期排好时序，正是这条规则存在的意义
     plans = plan_organize(db, book_id=book.id, period_id=periods[1].id, strategy="SORT_DATE")
-    assert [c.new_no for c in plans[0].changes] == ["记001", "记002"]
+    assert [c.new_no for c in plans[0].changes] == ["记0001", "记0002"]
 
 
 def test_已记账的凭证不改号(db, book, periods, subjects, admin_user):
@@ -222,8 +222,8 @@ def test_已记账的凭证不改号(db, book, periods, subjects, admin_user):
     plans = plan_organize(db, book_id=book.id, period_id=periods[1].id, strategy="SORT_DATE")
     new_no = {c_.voucher_id: c_.new_no for c_ in plans[0].changes}
     assert new_no[b.id] == b.voucher_no, "已记账那张号不能动"
-    assert new_no[a.id] == "记001"
-    assert new_no[c.id] == "记003"
+    assert new_no[a.id] == "记0001"
+    assert new_no[c.id] == "记0003"
 
     apply_organize(db, book_id=book.id, user=admin_user, period_id=periods[1].id)
     db.expire_all()
@@ -249,8 +249,8 @@ def test_断号的月份不许记账(db, book, periods, subjects, admin_user):
 def test_时序不对的月份不许结账(db, book, periods, subjects, admin_user):
     from app.accounting.periods import close_period
 
-    a = _mk(db, book, admin_user, subjects, "2026-01-25", no="记001")
-    _mk(db, book, admin_user, subjects, "2026-01-05", no="记002")
+    a = _mk(db, book, admin_user, subjects, "2026-01-25", no="记0001")
+    _mk(db, book, admin_user, subjects, "2026-01-05", no="记0002")
     with pytest.raises(ValueError, match="时序不对"):
         close_period(db, periods[1], admin_user)
     db.rollback()
@@ -263,41 +263,41 @@ def test_结转凭证垫底_录入单在前(db, book, periods, subjects, admin_u
     """结转损益也参与重编号，但排序键里它排在最后 —— 所以永远拿到末尾的号。
 
     早先的做法是「结转凭证不参与重编号」，于是手工凭证压紧之后会踩到结转占着的号：
-    三张手工凭证压成 001~003，而结转那张还占着 002，直接撞唯一约束。
+    三张手工凭证压成 0001~0003，而结转那张还占着 002，直接撞唯一约束。
     """
-    m1 = _mk(db, book, admin_user, subjects, "2026-01-05", no="记001")
-    m2 = _mk(db, book, admin_user, subjects, "2026-01-06", no="记003")
-    cf = _mk(db, book, admin_user, subjects, "2026-01-31", no="记002")
+    m1 = _mk(db, book, admin_user, subjects, "2026-01-05", no="记0001")
+    m2 = _mk(db, book, admin_user, subjects, "2026-01-06", no="记0003")
+    cf = _mk(db, book, admin_user, subjects, "2026-01-31", no="记0002")
     cf.source = "CARRY_FORWARD"
     db.commit()
 
     apply_organize(db, book_id=book.id, user=admin_user,
                    period_id=periods[1].id, strategy="SORT_DATE")
     db.expire_all()
-    assert db.get(Voucher, m1.id).voucher_no == "记001"
-    assert db.get(Voucher, m2.id).voucher_no == "记002"
-    assert db.get(Voucher, cf.id).voucher_no == "记003"
+    assert db.get(Voucher, m1.id).voucher_no == "记0001"
+    assert db.get(Voucher, m2.id).voucher_no == "记0002"
+    assert db.get(Voucher, cf.id).voucher_no == "记0003"
 
 
 def test_按当前顺序重排时结转也在最后(db, book, periods, subjects, admin_user):
     """RENUM 保持存储顺序，但结转键在最高位，所以照样垫底。"""
-    cf = _mk(db, book, admin_user, subjects, "2026-01-10", no="记001")
+    cf = _mk(db, book, admin_user, subjects, "2026-01-10", no="记0001")
     cf.source = "CARRY_FORWARD"
-    m = _mk(db, book, admin_user, subjects, "2026-01-20", no="记002")
+    m = _mk(db, book, admin_user, subjects, "2026-01-20", no="记0002")
     db.commit()
 
     apply_organize(db, book_id=book.id, user=admin_user,
                    period_id=periods[1].id, strategy="RENUM")
     db.expire_all()
-    assert db.get(Voucher, m.id).voucher_no == "记001"
-    assert db.get(Voucher, cf.id).voucher_no == "记002"
+    assert db.get(Voucher, m.id).voucher_no == "记0001"
+    assert db.get(Voucher, cf.id).voucher_no == "记0002"
 
 
 def test_已结账期间不能整理(db, book, periods, subjects, admin_user):
     from app.accounting.periods import carry_forward_profit, close_period
     from app.accounting.vouchers import post_vouchers
 
-    v = _mk(db, book, admin_user, subjects, "2026-01-05", no="记009")
+    v = _mk(db, book, admin_user, subjects, "2026-01-05", no="记0009")
     # 号段没整理干净就不许记账 —— 记账之前先把号排好，这是新的闸门
     with pytest.raises(ValueError, match="还没整理干净"):
         post_vouchers(db, book.id, [v.id], admin_user)
@@ -316,8 +316,8 @@ def test_已结账期间不能整理(db, book, periods, subjects, admin_user):
 
 
 def test_整账套整理按期间分组(db, book, periods, subjects, admin_user):
-    _mk(db, book, admin_user, subjects, "2026-01-05", no="记005")
-    _mk(db, book, admin_user, subjects, "2026-02-05", no="记005")
+    _mk(db, book, admin_user, subjects, "2026-01-05", no="记0005")
+    _mk(db, book, admin_user, subjects, "2026-02-05", no="记0005")
 
     r = apply_organize(db, book_id=book.id, user=admin_user, strategy="RENUM")
     assert len(r["periods"]) == 12               # 12 个期间各一段
@@ -325,7 +325,7 @@ def test_整账套整理按期间分组(db, book, periods, subjects, admin_user)
 
     db.expire_all()
     nos = sorted(n for _i, n in _nos(db, book))
-    assert nos == ["记001", "记001"]            # 各自期间内都压成 0001
+    assert nos == ["记0001", "记0001"]            # 各自期间内都压成 0001
 
 
 def test_未知整理方式报错(db, book, admin_user):
@@ -352,7 +352,7 @@ def test_整理后编号连续无断号(db, book, periods, subjects, admin_user)
 
     r = check_period(db, periods[1])
     assert r["clean"] is True
-    assert sorted(n for _i, n in _nos(db, book)) == ["记001", "记002"]
+    assert sorted(n for _i, n in _nos(db, book)) == ["记0001", "记0002"]
 
 
 # --------------------------------------------------------------------- 收 / 付 / 转账
@@ -466,9 +466,9 @@ def test_RENUM_插入凭证后不破坏时序(db, book, periods, subjects, admin
     修复前 RENUM 用 ``voucher.id`` 排序，而插入让新凭证拿中间的号、id 却最大，
     于是 RENUM 把它甩到末尾 —— 一个月从干净被整理成「时序不对」。
     """
-    # 连记 5 张，号 记001..记005
+    # 连记 5 张，号 记0001..记0005
     stack = [_mk(db, book, admin_user, subjects, f"2026-01-0{i}") for i in range(1, 6)]
-    # 在 记002 后面插一张，日期与参照凭证**同一天**（体检判它没错，RENUM 会放行）
+    # 在 记0002 后面插一张，日期与参照凭证**同一天**（体检判它没错，RENUM 会放行）
     inserted = _mk_cash(db, book, admin_user, subjects, "2026-01-02",
                         dr=[("1002", 50)], cr=[("5001", 50)],
                         insert_after_id=stack[1].id)
@@ -480,7 +480,7 @@ def test_RENUM_插入凭证后不破坏时序(db, book, periods, subjects, admin
 
     r = check_period(db, periods[1])
     assert r["clean"] is True, f"RENUM 不该制造时序错乱，实际 {r['blocking']}"
-    # 插入的那张仍待在号段中间（记002），没被甩到最后
+    # 插入的那张仍待在号段中间（记0002），没被甩到最后
     final = {v.id: v.voucher_no for v in db.scalars(
         select(Voucher).where(Voucher.book_id == book.id)).all()}
-    assert final[inserted.id] == "记002", f"插入的凭证应留在 记002，实际 {final[inserted.id]}"
+    assert final[inserted.id] == "记0002", f"插入的凭证应留在 记0002，实际 {final[inserted.id]}"
