@@ -37,13 +37,6 @@
         <span>点击金额单元格，在右侧用选择框配置取数、合计和计算关系</span>
       </div>
       <el-tag v-if="hiddenRowCount" type="info" effect="plain">{{ hiddenRowCount }} 行已隐藏</el-tag>
-      <!-- 公式面板固定占 330px，是设计模式「挤压」的最大来源。收起它画布就能
-           铺满整行；而收起之后点任意金额单元格会自动展开，所以收起来不会把
-           人堵在「想改公式却找不到面板」的处境里。 -->
-      <el-button size="small" class="inspector-toggle" @click="inspectorOpen = !inspectorOpen">
-        <el-icon><component :is="inspectorOpen ? ArrowRight : ArrowLeft" /></el-icon>
-        {{ inspectorOpen ? '收起公式面板' : '展开公式面板' }}
-      </el-button>
     </div>
 
     <div class="card">
@@ -109,7 +102,8 @@
           <div ref="scrollHost" class="table-scroll" @wheel="onWheel">
             <div class="canvas-box" :style="canvasBoxStyle">
               <div ref="zoomLayer" class="canvas-zoom" :style="zoomLayerStyle">
-                <table ref="tableEl" class="report-table" v-loading="loading">
+                <table ref="tableEl" class="report-table" v-loading="loading"
+                       :style="{ minWidth: `${tableMinWidth}px` }">
         <thead>
           <tr>
             <th class="c-gutter no-print" v-if="designMode">行</th>
@@ -325,8 +319,15 @@
             </div>
 
             <div class="inspector-actions">
-              <el-button text @click="clearFormula" :disabled="!editing?.formula && !isDirty(editing?.rowNo, editing?.colNo)">清空公式</el-button>
+              <!-- 收起面板是「关于这块面板本身」的操作，和「改这一格」不是一回事，
+                   所以摆在左边；右边两个按钮继续管当前格子的改动。
+                   收起之后画布就铺满整行了（见 report-workspace 的列宽），
+                   想调回来点任意金额单元格即可，面板会自己出来。 -->
+              <el-button text class="inspector-toggle" @click="inspectorOpen = false">
+                <el-icon><ArrowRight /></el-icon>收起面板
+              </el-button>
               <span class="spacer" />
+              <el-button text @click="clearFormula" :disabled="!editing?.formula && !isDirty(editing?.rowNo, editing?.colNo)">清空公式</el-button>
               <el-button type="primary" :disabled="!builtFormula" @click="applyFormula">应用修改</el-button>
             </div>
           </div>
@@ -334,6 +335,9 @@
             <div class="empty-icon"><el-icon><EditPen /></el-icon></div>
             <strong>选择一个金额单元格</strong>
             <span>公式会在这里变成可视化配置</span>
+            <el-button text class="inspector-toggle" @click="inspectorOpen = false">
+              <el-icon><ArrowRight /></el-icon>收起面板
+            </el-button>
           </div>
         </aside>
       </div>
@@ -356,7 +360,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  ArrowLeft, ArrowRight, CircleCheckFilled, DataAnalysis, Delete, Download,
+  ArrowRight, CircleCheckFilled, DataAnalysis, Delete, Download,
   EditPen, FullScreen, Link, MagicStick, Operation, Reading, Tools,
   TrendCharts, ZoomIn, ZoomOut,
 } from '@element-plus/icons-vue'
@@ -368,7 +372,7 @@ import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 import { visibleTemplates } from '@/utils/reportTemplates'
-import { MAX_SCALE, MIN_SCALE, clampScale, fitScale } from '@/utils/canvasZoom'
+import { MAX_SCALE, MIN_SCALE, clampScale, fitScale, naturalWidth } from '@/utils/canvasZoom'
 
 const store = useSessionStore()
 const route = useRoute()
@@ -717,6 +721,12 @@ const fitMode = ref(false)
 const availW = ref(0)
 /** 表格未缩放时的真实尺寸，用来做缩放后的占位 */
 const tableBox = reactive({ w: 0, h: 0 })
+
+/**
+ * 表格的自然宽度下限：各列模板自带的列宽之和。
+ * 规则和「为什么非有不可」都写在 canvasZoom.js 的 naturalWidth 上。
+ */
+const tableMinWidth = computed(() => naturalWidth(data.value.cols))
 
 const canvasBoxStyle = computed(() => {
   // 还没量到就交回给常规流：宁可一帧没缩放，也不要先塌成 0 高度
@@ -1118,8 +1128,6 @@ watch(() => store.periodId, () => load())
 .design-strip-copy strong { font-size: 13px; }
 .design-strip-copy span { font-size: 12px; color: #607594; }
 .design-strip .el-tag { margin-left: auto; }
-.inspector-toggle { flex: none; margin-left: 8px; }
-.inspector-toggle .el-icon { margin-right: 4px; }
 
 .report-card { padding: 18px; border-color: #dfe5ee; box-shadow: 0 6px 20px rgba(27, 44, 72, .04); }
 .report-head { text-align: center; margin: 0 0 18px; }
@@ -1243,6 +1251,10 @@ th.c-gutter, td.c-gutter { background: #fbfbfc; width: 1%; white-space: nowrap; 
 .preview-copy { color: #59677b; font-size: 11px; }
 .formula-preview code { display: block; overflow-wrap: anywhere; color: #244168; font-size: 11px; line-height: 1.5; }
 .inspector-actions { display: flex; align-items: center; gap: 6px; margin-top: 16px; padding-top: 12px; border-top: 1px solid #edf0f4; }
+/* 全局的 .spacer 只认 .toolbar / .topbar，这里得自己撑开，否则三个按钮会挤在左边 */
+.inspector-actions .spacer { flex: 1; }
+.inspector-toggle { flex: none; color: var(--report-muted); }
+.inspector-toggle .el-icon { margin-right: 4px; }
 .inspector-empty { display: grid; justify-items: center; gap: 8px; padding: 64px 24px; color: var(--report-muted); text-align: center; }
 .inspector-empty strong { color: #465469; font-size: 13px; }
 .inspector-empty span { font-size: 11px; }

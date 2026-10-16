@@ -72,6 +72,20 @@ await t('适应宽度也要受上下限管住', () => {
   assert.equal(zoom.fitScale(100000, 100), zoom.MAX_SCALE)
 })
 
+await t('表格自然宽度 = 各列宽之和，这就是 min-width 的下限', () => {
+  // 小企01表 8 列的真实列宽
+  assert.equal(zoom.naturalWidth(
+    [210, 46, 118, 118, 210, 46, 118, 118].map((width) => ({ width }))
+  ), 984)
+  // 列宽在模型里可空（Optional[int]），少一列不能把整张表的宽度拖成 NaN
+  assert.equal(zoom.naturalWidth([{ width: 210 }, { width: null }, { width: 46 }]), 256)
+  // 还没加载出列时是 0，min-width:0 相当于没设，表格不会凭空留白
+  assert.equal(zoom.naturalWidth([]), 0)
+  assert.equal(zoom.naturalWidth(undefined), 0)
+  // 字符串列宽按数值累加，不能拼成 "0210118118..."
+  assert.equal(zoom.naturalWidth([{ width: '210' }, { width: '46' }]), 256)
+})
+
 console.log('== 画布缩放：接进页面 ==')
 
 await t('两层结构：占位层按缩放后尺寸，缩放层才做 transform', () => {
@@ -125,11 +139,30 @@ await t('打印时把缩放还原：缩到 60% 的表打出来是看不清的', 
   assert.match(SRC, /@media print \{[\s\S]*\.canvas-box \{[^}]*overflow: visible/)
 })
 
+await t('表格先按自己的列宽站住，再交给画布整体缩', () => {
+  // 少了 min-width 就是用户报的「支持缩放了，怎么还是这么挤压」：
+  // 容器比列宽之和窄时浏览器把列压到两三个字，适应宽度缩小的
+  // 只是一张已经被压扁的表——整张表看得全，可每列还是读不出字
+  assert.match(SRC, /class="report-table"[\s\S]{0,160}minWidth: `\$\{tableMinWidth\}px`/,
+    '表格必须挂 min-width，否则缩放只是把压扁的表整体缩小')
+  // 取各列宽之和而不是写死一个数：改过列宽的模板得跟着变
+  assert.match(SRC, /const tableMinWidth = computed\(\(\) => naturalWidth\(data\.value\.cols\)\)/)
+})
+
 console.log('== 公式面板可收起 ==')
 
-await t('面板默认展开，收起按钮挂在设计提示条上', () => {
+await t('收起按钮跟着面板走，不再挂在设计提示条上', () => {
   assert.match(SRC, /const inspectorOpen = ref\(true\)/)
-  assert.match(SRC, /class="inspector-toggle" @click="inspectorOpen = !inspectorOpen"/)
+  // 收起是「关于这块面板本身」的操作，和「改这一格」不是一回事，
+  // 所以摆在清空公式/应用修改那一行的左端
+  assert.match(SRC, /class="inspector-actions">[\s\S]{0,400}class="inspector-toggle" @click="inspectorOpen = false"/)
+  // 空状态（还没选单元格）也得能收起，否则刚进设计模式就没人收得掉
+  assert.match(SRC, /class="inspector-empty">[\s\S]{0,400}class="inspector-toggle" @click="inspectorOpen = false"/)
+  assert.doesNotMatch(SRC, /design-strip[\s\S]{0,400}inspector-toggle/,
+    '按钮待在提示条上时既不挨着面板，也不挨着它要收起的东西')
+  // 全局的 .spacer 只认 .toolbar/.topbar，这里不自己撑开的话
+  // 收起按钮会跟「应用修改」贴在一起
+  assert.match(SRC, /\.inspector-actions \.spacer \{ flex: 1; \}/)
 })
 
 await t('收起面板时画布真的拿到那 330px（不是只把 aside 藏起来）', () => {
