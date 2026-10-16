@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.accounting.audit_helper import log, voucher_snapshot
 from app.accounting.util import constraint_name, period_label
-from app.models import Entry, Period, SysUser, Voucher
+from app.models import Entry, Period, Subject, SysUser, Voucher
 
 # 凭证号形如「记0001」，前缀是 1~2 个汉字，序号是数字（补零到 NO_WIDTH 位）
 NO_PATTERN = re.compile(r"^(?P<prefix>[^\d]{1,4})(?P<seq>\d+)$")
@@ -129,21 +129,27 @@ def _seq_of(voucher_no: str) -> int:
 # 拿来当判据既不用加列、也不会漏。
 CASH_SUBJECT_PREFIXES = ("1001", "1002", "1012")
 
-RECEIPT = 0   # 收：钱进账（现金/银行存款净增加）
-PAYMENT = 1   # 付：钱出账（现金/银行存款净减少）
-TRANSFER = 2  # 转账：不涉及现金/银行，或现金类借贷都有（提现、银行内部划转）
+RECEIPT = 0   # 收：钱进账（现金/银行存款净增加），或确认了收入
+PAYMENT = 1   # 付：钱出账（现金/银行存款净减少），或确认了费用
+TRANSFER = 2  # 转账：现金进出相抵（提现、银行转户），或收支两边打平
 
 
-def cash_flow_kind(entries) -> int:
+def cash_flow_kind(entries, income_of=None) -> int:
     """从分录判定这张凭证是收、付还是转账。
 
     判据是**现金类科目的净额**（借方合计 − 贷方合计），不引入凭证字、
     不落库、不改表：
 
-    * 完全不涉及现金/银行（计提工资、结转损益）→ 转账 TRANSFER
     * 净额 > 0（钱净进账）→ 收 RECEIPT
     * 净额 < 0（钱净出账）→ 付 PAYMENT
-    * 净额 = 0 → 转账 TRANSFER
+    * 净额 = 0 且碰过现金 → 转账 TRANSFER（内部划转）
+    * 压根没碰现金 → 转 _kind_by_profit 按损益方向定
+
+    **为什么没碰现金的不能一律当转账。** 挂应收确认管理费、计提折旧、
+    停车费支出这些凭证一笔现金都不碰，业务性质却清清楚楚是收入或支出。
+    星悦荟商管 2026 年 9 月记-0045「管理费2026-09-25-2026-12-24/周淑琴」
+    就是借应收账款、贷主营业务收入 —— 债权进来了，钱就在路上。把它和
+    「借应收账款 / 贷其他应付款」这种纯往来划拨混在同一段，对账时就找不着它了。
 
     **为什么用净额而不是「看现金类出现在哪一边」。** 一张凭证里只要有一笔
     内部划转（提现、银行转户、微信↔银行），原来那条「借贷两边都有就算转账」
@@ -172,10 +178,12 @@ def cash_flow_kind(entries) -> int:
     抵消掉了 —— 留在净额里的只有真正的钱进出。
     """
     net = Decimal(0)
+    has_cash = False
     for e in entries:
         code = getattr(getattr(e, "subject", None), "code", "") or ""
         if not code.startswith(CASH_SUBJECT_PREFIXES):
             continue
+        has_cash = True
         amount = Decimal(e.amount or 0)
         net += amount if e.direction == "DEBIT" else -amount
 
@@ -183,10 +191,127 @@ def cash_flow_kind(entries) -> int:
         return RECEIPT
     if net < 0:
         return PAYMENT
+    if has_cash:
+        # 碰过现金但进出相抵：内部划转（提现、银行转户、在途↔到账）。
+        # 这跟「压根没碰现金」是两回事，不该按损益去猜它的性质。
+        return TRANSFER
+    return _kind_by_profit(entries, income_of)
+
+
+def _kind_by_profit(entries, income_of) -> int:
+    """**完全不涉及现金**的凭证：按损益方向定收付（2026-10-16 用户定的口径）。
+
+    挂应收确认管理费收入（借 应收账款 / 贷 主营业务收入 + 贷 预收账款）、折旧、
+    停车费支出这些凭证一笔现金都不碰，按上一版「不涉及现金就是转账」会全被扫进
+    转账段 —— 而记-0045 那张「管理费…/周淑琴」业务性质明明是收入。
+
+    **确认收入就是钱（债权）进来，确认费用就是钱（负债）出去**，所以：
+
+    * 收入方金额 > 费用方金额 → 收
+    * 费用方金额 > 收入方金额 → 付
+    * 两边相等（成本分摊一类的对冲）或压根没有损益科目 → 转账
+
+    「收入方 / 费用方」是按**科目类型**分的组，不是按借贷方向：一张挂应收确认
+    管理费的凭证，收入方就是「主营业务收入」那一条（哪怕它是贷方），而不是
+    「贷方的所有科目」。
+
+    ``income_of`` 是「这个科目是不是收入方」的判定函数，由 ``plan_organize``
+    按父级链建好后传进来 —— 明细科目的名字是「157」「503」这种编号，
+    光看分录自己的科目名什么也判不出来。传 None 就一律回转账（老的保守行为）。
+    """
+    if income_of is None:
+        return TRANSFER
+
+    income = expense = Decimal(0)
+    for e in entries:
+        subject = getattr(e, "subject", None)
+        if subject is None:
+            continue
+        if getattr(subject, "category", "") not in ("PROFIT", "COST"):
+            continue
+        # 按**科目类型**分组，不看借贷方向。方向在这里不参与判断：收入类科目的
+        # 金额整体算收入方、费用类整体算费用方，「收入方为主」这句话问的是
+        # 这张凭证主要在确认收入还是在确认成本费用，不是问钱从哪边走。
+        # 资产/负债科目（应收账款、预收账款、累计折旧）两边都不进 —— 它们只是
+        # 收入或费用的对手方，本身不代表任何方向。
+        amount = Decimal(e.amount or 0)
+        if income_of(subject):
+            income += amount
+        else:
+            expense += amount
+
+    if income > expense:
+        return RECEIPT
+    if expense > income:
+        return PAYMENT
     return TRANSFER
 
 
-def _sort_key(voucher: Voucher, strategy: str):
+#: 回溯顶层时最多走几跳。正常科目树三层就到根（用友 4-2-2 就是三层），
+#: 留到 16 跳是给「导入的历史科目表层级更深」留余量，同时也是脏数据里 parent
+#: 指回自己形成的环的保险丝。
+_ROOT_WALK_GUARD = 16
+
+#: 顶层科目名里带这些字眼的，判成「收入方」。收入类科目是「钱进来」，
+#: 其余损益类（主营业务成本 / 税金及附加 / 销售费用 / 营业外支出 …）都算费用方 ——
+#: 所以这是**白名单**而不是黑名单：漏掉一个新造的收入科目，最坏是把它算成费用，
+#: 而不是把一堆成本费用误当成收入。
+INCOME_NAME_HINTS = ("收入", "收益", "补偿")
+
+
+def build_income_lookup(db, book_id: int):
+    """建「科目 id → 是不是收入方」的判定函数。
+
+    **为什么要回溯到顶层。** 星悦荟那类明细科目的名字就是「157」「503」
+    （单元编号），名字里没有任何信息；「是不是收入」这件事挂在顶层科目上 ——
+    5001 主营业务收入物业管理费 / 5004 停车费支出 / 5005 停车费收入。
+    按名字判只能对顶层判，所以每个科目都顺着 parent_id 一路走到根。
+
+    一次查完整个账套的科目（星悦荟 1390 个），在 Python 里走链，避免每条分录
+    回数据库 —— 整理是个「点一次、等一会儿」的动作，这种延迟最容易被误读成卡死。
+    """
+    rows = list(db.scalars(select(Subject).where(Subject.book_id == book_id)).all())
+    parent = {s.id: s.parent_id for s in rows}
+    names = {s.id: s.name for s in rows}
+    root: dict[int, str] = {}
+
+    def root_name(sid: int) -> str:
+        """这个科目挂在哪棵树的根上，根的名字是什么。
+
+        走过的**每一环**都写进 root 缓存 —— 星悦荟 1390 个科目绝大多数挂在二层
+        以下，不缓存就是每个科目各走一遍链（O(科目数×深度)）。
+        """
+        if sid in root:
+            return root[sid]
+        chain: list[int] = []
+        cur, name = sid, ""
+        for _ in range(_ROOT_WALK_GUARD):
+            if cur in root:
+                name = root[cur]
+                break
+            chain.append(cur)
+            nxt = parent.get(cur)
+            if not nxt:
+                name = names.get(cur, "")
+                break
+            cur = nxt
+        else:
+            # 走满保险丝还没到根：多半是 parent 指回了自己。就地截断，把最后一环
+            # 当根 —— 判据退化成只看自己这层的名字，也好过让一条坏科目把整个整理
+            # 卡死在这里。
+            name = names.get(chain[-1], "") if chain else ""
+        for node in chain:
+            root[node] = name
+        return name
+
+    def income_of(subject) -> bool:
+        name = root_name(subject.id) or subject.name or ""
+        return any(h in name for h in INCOME_NAME_HINTS)
+
+    return income_of
+
+
+def _sort_key(voucher: Voucher, strategy: str, income_of=None):
     """排序键。最高一位永远是「是不是结转损益」：1 排最后。
 
     月末的结转凭证是系统生成的，收入类、成本费用类各一张，落在最后两个号上，
@@ -198,7 +323,7 @@ def _sort_key(voucher: Voucher, strategy: str):
         # 这一天钱先怎么进来、再怎么出去、最后才是内部划转 —— 这正是
         # 银行流水对账时的阅读顺序。三类之内仍按录入顺序（id）兜底，
         # 保证排序稳定、可复现。
-        kind = cash_flow_kind(voucher.entries)
+        kind = cash_flow_kind(voucher.entries, income_of)
         return (tail, voucher.voucher_date.toordinal(), kind, voucher.id)
     # RENUM 保持**当前号段**顺序，不是 id 顺序。
     #
@@ -341,6 +466,11 @@ def plan_organize(
     if strategy not in STRATEGIES:
         raise ValueError(f"未知的整理方式：{strategy}")
 
+    # 「完全没碰现金」的凭证要按损益方向定收付，得知道哪个科目是收入方。这件事
+    # 对整批凭证是同一份答案，所以只查一次科目表，之后每张凭证都在内存里判。
+    # RENUM 不重排，用不上，白查一轮 1390 个科目不划算。
+    income_of = build_income_lookup(db, book_id) if strategy == "SORT_DATE" else None
+
     period_stmt = select(Period).where(Period.book_id == book_id).order_by(Period.ord)
     if period_id is not None:
         period_stmt = period_stmt.where(Period.id == period_id)
@@ -378,7 +508,8 @@ def plan_organize(
         reserved = {_seq_of(v.voucher_no) for v in rows if v.status == "POSTED"}
 
         prefix = _dominant_prefix(rows)
-        ordered = sorted(movable, key=lambda v: _sort_key(v, strategy))
+        ordered = sorted(movable,
+                        key=lambda v: _sort_key(v, strategy, income_of))
         n = 0
         for v in ordered:
             n += 1

@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from app.accounting.organize import (
     PAYMENT,
+    build_income_lookup,
     RECEIPT,
     TRANSFER,
     apply_organize,
@@ -17,7 +18,7 @@ from app.accounting.organize import (
     split_no,
 )
 from app.accounting.vouchers import delete_voucher
-from app.models import Voucher
+from app.models import Subject, Voucher
 
 
 def _mk(db, book, admin_user, subjects, date_, no=None, amount=10):
@@ -384,9 +385,39 @@ def _mk_cash(db, book, admin_user, subjects, date_, dr, cr, insert_after_id=None
 
 
 def _kind_of(db, voucher):
+    """只按现金净额判定 —— 不传 income_of，走的是「压根没碰现金就一律转账」的兜底。
+
+    真实调用路径一定会传 income_of（plan_organize 建好透传下来），所以下面凡是
+    判「没碰现金」的用例，都用 :func:`_kind_by_profit` 走完整路径。
+    """
     from app.accounting.organize import cash_flow_kind
     db.refresh(voucher)
     return cash_flow_kind(voucher.entries)
+
+
+def _kind_by_profit(db, book, voucher):
+    """按整理页真正调用的那条路判定：先建收入方 lookup，再传给 cash_flow_kind。"""
+    from app.accounting.organize import build_income_lookup, cash_flow_kind
+    db.refresh(voucher)
+    return cash_flow_kind(voucher.entries, build_income_lookup(db, book.id))
+
+
+def _add_detail_subject(db, book, parent_code, code, name):
+    """在既有科目下挂一个明细科目，返回它。
+
+    真实账里明细科目的名字就是「157」「503」这种单元编号，判据必须回溯到顶层
+    才认得出来 —— 所以测试也得用这种「看不出名堂」的名字，否则测的是名字而不是链。
+    """
+    parent = db.scalar(
+        select(Subject).where(Subject.book_id == book.id, Subject.code == parent_code))
+    assert parent is not None, f"父科目不存在：{parent_code}"
+    child = Subject(book_id=book.id, code=code, name=name, category=parent.category,
+                    direction=parent.direction, level=parent.level + 1,
+                    parent_id=parent.id, is_leaf=True, sort_no=99)
+    db.add(child)
+    parent.is_leaf = False
+    db.flush()
+    return child
 
 
 def test_判定_钱进账为收_钱出账为付_两边都是转账(db, book, periods, subjects, admin_user):
@@ -405,11 +436,83 @@ def test_判定_钱进账为收_钱出账为付_两边都是转账(db, book, per
     assert _kind_of(db, transfer) == TRANSFER
 
 
-def test_判定_不涉及现金的凭证归转账(db, book, periods, subjects, admin_user):
-    # 计提工资：不碰现金/银行
+def test_判定_没碰现金的凭证按损益方向_计提工资判付(
+        db, book, periods, subjects, admin_user):
+    """计提工资（借 管理费用-员工工资 / 贷 应付职工薪酬）→ **付**。
+
+    工资这笔钱是**欠**出去了，只是不在这张凭证上付 —— 业务性质是支出，
+    按旧规则「没碰现金就是转账」会把它和「借 应收账款 / 贷 其他应付款」这种
+    纯往来划拨混在同段，对账时找不着这笔已经发生的成本。
+    """
     accrue = _mk_cash(db, book, admin_user, subjects, "2026-01-05",
                       dr=[("560209", 800)], cr=[("221101", 800)])
-    assert _kind_of(db, accrue) == TRANSFER
+    assert _kind_by_profit(db, book, accrue) == PAYMENT
+
+
+def test_判定_挂应收确认管理费判收(db, book, periods, subjects, admin_user):
+    """记-0045 的真实形态：挂应收确认管理费收入 → **收**。
+
+    星悦荟商管 2026-09-30 记-0045「管理费2026-09-25-2026-12-24/周淑琴」
+    就是这个形态：一分钱现金都不碰，借 应收账款、贷 主营业务收入 + 预收账款。
+    债权进来了，钱在路上 —— 业务性质是收，判成转账就等于把这张凭证从收入段里抹掉。
+    """
+    v = _mk_cash(db, book, admin_user, subjects, "2026-09-30",
+                 dr=[("1122", 112000)], cr=[("5001", 70000), ("2203", 42000)])
+    assert _kind_by_profit(db, book, v) == RECEIPT
+
+
+def test_判定_折旧摊销没碰现金判付(db, book, periods, subjects, admin_user):
+    """折旧（借 管理费用-折旧 / 贷 累计折旧）→ **付**。"""
+    v = _mk_cash(db, book, admin_user, subjects, "2026-09-30",
+                 dr=[("560210", 966)], cr=[("1602", 966)])
+    assert _kind_by_profit(db, book, v) == PAYMENT
+
+
+def test_判定_损益收支相等归转账(db, book, periods, subjects, admin_user):
+    """收入 500 = 费用 500 → 转账（成本分摊一类的对冲）。
+
+    星悦荟商管「9月停车费支出」那张（借 停车费支出 / 贷 停车费收入，净额 0）
+    就是这个形态：钱既没进也没出，两边抵平了，硬判成收或付都是替用户编一个方向。
+    """
+    v = _mk_cash(db, book, admin_user, subjects, "2026-09-30",
+                 dr=[("1122", 500), ("560206", 500)],
+                 cr=[("5001", 500), ("2203", 500)])
+    assert _kind_by_profit(db, book, v) == TRANSFER
+
+
+def test_判定_没碰现金也没损益科目的往来划拨归转账(
+        db, book, periods, subjects, admin_user):
+    """借 应收账款 / 贷 预收账款：既没现金也没损益科目 → 转账。
+
+    这条守着兜底分支的另一半：不能因为「现在按损益方向判了」，就把这类纯往来
+    划拨也硬塞成收付 —— 方向是真的没有，编一个出来比留白更坏。
+    """
+    v = _mk_cash(db, book, admin_user, subjects, "2026-09-30",
+                 dr=[("1122", 500)], cr=[("2203", 500)])
+    assert _kind_by_profit(db, book, v) == TRANSFER
+
+
+def test_判定_收入方要回溯到顶层科目(db, book, periods, subjects, admin_user):
+    """明细科目名是「157」这种单元编号，判不出来 —— 判据必须挂在顶层科目上。
+
+    星悦荟商管真实的顶层就是靠名字分开的三棵：5001 主营业务收入物业管理费、
+    5004 停车费支出、5005 停车费收入。三者都挂在损益下，光看 category 分不出
+    收入还是支出，名字也只在顶层才有信息量。
+    """
+    income_detail = _add_detail_subject(db, book, "5001", "5001999", "157")
+    expense_detail = _add_detail_subject(db, book, "5602", "5602999", "503")
+    subjects["5001999"] = income_detail
+    subjects["5602999"] = expense_detail
+
+    # 名字里没有任何收入字样，但挂在 5001 主营业务收入下面 → 收
+    rec = _mk_cash(db, book, admin_user, subjects, "2026-09-30",
+                   dr=[("1122", 300)], cr=[("5001999", 300)])
+    assert _kind_by_profit(db, book, rec) == RECEIPT
+
+    # 同理挂在 5602 管理费用下面 → 付
+    pay = _mk_cash(db, book, admin_user, subjects, "2026-09-30",
+                   dr=[("5602999", 200)], cr=[("2203", 200)])
+    assert _kind_by_profit(db, book, pay) == PAYMENT
 
 
 def test_判定_收付混合按净额_净流入判收(db, book, periods, subjects, admin_user):
@@ -483,6 +586,38 @@ def test_同日排序_先收后付再转账(db, book, periods, subjects, admin_u
     assert kinds == [RECEIPT, PAYMENT, TRANSFER], f"实际顺序 {kinds}"
     assert rec.id == ordered[0].id
     assert pay.id == ordered[1].id
+
+
+def test_同日排序_没碰现金的两张也分得出先后(
+        db, book, periods, subjects, admin_user):
+    """接线守卫：income_of 真的从 plan_organize 透传到了排序。
+
+    判定逻辑单测全对也可能在链路上白写 —— 只要 ``_sort_key`` 忘了接收这个参数，
+    排序就会静默退回「没碰现金的一律转账」。所以这里必须从 ``apply_organize``
+    整条路走一遍，验的是**排出来的号**，不是某个函数的返回值。
+
+    故意按「转账 → 付 → 收」录：旧规则下三张全是转账、顺序不变；新规则下
+    期望严格 收 → 付 → 转账。这张用例挂了，就说明链路没接上。
+    """
+    _mk_cash(db, book, admin_user, subjects, "2026-09-30",
+             dr=[("1001", 500)], cr=[("1002", 500)])            # 转账（碰过现金）
+    pay = _mk_cash(db, book, admin_user, subjects, "2026-09-30",
+                   dr=[("560209", 800)], cr=[("221101", 800)])  # 没碰现金 → 付
+    rec = _mk_cash(db, book, admin_user, subjects, "2026-09-30",
+                   dr=[("1122", 1000)], cr=[("5001", 1000)])   # 没碰现金 → 收
+
+    apply_organize(db, book_id=book.id, user=admin_user,
+                   period_id=periods[9].id, strategy="SORT_DATE")
+
+    ordered = db.scalars(
+        select(Voucher).where(Voucher.book_id == book.id)
+        .order_by(Voucher.voucher_no)
+    ).all()
+    # 三张同为 2026-09-30，应严格按 收→付→转账
+    assert [v.id for v in ordered] == [rec.id, pay.id, ordered[2].id]
+    kinds = [cash_flow_kind(v.entries, build_income_lookup(db, book.id))
+             for v in ordered]
+    assert kinds == [RECEIPT, PAYMENT, TRANSFER], f"实际顺序 {kinds}"
 
 
 def test_判定不新增凭证字_号段仍是单一段(db, book, periods, subjects, admin_user):
