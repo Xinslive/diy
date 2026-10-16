@@ -329,6 +329,32 @@ def general_ledger(
 # --------------------------------------------------------------------- 科目余额表 / 试算平衡
 
 
+#: 科目余额表的「看哪些科目」三档。跟页面工具栏上的单选一一对应。
+BALANCE_SUBJECT_SCOPES = ("top", "leaf", "all")
+
+
+def filter_balance_rows(rows: list[dict], subject_scope: str = "all") -> list[dict]:
+    """按科目范围过滤余额表行。三档：top=仅一级 / leaf=仅明细 / all=全部。
+
+    **打印和导出必须跟屏幕同一个口径。** 屏幕上是「仅一级科目」、打出来却是
+    1253 行明细，用户不会以为导出坏了，只会把纸上那一份当成对的 —— 余额表
+    正是交给客户和审计的纸面数。页面过滤是纯前端的，导出走的是这里，两边
+    各写一套迟早对不上，所以取值只有这一个函数。
+
+    过滤**不动 check**：试算平衡那条 check 是按明细级算的（只累计叶子，
+    否则父级汇总行会重复计数），而一级科目行本身就是下级的上卷 —— 屏幕上
+    看到的加总与档位无关，打印/导出当然也不该随档位变。
+
+    未知档位一律当 ``all``：这是查询参数，值错了宁可多给几行，也不能给一份
+    少行的账 —— 缺行的账看不出问题，全行的账用户自己会发现多了什么。
+    """
+    if subject_scope == "top":
+        return [r for r in rows if r["level"] == 1]
+    if subject_scope == "leaf":
+        return [r for r in rows if r["is_leaf"]]
+    return list(rows)
+
+
 def balance_sheet_of_accounts(
     db: Session,
     book_id: int,

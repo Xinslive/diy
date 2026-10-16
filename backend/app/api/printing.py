@@ -610,6 +610,7 @@ def _render_scope(
     report_template_id: Optional[int] = None,
     include_unposted: bool = False,
     leaf_only: bool = False,
+    subject_scope: str = "all",
     status: Optional[str] = None,
     voucher_ids: Optional[list[int]] = None,
     max_pages: Optional[int] = None,
@@ -635,6 +636,8 @@ def _render_scope(
                 raise HTTPException(400, "起始期间不能晚于结束期间")
         rows, _check = queries.balance_sheet_of_accounts(
             db, book.id, subjects, period, include_unposted, from_period=bal_from)
+        # 范围跟屏幕上的三档单选一致，别让纸上多出一千多行明细
+        rows = queries.filter_balance_rows(rows, subject_scope)
         doc = render_table_page(tpl, pv.context(db, book, period),
                                 _check_print_rows(pv.balance_rows(rows), "科目余额表"), 1, 1)
         return _with_note(doc, note)
@@ -748,13 +751,15 @@ def print_vouchers(book_id: int, period_id: Optional[int] = None,
 def print_balance(book_id: int, period_id: Optional[int] = None,
                   from_period_id: Optional[int] = None,
                   template_id: Optional[int] = None, include_unposted: bool = Query(False),
+                  subject_scope: str = Query("all"),
                   paper: Optional[str] = None, orientation: Optional[str] = None,
                   book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     tpl = _with_paper(_tpl_dict(_template(db, book, "BALANCE", template_id)),
                       paper, orientation)
     return _html_response(_render_scope(db, book, "BALANCE", tpl,
                                         period_id=period_id, from_period_id=from_period_id,
-                                        include_unposted=include_unposted))
+                                        include_unposted=include_unposted,
+                                        subject_scope=subject_scope))
 
 
 @router.get("/general-ledger.html")
@@ -908,7 +913,8 @@ def export_vouchers(book_id: int, period_id: Optional[int] = None, book: Book = 
 def export_balance(book_id: int, period_id: Optional[int] = None,
                    from_period_id: Optional[int] = None,
                    book: Book = Depends(get_my_book),
-                   db: Session = Depends(get_db), include_unposted: bool = Query(False)):
+                   db: Session = Depends(get_db), include_unposted: bool = Query(False),
+                   subject_scope: str = Query("all")):
     """科目余额表导出。带 from_period_id 导出的是那一段区间。
 
     **区间必须一路带到文件里。** 屏幕上一段区间、下载下来是单期，
@@ -927,6 +933,9 @@ def export_balance(book_id: int, period_id: Optional[int] = None,
     subjects = queries.subject_tree(db, book.id)
     rows, check = queries.balance_sheet_of_accounts(
         db, book.id, subjects, period, include_unposted, from_period=from_period)
+    # 与屏幕同一个范围口径：屏幕上「仅一级科目」而文件里是全表，用户只会
+    # 把文件那份当成对的（这段 docstring 说的区间问题是同一个毛病）。
+    rows = queries.filter_balance_rows(rows, subject_scope)
     is_range = from_period is not None and from_period.id != period.id
     # 文件名把区间说清楚，避免一个月一份的命名习惯盖住「这是跨三个月的」
     label = f"{from_period.code}~{period.code}" if is_range else period.code

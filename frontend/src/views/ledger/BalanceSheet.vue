@@ -224,6 +224,10 @@ const printParams = computed(() => ({
   period_id: periodId.value,
   ...(isRange.value ? { from_period_id: fromId.value } : {}),
   include_unposted: includeUnposted.value,
+  // 范围必须一起带过去：屏幕上「仅一级科目」、打出来却是 1253 行明细，
+  // 用户不会以为导出坏了，只会把纸上那一份当成对的 —— 余额表正是交给
+  // 客户和审计的纸面数。后端 filter_balance_rows 是同一份过滤判据。
+  subject_scope: scope.value,
 }))
 
 function exportXlsx() {
