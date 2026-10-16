@@ -108,10 +108,10 @@
     <el-dialog v-model="visible" title="新建账套" width="520px">
       <el-form :model="form" label-width="100px">
         <el-form-item label="公司名称" required>
-          <el-input v-model="form.company_name" placeholder="如：启明物业管理有限公司" />
+          <el-input v-model="form.company_name" />
         </el-form-item>
         <el-form-item label="账套名称" required>
-          <el-input v-model="form.name" placeholder="如：租金账套" />
+          <el-input v-model="form.name" />
         </el-form-item>
         <el-form-item label="起始年度" required>
           <el-select v-model="form.start_year" style="width: 100%">
@@ -327,7 +327,10 @@ function closeCreate() {
 function openCreate() {
   store.setLastCreatedBook(0)
   form.company_name = ''
-  form.name = `${form.start_year} 账套`
+  // 账套名称留空，不再预填「2026 账套」：预填的名字看着省事，但用户多半是在
+  // 建第二本、第三本账，忘了改就留下一堆同名账套，列表里分不出谁是谁。
+  // 留空则「创建账套」按钮直接不可点，提示该填的名字反而一个都不漏。
+  form.name = ''
   form.start_month = 1
   visible.value = true
 }
