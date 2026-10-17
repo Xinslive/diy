@@ -64,12 +64,17 @@ LimitNOFILESoft=8192
 # 见 deploy/tuning.md。
 # MemoryMax=768M
 
-# 财务系统只读自己的代码目录，能写的地方只有日志
+# 财务系统只读自己的代码目录，能写的地方只有日志与发票原件目录
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/cwq/backend/logs
+# 发票原件也要落盘（INVOICE_STORAGE_DIR）。ProtectSystem=strict 把整个 /opt
+# 挂成只读，**没列进这里的话上传会以只读文件系统失败** —— 而且它失败在写文件
+# 那一刻，前面鉴权、解析、落库都已经过了，从外面看像是「上传功能坏了」。
+# 同一个键只能写一次（重复赋值是后者覆盖前者），所以两个路径写在同一行。
+# 两处要同步改：.env 的 INVOICE_STORAGE_DIR 与本行，缺一个就不通。
+ReadWritePaths=/opt/cwq/backend/logs /opt/cwq/backend/data
 StandardOutput=append:/opt/cwq/backend/logs/api.log
 StandardError=append:/opt/cwq/backend/logs/api.err.log
 
