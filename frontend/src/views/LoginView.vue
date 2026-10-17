@@ -19,7 +19,22 @@
               登录
             </el-button>
           </el-form>
-          <p class="hint muted">演示账号 admin / 123456</p>
+          <!-- 演示账号提示**只在开发构建里出现**。
+               它原先是无条件渲染的，于是生产站点 acct.xins.live 的登录页
+               公开写着「演示账号 admin / 123456」——等于替攻击者
+               念出管理员用户名，还顺带告诉他们这个站点的口令强度
+               就是六个数字。import.meta.env.DEV 由 vite 在
+               `vite build`（生产构建）时置为 false。
+
+               实测（构建后查 dist）：`isDev` 这个标识符被完全折掉，
+               产物里是 `username:""`，即预填也没有了；而那段提示文字
+               **仍然留在 chunk 里** —— vue 的模板编译把 `v-if` 编成
+               条件表达式，terser 不会把这个常量假分支删掉。
+               它不会被渲染（运行时恒为 false），但「产物里搜不到
+               演示口令」这句话是不成立的，别据它下结论。要连字面量
+               一起消失，得把提示文字挪出组件（例如放进 .env.local
+               之类的构建期变量），那是另一件事。 -->
+          <p v-if="isDev" class="hint muted">演示账号 admin / 123456</p>
         </el-tab-pane>
 
         <!-- ------------------------------------------------ 注册 -->
@@ -66,8 +81,17 @@ const router = useRouter()
 const tab = ref('login')
 const busy = ref(false)
 
-const username = ref('admin')
-const password = ref('123456')
+// 开发构建才有的便利（预填演示账号 + 显示提示）。
+// 生产构建里 isDev 恒为 false，于是：用户名不预填、口令不预填、提示不渲染。
+//
+// **口令原来无条件预填 `123456`。** 生产站点的登录框打开就是
+// 「admin / ••••••」，点一下登录按钮就等于把这套弱口令递出去。
+// 就算部署时把口令改掉了，这个预填仍然在替攻击者省掉输入成本，
+// 而且任何一次「重置成默认值」都会直接变成一次公网沦陷。
+const isDev = import.meta.env.DEV
+
+const username = ref(isDev ? 'admin' : '')
+const password = ref('')
 
 const reg = reactive({ username: '', real_name: '', password: '', confirm: '' })
 

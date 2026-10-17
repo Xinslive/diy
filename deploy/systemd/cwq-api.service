@@ -47,10 +47,19 @@ RestartSec=3
 # systemd 的默认值是 1024，而 **LimitNOFILE 是硬上限，不是软限**：
 # 超了进程报 EMFILE，日志里表现为
 # ``OSError: [Errno 24] Too many open files`` 或 uvicorn 直接退出重启，
-# 很容易被误判成「服务不稳定」而查不到根因。软限制在 systemd 上没有意义
-# （要调软限得在 Limits 里一起给 LimitNOFILE= 与 LimitNOFILESoft=）。
+# 很容易被误判成「服务不稳定」而查不到根因。
+#
+# **这里原来还有一行 LimitNOFILESoft=8192，它在 systemd 上是「未知键、
+# 静默忽略」** —— systemd-analyze verify 会报
+# ``Unknown key 'LimitNOFILESoft' in section [Service], ignoring.``，
+# 而 `systemctl show` 一切正常，于是没人会发现。
+#
+# 不需要它：**LimitNOFILE= 在 systemd < 254 上同时设置软限与硬限**。
+# 本机（Debian 12 / systemd 252.39）实测，cwq-api 进程的
+# ``/proc/<pid>/limits`` 是 ``Max open files 8192 8192`` —— 两档都是 8192。
+# 原文注释里「要调软限得在 Limits 里一起给 LimitNOFILE= 与 LimitNOFILESoft=」
+# 这条说法对 systemd 252 是错的，删掉这个键没有损失任何东西。
 LimitNOFILE=8192
-LimitNOFILESoft=8192
 
 # 内存软上限：让 cgroup 的内存压力先在 API 上表现出来（内核回收、
 # 分配失败），而不是整机耗尽后由 OOM killer 在**几个进程里随机挑一个**杀。

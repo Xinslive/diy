@@ -16,15 +16,40 @@ EnvironmentFile=/opt/cwq/backend/.env
 # 一个把自己搞挂的备份策略。14 份 ≈ 两周回溯窗口。
 Environment=CWQ_BACKUP_KEEP=14
 
-# 落盘目录与文件名里的日期都由 systemd 展开：systemd 的 ExecStart
-# **不走 shell**，所以 $(date ...) 不会执行 —— 必须写成 %% 或直接用
-# 时间戳规格。这里用 %F（YYYY-MM-DD）。
+# 落盘目录与文件名里的日期要拿到 YYYY-MM-DD 这个**日期**。
+#
+# **这里原来写的是 %F —— 那是个不存在的 systemd 规格符。**
+# %F 是 strftime 的写法（和 date +%F 一样），不是 systemd 的。systemd 解析不到
+# 对应字段就报 `Failed to resolve unit specifiers ...: Invalid slot`，
+# **整个 unit 被判为不可加载** —— timer 启动时只说
+# 「cwq-backup.service to trigger not loaded」，一条真正的报错藏在
+# `systemd-analyze verify` 里。表现是「脚本说启用失败、照它给的命令再敲一遍
+# 还是失败」，而这正是没有定时备份的最坏形态：看起来有。
+#
+# **也不要以为换成 %Y-%m-%d 就对了 —— 那更坏。**
+# systemd 的 `%m` 是 **machine ID**、`%d` 是 **state 目录**、`%S` 是 cache 目录、
+# `%H` 是主机名：这一组规格符里**没有任何一个是日期分量**。本机实测
+# （Debian 12 / systemd 252.39）把 `%Y-%m-%d` 写进去的结果是：
+# unit 能加载、`systemctl start` 返回 **Result: success**，
+# 而 `--out` 拿到的是一个被拼成目录的路径，备份脚本的
+# ``out.parent.mkdir(parents=True)`` 造出 `db-/etc/systemd/` 这棵树，
+# **一个字节的备份都没产生**。
+# 也就是说：照这条改完之后，备份会以「每天都成功」的姿态静默地什么都不做，
+# 还要把 ``--keep`` 的清理范围算在那个空目录上。这比 unit 加载失败危险得多 ——
+# 后者至少会吵。
+#
+# 结论：**systemd 没有日期规格符，这活儿必须借 shell。**
+# ExecStart 不走 shell，所以要显式写成 `/bin/sh -c`，并且：
+#   * `$$` —— systemd 的转义，交给 shell 一个字面 `$`（否则 `$` 会被 systemd 吃掉）
+#   * `%%F` —— systemd 把 `%%` 还原成 `%`，shell 才看得到 `date +%F`
+#   * `${CWQ_BACKUP_KEEP}` —— 仍然是 systemd 展开（Environment 里给了默认值 14），
+#     不经 shell，免得依赖 shell 的变量语义
 #
 # 文件名用固定日期而不是内容哈希：出事了运维要一眼看出「这是哪天的」。
 # 同一天重复跑会覆盖同一个文件，这没问题 —— 同一天的两份备份没有区别。
-ExecStart=/opt/cwq/backend/.venv/bin/python scripts/db_backup.py \
-    --out /opt/cwq/backups/db-%F.sql \
-    --keep ${CWQ_BACKUP_KEEP}
+ExecStart=/bin/sh -c 'exec /opt/cwq/backend/.venv/bin/python scripts/db_backup.py \
+    --out /opt/cwq/backups/db-$$(date +%%F).sql \
+    --keep ${CWQ_BACKUP_KEEP}'
 
 # ---------------------------------------------------------------------------
 # 加固项：**不能照抄 cwq-api.service**。

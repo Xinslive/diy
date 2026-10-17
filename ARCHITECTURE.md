@@ -2560,6 +2560,93 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
 
 ---
 
+## 11.7 生产发布的四条硬约束（2026-10-17 首次上线时确立）
+
+本节记的不是「怎么发布」，而是**四条会让发布「看起来成功了、其实没生效」的
+约束**。它们全部是在 acct.xins.live 首次上线当天实测撞出来的，每条都附了判据。
+
+### 11.7.1 `deploy.sh` 假定已有一版在跑，首次部署必须先预置
+
+`deploy.sh` 的顺序是：取产物 → 备份 → **装依赖** → **备份数据库 + `alembic upgrade`**
+→ 解压后端代码 → 切前端 → 重启。
+
+第 3、4 步要用 `scripts/db_backup.py`、`alembic.ini`、`migrations/` 和
+`.venv/bin/{pip,alembic}`，而这些**要到第 5 步才被解压到 `/opt/cwq/backend`**。
+第一次部署时那里是空的，于是脚本在第 3 步就 `set -e` 挂掉。
+
+另外第 5 步的 `mv "$APP/frontend/dist" "$FRONT_OLD"` 要求 `frontend/dist`
+**已经存在**——`mv` 不存在的源目录会失败。
+
+**首次部署必须先手工预置**（之后每次发布都不需要）：
+
+```
+tar -xzf cwq-backend-<sha>.tar.gz -C /opt/cwq/backend   # 让 alembic/scripts 先在
+python3 -m venv /opt/cwq/backend/.venv                   # 第 3、4 步有东西可用
+/opt/cwq/backend/.venv/bin/pip install -r /opt/cwq/backend/requirements.lock
+mkdir -p /opt/cwq/frontend/dist                          # 让第 5 步的 mv 有源
+```
+
+预置用的就是那份已校验和的 CI 产物本身，所以这里没有绕过任何闸门。
+
+### 11.7.2 systemd 没有日期规格符，取日期必须借 shell
+
+`cwq-backup.service` 原来在文件名里写 `%F`（`db-%F.sql`）。`%F` 是 strftime 的
+写法，**不是 systemd 的规格符**。systemd 解析不到字段就报
+`Failed to resolve unit specifiers ...: Invalid slot`，**整个 unit 被判为不可加载**，
+于是 `cwq-backup.timer` 只会说「cwq-backup.service to trigger not loaded」，
+真正的报错藏在 `systemd-analyze verify` 里。
+
+**不要以为换成 `%Y-%m-%d` 就对了——那更坏。** systemd 的 `%m` 是 machine ID、
+`%d` 是 state 目录、`%S` 是 cache 目录、`%H` 是主机名，这一组里**没有一个是
+日期分量**。本机实测（Debian 12 / systemd 252.39）把 `%Y-%m-%d` 写进去：
+unit 能加载、`systemctl start` 返回 **Result: success**，而 `--out` 拿到一个被拼成
+目录的路径，`db_backup.py` 的 `out.parent.mkdir(parents=True)` 造出一棵
+`db-/etc/systemd/` 目录树，**一个字节的备份都没产生**。也就是说照那样改完之后，
+备份会以「每天都成功」的姿态静默地什么都不做。这比加载失败危险得多——后者至少会吵。
+
+正确写法是显式借 shell，并注意 systemd 的两层转义：
+
+```
+ExecStart=/bin/sh -c 'exec .../python scripts/db_backup.py \
+    --out /opt/cwq/backups/db-$$(date +%%F).sql --keep ${CWQ_BACKUP_KEEP}'
+```
+
+`$$` 交给 shell 一个字面 `$`，`%%` 还原成 `%`，`${CWQ_BACKUP_KEEP}` 仍由 systemd 展开。
+
+**判据**：不看 `systemctl is-enabled`，要 `systemctl start cwq-backup.service`
+之后 `ls /opt/cwq/backups/` 里真的出现带日期的 `.sql`。
+
+### 11.7.3 单元文件里有「未知键」时 systemd 会静默忽略
+
+`cwq-api.service` 里的 `LimitNOFILESoft=` 在 systemd 252 上是**未知键**，
+`systemctl show` 一切正常，只有 `systemd-analyze verify` 会报
+`Unknown key 'LimitNOFILESoft' in section [Service], ignoring.`。
+
+删掉它没有损失：**`LimitNOFILE=` 在 systemd < 254 上同时设置软限与硬限**。
+本机实测 cwq-api 的 `/proc/<pid>/limits` 是 `Max open files 8192 8192`。
+
+新增或修改单元文件后，一律跑一次 `systemd-analyze verify`，它比 `systemctl
+status` 更能说出「你以为生效了、其实没有」的东西。
+
+### 11.7.4 生产构建不得预填或展示任何演示凭据
+
+`LoginView.vue` 原先无条件渲染「演示账号 admin / 123456」，且把口令框**预填成
+`123456`**。在 acct.xins.live 上就是：打开登录页即见管理员用户名，点一下登录
+就把这套弱口令递出去。
+
+现在口令框恒为空、用户名与提示都由 `import.meta.env.DEV` 门控。
+
+实测补充一句，免得据它下错结论：生产产物里 `isDev` 被完全折掉、`username` 变成
+`""`，但**那段提示文字仍留在 chunk 里**——vue 把 `v-if` 编成条件表达式，
+terser 不会删掉常量假分支。它不会被渲染，但「搜产物搜不到演示口令」并不成立。
+
+`scripts/init_db.py` 造的是 `admin/123456` 与 `zhangsan/123456` 两个演示账号，
+**它只用于本地开发**。生产播种后必须立刻改口令（并 `token_version += 1` 让
+已签发的令牌作废）、停用 `zhangsan`，且口令明文只落盘到 root-only 文件，
+不回显到日志或对话。
+
+---
+
 ## 12. 测试策略
 
 | 文件 | 覆盖 |
