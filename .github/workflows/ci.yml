@@ -227,7 +227,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           # CI 固定在 LTS 上，不追开发机的新版本 —— 流水线要的是可复现。
-          # 本地开发机跑的是 Node 26，两边都验证过（见 PR 里手工核对的结果）。
+          # 本地开发机跑的是 Node 26。
+          #
+          # **代价是两者对 `node --test` 的参数解析不一样**（这行注释原来写的是
+          # 「两边都验证过」，并没有）：Node 26 能把 `tests/` 当目录展开，Node 22
+          # 会把它当成一个模块去 require，直接
+          # `Cannot find module '.../frontend/tests'` 而失败。
+          # 所以 package.json 的 test 脚本传的是**展开后的文件列表**而不是目录
+          # （见 frontend/package.json），两边行为就一致了。
+          # 要改 node-version，先把这条一起改掉，别只改一半。
           node-version: '22'
 
       - uses: pnpm/action-setup@v4
