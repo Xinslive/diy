@@ -29,6 +29,8 @@
 set -euo pipefail
 
 APP=${APP_DIR:-/opt/cwq}
+# 服务账号：产物解压之后归位给谁。跟 unit 文件里的 User= 保持一致。
+: "${SERVICE_USER:=cwq}"
 KEEP=3
 # 分支不写死（仓库默认分支改名时，写死的名字会让发布脚本在 ``set -e`` 下
 # 直接失败 —— 而那是最不该失败的时候）。发布模式不再 checkout 分支，
@@ -247,11 +249,43 @@ if ! ./.venv/bin/alembic upgrade head; then
 fi
 log "  schema 版本：$(./.venv/bin/alembic current 2>/dev/null | tail -1)"
 
+chown_if_possible() {
+  # 非致命：属主是卫生问题，不是正确性闸门。
+  #
+  # 它**必须**非致命，原因有二。其一，CI 的沙箱演练是以非 root 的 runner 身份
+  # 跑的，那里 chown 本来就会失败；让它致命，等于把「只有 root 才能做的事」
+  # 变成「整条发布脚本在 CI 上必红」。其二，这一步排在迁移**之后**，而
+  # deploy.sh 自己的原则是「迁移后任何一步失败都不切产物」—— 属主不对就中止，
+  # 留下的正是「库已迁移、代码没换」这个最糟的状态。代码 755 可读，服务照常跑，
+  # 所以正确做法是把话说清楚，而不是在这里把发布掐死。
+  if chown -R "$SERVICE_USER:$SERVICE_USER" "$1" 2>/dev/null; then
+    log "  属主已归位到 ${SERVICE_USER}"
+  else
+    log "⚠️  属主未归位到 ${SERVICE_USER}（当前身份无权 chown）"
+    log "   服务不受影响（代码 755 可读），但这不是正确的终态。补一句即可："
+    log "     chown -R ${SERVICE_USER}:${SERVICE_USER} $1"
+  fi
+}
+
 log "5/7 切换代码与前端产物"
 # 代码换名落位而不是就地覆盖：就地 mv 会在解压与替换之间留一个「代码在、
 # 依赖不在」的窗口。替换本身用 tar 直接落到目标目录，失败时旧版本还在
 # .releases 里可退。
-tar -xzf "$STAGE/cwq-backend-${SHA}.tar.gz" -C "$APP/backend"
+#
+# --no-same-owner 与后面的 chown 是一对，缺一不可，原因见下。
+tar --no-same-owner -xzf "$STAGE/cwq-backend-${SHA}.tar.gz" -C "$APP/backend"
+# **归档里记的是 CI 的构建身份，不是部署机的服务账号。** build-artifacts 在
+# GitHub Actions 里打包，tar 逐条记下当时的 ``runner/runner``；而这一步是以
+# root 跑的，GNU tar 默认**还原归档里的数字 uid/gid**。那个号落到部署机上
+# 未必对应服务账号 —— 110.42.44.53 上 uid 1001 恰好是 ``mysql``，于是
+# /opt/cwq/backend/app 一夜之间变成 mysql:mysql。
+#
+# 后果不是服务起不来：755 之下服务照样读得到、跑得起来、/api/health 也过。
+# 是**代码不再属于服务账号** —— Python 写不了 __pycache__，日后任何收紧权限
+# 的动作都会在最不该炸的时候炸。与 unit 里的 %F、LimitNOFILESoft 同一类：
+# 看着成功，实则不对。所以这里 --no-same-owner 解压（不让归档改属主），
+# 再显式 chown 给 SERVICE_USER。
+chown_if_possible "$APP/backend"
 log "  代码已切到 ${SHA}"
 
 # 前端：解压到暂存名，再**换名**换上。
@@ -268,10 +302,13 @@ FRONT_IN="$APP/frontend/.dist.incoming"
 FRONT_OLD="$APP/frontend/.dist.old"
 rm -rf "$FRONT_IN" "$FRONT_OLD"
 mkdir -p "$FRONT_IN"
-tar -xzf "$STAGE/cwq-frontend-${SHA}.tar.gz" -C "$FRONT_IN"
+tar --no-same-owner -xzf "$STAGE/cwq-frontend-${SHA}.tar.gz" -C "$FRONT_IN"
 if [[ ! -d "$FRONT_IN/dist" ]]; then
   die "前端产物里没有 dist/ —— 解压出来的东西不对。**前端产物没切、代码没重启。**"
 fi
+# 理由同后端那一步：--no-same-owner 挡住 CI runner 的 uid，chown 把属主
+# 显式交给服务账号。nginx 以 root 读它，两种属主都读得到，但只有后者是对的。
+chown_if_possible "$FRONT_IN/dist"
 mv "$APP/frontend/dist" "$FRONT_OLD"
 mv "$FRONT_IN/dist" "$APP/frontend/dist"
 rm -rf "$FRONT_OLD" "$FRONT_IN"

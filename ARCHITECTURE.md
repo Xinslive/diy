@@ -2645,6 +2645,50 @@ terser 不会删掉常量假分支。它不会被渲染，但「搜产物搜不�
 已签发的令牌作废）、停用 `zhangsan`，且口令明文只落盘到 root-only 文件，
 不回显到日志或对话。
 
+### 11.7.5 以 root 解压 CI 产物会把归档里的 uid 落到不相干的系统账号
+
+`build-artifacts` 在 GitHub Actions 里打包，tar 逐条记下当时的
+`runner/runner`。`deploy.sh` 以 root 跑，而 GNU tar **默认还原归档里的数字
+uid/gid**——于是解压出来的代码带着 CI 构建机的号。
+
+实测 110.42.44.53：归档里记的是 uid 1001，而这台机器上 uid 1001 恰好是
+`mysql`，于是 `/opt/cwq/backend/app`、`scripts`、`migrations` 与
+`/opt/cwq/frontend/dist` 全部变成 `mysql:mysql`——共 240 个文件。
+
+**服务照样正常**：755 之下 `cwq` 读得到、跑得起来、`/api/health` 也过。
+坏的是「代码不属于服务账号」：`cwq` 写不了 `__pycache__`，日后任何收紧
+权限的动作都会在最不该炸的时候炸。与 §11.7.2、§11.7.3 同一类。
+
+现在 `deploy.sh` 两处解压都带 `--no-same-owner`（不让归档改属主），
+之后显式 `chown -R "$SERVICE_USER"` 到后端与前端产物。
+
+判据不是 `systemctl is-active`，而是：
+
+```
+find /opt/cwq/backend /opt/cwq/frontend ! -user cwq
+```
+
+该输出为空，才算属主正确。
+
+### 11.7.6 nginx 配置片段只在其对应的布局里有效，「语法检查通过」不代表被加载
+
+`deploy/nginx/cwq-host-map.conf` 装到 `/etc/nginx/cwq-include/`，那是**源码
+编译的标准 nginx 布局**。宝塔的主配置只 include
+`/www/server/panel/vhost/nginx/*.conf`，那条路径它不加载——文件放上去，
+`nginx -t` 通过，`reload` 成功，**两次「成功」都只是因为那份配置根本没被
+读**。这与 §11.7.3 的未知键是同一个陷阱的另一面。
+
+acct.xins.live 走的是 `deploy/nginx/acct.xins.live.conf`（宝塔形态独立
+vhost），它用 `server_name acct.xins.live` 精确匹配，不需要这份 host 白名单：
+伪造 `Host` 的请求会落到宝塔自己的默认站点。实测 `Host: evil.example`
+得到 200 而**不是** 301 到 `evil.example`，开放重定向不成立。
+
+装完任何 include 片段，必须反查它真的进了主配置：
+
+```
+grep -c cwq_https_redirect /etc/nginx/conf/nginx.conf
+```
+
 ---
 
 ## 12. 测试策略
