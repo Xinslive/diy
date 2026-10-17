@@ -162,5 +162,31 @@ def download_invoice_file(batch_id: int, book: Book = Depends(get_my_book), db: 
     return Response(
         content=content,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{batch.filename.replace(chr(34), "")}"'},
+        # RFC 5987 写法（P2-05）。原来这里是
+        # ``f'inline; filename="{batch.filename}"'``，只把 `"` 去掉。
+        #
+        # Starlette 发送响应头时按 **latin-1** 编码取值，而发票文件名默认就叫
+        # 「发票.pdf」—— 于是 `UnicodeEncodeError`，**下载任何中文名发票都是 500**。
+        # 字节还在 data/invoices/batch_N.pdf，原件没丢，但用户拿不回来。
+        #
+        # 同一个项目里 app/api/vouchers.py::_filename() 早就是正确写法
+        # （``filename*=UTF-8''`` + percent-encoding），这里只是没复用。
+        #
+        # 不写 includeSubDomains 之类的额外属性；`inline` 保留原有的
+        # 「浏览器里直接看」行为，下载另由前端决定。
+        headers={"Content-Disposition": f"inline; {_rfc5987(batch.filename)}"},
     )
+
+
+def _rfc5987(name: str) -> str:
+    """把文件名编码进 Content-Disposition 的 ``filename*=UTF-8''`` 形式。
+
+    与 vouchers.py::_filename 是同一个函数、同一套理由：latin-1 编不动的
+    字符必须 percent-encoding 后走扩展参数，不能塞进裸的 filename=。
+    """
+    import urllib.parse
+
+    # 控制字符（尤其 CR/LF）一律剔除 —— h11 在写出响应头时会因为头值里的
+    # 换行报错，而文件名来自上传方，是不可信输入。
+    safe = "".join(ch for ch in (name or "") if ch.isprintable())
+    return "filename*=UTF-8''" + urllib.parse.quote(safe)

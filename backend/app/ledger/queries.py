@@ -388,7 +388,28 @@ def balance_sheet_of_accounts(
 
     行结构与总账完全一致，``general_ledger`` 直接委托到这里 ——
     同一个口径只允许有一份实现。
+
+    **区间倒置的闸门在这里，不在每个路由里。** 倒过来的一段区间不会让查询
+    报错，只会算出一份「看起来自洽」的表：``range_movements`` 逐期按
+    ``from_ord <= ord <= to_ord`` 过滤，倒置区间一条都留不下 → 发生额全 0；
+    期初取的是起始期的上一期期末，期末 = 期初 + 0 − 0，于是每一行期初都等于
+    期末、试算也平。用户看到的是一张有模有样、数字却全错的账 —— 而余额表
+    正是交给客户和审计的纸面数（见 ``filter_balance_rows`` 的注释）。
+
+    以前这道闸只有 ``/ledger/balance`` 的路由里有，``/ledger/general`` 只校验了
+    起始期间属不属于本账套、没查 ord，两者却委托的是**同一个**函数：同一段
+    倒置区间，余额表报 400、总账悄悄给出一份全零的错账。闸门下沉到共享实现
+    之后，两张表、以及所有别的调用方都拿到同一条规则。
     """
+    if from_period is not None and from_period.ord > period.ord:
+        # 抛 HTTPException 而不是 ValueError：queries.py 本来就是 HTTP 耦合的
+        # （``detail_ledger`` 的区间校验、``subject_of_book`` 的 404 都在这儿抛
+        # HTTPException），而且本函数的调用方里有一批在 ``api/printing.py``：
+        # 那个文件的 ``_render_scope``（总账打印/预览）只接 ExportTooLarge，
+        # 裸 ValueError 会以 500 落给用户 —— 参数写错却回「服务器错误」，
+        # 比返回一份错账还让人无从下手。
+        raise HTTPException(400, "起始期间不能晚于结束期间")
+
     eng = LedgerEngine.for_ledger(db, book_id, include_unposted)
     ids = [s.id for s in subjects]
     fmap = eng.batch_figures(ids, period.ord)

@@ -127,6 +127,12 @@ def create(payload: VoucherIn, book: Book = Depends(get_my_book), db: Session = 
             entries=[e.model_dump() for e in payload.entries], remark=payload.remark,
             attachments=payload.attachments, source=payload.source,
             voucher_no=payload.voucher_no, insert_after_id=payload.insert_after,
+            # ``internal`` 刻意**不传**：它是「系统自己生成的凭证」的唯一入口
+            # （结转损益 / 年度结转在 periods.py 里以 internal=True 调本函数）。
+            # 这里传下去的任何东西都来自请求体，所以 source 只能取
+            # ``VoucherIn`` 那个封闭的 Literal —— CARRY_FORWARD 已经不在里面，
+            # 客户端提交它会直接 422。更新走 PUT 的那条路同样改不了 source：
+            # ``update_voucher`` 只认日期、分录、备注、附单据数。
         )
     except (ValueError, ArithmeticError) as e:
         db.rollback()
@@ -388,8 +394,35 @@ def list_imports(book: Book = Depends(get_my_book), db: Session = Depends(get_db
 @router.post("/import/{batch_id}/commit")
 def commit_import(batch_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                   _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
-    batch = db.get(ImportBatch, batch_id)
-    if batch is None or batch.book_id != book.id:
+    """确认入库。**批次行必须锁住再读状态** —— 这是并发提交的唯一闸门。
+
+    原来这里是裸的 ``db.get(ImportBatch, batch_id)``：无锁，读出来的
+    ``status`` 是**那一刻**的快照。两个并发的 ``POST /import/{id}/commit``
+    （用户手快按了两次双击；或者一个人提交、另一个人同时点了确认）会双双读到
+    PENDING，双双通过 ``importer.commit`` 里的 ``status != "PENDING"`` 检查。
+
+    表里**带凭证号**时，``uq_voucher_period_no`` 会把第二边顶回去（响亮地失败，
+    至少不会脏）；但工作簿常常不带号（``importer`` 里是
+    ``row_no or None``），这时两边各自 ``next_voucher_no`` 取「本期最大号 +1」。
+    READ COMMITTED 下第二个事务看得见第一个刚提交的凭证，于是拿到**另一个**号
+    —— 约束不触发，两批凭证安静地重复入库，而 ``committed_count`` 还各自
+    报「成功导入 N 张」。用户点一次确认，账上多出两份。
+
+    ``with_for_update()`` 把两个提交在**同一个事务里**串起来：后到的那个
+    一直等到前一个提交完，锁释放时重新读到 COMMITTED，
+    ``importer.commit`` 抛的 ValueError 由下面的 except 翻成 400
+    「该导入批次已是「COMMITTED」状态，不能重复提交」。锁一直持有到
+    ``importer.commit`` 内部的 ``db.commit()``（失败路径是 ``db.rollback()``），
+    正是本路由稍后提交的那一个事务 —— 锁提前释放或释放得太晚都不对。
+
+    与 ``periods.py`` / ``organize.py`` 的写法一致：先锁后算。
+    """
+    batch = db.scalar(
+        select(ImportBatch)
+        .where(ImportBatch.id == batch_id, ImportBatch.book_id == book.id)
+        .with_for_update()
+    )
+    if batch is None:
         raise HTTPException(404, "导入批次不存在")
     try:
         result = svc_import.commit(db, batch, user)

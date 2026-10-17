@@ -777,7 +777,7 @@ def carry_forward(book_id: int, period_id: int,
     try:
         # 永远「先删旧结转凭证再重算」，payload 只为兼容旧前端保留
         return svc.carry_forward_profit(
-            db, book.id, period, user, replace=bool(payload.replace) if payload else True
+            db, book.id, period, user
         )
     except ValueError as e:
         db.rollback()

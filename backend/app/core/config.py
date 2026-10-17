@@ -44,6 +44,29 @@ LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET")
 # 一并打进日志，而日志是被采集、被转发、被存盘的。
 PROD_FORBIDDEN_LOG_LEVELS = ("DEBUG",)
 
+# JWT 签名算法白名单（审计 P2-11）。
+#
+# ``jwt_algorithm`` 是 ``.env`` 里能改的项，而 ``validate_production_settings``
+# 当初把密钥的长度、弱口令、默认值都查了，**唯独没查它** ——
+# 于是「配对了强度、配错了算法」是一道没人拦的门。
+#
+# 现在的风险是潜在而不是现实的：PyJWT 在 ``algorithms=["none"]`` 下拒绝
+# 无签名 token（密钥非空时抛 InvalidKeyError，空串时抛 InvalidSignatureError），
+# 而 HS256 用一个 ≥32 字节的密钥去验 RS256 签的 token 也会因算法不符而失败。
+# 换句话说**当前不可利用**。但它是「一次重构就会变成真漏洞」的那类缺口：
+# 哪天有人把 ``security.py`` 的解码改成「按 token 自带的 alg 选算法」，
+# 这道本该在这里拦下的门就再也拦不住了。
+#
+# 所以显式白名单：HMAC 家族（对称）三项。
+ALLOWED_JWT_ALGORITHMS = ("HS256", "HS384", "HS512")
+
+# TRUSTED_PROXIES 的最小前缀长度（审计 P3）。
+#
+# 这份白名单只用来决定「敢不敢读 X-Forwarded-For」。代理部署里就是几个地址，
+# 没有理由写成 /8 以外的宽网段；而 0.0.0.0/0 会让限流彻底失效（见
+# trusted_proxy_networks 里的说明），所以在这里给一条下限。
+_MIN_PROXY_PREFIXLEN = 8
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -224,7 +247,19 @@ class Settings(BaseSettings):
 
     # 发票原件与解析结果的本地留存目录。数据库只保存相对文件名，便于迁移部署。
     invoice_storage_dir: str = "data/invoices"
-    invoice_max_bytes: int = 100 * 1024 * 1024
+    # 发票上传上限（审计 P2-12）。
+    #
+    # 原来是 100MB，而网关的 ``client_max_body_size`` 是 21m —— 两者矛盾，
+    # 且**小的那个先生效**：21~100MB 的发票批次会先被 nginx 完整接收、
+    # 写进临时文件，然后才被应用层拒掉。写死的那个 100MB 从来没真正生效过，
+    # 只是让配置与 .env.example 的说明看起来比实际宽松。
+    #
+    # 这里改成与 import_max_bytes 同档（20MB），让**配置里的数字等于实际能传的**。
+    # 注意这是零能力损失：100MB 本来就被 21m 的网关挡在门外。
+    #
+    # 要调大必须两边一起改（和 import_max_bytes 同一条规矩）：
+    # 这里放开的同时把 deploy/nginx/cwq.conf 的 client_max_body_size 提上去。
+    invoice_max_bytes: int = 20 * 1024 * 1024
     # 外部 PaddleOCR API。未同时配置 URL 和 token 时，发票功能仍可处理文本型 PDF，
     # 但不会尝试 OCR 兜底。
     invoice_ocr_api_url: str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
@@ -333,9 +368,27 @@ def trusted_proxy_networks(raw: str | None = None) -> tuple:
         if not item:
             continue
         try:
-            nets.append(ipaddress.ip_network(item, strict=False))
+            net = ipaddress.ip_network(item, strict=False)
         except ValueError:
             log.warning("TRUSTED_PROXIES 里的 %r 不是合法 IP 或 CIDR，已忽略（不生效）", item)
+            continue
+        # P3：给网段加一条下限。``0.0.0.0/0`` 与 ``::/0`` 在这里是**语法合法**
+        # 的，但它把「信任代理」变成了「信任所有人」——
+        # 而这份白名单唯一的作用就是决定敢不敢读 X-Forwarded-For。
+        # 读了就等于采信客户端能随便写的那个头，于是 ``_throttle_ip``
+        # （登录失败的 IP 限流）被彻底绕过：换个头就能换一个限流桶。
+        #
+        # 与其让它「配了就生效」地废掉限流，不如在这里拒掉并说清楚原因。
+        # 单条白名单本来就不该超过 /8 —— 代理在部署里就那么几个地址。
+        if net.prefixlen < _MIN_PROXY_PREFIXLEN:
+            log.error(
+                "TRUSTED_PROXIES 里的 %r 覆盖了几乎整个地址空间（/%d），已忽略。"
+                "信任这么宽的对端等于采信客户端伪造的 X-Forwarded-For，"
+                "登录 IP 限流会因此失效。请写具体的代理地址。",
+                item, net.prefixlen,
+            )
+            continue
+        nets.append(net)
     return tuple(nets)
 
 
@@ -385,6 +438,14 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
             "HS256 是对称签名，密钥短到这个程度，伪造 token 的成本可以忽略")
     if secret.strip().lower() in WEAK_SECRETS:
         problems.append(f"JWT_SECRET 是常见占位符 {secret.strip()!r}，等于没设")
+
+    # P2-11：密钥查够了，算法这一项不能是唯一的例外。
+    # ``none`` 与任何非 HMAC 的算法名都要在这里拦下 —— 理由见 ALLOWED_JWT_ALGORITHMS。
+    if settings.jwt_algorithm not in ALLOWED_JWT_ALGORITHMS:
+        problems.append(
+            f"JWT_ALGORITHM={settings.jwt_algorithm!r} 不在白名单里 "
+            f"（{'、'.join(ALLOWED_JWT_ALGORITHMS)}）—— "
+            "改成 none 或非 HMAC 算法等于关掉签名校验")
 
     if _db_password(settings.database_url) == DEFAULT_DB_PASSWORD:
         problems.append(

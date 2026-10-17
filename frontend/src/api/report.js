@@ -1,4 +1,4 @@
-import { http, apiUrl, getLatest } from './client'
+import { http, getLatest } from './client'
 // 列表必须带 book_id：服务端要靠它判断「这张模板对当前账套可见吗」，
 // 并按 code 去重（官方内置基线 vs 本账套副本并存时，副本优先）。
 export const templates = (bookId) =>

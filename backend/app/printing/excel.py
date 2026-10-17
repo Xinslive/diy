@@ -215,6 +215,86 @@ def vouchers_excel(rows: list[dict], *, title: str = "记账凭证", period: str
 
 # --------------------------------------------------------------------- 科目余额表
 
+#: 合计行用到的八个「按方向归过边」的数。键名与 ``queries.balance_sheet_of_accounts``
+#: 的 ``check`` 一一对应，别再另立一套叫法。
+_TOTAL_KEYS = ("opening_debit", "opening_credit", "period_debit", "period_credit",
+               "ytd_debit", "ytd_credit", "closing_debit", "closing_credit")
+
+
+def _balance_totals(rows: list[dict], check: dict) -> dict[str, Decimal]:
+    """科目余额表合计行 = **试算合计**，不是纸上那几行的算术和。
+
+    以前这里是 ``for row in rows: totals[idx] += _d(row.get(key))``，两个错叠在
+    一起，导出的余额表正好是交给客户和审计的纸面数：
+
+    1. **方向被吃掉了。** 行里的 ``opening`` / ``closing`` 来自
+       ``display_side()``，是**绝对值** —— 贷方余额同样存正数（它靠旁边的
+       「方向」列区分）。借方余额合计 1000 + 贷方余额合计 1000 直接相加，
+       合计「期初」写成 2000，而下面两行试算还打着「期末余额平衡 ✓」：
+       同一张纸上两处结论互相打脸，而 2000 不等于任何一边的合计。
+       归边口径必须与 ``app/ledger/queries.py::balance_sheet_of_accounts``
+       一致 —— 那边按 ``o_signed`` / ``c_signed`` 的符号拆借贷、只累计叶子，
+       行里的「方向」列就是那次拆分的结果，所以这里按方向列归边即同一个口径。
+    2. **重复计数。** 行是**过滤之后**的（``filter_balance_rows``：仅一级 /
+       仅明细 / 全部）。默认「全部」时父子同在一张表上，父级行本身就是下级的
+       上卷，逐行相加等于把同一笔钱数了两遍。``filter_balance_rows`` 的
+       docstring 明说它**不动 check** —— 那条 check 是叶子级算的，与档位无关，
+       屏幕上的加总也就与档位无关。合计必须跟 check 同源，否则「仅一级」与
+       「全部」打出来的合计不一样。
+
+    **有 check 就用 check。** 它是叶子级、按符号拆好边的四个数，是这套系统里
+    唯一一份试算口径的实现；本函数退化成「同样的算法」只为了在没有 check 的
+    旧调用方（以及直接调本函数的测试）下仍然给出正确的数。
+    期初的拆边 check 没给（那边只落了 ``opening_balanced`` 一个布尔），
+    只能从叶子行算 —— 这是本次不扩到 ledger 层的唯一遗留缺口。
+    """
+    # 叶子优先。``is_leaf`` 缺失（老调用方 / 直接构 payload）按叶子算，
+    # 宁可与 check 的口径同向，也不要把父子算两遍。
+    leaves = [row for row in rows if row.get("is_leaf", True)]
+    if not leaves:
+        # 「仅一级」档位下 payload 里一行叶子都没有。一级行是下级的上卷，
+        # 对发生额（借贷方、本年累计）来说它就是一次不重不漏的划分，按它算
+        # 与按叶子算同值；余额绝对值只在同一父级内部正负相抵时才会偏低，
+        # 那种行在导出纸上另有「方向」列可核对。
+        leaves = list(rows)
+
+    totals = dict.fromkeys(_TOTAL_KEYS, ZERO)
+    for row in leaves:
+        # Decimal 累加，不退回 float（见 _num 的说明）。逐格 round 也不能替代：
+        # round 是「四舍五入到分」，累加是「先加后舍」，两者在长表上不等价。
+        if row.get("opening_direction") == "借":
+            totals["opening_debit"] += _d(row.get("opening"))
+        else:
+            totals["opening_credit"] += _d(row.get("opening"))
+        totals["period_debit"] += _d(row.get("period_debit"))
+        totals["period_credit"] += _d(row.get("period_credit"))
+        totals["ytd_debit"] += _d(row.get("ytd_debit"))
+        totals["ytd_credit"] += _d(row.get("ytd_credit"))
+        if row.get("direction") == "借":
+            totals["closing_debit"] += _d(row.get("closing"))
+        else:
+            totals["closing_credit"] += _d(row.get("closing"))
+
+    for key, check_key in (("period_debit", "total_debit"), ("period_credit", "total_credit"),
+                           ("closing_debit", "total_closing_debit"),
+                           ("closing_credit", "total_closing_credit")):
+        if check.get(check_key) is not None:
+            totals[key] = _d(check[check_key])
+    return totals
+
+
+def _verdict(check: dict, key: str, label: str, debit: Decimal, credit: Decimal) -> str:
+    """试算行：「平衡 ✓ / 不平衡 ✗」+ 两边的数。
+
+    只打 ✓ 不打数，等于让读纸面的人自己回头把几百行加一遍 —— 而这份文件
+    的用途正是**免去**加法（交给审计方逐格核对）。不平衡时两边的差额一眼可见。
+    """
+    def money(v: Decimal) -> str:
+        return f"{v.quantize(CENT, rounding=ROUND_HALF_UP):,.2f}"
+
+    mark = "平衡 ✓" if check.get(key) else "不平衡 ✗"
+    return f"{label}{mark}（借 {money(debit)} / 贷 {money(credit)}）"
+
 
 def balance_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     wb = Workbook()
@@ -248,7 +328,6 @@ def balance_excel(payload: dict, *, company: str, book_name: str) -> bytes:
         c.alignment = CENTER
         c.border = Border(left=THIN, right=THIN, top=MEDIUM, bottom=MEDIUM)
 
-    totals = [ZERO] * 6
     for row in payload["rows"]:
         r += 1
         values = [_text(row["code"]), _text(row["name"]), _text(row["opening_direction"]),
@@ -260,16 +339,24 @@ def balance_excel(payload: dict, *, company: str, book_name: str) -> bytes:
             c = ws.cell(row=r, column=i, value=v)
             c.border = BOX
             c.alignment = LEFT if i in (1, 2) else (CENTER if i in (3, 9) else RIGHT)
-        # Decimal 累加，不退回 float（见 _num 的说明）。逐格 round 也不能替代：
-        # round 是「四舍五入到分」，累加是「先加后舍」，两者在长表上不等价。
-        for idx, key in enumerate(["opening", "period_debit", "period_credit",
-                                   "ytd_debit", "ytd_credit", "closing"]):
-            totals[idx] += _d(row.get(key))
+        # 合计**不在这个循环里累加**，见 _balance_totals：这里逐格加出来的是
+        # 「纸上那几行的算术和」，既不是试算合计，档位一变还会跟着变。
+
+    # 合计 = 试算合计（叶子级、按方向分借贷），见 _balance_totals。
+    totals = _balance_totals(payload["rows"], payload.get("check") or {})
 
     r += 1
     ws.cell(row=r, column=2, value="合计").font = Font(bold=True)
-    for i, t in enumerate(totals, start=4):
-        ws.cell(row=r, column=i, value=t.quantize(CENT, rounding=ROUND_HALF_UP)).font = Font(bold=True)
+    # 单栏的「期初 / 期末」在合计行只放得下一边，取**借方合计**。试算平衡成立
+    # 时借方合计 == 贷方合计，两边同值，所以这一格就是试算合计本身；真不平衡
+    # （不该发生，但账确实会错）时差额由下面两行试算行明写出来，不会藏起来。
+    #
+    # 第 9 列是「方向」，合计行没有方向可言 —— 以前把期末合计写在了那一列，
+    # 于是一格方向列里躺着一个金额，而真正的「期末」列空着。
+    for col, key in ((4, "opening_debit"), (5, "period_debit"), (6, "period_credit"),
+                     (7, "ytd_debit"), (8, "ytd_credit"), (10, "closing_debit")):
+        c = ws.cell(row=r, column=col, value=totals[key].quantize(CENT, rounding=ROUND_HALF_UP))
+        c.font = Font(bold=True)
     for c in range(1, 11):
         ws.cell(row=r, column=c).border = Border(left=THIN, right=THIN, top=MEDIUM, bottom=MEDIUM)
     _money_style(ws, r, range(4, 11))
@@ -277,10 +364,12 @@ def balance_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     check = payload["check"]
     r += 2
     ws.cell(row=r, column=2, value="试算平衡：").font = Font(bold=True)
-    ws.cell(row=r, column=4,
-            value="本期发生额平衡 ✓" if check["period_balanced"] else "本期发生额不平衡 ✗")
-    ws.cell(row=r + 1, column=4,
-            value="期末余额平衡 ✓" if check["closing_balanced"] else "期末余额不平衡 ✗")
+    # 试算行把**两边**的数一起写出来，不只是 ✓/✗：单栏版式在合计行只留了
+    # 借方合计，贷方合计在这里现身，收到纸面上的人不必自己回头加一遍。
+    ws.cell(row=r, column=4, value=_verdict(
+        check, "period_balanced", "本期发生额", totals["period_debit"], totals["period_credit"]))
+    ws.cell(row=r + 1, column=4, value=_verdict(
+        check, "closing_balanced", "期末余额", totals["closing_debit"], totals["closing_credit"]))
 
     buf = io.BytesIO()
     wb.save(buf)

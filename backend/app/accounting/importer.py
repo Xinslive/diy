@@ -67,7 +67,7 @@ from sqlalchemy.orm import Session
 
 from app.accounting import subject_importer
 from app.accounting.audit_helper import log
-from app.accounting.util import money
+from app.accounting.util import is_summary_label, money
 from app.core.config import settings
 from app.core.uploads import (RowBudget, UploadTooLarge, check_archive_size,
                               read_upload)
@@ -392,6 +392,21 @@ def _parse_rows(rows_iter, book_id: int, db: Session) -> dict:
         # 标成不通过 —— 那是把表尾的合计误算到别人的账上。
         if not (row_date or row_no or (row_subject not in (None, ""))):
             # 全空行在上一段已经 continue 过了，走到这里的必然有内容。
+            footer_rows += 1
+            continue
+
+        # 汇总行：**标签写进了科目列**的那种（审计 P2-13）。
+        #
+        # 上面那条只认「三项全空」这一个形状，而真实文件还有另一种：表尾
+        # 「合计」行把标签写进「科目名称」列、日期与凭证号留空。此时
+        # row_subject 非空，上面那条判据放它过去，接着它会在科目查找里
+        # 失败，于是「找不到科目「合计」」被挂到**上一张真实凭证**头上 ——
+        # 那张凭证因此被标成不通过、静默地不进库。
+        #
+        # 后果不脏数据但很冤：用户什么也没做错，一张正经凭证凭表尾一行
+        # 就没导进去。期初导入早就按标签剔过这类行（opening_importer），
+        # 凭证导入却只有结构性判据 —— 现在两处共用 util.is_summary_label。
+        if is_summary_label(col("subject_code", row), row_subject):
             footer_rows += 1
             continue
 

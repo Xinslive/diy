@@ -69,12 +69,29 @@ def _links_by_user(db: Session) -> dict[int, dict[int, str]]:
 # --------------------------------------------------------------------- 用户
 
 
+class BookLinkIn(BaseModel):
+    """一条账套授权。**这里必须是带类型的模型，不能是 ``dict``。**
+
+    P3：原来是 ``books: list[dict]``，于是 ``book_id`` 拼错或漏掉都不会在
+    入口被拦，一路走到 ``_apply_links`` 里才 ``KeyError`` → 500。
+    而那段流程里的 ``_check_roles`` 用的是 ``it.get("role")``，两处对畸形
+    输入的写法不一致 —— 同一个请求的缺字段表现成 500，调用方看不出是自己的
+    payload 不对。
+
+    改成带类型的模型后，FastAPI/pydantic 在**入口**就返回 422 并指明
+    缺哪个字段：那才是这类错误该有的样子，也不用在下游到处防 ``KeyError``。
+    """
+
+    book_id: int
+    role: str
+
+
 class UserIn(BaseModel):
     username: str = Field(min_length=2, max_length=64)
     password: str = Field(min_length=6, max_length=128)
     real_name: str = ""
     active: bool = True
-    books: list[dict] = Field(default_factory=list)   # [{"book_id":1,"role":"ACCOUNTANT"}]
+    books: list[BookLinkIn] = Field(default_factory=list)
 
 
 class UserPatch(BaseModel):
@@ -83,9 +100,16 @@ class UserPatch(BaseModel):
     active: Optional[bool] = None
 
 
-def _apply_links(db: Session, user: SysUser, books: list[dict]) -> None:
-    valid = {b["book_id"]: b["role"] for b in books
-             if db.get(Book, b["book_id"]) is not None}
+def _apply_links(db: Session, user: SysUser, books: list[BookLinkIn]) -> None:
+    # 入参现在是带类型的 ``BookLinkIn``（见上面那段），``book_id`` 缺失会
+    # 在入口被 pydantic 拦成 422，不再有 KeyError → 500 的路。
+    # 这里仍保留 ``.get`` 的写法：role 的合法性由 _check_roles 统一管，
+    # 而账套不存在（合法 int 但库里没有）在这里静默跳过 —— 那是「授权一个
+    # 不存在的账套」，与「payload 结构错了」不是一回事。
+    valid = {
+        b.book_id: b.role for b in books
+        if db.get(Book, b.book_id) is not None
+    }
     for link in db.scalars(select(UserBook).where(UserBook.user_id == user.id)).all():
         if link.book_id not in valid:
             db.delete(link)
@@ -95,10 +119,10 @@ def _apply_links(db: Session, user: SysUser, books: list[dict]) -> None:
         db.add(UserBook(user_id=user.id, book_id=book_id, role=role))
 
 
-def _check_roles(items: list[dict]) -> None:
+def _check_roles(items: list[BookLinkIn]) -> None:
     for it in items:
-        if it.get("role") not in ROLES:
-            raise HTTPException(400, f"未知角色「{it.get('role')}」，可选：{'、'.join(ROLES)}")
+        if it.role not in ROLES:
+            raise HTTPException(400, f"未知角色「{it.role}」，可选：{'、'.join(ROLES)}")
 
 
 @router.get("/users")
@@ -134,7 +158,7 @@ def create_user(payload: UserIn, user: SysUser = Depends(get_current_user),
         after={**_user_snapshot(u), "books": granted})
     db.commit()
     db.refresh(u)
-    return _serialize(u, {b["book_id"]: b["role"] for b in payload.books})
+    return _serialize(u, {b.book_id: b.role for b in payload.books})
 
 
 @router.patch("/users/{user_id}")
@@ -196,7 +220,7 @@ def update_user(user_id: int, payload: UserPatch, user: SysUser = Depends(get_cu
 
 
 @router.put("/users/{user_id}/books")
-def set_books(user_id: int, books: list[dict], user: SysUser = Depends(get_current_user),
+def set_books(user_id: int, books: list[BookLinkIn], user: SysUser = Depends(get_current_user),
               db: Session = Depends(get_db)):
     """整份替换某用户的账套授权列表。"""
 
@@ -235,7 +259,7 @@ def set_books(user_id: int, books: list[dict], user: SysUser = Depends(get_curre
             before={"user": target.username, "role": old_role},
             after={"user": target.username, "role": new_role})
     db.commit()
-    return _serialize(target, {b["book_id"]: b["role"] for b in books})
+    return _serialize(target, {b.book_id: b.role for b in books})
 
 
 @router.delete("/users/{user_id}")

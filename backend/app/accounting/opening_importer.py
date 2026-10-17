@@ -47,7 +47,8 @@ from decimal import Decimal
 from typing import Any, Iterable, Sequence
 
 from app.accounting.subject_importer import iter_workbook_rows
-from app.accounting.util import money
+from app.accounting.util import SUMMARY_LABELS as util_summary_labels
+from app.accounting.util import is_summary_label, money
 from app.core.config import settings
 from app.core.uploads import RowBudget, check_archive_size
 
@@ -59,16 +60,9 @@ EXPORT_HEADER_SCAN_ROWS = 15
 SOURCE_UFIDA = "用友余额表"
 SOURCE_EXPORT = "Excel 期初表"
 
-# 汇总行标签。真实文件里这行的「科目名称」列是空的、标签写在「科目编码」列，
-# 但别的版本会把标签写进名称列，所以两列都判一遍。
-#
-# 为什么必须整行剔除、而不是当成普通数据行：这些行是**已经加总过的数**
-# （合计行的期初借方 = 明细行加总），当成科目会重复计入，借贷合计直接翻倍。
-# 为什么不能报成错误：它们不是用户的错，报错等于让用户去改一张没错的表。
-SUMMARY_LABELS = frozenset({
-    "资产小计", "负债小计", "权益小计", "损益小计",
-    "合计", "总计", "本页合计", "累计", "本年累计",
-})
+# 汇总行标签。**定义在 app.accounting.util**（审计 P2-13）——
+# 凭证导入那边也用得到，这里保留一个别名只是不想把本文件里其余引用一起改掉。
+SUMMARY_LABELS = util_summary_labels
 
 CODE_KEYWORDS = ("编码", "代码", "编号")
 NAME_KEYWORDS = ("名称", "科目全名")
@@ -144,12 +138,12 @@ def _amount_text(value: Decimal) -> str:
 
 
 def _is_summary_row(code: str, name: str) -> bool:
-    """汇总行（资产小计/合计…）整行跳过 —— 它不是科目，也不是错误。"""
-    for text in (code, name):
-        compact = re.sub(r"\s+", "", text)
-        if compact and compact in SUMMARY_LABELS:
-            return True
-    return False
+    """汇总行（资产小计/合计…）整行跳过 —— 它不是科目，也不是错误。
+
+    判据与标签都搬到 ``util`` 了（审计 P2-13）：凭证导入也需要同一条判据，
+    两边各留一份迟早再次对不上。
+    """
+    return is_summary_label(code, name)
 
 
 def _side_columns(labels: Sequence[str], keywords: Iterable[str],

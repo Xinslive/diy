@@ -73,14 +73,31 @@ app = FastAPI(
     **api_docs_urls(),
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
-    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS 只在开发/测试环境装（审计 P2-10）。
+#
+# 原来这段是**无条件**加的，且带着一条通配正则
+# ``http://(localhost|127\.0\.0\.1):\d+`` + ``allow_credentials=True``：
+# 生产部署下，任何跑在本机 localhost 任意端口上的页面都能带着凭据
+# 跨源读本系统的任意响应。令牌存在 localStorage 而非 cookie，
+# 所以恶意源拿不到令牌、拿不到实质数据 —— 危害有限，但白名单
+# 「任何本机端口」这件事本身就不该出现在生产。
+#
+# 判环境用 ``detect_env``，和启动校验、/health 用**同一个口径**；
+# 显式 APP_ENV 没配时按 prod 处理（config.detect_env 的注释解释过为什么）。
+_cors_env = detect_env(settings)
+if _cors_env in ("dev", "test"):
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_credentials=True,
+        allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # 生产：前端与 API 同源（都经 nginx 转发），不需要 CORS。
+    # 留空而不是「装一个空白名单的中间件」—— 后者仍会让浏览器多跑一轮预检。
+    log.info("CORS 中间件未启用（环境=%s）：生产应由 nginx 同源提供前后端", _cors_env)
 
 
 # 外部请求号原样透传，只认这几种字符、限长 64。

@@ -583,8 +583,36 @@ def apply_organize(
     strategy: str = "SORT_DATE",
 ) -> dict:
     """落库整理。返回每期的实际改动张数。"""
+    # P2-1：**先锁，再算**。
+    #
+    # 原来是「先 plan_organize 算方案、再取行锁」，而 plan_organize 自己就是
+    # 「读一遍算一遍」。于是锁拿到的时候方案早算完了 —— 它挡住的是写入，
+    # 挡不住**读**。两个并发整理仍然会各自按自己的快照算出同一套目标号，
+    # 后提交的那个照旧撞 ``uq_voucher_period_no``。
+    #
+    # DB 侧有唯一约束兜底，所以从来不会产生脏数据；撞出来的是一条裸的
+    # IntegrityError，走全局处理器只得到 500，用户看不出是自己刚点过整理。
+    # 也就是说「并发防护」只在代码注释里成立过。
+    #
+    # 锁的**候选集合只由 period_id 决定**（指定一期 → 那期；不指定 → 本账套
+    # 全部期间），不需要看凭证就能确定，所以完全可以在算方案之前拿到。
+    #
+    # 锁粒度选期间而不是账套：整理是逐期发号的，锁期间就够把「同一个期间的
+    # 号段」串行化，不同期间仍可并行。锁顺序按 ``ord`` 升序 —— 全项目行锁
+    # 只有这两处，顺序一致才不会成环。
+    #
+    # 代价：不指定期间时，锁的是本账套**全部**期间，而不是「算下来有改动的
+    # 那些」。那是没办法的 —— 「有改动」这件事正是要读凭证才知道的，而读
+    # 必须在锁之后。整理是低频操作，多锁几期换来的是真的串行化，这笔买卖
+    # 划算；而且那一档的锁仍然在同一个事务里，几毫秒就放开了。
+    lock_stmt = select(Period.id).where(Period.book_id == book_id).order_by(Period.ord)
+    if period_id is not None:
+        lock_stmt = lock_stmt.where(Period.id == period_id)
+    db.execute(lock_stmt.with_for_update()).all()   # 取结果：锁才真正落在这些行上
+
     plans = plan_organize(db, book_id=book_id, period_id=period_id, strategy=strategy)
 
+    # 结账检查放在锁内：这样「读到未结账」与「发号」之间不再有窗口。
     locked = db.execute(
         select(Period.year, Period.month).where(
             Period.id.in_([p.period_id for p in plans]), Period.locked.is_(True)
@@ -597,27 +625,6 @@ def apply_organize(
 
     result: list[dict] = []
     total_changed = 0
-
-    # P3-11：改号全程无锁。计划是「读一遍算一遍」，落库是「写两遍」，
-    # 中间没有任何东西挡住并发的第二个整理 —— 两边会按**各自的**快照算出
-    # 同一套目标号，然后后提交的那个撞上 ``uq_voucher_period_no``。
-    #
-    # DB 侧有唯一约束兜底，所以不会产生脏数据（这是「翻成人话」而不是
-    # 「修数据错」的原因）；但撞出来的是一条裸的 IntegrityError，
-    # 走全局处理器只得到 500，用户看不出是自己刚点过整理。
-    #
-    # 这里锁**期间行**，与 periods.py 的 ``ensure_periods`` 同一套做法
-    # （它锁账套行）。锁粒度选期间而不是账套：整理是逐期发号的，
-    # 锁期间就够把「同一个期间的号段」串行化，不同期间可以并行。
-    # 锁顺序按 ``ord`` 升序 —— 全项目行锁只有这两处，顺序一致才不会成环。
-    lock_ids = [p.period_id for p in plans if any(c.changed for c in p.changes)]
-    if lock_ids:
-        db.execute(
-            select(Period.id)
-            .where(Period.id.in_(lock_ids))
-            .order_by(Period.ord)
-            .with_for_update()
-        )
 
     for plan in plans:
         before = {

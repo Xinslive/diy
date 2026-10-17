@@ -72,6 +72,80 @@ def test_整理会锁住期间行(db, book, admin_user, subjects, make_voucher, 
         f"整理凭证没有锁期间行，并发整理会各按各的快照算号：{seen}"
 
 
+def test_锁必须在算方案之前拿到(db, book, admin_user, subjects, make_voucher, monkeypatch):
+    """这条钉的是**顺序**，不是「有没有出现 FOR UPDATE」（审计 P2-1）。
+
+    原实现是「先 plan_organize 算方案、再取行锁」，而 plan_organize 自己就是
+    「读一遍算一遍」——锁拿到的时候方案早算完了，挡得住写、挡不住读。两个
+    并发整理仍然各按各的快照算出同一套目标号。
+
+    上面的 `test_整理会锁住期间行` 看着已经覆盖了这件事，其实没有：它只 spy
+    「发出了 FOR UPDATE」，锁在方案之后拿它照样通过。这正是当初让并发修复
+    误以为已经生效的原因 —— 所以这里断言的是**先锁后读这个次序本身**。
+
+    做法：记录 execute 的调用序列，把那条锁语句和 plan_organize 的读语句
+    各标一个序号，比较谁在前。
+    """
+    _mk(db, book, admin_user, subjects, "记003")
+    db.commit()
+
+    order: list[str] = []
+    real_execute = db.execute
+    real_plan = svc.plan_organize
+
+    def spy_execute(stmt, *a, **kw):
+        sql = str(stmt)
+        if "FOR UPDATE" in sql:
+            order.append("lock")
+        return real_execute(stmt, *a, **kw)
+
+    def spy_plan(*a, **kw):
+        order.append("plan")
+        return real_plan(*a, **kw)
+
+    monkeypatch.setattr(db, "execute", spy_execute)
+    monkeypatch.setattr(svc, "plan_organize", spy_plan)
+
+    svc.apply_organize(db, book_id=book.id, user=admin_user, period_id=None,
+                       strategy="SORT_DATE")
+
+    assert "lock" in order, f"没有取到期间行锁：{order}"
+    assert "plan" in order, f"plan_organize 没有被调用，用例前提不对：{order}"
+    assert order.index("lock") < order.index("plan"), (
+        "锁取得太晚（在算方案之后）—— 它只挡得住写、挡不住读，"
+        "并发整理仍会各按各的快照算出同一套目标号："
+        f"{order}")
+
+
+def test_指定期间时只锁那一期(db, book, admin_user, subjects, make_voucher, monkeypatch):
+    """锁的粒度不能退化成「每次都锁整个账套」。
+
+    不指定期间时锁全部（那是「哪些期会改动」在读凭证之前无从得知的代价），
+    但指定了期间就该只锁那一期 —— 不同期间的整理仍然可以并行。
+    """
+    _mk(db, book, admin_user, subjects, "记003")
+    db.commit()
+
+    seen: list[str] = []
+    real_execute = db.execute
+
+    def spy(stmt, *a, **kw):
+        sql = str(stmt)
+        if "FOR UPDATE" in sql:
+            seen.append(sql)
+        return real_execute(stmt, *a, **kw)
+
+    monkeypatch.setattr(db, "execute", spy)
+    target = db.execute(select(svc.Period).where(svc.Period.book_id == book.id)).scalars().first()
+    svc.apply_organize(db, book_id=book.id, user=admin_user, period_id=target.id,
+                       strategy="SORT_DATE")
+
+    locks = [s for s in seen if "FOR UPDATE" in s]
+    assert locks, "没有取到期间行锁"
+    assert any("period.id = " in s for s in locks), \
+        f"指定了期间却没按 id 过滤，锁成了整个账套：{locks}"
+
+
 def test_目标号被占时报人话而不是裸异常(db, book, admin_user, subjects):
     """兜底路径：数据库拒了也要说清是什么冲突、该怎么办。"""
     a = _mk(db, book, admin_user, subjects, "记001")

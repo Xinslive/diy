@@ -10,7 +10,12 @@
 """
 from __future__ import annotations
 
+import uuid
+
 import pytest
+from sqlalchemy import select
+
+from app.models import SysUser, UserBook
 
 
 # --------------------------------------------------------------------- 注册
@@ -121,6 +126,41 @@ def test_管理员仍然畅通(client, auth):
     assert client.get("/api/system/users", headers=auth).status_code == 200
     assert client.get("/api/system/books", headers=auth).status_code == 200
     assert client.get("/api/system/audit-logs", headers=auth).status_code == 200
+
+
+def test_授权项缺book_id是400不是500(client, auth, book):
+    """``books:[{"role":"OWNER"}]`` 原来在 ``_apply_links`` 里撞 ``KeyError``。
+
+    同一段流程里 ``_check_roles`` 用的是 ``it.get(...)``，两处对畸形输入
+    的写法不一致，于是同一个请求的缺字段表现成 500 —— 调用方看不出是自己的
+    payload 不对。
+
+    要求：给一个能指出问题的 4xx，而且**不要**因此授权成功。
+    """
+    r = client.post("/api/system/users", headers=auth, json={
+        "username": f"缺字段{uuid.uuid4().hex[:6]}",
+        "password": "abcd1234",
+        "books": [{"role": "OWNER"}],
+    })
+    assert r.status_code == 422 or r.status_code == 400, (
+        f"缺 book_id 变成了 {r.status_code}：{r.text}")
+    assert 500 != r.status_code
+
+
+def test_合法授权仍然正常生效(client, auth, book, db):
+    """补上缺字段的防御不能把正常授权路径也堵了。"""
+    name = f"正常授权{uuid.uuid4().hex[:6]}"
+    r = client.post("/api/system/users", headers=auth, json={
+        "username": name,
+        "password": "abcd1234",
+        "books": [{"book_id": book.id, "role": "ACCOUNTANT"}],
+    })
+    assert r.status_code == 201, r.text
+    user = db.scalar(select(SysUser).where(SysUser.username == name))
+    assert user is not None
+    link = db.scalar(select(UserBook).where(
+        UserBook.user_id == user.id, UserBook.book_id == book.id))
+    assert link is not None and link.role == "ACCOUNTANT"
 
 
 def test_普通用户只能看自己被授权的账套(client, plain_auth, db, plain_user, book):

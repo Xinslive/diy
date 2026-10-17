@@ -210,6 +210,12 @@ def side_totals(entries: list[dict]) -> tuple[Decimal, Decimal]:
 # 系统自己生成的凭证：结转损益、年度结转。
 # 它们搬的是**已经存在**的余额，不是「给这个科目记一笔新账」，
 # 所以不受「停用科目不能新记」的闸门约束（审计 P2-08）。
+#
+# **这个标记必须由服务端自己给。** 客户端曾经能在 ``VoucherIn.source`` 里
+# 提交 CARRY_FORWARD，于是「停用科目可豁免」这道闸对任何有写权限的人都开着，
+# 而 ``periods._drop_carry_forward`` 又会不看状态地删掉本期全部 CARRY_FORWARD
+# 凭证 —— 自己造的凭证、记上账、再点一次重新结转就没了。现在写权限来自
+# ``create_voucher(internal=True)``，客户端那份 ``Literal`` 里已经没有它。
 SYSTEM_SOURCES = ("CARRY_FORWARD",)
 
 
@@ -307,7 +313,23 @@ def create_voucher(
     period_id: int | None = None,
     insert_after_id: int | None = None,
     commit: bool = True,
+    internal: bool = False,
 ) -> Voucher:
+    """建一张凭证。
+
+    ``internal=True`` 是「这是系统自己生成的凭证」（结转损益、年度结转）的
+    **唯一**正规声明，也是 ``allow_inactive`` 唯一的来源 —— 它过去是
+    ``source in SYSTEM_SOURCES``，而 source 曾经由客户端提交，等于把这道
+    「停用科目也能记账」的豁免开给了所有人。现在豁免跟着调用方走：
+    客户端能构造的 source（MANUAL/IMPORT/INVOICE）拿不到它，
+    ``SYSTEM_SOURCES`` 只由 ``app/accounting/periods.py`` 那两个生成方使用。
+
+    刻意**不**在这里对 ``source in SYSTEM_SOURCES`` 再抛一次错：内部代码
+    （测试夹具 ``make_voucher`` 等）也会造 CARRY_FORWARD 凭证来验证查询口径，
+    而那条路上真正要守的不变量已经守住了 ——
+    ① 豁免拿不到，② ``_drop_carry_forward`` 只删签名对得上的系统凭证，
+    伪造一张出来既没有特权、也不会被悄悄删掉。
+    """
     period = db.get(Period, period_id) if period_id else find_period(db, book_id, voucher_date)
     if period is None:
         raise ValueError("会计期间不存在")
@@ -338,7 +360,9 @@ def create_voucher(
         }
         for e in entries
     ]
-    _validate_entries(db, book_id, payload, allow_inactive=source in SYSTEM_SOURCES)
+    # allow_inactive 只认 internal —— 见函数 docstring。原来是
+    # ``source in SYSTEM_SOURCES``，而 source 由客户端提交。
+    _validate_entries(db, book_id, payload, allow_inactive=internal)
 
     # 插入位上号沿用参照凭证的号（页面预填的就是它），后面的整体顺延。
     # 人要是自己改过号，以人填的为准 —— 顺位照做，占的是那个号。
@@ -456,11 +480,49 @@ def update_voucher(
             f"凭证 {voucher.voucher_no} 已记账，不能修改。"
             f"请到「期末结账」对本期执行「反结账」后再改。")
 
+    # ``insert_after`` 同属「以前静默丢弃」的那一类（P2-2）。它与 voucher_no
+    # 不同：改号是业务上允许的（凭证号可回收复用），而「插在谁后面、把后面
+    # 整体顺位」是**建凭证**独有的动作，对一张已存在的凭证说这句话没有意义 ——
+    # 照着办要动别的凭证的号，而那张凭证属于另一条业务规则。
+    #
+    # 与其又一次「返回成功但什么都没做」，不如明确拒绝并说清为什么。
+    if payload.get("insert_after"):
+        raise ValueError(
+            "insert_after 只在新增凭证时有效（「插在谁后面、后面的号顺位」）；"
+            "修改已存在的凭证请直接填 voucher_no。")
+
     if "voucher_date" in payload and payload["voucher_date"]:
         new_date = payload["voucher_date"]
         new_period = find_period(db, voucher.book_id, new_date)
         voucher.voucher_date = new_date
         voucher.period_id = new_period.id
+
+    # P2-2：``voucher_no`` 以前是**静默丢弃**的。API 层把整个
+    # ``payload.model_dump()`` 递进来，而这个函数从头到尾没读过 voucher_no ——
+    # 于是客户端 PUT 一个新凭证号会拿到 200、审计日志写「修改凭证」，
+    # 而号一个字都没变。返回成功却什么都没做，比报错更难查。
+    #
+    # 「凭证号可回收复用」这件事是 next_voucher_no 取 max+1 的前提，所以
+    # 改号本身是业务上允许的 —— 那就把它实现掉，而不是假装没这个字段。
+    new_no = (payload.get("voucher_no") or "").strip()
+    if new_no and new_no != voucher.voucher_no:
+        # 目标期间以**改完之后**的期间为准：改了日期就等于换了号段，
+        # uq_voucher_period_no 是 (period_id, voucher_no) 上的。
+        target_period = db.get(Period, voucher.period_id)
+        # 锁期间行：查占用与写入之间必须串行，否则并发改号会双双查到
+        # 「没被占」。与 create_voucher 的做法一致（那边靠 DB 约束兜底，
+        # 这里同理 —— 约束仍在，只是早一步报人话）。
+        db.execute(
+            select(Period.id).where(Period.id == target_period.id).with_for_update())
+        taken = db.scalar(select(Voucher.id).where(
+            Voucher.period_id == target_period.id,
+            Voucher.voucher_no == new_no,
+            Voucher.id != voucher.id,
+        ))
+        if taken is not None:
+            raise ValueError(
+                f"凭证号 {new_no} 在 {target_period.code} 已经有一张了，请改一个号")
+        voucher.voucher_no = new_no
 
     if "entries" in payload:
         entries = [

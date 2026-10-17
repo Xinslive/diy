@@ -23,10 +23,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from app.api.reports import _visible_template
 from app.api.vouchers import _book_subjects, _serialize
 from app.core.db import get_db
 from app.core.deps import get_book_link, get_current_user, get_my_book, require_book_write
-from app.models import Book, Period, PrintTemplate, SysUser, UserBook, Voucher
+from app.models import Book, Period, PrintTemplate, ReportTemplate, SysUser, UserBook, Voucher
 # ``preview`` 是轻量的（只依赖 sqlalchemy），留在模块级。
 #
 # ``excel`` 则是**故意延迟导入**的：它在模块级 import openpyxl，而 openpyxl
@@ -108,6 +109,27 @@ def _scoped_template(db: Session, book: Book, template_id: int) -> PrintTemplate
         # 否则这条接口本身就成了一个跨账套的存在性探测器。
         raise HTTPException(404, "打印模板不存在")
     return t
+
+
+def _scoped_report_template(db: Session, book: Book, template_id: int) -> ReportTemplate:
+    """按 id 取**报表**模板，并且校验它对当前账套可见。
+
+    与上面 ``_scoped_template`` 是同一个道理：``report_template_id`` 同样是
+    前端传来的任意整数，同样不是授权凭据。钱不会漏 —— ``evaluate`` 取数按
+    调用方的账套过滤科目 —— 但另一家账套的**报表名、行标签、列标签和取数
+    公式**会整份印出来，而那正是「这家单位怎么算账」。三个调用点（报表打印、
+    报表 Excel 导出、结果落库）以前都只判了「模板存在」，没有判「归属」。
+
+    看得见的口径与打印版式模板**不一样**，所以不能直接用 ``_scoped_template``：
+    报表模板的官方基线是 ``book_id IS NULL``（所有账套共看的那一份），可见
+    范围是「基线 + 本账套」，判定在 ``app.api.reports._visible_template``。
+
+    这里**导入**它而不是把判定重抄一遍：可见口径一旦分成两份实现，迟早有一处
+    先改、另一处没改，于是「列表里看不见、却能按 id 打印出来」这种更糟的状态
+    又回来了 —— 眼前这三处就是这么漏的。同理，不存在与不是你的必须落在同一句
+    404 上，那句接口才不是跨账套的存在性探测器。
+    """
+    return _visible_template(db, template_id, book)
 
 
 def _template(db: Session, book: Book, scope: str, template_id: int | None) -> PrintTemplate:
@@ -681,14 +703,13 @@ def _render_scope(
         return _with_note(doc, note)
 
     if scope == "REPORT":
-        from app.models import ReportTemplate
         from app.reports.evaluate import evaluate
 
         if not report_template_id:
             raise HTTPException(400, "报表预览需要先选择一张报表")
-        rtpl = db.get(ReportTemplate, report_template_id)
-        if rtpl is None:
-            raise HTTPException(404, "报表模板不存在")
+        # 归属校验与 evaluate 之前：报表名/行标签/列标签/取数公式整份都会
+        # 出现在纸上，钱虽不漏，口径会漏（理由见 _scoped_report_template）。
+        rtpl = _scoped_report_template(db, book, report_template_id)
         payload = pv.visible_report_payload(evaluate(db, report_template_id, book, period, False))
 
         tpl = dict(tpl)
@@ -991,14 +1012,13 @@ def export_general(book_id: int, period_id: Optional[int] = None,
 @_xlsx
 def export_report(book_id: int, template_id: int, period_id: int, book: Book = Depends(get_my_book),
                   db: Session = Depends(get_db)):
-    from app.models import ReportTemplate
     from app.printing import excel as xl
     from app.reports.evaluate import evaluate
 
     period = _period(db, book.id, period_id)
-    tpl = db.get(ReportTemplate, template_id)
-    if tpl is None:
-        raise HTTPException(404, "报表模板不存在")
+    # 与打印同一道闸：导出的那份 xlsx 会带上报表名与全部取数公式，
+    # 「能打出来但导不出来」不是理由，理由见 _scoped_report_template。
+    tpl = _scoped_report_template(db, book, template_id)
     payload = pv.visible_report_payload(evaluate(db, template_id, book, period, False))
     payload["name"] = tpl.name
     data = xl.report_excel(payload, company=book.company_name, book_name=book.name)

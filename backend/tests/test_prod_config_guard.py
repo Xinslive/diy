@@ -211,6 +211,37 @@ def test_DB_ECHO不是靠DEBUG那条顺带拦住的():
         _check(s)
 
 
+# ------------------------------------------------------- JWT 算法白名单（P2-11）
+
+
+def test_生产环境JWT_ALGORITHM必须是HMAC家族():
+    """密钥的长度、弱口令、默认值都查了，**唯独没查算法**。
+
+    现在补上。`none` 是最坏的一种：它意味着「签名不参与验证」。
+    当前 PyJWT 在 `algorithms=["none"]` 下会拒绝无签名 token，所以这还
+    不是活着的洞；但它是「一次重构就变成真漏洞」的那类缺口 ——
+    哪天有人改成按 token 自带的 alg 选算法，这里就是最后一道拦。
+    """
+    for bad in ("none", "None", "RS256", "ES256", "PS256", "hs256", ""):
+        with pytest.raises(ValueError) as e:
+            _check(_prod(jwt_algorithm=bad))
+        assert "JWT_ALGORITHM" in str(e.value), f"报错里没点名 JWT_ALGORITHM：{bad}"
+
+
+def test_HMAC算法白名单放行():
+    for ok in ("HS256", "HS384", "HS512"):
+        _check(_prod(jwt_algorithm=ok))      # 不抛异常即通过
+
+
+def test_算法这条不靠dev环境顺带通过():
+    """dev/test 会整体跳过生产校验 —— 所以「算法不合法但环境是 dev」
+    仍然能构造出来，这不构成问题；这里要钉住的是**生产**下确实拦得住。"""
+    s = _prod(jwt_algorithm="none")
+    assert s.jwt_algorithm == "none", "前提写错了：这条用的确实是非法算法"
+    with pytest.raises(ValueError):
+        _check(s)
+
+
 def test_dev环境允许DB_ECHO():
     """开发机要能看 SQL，否则「本地复现不了」和「库里明明是这样」会打架。"""
     validate_production_settings(_prod(db_echo=True), env="dev")

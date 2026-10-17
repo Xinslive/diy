@@ -129,7 +129,23 @@ class VoucherIn(BaseModel):
     remark: str = ""
     attachments: int = 0
     voucher_no: Optional[str] = None
-    source: Literal["MANUAL", "IMPORT", "INVOICE", "CARRY_FORWARD"] = "MANUAL"
+    # **客户端不能指定 CARRY_FORWARD（审计 P1-02）。**
+    #
+    # 它原来和 MANUAL/IMPORT/INVOICE 一起写在 Literal 里，于是任何有账套写权限
+    # 的人都能直接调接口把一张自己的凭证标成「系统结转」。这个标记不是装饰：
+    #
+    #   * ``create_voucher`` 过去按 ``source in SYSTEM_SOURCES`` 放开「停用科目
+    #     也能记账」这道闸（系统结转搬的是**已经存在**的余额，不该被拦）；
+    #   * ``periods._drop_carry_forward`` 删本期全部 CARRY_FORWARD 凭证时**不看
+    #     状态**，而正常删除路径（``vouchers.delete_voucher``）是拒绝删已记账凭证的。
+    #
+    # 两条叠起来就是：自己造一张 CARRY_FORWARD、记账、再点一次「重新结转损益」，
+    # 这张**已记账的**凭证被悄悄删掉，库里还不留任何提示（凭证号可复用）。
+    #
+    # 所以它从客户端可选值里拿掉，成为服务端内部值（``create_voucher`` 的
+    # ``internal=True`` 是唯一的正规入口）。前端只用它显示标签
+    # （``VoucherOrganize.vue`` 的 sourceLabel），从不提交这个值，不受影响。
+    source: Literal["MANUAL", "IMPORT", "INVOICE"] = "MANUAL"
     # 「插入凭证」告诉后端插在谁的后面：新凭证拿这个号，后面的号整体顺位。
     # 留空就是普通的新增凭证（取期间内最大号 +1）。
     insert_after: Optional[int] = None
@@ -202,8 +218,12 @@ class InvoicePreviewIn(BaseModel):
 class CarryForwardIn(BaseModel):
     """结转损益的入参。
 
-    结转永远是「有旧凭证就删掉重算」，这个字段保留只是为了兼容旧前端调用，
-    不再影响行为。
+    结转永远是「有旧凭证就删掉重算」，没有第二种模式。
+
+    ``replace`` 保留只是为了兼容旧前端调用（它还在发这个字段），**完全被忽略** ——
+    传 false 拿到的仍是「旧凭证已删除并重算」的结果。P2-3 修掉了服务层那个
+    从不生效的同名形参（那才是真正在骗人的地方：它对外承诺了一个这个函数
+    从不兑现的开关）；这里留着字段只是为了让旧调用不报 422。
     """
     replace: bool = True
 

@@ -392,6 +392,27 @@ def test_可信代理配置解析_认IP也认CIDR():
     assert trusted_proxy_networks("") == ()
 
 
+@pytest.mark.parametrize("raw", ["0.0.0.0/0", "::/0", "0.0.0.0/1", "0.0.0.0/7"])
+def test_过宽的代理网段被拒(raw):
+    """``0.0.0.0/0`` 语法合法，但它把「信任代理」变成了「信任所有人」。
+
+    这份白名单**唯一**的作用是决定敢不敢读 X-Forwarded-For。读了就是采信
+    客户端随便能写的那个头，于是登录 IP 限流（``_throttle_ip``）被彻底绕过：
+    换一个头就换一个限流桶。与其让它「配了就生效」地废掉限流，不如拒掉。
+    """
+    from app.core.config import is_trusted_proxy, trusted_proxy_networks
+
+    assert trusted_proxy_networks(raw) == ()
+    assert is_trusted_proxy("8.8.8.8", raw) is False
+
+
+def test_正常的代理网段仍然放行():
+    """下限是 /8，别把它收紧到误伤正常部署。"""
+    from app.core.config import trusted_proxy_networks
+
+    assert len(trusted_proxy_networks("127.0.0.1, 10.0.0.0/8, 172.16.0.0/12")) == 3
+
+
 # ============================================================== 4. 留痕
 
 

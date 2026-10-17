@@ -180,7 +180,7 @@ def fork_template(template_id: int, book_id: Optional[int] = None,
     * 目标**已经不是**内置基线（``book_id`` 就是当前账套）→ 什么都不做，
       直接返回它自己。反复进设计模式不会复制出一堆副本。
     * 目标是内置基线，而本账套**已有**同 code 的副本 → 返回那个副本。
-      第二���改的还是同一份，不会越改越多。
+      第二次改的还是同一份，不会越改越多。
     * 目标是内置基线且本账套没有副本 → 真复制一份（行、列、单元格公式
       整份带走，``_clone_skeleton``），归属当前账套。
 
@@ -335,6 +335,12 @@ def persist(template_id: int, book_id: int, period_id: int, db: Session = Depend
     """把一次求值结果落库，便于导出和排查。"""
     from app.reports.evaluate import evaluate
 
+    # 先确认这张报表对当前账套可见，**再**碰期间与求值：``template_id`` 是
+    # 前端传来的任意整数，只判「存在」的话，任何账套都能拿着别人的 id 在自己
+    # 账套里落一份别人口径的报表结果（落库的行/列/公式全是那家的）。
+    # 顺序与同文件的 ``render`` 一致；不存在与不是你的落在同一句 404 上，
+    # 这条接口才不是跨账套的存在性探测器。
+    _visible_template(db, template_id, book)
     period = db.get(Period, period_id)
     if period is None or period.book_id != book.id:
         raise HTTPException(404, "会计期间不存在")
@@ -631,10 +637,23 @@ def create_template(payload: ReportTemplateIn, book_id: Optional[int] = None,
     # base_code 按 code 找，且**只看当前账套看得见的**：本账套副本优先于
     # 同 code 的官方基线（与列表去重同一个口径，否则「以利润表为基础新建」
     # 可能复制到另一份去）。
+    #
+    # 排序必须**显式**写死，``.order_by(book_id.desc())`` 是反的：PostgreSQL 的
+    # DESC 默认 NULLS FIRST，而官方基线恰恰是 ``book_id IS NULL``，于是
+    # db.scalar() 取到的是出厂基线，把上面那句「副本优先」原样反过来 ——
+    # 账套 fork 改过的那张利润表完全不影响新建出来的表，用户看着「以我改过
+    # 的利润表为基础」得到一份原版，还找不到哪里出了错（本项目 PG 上实测过）。
+    #
+    # ``book_id IS NULL`` 对 NULL 行算出 true、对本账套行算出 false，ASC 排序下
+    # false 在前（PG 的 ASC 默认 NULLS LAST）—— 「先本账套、后基线」由排序保证，
+    # 不依赖 id 大小这类偶然。写法与 ``api/printing.py::_template`` 的默认模板
+    # 取用同一个先例。后面的 book_id DESC 只用于「同 code 有多份本账套副本」时
+    # 取最近建的那张，与列表去重的「副本覆盖基线」口径一致。
     base = db.scalar(select(ReportTemplate).where(
         ReportTemplate.code == payload.base_code).where(
         (ReportTemplate.book_id.is_(None)) | (ReportTemplate.book_id == book.id)
-    ).order_by(ReportTemplate.book_id.desc())) if payload.base_code else None
+    ).order_by(ReportTemplate.book_id.is_(None), ReportTemplate.book_id.desc())) \
+        if payload.base_code else None
     if base is not None:
         _clone_skeleton(db, base.id, tpl.id)
     db.commit()

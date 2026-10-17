@@ -1,4 +1,4 @@
-import { http, apiUrl } from './client'
+import { http } from './client'
 
 export const listBooks = () => http.get('/books').then(r => r.data)
 export const createBook = (payload) => http.post('/books', payload).then(r => r.data)

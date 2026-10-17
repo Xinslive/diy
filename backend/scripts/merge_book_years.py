@@ -62,23 +62,43 @@ def period_count(db, book_id: int) -> int:
 
 
 def find_groups(db) -> list[tuple[Book, list[Book]]]:
-    """找出需要合并的 (主账套, 待并入的账套列表)。主账套 = 年度最早的那个。"""
+    """找出需要合并的 (主账套, 待并入的账套列表)。主账套 = 年度最早的那个。
+
+    连年链（P2-04）：原来的判据是 ``other.start_year == main.start_year + 1``，
+    只认**紧接主账套的下一年**。于是 2026 → 2027 → 2028 这样的链会被切成
+    两组：2026 收到 2027，2028 变成一个只跟 2027 挨着但 2027 已被消费掉的
+    孤儿，**永远并不进 2026**。三年以上的老数据就是这么漏的。
+
+    现在按「年度连续 + 命名规则」把整条链收进同一组：从主账套出发，
+    年份逐个往上找，找到就接着往下游推进。
+    """
     books = list(db.scalars(select(Book).order_by(Book.start_year, Book.id)).all())
     groups: list[tuple[Book, list[Book]]] = []
     consumed: set[int] = set()
 
+    def _matches(main: Book, other: Book) -> bool:
+        # 名字规则：系统自动生成的下一年度账套叫 ``{原名} {年份}``。
+        # 逐年推进时比对的是**最初那个**主账套的名字，不能用中间那年的名字 ——
+        # 否则 2028 的「XX 2027」式命名链会在这里断掉。
+        same_name = other.name == main.name or other.name == f"{main.name} {other.start_year}"
+        return other.company_name == main.company_name and same_name
+
     for main in books:
         if main.id in consumed:
             continue
-        donors = []
-        for other in books:
-            if other.id == main.id or other.id in consumed:
-                continue
-            same_name = other.name == main.name or other.name == f"{main.name} {other.start_year}"
-            if (other.company_name == main.company_name and same_name
-                    and other.start_year == main.start_year + 1):
-                donors.append(other)
-                consumed.add(other.id)
+        donors: list[Book] = []
+        year = main.start_year + 1
+        while True:
+            nxt = next(
+                (b for b in books
+                 if b.id not in consumed and b.start_year == year and _matches(main, b)),
+                None,
+            )
+            if nxt is None:
+                break
+            donors.append(nxt)
+            consumed.add(nxt.id)
+            year += 1
         if donors:
             consumed.add(main.id)
             groups.append((main, donors))
@@ -114,8 +134,52 @@ def apply(db, groups) -> None:
     db.commit()
 
 
+def _subject_remap(db, donor: Book, main: Book) -> dict[int, int]:
+    """从账套科目 id → 主账套同名科目 id。
+
+    按**编码**配对，因为合并的正是「一年一个账套」的老模型：同一个单位在
+    跨年时被复制过一份科目表，编码是两边唯一稳定的对应关系。
+    """
+    main_by_code = {
+        s.code: s for s in db.scalars(select(Subject).where(Subject.book_id == main.id)).all()
+    }
+    remap: dict[int, int] = {}
+    missing: list[str] = []
+    for s in db.scalars(select(Subject).where(Subject.book_id == donor.id)).all():
+        hit = main_by_code.get(s.code)
+        if hit is None:
+            missing.append(f"{s.code} {s.name}")
+            continue
+        remap[s.id] = hit.id
+    if missing:
+        # 静默丢掉一条期初等于静默改数 —— 比合并不下去严重得多。
+        raise SystemExit(
+            f"账套 #{donor.id} 有 {len(missing)} 个科目在主账套 #{main.id} 里找不到同编码科目：\n"
+            "  " + "\n  ".join(missing[:20])
+            + "\n请先把两边科目表对齐再合并（不要靠这里硬凑）。"
+        )
+    return remap
+
+
 def _move_periods(db, donor: Book, main: Book) -> None:
-    """把从账套的会计期间搬进主账套，ord 按主账套的起始年度重算。"""
+    """把从账套的会计期间搬进主账套，ord 按主账套的起始年度重算。
+
+    顺带把期初行的 ``subject_id`` 改指到主账套的同名科目上（审计 P2-04）。
+    这一步原来**漏了**，而它是这个脚本在真实数据上必然失败的原因：
+
+    ``period_opening.subject_id`` 上的外键是 **RESTRICT**（models/book.py
+    的注释里记着这条外键的分歧史），而 ``apply`` 的下一步就是
+    ``delete(Subject).where(book_id == donor.id)``。原来这里只改了
+    ``period_id`` / ``book_id``，``subject_id`` 还指着将从账套 —— 于是删科目
+    时必然撞外键。
+
+    跨年账套存在的意义就是搬期初，所以这个脚本恰好**只在它唯一要处理的
+    那种数据上稳定失败**。事务是完整的，所以从不丢数据，只是可靠地中止。
+    对照 scripts/seed_demo.py:99-101 —— 那里是先删 PeriodOpening 再删
+    Subject，顺序是对的。
+    """
+    remap = _subject_remap(db, donor, main)
+
     existing = {
         (p.year, p.month): p
         for p in db.scalars(select(Period).where(Period.book_id == main.id)).all()
@@ -127,16 +191,63 @@ def _move_periods(db, donor: Book, main: Book) -> None:
             p.book_id = main.id
             p.ord = period_ord(p.year, p.month, main.start_year)
             db.flush()
+            _repoint_openings(db, p.id, p.id, main.id, remap, donor, keep_period_id=p.id)
             existing[(p.year, p.month)] = p
             continue
-        # 同月同期已存在（重复数据）：只搬期初快照，保留已有的那个期间
-        db.execute(
-            text("update period_opening set period_id = :t, book_id = :b "
-                 "where period_id = :p and book_id = :db"),
-            {"t": target.id, "b": main.id, "p": p.id, "db": donor.id},
-        )
+        # 同月同期已存在（重复数据）：只搬期初快照，保留已有的那个期间。
+        # 两边都有同一个科目的期初时，**以主账套已有的为准** —— 它才是这份
+        # 合并里被保留下来的那一份，从账套那份是重复。
+        _repoint_openings(db, p.id, target.id, main.id, remap, donor, keep_period_id=target.id)
         db.execute(delete(Period).where(Period.id == p.id))
         db.flush()
+
+
+def _repoint_openings(db, from_period_id: int, to_period_id: int, to_book_id: int,
+                      remap: dict[int, int], donor: Book, *, keep_period_id: int) -> None:
+    """把 ``period_opening`` 指向从账套的科目改成主账套的同名科目。
+
+    **只能删+插，不能 UPDATE。** 库层有一条 ``trg_opening_guard``
+    （db_init.sql:449）对 ``period_opening`` 的**任何** UPDATE 直接抛
+    check_violation：「期初快照不可直接修改，请通过反结账流程重算」。
+    那条守卫是对的 —— 期初是快照，只能重算不能就地改。所以这里走
+    「删掉旧的、按新归属重新插入」，与「反结账流程重算」同一条语义。
+    （一开始写成 UPDATE 的结果是脚本直接撞这条守卫报错。）
+
+    同 ``(period_id, subject_id)`` 撞上时**跳过从账套那份**，不报错也
+    **不相加**：相加会把余额凭空翻倍，那比重复更难被发现。保留主账套已有的
+    那份，因为它才是合并后留下来的那一份。
+    """
+    rows = db.execute(
+        select(PeriodOpening).where(PeriodOpening.period_id == from_period_id)
+    ).scalars().all()
+    present = {
+        r[0] for r in db.execute(
+            select(PeriodOpening.subject_id).where(PeriodOpening.period_id == keep_period_id)
+        ).all()
+    }
+    to_insert: list[PeriodOpening] = []
+    for row in rows:
+        new_subject = remap.get(row.subject_id)
+        if new_subject is None:
+            # _subject_remap 已经拦过「主账套没有同编码科目」，走到这里说明
+            # remap 与实际数据对不上。宁可中止也不要留下指向空处的行。
+            raise SystemExit(
+                f"账套 #{donor.id} 的期初行 {row.id} 指向一个无法映射的科目 "
+                f"(subject_id={row.subject_id})，已中止合并。")
+        if new_subject in present:
+            continue          # 重复数据：保主账套那份，从账套这份直接不要了
+        present.add(new_subject)
+        to_insert.append(PeriodOpening(
+            period_id=to_period_id, book_id=to_book_id,
+            subject_id=new_subject, amount=row.amount,
+        ))
+
+    if rows:
+        db.execute(delete(PeriodOpening).where(
+            PeriodOpening.period_id == from_period_id))
+    for row in to_insert:
+        db.add(row)
+    db.flush()
 
 
 def _move_links(db, donor: Book, main: Book) -> None:

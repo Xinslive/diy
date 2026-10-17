@@ -187,7 +187,7 @@ def test_重新结转删掉旧凭证再按最新余额生成(db, book, periods, 
     now = sorted(v.voucher_no for v in db.scalars(select(Voucher).where(
         Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD")).all())
 
-    r = carry_forward_profit(db, book.id, periods[1], admin_user, replace=True)
+    r = carry_forward_profit(db, book.id, periods[1], admin_user)
 
     assert r["replaced"] is True
     assert r["removed"] == now                        # 旧凭证号被回报给前端做提示
@@ -207,7 +207,7 @@ def test_重新结转不误伤同期手工凭证(db, book, periods, subjects, ad
                           cr=[("5001", 50, "手工")], posted=True)
     carry_forward_profit(db, book.id, periods[1], admin_user)
 
-    carry_forward_profit(db, book.id, periods[1], admin_user, replace=True)
+    carry_forward_profit(db, book.id, periods[1], admin_user)
 
     still = db.get(Voucher, manual.id)
     assert still is not None, "手工凭证被误删了"
@@ -219,7 +219,7 @@ def test_重新结转留下审计日志(db, book, periods, subjects, admin_user,
 
     make_voucher("2026-01-10", dr=[("1002", 300, "x")], cr=[("5001", 300, "x")], posted=True)
     first = carry_forward_profit(db, book.id, periods[1], admin_user)
-    carry_forward_profit(db, book.id, periods[1], admin_user, replace=True)
+    carry_forward_profit(db, book.id, periods[1], admin_user)
 
     row = db.scalar(
         select(AuditLog)
@@ -235,7 +235,7 @@ def test_重新结转后余额仍然结平(db, book, periods, subjects, admin_us
     """重结转是一次完整替换：跑完之后损益科目照旧能结平，不能留下两张半吊子凭证。"""
     make_voucher("2026-01-10", dr=[("1002", 300, "x")], cr=[("5001", 300, "x")], posted=True)
     carry_forward_profit(db, book.id, periods[1], admin_user)
-    carry_forward_profit(db, book.id, periods[1], admin_user, replace=True)
+    carry_forward_profit(db, book.id, periods[1], admin_user)
 
     assert db.scalar(select(func.count()).select_from(Voucher).where(
         Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD")) == 1
@@ -262,7 +262,7 @@ def test_重新结转保留已记账状态(db, book, periods, subjects, admin_us
         Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD")).all()
     post_vouchers(db, book.id, [v.id for v in old], admin_user)
 
-    carry_forward_profit(db, book.id, periods[1], admin_user, replace=True)
+    carry_forward_profit(db, book.id, periods[1], admin_user)
     db.expire_all()
 
     new = db.scalars(select(Voucher).where(

@@ -44,7 +44,12 @@ def balance(book_id: int, period_id: Optional[int] = None,
         if from_period is None or from_period.book_id != book.id:
             raise HTTPException(404, "起始期间不存在")
         # 起始晚于止期：界面把它归位了，直接调接口也照样挡住 ——
-        # 否则算出来的是一段「倒着走」的区间，期初比期末还晚，数字能看不能信
+        # 否则算出来的是一段「倒着走」的区间，期初比期末还晚，数字能看不能信。
+        #
+        # 同样的判断在共享实现 ``queries.balance_sheet_of_accounts`` 里也有一道
+        # （下面那个 ``from_period`` 传下去就会走到）。这里保留是因为它最早触发、
+        # 报错最直接；共享那一道才是真正的兜底 —— 它覆盖 ``/general``、
+        # 打印与导出等**所有**委托方，而以前只有这一个接口查过 ord。
         if from_period.ord > period.ord:
             raise HTTPException(400, "起始期间不能晚于结束期间")
     subjects = queries.subject_tree(db, book.id)
@@ -64,6 +69,13 @@ def balance(book_id: int, period_id: Optional[int] = None,
 def general(book_id: int, period_id: Optional[int] = None, from_period_id: Optional[int] = None,
             book: Book = Depends(get_my_book), db: Session = Depends(get_db),
             include_unposted: bool = Query(False), leaf_only: bool = Query(False)):
+    """总账：区间发生额 / 累计发生额 / 期末余额，与科目余额表同一份实现。
+
+    这里只校验起始期间属不属于本账套；**倒置区间由共享实现挡**
+    （``queries.balance_sheet_of_accounts`` 收到 from_period 后自己比 ord，
+    抛的也是同一个 400）。两张表委托的是同一个函数，闸门就该只有一个 ——
+    以前总账漏查 ord、余额表查了，同一段倒置区间一个 400 一份错账。
+    """
     to_period = _period(db, book.id, period_id)
     if from_period_id:
         from_period = db.get(Period, from_period_id)
@@ -88,6 +100,11 @@ def detail(book_id: int, subject_id: int, period_id: Optional[int] = None,
            from_period_id: Optional[int] = None, book: Book = Depends(get_my_book),
            db: Session = Depends(get_db), include_unposted: bool = Query(False),
            from_subject_id: Optional[int] = None, to_subject_id: Optional[int] = None):
+    """明细账。倒置区间由 ``queries.detail_ledger`` 自己挡（400，同一条消息）。
+
+    它跟余额表/总账不是同一个函数，所以那道 ord 校验是它自己的 ——
+    本路由只负责把起始期间解析出来并确认它属于本账套。
+    """
     to_period = _period(db, book.id, period_id)
     if from_period_id:
         from_period = db.get(Period, from_period_id)
