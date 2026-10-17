@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Iterator
+from datetime import datetime, timezone
+from typing import Any, Iterator, Optional
 
 # ---------------------------------------------------------------------------
 # 超时：不显式写，就用 SDK 默认的 60 秒（oss2.defaults.connect_timeout）
@@ -51,6 +51,85 @@ OSS_PROBE_TIMEOUT = (5, 15)
 
 class OssError(Exception):
     """OSS 调用失败。消息必须能让人不看源码就知道下一步做什么。"""
+
+
+# ---------------------------------------------------------------------------
+# 内网 Endpoint：`-internal` 只能在阿里云 VPC 里访问
+# ---------------------------------------------------------------------------
+#
+# 阿里云 OSS 控制台上「内网 Endpoint」就贴在「公网 Endpoint」旁边，**只差一个
+# `-internal`**，而配错的代价很不成比例：
+#
+#   * 每个对象先干等一个**连接超时**才报错，一轮几十本就是几十分钟；
+#   * 报错里只有一个没人认识的主机名（``xxx.oss-cn-heyuan-internal.aliyuncs.com``），
+#     读不出「不是我配错了格式，是这台机器根本到不了那个网段」。
+#
+# 而这台机器确实到不了：``-internal`` 解析出来的是 VPC 里的地址（在本机上还会
+# 被隧道软件劫持进 CGNAT 段），公网可达性为零。所以凡是把这个端点报给人看的
+# 地方，都要补一句人话 —— 报错文案的首要职责是让人**不用查 DNS 就知道下一步**。
+INTERNAL_ENDPOINT_MARK = "-internal.aliyuncs.com"
+
+INTERNAL_ENDPOINT_NOTE = (
+    "注意：这个 endpoint 带 -internal，是阿里云的**同地域内网**地址，"
+    "只有在阿里云 VPC 内部才能访问。如果后端不在阿里云 VPC 里（通常如此），"
+    "请改成不带 -internal 的公网 Endpoint。"
+)
+
+
+def is_internal_endpoint(endpoint: str) -> bool:
+    """这个 endpoint 是不是只在 VPC 内可达的内网地址。"""
+    return normalize_endpoint(endpoint or "").lower().endswith(
+        INTERNAL_ENDPOINT_MARK)
+
+
+def _note_for(bucket) -> str:
+    """按这个 Bucket 用的端点决定要不要补内网提示。
+
+    端点由 :func:`make_bucket` 挂在句柄上：报错发生在 ``put_bytes`` /
+    ``iter_objects`` / ``delete_object`` 里，而这三处只有 ``bucket``，
+    没有 cfg —— 让它们各自再读一遍配置，就多了一处会走样的地方。
+    """
+    endpoint = getattr(bucket, "_cwq_endpoint", "") or ""
+    return INTERNAL_ENDPOINT_NOTE if is_internal_endpoint(endpoint) else ""
+
+
+# ---------------------------------------------------------------------------
+# last_modified：SDK 给的类型不止一种
+# ---------------------------------------------------------------------------
+#
+# **这一层不是洁癖，是必需的。** oss2 2.19.1 的列表接口
+# （``xml_utils.parse_list_objects_v2``）是这样赋值的：
+#
+#     SimplifiedObjectInfo(..., iso8601_to_unixtime(_find_tag(contents_node, 'LastModified')), ...)
+#
+# 而 ``iso8601_to_unixtime`` 返回 ``calendar.timegm`` 的结果 —— **int 纪元秒**。
+# 同一个字段、同一个 SDK：``head_object`` 那条路给的是 datetime，列表这条路给 int。
+#
+# 代价不是「类型不优雅」：:attr:`RemoteObject.last_modified` 声明的是 datetime，
+# 下游就按声明去用（``lm.tzinfo``），于是**每一轮清理都崩** —— 崩在备份已经
+# 全部上传完之后，形态是「备份失败了」，而数据其实一份不差。
+#
+# 归一放在**边界**这一处：下游（判龄）不必为每一种 SDK 版本的分叉各写一遍。
+def normalize_last_modified(raw: Any) -> Optional[datetime]:
+    """把 SDK 给的 last_modified 归一成带时区的 datetime（认不出来就返回 None）。"""
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        # naive 的一律按 UTC 解：oss2 是从 HTTP 的 Last-Modified 头取的，那是 UTC。
+        return raw if raw.tzinfo is not None else raw.replace(tzinfo=timezone.utc)
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return datetime.fromtimestamp(raw, tz=timezone.utc)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            return normalize_last_modified(datetime.fromisoformat(text))
+        except ValueError:
+            return None
+    # 认不出来的形状一律当「没有」：判龄按「刚写下」处理（多留一份），
+    # 好过在这里抛一个把整轮备份带下水的异常。
+    return None
 
 
 def _import_oss2():
@@ -91,14 +170,21 @@ def make_bucket(cfg: dict[str, Any], *, timeout: tuple[float, float] = OSS_TIMEO
     """
     oss2 = _import_oss2()
     endpoint = normalize_endpoint(cfg.get("endpoint", ""))
+    note = INTERNAL_ENDPOINT_NOTE if is_internal_endpoint(endpoint) else ""
     try:
         auth = oss2.Auth(cfg["access_key_id"].strip(), cfg["access_key_secret"].strip())
-        return oss2.Bucket(auth, endpoint, cfg["bucket"].strip(),
-                           connect_timeout=timeout)
+        bucket = oss2.Bucket(auth, endpoint, cfg["bucket"].strip(),
+                             connect_timeout=timeout)
     except oss2.exceptions.OssError as exc:
-        raise OssError(f"连接 OSS 失败（{endpoint}）：{exc}") from exc
+        raise OssError(f"连接 OSS 失败（{endpoint}）：{exc}{note}") from exc
     except KeyError as exc:
         raise OssError(f"OSS 配置缺字段 {exc}，请到「系统管理 → 数据安全」检查。") from exc
+    # 挂上去，好让后面 put/列/删 报错时能判断该不该补内网提示（见 _note_for）。
+    try:
+        bucket._cwq_endpoint = endpoint
+    except AttributeError:      # pragma: no cover - 用了 __slots__ 的替身
+        pass
+    return bucket
 
 
 def close_bucket(bucket) -> None:
@@ -163,7 +249,7 @@ def put_bytes(bucket, key: str, data: bytes) -> str:
     try:
         return bucket.put_object(key, data).etag
     except oss2.exceptions.OssError as exc:
-        raise OssError(f"上传失败：{key} → {exc}") from exc
+        raise OssError(f"上传失败：{key} → {exc}{_note_for(bucket)}") from exc
 
 
 def iter_objects(bucket, prefix: str) -> Iterator[RemoteObject]:
@@ -177,9 +263,10 @@ def iter_objects(bucket, prefix: str) -> Iterator[RemoteObject]:
     try:
         for obj in oss2.ObjectIteratorV2(bucket, prefix=prefix):
             yield RemoteObject(key=obj.key, size=int(obj.size or 0),
-                               last_modified=obj.last_modified)
+                               last_modified=normalize_last_modified(
+                                   getattr(obj, "last_modified", None)))
     except oss2.exceptions.OssError as exc:
-        raise OssError(f"列举 {prefix} 失败：{exc}") from exc
+        raise OssError(f"列举 {prefix} 失败：{exc}{_note_for(bucket)}") from exc
 
 
 def delete_object(bucket, key: str) -> None:
@@ -191,7 +278,7 @@ def delete_object(bucket, key: str) -> None:
         # 本来就不该报错，否则一次并发清理会报出一堆假错。
         return
     except oss2.exceptions.OssError as exc:
-        raise OssError(f"删除失败：{key} → {exc}") from exc
+        raise OssError(f"删除失败：{key} → {exc}{_note_for(bucket)}") from exc
 
 
 def check_connection(cfg: dict[str, Any]) -> str:

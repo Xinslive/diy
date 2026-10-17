@@ -18,6 +18,7 @@ import json
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import event, func, select, text
@@ -1169,3 +1170,266 @@ def test_归档里有当前库里没有的列时报错要可操作(db, tmp_path)
     assert "alembic upgrade head" in msg, "没说该执行哪条命令"
     assert "不要" in msg and "删" in msg, \
         "没拦住「把归档里的列删掉」这个会丢账的做法"
+
+
+# ============================================================ 清理不能吞掉备份的成功
+#
+# 下面这一整组照抄的是一次真实事故：一轮 24 个目标全部上传成功，界面上却显示
+# 「整轮失败」，而真实原因是一个 ``AttributeError`` —— 它在清理阶段抛出，
+# 冒到最外层之后被兜底成「后台任务异常，见服务端日志」九个字。
+#
+# 两个缺陷叠在一起才形成这个形态，所以用例也按这两个方向写：
+#   1. 清理本身崩了（类型契约不成立 —— oss2 给的是 int 纪元秒）；
+#   2. 清理崩了之后，清理的失败吞掉了备份的成功。
+
+
+class _FakeOss2:
+    """内存版 oss2，**连字段类型都照抄真的**。
+
+    ``oss2.xml_utils.parse_list_objects_v2`` 是这么写的::
+
+        SimplifiedObjectInfo(..., iso8601_to_unixtime(_find_tag(contents_node, 'LastModified')), ...)
+
+    而 :func:`oss2.utils.iso8601_to_unixtime` 返回 ``calendar.timegm`` 的结果 ——
+    **int 纪元秒**。同一个字段：``head_object`` 那条路给 datetime，
+    列表这条路给 int。
+
+    之前所有测试替身都只递 datetime，于是这个分叉一次也没被踩到 ——
+    **替身越顺手，边界越没人测。**
+    """
+
+    class exceptions:                       # noqa: N801 - 照抄 SDK 的命名
+        OssError = type("OssError", (Exception,), {})
+        NoSuchKey = type("NoSuchKey", (Exception,), {})
+
+    def __init__(self):
+        self.objects: dict[str, bytes] = {}
+        self.mtimes: dict[str, int] = {}          # 每个对象各自的「写下的时刻」
+        self.deleted: list[str] = []
+
+    def seed(self, key: str, data: bytes, age_days: float) -> None:
+        """先摆一个 age_days 天前就在 Bucket 里的对象。"""
+        self.objects[key] = data
+        self.mtimes[key] = int(
+            (datetime.now(timezone.utc) - timedelta(days=age_days)).timestamp())
+
+    def Auth(self, ak, sk):                 # noqa: N802 - 照抄 SDK 的命名
+        return object()
+
+    def Bucket(self, auth, endpoint, bucket, connect_timeout=None):    # noqa: N802
+        return self
+
+    def put_object(self, key, data):
+        self.objects[key] = data
+        # 刚写下的就是「现在」。少了这一步，这个替身会把本轮刚上传的对象也
+        # 标成陈旧品，于是它们立刻被自己删掉 —— 一个只让测试通过、自己跑不通
+        # 的替身，比没有替身更糟。
+        self.mtimes[key] = int(datetime.now(timezone.utc).timestamp())
+        return SimpleNamespace(etag="etag")
+
+    def delete_object(self, key):
+        self.objects.pop(key, None)
+        self.mtimes.pop(key, None)
+        self.deleted.append(key)
+
+    def ObjectIteratorV2(self, bucket, prefix):    # noqa: N802
+        return [SimpleNamespace(key=k, size=len(v), last_modified=bucket.mtimes[k])
+                for k, v in sorted(bucket.objects.items()) if k.startswith(prefix)]
+
+
+@pytest.fixture
+def oss_sdk(monkeypatch, db):
+    """把**整个 oss2** 换成内存实现，让 run_backup 走真代码路径。
+
+    与上面那个 :func:`oss` fixture 的区别是刻意的：``oss`` 把
+    ``retention.iter_objects`` 整个替换掉了，于是恰好绕开出问题的那一层；
+    这里只换 SDK，``oss_client.iter_objects`` → ``retention`` 这条真实链路
+    会被完整跑到 —— 事故就发生在这一段上。
+    """
+    from app.core import system_settings
+
+    for key, value in (("oss_endpoint", "oss-cn-heyuan.aliyuncs.com"),
+                       ("oss_access_key_id", "AK"), ("oss_access_key_secret", "SK"),
+                       ("oss_bucket", "acct963"), ("oss_prefix", "acct-backup"),
+                       ("backup_include_system", "1"),
+                       ("backup_keep_daily_days", "30"),
+                       ("backup_keep_weekly_days", "365")):
+        system_settings.set_value(db, key, value)
+    db.commit()
+
+    fake = _FakeOss2()
+    monkeypatch.setattr(oss_mod, "_import_oss2", lambda: fake)
+    monkeypatch.setattr(oss_mod, "make_bucket", lambda cfg, **kw: fake)
+    return fake
+
+
+def test_整轮不该因为清理崩掉而报失败(db, book, admin_user, oss_sdk):
+    """一次真实事故的形状：上传全成功，却因为清理抛异常被记成「整轮失败」。
+
+    修法不能是「把清理包成什么都不做」—— 下一条用例盯着清理真的发生。
+    """
+    result = service.run_backup(db, actor=admin_user, now=NOW)
+
+    assert result.ok, [(r.scope, r.status, r.message[:200]) for r in result.runs]
+    assert not result.failed, [r.message[:200] for r in result.failed]
+    assert result.prune_error is None, result.prune_error
+
+
+def test_清理真的发生了_没有退化成静默空操作(db, book, admin_user, oss_sdk):
+    """过期 40 天的日档必须真的被删掉。
+
+    上一条不能靠「清理改成 no-op」通过 —— 那样只是把「误报失败」换成了
+    「清理从此不工作」，而后者更安静：退路越攒越多，没人知道。
+    """
+    stale = "acct-backup/daily/book-999/20200101-000000.json.gz"
+    oss_sdk.seed(stale, b"old daily", age_days=40)
+
+    result = service.run_backup(db, actor=admin_user, now=NOW)
+
+    assert [d.key for d in result.deleted] == [stale]
+    assert oss_sdk.deleted == [stale]
+    assert [d.age_days for d in result.deleted][0] == pytest.approx(40, abs=1)
+
+
+def test_清理失败是另一件事_不该把整轮判成失败(db, book, admin_user, oss, monkeypatch):
+    """清理失败是**另一件事**，它不能吞掉已经传上去的数据。
+
+    而且它必须有地方可查 —— 否则就是「静默地不清理」：退路窗口越缩越短，
+    而界面上永远一片绿。
+    """
+    def boom(bucket, prefix, keep_days, now=None, dry_run=False):
+        raise oss_mod.OssError("列举 acct-backup/daily/ 失败：AccessDenied")
+
+    monkeypatch.setattr(retention, "apply_retention", boom)
+    result = service.run_backup(db, actor=admin_user, now=NOW)
+
+    assert result.ok, [(r.status, r.message[:160]) for r in result.runs]
+    assert result.prune_error and "AccessDenied" in result.prune_error
+    assert result.deleted == []
+
+
+def test_清理失败要留审计痕迹(db, book, admin_user, oss, monkeypatch):
+    """清理失败要能在审计日志里查到 —— 那是运维唯一会主动翻的地方。"""
+    def boom(bucket, prefix, keep_days, now=None, dry_run=False):
+        raise oss_mod.OssError("列举 acct-backup/daily/ 失败：AccessDenied")
+
+    monkeypatch.setattr(retention, "apply_retention", boom)
+    service.run_backup(db, actor=admin_user, now=NOW)
+
+    row = db.scalars(select(AuditLog)
+                     .where(AuditLog.action == "BACKUP_RUN")
+                     .order_by(AuditLog.id.desc())).first()
+    assert row is not None
+    assert "AccessDenied" in row.detail, row.detail
+
+
+def test_判龄看到不像时间的东西时宁可多留():
+    """类型不对时按「刚写下」处理，而不是让判龄本身抛异常。
+
+    判龄崩掉的后果是**整轮备份被判失败** —— 一份备份的年龄算不出来，
+    和这份备份传没传上去本来毫无关系。
+    """
+    now = datetime.now(timezone.utc)
+    objs = [RemoteObject(key="p/daily/book-1/a.json.gz", size=1,
+                         last_modified=1792215388)]
+    assert retention.plan_deletions(objs, "daily", 30, now) == []
+
+
+@pytest.mark.parametrize("raw, want_epoch", [
+    (1792215388, 1792215388),                                  # oss2 列表接口：int
+    (datetime(2026, 10, 17, 5, 36, 28), 1792215388 - 0),        # naive：按 UTC 解
+])
+def test_iter_objects_把_sdk_给的各种时间形状归一成_datetime(monkeypatch, raw, want_epoch):
+    """``RemoteObject.last_modified`` 声明的是 datetime，就得永远是 datetime。
+
+    类型契约写在 dataclass 上不等于它成立 —— 值是 SDK 递进来的，而 SDK 在
+    列表和 HEAD 两条路上给的就是两种类型。把归一放在**边界**这一处，
+    下游（判龄）才不用为每一种 SDK 版本的分叉各写一遍。
+    """
+    fake = SimpleNamespace(
+        ObjectIteratorV2=lambda bucket, prefix: iter([
+            SimpleNamespace(key="p/daily/book-1/a.json.gz", size=7, last_modified=raw)]),
+        exceptions=SimpleNamespace(OssError=type("OssError", (Exception,), {})),
+    )
+    monkeypatch.setattr(oss_mod, "_import_oss2", lambda: fake)
+
+    (obj,) = list(oss_mod.iter_objects(object(), "p/daily/"))
+
+    assert isinstance(obj.last_modified, datetime), \
+        f"last_modified 还是 {type(obj.last_modified).__name__}，判龄会崩"
+    assert obj.last_modified.tzinfo is not None, "naive 时间会被当成东八区"
+    assert abs(obj.last_modified.timestamp() - want_epoch) < 1
+
+
+# ------------------------------------------------------------ 内网 Endpoint
+
+
+class _RefusingBucket(_FakeOss2):
+    """建连就失败，且抛的是真 SDK 那个异常类。"""
+
+    def __init__(self, endpoint):
+        super().__init__()
+        self.endpoint = endpoint
+
+    def Bucket(self, auth, endpoint, bucket, connect_timeout=None):    # noqa: N802
+        raise self.exceptions.OssError(
+            f"RequestError: connect timeout=60 to {endpoint} refused")
+
+
+def _endpoint_note_for(monkeypatch, endpoint):
+    fake = _RefusingBucket(endpoint)
+    monkeypatch.setattr(oss_mod, "_import_oss2", lambda: fake)
+    cfg = {"endpoint": endpoint, "access_key_id": "AK",
+           "access_key_secret": "SK", "bucket": "acct963"}
+    with pytest.raises(oss_mod.OssError) as ei:
+        oss_mod.make_bucket(cfg)
+    return str(ei.value)
+
+
+def test_内网端点的失败要说明只能在阿里云内网用(monkeypatch):
+    """``-internal`` 那个坑非常常见：控制台上它就贴在公网 Endpoint 旁边。
+
+    配错了的后果不是「连不上」这么轻描淡写：每个对象先干等一个连接超时，
+    一轮几十本就是几十分钟；而报错里只有一个没人认识的主机名。
+    """
+    msg = _endpoint_note_for(monkeypatch, "acct963.oss-cn-heyuan-internal.aliyuncs.com")
+    assert "VPC" in msg, msg
+
+
+def test_公网端点不该被安上内网提示(monkeypatch):
+    """提示只在真的用了内网端点时出现，否则就是噪音，久了没人看。"""
+    msg = _endpoint_note_for(monkeypatch, "acct963.oss-cn-heyuan.aliyuncs.com")
+    assert "VPC" not in msg, msg
+
+
+# ------------------------------------------------------------ 整轮失败记录
+
+
+def test_整轮失败记录要带上真实原因(db, client, auth, monkeypatch):
+    """「后台任务异常，见服务端日志」在排障时等于没写。
+
+    这次事故里它让人以为「备份失败了」，而真实原因只在服务端日志里躺着 ——
+    记录本身一个字都不肯说，于是排障从「读记录」变成了「考古日志」。
+    """
+    from app.api import system as system_api
+    from app.core import system_settings
+
+    for key, value in (("oss_endpoint", "oss-cn-heyuan.aliyuncs.com"),
+                       ("oss_access_key_id", "AK"), ("oss_access_key_secret", "SK"),
+                       ("oss_bucket", "acct963")):
+        system_settings.set_value(db, key, value)
+    db.commit()
+
+    def boom(session, actor=None, **kw):
+        raise RuntimeError("apply_retention: 'int' object has no attribute 'tzinfo'")
+
+    monkeypatch.setattr(system_api.backup_service, "run_backup", boom)
+    client.post("/api/system/backup/run", headers=auth)
+
+    db.expire_all()
+    row = db.scalars(select(BackupRun)
+                     .where(BackupRun.book_label == "（整轮）")
+                     .order_by(BackupRun.id.desc())).first()
+    assert row is not None, "整轮失败没有落记录"
+    assert "tzinfo" in row.message, row.message
+    assert "见服务端日志" not in row.message, row.message

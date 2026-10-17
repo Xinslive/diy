@@ -554,12 +554,18 @@ def trigger_backup(
         try:
             actor = session.get(SysUser, user_id)
             backup_service.run_backup(session, actor=actor or username)
-        except Exception:                            # noqa: BLE001
+        except Exception as exc:                     # noqa: BLE001
             # 后台任务里的异常会被 Starlette 吞掉，只写进 stderr；界面上会一直
             # 停在「没有新记录」而看不出为什么。落一行失败记录，让它可见。
+            #
+            # **记录里必须带真实原因。** 原来这里写的是「后台任务异常，见服务端
+            # 日志」—— 那九个字让排障从「读记录」变成「考古日志」：出过一次真实
+            # 事故（数据全传上去了、界面说整轮失败），真实原因就藏在那句话后面。
+            # 一个只在服务端日志里的原因，等于没有原因。
             session.add(BackupRun(
                 book_id=None, scope=SCOPE_SYSTEM, book_label="（整轮）",
-                tier=TIER_DAILY, status=STATUS_FAILED, message="后台任务异常，见服务端日志",
+                tier=TIER_DAILY, status=STATUS_FAILED,
+                message=f"后台任务异常：{type(exc).__name__}: {exc}",
                 started_at=datetime.now(timezone.utc),
                 finished_at=datetime.now(timezone.utc),
             ))

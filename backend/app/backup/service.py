@@ -12,9 +12,18 @@
 
 **但全部失败要吵。** 返回值里如果一条成功都没有，调用方（API / 脚本）会以
 非零退出。静默的「全灭」是最坏的形态：界面刷新一下还是绿的。
+
+**清理失败不是备份失败。**
+一次真实事故：24 个目标全部上传成功，界面上却是「整轮失败」。原因是清理阶段
+抛了一个 ``AttributeError``（oss2 列表接口给的 ``last_modified`` 是 int 纪元秒，
+而判龄按 datetime 用），它冒到 API 层被兜底成「后台任务异常，见服务端日志」。
+形态是最坏的一种 —— **看起来失败了，其实成功了**，而真实原因一个字都没留下。
+现在清理的异常就地捕获，进 ``RunResult.prune_error`` 与审计日志，备份的成败不受
+它影响；详见 ``_run_backup_with_bucket`` 里那段注释。
 """
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from dataclasses import dataclass
@@ -32,11 +41,20 @@ from app.backup import oss_client, retention, tier as tier_mod
 from app.models import (SCOPE_BOOK, SCOPE_SYSTEM, STATUS_FAILED, STATUS_SUCCESS,
                         BackupRun, Book)
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class RunResult:
     runs: list[BackupRun]
     deleted: list[retention.Deleted]
+    #: 清理失败时的原因，None = 清理正常跑完（或压根没要求清理）。
+    #:
+    #: **单独一个字段，而不是把整轮判成失败。** 清理失败与「数据有没有传上去」
+    #: 是两件事：把前者算成后者，得到的记录是「备份失败了」，而 Bucket 里的
+    #: 产物一份不差 —— 用户于是去重跑备份，而真实原因（清理里的一个异常）
+    #: 仍然只躺在服务端日志里。这个字段是那件事**唯一的去处**。
+    prune_error: Optional[str] = None
 
     @property
     def succeeded(self) -> list[BackupRun]:
@@ -169,23 +187,43 @@ def _run_backup_with_bucket(db: Session, cfg: dict, bucket, *, actor=None,
             _record(db, run)
             runs.append(run)
 
+    # **清理失败不许把整轮拖下水。**
+    #
+    # 清理原来写在逐账套那个 try/except 之外，于是它抛出去的异常一路冒到
+    # API 层，被兜底成一行「（整轮）failed / 后台任务异常，见服务端日志」。
+    # 那个形态是最坏的一种：数据全传上去了，界面说失败，而真实原因一个字都
+    # 没有。这不是理论 —— 见本模块开头那段事故记述。
+    #
+    # 现在分成两件事记：备份的成功仍然是成功（它确实成功了），清理的失败落到
+    # ``RunResult.prune_error`` 与审计日志里。后者不是可有可无的日志噪音：
+    # 「清理不工作」意味着退路窗口在悄悄缩短，而界面上一片绿。
     deleted: list[retention.Deleted] = []
+    prune_error: Optional[str] = None
     if prune:
-        deleted = retention.apply_retention(
-            bucket, cfg["prefix"], cfg_mod.retention_days(db), now=now_utc)
+        try:
+            deleted = retention.apply_retention(
+                bucket, cfg["prefix"], cfg_mod.retention_days(db), now=now_utc)
+        except Exception as exc:                       # noqa: BLE001
+            prune_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("OSS 备份已完成，但清理过期产物失败：%s",
+                           prune_error, exc_info=True)
 
     ok = sum(1 for r in runs if r.status == STATUS_SUCCESS)
+    detail = f"OSS 备份 {ok}/{len(runs)} 成功，清理 {len(deleted)} 份过期产物"
+    if prune_error:
+        detail += f"；⚠ 清理失败：{prune_error}"
     log(
         db,
         action="BACKUP_RUN",
         entity="backup_run",
         entity_id=now_utc.strftime("%Y%m%d-%H%M%S"),
         user=actor,
-        detail=f"OSS 备份 {ok}/{len(runs)} 成功，清理 {len(deleted)} 份过期产物",
-        after={"succeeded": ok, "total": len(runs), "deleted": len(deleted)},
+        detail=detail,
+        after={"succeeded": ok, "total": len(runs), "deleted": len(deleted),
+               "prune_error": prune_error or ""},
     )
     db.commit()
-    return RunResult(runs=runs, deleted=deleted)
+    return RunResult(runs=runs, deleted=deleted, prune_error=prune_error)
 
 
 def recent_runs(db: Session, limit: int = 50) -> list[BackupRun]:

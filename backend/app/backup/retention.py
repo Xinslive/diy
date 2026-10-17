@@ -18,6 +18,7 @@ LastModified 是「OSS 上真正写下的时刻」。两者在重传、跨区复
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
@@ -34,6 +35,8 @@ from app.models import TIER_MONTHLY, TIER_WEEKLY
 # 但多一道收窄的成本几乎为零。）
 _OUR_SUFFIX = ".json.gz"
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class Deleted:
@@ -48,8 +51,25 @@ def _age_days(obj_last_modified: Optional[datetime], now: datetime) -> float:
     **``last_modified`` 缺失时按「刚写下」处理**，返回 0 —— 于是这个对象这一轮
     不会被删。宁可多留一份（下次清理还会再看它），也不要因为远端没返回这个
     字段就把一份备份当成陈旧品清掉。
+
+    **类型不对时同样按「刚写下」处理，而且必须处理。**
+    :func:`app.backup.oss_client.normalize_last_modified` 已经在边界上把 SDK 的
+    各种形状归一过一遍，这里是**第二道闸门**：将来换个 SDK 版本、又递进来一个
+    没见过的形状时，这一层要保住的是「判龄不抛异常」，因为判龄抛异常的代价是
+    **整轮备份被判失败** —— 一份备份的年龄算不出来，和它有没有传上去毫无关系。
+    （这个代价是真实付过的：oss2 2.19.1 的列表接口给的是 int 纪元秒，
+    于是每轮清理都 ``AttributeError``，而那时数据其实早就全部上传完了。）
+
+    但也不能**静默**：静默的代价是「清理从此不工作」而没人知道。
+    所以这里留一条 warning —— 退路窗口在悄悄缩短，是要有人看见的。
     """
     if obj_last_modified is None:
+        return 0.0
+    if not isinstance(obj_last_modified, datetime):
+        logger.warning(
+            "OSS 对象的 last_modified 不是时间（拿到 %s：%r），这一轮不删它。"
+            "清理可能已经不再生效，请检查 oss2 版本。",
+            type(obj_last_modified).__name__, obj_last_modified)
         return 0.0
     lm = obj_last_modified
     if lm.tzinfo is None:

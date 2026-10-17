@@ -3109,6 +3109,99 @@ v1 归档躺在 OSS 上；等某天 VERSION 升到 2，那句判断会让**今�
 > 而那件事从来不会坏，测试全绿而什么都没验到。所以切换必须发生在写完之后，
 > 并且要断言归档里真的写着 `version: 1`。
 
+
+## 11.10 「看起来失败了，其实成功了」（2026-10-17 记录与修法）
+
+一次真实事故：`sys_backup_run` 里 [88]–[111] 共 **24 条全是 success**（含 SYSTEM 档），
+紧接着 [112] 一条 `book_label='（整轮）'`、`status=failed`、
+`message='后台任务异常，见服务端日志'`。也就是说：**数据一份不差地传上去了，
+界面说整轮失败。**
+
+### 11.10.1 根因链
+
+真实的异常在服务端日志里（`.run/api.log`）：
+
+```
+File "app/backup/service.py", line 174, in _run_backup_with_bucket
+    deleted = retention.apply_retention(
+File "app/backup/retention.py", line 77, in plan_deletions
+    age = _age_days(obj.last_modified, now)
+File "app/backup/retention.py", line 55, in _age_days
+    if lm.tzinfo is None:
+AttributeError: 'int' object has no attribute 'tzinfo'
+```
+
+四个环节，每一环单独看都没错，叠起来才是这个形态：
+
+1. **`oss2` 2.19.1 的列表接口给的是 int，不是 datetime。**
+   `xml_utils.parse_list_objects_v2` 里是
+   `SimplifiedObjectInfo(..., iso8601_to_unixtime(_find_tag(node, 'LastModified')), ...)`，
+   而 `iso8601_to_unixtime` 返回 `calendar.timegm(...)` —— **int 纪元秒**。
+   同一个字段、同一个 SDK：`head_object` 那条路给 datetime，列表这条路给 int。
+   线上实测：`1792240085  int`。
+2. **`iter_objects` 把 SDK 的值原样递给 `RemoteObject`**，而那个 dataclass 声明的是
+   `last_modified: datetime | None`。**声明不是保证。**
+3. **`retention._age_days` 按声明去用**（`lm.tzinfo`），于是每轮清理必崩。
+4. **清理写在逐账套那个 `try/except` 之外**，异常一路冒到 `app/api/system.py::_work`
+   的兜底分支，被压成「后台任务异常，见服务端日志」。
+
+第 4 条是把它变成「静默误报」的关键：**逐个隔离的 `try` 只包住了 export + put**，
+而清理在它外面 —— 于是清理的失败获得了判定整轮成败的权力。
+
+### 11.10.2 为什么测试一次也没踩到
+
+所有测试替身（包括 `_FakeOss`）都直接构造 `RemoteObject(last_modified=datetime.now(...))`
+并且把 `retention.iter_objects` 整个替换掉 —— **恰好绕开了出问题的那一层**。
+
+> **替身越顺手，边界越没人测。** 这是这次事故唯一真正的「测试策略」教训：
+> 替身要照抄真 SDK 的**形状**，而不只是照抄它的**行为**。现在的
+> `_FakeOss2` 连 `int` 纪元秒都照抄，并且只替换 SDK、不替换 `iter_objects`，
+> 让 `oss_client → retention` 这条真实链路被跑到。
+
+### 11.10.3 硬约束五：类型契约要在**边界**上兑现，下游再挡一道
+
+* `oss_client.normalize_last_modified` 是**归一的唯一入口**：int/float 纪元秒、
+  naive datetime（按 UTC 解，它来自 HTTP 的 `Last-Modified` 头）、ISO 字符串、
+  以及认不出来的形状（→ `None`）都归成**带时区的 datetime 或 None**。
+  下游不必为每一种 SDK 版本的分叉各写一遍。
+* `retention._age_days` 是**第二道闸门**：类型不对时按「刚写下」处理（不删），
+  并留一条 `logger.warning`。**不能静默** —— 静默的代价是「清理从此不工作」
+  而没人知道，退路窗口在悄悄缩短。
+
+### 11.10.4 硬约束六：清理失败不是备份失败，两件事分开记
+
+现在 `apply_retention` 有自己的 `try/except`，失败进 `RunResult.prune_error`
+与审计日志（`⚠ 清理失败：…`），**备份的成败不受它影响**。
+
+`scripts/backup_to_oss.py` 里它走 **stderr 且不改退出码**：退出码 4 的含义是
+「这一轮没备份出去」，而数据确实全传上去了 —— 让清理的失败占用那个码，等于把一次
+成功的备份报成失败，正是这次要修的那个毛病。stderr 由 systemd 收进
+`/opt/cwq/backups/oss-backup.log`。
+
+### 11.10.5 硬约束七：兜底记录必须带真实原因
+
+「后台任务异常，见服务端日志」在排障时等于没写：一个只在服务端日志里的原因，
+等于没有原因。现在是 `后台任务异常：{类型}: {内容}`。
+
+这次事故的排查成本几乎全在这九个字上 —— 记录本身不肯说，就只能去考古日志。
+
+### 11.10.6 顺带记下的两个事实
+
+* **`-internal` Endpoint 只能在阿里云 VPC 内访问。** 控制台上它就贴在公网
+  Endpoint 旁边，只差一个 `-internal`。本机把它解析到 `100.98.83.35` ——
+  `100.64.0.0/10` 是 CGNAT 段（macOS 上的隧道软件常用），隧道里没有这个目的地，
+  于是 SYN 发出去**收不到任何回应**，连接就一直挂着。配错的代价不是「连不上」：
+  每个对象先干等一个连接超时。现在凡是把端点报给人看的地方都补一句人话
+  （`INTERNAL_ENDPOINT_NOTE`），而 `make_bucket` 把端点挂在句柄上，好让
+  put / 列 / 删 报错时也能判断该不该补。
+* **失败的备份运行一条审计都不留**：`log()` 在 `_run_backup_with_bucket` 的末尾，
+  异常路径根本走不到。所以 [70]–[77] 那八次失败至今查不出是谁触发的
+  （它们是 8 次**单账套调用**、每次钉死一个 `now`，既不是每天 03:47 的定时器，
+  也不是 API —— API 端点不传 `now`）。这一条**没有修**：`BackupRun` 表没有
+  actor 列，加它要动 schema，而它的收益低于其它几条。
+
+---
+
 ---
 
 ## 12. 测试策略

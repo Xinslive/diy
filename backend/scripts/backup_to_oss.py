@@ -111,6 +111,13 @@ def main(argv: list[str] | None = None) -> int:
         ok = len(result.succeeded)
         print(f"\n{ok}/{len(result.runs)} 个备份对象成功，"
               f"清理 {len(result.deleted)} 份过期产物。")
+        if result.prune_error:
+            # **走 stderr，不改退出码。** 退出码 4 的含义是「这一轮没备份出去」，
+            # 而数据确实全传上去了 —— 让清理的失败占用那个码，等于把一次成功
+            # 的备份报成失败，正是这次要修的那个毛病。退路窗口在悄悄缩短这件事
+            # 要有人看见，而 systemd 早就把这个进程的 stderr 收进日志文件了。
+            print(f"⚠️  清理过期产物失败（不影响已上传的备份）：{result.prune_error}",
+                  file=sys.stderr)
         return 0 if ok else 4
     finally:
         session.close()
