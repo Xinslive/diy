@@ -1,7 +1,21 @@
+# pnpm 的安装期设置。
+#
+# onlyBuiltDependencies 与 allowBuilds 说的是同一件事：新版 pnpm 默认**不跑**
+# 依赖的构建脚本（供应链面收紧），没被点名的包一律不跑并报
+# ERR_PNPM_IGNORED_BUILDS。这里两个包都是确实需要的：
+#   esbuild  —— vite 的打包内核，要平台二进制
+#   vue-demi —— postinstall 决定它切到 Vue 2 还是 Vue 3 的那层垫片
+#
+# **这两个值以前写的是占位符字符串 `set this to true or false`，不是布尔值。**
+# pnpm 解析不了就当成「没批准」，于是 ERR_PNPM_IGNORED_BUILDS。
+# 之所以一直没被发现：前端 job 跑 pnpm 10，它对未批准的脚本只警告不失败；
+# 而构建产物的那个 job 从建仓起就没跑起来过（services 层级写错，见提交 0a4b518）。
+# 也就是说这条路径**从来没被真正执行过**，占位符才能一直没人发现。
 allowBuilds:
-  esbuild: set this to true or false
-  vue-demi: set this to true or false
+  esbuild: true
+  vue-demi: true
 onlyBuiltDependencies:
   - esbuild
   - vue-demi
+# 发版时依赖已在 CI 装好，这里不再每次跑脚本前对一遍依赖树。
 verifyDepsBeforeRun: false
