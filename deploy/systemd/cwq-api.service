@@ -31,6 +31,25 @@ Environment=TZ=Asia/Shanghai
 # 只做一件事：把「.env 里把这一项清空了」这种手滑，从「uvicorn 收到空的
 # --workers 参数、Restart=always 无限重启刷日志」变成一条看得懂的启动失败。
 ExecStartPre=/bin/sh -c 'case "$CWQ_API_WORKERS" in ""|*[!0-9]*|0) echo "CWQ_API_WORKERS 必须是正整数（.env 里不能把它清空）" >&2; exit 1;; esac'
+# schema/数据库预检，与开发环境 dev.sh 调的是**同一个入口**。
+#
+# 为什么生产也要有这一道（2026-10-17）：开发环境用 --reload，schema 闸门在
+# uvicorn 的 startup 里拦人，拦下来的形态是「reloader 父进程还握着 :8000 的
+# LISTEN 套接字、worker 已退出、于是没人 accept」—— 连接能建、请求永不
+# 应答、SIGTERM 还杀不掉它（父进程阻塞在 os_waitpid，收不到那个让它退出的
+# Event）。那个形态在日志里只有一行 SchemaVersionError，而在外面看就是
+# 「服务挂了但端口还在」。
+#
+# 生产这里虽然**没有 --reload**（走 --workers），但闸门放在 startup 里仍有一个
+# 真实的代价：失败时 systemd 看到的是「进程反复退出」，配 Restart=always
+# 就是每 3 秒刷一轮，而真实原因埋在日志中段。放在 ExecStartPre 里，失败会
+# 变成一条明确的启动失败，日志里紧挨着原因与该执行的命令。
+#
+# 退出码是有含义的，systemd 的日志能直接分辨处置方向：
+#   3 = schema 版本对不上 → 跑 alembic upgrade head（或 stamp，见报错文案）
+#   4 = 数据库连不上     → 查 postgresql.service / 网络 / 连接串
+# 它**不执行任何 DDL**：建表改表只由 Alembic 负责，启动路径只做版本检查。
+ExecStartPre=/opt/cwq/backend/.venv/bin/python scripts/preflight.py
 ExecStart=/opt/cwq/backend/.venv/bin/uvicorn app.main:app \
     --host 127.0.0.1 --port 8000 \
     --workers ${CWQ_API_WORKERS} --timeout-keep-alive 120
