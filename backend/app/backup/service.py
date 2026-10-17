@@ -91,10 +91,32 @@ def _record(db: Session, run: BackupRun) -> None:
 def run_backup(db: Session, *, actor=None, book_ids: Optional[Iterable[int]] = None,
                force_tier: Optional[str] = None, prune: bool = True,
                now: Optional[datetime] = None) -> RunResult:
-    """跑一轮备份。返回每个目标的运行记录与被清理的对象。"""
-    now_utc = now or datetime.now(timezone.utc)
+    """跑一轮备份。返回每个目标的运行记录与被清理的对象。
+
+    **连接池用完就关**，理由写在 :func:`app.backup.oss_client.close_bucket`：
+    不关的话 CLOSE_WAIT 的连接会一直占着 fd，日志里什么都看不出来，最后以
+    ``Too many open files`` 的形式在不相干的地方炸掉。
+
+    这里只做「建桶 + 收尾」，真正的活儿在 :func:`_run_backup_with_bucket` ——
+    拆开是为了不用给那 60 行主体再套一层 try/finally（缩进一多，diff 就没法看了）。
+    """
     cfg = cfg_mod.require_ready(db)
     bucket = oss_client.make_bucket(cfg)
+    try:
+        return _run_backup_with_bucket(
+            db, cfg, bucket, actor=actor, book_ids=book_ids,
+            force_tier=force_tier, prune=prune, now=now)
+    finally:
+        # finally 而不是「跑到最后一行关」：备份里最常见的结局是**抛异常**
+        # （某一本网络失败、配置被改掉）。只在成功路径上关，等于异常路径永远漏。
+        oss_client.close_bucket(bucket)
+
+
+def _run_backup_with_bucket(db: Session, cfg: dict, bucket, *, actor=None,
+                            book_ids: Optional[Iterable[int]] = None,
+                            force_tier: Optional[str] = None, prune: bool = True,
+                            now: Optional[datetime] = None) -> RunResult:
+    now_utc = now or datetime.now(timezone.utc)
     workdir = _workdir()
 
     targets: list[tuple[str, Optional[int], str, Optional[Book]]] = []

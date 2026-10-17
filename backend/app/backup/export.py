@@ -39,7 +39,124 @@ from app.models import SCOPE_BOOK, SCOPE_SYSTEM
 from app.models.base import Base
 
 FORMAT = "cwq-book-backup"
+
+#: 程序**当前写出**的格式版本。改它之前先读下面那段。
 VERSION = 1
+
+# ---------------------------------------------------------------------------
+# 版本 → reader 注册表
+# ---------------------------------------------------------------------------
+#
+# **为什么不能写 `if header["version"] != VERSION: raise`。**
+#
+# 那个判断（2026-10-17 之前就是这么写的）在 VERSION 还是 1、**一份归档都还没
+# 产生**的时候看着完全无害：它此刻拒绝不了任何东西。
+#
+# 致命之处在于月度归档是**永久保留**的（``app/models/backup.py`` 里
+# ``KEEP_DAYS[TIER_MONTHLY] = 0``，``retention.py`` 对 monthly 直接 continue，
+# 结构上就没有删除分支）。所以从今往后每年都会多出一批 v1 归档躺在 OSS 上，
+# 而等某天 VERSION 升到 2，那句 `!= VERSION` 会让**今天存的每一份月度备份
+# 同时失去可恢复性** —— 而它恰恰是出事那天唯一能救回来的东西。
+#
+# 也就是说：那个缺陷第一次发作的时刻，正好是它最没有机会被测试覆盖的时刻
+# （那时所有测试都已经是 v2 了），而代价是永久的。能在 VERSION 还是 1、
+# 还没有任何一份归档存在的时候把它改掉，是唯一便宜的时机。
+#
+# 所以规矩是：
+#
+#   * **v1 的 reader 永远不许删。** 不是「暂时留着」，是永久 —— 它是所有
+#     过去与将来月度归档的唯一入口。tests 里有一条守卫专门钉这条。
+#   * 升 VERSION 时**加 reader**，不是在旧判断上加一个 or。
+#   * 真的认不出来的版本仍然拒绝（硬灌一份读不懂的归档比恢复失败更糟），
+#     但报错必须说清「这份是哪一版、本程序能读哪几版、拿什么办法读」。
+FORMAT_READERS: dict[int, "Reader"] = {}
+
+
+class Reader:
+    """把某一版归档读成 :func:`restore` 认识的**规范形状**。
+
+    为什么要有这一层而不是「读出来直接用」：v1 恰好和规范形状同形（所以它的
+    reader 近似恒等），但**下一版不会**。加上这层之后，``restore`` 与所有
+    校验逻辑只需要认识一种形状，而每种历史版本各自负责把自己翻译过来 ——
+    新增一版归档格式时不必去改恢复主体，也就不必去动那条正在救命的代码。
+    """
+
+    __slots__ = ("version", "_fn", "summary")
+
+    def __init__(self, version: int, fn, summary: str):
+        self.version = version
+        self._fn = fn
+        self.summary = summary
+
+    def __call__(self, data: dict, path: "Path") -> dict:
+        return self._fn(data, path)
+
+
+def register_reader(version: int, summary: str):
+    """把某一版的 reader 登记进来。**升 VERSION 时第一件要做的就是它。**"""
+
+    def deco(fn):
+        if version in FORMAT_READERS:
+            raise ValueError(
+                f"格式版本 {version} 已经有 reader 了。"
+                "重复登记几乎总是意味着有人想「改掉」旧 reader —— "
+                "而那正是让已归档的备份集体失效的做法。旧 reader 永远不许替换。")
+        FORMAT_READERS[version] = Reader(version, fn, summary)
+        return fn
+
+    return deco
+
+
+@register_reader(1, "行式字典 + gzip，首版")
+def _read_v1(data: dict, path: "Path") -> dict:
+    """v1 的形状 = 规范形状：``tables[name] = {columns, rows}``。
+
+    这里只做**结构**校验。值的解码（``_decode``）与列名对不对得上留给
+    :func:`restore` —— 拆开是因为前者在解压后立刻就知道，后者要查数据库。
+    """
+    tables = data.get("tables")
+    if not isinstance(tables, dict) or not tables:
+        raise ExportRefused(f"{path.name} 里一张表都没有，拒绝恢复。")
+    for name, payload in tables.items():
+        if not isinstance(payload, dict):
+            raise ExportRefused(
+                f"{path.name} 里表「{name}」的内容不是一个对象 —— 文件可能被改过。")
+        if not isinstance(payload.get("rows", []), list):
+            raise ExportRefused(
+                f"{path.name} 里表「{name}」的 rows 不是数组 —— 文件可能被改过。")
+    return data
+
+
+# 程序当前能读的全部版本，从新到旧。用于「这份是哪一版 / 我能读哪几版」。
+def readable_versions() -> list[int]:
+    return sorted(FORMAT_READERS, reverse=True)
+
+
+def _version_refusal(path: "Path", got: object) -> ExportRefused:
+    """认不出来的版本：拒绝，但**必须可操作**。
+
+    「不兼容」这三个字本身是有害的：它既没说这份归档是哪一版、也没说这台
+    程序能读哪几版、更没说该怎么读到它。收到这句话的人只有两个选择：干等着，
+    或者凭感觉猜一个版本硬改数字。后者会把归档灌坏。
+    """
+    known = readable_versions()
+    if isinstance(got, int) and got > max(known):
+        # 比程序新：这是最常见的一种（拿新机器的程序去读旧机器的备份），
+        # 而且它是**可解**的 —— 找一台跑着对应旧版本的机器。
+        hint = (f"这份归档比本程序新。要恢复它，请换一台跑着**能读第 {got} 版**"
+                f"归档的程序来恢复（对应的是旧版本程序，不是新的）。")
+    elif isinstance(got, int):
+        hint = (f"这份归档比本程序老，本程序只会写第 {VERSION} 版。"
+                f"它自己读不了 —— 但**不要**去改归档里的 version 数字："
+                f"那只是把一个读不懂的文件说成读得懂。")
+    else:
+        hint = "连版本号都不是一个整数，这份文件不是本系统导出的备份。"
+    return ExportRefused(
+        f"{path.name} 的格式版本是 {got!r}，本程序只能读第 {'、'.join(map(str, known))} 版"
+        f"（当前写出第 {VERSION} 版）。\n"
+        f"  {hint}\n"
+        f"  月度归档是**永久保留**的（结构上没有删除分支），所以旧版本归档会一直"
+        f"存在 —— 程序侧会一直保留对应的 reader，不会因为将来升版本而失效。")
 
 # 不进备份的表。
 #
@@ -477,12 +594,13 @@ def read_snapshot(path: Path) -> dict:
             or header.get("format") != FORMAT:
         got = header.get("format") if isinstance(header, dict) else "?"
         raise ExportRefused(f"{path.name} 不是本系统导出的备份（format={got}）。")
-    if header.get("version") != VERSION:
-        raise ExportRefused(f"{path.name} 的格式版本是 {header.get('version')}，"
-                            f"本程序只认 {VERSION}。别用旧版本程序硬灌。")
-    if not isinstance(data.get("tables"), dict) or not data["tables"]:
-        raise ExportRefused(f"{path.name} 里一张表都没有，拒绝恢复。")
-    return data
+    # 版本查表，**不是** ``!= VERSION``。理由见 FORMAT_READERS 上方那段：
+    # 月度归档永久保留，而旧写法让升 VERSION 那天起所有历史归档同时失效。
+    got = header.get("version")
+    reader = FORMAT_READERS.get(got) if isinstance(got, int) else None
+    if reader is None:
+        raise _version_refusal(path, got)
+    return reader(data, path)
 
 
 def restore(db: Session, path: Path, *, dry_run: bool = False) -> dict[str, int]:

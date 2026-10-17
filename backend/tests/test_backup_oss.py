@@ -23,7 +23,8 @@ import pytest
 from sqlalchemy import event, func, select, text
 
 from app.backup import export as export_mod
-from app.backup import retention, tier as tier_mod
+from app.backup import oss_client as oss_mod
+from app.backup import retention, service, tier as tier_mod
 from app.backup.export import ExportRefused
 from app.backup.oss_client import RemoteObject
 from app.backup.retention import Deleted
@@ -476,13 +477,24 @@ def test_restore_refuses_a_foreign_file(db, tmp_path):
 
 
 def test_restore_refuses_unknown_version(db, tmp_path):
+    """未知版本**仍然拒绝** —— 但拒绝的理由必须可操作。
+
+    原来这条断言的是消息里有「只认」两个字（原文是「本程序只认 1」）。
+    那句话恰恰是要被换掉的：它既没说这份归档是哪一版、也没说这台程序能读哪几版、
+    更没说该怎么读到它。改成断言「说清了 99、说清了能读第 1 版、说了换哪台机器」。
+
+    **拒绝本身没有放松**：硬灌一份读不懂的归档，比恢复失败更糟 ——
+    最坏的结果不是恢复失败，而是恢复「成功」了。
+    """
     p = tmp_path / "v99.gz"
     p.write_bytes(gzip.compress(json.dumps(
         {"header": {"format": "cwq-book-backup", "version": 99},
          "tables": {"book": {"columns": ["id"], "rows": []}}}
     ).encode()))
-    with pytest.raises(ExportRefused, match="只认"):
+    with pytest.raises(ExportRefused) as ei:
         export_mod.restore(db, p, dry_run=True)
+    msg = str(ei.value)
+    assert "99" in msg and "第 1 版" in msg and "换一台" in msg
 
 
 def test_restore_refuses_archive_with_no_tables(db, tmp_path):
@@ -792,3 +804,348 @@ def test_backup_run_is_audited(db, book, admin_user, oss):
     service_mod.run_backup(db, actor=admin_user, now=NOW)
     rows = db.scalars(select(AuditLog).where(AuditLog.action == "BACKUP_RUN")).all()
     assert rows, "跑备份没有留痕"
+
+
+# ==================================================================
+# 超时与连接池（2026-10-17 那次故障里看到的 CLOSE_WAIT 引出来的）
+# ==================================================================
+
+class _FakeSession:
+    """记自己有没有被关掉的 requests.Session 替身。"""
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _BucketWithSession:
+    def __init__(self):
+        self.session = _FakeSession()
+
+
+def test_make_bucket显式传超时_不用SDK默认的60秒(monkeypatch):
+    """不传 ``connect_timeout`` 时 oss2 用的是 ``defaults.connect_timeout = 60``。
+
+    那个 60 与「这一次调用要做的事」毫无关系：列一页对象和传一个几百 MB 的
+    账套快照拿到的是同一个数。而 oss2 2.19.1 **没有任何重试** —— 所以这个值
+    是「多久承认失败」的唯一闸门，它不是保护，是上限。
+    """
+    import oss2
+
+    seen = {}
+
+    class FakeBucket:
+        def __init__(self, auth, endpoint, bucket_name, connect_timeout=None):
+            seen["timeout"] = connect_timeout
+
+    monkeypatch.setattr(oss2, "Auth", lambda a, b: object())
+    monkeypatch.setattr(oss2, "Bucket", FakeBucket)
+    cfg = {"endpoint": "oss-cn-heyuan.aliyuncs.com", "bucket": "b",
+           "access_key_id": "k", "access_key_secret": "s"}
+
+    oss_mod.make_bucket(cfg)
+
+    assert seen["timeout"] == oss_mod.OSS_TIMEOUT, \
+        "没传显式超时 —— 于是默默用了 SDK 的 60 秒"
+    # (建连, 读写)：握手和传大对象差一个数量级，不该共用一个数
+    connect, io = seen["timeout"]
+    assert connect < io, "建连超时不该大于读写超时"
+    assert connect <= 15, "建连超时给到几十秒，等于每次网络不通都要干等"
+
+
+def test_超时是二元组能一路传到requests():
+    """oss2 把 connect_timeout **原样**当 requests 的 timeout= 用。
+
+    钉住这一点是因为它是整个方案的前提：如果哪天 oss2 改成只接受标量
+    （或者自己做 int 转换），二元组会在 SDK 里炸掉，而炸点在那行
+    ``defaults.get(...)`` 之后 —— 离这里很远。
+    """
+    import oss2
+
+    b = oss2.Bucket(oss2.Auth("a", "b"), "oss-cn-heyuan.aliyuncs.com",
+                    "a-valid-bucket-name", connect_timeout=(10, 60))
+    assert b.timeout == (10, 60)
+
+
+def test_close_bucket关掉连接池():
+    """不关连接池，CLOSE_WAIT 的连接就一直占着 fd。
+
+    实测在 worker 上看到过一条长期挂着 CLOSE_WAIT 的连接，目的地正是
+    ``oss-cn-heyuan.aliyuncs.com``（解析到 47.113.155.25）。CLOSE_WAIT 是
+    「对端已发 FIN、本地还没 close」—— 本地这一侧还占着一个 fd，而且是
+    **不报错**地占着，最后以 ``Too many open files`` 在不相干的地方炸掉。
+    """
+    b = _BucketWithSession()
+    oss_mod.close_bucket(b)
+    assert b.session.closed
+
+
+def test_close_bucket对没有session的替身是空操作():
+    """测试替身没有 ``.session``；这时必须安静地什么都不做。
+
+    抛异常的话，所有用替身跑备份的用例都会变成「因为清理失败而失败」，
+    于是真正要测的东西被一个与它无关的失败盖住。
+    """
+    oss_mod.close_bucket(object())
+    oss_mod.close_bucket(None)
+
+
+def test_close_bucket自己抛异常时不能连带失败():
+    """关不掉连接池**不是**备份失败的原因。
+
+    一次已经成功的备份因为收尾出错而被报成失败，会让运维去查一个根本没坏的
+    地方 —— 那正是「看起来在工作但其实没生效」的变体。
+    """
+    class Bad:
+        class session:
+            @staticmethod
+            def close():
+                raise RuntimeError("boom")
+
+    oss_mod.close_bucket(Bad())          # 不抛就算过
+
+
+def test_oss_bucket用完一定关(monkeypatch):
+    """``with`` 形态：正常退出和抛异常都要关。"""
+    b = _BucketWithSession()
+    monkeypatch.setattr(oss_mod, "make_bucket", lambda cfg, **kw: b)
+
+    with oss_mod.oss_bucket({"endpoint": "e", "bucket": "b",
+                             "access_key_id": "k", "access_key_secret": "s"}):
+        pass
+    assert b.session.closed
+
+    b2 = _BucketWithSession()
+    monkeypatch.setattr(oss_mod, "make_bucket", lambda cfg, **kw: b2)
+    with pytest.raises(ValueError):
+        with oss_mod.oss_bucket({}):
+            raise ValueError("备份中途失败")
+    assert b2.session.closed, "异常路径上没关 —— 而那正是最常见的结局"
+
+
+def test_测试连接用更短的超时(monkeypatch):
+    """"测试连接"是**给人点的按钮**，等一分钟才报错是不能接受的。"""
+    seen = {}
+    monkeypatch.setattr(oss_mod, "make_bucket",
+                        lambda cfg, **kw: seen.setdefault("timeout", kw.get("timeout"))
+                        or _BucketWithSession())
+    monkeypatch.setattr(oss_mod, "put_bytes", lambda b, k, d: "etag")
+    monkeypatch.setattr(oss_mod, "delete_object", lambda b, k: None)
+    oss_mod.check_connection({"endpoint": "oss-cn-heyuan.aliyuncs.com",
+                              "bucket": "b", "access_key_id": "k",
+                              "access_key_secret": "s"})
+    assert seen["timeout"] == oss_mod.OSS_PROBE_TIMEOUT
+    assert oss_mod.OSS_PROBE_TIMEOUT[1] < oss_mod.OSS_TIMEOUT[1]
+
+
+def test_run_backup结束时关掉连接池(db, book, admin_user, oss, monkeypatch):
+    """整轮备份跑完，连接池必须被关。
+
+    旧版没有这一步：Bucket 句柄随函数返回被回收，连接池交给 GC 与
+    urllib3 的 keep-alive 超时 —— 两者都不是「这一轮结束时」。
+    """
+    holder = _BucketWithSession()
+    monkeypatch.setattr(oss_mod, "make_bucket", lambda cfg, **kw: holder)
+    service.run_backup(db, actor=admin_user, book_ids=[book.id])
+    assert holder.session.closed
+
+
+def test_run_backup抛异常时也关连接池(db, monkeypatch, oss):
+    """``finally`` 而不是「成功路径上关」。
+
+    备份最常见的结局就是抛异常（某一本网络失败、配置被改掉）。只在成功时
+    关，等于异常路径永远漏 —— 而异常恰恰是更常见的那条路。
+    """
+    holder = _BucketWithSession()
+    monkeypatch.setattr(oss_mod, "make_bucket", lambda cfg, **kw: holder)
+    # 配置不全会在 require_ready 阶段抛，那时**还没建桶**；这里要验的正是
+    # 「桶已经建好、然后才炸」的那条路径 —— 那种如果不关，就是漏的。
+    with pytest.raises(ExportRefused):
+        service.run_backup(db, book_ids=[999999])
+    assert holder.session.closed, "异常路径上连接池没关"
+
+
+# ==================================================================
+# 格式版本注册表 —— 用户的原话：「我可不想看到未来某天需要恢复数据的时候
+# 提示不兼容之类的」。
+#
+# 旧实现是 ``if header["version"] != VERSION: raise``。它在 VERSION 还是 1、
+# 一份归档都还没产生的时候看着无害，致命之处在于**月度归档永久保留**：
+# 等 VERSION 升到 2，今天存的每一份月度归档会同时失去可恢复性，
+# 而那恰恰是出事那天唯一能救回来的东西。
+# ==================================================================
+
+
+@pytest.fixture
+def become_future(monkeypatch):
+    """把程序**模拟**成将来那版（VERSION=2 + 一个 v2 reader）。
+
+    **为什么是「一个可调用的开关」而不是一个直接改好的夹具。** 第一版这么写的
+    时候，夹具在用例体之前就把 VERSION 改成了 2 —— 于是用例里的
+    ``export_book`` 用 v2 **写出**归档，然后拿它去验「v1 还能不能读」。
+    归档里写的本来就是 2，所以那条用例在旧代码下**也是绿的**。
+
+    这就是最该防的那种空洞：测试看着在验证兼容性，实际验证的是「新程序读新
+    归档」—— 而那件事从来不会坏。真正会坏的是「新程序读旧归档」。
+    所以切换必须发生在**写完之后**，并且要断言归档里真的写着 version 1。
+    """
+    before_readers = dict(export_mod.FORMAT_READERS)
+    before_version = export_mod.VERSION
+
+    def go():
+        @export_mod.register_reader(2, "测试用的假想 v2")
+        def _fake_v2(data, path):                   # pragma: no cover - 只为占位
+            return data
+        monkeypatch.setattr(export_mod, "VERSION", 2)
+
+    yield go
+    # 注册表是模块级全局，漏还原会让后面所有用例都以为自己活在一个能读两版的
+    # 程序里 —— 那样真正的拒绝路径就再也测不到了。
+    export_mod.FORMAT_READERS.clear()
+    export_mod.FORMAT_READERS.update(before_readers)
+    export_mod.VERSION = before_version
+
+
+def _assert_archive_is_v1(path):
+    """确认这份归档**真的是 v1**。
+
+    没有这一步，上面那个「先升版本再导出」的坑会原样复现：断言全绿，
+    而验证的根本不是历史归档。
+    """
+    with gzip.open(path, "rb") as fh:
+        head = json.loads(fh.readline().decode("utf-8").rstrip(",")[:-1]
+                          + "}")["header"]
+    assert head["version"] == 1, f"归档写的是 v{head['version']}，不是 v1 —— 用例验的不是历史归档"
+
+
+def test_v1的reader必须永久存在():
+    """**最要紧的一条守卫。**
+
+    v1 是所有过去与将来月度归档的唯一入口。删掉它（哪怕是「清理死代码」时顺手
+    删掉）就等于让全部历史归档在出事那天集体失效 —— 而这个删除动作在测试里
+    **不会让任何一条用例变红**，因为那时所有测试也都在用新版本导出。
+    """
+    assert 1 in export_mod.FORMAT_READERS, \
+        "v1 reader 不在了 —— 已归档的月度备份会集体变成不可恢复"
+    assert export_mod.readable_versions() == sorted(export_mod.FORMAT_READERS)
+
+
+def test_升到VERSION2之后v1归档仍然可以恢复(db, book, make_voucher, tmp_path,
+                                       become_future):
+    """核心断言：程序往前走一步，历史归档必须原地不受影响。
+
+    这条在旧实现下**必然是红的** —— ``!= VERSION`` 会直接拒绝 v1。
+    """
+    make_voucher("2026-02-10", dr=[("1002", "8888.88", "款")],
+                 cr=[("5001", "8888.88", "收入")])
+    db.commit()
+    out = tmp_path / "v1.json.gz"
+    export_mod.export_book(db, book, out)          # 先用 v1 写出来
+    _assert_archive_is_v1(out)
+    become_future()                                # 现在程序才是「将来那版」
+    assert export_mod.VERSION == 2
+
+    counts = export_mod.restore(db, out, dry_run=True)
+    assert counts, "v1 归档在 VERSION=2 的程序下被拒了 —— 旧归档全部失效"
+    assert counts["voucher"] == 1
+
+
+def test_升版本后v1归档能真正灌回数据库(db, book, make_voucher, tmp_path,
+                                         become_future):
+    """不只是 dry_run 通过，是真的灌回去。
+
+    dry_run 只走到 :func:`read_snapshot` 之后的列校验；真正灌回还要经过
+    :func:`_decode`、类型 coercion 与外键顺序。版本注册表如果只在读的那一步
+    生效、后面漏了，dry_run 会绿而这里会红。
+    """
+    make_voucher("2026-02-10", dr=[("1002", "8888.88", "款")],
+                 cr=[("5001", "8888.88", "收入")])
+    db.commit()
+    out = tmp_path / "v1.json.gz"
+    export_mod.export_book(db, book, out)
+    _assert_archive_is_v1(out)
+    become_future()                                # VERSION 从此刻起是 2
+    book_id = book.id
+    db.execute(text("DELETE FROM audit_log WHERE book_id = :i"), {"i": book_id})
+    db.execute(text("DELETE FROM book WHERE id = :i"), {"i": book_id})
+    db.commit()
+
+    export_mod.restore(db, out)                     # VERSION 此刻是 2
+    db.commit()
+    assert db.scalar(select(func.count()).select_from(Voucher)
+                     .where(Voucher.book_id == book_id)) == 1
+
+
+def test_重复登记同一版本会被拒绝():
+    """「改掉旧 reader」是最容易犯、后果最重的改动，所以在这里直接拦住。
+
+    真实的坏路径长这样：某一版出了 bug，于是有人去改那个 reader 的实现 ——
+    而那份格式的归档**已经躺在 OSS 上永久保存了**。改 reader 不会让它们报错，
+    只会在恢复时静默地读出错的内容 —— 那比拒绝恶劣得多。
+    """
+    with pytest.raises(ValueError, match="已经有 reader"):
+        @export_mod.register_reader(1, "偷偷替换 v1")
+        def _bad(data, path):                       # pragma: no cover
+            return data
+
+
+def test_认不出来的版本报错必须可操作(tmp_path):
+    """「不兼容」这三个字本身是有害的。
+
+    它既没说这份归档是哪一版、也没说这台程序能读哪几版、更没说该怎么读到它。
+    收到这句话的人只剩两个选择：干等着，或者凭感觉改归档里的 version 数字 ——
+    后者会把归档灌坏。
+    """
+    p = tmp_path / "future.json.gz"
+    p.write_bytes(_archive_bytes(version=99))
+    with pytest.raises(ExportRefused) as ei:
+        export_mod.read_snapshot(p)
+    msg = str(ei.value)
+    assert "99" in msg, "没说这份归档是哪一版"
+    assert "第 1 版" in msg, "没说本程序能读哪几版"
+    assert "换一台" in msg, "没说该怎么读到它 —— 这是最要紧的一半"
+    assert "永久保留" in msg, "没说旧归档不会因为升版本而失效"
+
+
+def test_版本号不是整数时报错也可操作(tmp_path):
+    p = tmp_path / "weird.json.gz"
+    p.write_bytes(_archive_bytes(version="一"))
+    with pytest.raises(ExportRefused) as ei:
+        export_mod.read_snapshot(p)
+    assert "不是本系统导出的备份" in str(ei.value)
+
+
+def test_不要回到版本必须相等的写法():
+    """静态守卫：``read_snapshot`` 里不许再出现 ``!= VERSION``。
+
+    旧实现就是这一句。它在 VERSION 还是 1 时**完全看不出问题** —— 而这正是
+    它能在没有任何一份归档存在的时候活下来的原因。等到有归档时再改，已经晚了。
+    """
+    import ast
+    import inspect
+    # 用 AST 而不是字符串查找：注释里**必须**能引用旧写法来说明为什么不能那么写
+    # （``# 版本查表，**不是** ``!= VERSION````），按文本查会把注释一起判成违规。
+    tree = ast.parse(inspect.getsource(export_mod.read_snapshot).lstrip())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare) and any(
+                isinstance(op, (ast.NotEq, ast.Eq)) for op in node.ops):
+            names = {getattr(n, "id", getattr(n, "attr", "")) for n in
+                     (node.left, *node.comparators)}
+            assert "VERSION" not in names, \
+                "read_snapshot 又变回「版本必须恰好等于 VERSION」了 —— 升版本当天所有历史归档失效"
+    src = inspect.getsource(export_mod.read_snapshot)
+    assert "FORMAT_READERS.get" in src, "应当查版本注册表"
+
+
+def _archive_bytes(*, version, tables=None, fmt=export_mod.FORMAT):
+    """造一份最小可读归档的字节（给版本相关的用例用）。"""
+    body = {
+        "header": {"format": fmt, "version": version, "scope": "book",
+                   "book_id": 1, "book_label": "x",
+                   "exported_at": "2026-10-17T00:00:00"},
+        "tables": tables if tables is not None else {
+            "sys_subject": {"columns": ["id"], "rows": [[1]]}},
+    }
+    return gzip.compress(json.dumps(body, ensure_ascii=False).encode("utf-8"))
