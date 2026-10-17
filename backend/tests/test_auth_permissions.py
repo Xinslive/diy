@@ -71,6 +71,57 @@ def test_用户名不可重复(client, registration_on):
     assert "已被占用" in r.json()["detail"]
 
 
+def test_手机号能当用户名注册并登录(client, registration_on):
+    """自助注册的「用户名」已经改成手机号 —— 11 位号码必须真的能建号、能登录。
+
+    这条钉的是**接口层面**：前端只是把占位符和校验正则改了，后端的
+    ``^[A-Za-z0-9_]{3,32}$`` 本来就放行纯数字，所以号码一直是能过的。
+    真哪天有人把那个 pattern 收紧成「不能全是数字」，这里会第一个红。
+    """
+    phone = "13800138000"
+    r = client.post("/api/auth/register", json={"username": phone, "password": "abcd1234"})
+    assert r.status_code == 201, r.text
+    assert r.json()["username"] == phone
+    r = client.post("/api/auth/login", json={"username": phone, "password": "abcd1234"})
+    assert r.status_code == 200, r.text
+    assert r.json()["user"]["username"] == phone
+
+
+def test_注册不填姓名时默认会计(client, registration_on):
+    """姓名输入框已经去掉，后端必须兜住「没填」。
+
+    这里验的是**兜底的取值**，不是「有默认值」—— 原来的兜底是
+    ``payload.username``，改用手机号注册后它会把一串号码存成人的名字。
+    """
+    phone = "13900139000"
+    r = client.post("/api/auth/register", json={"username": phone, "password": "abcd1234"})
+    assert r.status_code == 201, r.text
+    r = client.post("/api/auth/login", json={"username": phone, "password": "abcd1234"})
+    assert r.status_code == 200, r.text
+    assert r.json()["user"]["real_name"] == "会计"
+
+
+@pytest.mark.parametrize("real_name", ["", "   "], ids=["空串", "纯空白"])
+def test_注册姓名填空白也兜成会计(client, registration_on, real_name):
+    """纯空白也要兜。``"   " or "会计"`` 在 Python 里是真值，挡不住。"""
+    phone = "1390013" + str(len(real_name) + 1).zfill(4)
+    r = client.post("/api/auth/register",
+                    json={"username": phone, "password": "abcd1234", "real_name": real_name})
+    assert r.status_code == 201, r.text
+    r = client.post("/api/auth/login", json={"username": phone, "password": "abcd1234"})
+    assert r.json()["user"]["real_name"] == "会计"
+
+
+def test_注册填了姓名就用填的(client, registration_on):
+    """默认值只兜空值，别写成一刀切 —— 脚本和将来的接口仍要能指定姓名。"""
+    phone = "13700137000"
+    r = client.post("/api/auth/register",
+                    json={"username": phone, "password": "abcd1234", "real_name": " 张三 "})
+    assert r.status_code == 201, r.text
+    r = client.post("/api/auth/login", json={"username": phone, "password": "abcd1234"})
+    assert r.json()["user"]["real_name"] == "张三", "前后空白应被去掉，但填的值要留下"
+
+
 def test_注册开关关掉后拒绝(client):
     """默认就该是关的 —— 这条不设夹具，钉的是默认值本身。"""
     from app.core.config import settings

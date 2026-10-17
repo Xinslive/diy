@@ -1840,7 +1840,25 @@ B17 = B9+B16                      资产总计
 > `api/printing.py` 里 `payload.scope not in SCOPES` 直接 400 拒掉。
 
 渲染器 `app/printing/template.py`：HTML + CSS `@page`，浏览器原生分页。
-纸型、方向、页边距、字体、列宽、页眉页脚全部可配。
+方向、页边距、字体、列宽、页眉页脚全部可配。
+
+### 纸型只剩 A4，「每页几张凭证」独立成字段
+全局只有一种纸（`validate_template` 把任何纸型归一成 `A4`，`api/printing.py` 的
+`SELECTABLE_PAPERS = ("A4",)` 是设计器的可选项），而「一页放几张凭证」由模板里的
+`voucher.slots_per_page` 自己说（1 或 2，缺省 2）。
+
+**为什么不能继续从纸型推**：纸型恒为 A4 之后，推出来的答案永远是 2，
+「A4 一页一张」这条正当需求就走不通了。老模板（`paper: "A5"`）的「一页一张」
+意图由迁移 `0024_paper_a4_only` 在**归一化的同一个迁移里**接过来 —— 晚一步的话，
+一份调好的小纸会静默变成一页两张，内容一个字节没改而印出来的张数变了。
+
+**槽位尺寸与放几张无关。** `.voucher-sheet` 的网格轨道恒按「一页两张」排，
+`render_voucher_sheet` 只决定放几个 `.voucher-slot` 进去。原因是元素坐标是
+**槽位内的百分比**：槽位一旦跟着张数撑大，标题、表格、页脚会一起被纵向抻开，
+而模板里一个坐标都没改过 —— 看着就是「模板严重变形」。「每页一张」=
+两份里去掉一份，少放的那格留空。前端 `PrintStage.slotRects` 与
+`TemplateInspector.slotMm` 是同一条公式的两份镜像（`rowMm` 由槽位高度反推），
+三处任何一处改成「一张就占满」都会让拖动存下错坐标。
 
 金额中文大写 `to_cn_capital` 在这里，有专门的边界测试。
 
@@ -1850,10 +1868,9 @@ B17 = B9+B16                      资产总计
 同一张凭证自相矛盾，财务当场就能看出不对。
 
 ### 打印模板的信任边界（存储型 XSS）
-`print_template` **没有 `book_id`** —— 模板是全局的，任何账套的打印页在没传
-`template_id` 时都会取 `scope` 下的默认模板，而打印页只挂了 `get_my_book`，
-**VIEWER 也会渲染它**。因此模板内容是「任何写权限的人都能影响所有只读用户」的输入，
-凡进入 `<style>` 的字段都是注入面。三道防线，各自独立成立：
+打印页只挂了 `get_my_book`，没传 `template_id` 时取的是该 `scope` 下的默认
+模板，而**VIEWER 也会渲染它**。因此模板内容是「能改模板的人会影响所有只读用户
+的输入」，凡进入 `<style>` 的字段都是注入面。三道防线，各自独立成立：
 
 1. **校验**（`validate_template`）：`font.family` 走字体白名单、`font.size` 与
    `title/subtitle.size` 夹区间、`title/subtitle.align` 走 `ALIGN` 白名单、
@@ -1867,9 +1884,30 @@ B17 = B9+B16                      资产总计
    `srcdoc` / `document.write`，走这条链路响应头全部丢失。前端 iframe 另加
    `sandbox="allow-same-origin"`（不加 `allow-scripts`）作为第四道。
 
-**写门禁按全局资源收紧**：改全局模板要求 OWNER 或管理员，不是「非 VIEWER 即可」。
+**归属分三层（`book_id` × `user_id`，迁移 0020 之后的补齐见 0023）**：
+
+| 层 | 判定 | 谁看得见 | 谁改得动 |
+|---|---|---|---|
+| 系统基线 | 两个都 NULL | 所有人 | 账套里**能写**的人（改动写时复制成自己的私有副本） |
+| 账套模板 | `book_id = X` | 账套 X | OWNER / 管理员 |
+| 个人私有副本 | `user_id = 我` | 只有我 | 只有我（管理员也不开后门） |
+
+**写门禁按「影响面」收紧**：改账套模板要求 OWNER 或管理员，不是「非 VIEWER 即可」。
 理由同 `books.py::update_book` —— 模板错了整批单据都要重打。
-真正彻底的解法是给模板加 `book_id`（需要迁移），在此之前不开放给非 OWNER。
+
+**个人那一层有两个入口，都不挂 OWNER**，理由是同一句「爆炸半径是 1」：
+写时复制（`update_template` 改基线时自动复制）与**新建即私有**
+（`POST /templates` 带 `private: true`）。后者是**显式开口子**：`TemplateIn.private`
+默认 `False`，不传就是老契约（建账套模板、OWNER 门禁不变）。默认必须往窄的一边 ——
+翻成 `True`、或给模型开了 `extra` 透传，权限就会在一次看起来跟权限无关的改动里
+一起放宽。新建的私有模板**不挂 `forked_from_id`**（语义是「新画一张」而不是
+「把基线据为私有」，而列表接口按 `forked_from_id` 藏基线，挂错会让基线凭空消失）。
+
+**基线为什么不给 OWNER 门禁**：它的改动写时复制成 `user_id = 当前用户` 的私有
+副本，爆炸半径是 1，套 OWNER 就等于「版式只有一个人能调」。粒度必须是**人**而不是
+账套：账套里不止一个人，按账套 fork 意味着张三改版式、李四明天打印出来的凭证
+也跟着变，而李四从没同意过（报表模板那边是按账套 fork 的，因为报表口径确实是
+账套口径 —— 别照抄过来）。
 
 ### 前端打印的坑
 token 在 localStorage 由 axios 拦截器注入，所以 `iframe.src` / `window.open(url)`
@@ -2296,14 +2334,8 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
 `login_ip_throttle`（每来源一行的失败聚合；**跨账套、无 `book_id`**，
 它记的是「谁在扫」而不是「哪个账套的账」，见 §9.7）
 
-> **表数是 17，核实方法：模型里 17 个 `__tablename__`**
-> （`audit_log` `book` `entry` `import_batch` `login_ip_throttle` `period`
-> `period_opening` `print_template` `report_cell` `report_col` `report_result`
-> `report_row` `report_template` `subject` `sys_user` `sys_user_book` `voucher`）。
-> 迁移侧一致：`0001_baseline` 建 16 张，`0002`~`0007` 一张都不加（只加列、索引、
-> 约束与触发器），`0008_login_ip_throttle` 加第 17 张。
-> `db_init.sql` 里**没有** `CREATE TABLE` —— 建表只由 Alembic revision 负责。
-> README 里的同一处数字也要跟着改，两边不一致时以本节为准。
+
+
 
 ---
 
@@ -2722,6 +2754,44 @@ rm -f /opt/cwq/.backup-timer-off
 denied」这个真实存在的失败一直没人看见。现在第 10 组断言了启用、标记
 honor、不出 ⚠️ 告警、以及「关定时备份不牵连发版备份」四件事。为了让沙箱
 能测，`SYSTEMD_UNIT_DIR` 与 `BACKUP_DIR` 从硬编码路径参数化出来。
+
+### 11.7.8 库备份里是全量账务数据，权限必须由写它的一方钉死
+
+回滚快照目录 `/opt/cwq/.releases/` 里同时躺着三样东西：迁移前的**全量库 dump**、
+上一版的源码、以及产物包。dump 里是完整的凭证、科目和金额。
+
+原来这些文件走的是「目录 `mkdir -p` + 裸 shell 重定向」，权限完全取决于调用方的
+umask（root 默认 022）—— 实测落成 **755 / 644**，也就是**这台机器上任何本地账号
+都能读到账务数据**。而 `110.42.44.53` 是台跑着 19+ 站点的宝塔主机，其他站点的
+服务账号就在上面；实测 `su -s /bin/sh mysql` 能完整读出 dump。
+
+「按 umask 兜底」在这里是不成立的：umask 是运行环境给的，脚本没有资格假定它是
+严的。权限得由写文件的代码自己设。
+
+三处都收：
+
+| 位置 | 原来 | 现在 |
+|---|---|---|
+| `deploy.sh` 建快照目录 | `mkdir -p` | `install -d -m 700` |
+| `deploy.sh` 产 dump | `... > "$DUMP"` | `( umask 077; ... > "$DUMP" )`，子 shell 圈住不外泄 |
+| `db_backup.py` 产备份 | `open(tmp, "wb")` | 紧跟 `os.fchmod(fh.fileno(), 0o600)` |
+
+判据（`nobody` 与 `mysql` 都要被挡住，`root` 必须仍读得到——恢复命令靠它）：
+
+```
+stat -c '%U:%G %a' /opt/cwq/.releases                                  # root:root 700
+stat -c '%U:%G %a' /opt/cwq/.releases/*/database-before-migration.sql # root:root 600
+su -s /bin/sh nobody -c 'head -c 20 <dump>'                            # Permission denied
+head -c 60 <dump>                                                      # -- PostgreSQL database dump
+```
+
+`root` 读得到是硬要求：发布日志第 4 步打出来的恢复命令就是
+`scripts/db_backup.py --restore --file <dump>`，没有它退路等于不存在。已实测
+没有任何以 `cwq` 身份访问 `.releases` 的路径（`cwq-api` 与 `cwq-backup` 都只碰
+`/opt/cwq/backups`），所以收到 `root:root 700` 不影响运行。
+
+沙箱演练新增第 11 组断言这两条权限；后端新增 `test_产出文件权限是600`（断言的是
+**改名之后**的最终文件，因为 `.part` 改名时保留权限位，中间态的权限不作数）。
 
 ---
 

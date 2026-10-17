@@ -11,8 +11,6 @@
                 :placeholder="insertCtx ? '留空按插入位发号' : '留空自动发号'" />
       <span class="muted">日期</span>
       <el-date-picker v-model="form.voucher_date" type="date" value-format="YYYY-MM-DD" style="width: 150px" />
-      <span class="muted">附件</span>
-      <el-input-number v-model="form.attachments" :min="0" :max="999" style="width: 100px" />
       <span class="spacer" />
       <!-- 从列表进来的话，前一张/后一张翻的是**列表那个结果集**（筛选条件原样带着，
            可以跨月跨年）；直接打开某张凭证、不知道从哪来的，才退回同期间内翻。
@@ -27,7 +25,13 @@
       </el-tooltip>
       <el-button :disabled="!canAdd" @click="insertVoucher">插入凭证</el-button>
       <el-button :disabled="!canAdd" @click="addVoucher">增加凭证</el-button>
-      <el-button v-if="voucherId" :disabled="form.status === 'POSTED'" @click="printVoucher">打印预览</el-button>
+      <!-- 打印是**读**，不是写：所以它不受「这张不能改」的三条限制
+           （已记账 / 所在期间已结账 / 只读账号）影响，照样能点。
+           后端那条接口（GET /print/vouchers.html）本来就没有写门禁，只挂
+           get_my_book —— 把一张已记账的凭证打出来，是归档前最常做的事，
+           把它拦掉拦掉的是最该让打出来的那一类。
+           保留的唯一条件是有这张凭证可打（v-if="voucherId"）。 -->
+      <el-button v-if="voucherId" @click="printVoucher">打印预览</el-button>
     </div>
 
     <div class="card">

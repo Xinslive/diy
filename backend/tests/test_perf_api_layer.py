@@ -303,13 +303,19 @@ def test_凭证xlsx导出不按凭证张数查科目(client, auth, book, periods
         + "\n".join(s for s in stmts if "FROM subject" in s))
 
 
-def test_打印页的科目编码名称仍然填得上(client, auth, book, periods, mk_voucher):
-    """复用 ``subs`` 不能把序列化内容改掉 —— 科目编码与名称要照旧出现在页面上。"""
+def test_打印页的科目名称仍然填得上(client, auth, book, periods, mk_voucher):
+    """复用 ``subs`` 不能把序列化内容改掉 —— 科目要照旧出现在页面上。
+
+    这里断言的是**科目名称**，不是编码：科目列按需求改成只印
+    「一级/二级/.../末级」这条路径，不再印编码（见 _voucher_table_html）。
+    这条用例真正守的是「科目数据仍然从复用出来的 subs 里取到了」，
+    守的是数据来源，不是印出来的具体字样。
+    """
     mk_voucher("2026-01-05")
     r = client.get(f"/api/books/{book.id}/print/vouchers.html",
                    params={"period_id": periods[1].id}, headers=auth)
     assert r.status_code == 200, r.text
-    assert "1002" in r.text, r.text[:2000]
+    assert "银行存款" in r.text, r.text[:2000]
 
 
 # ===================================================================== 严重 5

@@ -197,8 +197,11 @@ log "2/7 备份当前版本"
 # 备份目录在**产物取到之后**才建。建早了的后果很小（多一个空目录），
 # 但它意味着「取不到产物」这件事在磁盘上留了痕迹 —— 而取不到产物正是
 # 「CI 没全绿」这条闸门触发的场合，那一刻应该**一个字节都没动**。
-mkdir -p "$RELEASES"
-mkdir -p "$RELEASES/$STAMP"
+# 回滚快照目录收成 700：里面躺着全量账务数据（备份的 dump、上一版的源码、
+# 产物包）。默认 755 意味着这台机器上任何本地账号都能列目录、读文件 ——
+# 而这是台多站点共用的机器，其他站点的账号也在上面。
+install -d -m 700 "$RELEASES"
+install -d -m 700 "$RELEASES/$STAMP"
 for d in backend frontend/dist; do
   if [[ -e "$APP/$d" ]]; then
     cp -a "$APP/$d" "$RELEASES/$STAMP/$(basename "$d")"
@@ -240,7 +243,10 @@ DUMP="$RELEASES/$STAMP/database-before-migration.sql"
 # 退路失败还继续往前走，等于「以为有退路」和「没有退路」两种状态跑在同一段
 # 代码上，而且分不出来。真要豁免，就把 pg_dump 装不上的时候把备份步骤整个
 # 去掉并让发布失败，不要留一个「记得看一眼日志」的分支 —— 没人会看。
-if ./.venv/bin/python scripts/db_backup.py > "$DUMP" 2>"$RELEASES/$STAMP/db_backup.err"; then
+# umask 077：dump 是全量账务数据，644 等于把这台机器上所有本地账号
+# （包括同机其他站点的）都变成合法读者。用子 shell 圈住，避免把 umask
+# 泄漏到后面的解压/切产物上 —— 那边的目录权限由 chown_if_possible 负责。
+if ( umask 077; ./.venv/bin/python scripts/db_backup.py > "$DUMP" 2>"$RELEASES/$STAMP/db_backup.err" ); then
   log "  数据库已备份到 ${DUMP}（$(wc -l < "$DUMP") 行）"
 else
   log "❌ 数据库备份失败，见 ${RELEASES}/${STAMP}/db_backup.err"

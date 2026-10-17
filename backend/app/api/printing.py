@@ -15,19 +15,21 @@ import calendar
 import functools
 import html
 import urllib.parse
+from copy import deepcopy
 from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.reports import _visible_template
 from app.api.vouchers import _book_subjects, _serialize
 from app.core.db import get_db
 from app.core.deps import get_book_link, get_current_user, get_my_book, require_book_write
-from app.models import Book, Period, PrintTemplate, ReportTemplate, SysUser, UserBook, Voucher
+from app.models import Book, Period, PrintTemplate, ReportTemplate, Subject, SysUser, UserBook, Voucher
 # ``preview`` 是轻量的（只依赖 sqlalchemy），留在模块级。
 #
 # ``excel`` 则是**故意延迟导入**的：它在模块级 import openpyxl，而 openpyxl
@@ -80,11 +82,21 @@ def _period(db: Session, book_id: int, period_id: int | None) -> Period:
     return p
 
 
-def _visible_templates(book_id: int):
-    """这个账套**看得见**的模板：本账套的，加上全局兜底的。
+def _visible_templates(book_id: int, user_id: int):
+    """**当前这个人**在当前账套里看得见的模板：三层并集。
 
-    ``print_template.book_id IS NULL`` 是「全局兜底」：迁移之前建的存量模板
-    没有任何一个账套真的拥有它们（见 ``models/printing.py``），把它们回填到
+    加上 ``print_template.user_id``（迁移 0023）之后，模板分三层归属，见
+    ``models/printing.py``：系统基线（两个 NULL，人人有）、账套模板
+    （``book_id = X``，本账套）、个人私有副本（``user_id = 我``，只给我）。
+
+    **别人的私有副本不在可见范围里，这是这一层唯一的存在理由。** 它一旦漏出来
+    后果比「跨账套看得见别的版式」更重：那不是串了口径，是把一个人对凭证纸的
+    个人偏好贴到全公司眼前。所以这里只按 ``user_id = 自己`` 取，绝不按
+    「不是我的就排除」的黑名单方式实现 —— 判据只有一个等式，不认识的人自动落
+    在外面。
+
+    ``print_template.book_id IS NULL`` 那一层是「全局兜底」：迁移之前建的存量
+    模板没有任何一个账套真的拥有它们（见 ``models/printing.py``），把它们回填到
     任意一个账套等于替人断言归属。算进可见范围是让老数据继续能打；它们
     **不参与**「设为默认」的互相清除，是让新数据从一开始就有主。
     """
@@ -92,21 +104,50 @@ def _visible_templates(book_id: int):
     # SQL 是三值逻辑，``NULL IN (6, NULL)`` 求值成 ``NULL``（不是 true），
     # 于是全局兜底模板会被 WHERE **悄悄滤掉**，一条都不返回。
     # 那个写法只在「没有 NULL 行」时与本式等价，而本式的全部意义恰恰是那几行。
-    return or_(PrintTemplate.book_id == book_id, PrintTemplate.book_id.is_(None))
+    return or_(
+        # 私有副本：判据是「owner 就是我」这一个等式，天然排掉所有人。
+        PrintTemplate.user_id == user_id,
+        # 另两层都要求「不是私有的」，免得私有副本从这一支再进来一次。
+        and_(
+            PrintTemplate.user_id.is_(None),
+            or_(PrintTemplate.book_id == book_id, PrintTemplate.book_id.is_(None)),
+        ),
+    )
 
 
-def _scoped_template(db: Session, book: Book, template_id: int) -> PrintTemplate:
-    """按 id 取模板，并且校验它属于当前账套（全局兜底模板也算可见）。
+def _is_baseline(t: PrintTemplate) -> bool:
+    """系统基线：不属于任何账套，也不属于任何个人（迁移 0022 种下的那两份）。
+
+    它是**写时复制的源** —— 改它会先复制一份只有改动者看得见的私有副本，
+    基线自己一个字节都不动。所以「基线」这个判定在读写两侧都要用到，
+    写成函数是为了让两侧不可能各写一份。
+    """
+    return t.book_id is None and t.user_id is None
+
+
+def _scoped_template(db: Session, book: Book, template_id: int, user_id: int) -> PrintTemplate:
+    """按 id 取模板，并且校验它对**当前这个人**可见。
 
     ``template_id`` 是前端传来的任意整数，**不是授权凭据**：没有这一层校验，
-    任何账套都能拿着别人的 id 进打印页。口径必须与 ``_template`` 的取用口径
-    一致（同一份 ``_visible_templates``），否则会出现「列表里看不见、却能
-    按 id 打出来」这种更糟的状态。
+    任何账套都能拿着别人的 id 进打印页，任何人都能拿着别人的私有副本 id
+    进设计器。口径必须与 ``_template`` 的取用口径一致（同一份
+    ``_visible_templates``），否则会出现「列表里看不见、却能按 id 打出来」
+    这种更糟的状态。
+
+    **可见性直接写进 WHERE，而不是 ``db.get`` 之后再判断。** 写成
+    ``db.get(...) + if not 可见`` 的话，可见与否就有两份实现
+    （SQL 一个表达式、Python 一个 if），迟早有一处先改、另一处没改 ——
+    眼前这处就是这么漏的：先按 id 拿到行，再拿 ``book_id not in (book.id, None)``
+    判断，那份判断里**根本没有 user_id**，私有副本会从缝里漏过去。
     """
-    t = db.get(PrintTemplate, template_id)
-    if t is None or t.book_id not in (book.id, None):
-        # 跨账套与不存在返回同一个 404：不区分「没有」和「不是你的」，
-        # 否则这条接口本身就成了一个跨账套的存在性探测器。
+    t = db.scalar(
+        select(PrintTemplate)
+        .where(PrintTemplate.id == template_id,
+               _visible_templates(book.id, user_id))
+    )
+    if t is None:
+        # 跨账套、别人的私有副本与不存在返回同一个 404：不区分「没有」和
+        # 「不是你的」，否则这条接口本身就成了一个存在性探测器。
         raise HTTPException(404, "打印模板不存在")
     return t
 
@@ -132,18 +173,24 @@ def _scoped_report_template(db: Session, book: Book, template_id: int) -> Report
     return _visible_template(db, template_id, book)
 
 
-def _template(db: Session, book: Book, scope: str, template_id: int | None) -> PrintTemplate:
+def _template(db: Session, book: Book, scope: str, template_id: int | None,
+              user_id: int) -> PrintTemplate:
     if template_id is not None and template_id != 0:
-        return _scoped_template(db, book, template_id)
+        return _scoped_template(db, book, template_id, user_id)
     # 0 是明确选择内置版式；未传 id 才沿用账套默认模板。
     t = None if template_id == 0 else db.scalar(
         select(PrintTemplate)
         .where(PrintTemplate.scope == scope, PrintTemplate.is_default.is_(True),
-               _visible_templates(book.id))
-        # 本账套模板优先、全局模板兜底。``book_id IS NULL`` 对 NULL 行算出
-        # true、对本账套行算出 false，ASC 排序下 false 在前 —— 「先本账套、
-        # 后全局」由排序保证，不依赖 id 大小这类偶然。
-        .order_by(PrintTemplate.book_id.is_(None), PrintTemplate.id)
+               _visible_templates(book.id, user_id))
+        # 三层由近及远：**我的私有副本 → 本账套模板 → 全局基线**。ASC 排序下
+        # 布尔表达式算出 false 的排前面，于是 ``user_id IS NULL``（我的副本算
+        # false、其余算 true）先把私有副本顶上来；再按 ``book_id IS NULL``
+        # 把本账套模板排在基线前面。全程不依赖 id 大小这类偶然。
+        #
+        # 前端 ``utils/printTemplate.js::effectiveDefaultId`` 照这个顺序复算
+        # 一遍，好让「默认」那个标记指的就是真会印出来的那份。改这里就得改那里。
+        .order_by(PrintTemplate.user_id.is_(None),
+                  PrintTemplate.book_id.is_(None), PrintTemplate.id)
         .limit(1)
     )
     if t is None:
@@ -164,46 +211,32 @@ def _tpl_dict(t) -> dict:
     return validate_template(t.scope, t.content or {})
 
 
-def _with_paper(tpl: dict, paper: str | None, orientation: str | None) -> dict:
-    """按本次打印的要求临时改纸型/方向 —— 只影响这一次，不落库。
+def _with_orientation(tpl: dict, orientation: str | None) -> dict:
+    """按本次打印的要求临时改方向 —— 只影响这一次，不落库。
 
-    **为什么单独开这条路**：纸型原先只有一条入口，就是改模板存起来。但临时
-    换纸是高频且一次性的小事 —— 同一张凭证先用 A4 打一张给领导签字，再改 A5
-    塞进凭证册第二层，为此去改「默认模板」等于把整本账的默认纸型都换掉，
+    **为什么单独开这条路**：方向原先只有一条入口，就是改模板存起来。但临时
+    换向是高频且一次性的小事 —— 同一本账的明细账平时竖着打，某几张要横着
+    夹进汇报材料，为此去改「默认模板」等于把整本账的默认方向都换掉，
     后面每一次正常打印都得记得改回来。改回去这件事必然有人忘。
 
     所以这里只在**这一页**生效：新函数返回一份新字典，``tpl`` 本身不动，
     模板表里的那份内容更是原封不动。下一次不带参数打印，拿回来的仍是原来
-    的纸型（``print_template.paper`` 那列是保存时冗余出来的副本，渲染层
-    从来不读它，这里也不碰）。
+    的方向。
 
-    两个参数都可以只给一个：只给方向、纸型仍走模板；只给纸型、方向仍走
-    模板。都没给就原样返回同一个对象 —— 不复制，也就没有「为了打印而复制
-    出一份字典」这种看不出来的开销。
+    不给参数就原样返回同一个对象 —— 不复制，也就没有「为了打印而复制出
+    一份字典」这种看不出来的开销。
+
+    **纸型为什么不在这里**：纸型已经全局只剩 A4 了（``validate_template`` 会
+    把任何纸型归一成 A4），再加一个「临时换纸」的口子只会让调用方以为还有
+    别的纸可选，然后拿到一个被静默改掉的值 —— 那个值和用户按下的按钮对不上，
+    比直接不支持更坏。现在这里只剩方向这一个可临时覆盖的维度。
     """
-    if paper is None and orientation is None:
+    if orientation is None:
         return tpl
-    if paper is not None and paper not in PAPERS:
-        # 白名单而不是「查到就用」：纸型是前端拼 URL 传进来的任意字符串，
-        # 认不出来就该当场说清楚，而不是让 _page_css 悄悄退回 A4 打出来
-        # （见 template.py::_page_css 的 ``PAPERS.get(paper, PAPERS["A4"])``）——
-        # 那种退化会让「我明明选了 A3」和实际拿到的纸对不上。
-        raise HTTPException(400, f"不支持的纸型：{paper}")
-    if orientation is not None and orientation not in DIRECTIONS:
+    if orientation not in DIRECTIONS:
         raise HTTPException(400, f"不支持的方向：{orientation}")
-
-    # 覆盖没给的字段取模板自己的值；纸型沿用原对象（老数据可能是
-    # {"w":..,"h":..} 这种写法，见 validate_template），不为了凑成字符串
-    # 而改写它 —— 这一层只负责「替换用户指定的那几项」。
-    eff_paper = paper if paper is not None else tpl.get("paper", "A4")
-    eff_orientation = (orientation if orientation is not None
-                       else tpl.get("orientation", "portrait"))
-    # 与 validate_template 同一条规则：A4_LANDSCAPE 这个纸名本身就表示
-    # 横版，放着 portrait 打印出来是竖着的 A4，两头都不是。这里以纸型为准，
-    # 否则用户会被浏览器按竖版缩放成一张谁也不想要的纸。
-    if eff_paper == "A4_LANDSCAPE":
-        eff_orientation = "landscape"
-    return {**tpl, "paper": eff_paper, "orientation": eff_orientation}
+    # 覆盖没给的字段取模板自己的值；这一层只负责「替换用户指定的那几项」。
+    return {**tpl, "orientation": orientation}
 
 
 # ===================================================================== 打印模板 CRUD
@@ -216,6 +249,13 @@ class TemplateIn(BaseModel):
     content: dict = Field(default_factory=dict)
     is_default: bool = False
     remark: str = ""
+    # 「新建即私有」这条口子的开关。**默认 False 是刻意的**（fail-closed）：
+    # 不带这个标志的调用方拿到的仍是老契约 —— 建账套模板，OWNER 门禁不变
+    # （tests/test_print_template.py::test_新建的模板归属当前账套 依赖这一点）。
+    # 要放开的那条路必须**显式**开口子；否则哪天有人给 ``is_default`` 之类
+    # 改了默认值、或给这个模型开了 ``extra="allow"`` 再传进来，权限会跟着
+    # 一起放宽 —— 而那种改动看起来跟权限毫无关系。
+    private: bool = False
 
 
 class TemplatePatch(BaseModel):
@@ -226,41 +266,64 @@ class TemplatePatch(BaseModel):
     remark: Optional[str] = None
 
 
+#: 设计器**给用户选**的纸型。全局只剩 A4 —— 模板里存的其它纸型只是历史数据，
+#: 由 ``validate_template`` 归一成 A4，不该再出现在选择框里让人以为还能选。
+#: （``template.PAPERS`` 仍保留全部纸型，那是渲染/校验用的白名单，不是选项表。）
+SELECTABLE_PAPERS = ("A4",)
+
+
 @router.get("/templates/meta")
 def template_meta():
     """设计器需要的元信息：可选纸型、字段字典、默认模板。"""
     return {
         "scopes": list(SCOPES),
-        "papers": [{"key": k, **v, "landscape": k.endswith("_LANDSCAPE")} for k, v in PAPERS.items()],
+        "papers": [{"key": k, **PAPERS[k], "landscape": k.endswith("_LANDSCAPE")}
+                   for k in SELECTABLE_PAPERS],
         "defaults": DEFAULT_TEMPLATES,
     }
 
 
+def _tpl_dict_of(t: PrintTemplate) -> dict:
+    """列表/详情共用的序列化。**三层归属要在这里说清**，前端才能判断
+    「这份我能改吗、改了会落到哪一层」。漏掉任何一个字段，前端就只能靠猜。"""
+    return {
+        "id": t.id, "scope": t.scope, "name": t.name, "paper": t.paper,
+        "is_default": t.is_default, "remark": t.remark,
+        "book_id": t.book_id, "user_id": t.user_id,
+        "is_private": t.user_id is not None,
+        "is_baseline": _is_baseline(t),
+        "forked_from": t.forked_from_id,
+    }
+
+
 @router.get("/templates")
-def templates(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    # 按账套过滤：设计器列的是「这个账套能改的模板」。跨账套可见既会让
-    # 别的账套看到本账套的版式，点下去也只能拿到 404（见 _scoped_template）。
+def templates(book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+              user: SysUser = Depends(get_current_user)):
+    # 按「这个人 + 这个账套」过滤：跨账套、别人的私有副本一律不返回
+    # （见 _visible_templates）。
     rows = db.scalars(
         select(PrintTemplate)
-        .where(_visible_templates(book.id))
-        .order_by(PrintTemplate.book_id.is_(None), PrintTemplate.scope, PrintTemplate.id)
+        .where(_visible_templates(book.id, user.id))
+        .order_by(PrintTemplate.user_id.is_(None), PrintTemplate.book_id.is_(None),
+                  PrintTemplate.scope, PrintTemplate.id)
     ).all()
-    return [{"id": t.id, "scope": t.scope, "name": t.name, "paper": t.paper,
-             "is_default": t.is_default, "remark": t.remark, "content": t.content,
-             "book_id": t.book_id}
-            for t in rows]
+    # **我 fork 过的那份基线不摆出来。** 摆出来就是列表里两份同名，用户得先猜
+    # 哪一份在用 —— 而真正在用的恰恰是看不见的那份。报表模板那边是同一招
+    # （app/api/reports.py：列表按 code 去重、副本优先）。
+    # 判据用 ``forked_from_id`` 而不是 name：名字是用户自己可改的，改完就对不上。
+    forked = {t.forked_from_id for t in rows
+              if t.user_id == user.id and t.forked_from_id is not None}
+    return [dict(_tpl_dict_of(t), content=t.content)
+            for t in rows if not (_is_baseline(t) and t.id in forked)]
 
 
 @router.get("/templates/{template_id}")
 def template_detail(template_id: int, book: Book = Depends(get_my_book),
-                    db: Session = Depends(get_db)):
-    t = _scoped_template(db, book, template_id)
+                    db: Session = Depends(get_db), user: SysUser = Depends(get_current_user)):
+    t = _scoped_template(db, book, template_id, user.id)
     merged = _tpl_dict(t)
-    # book_id 与列表接口保持一致：设计器要能看出这张是本账套的模板还是
-    # 全局兜底的老数据（后者改动会影响所有账套）。
-    return {"id": t.id, "scope": t.scope, "name": t.name, "paper": t.paper,
-            "is_default": t.is_default, "remark": t.remark, "content": merged,
-            "book_id": t.book_id, "raw": t.content}
+    # 三层归属字段与列表接口保持一致（见 _tpl_dict_of）。
+    return dict(_tpl_dict_of(t), content=merged, raw=t.content)
 
 
 @router.post("/templates", status_code=201)
@@ -268,28 +331,54 @@ def create_template(payload: TemplateIn, book: Book = Depends(get_my_book),
                     db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
                     user: SysUser = Depends(get_current_user),
                     _link: UserBook = Depends(require_book_write)):
-    # 门禁按「模板是全局资源」收紧（见 _require_global_template_write）；模板本身
-    # 从这一版起归属本账套（book_id=book.id），门禁暂时不放宽。
-    # require_book_write 仍然挂着：它让「每个写接口都挂了写依赖」保持机械可查
-    # （tests/test_viewer_matrix.py 遍历路由表检查），与 books.py 的做法一致。
-    _require_global_template_write(link, user)
+    # 两条路，一句话分开的是**「这份版式会落到哪一层、谁会看见它」**：
+    #
+    #  * ``private=False``（默认，老契约）：落在账套那一层（``book_id=book.id,
+    #    user_id=NULL``），是要跟同事共用的东西，所以门禁仍按 OWNER 收紧。
+    #  * ``private=True``（新建即私有）：落在个人那一层（``book_id=None,
+    #    user_id=user.id``），只有改动者一个人看得见 —— 爆炸半径 1，
+    #    因此**不挂** OWNER 门禁。
+    #
+    # 为什么私有那条路的门禁只要 ``require_book_write``（上面那个依赖）：
+    # 它已经是「这个人在这个账套不是 VIEWER」的判据，而改动只对改动者可见，
+    # 和 update_template 里写时复制那一支是同一道理由（见那里的注释）。
+    # 真正的 OWNER 级门禁留给「会影响别人」的路径。
+    #
+    # require_book_write 两条路都仍然挂着：它让「每个写接口都挂了写依赖」保持
+    # 机械可查（tests/test_viewer_matrix.py 遍历路由表检查），与 books.py 一致。
+    if not payload.private:
+        _require_global_template_write(link, user)
     if payload.scope not in SCOPES:
         raise HTTPException(400, f"未知打印范围：{payload.scope}，可选：{'、'.join(SCOPES)}")
     try:
         content = validate_template(payload.scope, payload.content)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    t = PrintTemplate(book_id=book.id, scope=payload.scope, name=payload.name,
-                      paper=content.get("paper", "A4"),
-                      content=content, is_default=payload.is_default, remark=payload.remark)
+    t = PrintTemplate(
+        book_id=None if payload.private else book.id,
+        user_id=user.id if payload.private else None,
+        # **私有新建不挂 forked_from_id。** 挂了就等于宣称「这一份是从某份基线
+        # 复制来的」，而语义上这是**新画的一张**，不是把谁的基线据为私有。判据
+        # 本身是有副作用的：``templates`` 列表会按 forked_from_id 把「我已经
+        # fork 过的那份基线」藏起来（见那里的注释），挂错会让基线凭空从列表
+        # 里消失，而我从没 fork 过它。
+        scope=payload.scope, name=payload.name,
+        paper=content.get("paper", "A4"),
+        content=content, is_default=payload.is_default, remark=payload.remark)
     db.add(t)
     db.flush()
     if t.is_default:
         _clear_other_defaults(db, t)
-    _log(db, user, book.id, "CREATE_PRINT_TEMPLATE", t.id, f"新增打印模板 {t.name}")
+    # 审计 detail 里写明落在哪一层。「账套模板」和「只有你可见的个人版式」
+    # 事后看是两回事，日志上要分得开；action 名不变，避免多出一类查询不到
+    # 自己写过的动作。
+    _log(db, user, book.id, "CREATE_PRINT_TEMPLATE", t.id,
+         f"新增{'我的私有版式（只有你可见）' if payload.private else ''}打印模板 {t.name}")
     db.commit()
     db.refresh(t)
-    return {"id": t.id, "scope": t.scope, "name": t.name, "content": t.content}
+    # 归属字段跟列表/详情接口对齐（见 _tpl_dict_of）：前端保存完要靠它决定
+    # 「选中的那份」换成哪个 id（私有那份和账套那份不是同一行）。
+    return dict(_tpl_dict_of(t), content=t.content)
 
 
 @router.put("/templates/{template_id}")
@@ -297,8 +386,25 @@ def update_template(template_id: int, payload: TemplatePatch, book: Book = Depen
                     db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
                     user: SysUser = Depends(get_current_user),
                     _link: UserBook = Depends(require_book_write)):
-    t = _scoped_template(db, book, template_id)
-    _require_global_template_write(link, user)
+    t = _scoped_template(db, book, template_id, user.id)
+    forked = False
+    if _is_baseline(t):
+        # **写时复制的那一步。** 目标是系统基线时不直接改它 —— 改成了大家都被
+        # 改，基线就不成其为基线了。整份复制成 ``user_id = 当前用户`` 的私有副本，
+        # 后面这次保存落在副本上，基线一个字节都不动。
+        #
+        # 门禁在这里**故意只要求「能写这个账套」**（``require_book_write`` 依赖，
+        # 上面已经挂好）：改动只对改动者一个人可见，爆炸半径是 1，不是全站。
+        # 真正的 OWNER 级门禁留给「会影响别人」的两层（账套模板、基线本身）。
+        # 「用户也要可改」这句话在这一行落地：只有 OWNER 才能改基线的话，
+        # 改版式就成了一个人的特权，而不是每个人都能顺手做的事。
+        t = _fork_private(db, user, t)
+        forked = True
+    elif t.user_id != user.id:
+        # 账套模板：改它等于改全账套的版式，门禁与建库以来一致，不放宽。
+        _require_global_template_write(link, user)
+    # 私有副本（t.user_id == user.id）：只有主人自己看得见，也就只有他自己有资格
+    # 改 —— 管理员也不开后门，「仅自己可见」要真的只有自己。
     before = t.content
     # 局部更新：先把补丁叠到「已保存的模板」上，再叠加内置默认值兜底。
     # 直接把补丁丢给 validate_template 会让默认值里的 paper/margins 盖掉用户已保存的值。
@@ -318,10 +424,14 @@ def update_template(template_id: int, payload: TemplatePatch, book: Book = Depen
     db.flush()
     if t.is_default:
         _clear_other_defaults(db, t)
-    _log(db, user, book.id, "UPDATE_PRINT_TEMPLATE", t.id, f"修改打印模板 {t.name}",
+    _log(db, user, book.id, "UPDATE_PRINT_TEMPLATE", t.id,
+         f"修改打印模板 {t.name}" + ("（基线→我的私有副本）" if forked else ""),
          before={"content": before}, after={"content": merged})
     db.commit()
-    return {"id": t.id, "content": t.content}
+    # **id 会变**：改基线时前端拿到的是新副本的 id，必须切过去，否则下一次保存
+    # 又会拿旧 id 再复制一份，越改越多。``forked`` 明说这件事发生过。
+    return {"id": t.id, "content": t.content, "forked": forked,
+            "name": t.name, "is_private": True if forked else t.user_id is not None}
 
 
 @router.delete("/templates/{template_id}")
@@ -329,8 +439,16 @@ def delete_template(template_id: int, book: Book = Depends(get_my_book),
                     db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
                     user: SysUser = Depends(get_current_user),
                     _link: UserBook = Depends(require_book_write)):
-    t = _scoped_template(db, book, template_id)
-    _require_global_template_write(link, user)
+    t = _scoped_template(db, book, template_id, user.id)
+    if _is_baseline(t):
+        # 基线是出厂版式，所有账套共看那一份。删掉它不是「改我的偏好」，
+        # 是把系统重新变回「没有凭证版式可用」—— 所以这条路直接封掉。
+        # 403 而不是 404：它本来就在每个人的列表里，说不说它存在都不泄密。
+        raise HTTPException(
+            403, "系统基线模板不能删除。它是所有账套共用的出厂版式；"
+                 "要按自己的习惯改，直接保存即可 —— 改动会变成只有你可见的个人版式。")
+    if t.user_id != user.id:
+        _require_global_template_write(link, user)
     name = t.name
     db.delete(t)
     _log(db, user, book.id, "DELETE_PRINT_TEMPLATE", template_id, f"删除打印模板 {name}")
@@ -343,9 +461,14 @@ def copy_template(template_id: int, book: Book = Depends(get_my_book),
                   db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
                   user: SysUser = Depends(get_current_user),
                   _link: UserBook = Depends(require_book_write)):
-    """复制一份再改 —— 改模板前先留个底，财务自己就能做。"""
-    src = _scoped_template(db, book, template_id)
-    # 复制出来的仍是本账套的模板，同样按门禁收紧（否则「复制」就是个绕过点）。
+    """复制一份再改 —— 改模板前先留个底，财务自己就能做。
+
+    **复制出来的是账套模板**，不是私有副本：这条口子的语义是「在本账套里另存
+    一份给同事用」，所以门禁与别的账套级写操作一样按 OWNER 收紧（否则「复制」
+    就是个绕过点）。只想给自己留一份的人不用走这里 —— 改基线时系统自动复制
+    私有副本（见 ``update_template``），或者直接删掉自己那份副本就回到基线。
+    """
+    src = _scoped_template(db, book, template_id, user.id)
     _require_global_template_write(link, user)
     t = PrintTemplate(book_id=book.id, scope=src.scope, name=f"{src.name} 副本",
                       paper=src.paper,
@@ -358,15 +481,73 @@ def copy_template(template_id: int, book: Book = Depends(get_my_book),
 
 
 def _clear_other_defaults(db: Session, keep: PrintTemplate) -> None:
-    # 按 (book_id, scope) 分组：A 账套「设为默认」不该把 B 账套的默认模板
-    # 一起清掉 —— 那等于「在 A 账套点一下，B 账套的版式就变回旧的了」。
-    # book_id 为 NULL 的全局模板各自成组，跨账套互不影响。
+    # 按 **(user_id, book_id, scope)** 分组，三层各算各的：
+    #  * A 账套「设为默认」不该把 B 账套的默认模板一起清掉 —— 那等于
+    #    「在 A 账套点一下，B 账套的版式就变回旧的了」；
+    #  * **我把自己的私有副本设为默认，更不该把基线的默认标记清掉** ——
+    #    那等于我点一下，全公司明天的凭证版式都变回出厂值。
+    # 所以分组键必须带上 user_id：这是「改动不影响别人」在默认标记上的那条。
+    #
+    # NULL 在这里是「某一层的全体」，不是「没填」，所以两个条件都写成
+    # 三值逻辑里的 IS NULL 分支（照抄 book_id 的老写法）。
     db.query(PrintTemplate).filter(
         PrintTemplate.scope == keep.scope, PrintTemplate.id != keep.id,
         PrintTemplate.is_default.is_(True),
+        PrintTemplate.user_id == keep.user_id if keep.user_id is not None
+        else PrintTemplate.user_id.is_(None),
         PrintTemplate.book_id == keep.book_id if keep.book_id is not None
         else PrintTemplate.book_id.is_(None)
     ).update({PrintTemplate.is_default: False}, synchronize_session=False)
+
+
+def _fork_private(db: Session, user: SysUser, src: PrintTemplate) -> PrintTemplate:
+    """把一份**基线**整份复制成「只有 ``user`` 看得见」的私有副本。
+
+    幂等：已经 fork 过就返回那一份。不做幂等的话，在同一个基线上连按两次保存就
+    攒出两份一模一样的私有副本，而列表里两份同名 —— 用户得自己猜哪份在用，
+    取默认模板时也可能挑到旧的那份。判据是 ``forked_from_id`` 而不是 name：
+    名字是用户自己可改的，改完就对不上了。
+
+    副本**继承基线的 ``is_default``**：我 fork 的正是我每天在用的那份（不指定
+    模板打印时打出来的就是它），不继承的话我的私有副本会立刻变成一张没人用的
+    死模板，而打印仍然走基线 —— 改了半天没生效。基线那一行的 ``is_default``
+    一个字节都不动（它在另一组，见 ``_clear_other_defaults``）。
+    """
+    existing = db.scalar(
+        select(PrintTemplate)
+        .where(PrintTemplate.user_id == user.id,
+               PrintTemplate.forked_from_id == src.id)
+    )
+    if existing is not None:
+        return existing
+    t = PrintTemplate(
+        book_id=None, user_id=user.id, forked_from_id=src.id,
+        scope=src.scope, name=src.name, paper=src.paper,
+        content=deepcopy(src.content or {}),
+        is_default=src.is_default, remark=src.remark)
+    db.add(t)
+    try:
+        db.flush()
+    except IntegrityError:
+        # 唯一索引 uq_print_template_user_fork 兜住了「两个窗口同时保存同一份
+        # 基线」：先查后插在真并发下仍会双双插进去，那时由索引把第二个拦下。
+        # 这里不把它当错误抛出去，而是认了同一份副本继续走 —— 用户看到的结果
+        # 就是「保存成功，两边改到同一份上」，而不是一个 500。
+        #
+        # 回滚是安全的：``_fork_private`` 在 ``update_template`` 里是**第一件**
+        # 改动，本次请求此刻还没往事务里写别的东西。
+        db.rollback()
+        existing = db.scalar(
+            select(PrintTemplate)
+            .where(PrintTemplate.user_id == user.id,
+                   PrintTemplate.forked_from_id == src.id)
+        )
+        if existing is None:
+            raise
+        return existing
+    if t.is_default:
+        _clear_other_defaults(db, t)
+    return t
 
 
 def _log(db, user, book_id, action, entity_id, detail, before=None, after=None) -> None:
@@ -377,7 +558,10 @@ def _log(db, user, book_id, action, entity_id, detail, before=None, after=None) 
 
 
 def _require_global_template_write(link: UserBook, user: SysUser) -> None:
-    """改打印模板需要本账套 OWNER（管理员放行）。
+    """改**会被别人看到**的打印模板，需要本账套 OWNER（管理员放行）。
+
+    **调用方只有两类**：新建模板、改账套模板。基线改不动（``update_template``
+    会先复制成私有副本），别人的私有副本连看都看不见，所以它们都不走这里。
 
     **为什么不能只看「当前账套能不能写」**：模板内容进 ``<style>``（P0-2），
     改错一次，整批单据都要重打。``require_book_write`` 问的是「非 VIEWER 即可」，
@@ -385,19 +569,17 @@ def _require_global_template_write(link: UserBook, user: SysUser) -> None:
     ``app/api/system.py`` 里 OWNER 的定义（「账套负责人，可改科目/模板/授权」）
     与 ``app/api/books.py::update_book`` 的先例。
 
-    **``print_template.book_id`` 落地之后，这道门禁还不能放宽**，三个理由：
+    **账套模板已经按账套隔离了，为什么还不能放宽**，两个理由：
 
-    1. **仍有全局模板。** 迁移之前的存量模板 ``book_id IS NULL``，它们照样流进
-       每一个账套的打印页，而**任何一个**账套的 OWNER 都能改它们 —— 跨账套
-       窃取这条路还开着，只是从「改一张」变成「改一张还没有主的」。
+    1. **它仍然是「全账套共看的那一份」。** 一个人在账套里改版式，同事明天
+       打印出来的凭证就跟着变了 —— 隔离到账套只挡住了**别的账套**，没解决
+       「同账套里别人被动跟着变」。``book_id IS NULL`` 的基线与「我自己的私有
+       副本」都拆出去了（前者写时复制，后者只归本人），这一层剩下的正是
+       影响面 = 整个账套的那部分。
     2. **门禁本身不是这次新加的。** 它是上一批为了止血加的收紧；把它撤掉
        属于「拿掉一道已经生效的防线」，而放宽的前提是「已经有更好的那道」，
-       不是「原来的问题看起来没那么严重」。
-    3. **没有回归网。** 模板是 JSON 自由文本，样式注入只有渲染层二次夹取
-       兜底；门禁是写入路径上唯一一道按**角色**判断的关卡。
-
-    真正该放宽的时机是「全局模板退役」之后：所有 ``book_id IS NULL`` 的行
-    都不再参与取用，写路径就真的只剩一个账套，可以回到「该账套 OWNER 以上」。
+       不是「原来的问题看起来没那么严重」。模板是 JSON 自由文本，样式注入只有
+       渲染层二次夹取兜底；门禁是写入路径上唯一一道按**角色**判断的关卡。
 
     fail-closed：角色认不出来一律当拒绝，不做「不是 VIEWER 就放行」的黑名单判断
     （见 ``frontend/src/stores/session.js::canWrite`` 里同一段推理）。
@@ -406,8 +588,9 @@ def _require_global_template_write(link: UserBook, user: SysUser) -> None:
         return
     if link.role != "OWNER":
         raise HTTPException(
-            403, "打印模板是全局模板（所有账套的打印页都会用到），"
-                 "只有账套所有者或管理员可以修改")
+            403, "打印模板是账套共用的版式（账套里每个人打印时都会用到），"
+                 "只有账套所有者或管理员可以修改。只想改自己那份的话，"
+                 "打开系统基线模板直接保存即可 —— 改动会变成只有你可见的个人版式")
 
 
 # ===================================================================== HTML 打印
@@ -467,6 +650,50 @@ def _html_response(doc: str) -> Response:
     )
 
 
+def _subject_paths(subs: dict[int, Subject]) -> dict[int, str]:
+    """科目 id -> 「一级/二级/.../末级」的完整层级路径。
+
+    凭证的科目列要印的是这条路径，而不是「编码 名称」。路径按 ``parent_id``
+    一路往上拼，**不是**把编码里的分隔符换成斜杠 —— 编码怎么分段是各账套自己
+    定的，拿它拼出来的层级跟真实科目树未必对得上（父级改过编码就废了）。
+
+    每个科目只往上走一次（memo），一张凭证十几条分录、一屏几百行，都不该
+    重复爬树。
+    """
+    memo: dict[int, str] = {}
+
+    def path(sid, chain: frozenset) -> str:
+        if sid is None:
+            return ""
+        if sid in memo:
+            return memo[sid]
+        sub = subs.get(sid)
+        if sub is None:
+            return ""
+        # parent_id 指回自己就是环（A -> A -> A ...），再往上走会一直递归下去。
+        # 发现走过的 id 就返回空串当「没有前缀」，于是这一支只剩自己一个名字 ——
+        # 印出来的路径是「自己」而不是「自己/自己/自己...」，也不会把整页打印卡死。
+        # 深度也封一道顶，兜住没有成环但链异常长的情况。
+        if sid in chain or len(chain) > 32:
+            return ""
+        prefix = path(sub.parent_id, chain | {sid})
+        memo[sid] = f"{prefix}/{sub.name}" if prefix else sub.name
+        return memo[sid]
+
+    return {sid: path(sid, frozenset()) for sid in subs}
+
+
+def _attach_subject_paths(voucher: dict, paths: dict[int, str]) -> dict:
+    """给每条分录补 ``subject_path``，渲染层直接取用。
+
+    兜底回科目名：科目被删、跨账套串了 id 这类情况下，印一个能对上的名字，
+    好过印空白让人以为这里本来就没填。
+    """
+    for e in voucher.get("entries") or []:
+        e["subject_path"] = paths.get(e.get("subject_id")) or e.get("subject_name", "")
+    return voucher
+
+
 def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
                   status: Optional[str] = None, max_pages: Optional[int] = None,
                   note: str = "", voucher_ids: Optional[list[int]] = None) -> str:
@@ -509,9 +736,10 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
     # 列表接口早已在 vouchers.py::query 修好同一个坑（一次取好复用，审计 P3-12），
     # 打印层漏了：这里 page_size=5000，满月的账就是 5000 次同样的 SELECT。
     subs = _book_subjects(db, book.id)
+    subj_paths = _subject_paths(subs)
     pieces: list[dict] = []
     for v in shown:
-        voucher = _serialize(db, v, subs)
+        voucher = _attach_subject_paths(_serialize(db, v, subs), subj_paths)
         voucher["period"] = period_codes.get(v.period_id, period.code)
         pieces.extend(split_voucher(voucher, rows_per_page, split_format))
 
@@ -745,9 +973,11 @@ def _render_scope(
 def print_vouchers(book_id: int, period_id: Optional[int] = None,
                    template_id: Optional[int] = None, status: Optional[str] = None,
                    voucher_ids: Optional[str] = None,
-                   paper: Optional[str] = None, orientation: Optional[str] = None,
-                   book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    """记账凭证：A4 每页 2 张、A5 每页 1 张，每张最多 5 行摘要。"""
+                   orientation: Optional[str] = None,
+                   book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                  user: SysUser = Depends(get_current_user)):
+    """记账凭证：一页几张由模板的 voucher.slots_per_page 决定（1 或 2），
+    每张最多 5 行摘要，超出的行挪到下一张凭证并加分页号。"""
     selected_ids = None
     if voucher_ids is not None:
         try:
@@ -758,11 +988,10 @@ def print_vouchers(book_id: int, period_id: Optional[int] = None,
             raise HTTPException(422, "所选凭证编号格式无效") from exc
         if not selected_ids or any(voucher_id <= 0 for voucher_id in selected_ids):
             raise HTTPException(422, "至少选择一张有效凭证")
-    tpl = _tpl_dict(_template(db, book, "VOUCHER", template_id))
-    # 纸型临时覆盖顺带也改了「一页几张」：voucher_slots_per_page 按纸型判断，
-    # A4/A3 是 2 张、A5 是 1 张。这不是副作用，是这张纸本来就能放几张 ——
-    # 换成 A5 还硬塞两张，打出来就是两张叠在一起，谁也读不了。
-    tpl = _with_paper(tpl, paper, orientation)
+    tpl = _tpl_dict(_template(db, book, "VOUCHER", template_id, user.id))
+    # 「一页几张」只由模板的 slots_per_page 决定，不跟着这次的打印参数变 ——
+    # 用户在模板里定的密度就是这本的账密度，不该被一次性的打印悄悄改掉。
+    tpl = _with_orientation(tpl, orientation)
     return _html_response(_render_scope(db, book, "VOUCHER", tpl,
                                         period_id=period_id, status=status,
                                         voucher_ids=selected_ids))
@@ -773,10 +1002,10 @@ def print_balance(book_id: int, period_id: Optional[int] = None,
                   from_period_id: Optional[int] = None,
                   template_id: Optional[int] = None, include_unposted: bool = Query(False),
                   subject_scope: str = Query("all"),
-                  paper: Optional[str] = None, orientation: Optional[str] = None,
-                  book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    tpl = _with_paper(_tpl_dict(_template(db, book, "BALANCE", template_id)),
-                      paper, orientation)
+                  orientation: Optional[str] = None,
+                  book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                  user: SysUser = Depends(get_current_user)):
+    tpl = _with_orientation(_tpl_dict(_template(db, book, "BALANCE", template_id, user.id)), orientation)
     return _html_response(_render_scope(db, book, "BALANCE", tpl,
                                         period_id=period_id, from_period_id=from_period_id,
                                         include_unposted=include_unposted,
@@ -787,10 +1016,10 @@ def print_balance(book_id: int, period_id: Optional[int] = None,
 def print_general(book_id: int, period_id: Optional[int] = None,
                   from_period_id: Optional[int] = None, template_id: Optional[int] = None,
                   include_unposted: bool = Query(False), leaf_only: bool = Query(False),
-                  paper: Optional[str] = None, orientation: Optional[str] = None,
-                  book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    tpl = _with_paper(_tpl_dict(_template(db, book, "LEDGER", template_id)),
-                      paper, orientation)
+                  orientation: Optional[str] = None,
+                  book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                  user: SysUser = Depends(get_current_user)):
+    tpl = _with_orientation(_tpl_dict(_template(db, book, "LEDGER", template_id, user.id)), orientation)
     return _html_response(_render_scope(db, book, "LEDGER", tpl, period_id=period_id,
                                         from_period_id=from_period_id,
                                         include_unposted=include_unposted,
@@ -802,10 +1031,10 @@ def print_detail(book_id: int, subject_id: int, period_id: Optional[int] = None,
                  from_period_id: Optional[int] = None, template_id: Optional[int] = None,
                  from_subject_id: Optional[int] = None, to_subject_id: Optional[int] = None,
                  include_unposted: bool = Query(False),
-                 paper: Optional[str] = None, orientation: Optional[str] = None,
-                 book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    tpl = _with_paper(_tpl_dict(_template(db, book, "DETAIL_LEDGER", template_id)),
-                      paper, orientation)
+                 orientation: Optional[str] = None,
+                 book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                  user: SysUser = Depends(get_current_user)):
+    tpl = _with_orientation(_tpl_dict(_template(db, book, "DETAIL_LEDGER", template_id, user.id)), orientation)
     return _html_response(_render_scope(db, book, "DETAIL_LEDGER", tpl, period_id=period_id,
                                         from_period_id=from_period_id, subject_id=subject_id,
                                         from_subject_id=from_subject_id,
@@ -816,10 +1045,10 @@ def print_detail(book_id: int, subject_id: int, period_id: Optional[int] = None,
 @router.get("/report.html")
 def print_report(book_id: int, template_id: int, period_id: int,
                  print_template_id: Optional[int] = None,
-                 paper: Optional[str] = None, orientation: Optional[str] = None,
-                 book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    tpl = _with_paper(_tpl_dict(_template(db, book, "REPORT", print_template_id)),
-                      paper, orientation)
+                 orientation: Optional[str] = None,
+                 book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                  user: SysUser = Depends(get_current_user)):
+    tpl = _with_orientation(_tpl_dict(_template(db, book, "REPORT", print_template_id, user.id)), orientation)
     return _html_response(_render_scope(db, book, "REPORT", tpl, period_id=period_id,
                                         report_template_id=template_id))
 

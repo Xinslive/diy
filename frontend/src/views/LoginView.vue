@@ -41,11 +41,8 @@
         <el-tab-pane label="注册" name="register">
           <el-form @submit.prevent="submitRegister">
             <el-form-item>
-              <el-input v-model="reg.username" placeholder="用户名（3-32 位字母、数字或下划线）"
+              <el-input v-model="reg.username" placeholder="手机号（11 位）"
                         size="large" @keyup.enter="submitRegister" />
-            </el-form-item>
-            <el-form-item>
-              <el-input v-model="reg.real_name" placeholder="姓名（选填）" size="large" />
             </el-form-item>
             <el-form-item>
               <el-input v-model="reg.password" type="password" placeholder="密码（至少 8 位）"
@@ -59,9 +56,6 @@
               注册
             </el-button>
           </el-form>
-          <p class="hint muted">
-            注册只开账号，账套需要管理员在「用户与授权」里分配。
-          </p>
         </el-tab-pane>
       </el-tabs>
     </div>
@@ -93,7 +87,15 @@ const isDev = import.meta.env.DEV
 const username = ref(isDev ? 'admin' : '')
 const password = ref('')
 
-const reg = reactive({ username: '', real_name: '', password: '', confirm: '' })
+// 自助注册的「用户名」就是手机号：11 位大陆号码（1 开头，第二位 3-9）。
+//
+// 这条**只是前端的约定，不是服务端强制的**：后端 `RegisterIn.username`
+// 仍然是 `^[A-Za-z0-9_]{3,32}$`，手机号本来就落在里面，所以以前后不用改
+// 接口就能收号码。别把这里的正则当成安全边界 —— 真要只收手机号，得在
+// schemas.py 里收紧 pattern，那会连带改掉若干以用户名当标识的测试。
+const PHONE_RE = /^1[3-9]\d{9}$/
+
+const reg = reactive({ username: '', password: '', confirm: '' })
 
 const err = (e, fallback) => e?.response?.data?.detail || fallback
 
@@ -111,9 +113,10 @@ async function submitLogin() {
 }
 
 async function submitRegister() {
-  // 前端先拦一道：后端 pydantic 也会校验，但当场提示比等一次往返舒服
-  if (!/^[A-Za-z0-9_]{3,32}$/.test(reg.username))
-    return ElMessage.warning('用户名需为 3-32 位字母、数字或下划线')
+  // 前端先拦一道：当场提示比等一次往返舒服
+  const phone = reg.username.trim()
+  if (!PHONE_RE.test(phone))
+    return ElMessage.warning('请输入 11 位手机号')
   if (reg.password.length < 8)
     return ElMessage.warning('密码至少 8 位')
   if (reg.password !== reg.confirm)
@@ -121,16 +124,17 @@ async function submitRegister() {
 
   busy.value = true
   try {
+    // 刻意不发 real_name：空姓名由后端兜成「会计」（见 app/api/auth.py
+    // 的 register）。默认值放在服务端，脚本和将来的调用方拿到同一个口径。
     await authApi.register({
-      username: reg.username,
-      password: reg.password,
-      real_name: reg.real_name.trim()
+      username: phone,
+      password: reg.password
     })
     ElMessage.success('注册成功，请登录；登录后联系管理员分配账套')
     // 切回登录页并把用户名带过去，省得再输一遍
-    username.value = reg.username
+    username.value = phone
     password.value = ''
-    Object.assign(reg, { username: '', real_name: '', password: '', confirm: '' })
+    Object.assign(reg, { username: '', password: '', confirm: '' })
     tab.value = 'login'
   } catch (e) {
     ElMessage.error(err(e, '注册失败'))

@@ -176,6 +176,10 @@ def dump_to_file(out: Path, keep: int | None = None) -> int:
 
     try:
         with open(tmp, "wb") as fh:
+            # 备份里是全量账务数据（凭证、科目、金额）。靠 umask 兜底是不够的
+            # —— 默认 022 会把它落成 644，而这台机器上任何本地账号都读得到。
+            # 显式收成 600，不猜调用方的 umask。
+            os.fchmod(fh.fileno(), 0o600)
             rc = dump_to(fh)
     except BaseException:
         # **抛异常也要清。** dump_to 不只可能「返回非零」：

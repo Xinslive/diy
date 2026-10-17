@@ -1,6 +1,7 @@
 import { chromium } from 'playwright'
 const browser = await chromium.launch()
-for (const [paper, label] of [['A4','A4(2张/页)'], ['A5','A5(1张/页)']]) {
+// 纸型恒为 A4，所以这里探的是「每页凭证数」1 / 2 —— 以前那两行探的是 A4 / A5。
+for (const [slots, label] of [[2, 'A4(2张/页)'], [1, 'A4(1张/页)']]) {
   const page = await browser.newPage({ viewport: { width: 1539, height: 954 } })
   const errs = []
   page.on('pageerror', e => errs.push(e.message))
@@ -10,12 +11,13 @@ for (const [paper, label] of [['A4','A4(2张/页)'], ['A5','A5(1张/页)']]) {
   }
   await page.goto('http://127.0.0.1:5173/#/print-templates', { waitUntil: 'networkidle' })
   await page.waitForTimeout(2500)
-  const pick = async (l) => {
-    await page.locator('.el-form-item:has-text("纸型") .el-select').first().click(); await page.waitForTimeout(500)
-    await page.locator('.el-select-dropdown:visible .el-select-dropdown__item', { hasText: new RegExp('^' + l) }).first().click()
+  const pick = async (n) => {
+    await page.locator('.ti-page .fl').filter({ hasText: '每页凭证数' }).locator('.el-select').click()
+    await page.waitForTimeout(500)
+    await page.locator('.el-select-dropdown:visible .el-select-dropdown__item', { hasText: `每页 ${n} 张` }).first().click()
     await page.waitForTimeout(3000)
   }
-  await pick('A4'); await pick(paper)
+  await pick(slots)
   const fr = page.frames().find(f => f.url() === 'about:srcdoc')
   const r = await page.evaluate(() => {
     const b = document.querySelector('.preview-box')

@@ -184,8 +184,16 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
         raise HTTPException(403, "系统未开放自助注册，请联系管理员开号")
     if db.scalar(select(SysUser).where(SysUser.username == payload.username)):
         raise HTTPException(400, f"用户名「{payload.username}」已被占用")
+    # real_name **不再让自助注册的用户填**（前端那个输入框已去掉），空值兜底成
+    # 「会计」。原先的兜底是 ``payload.username``，那是「用户名即身份标识」时代
+    # 的做法；注册改成手机号之后，它会把一串号码当人的名字存进库，界面上就出现
+    # 「13800138000」这种姓名。strip() 是为了连纯空白也一起兜住 ——
+    # ``"   " or x`` 在 Python 里是真值。
+    #
+    # 注意管理员建号那条路径（api/system.py）**保持** ``or payload.username`` 不动：
+    # 那里姓名是管理员显式填的，填了空才退回用户名，语义不同。
     u = SysUser(username=payload.username, password_hash=hash_password(payload.password),
-                real_name=payload.real_name or payload.username, active=True)
+                real_name=(payload.real_name or "").strip() or "会计", active=True)
     db.add(u)
     db.flush()
     # 快照字段与 system.py::_user_snapshot 对齐，**刻意不含 password_hash**：

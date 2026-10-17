@@ -27,6 +27,7 @@ from __future__ import annotations
 import calendar
 import html
 import re
+from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
@@ -238,12 +239,30 @@ SCOPES = tuple(DEFAULT_TEMPLATES)
 
 
 def _deep_merge(base: Any, override: Any) -> Any:
+    """两边都**深拷贝**，返回的东西与 ``base``/``override`` 不共享任何结构。
+
+    原来这里是 ``dict(base)`` —— 只浅拷贝最外层，里面那些 dict/list 仍然是
+    ``DEFAULT_TEMPLATES`` 里的**同一个对象**。于是调用方改一句
+    ``merged["voucher"]["slots_per_page"] = 1``，改的是全局默认值本身。
+
+    症状是「同一个接口连着调两次，第二次的结果和第一次不一样」，而且**取决于
+    调用顺序**：先渲染一张自定义过 ``rows_per_page`` 的模板，再渲染一张全新
+    模板，后者会拿到前者的值。改动没落库、没重启，出来的东西自己变了 ——
+    这样的 bug 极难定位（同一个 URL 刷新一次就好了）。
+
+    ``validate_template`` 从头到尾都在往 merged 里写归一化后的值（voucher、
+    font、title、margins、columns…），所以这不是理论风险，是每一次调用都在
+    发生。拷贝一次的成本是微秒级（一个小 dict），而它换来的是「模板校验是纯
+    函数」——这条不成立的话，后面任何以默认值为准的测试都会时对时错。
+    """
     if isinstance(base, dict) and isinstance(override, dict):
-        out = dict(base)
+        out = deepcopy(base)
         for k, v in override.items():
-            out[k] = _deep_merge(base.get(k), v) if k in base else v
+            out[k] = _deep_merge(base.get(k), v) if k in base else deepcopy(v)
         return out
-    return base if override is None else override
+    if override is None:
+        return deepcopy(base)
+    return deepcopy(override)
 
 
 def merge_defaults(scope: str, content: dict | None) -> dict:
@@ -314,21 +333,30 @@ def validate_template(scope: str, content: dict | None) -> dict:
         merged["title"]["text"] = _correct_voucher_title(
             str(merged["title"].get("text", "")))
 
+    # **纸型只剩 A4。** 认不出来的纸型照样拒（那是坏数据，不是「兼容」，
+    # 与 ``font.family`` 走白名单是同一条理由），但通过之后一律按 A4 存 ——
+    # 界面上已经不再让人选纸型（见 api/printing.py 的 _with_paper 注释），
+    # 模板里留着别的值就只会让「用户看到的」和「纸上出来的」对不上。
     paper = merged.get("paper", "A4")
-    if isinstance(paper, dict):          # 兼容早期写法 {"w":..,"h":..}
-        spec = paper
-    else:
-        spec = PAPERS.get(str(paper))
-        if spec is None:
+    if not isinstance(paper, dict):      # 兼容早期写法 {"w":..,"h":..}
+        if PAPERS.get(str(paper)) is None:
             raise ValueError(f"未知纸型「{paper}」，可选：{'、'.join(PAPERS)}")
-    if isinstance(paper, str):
-        merged["paper"] = paper
-
-    if str(paper).endswith("_LANDSCAPE") and merged.get("orientation") != "landscape":
-        merged["orientation"] = "landscape"
+    # 「一页几张」在旧模板里是靠纸型表达的（A5 = 一页一张）。纸型收敛成 A4
+    # 之前必须先把这个意图接过来，否则用户精心调好的一张纸会**静默**从
+    # 一页一张变成一页两张 —— 内容一个字节没改，印出来的张数变了。
+    _legacy_slots = 2 if str(paper) in TWO_UP_PAPERS else 1
+    # ``A4_LANDSCAPE`` 这种纸名里的 ``_LANDSCAPE`` 是**方向**本身，不是纸型 ——
+    # 它和 A4 是同一张纸，宽高都是 210×297，区别只在横着放。归一成 A4 时必须
+    # 把它记到 orientation 上，否则一份横排的资产负债表会被静默转成竖排，
+    # 元素坐标一个没改、印出来全错位。A5/B5 之类没有这个后缀，走用户自己
+    # 存的 orientation（没有就纵向）。
+    _forced = "landscape" if str(paper).endswith("_LANDSCAPE") else None
+    merged["paper"] = "A4"
 
     if merged.get("orientation") not in DIRECTIONS:
         merged["orientation"] = "portrait"
+    if _forced is not None:
+        merged["orientation"] = _forced
 
     # font.family 会拼进 font-family，font.size 会拼进 font-size ——
     # 与下面 title/subtitle 同理，会进 <style> 的字段一律过白名单或夹区间。
@@ -384,6 +412,15 @@ def validate_template(scope: str, content: dict | None) -> dict:
             rows_per_page = 5
         # 会计凭证的物理版式固定最多五行，不能通过模板把分录挤到下一张纸上。
         voucher["rows_per_page"] = max(1, min(5, rows_per_page))
+        # **一张 A4 纸上放几张凭证**（1 或 2）。这一项取代了原先「靠纸型决定
+        # 放几张」：纸型固定 A4 之后，「A4 一页一张」就只能自己说了。
+        # 老模板没这个字段时按它原来的纸型推（上面 _legacy_slots 已算好），
+        # 所以一张 A5 版式的历史模板**不会**因为这次改动变成一页两张。
+        try:
+            slots_per_page = int(voucher.get("slots_per_page", _legacy_slots))
+        except (TypeError, ValueError):
+            slots_per_page = _legacy_slots
+        voucher["slots_per_page"] = 1 if slots_per_page <= 1 else 2
         voucher["split_number"] = bool(voucher.get("split_number", True))
         voucher["fill_rows"] = bool(voucher.get("fill_rows", True))
         # 拆页后凭证号的写法，默认「记001 - 001/006」。空串等于退回默认写法，
@@ -675,14 +712,17 @@ table.grid tfoot td {{ font-weight:700; }}
 .doc-form-head .fh-right {{ text-align:right; }}
 .doc-footer {{ margin-top:8px; font-size:9pt; color:#333;
   display:flex; justify-content:space-between; }}
-/* 凭证按「槽位」铺在纸上：A4 一页两个槽位，A5 一个。
-   槽位是元素的定位参照（.voucher-element 的百分比坐标都相对它），
-   因此槽位高度必须等于纸面去掉上下边距后的净高，否则内容会溢出到第二张纸。 */
+/* 凭证按「槽位」铺在纸上。
+   槽位是元素的定位参照（.voucher-element 的百分比坐标都相对它）。
+   **网格轨道恒按「一页两张」排，不管这一页实际放几张。**
+   「每页一张」= 两张里去掉一张，不是把剩下那张拉到整页高：槽位一变高，
+   里面每个元素的 top/height 百分比跟着一起变大，整张凭证就被纵向抻开 ——
+   表格行高、标题字号、页脚位置全都跟着变形，而用户一个坐标都没改过。
+   少放的那一格留空，纸下半截白着，这才是「去掉一张」本来的意思。 */
 .voucher-sheet-page {{ width:100%; height:calc({h}mm - {mt}mm - {mb}mm); overflow:hidden; }}
 .voucher-sheet {{ display:grid; gap:3mm; height:100%; }}
-.voucher-sheet.slots-1 {{ grid-template-columns:minmax(0,1fr); grid-template-rows:minmax(0,1fr); }}
-.voucher-sheet.slots-2.flow-rows {{ grid-template-columns:minmax(0,1fr); grid-template-rows:repeat(2,minmax(0,1fr)); }}
-.voucher-sheet.slots-2.flow-columns {{ grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-rows:minmax(0,1fr); }}
+.voucher-sheet.flow-rows {{ grid-template-columns:minmax(0,1fr); grid-template-rows:repeat(2,minmax(0,1fr)); }}
+.voucher-sheet.flow-columns {{ grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-rows:minmax(0,1fr); }}
 .voucher-slot {{ position:relative; min-width:0; min-height:0; overflow:hidden; }}
 .voucher-element {{ position:absolute; overflow:hidden; white-space:pre-wrap;
   word-break:break-word; line-height:1.3; padding:0 1mm; }}
@@ -704,6 +744,16 @@ table.grid tfoot td {{ font-weight:700; }}
 .voucher-element.table table.grid th,
 .voucher-element.table table.grid td {{ padding:0.5mm 1mm; vertical-align:middle;
   overflow:hidden; text-overflow:ellipsis; }}
+/* 分录单元格最多两行，超出的省略。
+   **overflow:hidden 单独用不管用**：它只把多出来的部分裁掉，行高照样被内容
+   撑开 —— 摘要长一点，第三行就把整行的 --vrow 顶高，一页纸上的分录行跟着
+   全变高，多页凭证的分页位置跟着错，而版式是按固定行数算的。
+   真正限行数的是 line-clamp，由它在第二行末尾补省略号。
+   （text-overflow:ellipsis 只对 nowrap 的单行生效，摘要会折行，它等于没写。）
+   clamp 不能直接写到 td 上：display:-webkit-box 会把这个 td 从表格的列模型里
+   摘出去，列宽跟着塌。所以 td 保持 table-cell，截断交给里面的 span。 */
+.voucher-element.table table.grid td .clamp2 {{ display:-webkit-box;
+  -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; }}
 @media screen {{
   /* 左右不能留内边距：预览 iframe 的宽度就等于纸宽（A5=559px），
      body 一旦 padding:16px，内容区只剩 527px 装不下 559px 的纸 ——
@@ -898,7 +948,8 @@ def render_table_page(tpl: dict, ctx: dict, rows: list[dict], page: int, total: 
 #
 #   * 一张凭证最多 5 行摘要，超出的行续到下一张凭证上打印
 #     （记001号 - 001/006 / 记001号 - 002/006）；
-#   * A4 一页 2 张（A4 纵向上下排、A4 横向左右排），A5 一页 1 张；
+#   * **只有 A4**；一页放 1 张还是 2 张由 ``voucher.slots_per_page`` 决定
+#     （2 张时纵向上下排、横向左右排，1 张时占满整页）；
 #   * 每一张的位置、字号由模板的 elements 决定 —— 坐标是「当前槽位」的百分比，
 #     所以同一份元素在不同纸型上自动等比缩放，模板不必为 A4/A5 各存一份。
 
@@ -943,8 +994,18 @@ def voucher_rows_per_page(tpl: dict) -> int:
 
 
 def voucher_slots_per_page(tpl: dict) -> int:
-    """一张物理纸放几张凭证。"""
-    return 2 if str(tpl.get("paper", "A4")) in TWO_UP_PAPERS else 1
+    """一张 A4 纸放几张凭证（1 或 2）。
+
+    口径只有一个来源：``voucher.slots_per_page``（``validate_template`` 夹过）。
+    **不要再从纸型推** —— 纸型已经恒为 A4，那样推出来永远是 2，
+    「A4 一页一张」这条用户要求就再也走不通了。老模板（没有这个字段）在
+    validate 阶段按旧纸型补齐，所以到这里一定有值；下面的兜底只是防御。
+    """
+    try:
+        n = int((tpl.get("voucher") or {}).get("slots_per_page", 2))
+    except (TypeError, ValueError):
+        return 2
+    return 1 if n <= 1 else 2
 
 
 def _entry_amount(entry: dict) -> Decimal:
@@ -1166,7 +1227,11 @@ def _voucher_table_html(tpl: dict, voucher: dict, el: dict | None = None) -> str
         for c in cols:
             key = c["key"]
             if key == "subject":
-                text = f"{e.get('subject_code','')} {e.get('subject_name','')}".strip()
+                # 只印「一级/二级/.../末级」，不再印编码。
+                # 编码是录入凭证时用的，印在凭证纸上是给人对账看的，
+                # 一串数字夹在中文科目名里只会挤掉真正要读的层级。
+                # 老数据没有 subject_path 时退回科目名，而不是退回「编码 名称」。
+                text = e.get("subject_path") or e.get("subject_name", "")
             elif key in ("debit", "credit"):
                 # 分录只有 direction + amount，borrow/credit 两列要按方向取金额，
                 # 方向对不上就留空（不能把同一笔金额同时印在借方和贷方）。
@@ -1175,7 +1240,12 @@ def _voucher_table_html(tpl: dict, voucher: dict, el: dict | None = None) -> str
                 text = e.get(key, "")
             cls = "num" if c["align"] == "right" else ("ctr" if c["align"] == "center" else "")
             shown = _fmt(text) if c["align"] == "right" else text
-            tds.append(f'<td class="{cls}">{_esc(shown)}</td>')
+            if c["align"] == "right":
+                # 金额列是 nowrap 的单行，套截断没有意义，还会让「借贷两列并排」
+                # 那一类断言全部要跟着改。clamp 只给会折行的文本列。
+                tds.append(f'<td class="{cls}">{_esc(shown)}</td>')
+            else:
+                tds.append(f'<td class="{cls}"><span class="clamp2">{_esc(shown)}</span></td>')
         rows.append("<tr>" + "".join(tds) + "</tr>")
 
     if (tpl.get("voucher") or {}).get("fill_rows", True):
@@ -1267,8 +1337,10 @@ def render_voucher_sheet(tpl: dict, ctx: dict, vouchers: list[dict],
                          page: int, total_pages: int) -> str:
     """一张**物理纸**。``vouchers`` 是要放进本页槽位的凭证（分片后）。"""
     slots = voucher_slots_per_page(tpl)
-    # A4 横向时上下两张会非常扁，横排更符合直觉；纵向则上下叠。
-    flow = "flow-columns" if slots == 2 and tpl.get("orientation") == "landscape" else "flow-rows"
+    # 横排还是竖排只看纸的横竖，与放几张无关：横向时上下两张会非常扁，
+    # 横排更符合直觉；纵向则上下叠。放几张只决定放几个 .voucher-slot 进去，
+    # 槽位尺寸恒定（见 _page_css 的注释）。
+    flow = "flow-columns" if tpl.get("orientation") == "landscape" else "flow-rows"
     inner = ""
     for v in vouchers:
         elements = "".join(

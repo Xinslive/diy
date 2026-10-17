@@ -162,20 +162,23 @@ const contentBox = computed(() => {
 
 /**
  * 凭证槽位矩形，与后端 render_voucher_sheet 的 grid 完全同构：
- *   两张 + 横向 → 左右排列；两张 + 纵向 → 上下排列；一张 → 占满内容区。
+ *   横向 → 左右两个格子；纵向 → 上下两个格子。
  * 槽位之间固定 3mm 缝（后端 .voucher-sheet 的 gap），少算这 3mm，
  * 第二张凭证的元素框就会整体偏 3mm，拖哪儿都对不上。
+ *
+ * **格子尺寸恒按「一页两张」算，放几张只决定返回前几个。**
+ * 「每页一张」是两份里去掉一份，不是把剩下一份撑满整页：槽位一旦跟着张数
+ * 变大，里面每个元素的百分比坐标就跟着放大，凭证被纵向抻开，而用户一个坐标
+ * 都没改过。之前这里写着 `if (slots <= 1) return [c]`，正是那个抻开的来源 ——
+ * 而且它只在设计器里抻、真打印时后端另算一套，两者对不上，拖动还会存下错坐标。
  */
 const slotRects = computed(() => {
   const c = contentBox.value
-  if (props.slots <= 1) return [c]
   const gap = mm(3)
-  if (props.orientation === 'landscape') {
-    const w = (c.w - gap) / 2
-    return [0, 1].map((i) => ({ x: c.x + i * (w + gap), y: c.y, w, h: c.h }))
-  }
-  const h = (c.h - gap) / 2
-  return [0, 1].map((i) => ({ x: c.x, y: c.y + i * (h + gap), w: c.w, h }))
+  const cells = props.orientation === 'landscape'
+    ? (() => { const w = (c.w - gap) / 2; return [0, 1].map((i) => ({ x: c.x + i * (w + gap), y: c.y, w, h: c.h })) })()
+    : (() => { const h = (c.h - gap) / 2; return [0, 1].map((i) => ({ x: c.x, y: c.y + i * (h + gap), w: c.w, h })) })()
+  return cells.slice(0, Math.max(1, Number(props.slots) || 1))
 })
 
 const docH = computed(() => Math.max(pageH.value, contentH.value || pageH.value))

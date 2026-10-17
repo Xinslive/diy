@@ -900,8 +900,14 @@ await page.screenshot({ path: OUT + 'ui-voucher-edit.png' })
 if (old.posted) {
   await page.goto(`${BASE}/#/vouchers/${old.posted}`); await sleep(2000)
   await check('已记账凭证只读', await page.locator('.amt-input').first().isDisabled(), true)
+  // 只读的是「改」，不是「读」：已记账恰恰是最该打得出来的那一类（归档）。
+  // 后端 GET /print/vouchers.html 本来就没有写门禁，所以这里不该有任何禁用。
+  await check('已记账凭证仍能打印预览',
+    await page.locator('.toolbar button').filter({ hasText: '打印预览' }).isEnabled(), true)
   await page.screenshot({ path: OUT + 'ui-voucher-posted.png' })
 }
+// 「附件」输入框撤掉了，但附件数还在 load/save 里来回搬（存量不能被清零）
+await check('工具条上没有附件输入框', await page.locator('.toolbar .el-input-number').count(), 0)
 
 // ==================================================== 标记科目时的余额 / 新增科目预填
 // 这两段跑在一张全新凭证上：前面那几百行断言的状态别让它们碰坏

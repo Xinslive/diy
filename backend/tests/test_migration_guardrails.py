@@ -910,6 +910,9 @@ def test_head_是本文件认识的那一版():
         "0019_book_order",                     # 账套磁贴的**个人**排序：每个用户各一份磁贴顺序
         "0020_report_template_book_scope",     # 报表模板按账套隔离（book_id 可空 = 官方内置基线）
         "0021_youyou_chart_of_accounts",       # 内置科目表换成用友 4-2-2 的 140 个科目
+        "0022_voucher_baseline_templates",     # 凭证模板基线入库（种子数据迁移）
+        "0023_print_template_private_copy",    # 打印模板的按用户私有副本（写时复制，粒度到人）
+        "0024_paper_a4_only",                  # 纸型只留 A4；A5 模板的「一页一张」意图落成 voucher.slots_per_page
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")

@@ -332,6 +332,26 @@ def test_成功时产出的是完整文件且无临时文件(tmp_path, monkeypat
     assert not list(tmp_path.glob("*.part"))
 
 
+def test_产出文件权限是600(tmp_path, monkeypatch):
+    """备份是全量账务数据，不该对本机其他账号可读。
+
+    原来靠 umask 兜底 —— 而 umask 是调用方的运行环境决定的，默认 022
+    会把它落成 644。这台机器上跑着多个站点，任何本地账号（包括别的站点
+    的服务账号）都能读到凭证、科目和金额。所以权限要由备份自己钉死，
+    不能指望运行环境碰巧给个严的 umask。
+
+    断言的是**改名之后**的最终文件：``.part`` 改名成正式备份时是保留权限
+    位的，所以最终文件才是真正会被拿去恢复的那一份。
+    """
+    monkeypatch.setattr(db_backup, "dump_to",
+                        lambda fh: (fh.write(b"-- PostgreSQL database dump\n"), 0)[1])
+
+    out = tmp_path / "db-2026-10-17.sql"
+    assert db_backup.dump_to_file(out) == 0
+    mode = out.stat().st_mode & 0o777
+    assert mode == 0o600, f"备份落成了 {mode:o}，本机其他账号可读"
+
+
 def test_产出0字节按失败处理(tmp_path, monkeypatch):
     """pg_dump 返回 0 却什么都没写 —— 极少发生，但发生时它返回 0。
 

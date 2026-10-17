@@ -353,5 +353,37 @@ else
 fi
 
 echo
+echo "== 11. 回滚快照与库备份不该对本机其他账号可读 =="
+# 快照目录里躺着全量的库备份、上一版源码和产物包。这台机器跑着多个站点，
+# 默认的 755/644 等于把账务数据开放给其他站点的服务账号。
+# 实际修法（2026-10-17）：快照目录 install -d -m 700，dump 在 umask 077 的
+# 子 shell 里产出。原来是 mkdir -p + 裸重定向，权限全看调用方 umask。
+mode_of(){ stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+setup_sandbox
+run_script >/dev/null
+assert_ran "全量发布" || exit 1
+SNAP=$(ls -d "$APP"/.releases/*/ 2>/dev/null | head -1)
+if [[ -z "$SNAP" ]]; then
+  no "找不到回滚快照目录，权限无从检查"
+else
+  DUMP="$SNAP/database-before-migration.sql"
+  if [[ ! -f "$DUMP" ]]; then
+    no "快照里没有 database-before-migration.sql"
+  else
+    SM=$(mode_of "$SNAP"); DM=$(mode_of "$DUMP")
+    if [[ "$SM" == "700" ]]; then
+      ok "回滚快照目录是 700"
+    else
+      no "回滚快照目录是 ${SM} —— 本机其他账号能列目录"
+    fi
+    if [[ "$DM" == "600" ]]; then
+      ok "库备份 dump 是 600"
+    else
+      no "库备份 dump 是 ${DM} —— 全量账务数据对本机其他账号可读"
+    fi
+  fi
+fi
+
+echo
 echo "通过 $PASS / 失败 $FAIL"
 [[ "$FAIL" == "0" ]]
