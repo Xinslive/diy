@@ -396,11 +396,28 @@ jobs:
           python -m alembic upgrade head
           echo "schema 版本：$(python -m alembic current | tail -1)"
 
+      # 与 frontend job **完全同一套** Node/pnpm 接入。
+      #
+      # 原来这里是裸的 ``corepack enable``：package.json 里没有 packageManager
+      # 字段，corepack 就按「它当前认为的最新版」装 pnpm —— 实测当天给的是
+      # 12.14.0，而 frontend job 用 pnpm/action-setup 钉的是 10.x。**同一个
+      # workflow 里两个 job 用了两个不同的 pnpm**，于是 frontend 验过的构建，
+      # 产物 job 未必跑得通；而 corepack 装哪个版本还会随时间漂移。
+      #
+      # 换成显式 setup 后两边锁死在同一个大版本，构建产物与被验证过的行为一致。
+      # 要改版本，这里和 frontend job 的 pnpm/action-setup 一起改。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+
       - name: 构建前端
         working-directory: frontend
         run: |
           set -euo pipefail
-          corepack enable
           pnpm install --frozen-lockfile --silent
           pnpm run build
 
