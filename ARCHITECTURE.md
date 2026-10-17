@@ -2689,6 +2689,40 @@ vhost），它用 `server_name acct.xins.live` 精确匹配，不需要这份 ho
 grep -c cwq_https_redirect /etc/nginx/conf/nginx.conf
 ```
 
+### 11.7.7 发布脚本末尾会无条件 `enable` 单元，所以「关掉」必须是显式状态
+
+`deploy.sh` 第 7 步每次发布末尾都会 `systemctl enable --now cwq-backup.timer`。
+因此 **只 `systemctl stop` 是按不住的**——下一次发版它会自己复活，而且日志
+上照样打印「定时备份已启用」，运维看到的是「明明关了怎么又开了」。
+
+关停因此写成发布脚本认得的一个状态，而不是一次性的动作：标记文件
+`/opt/cwq/.backup-timer-off`，存在即跳过整个启用流程。标记存在时**连 unit
+都不复制**——只 stop 不 disable 的话服务器重启后 timer 照样起来。
+
+判据（三个都要满足，缺一即视为没关掉）：
+
+```
+systemctl is-enabled cwq-backup.timer     # disabled
+systemctl is-active  cwq-backup.timer     # inactive
+ls /opt/cwq/.backup-timer-off              # 存在
+```
+
+关停定时备份**不影响发版时的库备份**（第 4 步 `db_backup.py`）。那是迁移前的
+唯一退路，与日常定时备份是两回事，两者都关掉等于没有退路。
+
+恢复：
+
+```bash
+systemctl enable --now cwq-backup.timer
+rm -f /opt/cwq/.backup-timer-off
+```
+
+这条曾经完全没有测试覆盖——沙箱演练里没有任何关于 `enable_backup_timer`
+的断言，于是「往 `/etc/systemd/system` 复制在非 root 下必然 Permission
+denied」这个真实存在的失败一直没人看见。现在第 10 组断言了启用、标记
+honor、不出 ⚠️ 告警、以及「关定时备份不牵连发版备份」四件事。为了让沙箱
+能测，`SYSTEMD_UNIT_DIR` 与 `BACKUP_DIR` 从硬编码路径参数化出来。
+
 ---
 
 ## 12. 测试策略

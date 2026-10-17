@@ -81,15 +81,21 @@ setup_sandbox(){
   printf '#!/bin/sh\nif [ "$1" = "scripts/db_backup.py" ]; then echo "SELECT 1;"; exit ${STUB_BACKUP_RC:-0}; fi\necho "python $*" >> "$DEPDIR/calls"\nexit 0\n' \
     > "$APP/backend/.venv/bin/python"
   chmod +x "$DEPDIR/bin"/* "$APP/backend/.venv/bin"/*
+  # unit 与备份的落地位置由 deploy.sh 通过 SYSTEMD_UNIT_DIR / BACKUP_DIR 传入。
+  # 这里必须先建出来：真实机器上 /etc/systemd/system 与 /opt/cwq/backups
+  # 本来就存在，脚本不负责建；沙箱里没人建，cp 就会落不下去。
+  mkdir -p "$DEPDIR/units" "$DEPDIR/backups"
   : > "$DEPDIR/calls"
 }
 
 run_script(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+    SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 run_script_no_artifacts(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/empty-artifacts" \
+    SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 calls(){ cat "$DEPDIR/calls" 2>/dev/null; }
@@ -292,6 +298,59 @@ else
   ok "备份失败没有重启"
 fi
 if grep -q "数据库备份失败" <<<"$OUT"; then ok "明确报出备份失败"; else no "没有明确报错"; fi
+
+# --------------------------------------------------------------------------
+# 定时备份的启用/关停
+#
+# 这一段以前**完全没有断言** —— enable_backup_timer 挂在发布末尾，任何一次
+# 行为变化都不会被测到。它的实际后果不小：这一步每次发布都会
+# ``enable --now``，所以「按要求关掉了定时备份」这件事如果不写成发布脚本
+# 认得的显式状态，下一次发版就会把它悄悄拉回来。
+# --------------------------------------------------------------------------
+echo "== 10. 定时备份：默认启用，关停标记 honored =="
+
+setup_sandbox
+OUT=$(run_script)
+assert_ran "全量发布" || exit 1
+if calls | grep -q "systemctl enable --now cwq-backup.timer"; then
+  ok "默认会启用定时备份"
+else
+  no "默认没有启用定时备份"
+fi
+if grep -q "定时备份已启用" <<<"$OUT"; then ok "明确报出已启用"; else no "没有报出定时备份状态"; fi
+# 单元文件必须真的落到目标目录 —— 只 enable 不装 unit 等于没装
+if [[ -f "$DEPDIR/units/cwq-backup.timer" && -f "$DEPDIR/units/cwq-backup.service" ]]; then
+  ok "两个 unit 文件都装到了目标目录"
+else
+  no "unit 文件没落到 ${DEPDIR}/units —— enable 了一个不存在的 unit"
+fi
+
+# 关停标记在 → 一次 systemctl enable 都不能有，且要说清楚是「按要求关的」
+setup_sandbox
+: > "$APP/.backup-timer-off"
+OUT=$(run_script)
+assert_ran "带关停标记的发布" || exit 1
+if calls | grep -q "cwq-backup.timer"; then
+  no "有关停标记却仍然动了 cwq-backup.timer —— 下次发版它会自己复活"
+else
+  ok "有关停标记时不碰 cwq-backup.timer"
+fi
+if grep -q "按要求保持关闭" <<<"$OUT"; then
+  ok "明确报出「按要求保持关闭」（而不是含糊成启用失败）"
+else
+  no "没有把「按要求关闭」与「启用失败」区分开"
+fi
+if grep -q "⚠️  定时备份启用失败" <<<"$OUT"; then
+  no "把按要求关闭报成了 ⚠️ 失败 —— 运维会去修一个没坏的东西"
+else
+  ok "按要求关闭时不出 ⚠️ 告警"
+fi
+# 关停定时**不能**连发版时的库备份一起关掉 —— 那是迁移前的唯一退路
+if calls | grep -q "alembic upgrade head"; then
+  ok "关停定时备份不影响发版时的库备份与迁移"
+else
+  no "关停定时备份把发版备份也一起弄没了"
+fi
 
 echo
 echo "通过 $PASS / 失败 $FAIL"

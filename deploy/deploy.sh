@@ -31,6 +31,14 @@ set -euo pipefail
 APP=${APP_DIR:-/opt/cwq}
 # 服务账号：产物解压之后归位给谁。跟 unit 文件里的 User= 保持一致。
 : "${SERVICE_USER:=cwq}"
+# 定时备份的关停标记。存在即不启用（详见 enable_backup_timer 里的说明）。
+: "${BACKUP_TIMER_OFF_MARKER:=$APP/.backup-timer-off}"
+# unit 与备份的落地位置。参数化的理由不是洁癖：沙箱演练以非 root 身份跑，
+# 往 /etc/systemd/system 与 /opt/cwq/backups 写都会 Permission denied，于是
+# enable_backup_timer 直接 return 1 —— 而它以前没有任何断言，这个失败
+# 一直没人看见。与 APP_DIR / ARTIFACT_DIR 同一套做法。
+: "${SYSTEMD_UNIT_DIR:=/etc/systemd/system}"
+: "${BACKUP_DIR:=/opt/cwq/backups}"
 KEEP=3
 # 分支不写死（仓库默认分支改名时，写死的名字会让发布脚本在 ``set -e`` 下
 # 直接失败 —— 而那是最不该失败的时候）。发布模式不再 checkout 分支，
@@ -361,16 +369,30 @@ log "7/7 发布后体检"
 # 产物是 CI 打的 tar，deploy/systemd/ 不在其中，所以先看这台机器上有没有：
 # 没有就把两条命令原样打出来（不猜路径、不静默跳过）。
 enable_backup_timer() {
+  # 关停标记（2026-10-17 起）。存在即跳过，且**连 unit 都不复制**。
+  #
+  # 为什么不直接 systemctl stop 就完事：这一步在**每次发布**末尾都会跑
+  # ``enable --now``，也就是说任何一次发版都会把 timer 重新拉起来；只 stop
+  # 的话它会在下一次发布后自己复活，而且日志上显示「定时备份已启用」——
+  # 正是那种「关不掉还以为关掉了」的状态。所以关停必须是**发布脚本认得的
+  # 一个显式状态**，而不是一次性的动作。
+  #
+  # 为什么不复制 unit：只 stop 不 disable 的话服务器重启后 timer 照样起来。
+  # 跳过复制 + 已 disable 才是完整的关停。
+  if [ -f "$BACKUP_TIMER_OFF_MARKER" ]; then
+    return 2
+  fi
+
   local src=""
   for d in "$APP/deploy/systemd" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/systemd"; do
     if [ -f "$d/cwq-backup.timer" ]; then src="$d"; break; fi
   done
 
   if [ -n "$src" ]; then
-    mkdir -p /opt/cwq/backups
+    mkdir -p "$BACKUP_DIR"
     # daemon-reload 必须排在 enable 之前，否则 systemd 认的还是旧缓存 ——
     # 首次安装时 unit 名不存在，enable 会报「unit not found」。
-    cp "$src/cwq-backup.service" "$src/cwq-backup.timer" /etc/systemd/system/ \
+    cp "$src/cwq-backup.service" "$src/cwq-backup.timer" "$SYSTEMD_UNIT_DIR/" \
       || return 1
     systemctl daemon-reload || return 1
   fi
@@ -378,14 +400,23 @@ enable_backup_timer() {
   systemctl enable --now cwq-backup.timer
 }
 
-if enable_backup_timer >/dev/null 2>&1; then
+backup_timer_rc=0
+enable_backup_timer >/dev/null 2>&1 || backup_timer_rc=$?
+
+if [[ "$backup_timer_rc" -eq 2 ]]; then
+  # 退出码 2 = 按要求保持关闭，不是失败。必须和下面的失败分支分开说，
+  # 否则运维看到 ⚠️ 会去「修」一个根本没坏的东西。
+  log "  定时备份按要求保持关闭（标记文件：${BACKUP_TIMER_OFF_MARKER}）"
+  log "     发版时的库备份（第 4 步）不受影响，仍在执行 —— 那是迁移前的退路"
+  log "     要恢复：systemctl enable --now cwq-backup.timer && 删掉那个标记文件"
+elif [[ "$backup_timer_rc" -eq 0 ]]; then
   next_run=$(systemctl show cwq-backup.timer -p NextElapseUSecRealtime --value 2>/dev/null || echo "")
-  log "  定时备份已启用${next_run:+（下次：${next_run}）}，备份目录 /opt/cwq/backups"
+  log "  定时备份已启用${next_run:+（下次：${next_run}）}，备份目录 ${BACKUP_DIR}"
 else
   log "  ⚠️  定时备份启用失败 —— 当前备份仍然只发生在发版时"
   log "     手动补一次（把 deploy/systemd/ 两个文件拷过去）："
-  log "       mkdir -p /opt/cwq/backups"
-  log "       cp deploy/systemd/cwq-backup.{service,timer} /etc/systemd/system/"
+  log "       mkdir -p ${BACKUP_DIR}"
+  log "       cp deploy/systemd/cwq-backup.{service,timer} ${SYSTEMD_UNIT_DIR}/"
   log "       systemctl daemon-reload && systemctl enable --now cwq-backup.timer"
   log "     然后验证真的产出文件：systemctl start cwq-backup.service && ls -l /opt/cwq/backups/"
 fi
