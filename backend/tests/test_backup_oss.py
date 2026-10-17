@@ -1149,3 +1149,23 @@ def _archive_bytes(*, version, tables=None, fmt=export_mod.FORMAT):
             "sys_subject": {"columns": ["id"], "rows": [[1]]}},
     }
     return gzip.compress(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+
+
+def test_归档里有当前库里没有的列时报错要可操作(db, tmp_path):
+    """列缺失与「表整张不认识」是同一个病因：程序比库新。
+
+    处置动作是唯一的 —— 先跑迁移 —— 而旧文案只说了「有哪些列没有」，
+    于是最可能的反应是「归档坏了，重传一份」；而重传的归档有完全相同的问题，
+    于是又重传一次。**报错文案不给出动作，就会把人引向错误的循环。**
+    """
+    p = tmp_path / "newer.json.gz"
+    p.write_bytes(_archive_bytes(version=export_mod.VERSION, tables={
+        "book": {"columns": ["id", "name", "不存在的列"], "rows": []},
+    }))
+    with pytest.raises(ExportRefused) as ei:
+        export_mod.restore(db, p, dry_run=True)
+    msg = str(ei.value)
+    assert "不存在的列" in msg, "没说缺的是哪一列"
+    assert "alembic upgrade head" in msg, "没说该执行哪条命令"
+    assert "不要" in msg and "删" in msg, \
+        "没拦住「把归档里的列删掉」这个会丢账的做法"

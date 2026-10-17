@@ -35,6 +35,7 @@ from typing import Any, Iterator, Optional
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
+from app.core.schema_version import BACKEND_ROOT
 from app.models import SCOPE_BOOK, SCOPE_SYSTEM
 from app.models.base import Base
 
@@ -629,8 +630,15 @@ def restore(db: Session, path: Path, *, dry_run: bool = False) -> dict[str, int]
                 "多半是备份来自更新的版本；先升级程序，再恢复。")
         missing = [c for c in payload.get("columns", []) if c not in table.c]
         if missing:
+            # 同样要可操作。**列缺失几乎总是「程序比库新」**，处置动作是明确的：
+            # 先把迁移跑了。这与「表整张都不认识」是同一个病因、两种表现，
+            # 所以两处必须给同一句话 —— 否则用户会以为是归档坏了而去重传，
+            # 而重传的归档有同样的问题。
             raise ExportRefused(
-                f"表「{name}」在归档里有而当前库里没有的列：{'、'.join(missing)}。")
+                f"表「{name}」在归档里有、而当前数据库没有的列：{'、'.join(missing)}。\n"
+                f"  这几乎总是**程序比数据库新**：归档是旧程序写的，那些列是之后才加的。\n"
+                f"  执行：cd {BACKEND_ROOT} && .venv/bin/alembic upgrade head\n"
+                f"  迁移跑完再恢复。**不要**去删归档里的列 —— 那些列里是账。")
 
     if dry_run:
         for name, payload in tables.items():
