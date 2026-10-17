@@ -2307,6 +2307,56 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
 
 ---
 
+## 10.5 时间戳一律 UTC（2026-10-17 补）
+
+**不变量：应用从库里读回的每一个 `timestamptz`，tzinfo 都是 `timezone.utc`。**
+
+### 为什么必须钉死
+
+`timestamptz` 存的是**绝对时刻**（UTC），本身不带时区；但取回来时 psycopg
+附的 tzinfo 由**会话的 `TimeZone` GUC** 决定，而这个 GUC 默认来自服务器配置，
+服务器之间并不一致：
+
+| 环境 | 会话 TimeZone | psycopg 返回的 tzinfo |
+|---|---|---|
+| 生产 110.42.44.53 | `Asia/Shanghai` | `ZoneInfo('Asia/Shanghai')`，偏移 **+08:00** |
+| GitHub `postgres:16` 容器 | `Etc/UTC` | `ZoneInfo('Etc/UTC')`，偏移 0 |
+| 字面量恰好 `UTC` | `UTC` | `datetime.timezone.utc`，偏移 0 |
+
+`Etc/UTC` 与 `UTC` 是**同一时刻**（`utcoffset()` 都是 0），但 `== timezone.utc`
+为 False。所以断言写成哪种，取决于那台机器怎么配 —— 这不是测试问题，是
+**应用读回来的数据取决于部署环境**。
+
++08:00 那一条是真会出事的：任何「拿库里时间戳和 `utcnow()` 比」的地方都会
+**静默差 8 小时** —— TTL 清理、是否逾期、是否已结账。库里存的还是同一瞬间，
+所以从数据上看不出任何异常。
+
+### 钉在哪
+
+`app/core/db.py` 的 `engine` 上注册 `connect` 事件，每条新连接执行一次
+`SET TIME ZONE 'UTC'`。
+
+- **不靠运维侧配 PG**（`ALTER ROLE` / `ALTER DATABASE`）：那是部署步骤，
+  换连接串、换实例、新建库都会失效。
+- **不靠环境变量**：PG 的 `TimeZone` 一旦被设了，会**盖住** `TZ` 环境变量。
+  优先级是 session > role > database > `postgresql.conf`，而 `postgresql.conf`
+  读的就是 `TZ`。
+- 测试侧（`tests/conftest.py` 的 `_test_database`）另有一道**库级**
+  `ALTER DATABASE ... SET TimeZone TO 'UTC'`，那是让测试库自身口径正确，
+  与上面那条不互相依赖。
+
+### 验收
+
+`tests/test_importer.py::test_入库时间与记账时间同一时源` 断言
+`committed_at.tzinfo == timezone.utc`。**这条断言不许放松** ——
+把它改成「比较 `utcoffset()`」也能让当前实现变绿，但那样就再也测不到
+「读回来的是不是 UTC」了，而 §10.5 要守的正是这一条。
+
+> 教训：这条断言在本机一直是绿的，因为本机 PG 默认就是 `UTC`。本机绿
+> **不等于**修复被验证过 —— 要验证它，得先把本地环境改成会失败的那一种。
+
+---
+
 ## 11. 加新功能的标准动作
 
 ### 加一个新的账簿/报表

@@ -149,36 +149,9 @@ os.environ["APP_ENV"] = "test"
 os.environ["DB_ECHO"] = "false"
 
 from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import create_engine, event, select, text, update  # noqa: E402
+from sqlalchemy import create_engine, select, text, update  # noqa: E402
 
 from app.core.db import SessionLocal, engine  # noqa: E402
-
-
-# --------------------------------------------------------------------------
-# 会话时区钉死成 UTC
-# --------------------------------------------------------------------------
-#
-# PostgreSQL 的 TimeZone GUC 决定 TIMESTAMPTZ 取回来时带什么 tzinfo 对象：
-# 字面量恰好是 `UTC` 时 psycopg 交出 ``datetime.timezone.utc``；写成
-# ``Etc/UTC``（GitHub 的 ``postgres:16`` 服务容器就是默认这个）它交出
-# ``zoneinfo.ZoneInfo('Etc/UTC')``。
-#
-# 两者是**同一时刻**，`utcoffset()` 都是 0，但 ``== timezone.utc`` 为 False。
-# 于是 ``test_importer.py::test_入库时间与记账时间同一时源`` 在本机绿、在 CI 红 ——
-# 它测到的是「跑测试那台机器的时区配置」，不是被测代码。
-#
-# 所以修的是环境，不是断言：把断言改成「比较偏移量」看着也能变绿，但那条断言
-# 本来就是护栏（时间戳必须是 UTC），放松它等于把护栏摘掉。这里对**每个新建连接**
-# 执行一次 SET TIME ZONE，让断言回到它本来要测的东西。
-# 本来是挂在 Engine 类上的全局监听（``event.listens_for(Engine, "connect")``），
-# 那样更省事，但会把建库用的 admin 引擎也带上 —— 那个引擎是
-# ``isolation_level="AUTOCOMMIT"`` 建的，而 ``SET TIME ZONE`` 一执行连接就进入
-# 事务，psycopg 直接拒绝（``can't change 'autocommit' now``），整个套件起不来。
-# 所以只挂在应用引擎上：管理引擎只做 CREATE/DROP DATABASE，不读时间戳。
-@event.listens_for(engine, "connect")
-def _pin_session_timezone(dbapi_conn, _record):
-    with dbapi_conn.cursor() as cur:
-        cur.execute("SET TIME ZONE 'UTC'")
 
 
 from app.core.schema_version import upgrade_to_head  # noqa: E402
@@ -205,6 +178,28 @@ def _test_database():
             ).scalar()
             if not exists:
                 conn.execute(text(f'CREATE DATABASE "{name}"'))
+            # 把时区钉在**库**上，而不是靠连接事件逐个 SET。
+            #
+            # PostgreSQL 的 TimeZone GUC 决定 TIMESTAMPTZ 取回来时带什么 tzinfo：
+            # 字面量恰好是 `UTC` 时 psycopg 交出 datetime.timezone.utc；写成
+            # `Etc/UTC`（GitHub 的 postgres:16 服务容器默认）或 `Asia/Shanghai`
+            # （生产机实测就是这个）它交出对应的 ZoneInfo。两者是**同一时刻**，
+            # utcoffset 都是 0，但 `== timezone.utc` 为 False。
+            #
+            # 之前用 `event.listens_for(engine, "connect")` 在每个新连接上 SET。
+            # 那个办法**不可靠**：套件里到处是 commit → 归还连接 → 再取一条，
+            # 一旦某条物理连接是在监听器生效之前建好并留在池里，之后所有复用
+            # 它的用例都拿到 Etc/UTC —— 表现为同一个提交 CI 上时绿时红
+            # （6e5fc0e 提交后 293a435 绿、0a57860 红，两次只差前端与产物 job）。
+            # 而且本机 PG 默认就是 UTC，**本地怎么跑都绿**，等于从未验证过。
+            #
+            # 库级默认不依赖连接的创建时机：连到这个库的每一条连接、任何时刻、
+            # 任何引擎拿到的都是 UTC。顺带这也是「测试库本来就应该配成 UTC」
+            # 这件事的正面表达，而不是在测试代码里打补丁。
+            #
+            # 注意这条 ALTER 必须在**建库之后**、每次都执行：库是复用的，
+            # 上一轮留下的设置也得被重新确认一遍。
+            conn.execute(text(f"""ALTER DATABASE "{name}" SET TimeZone TO 'UTC'"""))
     finally:
         admin.dispose()
 

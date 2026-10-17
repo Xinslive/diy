@@ -7,7 +7,7 @@ config.py 对应字段的注释里。
 """
 from collections.abc import Iterator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import settings
@@ -25,6 +25,33 @@ engine = create_engine(
     pool_recycle=settings.db_pool_recycle,
     future=True,
 )
+
+
+@event.listens_for(engine, "connect")
+def _pin_session_timezone(dbapi_conn, _record) -> None:
+    """把每条连接的会话时区钉死成 UTC。
+
+    PostgreSQL 的 ``TimeZone`` GUC 决定 ``timestamptz`` 取回来时带什么
+    tzinfo：**同一个时刻，写进去的时候不带偏置，读回来带什么完全由会话时区
+    决定**。默认取自服务器配置，而服务器之间并不一致 ——
+
+      · 生产机 110.42.44.53 实测是 ``Asia/Shanghai``
+      · GitHub 的 ``postgres:16`` 服务容器是 ``Etc/UTC``
+      · 字面量恰好是 ``UTC`` 时 psycopg 交出 ``datetime.timezone.utc``
+
+    于是不钉的话，应用读回的每个时间戳都可能带 +08:00，而库里存的是同一瞬间。
+    任何「拿库里时间戳和 ``utcnow()`` 比」的地方都会差 8 小时 —— TTL 清理、
+    「是否逾期」「是否已结账」这类判断都会算错，而且是静默算错。
+
+    钉死之后无论服务器怎么配都返回 UTC，账务口径与部署环境解耦。
+
+    这里只挂应用引擎：``ALTER ROLE`` / ``ALTER DATABASE`` 那条路要写进部署步骤，
+    换个连接串或者换个 PG 实例就失效了；而「应用自己保证读回来的时间戳是 UTC」
+    是这条不变量本来就该成立的地方。
+    """
+    with dbapi_conn.cursor() as cur:
+        cur.execute("SET TIME ZONE 'UTC'")
+
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, class_=Session)
 
