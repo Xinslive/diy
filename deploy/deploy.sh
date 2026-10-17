@@ -48,7 +48,28 @@ RELEASES="$APP/.releases"
 # 走内网镜像、对象存储、或人工上传 —— 脚本不关心来源，只校验产物本身。
 : "${ARTIFACT_DIR:=}"
 : "${REPO:=$(cd "$APP" 2>/dev/null && git config --get remote.origin.url || echo '')}"
-: "${ARTIFACT_REF:=main}"
+
+# ARTIFACT_REF 决定「取哪条线上的 CI 产物」。
+#
+# **它以前是个死变量。** 原先这里写死 ``:=main``，但下面 fetch_artifacts
+# 里那两条 gh 命令**都没带 --branch / --ref**，于是 gh 取的是「仓库默认
+# 分支的最近一次运行」。ARTIFACT_REF 只出现在一行 log 里 —— 设成什么、
+# 甚至不设，取到的产物都一样。
+#
+# 后果不是取不到产物，而是**取到另一条线的产物却不报错**：默认分支刚跑完
+# 一次 CI，而你要发的是别的分支，脚本会安安静静把默认分支那份装上去。
+# 发布脚本里最不能出的错就是这种「装上了、但装的不是你要的那个」。
+# （本仓库当时就没有 main 分支 —— 这个默认值从一开始就是错的。）
+#
+# 所以：值必须真的传进 gh 命令，且默认值不再写死。写死的分支名在换默认
+# 分支时会静默指向错误的产物；这里从远端问出默认分支，问不出来就要求
+# 操作者显式给，不猜。ARTIFACT_DIR 那条路不经过 gh，不需要这个值。
+# 显式给 ARTIFACT_REF 就用它；否则从远端问默认分支。
+# 只在走 gh 路径时才问：ARTIFACT_DIR 那条路压根不经过 gh，为了一个用不上的值
+# 多打一次网络请求没有意义（离线环境还会平白卡住）。
+if [[ -z "$ARTIFACT_DIR" ]]; then
+  : "${ARTIFACT_REF:=$(gh repo view "$REPO" --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || echo '')}"
+fi
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
@@ -82,10 +103,29 @@ fetch_artifacts() {
      1) 装 gh 并设好 GH_TOKEN，然后重跑
      2) 把 build-artifacts 的产物下载到任意目录，用 ARTIFACT_DIR=... 指定"
 
-  log "  从 GitHub Actions 拉取 ${ARTIFACT_REF} 的产物"
+  # 下面这两处 die 不是走过场：REPO 为空说明 /opt/cwq 不是 git 仓库且没给
+  # REPO，ARTIFACT_REF 为空说明问不出默认分支也没显式给。两种情况都只能靠
+  # 猜，而猜错的代价是「装上别的分支的产物且不报错」，所以在这里停。
+  [[ -n "$REPO" ]] || die "REPO 为空，gh 不知道该去哪个仓库。
+   给 REPO=owner/repo，或改用 ARTIFACT_DIR=... 人工投放产物。"
+  [[ -n "$ARTIFACT_REF" ]] || die "ARTIFACT_REF 为空，问不出默认分支。
+   显式给 ARTIFACT_REF=<分支名>，或改用 ARTIFACT_DIR=... 人工投放产物。"
+
+  log "  从 GitHub Actions 拉取 ${ARTIFACT_REF} 分支的产物"
   # ``--repo`` 显式给，不依赖当前目录是不是 git 仓库 —— 部署目录可能只是
   # 一个被 rsync 过来的产物，没有 .git，那 gh 会因为认不出仓库而失败。
-  ( cd "$dest" && gh run download --repo "$REPO" --name "cwq-deploy-$(gh run view --repo "$REPO" --json headSha -q .headSha)" ) \
+  #
+  # ``--branch`` 必须给：不给就是「默认分支的最近一次运行」，也就是上面
+  # 注释里说的「装上别的分支的产物」。这里取「最近一次运行」而不是「最近
+  # 一次**成功**」是有意的：若那次 build-artifacts 失败了，取产物就会失败
+  # 并停在发布之前；改成挑「最近一次成功」则会在失败时静默装上更旧的版本,
+  # 那是更难发现的一种错。
+  local head_sha
+  head_sha=$(gh run view --repo "$REPO" --branch "$ARTIFACT_REF" \
+               --json headSha -q .headSha) \
+    || die "在 ${ARTIFACT_REF} 分支上找不到 CI 运行记录。
+   先确认这次提交已经推上去、且 Actions 跑过。**没有任何东西被改动。**"
+  ( cd "$dest" && gh run download --repo "$REPO" --name "cwq-deploy-${head_sha}" ) \
     || die "取产物失败 —— 这一步取不到就意味着 CI 没全绿（build-artifacts 的 needs
    是 [backend, frontend]）。**没有任何东西被改动，服务仍是上一版。**"
 }

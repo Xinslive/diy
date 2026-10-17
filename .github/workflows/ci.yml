@@ -15,11 +15,13 @@
 #      以后谁想用 -k 悄悄把范围收窄，这一步会先红。
 # 想改这三处，请连带在 PR 描述里说清楚理由。
 #
-# 三条 job：
-#   backend   —— 全量 pytest（PostgreSQL 服务 + 真实 pg_dump/psql）
-#   frontend  —— node --test 与 vite build
-#   docker    —— 镜像必须真的构建得出来，且 alembic.ini / migrations/ 在镜像里
-#   deploy    —— 发布脚本沙箱演练（deploy/tests/test_deploy.sh）
+# 五条 job：
+#   backend          —— 全量 pytest（PostgreSQL 服务 + 真实 pg_dump/psql）
+#   frontend         —— node --test 与 vite build
+#   docker           —— 镜像必须真的构建得出来，且 alembic.ini / migrations/ 在镜像里
+#   deploy           —— 发布脚本沙箱演练（deploy/tests/test_deploy.sh）
+#   build-artifacts  —— 出部署产物；needs backend+frontend，所以「产物存在」即代表
+#                       后端全量测试与前端测试构建都过了（deploy.sh 的测试闸门靠它）
 
 name: CI
 
@@ -331,6 +333,32 @@ jobs:
     runs-on: ubuntu-latest
     needs: [backend, frontend]
 
+    # **services 必须挂在 job 上，不能挂在 step 上。**
+    #
+    # 它原先写在下面「验证 schema 自洽」那个 step 里面，而 step 的 schema 里
+    # 根本没有 services 这个键。GitHub 校验工作流文件时不认，于是**整个工作流
+    # 被判为非法**：一次 job 都不会创建，运行直接失败，而且界面只给一句
+    # "This run likely failed because of a workflow file issue" —— 没有任何
+    # 行号、没有任何原因。
+    #
+    # 后果不是「这一步没跑」，而是**整条流水线自 2026-10-13 起从未创建过任何一个
+    # job**：backend / frontend / docker / deploy / build-artifacts 一条都没跑过。
+    # 顺带也意味着 build-artifacts 从没产出过产物，deploy.sh 取产物的第一道闸门
+    # 在此之前根本不可能通过。
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cwq
+          POSTGRES_PASSWORD: cwq123
+          POSTGRES_DB: cwq_artifacts
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U cwq"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -355,19 +383,6 @@ jobs:
         # 产物里带了 migrations/ 却不保证它能 upgrade，生产机上就是
         # 「代码已切、schema 没升」—— 服务起不来，或者更糟：起得来但读的是旧表。
         # 这里在 CI 里先跑一遍，失败就不该有产物。
-        services:
-          postgres:
-            image: postgres:16
-            env:
-              POSTGRES_USER: cwq
-              POSTGRES_PASSWORD: cwq123
-              POSTGRES_DB: cwq_artifacts
-            ports: ['5432:5432']
-            options: >-
-              --health-cmd "pg_isready -U cwq"
-              --health-interval 5s
-              --health-timeout 5s
-              --health-retries 10
         run: |
           set -euo pipefail
           python -m alembic upgrade head
