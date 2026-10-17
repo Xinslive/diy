@@ -79,10 +79,14 @@ t('非管理员看不到「操作日志 / 用户与授权」', () => {
   const n = visibleNav(false)
   const names = n.flatMap(m => m.items.map(i => i.name))
   assert.ok(!names.includes('audit') && !names.includes('users'))
+  // 「数据安全」也是管理员页：它管的是 AccessKey，普通会计不该看见。
+  assert.ok(!names.includes('data-security'), '非管理员看到了数据安全')
 })
-t('管理员侧栏是 14 项（整理凭证 / 凭证导入 标了 hidden 不进侧栏）', () => {
+t('管理员侧栏是 15 项（整理凭证 / 凭证导入 标了 hidden 不进侧栏）', () => {
   const names = visibleNav(true).flatMap(m => m.items.map(i => i.name))
-  assert.equal(names.length, 14, `实际 ${names.length}`)
+  // 这条是**钉子**：加一项菜单就要回来改这个数。少改说明菜单没进侧栏，
+  // 多改说明它进了不该进的地方（hidden 失效、adminOnly 失效）。
+  assert.equal(names.length, 15, `实际 ${names.length}`)
   assert.ok(!names.includes('voucher-organize'), '整理凭证又冒进侧栏了')
   assert.ok(!names.includes('voucher-import'), '凭证导入又冒进侧栏了')
 })

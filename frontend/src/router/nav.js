@@ -8,7 +8,7 @@
 import {
   Collection, Connection, DataAnalysis, Document, Files, Folder, Grid, List,
   Notebook, Printer, Setting, Sort, Tickets, TrendCharts, Upload, User, Coin,
-  CircleCheck,
+  CircleCheck, Lock,
 } from '@element-plus/icons-vue'
 
 export const NAV = [
@@ -62,9 +62,10 @@ export const NAV = [
     items: [
       { name: 'audit', title: '操作日志', icon: Document, adminOnly: true },
       { name: 'users', title: '用户与授权', icon: User, adminOnly: true },
-      // 排最后，别插在前面：这个模块没写 landing，点顶部「系统管理」落到第一项，
-      // 插到首位会把落地页从「操作日志」悄悄换成这个低频页面。
+      // 下面两项都排最后，别插在前面：这个模块没写 landing，点顶部「系统管理」
+      // 落到第一项，插到首位会把落地页从「操作日志」悄悄换成这个低频页面。
       { name: 'ocr-settings', title: '外部服务', icon: Connection, adminOnly: true },
+      { name: 'data-security', title: '数据安全', icon: Lock, adminOnly: true },
     ],
   },
 ]

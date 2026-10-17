@@ -26,7 +26,8 @@ const routes = [
       { path: 'vouchers/invoices', name: 'invoice-import', component: () => import('@/views/voucher/InvoiceImport.vue'), meta: { title: '发票导入' } },
       { path: 'print-templates', name: 'print-templates', component: () => import('@/views/print/PrintTemplate.vue'), meta: { title: '打印模板' } },
       { path: 'users', name: 'users', component: () => import('@/views/system/UserAdmin.vue'), meta: { title: '用户与授权', adminOnly: true } },
-      { path: 'ocr-settings', name: 'ocr-settings', component: () => import('@/views/system/OcrSettings.vue'), meta: { title: '外部服务', adminOnly: true } }
+      { path: 'ocr-settings', name: 'ocr-settings', component: () => import('@/views/system/OcrSettings.vue'), meta: { title: '外部服务', adminOnly: true } },
+      { path: 'data-security', name: 'data-security', component: () => import('@/views/system/DataSecurity.vue'), meta: { title: '数据安全', adminOnly: true } }
     ]
   },
   { path: '/:pathMatch(.*)*', redirect: '/books' }

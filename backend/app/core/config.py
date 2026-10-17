@@ -272,6 +272,31 @@ class Settings(BaseSettings):
         '"useChartRecognition":false}'
     )
 
+    # ---- 数据安全：备份到阿里云 OSS ------------------------------------
+    #
+    # 这几项只是**兜底**：正常的配置入口是「系统管理 → 数据安全」页面，
+    # 值存在 sys_setting 里，改完即生效（见 app/backup/config.py）。
+    # env 存在的意义是容器首次启动时还没建过库 —— 那时界面上什么都填不了，
+    # 总得有一条路先把凭据放进去。
+    #
+    # endpoint 写不写 https:// 都行（oss_client 归一化），但**要写区域**：
+    # oss-cn-hangzhou.aliyuncs.com 而不是裸的 xxx.oss.aliyuncs.com，
+    # 后者会解析到内网地址。
+    oss_endpoint: str = ""
+    oss_access_key_id: str = ""
+    oss_access_key_secret: str = ""
+    oss_bucket: str = ""
+    oss_prefix: str = "acct-backup"
+
+    # 定时备份总开关。关掉之后界面与手动触发仍可用，只是不再有 systemd 定时跑。
+    backup_enabled: bool = True
+    # 是否额外备份系统级数据（用户、授权、参数、全局基线模板）。
+    backup_include_system: bool = True
+    # 保留天数的天级/周级。月度恒为永久 —— 不做成可配，理由见
+    # app/models/backup.py 的 KEEP_DAYS。
+    backup_keep_daily_days: int = 30
+    backup_keep_weekly_days: int = 365
+
     # 这里曾经有一个 ``default_timezone: str = "Asia/Shanghai"``，现在**没有**了
     # （审计 P2-23）。它定义了但全仓零引用，而三个真正需要时区的时源已经各自
     # 收敛到唯一的正确写法：

@@ -1,4 +1,4 @@
-"""系统管理：用户、账套授权、外部服务配置。
+"""系统管理：用户、账套授权、外部服务配置、数据安全（OSS 备份）。
 
 内部系统只有几十个人，但「谁能看哪个账套」这件事必须落在数据库里，
 不能靠前端藏按钮。因此权限模型只有三个角色：
@@ -11,19 +11,24 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.accounting.audit_helper import log
+from app.backup import config as backup_config
+from app.backup import oss_client
+from app.backup import service as backup_service
 from app.core import system_settings
-from app.core.db import get_db
+from app.core.db import SessionLocal, get_db
 from app.core.deps import get_current_user
 from app.core.security import hash_password
-from app.models import AuditLog, Book, SysUser, UserBook
+from app.models import (SCOPE_SYSTEM, STATUS_FAILED, TIER_DAILY, AuditLog,
+                        BackupRun, Book, SysUser, UserBook)
 
 router = APIRouter(prefix="/api/system", tags=["系统管理"])
 
@@ -400,3 +405,186 @@ def put_ocr_config(payload: OcrConfigPatch, user: SysUser = Depends(get_current_
     )
     db.commit()
     return system_settings.ocr_config_public(db)
+
+
+# ------------------------------------------------- 数据安全（OSS 备份）
+
+
+class BackupConfigPatch(BaseModel):
+    """备份配置。两个 AccessKey 项都是**只写**的，语义与 OCR 的 token 一致。
+
+    ``access_key_secret`` / ``access_key_id`` 不接受「传空串 = 清空」：
+    想清空要走 ``clear_access_key=True``。否则界面上一个没填内容的输入框
+    一次普通保存就把凭据悄悄抹掉了，而界面上看不出任何区别 ——
+    而抹掉之后，下一次定时备份会失败，而失败要等到第二天才被发现。
+    """
+
+    endpoint: Optional[str] = Field(default=None, max_length=256)
+    bucket: Optional[str] = Field(default=None, max_length=128)
+    prefix: Optional[str] = Field(default=None, max_length=128)
+    access_key_id: Optional[str] = Field(default=None, max_length=256)
+    access_key_secret: Optional[str] = Field(default=None, max_length=256)
+    enabled: Optional[bool] = None
+    include_system: Optional[bool] = None
+    keep_daily_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    keep_weekly_days: Optional[int] = Field(default=None, ge=1, le=36500)
+    clear_access_key: bool = False
+
+    @field_validator("prefix")
+    @classmethod
+    def _clean_prefix(cls, v: Optional[str]) -> Optional[str]:
+        # 前缀去掉首尾斜杠：``/a/`` 与 ``a`` 在 OSS 上是两个不同的目录，
+        # 而用户多半随手打个斜杠。与其在清理时两处都判，不如在存的时候就定死。
+        if v is None:
+            return None
+        return v.strip().strip("/")
+
+
+def _backup_view(db: Session) -> dict:
+    view = backup_config.oss_config_public(db)
+    view["enabled"] = backup_config.is_enabled(db)
+    view["include_system"] = backup_config.include_system(db)
+    view["keep_days"] = backup_config.retention_days(db)
+    # 月度恒为永久（0），页面据此把「永久」显示成不可编辑 —— 见 retention.py。
+    view["monthly_forever"] = True
+    return view
+
+
+@router.get("/backup")
+def get_backup_config(user: SysUser = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    _require_admin(user)
+    return _backup_view(db)
+
+
+@router.put("/backup")
+def put_backup_config(payload: BackupConfigPatch, user: SysUser = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    _require_admin(user)
+    before = _backup_view(db)
+    updates: dict[str, str] = {}
+    for field, key in (("endpoint", "oss_endpoint"), ("bucket", "oss_bucket"),
+                       ("prefix", "oss_prefix")):
+        value = getattr(payload, field)
+        if value is not None:
+            updates[key] = value
+    if payload.keep_daily_days is not None:
+        updates["backup_keep_daily_days"] = str(payload.keep_daily_days)
+    if payload.keep_weekly_days is not None:
+        updates["backup_keep_weekly_days"] = str(payload.keep_weekly_days)
+    if payload.enabled is not None:
+        updates["backup_enabled"] = "1" if payload.enabled else "0"
+    if payload.include_system is not None:
+        updates["backup_include_system"] = "1" if payload.include_system else "0"
+
+    if payload.clear_access_key:
+        for key in ("oss_access_key_id", "oss_access_key_secret"):
+            system_settings.set_value(db, key, "", updated_by=user.username)
+    else:
+        if payload.access_key_id:
+            system_settings.set_value(db, "oss_access_key_id", payload.access_key_id,
+                                      updated_by=user.username)
+        if payload.access_key_secret:
+            system_settings.set_value(db, "oss_access_key_secret", payload.access_key_secret,
+                                      updated_by=user.username)
+
+    for key, value in updates.items():
+        system_settings.set_value(db, key, value, updated_by=user.username)
+
+    db.flush()   # 见 put_ocr_config 里的同一段：flush 之后才能取到改后的值
+    after = _backup_view(db)
+    log(
+        db,
+        action="SYSTEM_BACKUP_CONFIG_UPDATE",
+        entity="system_setting",
+        entity_id="backup",
+        user=user,
+        detail="更新数据安全配置"
+               + ("（含 AccessKey）" if (payload.access_key_id or payload.access_key_secret
+                                          or payload.clear_access_key) else ""),
+        before={k: before.get(k) for k in
+                ("endpoint", "bucket", "prefix", "access_key_id_hint",
+                 "access_key_secret_hint", "enabled", "keep_days")},
+        after={k: after.get(k) for k in
+               ("endpoint", "bucket", "prefix", "access_key_id_hint",
+                "access_key_secret_hint", "enabled", "keep_days")},
+    )
+    db.commit()
+    return after
+
+
+@router.post("/backup/test")
+def test_backup_connection(user: SysUser = Depends(get_current_user),
+                           db: Session = Depends(get_db)):
+    """写一个探针对象再删掉 —— 验的是「能不能写」，那才是备份唯一要紧的事。"""
+    _require_admin(user)
+    try:
+        cfg = backup_config.require_ready(db)
+        message = oss_client.check_connection(cfg)
+    except (backup_config.ConfigIncomplete, oss_client.OssError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, "message": message}
+
+
+@router.post("/backup/run")
+def trigger_backup(
+    background: BackgroundTasks,
+    user: SysUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """立刻跑一轮备份。**立即返回，后台跑。**
+
+    同步跑会占住一个 HTTP 连接直到全部账套传完 —— 几本书几分钟，而这期间
+    页面上的「备份中」是靠超时猜的。后台任务 + 轮询 ``/backup/runs`` 才能让
+    界面如实反映进度（跑几个了、哪本失败了），而不是转圈转到超时。
+
+    后台任务里**另开一个会话**：请求结束时会话就被关掉了，继续用它写
+    ``sys_backup_run`` 会在提交时抛 ``Session is closed``。
+    """
+    _require_admin(user)
+    username = user.username
+    user_id = user.id
+    try:
+        backup_config.require_ready(db)
+    except backup_config.ConfigIncomplete as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    def _work():
+        session = SessionLocal()
+        try:
+            actor = session.get(SysUser, user_id)
+            backup_service.run_backup(session, actor=actor or username)
+        except Exception:                            # noqa: BLE001
+            # 后台任务里的异常会被 Starlette 吞掉，只写进 stderr；界面上会一直
+            # 停在「没有新记录」而看不出为什么。落一行失败记录，让它可见。
+            session.add(BackupRun(
+                book_id=None, scope=SCOPE_SYSTEM, book_label="（整轮）",
+                tier=TIER_DAILY, status=STATUS_FAILED, message="后台任务异常，见服务端日志",
+                started_at=datetime.now(timezone.utc),
+                finished_at=datetime.now(timezone.utc),
+            ))
+            session.commit()
+            raise
+        finally:
+            session.close()
+
+    background.add_task(_work)
+    return {"ok": True, "message": "已开始备份，完成后可在下方记录里看到结果。"}
+
+
+@router.get("/backup/runs")
+def list_backup_runs(limit: int = 50, user: SysUser = Depends(get_current_user),
+                     db: Session = Depends(get_db)):
+    _require_admin(user)
+    return [_run_view(r) for r in backup_service.recent_runs(db, limit)]
+
+
+def _run_view(r: BackupRun) -> dict:
+    return {
+        "id": r.id, "book_id": r.book_id, "scope": r.scope,
+        "book_label": r.book_label, "tier": r.tier, "status": r.status,
+        "oss_key": r.oss_key, "size_bytes": r.size_bytes, "row_count": r.row_count,
+        "checksum": r.checksum, "message": r.message,
+        "started_at": r.started_at.isoformat() if r.started_at else None,
+        "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+    }

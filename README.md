@@ -153,6 +153,7 @@ cd backend
 | 期末结账 | `/periods` | 结转损益 / 结账 / **批量反结账** / 年度结转 |
 | 科目表 | `/subjects` | 树形维护，**每账套独立** |
 | 系统 | `/users` `/audit` | 用户授权（OWNER / ACCOUNTANT / VIEWER）、审计日志。仅管理员可见 |
+| 数据安全 | `/data-security` | 阿里云 OSS 备份：配置 / 连通性测试 / 立即备份 / 运行历史。**仅管理员可见** |
 
 ---
 
@@ -174,18 +175,149 @@ cd backend
 
 ---
 
+## 数据安全：备份到阿里云 OSS
+
+界面在 **系统管理 → 数据安全**（`/data-security`，仅管理员可见）。填 OSS 参数，
+点「测试连接」验通了之后，剩下的交给 `cwq-oss-backup.timer` 每天凌晨 03:47 自己跑。
+
+### 备份的是什么
+
+每个账套一份 **gzip JSON 逻辑快照**，外加一份系统级快照（用户、授权、审计日志、
+系统参数等不属于任何账套的表）。不用 `pg_dump` 分表，因为要的是「能把某一本书原样
+搬走」，不是「把整个库搬走」。
+
+产物长这样：
+
+```json
+{"header": {"format": "cwq-book-backup", "version": 1,
+            "scope": "book", "book_id": 3, "book_label": "某某公司/2026 年度",
+            "exported_at": "2026-10-17T03:47:12+08:00"},
+ "tables": {"entry": {"columns": [...], "rows": [{...}, ...]}, ...}}
+```
+
+对应的对象键是 `acct-backup/monthly/book-3/20261001-031700.json.gz` ——
+**档位必须是第一层目录**，因为按档位清理和按目录清理是同一件事。
+键里刻意不含中文（公司名写在归档头和运行记录里，界面上看得到），
+非 ASCII 键在 `ossutil` 和各种第三方工具的日志里反复出问题。
+
+取的是哪几张表不是「有 book_id 列就算」，而是**沿外键递归到闭包**
+（`app/backup/export.py::build_table_scopes`）。原因：`report_row` / `report_col` /
+`report_cell` 自己没有 `book_id`，只有 `template_id → report_template.id`。按
+book_id 筛表的话，用户设计的那套报表版式**不在任何一个备份里，而且不报错**。
+现在账套级 = book + direct + indirect 共 19 张表，系统级 = 其余全部
+（direct 取 `book_id IS NULL`，global 取全表）。
+
+`sys_backup_run` 在排除表里（`EXCLUDED_TABLES`）。它自己带 book_id，会被上面那条
+规则捞进来，然后递归膨胀 —— 每期比上期大且不报错。
+
+### 分级：够格的最高一档
+
+```
+这个月还没成功过月度  ->  monthly（永久保留）
+本周里还没成功过周备份 ->  weekly （保留 365 天）
+其余                 ->  daily  （保留 30 天）
+```
+
+判重只看 `status='success'` —— **失败不算占位**。一次失败的月度备份如果算成
+「本月已留档」，接下来一个月都不会再补，月度档就悄悄空了一个月。
+
+判重用 `Asia/Shanghai`（`tier.BUSINESS_TZ`），不依赖部署机的 TZ：机器在 UTC 上
+跑，周一 00:00 UTC 是周日的 8 点，按机器时区判会整周错位。
+
+### 保留：月度是结构性的，不是配出来的
+
+`.env` 里只有 `BACKUP_KEEP_DAILY_DAYS` / `BACKUP_KEEP_WEEKLY_DAYS`，
+**月度备份没有对应配置项**。`app/backup/retention.py` 对 `tier == monthly`
+直接 `continue`（连对象列表都不列），`plan_deletions` 入口再挡一次 ——
+将来谁新写一条清理路径，也碰不到月度档。
+
+做成「保留天数 = 一个很大的数」是危险的：哪天有人觉得 3650 太大改成 1095，
+「永久」就悄悄变成了 3 年，而且没人会发现。
+
+清理按 `daily/` `weekly/` 前缀 + 对象修改时间判定，**跑完当轮备份立即执行**
+（不单独排一个清理任务）。systemd unit 里那个 `--no-prune` 不是可选的 ——
+留着过期产物不只是浪费存储费，还让人以为回溯窗口比实际更长。
+
+### 凭据只写不读
+
+`GET /system/backup` 永远不返回 AccessKey 明文，只回 `…EYID` / `…0000`
+这样的 mask 提示。改密钥只能整份重填，没有「回显」这条路
+（和「系统管理 → 外部服务」里的 OCR token 同一套规矩）。
+`OSS_PUBLIC_KEYS` 里根本没有那两个键。
+
+### 出事了怎么恢复
+
+```bash
+# 1. 先干跑：只校验归档并报行数，一个字节都不写库
+.venv/bin/python scripts/backup_to_oss.py \
+    --restore /tmp/book-3-20261001.json.gz --restore-dry-run
+
+# 2. 确认无误再灌（整批一个事务，中途失败整体回滚）
+.venv/bin/python scripts/backup_to_oss.py \
+    --restore /tmp/book-3-20261001.json.gz
+```
+
+`read_snapshot` 先验后跑：format / version 不认、tables 为空，一律拒绝。
+恢复是**灾难恢复，不是覆盖写** —— 往一个有数据的库里灌会撞主键并整体回滚
+（有测试锁住这个行为）。也就是说「恢复」永远是「恢复到一个空库/新环境」。
+
+恢复完 `_reset_sequence` 会把序列推到当前最大值之后，不然恢复之后第一张
+新凭证就会撞主键；`_ordered_rows` 会对自引用外键（`subject.parent_id`）
+做表内拓扑排序，否则多行 INSERT 逐行校验 FK 时父行还没插进去。
+
+### 启用定时备份
+
+```bash
+sudo cp deploy/systemd/cwq-oss-backup.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now cwq-oss-backup.timer
+systemctl list-timers cwq-oss-backup.timer    # 看下次触发时间
+```
+
+03:47 是刻意的：本机原有的数据库 dump 在 03:17，两件都是重 IO 的活，
+同一分钟起跑会互相抢磁盘。`Persistent=true`，关机期间错过的会补跑。
+
+### 手动跑一轮
+
+```bash
+cd backend
+.venv/bin/python scripts/backup_to_oss.py --dry-run    # 只打印会传什么、会删什么
+.venv/bin/python scripts/backup_to_oss.py              # 真跑
+.venv/bin/python scripts/backup_to_oss.py --book 3 --tier monthly   # 补一份永久档
+```
+
+退出码：`0` 至少一本成功；`2` 配置不全 / 没东西可备；`4` 一本都没成功。
+一轮全灭必须是非零 —— 返回 0 的表现就是「定时任务每天都是绿的」。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/system/backup` | 读配置（**无 AccessKey 明文**）+ 开关 + 保留天数 |
+| PUT | `/api/system/backup` | 改配置（凭据留空 = 不动已存的值） |
+| POST | `/api/system/backup/test` | 连通性测试：上传一个探针对象再删掉 |
+| POST | `/api/system/backup/run` | 立即备份（后台任务 + 轮询历史，页面不靠超时猜） |
+| GET | `/api/system/backup/runs` | 运行历史（状态 / OSS key / 字节数 / SHA256 / 行数 / 错误全文） |
+
+五个都要求管理员。
+
+「测试连接」是**写探针再删**，不是 `head_bucket`：只读权限的 Key 在
+`head_bucket` 上是绿的，真备份时却写不进去 —— 那才是最难在事后发现的形态。
+
+---
+
 ## 测试
 
 ```bash
 cd backend
 
-.venv/bin/python -m pytest                      # 1422 个单元/接口测试（69 个测试文件，实测 `--collect-only`）
+.venv/bin/python -m pytest                      # 1649 个单元/接口测试（83 个测试文件，实测 `--collect-only`）
 .venv/bin/python scripts/demo_e2e.py            # 69 项端到端流程
 .venv/bin/python scripts/demo_modules.py        # 53 项模块冒烟
 node onboard.mjs                                # 19 步浏览器开户全流程（需前后端都起着）
 node report_design.mjs                          # 7 步浏览器报表设计器（需前后端都起着）
 
-cd ../frontend && npm run test                  # 14 个前端测试文件（node --test）
+cd ../frontend && npm run test                  # 22 个前端测试文件（node --test）
 ```
 
 - pytest 用**独立测试库** `cwq_test`，每个用例一个全新账套，绝不碰开发库
@@ -211,11 +343,13 @@ backend/
       queries.py    #   总账 / 明细账 / 余额表 / 试算平衡
     reports/        # 报表公式引擎（自由配公式）
     printing/       # 打印模板引擎（HTML+CSS @page）
+    backup/         # 账套快照 → OSS：分级 / 保留清理 / 导出与恢复
     api/            # HTTP 层，只做参数转换和错误翻译
-    models/         # 17 张表
+    models/         # 23 张表
     core/           # 配置、连接、鉴权、初始化 SQL
     seed/           # 标准科目表、内置报表模板
   scripts/          # seed_demo.py 演示数据 + demo_e2e/demo_modules 端到端脚本
+                   # + db_backup.py（pg_dump）+ backup_to_oss.py（账套快照）
   tests/            # pytest
 frontend/
   src/views/        # 按业务模块分目录

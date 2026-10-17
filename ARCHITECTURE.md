@@ -2259,7 +2259,7 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
 
 ---
 
-## 10. 数据模型（17 张表）
+## 10. 数据模型（23 张表）
 
 **账套与授权**
 `sys_user` `book` `sys_user_book`（OWNER / ACCOUNTANT / VIEWER）
@@ -2334,8 +2334,30 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
 `login_ip_throttle`（每来源一行的失败聚合；**跨账套、无 `book_id`**，
 它记的是「谁在扫」而不是「哪个账套的账」，见 §9.7）
 
+**备份**
+`sys_backup_run`（每账套每轮一行：档位 / 状态 / OSS key / 字节数 / SHA256 / 行数 /
+错误全文。**自带 `book_id`，但它被排除在备份范围之外** ——
+否则它会被 `build_table_scopes()` 捞进去，然后自己递归装自己，每期比上期大且
+不报错，见 §11.8）
 
-
+> **表数是 23，核实方法：`grep -rh --include=*.py __tablename__ app/models/ | wc -l`**
+> （`audit_log` `book` `entry` `import_batch` `invoice_batch` `invoice_config`
+> `invoice_record` `invoice_rule` `login_ip_throttle` `period` `period_opening`
+> `print_template` `report_cell` `report_col` `report_result` `report_row`
+> `report_template` `subject` `sys_backup_run` `sys_setting` `sys_user`
+> `sys_user_book` `voucher`）。
+> 迁移侧一致：`0001_baseline` 建 16 张，`0002`~`0007` 一张都不加（只加列、索引、
+> 约束与触发器），`0008_login_ip_throttle` 第 17 张，`0016_invoice_import`
+> +4（发票导入），`0017_system_settings` 第 22 张（`sys_setting`），
+> `0025_backup_run` 第 23 张（备份运行记录，见 §11.8）。
+> `db_init.sql` 里**没有** `CREATE TABLE` —— 建表只由 Alembic revision 负责。
+> README 里的同一处数字也要跟着改，两边不一致时以本节为准。
+>
+> **这张表数曾经长期停在 17**，而 `sys_setting`（0017）与四张发票表（0016）
+> 都已经加进来了 —— 也就是说「17」在加第 22 张之前就已经是错的。
+> 教训不是「记得改」，是**别手抄**：上面那条 `grep` 能自己算出来的事，
+> 手抄成一段散文就一定会漂。所以核实方法必须是一条可执行的命令，
+> 而不是一段声称的清单。
 
 ---
 
@@ -2795,6 +2817,150 @@ head -c 60 <dump>                                                      # -- Post
 
 ---
 
+## 11.8 数据安全：账套快照备份到阿里云 OSS（2026-10-17 加）
+
+界面在「系统管理 → 数据安全」。这一节记录的是**为什么不那么写**的地方 ——
+剩下的用法在 `README.md` 那一节。
+
+### 逻辑快照，不是 pg_dump 分表
+
+每个账套导出一份 **gzip JSON** 归档（外加一份系统级快照）：
+
+```
+{"header": {format, version, scope, book_id, book_label, exported_at},
+ "tables": {"<表名>": {"columns": [...], "rows": [{...}, ...]}}}
+```
+
+行是字典、逐行流式写（`BATCH=1000`，SQLAlchemy `yield_per`），
+**内存占用与账套大小无关**。用 `pg_dump` 分表不是不行，但那样
+「把某一本书原样搬走」就要拼十几次导入，产物也不自描述 ——
+而自描述很重要：出事那天拿到一个 `.json.gz`，得能自己看出它是谁、什么时候的。
+
+**导出走独立连接 + `REPEATABLE READ`。** 用 `engine.connect()` + `conn.begin()`，
+然后第一条语句就是 `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`。
+
+> 这里**不能**用 SQLAlchemy 的 `execution_options(isolation_level=...)`。
+> 那时连接已经 INTRANS，psycopg 直接抛 `can't change 'autocommit' now` ——
+> 而 SQLAlchemy 只发一个 `SAWarning` 就把它**静默忽略**了，
+> 于是你以为设了 REPEATABLE READ，实际还是 READ COMMITTED。
+> READ COMMITTED 下逐张表读，会读出一个**从未存在过**的混合状态：
+> 上一张表读到的是删除之前的行，下一张表已经读不到它了。
+> 那种快照恢复出来的东西不会报错，只会算错账。
+
+### 表归属：沿外键递归到闭包，不是「有 book_id 列」
+
+`build_table_scopes()` 把每张表判成四种之一，迭代到不动点：
+
+| kind | 判据 |
+|---|---|
+| `book` | 表本身就是一本账（`book`） |
+| `direct` | 有 `book_id` 列 |
+| `indirect` | **所有**外键都指向已判定为账套内的表 |
+| `global` | 其余（系统级） |
+
+**为什么不能只看 `book_id`**：`report_row` / `report_col` / `report_cell`
+自己没有 `book_id`，只有 `template_id → report_template.id`。
+按 book_id 筛表的话，用户花时间设计的报表版式**不在任何一个备份里，
+而且不报任何错**。这是「静默丢数据」里最难发现的一类 ——
+备份报告一切正常，恢复出来才发现少了半张报表。
+
+账套级 = `book` + `direct` + `indirect`（19 张表）；
+系统级 = 除 `book` 外全部，其中 `direct` 取 `book_id IS NULL`、`global` 取全表。
+
+> `EXCLUDED_TABLES = frozenset({"sys_backup_run"})`。
+> 它自带 `book_id`，会被上面那条规则捞进来，然后**递归装自己** ——
+> 每期比上期大、不报错、能一直跑下去。
+> 这类东西不会在第一天炸，所以给它配了一条专门的测试
+> （`test_excluded_tables_has_no_second_member`）钉住它**不许长出第二个成员**。
+
+### 分级：够格的最高一档，失败不算占位
+
+```
+这个月还没成功过月度  ->  monthly（永久）
+本周里还没成功过周备份 ->  weekly （365 天）
+其余                 ->  daily  （30 天）
+```
+
+判重只看 `status='success'`。**一次失败的月度备份如果算成「本月已留档」，
+接下来一个月都不会再补** —— 月度档就悄悄空了一个月，而备份列表里全是绿的。
+
+时区用 `tier.BUSINESS_TZ = ZoneInfo("Asia/Shanghai")`，**不读部署机的 TZ**。
+机器在 UTC 上跑的话，周一 00:00 UTC 是当地的周日 8 点，
+按机器时区判会把整周的档位错位，而错位的那一天看起来「正常」。
+
+### 保留：月度是结构性的，不是配出来的
+
+`retention.apply_retention()` 对 `tier == monthly` 直接 `continue` ——
+连对象列表都不列；`plan_deletions()` 入口再挡一次
+`if tier == TIER_MONTHLY or keep_days <= 0: return []`。双保险，
+防的是将来有人新写一条清理路径时踩进来。
+
+`.env` / 界面里**没有**月度的保留天数项，`retention_days()` 里
+`TIER_MONTHLY: 0` 是硬编码的。
+
+> 「月度永久」做成「保留天数 = 一个很大的数」是危险的：
+> 哪天有人觉得 3650 太大、顺手改成 1095，「永久」就悄悄变成了 3 年，
+> 而且**没有任何一行会报错**。要永久的东西必须由「压根不删」来保证，
+> 不能由「删得少一点」来保证。
+
+清理按 `daily/` `weekly/` 前缀 + 对象修改时间判定，**跑完当轮备份立即执行**。
+systemd unit 刻意没有 `--no-prune`：留着过期产物不只是浪费存储费，
+它还让人**以为**回溯窗口比实际更长 —— 你以为能翻到 60 天前，
+实际上 45 天前那份上个月就被删了。
+
+### 凭据只写不读
+
+`oss_config_public()` 只回 `access_key_id_set` / `..._hint`（mask 过），
+`OSS_PUBLIC_KEYS = ("endpoint", "bucket", "prefix")` 里**根本没有那两个 AccessKey 键**。
+改密钥只能整份重填（PUT 时留空 = 不动已存的值）。
+
+同一份规矩已经有第二处实现了（`OcrSettings.vue` 的 OCR token），
+所以这里是照抄既有价值观，不是新发明。
+
+### 跑之前先验，跑的时候事务，回退路径要真的跑过
+
+`read_snapshot()` **先验后跑**：format / version 不认、`tables` 为空，一律拒绝。
+恢复整批一个事务，中途失败整体回滚。
+
+`_reset_sequence()` 在恢复后把序列推到当前最大值之后 ——
+不做这一步，恢复完第一张新凭证就会撞主键。
+`_ordered_rows()` 对自引用外键（`subject.parent_id`）做表内 Kahn 拓扑排序，
+否则多行 INSERT 逐行校验 FK 时，父行还没插进去。
+
+**恢复是灾难恢复，不是覆盖写。** 往一个有数据的库里灌会撞主键并整体回滚
+（有测试锁住这个行为）。这是有意的：静默合并比响亮地失败危险得多。
+
+### 为什么产物里写 `mtime=0`
+
+gzip 头部默认带导出时间戳，同样的数据两次导出的字节不一样。
+`mtime=0` 让产物**内容寻址** —— 同一份数据两次导出 SHA256 相同。
+SHA256 对**压缩后**的字节算（中间挂一个 `_HashingWriter`），
+因为那才是 OSS 上真正存的东西；算解压前的字节等于给运维一个对不上的校验值。
+
+### 定时任务的四个坑
+
+`deploy/systemd/cwq-oss-backup.{service,timer}`：
+
+- **03:47，不是 03:17** —— 本机的 `cwq-backup.timer`（pg_dump）在 03:17。
+  两件都是重 IO 的活，同一分钟起跑会互相抢磁盘，而**先失败的那个不是备份**。
+- `ReadWritePaths=/opt/cwq/backups` **不能照抄** `cwq-api.service` 的
+  （那个只白名单了 `logs`）。照抄的话备份写不进去，而 systemd 只报一个含糊的
+  失败码 —— 表现是「每天定时跑、每天都失败、没人看 journal」，
+  比没有定时备份更危险，因为它看起来是有的。
+- `EnvironmentFile=/opt/cwq/backend/.env` **只是兜底**。真正生效的配置存在
+  `sys_setting`（页面上配的），`.env` 里那几项只在库里没配时才被读到
+  （`oss_config()`：库里有的用库里，没有的才退回 env）。
+  于是最坏的情形是：`.env` 看起来配好了、库里也早就配好了，
+  改错的是`.env` 里的那一份 —— **改它没有任何效果，也不报错**。
+  要临时改配置，从界面改；要临时禁用，`--ignore-enabled` 之外没有第二条路。
+- 对象键里**没有** systemd 规格符。归档名是代码算的
+  （`acct-backup/monthly/book-3/20261001-031700.json.gz`，见 `tier.object_key`），所以这个 unit 不会出现
+  `cwq-backup.timer` 那个「`Result: success` 但一个字节都没产生」的坑 ——
+  那是把 `date` 的格式串误当成 systemd 规格符写进文件名才有的，
+  这个 unit 干脆没有文件名。
+
+---
+
 ## 12. 测试策略
 
 | 文件 | 覆盖 |
@@ -2812,6 +2978,7 @@ head -c 60 <dump>                                                      # -- Post
 | `test_importer.py` | 三段式导入 |
 | `test_importer_xls.py` | 用友序时账（**真 .xls**，xlwt 写的 OLE2）：相同日期+凭证号并成一张、合计行挡掉、跨月重号是两张、红字保真、同侧相抵放行；以及不许被改坏的两条（模板断行、无凭证号不合并）、魔数分流 |
 | `test_import_limits.py` | 上传字节/解压体积/行数/凭证数四道闸、确认与作废后清空 `payload`、过期批次清理不越账套 |
+| `test_backup_oss.py` | 分级判重（**失败不算占位**）、保留清理（**月度永不删**是结构性的，双保险各有钉子）、表归属闭包（`report_row/col/cell` 必须靠 `indirect` 进得来）、`EXCLUDED_TABLES` 不许长出第二个成员、快照往返恢复、自引用外键的拓扑排序、恢复不覆盖写、**系统级判重必须 `IS NULL`**、导出用 REPEATABLE READ、API 鉴权与**凭据只写不回显** |
 | `test_subject_leaf_integrity.py` | `is_leaf` 不听客户端的（凭证与期初两条负向路径）、数据库触发器、移动整棵子树重算级次 |
 | `test_token_revocation.py` | 改密/停用后旧令牌立即失效、重登可用、牵连不到别人、升级前的老令牌不误杀 |
 | `test_user_audit_log.py` | 建号/停用/启用/改密/删号留痕、初始授权入档、**日志里没有口令与散列** |

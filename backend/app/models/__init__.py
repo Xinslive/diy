@@ -8,6 +8,8 @@ from app.models.printing import PrintTemplate
 from app.models.importing import ImportBatch
 from app.models.invoice import InvoiceBatch, InvoiceConfig, InvoiceRecord, InvoiceRule
 from app.models.audit import AuditLog
+from app.models.backup import (BackupRun, KEEP_DAYS, SCOPE_BOOK, SCOPE_SYSTEM, STATUS_FAILED,
+                          STATUS_SUCCESS, TIER_DAILY, TIER_MONTHLY, TIERS, TIER_WEEKLY)
 
 __all__ = [
     "Base", "SysUser", "UserBook", "SystemSetting",
@@ -17,4 +19,7 @@ __all__ = [
     "ReportTemplate", "ReportRow", "ReportCol", "ReportCell", "ReportResult",
     "PrintTemplate", "AuditLog", "ImportBatch",
     "InvoiceConfig", "InvoiceRule", "InvoiceBatch", "InvoiceRecord",
+    "BackupRun", "TIERS", "KEEP_DAYS",
+    "TIER_DAILY", "TIER_WEEKLY", "TIER_MONTHLY",
+    "STATUS_SUCCESS", "STATUS_FAILED", "SCOPE_BOOK", "SCOPE_SYSTEM",
 ]
