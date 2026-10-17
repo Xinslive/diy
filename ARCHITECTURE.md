@@ -2961,6 +2961,156 @@ SHA256 对**压缩后**的字节算（中间挂一个 `_HashingWriter`），
 
 ---
 
+## 11.9 「端口在监听但没人应答」（2026-10-17 记录与修法）
+
+本节记的是一次真实故障的**完整根因链**，以及它引出的四条硬约束。
+记它的理由不是「修了一个 bug」，而是那个 bug 属于这一类：
+
+> **表面症状（连不上）与真实原因（在等一个已经死掉的子进程）之间，
+> 没有任何可观察的关联。** 从外面看它和「服务器卡死」完全一样，
+> 而从外面看是最容易下结论的时候。
+
+### 11.9.1 根因链
+
+开发环境用 `uvicorn --reload`。uvicorn 的 **reloader 父进程**自己 bind 住
+`:8000` 的 LISTEN 套接字，再经 `multiprocessing` pickle 交给 worker 子进程。
+于是：
+
+1. worker 的 `startup()` 里调 `assert_schema_ready()`；
+2. 迁移 head 前进而库没跟着 `upgrade` → worker 抛 `SchemaVersionError` 后退出；
+3. **父进程还活着、还握着那个 LISTEN 套接字、且阻塞在 `os_waitpid`** ——
+   于是永远没有人调 `accept()`。
+
+TCP 三次握手照样成功（客户端看到 `ESTABLISHED`），事件循环健康空闲，
+但一个请求都得不到应答。
+
+实测证据（在 `.run/` 里，不引用记忆）：
+
+```bash
+# ① 闸门是被反复触发的，不是偶发
+grep -c SchemaVersionError .run/api.log
+
+# ② 谁在 listen、谁在干活 —— 两者的 pid 不同，说明 listen 的那个不是 worker
+lsof -nP -p "$(pgrep -f 'uvicorn app.main:app' | head -1)" -a -iTCP:8000 -sTCP:LISTEN
+
+# ③ 连得上但没有应答
+curl -sv -m 3 http://127.0.0.1:8000/api/health
+```
+
+### 11.9.2 硬约束一：schema 闸门必须长在**进程起来之前**
+
+应用里的 `startup()` 闸门**保留**（纵深防御：直接手跑 uvicorn 时它仍拦得住），
+但它**不够**。闸门长在 uvicorn 里，意味着每拦一次人就产出一次
+「端口在监听、没人应答、又杀不掉」的进程 —— 报错信息只剩日志中段的一行。
+
+所以另有一个**进程外**的闸门，`dev.sh` 与 systemd 的 `ExecStartPre=` 调的是
+同一个入口：
+
+```bash
+cd backend && .venv/bin/python scripts/preflight.py    # 0 就绪 / 3 版本不符 / 4 连不上
+```
+
+它**不执行任何 DDL**（理由与 `app/core/schema_version.py` 的模块注释一致：
+建表改表只由 Alembic 负责，启动路径只做版本检查）。
+
+### 11.9.3 硬约束二：`--reload` 的进程树 SIGTERM 杀不掉
+
+`supervisors/basereload.py` 的 `signal_handler` 只做 `self.should_exit.set()`，
+而那个 Event 只在 `pause()` / `should_restart()` 里被看。父进程此刻阻塞在
+`os_waitpid`，事件永远轮不到被看一眼 —— 实测连发两次 SIGTERM 纹丝不动，
+`kill -9` 之后端口才释放。
+
+**后果**：`./dev.sh stop` 之后端口仍被僵尸占着，下一次 `./dev.sh` 就是
+`ERROR: [Errno 48] Address already in use`，新 worker 又 bind 失败退出 ——
+于是「重启也起不来」。
+
+因此 `dev.sh stop` 的形状是定死的：**TERM → 等 → 按进程组 KILL → 确认端口真的空了**。
+能按进程组杀是因为 `spawn()` 用了 `os.setsid()`，孙进程自己就是组长（pgid == pid）。
+
+生产不走 `--reload`（`--workers`），所以这个形态只出现在开发环境；
+但生产的闸门仍然要前移到 `ExecStartPre=`，理由是 `Restart=always`：
+失败会变成「每 3 秒刷一轮进程退出」，而真实原因埋在日志中段。
+
+### 11.9.4 硬约束三：起不来就必须返回非零
+
+旧 `dev.sh` 的 `wait_http` 失败只打一行 `✗`，不清理、不返回非零，
+接着照常打印 `好了：…` 并 exit 0。现在：
+
+* 探测分两级 —— `/api/health`（**存活**，故意不碰库）与 `/api/ready`
+  （**就绪**，查库 + 核对 schema）。只探 health 的话，一个 schema 不对但进程
+  活着的后端会被报成「起来了」，而那正是它下一次 reload 就会崩掉的形态。
+* 失败时**区分三种形态**（它们从外面看一模一样，处置动作完全不同）：进程退了 /
+  半拉起来 / 楔住了（端口 LISTEN 却没人应答）。
+* 楔住了就连之前那一轮拉起来的也一并清掉 —— 留着它的代价是确定的（端口被占，
+  下一次必然 Errno 48），而它本身无可争议（没人应答的后端没有保留价值）。
+* `./dev.sh status` **真的发一个请求**。靠 pid 文件判断的话，那天会报
+  「backend 运行中」而实际上一个请求都进不来。
+* `./dev.sh doctor` 是定点修复入口：不重启任何东西，先给结论再动手。
+
+沙箱演练复现的是**那个具体进程形态**，不是「脚本跑不通」：真的起一个 listen
+着 8000、永远不 accept、并且吞掉 SIGTERM 的进程，再真的拿 curl 去连 ——
+不造假 `lsof`、不造假 `curl`。
+
+```bash
+bash deploy/tests/test_dev_sh.sh       # 16 项
+```
+
+### 11.9.5 OSS 客户端的两个事实
+
+* **oss2 没有重试**（2.19.1 里没有任何 retry 逻辑）。所以超时层是「多久承认失败」
+  的**唯一**闸门，它不是保护，是上限。
+* **不写 `connect_timeout` 就用 SDK 默认的 60 秒**，而 oss2 把它原样当
+  `requests` 的 `timeout=` 用 —— 于是它是「建连 60 秒**且**读 60 秒」，
+  与「列一页对象」还是「传几百 MB 快照」毫无关系。实测把 `put_object` 指向
+  黑洞地址，**恰好 60.0 秒**后抛 `RequestError`（所以「一次调用无限挂住」
+  这个假设是错的，别照它写结论）。
+* **每个 Bucket 自带一个 `requests.Session`**，连接池里是真的 TCP 连接，
+  不显式关就等 urllib3 的 keep-alive 超时才回收。CLOSE_WAIT 的含义是
+  「对端已发 FIN、本地还没 close」—— 本地还占着一个 fd，而且是**不报错**地占着，
+  最后以 `Too many open files` 在不相干的地方炸掉。
+
+现在：`OSS_TIMEOUT = (10, 60)`，探针用 `(5, 15)`，`close_bucket` 在
+`finally` 里调。`run_backup` 只把「建桶 + 收尾」留在外面，是为了让收尾一定
+覆盖**异常**路径 —— 备份最常见的结局就是抛异常。
+
+> 顺带澄清一个容易搞错的地方：`BackgroundTasks` 里的**同步**函数会被 Starlette
+> 丢进 `run_in_threadpool`（见 `starlette/background.py`），所以跑备份占的是
+> anyio 那 40 个共享槽里的一个，**不会阻塞事件循环**。槽是共享的，所以这类任务
+> 的单次时长要有上限 —— 上面那两个超时就是那个上限。
+
+### 11.9.6 硬约束四：归档格式只能加 reader，不能改判定
+
+旧的快照恢复判定是 `if header["version"] != VERSION: raise`。它在 VERSION 还是 1、
+**一份归档都还没产生**的时候看着完全无害。
+
+致命之处在于**月度归档永久保留**（`KEEP_DAYS[TIER_MONTHLY] = 0`，
+`retention.py` 对 monthly 结构上就没有删除分支）。所以从今往后每年都会多出一批
+v1 归档躺在 OSS 上；等某天 VERSION 升到 2，那句判断会让**今天存的每一份月度
+归档同时失去可恢复性** —— 而它恰恰是出事那天唯一能救回来的东西。
+
+也就是说：**那个缺陷第一次发作的时刻，正好是它最没有机会被测试覆盖的时刻**
+（那时所有测试都已经是 v2 了），而代价是永久的。能在 VERSION 还是 1、
+还没有任何一份归档存在的时候改掉，是唯一便宜的时机。
+
+现在是 `FORMAT_READERS`（`版本 → reader`）：
+
+* **v1 的 reader 永久不许删、不许改。** `register_reader` 拒绝重复登记；
+  tests 里有守卫专门钉「1 in FORMAT_READERS」。改旧 reader 不会让归档报错，
+  只会在恢复时静默读出错的**内容** —— 那比拒绝糟糕得多。
+* 升 VERSION 时**加 reader**，让各版把自己翻译成 `restore` 认识的规范形状，
+  于是恢复主体不必为了新格式而改动。
+* 真认不出来的版本仍然拒绝（硬灌读不懂的归档比恢复失败更糟 —— 最坏的结果是
+  恢复「成功」了），但报错必须可操作：这份是哪一版、本程序能读哪几版、
+  换哪台机器去恢复、以及旧归档不会因升版本而失效。原话「本程序只认 1」被换掉了，
+  因为它既没说版本、也没说读哪几版、更没说怎么读到。
+
+> 写这类兼容用例时踩过一个坑，值得单独记：夹具如果在用例体**之前**就把 VERSION
+> 改成 2，那么用例里的导出动作会用 v2 **写出**归档，拿它验「v1 还能不能读」——
+> 而那件事从来不会坏，测试全绿而什么都没验到。所以切换必须发生在写完之后，
+> 并且要断言归档里真的写着 `version: 1`。
+
+---
+
 ## 12. 测试策略
 
 | 文件 | 覆盖 |
@@ -2978,7 +3128,10 @@ SHA256 对**压缩后**的字节算（中间挂一个 `_HashingWriter`），
 | `test_importer.py` | 三段式导入 |
 | `test_importer_xls.py` | 用友序时账（**真 .xls**，xlwt 写的 OLE2）：相同日期+凭证号并成一张、合计行挡掉、跨月重号是两张、红字保真、同侧相抵放行；以及不许被改坏的两条（模板断行、无凭证号不合并）、魔数分流 |
 | `test_import_limits.py` | 上传字节/解压体积/行数/凭证数四道闸、确认与作废后清空 `payload`、过期批次清理不越账套 |
-| `test_backup_oss.py` | 分级判重（**失败不算占位**）、保留清理（**月度永不删**是结构性的，双保险各有钉子）、表归属闭包（`report_row/col/cell` 必须靠 `indirect` 进得来）、`EXCLUDED_TABLES` 不许长出第二个成员、快照往返恢复、自引用外键的拓扑排序、恢复不覆盖写、**系统级判重必须 `IS NULL`**、导出用 REPEATABLE READ、API 鉴权与**凭据只写不回显** |
+| `test_backup_oss.py` | 分级判重（**失败不算占位**）、保留清理（**月度永不删**是结构性的，双保险各有钉子）、表归属闭包（`report_row/col/cell` 必须靠 `indirect` 进得来）、`EXCLUDED_TABLES` 不许长出第二个成员、快照往返恢复、自引用外键的拓扑排序、恢复不覆盖写、**系统级判重必须 `IS NULL`**、导出用 REPEATABLE READ、API 鉴权与**凭据只写不回显**、**格式版本注册表**（升到 v2 后 v1 归档仍能恢复、v1 reader 必须存在、重复登记被拒、未知版本报错可操作、静态禁止回到 `!= VERSION`）、**OSS 超时与连接池**（显式 (10,60)、`close_bucket` 覆盖异常路径、探针用短超时） |
+| `deploy/tests/test_dev_sh.sh` | **沙箱里真的复现「端口在监听但没人应答」**：真起一个 listen 8000、永不 accept、吞 SIGTERM 的进程（不造假 lsof/curl）；断言起不来必须非零、**不许打印「好了」**、楔住的进程组被清干净、端口真的空、预检不过时 uvicorn 没被拉起、stop 的 TERM→KILL 升级、以及正常时照常报「好了」 |
+| `deploy/tests/test_deploy.sh` | 发布脚本沙箱演练（取产物/备份/迁移/切前端/重启的顺序与失败处置） |
+| `test_preflight.py` | 启动前闸门：三条退出码（0/3/4）分开、脱敏后连接串仍带 host、预检**不做 DDL**、闸门排在 uvicorn 之前、systemd `ExecStartPre` 调同一入口、`wait_live` 调用元数、全仓 `$变量紧跟非 ASCII` 扫描（§11.9） |
 | `test_subject_leaf_integrity.py` | `is_leaf` 不听客户端的（凭证与期初两条负向路径）、数据库触发器、移动整棵子树重算级次 |
 | `test_token_revocation.py` | 改密/停用后旧令牌立即失效、重登可用、牵连不到别人、升级前的老令牌不误杀 |
 | `test_user_audit_log.py` | 建号/停用/启用/改密/删号留痕、初始授权入档、**日志里没有口令与散列** |
