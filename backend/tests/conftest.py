@@ -149,9 +149,38 @@ os.environ["APP_ENV"] = "test"
 os.environ["DB_ECHO"] = "false"
 
 from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import create_engine, select, text, update  # noqa: E402
+from sqlalchemy import create_engine, event, select, text, update  # noqa: E402
 
 from app.core.db import SessionLocal, engine  # noqa: E402
+
+
+# --------------------------------------------------------------------------
+# 会话时区钉死成 UTC
+# --------------------------------------------------------------------------
+#
+# PostgreSQL 的 TimeZone GUC 决定 TIMESTAMPTZ 取回来时带什么 tzinfo 对象：
+# 字面量恰好是 `UTC` 时 psycopg 交出 ``datetime.timezone.utc``；写成
+# ``Etc/UTC``（GitHub 的 ``postgres:16`` 服务容器就是默认这个）它交出
+# ``zoneinfo.ZoneInfo('Etc/UTC')``。
+#
+# 两者是**同一时刻**，`utcoffset()` 都是 0，但 ``== timezone.utc`` 为 False。
+# 于是 ``test_importer.py::test_入库时间与记账时间同一时源`` 在本机绿、在 CI 红 ——
+# 它测到的是「跑测试那台机器的时区配置」，不是被测代码。
+#
+# 所以修的是环境，不是断言：把断言改成「比较偏移量」看着也能变绿，但那条断言
+# 本来就是护栏（时间戳必须是 UTC），放松它等于把护栏摘掉。这里对**每个新建连接**
+# 执行一次 SET TIME ZONE，让断言回到它本来要测的东西。
+# 本来是挂在 Engine 类上的全局监听（``event.listens_for(Engine, "connect")``），
+# 那样更省事，但会把建库用的 admin 引擎也带上 —— 那个引擎是
+# ``isolation_level="AUTOCOMMIT"`` 建的，而 ``SET TIME ZONE`` 一执行连接就进入
+# 事务，psycopg 直接拒绝（``can't change 'autocommit' now``），整个套件起不来。
+# 所以只挂在应用引擎上：管理引擎只做 CREATE/DROP DATABASE，不读时间戳。
+@event.listens_for(engine, "connect")
+def _pin_session_timezone(dbapi_conn, _record):
+    with dbapi_conn.cursor() as cur:
+        cur.execute("SET TIME ZONE 'UTC'")
+
+
 from app.core.schema_version import upgrade_to_head  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402
 from app.models import Book, Period, Subject, SysUser, UserBook  # noqa: E402
