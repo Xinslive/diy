@@ -40,6 +40,7 @@ make_artifacts(){
   echo "NEW backend code" > "$be/app/main.py"
   echo "# new" > "$be/app/__init__.py"
   echo "print('backup')" > "$be/scripts/db_backup.py"
+  echo "print('plugin status')" > "$be/scripts/plugin_status.py"
   echo "print('pass')" > "$be/migrations/env.py"
   echo "[alembic]" > "$be/alembic.ini"
   echo "SQLAlchemy==2.1.4" > "$be/requirements.lock"
@@ -78,7 +79,7 @@ setup_sandbox(){
   printf '#!/bin/sh\necho "alembic $*" >> "$DEPDIR/calls"\nexit ${STUB_ALEMBIC_RC:-0}\n' \
     > "$APP/backend/.venv/bin/alembic"
   # db_backup.py 走 venv 里的 python，要真的吐点东西当备份
-  printf '#!/bin/sh\nif [ "$1" = "scripts/db_backup.py" ]; then echo "SELECT 1;"; exit ${STUB_BACKUP_RC:-0}; fi\necho "python $*" >> "$DEPDIR/calls"\nexit 0\n' \
+  printf '#!/bin/sh\nif [ "$1" = "scripts/db_backup.py" ]; then echo "SELECT 1;"; exit ${STUB_BACKUP_RC:-0}; fi\necho "python $*" >> "$DEPDIR/calls"\nif [ "$1" = "scripts/plugin_status.py" ]; then exit ${STUB_PLUGIN_STATUS_RC:-0}; fi\nexit 0\n' \
     > "$APP/backend/.venv/bin/python"
   chmod +x "$DEPDIR/bin"/* "$APP/backend/.venv/bin"/*
   # unit 与备份的落地位置由 deploy.sh 通过 SYSTEMD_UNIT_DIR / BACKUP_DIR 传入。
@@ -382,6 +383,45 @@ else
       no "库备份 dump 是 ${DM} —— 全量账务数据对本机其他账号可读"
     fi
   fi
+fi
+
+echo
+echo "== 12. 插件屏障检查与持久运行目录 =="
+setup_sandbox
+mkdir -p "$APP/backend/data/plugins/com.test.retained/digest"
+echo "retained plugin code" > "$APP/backend/data/plugins/com.test.retained/digest/marker"
+OUT=$(run_script); RC=$?
+assert_ran "带插件运行目录的发布" || exit 1
+if [[ "$RC" == "0" ]] && calls | grep -q "python scripts/plugin_status.py --wait 30"; then
+  ok "主服务启动后核验插件屏障才报告成功"
+else
+  no "没有执行插件屏障或成功发布返回非零"
+fi
+if [[ "$(cat "$APP/backend/data/plugins/com.test.retained/digest/marker" 2>/dev/null)" == "retained plugin code" ]]; then
+  ok "发布产物没有覆盖持久插件运行目录"
+else
+  no "发布产物覆盖或删除了插件运行目录"
+fi
+
+setup_sandbox
+export STUB_PLUGIN_STATUS_RC=1
+OUT=$(run_script); RC=$?
+unset STUB_PLUGIN_STATUS_RC
+assert_ran "插件屏障失败的发布" || exit 1
+if calls | grep -q "python scripts/plugin_status.py --wait 30" && [[ "$RC" != "0" ]]; then
+  ok "插件屏障失败时发布返回非零"
+else
+  no "插件屏障失败却仍然报告发布成功"
+fi
+if grep -q "插件 worker barrier 未通过" <<<"$OUT" && grep -q "新版本已启动" <<<"$OUT"; then
+  ok "屏障失败明确说明运行现场及处置方式"
+else
+  no "屏障失败没有准确报告已启动的现场"
+fi
+if calls | grep -q "systemctl enable --now cwq-backup.timer"; then
+  no "屏障失败仍执行成功后的发布步骤"
+else
+  ok "屏障失败停止后续发布步骤"
 fi
 
 echo

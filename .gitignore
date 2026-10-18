@@ -40,3 +40,6 @@ dl.mjs
 
 # 运行时数据。发票原件与解析结果（data/invoices）含购销方税号等敏感信息，只留本机。
 data/
+
+# 隔离浏览器演练的截图和跟踪产物
+output/playwright/

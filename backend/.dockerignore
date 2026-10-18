@@ -63,3 +63,6 @@ tests/
 # 注意：requirements*.txt 与 requirements*.lock **不能**排除 ——
 # Dockerfile 第 53 行就是 COPY 它们。alembic.ini 与 migrations/ 同理
 # （启动闸门要读，见 schema_version.py）。
+# 安装包、备份和发票只能在运行时持久卷，不能进入构建上下文。
+data/
+logs/

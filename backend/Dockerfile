@@ -13,7 +13,7 @@
 #     和 compose 里的 cwq-db 不是同一个东西，也不对外暴露。
 #   * 真实生产路径是 deploy/：systemd 单元 + nginx + /opt/cwq。
 # 所以 compose 已删除（P1-24）。这个镜像保留下来，作为「拿 Docker 试一下」的
-# 通道，但它不承担生产职责，也**没有**任何 CI 或脚本在用它。
+# 通道，由 CI 构建并检查迁移文件；生产职责仍由 deploy/ 承担。
 #
 # 生产部署请用 deploy/deploy.sh（备份 → 装依赖 → 跑测试 → 构建前端 → 迁移 →
 # 切产物 → 重启 → 健康检查）。
@@ -71,7 +71,10 @@ COPY migrations ./migrations
 # 漂移。nologin + 无 home：这个进程不登录、不需要家目录。
 RUN groupadd --gid 10001 cwq \
  && useradd --uid 10001 --gid cwq --no-create-home \
-            --home-dir /nonexistent --shell /usr/sbin/nologin cwq
+            --home-dir /nonexistent --shell /usr/sbin/nologin cwq \
+ && mkdir -p /app/data/plugins /app/logs \
+ && chown -R cwq:cwq /app/data /app/logs
+VOLUME ["/app/data"]
 USER cwq
 
 EXPOSE 8000
@@ -91,9 +94,4 @@ EXPOSE 8000
 # ``--threads`` 已删除：gunicorn 的 thread 开关只对**同步** worker 生效，而这里
 # 是 ``-k uvicorn.workers.UvicornWorker``（异步 worker），每个进程已经是事件循环，
 # 起线程没有作用。它此前在这里静默无效，容易让人以为「4 线程」真的存在。
-CMD ["sh", "-c", "alembic upgrade head && exec gunicorn app.main:app \
-     -k uvicorn.workers.UvicornWorker \
-     --workers ${CWQ_API_WORKERS:-2} \
-     --timeout 120 \
-     --bind 0.0.0.0:8000 \
-     --access-logfile -"]
+CMD ["sh", "-c", "alembic upgrade head && exec python scripts/start_server.py --server gunicorn --host 0.0.0.0 --port 8000"]

@@ -50,9 +50,8 @@ ExecStartPre=/bin/sh -c 'case "$CWQ_API_WORKERS" in ""|*[!0-9]*|0) echo "CWQ_API
 #   4 = 数据库连不上     → 查 postgresql.service / 网络 / 连接串
 # 它**不执行任何 DDL**：建表改表只由 Alembic 负责，启动路径只做版本检查。
 ExecStartPre=/opt/cwq/backend/.venv/bin/python scripts/preflight.py
-ExecStart=/opt/cwq/backend/.venv/bin/uvicorn app.main:app \
-    --host 127.0.0.1 --port 8000 \
-    --workers ${CWQ_API_WORKERS} --timeout-keep-alive 120
+ExecStart=/opt/cwq/backend/.venv/bin/python scripts/start_server.py \
+    --server uvicorn --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=3
 
@@ -92,7 +91,7 @@ LimitNOFILE=8192
 # 见 deploy/tuning.md。
 # MemoryMax=768M
 
-# 财务系统只读自己的代码目录，能写的地方只有日志与发票原件目录
+# 财务系统只读代码目录；运行时目录包含发票和可信插件包、journal 备份。
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
