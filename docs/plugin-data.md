@@ -19,18 +19,17 @@
 | `audit:write` | `audit_write(action)` | 记一条审计事件（1–32 字符） |
 | `settings:rw` | `settings.get/put` | 插件私有配置，写入要管理员 |
 
-没有的东西同样重要：**没有 engine，没有 Session，没有拼 SQL 字符串的接口，没有直写核心表的接口**。想写凭证只能走 `voucher_create`，它会经过宿主全部会计校验；想存数据只能写自己 manifest 里声明的那几张表。
+没有的东西同样重要：**没有 engine，没有 Session，没有拼 SQL 字符串的接口，没有直写核心表的接口**。想写凭证只能走 `voucher_create` 或 `voucher_batch_create`，它们会经过宿主全部会计校验；想存数据只能写自己 manifest 里声明的那几张表。
 
 每次调用都重新读数据库里已提交的当前用户与授权，不缓存。管理员撤销授权，下一次请求就失效。
 
 ## 第一段：把科目编码换成 subject_id
 
-`voucher_create` 的分录要的是 `subject_id` —— 科目表的主键，比如 `47`。而你的文件里写的是 `1001`。
+`voucher_create` 的分录要的是 `subject_id` —— 科目表的主键，比如 `47`。而你的文件里写的是 `1001`。要换就得先读一张科目表：
 
 ```python
-def register(registrar, ctx):
-    def chart(book_id: int):
-        return ctx.subject_read(book_id)
+def chart(book_id: int):
+    return ctx.subject_read(book_id)
 ```
 
 返回当前账套的**全部**科目：
@@ -42,9 +41,9 @@ def register(registrar, ctx):
 
 注意它**不过滤**。宿主自己的 `/subjects/flat` 默认只给末级且启用的，这里刻意不给。原因是插件要能把三种坏情况分开报错：
 
-- `by_code["1001"]` 不存在 → 「科目 9999 不在这个账套的科目表里」
-- 存在但 `is_leaf` 为假 → 「科目 1001 是上级科目，不能记账」
-- 存在但 `active` 为假 → 「科目 1001 已停用，不能记账」
+- 编码查不到 → 「科目 9999 不在这个账套的科目表里」
+- 查到了但 `is_leaf` 为假 → 「科目 1001 不能记账」（它是上级科目）
+- 查到了但 `active` 为假 → 「科目 1001 不能记账」（已停用）
 
 只给可用集合的话，这三种都塌成一句「找不到」，用户拿到之后得自己去翻科目表。筛选是你自己的判断，宿主不替你做。
 
@@ -52,17 +51,22 @@ def register(registrar, ctx):
 
 **别用 `voucher_create` 循环。**
 
-这不是风格问题。`voucher_create` 每调用一次就自己提交一次，所以循环 500 行、第 300 行失败时，**前 299 张已经在账上了**。
+这不是风格问题。`voucher_create` 每调用一次就自己提交一次，所以循环 500 行、第 300 行失败时，**前 299 张已经在账上了**，剩下 201 行根本没轮到。
 
-这个仓库里实测过这个形状：循环三张（好、坏、好），接口返回 400、提示也是对的，但数据库里的凭证数从 0 变成 **1** —— 半批留在账上，第三张还没轮到。剩下 299 行要靠人一张张去账上删，删漏一张账就不平了。
+这个仓库里实测过这个形状：循环三张（好、坏、好），接口返回 400、提示也是对的，但数据库里的凭证数从 0 变成 **1** —— 半批留在账上，第三张还没轮到。放大到 500 行就是 299 张躺在账上、要靠人一张张去删，删漏一张账就不平了。
 
 正确做法是 `voucher_batch_create`：整批一个事务，要么全成，要么一张都不留。错误信息会告诉你是第几张。
+
+下面这份是完整可用的（和上面那段合起来了，`chart` 就在里面）：
 
 ```python
 from fastapi import HTTPException
 
 
 def register(registrar, ctx):
+    def chart(book_id: int):
+        return ctx.subject_read(book_id)
+
     def batch(book_id: int, payload: dict):
         rows = payload.get("rows") or []
         by_code = {s["code"]: s for s in ctx.subject_read(book_id)}
@@ -135,7 +139,7 @@ def downgrade():
     op.drop_table("plugin_<你的12位前缀>_import")
 ```
 
-`digest` 是文件内容的 SHA-256，`status` 取 `PENDING` / `DONE` / `FAILED`。`book_id + digest` 有唯一约束。
+`digest` 是文件内容的 SHA-256，`status` 取 `PENDING` / `DONE` / `FAILED`。`book_id + digest` 有唯一约束。下面代码里的 `IMPORT_TABLE` 就是这个表名。
 
 那个 `status` 不是装饰。去重最容易写成「先查有没有，再插一条」—— 查和插之间有缝，并发两个请求都能查到「没有」，然后都插进去。真正兜住的是 `uq_import_digest` 这个唯一约束：第二个插入会被数据库挡下来。代价是它以数据库异常的形式冒出来，插件那边看到的是 500 而不是一句人话 —— 所以别指望这条路径能给出友好提示，正常的重复导入在上面的 `DONE` 分支早就被拦住了，能走到并发插入的只可能是同一文件被同时传两次。
 
@@ -174,7 +178,7 @@ def batch(book_id: int, payload: dict, raw: bytes = None):
     return made
 ```
 
-`build_rows` 就是上一节那个把文件里的科目编码换成的函数，这里不重复贴。
+`build_rows` 是把上面那个 `batch` 里的「读科目表 → 换 subject_id → 组 payload」抽出来的一个函数，签名随意，重点是它返回的就是 `voucher_batch_create` 要的那串字典。
 
 三件事要知道：
 
