@@ -17,7 +17,7 @@ import logging
 import re
 from functools import lru_cache
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 log = logging.getLogger("app.core.config")
@@ -245,6 +245,20 @@ class Settings(BaseSettings):
     # 但人上传完忘了点确认的批次会一直在）。见 importer.purge_stale_batches。
     import_batch_ttl_days: int = 7
 
+    # 插件是管理员信任的进程内代码；默认关闭。密钥为 key_id -> raw Ed25519 公钥的 base64 JSON。
+    plugin_enabled: bool = False
+    plugin_root: str = "data/plugins"
+    plugin_trusted_keys: str = "{}"
+    plugin_revoked_keys: str = ""
+    plugin_historical_keys: str = ""
+    plugin_max_bytes: int = 20 * 1024 * 1024
+    plugin_max_unzipped_bytes: int = 100 * 1024 * 1024
+    plugin_max_file_bytes: int = 10 * 1024 * 1024
+    plugin_max_files: int = 512
+    plugin_disk_quota_bytes: int = 1024 * 1024 * 1024
+    plugin_lease_seconds: int = 30
+    plugin_heartbeat_seconds: int = 5
+
     # 发票原件与解析结果的本地留存目录。数据库只保存相对文件名，便于迁移部署。
     invoice_storage_dir: str = "data/invoices"
     # 发票上传上限（审计 P2-12）。
@@ -350,6 +364,20 @@ class Settings(BaseSettings):
     # 默认 INFO：启动校验、生产配置校验、登录审计这些运维必须看得见的事
     # 在 INFO 及以上；SQL 回显、SQLAlchemy echo 那些调试内容一律不默认开。
     log_level: str = "INFO"
+
+    @model_validator(mode="after")
+    def _check_plugin_limits(self):
+        limits = (self.plugin_max_bytes, self.plugin_max_unzipped_bytes,
+                  self.plugin_max_file_bytes, self.plugin_max_files, self.plugin_disk_quota_bytes)
+        if any(value <= 0 for value in limits):
+            raise ValueError("PLUGIN 配额和文件数量必须大于 0")
+        if self.plugin_max_file_bytes > self.plugin_max_unzipped_bytes:
+            raise ValueError("PLUGIN_MAX_FILE_BYTES 不能超过解压总上限")
+        if not 1 <= self.plugin_heartbeat_seconds * 3 <= self.plugin_lease_seconds <= 3600:
+            raise ValueError("插件 lease 必须至少为 heartbeat 的三倍，且不超过 3600 秒")
+        if not self.plugin_root.strip():
+            raise ValueError("PLUGIN_ROOT 不能为空")
+        return self
 
     @field_validator("log_level")
     @classmethod

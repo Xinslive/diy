@@ -914,6 +914,7 @@ def test_head_是本文件认识的那一版():
         "0023_print_template_private_copy",    # 打印模板的按用户私有副本（写时复制，粒度到人）
         "0024_paper_a4_only",                  # 纸型只留 A4；A5 模板的「一页一张」意图落成 voucher.slots_per_page
         "0025_backup_run",                     # 数据安全：OSS 备份运行记录（分级判重与「退路在不在」都问它）
+        "0026_plugin_registry",                # 插件宿主管理、授权与 worker barrier
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")

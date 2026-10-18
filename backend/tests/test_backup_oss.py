@@ -40,15 +40,17 @@ NOW = datetime(2026, 10, 17, 3, 17, tzinfo=timezone.utc)   # 东八区 11:17，�
 # ------------------------------------------------------------ 表归属
 
 
-def test_excluded_tables_has_no_second_member():
-    """排除表**只允许**有 sys_backup_run 一个。
+def test_excluded_tables_are_only_operational_state():
+    """排除备份自引用和不可移植的插件运行状态；授权仍然进入 SYSTEM 备份。
 
-    它自己带 book_id，于是「所有带 book_id 的表」这条规则会把它捞进来 ——
-    于是这一期的备份里装着上一期的备份记录，体积每一期都比上一期大，
-    而且没有任何东西会报错。要加第二个排除项之前，先想清楚它为什么不能
-    被备份。
+    registry 的 digest、head、表元数据写入 v2 header 并与已安装代码核对，
+    禁止把旧 worker lease、路径、未完成安装事务灌进另一台宿主。
     """
-    assert export_mod.EXCLUDED_TABLES == frozenset({"sys_backup_run"})
+    assert export_mod.EXCLUDED_TABLES == frozenset({
+        "sys_backup_run", "plugin_registry", "plugin_install_attempt",
+        "plugin_worker_runtime", "plugin_cohort",
+    })
+    assert "plugin_user_access" not in export_mod.EXCLUDED_TABLES
 
 
 def test_backup_run_never_appears_in_any_backup():
@@ -981,7 +983,7 @@ def test_run_backup抛异常时也关连接池(db, monkeypatch, oss):
 
 @pytest.fixture
 def become_future(monkeypatch):
-    """把程序**模拟**成将来那版（VERSION=2 + 一个 v2 reader）。
+    """把程序**模拟**成下一个格式版本（不覆盖已有 reader）。
 
     **为什么是「一个可调用的开关」而不是一个直接改好的夹具。** 第一版这么写的
     时候，夹具在用例体之前就把 VERSION 改成了 2 —— 于是用例里的
@@ -996,10 +998,11 @@ def become_future(monkeypatch):
     before_version = export_mod.VERSION
 
     def go():
-        @export_mod.register_reader(2, "测试用的假想 v2")
+        @export_mod.register_reader(before_version + 1, "测试用的下一个格式版本")
         def _fake_v2(data, path):                   # pragma: no cover - 只为占位
             return data
-        monkeypatch.setattr(export_mod, "VERSION", 2)
+        monkeypatch.setattr(export_mod, "VERSION", before_version + 1)
+        return before_version + 1
 
     yield go
     # 注册表是模块级全局，漏还原会让后面所有用例都以为自己活在一个能读两版的
@@ -1033,7 +1036,7 @@ def test_v1的reader必须永久存在():
     assert export_mod.readable_versions() == sorted(export_mod.FORMAT_READERS)
 
 
-def test_升到VERSION2之后v1归档仍然可以恢复(db, book, make_voucher, tmp_path,
+def test_升到下一个版本之后v1归档仍然可以恢复(db, book, make_voucher, tmp_path,
                                        become_future):
     """核心断言：程序往前走一步，历史归档必须原地不受影响。
 
@@ -1045,8 +1048,8 @@ def test_升到VERSION2之后v1归档仍然可以恢复(db, book, make_voucher, 
     out = tmp_path / "v1.json.gz"
     export_mod.export_book(db, book, out)          # 先用 v1 写出来
     _assert_archive_is_v1(out)
-    become_future()                                # 现在程序才是「将来那版」
-    assert export_mod.VERSION == 2
+    future_version = become_future()               # 写完历史格式后再模拟升级
+    assert export_mod.VERSION == future_version
 
     counts = export_mod.restore(db, out, dry_run=True)
     assert counts, "v1 归档在 VERSION=2 的程序下被拒了 —— 旧归档全部失效"
@@ -1149,6 +1152,8 @@ def _archive_bytes(*, version, tables=None, fmt=export_mod.FORMAT):
         "tables": tables if tables is not None else {
             "sys_subject": {"columns": ["id"], "rows": [[1]]}},
     }
+    if isinstance(version, int) and version >= 2:
+        body["header"]["plugins"] = []
     return gzip.compress(json.dumps(body, ensure_ascii=False).encode("utf-8"))
 
 
@@ -1202,7 +1207,9 @@ class _FakeOss2:
         OssError = type("OssError", (Exception,), {})
         NoSuchKey = type("NoSuchKey", (Exception,), {})
 
-    def __init__(self):
+    def __init__(self, now=NOW):
+        # 与 run_backup(now=NOW) 共用时钟；不能让日期流逝改变对象年龄。
+        self.now = now
         self.objects: dict[str, bytes] = {}
         self.mtimes: dict[str, int] = {}          # 每个对象各自的「写下的时刻」
         self.deleted: list[str] = []
@@ -1211,7 +1218,7 @@ class _FakeOss2:
         """先摆一个 age_days 天前就在 Bucket 里的对象。"""
         self.objects[key] = data
         self.mtimes[key] = int(
-            (datetime.now(timezone.utc) - timedelta(days=age_days)).timestamp())
+            (self.now - timedelta(days=age_days)).timestamp())
 
     def Auth(self, ak, sk):                 # noqa: N802 - 照抄 SDK 的命名
         return object()
@@ -1224,7 +1231,7 @@ class _FakeOss2:
         # 刚写下的就是「现在」。少了这一步，这个替身会把本轮刚上传的对象也
         # 标成陈旧品，于是它们立刻被自己删掉 —— 一个只让测试通过、自己跑不通
         # 的替身，比没有替身更糟。
-        self.mtimes[key] = int(datetime.now(timezone.utc).timestamp())
+        self.mtimes[key] = int(self.now.timestamp())
         return SimpleNamespace(etag="etag")
 
     def delete_object(self, key):

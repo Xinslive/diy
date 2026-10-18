@@ -23,3 +23,6 @@ __all__ = [
     "TIER_DAILY", "TIER_WEEKLY", "TIER_MONTHLY",
     "STATUS_SUCCESS", "STATUS_FAILED", "SCOPE_BOOK", "SCOPE_SYSTEM",
 ]
+
+# Import for schema discovery; runtime packages never join Base.metadata.
+from app.models.plugin import PluginRegistry, PluginInstallAttempt, PluginUserAccess, PluginCohort, PluginWorkerRuntime

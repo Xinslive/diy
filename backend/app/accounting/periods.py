@@ -248,6 +248,8 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
         p.closed_at = func.now()
         p.closed_by = user.username
         p.version = fresh[p.id][1] + 1
+        from app.plugins.hooks import period_closed
+        period_closed(db, user_id=user.id, book_id=p.book_id, period_id=p.id)
 
     log(
         db, action="CLOSE", entity="period", entity_id=target.id, user=user,

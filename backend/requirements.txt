@@ -91,3 +91,8 @@ oss2>=2.19.1
 # 原来是 Dockerfile 里 `pip install gunicorn` 单独装、不受任何清单约束，
 # 镜像里跑的是哪一版完全看构建那天 PyPI 的脸色。收进清单是为了能被 lock 定版。
 gunicorn>=23.0.0
+
+# 插件全包签名、RFC 8785 规范化与 SDK 版本范围校验。
+cryptography>=50.0.2
+rfc8785>=0.1.4
+packaging>=26.3

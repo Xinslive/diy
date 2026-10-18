@@ -115,6 +115,12 @@ def _request_id(request: Request) -> str:
     return uuid.uuid4().hex[:16]
 
 
+from app.plugins.loader import PluginGateway
+from app.plugins.api import router as plugins_router
+app.add_middleware(PluginGateway)
+app.include_router(plugins_router)
+
+
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
     """给每个请求发一个号，并贯穿到响应头与日志（审计 P2-24）。
@@ -200,6 +206,18 @@ def startup() -> None:
     # 建表、改表的职责已经移交 Alembic（backend/migrations/），
     # 版本对不上就拒绝启动，并打印该执行哪条命令。
     assert_schema_ready()
+    from app.plugins.loader import startup as plugin_startup
+    app.state.plugin_runtime = plugin_startup()
+
+
+@app.on_event("shutdown")
+def shutdown_plugins():
+    from app.plugins.hooks import set_runtime
+    set_runtime(None)
+    runtime = getattr(app.state, "plugin_runtime", None)
+    if runtime:
+        runtime.close()
+        app.state.plugin_runtime = None
 
 
 @app.get("/api/health")

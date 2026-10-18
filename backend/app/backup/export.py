@@ -23,6 +23,7 @@ REPEATABLE READ（见 :func:`export_scope`）。
 from __future__ import annotations
 
 import base64
+import re
 import gzip
 import hashlib
 import json
@@ -42,7 +43,7 @@ from app.models.base import Base
 FORMAT = "cwq-book-backup"
 
 #: 程序**当前写出**的格式版本。改它之前先读下面那段。
-VERSION = 1
+VERSION = 2
 
 # ---------------------------------------------------------------------------
 # 版本 → reader 注册表
@@ -118,6 +119,9 @@ def _read_v1(data: dict, path: "Path") -> dict:
     tables = data.get("tables")
     if not isinstance(tables, dict) or not tables:
         raise ExportRefused(f"{path.name} 里一张表都没有，拒绝恢复。")
+    if data["header"].get("version") == 1 and (data["header"].get("plugins") or any(
+            re.fullmatch(r"plugin_[a-f0-9]{12}_.+", name) for name in tables)):
+        raise ExportRefused("v1 归档不得含插件 metadata 或插件业务表")
     for name, payload in tables.items():
         if not isinstance(payload, dict):
             raise ExportRefused(
@@ -128,9 +132,17 @@ def _read_v1(data: dict, path: "Path") -> dict:
     return data
 
 
-# 程序当前能读的全部版本，从新到旧。用于「这份是哪一版 / 我能读哪几版」。
+@register_reader(2, "插件 metadata、scope 与存量库结构校验")
+def _read_v2(data: dict, path: "Path") -> dict:
+    _read_v1(data, path)
+    if not isinstance(data["header"].get("plugins"), list):
+        raise ExportRefused("v2 归档缺少 plugins 段")
+    return data
+
+
+# 程序当前能读的全部版本，按版本升序。用于「这份是哪一版 / 我能读哪几版」。
 def readable_versions() -> list[int]:
-    return sorted(FORMAT_READERS, reverse=True)
+    return sorted(FORMAT_READERS)
 
 
 def _version_refusal(path: "Path", got: object) -> ExportRefused:
@@ -145,7 +157,7 @@ def _version_refusal(path: "Path", got: object) -> ExportRefused:
         # 比程序新：这是最常见的一种（拿新机器的程序去读旧机器的备份），
         # 而且它是**可解**的 —— 找一台跑着对应旧版本的机器。
         hint = (f"这份归档比本程序新。要恢复它，请换一台跑着**能读第 {got} 版**"
-                f"归档的程序来恢复（对应的是旧版本程序，不是新的）。")
+                f"归档的程序来恢复。")
     elif isinstance(got, int):
         hint = (f"这份归档比本程序老，本程序只会写第 {VERSION} 版。"
                 f"它自己读不了 —— 但**不要**去改归档里的 version 数字："
@@ -153,7 +165,7 @@ def _version_refusal(path: "Path", got: object) -> ExportRefused:
     else:
         hint = "连版本号都不是一个整数，这份文件不是本系统导出的备份。"
     return ExportRefused(
-        f"{path.name} 的格式版本是 {got!r}，本程序只能读第 {'、'.join(map(str, known))} 版"
+        f"{path.name} 的格式版本是 {got!r}，本程序只能读{'、'.join(f'第 {v} 版' for v in known)}"
         f"（当前写出第 {VERSION} 版）。\n"
         f"  {hint}\n"
         f"  月度归档是**永久保留**的（结构上没有删除分支），所以旧版本归档会一直"
@@ -161,12 +173,14 @@ def _version_refusal(path: "Path", got: object) -> ExportRefused:
 
 # 不进备份的表。
 #
-# **``sys_backup_run`` 是唯一的一个，而且它非进不可不可。**
+# ``sys_backup_run`` 排除，避免备份运行日志递归膨胀。
+# 插件 registry 在 v2 header 表示；安装 journal、cohort、worker lease 属于本机运行状态，
+# 恢复时保留现场事实，不允许用旧归档覆盖。plugin_user_access 仍按 SYSTEM 表备份。
 # 它自己带 book_id，所以「所有带 book_id 的表」这条规则会把它一并捞进来 ——
 # 于是这一期的备份里装着上一期的备份记录，上上期的还装着…，体积每一期都比上一期
 # 大，而且没有任何东西会报错。这正是「递归的日志表」这类陷阱：它只会慢慢胀，
 # 不会坏，你要在两年之后才发现 OSS 账单不对。
-EXCLUDED_TABLES = frozenset({"sys_backup_run"})
+EXCLUDED_TABLES = frozenset({"sys_backup_run", "plugin_registry", "plugin_install_attempt", "plugin_worker_runtime", "plugin_cohort"})
 
 # 每批取多少行就往 gzip 里写多少。1 千行是个平衡点：再大则一次 flush 的
 # 内存峰值高，再小则 flush 次数多、gzip 窗口利用率低。
@@ -463,6 +477,15 @@ def export_scope(db: Session, *, scope: str, book_id: Optional[int],
             # 「can't change 'autocommit' now」。SET TRANSACTION 只要是事务里的
             # 第一条语句就合法，而这里它确实是。
             conn.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+            from app.plugins.backup import catalog
+            from app.plugins.errors import PluginError
+            try:
+                plugin_metadata, plugin_tables = catalog(conn)
+            except PluginError as exc:
+                raise ExportRefused(f"插件 metadata 核验失败：{exc.code}") from exc
+            plugin_scopes = {t["name"]: t["scope"] for p in plugin_metadata for t in p["tables"]}
+            tables = list(tables) + [TableScope(t, "direct" if plugin_scopes[t.name] == "book" else "global")
+                for t in plugin_tables]
             with open(out_path, "wb") as raw_fh:
                 digest = hashlib.sha256()
                 # 校验和对的是**压缩后**写进文件的那串字节 —— 那才是 OSS 上存着的
@@ -473,10 +496,12 @@ def export_scope(db: Session, *, scope: str, book_id: Optional[int],
                     # 两个不同文件、SHA256 也就不一样 —— 于是这个校验和没法用来
                     # 判断两份备份内容是否相同。固定 0 之后它是内容寻址的。
                     header = {
-                        "format": FORMAT, "version": VERSION, "scope": scope,
+                        "format": FORMAT, "version": VERSION if plugin_metadata else 1, "scope": scope,
                         "book_id": book_id, "book_label": book_label,
                         "exported_at": (now or datetime.now()).isoformat(),
                     }
+                    if plugin_metadata:
+                        header["plugins"] = plugin_metadata
                     gz.write(b'{"header":'
                              + json.dumps(header, ensure_ascii=False).encode("utf-8")
                              + b',"tables":{')
@@ -604,7 +629,8 @@ def read_snapshot(path: Path) -> dict:
     return reader(data, path)
 
 
-def restore(db: Session, path: Path, *, dry_run: bool = False) -> dict[str, int]:
+def restore(db: Session, path: Path, *, dry_run: bool = False,
+            _retained_backup_validation: bool = False) -> dict[str, int]:
     """把一份快照灌回数据库。**全有或全无**。
 
     先验后跑、整批走同一个事务：任何一张表失败就整体回滚。恢复出一半的库比
@@ -615,13 +641,22 @@ def restore(db: Session, path: Path, *, dry_run: bool = False) -> dict[str, int]
     最后重置序列：带显式 id 插进去之后，序列还停在旧位置，于是恢复完成后
     **第一张新凭证就会撞主键** —— 一个只在恢复之后才发作的故障。
     """
+    if _retained_backup_validation and not dry_run:
+        raise ValueError("保留表备份的结构核验不能用于写入恢复")
     data = read_snapshot(path)
     tables = data["tables"]
     counts: dict[str, int] = {}
 
+    plugin_tables = []
+    if data["header"]["version"] == 2:
+        from app.plugins.backup import validate_restore
+        plugin_tables = validate_restore(db.connection(), data, data["header"].get("scope"),
+                                         require_installed=not _retained_backup_validation)
+
     # 预检：列对不上就先说清楚，别插到一半才发现。
     known = {t.name: t for t in Base.metadata.tables.values()
              if t.name not in EXCLUDED_TABLES}
+    known.update({t.name: t for t in plugin_tables})
     for name, payload in tables.items():
         table = known.get(name)
         if table is None:
@@ -645,7 +680,7 @@ def restore(db: Session, path: Path, *, dry_run: bool = False) -> dict[str, int]
             counts[name] = len(payload.get("rows", []))
         return counts
 
-    for table in Base.metadata.sorted_tables:
+    for table in list(Base.metadata.sorted_tables) + plugin_tables:
         payload = tables.get(table.name)
         if payload is None:
             continue

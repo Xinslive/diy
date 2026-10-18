@@ -71,3 +71,6 @@ uvloop==0.23.0
 watchfiles==1.3.0
 websockets==17.2
 xlrd==2.0.2
+
+rfc8785==0.1.4
+packaging==26.3
