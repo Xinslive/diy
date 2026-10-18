@@ -2699,6 +2699,26 @@ terser 不会删掉常量假分支。它不会被渲染，但「搜产物搜不�
 已签发的令牌作废）、停用 `zhangsan`，且口令明文只落盘到 root-only 文件，
 不回显到日志或对话。
 
+**这个脚本没有 argparse，`--help` 不是「看看有哪些参数」，而是直接把种子跑起来。**
+2026-10-18 在新生产机上正是这样意外建出了两个 `123456` 账号——而站点此时已经
+公网可达，等于把管理员口令挂在公网上。查参数请直接读源码，不要先 `--help`。
+
+处置顺序按 §11.7.4 走，实测有效：用应用自己的 `hash_password` 生成
+`pbkdf2_sha256` 摘要后更新（不要自己拼哈希），并让 `token_version += 1` 作废旧令牌；
+`zhangsan` 用 `active = false` 停用而**不删**——删是不可逆操作，而停用可回退，
+两者关掉的漏洞完全相同。
+
+判据（两个演示口令都必须是 401）：
+
+```bash
+curl -s -X POST https://acct.xins.live/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"zhangsan","password":"123456"}' -o /dev/null -w '%{http_code}\n'  # 401
+curl -s -X POST https://acct.xins.live/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"123456"}' -o /dev/null -w '%{http_code}\n'    # 401
+```
+
 ### 11.7.5 以 root 解压 CI 产物会把归档里的 uid 落到不相干的系统账号
 
 `build-artifacts` 在 GitHub Actions 里打包，tar 逐条记下当时的
@@ -2811,6 +2831,41 @@ head -c 60 <dump>                                                      # -- Post
 `scripts/db_backup.py --restore --file <dump>`，没有它退路等于不存在。已实测
 没有任何以 `cwq` 身份访问 `.releases` 的路径（`cwq-api` 与 `cwq-backup` 都只碰
 `/opt/cwq/backups`），所以收到 `root:root 700` 不影响运行。
+
+### 11.7.9 第二台生产机把应用根放在宝塔站点根，`/opt/cwq` 不再是唯一布局
+
+2026-10-18 起 `acct.xins.live` 指向 `8.155.171.57`（`iZf8zah6zow0n8277dekxvZ`），
+并按站点根即应用根的方式部署：应用在 `/www/wwwroot/acct.xins.live`，不是
+`/opt/cwq`。这台机总内存仅 1.6 GB 且还承载 11+ 子域与 3 个 Docker 容器，
+是「能不能在低内存机上跑起来」的实测目标，不是等效迁移。
+
+**参数化只做了一半，这是最容易漏的一处。** `deploy.sh` 早就能用 `APP_DIR` /
+`BACKUP_DIR` 接管路径，但**三样东西仍然把 `/opt/cwq` 写死**：
+
+| 东西 | 写死处 | 处理 |
+|---|---|---|
+| `deploy/systemd/cwq-api.service` | `WorkingDirectory`/`EnvironmentFile`/`ExecStart`/`ReadWritePaths`/日志 | 按主机渲染 |
+| `deploy/systemd/cwq-backup.service` | 同上 | 按主机渲染 |
+| `deploy/nginx/acct.xins.live.conf` | `root` 指向 `frontend/dist` | 按主机渲染 |
+
+判据（渲染后逐条核对，漏一条症状都是「服务起了但不写日志」或「前端 404」）：
+
+```bash
+grep -n '/opt/cwq' /etc/systemd/system/cwq-api.service          # 应无输出
+grep -n 'WorkingDirectory\|ReadWritePaths' /etc/systemd/system/cwq-api.service
+grep -n 'root ' /www/server/panel/vhost/nginx/acct.xins.live.conf
+```
+
+**本次刻意没有改仓库里的模板。** 产物是 CI 按 commit 出的，改了 `deploy/` 模板
+再发版，装上去的代码就与「测试通过的那一版」对不上号了。所以模板保持 `/opt/cwq`
+（老机仍按它发布），新机用 `sed` 按 `APP_DIR` 渲染出主机专用副本。代价是
+「改路径」目前不在版本控制里、只存在于渲染命令里；后续若要把它做进发布脚本，
+应作为独立提交单独走一遍 CI，而不是夹带在某次发版里。
+
+首次上线仍要按 §11.7.1 预置（venv、后端解压、`frontend/dist`）——参数化并没有
+让 `deploy.sh` 变成能装到空机器上的引导脚本。
+
+新机的 `.well-known/` 宝塔建站时没有生成，需手工 `mkdir` 补上，否则证书续签会 404。
 
 沙箱演练新增第 11 组断言这两条权限；后端新增 `test_产出文件权限是600`（断言的是
 **改名之后**的最终文件，因为 `.part` 改名时保留权限位，中间态的权限不作数）。
