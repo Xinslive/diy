@@ -1,0 +1,38 @@
+{
+  "format_version": 1,
+  "id": "com.cwq.periodnote",
+  "name": "期间工作笔记",
+  "version": "1.0.0",
+  "api_version": ">=1.0.0 <2.0.0",
+  "description": "仅在当前授权账套内记录工作笔记。",
+  "permissions": [
+    "book:read",
+    "plugin_data:rw",
+    "audit:write"
+  ],
+  "access": {
+    "assignment": "admin_users",
+    "default": "none"
+  },
+  "contributes": {
+    "backend_entry": "backend/main.py",
+    "frontend_entry": "frontend/index.js",
+    "menu": {
+      "module": "extensions",
+      "title": "期间工作笔记",
+      "icon": "Document",
+      "route": "/plugin/com.cwq.periodnote",
+      "order": 10
+    }
+  },
+  "hooks": [
+    "on_period_close"
+  ],
+  "tables": [
+    {
+      "name": "plugin_4b8db6655ff5_note",
+      "schema": "public",
+      "scope": "book"
+    }
+  ]
+}

@@ -3289,6 +3289,36 @@ AttributeError: 'int' object has no attribute 'tzinfo'
 
 ---
 
+## 11.12 受信任插件宿主（2026-10-18）
+
+完整契约见 [插件规范](docs/plugin-spec.md)，六项 P0 门禁和回归证据见 [验证记录](docs/plugin-verification.md)，生产风险记录见 [风险记录](docs/plugin-risk.md)。`PLUGIN_ENABLED=false` 是默认配置，本次工程实现不代表生产启用批准。
+
+插件是受信任的同进程 Python + 同源预编译 JavaScript，**没有 Python、数据库或浏览器沙箱**。签名、管理员权限、静态扫描和 SDK 约束降低误装风险，不能隔离恶意代码。若必须抵抗恶意第三方代码，应采用进程外架构和独立数据库身份。公开 SDK 不暴露 FastAPI app、engine、Session、任意 SQL；账套、凭证和余额访问继续经过现有权限与 LedgerEngine。
+
+### 包、安装与迁移
+
+`.cwp` 是严格校验的 ZIP。RFC8785 canonical payload 同时覆盖 manifest 和完整 `path/size/sha256` 清单，由 Ed25519 签名；plugin_digest 是这个 payload 的摘要，不是 ZIP 摘要。上传统一经过现有容量闸、路径/链接/重复/文件类型/压缩资源校验、签名及扫描，管理接口没有跳过开关。
+
+安装使用 runtime staging、文件锁、PostgreSQL session advisory lock 和 durable attempt journal。插件迁移及 MIGRATED journal 在同一 DB 事务提交，再 fsync + 同文件系统 rename，最后短事务提交 registry。文件系统和数据库不具有共同原子事务；reconcile 按已提交阶段向前恢复或隔离孤儿，结构不明时保留现场。
+
+主迁移只新增 `0026_plugin_registry`，前 25 条保持原样。插件分别使用 ScriptDirectory 和 `plugin_schema_version_<sha256(id)[:12]>`，只有显式安装/升级执行 DDL；启动只核对 head 和真实 metadata。业务表仅在 public 下使用 `plugin_<sha256(id)[:12]>_` 前缀，账套表必须有 book_id 和实际 FK，global 只允许配置/参考数据。迁移后核对列、PK/FK/check/index/trigger/function 及宿主结构快照，越界或不匹配即事务回滚。
+
+### 期望状态、worker 和用户授权
+
+安装、启用和停用都写入期望状态并返回 pending_restart，不热加载。supervisor 入口 `scripts/start_server.py` 每次启动生成一个随机 generation、启动时间及 expected worker count，所有子进程继承。每个 worker 独立预加载并登记 digest、revision、结果和 lease；逐请求核对整个 cohort，新 cohort 等待旧代次有效租约清空后才开放。任一 worker 失败、缺失、租约失效或版本不同，则所有插件业务请求一致 503，包括尚未注册具体路由的 worker。主 `/api/health` 和 `/api/ready` 继续只反映核心服务。
+
+用户授权单独存于 plugin_user_access，不参与代码就绪判断。新装默认零授权，管理员没有隐式业务使用权。每个 manifest/API/SDK 调用读取当前已提交的用户启用状态和 grant；未授权返回固定 404 `PLUGIN_NOT_FOUND_OR_UNAVAILABLE`，已授权但不可用返回 503 `PLUGIN_UNAVAILABLE`。授权修改立即影响下一请求，无需等待 worker 重启；账套写操作仍需 OWNER/ACCOUNTANT。
+
+升级、卸载必须先停用并重启，确认旧 worker lease 清空。升级先备份、保留 grant、成功后仍禁用；卸载撤权并保留业务表。独立清表需要插件 id 确认和备份，不提供未经验证的自动 downgrade。应急关闭开关并重启全部 worker，保留数据和 journal 供恢复。
+
+### 前端与备份
+
+manifest 与业务 API 用 Bearer 和实时 grant；JS/CSS/assets 是不含敏感数据的公开、不可变、带 digest 的同源资产，供原生 import 加载。没有 token query、CDN、eval 或 CSP 放宽。动态 route/menu/tab 从当前用户 manifest 派生，不修改静态 NAV；退出、换用户、401、撤权、focus/route 刷新会清理注册。组件错误局部降级，核心页面不白屏；已下载模块和已读取数据无法从浏览器撤回。
+
+备份 writer 无插件时保持 v1，有插件 metadata 时用 v2，v1 reader 永久保留。v2 使用 live DB 反射和实际表集合，校验摘要、版本、head、表 metadata、scope、FK 闭包，所有拒绝发生在写入之前；真实 round-trip 验证覆盖插件行。registry/journal/cohort/worker 是安装现场，不作为可移植业务行恢复。普通 restore 必须存在匹配签名代码及未卸载 registry；保留表清理前的内部结构校验仅允许 dry-run，不能借此写入。恢复时需准备匹配代码、公钥、数据库版本及快照，JSON 数据备份不能替代完整环境备份。
+
+运行目录在持久化 data 下，不进 CI 发布包。systemd 与 Docker 都使用 supervisor 入口，发布脚本在主 ready 后再等待插件屏障。CI 保留原有全量后端、前端发现数、构建与部署演练闸门，并加入隔离数据库下的生产构建/CSP、两 worker 重启和真实浏览器授权闭环。
+
 ## 12. 测试策略
 
 | 文件 | 覆盖 |

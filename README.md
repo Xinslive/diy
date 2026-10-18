@@ -153,7 +153,45 @@ cd backend
 | 期末结账 | `/periods` | 结转损益 / 结账 / **批量反结账** / 年度结转 |
 | 科目表 | `/subjects` | 树形维护，**每账套独立** |
 | 系统 | `/users` `/audit` | 用户授权（OWNER / ACCOUNTANT / VIEWER）、审计日志。仅管理员可见 |
+| 扩展 | `/plugins` / `/plugin/{id}` | 管理员安装签名插件、重启生效、指定使用用户；能力与用户授权分别检查。默认关闭 |
 | 数据安全 | `/data-security` | 阿里云 OSS 备份：配置 / 连通性测试 / 立即备份 / 运行历史。**仅管理员可见** |
+
+---
+
+## 受信任插件（默认关闭）
+
+系统支持签名 `.cwp` 全栈扩展，包括后端 API、预编译前端和独立迁移。插件与宿主同进程、同操作系统权限，**没有沙箱**；只安装经人工审阅、受信任发布者签名的代码。扫描用于拦截明显危险行为，不保证任意代码安全。规范、限制和验收记录分别见 [插件规范](docs/plugin-spec.md)、[风险记录](docs/plugin-risk.md)、[验证记录](docs/plugin-verification.md)。
+
+首次启用前先执行主迁移 `alembic upgrade head`（新增 `0026_plugin_registry`），在服务环境中配置 `PLUGIN_ENABLED=true`、`PLUGIN_TRUSTED_KEYS`（`key_id → base64 Ed25519 公钥` 的 JSON），并设置持久化的 `PLUGIN_ROOT`。systemd 默认工作目录下为 `backend/data/plugins`，Docker 为 `/app/data/plugins`；部署产物不包含、也不覆盖这个运行目录。Docker 应持久化挂载 `/app/data`。配置项及配额见根目录 `.env.example`。
+
+从仓库根目录可生成仅供本地演示的签名包；生产私钥应保存在独立签名环境，不能复制进服务器或插件目录：
+
+```bash
+mkdir -p /tmp/cwq-plugin-demo
+backend/.venv/bin/python backend/scripts/plugin_package.py keygen \
+  --key-id demo-local --private /tmp/cwq-plugin-demo/signing.pem \
+  > /tmp/cwq-plugin-demo/public-keys.json
+backend/.venv/bin/python backend/scripts/plugin_package.py build docs/plugin-example \
+  --private /tmp/cwq-plugin-demo/signing.pem --key-id demo-local \
+  --output /tmp/cwq-plugin-demo/periodnote.cwp
+backend/.venv/bin/python backend/scripts/plugin_package.py verify \
+  /tmp/cwq-plugin-demo/periodnote.cwp \
+  --public-keys /tmp/cwq-plugin-demo/public-keys.json
+```
+
+启用插件时必须使用 supervisor 入口，使同一批 worker 继承同一个随机 generation。不要为每个 worker 各自设置 generation。systemd 和 Docker 已接入，手动演练可在 `backend/` 下运行：
+
+```bash
+CWQ_API_WORKERS=2 .venv/bin/python scripts/start_server.py --port 8000
+# 在另一个终端检查整个 worker 屏障；失败返回非零
+.venv/bin/python scripts/plugin_status.py --wait 30
+```
+
+管理员在「系统管理 → 扩展管理」上传包，安装结果是“等待重启”。**安装后默认无人获得使用授权，安装者和管理员也不例外**；通过“管理用户”搜索并选择使用者。重启整个服务并通过屏障后，已授权用户才会看到扩展。授权和撤销无需重启，后端按每次请求的当前数据库记录检查；账套读写仍检查原有账套角色。
+
+停用也需要重启。升级、卸载和清理表之前，先停用并重启全部 worker，确认没有旧 lease。升级前生成校验过的本地数据快照，成功后保持停用并保留授权；卸载撤销授权、保留业务表。表清理是单独确认操作。代码/数据库/文件系统没有跨资源原子事务，未完成操作由 journal + reconcile 检测和恢复。恢复必须保留匹配版本的签名包、公钥、registry/迁移现场及数据备份，不能把新版本快照强灌到旧版本。
+
+前端代码资产为不含业务数据、带 digest 的同源只读资源，原生 `import()` 不带 Bearer；manifest 和业务 API 则实时鉴权。不通过 query string 传 token，也不放宽现有 CSP。插件模块加载失败会展示降级页，核心记账页面仍可使用。
 
 ---
 
@@ -207,8 +245,9 @@ book_id 筛表的话，用户设计的那套报表版式**不在任何一个备�
 现在账套级 = book + direct + indirect 共 19 张表，系统级 = 其余全部
 （direct 取 `book_id IS NULL`，global 取全表）。
 
-`sys_backup_run` 在排除表里（`EXCLUDED_TABLES`）。它自己带 book_id，会被上面那条
-规则捞进来，然后递归膨胀 —— 每期比上期大且不报错。
+`sys_backup_run` 在排除表里（`EXCLUDED_TABLES`），避免运行记录递归膨胀。插件 registry、安装 journal、cohort 和 worker lease 也不作为可移植业务行恢复；用户插件授权仍属于 SYSTEM 快照。
+
+没有插件元数据时继续写 v1；包含插件元数据/表时写 v2，增加 digest、独立迁移 head 和实时表结构。v1 reader 保留。插件数据只在目标库已安装完全匹配的代码、迁移和表结构时允许恢复，未知插件、卸载状态及任何漂移均在写入前拒绝。详见[插件备份约束](docs/plugin-spec.md#备份与恢复)。
 
 ### 分级：够格的最高一档
 
@@ -311,15 +350,16 @@ cd backend
 ```bash
 cd backend
 
-.venv/bin/python -m pytest                      # 1649 个单元/接口测试（83 个测试文件，实测 `--collect-only`）
+.venv/bin/python -m pytest                      # 全量单元/接口测试；当前数量以收集与验证记录为准
 .venv/bin/python scripts/demo_e2e.py            # 69 项端到端流程
 .venv/bin/python scripts/demo_modules.py        # 53 项模块冒烟
 node onboard.mjs                                # 19 步浏览器开户全流程（需前后端都起着）
 node report_design.mjs                          # 7 步浏览器报表设计器（需前后端都起着）
 
-cd ../frontend && npm run test                  # 22 个前端测试文件（node --test）
+cd ../frontend && npm run test                  # 全量前端测试（node --test）
 ```
 
+- 插件专项及完整回归命令见 [验证记录](docs/plugin-verification.md)。真实浏览器演练使用专用 `*_plugin_browser_test` 库和临时签名密钥，不能传业务库连接串。
 - pytest 用**独立测试库** `cwq_test`，每个用例一个全新账套，绝不碰开发库
 - 两个 demo 脚本每次运行自建 uuid 账套，可以反复跑
 - `onboard.mjs` 跑真实浏览器：新建账套 → 初始化两步向导 → 录期初（含反方向余额）
@@ -343,9 +383,10 @@ backend/
       queries.py    #   总账 / 明细账 / 余额表 / 试算平衡
     reports/        # 报表公式引擎（自由配公式）
     printing/       # 打印模板引擎（HTML+CSS @page）
-    backup/         # 账套快照 → OSS：分级 / 保留清理 / 导出与恢复
+    backup/         # 账套快照 → OSS：分级 / 保留清理 / v1、v2 导出与恢复
+    plugins/        # 签名、安装 journal、worker 屏障、SDK、授权、独立迁移
     api/            # HTTP 层，只做参数转换和错误翻译
-    models/         # 23 张表
+    models/         # 宿主 ORM 和插件注册/授权/运行记录
     core/           # 配置、连接、鉴权、初始化 SQL
     seed/           # 标准科目表、内置报表模板
   scripts/          # seed_demo.py 演示数据 + demo_e2e/demo_modules 端到端脚本
