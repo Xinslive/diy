@@ -15,13 +15,13 @@
 #      以后谁想用 -k 悄悄把范围收窄，这一步会先红。
 # 想改这三处，请连带在 PR 描述里说清楚理由。
 #
-# 五条 job：
+# 六条 job：
 #   backend          —— 全量 pytest（PostgreSQL 服务 + 真实 pg_dump/psql）
 #   frontend         —— node --test 与 vite build
 #   docker           —— 镜像必须真的构建得出来，且 alembic.ini / migrations/ 在镜像里
 #   deploy           —— 发布脚本沙箱演练（deploy/tests/test_deploy.sh）
-#   build-artifacts  —— 出部署产物；needs backend+frontend，所以「产物存在」即代表
-#                       后端全量测试与前端测试构建都过了（deploy.sh 的测试闸门靠它）
+#   plugin-browser   —— 生产构建/CSP、签名安装、两 worker 重启、用户授权闭环
+#   build-artifacts  —— 出部署产物；依赖 backend、frontend、plugin-browser 全部成功
 
 name: CI
 
@@ -278,6 +278,56 @@ jobs:
         working-directory: frontend
         run: npm run build
 
+  # 独立数据库、临时签名密钥、生产构建/CSP，实际重启两 worker。
+  plugin-browser:
+    name: 签名插件安装与授权浏览器演练
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cwq
+          POSTGRES_PASSWORD: cwq123
+          POSTGRES_DB: cwq_plugin_browser_test
+        ports:
+          - '5432:5432'
+        options: >-
+          --health-cmd "pg_isready -U cwq"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CWQ_PLUGIN_E2E_DATABASE_URL: postgresql+psycopg://cwq:cwq123@127.0.0.1:5432/cwq_plugin_browser_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+      - name: 安装锁定依赖与 Chromium
+        run: |
+          python -m pip install -r backend/requirements-dev.lock
+          npm ci
+          pnpm --dir frontend install --frozen-lockfile
+          npx playwright install --with-deps chromium
+      - name: 构建并执行真实浏览器演练
+        run: |
+          pnpm --dir frontend build
+          python backend/scripts/plugin_e2e.py
+      - name: 保留浏览器截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-browser-screenshots
+          path: output/playwright/
+          if-no-files-found: warn
+
   # ------------------------------------------------------------------ 镜像
   docker:
     name: 镜像能构建且迁移文件在镜像里
@@ -301,7 +351,9 @@ jobs:
           # 闸门本身也要能算出 head
           docker run --rm --entrypoint alembic cwq-api:ci heads \
             || { echo "❌ 镜像里 alembic 算不出 head"; exit 1; }
-          echo "✅ 迁移文件在镜像里"
+          docker run --rm --entrypoint python cwq-api:ci -c "import os; from pathlib import Path; from app.core.config import settings; assert os.geteuid() != 0; assert os.access('/app/data/plugins', os.W_OK); assert Path('/app/scripts/start_server.py').is_file(); assert not settings.plugin_enabled"
+          docker image inspect cwq-api:ci --format '{{json .Config}}' | python -c "import json, sys; c=json.load(sys.stdin); assert '/app/data' in c['Volumes']; assert 'scripts/start_server.py' in ' '.join(c['Cmd'])"
+          echo "✅ 迁移、非 root 运行目录、持久化卷与 supervisor 入口均有效"
 
   # ------------------------------------------------------------------ 发布脚本
   deploy:
@@ -329,8 +381,8 @@ jobs:
   #
   # **「测试闸门」没有被削弱，只是换了位置。** deploy.sh 原来的第一条铁律是
   # 「先跑测试再切流量」。现在这个闸门由 `needs:` 承担：本 job 必须等
-  # backend 与 frontend 两条 job 都成功才会跑，所以**产物存在即代表后端全量
-  # pytest 与前端测试/构建都过了**。生产机「能不能取到产物」就是新的闸门 ——
+  # backend、frontend 与 plugin-browser 都成功才会跑，所以**产物存在即代表后端全量
+  # pytest、前端测试/构建和真实插件浏览器演练都过了**。生产机「能不能取到产物」就是新的闸门 ——
   # 取不到就不会重启服务。
   #
   # 护栏校验（护栏必须真的被执行、用例数下限，见 backend job 里的说明）
@@ -339,7 +391,7 @@ jobs:
   build-artifacts:
     name: 构建可部署产物
     runs-on: ubuntu-latest
-    needs: [backend, frontend]
+    needs: [backend, frontend, plugin-browser]
 
     # **services 必须挂在 job 上，不能挂在 step 上。**
     #
