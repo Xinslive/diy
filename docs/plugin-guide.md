@@ -2,7 +2,7 @@
 
 这篇教程创建一个“期间工作笔记”插件。它包含一个账套级数据表、两个后端接口和一个简单的前端页面，适合先验证完整的开发、打包、安装和授权流程。
 
-教程使用 SDK 1.1.0。命令中的路径按项目目录调整；签名私钥始终放在项目目录之外。
+教程使用 SDK 1.2.0。命令中的路径按项目目录调整；签名私钥始终放在项目目录之外。
 
 ## 第 1 步：准备目录
 
@@ -33,7 +33,7 @@ period-note/
   "id": "com.example.periodnote",
   "name": "期间工作笔记",
   "version": "1.0.0",
-  "api_version": ">=1.1.0 <2.0.0",
+  "api_version": ">=1.2.0 <2.0.0",
   "description": "在当前账套中记录期间工作笔记。",
   "permissions": ["book:read", "plugin_data:rw", "audit:write"],
   "access": { "assignment": "admin_users", "default": "none" },
@@ -95,6 +95,34 @@ def register(registrar, ctx):
 ```
 
 插件接口的实际路径会自动带上 `/api/plugins/{id}` 前缀，因此注册时只写相对路径。`register` 阶段还没有当前用户上下文，不要在模块导入或注册函数里读取账套数据；把鉴权和数据访问放在请求 handler 中。
+
+## 可选：注册定时任务
+
+需要周期处理时，在 manifest 中增加声明。使用这项能力的插件，其 `api_version` 范围必须包含 SDK 1.2.0：
+
+```json
+"tasks": [
+  {"name": "sync_remote", "schedule": {"type": "interval", "minutes": 15}}
+]
+```
+
+在上文的 `register` 函数内部增加处理函数及注册语句；任务名必须与 manifest 一致，每个已声明任务都必须注册：
+
+```python
+def register(registrar, ctx):
+    # 此处保留前面的接口注册代码。
+    def sync_remote(task):
+        # 本例需要 audit:write；ctx 已绑定 task.user_id 对应的授权。
+        ctx.audit_write("remote_sync")
+
+    registrar.task("sync_remote", sync_remote)
+```
+
+也可将 schedule 改为 `{"type": "cron", "expression": "10 2 * * *", "timezone": "Asia/Shanghai"}`，表示每天北京时间 02:10。处理函数必须同步、接收一个任务上下文；不要在插件中另外启动循环或定时线程。
+
+管理员通过 `PUT /api/system/scheduler/tasks/{plugin_id}/sync_remote` 提交 `{"enabled": true}` 启用。开关覆盖整个任务，每次到期时宿主会按当前有效的插件授权分别调用每个 active 用户。新增授权用户在下一周期自动加入；用户撤权、账号停用后被排除。处理函数中的 `ctx.book_list()`、账套读写和凭证能力仍按当前用户的账套角色实时校验。
+
+`task.idempotency_key` 在同一次运行的重领中保持不变，可用于用户级外部写入。多个用户可能有权操作同一本账，记账插件还需要按“账套 + 业务规则 + 期间”等业务键做持久去重，避免给共享账套重复记账。网络请求应设置有限超时；普通失败等待下一周期，进程崩溃后的重领采用至少一次执行语义。全部上下文字段和失败规则见[插件规范](plugin-spec.md#定时任务)。
 
 ## 第 4 步：写迁移
 

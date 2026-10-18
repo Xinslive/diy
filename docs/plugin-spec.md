@@ -1,6 +1,6 @@
 # Manifest、权限与运行时参考
 
-本页是插件开发时需要反复查阅的契约。当前版本为 **SDK 1.1.0 / CWP 1**；示例包中的 `plugin.json`、后端入口、迁移和前端入口可以直接作为最小模板。
+本页是插件开发时需要反复查阅的契约。当前版本为 **SDK 1.2.0 / CWP 1**；示例包中的 `plugin.json`、后端入口、迁移和前端入口可以直接作为最小模板。SDK 1.1.x 插件仍可继续运行，使用定时任务时，`api_version` 范围必须包含 1.2.0。
 
 ## Manifest 结构
 
@@ -18,6 +18,7 @@
 | `access` | 是 | 当前固定为 `{ "assignment": "admin_users", "default": "none" }` |
 | `contributes` | 是 | 后端入口、可选前端入口和菜单 |
 | `hooks` | 否 | 当前支持 `on_period_close` |
+| `tasks` | 否 | 插件声明的定时任务；宿主管理员启用后才会执行 |
 | `tables` | 是 | 插件迁移创建并由宿主登记的数据表 |
 
 一个带页面的插件至少需要下面这些入口字段：
@@ -59,6 +60,49 @@
 
 `import:rw` 只提供导入批次能力；正式提交还必须声明 `voucher:write`。`plugin_data:rw` 只允许访问 manifest 声明的插件表，不能用来读取宿主业务表。
 
+## 定时任务
+
+插件可以声明最多 32 个定时任务。任务默认关闭，必须由系统管理员通过宿主管理接口启用；插件升级后如果插件包摘要或 schedule 发生变化，宿主会自动关闭该任务，管理员确认后再启用。
+
+```json
+{
+  "tasks": [
+    {"name": "sync_remote", "schedule": {"type": "interval", "minutes": 15}}
+  ]
+}
+```
+
+`interval.minutes` 为 1 到 525600；cron 采用五字段和 `Asia/Shanghai` 时区。例如 `{"type": "cron", "expression": "10 2 * * *", "timezone": "Asia/Shanghai"}` 表示北京时间每天 02:10。任务名使用 `[a-z][a-z0-9_]{0,47}`，同插件内唯一。处理函数必须同步、只接收一个上下文参数，每个 manifest 声明都必须在 `register` 中注册：
+
+```python
+def register(registrar, ctx):
+    def sync_remote(task):
+        # 示例需要 audit:write；实际处理可使用 task.idempotency_key 做幂等键。
+        ctx.audit_write("scheduled_sync")
+
+    registrar.task("sync_remote", sync_remote)
+```
+
+管理员的启用决定任务是否参与调度。宿主在每次触发时读取 active 且拥有未撤销插件授权的用户，分别绑定用户身份调用处理函数；新增授权在下一周期自动纳入，撤权和停用会被排除，执行每个用户前再次检查授权。管理员身份也需要显式插件授权。没有有效用户时记录 `SKIPPED`；一个用户失败不阻断其他用户，整次运行记为 `FAILED` 并保存逐用户结果。
+
+账套和业务权限继续通过原有 SDK 检查：`ctx.book_list()` 只返回当前用户获授权的账套，账套写入和凭证提交仍要求相应角色与 capability。插件级 `ctx.settings` 仍是管理员能力，不应作为普通用户任务的可写配置。多个用户可访问同一本账，插件必须额外按“账套 + 业务规则 + 期间”等业务键持久去重；用户幂等键不能替代共享账套的业务去重。
+
+| TaskContext 字段 | 含义 |
+|---|---|
+| `plugin_id` / `task_name` | 插件和声明的任务名 |
+| `run_id` | 本次计划运行的唯一编号；崩溃重领沿用 |
+| `scheduled_for` | 本次原定执行时间，带 UTC 时区的 `datetime` |
+| `user_id` | 本次调用对应的用户 |
+| `attempt` | 租约领取次数，从 1 开始；崩溃重领递增 |
+| `idempotency_key` | `run_id:user_id`；同次运行同用户的重领保持不变 |
+| `scope` | 固定为 `per_user` |
+
+外部每分钟请求一次宿主 tick，任务按分钟精度运行。首次启用 interval 任务时从启用时间计算间隔；cron 可领取当前分钟到期的任务。延迟或停机期间错过的周期合并为一次，不逐周期补跑；同一任务已有有效租约时不会再次领取。每次 tick 最多领取 20 个任务，余下任务等待后续 tick。运行记录保留 90 天。
+
+普通失败记录为 `FAILED`，等待下一个计划周期。进程崩溃后，600 秒租约过期可重领，正常执行中每 60 秒续租；重领复用原 `run_id` 和用户幂等键，已经成功的用户也可能再次调用，处理函数必须按至少一次执行设计。重领时重新检查当前用户授权。已关闭、移除或升级的任务不重放旧版本运行，留下 `SKIPPED` 记录；worker 临时未就绪会延后领取并保留任务开关。关闭任务不会强制中断正在执行的函数。
+
+处理函数运行在受信任插件 worker 的后台线程中，不接收 HTTP Request、数据库 Session 或宿主内部对象。宿主未提供对插件函数的强制超时或线程终止，插件应自行限制网络超时和单次工作量。管理员使用 `GET /api/system/scheduler/tasks` 查看任务，使用 `PUT /api/system/scheduler/tasks/{plugin_id}/{task_name}` 开关，使用 `GET /api/system/scheduler/runs` 查看结果。外部 tick 的 `202` 仅表示本次领取已被接受，最终结果以运行记录为准。
+
 ## 包与签名
 
 `.cwp` 是一个 ZIP 包，根目录必须包含唯一的 `plugin.json`。所有 Python、JavaScript、迁移、样式和图片都会进入签名文件清单。打包工具使用 Ed25519 签名；服务端按文件路径、大小和 SHA-256 重新核验，任何成员被修改都会使验签失败。
@@ -92,6 +136,7 @@ def register(registrar, ctx):
 | `registrar.add(path, handler, methods)` | 注册多个 HTTP 方法 |
 | `registrar.route(router)` | 挂载受限路由 |
 | `registrar.hook(name, handler)` | 注册已声明的 hook |
+| `registrar.task(name, handler)` | 注册 manifest 声明的同步定时任务 |
 
 `ctx` 的能力由 manifest 决定。handler 内部使用普通类型、字典和宿主支持的上传对象；不要依赖宿主的 FastAPI app、Request、Response、Session 或 WebSocket。
 
