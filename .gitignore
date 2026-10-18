@@ -41,5 +41,8 @@ dl.mjs
 # 运行时数据。发票原件与解析结果（data/invoices）含购销方税号等敏感信息，只留本机。
 data/
 
-# 隔离浏览器演练的截图和跟踪产物
-output/playwright/
+# 本地构建与演练产物：隔离浏览器演练的截图/跟踪产物（output/playwright/），
+# 以及 plugin_package.py --output 打出来的 .cwp 安装包（output/plugins/）。
+# 和上面的 .shots/ 一样：它们是「某一次构建或验证当时产出了什么」，不是源码，
+# 入库后既会被误当成发布用的安装包，又会永久占仓库体积。
+output/

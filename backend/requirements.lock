@@ -29,6 +29,8 @@ cffi==2.1.1
 charset-normalizer==3.5.2
 click==8.5.0
 crcmod==1.7
+croniter==6.2.4
+python-dateutil==2.9.0.post0
 cryptography==50.0.2
 et-xmlfile==2.0.0
 fastapi==0.143.0

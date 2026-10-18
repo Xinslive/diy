@@ -13,7 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
-from app.api import auth, books, invoices, ledger, printing, reports, subjects, system, vouchers
+from app.api import auth, books, invoices, ledger, printing, reports, scheduler, subjects, system, vouchers
 from app.core.config import detect_env, settings
 from app.core.db import get_db
 from app.core.schema_version import assert_schema_ready
@@ -134,11 +134,22 @@ async def request_id_middleware(request: Request, call_next):
     """
     rid = _request_id(request)
     request.state.request_id = rid
+    scheduler_tick = request.scope.get("path", "").rstrip("/") == "/api/scheduler/tick"
+    if scheduler_tick:
+        token = request.query_params.get("key", "")
+        request.state.scheduler_token = token if len(token) <= 256 else ""
+        # The trigger credential is accepted in the URL for external cron services,
+        # but must not be retained in ASGI access logs or downstream request metadata.
+        request.scope["query_string"] = b""
+        request.__dict__.pop("_url", None)
+        request.__dict__.pop("_query_params", None)
     response = await call_next(request)
     response.headers["X-Request-ID"] = rid
+    if scheduler_tick:
+        response.headers["Cache-Control"] = "no-store"
     return response
 
-for r in (auth.router, system.router, books.router, subjects.router, vouchers.router, invoices.router,
+for r in (auth.router, system.router, scheduler.router, books.router, subjects.router, vouchers.router, invoices.router,
           ledger.router, reports.router, printing.router):
     app.include_router(r)
 

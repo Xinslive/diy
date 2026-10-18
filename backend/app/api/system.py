@@ -14,8 +14,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from fastapi.responses import JSONResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from pydantic import BaseModel, Field, StrictBool, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -29,6 +30,10 @@ from app.core.deps import get_current_user
 from app.core.security import hash_password
 from app.models import (SCOPE_SYSTEM, STATUS_FAILED, TIER_DAILY, AuditLog,
                         BackupRun, Book, SysUser, UserBook)
+from app.models.scheduler import ScheduledTask, ScheduledTaskRun
+from app.scheduler import service as scheduler_service
+from app.plugins.workers import status as plugin_status
+from app.models.plugin import PluginRegistry
 
 router = APIRouter(prefix="/api/system", tags=["系统管理"])
 
@@ -103,6 +108,10 @@ class UserPatch(BaseModel):
     real_name: Optional[str] = None
     password: Optional[str] = None
     active: Optional[bool] = None
+
+
+class SchedulerTaskPatch(BaseModel):
+    enabled: StrictBool
 
 
 def _apply_links(db: Session, user: SysUser, books: list[BookLinkIn]) -> None:
@@ -583,6 +592,84 @@ def list_backup_runs(limit: int = 50, user: SysUser = Depends(get_current_user),
                      db: Session = Depends(get_db)):
     _require_admin(user)
     return [_run_view(r) for r in backup_service.recent_runs(db, limit)]
+
+
+@router.get("/scheduler/tasks")
+def list_scheduler_tasks(request: Request, user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require_admin(user)
+    now = scheduler_service.utcnow()
+    scheduler_service.sync_tasks(db, getattr(request.app.state, "plugin_runtime", None), now)
+    db.commit()
+    return [{"task_key": row.task_key, "owner_type": row.owner_type, "plugin_id": row.plugin_id,
+             "task_name": row.task_name, "schedule": row.schedule, "enabled": row.enabled,
+             "next_run_at": row.next_run_at.isoformat(), "last_run_at": row.last_run_at.isoformat() if row.last_run_at else None}
+            for row in db.scalars(select(ScheduledTask).order_by(ScheduledTask.task_key))]
+
+
+@router.put("/scheduler/tasks/{plugin_id}/{task_name}")
+def set_scheduler_plugin_task(plugin_id: str, task_name: str, payload: SchedulerTaskPatch,
+                              request: Request, user: SysUser = Depends(get_current_user),
+                              db: Session = Depends(get_db)):
+    _require_admin(user)
+    now = scheduler_service.utcnow()
+    scheduler_service.sync_tasks(db, getattr(request.app.state, "plugin_runtime", None), now)
+    row = db.get(ScheduledTask, scheduler_service.task_key(plugin_id, task_name))
+    if not row or row.owner_type != "PLUGIN":
+        raise HTTPException(404, "插件定时任务不存在或 worker 尚未加载最新版本")
+    was_enabled = row.enabled
+    if payload.enabled:
+        plugin = db.get(PluginRegistry, plugin_id)
+        runtime = getattr(request.app.state, "plugin_runtime", None)
+        if not plugin or not plugin.desired_enabled or runtime is None:
+            raise HTTPException(409, "插件当前未启用")
+        current, code = plugin_status(db, plugin, runtime.generation)
+        if current != "READY":
+            raise HTTPException(409, {"code": code or current, "message": "插件 worker 尚未就绪"})
+        task = runtime.tasks.get(plugin_id, {}).get(task_name)
+        if task is None or task[2] != row.plugin_digest:
+            raise HTTPException(409, "当前插件版本没有注册该定时任务")
+        if not row.enabled:
+            row.next_run_at = scheduler_service._next(row.schedule, now, include_current_minute=True)
+    row.enabled = payload.enabled
+    log(db, action="SCHEDULER_TASK_UPDATE", entity="scheduled_task", entity_id=row.task_key,
+        user=user, detail="更新插件定时任务开关", before={"enabled": was_enabled}, after={"enabled": row.enabled})
+    db.commit()
+    return {"task_key": row.task_key, "enabled": row.enabled,
+            "next_run_at": row.next_run_at.isoformat()}
+
+
+@router.get("/scheduler/runs")
+def list_scheduler_runs(limit: int = 50, user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require_admin(user)
+    limit = min(max(limit, 1), 200)
+    return [{"run_id": row.run_id, "task_key": row.task_key, "status": row.status,
+             "scheduled_for": row.scheduled_for.isoformat(), "started_at": row.started_at.isoformat(),
+             "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+             "error_code": row.error_code, "message": row.message, "user_results": row.user_results}
+            for row in db.scalars(select(ScheduledTaskRun).order_by(ScheduledTaskRun.started_at.desc()).limit(limit))]
+
+
+@router.post("/scheduler/secret/rotate")
+def rotate_scheduler_secret(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require_admin(user)
+    scheduler_service.lock_scheduler_sync(db)
+    value = scheduler_service.rotate_trigger_secret(db, updated_by=user.username)
+    log(db, action="SCHEDULER_SECRET_ROTATE", entity="system_setting", entity_id="scheduler_trigger_secret",
+        user=user, detail="轮换外部调度触发密钥")
+    db.commit()
+    return JSONResponse({"secret": value, "warning": "只显示本次生成的明文；请放入外部调用方的安全配置"},
+                        headers={"Cache-Control": "no-store"})
+
+
+@router.delete("/scheduler/secret/previous")
+def retire_previous_scheduler_secret(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require_admin(user)
+    scheduler_service.lock_scheduler_sync(db)
+    scheduler_service.clear_previous_trigger_secret(db, updated_by=user.username)
+    log(db, action="SCHEDULER_SECRET_RETIRE", entity="system_setting", entity_id="scheduler_trigger_secret_previous",
+        user=user, detail="停用旧的外部调度触发密钥")
+    db.commit()
+    return {"ok": True}
 
 
 def _run_view(r: BackupRun) -> dict:

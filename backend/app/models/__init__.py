@@ -28,3 +28,6 @@ __all__ = [
 from app.models.plugin import PluginRegistry, PluginInstallAttempt, PluginUserAccess, PluginCohort, PluginWorkerRuntime
 
 from app.models.plugin_import import PluginImportBatch, PluginImportFile, PluginVoucherOrigin
+from app.models.scheduler import ScheduledTask, ScheduledTaskRun
+
+__all__ += ["ScheduledTask", "ScheduledTaskRun"]

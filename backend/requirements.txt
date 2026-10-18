@@ -96,3 +96,8 @@ gunicorn>=23.0.0
 cryptography>=50.0.2
 rfc8785>=0.1.4
 packaging>=26.3
+
+# 插件定时任务的五字段 Cron 解析与下次触发时间计算。
+croniter>=6.0.0
+# croniter uses python-dateutil for timezone-aware schedule calculations.
+python-dateutil>=2.9.0.post0

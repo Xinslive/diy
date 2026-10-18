@@ -162,7 +162,7 @@ cd backend
 
 系统支持签名 `.cwp` 全栈扩展，包括后端 API、预编译前端和独立迁移。插件与宿主同进程、同操作系统权限，**没有沙箱**；只安装经人工审阅、受信任发布者签名的代码。扫描用于拦截明显危险行为，不保证任意代码安全。规范、限制和验收记录分别见 [插件规范](docs/plugin-spec.md)、[风险记录](docs/plugin-risk.md)、[验证记录](docs/plugin-verification.md)。
 
-首次启用前先执行主迁移 `alembic upgrade head`（当前 head 为 `0027_plugin_imports`，包含注册表与导入批次），在服务环境中配置 `PLUGIN_ENABLED=true`、`PLUGIN_TRUSTED_KEYS`（`key_id → base64 Ed25519 公钥` 的 JSON），并设置持久化的 `PLUGIN_ROOT`。systemd 默认工作目录下为 `backend/data/plugins`，Docker 为 `/app/data/plugins`；部署产物不包含、也不覆盖这个运行目录。Docker 应持久化挂载 `/app/data`。配置项及配额见根目录 `.env.example`。
+首次启用前先执行主迁移 `alembic upgrade head`（当前 head 为 `0028_scheduled_tasks`，包含注册表、导入批次和计划任务），在服务环境中配置 `PLUGIN_ENABLED=true`、`PLUGIN_TRUSTED_KEYS`（`key_id → base64 Ed25519 公钥` 的 JSON），并设置持久化的 `PLUGIN_ROOT`。systemd 默认工作目录下为 `backend/data/plugins`，Docker 为 `/app/data/plugins`；部署产物不包含、也不覆盖这个运行目录。Docker 应持久化挂载 `/app/data`。配置项及配额见根目录 `.env.example`。
 
 从仓库根目录可生成仅供本地演示的签名包；生产私钥应保存在独立签名环境，不能复制进服务器或插件目录：
 
@@ -193,7 +193,7 @@ CWQ_API_WORKERS=2 .venv/bin/python scripts/start_server.py --port 8000
 
 前端代码资产为不含业务数据、带 digest 的同源只读资源，原生 `import()` 不带 Bearer；manifest 和业务 API 则实时鉴权。不通过 query string 传 token，也不放宽现有 CSP。插件模块加载失败会展示降级页，核心记账页面仍可使用。
 
-SDK 1.1.0 支持由用户在插件页面选择目标账套、保存账套配置，以及上传文件、持久预览、人工确认和整批原子制证。可签名运行的示例为 `docs/plugin-import-example/`，样例文件为 `docs/plugin-import-sample.csv`；契约见 [数据接口](docs/plugin-data.md)，已完成范围与后续任务见 [优化清单](docs/plugin-roadmap.md)。到期内容清理命令为 `python -m app.plugins.imports_cleanup --apply`（backend 目录），尚需部署方安排定期执行。
+SDK 1.2.0 支持由用户在插件页面选择目标账套、保存账套配置、上传文件、持久预览、人工确认和整批原子制证，并增加由宿主调度器按当前有效授权逐用户执行的插件定时任务。可签名运行的示例为 `docs/plugin-import-example/`；契约见 [插件规范](docs/plugin-spec.md) 和 [数据接口](docs/plugin-data.md)。
 
 ---
 
@@ -217,8 +217,7 @@ SDK 1.1.0 支持由用户在插件页面选择目标账套、保存账套配置�
 
 ## 数据安全：备份到阿里云 OSS
 
-界面在 **系统管理 → 数据安全**（`/data-security`，仅管理员可见）。填 OSS 参数，
-点「测试连接」验通了之后，剩下的交给 `cwq-oss-backup.timer` 每天凌晨 03:47 自己跑。
+界面在 **系统管理 → 数据安全**（`/data-security`，仅管理员可见）。填 OSS 参数并点「测试连接」验通后，由应用级调度器执行备份。外部调度服务每分钟调用一次 tick 接口，应用再按数据库中的计划领取到期任务。
 
 ### 备份的是什么
 
@@ -306,17 +305,25 @@ book_id 筛表的话，用户设计的那套报表版式**不在任何一个备�
 新凭证就会撞主键；`_ordered_rows` 会对自引用外键（`subject.parent_id`）
 做表内拓扑排序，否则多行 INSERT 逐行校验 FK 时父行还没插进去。
 
-### 启用定时备份
+### 启用定时调度
 
 ```bash
-sudo cp deploy/systemd/cwq-oss-backup.{service,timer} /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now cwq-oss-backup.timer
-systemctl list-timers cwq-oss-backup.timer    # 看下次触发时间
+# 先把主迁移升级到 0028_scheduled_tasks
+cd backend
+.venv/bin/alembic upgrade head
 ```
 
-03:47 是刻意的：本机原有的数据库 dump 在 03:17，两件都是重 IO 的活，
-同一分钟起跑会互相抢磁盘。`Persistent=true`，关机期间错过的会补跑。
+然后用管理员令牌调用 `POST /api/system/scheduler/secret/rotate`，将响应中的明文密钥只保存到外部调度服务的密钥配置中。外部服务每分钟请求：
+
+```text
+GET https://<域名>/api/scheduler/tick?key=<调度密钥>
+```
+
+接口只接受当前密钥或轮换期间保留的上一把密钥；数据库只保存 SHA-256 摘要，轮换完成后用 `DELETE /api/system/scheduler/secret/previous` 关闭旧密钥。提供的 Nginx 配置会关闭该路径及其末尾斜杠形式的访问日志，但云负载均衡、CDN、外部调度平台仍可能记录 URL，必须在这些位置开启查询参数脱敏。不要把密钥放进普通脚本、聊天或监控标签。
+
+tick 返回 `202` 表示本次任务领取已接受，最终结果通过 `GET /api/system/scheduler/runs` 查看。内置 OSS 备份每天北京时间 03:47 执行，沿用数据安全页面的 `backup_enabled` 开关、OSS 参数和保留策略；插件导入过期文件每小时清理一次。每次最多领取 20 个任务，同一任务租约有效时不会重复领取，错过的周期合并执行。
+
+插件任务默认关闭，管理员可通过 `GET /api/system/scheduler/tasks` 查看，并用 `PUT /api/system/scheduler/tasks/{plugin_id}/{task_name}` 传入 `{"enabled": true}` 启用。启用是全局开关；每次运行按当时仍 active 且未撤销插件授权的用户逐个执行。旧的 `cwq-oss-backup.timer` 不应再启用，否则会产生重复备份；旧的本地 pg_dump timer 仍保持禁用。
 
 ### 手动跑一轮
 
@@ -338,6 +345,10 @@ cd backend
 | PUT | `/api/system/backup` | 改配置（凭据留空 = 不动已存的值） |
 | POST | `/api/system/backup/test` | 连通性测试：上传一个探针对象再删掉 |
 | POST | `/api/system/backup/run` | 立即备份（后台任务 + 轮询历史，页面不靠超时猜） |
+| GET | `/api/scheduler/tick?key=...` | 外部每分钟触发应用级计划任务 |
+| GET | `/api/system/scheduler/tasks` | 管理员查看内置与插件计划任务 |
+| PUT | `/api/system/scheduler/tasks/{plugin_id}/{task_name}` | 管理员启用/停用插件计划任务 |
+| GET | `/api/system/scheduler/runs` | 管理员查看计划任务运行记录与逐用户结果 |
 | GET | `/api/system/backup/runs` | 运行历史（状态 / OSS key / 字节数 / SHA256 / 行数 / 错误全文） |
 
 五个都要求管理员。

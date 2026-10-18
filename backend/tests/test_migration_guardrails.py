@@ -916,6 +916,7 @@ def test_head_是本文件认识的那一版():
         "0025_backup_run",                     # 数据安全：OSS 备份运行记录（分级判重与「退路在不在」都问它）
         "0027_plugin_imports",           # 宿主导入批次、源文件及凭证来源
         "0026_plugin_registry",                # 插件宿主管理、授权与 worker barrier
+        "0028_scheduled_tasks",                # 外部 tick 驱动的应用级计划任务
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")

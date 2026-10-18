@@ -3502,6 +3502,44 @@ manifest 与业务 API 用 Bearer 和实时 grant；JS/CSS/assets 是不含敏�
 
 运行目录在持久化 data 下，不进 CI 发布包。systemd 与 Docker 都使用 supervisor 入口，发布脚本在主 ready 后再等待插件屏障。CI 保留原有全量后端、前端发现数、构建与部署演练闸门，并加入隔离数据库下的生产构建/CSP、两 worker 重启和真实浏览器授权闭环。
 
+## 11.13 应用级计划任务（2026-10-18）
+
+主迁移追加 `0028_scheduled_tasks`，两张表：`sys_scheduled_task`（计划、开关、下次触发、租约）和 `sys_scheduled_task_run`（每次触发的结果，`(task_key, scheduled_for)` 唯一）。`docs/plugin-spec.md` 是对外契约，本节记的是**为什么这样定**。
+
+### 触发权在外部，执行权在宿主
+
+宿主**不起自己的常驻调度循环**。外部调度服务每分钟 GET 一次 `/api/scheduler/tick?key=...`，宿主只做两件事：校验密钥、按数据库里的计划领取到期任务。2026-10-18 的理由：常驻循环要多 worker 选主、要处理进程重启丢状态、还要在 `cwq-api` 之外再挂一个 systemd 单元；改成外部触发后，触发频率、重试和告警都归运维已经在用的那套 cron，宿主侧只剩一次性领取。心跳续租（`LEASE_SECONDS=600`，每 60s 续）是执行期间的兜底，不是第二套调度器。
+
+密钥**不进 `.env`**，由管理员 API 轮换生成，数据库只存 SHA-256 摘要，比对用 `hmac.compare_digest`。轮换保留上一把密钥（`scheduler_trigger_secret_previous`），轮换完成再调 `DELETE /api/system/scheduler/secret/previous` 关闭旧密钥——先换后撤的窗口是为了让外部调度服务有机会换配置。tick 未配置密钥返回 503，不做「无密钥即放行」。
+
+**query string 里带密钥是有意的取舍**（外部 cron 的通用形态），代价是这条 URL 会进日志。硬约束有两条：nginx 对 `^/api/scheduler/tick/?$` 关闭 `access_log`；`request_id_middleware` 在进入下游前清空 `scope["query_string"]`，并清掉 `_url`/`_query_params` 缓存，避免 ASGI 访问日志和下游读到它。**云负载均衡、CDN、外部调度平台仍可能记录完整 URL**，必须在那些位置开查询参数脱敏；这一条写进了 README，运维侧要自己确认。
+
+### 至少一次，靠幂等键和租约收敛
+
+领取用 `FOR UPDATE SKIP LOCKED` + 每次最多 20 个任务，同一任务在租约有效期内不会被第二个 tick 领走。执行语义是**至少一次**：进程在「已领取、未记账」之间挂掉，下一个 tick 会把同一条 run 重新置为 RUNNING 并 `claim_count += 1`，因此插件侧必须用 `context.idempotency_key`（`{run_id}:{user_id}`）去重，不能假设只执行一次。漏掉的周期**合并执行**而不是补跑（`_next_after_claim`），否则主机停机一夜后会在开机瞬间连打十几次。已完成 90 天的 run 记录在领取时顺手删掉。
+
+run 记录同时承担第二条职责：任务在租约到期时若已停用、被移除或插件版本变了，旧 run 记 `SKIPPED / TASK_UNAVAILABLE` 而不是重放——**版本不匹配的旧执行不能在新版本上重放**。
+
+### 备份与清理的触发方式变了
+
+内置两个 SYSTEM 任务：`oss_backup`（cron `47 3 * * *`，Asia/Shanghai）和 `plugin_import_cleanup`（每 60 分钟）。两者都只是**入口**，实际策略仍由既有的 `backup_enabled` 开关、OSS 参数、留存规则和 `purge_expired` 决定；调度层不新增第二套策略。
+
+**硬约束：旧的 `cwq-oss-backup.timer` 与应用调度器不能同时启用**，否则每天两次备份。新的本地 pg_dump timer 保持禁用。反过来也有一条同样重要的：**没有配置 tick 密钥，OSS 备份就不会跑**——所以上线必须把「轮换密钥 + 外部每分钟调用」当成发布的收尾步骤，而不是可选项。备份失败的判定沿用 §11.10.4：清理失败不是备份失败，两件事分开记。
+
+### 插件定时任务
+
+manifest 新增 `tasks`（最多 32 条，名称 `[a-z][a-z0-9_]{0,47}`），schedule 只支持 `interval`（1–525600 分钟）和五字段 `cron`（只允许 `Asia/Shanghai`，用 croniter 解析且必须能算出下一次）。声明任务**要求 SDK 兼容 1.2**；`api_version` 仍支持 `>=1.1.0`，老插件继续可用，两者分开判定。
+
+`Registrar.task()` 只接受同步、单参数（`TaskContext`）的函数，async/generator 一律拒绝；声明了但没注册的插件在加载时整体失败，不允许「声明即默认开启」。每个任务的处理函数在加载时连同 `plugin_digest` 记进 `runtime.tasks`。
+
+三条硬约束：
+
+1. **默认关闭**，管理员逐任务开。启用时校验插件 READY、任务已注册且 digest 与库中一致，否则 409。
+2. **digest 变化即重置为关闭**。重启/屏障延迟**不得**抹掉管理员已开的开关——这两件事相反的原因见 `sync_plugin_tasks`：包没变是启动问题，包变了是新的执行内容，必须重新决定。
+3. **逐用户扇出按当时的授权**。每次运行重新查 active 且未撤销的用户，逐个建上下文执行；任一用户失败不阻断其他用户，run 记 `PLUGIN_USER_TASK_FAILED` 并保留逐用户明细。全部用户被停用或撤权时记 `SKIPPED / NO_AUTHORIZED_USERS`，不算失败。
+
+插件定时任务和 §11.12 的授权模型是同一条：用户授权单独存表、不参与代码就绪判断、每次执行重新读。也就是说，**撤销授权对下一个周期立即生效，不需要重启 worker**——这正是「凭据不进插件、每次现查」的价值。
+
 ## 12. 测试策略
 
 | 文件 | 覆盖 |
