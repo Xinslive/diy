@@ -96,6 +96,31 @@ def register(registrar, ctx):
 
 插件接口的实际路径会自动带上 `/api/plugins/{id}` 前缀，因此注册时只写相对路径。`register` 阶段还没有当前用户上下文，不要在模块导入或注册函数里读取账套数据；把鉴权和数据访问放在请求 handler 中。
 
+### POST 处理函数的参数从哪里来
+
+`GET` 惯例是查询串，但 SDK 客户端的 `host.api.post(url, data)` 提交的是 JSON 请求体。两种都支持，路由装配会替你判断：
+
+```python
+def save_note(payload: dict):
+    ...
+
+def save_rule(book_id: int, payload: dict):
+    ...
+
+def undo_run(book_id: int, run_id: int):
+    ...
+```
+
+第一种写法里 `payload` 收到整个请求体；第二种同样合法，`payload` 收请求体而 `book_id` 走查询串或请求体都行；第三种全是标量，请求体整体由宿主接住。
+
+三条规则：
+
+- 标了 `dict` 的参数收到**整个请求体**，不是某个字段。
+- **查询串优先、请求体兜底**。请求体里的 `book_id` 只能当数据字段，不会改写 `book_id` 指向的授权账套——`ctx.data.*` 会自行比对两者是否一致，不一致直接 400。
+- 路径参数照常从 URL 取：`/rules/{rule_id}/delete` 里的 `rule_id`。
+
+标量参数不会因为没写 `Body()` 就变成必填查询参数，所以前端不必再重复带一份 `book_id`。`UploadFile = File(...)` 这类文件上传路由不受这套规则影响。
+
 ## 可选：注册定时任务
 
 需要周期处理时，在 manifest 中增加声明。使用这项能力的插件，其 `api_version` 范围必须包含 SDK 1.2.0：

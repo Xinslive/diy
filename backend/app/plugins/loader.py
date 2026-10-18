@@ -10,7 +10,10 @@ import re
 import sys
 from functools import wraps
 from pathlib import Path
+from typing import Any, Dict, List
 from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi.params import File as FastapiFile, Form as FastapiForm
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from fastapi.routing import APIRoute
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.asyncexitstack import AsyncExitStackMiddleware
@@ -33,40 +36,138 @@ from app.plugins.workers import WorkerRuntime
 log = logging.getLogger(__name__)
 
 
-def _with_body_payload(endpoint):
-    """把处理函数里裸 ``dict`` 注解的参数改判为**请求体**。
+_BODY_ANCHOR = "cwq_body"
 
-    SDK 约定的写法是 ``def save_note(payload: dict)``，然后从 ``payload`` 里取
-    ``book_id`` 等字段（见 docs/plugin-guide.md）。但 FastAPI 只按注解决定参数
-    去处：标了 ``dict`` 又没写 ``Body()`` 的参数会被当成**查询参数**，于是插件
-    前端用 JSON body 提交的数据根本收不到，接口一律回 422 ``Field required``。
-    也就是说文档、插件客户端、插件三方的约定是一致的，只有路由装配这一步漏了。
+
+def _path_param_names(path):
+    return set(re.findall(r"\{([a-z][a-z0-9_]*)\}", path or ""))
+
+
+def _is_dict_annotation(annotation):
+    if annotation is dict or annotation == "dict":
+        return True
+    return getattr(annotation, "__origin__", None) is dict
+
+
+def _is_upload_param(param):
+    """文件/表单参数：multipart 请求体由 FastAPI 自己拆，不能碰。"""
+    if isinstance(param.default, (FastapiFile, FastapiForm)):
+        return True
+    for candidate in (param.annotation, getattr(param.annotation, "__origin__", None)):
+        if isinstance(candidate, type) and issubclass(candidate, StarletteUploadFile):
+            return True
+    return False
+
+
+def _with_body_payload(endpoint, path=None, methods=None):
+    """让插件 POST 处理函数能按 SDK 约定从**请求体**收到前端提交的字段。
+
+    SDK 约定前端用 JSON body 提交（``host.api.post(url, data)``，见
+    docs/plugin-guide.md），处理函数按名字收这些字段：既可能写成文档里的
+    ``def save_note(payload: dict)`` 从 payload 里取，也可能像两个插件实际那样写成
+    ``def save_rule(book_id: int, payload: dict)``。但 FastAPI 只按注解决定参数
+    去处——标了 ``dict`` 又没写 ``Body()`` 的按**查询参数**，标量没写 ``Body()`` 的
+    更是**必填查询参数**。于是 body 里的一切都收不到，接口一律回 422
+    ``Field required``：文档、插件客户端、插件三方的约定其实是一致的，只有路由
+    装配这一步漏了。
 
     这里不改插件的函数对象（它是别人写的，且被 ``_check`` 验过签名），而是套一层
     只改签名的壳：``__signature__`` 优先于 ``__wrapped__``，FastAPI 的
-    ``get_typed_signature`` 看到的是带 ``Body()`` 缺省值的那个签名，真正的实现
-    原样保留。
+    ``get_typed_signature`` 看到改过的签名，wrapper 再按原签名把 body 里的字段
+    分发回去，真正的实现原样保留。
+
+    兼容面必须一起守住，否则修一个坏两个：
+    - 路径参数仍由 FastAPI 从路径取（``/rules/{rule_id}/delete`` 里的 ``rule_id``）；
+    - 标量参数改成**可省查询参数**，``params={'book_id': ...}`` 这种旧调用照旧；
+    - 分发时查询串优先、body 同名字段兜底，所以前端把 book_id 放进 JSON body 也
+      照样收得到，同时请求体不能改写授权指向的账套；
+    - 文件/表单路由（``UploadFile = File(...)``）整个不包装；
+    - GET 路由与同时挂 GET 的路由完全不动。
     """
-    signature = pyinspect.signature(endpoint)
-    params = []
-    changed = False
-    for param in signature.parameters.values():
-        if param.annotation is dict:
-            # 一律按「请求体」判：这是 SDK 文档写死的约定，插件没法也不该为了迁就
-            # FastAPI 的默认值推断去改写法。带默认值的保留原来的默认，语义不变。
-            default = Body(...) if param.default is pyinspect.Parameter.empty else Body(param.default)
-            params.append(param.replace(default=default))
-            changed = True
-        else:
-            params.append(param)
-    if not changed:
+    if not methods or "POST" not in methods or "GET" in methods:
         return endpoint
+    try:
+        signature = pyinspect.signature(endpoint)
+    except (TypeError, ValueError):
+        return endpoint
+    params = list(signature.parameters.values())
+    if not params or any(p.kind in (pyinspect.Parameter.POSITIONAL_ONLY,
+                                    pyinspect.Parameter.VAR_POSITIONAL,
+                                    pyinspect.Parameter.VAR_KEYWORD) for p in params):
+        return endpoint
+    if any(_is_upload_param(p) for p in params):
+        return endpoint
+    path_params = _path_param_names(path)
+    head = [p for p in params if p.name in path_params]
+    body_params = [p for p in params if p.name not in path_params]
+    if not body_params:
+        return endpoint
+    for param in head:
+        if param.default is not pyinspect.Parameter.empty:
+            # 路径参数不该有默认值，有就说明签名写得古怪，别自作主张。
+            return endpoint
+
+    dict_params = [p for p in body_params if _is_dict_annotation(p.annotation)]
+    new_params = list(head)
+    if dict_params:
+        # 第一个 ``dict`` 参数就是整个请求体：既是文档里的 ``def save_note(payload:
+        # dict)``，也是 ``def save_rule(book_id: int, payload: dict)`` 里 payload 的本意。
+        carrier = dict_params[0].name
+        new_params.append(dict_params[0].replace(default=Body(default=None)))
+        rest = [p for p in body_params if p.name != carrier]
+    else:
+        # 全是标量（例如 ``def undo_run(book_id: int, run_id: int)``）：合成一个参数
+        # 接住整体 body，标量照旧留在查询串上，两者都能收到。
+        carrier = _BODY_ANCHOR
+        taken = {p.name for p in params}
+        suffix = 0
+        while carrier in taken:
+            suffix += 1
+            carrier = _BODY_ANCHOR + str(suffix)
+        first = body_params[0].annotation
+        origin = getattr(first, "__origin__", None)
+        # body 未必是对象：插件也可以直接收 list 或标量，按原注解照收。
+        annotation = List[Any] if (origin is list or first is list) else Dict[str, Any]
+        new_params.append(pyinspect.Parameter(
+            carrier, pyinspect.Parameter.POSITIONAL_OR_KEYWORD,
+            default=Body(default=None), annotation=annotation))
+        rest = list(body_params)
+    # 其余参数一律变成可省：FastAPI 把「简单类型 + 有默认值」的参数判成**可选**
+    # 查询参数，于是既不再 422，旧调用方的查询串也照样有效。
+    for param in rest:
+        new_params.append(param.replace(
+            default=None if param.default is pyinspect.Parameter.empty else param.default))
+
+    # body 里没给、原签名又没默认值的标量：给中文 422，而不是把 None 塞进插件函数
+    # 让它在半路炸成 500。
+    required = [p.name for p in rest if p.default is pyinspect.Parameter.empty]
 
     @wraps(endpoint)
     def wrapper(*args, **kwargs):
-        return endpoint(*args, **kwargs)
+        raw = kwargs.get(carrier)
+        body = raw if isinstance(raw, dict) else {}
+        call = {param.name: kwargs.get(param.name) for param in head}
+        for param in body_params:
+            if param.name == carrier:
+                call[param.name] = raw
+                continue
+            if kwargs.get(param.name) is not None:
+                # 查询串优先。body 里的同名字段只能当**数据字段**：让它覆盖路由参数
+                # 等于让请求体改写授权目标，跨账套一致性校验（data 层比对 values
+                # 与 book_id）也就形同虚设了。
+                call[param.name] = kwargs[param.name]
+            elif isinstance(raw, dict) and param.name in raw:
+                call[param.name] = raw[param.name]
+            elif param.default is not pyinspect.Parameter.empty:
+                call[param.name] = param.default
+            else:
+                call[param.name] = None
+        for name in required:
+            if call.get(name) is None:
+                raise HTTPException(422, "缺少参数：%s" % name)
+        return endpoint(**call)
 
-    wrapper.__signature__ = signature.replace(parameters=params)
+    wrapper.__signature__ = signature.replace(parameters=new_params)
     return wrapper
 
 
@@ -97,7 +198,7 @@ class Registrar:
     def add(self, path, endpoint, methods):
         self._check(path, endpoint, methods)
         self._router.add_api_route("/api/plugins/" + self._plugin_id + path,
-            _with_body_payload(endpoint), methods=methods,
+            _with_body_payload(endpoint, path, methods), methods=methods,
             name=f"plugin:{self._plugin_id}:{len(self._router.routes)}")
 
     def get(self, path, endpoint):
