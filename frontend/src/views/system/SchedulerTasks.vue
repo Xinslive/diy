@@ -6,14 +6,6 @@
       <div class="tools"><el-button :loading="loading || runsLoading" @click="refresh">刷新</el-button></div>
     </div>
 
-    <!-- 这条说明是页面的关键：光打开开关不会自己跑。写给不懂技术的用户，
-         所以只在括号里点一次接口名，并说清那是运维在管、外部程序在调。 -->
-    <el-alert type="info" :closable="false" show-icon class="notice">
-      <template #title>这里的开关只决定「到点了要不要跑」，不负责把任务叫醒</template>
-      真正的触发要靠外部程序每分钟来问一次系统「有没有到点的任务」（这是运维要配的事，接口是 GET /api/scheduler/tick）。
-      没人来问，任务就一直停在开关上，永远不会自己执行。所以改了开关之后，如果到点没动静，先确认运维那边在调这个接口。
-    </el-alert>
-
     <h3 class="section">任务清单</h3>
     <el-table v-loading="loading" :data="tasks" row-key="task_key" class="task-table" empty-text="暂无计划任务">
       <el-table-column label="任务" min-width="235">
@@ -261,7 +253,6 @@ onUnmounted(() => clearInterval(timer))
 .heading { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin-bottom: 18px; flex-wrap: wrap; }
 h2 { margin: 0 0 8px; } p { color: var(--el-text-color-secondary); line-height: 1.7; }
 .tools { display: flex; gap: 8px; flex-wrap: wrap; }
-.notice { margin-bottom: 8px; }
 .section { margin: 24px 0 10px; font-size: 15px; } .lead { margin: 0 0 12px; }
 .task-table { margin-bottom: 4px; }
 .muted, .task-key { color: var(--el-text-color-secondary); font-size: 12px; margin-top: 5px; }
