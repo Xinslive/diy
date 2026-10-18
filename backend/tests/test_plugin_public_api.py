@@ -1,4 +1,5 @@
 from sqlalchemy import func, select
+import hashlib
 from app.core.db import SessionLocal
 from app.models.accounting import Subject, Voucher
 from app.models.system import UserBook
@@ -17,9 +18,14 @@ def test_context_exposes_only_declared_capabilities_and_requires_request():
     assert vars(ctx) == {'plugin_id': manifest['id']}
     manifest['permissions'] = ['book:read']
     ctx = context_for(manifest)
-    assert set(vars(ctx)) == {'plugin_id', 'book_read'}
+    assert set(vars(ctx)) == {'plugin_id', 'book_read', 'book_list'}
     with pytest.raises(HTTPException):
         ctx.book_read(1)
+    manifest['permissions'] = ['upload:read']
+    ctx = context_for(manifest)
+    assert set(vars(ctx)) == {'plugin_id', 'upload_read'}
+    with pytest.raises(HTTPException):
+        ctx.upload_read(object())
 
 
 def test_plugin_data_book_scope_roles_and_host_helpers(plugin_env, client, auth, plain_auth, plain_user, book, db):
@@ -35,6 +41,8 @@ def test_plugin_data_book_scope_roles_and_host_helpers(plugin_env, client, auth,
         return ctx.data.update("{name}", ident, payload, book_id=book_id)
     def host_book(book_id: int):
         return ctx.book_read(book_id)
+    def host_books():
+        return ctx.book_list()
     def ledger(book_id: int, period_id: int):
         return ctx.ledger_read(book_id, period_id)
     def voucher(book_id: int, payload: dict):
@@ -43,6 +51,7 @@ def test_plugin_data_book_scope_roles_and_host_helpers(plugin_env, client, auth,
     registrar.post("/rows", insert)
     registrar.add("/rows", update, ["PUT"])
     registrar.get("/book", host_book)
+    registrar.get("/books", host_books)
     registrar.get("/ledger", ledger)
     registrar.post("/voucher", voucher)
 '''.encode()
@@ -55,10 +64,17 @@ def test_plugin_data_book_scope_roles_and_host_helpers(plugin_env, client, auth,
     assert client.get(path + '/rows', params={'book_id': book.id}, headers=plain_auth).status_code == 403
     link = UserBook(user_id=plain_user.id, book_id=book.id, role='VIEWER')
     db.add(link); db.commit()
+    books = client.get(path + '/books', headers=plain_auth)
+    assert books.status_code == 200, books.text
+    assert books.json() == [{
+        'id': book.id, 'name': book.name, 'company_name': book.company_name,
+        'status': book.status, 'role': 'VIEWER', 'can_write': False,
+    }]
     assert client.get(path + '/book', params={'book_id': book.id}, headers=plain_auth).json()['id'] == book.id
     assert client.get(path + '/rows', params={'book_id': book.id}, headers=plain_auth).json() == []
     assert client.post(path + '/rows', params={'book_id': book.id}, json={'label': 'x'}, headers=plain_auth).status_code == 403
     link.role = 'ACCOUNTANT'; db.commit()
+    assert client.get(path + '/books', headers=plain_auth).json()[0]['can_write'] is True
     r = client.post(path + '/rows', params={'book_id': book.id}, json={'label': 'x'}, headers=plain_auth)
     assert r.status_code == 200, r.text
     ident = r.json()['id']
@@ -70,6 +86,44 @@ def test_plugin_data_book_scope_roles_and_host_helpers(plugin_env, client, auth,
     r = client.post(path + '/voucher', params={'book_id': book.id}, json={}, headers=plain_auth)
     assert r.status_code == 422
     assert client.get('/api/health').status_code == 200
+
+
+def test_plugin_upload_read_returns_bounded_content_and_metadata(plugin_env, client, auth, plain_auth, plain_user):
+    build, restart = plugin_env
+    pid = 'com.test.upload'
+    code = '''from fastapi import File, UploadFile
+
+
+def register(registrar, ctx):
+    def upload(file: UploadFile = File(...)):
+        value = ctx.upload_read(file)
+        return {key: value[key] for key in ("filename", "content_type", "size", "sha256")}
+
+    registrar.post("/upload", upload)
+'''.encode()
+    raw, manifest, _, _ = build(
+        plugin_id=pid,
+        files={'backend/main.py': code, 'frontend/index.js': b'export default host => ({render: () => host.h("div")});'},
+        edit=lambda m: m.update(permissions=['upload:read']),
+    )
+    assert client.post('/api/system/plugins/install', files={'file': ('upload.cwp', raw)}, headers=auth).status_code == 200
+    restart()
+    assert client.put(f'/api/system/plugins/{pid}/users', headers=auth,
+                      json={'user_ids': [plain_user.id]}).status_code == 200
+
+    content = b'hello plugin'
+    response = client.post(
+        f'/api/plugins/{pid}/upload',
+        files={'file': ('../hello.txt', content, 'text/plain')},
+        headers=plain_auth,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        'filename': 'hello.txt',
+        'content_type': 'text/plain',
+        'size': len(content),
+        'sha256': hashlib.sha256(content).hexdigest(),
+    }
 
 
 # 插件按外部文件批量制证要用的那条配方，逐段单独测过：

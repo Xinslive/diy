@@ -26,3 +26,5 @@ __all__ = [
 
 # Import for schema discovery; runtime packages never join Base.metadata.
 from app.models.plugin import PluginRegistry, PluginInstallAttempt, PluginUserAccess, PluginCohort, PluginWorkerRuntime
+
+from app.models.plugin_import import PluginImportBatch, PluginImportFile, PluginVoucherOrigin

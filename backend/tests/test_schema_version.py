@@ -519,6 +519,8 @@ def test_会计护栏触发器确实装上了(db):
         "trg_opening_guard",
         # 触发器改写行时也刷新 updated_at（P2-09）
         "trg_updated_at",
+        # SDK 1.1 宿主导入批次的更新时间戳（迁移 0027）
+        "trg_plugin_import_touch",
     }
     # 账套数据版本号（迁移 0015）：每张影响聚合的表三个（增/改/删）。
     # 必须是**语句级**而不是行级 —— 一次 5000 行导入用行级会对 book 行

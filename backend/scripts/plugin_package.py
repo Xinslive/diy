@@ -37,6 +37,9 @@ def build(source: Path, private_path: Path, key_id: str, output: Path):
     for path in sorted(source.rglob('*')):
         if path.is_symlink() or (not path.is_file() and not path.is_dir()):
             raise ValueError('源目录不允许链接或特殊文件')
+        # Finder metadata is not a plugin asset; keep it outside the signed file set.
+        if path.is_file() and path.name == '.DS_Store':
+            continue
         if path.is_file() and path.name != 'plugin.json':
             if path.resolve() in {private_path.resolve(), output.resolve()}:
                 raise ValueError('私钥/输出包不能位于源目录中')

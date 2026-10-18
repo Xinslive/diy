@@ -24,7 +24,7 @@ DIGEST_RE = re.compile(r"[a-f0-9]{64}\Z")
 # 能力**，于是这条路径只剩两个走不通的走法：把 id 硬编码进插件（换个账套就
 # 全错），或者绕开能力模型自己去查宿主表（正好是这套窄 SDK 要防的事）。
 # 它只读、不写，且和 ``book:read`` 一样每次调用重读当前用户状态。
-PERMISSIONS = frozenset({"ledger:read", "book:read", "book:write", "subject:read", "voucher:write", "plugin_data:rw", "audit:write", "settings:rw"})
+PERMISSIONS = frozenset({"ledger:read", "book:read", "book:write", "subject:read", "voucher:write", "plugin_data:rw", "audit:write", "settings:rw", "upload:read", "import:rw"})
 HOOKS = frozenset({"on_period_close"})
 ICONS = frozenset({"Calendar", "Grid", "Document", "DataAnalysis", "Tools", "Coin", "Folder"})
 

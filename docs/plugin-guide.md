@@ -109,8 +109,8 @@ export default function createPeriodNote(host) {
 }
 ```
 
-`host` 提供 `h / ref / computed / watch / onMounted / api` 和 `bookId() / periodId()`。
-`host.api` 固定打在当前插件的命名空间下并自动带上当前登录的 token，不用自己管鉴权头。
+`host` 提供 `h / ref / computed / watch / onMounted / api`、`bookId() / periodId()` 和 `books()`。`books()` 返回当前用户可访问的账套及 `canWrite` 提示，文件导入插件应在自己的页面内让用户选择目标账套；提交时后端仍会重新校验账套权限。
+`host.api` 固定打在当前插件的命名空间下并自动带上当前登录的 token，不用自己管鉴权头。SDK 1.1.0 还提供 `host.services.books/config/imports`，用于目标账套、账套配置和完整导入流程。
 
 首版是预编译自包含 ESM：**不能**用运行时 SFC 编译器、不能 import 外部依赖、不能从 CDN 加载。
 需要图标就用手写的 `host.h('span', '…')`，别引组件库。
@@ -156,7 +156,7 @@ staging、迁移、原子 rename、登记。返回 `pending_restart`。
 - `GET /api/system/plugins/{id}/users` 看当前名单；
 - `POST /api/system/plugins/{id}/users/{user_id}` 授予单个，或 `PUT .../users` 整体替换。
 
-授权是**用户级**的，不是账套级。用户在哪个账套里能看到你的菜单，仍然由宿主自己的账套权限决定。
+授权是**用户级**的，不是账套级。菜单由用户的插件使用权决定；用户在插件页面内选择可访问的目标账套，写入时宿主重新校验该账套的角色。
 
 ## 第 9 步：重启
 
@@ -207,9 +207,25 @@ python scripts/start_server.py
 
 这是有意的：卸载和删表是两件风险完全不同的事，不该被一个按钮捆在一起。
 
+## 文件转凭证示例
+
+`docs/plugin-import-example/` 是 SDK 1.1.0 的第二个完整示例 `com.cwq.csvvoucher`，与期间工作笔记分别打包。规则在 `backend/main.py`；借贷科目映射在插件自己的 book-scoped 配置表；全部工作发生在插件自己的页面。安装仍按前述签名、管理员安装、授予用户和重启步骤完成。
+
+在 backend 目录打包（密钥/输出文件置于示例目录外）：
+
+```bash
+python scripts/plugin_package.py build ../docs/plugin-import-example \
+  --private /secure/plugin-signing.pem --key-id periodnote-2026 \
+  --output /tmp/csvvoucher.cwp
+```
+
+先执行主数据库迁移到 `0027_plugin_imports` 并重新构建前端。安装授权后，进入“CSV 转凭证”，选择目标账套，配置两科目，再上传 `docs/plugin-import-sample.csv`。样例日期为 2026 年 3 月，应使用对应期间已建且开放的测试账套，或调整日期。
+
+检查预览、按需修改金额或摘要并保存、点击确认、最后整批提交。刷新可从“恢复批次”选择旧批次。示例文件不要放进 `.cwp` 源目录：业务上传的 CSV 不是可执行插件资产。详细限制和错误恢复见 [plugin-data.md](plugin-data.md)。
+
 ## 下一步读什么
 
-- **想把文件里的数据写进账上**（批量生成凭证之类）：看 [plugin-data.md](plugin-data.md)，那里有八个能力各长什么样，以及整批回滚和防重复的做法
+- **想把文件里的数据写进账上**（批量生成凭证之类）：看 [plugin-data.md](plugin-data.md)，那里有 SDK 能力、持久预览、人工确认、整批回滚和防重复的契约
 - 想改包结构、签名算法、限额：看「包和签名」
 - 想写后端：看「Python SDK」和「独立迁移与数据库契约」
 - 想写前端：看「前端运行时和公共资产」

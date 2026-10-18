@@ -52,8 +52,8 @@
         <section class="examples">
           <h2 id="示例包">示例包</h2>
           <p>
-            一个能装上、能授权、能升级也能卸干净的完整示例。下面是它的全部源文件，
-            顺序就是照着写的顺序。把它整份签成 .cwp 跑一遍，比读十遍文档更快。
+            两个完整示例分别位于 plugin-example 和 plugin-import-example 目录。每个目录独立签名打包；
+            下面直接展示仓库源码，文件转凭证示例需要 SDK 1.1.0。
           </p>
           <div v-for="file in exampleFiles" :key="file.label" class="file">
             <div class="file-head">

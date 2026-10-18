@@ -299,37 +299,10 @@ def _validate_entries(db: Session, book_id: int, entries: list[dict],
 # --------------------------------------------------------------------- 写操作
 
 
-def create_voucher(
-    db: Session,
-    *,
-    book_id: int,
-    user: SysUser,
-    voucher_date: date,
-    entries: list[dict],
-    remark: str = "",
-    attachments: int = 0,
-    source: str = "MANUAL",
-    voucher_no: str | None = None,
-    period_id: int | None = None,
-    insert_after_id: int | None = None,
-    commit: bool = True,
-    internal: bool = False,
-) -> Voucher:
-    """建一张凭证。
-
-    ``internal=True`` 是「这是系统自己生成的凭证」（结转损益、年度结转）的
-    **唯一**正规声明，也是 ``allow_inactive`` 唯一的来源 —— 它过去是
-    ``source in SYSTEM_SOURCES``，而 source 曾经由客户端提交，等于把这道
-    「停用科目也能记账」的豁免开给了所有人。现在豁免跟着调用方走：
-    客户端能构造的 source（MANUAL/IMPORT/INVOICE）拿不到它，
-    ``SYSTEM_SOURCES`` 只由 ``app/accounting/periods.py`` 那两个生成方使用。
-
-    刻意**不**在这里对 ``source in SYSTEM_SOURCES`` 再抛一次错：内部代码
-    （测试夹具 ``make_voucher`` 等）也会造 CARRY_FORWARD 凭证来验证查询口径，
-    而那条路上真正要守的不变量已经守住了 ——
-    ① 豁免拿不到，② ``_drop_carry_forward`` 只删签名对得上的系统凭证，
-    伪造一张出来既没有特权、也不会被悄悄删掉。
-    """
+def validate_new_voucher(db: Session, *, book_id: int, voucher_date: date,
+                         entries: list[dict], period_id: int | None = None,
+                         insert_after_id: int | None = None, internal: bool = False):
+    """无写入地校验新凭证，返回期间、标准化分录和插入锚点。"""
     period = db.get(Period, period_id) if period_id else find_period(db, book_id, voucher_date)
     if period is None:
         raise ValueError("会计期间不存在")
@@ -363,6 +336,44 @@ def create_voucher(
     # allow_inactive 只认 internal —— 见函数 docstring。原来是
     # ``source in SYSTEM_SOURCES``，而 source 由客户端提交。
     _validate_entries(db, book_id, payload, allow_inactive=internal)
+
+    return period, payload, anchor
+
+
+def create_voucher(
+    db: Session,
+    *,
+    book_id: int,
+    user: SysUser,
+    voucher_date: date,
+    entries: list[dict],
+    remark: str = "",
+    attachments: int = 0,
+    source: str = "MANUAL",
+    voucher_no: str | None = None,
+    period_id: int | None = None,
+    insert_after_id: int | None = None,
+    commit: bool = True,
+    internal: bool = False,
+) -> Voucher:
+    """建一张凭证。
+
+    ``internal=True`` 是「这是系统自己生成的凭证」（结转损益、年度结转）的
+    **唯一**正规声明，也是 ``allow_inactive`` 唯一的来源 —— 它过去是
+    ``source in SYSTEM_SOURCES``，而 source 曾经由客户端提交，等于把这道
+    「停用科目也能记账」的豁免开给了所有人。现在豁免跟着调用方走：
+    客户端能构造的 source（MANUAL/IMPORT/INVOICE）拿不到它，
+    ``SYSTEM_SOURCES`` 只由 ``app/accounting/periods.py`` 那两个生成方使用。
+
+    刻意**不**在这里对 ``source in SYSTEM_SOURCES`` 再抛一次错：内部代码
+    （测试夹具 ``make_voucher`` 等）也会造 CARRY_FORWARD 凭证来验证查询口径，
+    而那条路上真正要守的不变量已经守住了 ——
+    ① 豁免拿不到，② ``_drop_carry_forward`` 只删签名对得上的系统凭证，
+    伪造一张出来既没有特权、也不会被悄悄删掉。
+    """
+    period, payload, anchor = validate_new_voucher(
+        db, book_id=book_id, voucher_date=voucher_date, entries=entries,
+        period_id=period_id, insert_after_id=insert_after_id, internal=internal)
 
     # 插入位上号沿用参照凭证的号（页面预填的就是它），后面的整体顺延。
     # 人要是自己改过号，以人填的为准 —— 顺位照做，占的是那个号。

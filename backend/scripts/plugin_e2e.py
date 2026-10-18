@@ -40,6 +40,8 @@ def main():
     from app.core.security import hash_password
     from app.models import SysUser, UserBook, Book
     from app.accounting.periods import create_periods
+    from app.seed.chart_of_accounts import install_chart
+    from datetime import datetime, timezone
     from scripts.plugin_package import generate_key, build
     with engine.begin() as conn:
         conn.execute(text('DROP SCHEMA public CASCADE'))
@@ -49,10 +51,16 @@ def main():
     with SessionLocal.begin() as db:
         users = [SysUser(username=name, password_hash=hash_password(password), active=True, is_admin=name=='plugin-admin', real_name=name) for name in ['plugin-admin','plugin-staff','plugin-other']]
         db.add_all(users); db.flush()
-        book = Book(company_name='浏览器测试公司', name='插件隔离演练账套', start_year=2026, start_month=1)
+        book = Book(company_name='浏览器测试公司', name='插件隔离演练账套', start_year=2026, start_month=1, init_subjects_at=datetime.now(timezone.utc), init_subjects_source='CHART')
         db.add(book); db.flush(); create_periods(db, book)
-        db.add_all([UserBook(user_id=user.id, book_id=book.id, role='OWNER' if user.is_admin else 'ACCOUNTANT') for user in users])
+        install_chart(db, book.id)
+        db.add_all([UserBook(user_id=user.id, book_id=book.id, role='OWNER' if user.is_admin else 'ACCOUNTANT', sort_order=0) for user in users])
         book_id = book.id
+        other = Book(company_name='浏览器测试公司', name='切换演练账套', start_year=2026, start_month=1,
+                     init_subjects_at=datetime.now(timezone.utc), init_subjects_source='CHART')
+        db.add(other); db.flush(); create_periods(db, other); install_chart(db, other.id)
+        db.add_all([UserBook(user_id=user.id, book_id=other.id, role='OWNER' if user.is_admin else 'ACCOUNTANT', sort_order=1) for user in users])
+        other_id = other.id
     processes, handles = [], []
     with tempfile.TemporaryDirectory(prefix='cwq-plugin-browser-') as tmp:
         temporary = Path(tmp)
@@ -70,11 +78,13 @@ def main():
         (failed_source/'frontend/index.js').write_text('export default () => { throw new Error("expected frontend failure") };')
         failed_path = temporary/'failed.cwp'
         failed = build(failed_source, temporary/'key.pem', 'browser-test', failed_path)
+        csv_path = temporary/'csv.cwp'
+        csv_plugin = build(ROOT/'docs/plugin-import-example', temporary/'key.pem', 'browser-test', csv_path)
         api_port, web_port = free_port(), free_port()
         env = dict(os.environ, PLUGIN_ROOT=str(temporary/'plugins'), PLUGIN_TRUSTED_KEYS=json.dumps(keys), CWQ_API_WORKERS='2')
         state_file = temporary/'state.json'
-        state_file.write_text(json.dumps({'url': f'http://127.0.0.1:{web_port}', 'password': password, 'bookId': book_id,
-            'packages': [{'id':normal['id'], 'path':str(package_path)}, {'id':failed['id'], 'path':str(failed_path)}]}))
+        state_file.write_text(json.dumps({'url': f'http://127.0.0.1:{web_port}', 'password': password, 'bookId': book_id, 'otherBookId': other_id,
+            'packages': [{'id':normal['id'], 'path':str(package_path)}, {'id':failed['id'], 'path':str(failed_path)}, {'id':csv_plugin['id'], 'path':str(csv_path)}]}))
         def start_backend():
             log = (temporary/('backend-'+str(len(handles))+'.log')).open('w')
             handles.append(log)
@@ -92,7 +102,7 @@ def main():
             api = start_backend()
             subprocess.run([sys.executable,'scripts/plugin_status.py','--wait','20'], cwd=ROOT/'backend', env=env, check=True)
             subprocess.run(['node','tools/uitest/plugin_e2e.mjs','verify',str(state_file)], cwd=ROOT, check=True)
-            verify_data_and_retained_uninstall(api, start_backend, api_port, env, temporary, book_id, password, normal['id'], failed['id'])
+            verify_data_and_retained_uninstall(api, start_backend, api_port, env, temporary, book_id, password, normal['id'], failed['id'], csv_plugin['id'])
             print('PASS isolated signed-plugin browser E2E with production bundle/CSP and supervisor workers=2')
         except BaseException:
             for log in handles:
@@ -114,7 +124,7 @@ def main():
 
 
 
-def verify_data_and_retained_uninstall(api, start_backend, port, env, temporary, book_id, password, normal_id, failed_id):
+def verify_data_and_retained_uninstall(api, start_backend, port, env, temporary, book_id, password, normal_id, failed_id, csv_id):
     """真实示例的恢复演练和保留表卸载；所有生命周期修改经过管理 API。"""
     import httpx
     url = f'http://127.0.0.1:{port}'
@@ -161,7 +171,7 @@ print('PASS signed example backup v2 dry-run, FK restore and sequence reset')
         inserted = http.post(f'/api/plugins/{normal_id}/notes', json={'book_id':book_id,'label':'恢复后序列验证'}, headers=staff)
         assert inserted.status_code == 200, inserted.text
         assert inserted.json()['id'] > before.json()[0]['id']
-        for pid in (normal_id, failed_id):
+        for pid in (normal_id, failed_id, csv_id):
             response = http.post(f'/api/system/plugins/{pid}/disable', headers=admin)
             assert response.status_code == 200 and response.json()['status'] == 'pending_restart', response.text
         assert http.delete(f'/api/system/plugins/{normal_id}', headers=admin).status_code == 409

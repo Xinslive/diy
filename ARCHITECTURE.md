@@ -3301,7 +3301,7 @@ AttributeError: 'int' object has no attribute 'tzinfo'
 
 安装使用 runtime staging、文件锁、PostgreSQL session advisory lock 和 durable attempt journal。插件迁移及 MIGRATED journal 在同一 DB 事务提交，再 fsync + 同文件系统 rename，最后短事务提交 registry。文件系统和数据库不具有共同原子事务；reconcile 按已提交阶段向前恢复或隔离孤儿，结构不明时保留现场。
 
-主迁移只新增 `0026_plugin_registry`，前 25 条保持原样。插件分别使用 ScriptDirectory 和 `plugin_schema_version_<sha256(id)[:12]>`，只有显式安装/升级执行 DDL；启动只核对 head 和真实 metadata。业务表仅在 public 下使用 `plugin_<sha256(id)[:12]>_` 前缀，账套表必须有 book_id 和实际 FK，global 只允许配置/参考数据。迁移后核对列、PK/FK/check/index/trigger/function 及宿主结构快照，越界或不匹配即事务回滚。
+主迁移追加 `0026_plugin_registry` 和 `0027_plugin_imports`，前 25 条保持原样。后者管理宿主导入批次、源文件和凭证来源；插件自有迁移仍与主链分离。插件分别使用 ScriptDirectory 和 `plugin_schema_version_<sha256(id)[:12]>`，只有显式安装/升级执行 DDL；启动只核对 head 和真实 metadata。业务表仅在 public 下使用 `plugin_<sha256(id)[:12]>_` 前缀，账套表必须有 book_id 和实际 FK，global 只允许配置/参考数据。迁移后核对列、PK/FK/check/index/trigger/function 及宿主结构快照，越界或不匹配即事务回滚。
 
 ### 期望状态、worker 和用户授权
 
@@ -3310,6 +3310,14 @@ AttributeError: 'int' object has no attribute 'tzinfo'
 用户授权单独存于 plugin_user_access，不参与代码就绪判断。新装默认零授权，管理员没有隐式业务使用权。每个 manifest/API/SDK 调用读取当前已提交的用户启用状态和 grant；未授权返回固定 404 `PLUGIN_NOT_FOUND_OR_UNAVAILABLE`，已授权但不可用返回 503 `PLUGIN_UNAVAILABLE`。授权修改立即影响下一请求，无需等待 worker 重启；账套写操作仍需 OWNER/ACCOUNTANT。
 
 升级、卸载必须先停用并重启，确认旧 worker lease 清空。升级先备份、保留 grant、成功后仍禁用；卸载撤权并保留业务表。独立清表需要插件 id 确认和备份，不提供未经验证的自动 downgrade。应急关闭开关并重启全部 worker，保留数据和 journal 供恢复。
+
+### SDK 1.1 文件转凭证
+
+插件使用权绑定用户；用户在插件自己的页面选择有写权限的目标账套。格式适配和业务规则在插件代码中，账套差异配置在插件自己的 book-scoped 表中，`ctx.config` 提供版本比较更新和内容摘要。标准宿主服务使用插件命名空间的保留路径 `/_host`，按 manifest capability 注册，插件路由不能覆盖。
+
+宿主导入流程为上传并保存原始字节、插件解析并持久化预览、用户确认、整批原子提交。批次行锁和修订号控制编辑与并发提交；确认及提交重新核验插件 digest、配置版本、账套角色、期间和科目。凭证、来源关联、结果及成功审计一起提交，末张失败也回滚整批；成功后的重试返回原结果。同插件同账套按原文件摘要防止整批重复和部分交叠，取消后释放占位。
+
+插件页不随宿主顶栏账套/期间切换而重挂载，刷新后从宿主批次恢复。到期完整内容由有界清理 CLI 删除，摘要、结果和来源保留；尚无自动调度。标准契约及容量见 [数据接口](docs/plugin-data.md)，可运行 CSV 示例和后续查询、附件、后台作业、事件任务见 [优化清单](docs/plugin-roadmap.md)。
 
 ### 前端与备份
 

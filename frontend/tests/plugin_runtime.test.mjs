@@ -6,15 +6,22 @@ const { createPluginRuntime } = await source('/src/plugins/runtime.js')
 const component = { render: () => null }
 function setup() {
   let payload = { plugins: [metadata()] }, loads = [], links = [], removed = []
-  const session = { token: 'user-token', user: { id: 1 }, bookId: 1 }
+  let hosts = []
+  const session = { token: 'user-token', user: { id: 1 }, bookId: 1, books: [
+    { id: 1, name: '现金账', company_name: '甲公司', status: 'ACTIVE', role: 'ACCOUNTANT' },
+    { id: 2, name: '只读账', company_name: '乙公司', status: 'ACTIVE', role: 'VIEWER' },
+  ] }
   const router = createRouter({ history: createMemoryHistory(), routes: [{ name: 'workspace', path: '/', component,
     children: [{ name: 'books', path: 'books', component }, { name: 'placeholder', path: 'plugin/:id', component }] }] })
   const entries = { value: [] }, tabs = { setPluginEntries: value => removed.push(value) }
   const document = { createElement: () => ({ remove() { this.removed = true } }), head: { appendChild: link => links.push(link) } }
   const runtime = createPluginRuntime({ router, session, tabs, entries, document,
     fetch: async () => { if (payload instanceof Error) throw payload; return payload },
-    importer: async url => { loads.push(url); return { default: host => ({ render: () => host.h('div', 'loaded') }) } } })
-  return { runtime, router, session, entries, loads, links, setPayload: p => payload = p }
+    importer: async url => {
+      loads.push(url)
+      return { default: host => { hosts.push(host); return { render: () => host.h('div', 'loaded') } } }
+    } })
+  return { runtime, router, session, entries, loads, links, hosts, setPayload: p => payload = p }
 }
 test('授权路由可直接进入，module factory 加载同源资源；撤权移除路由、样式和入口', async () => {
   const s = setup(); await s.runtime.refresh()
@@ -22,6 +29,10 @@ test('授权路由可直接进入，module factory 加载同源资源；撤权�
   const route = s.router.getRoutes().find(r => r.name === 'plugin:com.test.demo:main')
   await route.components.default.__asyncLoader()
   assert.equal(s.loads.length, 1); assert.equal(s.links.length, 1)
+  assert.deepEqual(s.hosts[0].books(), [
+    { id: 1, name: '现金账', companyName: '甲公司', status: 'ACTIVE', role: 'ACCOUNTANT', canWrite: true },
+    { id: 2, name: '只读账', companyName: '乙公司', status: 'ACTIVE', role: 'VIEWER', canWrite: false },
+  ])
   assert.equal(await s.runtime.routeGuard({ path: '/plugin/com.test.demo', name: route.name }), true)
   s.setPayload({ plugins: [] }); await s.runtime.refresh()
   assert.equal(s.entries.value.length, 0); assert.ok(!s.router.hasRoute(route.name)); assert.ok(s.links[0].removed)

@@ -7,13 +7,27 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import MetaData, Table, select
 from app.core.db import SessionLocal
-from app.core.deps import get_my_book, require_book_write
+from app.core.deps import WRITE_ROLES, get_my_book, require_book_write
+from app.models.book import Book
 from app.models.system import SysUser, SystemSetting
 from app.plugins import audit
 from app.plugins.access import require_plugin_access
 
 # 只由宿主 ASGI 门禁设置，插件不能选择调用者。
 current_principal = ContextVar("plugin_principal", default=None)
+current_request_id = ContextVar("plugin_request_id", default="")
+
+
+def request_user(db, pid):
+    value = current_principal.get()
+    if value is None or value[0] != pid:
+        raise HTTPException(403, "插件能力只能在已鉴权请求内调用")
+    user = db.get(SysUser, value[1])
+    if not user or not user.active:
+        raise HTTPException(401, "用户已停用")
+    require_plugin_access(db, pid, user, generation=value[2])
+    return user
+
 
 
 def context_for(manifest):
@@ -22,14 +36,7 @@ def context_for(manifest):
     declarations = {t["name"]: t["scope"] for t in manifest.get("tables", [])}
 
     def principal(db):
-        value = current_principal.get()
-        if value is None or value[0] != pid:
-            raise HTTPException(403, "插件能力只能在已鉴权请求内调用")
-        user = db.get(SysUser, value[1])
-        if not user or not user.active:
-            raise HTTPException(401, "用户已停用")
-        require_plugin_access(db, pid, user, generation=value[2])
-        return user
+        return request_user(db, pid)
 
     def book_read(book_id: int):
         with SessionLocal() as db:
@@ -37,12 +44,49 @@ def context_for(manifest):
             book = get_my_book(book_id, db, user)
             return {"id": book.id, "name": book.name}
 
+    def book_list():
+        """返回当前用户可访问的账套，附带能否写入的明确结果。
+
+        插件是用户级授权，不绑定某一本账。文件导入插件需要在自己的页面
+        让用户选择目标账套，因此不能只依赖宿主顶部当前账套。列表只来自
+        当前用户的 ``UserBook`` 授权，``can_write`` 仅是提示；提交时仍由
+        ``book_write`` 或凭证写入助手重新做实时校验。
+        """
+        from app.models.system import UserBook
+        with SessionLocal() as db:
+            user = principal(db)
+            rows = db.execute(
+                select(Book, UserBook.role)
+                .join(UserBook, UserBook.book_id == Book.id)
+                .where(UserBook.user_id == user.id)
+                .order_by(UserBook.sort_order.asc().nulls_last(), Book.company_name, Book.name)
+            ).all()
+            return [
+                {"id": book.id, "name": book.name, "company_name": book.company_name,
+                 "status": book.status, "role": role,
+                 "can_write": (role or "").strip().upper() in WRITE_ROLES}
+                for book, role in rows
+            ]
+
     def book_write(book_id: int):
         with SessionLocal() as db:
             user = principal(db)
             book = get_my_book(book_id, db, user)
             require_book_write(book_id, db, user)
             return {"id": book.id, "name": book.name}
+
+    def upload_read(file, *, limit=None):
+        """受宿主容量闸保护地读取插件路由收到的 UploadFile。
+
+        插件可以决定更小的单次上限，但不能放宽宿主 ``import_max_bytes``。
+        原始字节只在当前请求内返回给插件；持久化、去重和批次关联属于后续
+        导入批次能力，不由这个低层读取助手偷偷完成。
+        """
+        from app.plugins.uploads import read_file
+
+        with SessionLocal() as db:
+            principal(db)
+        return read_file(file, limit=limit)
 
     def ledger_read(book_id: int, period_id: int):
         from app.api.ledger import balance
@@ -229,7 +273,9 @@ def context_for(manifest):
                 db.add(SystemSetting(key=ident, value=value))
 
     exposed = {"plugin_id": pid}
-    for permission, key, fn in [("book:read", "book_read", book_read), ("book:write", "book_write", book_write),
+    for permission, key, fn in [("book:read", "book_read", book_read), ("book:read", "book_list", book_list),
+        ("book:write", "book_write", book_write),
+        ("upload:read", "upload_read", upload_read),
         ("ledger:read", "ledger_read", ledger_read), ("subject:read", "subject_read", subject_read),
         ("voucher:write", "voucher_create", voucher_create),
         ("audit:write", "audit_write", audit_write)]:
@@ -239,7 +285,12 @@ def context_for(manifest):
     if "voucher:write" in permissions:
         exposed["voucher_batch_create"] = voucher_batch_create
     if "plugin_data:rw" in permissions:
+        from app.plugins.configuration import service as configuration_service
+        exposed["config"] = configuration_service(manifest, principal)
         exposed["data"] = SimpleNamespace(read=data_read, insert=data_insert, update=data_update, delete=data_delete)
     if "settings:rw" in permissions:
         exposed["settings"] = SimpleNamespace(get=setting_get, put=setting_put)
+    if "import:rw" in permissions:
+        from app.plugins.imports import service
+        exposed["imports"] = service(manifest, principal)
     return SimpleNamespace(**exposed)

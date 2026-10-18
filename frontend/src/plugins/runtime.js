@@ -1,6 +1,6 @@
 import * as Vue from 'vue'
 import { validatePlugin } from './manifest'
-import { fetchManifest, pluginClient } from './api'
+import { fetchManifest, pluginClient, pluginServices } from './api'
 
 export const pluginEntries = Vue.shallowRef([])
 import { PluginUnavailable as Unavailable } from './unavailable'
@@ -66,9 +66,15 @@ export function createPluginRuntime({ router, session, tabs, fetch = fetchManife
               if (link) { link.rel = 'stylesheet'; link.href = href; document.head.appendChild(link); styles.push(link) }
             }
             if (typeof module.default !== 'function') throw new Error('插件必须导出组件工厂')
+            const api = pluginClient(id)
             const host = Object.freeze({ h: Vue.h, ref: Vue.ref, computed: Vue.computed, onMounted: Vue.onMounted,
-              onUnmounted: Vue.onUnmounted, watch: Vue.watch, api: pluginClient(id),
-              bookId: () => session.bookId, periodId: () => session.periodId })
+              onUnmounted: Vue.onUnmounted, watch: Vue.watch, api, services: pluginServices(api),
+              bookId: () => session.bookId, periodId: () => session.periodId,
+              books: () => (session.books || []).map(book => ({
+                id: book.id, name: book.name, companyName: book.company_name,
+                status: book.status, role: book.role,
+                canWrite: ['OWNER', 'ACCOUNTANT'].includes(String(book.role || '').trim().toUpperCase())
+              })) })
             return module.default(host)
           },
           errorComponent: Unavailable, timeout: 30000,

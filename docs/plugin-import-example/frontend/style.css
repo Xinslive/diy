@@ -1,0 +1,12 @@
+.cwq-csvvoucher { max-width: 1180px; padding: 24px; color: #243247; }
+.cwq-csvvoucher h1 { font-size: 24px; margin: 0 0 16px; }
+.cwq-csvvoucher p { line-height: 1.65; }
+.cwq-csvvoucher fieldset { margin: 20px 0; padding: 14px; border: 1px solid #d6dee8; border-radius: 8px; }
+.cwq-csvvoucher label { display: inline-flex; align-items: center; gap: 8px; margin: 6px 16px 6px 0; }
+.cwq-csvvoucher button, .cwq-csvvoucher select, .cwq-csvvoucher input { padding: 8px; border: 1px solid #c5cfdd; border-radius: 5px; font: inherit; }
+.cwq-csvvoucher button { margin: 6px 8px 6px 0; background: #f0f5fc; cursor: pointer; }
+.cwq-csvvoucher button:disabled { opacity: .5; cursor: default; }
+.cwq-csvvoucher table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+.cwq-csvvoucher th, .cwq-csvvoucher td { padding: 8px; border: 1px solid #d6dee8; text-align: left; }
+.cwq-csvvoucher td input { width: 100%; min-width: 90px; box-sizing: border-box; }
+.cwq-csvvoucher [role="alert"] { color: #9a3024; background: #fff3ee; padding: 12px; }

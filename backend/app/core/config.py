@@ -246,6 +246,12 @@ class Settings(BaseSettings):
     import_batch_ttl_days: int = 7
 
     # 插件是管理员信任的进程内代码；默认关闭。密钥为 key_id -> raw Ed25519 公钥的 base64 JSON。
+    # 插件业务导入资源（与插件代码包容量分开）。一批所有文件合计仍受 import_max_bytes 限制。
+    plugin_import_max_files: int = 20
+    plugin_import_max_pending: int = 50
+    plugin_import_storage_max_bytes: int = 1024 * 1024 * 1024  # 每账套原文件留存总量
+    plugin_import_retention_days: int = 30  # 已提交文件和完整预览；保留摘要和结果
+
     plugin_enabled: bool = False
     plugin_root: str = "data/plugins"
     plugin_trusted_keys: str = "{}"
@@ -368,7 +374,9 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _check_plugin_limits(self):
         limits = (self.plugin_max_bytes, self.plugin_max_unzipped_bytes,
-                  self.plugin_max_file_bytes, self.plugin_max_files, self.plugin_disk_quota_bytes)
+                  self.plugin_max_file_bytes, self.plugin_max_files, self.plugin_disk_quota_bytes,
+                  self.plugin_import_max_files, self.plugin_import_max_pending,
+                  self.plugin_import_storage_max_bytes, self.plugin_import_retention_days)
         if any(value <= 0 for value in limits):
             raise ValueError("PLUGIN 配额和文件数量必须大于 0")
         if self.plugin_max_file_bytes > self.plugin_max_unzipped_bytes:

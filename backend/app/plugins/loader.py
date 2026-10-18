@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.routing import APIRoute
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.asyncexitstack import AsyncExitStackMiddleware
 from sqlalchemy import select
 from starlette.concurrency import run_in_threadpool
@@ -24,7 +25,7 @@ from app.plugins.errors import PluginError, unavailable
 from app.plugins.installer import root_path
 from app.plugins.migrations import read_head, read_version, validate_tables
 from app.plugins.models import PluginRegistry
-from app.plugins.public_api import context_for, current_principal
+from app.plugins.public_api import context_for, current_principal, current_request_id
 from app.plugins.security import verify_directory
 from app.plugins.workers import WorkerRuntime
 
@@ -42,6 +43,8 @@ class Registrar:
     def _check(self, path, endpoint, methods):
         if not isinstance(path, str) or not re.fullmatch(r"/(?:[a-z0-9_-]+|\{[a-z][a-z0-9_]*\})(?:/(?:[a-z0-9_-]+|\{[a-z][a-z0-9_]*\}))*|/", path):
             raise PluginError("INVALID_PLUGIN_ROUTE", "插件路由必须是命名空间内的相对路径")
+        if path == "/_host" or path.startswith("/_host/"):
+            raise PluginError("INVALID_PLUGIN_ROUTE", "_host 是宿主服务保留路由")
         if not set(methods) <= {"GET", "POST", "PUT", "PATCH", "DELETE"}:
             raise PluginError("INVALID_PLUGIN_ROUTE", "插件路由方法不允许")
         for param in pyinspect.signature(endpoint).parameters.values():
@@ -101,7 +104,11 @@ def load_one(runtime, plugin):
     result = register(registrar, context_for(verified.manifest))
     if result is not None:
         raise PluginError("INVALID_PLUGIN_ENTRY", "register 不得返回 app 或其他对象")
-    runtime.handlers[plugin.plugin_id] = AsyncExitStackMiddleware(registrar._router)
+    from app.plugins.services import router_for
+    # 宿主路由先匹配，插件的 /{path} 等通配路由不能遮住宿主服务。
+    services = router_for(verified.manifest)
+    services.routes.extend(registrar._router.routes)
+    runtime.handlers[plugin.plugin_id] = AsyncExitStackMiddleware(services)
     runtime.hooks[plugin.plugin_id] = registrar._hooks
 
 
@@ -177,12 +184,18 @@ class PluginGateway:
                 message = {**message, "headers": [(k, v) for k, v in message.get("headers", []) if k.lower() != b"cache-control"] + [(b"cache-control", b"private, no-store")]}
             await send(message)
         token = current_principal.set((pid, user_id, runtime.generation))
+        request_token = current_request_id.set(str(scope.get("state", {}).get("request_id", ""))[:128])
         try:
             await runtime.handlers[pid](scope, receive, private_send)
         except HTTPException as exc:
             if response_started:
                 raise
             await JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)(scope, receive, private_send)
+        except RequestValidationError as exc:
+            if response_started:
+                raise
+            errors = [{key: error[key] for key in ("loc", "msg", "type")} for error in exc.errors()]
+            await JSONResponse({"detail": errors}, status_code=422)(scope, receive, private_send)
         except Exception:
             request_id = scope.get("state", {}).get("request_id", "")
             log.exception("plugin request failed id=%s request_id=%s", pid, request_id)
@@ -191,3 +204,4 @@ class PluginGateway:
             await JSONResponse({"detail": {"code": "PLUGIN_EXECUTION_FAILED", "message": "插件执行失败", "request_id": request_id}}, status_code=500)(scope, receive, private_send)
         finally:
             current_principal.reset(token)
+            current_request_id.reset(request_token)

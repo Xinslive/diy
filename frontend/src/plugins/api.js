@@ -24,7 +24,38 @@ export function pluginClient(id) {
   return Object.freeze({
     get: async (url, params) => (await http.get(path(url), { params })).data,
     post: async (url, data) => (await http.post(path(url), data)).data,
-    put: async (url, data) => (await http.put(path(url), data)).data,
+    patch: async (url, data) => (await http.patch(path(url), data)).data,
+    put: async (url, data, params) => (await http.put(path(url), data, { params })).data,
     delete: async url => (await http.delete(path(url))).data,
+    upload: async (url, files, params = {}) => {
+      const data = new FormData()
+      for (const file of Array.isArray(files) ? files : [files]) data.append('files', file)
+      return (await http.post(path(url), data, { params, timeout: 120000 })).data
+    },
+    download: async url => (await http.get(path(url), { responseType: 'blob' })).data,
+  })
+}
+
+// 标准服务只走当前插件命名空间，服务端仍逐次检查 capability、用户和账套角色。
+export function pluginServices(api) {
+  const imports = '/_host/imports'
+  return Object.freeze({
+    books: () => api.get('/_host/books'),
+    config: Object.freeze({
+      get: (table, key, bookId) => api.get(`/_host/config/${table}/${key}`, { book_id: bookId }),
+      put: (table, key, bookId, expectedVersion, value) => api.put(`/_host/config/${table}/${key}`, { expected_version: expectedVersion, value }, { book_id: bookId }),
+    }),
+    imports: Object.freeze({
+      limits: () => api.get('/_host/import-limits'),
+      origin: voucherId => api.get(`/_host/vouchers/${voucherId}/origin`),
+      upload: (bookId, files) => api.upload(imports, files, { book_id: bookId }),
+      list: (bookId, params = {}) => api.get(imports, { ...params, book_id: bookId }),
+      read: id => api.get(`${imports}/${id}`),
+      edit: (id, revision, vouchers) => api.put(`${imports}/${id}/preview`, { revision, vouchers }),
+      confirm: (id, revision) => api.post(`${imports}/${id}/confirm`, { revision }),
+      submit: (id, revision) => api.post(`${imports}/${id}/submit`, { revision }),
+      cancel: (id, revision) => api.post(`${imports}/${id}/cancel`, { revision }),
+      download: (id, fileId) => api.download(`${imports}/${id}/files/${fileId}`),
+    }),
   })
 }

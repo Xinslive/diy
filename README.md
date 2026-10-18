@@ -162,7 +162,7 @@ cd backend
 
 系统支持签名 `.cwp` 全栈扩展，包括后端 API、预编译前端和独立迁移。插件与宿主同进程、同操作系统权限，**没有沙箱**；只安装经人工审阅、受信任发布者签名的代码。扫描用于拦截明显危险行为，不保证任意代码安全。规范、限制和验收记录分别见 [插件规范](docs/plugin-spec.md)、[风险记录](docs/plugin-risk.md)、[验证记录](docs/plugin-verification.md)。
 
-首次启用前先执行主迁移 `alembic upgrade head`（新增 `0026_plugin_registry`），在服务环境中配置 `PLUGIN_ENABLED=true`、`PLUGIN_TRUSTED_KEYS`（`key_id → base64 Ed25519 公钥` 的 JSON），并设置持久化的 `PLUGIN_ROOT`。systemd 默认工作目录下为 `backend/data/plugins`，Docker 为 `/app/data/plugins`；部署产物不包含、也不覆盖这个运行目录。Docker 应持久化挂载 `/app/data`。配置项及配额见根目录 `.env.example`。
+首次启用前先执行主迁移 `alembic upgrade head`（当前 head 为 `0027_plugin_imports`，包含注册表与导入批次），在服务环境中配置 `PLUGIN_ENABLED=true`、`PLUGIN_TRUSTED_KEYS`（`key_id → base64 Ed25519 公钥` 的 JSON），并设置持久化的 `PLUGIN_ROOT`。systemd 默认工作目录下为 `backend/data/plugins`，Docker 为 `/app/data/plugins`；部署产物不包含、也不覆盖这个运行目录。Docker 应持久化挂载 `/app/data`。配置项及配额见根目录 `.env.example`。
 
 从仓库根目录可生成仅供本地演示的签名包；生产私钥应保存在独立签名环境，不能复制进服务器或插件目录：
 
@@ -192,6 +192,8 @@ CWQ_API_WORKERS=2 .venv/bin/python scripts/start_server.py --port 8000
 停用也需要重启。升级、卸载和清理表之前，先停用并重启全部 worker，确认没有旧 lease。升级前生成校验过的本地数据快照，成功后保持停用并保留授权；卸载撤销授权、保留业务表。表清理是单独确认操作。代码/数据库/文件系统没有跨资源原子事务，未完成操作由 journal + reconcile 检测和恢复。恢复必须保留匹配版本的签名包、公钥、registry/迁移现场及数据备份，不能把新版本快照强灌到旧版本。
 
 前端代码资产为不含业务数据、带 digest 的同源只读资源，原生 `import()` 不带 Bearer；manifest 和业务 API 则实时鉴权。不通过 query string 传 token，也不放宽现有 CSP。插件模块加载失败会展示降级页，核心记账页面仍可使用。
+
+SDK 1.1.0 支持由用户在插件页面选择目标账套、保存账套配置，以及上传文件、持久预览、人工确认和整批原子制证。可签名运行的示例为 `docs/plugin-import-example/`，样例文件为 `docs/plugin-import-sample.csv`；契约见 [数据接口](docs/plugin-data.md)，已完成范围与后续任务见 [优化清单](docs/plugin-roadmap.md)。到期内容清理命令为 `python -m app.plugins.imports_cleanup --apply`（backend 目录），尚需部署方安排定期执行。
 
 ---
 

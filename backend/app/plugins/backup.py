@@ -70,7 +70,10 @@ def validate_restore(conn, data, scope, *, require_installed=True):
                     raise ExportRefused("插件表归档行字段不一致")
                 if meta["scope"] == "book" and (type(row.get("book_id")) is not int or row["book_id"] != data["header"].get("book_id")):
                     raise ExportRefused("插件表数据超出归档账套 scope")
-    injected = {name for name in data["tables"] if name.startswith("plugin_") and name not in {"plugin_user_access"}}
+    from app.models.base import Base
+    # plugin_* 也包含宿主自己管理的用户授权、源文件和导入批次。
+    # 只排除明确注册在宿主 metadata 中的表，未知插件表仍拒绝恢复。
+    injected = {name for name in data["tables"] if name.startswith("plugin_") and name not in Base.metadata.tables}
     if injected != expected_names:
         raise ExportRefused("归档插件表与 metadata 集合不一致")
     # 同插件外键闭包必须在本归档中，不能让 dry-run 漏掉丢失的父行。

@@ -148,7 +148,7 @@ test('正文确实来自仓库的规范文件，不是页面里另写的一份',
   const headings = [...spec.matchAll(/^##\s+(.+)$/gm)].map((m) => m[1].trim())
   const inToc = new Set(specDocument.toc.map((x) => x.title))
   assert.deepEqual(headings.filter((h) => !inToc.has(h)), [])
-  assert.equal(EXAMPLE_FILES.length, 5)
+  assert.equal(EXAMPLE_FILES.length, 10)
 })
 
 /**
@@ -191,11 +191,11 @@ test('目录锚点走路由 query，不会把 hash 换成陌生路径', async ()
     '目录项应当走 sectionTo(sectionTo 之外还有别的写法也要紧跟锚点检查)')
 })
 
-test('三份文档拼在一页，锚点互不覆盖', async () => {
+test('教程、数据、规范、风险、验证和路线拼在一页，锚点互不覆盖', async () => {
   const { guideDocument, dataDocument, specDocument, toc: allToc } = await source('/src/docs/content.js')
   assert.ok(guideDocument.toc.length >= 8, `教程目录只有 ${guideDocument.toc.length} 项，教程可能没接上`)
   const ids = allToc.map((x) => x.id)
-  assert.equal(new Set(ids).size, ids.length, '三份文档的锚点 id 撞车了，后写的会覆盖前面的')
+  assert.equal(new Set(ids).size, ids.length, '文档的锚点 id 撞车了，后写的会覆盖前面的')
 
   // 教程确实是从仓库文件读来的，不是页面里另写的一份
   const guide = fs.readFileSync(path.join(REPO, 'docs', 'plugin-guide.md'), 'utf8')
@@ -211,13 +211,13 @@ test('三份文档拼在一页，锚点互不覆盖', async () => {
 })
 
 test('数据接口章节能在页面上找到，能力表和批量建法都真在里面', async () => {
-  // 这条是为了「读者打开文档找不到数据接口」这件事不再发生。上一版把八个能力
+  // 这条是为了「读者打开文档找不到数据接口」这件事不再发生。上一版把SDK 能力
   // 压在规范里一张没有代码的表里，等于没有；而批量制证这件事横跨科目编码、
   // 原子性和去重三节，没有独立一章就没人读得到。
   const { dataDocument, toc: allToc } = await source('/src/docs/content.js')
   const titles = dataDocument.toc.map((x) => x.title)
   assert.deepEqual(
-    titles.filter((t) => /科目编码|整批|重复/.test(t)).length >= 3,
+    ["一条完整工作流", "账套配置存在哪里", "状态、修订和失败恢复", "去重和追溯"].every(title => titles.includes(title)),
     true,
     `数据接口章的目录少了几节：${JSON.stringify(titles)}`)
   assert.match(dataDocument.html, /subject_read/, '正文里没有 subject_read')
@@ -232,7 +232,7 @@ test('数据接口章节能在页面上找到，能力表和批量建法都真�
 
   // 「从哪开始」里必须有数据接口那一节，否则读者仍然要先自己翻目录
   const { startHere } = await source('/src/docs/content.js')
-  assert.ok(startHere(allToc).some((x) => /八个能力/.test(x.title)),
+  assert.ok(startHere(allToc).some((x) => /SDK 能力/.test(x.title)),
     '「从哪开始」没有指向数据接口的入口')
 })
 

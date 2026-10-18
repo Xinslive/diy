@@ -18,7 +18,7 @@ def test_registrar_rejects_host_route_request_dependencies_and_hooks():
         return {}
     def dependency(value=Depends(good)):
         return {}
-    for path, fn in [('http://foreign', good), ('/../../host', good), ('/a', bad), ('/a', dependency)]:
+    for path, fn in [('http://foreign', good), ('/../../host', good), ('/a', bad), ('/a', dependency), ('/_host', good), ('/_host/imports', good)]:
         with pytest.raises(PluginError):
             r.get(path, fn)
     r.get('/a', good)
