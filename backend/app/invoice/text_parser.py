@@ -35,6 +35,17 @@ def extract_pages_text(pdf_path: str) -> List[str]:
     return out
 
 
+def page_count(pdf_path: str) -> int:
+    """页数。批量上传时用它把「页码 → 来自哪个源文件」对上。"""
+    if p is None:
+        raise RuntimeError("缺少 pypdfium2 依赖，请安装后再解析 PDF")
+    doc = p.PdfDocument(pdf_path)
+    try:
+        return len(doc)
+    finally:
+        doc.close()
+
+
 # ---------- 数据模型 ----------
 
 @dataclass

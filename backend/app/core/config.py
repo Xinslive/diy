@@ -260,6 +260,18 @@ class Settings(BaseSettings):
     # 要调大必须两边一起改（和 import_max_bytes 同一条规矩）：
     # 这里放开的同时把 deploy/nginx/cwq.conf 的 client_max_body_size 提上去。
     invoice_max_bytes: int = 20 * 1024 * 1024
+    # 单次批量上传的**合计**体积上限与文件数上限。
+    #
+    # 批量上传是一次请求带多个文件，所以「每个文件 20MB」不等于「能传 20MB」：
+    # 网关那条 client_max_body_size=21m 限的是**整个请求体**，先于应用层生效。
+    # 合计上限与 invoice_max_bytes 同档，正是为了让配置里的数字等于实际能传的
+    # —— 和上面那条同一个理由：两边不一样时，小的那条先生效，大的那个数字
+    # 只是个让人误以为能传的摆设。
+    #
+    # 文件数上限挡住「一次丢 500 个文件进来逐个 OCR」：解析是按页同步跑的，
+    # 没有这个闸，单次请求能占住一个 worker 线程几十分钟。
+    invoice_max_total_bytes: int = 20 * 1024 * 1024
+    invoice_max_files: int = 60
     # 外部 PaddleOCR API。未同时配置 URL 和 token 时，发票功能仍可处理文本型 PDF，
     # 但不会尝试 OCR 兜底。
     invoice_ocr_api_url: str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"

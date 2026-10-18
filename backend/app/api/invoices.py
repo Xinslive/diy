@@ -15,7 +15,7 @@ from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
 # 本地别名保持函数名 ``read_upload`` 不变（守卫测试按这个名字认共享容量闸），
 # 指向的其实是同步版 —— 端点是同步 ``def``，不能再 await。
-from app.core.uploads import UploadTooLarge, read_upload_sync as read_upload
+from app.core.uploads import UploadTooLarge, human_bytes, read_upload_sync as read_upload
 from app.invoice import service
 from app.invoice import storage
 from app.models import InvoiceBatch, InvoiceRecord, Book, SysUser, UserBook
@@ -29,6 +29,21 @@ def _batch(book: Book, db: Session, batch_id: int) -> InvoiceBatch:
     if batch is None or batch.book_id != book.id:
         raise HTTPException(404, "发票批次不存在")
     return batch
+
+
+@router.get("/limits")
+def get_invoice_limits(book: Book = Depends(get_my_book)):
+    """单次上传的容量上限。
+
+    前端要把这两个数显示出来（超限前就让人知道），所以由后端给 —— 前端
+    抄一份常量的话，改了配置就会两边不一致，而不一致的那边只会安静地
+    让用户撞上后端的报错。
+    """
+    return {
+        "max_files": settings.invoice_max_files,
+        "max_total_bytes": settings.invoice_max_total_bytes,
+        "max_bytes": settings.invoice_max_bytes,
+    }
 
 
 @router.get("/config")
@@ -84,15 +99,42 @@ def remove_invoice_rule(rule_id: int, book: Book = Depends(get_my_book), db: Ses
     return {"ok": True}
 
 
+def _check_upload_limits(files: list[UploadFile]) -> list[UploadFile]:
+    """单次请求的容量闸：文件数与**合计**体积。
+
+    合计而不是单个：网关那条 client_max_body_size 限的是整个请求体，
+    「每个文件 20MB」不等于「一次能传 20MB」。非 PDF 也算进合计 ——
+    它们照样占请求体。
+
+    故意放在读第一个字节**之前**：超限的请求连文件内容都不进内存。
+    """
+    if not files:
+        raise HTTPException(400, "请选择要上传的 PDF 文件")
+    if len(files) > settings.invoice_max_files:
+        raise UploadTooLarge(f"一次最多上传 {settings.invoice_max_files} 个文件，本次选了 {len(files)} 个")
+    total = sum(getattr(upload, "size", 0) or 0 for upload in files)
+    if total > settings.invoice_max_total_bytes:
+        raise UploadTooLarge(
+            f"本次上传合计 {human_bytes(total)}，超过单次上限 {human_bytes(settings.invoice_max_total_bytes)}。"
+            "请分批上传")
+    return files
+
+
 @router.post("/batches", status_code=201)
-def upload_invoice_batch(file: UploadFile = File(...), book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+def upload_invoice_batch(files: list[UploadFile] = File(...), book: Book = Depends(get_my_book),
+                         db: Session = Depends(get_db),
                          _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
-    filename = file.filename or "发票.pdf"
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "只支持 PDF 发票文件")
     try:
-        data = read_upload(file, limit=settings.invoice_max_bytes, label="发票 PDF")
-        batch = service.create_batch(db, book.id, user, filename, data)
+        # 容量闸必须在读第一个字节之前；「非 PDF 忽略」交给 service ——
+        # 那是唯一一处判定什么该被跳过，接口层不再写第二份规则。
+        files = _check_upload_limits(files)
+        payloads: list[tuple[str, bytes]] = []
+        for upload in files:
+            name = upload.filename or "发票.pdf"
+            payloads.append((name, read_upload(
+                upload, limit=settings.invoice_max_bytes, label=f"发票 {name}",
+                hint="请拆成多份分别上传")))
+        batch = service.create_batch(db, book.id, user, payloads)
         preview = service.preview_batch(db, batch)
     except UploadTooLarge as exc:
         db.rollback()
@@ -106,14 +148,17 @@ def upload_invoice_batch(file: UploadFile = File(...), book: Book = Depends(get_
 @router.get("/batches")
 def list_invoice_batches(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     rows = db.scalars(select(InvoiceBatch).where(InvoiceBatch.book_id == book.id).order_by(InvoiceBatch.id.desc()).limit(100)).all()
-    return [service.batch_summary(row) for row in rows]
+    # 一次分组查询算完所有批次的「已忽略」张数，别按批次逐个查。
+    ignored = service.ignored_counts(db, [row.id for row in rows])
+    return [service.batch_summary(row, ignored.get(row.id, 0)) for row in rows]
 
 
 @router.get("/batches/{batch_id}")
 def get_invoice_batch(batch_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     batch = _batch(book, db, batch_id)
     records = db.scalars(select(InvoiceRecord).where(InvoiceRecord.batch_id == batch.id).order_by(InvoiceRecord.page_index)).all()
-    return {**service.batch_summary(batch), "invoices": [service.serialize_record(record) for record in records]}
+    ignored = sum(1 for record in records if record.status == "IGNORED")
+    return {**service.batch_summary(batch, ignored), "invoices": [service.serialize_record(record) for record in records]}
 
 
 @router.post("/batches/{batch_id}/preview")

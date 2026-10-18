@@ -69,19 +69,58 @@
           <template #header>
             <div class="section-head">
               <span>上传电子发票</span>
+              <span class="muted">支持多份 PDF、整个文件夹，或一份合并好的 PDF（每页一张发票）</span>
             </div>
           </template>
-          <el-upload
-            drag :auto-upload="false" :show-file-list="false" accept=".pdf"
-            :disabled="!store.canWrite" :on-change="onFile"
-          >
-            <el-icon class="el-icon--upload"><Upload /></el-icon>
-            <div class="el-upload__text">把 PDF 拖到此处，或<em>点击选择文件</em></div>
-          </el-upload>
+          <!--
+            拖放自己接，不用 el-upload 的。
+            `dataTransfer.files` 在拖进来的是**文件夹**时是空的，只有
+            `webkitGetAsEntry` 能递归出里面的文件（见 invoice_upload.js）。
+            capture + stop 是为了在事件到达拖拽框之前截住它 —— 否则同一批文件
+            会被这里和 el-upload 各收一遍，列表里出现重复行。
+            dragover 不拦：让 el-upload 继续负责那个高亮反馈。
+          -->
+          <div @drop.capture.stop.prevent="onDrop">
+            <el-upload
+              drag multiple :auto-upload="false" :show-file-list="false" accept=".pdf"
+              :disabled="!store.canWrite" :on-change="onFile"
+            >
+              <el-icon class="el-icon--upload"><Upload /></el-icon>
+              <div class="el-upload__text">把 PDF（或整个文件夹）拖到此处，或<em>点击选择文件</em></div>
+            </el-upload>
+          </div>
+          <div class="upload-actions">
+            <el-button :disabled="!store.canWrite" @click="folderInput?.click()">
+              <el-icon><FolderOpened /></el-icon>选择文件夹
+            </el-button>
+            <!--
+              不给目录选择器加 accept：加了浏览器的目录对话框会把非 PDF 直接
+              藏起来，用户就看不到「这个文件夹里到底有哪些文件被跳过了」。
+              这里宁可全部捞进来，由页面按后端同一套规则挑出 PDF 并列出忽略项。
+            -->
+            <input ref="folderInput" type="file" webkitdirectory multiple class="hidden-input" @change="onFolderPicked" />
+            <span class="muted">最多 {{ uploadLimits.maxFiles }} 个文件，单次合计 {{ humanBytes(uploadLimits.maxTotalBytes) }}</span>
+          </div>
+          <div v-if="files.length" class="picked-list">
+            <div class="picked-head">
+              <span>已选 {{ files.length }} 个 PDF，合计 {{ humanBytes(totalBytes) }}</span>
+              <el-button link type="primary" :disabled="!store.canWrite" @click="clearFiles">清空</el-button>
+            </div>
+            <div class="picked-scroll">
+              <div v-for="(item, index) in files" :key="itemKey(item, index)" class="picked-row">
+                <span class="picked-name" :title="item.webkitRelativePath || item.name">{{ item.name }}</span>
+                <span class="muted">{{ humanBytes(item.size) }}</span>
+                <el-button link :disabled="!store.canWrite" @click="removeFile(index)">移除</el-button>
+              </div>
+            </div>
+            <div v-if="skipped.length" class="skipped-note">
+              {{ skipNote(skipped) }}
+            </div>
+          </div>
           <div class="upload-footer">
-            <span class="muted">{{ file?.name || '尚未选择文件' }}</span>
-            <el-button type="primary" :disabled="!file || !store.canWrite" :loading="uploading" @click="upload">
-              <el-icon><Upload /></el-icon>上传并解析
+            <span class="muted">{{ files.length ? '' : '尚未选择文件' }}</span>
+            <el-button type="primary" :disabled="!files.length || !store.canWrite" :loading="uploading" @click="upload">
+              <el-icon><Upload /></el-icon>上传并解析{{ files.length > 1 ? `（${files.length} 个文件）` : '' }}
             </el-button>
           </div>
         </el-card>
@@ -159,15 +198,27 @@
         </template>
         <el-alert
           :type="batch.error_count ? 'error' : 'success'" :closable="false" show-icon class="mb"
-          :title="`共 ${batch.total} 张发票：${batch.ready_count} 张可生成，${batch.error_count} 张有问题`"
+          :title="batchSummaryTitle"
         />
         <el-alert v-if="batch.error_count" type="warning" :closable="false" show-icon class="mb"
                   title="请展开红色发票，修正类型或科目后点击「重新计算预览」；所有异常消除后才能确认。" />
+        <el-alert v-if="batch.error_count" type="info" :closable="false" show-icon class="mb"
+                  title="合并件里的封面、装订页、重复扫描页都不是发票：展开该行点「忽略这张」，它不会生成凭证，也不再算异常。" />
 
         <el-table :data="batch.invoices" size="small" border row-key="id" :row-class-name="invoiceRowClass">
           <el-table-column type="expand">
             <template #default="{ row }">
               <div class="invoice-detail">
+                <!--
+                  已被点名忽略的行只留「说明 + 取消忽略」。
+                  还摊着一排科目下拉和一张空的明细表，看着像「这张还要填」，
+                  而它已经不参与生成凭证了 —— 控件摆在那里只会误导。
+                -->
+                <div v-if="isIgnored(row)" class="ignored-note">
+                  <span>已忽略：这一页不参与生成凭证，也不计为异常；确认时自动跳过。</span>
+                  <el-button size="small" :disabled="!store.canWrite" @click="toggleIgnored(row)">取消忽略</el-button>
+                </div>
+                <template v-else>
                 <div class="detail-toolbar">
                   <el-form inline size="small">
                     <el-form-item label="发票类型">
@@ -187,6 +238,9 @@
                       <el-select :model-value="settlementSubjectFor(row)" :disabled="!store.canWrite" filterable style="width: 210px" @update:model-value="(v) => setSettlementSubject(row, v)">
                         <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                       </el-select>
+                    </el-form-item>
+                    <el-form-item label="这张">
+                      <el-button size="small" :disabled="!store.canWrite" @click="toggleIgnored(row)">忽略这张</el-button>
                     </el-form-item>
                   </el-form>
                 </div>
@@ -213,12 +267,14 @@
                     {{ entry.direction === 'DEBIT' ? '借' : '贷' }} {{ entry.subject_code }} {{ entry.subject_name }} {{ entry.amount }}
                   </span>
                 </div>
+                </template>
               </div>
             </template>
           </el-table-column>
           <el-table-column prop="page_index" label="页码" width="70" align="center">
             <template #default="{ row }">{{ row.page_index + 1 }}</template>
           </el-table-column>
+          <el-table-column v-if="batch.sources?.length > 1" prop="source_file" label="来源文件" min-width="170" show-overflow-tooltip />
           <el-table-column prop="invoice_no" label="发票号码" min-width="190" />
           <el-table-column prop="issue_date" label="开票日期" width="120" />
           <el-table-column label="类型" width="85" align="center"><template #default="{ row }">{{ invoiceTypeText(row.invoice_type) }}</template></el-table-column>
@@ -242,11 +298,12 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Check, Plus, Refresh, Upload } from '@element-plus/icons-vue'
+import { Check, FolderOpened, Plus, Refresh, Upload } from '@element-plus/icons-vue'
 import * as invoiceApi from '@/api/invoice'
 import * as subjectApi from '@/api/subject'
+import { filesFromDataTransfer, humanBytes, isIgnoredRow, partitionFiles, skipNote } from './invoice_upload'
 import { useSessionStore } from '@/stores/session'
 
 const store = useSessionStore()
@@ -255,7 +312,13 @@ const subjects = ref([])
 const rules = ref([])
 const history = ref([])
 const batch = ref(null)
-const file = ref(null)
+const files = ref([])
+const skipped = ref([])
+const folderInput = ref(null)
+// 上限由后端给（/invoices/limits）。兜底值只是让接口没回来之前界面也有个数，
+// 不能当成契约 —— 真超了后端会拒，兜底值偏小的话只是提前少选几个文件。
+const uploadLimits = ref({ maxFiles: 60, maxTotalBytes: 20 * 1024 * 1024 })
+const totalBytes = computed(() => files.value.reduce((sum, file) => sum + (file.size || 0), 0))
 const uploading = ref(false)
 const committing = ref(false)
 const previewing = ref(false)
@@ -268,12 +331,50 @@ const ruleForm = reactive({ match_type: 'SELLER', invoice_type: 'BOTH', keyword:
 
 const subjectLabel = (s) => `${s.code} ${s.name}`
 const invoiceTypeText = (v) => ({ INPUT: '进项', OUTPUT: '销项', UNKNOWN: '未判断' }[v] || v || '未判断')
-const invoiceStatusText = (v) => ({ READY: '可生成', REJECTED: '有问题', COMMITTED: '已生成', DISCARDED: '已作废' }[v] || v)
-const invoiceType = (v) => ({ READY: 'success', REJECTED: 'danger', COMMITTED: 'success', DISCARDED: 'info' }[v] || 'warning')
+const invoiceStatusText = (v) => ({ READY: '可生成', REJECTED: '有问题', COMMITTED: '已生成', IGNORED: '已忽略', DISCARDED: '已作废' }[v] || v)
+const invoiceType = (v) => ({ READY: 'success', REJECTED: 'danger', COMMITTED: 'success', IGNORED: 'info', DISCARDED: 'info' }[v] || 'warning')
+const itemKey = (file, index) => `${file.name}|${file.size}|${file.lastModified || index}`
+// 一句话把「几张可生成 / 几张有问题 / 几张被忽略」讲全 —— 少了「已忽略」这一项
+// 的话，被合并进来的封面页会让人以为批次比预想的多。
+const batchSummaryTitle = computed(() => {
+  const current = batch.value
+  if (!current) return ''
+  const parts = [`共 ${current.total} 张发票：${current.ready_count} 张可生成`]
+  if (current.error_count) parts.push(`${current.error_count} 张有问题`)
+  if (current.ignored_count) parts.push(`${current.ignored_count} 张已忽略`)
+  return parts.join('，')
+})
 const batchText = (v) => ({ PENDING: '待确认', COMMITTED: '已生成', DISCARDED: '已作废' }[v] || v)
 const batchType = (v) => ({ PENDING: 'warning', COMMITTED: 'success', DISCARDED: 'info' }[v] || '')
 
-function onFile(value) { file.value = value.raw }
+// 选文件、拖文件、选文件夹都汇到这一处：追加、去重、挑出 PDF，
+// 非 PDF 进 skipped（会被提示出来，不无声消失）。
+function addFiles(list) {
+  const { pdfs, skipped: ignored } = partitionFiles(list)
+  if (ignored.length) skipped.value = [...new Set([...skipped.value, ...ignored])]
+  files.value = [...files.value, ...pdfs]
+  const { maxFiles, maxTotalBytes } = uploadLimits.value
+  if (files.value.length > maxFiles) {
+    ElMessage.warning(`一次最多上传 ${maxFiles} 个文件，多出来的没有加入`)
+    files.value = files.value.slice(0, maxFiles)
+  }
+  if (totalBytes.value > maxTotalBytes) {
+    ElMessage.warning(`已选文件合计 ${humanBytes(totalBytes.value)}，超过单次上限 ${humanBytes(maxTotalBytes)}，请先移除几个`)
+  }
+  return files.value.length
+}
+function onFile(_value, list) { addFiles(list.map((item) => item.raw || item)) }
+function onFolderPicked(event) {
+  addFiles(Array.from(event.target.files || []))
+  // 清空 value：同一个文件夹连选两次时，否则 change 不会再触发。
+  event.target.value = ''
+}
+async function onDrop(event) {
+  const picked = await filesFromDataTransfer(event.dataTransfer)
+  if (picked.length) addFiles(picked)
+}
+function removeFile(index) { files.value.splice(index, 1) }
+function clearFiles() { files.value = []; skipped.value = [] }
 function ensureOverride(row) {
   if (!overrides[row.id]) overrides[row.id] = { line_subjects: {} }
   overrides[row.id].line_subjects ||= {}
@@ -300,9 +401,11 @@ function invoiceRowClass({ row }) { return row.status === 'REJECTED' ? 'invoice-
 
 async function loadAll() {
   if (!store.bookId) return
-  const [cfg, flat, ruleRows, batches] = await Promise.all([
-    invoiceApi.getConfig(store.bookId), subjectApi.subjectFlat(store.bookId), invoiceApi.listRules(store.bookId), invoiceApi.listBatches(store.bookId)
+  const [cfg, flat, ruleRows, batches, limits] = await Promise.all([
+    invoiceApi.getConfig(store.bookId), subjectApi.subjectFlat(store.bookId), invoiceApi.listRules(store.bookId),
+    invoiceApi.listBatches(store.bookId), invoiceApi.getLimits(store.bookId).catch(() => null)
   ])
+  if (limits) uploadLimits.value = { maxFiles: limits.max_files, maxTotalBytes: limits.max_total_bytes }
   Object.assign(config, cfg)
   subjects.value = flat
   rules.value = ruleRows
@@ -313,14 +416,24 @@ async function saveConfig() {
   try { Object.assign(config, await invoiceApi.saveConfig(store.bookId, { ...config })); ElMessage.success('发票制证配置已保存') } finally { savingConfig.value = false }
 }
 async function upload() {
+  if (!files.value.length) return
   uploading.value = true
-  try { batch.value = await invoiceApi.uploadBatch(store.bookId, file.value); await loadAll(); ElMessage.success(`解析完成：${batch.value.total} 张发票`) } finally { uploading.value = false }
+  try {
+    batch.value = await invoiceApi.uploadBatch(store.bookId, files.value)
+    clearFiles()
+    await loadAll()
+    ElMessage.success(`解析完成：${batch.value.total} 张发票`)
+    if (batch.value.ignored_count) ElMessage.warning(`其中 ${batch.value.ignored_count} 张被忽略`)
+    if (batch.value.error_count) ElMessage.warning(`${batch.value.error_count} 张需要核对后才能确认`)
+  } finally { uploading.value = false }
 }
 async function loadBatch(row) {
   batch.value = await invoiceApi.getBatch(store.bookId, row.id || row)
   tab.value = 'batches'
 }
-function newBatch() { batch.value = null; file.value = null; Object.keys(overrides).forEach(key => delete overrides[key]) }
+function newBatch() { batch.value = null; clearFiles(); Object.keys(overrides).forEach(key => delete overrides[key]) }
+function isIgnored(row) { return isIgnoredRow(row, overrides) }
+function toggleIgnored(row) { ensureOverride(row).ignored = !isIgnored(row) }
 function overridePayload() { return JSON.parse(JSON.stringify(overrides)) }
 async function recalculate() {
   previewing.value = true
@@ -368,7 +481,19 @@ onMounted(loadAll)
 .invoice-config-form :deep(.el-select),
 .invoice-config-form :deep(.el-input) { width: 100%; }
 .invoice-upload-card :deep(.el-upload-dragger) { padding: 26px 0; }
+.upload-actions { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+.upload-actions .muted { font-size: 12px; }
+.hidden-input { display: none; }
+/* 选中的文件多到几十份时不给它无限长高：内部滚动，标题与上传按钮留在原位。 */
+.picked-list { margin-top: 10px; border: 1px solid #e4e7ed; background: #fafbfc; }
+.picked-head { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; border-bottom: 1px solid #e4e7ed; font-size: 12px; color: #475467; }
+.picked-scroll { max-height: 180px; overflow-y: auto; }
+.picked-row { display: flex; align-items: center; gap: 10px; padding: 4px 10px; font-size: 12px; }
+.picked-row .muted { font-size: 12px; }
+.picked-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skipped-note { padding: 6px 10px; border-top: 1px dashed #e4e7ed; color: #8a6d1f; font-size: 12px; }
 .upload-footer { justify-content: space-between; margin-top: 14px; }
+.ignored-note { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px; background: #f4f5f7; color: #475467; font-size: 12px; }
 .result-title { gap: 10px; }
 .mb { margin-bottom: 12px; }
 .rule-help { margin-bottom: 12px; }

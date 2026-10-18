@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -18,6 +18,7 @@ from app.core.config import settings
 from app.core.system_settings import ocr_config
 from app.invoice import storage
 from app.invoice.parser import invoice_dict, parse_pdf_with_fallback
+from app.invoice.text_parser import page_count
 from app.models import (
     InvoiceBatch,
     InvoiceConfig,
@@ -298,6 +299,17 @@ def _build_preview(
         meta = _meta(record)
         lines = _lines(record)
         override = _override(record, overrides)
+        if override.get("ignored"):
+            # 用户点名「这张不算发票」：合并 PDF 里的封面、装订页、重复扫描页。
+            # 不给它编造科目，也不把它算进可生成/有问题 —— 两头都不该拦下整批。
+            record.status = "IGNORED"
+            record.errors = []
+            record.payload = {
+                **(record.payload or {}),
+                "resolution": {**((record.payload or {}).get("resolution") or {}), "ignored": True},
+            }
+            previews.append(serialize_record(record, subjects))
+            continue
         invoice_type = str(override.get("invoice_type") or record.invoice_type or "UNKNOWN")
         if invoice_type == "UNKNOWN":
             invoice_type = _type_from_taxpayer(meta, config.get("taxpayer_id", ""))
@@ -506,6 +518,7 @@ def serialize_record(record: InvoiceRecord, subjects: dict[int, Subject] | None 
     return {
         "id": record.id,
         "page_index": record.page_index,
+        "source_file": _text(payload.get("source_file")),
         "invoice_no": record.invoice_no or _text(meta.get("invoice_no")),
         "issue_date": record.issue_date.isoformat() if record.issue_date else _text(meta.get("issue_date")),
         "invoice_type": record.invoice_type,
@@ -519,14 +532,103 @@ def serialize_record(record: InvoiceRecord, subjects: dict[int, Subject] | None 
     }
 
 
-def create_batch(db: Session, book_id: int, user: SysUser, filename: str, data: bytes) -> InvoiceBatch:
+def is_pdf(name: str) -> bool:
+    return str(name or "").lower().endswith(".pdf")
+
+
+def skip_note(skipped: list[str]) -> str:
+    """被忽略的非 PDF 要留下名字，不能无声消失。"""
+    if not skipped:
+        return ""
+    head = "、".join(skipped[:5])
+    more = f" 等 {len(skipped)} 个" if len(skipped) > 5 else ""
+    return f"已忽略 {len(skipped)} 个非 PDF 文件：{head}{more}"
+
+
+def batch_label(files: list[tuple[str, bytes]]) -> str:
+    """批次标题：一份就写原名，多份写成「首个文件名 等 N 个文件」。
+
+    历史列表与确认页都用它当标题，所以要短、要能认出是哪批。全量文件名
+    只在提醒里出现（几十个名字铺满一列反而认不出哪批）。
+    """
+    names = [name for name, _ in files]
+    if len(names) == 1:
+        return names[0]
+    return f"{names[0]} 等 {len(names)} 个文件"
+
+
+def _page_sources(files: list[tuple[str, bytes]], relatives: list[str]) -> list[tuple[str, int, int]]:
+    """算出每个源文件在合并后 PDF 里的页码区间 ``(文件名, 起页, 止页)``。
+
+    合并之后原件字节流已经不按文件分开了，但「这张发票来自哪个文件」在核对
+    时必须能说出来（哪个文件有问题、重传哪一份）。所以合并前先把每份的页数
+    读出来，按选择顺序累加成区间。
+    """
+    spans: list[tuple[str, int, int]] = []
+    cursor = 0
+    for (name, _), relative in zip(files, relatives):
+        count = page_count(str(storage.path_for(relative)))
+        spans.append((name, cursor, cursor + count))
+        cursor += count
+    return spans
+
+
+def _source_of_page(spans: list[tuple[str, int, int]], page_index: int) -> str:
+    for name, start, end in spans:
+        if start <= page_index < end:
+            return name
+    return spans[-1][0] if spans else ""
+
+
+def _duplicate_detail(spans: list[tuple[str, int, int]], pages: list[int],
+                      numbers: list[str], wanted: list[str]) -> str:
+    """判重报错里带上「号码（来自哪几个文件）」。
+
+    批量上传时重复可能跨文件，只给号码的话用户要在几十个文件里自己找是哪
+    两张。点名的是**刚传上来的**这份清单里的文件 —— 用户手里只有这批。
+    """
+    detail = []
+    for number in wanted:
+        sources = {_source_of_page(spans, index) for index, no in zip(pages, numbers) if no == number}
+        detail.append(f"{number}（{'、'.join(sorted(sources))}）")
+    return "、".join(detail)
+
+
+def create_batch(db: Session, book_id: int, user: SysUser, files: list[tuple[str, bytes]]) -> InvoiceBatch:
+    """一次上传 1..N 个文件，落成一个批次；非 PDF 在这里被忽略。
+
+    单份时就是原来的行为：原文件原样落盘，不合并、不重写。多份时先各自暂存，
+    再按选择顺序合并成一份 —— 解析器本来就是按页切发票的，所以合并之后
+    「一份批次 N 张发票」的老链路一个字不用改，页码也天然连续。
+
+    **非 PDF 被忽略，PDF 却解析不了就不放行**：整个文件夹里混着 jpg/xlsx 是
+    常态，让它们把整批判掉等于这个功能不可用；而该成功的文件失败了还静默
+    跳过，等于用户以为传进去了。忽略掉的名字写进批次备注，不无声消失。
+    """
+    pdfs = [(name, data) for name, data in files if is_pdf(name)]
+    skipped = [name for name, _ in files if not is_pdf(name)]
+    if not pdfs:
+        detail = f"，本次 {len(skipped)} 个文件都不是 PDF：{'、'.join(skipped[:5])}" if skipped else ""
+        raise ValueError(f"没有可解析的 PDF 文件{detail}")
+    message = skip_note(skipped)
+    files = pdfs
+    filename = batch_label(files)
     batch = InvoiceBatch(book_id=book_id, filename=filename, created_by=user.username)
     db.add(batch)
     db.flush()
     saved_path = ""
+    staged: list[str] = []
     try:
-        saved_path = storage.save_pdf(batch.id, data)
+        if len(files) == 1:
+            saved_path = storage.save_pdf(batch.id, files[0][1])
+        else:
+            staged = [storage.stage_pdf(batch.id, index, data) for index, (_, data) in enumerate(files, start=1)]
+            saved_path = storage.merge_pdfs(list(zip(staged, [name for name, _ in files])), batch.id)
         batch.file_path = saved_path
+        spans = _page_sources(files, staged or [saved_path])
+        for relative in staged:
+            storage.delete(relative)
+        staged = []
         # 凭据从系统配置解析（库里优先、.env 兜底），解析层只负责执行。
         ocr = ocr_config(db)
         invoices, ocr_used = parse_pdf_with_fallback(str(storage.path_for(saved_path)), ocr)
@@ -537,23 +639,36 @@ def create_batch(db: Session, book_id: int, user: SysUser, filename: str, data: 
             _text((invoice_dict(invoice).get("meta") or {}).get("invoice_no"))
             for invoice in invoices
         ]
+        # 每张发票对应哪一页，判重报错要靠它点名来源文件
+        page_of_invoice = [invoice.page_index for invoice in invoices]
         duplicate_in_file = sorted({number for number in invoice_numbers if number and invoice_numbers.count(number) > 1})
         if duplicate_in_file:
-            raise ValueError(f"同一文件内发票号码重复，无法导入：{'、'.join(duplicate_in_file)}")
+            raise ValueError("本次上传中有重复发票号码，无法导入："
+                             + _duplicate_detail(spans, page_of_invoice, invoice_numbers, duplicate_in_file))
+        # 只认「还会变成凭证」的那些：已确认的（PENDING 还没确认，COMMITTED 已生成）
+        # 都要挡住重复上传，已**作废**的批次不算 —— 用户点「作废批次」的意思就是
+        # 「这批不要」，转头上传同一份 PDF 却一直被拦，等于这个功能没法用
+        # （commit_batch 那边的判重同样只看 COMMITTED，两边口径必须一致）。
         existing_numbers = {
             number for number in db.scalars(
-                select(InvoiceRecord.invoice_no).where(
+                select(InvoiceRecord.invoice_no)
+                .join(InvoiceBatch, InvoiceBatch.id == InvoiceRecord.batch_id)
+                .where(
                     InvoiceRecord.book_id == book_id,
                     InvoiceRecord.invoice_no.in_({number for number in invoice_numbers if number}),
+                    InvoiceBatch.status != "DISCARDED",
                 )
             ).all() if number
         }
         if existing_numbers:
-            raise ValueError(f"发票已存在，不能重复导入：{'、'.join(sorted(existing_numbers))}")
+            raise ValueError("发票已存在，不能重复导入："
+                             + _duplicate_detail(spans, page_of_invoice, invoice_numbers,
+                                                 sorted(existing_numbers)))
 
         records: list[InvoiceRecord] = []
         for invoice, invoice_no in zip(invoices, invoice_numbers):
-            payload = invoice_dict(invoice)
+            payload = {**invoice_dict(invoice),
+                       "source_file": _source_of_page(spans, invoice.page_index)}
             meta = payload.get("meta") or {}
             record = InvoiceRecord(
                 batch=batch,
@@ -570,10 +685,13 @@ def create_batch(db: Session, book_id: int, user: SysUser, filename: str, data: 
         db.flush()
         batch.total = len(records) if records else len(invoices)
         batch.ocr_used = ocr_used
+        batch.message = message
         # 解析时只写暂存记录；预览接口再按最新规则计算，允许先维护规则再回来看批次。
         batch.status = "PENDING"
         db.commit()
     except Exception:
+        for relative in staged:
+            storage.delete(relative)
         if saved_path:
             storage.delete(saved_path)
         db.rollback()
@@ -590,14 +708,23 @@ def preview_batch(db: Session, batch: InvoiceBatch, overrides: dict[str, dict] |
     _, ready, errors = _build_preview(db, batch, rules, config, overrides or {})
     db.commit()
     records = db.scalars(select(InvoiceRecord).where(InvoiceRecord.batch_id == batch.id).order_by(InvoiceRecord.page_index)).all()
+    sources = sorted({_text((record.payload or {}).get("source_file")) for record in records} - {""})
     return {
-        "batch_id": batch.id,
+        # 键是 ``id``，和 batch_summary / GET /batches/{id} 一致。
+        #
+        # 原来这里叫 ``batch_id``，前端拿到上传结果后却按 ``batch.id`` 去
+        # commit/recalculate/discard —— 于是「上传完直接点确认生成」必然
+        # POST /batches/undefined，422。上传是主路径，这条路却从来没通过。
+        "id": batch.id,
         "filename": batch.filename,
         "status": batch.status,
+        "message": batch.message,
         "total": batch.total,
         "ready_count": ready,
         "error_count": errors,
+        "ignored_count": sum(1 for record in records if record.status == "IGNORED"),
         "ocr_used": batch.ocr_used,
+        "sources": sources,
         "invoices": [serialize_record(record) for record in records],
     }
 
@@ -608,8 +735,10 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
     records = db.scalars(select(InvoiceRecord).where(InvoiceRecord.batch_id == batch.id).order_by(InvoiceRecord.page_index)).all()
     if not records:
         raise ValueError("批次没有发票")
-    if any(record.status != "READY" for record in records):
+    # IGNORED 是用户点名不要的（封面页之类），既不该被拦下，也不该生成凭证。
+    if any(record.status not in ("READY", "IGNORED") for record in records):
         raise ValueError("仍有发票未通过校验，请处理红色异常后再确认")
+    targets = [record for record in records if record.status == "READY"]
     existing = {
         value for value in db.scalars(select(InvoiceRecord.invoice_no).where(
             InvoiceRecord.book_id == batch.book_id,
@@ -617,13 +746,13 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
             InvoiceRecord.status == "COMMITTED",
         )).all() if value
     }
-    numbers = [record.invoice_no for record in records if record.invoice_no]
+    numbers = [record.invoice_no for record in targets if record.invoice_no]
     duplicate = sorted(set(numbers) & existing)
     if duplicate:
         raise ValueError(f"发票已存在，不能重复生成凭证：{'、'.join(duplicate)}")
     created = 0
     try:
-        for record in records:
+        for record in targets:
             resolution = (record.payload or {}).get("resolution") or {}
             voucher = voucher_service.create_voucher(
                 db,
@@ -646,7 +775,8 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
     batch.committed_count = created
     batch.committed_at = datetime.now(timezone.utc)
     batch.committed_by = user.username
-    batch.message = f"成功生成 {created} 张凭证"
+    ignored = len(records) - len(targets)
+    batch.message = (f"成功生成 {created} 张凭证" + (f"，{ignored} 张已忽略" if ignored else ""))
     log(db, action="IMPORT_INVOICES", entity="invoice_batch", entity_id=batch.id,
         user=user, book_id=batch.book_id, detail=f"发票导入生成凭证 {created} 张（{batch.filename}）",
         after={"batch_id": batch.id, "created": created})
@@ -661,12 +791,38 @@ def discard_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> None:
     batch.message = "已作废"
     for record in batch.invoices:
         record.status = "DISCARDED"
+        # 作废 = 这批不要了，发票号码要让出来给人重传。
+        #
+        # 号码并没有丢：payload 里原样留着，历史里照常看得到（serialize_record
+        # 会回落到 meta）。但那一列必须置空 —— ``uq_invoice_record_book_no``
+        # 是 book_id + invoice_no 上的唯一约束，不置空的话「作废完再传同一份
+        # PDF」会被数据库直接拒掉，用户从此再也传不进这张发票。批量导入里
+        # 「先传错、作废、再重传」是正常动作，这条约束不该把它堵死。
+        record.invoice_no = None
     log(db, action="DISCARD_INVOICES", entity="invoice_batch", entity_id=batch.id,
         user=user, book_id=batch.book_id, detail=f"作废发票批次（{batch.filename}）")
     db.commit()
 
 
-def batch_summary(batch: InvoiceBatch) -> dict[str, Any]:
+def ignored_counts(db: Session, batch_ids: list[int]) -> dict[int, int]:
+    """一批批次的「已忽略」张数，按批次 id 归拢。
+
+    忽略状态记在 invoice_record.status 上，不回写批次表，所以重开一个
+    批次（GET /batches/{id}、历史列表）时必须现算。少了这一格，用户看到的
+    是「共 3 张发票：2 张可生成」—— 第 3 张既不在可生成里也不在异常里，
+    像是凭空多出来的一页。
+    """
+    if not batch_ids:
+        return {}
+    rows = db.execute(
+        select(InvoiceRecord.batch_id, func.count(InvoiceRecord.id))
+        .where(InvoiceRecord.batch_id.in_(batch_ids), InvoiceRecord.status == "IGNORED")
+        .group_by(InvoiceRecord.batch_id)
+    ).all()
+    return {batch_id: count for batch_id, count in rows}
+
+
+def batch_summary(batch: InvoiceBatch, ignored_count: int = 0) -> dict[str, Any]:
     return {
         "id": batch.id,
         "filename": batch.filename,
@@ -674,6 +830,7 @@ def batch_summary(batch: InvoiceBatch) -> dict[str, Any]:
         "total": batch.total,
         "ready_count": batch.ready_count,
         "error_count": batch.error_count,
+        "ignored_count": ignored_count,
         "committed_count": batch.committed_count,
         "ocr_used": batch.ocr_used,
         "created_by": batch.created_by,
