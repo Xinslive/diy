@@ -29,6 +29,32 @@ def test_registrar_rejects_host_route_request_dependencies_and_hooks():
         r.hook('unknown', good)
 
 
+def test_registrar_accepts_only_declared_sync_task_handler():
+    manifest = {"id": "com.example.tasks", "tasks": [
+        {"name": "hourly", "schedule": {"type": "interval", "minutes": 60}}
+    ]}
+    registrar = Registrar(manifest)
+
+    def handler(context):
+        return context
+
+    async def async_handler(context):
+        return context
+
+    def two_args(context, other):
+        return context, other
+
+    with pytest.raises(PluginError):
+        registrar.task("missing", handler)
+    with pytest.raises(PluginError):
+        registrar.task("hourly", async_handler)
+    with pytest.raises(PluginError):
+        registrar.task("hourly", two_args)
+    registrar.task("hourly", handler)
+    with pytest.raises(PluginError):
+        registrar.task("hourly", handler)
+
+
 def test_good_bad_plugin_isolation_startup_has_no_ddl_and_exception_boundary(plugin_env, client, auth, admin_user):
     build, restart = plugin_env
     bad, bad_m, _, _ = build(files={'backend/main.py': b'def register(registrar, ctx):\n    raise ValueError("private source error")\n', 'frontend/index.js': b'export default host => ({render: () => host.h("div")});'})

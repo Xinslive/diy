@@ -81,6 +81,7 @@ class WorkerRuntime:
         self._thread = None
         self.handlers = {}
         self.hooks = {}
+        self.tasks = {}
 
     def join(self):
         if not re.fullmatch(r"[a-f0-9]{32,64}", self.generation) or not self.started_at or not 1 <= self.expected <= 64:

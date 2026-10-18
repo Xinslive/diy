@@ -33,12 +33,13 @@ log = logging.getLogger(__name__)
 
 
 class Registrar:
-    __slots__ = ("_plugin_id", "_router", "_hooks", "_declared_hooks")
+    __slots__ = ("_plugin_id", "_router", "_hooks", "_declared_hooks", "_tasks", "_declared_tasks")
 
     def __init__(self, manifest):
         self._plugin_id = manifest["id"]
         self._router = APIRouter()
         self._hooks, self._declared_hooks = {}, set(manifest.get("hooks", []))
+        self._tasks, self._declared_tasks = {}, {task["name"]: task for task in manifest.get("tasks", [])}
 
     def _check(self, path, endpoint, methods):
         if not isinstance(path, str) or not re.fullmatch(r"/(?:[a-z0-9_-]+|\{[a-z][a-z0-9_]*\})(?:/(?:[a-z0-9_-]+|\{[a-z][a-z0-9_]*\}))*|/", path):
@@ -79,6 +80,19 @@ class Registrar:
             raise PluginError("INVALID_PLUGIN_HOOK", "插件 hook 未声明、重复或不在白名单中")
         self._hooks[name] = handler
 
+    def task(self, name, handler):
+        if (name not in self._declared_tasks or name in self._tasks or not callable(handler)
+                or pyinspect.iscoroutinefunction(handler) or pyinspect.isgeneratorfunction(handler)
+                or pyinspect.isasyncgenfunction(handler)):
+            raise PluginError("INVALID_PLUGIN_TASK", "插件定时任务未声明、重复或不能是异步函数")
+        try:
+            params = list(pyinspect.signature(handler).parameters.values())
+        except (ValueError, TypeError) as exc:
+            raise PluginError("INVALID_PLUGIN_TASK", "定时任务处理函数签名无效") from exc
+        if len(params) != 1 or params[0].kind not in (pyinspect.Parameter.POSITIONAL_ONLY, pyinspect.Parameter.POSITIONAL_OR_KEYWORD):
+            raise PluginError("INVALID_PLUGIN_TASK", "定时任务处理函数必须只接收一个 TaskContext 参数")
+        self._tasks[name] = handler
+
 
 def load_one(runtime, plugin):
     directory = root_path() / plugin.plugin_id / plugin.plugin_digest
@@ -108,8 +122,12 @@ def load_one(runtime, plugin):
     # 宿主路由先匹配，插件的 /{path} 等通配路由不能遮住宿主服务。
     services = router_for(verified.manifest)
     services.routes.extend(registrar._router.routes)
+    if set(registrar._tasks) != set(registrar._declared_tasks):
+        raise PluginError("INVALID_PLUGIN_TASK", "每个已声明的定时任务都必须注册一个处理函数")
     runtime.handlers[plugin.plugin_id] = AsyncExitStackMiddleware(services)
     runtime.hooks[plugin.plugin_id] = registrar._hooks
+    runtime.tasks[plugin.plugin_id] = {name: (spec["schedule"], registrar._tasks[name], plugin.plugin_digest)
+                                       for name, spec in registrar._declared_tasks.items()}
 
 
 def startup():

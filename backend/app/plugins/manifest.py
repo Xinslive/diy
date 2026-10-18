@@ -9,10 +9,12 @@ import unicodedata
 from pathlib import PurePosixPath
 
 import rfc8785
+from croniter import croniter
+from datetime import datetime
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import Version
 
-from app.plugins import API_VERSION
+from app.plugins import API_VERSION, SUPPORTED_API_VERSIONS
 from app.plugins.errors import PluginError
 
 ID_RE = re.compile(r"[a-z][a-z0-9]*(?:[.-][a-z][a-z0-9]*){1,10}\Z")
@@ -87,7 +89,7 @@ def parse_manifest(raw: bytes) -> dict:
 
 def validate_manifest(source: dict) -> dict:
     doc = copy.deepcopy(source)
-    _object(doc, {"format_version", "id", "name", "version", "api_version", "description", "permissions", "access", "contributes", "hooks", "tables", "files", "signature"},
+    _object(doc, {"format_version", "id", "name", "version", "api_version", "description", "permissions", "access", "contributes", "hooks", "tasks", "tables", "files", "signature"},
             {"format_version", "id", "name", "version", "api_version", "permissions", "access", "contributes", "files", "signature"})
     if type(doc["format_version"]) is not int or doc["format_version"] != 1:
         fail("不支持的插件包格式")
@@ -104,12 +106,43 @@ def validate_manifest(source: dict) -> dict:
         if not isinstance(spec, str) or not spec or len(spec) > 128:
             fail("api_version 无效")
         spec = re.sub(r"\s+(?=[<>=!~])", ",", spec.strip())
-        if Version(API_VERSION) not in SpecifierSet(spec):
+        if not any(Version(version) in SpecifierSet(spec) for version in SUPPORTED_API_VERSIONS):
             fail("插件不兼容当前宿主 SDK", "INCOMPATIBLE_API")
     except (InvalidSpecifier, TypeError) as exc:
         raise PluginError("INVALID_MANIFEST", "api_version 无效") from exc
     _unique_list(doc["permissions"], PERMISSIONS)
     _unique_list(doc.get("hooks", []), HOOKS)
+    tasks = doc.get("tasks", [])
+    if not isinstance(tasks, list) or len(tasks) > 32:
+        fail("插件定时任务声明无效")
+    if tasks and Version(API_VERSION) not in SpecifierSet(spec):
+        fail("定时任务需要兼容 SDK 1.2", "INCOMPATIBLE_API")
+    task_names = set()
+    for task in tasks:
+        _object(task, {"name", "schedule"}, {"name", "schedule"})
+        name = task["name"]
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,47}", name) or name in task_names:
+            fail("插件定时任务名称无效或重复")
+        task_names.add(name)
+        schedule = task["schedule"]
+        _object(schedule, {"type", "minutes", "expression", "timezone"}, {"type"})
+        kind = schedule["type"]
+        if kind == "interval":
+            if set(schedule) - {"type", "minutes"} or type(schedule.get("minutes")) is not int or not 1 <= schedule["minutes"] <= 525600:
+                fail("插件定时任务 interval 必须指定 1 到 525600 分钟")
+        elif kind == "cron":
+            if set(schedule) - {"type", "expression", "timezone"} or not isinstance(schedule.get("expression"), str) or not schedule["expression"].strip() or len(schedule["expression"]) > 128:
+                fail("插件定时任务 cron 必须指定表达式")
+            if schedule.get("timezone", "Asia/Shanghai") != "Asia/Shanghai":
+                fail("插件定时任务当前只支持 Asia/Shanghai 时区")
+            try:
+                if len(schedule["expression"].split()) != 5 or not croniter.is_valid(schedule["expression"]):
+                    fail("插件定时任务 cron 表达式无效")
+                croniter(schedule["expression"], datetime.now()).get_next(datetime)
+            except (ValueError, KeyError, TypeError):
+                fail("插件定时任务 cron 表达式无效")
+        else:
+            fail("插件定时任务 schedule.type 只能是 interval 或 cron")
     _object(doc["access"], {"assignment", "default"}, {"assignment", "default"})
     if doc["access"] != {"assignment": "admin_users", "default": "none"}:
         fail("插件必须由管理员显式授权且默认无人可用")
