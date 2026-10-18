@@ -10,6 +10,7 @@
 5. **只读账套不能记账**：VIEWER 触发保存与执行都要被宿主挡下。
 """
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -83,17 +84,38 @@ def _manifest_edit(manifest):
 
 def _rule(client, path, headers, book, **overrides):
     payload = {
-        "book_id": book,
         "name": overrides.pop("name", "办公室租金"),
         "day_of_month": overrides.pop("day_of_month", 5),
         "amount": overrides.pop("amount", "8000.00"),
         "entries": overrides.pop("entries", [
-            {"code": "5602", "direction": "DEBIT", "summary": "房租"},
+            {"code": "560207", "direction": "DEBIT", "summary": "房租"},
             {"code": "1002", "direction": "CREDIT", "summary": "付租"},
         ]),
     }
     payload.update(overrides)
-    return client.post(path + "/rules", json=payload, headers=headers)
+    # book_id 是处理函数的**标量**参数，宿主按 FastAPI 的规则把它映射成 query；
+    # 只有 dict 参数才是 JSON body。写进 body 会被 422 挡在插件代码之前。
+    return client.post(path + "/rules", params={"book_id": book}, json=payload, headers=headers)
+
+
+def _scheduled_post(db, runtime):
+    """按宿主的真实路径跑一次插件定时任务。
+
+    直接调 handler 会跳过宿主注入身份上下文（``current_principal``），插件的
+    能力调用会直接抛「插件能力只能在已鉴权请求内调用」—— 那样测的就不是线上
+    真正走的那条路径了。这里走 ``service._run_plugin``，它同时也是「按当前有效
+    授权逐用户执行」这条规则的实现处。
+    """
+    from app.models.plugin import PluginRegistry
+    from app.scheduler import service
+
+    plugin = db.get(PluginRegistry, PID)
+    handler = runtime.tasks[PID]["monthly_posting"][1]
+    claim = {"task_key": f"plugin:{PID}:monthly_posting", "plugin_id": PID,
+             "task_name": "monthly_posting", "plugin_digest": plugin.plugin_digest,
+             "run_id": "test-run", "scheduled_for": datetime.now(timezone.utc),
+             "claim_count": 1}
+    return service._run_plugin(runtime, PID, "monthly_posting", handler, claim)
 
 
 def _vouchers_of(db, book):
@@ -110,7 +132,7 @@ def test_rule_roundtrip_and_duplicate_month_is_idempotent(db, periodic, client, 
     assert rule["amount"] == "8000.00"
     assert rule["day_of_month"] == 5
 
-    first = client.post(periodic + "/run", json={"book_id": book.id}, headers=headers)
+    first = client.post(periodic + "/run", params={"book_id": book.id}, json={}, headers=headers)
     assert first.status_code == 200, first.text
     body = first.json()
     assert len(body["created"]) == 1, body
@@ -118,7 +140,7 @@ def test_rule_roundtrip_and_duplicate_month_is_idempotent(db, periodic, client, 
     voucher_no = body["created"][0]["voucher_no"]
     assert voucher_no
 
-    second = client.post(periodic + "/run", json={"book_id": book.id}, headers=headers)
+    second = client.post(periodic + "/run", params={"book_id": book.id}, json={}, headers=headers)
     assert second.status_code == 200, second.text
     assert second.json()["created"] == []
     assert any(item.get("done") for item in second.json()["skipped"])
@@ -131,7 +153,7 @@ def test_rule_roundtrip_and_duplicate_month_is_idempotent(db, periodic, client, 
 def test_generated_voucher_is_balanced_and_dated_by_rule(db, periodic, client, auth, book):
     """生成的分录借贷相等、金额取规则值、日期落在规则声明的那天。"""
     _rule(client, periodic, auth, book.id, amount="1234.56")
-    body = client.post(periodic + "/run", json={"book_id": book.id, "year": 2026, "month": 3},
+    body = client.post(periodic + "/run", params={"book_id": book.id}, json={"year": 2026, "month": 3},
                        headers=auth).json()
     assert len(body["created"]) == 1, body
 
@@ -147,7 +169,7 @@ def test_generated_voucher_is_balanced_and_dated_by_rule(db, periodic, client, a
 def test_day_31_falls_back_to_month_end(db, periodic, client, auth, book):
     """31 号在小月应落到当月最后一天，而不是跳过这个月。"""
     _rule(client, periodic, auth, book.id, day_of_month=31)
-    body = client.post(periodic + "/run", json={"book_id": book.id, "year": 2026, "month": 2},
+    body = client.post(periodic + "/run", params={"book_id": book.id}, json={"year": 2026, "month": 2},
                        headers=auth).json()
     assert len(body["created"]) == 1, body
     assert body["created"][0]["voucher_date"] == "2026-02-28"
@@ -170,7 +192,7 @@ def test_rules_are_book_scoped(db, periodic, client, auth, book, admin_user):
     db.commit()
 
     _rule(client, periodic, auth, book.id, name="租金A")
-    assert client.post(periodic + "/run", json={"book_id": other.id}, headers=auth).json()["created"] == []
+    assert client.post(periodic + "/run", params={"book_id": other.id}, json={}, headers=auth).json()["created"] == []
     assert _vouchers_of(db, other.id) == []
     names = [r["name"] for r in client.get(periodic + "/rules", params={"book_id": other.id},
                                            headers=auth).json()["rules"]]
@@ -184,13 +206,17 @@ def test_viewer_cannot_write(plugin_env, client, auth, plain_auth, plain_user, b
     link = UserBook(user_id=plain_user.id, book_id=book_id_, role="VIEWER")
     db.add(link)
     db.commit()
+    # 插件授权和账套角色是两道独立的闸：没有插件授权时宿主一律回固定的 404，
+    # 那样断言到的就不是「只读账套不能记账」，而是「这个人根本没被授权」。
+    assert client.put(f"/api/system/plugins/{PID}/users", headers=auth,
+                      json={"user_ids": [plain_user.id]}).status_code == 200
     assert _rule(client, path, plain_auth, book_id_).status_code == 403
-    assert client.post(path + "/run", json={"book_id": book_id_}, headers=plain_auth).status_code == 403
+    assert client.post(path + "/run", params={"book_id": book_id_}, json={}, headers=plain_auth).status_code == 403
 
 
 @pytest.fixture
-def periodic_admin_book(installed, client, auth, book):
-    return installed, book.id
+def periodic_admin_book(periodic, book):
+    return periodic, book.id
 
 
 def test_close_period_hook_backfills_missing_months(db, periodic, client, auth, book, admin_user):
@@ -198,17 +224,17 @@ def test_close_period_hook_backfills_missing_months(db, periodic, client, auth, 
     from app.accounting.periods import close_period
 
     _rule(client, periodic, auth, book.id)
-    assert client.post(periodic + "/run", json={"book_id": book.id, "year": 2026, "month": 1},
+    assert client.post(periodic + "/run", params={"book_id": book.id}, json={"year": 2026, "month": 1},
                        headers=auth).json()["created"]
-    assert client.post(periodic + "/run", json={"book_id": book.id, "year": 2026, "month": 2},
+    assert client.post(periodic + "/run", params={"book_id": book.id}, json={"year": 2026, "month": 2},
                        headers=auth).json()["created"]
 
     # 制造一个缺口：把 2 月的台账撤掉（模拟「2 月漏记、3 月已记」）
     rows = client.get(periodic + "/rules", params={"book_id": book.id}, headers=auth).json()["runs"]
     feb = [row for row in rows if row["period_label"] == "2026年2月"]
     assert feb, rows
-    client.post(periodic + f"/runs/{feb[0]['id']}/undo", json={"book_id": book.id}, headers=auth)
-    assert client.post(periodic + "/run", json={"book_id": book.id, "year": 2026, "month": 3},
+    client.post(periodic + f"/runs/{feb[0]['id']}/undo", params={"book_id": book.id}, headers=auth)
+    assert client.post(periodic + "/run", params={"book_id": book.id}, json={"year": 2026, "month": 3},
                        headers=auth).json()["created"]
 
     period = db.scalar(select(Period).where(Period.book_id == book.id, Period.year == 2026,
@@ -229,38 +255,29 @@ def test_scheduled_task_and_manual_do_not_double_post(db, periodic, client, auth
     from app.scheduler import service as scheduler
 
     _rule(client, periodic, auth, book.id)
-    assert client.post(periodic + "/run", json={"book_id": book.id, "year": 2026, "month": 3},
+    assert client.post(periodic + "/run", params={"book_id": book.id}, json={"year": 2026, "month": 3},
                        headers=auth).json()["created"]
 
     runtime = client.app.state.plugin_runtime
-    handler = runtime.tasks[PID]["monthly_posting"][1]
-    handler(_TaskContext())
+    _scheduled_post(db, runtime)
 
     assert len(_vouchers_of(db, book.id)) == 1, [v.voucher_no for v in _vouchers_of(db, book.id)]
 
     # 反向顺序：撤销台账后先跑定时任务，再手动执行，同样只能记一次。
     rows = client.get(periodic + "/rules", params={"book_id": book.id}, headers=auth).json()["runs"]
-    client.post(periodic + f"/runs/{rows[0]['id']}/undo", json={"book_id": book.id}, headers=auth)
+    client.post(periodic + f"/runs/{rows[0]['id']}/undo", params={"book_id": book.id}, headers=auth)
     db.expire_all()
     for voucher in _vouchers_of(db, book.id):
         db.delete(voucher)
     db.commit()
 
-    handler(_TaskContext())
+    _scheduled_post(db, runtime)
     assert len(_vouchers_of(db, book.id)) == 1
-    again = client.post(periodic + "/run", json={"book_id": book.id, "year": 2026, "month": 3},
+    again = client.post(periodic + "/run", params={"book_id": book.id}, json={"year": 2026, "month": 3},
                         headers=auth).json()
     assert again["created"] == [], again
     assert any(item.get("done") for item in again["skipped"])
     assert len(_vouchers_of(db, book.id)) == 1
-
-
-class _TaskContext:
-    """宿主传给定时任务的上下文（handler 只用到 plugin_id / task_name）。"""
-    plugin_id = PID
-    task_name = "monthly_posting"
-    run_id = "test-run"
-    scheduled = True
 
 
 def test_scheduled_task_respects_start_label(db, periodic, client, auth, book):
@@ -269,7 +286,7 @@ def test_scheduled_task_respects_start_label(db, periodic, client, auth, book):
 
     _rule(client, periodic, auth, book.id, start_label="2999-01")
     runtime = client.app.state.plugin_runtime
-    runtime.tasks[PID]["monthly_posting"][1](_TaskContext())
+    _scheduled_post(db, runtime)
     assert _vouchers_of(db, book.id) == []
 
 
@@ -286,7 +303,7 @@ def test_periodic_task_is_declared_and_registered(db, periodic, client, auth):
 def test_start_label_limits_backfill(db, periodic, client, auth, book):
     """起始年月之前不生成。"""
     _rule(client, periodic, auth, book.id, start_label="2026-03")
-    body = client.post(periodic + "/preview", json={"book_id": book.id, "year": 2026, "month": 1},
+    body = client.post(periodic + "/preview", params={"book_id": book.id}, json={"year": 2026, "month": 1},
                        headers=auth)
     assert body.status_code == 200, body.text
     assert body.json()["plans"] == []
