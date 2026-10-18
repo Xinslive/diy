@@ -129,7 +129,7 @@
           <template #header><span>处理历史</span></template>
           <el-table :data="history" size="small" border @row-click="loadBatch">
             <el-table-column prop="filename" label="文件" min-width="220" />
-            <el-table-column prop="created_at" label="时间" width="180" />
+            <el-table-column label="时间" width="180"><template #default="{ row }">{{ formatDateTime(row.created_at) }}</template></el-table-column>
             <el-table-column label="状态" width="110">
               <template #default="{ row }"><el-tag size="small" :type="batchType(row.status)">{{ batchText(row.status) }}</el-tag></template>
             </el-table-column>
@@ -304,6 +304,7 @@ import { Check, FolderOpened, Plus, Refresh, Upload } from '@element-plus/icons-
 import * as invoiceApi from '@/api/invoice'
 import * as subjectApi from '@/api/subject'
 import { filesFromDataTransfer, humanBytes, isIgnoredRow, partitionFiles, skipNote } from './invoice_upload'
+import { formatDateTime } from '@/utils/datetime'
 import { useSessionStore } from '@/stores/session'
 
 const store = useSessionStore()

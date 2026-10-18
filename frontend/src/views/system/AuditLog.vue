@@ -7,7 +7,7 @@
     <div class="card">
       <el-table :data="logs" border size="small" v-loading="loading">
         <el-table-column label="时间" width="170">
-          <template #default="{ row }">{{ (row.created_at || '').replace('T', ' ').slice(0, 19) }}</template>
+          <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
         </el-table-column>
         <el-table-column label="操作人" width="90" prop="username" />
         <el-table-column label="动作" width="90">
@@ -35,6 +35,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import * as api from '@/api/book'
 import { useSessionStore } from '@/stores/session'
+import { formatDateTime } from '@/utils/datetime'
 
 const store = useSessionStore()
 const logs = ref([])

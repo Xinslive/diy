@@ -98,6 +98,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import * as api from '@/api/system'
+import { formatDateTime } from '@/utils/datetime'
 
 const tasks = ref([]), runs = ref([])
 const loading = ref(false), runsLoading = ref(false), busy = ref(false), toggling = ref('')
@@ -175,11 +176,10 @@ const zoneOf = schedule => (schedule && typeof schedule === 'object' ? schedule.
 // ------------------------------------------------------------------
 // 时间
 // ------------------------------------------------------------------
+// 固定显示北京时间，不用 toLocaleString：后者按浏览器时区转换，
+// 换个设备打开，同一次执行会显示成另一个时间。
 function timeText(iso) {
-  if (!iso) return '—'
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return String(iso)
-  return date.toLocaleString('zh-CN', { hour12: false })
+  return iso ? formatDateTime(iso) : '—'
 }
 
 function durationText(row) {

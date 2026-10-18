@@ -154,7 +154,7 @@
         <el-table-column prop="error_count" label="有问题" width="80" align="center" />
         <el-table-column prop="committed_count" label="已入库" width="80" align="center" />
         <el-table-column prop="created_by" label="操作人" width="90" />
-        <el-table-column prop="created_at" label="时间" width="170" />
+        <el-table-column label="时间" width="170"><template #default="{ row }">{{ formatDateTime(row.created_at) }}</template></el-table-column>
         <el-table-column prop="message" label="备注" min-width="180" show-overflow-tooltip />
       </el-table>
     </el-card>
@@ -168,6 +168,7 @@ import { Upload, UploadFilled, Download } from '@element-plus/icons-vue'
 import * as voucherApi from '@/api/voucher'
 import { downloadFile } from '@/api/print'
 import { useSessionStore } from '@/stores/session'
+import { formatDateTime } from '@/utils/datetime'
 
 const store = useSessionStore()
 const step = ref(0)
