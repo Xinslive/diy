@@ -21,6 +21,7 @@ const routes = [
     children: [
       { path: 'plugin/:pluginId/:rest(.*)*', name: 'plugin-entry', component: () => import('@/plugins/unavailable').then(m => m.PluginUnavailable) },
       { path: 'plugins', name: 'plugins', component: () => import('@/views/system/PluginManager.vue'), meta: { title: '扩展管理', adminOnly: true } },
+      { path: 'scheduler-tasks', name: 'scheduler-tasks', component: () => import('@/views/system/SchedulerTasks.vue'), meta: { title: '计划任务', adminOnly: true } },
       { path: 'books', name: 'books', component: () => import('@/views/book/BookManager.vue'), meta: { title: '账套管理' } },
       { path: 'openings', name: 'openings', component: () => import('@/views/book/OpeningBalance.vue'), meta: { title: '期初余额' } },
       { path: 'vouchers', name: 'vouchers', component: () => import('@/views/voucher/VoucherList.vue'), meta: { title: '凭证' } },

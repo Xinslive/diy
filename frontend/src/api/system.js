@@ -23,6 +23,14 @@ export const testBackupConnection = () => http.post('/system/backup/test').then(
 export const triggerBackup = () => http.post('/system/backup/run').then(r => r.data)
 export const getBackupRuns = (limit = 50) => http.get('/system/backup/runs', { params: { limit } }).then(r => r.data)
 
+// 计划任务。任务的定义写在扩展自己的 manifest 里，任务行由后端同步到
+// `sys_scheduled_task`；这里只是把它摊开给管理员看，并开关**扩展**的任务。
+// 系统任务（如每日备份）归后端管，只读，没有对应的 PUT。
+export const schedulerTasks = () => http.get('/system/scheduler/tasks').then(r => r.data)
+export const setSchedulerTask = (pluginId, taskName, enabled) =>
+  http.put(`/system/scheduler/tasks/${pluginId}/${taskName}`, { enabled }).then(r => r.data)
+export const schedulerRuns = (limit = 50) => http.get('/system/scheduler/runs', { params: { limit } }).then(r => r.data)
+
 // 审计日志走 `@/api/book` 的 `auditLogs(bookId, limit)` —— 审计是**按账套**的，
 // 而这里原来包的是 `/system/audit-logs`（不带 book_id），两个函数**同名不同义**。
 // `AuditLog.vue` 实际 import 的是 `@/api/book`，这个从未被调用，留着只会让

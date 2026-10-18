@@ -67,6 +67,7 @@ export const NAV = [
       { name: 'ocr-settings', title: '外部服务', icon: Connection, adminOnly: true },
       { name: 'data-security', title: '数据安全', icon: Lock, adminOnly: true },
       { name: 'plugins', title: '扩展管理', icon: Grid, adminOnly: true },
+      { name: 'scheduler-tasks', title: '计划任务', icon: Calendar, adminOnly: true },
     ],
   },
 ]
