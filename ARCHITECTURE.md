@@ -2870,6 +2870,69 @@ grep -n 'root ' /www/server/panel/vhost/nginx/acct.xins.live.conf
 沙箱演练新增第 11 组断言这两条权限；后端新增 `test_产出文件权限是600`（断言的是
 **改名之后**的最终文件，因为 `.part` 改名时保留权限位，中间态的权限不作数）。
 
+### 11.7.10 账套在产品上删不掉，只能直接动库，而外键不是「全 CASCADE」
+
+`app/api/books.py` 只暴露 `GET /api/books` 与 `POST /api/books`，**没有
+`DELETE /api/books/{id}`**。账套在产品层是单向门：建得了，删不了。
+`scripts/loadtest.py:410` 早就把这件事记下来了。所以「删掉某个账套」这个运维动作
+必然要落到库上，而落到库上之后，最容易踩的误判是「`book` 的子表全是 CASCADE，
+删一行 `book` 就完事」——**不成立**，有三处 RESTRICT 会挡住级联：
+
+| 挡路的引用 | delete_rule | 什么时候会撞上 |
+|---|---|---|
+| `invoice_config.{output_tax,input_credit,output_debit}_subject_id` → `subject` | RESTRICT | 账套配过发票科目 |
+| `invoice_rule.subject_id` → `subject` | RESTRICT | 配过发票规则 |
+| `period_opening.subject_id` → `subject` | RESTRICT | 录过期初数 |
+| `voucher.period_id` → `period` | NO ACTION | 有凭证时删账期 |
+| `report_result.period_id` → `period` | NO ACTION | 跑过报表时删账期 |
+
+反过来，有两处**不必**操心删除顺序：`book → 各子表` 基本都是 CASCADE
+（`audit_log` 是 SET NULL，所以删账套不会连带抹掉审计日志）；
+`entry.voucher_id → voucher` 也是 CASCADE，凭证分录不用单独先删。
+
+正确顺序：
+
+```sql
+BEGIN;
+-- 1. 先解掉指向 subject 的 RESTRICT 与指向 period 的 NO ACTION
+DELETE FROM invoice_config WHERE book_id IN (:b);
+DELETE FROM invoice_rule    WHERE book_id IN (:b);
+DELETE FROM period_opening  WHERE book_id IN (:b);
+DELETE FROM voucher         WHERE book_id IN (:b);
+DELETE FROM report_result   WHERE book_id IN (:b);
+-- 2. 剩下的都是 book 的 CASCADE 子表，一行带走全部
+DELETE FROM book WHERE id IN (:b);
+COMMIT;
+```
+
+第 2 步之后 `subject`、`period`、`sys_user_book` 会被级联清掉，不必显式写。
+对**空账套**（无凭证、无期初、无发票配置）来说，整段等价于一行 `DELETE FROM book`。
+
+**不要用「遍历 `information_schema` 找所有带 `book_id` 的表逐个删」来代替上面这段。**
+那个 DO 块有两个隐患：一是遍历顺序取自 `information_schema.columns` 而那里没有
+`ORDER BY`，`voucher` 与 `entry` 谁先谁后不可控；二是它按 `book_id` 匹配，
+漏掉了 `invoice_config` / `invoice_rule` 里**不靠 `book_id` 而靠 `subject_id` 关联**
+的那些行——空账套上无害，对录过期初或配过发票科目的账套会直接违反上面那三条 RESTRICT。
+
+判据（删完必查）：
+
+```bash
+psql -c "select count(*) from book"                                    # 期望 0
+psql -c "select count(*) from subject where book_id in (1,2)"          # 期望 0，确认无孤儿科目
+psql -c "select count(*) from audit_log"                               # 不变：SET NULL 不是 CASCADE
+curl -s -H "Authorization: Bearer $TOKEN" https://acct.xins.live/api/books   # 期望 []
+```
+
+删完原持有人会变成**零账套**（`sys_user_book` 一并被 CASCADE 带走），
+`/api/auth/me` 的 `books` 变成 `[]`。这不是死局：重建走 `POST /api/books`，
+任何登录用户都能建、建完自动 OWNER（`app/api/books.py:113` 明确不设管理员门槛）。
+
+2026-10-18 在 `8.155.171.57` 上按此删除了 `init_db.py` 播种出的两个账套
+（租金账套 / 管理费账套，均属紫欣星悦荟，2026-01 起），删除前各带 140 科目、
+12 账期，凭证与期初均为 0 行；实际清理 310 行，删前已用
+`pg_dump -Fc` 留下快照 `/www/wwwroot/acct.xins.live/backups/pre-delete-books-20261018.dump`。
+当时线上处于「零账套」状态，等待按真实公司信息重建。
+
 ---
 
 ## 11.8 数据安全：账套快照备份到阿里云 OSS（2026-10-17 加）
