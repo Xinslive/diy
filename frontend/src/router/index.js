@@ -3,6 +3,16 @@ import { useSessionStore } from '@/stores/session'
 
 const routes = [
   { path: '/login', name: 'login', component: () => import('@/views/LoginView.vue'), meta: { public: true } },
+  // 插件开发文档：全站**唯一**免登录的页面，也是全站**唯一没有入口**的页面。
+  //
+  // 「没有入口」不是靠自觉，而是靠它不在 nav.js 的 NAV 里 —— 不在 NAV
+  // 就不会出现在侧栏和顶部模块，tabs.js 的 KNOWN_KEYS（由 NAV 派生）也
+  // 自动不含它，于是标签页和 localStorage 同样不会记它。任何页面、README、
+  // ARCHITECTURE 都不放它的链接；tests/docs_page.test.mjs 会把这条钉死。
+  //
+  // 放成顶层路由而不是 '/' 的 children，正是为了不经过 MainLayout：
+  // 不创建标签页，也不用它的账套/期间选择器。
+  { path: '/docs', name: 'docs', component: () => import('@/views/docs/DocsView.vue'), meta: { public: true, title: '插件开发文档' } },
   {
     path: '/',
     name: 'workspace',
