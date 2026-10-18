@@ -132,6 +132,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from '@/stores/session'
 import { useTabsStore } from '@/stores/tabs'
 import { landingOf, menuKeyOf, visibleNav } from '@/router/nav'
+import { pluginEntries } from '@/plugins/runtime'
 import {
   ArrowDown, ArrowLeft, ArrowRight, Close, DArrowRight, Expand, Fold, HomeFilled,
 } from '@element-plus/icons-vue'
@@ -141,7 +142,7 @@ const tabs = useTabsStore()
 const route = useRoute()
 const router = useRouter()
 
-const nav = computed(() => visibleNav(store.isAdmin))
+const nav = computed(() => visibleNav(store.isAdmin, pluginEntries.value))
 
 // 切换账套/期间后让当前页面重新取数
 const viewKey = computed(() => `${route.name}-${store.bookId}-${store.periodId}`)

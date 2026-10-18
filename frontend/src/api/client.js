@@ -19,6 +19,8 @@ let clearSession = () => {
   localStorage.removeItem('cwq_token')
 }
 export function onUnauthorized(fn) { clearSession = fn || clearSession }
+let pluginRejected = () => {}
+export function onPluginRejected(fn) { pluginRejected = fn }
 
 http.interceptors.request.use((config) => {
   const token = localStorage.getItem('cwq_token')
@@ -47,7 +49,11 @@ http.interceptors.response.use(
       return Promise.reject(error)
     }
     const detail = error.response?.data?.detail
-    const msg = typeof detail === 'string' ? detail : Array.isArray(detail) ? detail[0]?.msg : null
+    if (status === 404 && detail?.code === 'PLUGIN_NOT_FOUND_OR_UNAVAILABLE') {
+      const match = error.config?.url?.match(/^\/plugins\/([a-z0-9.-]+)\//)
+      if (match) pluginRejected(match[1])
+    }
+    const msg = typeof detail === 'string' ? detail : Array.isArray(detail) ? detail[0]?.msg : detail?.message
     if (msg) ElMessage.error(msg)
     return Promise.reject(error)
   }

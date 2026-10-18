@@ -1,4 +1,4 @@
-import { createApp } from 'vue'
+import { createApp, watch } from 'vue'
 import { createPinia } from 'pinia'
 // Element Plus 改成按需引入之后（见 vite.config.js 的 ElementPlusResolver），
 // 全局 CSS 不再整包 import。ElMessage / ElMessageBox 这些是**命令式**调用，
@@ -10,7 +10,9 @@ import 'element-plus/es/components/message-box/style/css'
 import App from './App.vue'
 import router from './router'
 import './styles/main.css'
-import { onUnauthorized } from './api/client'
+import { onUnauthorized, onPluginRejected } from './api/client'
+import { createPluginRuntime } from './plugins/runtime'
+import { useTabsStore } from './stores/tabs'
 import { useSessionStore } from './stores/session'
 
 const pinia = createPinia()
@@ -20,11 +22,19 @@ const app = createApp(App)
 // 语言（locale）改由 App.vue 的 <el-config-provider> 提供 ——
 // 那是按需引入下配 locale 的正规位置，效果与原来的
 // app.use(ElementPlus, { locale: zhCn }) 一致。
-app.use(pinia).use(router)
+app.use(pinia)
+const session = useSessionStore(pinia)
+const plugins = createPluginRuntime({ router, session, tabs: useTabsStore(pinia) })
+router.beforeEach(plugins.routeGuard)
+watch(() => [session.token, session.user?.id], () => { plugins.clear(); void plugins.refreshAndLeave() }, { flush: 'sync' })
+window.addEventListener('focus', () => void plugins.refreshAndLeave())
+onPluginRejected(plugins.rejectPlugin)
+void plugins.refresh()
+app.use(router)
 
 // 401 的善后交给 store 在这里装配，而不是让 client.js 直接 import session
 // —— 那是 client → session → api/auth → client 的环，ESM 下不报错，
 // 只是静默拿到 undefined。见 api/client.js 里 onUnauthorized 的注释。
-onUnauthorized(() => useSessionStore(pinia).logout())
+onUnauthorized(() => { plugins.clear(); session.logout() })
 
 app.mount('#app')

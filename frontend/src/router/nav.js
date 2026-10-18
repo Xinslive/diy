@@ -8,7 +8,7 @@
 import {
   Collection, Connection, DataAnalysis, Document, Files, Folder, Grid, List,
   Notebook, Printer, Setting, Sort, Tickets, TrendCharts, Upload, User, Coin,
-  CircleCheck, Lock,
+  CircleCheck, Lock, Calendar, Tools,
 } from '@element-plus/icons-vue'
 
 export const NAV = [
@@ -66,6 +66,7 @@ export const NAV = [
       // 落到第一项，插到首位会把落地页从「操作日志」悄悄换成这个低频页面。
       { name: 'ocr-settings', title: '外部服务', icon: Connection, adminOnly: true },
       { name: 'data-security', title: '数据安全', icon: Lock, adminOnly: true },
+      { name: 'plugins', title: '扩展管理', icon: Grid, adminOnly: true },
     ],
   },
 ]
@@ -97,8 +98,12 @@ function liftLanding(module) {
 }
 
 /** 菜单按当前身份过滤：非管理员看不到系统管理里那两项，hidden 的也不进菜单。 */
-export function visibleNav(isAdmin) {
-  return NAV
+export function visibleNav(isAdmin, plugins = []) {
+  const source = [...NAV]
+  const icons = { Calendar, Grid, Document, DataAnalysis, Tools, Coin, Folder }
+  if (plugins.length) source.push({ key: 'extensions', title: '扩展', icon: Tools,
+    items: [...plugins].sort((a, b) => (a.menu.order || 0) - (b.menu.order || 0) || a.id.localeCompare(b.id)).map(p => ({ name: p.menu.name, title: p.menu.title, icon: icons[p.menu.icon] || Grid })) })
+  return source
     .map((m) => liftLanding({ ...m, items: m.items.filter((it) => (!it.adminOnly || isAdmin) && !it.hidden) }))
     // 整个模块被过滤空了（理论上只有非管理员才会发生）就不占顶部位置
     .filter((m) => m.items.length)
