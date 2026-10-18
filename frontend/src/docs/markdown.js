@@ -103,27 +103,44 @@ md.renderer.rules.link_close = (tokens, idx, options, env, self) => {
  * 若目录改成拿正则去扫原文，代码围栏里的 `# 部署` 会被当成一级标题，目录
  * 就多出一项，而且点过去落到一个不存在的位置。同源则从构造上排除这种错位。
  *
+ * 文档自己的**一级标题不渲染进正文**，而是作为 `title` 返回，由页面当章节标题
+ * 显示。页面头部已经有一个 h1，再让每份文档各带一个 h1，层级就散了。
+ *
+ * `idPrefix` 是给多份文档拼在一页时用的：教程和规范可能各有同名小节
+ * （例如都有「Python SDK」），不加前缀两边的锚点会撞成一个，后写的
+ * 把前面的覆盖掉，于是有一条链接永远指错地方。
+ *
  * @param {string} source
- * @returns {{ html: string, toc: Array<{level:number,title:string,id:string}> }}
+ * @param {{ idPrefix?: string }} [options]
+ * @returns {{ title: string, html: string, toc: Array<{level:number,title:string,id:string}> }}
  */
-export function buildDocument(source) {
+export function buildDocument(source, { idPrefix = '' } = {}) {
   const tokens = md.parse(String(source ?? ''), {})
   const toc = []
   const used = new Set()
+  let title = ''
+  let dropTitleAt = -1
 
   for (let i = 0; i < tokens.length; i += 1) {
     if (tokens[i].type !== 'heading_open') continue
     const inline = tokens[i + 1]
     if (!inline || inline.type !== 'inline') continue
-    // 一级标题是文档名，不进目录：目录是「这一页里有什么」，不是把标题复述一遍。
     const level = Number(tokens[i].tag.slice(1))
-    if (level < 2) continue
-    const title = (inline.content || '').trim()
-    if (!title) continue
-    const id = uniqueId(used, slugify(title))
+    const heading = (inline.content || '').trim()
+    if (!heading) continue
+    // 一级标题是文档名：交给页面渲染，正文里去掉（heading_open/inline/heading_close）。
+    if (level === 1) {
+      if (!title) { title = heading; dropTitleAt = i }
+      continue
+    }
+    const id = uniqueId(used, idPrefix + slugify(heading))
     tokens[i].attrSet('id', id)
-    toc.push({ level, title, id })
+    toc.push({ level, title: heading, id })
   }
 
-  return { html: md.renderer.render(tokens, md.options, {}), toc }
+  const body = dropTitleAt < 0
+    ? tokens
+    : [...tokens.slice(0, dropTitleAt), ...tokens.slice(dropTitleAt + 3)]
+
+  return { title, html: md.renderer.render(body, md.options, {}), toc }
 }

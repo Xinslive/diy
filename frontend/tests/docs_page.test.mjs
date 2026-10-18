@@ -150,3 +150,97 @@ test('正文确实来自仓库的规范文件，不是页面里另写的一份',
   assert.deepEqual(headings.filter((h) => !inToc.has(h)), [])
   assert.equal(EXAMPLE_FILES.length, 5)
 })
+
+/**
+ * 回归：目录项曾经一点就掉出文档页。
+ *
+ * 当时模板写的是 `href="#包和签名"`。应用是 hash 路由，`/#/docs` 的 hash 已被
+ * 路由占用，裸片段会把整个 hash 替换掉，路由读到的路径变成「包和签名」，
+ * 匹配不到任何路由，守卫随即把人送去登录页 —— 而服务器日志一切正常，
+ * 页面也不会报错，只是安静地失效。
+ *
+ * 这类缺陷测试很容易放过：它不在任何 assert 覆盖的纯逻辑里，只有真点一下
+ * 才会发现。所以这里从两头钉住 —— 锚点目标的形状，以及模板里不许再出现裸 `#`。
+ */
+test('目录锚点走路由 query，不会把 hash 换成陌生路径', async () => {
+  const routerSrc = fs.readFileSync(path.join(FRONTEND, 'src', 'router', 'index.js'), 'utf8')
+  // 前提：应用确实是 hash 路由。将来换掉路由，这条断言的前提就不成立了，
+  // 那时要一并改这里，而不是让测试继续绿着骗人。
+  assert.match(routerSrc, /createWebHashHistory/, '路由不再是 hash 路由了，请重新判断锚点该怎么做')
+
+  const { sectionTo } = await source('/src/docs/anchor.js')
+  assert.deepEqual(sectionTo('包和签名'), { name: 'docs', query: { s: '包和签名' } })
+
+  // 把这个 query 位置还原成浏览器看到的 hash：路由读到的路径必须仍是 /docs。
+  const { query, name } = sectionTo('包和签名')
+  assert.equal(name, 'docs')
+  assert.equal(`#/${name}?s=${encodeURIComponent(query.s)}`.split('?')[0], '#/docs',
+    '锚点必须落在 /docs 路由下，而不是把 hash 整个换成锚点')
+
+  // 模板这一页不允许出现任何原生 href。
+  //
+  // 判据特意写成「一个都没有」，而不是「不许以 # 开头」：后者只查得出
+  // `href="#x"`，查不出实际写法 ``:href="`#${id}`"``（引号加反引号两个字符
+  // 在 # 前面），于是测试全绿、缺陷照旧。跳转一律走 router-link 的 to。
+  const view = fs.readFileSync(path.join(FRONTEND, 'src', 'views', 'docs', 'DocsView.vue'), 'utf8')
+  assert.ok(
+    !/\bhref\s*=/.test(view),
+    '模板里还有原生 href：hash 路由下片段链接会把 hash 整个换掉，点一下就掉出文档页。跳转请一律用 router-link 的 to。'
+  )
+  assert.match(view, /<router-link[\s\S]{0,120}?:to="sectionTo\(item\.id\)"/,
+    '目录项应当走 sectionTo(sectionTo 之外还有别的写法也要紧跟锚点检查)')
+})
+
+test('两份文档拼在一页，锚点互不覆盖', async () => {
+  const { guideDocument, specDocument, toc: allToc } = await source('/src/docs/content.js')
+  assert.ok(guideDocument.toc.length >= 8, `教程目录只有 ${guideDocument.toc.length} 项，教程可能没接上`)
+  const ids = allToc.map((x) => x.id)
+  assert.equal(new Set(ids).size, ids.length, '教程与规范的锚点 id 撞车了，后写的会覆盖前面的')
+
+  // 教程确实是从仓库文件读来的，不是页面里另写的一份
+  const guide = fs.readFileSync(path.join(REPO, 'docs', 'plugin-guide.md'), 'utf8')
+  const headings = [...guide.matchAll(/^##\s+(.+)$/gm)].map((m) => m[1].trim())
+  const inToc = new Set(guideDocument.toc.map((x) => x.title))
+  assert.deepEqual(headings.filter((h) => !inToc.has(h)), [], '教程里的二级标题没全部进目录')
+
+  // 规范侧的目录一个都不能少
+  const spec = fs.readFileSync(path.join(REPO, 'docs', 'plugin-spec.md'), 'utf8')
+  const specHeadings = [...spec.matchAll(/^##\s+(.+)$/gm)].map((m) => m[1].trim())
+  const specToc = new Set(specDocument.toc.map((x) => x.title))
+  assert.deepEqual(specHeadings.filter((h) => !specToc.has(h)), [])
+})
+
+test('文档的一级标题由页面当章节标题渲染，不混进正文', async () => {
+  const { buildDocument } = await source('/src/docs/markdown.js')
+  const { title, html, toc } = buildDocument([
+    '# 写一个插件',
+    '',
+    '正文一句。',
+    '',
+    '## 第一步',
+  ].join('\n'))
+  assert.equal(title, '写一个插件')
+  assert.deepEqual(toc.map((x) => x.title), ['第一步'], '一级标题不该进目录')
+  assert.ok(!html.includes('写一个插件'), '文档标题又混进正文了，页面会出现第二个 h1')
+  assert.ok(html.includes('第一步'), '正文本身不该被一起吃掉')
+})
+
+test('零入口的文档页挂 noindex，且离开时摘掉', () => {
+  const view = fs.readFileSync(path.join(FRONTEND, 'src', 'views', 'docs', 'DocsView.vue'), 'utf8')
+  assert.match(view, /noindex/, '零入口页没挂 noindex，爬虫猜得到路径就会收录')
+  assert.match(view, /onUnmounted/, '离开文档页时必须摘掉 meta，否则整站都会被标成 noindex')
+})
+
+test('nginx 把 /docs 导到 /#/docs，否则文档链接打不开', () => {
+  const conf = fs.readFileSync(path.join(REPO, 'deploy', 'nginx', 'acct.xins.live.conf'), 'utf8')
+  assert.match(conf, /location\s*=\s*\/docs\s*\{/, '缺少 /docs 的精确匹配 location')
+  // hash 路由下裸 /docs 会拿到首页 HTML，SPA 看不到路径，最后落到登录页
+  assert.match(conf, /location\s*=\s*\/docs\s*\{[^}]*return\s+30\d\s+"?\/#\/docs"?/, '/docs 没有重定向到 /#/docs')
+  // 必须排在 SPA 兜底之前，否则永远走不到。
+  // 找 `try_files $uri` 这个指令本身而不是单词 —— 配置里解释原因的注释
+  // 也提到了它，拿单词定位会被注释抢在前面。
+  assert.ok(
+    conf.indexOf('location = /docs') < conf.indexOf('try_files $uri'),
+    '/docs 必须在 try_files 兜底之前匹配'
+  )
+})

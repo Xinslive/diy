@@ -5,8 +5,8 @@
         <div>
           <h1>插件开发文档</h1>
           <p class="docs-lede">
-            写一个插件包需要知道的事，全部来自仓库 <code>docs/plugin-spec.md</code>，
-            与规范正文逐字一致。
+            先按教程走通一遍，再回头查规范里的逐字段定义。全部内容来自仓库 <code>docs/</code>
+            下的 Markdown，与源文件逐字一致。
           </p>
         </div>
         <router-link class="docs-back" to="/books">返回系统</router-link>
@@ -19,13 +19,13 @@
           目录
         </button>
         <nav aria-label="文档目录">
-          <a
-            v-for="item in doc.toc"
+          <router-link
+            v-for="item in toc"
             :key="item.id"
-            :href="`#${item.id}`"
-            :class="['toc-item', `lv${item.level}`]"
-            @click="onTocClick"
-          >{{ item.title }}</a>
+            :to="sectionTo(item.id)"
+            :class="['toc-item', `lv${item.level}`, { current: route.query.s === item.id }]"
+            @click="scrollToSection(item.id)"
+          >{{ item.title }}</router-link>
         </nav>
       </aside>
 
@@ -34,7 +34,9 @@
           <h2>从哪开始</h2>
           <ul>
             <li v-for="item in start" :key="item.id">
-              <a :href="`#${item.id}`">{{ item.title }}</a>
+              <router-link :to="sectionTo(item.id)" @click="scrollToSection(item.id)">
+                {{ item.title }}
+              </router-link>
               <span>{{ item.hint }}</span>
             </li>
           </ul>
@@ -42,13 +44,16 @@
 
         <!-- eslint-disable vue/no-v-html -- 正文由本仓库的 Markdown 构建期渲染，
              markdown-it 以 html:false 关闭了原始 HTML，产物不可能带进标签。 -->
-        <article class="prose" v-html="doc.html"></article>
+        <section v-for="chapter in chapters" :key="chapter.title" class="chapter">
+          <h2 class="chapter-title">{{ chapter.title }}</h2>
+          <article class="prose" v-html="chapter.html" />
+        </section>
 
         <section class="examples">
           <h2 id="示例包">示例包</h2>
           <p>
             一个能装上、能授权、能升级也能卸干净的完整示例。下面是它的全部源文件，
-            顺序就是照着写的顺序。
+            顺序就是照着写的顺序。把它整份签成 .cwp 跑一遍，比读十遍文档更快。
           </p>
           <div v-for="file in exampleFiles" :key="file.label" class="file">
             <div class="file-head">
@@ -65,23 +70,32 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
-import { EXAMPLE_FILES, specDocument, startHere } from '@/docs/content'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
+import { sectionTo } from '@/docs/anchor'
+import { CHAPTERS, EXAMPLE_FILES, startHere, toc } from '@/docs/content'
 
-const doc = specDocument
+const route = useRoute()
+const chapters = CHAPTERS
 const exampleFiles = EXAMPLE_FILES
-const start = startHere(doc.toc)
+const start = startHere(toc)
 const tocOpen = ref(false)
 const copied = ref('')
 
-/**
- * 目录跳转只改 hash，不触发路由跳转 —— 这一页是独立顶层路由，
- * 走 router.push 会把 hash 路由的路径一起改掉，反而离开文档页。
- * 移动端点完顺手收起目录，否则它盖住刚跳到的那一段。
- */
-function onTocClick() {
-  tocOpen.value = false
+function scrollToSection(id) {
+  // router-link 已经发起跳转，正文是静态的，等一次渲染再找元素。
+  requestAnimationFrame(() => {
+    const el = document.getElementById(id)
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    else tocOpen.value = false
+  })
 }
+
+// 直接粘 `/#/docs?s=…` 进来时也要落到那一节。
+watch(() => route.query.s, (id) => {
+  tocOpen.value = false
+  if (typeof id === 'string' && id) scrollToSection(id)
+}, { immediate: true })
 
 /**
  * 复制示例文件内容。失败（剪贴板被拒、非安全上下文）**不提示**：
@@ -98,6 +112,24 @@ async function copy(text, label) {
   clearTimeout(copiedTimer)
   copiedTimer = setTimeout(() => { copied.value = '' }, 1600)
 }
+
+/**
+ * 零入口的页面更不该被收录：没有链接指向它，但路径是猜得到的。
+ * 装/卸时挂上 head、离开时摘掉 —— 单页应用只有一个 head，不摘就会
+ * 跟着留到别的页面上，把整站都标成 noindex。
+ */
+let robotsMeta = null
+onMounted(() => {
+  if (document.querySelector('meta[name="robots"]')) return
+  robotsMeta = document.createElement('meta')
+  robotsMeta.setAttribute('name', 'robots')
+  robotsMeta.setAttribute('content', 'noindex, nofollow')
+  document.head.appendChild(robotsMeta)
+})
+onUnmounted(() => {
+  robotsMeta?.remove()
+  robotsMeta = null
+})
 </script>
 
 <style scoped>
@@ -212,13 +244,25 @@ async function copy(text, label) {
   border-left-color: #3370ff;
 }
 
+/* 当前位置。
+ *
+ * 不用 router-link 自带的 router-link-active：它只比路径不比 query，而这一页
+ * 所有链接的路径都是 /docs，于是整份目录会同时「全部选中」。这里直接拿
+ * route.query.s 自己比，那个才是真正决定落在哪一节的值。 */
+.toc-item.current {
+  color: #3370ff;
+  font-weight: 600;
+  background: #f2f6ff;
+  border-left-color: #3370ff;
+}
+
 .docs-main {
   flex: 1;
   min-width: 0;
 }
 
 .start-here,
-.prose,
+.chapter,
 .examples {
   background: #fff;
   border: 1px solid #e5e6eb;
@@ -261,15 +305,21 @@ async function copy(text, label) {
   line-height: 1.6;
 }
 
-/* -- 正文排版 --------------------------------------------------------- */
-.prose :deep(h1) { font-size: 22px; margin: 0 0 16px; }
-.prose :deep(h2) {
-  font-size: 18px;
-  margin: 32px 0 12px;
-  padding-top: 20px;
-  border-top: 1px solid #eef0f2;
+/* 章节标题：页面头部已经是 h1，每份文档的标题降一级才不会把层级撑乱 */
+.chapter-title {
+  margin: 0 0 4px;
+  font-size: 21px;
+  font-weight: 600;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #eef0f2;
 }
-.prose :deep(h2:first-of-type) { border-top: 0; padding-top: 0; margin-top: 0; }
+
+/* -- 正文排版 --------------------------------------------------------- */
+.prose :deep(h2) {
+  font-size: 17px;
+  margin: 30px 0 12px;
+}
+.prose :deep(h2:first-of-type) { margin-top: 16px; }
 .prose :deep(h3) { font-size: 15.5px; margin: 22px 0 8px; }
 .prose :deep(p) { font-size: 14px; line-height: 1.85; margin: 0 0 12px; }
 .prose :deep(ul), .prose :deep(ol) { font-size: 14px; line-height: 1.85; padding-left: 22px; margin: 0 0 12px; }
