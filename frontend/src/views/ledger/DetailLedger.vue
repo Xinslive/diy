@@ -56,7 +56,11 @@
           <el-table-column label="月" width="48" align="center" prop="month" />
           <el-table-column label="日" width="48" align="center" prop="day" />
         </el-table-column>
-        <el-table-column label="凭证号" width="95">
+        <!-- 凭证号是「记 + 3 位数字」（记001），内容本身很窄。
+             原来给到 95，标题「凭证号」三个字撑满、左右各空一截，
+             而同级的月/日两列各只有 48，横向被这一列拉得松垮。
+             收到 72：标题与内容都不折行，还比原来省出 23px 给摘要。 -->
+        <el-table-column label="凭证号" width="72">
           <template #default="{ row }">
             <button v-if="row.voucher_id" type="button" class="vno-link"
                     :title="`打开凭证 ${row.voucher_no}`"
@@ -65,7 +69,10 @@
         </el-table-column>
         <template v-if="data.comprehensive">
           <el-table-column prop="subject_code" label="科目编码" width="105" />
-          <el-table-column label="科目名称" width="180" prop="subjectText" />
+          <!-- 科目名有长有短（「银行存款—中国工商银行基本户」这类），
+               固定宽度下只能截断。截断成省略号、悬停出全称，
+               与全站其它表格一致（见 VoucherList 的摘要列）。 -->
+          <el-table-column label="科目名称" width="180" prop="subjectText" show-overflow-tooltip />
         </template>
         <el-table-column label="摘要" min-width="240" prop="summary" />
         <el-table-column label="借方" width="120" align="right" prop="debitText" />

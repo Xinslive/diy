@@ -1,5 +1,8 @@
 <template>
-  <div class="plugin-manager">
+  <!-- 根节点跟其余 14 个页面一样用 .page：它带 16px 内边距，
+       页面内容才不会紧贴侧边栏。原先这里写的是没有样式的
+       plugin-manager，整页内容直接顶到侧边栏边上。 -->
+  <div class="page">
     <div class="heading">
       <div><h2>扩展管理</h2><p>安装、运行状态和使用授权分别管理。安装后需重启服务，且默认没有可使用的用户。</p></div>
       <div class="tools"><el-button :loading="loading" @click="load">刷新状态</el-button><el-button type="primary" :disabled="!enabled || busy" @click="chooseFile()">安装扩展</el-button></div>
