@@ -1,150 +1,170 @@
-# 受信任插件平台规范（SDK 1.1.0 / CWP 1）
+# Manifest、权限与运行时参考
 
-本规范对应 `plan.md` 的 P0–P4。实现位于 `backend/app/plugins/`、`frontend/src/plugins/`。运行目录必须独立于程序包和 Git checkout；默认关闭。风险边界及生产启用条件见 [plugin-risk.md](plugin-risk.md)，验证记录见 [plugin-verification.md](plugin-verification.md)。
+本页是插件开发时需要反复查阅的契约。当前版本为 **SDK 1.1.0 / CWP 1**；示例包中的 `plugin.json`、后端入口、迁移和前端入口可以直接作为最小模板。
 
-## 信任与授权
+## Manifest 结构
 
-插件 Python、迁移和同源 JS 都是经管理员接受的受信任代码。它们在宿主进程或浏览器 origin 内执行。窄 SDK、签名、扫描、书面审查降低误装风险，不构成 Python、SQL 或 JavaScript 沙箱；恶意插件理论上可以访问宿主进程能访问的数据和浏览器会话。
+源目录根部必须有 `plugin.json`。签名打包后，工具会在 manifest 中补齐 `files` 和 `signature`；开发者只维护下面的源字段。
 
-管理权、用户使用权、插件声明能力、账套角色是四层独立条件：
+| 字段 | 必填 | 说明 |
+|---|---:|---|
+| `format_version` | 是 | 当前固定为 `1` |
+| `id` | 是 | 小写分段标识，例如 `com.example.periodnote` |
+| `name` | 是 | 展示名称 |
+| `version` | 是 | SemVer 版本号 |
+| `api_version` | 是 | SDK 兼容范围，例如 `>=1.1.0 <2.0.0` |
+| `description` | 否 | 插件简介 |
+| `permissions` | 是 | 只声明实际使用的 capability |
+| `access` | 是 | 当前固定为 `{ "assignment": "admin_users", "default": "none" }` |
+| `contributes` | 是 | 后端入口、可选前端入口和菜单 |
+| `hooks` | 否 | 当前支持 `on_period_close` |
+| `tables` | 是 | 插件迁移创建并由宿主登记的数据表 |
 
-- 管理操作要求有效登录及 `is_admin`。
-- `access` 必须等于 `{"assignment":"admin_users","default":"none"}`。新装不授权任何人，安装者和管理员也无使用权。
-- 插件只能获得其 manifest 声明的 SDK 能力。未声明的属性不存在。
-- 读写账套仍执行宿主 `get_my_book`、`require_book_write`。VIEWER 只能读，凭证创建走原有会计校验。
+一个带页面的插件至少需要下面这些入口字段：
 
-manifest、业务 API、SDK 每次调用都读取当前已提交用户状态/授权，不缓存 READY 或授权结果。撤销下一次请求生效，不撤回已经完成的响应，也不会中止已经开始的事务。已认证未授权用户访问任意插件业务路径（包括加载失败 worker 上不存在的路径）统一 404，`detail.code=PLUGIN_NOT_FOUND_OR_UNAVAILABLE`，不泄露插件元数据；已授权而屏障未就绪统一 503，`detail.code=PLUGIN_UNAVAILABLE`。匿名请求 401。插件运行异常返回带 request id 的 500；核心 `/api/health`、`/api/ready` 保持各自语义。
-
-## 包和签名
-
-`.cwp` 为 ZIP，根目录有唯一 `plugin.json`，成员只允许普通文件。无目录成员、链接、可执行权限、设备、加密成员；路径使用相对 POSIX 格式，NFC 规范化；拒绝绝对路径、反斜杠、百分号、冒号、控制字符、空段、`.`、`..`、大小写折叠重名。最长 240 UTF-8 字节、10 层。实际解压也逐成员计数/计字节，不能仅相信中央目录的声明。
-
-共享 `read_upload_sync`、`check_archive_size`、`RowBudget` 与插件上限同时生效，超限 413。默认上传 20 MiB、解压总计 100 MiB、单文件 10 MiB、文件数 512、运行目录总配额 1 GiB；共享 import 上限更小时取更严者。`plugin.json` 上限 256 KiB。备份后重新检查总配额，超限保留备份并停止变更。
-
-签名清单 `files` 必须精确包含除根 `plugin.json` 外的每个文件：`path`、实际 `size`、小写 SHA-256；按 NFC 后路径的 UTF-8 字节排序。Python、JS、迁移、样式、图片均在清单内。不得有清单外文件。签名算法只接受 Ed25519，公钥是 32 字节 raw key 的标准 Base64；`signature.value` 为 64 字节签名的标准 Base64。
-
-令 M 为通过严格 schema 检查且文件清单排序后的 manifest；仅删除 `M.signature.value`，保留 `algo`、`key_id`，构造：
-
-```text
-P = RFC8785({"format_version": M.format_version,
-             "manifest": M_without_signature_value,
-             "files": M.files})
-signature.value = Base64(Ed25519.sign(private_key, P))
-plugin_digest = lowercase_hex(SHA256(P))
-archive_digest = lowercase_hex(SHA256(original_zip_bytes))
+```json
+{
+  "contributes": {
+    "backend_entry": "backend/main.py",
+    "frontend_entry": "frontend/index.js",
+    "menu": {
+      "module": "extensions",
+      "title": "期间工作笔记",
+      "icon": "Document",
+      "route": "/plugin/com.example.periodnote",
+      "order": 10
+    }
+  }
+}
 ```
 
-清单在 manifest 和外层各出现一次是 CWP 1 的固定契约，不可由打包者自行省略。ZIP 时间、压缩级别、成员顺序改变不会改变 plugin_digest。拒绝 JSON 重复键、非有限数字和未知字段。不能用普通 `json.dumps(sort_keys=True)` 代替 RFC 8785。
+`backend_entry` 必须位于 `backend/` 下；`frontend_entry` 必须位于 `frontend/` 下。配置了前端入口就必须配置菜单。菜单路由只能是 `/plugin/{id}` 或它的小写子路径，图标使用平台白名单中的 `Calendar`、`Grid`、`Document`、`DataAnalysis`、`Tools`、`Coin`、`Folder`。
 
-`PLUGIN_TRUSTED_KEYS` 是 `{key_id: public_base64}` JSON。`PLUGIN_REVOKED_KEYS` 和 `PLUGIN_HISTORICAL_KEYS` 为逗号分隔 key id，均禁止新装/升级；历史已安装 digest 仍允许完整验签启动，公钥需留存。这是兼容历史包的明确策略，紧急阻断历史代码应关闭平台并重启，或停用该插件并重启；不能把撤销 key 当作即时终止已运行进程。
+## 权限 capability
 
-扫描包含明显危险 Python import/反射/动态执行、JS import/eval/Function/远程代码、CSS 外部代码、危险 SQL 和二进制检查。静态扫描不能证明代码安全。首版前端是预编译、自包含的 ESM，不接受运行时 SFC 编译器、外部依赖导入、CDN 或 eval。图片仅允许通过文件头校验的 PNG/JPEG/WebP。
+未声明的能力不会出现在 `ctx` 或宿主服务中。权限应按最小需要声明：
 
-## manifest
+| capability | 后端能力 | 典型用途 |
+|---|---|---|
+| `book:read` | `ctx.book_read()`、`ctx.book_list()` | 读取账套基本资料、列出用户可访问账套 |
+| `book:write` | `ctx.book_write()` | 要求目标账套具有 OWNER 或 ACCOUNTANT 写权限 |
+| `ledger:read` | `ctx.ledger_read()` | 读取指定账套和期间的余额数据 |
+| `subject:read` | `ctx.subject_read()` | 读取科目并把外部科目编码映射为 `subject_id` |
+| `voucher:write` | `ctx.voucher_create()`、`ctx.voucher_batch_create()` | 创建凭证；导入提交也需要此能力 |
+| `plugin_data:rw` | `ctx.data.*`、`ctx.config.*`、前端 `services.config` | 访问插件自有表和账套级配置 |
+| `audit:write` | `ctx.audit_write()` | 写入插件自定义审计事件 |
+| `settings:rw` | `ctx.settings.*` | 管理员维护插件级短配置 |
+| `upload:read` | `ctx.upload_read()` | 在当前请求中读取插件接口收到的文件 |
+| `import:rw` | `ctx.imports.*`、前端 `services.imports` | 持久文件、预览、确认、整批提交和来源追溯 |
 
-完整可打包源见 [plugin-example/plugin.json](plugin-example/plugin.json)。源模板不包含 `files`/`signature`，由离线工具补齐；上传的包必须已经具备这两段。
+`import:rw` 只提供导入批次能力；正式提交还必须声明 `voucher:write`。`plugin_data:rw` 只允许访问 manifest 声明的插件表，不能用来读取宿主业务表。
 
-- `id` 为小写分段标识，最多 96 字符，至少两段；SDK 不允许注册内部保留 id。
-- `version` 为严格 SemVer，最多 64 字符；升级按 SemVer precedence，只接受更高版本，build metadata 不参与高低比较。
-- `api_version` 使用数值 SDK comparator，例如 `>=1.0.0 <2.0.0`；SDK 当前 `1.1.0`。
-- 必须有 `contributes.backend_entry`（`backend/*.py`）；可选 `frontend_entry`（`frontend/*.js`），有前端时必须有 menu，反之亦然。
-- menu 固定归属 `extensions`；route 限 `/plugin/{id}` 及小写子路径；route name/key 如显式给出必须为 `plugin:{id}:main`。可选 order 为 0–10000。图标只允许 Calendar、Grid、Document、DataAnalysis、Tools、Coin、Folder。
-- 首版只开放 `on_period_close` hook；一次提交后同步通知，rollback 不通知，hook 错误审计并隔离，不回滚已完成的结账。
-- `tables` 最多 32 张，schema 仅 `public`。global 表必须声明 `purpose=configuration|reference`，不得存账套业务行。
+## 包与签名
 
-## 安装、重启与恢复日志
+`.cwp` 是一个 ZIP 包，根目录必须包含唯一的 `plugin.json`。所有 Python、JavaScript、迁移、样式和图片都会进入签名文件清单。打包工具使用 Ed25519 签名；服务端按文件路径、大小和 SHA-256 重新核验，任何成员被修改都会使验签失败。
 
-安装流程：完整校验和扫描 → 同文件系统 staging → PostgreSQL session advisory lock + 文件锁 → PREPARED journal → 插件迁移与 MIGRATED journal 同事务提交 → 原子 rename → 短 registry commit/COMMITTED。
+签名工具负责：
 
-文件系统与 PostgreSQL 没有跨资源原子事务。关键文件和目录 fsync，DB journal 持久化；进程中断后由 reconcile 验证事实并向前完成或隔离，不能声称 DB+FS 一次原子提交。全局文件锁还串行化磁盘配额和 reconcile；advisory lock 不因 migration commit 释放。
+- 生成并排序文件清单；
+- 计算文件摘要和包摘要；
+- 生成 `signature` 字段；
+- 拒绝路径穿越、链接文件、重复路径和超出容量的包。
 
-安装、启用、禁用返回 `pending_restart`；安装后 desired_enabled=true，但没有运行代码或用户授权。管理页不得显示热加载成功。registry.generation 记录期望变更时的 supervisor 代次；该代次的心跳不能把期望变更变成 READY。
+私钥只放在受控的打包环境中。可信公钥由运行环境配置，插件包本身不携带可替代可信配置的公钥。签名证明包来自可信发布者且内容未被修改，不代表业务逻辑已经正确，也不提供代码沙箱。
 
-重启必须通过 `scripts/start_server.py`：supervisor 一次生成随机 generation、纳秒 started_at、expected_workers，然后 exec uvicorn/gunicorn，由所有子 worker 继承。生产默认 2 worker。不要手工为每个 worker 生成 generation。
-
-每 worker 注册随机 worker id、宿主行和各插件 LOADING/LOADED/FAILED/DISABLED 行，定期续租。每次请求读取当前 cohort、live host 集合、插件 worker 集合、digest 和 desired_revision。必须恰好匹配 expected_workers 且全部 LOADED 才 READY。任一失败、缺席、过期或旧 generation 均拒绝业务流量，连没有匹配路由的 worker 也执行相同前置门禁。较老 supervisor 不能接管较新 cohort；新 cohort 还要等待所有旧代次有效租约退出或过期，重启交叠期间统一拒绝业务流量。核心 ready 不代表插件 ready，部署还运行 `plugin_status.py --wait 30`。
-
-升级、卸载必须先禁用并重启，确认本代次全 DISABLED，且任何代次不存在活的旧 LOADED/LOADING/FAILED lease。升级先生成 SYSTEM+全部 BOOK 备份，检查哈希与 metadata/scope/FK，再迁移；保留授权，保持禁用。启用新版本后再重启。首版禁止移除已登记表、版本重放、降级、复用已卸载 id。
-
-卸载撤销全部授权，隔离代码，保留表及 ORPHANED metadata；不自动删表。独立清理接口要求插件已卸载、无旧 lease、输入完整 id、再次备份；管理页显示表行数、结构及备份位置。备份、旧 digest 目录、quarantine 属于恢复材料，不随应用发布删除。
-
-reconcile 的处理：PREPARED（DDL 未提交）隔离 staging/active 并标 FAILED；MIGRATED 先验证完整签名文件、版本表与实时结构，再完成 rename/registry；commit uncertain 检查 attempt id + digest，幂等完成；未知陈旧目录隔离；缺失 active/结构不明保持 unavailable，不猜测、不重跑已提交 DDL、不自动 downgrade。
+前端必须是随包提供的自包含 ESM。不能运行时加载 CDN、远程模块、SFC 编译器或未打包依赖。
 
 ## Python SDK
 
-入口签名固定 `register(registrar, ctx)`，返回 None。registrar 在私有 APIRouter 收集相对 HTTP 路径：`get(path, fn)`、`post(path, fn)`、`add(path, fn, methods)`、`route(router, namespace=id)`、`hook(name, fn)`。宿主加 `/api/plugins/{id}` 前缀。无生命周期、自定义 Depends、WebSocket、宿主 Request/Response/Session；不传 FastAPI app。handler 使用普通类型/字典参数或 `UploadFile`，宿主统一解析验证，参数错误返回 422；不回显完整输入。`/_host` 是宿主服务保留命名空间，先于插件参数路由匹配，禁止插件显式覆盖。
+后端入口固定为：
 
-| permission | ctx 属性 | 约束 |
-|---|---|---|
-| book:read | book_read(book_id)<br>book_list() | 读取指定账套，或列出当前用户可访问的账套 |
-| book:write | book_write(book_id) | 检查 OWNER/ACCOUNTANT 写权限 |
-| ledger:read | ledger_read(book_id, period_id) | 调宿主余额查询，保留账套/期间校验 |
-| subject:read | subject_read(book_id) | 当前账套全部科目，不过滤末级与停用；插件据此把科目编码换成 subject_id |
-| voucher:write | voucher_create(book_id, payload)<br>voucher_batch_create(book_id, payloads) | 宿主 VoucherIn 与凭证创建链，不能直写核心表 |
-| plugin_data:rw | data.read/insert/update/delete<br>config.get/put | 仅 manifest 自有表，book 表必须 book_id；global 写入还需 admin；config 为带版本的 book-scoped 配置 |
-| audit:write | audit_write(action) | 1–32 字符事件标识，宿主带用户/plugin/digest |
-| settings:rw | settings.get/put(key, value) | 私有短前缀，值最长 4096；写入需 admin |
-| upload:read | upload_read(file, limit=None) | 按宿主容量上限读取当前插件路由收到的文件并返回摘要元数据 |
-| import:rw | imports.create/read/list/source/preview/edit/confirm/submit/cancel/limits/origin | 持久文件与预览、修订检查、确认、整批幂等事务；submit 另需 voucher:write |
+```python
+def register(registrar, ctx):
+    ...
+```
 
-`voucher_create` 每次调用自己开事务并提交，因此循环 N 次即 N 个独立事务，中途失败会留下半批凭证。`voucher_batch_create` 把整批放进**同一个事务**：逐张 `create_voucher(commit=False)`，与宿主 `importer.commit` 同一条路；任一张失败整个事务回滚，错误信息带「第几张」。上限与宿主导入共用 `import_max_vouchers`（默认 5000），超限拒绝而非截断。取号与撞号检查都在同一 session 内，后一张接前一张的号。
+`registrar` 注册的是插件自己的相对路径，宿主会自动加上 `/api/plugins/{id}` 前缀：
 
-`subject_read` 刻意不做过滤：插件要区分「编码不存在」「是上级科目」「已停用」三种情况才能报出有用的错，只给可用集合会让三种都塌成「找不到」。筛选是插件自己的判断。
+| 方法 | 用途 |
+|---|---|
+| `registrar.get(path, handler)` | 注册 GET |
+| `registrar.post(path, handler)` | 注册 POST |
+| `registrar.add(path, handler, methods)` | 注册多个 HTTP 方法 |
+| `registrar.route(router)` | 挂载受限路由 |
+| `registrar.hook(name, handler)` | 注册已声明的 hook |
 
-数据助手：`read(name, book_id=None, limit=100)` 返回字典列表、最多 500 行；`insert(name, values, book_id=None)` 返回新行；`update(name, id, values, book_id=None)`/`delete(name,id,book_id=None)` 返回 affected count。update/delete 要求 id 列；禁止修改 id/book_id。`upload_read(file, limit=None)` 只能按宿主上传上限读取当前插件路由收到的文件，返回文件摘要和当前请求内的字节，不负责持久化。每个助手独立使用宿主管理的短事务，不提供跨助手事务承诺 —— `voucher_batch_create` 与 `data.insert/update` 因此是不同事务，文件导入应使用 `imports` 将批次结果、去重、凭证和来源关联放入宿主事务（见 plugin-data.md）。未鉴权的 register 阶段不能调用数据能力。SDK 无 engine、Session、SQL 字符串接口；也没有修改或删除凭证的能力。
+`ctx` 的能力由 manifest 决定。handler 内部使用普通类型、字典和宿主支持的上传对象；不要依赖宿主的 FastAPI app、Request、Response、Session 或 WebSocket。
 
-## 宿主导入契约
+凭证写入有两种事务语义：`voucher_create` 每次调用单独提交；`voucher_batch_create` 把整批放在同一个事务里，任意一张失败时整批回滚。需要文件、人工预览、幂等和来源追溯时，使用 `import:rw` 的导入流程，不要循环调用单张创建。
 
-SDK 1.1.0 提供“上传 → 插件解析 → 持久预览 → 人工确认 → 整批原子提交”。`import:rw` 管理当前插件、当前用户的批次；账套选择独立于插件授权。写操作逐次验证目标账套 OWNER / ACCOUNTANT，正式提交另需 `voucher:write`。解析逻辑仍在插件代码中，不增加宿主文件适配器或宿主页面插槽。
+数据助手只操作插件自有表：
 
-状态包括 `UPLOADED/PREVIEW_READY/EDITING/CONFIRMED/SUBMITTING/SUBMITTED/FAILED/CANCELLED`。批次行锁和 revision 防止旧页面覆盖/并发重复提交；SUBMITTING 不单独提交，异常中断回滚。凭证、来源关联、审计和成功状态同事务；可预期的会计失败保存 FAILED，凭证整批回滚。提交后保留摘要去重，取消释放占位。插件升级或标准配置版本变化要求重新解析确认。单批最多 20 文件、20 MiB、5,000 凭证、20,000 分录，均可由宿主配置收紧；完整草稿默认 7 天，成功内容默认 30 天，明确运维清理，不自动后台删除。
+```python
+rows = ctx.data.read(TABLE, book_id=book_id, limit=100)
+created = ctx.data.insert(TABLE, {"label": "月末检查"}, book_id=book_id)
+changed = ctx.data.update(TABLE, row_id, {"label": "已完成"}, book_id=book_id)
+removed = ctx.data.delete(TABLE, row_id, book_id=book_id)
+```
 
-配置仍在插件自己的 book-scoped 表，`config.get/put` 返回 version/sha256，CAS 写入和批次配置引用校验使用相同账套事务锁。宿主新增三张核心表 `plugin_import_batch/plugin_import_file/plugin_voucher_origin`，由主迁移 0027 管理，包含在 BOOK 备份。它们不是 manifest 可声明的插件业务表。详见 [plugin-data.md](plugin-data.md) 及可签名示例 `plugin-import-example/`。
+`data.read` 最多返回 500 行；`update` 和 `delete` 要求表有 `id` 主键，不能修改 `id` 或 `book_id`。这些助手彼此不提供跨调用事务；跨步骤的文件导入应使用宿主导入服务。
 
-## 独立迁移与数据库契约
+## 前端运行时
 
-迁移脚本位于 `migrations/versions/*.py`，单根单头线性 revision/down_revision；宿主读取 AST 检查链。只执行显式安装/升级，启动只读 head/version/metadata。脚本用 Alembic op/SQLAlchemy，但不运行包内 env.py。主 `alembic_version` 不变，version table 为 `plugin_schema_version_<sha256(id)[:12]>`；业务表前缀为 `plugin_<sha256(id)[:12]>_`。两个 id 哈希前缀碰撞拒绝安装。
+前端模块默认导出组件工厂：
 
-安装真实反射列/type/default/identity/computed、PK/FK/check/unique/index、触发器定义及函数源码，规范化存 registry。验证前后宿主/其他插件结构、非本插件 sequence、schema、view、函数和自定义类型不变。不允许改宿主表或跨插件 FK。book 表要求非空 INTEGER/BIGINT book_id → book.id；book 表互相引用要求复合 FK 在同一位置包含 book_id；global 只能引用 global。触发器仅接受本前缀、public、SECURITY INVOKER 函数，首版仅允许 NEW 行正规化，禁止查询/写表/动态执行。正常插件的 DDL 误操作可被回滚；此检查仍不是抵抗恶意进程代码的权限隔离。
+```javascript
+export default function createPlugin(host) {
+  return { name: 'MyPlugin', setup() { /* 返回渲染函数 */ } }
+}
+```
 
-迁移后的真实结构是登记依据；缺失或被删除的约束、触发器/函数变更会使 startup 和备份拒绝，不能用 manifest JSON 冒充已经落地的 guardrail。没有通用自动 downgrade。
+`host` 提供以下能力：
 
-## 前端运行时和公共资产
+| 能力 | 说明 |
+|---|---|
+| `h`、`ref`、`computed`、`watch` | 使用宿主提供的 Vue 运行时 |
+| `onMounted`、`onUnmounted` | 组件生命周期 |
+| `bookId()`、`periodId()` | 当前宿主选择 |
+| `books()` | 当前用户可访问账套及 `canWrite` 提示 |
+| `api.get/post/put/patch/delete` | 请求当前插件命名空间 |
+| `api.upload(url, files, params)` | 上传文件到当前插件接口 |
+| `api.download(url)` | 获取当前插件命名空间下的 Blob |
+| `services` | 标准账套、配置和导入服务 |
 
-用户 manifest 为 `GET /api/plugins/manifest`，Bearer、`Cache-Control: private, no-store`，只含当前用户明确授权且全 worker READY 的前端插件。没有授权时 `{"plugins":[]}`。
+`host.api` 会自动携带登录凭据，插件不需要创建 Axios 实例或手工拼接 Bearer。`put(url, data, params)` 的第三个参数用于 query。前端可以根据 `canWrite` 调整界面，但后端提交时仍必须重新检查账套权限。
 
-资产 URL 为 `/api/plugins/assets/{id}/{digest}/frontend/...`，仅当前已登记 digest，公开 GET、只读、同源、immutable、nosniff、CORP same-origin。不含用户数据、token 或秘密；本机代理不放宽 CSP/CORS。Python、迁移、plugin.json 不作为公共资产。没有 query token；所有资产 URL 禁止 query。公开代码不等于匿名可调用业务 API。
+宿主不会因为顶部账套或期间切换而重新挂载插件页面。跟随顶部选择的插件可以监听 `host.bookId()`；需要用户独立选择目标账套的插件应使用 `host.services.books()` 并在自己的页面保存选择。
 
-运行时 native `import(entry)`，因此 JS 请求不带 Axios Bearer。模块 default 导出为接收冻结 host 的组件工厂。host 提供 `h/ref/computed/watch/onMounted/onUnmounted`、`bookId()/periodId()`、`books()`、`api.get/post/put/patch/delete/upload/download` 和 `services`。`books()` 只返回当前用户已获授权的账套，并附带 `canWrite` 提示；插件提交时仍由后端重新校验。api 固定请求当前插件命名空间，自动携带当前登录 Bearer；不提供 raw Axios 实例。标准 `host.services.books/config/imports` 通过当前插件 `/_host` 路由提供；输入、事务、状态机、留存及错误码见 [plugin-data.md](plugin-data.md)。`host.api.put(url,data,params)` 的第三参数用于 query。插件页面不因顶部账套/期间变化重新挂载，由插件自己决定是否 watch。示例见 `plugin-example/frontend/index.js` 和 `plugin-import-example/frontend/index.js`。
+## 迁移与数据表
 
-动态路由及 menu 派生合并，不修改静态 NAV。tabs 使用动态 key 注册表；恢复前先校验当前用户 manifest，丢弃伪造 path/陈旧 key。登录、切换用户、退出、401、授权刷新、route entry、窗口 focus 都参与清理/刷新；异步旧 manifest 不能重装上个用户的路由。撤权移除 routes/menu/tabs/styles 并回 books。加载失败使用“扩展暂不可用”组件，核心页面继续可用。代码已进入浏览器模块缓存无法被撤回；服务端实时授权是数据访问的最终门禁。
+插件迁移位于 `migrations/versions/*.py`，必须是单根、单头的线性 revision。宿主为每个插件维护独立的版本记录；插件迁移不会改变宿主主迁移链。
 
-## 管理 API
+- `scope: "book"` 的表必须有非空 `book_id`，并且外键指向 `book.id`；
+- `scope: "global"` 只适合配置或参考数据，不能存账套业务行；
+- 表名必须使用 `plugin_<sha256(id)[:12]>_` 前缀；例如 `com.example.periodnote` 的前缀是 `plugin_e3efc9984ace_`；
+- 不能修改宿主表、其他插件的表或跨插件外键；
+- 表结构、约束、索引和触发器必须与已登记的迁移结果一致。
 
-以下均要求 admin，响应不缓存，修改记录审计；`GET /api/system/plugins` 仍可在平台关闭时检查登记状态。
+把配置写入插件自己的 book-scoped 表，并通过 `ctx.config.get/put` 做版本控制。不要把账套配置写入全局 settings，也不要在服务启动时执行隐式 DDL。
 
-| 方法 | `/api/system/plugins` 后缀 | 含义 |
-|---|---|---|
-| GET | 空 | 列表、desired/runtime/error、digest/head、授权数、表数 |
-| POST | /install | multipart `file`；全部闸门后安装 |
-| POST | /reconcile | 显式恢复未完成日志 |
-| GET | /eligible-users?query=&page=1 | 启用用户搜索/30 条分页 |
-| GET / PUT | /{id}/users | 读授权名单 / `{user_ids:[...]}` 替换名单 |
-| POST / DELETE | /{id}/users/{user_id} | 幂等授予/撤销 |
-| POST | /{id}/enable 或 /disable | 保存期望，等待重启 |
-| POST | /{id}/upgrade | multipart file，先备份；成功仍禁用 |
-| DELETE | /{id} | 先备份，撤权、隔离代码、保留表 |
-| GET | /{id}/tables | 真实 metadata、row_count、backup_path |
-| POST | /{id}/tables/cleanup | `{confirmation:"完整插件id"}`，独立确认 |
+## 安装、升级和卸载
 
-稳定管理错误码包括 INVALID_MANIFEST、UNSAFE_PATH、INVALID_SIGNATURE、UNTRUSTED_SIGNATURE、PLUGIN_BUSY、DISABLE_AND_RESTART_REQUIRED、DOWNGRADE_OR_REPLAY_REJECTED、TABLE_METADATA_MISMATCH、MIGRATION_SCOPE_VIOLATION。扫描失败含 findings，但不返回源码/密钥。审计不写全量用户名单、原始插件代码或密钥；每条 grant/revoke 带目标 user id，实体 id 长度受宿主列约束，完整 plugin id 留在结构化 detail 中。
+安装会先校验 manifest、签名、文件和迁移，再把插件登记为待重启状态。安装完成不代表任何用户已经获得使用权；管理员还需要显式授权并按提示重启。
 
-## 备份 v2 与恢复
+升级必须使用更高的插件版本。宿主会重新检查签名、迁移和已登记表结构；升级成功后插件通常保持禁用，启用新版本前需要再次重启。插件应通过新增 revision 迁移数据，不要依赖降级或重放旧 revision。
 
-无插件 metadata/业务表时仍写 v1；存在任意插件 metadata（即使无表或空表）写 v2。FORMAT_READERS 永久保留 v1，拒绝替换已有 reader。v1 不猜测插件表。
+卸载会撤销用户授权并隔离插件代码，但默认保留插件数据表，避免把业务数据和卸载操作绑在一起。删除表是独立的管理员操作，只有在确认不再需要数据并完成备份后才执行。
 
-v2 header.plugins 保存 id/version/digest/migration_head 与规范化真实 tables。导出在同一 REPEATABLE READ 快照中核对 registry、版本表、实际结构及所有散落的插件前缀表；未知/多余/漂移拒绝导出。BOOK 含自己的 book 行与 global reference 的 FK 闭包；SYSTEM 不混入账套数据。运行时 registry/journal/cohort/worker 不作为可回灌业务表；registry 事实由 header 校对，用户授权作为 SYSTEM 数据保留。
+## 运行时权限结果
 
-普通 restore/dry-run 在写入前要求对应插件仍已安装、完整代码验签通过、digest/version/head/metadata 精确相等，逐表逐行核对 scope、完整列和 FK 闭包；不存在推断 SemVer 兼容的分支。未知/缺失插件、卸载 tombstone、篡改代码/结构、缺父行均拒绝；不会先灌核心表再丢插件表。恢复按核心/插件 FK 拓扑插入并重置序列，不运行归档代码、不写主代码目录。调用者控制整个 DB transaction，任一插入失败回滚。
+插件接口常见的结果如下：
 
-变更前本地 `.backups/{attempt}/` 含 SYSTEM 与全部 BOOK gzip、index.json/SHA-256、行数。为支持卸载后保留表的再次备份，内部备份结构核验可核对 tombstone 元数据；该模式仅限 dry-run，硬性拒绝写入，不是普通 restore 的绕过选项。恢复这些材料前必须重新建立完全匹配的代码及 registry/DB 版本现场。操作员另行保存匹配的签名 `.cwp`、公钥及数据库备份；JSON 数据快照不能代替完整环境备份。不要编辑归档里的 version/digest/head 或删除列来强行恢复。
+| 情况 | 结果 |
+|---|---|
+| 未登录 | `401` |
+| 已登录但没有插件使用权 | `404`，不暴露插件是否存在 |
+| 有插件使用权但没有目标账套权限 | `403` |
+| 插件 worker 尚未就绪 | `503` |
+| 插件代码抛出未处理异常 | `500`，响应带请求标识 |
+
+撤销授权会影响下一次请求；已经完成的响应不会被回溯撤回，正在进行的事务也不会被中途强行取消。

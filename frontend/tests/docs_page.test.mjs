@@ -140,15 +140,23 @@ test('规范里的相对链接不渲染成死链，外链照常保留', async ()
   assert.match(html, /href="https:\/\/example\.com\/a"[^>]*rel="noopener noreferrer"|rel="noopener noreferrer"[^>]*href="https:\/\/example\.com\/a"/)
 })
 
-test('正文确实来自仓库的规范文件，不是页面里另写的一份', async () => {
-  const spec = fs.readFileSync(path.join(REPO, 'docs', 'plugin-spec.md'), 'utf8')
-  const { specDocument, EXAMPLE_FILES } = await source('/src/docs/content.js')
-  assert.ok(specDocument.toc.length >= 8, `规范目录只有 ${specDocument.toc.length} 项，规范可能没接上`)
-  // 规范里的每个二级标题都必须出现在目录里
-  const headings = [...spec.matchAll(/^##\s+(.+)$/gm)].map((m) => m[1].trim())
-  const inToc = new Set(specDocument.toc.map((x) => x.title))
-  assert.deepEqual(headings.filter((h) => !inToc.has(h)), [])
+test('公开章节来自开发者文档源，不把内部报告装进页面', async () => {
+  const { CHAPTER_GROUPS, CHAPTERS, EXAMPLE_FILES } = await source('/src/docs/content.js')
+  const titles = CHAPTERS.map((chapter) => chapter.title)
+  assert.deepEqual(titles, [
+    '插件开发总览',
+    '快速开始：从零创建一个插件',
+    'Manifest、权限与运行时参考',
+    '数据导入 API：从文件到整批凭证',
+    '排错与错误码',
+  ])
+  assert.equal(CHAPTER_GROUPS.length, 4)
   assert.equal(EXAMPLE_FILES.length, 10)
+
+  const publicSource = CHAPTERS.map((chapter) => `${chapter.title}\n${chapter.html}`).join('\n')
+  for (const internalTerm of ['验收记录', '风险记录', '优化任务清单', 'P0：', 'P1：', 'P2：', 'plugin-verification.md', 'plugin-risk.md', 'plugin-roadmap.md']) {
+    assert.ok(!publicSource.includes(internalTerm), `公开文档仍包含内部内容：${internalTerm}`)
+  }
 })
 
 /**
@@ -191,49 +199,41 @@ test('目录锚点走路由 query，不会把 hash 换成陌生路径', async ()
     '目录项应当走 sectionTo(sectionTo 之外还有别的写法也要紧跟锚点检查)')
 })
 
-test('教程、数据、规范、风险、验证和路线拼在一页，锚点互不覆盖', async () => {
-  const { guideDocument, dataDocument, specDocument, toc: allToc } = await source('/src/docs/content.js')
-  assert.ok(guideDocument.toc.length >= 8, `教程目录只有 ${guideDocument.toc.length} 项，教程可能没接上`)
+test('公开章节标题、正文标题和目录锚点保持同源', async () => {
+  const { CHAPTERS, toc: allToc, EXAMPLES_SECTION } = await source('/src/docs/content.js')
+  assert.ok(CHAPTERS.every(chapter => chapter.toc.length >= 4), '开发者章节过短，可能没有接上正文')
+
   const ids = allToc.map((x) => x.id)
   assert.equal(new Set(ids).size, ids.length, '文档的锚点 id 撞车了，后写的会覆盖前面的')
+  assert.ok(allToc.some(item => item.id === EXAMPLES_SECTION.id), '示例代码没有进入目录')
 
-  // 教程确实是从仓库文件读来的，不是页面里另写的一份
-  const guide = fs.readFileSync(path.join(REPO, 'docs', 'plugin-guide.md'), 'utf8')
-  const headings = [...guide.matchAll(/^##\s+(.+)$/gm)].map((m) => m[1].trim())
-  const inToc = new Set(guideDocument.toc.map((x) => x.title))
-  assert.deepEqual(headings.filter((h) => !inToc.has(h)), [], '教程里的二级标题没全部进目录')
-
-  // 规范侧的目录一个都不能少
-  const spec = fs.readFileSync(path.join(REPO, 'docs', 'plugin-spec.md'), 'utf8')
-  const specHeadings = [...spec.matchAll(/^##\s+(.+)$/gm)].map((m) => m[1].trim())
-  const specToc = new Set(specDocument.toc.map((x) => x.title))
-  assert.deepEqual(specHeadings.filter((h) => !specToc.has(h)), [])
+  for (const chapter of CHAPTERS) {
+    const sourceText = fs.readFileSync(path.join(REPO, 'docs', {
+      '插件开发总览': 'plugin-overview.md',
+      '快速开始：从零创建一个插件': 'plugin-guide.md',
+      'Manifest、权限与运行时参考': 'plugin-spec.md',
+      '数据导入 API：从文件到整批凭证': 'plugin-data.md',
+      '排错与错误码': 'plugin-troubleshooting.md',
+    }[chapter.title]), 'utf8')
+    const headings = [...sourceText.matchAll(/^##\s+(.+)$/gm)].map((m) => m[1].trim())
+    const inToc = new Set(chapter.toc.map((x) => x.title))
+    assert.deepEqual(headings.filter((h) => !inToc.has(h)), [], `${chapter.title} 有标题没进目录`)
+    assert.match(chapter.html, /<h2 id="[^"]+"/, `${chapter.title} 没有渲染可跳转的章节标题`)
+  }
 })
 
-test('数据接口章节能在页面上找到，能力表和批量建法都真在里面', async () => {
-  // 这条是为了「读者打开文档找不到数据接口」这件事不再发生。上一版把SDK 能力
-  // 压在规范里一张没有代码的表里，等于没有；而批量制证这件事横跨科目编码、
-  // 原子性和去重三节，没有独立一章就没人读得到。
-  const { dataDocument, toc: allToc } = await source('/src/docs/content.js')
+test('数据导入章节包含真实工作流和批次契约', async () => {
+  const { dataDocument, toc: allToc, startHere } = await source('/src/docs/content.js')
   const titles = dataDocument.toc.map((x) => x.title)
-  assert.deepEqual(
-    ["一条完整工作流", "账套配置存在哪里", "状态、修订和失败恢复", "去重和追溯"].every(title => titles.includes(title)),
-    true,
-    `数据接口章的目录少了几节：${JSON.stringify(titles)}`)
-  assert.match(dataDocument.html, /subject_read/, '正文里没有 subject_read')
-  assert.match(dataDocument.html, /voucher_batch_create/, '正文里没有 voucher_batch_create')
-  // 能力表要有表格，不能又是一段散文
-  assert.match(dataDocument.html, /<table>[\s\S]*subject_read[\s\S]*<\/table>/,
-    '能力表没有渲染成表格')
-
-  const fromRepo = fs.readFileSync(path.join(REPO, 'docs', 'plugin-data.md'), 'utf8')
-  const headings = [...fromRepo.matchAll(/^##\s+(.+)$/gm)].map((m) => m[1].trim())
-  assert.deepEqual(headings.filter((h) => !new Set(titles).has(h)), [], '数据接口章有标题没进目录')
-
-  // 「从哪开始」里必须有数据接口那一节，否则读者仍然要先自己翻目录
-  const { startHere } = await source('/src/docs/content.js')
-  assert.ok(startHere(allToc).some((x) => /SDK 能力/.test(x.title)),
-    '「从哪开始」没有指向数据接口的入口')
+  for (const title of ['一条完整工作流', '批次状态', '账套配置与版本', '去重、幂等与来源追溯']) {
+    assert.ok(titles.includes(title), `数据导入章缺少 ${title}`)
+  }
+  assert.match(dataDocument.html, /ctx\.imports\.preview/, '正文里没有插件解析到持久预览的 API')
+  assert.match(dataDocument.html, /services\.imports\.submit/, '正文里没有整批提交 API')
+  assert.match(dataDocument.html, /<table>[\s\S]*services\.imports\.submit[\s\S]*<\/table>/,
+    '标准服务方法没有渲染成表格')
+  assert.ok(startHere(allToc).some((x) => /数据导入 API/.test(x.title)),
+    '「从哪开始」没有指向数据导入章节')
 })
 
 test('文档的一级标题由页面当章节标题渲染，不混进正文', async () => {
