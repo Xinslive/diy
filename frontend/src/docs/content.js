@@ -9,6 +9,7 @@
  * 新增文件再在这里引入，而不是在 Vue 模板里另写一份。
  */
 import guide from '@docs/plugin-guide.md?raw'
+import data from '@docs/plugin-data.md?raw'
 import spec from '@docs/plugin-spec.md?raw'
 import exampleManifest from '@docs/plugin-example/plugin.json?raw'
 import exampleBackend from '@docs/plugin-example/backend/main.py?raw'
@@ -19,19 +20,24 @@ import exampleStyle from '@docs/plugin-example/frontend/style.css?raw'
 import { buildDocument } from './markdown'
 
 /**
- * 页面按「先教怎么做，再给规范」的顺序排：读者第一次来要的是一条走得通的路，
- * 不是先读二十段约束。
+ * 页面按「先教怎么做 → 再讲数据怎么读写 → 最后给规范」的顺序排：读者第一次来
+ * 要的是一条走得通的路，不是先读二十段约束。
  *
- * 教程带 `guide-` 前缀，因为两份文档会有同名小节（都有「Python SDK」、
- * 都有「升级」一类），不隔开的话锚点会互相覆盖。
+ * 数据接口单独成章而不是塞进规范里，是因为它回答的是一个具体问题 ——「我这份
+ * 文件怎么变成账上的凭证」—— 而答案横跨科目编码、批量原子性和去重三件事，
+ * 放在规范的能力表里只会被压成一行字。
+ *
+ * 教程带 `guide-` 前缀，数据带 `data-`：三份文档会有同名小节（都有「下一步读
+ * 什么」、都有「Python SDK」一类），不隔开的话锚点会互相覆盖。
  */
 export const guideDocument = buildDocument(guide, { idPrefix: 'guide-' })
+export const dataDocument = buildDocument(data, { idPrefix: 'data-' })
 export const specDocument = buildDocument(spec)
 
 /** 页面上的章节顺序，即目录的顺序。 */
-export const CHAPTERS = [guideDocument, specDocument]
+export const CHAPTERS = [guideDocument, dataDocument, specDocument]
 
-/** 全页目录：先教程后规范。 */
+/** 全页目录：先教程，后数据接口，最后规范。 */
 export const toc = CHAPTERS.flatMap((doc) => doc.toc)
 
 /**
@@ -60,6 +66,7 @@ const START_HERE_PICKS = [
   { title: '第 1 步：生成签名密钥', hint: '先把签名的这条路走通，没有它后面都白做' },
   { title: '第 2 步：写 plugin.json', hint: '声明装什么、能碰什么、菜单在哪' },
   { title: '第 6 步：签名打包', hint: '产出可上传的 .cwp，并自查一遍' },
+  { title: '八个能力，没别的', hint: '插件能碰的数据全在这儿，没有别的口子' },
   { title: '第 10 步：确认它真的起来了', hint: '三个判据，少一条都不算成' },
 ]
 

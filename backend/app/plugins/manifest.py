@@ -18,7 +18,13 @@ from app.plugins.errors import PluginError
 ID_RE = re.compile(r"[a-z][a-z0-9]*(?:[.-][a-z][a-z0-9]*){1,10}\Z")
 SEMVER_RE = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\Z")
 DIGEST_RE = re.compile(r"[a-f0-9]{64}\Z")
-PERMISSIONS = frozenset({"ledger:read", "book:read", "book:write", "voucher:write", "plugin_data:rw", "audit:write", "settings:rw"})
+# ``subject:read`` 是为「按外部文件批量制证」补的：``VoucherIn`` 的分录要的是
+# ``subject_id``（科目表主键），而插件拿到的往往是一张写着「6001」的表。
+# 宿主有 ``/subjects/flat`` 能做 code→id 映射，但插件此前**没有任何读科目的
+# 能力**，于是这条路径只剩两个走不通的走法：把 id 硬编码进插件（换个账套就
+# 全错），或者绕开能力模型自己去查宿主表（正好是这套窄 SDK 要防的事）。
+# 它只读、不写，且和 ``book:read`` 一样每次调用重读当前用户状态。
+PERMISSIONS = frozenset({"ledger:read", "book:read", "book:write", "subject:read", "voucher:write", "plugin_data:rw", "audit:write", "settings:rw"})
 HOOKS = frozenset({"on_period_close"})
 ICONS = frozenset({"Calendar", "Grid", "Document", "DataAnalysis", "Tools", "Coin", "Folder"})
 

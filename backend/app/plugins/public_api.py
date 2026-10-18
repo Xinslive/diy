@@ -52,6 +52,29 @@ def context_for(manifest):
             return balance(book_id=book_id, period_id=period_id, from_period_id=None,
                            book=book, db=db, include_unposted=False)
 
+    def subject_read(book_id: int):
+        """当前账套的科目表。插件用它把文件里的科目**编码**换成凭证要的
+        ``subject_id``。
+
+        返回**全部**科目（末级与非末级、启用与停用都给），而不是像
+        ``/subjects/flat`` 那样默认只给末级且启用的：插件要区分「这个编码根本
+        不存在」「这个科目已停用」「这是个上级科目，不能记账」三种情况才能
+        给人报出有用的错。只给可用集合的话，插件只能说「找不到」，用户拿到
+        一句没有指向的错。筛选是插件自己的事，宿主不替它做这个判断。
+        """
+        from app.models.accounting import Subject
+        with SessionLocal() as db:
+            user = principal(db)
+            book = get_my_book(book_id, db, user)
+            rows = db.scalars(
+                select(Subject)
+                .where(Subject.book_id == book.id)
+                .order_by(Subject.code)
+            ).all()
+            return [{"id": s.id, "code": s.code, "name": s.name, "level": s.level,
+                     "category": s.category, "direction": s.direction,
+                     "is_leaf": s.is_leaf, "active": s.active} for s in rows]
+
     def voucher_create(book_id: int, payload: dict):
         from app.api.schemas import VoucherIn
         from app.api.vouchers import create
@@ -64,6 +87,52 @@ def context_for(manifest):
             except ValidationError as exc:
                 raise HTTPException(422, "插件凭证输入不符合宿主校验规则") from exc
             return create(payload=data, book=book, db=db, _link=link, user=user)
+
+    def voucher_batch_create(book_id: int, payloads: list[dict]):
+        """一次建多张凭证，**整批同一个事务**。
+
+        单张 ``voucher_create`` 每次自己开一个 session 并提交，所以拿它循环
+        500 行：一行失败时前 499 张**已经落库**了。「按文件批量生成凭证」正是
+        这个形状 —— 失败留下半批凭证，重跑又因为没有水位而重复，用户要自己去
+        账上把半批一张张删掉。这里对齐宿主导入那条路（``importer.commit``）：
+        逐张 ``commit=False``，退出时才统一提交，任一张抛错整个事务回滚。
+
+        错误信息带上**第几张**，否则插件只能回一句「失败了」，用户面对 500 行
+        不知道该改哪一行。
+        """
+        from app.accounting import vouchers as svc
+        from app.api.schemas import VoucherIn
+        from app.api.vouchers import _book_subjects, _serialize
+        from app.core.config import settings
+
+        if not isinstance(payloads, list) or not payloads:
+            raise HTTPException(400, "批量创建至少需要一张凭证")
+        limit = settings.import_max_vouchers
+        if len(payloads) > limit:
+            raise HTTPException(400, f"一次最多创建 {limit} 张凭证，本次传了 {len(payloads)} 张。"
+                                     "请拆成多批，每批成功后再提交下一批")
+        with SessionLocal.begin() as db:
+            user = principal(db)
+            book = get_my_book(book_id, db, user)
+            require_book_write(book_id, db, user)
+            made = []
+            for i, raw in enumerate(payloads, 1):
+                try:
+                    data = VoucherIn.model_validate(raw)
+                except ValidationError as exc:
+                    raise HTTPException(422, f"第 {i} 张凭证输入不符合宿主校验规则：{exc.errors()[0]['msg']}") from exc
+                try:
+                    made.append(svc.create_voucher(
+                        db, book_id=book.id, user=user, voucher_date=data.voucher_date,
+                        entries=[e.model_dump() for e in data.entries], remark=data.remark,
+                        attachments=data.attachments, source=data.source,
+                        voucher_no=data.voucher_no, insert_after_id=data.insert_after,
+                        commit=False))
+                except (ValueError, ArithmeticError) as e:
+                    raise HTTPException(400, f"第 {i} 张凭证没建成，整批已回滚：{e}") from e
+            # 科目一次取回给所有凭证复用（见 _book_subjects 的 docstring）。
+            subs = _book_subjects(db, book.id)
+            return [_serialize(db, v, subs) for v in made]
 
     def table_access(db, user, name, book_id, write=False):
         if name not in declarations:
@@ -161,10 +230,14 @@ def context_for(manifest):
 
     exposed = {"plugin_id": pid}
     for permission, key, fn in [("book:read", "book_read", book_read), ("book:write", "book_write", book_write),
-        ("ledger:read", "ledger_read", ledger_read), ("voucher:write", "voucher_create", voucher_create),
+        ("ledger:read", "ledger_read", ledger_read), ("subject:read", "subject_read", subject_read),
+        ("voucher:write", "voucher_create", voucher_create),
         ("audit:write", "audit_write", audit_write)]:
         if permission in permissions:
             exposed[key] = fn
+    # 批量与单张同权限：批量只是把同一套校验放进一个事务，不额外给权。
+    if "voucher:write" in permissions:
+        exposed["voucher_batch_create"] = voucher_batch_create
     if "plugin_data:rw" in permissions:
         exposed["data"] = SimpleNamespace(read=data_read, insert=data_insert, update=data_update, delete=data_delete)
     if "settings:rw" in permissions:

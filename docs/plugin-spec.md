@@ -79,12 +79,17 @@ reconcile 的处理：PREPARED（DDL 未提交）隔离 staging/active 并标 FA
 | book:read | book_read(book_id) | 返回 id/name，检查账套成员 |
 | book:write | book_write(book_id) | 检查 OWNER/ACCOUNTANT 写权限 |
 | ledger:read | ledger_read(book_id, period_id) | 调宿主余额查询，保留账套/期间校验 |
-| voucher:write | voucher_create(book_id, payload) | 宿主 VoucherIn 与凭证创建链，不能直写核心表 |
+| subject:read | subject_read(book_id) | 当前账套全部科目，不过滤末级与停用；插件据此把科目编码换成 subject_id |
+| voucher:write | voucher_create(book_id, payload)<br>voucher_batch_create(book_id, payloads) | 宿主 VoucherIn 与凭证创建链，不能直写核心表 |
 | plugin_data:rw | data.read/insert/update/delete | 仅 manifest 自有表，book 表必须 book_id；global 写入还需 admin |
 | audit:write | audit_write(action) | 1–32 字符事件标识，宿主带用户/plugin/digest |
 | settings:rw | settings.get/put(key, value) | 私有短前缀，值最长 4096；写入需 admin |
 
-数据助手：`read(name, book_id=None, limit=100)` 返回字典列表、最多 500 行；`insert(name, values, book_id=None)` 返回新行；`update(name, id, values, book_id=None)`/`delete(name,id,book_id=None)` 返回 affected count。update/delete 要求 id 列；禁止修改 id/book_id。每个助手独立使用宿主管理的短事务，不提供跨助手事务承诺。未鉴权的 register 阶段不能调用数据能力。SDK 无 engine、Session、SQL 字符串接口。
+`voucher_create` 每次调用自己开事务并提交，因此循环 N 次即 N 个独立事务，中途失败会留下半批凭证。`voucher_batch_create` 把整批放进**同一个事务**：逐张 `create_voucher(commit=False)`，与宿主 `importer.commit` 同一条路；任一张失败整个事务回滚，错误信息带「第几张」。上限与宿主导入共用 `import_max_vouchers`（默认 5000），超限拒绝而非截断。取号与撞号检查都在同一 session 内，后一张接前一张的号。
+
+`subject_read` 刻意不做过滤：插件要区分「编码不存在」「是上级科目」「已停用」三种情况才能报出有用的错，只给可用集合会让三种都塌成「找不到」。筛选是插件自己的判断。
+
+数据助手：`read(name, book_id=None, limit=100)` 返回字典列表、最多 500 行；`insert(name, values, book_id=None)` 返回新行；`update(name, id, values, book_id=None)`/`delete(name,id,book_id=None)` 返回 affected count。update/delete 要求 id 列；禁止修改 id/book_id。每个助手独立使用宿主管理的短事务，不提供跨助手事务承诺 —— `voucher_batch_create` 与 `data.insert/update` 因此是不同事务，去重水位要在插件自己的表里另行维护（见 plugin-data.md）。未鉴权的 register 阶段不能调用数据能力。SDK 无 engine、Session、SQL 字符串接口；也没有修改或删除凭证的能力。
 
 ## 独立迁移与数据库契约
 
