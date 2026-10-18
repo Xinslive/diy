@@ -33,6 +33,26 @@
 #
 # spawn() 用的是 os.setsid()，所以孙进程自己就是**进程组长**（pgid == pid），
 # `kill -- -<pid>` 因此能一次干掉 reloader + worker 及其全部后代。
+#
+# ---------------------------------------------------------------------------
+# 后端有两条启动路径（2026-10-18 接入受信任插件时加的第二条）
+# ---------------------------------------------------------------------------
+#   * 默认：`uvicorn --reload --reload-dir app`。热重载是这套开发体验的核心，
+#     上面那些坑全是围绕它总结出来的。
+#   * 本地开了插件：改走 `scripts/start_server.py`（supervisor）。原因不是
+#     偏好，是**没有第三条路**：supervisor 每次启动生成一个随机 generation
+#     交给全部 worker，插件的全 worker 屏障就建立在这个代号上。缺代号的
+#     worker 直接 fail-closed（INVALID_WORKER_CONFIGURATION → 503）；而
+#     --reload 每次代码重载都会换掉 worker 进程，补上代号也凑不齐 cohort，
+#     结果是「插件永远不 READY」。生产侧（systemd、Docker）走的就是这一条，
+#     本地不跟生产同构就等于本地调试的不是要上线的那套。
+#
+# 所以这一条路径**必然放弃热重载**：要改后端代码就 ./dev.sh stop && ./dev.sh。
+#
+# 两条路径是互斥分支，默认那条一个字节都没改。判据也不是自己解析 .env，而是
+# 以 backend/ 为 cwd 问应用自己的 settings（见下面的 PLUGIN_ENABLED_LOCAL）：
+# 解析两份配置迟早会在某次改动后静默分裂，然后开发者看到一片 503 却查不到
+# 任何配置 —— 那比一开始就用 supervisor 难查得多。
 set -uo pipefail
 cd "$(dirname "$0")"
 ROOT="$PWD"
@@ -341,6 +361,22 @@ echo "2) 后端 :$BACKEND_PORT"
 # **函数**时，变量会在函数返回后仍然留着，容易在后面几行意外生效。
 export APP_ENV="${APP_ENV:-dev}"
 
+# 插件开关的**唯一事实来源是应用自己的配置**（含 backend/.env）。
+#
+# 不在这里重新解析一遍 .env：解析两份就会在某次改动后静默分裂 —— 这个脚本
+# 以为插件关着、进程却开着，于是开发者看到的是一片 503，却查不到任何配置。
+#
+# 必须以 backend/ 为 cwd 跑：pydantic-settings 从**当前目录**读 .env，在
+# 仓库根执行会漏读 backend/.env，正好制造上面那种分裂。
+#
+# 探测不到就当关着 —— 默认路径必须和今天一模一样。
+PLUGIN_ENABLED_LOCAL=0
+if [ -x "$PY" ]; then
+  probe=$(cd "$ROOT/backend" && "$PY" -c \
+    "from app.core.config import settings; print('1' if settings.plugin_enabled else '0')" 2>/dev/null)
+  [ "$probe" = "1" ] && PLUGIN_ENABLED_LOCAL=1
+fi
+
 STARTED_BACKEND=0
 if alive backend; then
   echo "  · backend 已在跑（pid $(cat "$RUN/backend.pid")）"
@@ -361,8 +397,24 @@ else
     echo "  照上面给的命令处理完，再跑 ./dev.sh。" >&2
     exit 1
   fi
-  start_one backend "$ROOT/backend" api .venv/bin/uvicorn app.main:app \
-    --host 127.0.0.1 --port "$BACKEND_PORT" --reload --reload-dir app
+  if [ "$PLUGIN_ENABLED_LOCAL" -eq 1 ]; then
+    # 插件开启时**放弃热重载**，改走 supervisor 入口（scripts/start_server.py）。
+    #
+    # 为什么不能两条都要：supervisor 每次启动生成一个随机 generation 交给
+    # 全部 worker，而 --reload 的每次代码重载都会换掉 worker 进程。没有
+    # generation 的 worker 直接 fail-closed（workers.py 的
+    # INVALID_WORKER_CONFIGURATION → 503）；就算补上，重载产生的**半截
+    # cohort** 也永远凑不齐 expected worker 数，结果就是「插件永远不 READY」。
+    # 这与首版不热加载的设计是同一件事：重启才换代号。
+    #
+    # 要改后端代码就 ./dev.sh stop && ./dev.sh。
+    echo "  · 检测到 PLUGIN_ENABLED：走 supervisor 入口（放弃热重载），worker=${CWQ_API_WORKERS:-2}"
+    start_one backend "$ROOT/backend" api .venv/bin/python scripts/start_server.py \
+      --host 127.0.0.1 --port "$BACKEND_PORT" --workers "${CWQ_API_WORKERS:-2}"
+  else
+    start_one backend "$ROOT/backend" api .venv/bin/uvicorn app.main:app \
+      --host 127.0.0.1 --port "$BACKEND_PORT" --reload --reload-dir app
+  fi
   STARTED_BACKEND=1
 fi
 
@@ -387,6 +439,24 @@ if [ "$RC" -eq 0 ] && ! wait_live frontend "$VITE_URL" "$VITE_TIMEOUT"; then
   log_hint vite
   log_tail vite
   RC=1
+fi
+
+# 插件屏障：主服务活着**不代表**插件可用。任一 worker 没起来、租约失效或
+# 代次不同，所有插件请求都一致 503 —— 和 deploy.sh 发布后的那道闸门同构。
+#
+# 为什么在开发环境也返回非零：这个脚本存在的全部理由就是不许把「没真起来」
+# 报成「好了」（见文件头 2026-10-17）。本地显式开了插件却拿不到屏障，是同一
+# 类假活：核心账务能用，但插件页一进去就是 503，与其让人自己撞上，不如这里
+# 说清楚。plugin_status.py 在插件关闭或注册表为空时返回 0，不会假失败。
+if [ "$RC" -eq 0 ] && [ "$PLUGIN_ENABLED_LOCAL" -eq 1 ]; then
+  if (cd "$ROOT/backend" && "$PY" scripts/plugin_status.py --wait "${CWQ_PLUGIN_BARRIER_TIMEOUT:-30}"); then
+    echo "  · 插件 worker 屏障已通过"
+  else
+    echo "  ✗ 插件 worker 屏障未通过 —— 插件请求会一律 503，见 .run/api.log" >&2
+    echo "    核心记账不受影响。查 PLUGIN_ROOT / PLUGIN_TRUSTED_KEYS，" >&2
+    echo "    或 PLUGIN_ENABLED=false 后重跑。" >&2
+    RC=1
+  fi
 fi
 
 if [ "$RC" -ne 0 ]; then
