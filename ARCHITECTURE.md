@@ -2621,12 +2621,13 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
 
 ### 11.7.1 `deploy.sh` 假定已有一版在跑，首次部署必须先预置
 
-`deploy.sh` 的顺序是：取产物 → 备份 → **装依赖** → **备份数据库 + `alembic upgrade`**
-→ 解压后端代码 → 切前端 → 重启。
+`deploy.sh` 的顺序是：取产物 → 备份 → **解包新代码到暂存目录 + 按新锁装依赖**
+→ **备份数据库 + 在暂存目录里 `alembic upgrade`** → 解压后端代码 → 切前端 → 重启。
 
-第 3、4 步要用 `scripts/db_backup.py`、`alembic.ini`、`migrations/` 和
-`.venv/bin/{pip,alembic}`，而这些**要到第 5 步才被解压到 `/opt/cwq/backend`**。
-第一次部署时那里是空的，于是脚本在第 3 步就 `set -e` 挂掉。
+第 3、4 步要用 `$APP/backend/.venv/bin/{pip,alembic}` 和
+`$APP/backend/scripts/db_backup.py`，而 `alembic.ini`、`migrations/` 与
+`requirements.lock` 自 2026-10-18 起**取自暂存目录**（见 11.7.11）。
+第一次部署时 `/opt/cwq/backend` 是空的，于是脚本在第 3 步就 `set -e` 挂掉。
 
 另外第 5 步的 `mv "$APP/frontend/dist" "$FRONT_OLD"` 要求 `frontend/dist`
 **已经存在**——`mv` 不存在的源目录会失败。
@@ -2634,7 +2635,7 @@ JWT 是自签名的，服务端不存会话，所以「验证一个令牌」的�
 **首次部署必须先手工预置**（之后每次发布都不需要）：
 
 ```
-tar -xzf cwq-backend-<sha>.tar.gz -C /opt/cwq/backend   # 让 alembic/scripts 先在
+tar -xzf cwq-backend-<sha>.tar.gz -C /opt/cwq/backend   # 让 scripts/db_backup.py 先在
 python3 -m venv /opt/cwq/backend/.venv                   # 第 3、4 步有东西可用
 /opt/cwq/backend/.venv/bin/pip install -r /opt/cwq/backend/requirements.lock
 mkdir -p /opt/cwq/frontend/dist                          # 让第 5 步的 mv 有源
@@ -2932,6 +2933,62 @@ curl -s -H "Authorization: Bearer $TOKEN" https://acct.xins.live/api/books   # �
 12 账期，凭证与期初均为 0 行；实际清理 310 行，删前已用
 `pg_dump -Fc` 留下快照 `/www/wwwroot/acct.xins.live/backups/pre-delete-books-20261018.dump`。
 当时线上处于「零账套」状态，等待按真实公司信息重建。
+
+### 11.7.11 装依赖与迁移的依据必须是「这一版」，不是上一版留在现网的文件
+
+2026-10-18 首次踩中并已修。旧顺序里，`pip install -r requirements.lock` 与
+`alembic upgrade head` 都在 `$APP/backend` 里跑 —— 而那**此刻装的是上一版的代码**。
+于是两份依据全是旧的：
+
+- 锁文件是旧的 → 这一版新增的依赖（`rfc8785`）**根本没被要求安装**，pip 照样返回成功；
+- 迁移链是旧的 → alembic 的 head 停在 `0021_youyou_chart_of_accounts`，
+  而新代码要求 `0027_plugin_imports`。
+
+两步都显示成功，直到第 5 步切完代码、第 6 步重启才炸：
+
+```
+ModuleNotFoundError: No module named 'rfc8785'
+SchemaVersionError: 数据库停在 0021，代码要求 0027
+```
+
+**凡是一次发布同时带来新依赖和新迁移，这个缺陷必然触发，不是偶发。**
+
+修法不是把两步整体后移一格。后移确实能让它们读到新代码，但顺序仍在
+「切产物」之前，于是迁移一失败就留下**「库已迁移、代码没换」**这个最糟的状态
+（跑的还是旧代码，库已经是新的）。所以现在先把新代码解到 `$APP/.incoming.$$`，
+装依赖与迁移都**在暂存目录里**完成，现网目录到第 5 步才第一次被碰：
+
+```
+取产物 → 备份 → 解包到暂存 + pip -r 暂存/requirements.lock
+       → 备份数据库 + cd 暂存 && alembic upgrade head
+       → 解压后端代码 → 切前端 → 重启
+```
+
+判据（沙箱演练第 13 组钉的，桩会把它读出来）：`pip` 实际读到的那份锁文件、
+`alembic` 的 cwd 下看到的是新迁移链还是旧迁移链。
+
+**为什么不用整目录换名顶上。** 产物里只有
+`app/ scripts/ migrations/ alembic.ini/ requirements.lock/ pytest.ini`，
+**不含** `.env`、`.venv`、`logs/` 与 `data/plugins`。整目录换名会把密钥、
+虚拟环境和插件运行目录一起换掉 —— 恰恰是最不该被一次发布顺手抹掉的东西。
+第 5 步仍然用 tar 解包覆盖，天然只写产物里有的那几个路径。
+
+**从暂存目录跑迁移，`.env` 必须显式链过去。** `app/core/config.py` 的
+`SettingsConfigDict(env_file=".env")` 是**相对 cwd** 的，暂存目录里没有
+`.env`，配置会一路退回源码里写死的默认值 `localhost:15432/cwq` ——
+把迁移打到另一个库上，破坏性变更不可挽回（`backend/alembic.ini` 开头的
+注释说的就是这件事）。所以脚本 `ln -sfn` 现有网 `.env`，**一份真源**；
+`.env` 与 `DATABASE_URL` 都没有时**拒绝迁移并退出**，不猜。
+
+**库备份刻意不跟发布版本走。** 迁移前的 dump 是唯一退路，退路本身不该由
+「正在发布的那一版」来决定能不能用：产物里那份 `db_backup.py` 在这台机器上
+从没跑过，用它生成唯一退路等于把退路的可靠性押在发布版本上。所以备份仍跑
+现网那份（代价是首次部署必须先预置，见 11.7.1）。
+
+**没有解决的窗口，说清楚胜过装作没有。** 迁移完成后到 `systemctl restart`
+之间，服务进程跑的还是上一版代码、库已经是新的。这个窗口在改动前就存在
+（迁移一直排在重启之前），本次改动没有引入它，也没有缩小它。`schema_version.py`
+在启动时 fail-closed，所以真出了不一致是**启动即报错**，不会静默带病运行。
 
 ---
 

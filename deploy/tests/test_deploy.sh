@@ -42,8 +42,13 @@ make_artifacts(){
   echo "print('backup')" > "$be/scripts/db_backup.py"
   echo "print('plugin status')" > "$be/scripts/plugin_status.py"
   echo "print('pass')" > "$be/migrations/env.py"
+  # 新迁移链的标记。断言「迁移跑的是产物里那条链」全靠它。
+  echo "# NEW MIGRATION CHAIN" > "$be/migrations/versions/0027_plugin_imports.py"
   echo "[alembic]" > "$be/alembic.ini"
-  echo "SQLAlchemy==2.1.4" > "$be/requirements.lock"
+  # 第一行是这一版新增的依赖 —— 真实事故里就是 rfc8785 没被装上。
+  # 它必须与现网旧锁的第一行**不同**，否则断言分不出装的是哪一份锁。
+  echo "rfc8785==0.1.4" > "$be/requirements.lock"
+  echo "SQLAlchemy==2.1.4" >> "$be/requirements.lock"
   echo "[pytest]" > "$be/pytest.ini"
   echo "<html>new frontend</html>" > "$fe/dist/index.html"
   tar -czf "$out/cwq-backend-${FAKE_SHA}.tar.gz" -C "$be" .
@@ -66,18 +71,49 @@ setup_sandbox(){
   rm -rf "$DEPDIR"
   mkdir -p "$DEPDIR/bin"
   APP="$DEPDIR/app"
-  mkdir -p "$APP/backend/.venv/bin" "$APP/frontend/dist" "$APP/.git"
+  mkdir -p "$APP/backend/.venv/bin" "$APP/backend/migrations/versions" \
+           "$APP/frontend/dist" "$APP/.git"
   echo "OLD backend content" > "$APP/backend/app.py"
   echo "<html>old frontend</html>" > "$APP/frontend/dist/index.html"
+  # 现网（上一版）留下的锁文件与迁移链，内容都与产物里的**刻意不同**。
+  # 「装的是哪一份锁」「跑的是哪一条链」必须能被断言直接读出来，
+  # 只断言「跑过 pip / 跑过 alembic」的话，改坏了也测不出来。
   echo "SQLAlchemy==2.1.4" > "$APP/backend/requirements.lock"
+  echo "# OLD MIGRATION CHAIN" > "$APP/backend/migrations/versions/0021_youyou_chart_of_accounts.py"
+  # 现网的 .env：连接串在这里。真实机器上 systemd 的 EnvironmentFile
+  # 指向的也是这个文件，迁移必须打在它说的那个库上。
+  echo "DATABASE_URL=postgresql+psycopg://cwq:pw@127.0.0.1:15432/cwq" > "$APP/backend/.env"
   make_artifacts "$DEPDIR/artifacts"
 
   for c in systemctl curl; do
     printf '#!/bin/sh\necho "%s $*" >> "$DEPDIR/calls"\nexit 0\n' "$c" > "$DEPDIR/bin/$c"
   done
-  printf '#!/bin/sh\necho "pip $*" >> "$DEPDIR/calls"\nexit 0\n' > "$APP/backend/.venv/bin/pip"
-  printf '#!/bin/sh\necho "alembic $*" >> "$DEPDIR/calls"\nexit ${STUB_ALEMBIC_RC:-0}\n' \
-    > "$APP/backend/.venv/bin/alembic"
+  # pip 桩：把「-r 指向的那份锁文件的第一行」记进 calls。
+  # 2026-10-18 那次事故里 pip **返回成功**，装的是旧锁；只记「跑过 pip」
+  # 等于把那次失败判成绿灯。
+  cat > "$APP/backend/.venv/bin/pip" <<'STUB'
+#!/bin/sh
+lock=""
+next=0
+for a in "$@"; do
+  if [ "$next" = "1" ]; then lock=$(head -1 "$a" 2>/dev/null); next=0; continue; fi
+  if [ "$a" = "-r" ]; then next=1; fi
+done
+echo "pip $* [lock=${lock}]" >> "$DEPDIR/calls"
+exit ${STUB_PIP_RC:-0}
+STUB
+  # alembic 桩：记下**从 cwd 看**到的是新链还是旧链、以及 cwd 里的 .env 是否可用。
+  # cwd 才是决定依据来源的那一个（alembic.ini 的 %(here)s 与
+  # prepend_sys_path = . 都相对它解析），所以记「cwd 看到什么」而不是记路径。
+  # [env=ok] 是「迁移打在现网那个库上」的证据：pydantic 的 env_file 相对 cwd，
+  # cwd 里没有 .env 就会退回源码默认值，把迁移打到另一个库上去。
+  cat > "$APP/backend/.venv/bin/alembic" <<'STUB'
+#!/bin/sh
+if grep -rqs "NEW MIGRATION CHAIN" migrations 2>/dev/null; then chain=NEW; else chain=OLD; fi
+if [ -e .env ] && grep -q DATABASE_URL .env 2>/dev/null; then envsrc=ok; else envsrc=MISSING; fi
+echo "alembic $* [chain=${chain}] [env=${envsrc}]" >> "$DEPDIR/calls"
+exit ${STUB_ALEMBIC_RC:-0}
+STUB
   # db_backup.py 走 venv 里的 python，要真的吐点东西当备份
   printf '#!/bin/sh\nif [ "$1" = "scripts/db_backup.py" ]; then echo "SELECT 1;"; exit ${STUB_BACKUP_RC:-0}; fi\necho "python $*" >> "$DEPDIR/calls"\nif [ "$1" = "scripts/plugin_status.py" ]; then exit ${STUB_PLUGIN_STATUS_RC:-0}; fi\nexit 0\n' \
     > "$APP/backend/.venv/bin/python"
@@ -98,6 +134,13 @@ run_script_no_artifacts(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/empty-artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
+}
+# 显式清掉 DATABASE_URL：这条只用来验证「目标库不确定时脚本会停手」。
+# 不能依赖 CI 机器上恰好没有这个变量 —— 那种断言一旦环境一变就变成恒绿。
+run_script_no_db_url(){
+  ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+    SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+    env -u DATABASE_URL LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 calls(){ cat "$DEPDIR/calls" 2>/dev/null; }
 
@@ -135,14 +178,17 @@ setup_sandbox
 OUT=$(run_script)
 assert_ran "全量发布" || exit 1
 # 这两条是本次改造的核心目的：把生产机从构建机上摘下来。
-for pair in "pytest:跑测试" "pnpm:构建前端" "node:跑前端"; do
-  tool="${pair%%:*}"; what="${pair##*:}"
-  if calls | grep -q "$tool"; then no "生产机仍然${what}（${tool}）"; else ok "生产机不再${what}"; fi
-done
-if calls | grep -q "pip install -q -r requirements.lock"; then
-  ok "装的是运行时锁 requirements.lock（不是 dev 锁）"
+if calls | grep -q "pytest"; then no "生产机仍然跑测试（pytest）"; else ok "生产机不再跑测试"; fi
+if calls | grep -q "pnpm"; then no "生产机仍然构建前端（pnpm）"; else ok "生产机不再构建前端"; fi
+if calls | grep -q "node"; then no "生产机仍然跑前端（node）"; else ok "生产机不再跑前端"; fi
+# 断言「装的锁是哪一份」，不是「有没有跑 pip」。产物里的锁第一行是
+# rfc8785（这一版新增的依赖），现网旧锁第一行是 SQLAlchemy —— 两者不同，
+# 断言才分得出来。
+PIPLINE=$(calls | grep -F 'pip install' | head -1)
+if [[ "$PIPLINE" == *"[lock=rfc8785==0.1.4]"* ]]; then
+  ok "装的是产物里的运行时锁（第一行 rfc8785；不是 dev 锁，也不是现网旧锁）"
 else
-  no "没有装 requirements.lock"
+  no "没装、或装的不是产物里那份锁：${PIPLINE:-（根本没有 pip 调用）}"
 fi
 
 echo "== 3. 产物被取走并校验通过 =="
@@ -280,6 +326,13 @@ if grep -q "NEW backend code" "$APP/backend/app/main.py" 2>/dev/null; then
   no "迁移失败却切换了后端代码"
 else
   ok "迁移失败没有切换代码"
+fi
+# 「不切产物」包括前端。nginx 直接从磁盘读 dist，不经后端进程，
+# 所以前端一旦换上就已经对外可见了 —— 它必须跟后端代码同一个闸门。
+if grep -q "new frontend" "$APP/frontend/dist/index.html" 2>/dev/null; then
+  no "迁移失败却切换了前端产物（nginx 直接读磁盘，换上就已对外可见）"
+else
+  ok "迁移失败没有切换前端产物"
 fi
 if grep -q "迁移失败" <<<"$OUT"; then ok "明确报出迁移失败"; else no "没有明确报错"; fi
 
@@ -422,6 +475,104 @@ if calls | grep -q "systemctl enable --now cwq-backup.timer"; then
   no "屏障失败仍执行成功后的发布步骤"
 else
   ok "屏障失败停止后续发布步骤"
+fi
+
+echo
+echo "== 13. 发布顺序：依赖与迁移的依据必须是**这一版**，不是上一版 =="
+# 这一组是 2026-10-18 生产事故的回归测试。
+#
+# 那次发布在现网目录里直接 ``pip install -r requirements.lock`` +
+# ``alembic upgrade head``，两份依据都是**上一版留在现网的文件**：
+# 新依赖 rfc8785 压根没装、alembic 的 head 停在 0021 而新代码要求 0027，
+# 两步都显示成功，切到新代码之后服务才炸（ModuleNotFoundError +
+# SchemaVersionError）。凡是一次发布同时带来新依赖和新迁移，必然触发。
+setup_sandbox
+OUT=$(run_script); RC=$?
+assert_ran "全量发布" || exit 1
+
+PIPLINE=$(calls | grep -F 'pip install' | head -1)
+if [[ "$PIPLINE" == *"[lock=rfc8785==0.1.4]"* ]]; then
+  ok "装依赖用的是产物里的锁文件，不是现网那份旧的"
+else
+  no "装依赖的依据不对：${PIPLINE:-（根本没有 pip 调用）}"
+fi
+
+ALEM=$(calls | grep -F 'alembic upgrade head' | head -1)
+if [[ "$ALEM" == *"[chain=NEW]"* ]]; then
+  ok "迁移跑的是产物里的新迁移链（head 来自这一版，不是上一版）"
+else
+  no "迁移仍在用现网的旧迁移链：${ALEM:-（根本没跑迁移）}"
+fi
+# [chain=NEW] 同时证明迁移是在**解包到暂存目录之后、切产物之前**跑的：
+# 现网目录里那份迁移链是 OLD，只有暂存目录里才是 NEW。
+if [[ "$ALEM" == *"[env=ok]"* ]]; then
+  ok "迁移时的代码上下文里能读到现网 .env（迁移打在现网那个库上）"
+else
+  no "迁移时读不到现网 .env —— 会退回源码默认值，可能打错库：${ALEM}"
+fi
+if [[ "$RC" == "0" ]]; then
+  ok "新顺序下完整发布成功（${RC}）"
+else
+  no "新顺序下发布失败（${RC}）：$(tail -3 <<<"$OUT")"
+fi
+# 暂存目录收尾：跑通之后不能留在应用根目录里
+LEFTOVER=$(find "$APP" -maxdepth 1 -name '.incoming.*' 2>/dev/null | head -1)
+if [[ -z "$LEFTOVER" ]]; then
+  ok "临时解包目录已清理"
+else
+  no "临时解包目录残留：${LEFTOVER}"
+fi
+
+echo
+echo "== 14. 依据不成立时就地停手：装依赖失败 / 目标库不确定 =="
+
+# 装依赖失败就是「依赖没到位」，绝不能先切产物再重启。
+setup_sandbox
+export STUB_PIP_RC=1
+OUT=$(run_script); RC=$?
+unset STUB_PIP_RC
+if [[ "$RC" != "0" ]]; then
+  ok "装依赖失败以非零退出（${RC}）"
+else
+  no "装依赖失败却返回成功"
+fi
+if calls | grep -qF 'alembic upgrade head'; then
+  no "依赖没装好就迁移了库 —— 迁移脚本要靠新代码跑，依赖不齐就是跑不通"
+else
+  ok "依赖没装好就不迁移"
+fi
+if calls | grep -q "systemctl restart"; then
+  no "装依赖失败却重启了服务"
+else
+  ok "装依赖失败没有重启"
+fi
+if grep -q "OLD backend content" "$APP/backend/app.py" 2>/dev/null; then
+  ok "装依赖失败没有切换后端代码"
+else
+  no "装依赖失败却切换了后端代码"
+fi
+if grep -q "old frontend" "$APP/frontend/dist/index.html" 2>/dev/null; then
+  ok "装依赖失败没有切换前端产物"
+else
+  no "装依赖失败却切换了前端产物"
+fi
+
+# 目标库不确定时必须**停**，而不是猜。
+# pydantic 的 env_file 是相对 cwd 的（app/core/config.py），而迁移现在从
+# 暂存目录跑 —— 没有现网 .env 时它会退回源码里写死的 localhost:15432/cwq。
+# 把迁移打到另一个库上不可挽回（backend/alembic.ini 开头的注释说的就是它）。
+setup_sandbox
+rm -f "$APP/backend/.env"
+OUT=$(run_script_no_db_url); RC=$?
+if [[ "$RC" != "0" ]] && grep -q "无法确认迁移会打在哪个库上" <<<"$OUT"; then
+  ok "无法确定目标库时拒绝迁移（不退回源码默认值）"
+else
+  no "没有 .env 也没有 DATABASE_URL 时仍然往下走了（RC=${RC}）"
+fi
+if calls | grep -qF 'alembic upgrade head'; then
+  no "目标库不确定却仍然跑了迁移"
+else
+  ok "目标库不确定时 alembic upgrade head 一次都没跑"
 fi
 
 echo

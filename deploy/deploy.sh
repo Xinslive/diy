@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# 发布脚本。四个铁律：
+# 发布脚本。五个铁律：
 #   1. 先验证再切流量 —— 产物取不到就不重启
 #   2. 备份上一版，回滚是改回来而不是重新编译
 #   3. 表结构变更只由 Alembic 负责，迁移前必须先备份数据库
 #   4. 备份失败就不迁移
+#   5. 依赖与迁移的依据必须是**这一版**的代码，不是上一版留在现网的文件
 #
 # ---------------------------------------------------------------------------
 # **第 1 条的铁律变了，闸门没变弱。**
@@ -16,7 +17,10 @@
 # 工具链，还让发版尖峰有机会把机器压垮。
 #
 # 现在改成：CI（.github/workflows/ci.yml 的 build-artifacts job）出产物，
-# 生产机只负责取产物 → 装运行时依赖 → 迁移 → 切产物 → 重启。
+# 生产机只负责取产物 → 解包到暂存 → 装运行时依赖 → 迁移 → 切产物 → 重启。
+#
+# 顺序里的**「解包到暂存」是第 5 条铁律的兑现方式**，2026-10-18 之前它不存在，
+# 于是装依赖与迁移读的都是现网里上一版留下的文件。详见第 3 步的说明。
 #
 # **「先跑测试再切流量」并没有被削弱，只是闸门换了位置。** build-artifacts
 # job 的 ``needs: [backend, frontend]`` 意味着：产物存在 = 后端全量 pytest
@@ -212,30 +216,91 @@ cp -a "$STAGE" "$RELEASES/$STAMP/artifact"
 echo "  已备份到 ${RELEASES}/${STAMP}"
 
 # --------------------------------------------------------------------------
-# 装依赖：只装 requirements.lock
+# 3/7 解包新代码到暂存目录，并按**这一版**的锁文件装运行时依赖
 # --------------------------------------------------------------------------
-# 原来装的是 requirements-dev.lock —— 因为第 4 步的测试闸要用 pytest。
-# 测试闸移到 CI 之后，生产机就不需要测试框架了，于是这里也换成运行时锁。
-# 这条改动不是顺手：dev 锁里带 pytest / httpx，生产机上装不装测试框架
-# 曾经是「说不清这台机器装的东西是给谁用的」。
-log "3/7 装运行时依赖"
-cd "$APP/backend"
-if [[ -f requirements.lock ]]; then
-  ./.venv/bin/pip install -q -r requirements.lock
-else
-  die "缺 requirements.lock —— 没有锁文件就无法保证「装出来的就是测试时那一版」。
-   **当前版本仍在服务，未做任何改动。**"
+# **这个暂存目录以前不存在，而它就是 2026-10-18 那次发布失败的根因。**
+#
+# 原来这里是直接在 ``$APP/backend`` 里 ``pip install -r requirements.lock``，
+# 下一步直接在同一个目录里 ``alembic upgrade head``。两者读的都是
+# **上一版留在现网的文件**：锁文件是旧的，于是这一版新增的依赖（当时是
+# rfc8785）压根没装；迁移链也是旧的，于是 alembic 的 head 停在 0021，
+# 而新代码要求 0027。两步都显示成功，切到新代码之后服务才炸：
+#
+#     ModuleNotFoundError: No module named 'rfc8785'
+#     SchemaVersionError: 数据库停在 0021_youyou_chart_of_accounts，
+#                         代码要求 0027_plugin_imports
+#
+# **凡是一次发布同时带来新依赖和新迁移，这个缺陷必然触发**，不是偶发。
+#
+# 修法不是把这两步整体往后挪一格 —— 往后挪确实能让它们读到新代码，
+# 但顺序仍在「切产物」之前，于是迁移一失败就留下「库已迁移、代码没换」
+# 这个最糟的状态（正在跑的是旧代码，库已经是新的）。
+# 所以这里先把新代码解到暂存目录：**装依赖与迁移都以暂存目录里的新代码
+# 为依据，而现网目录在第 5 步之前一个字节都不动。** 失败时留下的仍是
+# 「库没动、代码没换、服务没重启」，与本脚本原有的失败语义一致。
+log "3/7 解包新代码到暂存目录，并按这一版的锁文件装运行时依赖"
+VENV="$APP/backend/.venv"
+INCOMING="$APP/.incoming.$$"
+# 与 $STAGE 一样带 pid；失败时**不删** —— 出事时要能翻看「新代码到底长什么样」。
+# 走完全流程时随 $STAGE 一起清掉。
+rm -rf "$INCOMING"
+# 权限先收到 700 再往里放东西：紧接着就会给它加一个指向 .env 的软链，
+# 而这台机器上还跑着别的站点，不该在任何一个瞬间留一条通往密钥的路径。
+mkdir -p "$INCOMING"
+chmod 700 "$INCOMING"
+# --no-same-owner 与第 5 步同一理由：不让归档里 CI runner 的 uid 落盘。
+# 暂存目录是 root 建的临时目录，chown 归位在第 5 步做（产物会再解一次到现网）。
+tar --no-same-owner -xzf "$STAGE/cwq-backend-${SHA}.tar.gz" -C "$INCOMING"
+
+# 迁移必须打在**现网那个库**上，而连接串是 pydantic 按 **cwd** 找 .env 的
+# （app/core/config.py 的 ``SettingsConfigDict(env_file=".env")``，相对路径）。
+# 从暂存目录跑 alembic 时它读不到 ``$APP/backend/.env``，会一路退回源码里
+# 写死的默认值 ``localhost:15432/cwq`` —— 那是本脚本最不能犯的错：
+# 把迁移打到另一个库上，破坏性变更不可挽回（backend/alembic.ini 开头的注释
+# 说的就是这件事）。
+#
+# 所以这里显式把现网的 .env 链过去：**一份真源**，不复制、不生成、不猜。
+if [[ -f "$APP/backend/.env" ]]; then
+  ln -sfn "$APP/backend/.env" "$INCOMING/.env"
+elif [[ -z "${DATABASE_URL:-}" ]]; then
+  die "找不到 ${APP}/backend/.env，环境里也没有 DATABASE_URL。
+   **无法确认迁移会打在哪个库上，因此不迁移。**
+   现网代码、前端产物与服务均未改动，线上仍是上一版。"
 fi
 
+# 装依赖。**关键在这一行指向的是哪份锁文件** —— 「venv 装完了就等于装对了」
+# 这个说法不够，锁文件是旧的时装得再成功也是错的（新依赖根本没被要求安装）。
+# 解释成「装的是新锁」才是真的，装到哪一版只有锁文件本身能证明。
+#
+# venv 仍然用现网那个：.venv 不在产物里（build-artifacts 显式 --exclude），
+# 也不该在 —— 换掉它等于让「测试时那一版」与「运行时那一版」又对不上。
+if [[ ! -f "$INCOMING/requirements.lock" ]]; then
+  die "产物里缺 requirements.lock —— 没有锁文件就无法保证「装出来的就是测试时那一版」。
+   **现网代码、前端产物与服务均未改动。**"
+fi
+if ! "$VENV/bin/pip" install -q -r "$INCOMING/requirements.lock"; then
+  log "❌ 装运行时依赖失败"
+  log "   现网代码、前端产物与服务**均未改动**，线上仍是上一版在跑"
+  log "   常见原因是锁文件里有这台机器装不上的包；修好后重新发布即可"
+  log "   新代码留在 ${INCOMING}，可以先翻看 requirements.lock 与本机环境的差异"
+  exit 1
+fi
+log "  已按产物里的 requirements.lock 装完运行时依赖"
+
 # --------------------------------------------------------------------------
-# 表结构变更只由 Alembic 负责（P3-01）
+# 4/7 备份数据库并执行迁移（迁移链同样取自暂存目录）
 # --------------------------------------------------------------------------
+# 表结构变更只由 Alembic 负责（P3-01）。
 # 原来这里跑的是「应用启动时 create_all」，而 create_all 只建缺失的表、
 # 不改已存在的表 —— 生产上加一列 NOT NULL 会静默不生效，服务照常启动，
 # 问题到运行时才炸。现在由 CI 产出的迁移 + 这里的 upgrade head 负责。
 #
-# 顺序仍然是「备份数据库 → 迁移 → 切产物 → 重启」，且任何一步失败都不切产物。
+# **备份仍然用现网的 db_backup.py，不跟发布版本走。** 这份 dump 是迁移的
+# 唯一退路，而退路本身不该由「正在发布的那一版」来决定能不能用：产物里那
+# 份 db_backup.py 在这台机器上从没跑过，用一份没验证过的脚本去生成唯一的
+# 退路，等于把退路的可靠性押在发布版本上。现网这一份是一直在用的那份。
 log "4/7 备份数据库并执行迁移"
+cd "$APP/backend"
 DUMP="$RELEASES/$STAMP/database-before-migration.sql"
 # 备份失败**必须中止**（P2-25）。
 # 原来这里是「备份失败只喊一句，迁移照跑」。但备份是这个系统唯一的退路 ——
@@ -251,17 +316,31 @@ if ( umask 077; ./.venv/bin/python scripts/db_backup.py > "$DUMP" 2>"$RELEASES/$
 else
   log "❌ 数据库备份失败，见 ${RELEASES}/${STAMP}/db_backup.err"
   log "   没有退路就不迁移：生产库的 schema 一个字节都没动，保持现状不变"
+  log "   现网代码、前端产物与服务也都没有改动"
   log "   修好备份（装 postgresql-client，或核对 DATABASE_URL）后重新发布"
+  log "   新代码留在 ${INCOMING}"
   exit 1
 fi
 # 恢复命令一并打出来：出事时要靠它，而临场想起来的命令一定是错的
 log "  万一要退：cd $APP/backend && .venv/bin/python scripts/db_backup.py --restore --file ${DUMP}"
-if ! ./.venv/bin/alembic upgrade head; then
-  log "❌ 数据库迁移失败，保持现状不变（前端产物没切、没重启）"
-  log "   库已回滚到迁移前状态；修好 revision 后重新发布即可"
+
+# 迁移在**暂存目录**里跑。两条配置各自负责一半，缺一不可：
+#   ``script_location = %(here)s/migrations`` 里的 ``%(here)s`` 是
+#     alembic.ini 所在目录 —— 迁移链来自这一版；
+#   ``prepend_sys_path = .`` 把 ``app`` 包也解析到这一版 ——
+#     迁移脚本里 ``from app...`` 拿到的是新代码而不是旧的。
+# 于是 head 是「这一版要求的 head」，而不是「上一版知道的最大 head」。
+# 数据库在迁移后确实是新的、而**服务还没重启**（跑的还是上一版），
+# 这与改动前完全一致：迁移一直就排在重启之前，不是这次引入的窗口。
+if ! ( cd "$INCOMING" && "$VENV/bin/alembic" upgrade head ); then
+  log "❌ 数据库迁移失败"
+  log "   现网代码、前端产物与服务**都未改动**（线上跑的仍是上一版）"
+  log "   库可能已经迁了一半 —— 退路在 ${DUMP}"
+  log "     cd $APP/backend && .venv/bin/python scripts/db_backup.py --restore --file ${DUMP}"
+  log "   修好 revision 后重新发布即可；新代码留在 ${INCOMING}"
   exit 1
 fi
-log "  schema 版本：$(./.venv/bin/alembic current 2>/dev/null | tail -1)"
+log "  schema 版本：$( cd "$INCOMING" && "$VENV/bin/alembic" current 2>/dev/null | tail -1 )"
 
 chown_if_possible() {
   # 非致命：属主是卫生问题，不是正确性闸门。
@@ -282,11 +361,16 @@ chown_if_possible() {
 }
 
 log "5/7 切换代码与前端产物"
-# 代码换名落位而不是就地覆盖：就地 mv 会在解压与替换之间留一个「代码在、
-# 依赖不在」的窗口。替换本身用 tar 直接落到目标目录，失败时旧版本还在
-# .releases 里可退。
+# 走到这一步，说明依赖已按新锁装好、schema 已按新迁移链升到位。
+# **这两件事的依据都在暂存目录里，不在现网** —— 所以现在才是第一次
+# 动现网代码的时刻，前面任何一步失败都不会走到这里。
 #
-# --no-same-owner 与后面的 chown 是一对，缺一不可，原因见下。
+# 这里仍然把后端 tar 直接解到目标目录，而不是拿暂存目录换名顶上：
+# 产物里只有 app/scripts/migrations/alembic.ini/requirements.lock/pytest.ini，
+# **不含** .env、.venv、logs/ 和 data/plugins（build-artifacts 显式 --exclude，
+# .env 与 .venv 本来就不在仓库里）。整目录换名会把这些运行时状态一起换掉 ——
+# 密钥、虚拟环境、插件运行目录，正是最不该被一次发布顺手抹掉的东西。
+# 解包覆盖则天然只写产物里有的那几个路径。
 tar --no-same-owner -xzf "$STAGE/cwq-backend-${SHA}.tar.gz" -C "$APP/backend"
 # **归档里记的是 CI 的构建身份，不是部署机的服务账号。** build-artifacts 在
 # GitHub Actions 里打包，tar 逐条记下当时的 ``runner/runner``；而这一步是以
@@ -454,8 +538,11 @@ fi
 
 log "✅ 发布完成（${SHA}）"
 
-# 暂存目录：产物已经解压进 ${APP}，这里只是下载暂存
-rm -rf "$STAGE"
+# 暂存目录：产物已经解压进 ${APP}，这里只是下载暂存。
+# $INCOMING（第 3 步解新代码用的那份）也一并清掉 —— 它只在发布过程中有用。
+# 中途失败时这两个目录都**故意留着**，方便翻现场；产物另有一份在
+# ${RELEASES}/${STAMP}/artifact，所以留着并不等于「只有现场里有新代码」。
+rm -rf "$STAGE" "$INCOMING"
 
 # 只保留最近 KEEP 份备份
 ls -dt "$RELEASES"/*/ 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -rf
