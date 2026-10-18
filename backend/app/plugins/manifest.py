@@ -119,7 +119,16 @@ def validate_manifest(source: dict) -> dict:
         fail("定时任务需要兼容 SDK 1.2", "INCOMPATIBLE_API")
     task_names = set()
     for task in tasks:
-        _object(task, {"name", "schedule"}, {"name", "schedule"})
+        _object(task, {"name", "schedule", "enabled_default"}, {"name", "schedule"})
+        # 插件可以要求任务随自己一起启用（``enabled_default: true``），省掉管理员
+        # 装完插件还要去别处点一次开关。默认值仍然是 false —— 自动触发意味着自动
+        # 产生业务单据，这条只能由插件作者显式声明，不能默认打开。
+        #
+        # ``type(...) is not bool`` 而不是 ``isinstance``：JSON 里的 ``true`` 解析成
+        # Python 的 ``True``，而 ``1`` 虽然 ``isinstance(1, bool)`` 为 False 却仍可能被
+        # 误当成开关值放进来，这里要求严格布尔。
+        if "enabled_default" in task and type(task["enabled_default"]) is not bool:
+            fail("插件定时任务 enabled_default 只能是布尔值")
         name = task["name"]
         if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,47}", name) or name in task_names:
             fail("插件定时任务名称无效或重复")

@@ -115,6 +115,23 @@ def sync_system_tasks(db, now):
                 row.next_run_at = _next(spec["schedule"], now, include_current_minute=True)
 
 
+def task_default_enabled(plugin, name):
+    """插件是否声明了「装好就开」。
+
+    manifest 的任务项可以写 ``"enabled_default": true``，表示这个任务应该随插件
+    一起启用，不必让管理员装完插件再去另一个页面上找开关。默认是 False。
+
+    只影响**新建**任务行。已有行的 enabled 是管理员的决定或上一次声明的结果，
+    同步过程不得改写它 —— 否则管理员手动关掉一个任务，下次任意一次 tick 都会
+    把它悄悄打开。
+    """
+    tasks = (getattr(plugin, "manifest_metadata", None) or {}).get("tasks") or []
+    for task in tasks:
+        if isinstance(task, dict) and task.get("name") == name:
+            return task.get("enabled_default") is True
+    return False
+
+
 def sync_plugin_tasks(db, runtime, now):
     persisted = list(db.scalars(select(ScheduledTask).where(ScheduledTask.owner_type == "PLUGIN")))
     rows_by_plugin = {}
@@ -147,7 +164,8 @@ def sync_plugin_tasks(db, runtime, now):
             row = existing.get(name)
             if row is None:
                 db.add(ScheduledTask(task_key=key, owner_type="PLUGIN", plugin_id=pid,
-                                     task_name=name, plugin_digest=digest, schedule=schedule, enabled=False,
+                                     task_name=name, plugin_digest=digest, schedule=schedule,
+                                     enabled=task_default_enabled(plugin, name),
                                      next_run_at=_next(schedule, now, include_current_minute=True)))
             elif row.plugin_digest != digest or row.schedule != schedule:
                 row.plugin_digest, row.schedule, row.enabled = digest, schedule, False

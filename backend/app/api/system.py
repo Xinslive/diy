@@ -594,16 +594,56 @@ def list_backup_runs(limit: int = 50, user: SysUser = Depends(get_current_user),
     return [_run_view(r) for r in backup_service.recent_runs(db, limit)]
 
 
+_SCHEDULER_BLOCK_REASONS = {
+    "PLATFORM_DISABLED": "扩展平台未开启",
+    "STALE_GENERATION": "服务正在切换插件代次，请稍后刷新",
+    "OLD_WORKERS_ACTIVE": "仍有旧进程持有插件，请稍后刷新",
+    "WORKER_BARRIER_PENDING": "插件尚未就绪，请稍后刷新",
+    "RESTART_REQUIRED": "插件安装包已变更，需重启服务后重新启用",
+    "PACKAGE_MISSING": "插件安装包缺失",
+    "LOAD_FAILED": "插件加载失败",
+}
+
+
+def _task_switchable(db, row, runtime):
+    """这个任务的开关现在能不能点，以及不能点的**原因**。
+
+    提前算好是给界面用的：让人在按钮上直接看到「为什么灰着」，
+    而不是点下去吃一个 409 再去猜哪里不对。真正的准入判断仍在
+    ``set_scheduler_plugin_task`` 里按当刻状态重做一遍 —— 这里只是把
+    结论提前告诉前端，不构成放行。
+    """
+    if row.owner_type != "PLUGIN":
+        return False, "系统任务，不能在此开关"
+    plugin = db.get(PluginRegistry, row.plugin_id)
+    if plugin is None or plugin.deleted_at is not None:
+        return False, "插件已卸载"
+    if not plugin.desired_enabled:
+        return False, "插件本身未启用，请先在扩展管理里启用"
+    if runtime is None:
+        return False, "等待服务加载插件"
+    current, code = plugin_status(db, plugin, runtime.generation)
+    if current != "READY":
+        return False, _SCHEDULER_BLOCK_REASONS.get(code, "插件当前不可用（%s）" % (code or current))
+    return True, ""
+
+
 @router.get("/scheduler/tasks")
 def list_scheduler_tasks(request: Request, user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
     _require_admin(user)
     now = scheduler_service.utcnow()
-    scheduler_service.sync_tasks(db, getattr(request.app.state, "plugin_runtime", None), now)
+    runtime = getattr(request.app.state, "plugin_runtime", None)
+    scheduler_service.sync_tasks(db, runtime, now)
     db.commit()
-    return [{"task_key": row.task_key, "owner_type": row.owner_type, "plugin_id": row.plugin_id,
-             "task_name": row.task_name, "schedule": row.schedule, "enabled": row.enabled,
-             "next_run_at": row.next_run_at.isoformat(), "last_run_at": row.last_run_at.isoformat() if row.last_run_at else None}
-            for row in db.scalars(select(ScheduledTask).order_by(ScheduledTask.task_key))]
+    result = []
+    for row in db.scalars(select(ScheduledTask).order_by(ScheduledTask.task_key)):
+        available, reason = _task_switchable(db, row, runtime)
+        result.append({"task_key": row.task_key, "owner_type": row.owner_type, "plugin_id": row.plugin_id,
+                       "task_name": row.task_name, "schedule": row.schedule, "enabled": row.enabled,
+                       "next_run_at": row.next_run_at.isoformat(),
+                       "last_run_at": row.last_run_at.isoformat() if row.last_run_at else None,
+                       "available": available, "unavailable_reason": reason})
+    return result
 
 
 @router.put("/scheduler/tasks/{plugin_id}/{task_name}")

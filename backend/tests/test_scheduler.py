@@ -38,6 +38,23 @@ def scheduler_db(db):
         db.commit()
 
 
+@pytest.mark.parametrize("metadata,name,expected", [
+    (None, "nightly", False),
+    ({}, "nightly", False),
+    ({"tasks": []}, "nightly", False),
+    ({"tasks": [{"name": "nightly"}]}, "nightly", False),
+    ({"tasks": [{"name": "nightly", "enabled_default": False}]}, "nightly", False),
+    ({"tasks": [{"name": "nightly", "enabled_default": True}]}, "nightly", True),
+    # 别的任务声明了默认启用，不代表这个任务也启用。
+    ({"tasks": [{"name": "other", "enabled_default": True}]}, "nightly", False),
+    ({"tasks": [{"name": "other", "enabled_default": True}, {"name": "nightly"}]}, "nightly", False),
+    # 清单里没有任务声明这一节（老插件）时按未声明处理。
+    ({"version": "1.0.0"}, "nightly", False),
+])
+def test_task_default_enabled_reads_only_the_named_declaration(metadata, name, expected):
+    assert service.task_default_enabled(SimpleNamespace(manifest_metadata=metadata), name) is expected
+
+
 def test_schedule_next_occurrence_and_coalesces_missed_intervals():
     now = datetime(2026, 10, 17, 19, 46, tzinfo=timezone.utc)
     assert service._next({"type": "cron", "expression": "47 3 * * *"}, now) == datetime(
@@ -259,6 +276,115 @@ def test_plugin_task_fans_out_to_current_authorized_users_and_records_outcomes(
         assert db.get(ScheduledTask, task["task_key"]).enabled is False
         assert db.get(ScheduledTaskRun, abandoned["run_id"]).status == "SKIPPED"
 
+    finally:
+        with SessionLocal.begin() as cleanup:
+            cleanup.execute(delete(ScheduledTaskRun).where(ScheduledTaskRun.plugin_id == pid))
+            cleanup.execute(delete(ScheduledTask).where(ScheduledTask.plugin_id == pid))
+
+
+def test_declared_default_enabled_starts_the_task_but_never_survives_an_upgrade(
+    plugin_env, client, auth, book, scheduler_db
+):
+    """插件声明 ``enabled_default: true`` 时，装好就是开的。
+
+    但**升级**后必须重新变成关闭的：换包等于换了代码，上一次的开启动作
+    是针对旧包做的决定，不能悄悄延续到新包上 —— 否则管理员装新版时，
+    一个自己都没看过的新包会立刻开始自动跑。
+    """
+    db = scheduler_db
+    build, restart = plugin_env
+    pid = f"com.test.deflt{uuid.uuid4().hex[:8]}"
+    source = (
+        "def register(registrar, ctx):\n"
+        "    def nightly(task):\n"
+        f"        ctx.book_write({book.id})\n"
+        "        ctx.audit_write('scheduled_run')\n"
+        "    registrar.task('nightly', nightly)\n"
+    ).encode()
+    edit = lambda manifest: manifest.update(
+        api_version=">=1.2.0 <2.0.0", permissions=["audit:write", "book:write"],
+        tasks=[{"name": "nightly", "schedule": {"type": "interval", "minutes": 60},
+                "enabled_default": True}],
+    )
+    raw, _, _, _ = build(plugin_id=pid, tables=False, files={
+        "backend/main.py": source,
+        "frontend/index.js": b"export default host => ({render: () => host.h('div')});\n",
+    }, edit=edit)
+    try:
+        assert client.post("/api/system/plugins/install", files={"file": ("scheduled.cwp", raw)},
+                           headers=auth).status_code == 200
+        runtime = restart()
+        # Never touched the switch: the declaration alone has to do it.
+        task = next(row for row in client.get("/api/system/scheduler/tasks", headers=auth).json()
+                    if row["task_key"] == f"plugin:{pid}:nightly")
+        assert task["enabled"] is True
+        assert task["available"] is True
+        assert task["unavailable_reason"] == ""
+
+        # Switching it off, then syncing again, must not re-open it behind the admin's back.
+        assert client.put(f"/api/system/scheduler/tasks/{pid}/nightly", headers=auth,
+                          json={"enabled": False}).status_code == 200
+        task = next(row for row in client.get("/api/system/scheduler/tasks", headers=auth).json()
+                    if row["task_key"] == f"plugin:{pid}:nightly")
+        assert task["enabled"] is False
+
+        from app.models.plugin import PluginRegistry
+        with SessionLocal.begin() as session:
+            session.get(ScheduledTask, task["task_key"]).enabled = True
+            session.get(PluginRegistry, pid).plugin_digest = "a" * 64
+        # A package change (upgrade or rollback) forces a fresh enable decision.
+        with SessionLocal.begin() as session:
+            service.sync_tasks(session, runtime, service.utcnow())
+        db.expire_all()
+        assert db.get(ScheduledTask, task["task_key"]).enabled is False
+    finally:
+        with SessionLocal.begin() as cleanup:
+            cleanup.execute(delete(ScheduledTaskRun).where(ScheduledTaskRun.plugin_id == pid))
+            cleanup.execute(delete(ScheduledTask).where(ScheduledTask.plugin_id == pid))
+
+
+def test_task_list_explains_why_a_switch_is_unavailable(plugin_env, client, auth, book, scheduler_db):
+    """开关点不动时要能在列表里看到原因，而不是让人猜。"""
+    db = scheduler_db
+    build, restart = plugin_env
+    pid = f"com.test.block{uuid.uuid4().hex[:8]}"
+    source = (
+        "def register(registrar, ctx):\n"
+        "    def nightly(task):\n"
+        f"        ctx.book_write({book.id})\n"
+        "        ctx.audit_write('scheduled_run')\n"
+        "    registrar.task('nightly', nightly)\n"
+    ).encode()
+    edit = lambda manifest: manifest.update(
+        api_version=">=1.2.0 <2.0.0", permissions=["audit:write", "book:write"],
+        tasks=[{"name": "nightly", "schedule": {"type": "interval", "minutes": 60}}],
+    )
+    raw, _, _, _ = build(plugin_id=pid, tables=False, files={
+        "backend/main.py": source,
+        "frontend/index.js": b"export default host => ({render: () => host.h('div')});\n",
+    }, edit=edit)
+    try:
+        assert client.post("/api/system/plugins/install", files={"file": ("scheduled.cwp", raw)},
+                           headers=auth).status_code == 200
+        restart()
+        tasks = client.get("/api/system/scheduler/tasks", headers=auth).json()
+        task = next(row for row in tasks if row["task_key"] == f"plugin:{pid}:nightly")
+        # No declaration: the task still starts closed.
+        assert task["enabled"] is False
+        assert task["available"] is True
+        # System tasks are never switchable here.
+        system = next(row for row in tasks if row["owner_type"] == "SYSTEM")
+        assert system["available"] is False
+        assert "系统任务" in system["unavailable_reason"]
+
+        # Disabling the plugin itself is reported instead of a bare 409.
+        from app.models.plugin import PluginRegistry
+        with SessionLocal.begin() as session:
+            session.get(PluginRegistry, pid).desired_enabled = False
+        blocked = next(row for row in client.get("/api/system/scheduler/tasks", headers=auth).json()
+                       if row["task_key"] == f"plugin:{pid}:nightly")
+        assert blocked["available"] is False
+        assert "扩展管理" in blocked["unavailable_reason"]
     finally:
         with SessionLocal.begin() as cleanup:
             cleanup.execute(delete(ScheduledTaskRun).where(ScheduledTaskRun.plugin_id == pid))

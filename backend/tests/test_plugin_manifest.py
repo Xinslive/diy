@@ -40,6 +40,8 @@ def test_duplicate_json_and_canonical_signature():
     {"name": "hourly_sync", "schedule": {"type": "interval", "minutes": 15}},
     {"name": "nightly_sync", "schedule": {"type": "cron", "expression": "10 2 * * *"}},
     {"name": "nightly_sync", "schedule": {"type": "cron", "expression": "10 2 * * *", "timezone": "Asia/Shanghai"}},
+    {"name": "daily", "schedule": {"type": "cron", "expression": "10 2 * * *"}, "enabled_default": True},
+    {"name": "daily", "schedule": {"type": "cron", "expression": "10 2 * * *"}, "enabled_default": False},
 ])
 def test_manifest_accepts_scheduled_task(task):
     _, manifest, _, _ = package(edit=lambda value: value.update(tasks=[task]))
@@ -56,6 +58,11 @@ def test_manifest_accepts_scheduled_task(task):
         {"name": "daily", "schedule": {"type": "interval", "minutes": 1}},
         {"name": "daily", "schedule": {"type": "interval", "minutes": 2}},
     ],
+    # enabled_default 必须是严格布尔：1 / "true" 这类能当条件用的值一律拒掉，
+    # 否则「声明了但没生效」会以最难查的形式留在生产上。
+    [{"name": "daily", "schedule": {"type": "interval", "minutes": 1}, "enabled_default": 1}],
+    [{"name": "daily", "schedule": {"type": "interval", "minutes": 1}, "enabled_default": "true"}],
+    [{"name": "daily", "schedule": {"type": "interval", "minutes": 1}, "enabled_default": None}],
 ])
 def test_manifest_rejects_invalid_scheduled_tasks(tasks):
     with pytest.raises(PluginError):
