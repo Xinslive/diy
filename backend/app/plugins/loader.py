@@ -8,8 +8,9 @@ import inspect as pyinspect
 import logging
 import re
 import sys
+from functools import wraps
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.routing import APIRoute
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.asyncexitstack import AsyncExitStackMiddleware
@@ -30,6 +31,43 @@ from app.plugins.security import verify_directory
 from app.plugins.workers import WorkerRuntime
 
 log = logging.getLogger(__name__)
+
+
+def _with_body_payload(endpoint):
+    """把处理函数里裸 ``dict`` 注解的参数改判为**请求体**。
+
+    SDK 约定的写法是 ``def save_note(payload: dict)``，然后从 ``payload`` 里取
+    ``book_id`` 等字段（见 docs/plugin-guide.md）。但 FastAPI 只按注解决定参数
+    去处：标了 ``dict`` 又没写 ``Body()`` 的参数会被当成**查询参数**，于是插件
+    前端用 JSON body 提交的数据根本收不到，接口一律回 422 ``Field required``。
+    也就是说文档、插件客户端、插件三方的约定是一致的，只有路由装配这一步漏了。
+
+    这里不改插件的函数对象（它是别人写的，且被 ``_check`` 验过签名），而是套一层
+    只改签名的壳：``__signature__`` 优先于 ``__wrapped__``，FastAPI 的
+    ``get_typed_signature`` 看到的是带 ``Body()`` 缺省值的那个签名，真正的实现
+    原样保留。
+    """
+    signature = pyinspect.signature(endpoint)
+    params = []
+    changed = False
+    for param in signature.parameters.values():
+        if param.annotation is dict:
+            # 一律按「请求体」判：这是 SDK 文档写死的约定，插件没法也不该为了迁就
+            # FastAPI 的默认值推断去改写法。带默认值的保留原来的默认，语义不变。
+            default = Body(...) if param.default is pyinspect.Parameter.empty else Body(param.default)
+            params.append(param.replace(default=default))
+            changed = True
+        else:
+            params.append(param)
+    if not changed:
+        return endpoint
+
+    @wraps(endpoint)
+    def wrapper(*args, **kwargs):
+        return endpoint(*args, **kwargs)
+
+    wrapper.__signature__ = signature.replace(parameters=params)
+    return wrapper
 
 
 class Registrar:
@@ -58,8 +96,9 @@ class Registrar:
 
     def add(self, path, endpoint, methods):
         self._check(path, endpoint, methods)
-        self._router.add_api_route("/api/plugins/" + self._plugin_id + path, endpoint,
-            methods=methods, name=f"plugin:{self._plugin_id}:{len(self._router.routes)}")
+        self._router.add_api_route("/api/plugins/" + self._plugin_id + path,
+            _with_body_payload(endpoint), methods=methods,
+            name=f"plugin:{self._plugin_id}:{len(self._router.routes)}")
 
     def get(self, path, endpoint):
         self.add(path, endpoint, ["GET"])

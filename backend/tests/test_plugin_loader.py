@@ -29,6 +29,54 @@ def test_registrar_rejects_host_route_request_dependencies_and_hooks():
         r.hook('unknown', good)
 
 
+def test_registrar_treats_bare_dict_payload_as_request_body():
+    """SDK 约定 ``def save_note(payload: dict)`` 里的 payload 是**请求体**。
+
+    FastAPI 只按注解决定参数去处：裸 ``dict`` 又没写 ``Body()`` 的参数会被当成
+    查询参数，于是插件前端用 JSON body 提交的数据收不到，接口一律回 422
+    ``Field required``。文档、插件客户端、插件三方约定一致，路由装配不能掉链子。
+    """
+    _, manifest, _, _ = package()
+    r = Registrar(manifest)
+
+    def save_note(payload: dict):
+        return payload
+
+    def list_notes(book_id: int):
+        return {'book_id': book_id}
+
+    r.post('/notes', save_note)
+    r.get('/charts', list_notes)
+    post_route = next(x for x in r._router.routes if 'POST' in x.methods)
+    get_route = next(x for x in r._router.routes if 'GET' in x.methods)
+    assert [p.name for p in post_route.dependant.body_params] == ['payload']
+    assert post_route.dependant.query_params == []
+    # 标量参数仍然是查询参数：GET 接口靠它带 book_id，不能顺手也改成 body
+    assert [p.name for p in get_route.dependant.query_params] == ['book_id']
+    assert get_route.dependant.body_params == []
+
+
+def test_body_payload_wrapper_keeps_original_handler_intact():
+    """套壳只改签名，不改也不替换插件自己的函数对象。"""
+    from app.plugins.loader import _with_body_payload
+
+    def save_note(payload: dict):
+        return {'got': payload}
+
+    wrapper = _with_body_payload(save_note)
+    assert wrapper is not save_note
+    assert wrapper({'a': 1}) == {'got': {'a': 1}}
+    # 原函数的签名一个都没动，否则 _check 验过的约束就被绕过去了
+    import inspect as pyinspect
+    params = pyinspect.signature(save_note).parameters
+    assert params['payload'].default is pyinspect.Parameter.empty
+
+    def list_notes(book_id: int):
+        return book_id
+
+    assert _with_body_payload(list_notes) is list_notes
+
+
 def test_registrar_accepts_only_declared_sync_task_handler():
     manifest = {"id": "com.example.tasks", "tasks": [
         {"name": "hourly", "schedule": {"type": "interval", "minutes": 60}}
