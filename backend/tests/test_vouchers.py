@@ -24,6 +24,7 @@ from app.accounting.vouchers import (
     update_voucher,
 )
 from app.models import Entry, Period, Voucher
+from tests.accounting_helpers import close_any
 
 
 def sid(subjects, code):
@@ -456,14 +457,14 @@ def test_跨年看的是上年十二月(db, book, admin_user, subjects, make_vou
     nov26 = db.scalar(select(Period).where(Period.book_id == book.id,
                                            Period.year == 2026, Period.month == 11))
     carry_forward_profit(db, book.id, jan26, admin_user)
-    close_period(db, jan26, admin_user)
-    close_period(db, nov26, admin_user)      # 级联封掉 2~11 月
+    close_any(db, book, jan26, admin_user)
+    close_any(db, book, nov26, admin_user)      # 级联封掉 2~11 月
 
     # 年度结转要求全年封账，先把 2026 整年结掉，再把 12 月退回来当「未结账」
     # 1 月的损益已经在 1 月结转走了，12 月账上没余额，不必再结转
     dec26 = db.scalar(select(Period).where(Period.book_id == book.id,
                                            Period.year == 2026, Period.month == 12))
-    close_period(db, dec26, admin_user)
+    close_any(db, book, dec26, admin_user)
     year_end_carry(db, book, admin_user)
     dec26.locked = False
     db.commit()

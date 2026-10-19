@@ -13,6 +13,7 @@ from decimal import Decimal
 
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import select
+from tests.accounting_helpers import close_any
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -392,7 +393,7 @@ def test_年度结转后列表仍是同一行年度变多(client, auth, db, book
         if db.scalar(select(Voucher.id).where(
                 Voucher.book_id == book.id, Voucher.period_id == periods[m].id)):
             carry_forward_profit(db, book.id, periods[m], admin_user)
-        close_period(db, periods[m], admin_user)
+        close_any(db, book, periods[m], admin_user)
 
     r = client.post(f"/api/books/{book.id}/year-end", json={}, headers=auth)
     assert r.status_code == 200, r.text

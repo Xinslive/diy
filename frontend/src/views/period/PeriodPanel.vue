@@ -45,16 +45,24 @@
           <span class="tile-icon green"><el-icon><Lock /></el-icon></span>
           <span class="tile-title">结账</span>
         </div>
-        <div class="tile-status" :class="store.currentPeriod?.locked ? 'ok' : 'idle'">
+        <div class="tile-status" :class="store.currentPeriod?.locked ? 'ok' : (emptyPeriod ? 'warn' : 'idle')">
           <template v-if="store.currentPeriod?.locked">
             <el-icon><CircleCheck /></el-icon><span>本期已结账</span>
           </template>
+          <template v-else-if="emptyPeriod">
+            <el-icon><Warning /></el-icon><span>本期没有任何凭证</span>
+          </template>
           <template v-else><span class="plain">本期未结账</span></template>
         </div>
-        <p class="tile-desc">锁定本期，之后凭证不可再改。</p>
-        <el-button class="tile-btn" type="success" :disabled="!store.canWrite || store.currentPeriod?.locked"
+        <p class="tile-desc">
+          {{ emptyPeriod ? '空月份不能结账：结账后补凭证只能反结账重来，而反结账会连带把后面已结账的月份全部退回。请先录入本期凭证。'
+                          : '锁定本期，之后凭证不可再改。' }}
+        </p>
+        <el-button class="tile-btn" type="success"
+                   :disabled="!store.canWrite || store.currentPeriod?.locked || emptyPeriod"
                    @click="doClose">
-          {{ store.currentPeriod?.locked ? '已结账' : `结账 ${store.currentPeriod?.code}` }}
+          {{ store.currentPeriod?.locked ? '已结账'
+             : (emptyPeriod ? '无凭证，不能结账' : `结账 ${store.currentPeriod?.code}`) }}
         </el-button>
       </div>
 
@@ -166,6 +174,18 @@ const prevPeriod = computed(() => {
   return store.periods.find(p => p.ord === cur.ord - 1) || null
 })
 const prevBlocked = computed(() => !!prevPeriod.value && !prevPeriod.value.locked)
+
+/**
+ * 本期一张凭证都没有。
+ *
+ * 空月份**不能结账**，按钮直接禁用并说明原因，不给「确认一下就放行」的旁路：
+ * 点了确定的人多半正是没意识到自己漏录了账的那个人，而后端一旦封了这一期，
+ * 补录就只能反结账重来，反结账会连带把后面已结账的月份全部退回。
+ */
+const emptyPeriod = computed(() => {
+  const cur = store.currentPeriod
+  return !!cur && !cur.locked && !cur.vouchers
+})
 
 /** 月份小块的配色：一眼分清「已收尾」「有凭证没收尾」「本月空着」。 */
 function monthClass(p) {

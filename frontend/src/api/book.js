@@ -31,6 +31,10 @@ export const carryForward = (id, pid, replace = true) =>
  *  这条以前不在本文件里：PeriodPanel.vue 自己 import 了共享 http 手写路径，
  *  理由是「closePeriod 还没有 version 参数」。现在有了 ——
  *  路径写在两个文件里，改后端路由时必然漏改一处。
+ *  一张凭证都没有的期间后端一律拒收，**没有旁路**：空月份恰好能穿过整理体检、
+ *  自动记账和损益结平三道闸门，「忘录账」会被静默封进历史，而补录得反结账、
+ *  反结账会连带把后面已结的月份全部退回。真的无业务也要录凭证（哪怕一张
+ *  说明凭证）—— 那张凭证本身就是「这个月我看过、是空的」的记录。
  */
 export const closePeriod = (id, pid, version) =>
   http.post(`/books/${id}/periods/${pid}/close`, { version }).then(r => r.data)

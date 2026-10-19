@@ -29,6 +29,7 @@ import pytest
 import sqlalchemy
 from sqlalchemy import select, update
 
+from tests.accounting_helpers import close_any
 from app.accounting import organize as svc_organize
 from app.accounting import periods as svc_periods
 from app.accounting import vouchers as svc
@@ -318,7 +319,7 @@ def test_结账不再逐行取期间(db, book, periods, admin_user):
     """原来 ``db.get`` 每个期间一条 SELECT，十年账套结一次 12 月就是 24 次。
     现在是一条 ``id IN (…)``。"""
     with _statements() as stmts:
-        svc_periods.close_period(db, db.get(Period, periods[3].id), admin_user,
+        close_any(db, book, db.get(Period, periods[3].id), admin_user,
                                  auto_post=False, commit=False)
 
     # 整列的 Period 实体查询 + 单 id 谓词 = 原来那条 ``db.get``。
@@ -336,7 +337,7 @@ def test_结账的顺带结账与版本号不变(db, book, periods, admin_user):
     """链上每一期都锁、version 各加 1、结果里的「顺带结账」列表照旧。"""
     before = {m: periods[m].version for m in (1, 2, 3)}
 
-    res = svc_periods.close_period(db, db.get(Period, periods[3].id), admin_user,
+    res = close_any(db, book, db.get(Period, periods[3].id), admin_user,
                                    auto_post=False, commit=False)
 
     assert res["period"] == periods[3].code
@@ -369,7 +370,7 @@ def test_结账后_identity_map_里的期间对象是库里那份(db, book, peri
     finally:
         other.close()
 
-    svc_periods.close_period(db, db.get(Period, periods[3].id), admin_user,
+    close_any(db, book, db.get(Period, periods[3].id), admin_user,
                              auto_post=False, commit=False)
 
     assert stale.locked is True, "链上的期间对象必须是库里刷新过的那一份"
@@ -381,9 +382,9 @@ def test_批量反结账结果不变(db, book, periods, admin_user, make_voucher
     # 而这条用例要验的是反结账，不是结转损益。
     vs = [make_voucher(f"2026-0{m}-10", dr=[("1122", 100, "挂应收")],
                        cr=[("1002", 100, "收款")])
-          for m in (1, 2)]
+          for m in (1, 2, 3)]
     for m in (1, 2, 3):
-        svc_periods.close_period(db, db.get(Period, periods[m].id), admin_user,
+        close_any(db, book, db.get(Period, periods[m].id), admin_user,
                                  commit=False)
     db.commit()
     assert all(v.status == "POSTED" for v in vs)
@@ -392,7 +393,7 @@ def test_批量反结账结果不变(db, book, periods, admin_user, make_voucher
                                     admin_user, commit=False)
 
     assert res["periods"] == [periods[1].code, periods[2].code, periods[3].code]
-    assert res["unposted_vouchers"] == 2
+    assert res["unposted_vouchers"] == 3
     for m in (1, 2, 3):
         p = db.get(Period, periods[m].id)
         assert p.locked is False

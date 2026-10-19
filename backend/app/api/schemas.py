@@ -237,6 +237,10 @@ class CloseIn(BaseModel):
     # 乐观锁的期望版本（审计 P1-19）。值来自 ``GET /periods`` 返回的
     # ``version``；留空表示「老调用方，不比对」。
     version: Optional[int] = None
+    # **没有 allow_empty**：空月份一律不许结账，不留「我知道、我确认」的旁路。
+    # 一张凭证都没有的月份能穿过整理体检、自动记账和损益结平三道闸门，
+    # 「这个月忘录了账」于是被静默封进历史，而补录就得反结账、反结账会连带把
+    # 后面已结的月份全部退回。确认弹窗挡不住它 —— 人会点「确定」。
 
 
 class UncloseIn(BaseModel):

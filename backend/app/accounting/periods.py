@@ -155,6 +155,8 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
 
     ``expected_version`` 是乐观锁（P1-19）：调用方把页面上看到的
     ``period.version`` 传进来，不一致就抛 :class:`PeriodVersionConflict`。
+
+    **一张凭证都没有的期间结不了账**，没有旁路 —— 理由与后果见下面那道闸门。
     """
     # P1-19：locked 与 version 都从**库里**读，不读传入对象上的旧值。
     target, locked_now, version_now = _fresh_period(db, period.id)
@@ -196,6 +198,29 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
     # 整条链都要先过一遍「整理就绪」：断号、时序不对的月份一旦封进历史，
     # 纸质凭证按号装订就跟系统对不上，再想改只能作废重记。
     svc_organize.assert_tidy(db, chain)
+
+    # 空月份不许结账，没有旁路。
+    #
+    # 以前一张凭证都没有的期间也能结，而且三道闸门**恰好都对它放行**：整理
+    # 体检对空集通过，自动记账记 0 张，损益检查因为余额全为零也通过。于是
+    # 「这个月的账忘了录」被静默封进历史 —— 期间一锁，补凭证就得反结账，
+    # 而反结账会连带把后面已经结好的月份全部退回，一笔糊涂账就是这么来的。
+    #
+    # 曾经想过留一个「我确认本月无业务」的旁路，否掉了：那个确认拦不住它 ——
+    # 人会点确定，而点确定的人多半正是没意识到自己漏录了的人。
+    # 真的要表达「本月无业务」，办法是录入凭证（哪怕只是一张说明凭证），
+    # 那张凭证本身就是「这个月我看过、是空的」的记录。
+    #
+    # **只卡被结的那一期**：链上更早的空月份照旧顺带结掉。年度结转要求
+    # 12 期全部结完，所以一个账套里若有整月无业务，会在结到 12 月的路上
+    # 被挡住 —— 这是有意的：先把这个月处理成「有凭证」再往下走。
+    if not db.scalar(
+        select(func.count()).select_from(Voucher).where(Voucher.period_id == target.id)
+    ):
+        raise ValueError(
+            f"{target.code} 没有任何凭证，不能结账。"
+            "请确认本期凭证是否漏录；若本月确实没有业务，请录入凭证（哪怕只是一张说明凭证）后再结账。"
+        )
 
     auto_closed, auto_posted = [], 0
     pending = []

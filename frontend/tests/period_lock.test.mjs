@@ -125,6 +125,19 @@ t('其他失败（500 / 断网）：也走普通错误，不假装是版本冲�
   assert.equal(said.warnings.length, 0)
 })
 
+t('空月份不能结账：按钮禁用，且接口不带任何「确认空月」的旁路', () => {
+  // 后端已经硬拒（app/accounting/periods.py：一张凭证都没有就不结账）。
+  // 这里守的是**前端没有偷偷开旁路**：曾经有过一个 allow_empty 开关，
+  // 靠一个确认弹窗放行 —— 而空月份恰好能穿过整理体检、自动记账和损益结平
+  // 三道闸门，「忘录账」会被静默封进历史，补录得反结账、反结账会连带把
+  // 后面已结的月份全部退回。
+  assert.match(SRC, /const emptyPeriod = computed/, '空月份判定没了')
+  assert.match(SRC, /:disabled="[^"]*emptyPeriod[^"]*"/, '结账按钮没有把空月份算进 disabled')
+  assert.match(SRC, /无凭证，不能结账/, '按钮上应当直接说明为什么不能结')
+  assert.doesNotMatch(API, /allow_empty/, '接口层出现了 allow_empty —— 后端不认这个字段，会被静默忽略')
+  assert.doesNotMatch(SRC, /allowEmpty/, '前端还在传「确认空月」，等于把硬闸门又开了个口子')
+})
+
 console.log('')
 for (const [name, fn] of tests) {
   try { await fn(); console.log('  OK   ' + name); pass++ }

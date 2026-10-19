@@ -286,8 +286,16 @@ def test_已结账期间不能结转(db, book, periods, subjects, admin_user, ma
 # --------------------------------------------------------------------- 结账 / 级联
 
 
-def test_结账级联关闭之前所有期间(db, book, periods, admin_user):
-    """不允许出现「3 月已结账、1 月还开着」—— 否则已结账期间的累计数会随上游改动漂移。"""
+def test_结账级联关闭之前所有期间(db, book, periods, admin_user, make_voucher):
+    """不允许出现「3 月已结账、1 月还开着」—— 否则已结账期间的累计数会随上游改动漂移。
+
+    3 月必须有凭证：空月份现在会被结账闸门挡下（见 test_无凭证的月份不能结账），
+    而 1、2 月留着空正好演示另一条口径 —— **被结的那一期要有凭证，更早的空月
+    照旧顺带结掉**。
+    """
+    # 用资产类科目对冲，别用损益科目 —— 否则这张凭证本身就让 3 月「损益未结平」
+    make_voucher("2026-03-05", dr=[("1002", 10, "x")], cr=[("1001", 10, "x")])
+
     r = close_period(db, periods[3], admin_user)
 
     assert r["period"] == "2026-03"
@@ -297,7 +305,31 @@ def test_结账级联关闭之前所有期间(db, book, periods, admin_user):
     assert db.get(Period, periods[4].id).locked is False
 
 
-def test_重复结账报错(db, book, periods, admin_user):
+def test_无凭证的月份不能结账(db, book, periods, admin_user):
+    """一张凭证都没有的月份不许结账。
+
+    以前它能结，而且三道闸门恰好都对它放行：整理体检对空集通过、自动记账记
+    0 张、损益检查因余额全零通过 —— 于是「这个月的账忘了录」被静默封进历史，
+    补凭证就得反结账，而反结账会连带把后面已结的月份全部退回。
+    """
+    with pytest.raises(ValueError, match="没有任何凭证"):
+        close_period(db, periods[2], admin_user)
+    db.rollback()
+
+    assert db.get(Period, periods[2].id).locked is False, "被拒之后这一期必须还是开着的"
+
+
+def test_结账被拒时不会留下任何一处上锁(db, book, periods, admin_user):
+    """闸门要在**动任何一行之前**就拒 —— 一边封一边验，验不过就是脏数据。"""
+    with pytest.raises(ValueError):
+        close_period(db, periods[3], admin_user)
+    db.rollback()
+
+    assert [db.get(Period, periods[m].id).locked for m in range(1, 5)] == [False] * 4
+
+
+def test_重复结账报错(db, book, periods, admin_user, make_voucher):
+    make_voucher("2026-01-10", dr=[("1002", 10, "x")], cr=[("1001", 10, "x")])
     close_period(db, periods[1], admin_user)
     db.refresh(periods[1])
     with pytest.raises(ValueError, match="已经结账"):
@@ -307,6 +339,7 @@ def test_重复结账报错(db, book, periods, admin_user):
 
 def test_结账期间禁止写入凭证(db, book, periods, subjects, admin_user, make_voucher):
     """写保护在数据库触发器里，不只是应用层判断。"""
+    make_voucher("2026-01-05", dr=[("1002", 10, "x")], cr=[("1001", 10, "x")])
     close_period(db, periods[1], admin_user)
     db.refresh(periods[1])
     with pytest.raises(Exception) as e:
@@ -503,6 +536,22 @@ def test_损益没结平就不许结账并说明先结转(db, book, periods, sub
 # --------------------------------------------------------------------- 年度结转
 
 
+def _voucher_every_month(periods, make_voucher, months=range(2, 13), code="1001"):
+    """给每个月补一张凭证，让「这一年」真的可以结完。
+
+    空月份**不能结账**（见 test_无凭证的月份不能结账），而年度结转要求 12 期
+    全部结完 —— 所以这些用例必须先把前提造出来，而不是把闸门绕过去。
+
+    借方贷方用**同一个科目**（1001 库存现金，年度结转那批用例断言的是 1002
+    银行存款的累计发生额）、金额相同：净效果为零。这是刻意的 ——
+    往里加一张动余额的凭证会把这些用例的期望值全部作废，而这个辅助函数要
+    提供的只是「本月有业务」这件事。
+    """
+    for m in months:
+        make_voucher(f"2026-{m:02d}-10", dr=[(code, 100, "本月业务")],
+                     cr=[(code, 100, "本月业务")])
+
+
 def _close_year(db, book, periods, admin_user):
     """年度结转要求 12 期全部结账，逐月「有损益就结转 -> 结账」。"""
     for m in range(1, 13):
@@ -514,6 +563,7 @@ def _close_year(db, book, periods, admin_user):
 def test_年度结转给同一账套追加下一年度(db, book, periods, admin_user, make_voucher):
     """年度是账套的属性：一个账套一个年度一个账套的做法已经取消。"""
     make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
+    _voucher_every_month(periods, make_voucher)
     _close_year(db, book, periods, admin_user)
 
     before = db.scalar(select(func.count()).select_from(Book))
@@ -532,6 +582,7 @@ def test_年度结转给同一账套追加下一年度(db, book, periods, admin_
 
 def test_年度结转把本年期末写成下一年1月期初(db, book, periods, subjects, admin_user, make_voucher):
     make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
+    _voucher_every_month(periods, make_voucher)
     _close_year(db, book, periods, admin_user)
 
     year_end_carry(db, book, admin_user)
@@ -547,6 +598,7 @@ def test_年度结转把本年期末写成下一年1月期初(db, book, periods,
 def test_跨年后账簿连续且本年累计归零(db, book, periods, subjects, admin_user, make_voucher):
     """跨年最容易出的两个错：期初断档、本年累计变成两年累计。"""
     make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
+    _voucher_every_month(periods, make_voucher)
     _close_year(db, book, periods, admin_user)
     year_end_carry(db, book, admin_user)
 
@@ -586,6 +638,7 @@ def test_跨年后账簿连续且本年累计归零(db, book, periods, subjects,
 def test_年度结转把本年利润转到未分配利润(db, book, periods, subjects, admin_user, make_voucher):
     """利润表算出来的钱，最终要落到 4104 未分配利润上。"""
     make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
+    _voucher_every_month(periods, make_voucher)
     _close_year(db, book, periods, admin_user)
 
     year_end_carry(db, book, admin_user)
@@ -607,6 +660,7 @@ def test_下一年没记账时可以再结转刷新期初(db, book, periods, sub
     from app.accounting.periods import ensure_periods
 
     make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
+    _voucher_every_month(periods, make_voucher)
     _close_year(db, book, periods, admin_user)
     ensure_periods(db, book, 2027)
     db.commit()
@@ -641,6 +695,7 @@ def test_下一年没记账时可以再结转刷新期初(db, book, periods, sub
 def test_下一年已记账时拒绝刷新期初(db, book, periods, subjects, admin_user, make_voucher):
     """下一年一旦记了凭证，它的期初就被凭证引用，不能再被悄悄改掉。"""
     make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
+    _voucher_every_month(periods, make_voucher)
     _close_year(db, book, periods, admin_user)
     year_end_carry(db, book, admin_user)
 
@@ -659,6 +714,7 @@ def test_已结出下一年度后不能再结一次(db, book, periods, admin_use
     不能悄悄把 2027 直接跳到 2028。
     """
     make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
+    _voucher_every_month(periods, make_voucher)
     _close_year(db, book, periods, admin_user)
     year_end_carry(db, book, admin_user)
 
@@ -678,6 +734,7 @@ def test_下一年空期间已预建时仍结转本年(db, book, periods, subjec
     from app.accounting.periods import ensure_periods
 
     make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
+    _voucher_every_month(periods, make_voucher)
     _close_year(db, book, periods, admin_user)
     ensure_periods(db, book, 2027)          # 预建下一年，账上还没有任何动静
     db.commit()
@@ -696,6 +753,7 @@ def test_下一年空期间已预建时仍结转本年(db, book, periods, subjec
 
 def test_年度结转拒绝账套里不存在的年度(db, book, periods, admin_user, make_voucher):
     make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
+    _voucher_every_month(periods, make_voucher)
     _close_year(db, book, periods, admin_user)
 
     with pytest.raises(ValueError, match="本账套没有 2019 年的会计期间"):
@@ -705,6 +763,7 @@ def test_年度结转拒绝账套里不存在的年度(db, book, periods, admin_
 
 def test_年度结转不接受跨过一年的目标(db, book, periods, admin_user, make_voucher):
     make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
+    _voucher_every_month(periods, make_voucher)
     _close_year(db, book, periods, admin_user)
 
     with pytest.raises(ValueError, match="只能结转到紧接的下一个年度"):
@@ -1039,3 +1098,12 @@ def test_未结账时反结账被拒且状态不变(client, auth, db, book, peri
     after = {p.id: (p.locked, p.version) for p in
              db.scalars(select(Period).where(Period.book_id == book.id)).all()}
     assert after == before, f"反结账失败却改了库：{before} → {after}"
+
+
+def test_接口层也拒收空月份(client, auth, book, periods):
+    """钉住对外行为：闸门在 service 层，但**接口是另一条路**（路由层还包着
+    事务与错误映射），只测 service 会漏掉「路由没把校验挡住」这类改动。"""
+    r = client.post(f"/api/books/{book.id}/periods/{periods[2].id}/close",
+                    headers=auth, json={})
+    assert r.status_code == 400, r.text
+    assert "没有任何凭证" in r.json()["detail"]

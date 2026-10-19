@@ -37,6 +37,7 @@ from app.accounting.periods import (carry_forward_profit, close_period,
                                     year_end_carry)
 from app.ledger.engine import LedgerEngine
 from app.models import Entry, Period, PeriodOpening, Subject
+from tests.accounting_helpers import close_any
 
 ZERO = Decimal("0")
 
@@ -50,7 +51,7 @@ def _close_year(db, book, periods, admin_user):
             carry_forward_profit(db, book.id, p, admin_user)
         except ValueError:
             pass
-        close_period(db, p, admin_user)
+        close_any(db, book, p, admin_user)
 
 
 def _payload(**kw):

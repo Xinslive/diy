@@ -26,6 +26,7 @@ from app.accounting.periods import (carry_forward_profit, close_period,
                                     year_end_carry)
 from app.ledger.engine import LedgerEngine
 from app.models import Period, PeriodOpening, Voucher
+from tests.accounting_helpers import close_any
 
 
 def sid(subjects, code):
@@ -41,7 +42,7 @@ def _close_year(db, book, periods, admin_user):
             carry_forward_profit(db, book.id, period, admin_user)
         except ValueError:
             pass          # 该月没损益，跳过
-        close_period(db, period, admin_user)
+        close_any(db, book, period, admin_user)
 
 
 def _dec26_ord(db, book):

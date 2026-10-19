@@ -17,6 +17,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
+from tests.accounting_helpers import close_any
 from app.reports.evaluate import evaluate
 from app.models import ReportCell, ReportTemplate, Subject, Voucher
 
@@ -179,7 +180,7 @@ def _make_year(db, book, periods, subjects, admin_user):
         ], admin_user)
         # 真实流程就是这样：当月记账 → 结转损益 → 结账，下个月才允许再记凭证。
         # 少了这一步，m+1 月会因为「上一期未结账」而记不了账。
-        close_period(db, periods[m], admin_user)
+        close_any(db, book, periods[m], admin_user)
     db.commit()
 
 
@@ -404,7 +405,7 @@ def test_跨年后年初余额等于上年期末(db, book, periods, subjects, ad
             Voucher.book_id == book.id, Voucher.period_id == periods[m].id))
         if has:
             carry_forward_profit(db, book.id, periods[m], admin_user)
-        close_period(db, periods[m], admin_user)
+        close_any(db, book, periods[m], admin_user)
     year_end_carry(db, book, admin_user)
 
     jan27 = db.scalar(select(Period).where(Period.book_id == book.id,
@@ -434,7 +435,7 @@ def test_跨年后本年累计不带上一年(db, book, periods, subjects, admin
         if db.scalar(select(Voucher.id).where(
                 Voucher.book_id == book.id, Voucher.period_id == periods[m].id)):
             carry_forward_profit(db, book.id, periods[m], admin_user)
-        close_period(db, periods[m], admin_user)
+        close_any(db, book, periods[m], admin_user)
     year_end_carry(db, book, admin_user)
 
     jan27 = db.scalar(select(Period).where(Period.book_id == book.id,

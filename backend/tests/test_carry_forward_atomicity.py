@@ -24,6 +24,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import func, select
 
+from tests.accounting_helpers import close_any
 from app.accounting import periods as svc
 from app.accounting.periods import (carry_forward_profit, close_period,
                                     year_end_carry)
@@ -176,7 +177,7 @@ def test_年度结转仍然是单次提交(db, book, periods, subjects, admin_us
             carry_forward_profit(db, book.id, p, admin_user)
         except ValueError:
             pass          # 后面几个月没有损益发生额，结转不了是正常的
-        close_period(db, p, admin_user)
+        close_any(db, book, p, admin_user)
 
     calls = _count_commits(db, monkeypatch)
     year_end_carry(db, book, admin_user, 2026, 2027)

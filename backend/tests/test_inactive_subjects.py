@@ -21,6 +21,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
+from tests.accounting_helpers import close_any
 from app.accounting.periods import (carry_forward_profit, close_period,
                                     year_end_carry)
 from app.ledger import queries
@@ -37,7 +38,7 @@ def _close_year(db, book, periods, admin_user):
             carry_forward_profit(db, book.id, period, admin_user)
         except ValueError:
             pass          # 该月没损益，跳过
-        close_period(db, period, admin_user)
+        close_any(db, book, period, admin_user)
 
 
 def _deactivate(db, subject):
@@ -140,7 +141,7 @@ def test_停用的损益科目有余额时不允许结账(db, book, periods, sub
 
     dec = db.get(Period, periods[12].id)
     with pytest.raises(ValueError) as e:
-        close_period(db, dec, admin_user)
+        close_any(db, book, dec, admin_user)
     assert "560206" in str(e.value), (
         f"报错里应当点名那个停用但仍有余额的损益科目，实际：{e}")
 
