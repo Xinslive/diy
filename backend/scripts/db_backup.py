@@ -142,10 +142,41 @@ def _run(cmd: list[str], env: dict, stdin_bytes: bytes | None = None) -> int:
         return 127
 
 
+def _通知备份失败(message: str) -> None:
+    """备份失败时发一封告警邮件。**发不出去也不影响脚本的退出码。**
+
+    **为什么脚本要自己发**：这条备份是 **systemd timer**
+    （``cwq-backup.timer``，``deploy.sh`` 默认会装上并启用）直接调的本脚本，
+    **不经过应用内的调度器**。只在调度器里挂告警，这条路径失败时就是
+    一声不吭。
+
+    同步发送：进程马上就要退出，异步线程会随进程一起死，信就永远送不到。
+
+    **只报备份失败，不报恢复失败**：恢复被拒（RestoreRefused）说明校验
+    起作用了，那是**好事**，不该发告警。
+
+    **通知模块是懒加载的**：这个脚本是**恢复路径**，而恢复恰恰发生在
+    应用已经坏了的时候（配置写错、依赖装不上、库连不上）。模块级
+    import 通知子系统会把它一起拖下水 —— 于是「最后一道退路」在最需要
+    它的时刻起不来。import 放进函数里，失败只少一封信，脚本照常工作。
+    """
+    try:
+        from app.notify import events as notify_events
+
+        notify_events.local_backup_failed_blocking(
+            "本机数据库备份（每日 pg_dump）", message)
+    except Exception as exc:  # noqa: BLE001
+        # 告警本身绝不能把备份脚本搞崩：退出码是 systemd 判断成败的依据。
+        print(f"⚠️  告警邮件发送失败（已忽略）：{exc}", file=sys.stderr)
+
+
 def dump(url: str) -> int:
     """导出到 stdout。返回进程退出码。"""
     u = _parse(url)
-    return _run(dump_command(url), _env(u))
+    rc = _run(dump_command(url), _env(u))
+    if rc != 0:
+        _通知备份失败(f"pg_dump 退出码 {rc}（导出到 stdout）")
+    return rc
 
 
 def restore(url: str, sql: bytes) -> int:
@@ -191,10 +222,12 @@ def dump_to_file(out: Path, keep: int | None = None) -> int:
     if rc != 0:
         tmp.unlink(missing_ok=True)      # 别把半截文件留在目录里冒充备份
         print(f"❌ 备份失败（退出码 {rc}），未生成 {out.name}", file=sys.stderr)
+        _通知备份失败(f"pg_dump 退出码 {rc}，未生成 {out.name}")
         return rc
     if tmp.stat().st_size == 0:
         tmp.unlink(missing_ok=True)
         print(f"❌ 备份产出是 0 字节，已丢弃：{out}", file=sys.stderr)
+        _通知备份失败(f"备份产出是 0 字节，已丢弃：{out}")
         return 4
     tmp.replace(out)                      # 原子改名：目录里不会出现半截备份
 

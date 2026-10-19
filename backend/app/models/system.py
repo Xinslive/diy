@@ -35,6 +35,21 @@ class SysUser(Base, TimestampMixin):
     failed_logins: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
     locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
 
+    # 连续锁定的轮次（递进式锁定）。
+    #
+    # **为什么需要单独一列**：`failed_logins` 表达的是「离下一次锁定还差几次」，
+    # 触发锁定时它被清零 —— 于是「这个账号已经被锁过几轮」这个信息就丢了，
+    # 而它恰恰是决定「这次锁多久」的那一项。
+    #
+    # 口径：第 N 次连续锁定 → 锁定时长 = ``login_lock_minutes × N``
+    # （10 → 20 → 30 …，上限 ``login_lock_max_minutes``）。
+    # 登录成功或管理员提前解除锁定时清零 —— 那两件事都意味着「这个账号
+    # 回到了正常状态」，递进也就该从头算。
+    #
+    # 存账号上而不是内存里，与 failed_logins 同一个理由：多进程各有一份内存
+    # 计数的话，打满 N 个进程就能把 N 次额度用满。
+    lock_level: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+
     # 令牌版本号（审计 P2-01）。
     #
     # JWT 是自签名的，服务端不存会话，所以「重置口令」过去只能改

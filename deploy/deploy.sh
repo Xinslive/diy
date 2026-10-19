@@ -530,6 +530,37 @@ enable_backup_timer() {
   systemctl enable --now cwq-backup.timer
 }
 
+# 调度看门狗的关停标记。存在即跳过（与定时备份同一个道理：只 stop 的话
+# 下一次发版会把它自己拉回来）。
+#
+# **用 `: "${VAR:=默认}"` 而不是 `VAR=默认`**：后者会覆盖运维从环境里传进来的
+# 值，而前者是"没传才用默认"。另外 `VAR:=默认` 这种写法在 bash 里**不是
+# 赋值语句**（`:=` 只在 `${...}` 展开里才有意义），会被当成命令去执行，
+# 报一句莫名其妙的 "No such file or directory"。
+: "${WATCHDOG_TIMER_OFF_MARKER:=$APP/.watchdog-timer-off}"
+
+enable_watchdog_timer() {
+  # 关停标记：存在即跳过，且**连 unit 都不复制**。理由同 enable_backup_timer。
+  if [ -f "$WATCHDOG_TIMER_OFF_MARKER" ]; then
+    return 2
+  fi
+
+  local src=""
+  for d in "$APP/deploy/systemd" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/systemd"; do
+    if [ -f "$d/cwq-scheduler-watchdog.timer" ]; then src="$d"; break; fi
+  done
+
+  if [ -n "$src" ]; then
+    local u
+    for u in cwq-scheduler-watchdog.service cwq-scheduler-watchdog.timer; do
+      render_unit "$src/$u" "$SYSTEMD_UNIT_DIR/$u" || return 1
+    done
+    systemctl daemon-reload || return 1
+  fi
+
+  systemctl enable --now cwq-scheduler-watchdog.timer
+}
+
 backup_timer_rc=0
 enable_backup_timer >/dev/null 2>&1 || backup_timer_rc=$?
 
@@ -552,6 +583,34 @@ else
   log "           deploy/systemd/\$u > ${SYSTEMD_UNIT_DIR}/\$u; done"
   log "       systemctl daemon-reload && systemctl enable --now cwq-backup.timer"
   log "     然后验证真的产出文件：systemctl start cwq-backup.service && ls -l ${BACKUP_DIR}/"
+fi
+
+# (1.5) 调度看门狗
+#
+# 计划任务由**外部调度服务**每分钟调一次 tick 驱动（见 README「启用定时调度」）。
+# 那个服务挂了 → tick 不来 → 任务不被领取 → **所有定时任务静默停摆**，
+# 而这件事应用自己发现不了（它只在被 tick 到时才醒着）。
+#
+# 看门狗就补这一段：每 15 分钟查一次「有任务到期没人领」，有就发告警邮件。
+# 它**独立于应用**跑（systemd timer），所以它能发现"应用没被叫醒"。
+watchdog_timer_rc=0
+enable_watchdog_timer >/dev/null 2>&1 || watchdog_timer_rc=$?
+
+if [[ "$watchdog_timer_rc" -eq 2 ]]; then
+  log "  调度看门狗按要求保持关闭（标记文件：${WATCHDOG_TIMER_OFF_MARKER}）"
+  log "     关掉它意味着「外部调度服务停了」这件事没人会被通知"
+  log "     要恢复：systemctl enable --now cwq-scheduler-watchdog.timer && 删掉那个标记文件"
+elif [[ "$watchdog_timer_rc" -eq 0 ]]; then
+  next_run=$(systemctl show cwq-scheduler-watchdog.timer -p NextElapseUSecRealtime --value 2>/dev/null || echo "")
+  log "  调度看门狗已启用${next_run:+（下次：${next_run}）}"
+  log "     它每 15 分钟查一次「有计划任务到点没跑」，有就发告警邮件"
+else
+  log "  ⚠️  调度看门狗启用失败 —— 外部调度服务停掉时不会有任何通知"
+  log "     手动装一次："
+  log "       for u in cwq-scheduler-watchdog.service cwq-scheduler-watchdog.timer; do \\"
+  log "         sed -e \"s|/opt/cwq|${APP}|g\" \\"
+  log "           deploy/systemd/\$u > ${SYSTEMD_UNIT_DIR}/\$u; done"
+  log "       systemctl daemon-reload && systemctl enable --now cwq-scheduler-watchdog.timer"
 fi
 
 # (2) TRUSTED_PROXIES 没配 → IP 维度的登录节流形同虚设

@@ -182,8 +182,30 @@ def _version_refusal(path: "Path", got: object) -> ExportRefused:
 # 不会坏，你要在两年之后才发现 OSS 账单不对。
 EXCLUDED_TABLES = frozenset({"sys_backup_run", "plugin_registry", "plugin_install_attempt", "plugin_worker_runtime", "plugin_cohort"})
 
-# 每批取多少行就往 gzip 里写多少。1 千行是个平衡点：再大则一次 flush 的
-# 内存峰值高，再小则 flush 次数多、gzip 窗口利用率低。
+#: 备份制品里**不带走**的凭据型配置键（``sys_setting.value`` 写空）。
+#:
+#: **为什么。** 备份制品会离开这台机器：传到 OSS、落在运维的笔记本上、
+#: 塞进别人的手里。而这些值都是**拿起来就能用**的凭据 ——
+#: AccessKey 能往桶里写，token 能调 OCR，SMTP 口令能发信。带着它们的
+#: 备份等于把凭据抄送了一份给每一个拿到备份的人（审计 P0-1 点的就是这个面：
+#: 备份制品内含「用于上传该备份的 AccessKey」）。
+#:
+#: **只列「值本身即可用」的键。** 调度密钥在库里存的是 SHA-256 摘要
+#: （不可用），而且恢复之后要能继续跑 —— 把它清掉等于让恢复后的系统
+#: 收不到任何调度触发，留下一个「恢复好了」的假象。
+#:
+#: **写空而不是删行。** 行还在，页面上还看得到那个键，管理员一看就知道
+#: 「这个凭据没被带走、恢复后要重填」；删行的话，恢复后页面上干干净净，
+#: 与"压根没配过"长得一模一样。
+REDACTED_SETTING_KEYS = frozenset({
+    "oss_access_key_id",
+    "oss_access_key_secret",
+    "ocr_api_token",
+    "smtp_password",
+})
+
+#: 每批取多少行就往 gzip 里写多少。1 千行是个平衡点：再大则一次 flush 的
+#: 内存峰值高，再小则 flush 次数多、gzip 窗口利用率低。
 BATCH = 1000
 
 
@@ -361,7 +383,22 @@ def rows_of(conn, ts: TableScope, scope: str,
     if where is not None:
         stmt = stmt.where(where)
     for row in conn.execute(stmt.execution_options(yield_per=BATCH)):
-        yield {col.name: encode(row._mapping[col.name]) for col in ts.table.c}
+        record = {col.name: encode(row._mapping[col.name]) for col in ts.table.c}
+        yield _redact(ts.table.name, record)
+
+
+def _redact(table_name: str, record: dict) -> dict:
+    """把这一行里**不能进备份制品**的值写空。
+
+    只认一张表、一组键：``sys_setting`` 里那几个**值本身即可用**的凭据。
+    别的表别的列不碰 —— 脱敏必须是**白名单**式的：漏掉一个键是漏一个
+    凭据，多脱一个是把业务数据也毁了（而后者更隐蔽：数据少了没人知道）。
+    """
+    if table_name != "sys_setting":
+        return record
+    if record.get("key") in REDACTED_SETTING_KEYS:
+        record["value"] = ""
+    return record
 
 
 # ------------------------------------------------------------ 值编码

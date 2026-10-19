@@ -38,6 +38,7 @@ from sqlalchemy.orm import Session
 from app.accounting.audit_helper import log as write_audit
 from app.api.schemas import LoginIn, RegisterIn, TokenOut
 from app.core import system_settings
+from app.core import lockout
 from app.core.config import is_trusted_proxy, settings
 from app.core.db import get_db
 from app.core.deps import get_current_user
@@ -242,8 +243,11 @@ def _utcnow() -> datetime:
     这里显式转成 UTC 再去掉 tzinfo，而不是用 ``datetime.utcnow()`` ——
     后者在新版 Python 已废弃，而它被悄悄换成「本地时间」的那天，
     东八区部署的锁定时长会凭空变成 8 小时。
+
+    **实现在 core/lockout.py**：管理员后台也要用同一口径算「还剩多久」，
+    两处各算一次迟早对不上（界面说没锁、登录却回 423，两头都在说谎）。
     """
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return lockout.utcnow()
 
 
 def _lock_left(user: SysUser) -> int:
@@ -253,13 +257,24 @@ def _lock_left(user: SysUser) -> int:
     库里的 ``locked_until`` 是 UTC naive 时间，比较时必须同样按 UTC 处理，
     否则部署在东八区时锁定会**变成 8 小时**（把本地时间当 UTC 比，偏了 8 小时）。
     """
-    if user.locked_until is None:
-        return 0
-    return max(0, int((user.locked_until - _utcnow()).total_seconds()))
+    return lockout.lock_left_seconds(user)
 
 
-def _record_failure(db: Session, user: SysUser) -> bool:
-    """记一次失败，达阈值就锁。**返回这次是否触发了锁定**。
+def lock_duration_minutes(level: int) -> int:
+    """第 ``level`` 轮连续锁定要锁多久（分钟）。实现在 core/lockout.py。
+
+    这里保留一个同名薄封装，是为了让本模块的读者不必跳到 core 才知道
+    「锁多久」这件事的全部口径 —— 口径本身只有一份实现。
+    """
+    return lockout.lock_duration_minutes(level)
+
+
+def _record_failure(db: Session, user: SysUser) -> dict | None:
+    """记一次失败，达阈值就锁。
+
+    返回**这次锁定的详情**（时长、轮次、截止时刻），没触发锁定时返回
+    ``None``。调用方用它写审计并发通知 —— 这两件事都需要「锁了多久、
+    第几轮」这两个数，而它们只在触发的那一刻才知道。
 
     计数与锁定时间在同一个 flush 里写、分开写的话，中途断电会留下
     「计数加了但没锁」的账，攻击者正好卡在这个窗口里无限试。
@@ -270,10 +285,15 @@ def _record_failure(db: Session, user: SysUser) -> bool:
     """
     user.failed_logins = (user.failed_logins or 0) + 1
     if user.failed_logins >= settings.login_max_failures:
-        user.locked_until = _utcnow() + timedelta(minutes=settings.login_lock_minutes)
+        # 轮次 +1，**不重置**：这正是递进式的「连续」所在。
+        user.lock_level = (user.lock_level or 0) + 1
+        minutes = lock_duration_minutes(user.lock_level)
+        user.locked_until = _utcnow() + timedelta(minutes=minutes)
+        # 这一轮内重新计数：从现在起又要错够阈值才会再次触发。
         user.failed_logins = 0
-        return True
-    return False
+        return {"minutes": minutes, "level": user.lock_level,
+                "locked_until": user.locked_until}
+    return None
 
 
 # ------------------------------------------------------------- IP 维度软节流
@@ -632,7 +652,8 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
             # 口令信息）。锁定本身留痕，见下。
             _audit_login(False, db, ip, user, payload.username,
                          f"账号锁定中，剩余 {left // 60 + 1} 分钟",
-                         locked_until=user.locked_until.isoformat() if user.locked_until else None)
+                         locked_until=user.locked_until.isoformat() if user.locked_until else None,
+                         lock_level=user.lock_level or 0)
             # 锁定中的尝试照样计入来源计数：它同样是一次未经认证的尝试，
             # 而「有人在猛敲一个已锁定的账号」正是这一层要看的东西。
             # （不计入的话，攻击者只要等账号被锁住就自动获得无限额度。）
@@ -665,19 +686,35 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
                 entity="user",
                 entity_id=user.id,
                 user=user,
-                detail=f"连续登录失败达到阈值，账号被锁定 {settings.login_lock_minutes} 分钟："
-                       f"{user.username}（{ip}）",
+                detail=f"连续登录失败达到阈值，账号被锁定 {locked['minutes']} 分钟"
+                       f"（第 {locked['level']} 轮）：{user.username}（{ip}）",
                 after={"username": user.username, "ip": ip,
-                       "lock_minutes": settings.login_lock_minutes,
+                       "lock_minutes": locked["minutes"],
+                       "lock_level": locked["level"],
                        "locked_until": user.locked_until.isoformat()},
             )
         db.commit()
+        if locked:
+            # **通知在提交之后发**：状态与审计先落库，邮件是旁路。
+            # 发不出去也不该有任何后果（notify.events.dispatch 自己兜住）。
+            # 异步发：登录路径上多等一毫秒，都是攻击者能免费放大的。
+            from app.notify import events as notify_events
+
+            notify_events.account_locked(
+                username=user.username, real_name=user.real_name or "",
+                ip=ip, minutes=locked["minutes"], level=locked["level"],
+                threshold=settings.login_max_failures)
         raise HTTPException(401, "用户名或密码错误")
 
     # 登录成功即清零：否则一次误输留下的计数会跟后面几次正常登录叠起来，
     # 最终把一个从没被人猜过的账号锁住。
+    #
+    # **lock_level 也一起清零**：登录成功意味着「这个账号回到了正常状态」，
+    # 递进就该从头算 —— 否则一个人只要在解锁窗口里成功登录一次，下一轮
+    # 又从 10 分钟起步，那条曲线永远升不上去。
     user.failed_logins = 0
     user.locked_until = None
+    user.lock_level = 0
     _audit_login(True, db, ip, user, payload.username,
                  is_admin=bool(user.is_admin))
     db.commit()

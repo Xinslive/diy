@@ -513,3 +513,94 @@ def test_reenabling_cron_in_same_minute_keeps_completed_occurrence(scheduler_db,
     assert scheduler_db.get(ScheduledTask, claim["task_key"]).next_run_at > now
     runs = list(scheduler_db.scalars(select(ScheduledTaskRun)))
     assert len(runs) == 1 and runs[0].status == "SUCCESS"
+
+
+# ------------------------------------------------------------------ 失败告警的接线
+
+
+def _拦下告警(monkeypatch):
+    """把通知派发换成同步记录器。
+
+    拦在 ``dispatch_async`` 这一层：事件函数（``task_failed`` /
+    ``backup_failed``）自己会调它，而那一层是**同步**的 —— 于是断言是
+    确定的，不依赖守护线程跑到哪一步（跑线程是 flaky 事）。
+    """
+    from app.notify import events as notify_events
+
+    发出的 = []
+    monkeypatch.setattr(notify_events, "dispatch_async",
+                        lambda event, subject, body: 发出的.append((event, subject, body)))
+    return 发出的
+
+
+def _建到期任务(db, task_key, task_name):
+    now = service.utcnow()
+    db.add(ScheduledTask(
+        task_key=task_key, owner_type="SYSTEM", task_name=task_name,
+        schedule={"type": "cron", "expression": "47 3 * * *"}, enabled=True,
+        next_run_at=now - timedelta(minutes=1),
+    ))
+    db.commit()
+    return now
+
+
+def test_任务失败会发告警邮件(scheduler_db, monkeypatch):
+    """**接线**的证据：任务失败 → 真的发出一封告警邮件。
+
+    ``test_notify.py`` 测的是事件函数**本身**；这里测的是**调用点** ——
+    ``scheduler/service.py::_notify_failure`` 是不是真的在任务失败时被调到。
+
+    少了这条，将来有人重构 ``execute_claim`` 把那两行删掉，通知就会
+    **静默消失**：任务失败照旧记进 run 记录，界面照旧看得到，但管理员
+    再也收不到信 —— 而 ``test_notify.py`` 照样全绿（它测的是那个函数，
+    不是谁在调它）。
+    """
+    发出的 = _拦下告警(monkeypatch)
+
+    def _炸(name):
+        raise RuntimeError("任务炸了")
+
+    monkeypatch.setattr(service, "_run_system", _炸)
+    now = _建到期任务(scheduler_db, "system:custom_task", "custom_task")
+
+    claim = next(item for item in service.claim_due(now=now)
+                 if item["task_key"] == "system:custom_task")
+    service.execute_claim(claim)
+
+    assert len(发出的) == 1, f"任务失败了却没有告警：{发出的}"
+    event, subject, body = 发出的[0]
+    assert event == "TASK_FAILED"
+    assert "system:custom_task" in subject
+    assert "任务炸了" in body
+    # run 记录仍然是失败的 —— 两条通道各司其职：审计是证据，邮件是检测
+    scheduler_db.expire_all()
+    run = scheduler_db.get(ScheduledTaskRun, claim["run_id"])
+    assert run.status == "FAILED"
+
+
+def test_备份任务失败发的是备份告警(scheduler_db, monkeypatch):
+    """备份失败走**另一个事件类型**（BACKUP_FAILED）。
+
+    分流不是洁癖：备份失败时该说的那句是「备份是出事后的退路」，而对
+    插件任务说这句话是错的。分开还让两条告警**不共用限流桶** —— 锁定
+    告警刷屏不该把备份告警一起压掉。
+    """
+    发出的 = _拦下告警(monkeypatch)
+
+    def _炸(name):
+        raise RuntimeError("AccessKey 无效")
+
+    monkeypatch.setattr(service, "_run_system", _炸)
+    system_settings.set_value(scheduler_db, "backup_enabled", "1", updated_by="test")
+    scheduler_db.commit()
+    now = _建到期任务(scheduler_db, "system:oss_backup", "oss_backup")
+
+    claim = next(item for item in service.claim_due(now=now)
+                 if item["task_key"] == "system:oss_backup")
+    service.execute_claim(claim)
+
+    assert len(发出的) == 1, f"备份失败了却没有告警：{发出的}"
+    event, subject, body = 发出的[0]
+    assert event == "BACKUP_FAILED"
+    assert "AccessKey 无效" in body
+    assert "退路" in body, f"备份告警里没有点明它是退路：{body!r}"

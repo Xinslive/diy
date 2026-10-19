@@ -25,12 +25,16 @@ from app.backup import config as backup_config
 from app.backup import oss_client
 from app.backup import service as backup_service
 from app.core import system_settings
+from app.core import lockout
 from app.core.db import SessionLocal, get_db
 from app.core.deps import get_current_user
 from app.core.security import hash_password
 from app.models import (SCOPE_SYSTEM, STATUS_FAILED, TIER_DAILY, AuditLog,
                         BackupRun, Book, SysUser, UserBook)
 from app.models.scheduler import ScheduledTask, ScheduledTaskRun
+from app.notify import config as notify_config
+from app.notify import events as notify_events
+from app.notify import mailer as notify_mailer
 from app.scheduler import service as scheduler_service
 from app.plugins.workers import status as plugin_status
 from app.models.plugin import PluginRegistry
@@ -66,6 +70,10 @@ def _serialize(u: SysUser, links: dict[int, str]) -> dict:
         "id": u.id, "username": u.username, "real_name": u.real_name,
         "active": u.active, "is_admin": u.is_admin,
         "books": [{"book_id": bid, "role": role} for bid, role in sorted(links.items())],
+        # 锁定状态。**一次算全**（core/lockout.py::lock_summary）——
+        # 免得前端自己拿 locked_until 去和浏览器时钟比，那又是一次口径
+        # 分裂，而且用的是浏览器时区。
+        **lockout.lock_summary(u),
     }
 
 
@@ -297,6 +305,44 @@ def delete_user(user_id: int, user: SysUser = Depends(get_current_user),
     return {"ok": True}
 
 
+@router.post("/users/{user_id}/unlock")
+def unlock_user(user_id: int, user: SysUser = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    """**提前解除锁定**，不等锁定自然到期。
+
+    为什么必须有这个口子：递进式锁定本身是**可被主动触发的拒绝服务** ——
+    知道用户名的人连错三次就能把账号挡在门外，而锁定时长会随轮次递增。
+    审计 P2-3 把这条点成了"账号级锁定走的是和 IP 硬锁同一条路"：
+    IP 硬锁会变成 DoS 放大器，账号硬锁也一样，只是范围小一点。
+
+    所以锁定不能是"没人能解的状态"。这一条就是那个出口：
+    管理员看一眼就知道是谁被锁了，一键解开，不必等 10 分钟 / 20 分钟 / …。
+
+    **解封会把递进轮次清零**（``lock_level = 0``）：管理员明确介入过了，
+    意味着「这个账号回到了正常状态」，下一轮该从 10 分钟重新算。
+    不清零的话，被反复锁的账号会一路涨到上限，管理员每解一次都要重新
+    走一遍 10→20→30 的阶梯。
+
+    留痕：解锁是「谁在什么时候放行了谁」—— 这条在事后是要看的。
+    """
+    _require_admin(user)
+    target = db.get(SysUser, user_id)
+    if target is None:
+        raise HTTPException(404, "用户不存在")
+    was_locked = lockout.is_locked(target)
+    before = {**lockout.lock_summary(target)}
+    target.locked_until = None
+    target.failed_logins = 0
+    target.lock_level = 0
+    log(db, action="UNLOCK_USER", entity="user", entity_id=target.id, user=user,
+        detail=f"提前解除锁定：{target.username}"
+               + ("" if was_locked else "（该账号当时并未处于锁定中）"),
+        before=before, after={**lockout.lock_summary(target)})
+    db.commit()
+    return {"ok": True, "was_locked": was_locked,
+            "user": _serialize(target, _links_by_user(db).get(target.id, {}))}
+
+
 # --------------------------------------------------------------------- 账套
 
 
@@ -461,6 +507,142 @@ def put_ocr_config(payload: OcrConfigPatch, user: SysUser = Depends(get_current_
     )
     db.commit()
     return system_settings.ocr_config_public(db)
+
+
+# ------------------------------------------------- 邮件通知（SMTP）
+
+
+class NotifyConfigPatch(BaseModel):
+    """邮件通知配置。
+
+    口令是**只写**的，语义与 OCR token / OSS AccessKey 一致：
+    想清空要走 ``clear_password=True``。否则界面上一个没填内容的输入框
+    一次普通保存就把凭据悄悄抹掉了，而界面上看不出任何区别 ——
+    而抹掉之后通知会静默地发不出去（那正是最该被发现的故障）。
+    """
+
+    host: Optional[str] = Field(default=None, max_length=255)
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
+    username: Optional[str] = Field(default=None, max_length=255)
+    password: Optional[str] = Field(default=None, max_length=255)
+    from_address: Optional[str] = Field(default=None, max_length=255)
+    use_ssl: Optional[bool] = None
+    use_tls: Optional[bool] = None
+    timeout_seconds: Optional[int] = Field(default=None, ge=1, le=60)
+    recipients: Optional[str] = Field(default=None, max_length=2000)
+    enabled: Optional[bool] = None
+    clear_password: bool = False
+
+    @field_validator("recipients")
+    @classmethod
+    def _check_recipients(cls, v: Optional[str]) -> Optional[str]:
+        """收件人逐个校验，但**不因为有一个不合法就整份拒绝**。
+
+        这里与别处的严格校验不同：收件人是一串地址，其中一个写错不该
+        让另外几个也配不上（那等于「一个人填错，全组人收不到」）。
+        不合法的项在真正发送时被 :func:`notify_config.parse_recipients`
+        跳过，界面上会显示有效收件人数，让管理员自己看出少了谁。
+
+        但**换行是硬拒** —— 收件人字段会被拼进邮件头，换行等于邮件头注入
+        （「一封信发到别处去」）。这一条不能靠"管理员不会这么填"来防。
+        """
+        if v is None:
+            return None
+        if "\r" in v or "\n" in v:
+            raise ValueError("收件人列表不能包含换行")
+        return v.strip()
+
+
+@router.get("/notify")
+def get_notify_config(user: SysUser = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    """返回通知配置，**但没有口令明文** —— 只有 ``password_set`` 与末 4 位。
+
+    与 OCR / OSS 那两个接口同一条口径：管理员要能回答「到底配没配上」，
+    但不需要把口令再读出来贴到别处。
+    """
+    _require_admin(user)
+    return notify_config.smtp_config_public(db)
+
+
+@router.put("/notify")
+def put_notify_config(payload: NotifyConfigPatch,
+                      user: SysUser = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    _require_admin(user)
+    before = notify_config.smtp_config_public(db)
+    updates: dict[str, str] = {}
+    for field, key in (("host", "smtp_host"), ("port", "smtp_port"),
+                       ("username", "smtp_username"), ("from_address", "smtp_from"),
+                       ("use_ssl", "smtp_use_ssl"), ("use_tls", "smtp_use_tls"),
+                       ("timeout_seconds", "smtp_timeout_seconds")):
+        value = getattr(payload, field)
+        if value is not None:
+            updates[key] = str(value)
+
+    if payload.clear_password:
+        system_settings.set_value(db, "smtp_password", "", updated_by=user.username)
+    elif payload.password:
+        system_settings.set_value(db, "smtp_password", payload.password,
+                                  updated_by=user.username)
+
+    for key, value in updates.items():
+        system_settings.set_value(db, key, value, updated_by=user.username)
+
+    if payload.recipients is not None:
+        notify_config.set_recipients(db, payload.recipients, updated_by=user.username)
+    if payload.enabled is not None:
+        notify_config.set_notify_enabled(db, payload.enabled, updated_by=user.username)
+
+    # 必须 flush 之后才能取 after 快照。本工程的 session 是 autoflush=False
+    # （见 app/core/db.py），而 Session.get() 找不到还没 flush 的 pending 行 ——
+    # 于是这里读到的是「改之前」的值，审计日志会记一条 before == after 的假变更。
+    db.flush()
+    after = notify_config.smtp_config_public(db)
+    log(
+        db,
+        action="SYSTEM_NOTIFY_CONFIG_UPDATE",
+        entity="system_setting",
+        entity_id="notify",
+        user=user,
+        detail="更新邮件通知配置"
+               + ("（含口令）" if (payload.password or payload.clear_password) else ""),
+        before={k: before.get(k) for k in
+                ("host", "port", "username", "password_hint",
+                 "from_address", "use_ssl", "use_tls", "recipients", "enabled")},
+        after={k: after.get(k) for k in
+               ("host", "port", "username", "password_hint",
+                "from_address", "use_ssl", "use_tls", "recipients", "enabled")},
+    )
+    db.commit()
+    return after
+
+
+@router.post("/notify/test")
+def test_notify(user: SysUser = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    """发一封测试信。
+
+    **收件人就是真实的收件人** —— 收不到信的地址就是配错了，而
+    「配错了却显示测试成功」是最没用的测试结果。
+    """
+    _require_admin(user)
+    config = notify_config.smtp_config(db)
+    targets = notify_config.recipients(db)
+    if not targets:
+        raise HTTPException(400, "还没有配置收件人邮箱")
+    if not (config.get("host") or "").strip():
+        raise HTTPException(400, "还没有配置 SMTP 服务器地址")
+    try:
+        count = notify_mailer.test_connection(config, targets)
+    except notify_mailer.MailError as exc:
+        # 发不出去要说清原因，但**不能把口令回显**。MailError 的消息里
+        # 本来就不含口令（mailer.py 里刻意不拼它），这里原样透出即可。
+        raise HTTPException(400, f"测试发送失败：{exc}") from exc
+    log(db, action="SYSTEM_NOTIFY_TEST", entity="system_setting", entity_id="notify",
+        user=user, detail=f"发送测试邮件给 {count} 个收件人")
+    db.commit()
+    return {"ok": True, "recipients": count}
 
 
 # ------------------------------------------------- 数据安全（OSS 备份）

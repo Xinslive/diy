@@ -37,6 +37,28 @@ from app.backup import config as cfg_mod           # noqa: E402
 from app.backup import export as export_mod        # noqa: E402
 from app.backup import service                     # noqa: E402
 from app.core.db import SessionLocal                # noqa: E402
+from app.notify import events as notify_events      # noqa: E402
+
+
+def _通知备份失败(message: str) -> None:
+    """备份失败时发一封告警邮件。**发不出去也不影响脚本的退出码。**
+
+    **为什么脚本要自己发**：这条路径由 systemd timer 直接调（仓库里那个
+    ``cwq-oss-backup.timer``），**不经过应用内的调度器**。只在调度器里挂
+    告警的话，这条路径失败时就是一声不吭。
+
+    生产上 OSS 备份走的是应用内调度器（外部每分钟调 tick），那边已经有
+    告警了；这个脚本是**另一条**路径（旧的 timer 与手动补跑），所以它
+    自己也要能说话 —— 否则谁装了那个 unit，谁的备份就是静默的。
+
+    同步发送：进程马上就要退出，异步线程会随进程一起死，信就永远送不到。
+    """
+    try:
+        notify_events.backup_failed_blocking("账套备份（每日 OSS）", message)
+    except Exception as exc:  # noqa: BLE001
+        # 告警本身绝不能把备份脚本搞崩：退出码是 systemd 判断成败的依据，
+        # 这里抛出去会让「备份失败」变成「脚本异常」，两件事混在一起。
+        print(f"⚠️  告警邮件发送失败（已忽略）：{exc}", file=sys.stderr)
 
 
 def _print_run(run) -> str:
@@ -79,6 +101,9 @@ def main(argv: list[str] | None = None) -> int:
             cfg = cfg_mod.require_ready(session)
         except cfg_mod.ConfigIncomplete as e:
             print(f"❌ {e}", file=sys.stderr)
+            # 配置不全 = 备份**根本没跑**。这不是"少备了几本"，是退路一条
+            # 都没留下 —— 最该被知道的情况。
+            _通知备份失败(f"配置不全，备份未执行：{e}")
             return 2
 
         if args.dry_run:
@@ -118,9 +143,42 @@ def main(argv: list[str] | None = None) -> int:
             # 要有人看见，而 systemd 早就把这个进程的 stderr 收进日志文件了。
             print(f"⚠️  清理过期产物失败（不影响已上传的备份）：{result.prune_error}",
                   file=sys.stderr)
+        失败摘要 = _失败摘要(result)
+        if 失败摘要:
+            # **部分失败也要告警。** 退出码仍然是 0（这轮确实有东西备份出去了），
+            # 但"有 1 本账套没备上"在定时任务里是**看不见的** —— systemd 只看
+            # 退出码，而没备上的那本账套是没人会主动去翻的。
+            _通知备份失败(失败摘要)
         return 0 if ok else 4
     finally:
         session.close()
+
+
+def _失败摘要(result) -> str:
+    """把这一轮的失败整理成一句话。**空串表示没有失败。**"""
+    失败 = list(getattr(result, "failed", []) or [])
+    片段 = [f"{run.book_label}：{run.message or '未知原因'}" for run in 失败]
+    if result.prune_error:
+        片段.append(f"清理过期产物失败：{result.prune_error}")
+    if not 片段:
+        return ""
+    头 = f"{len(失败)} 个备份对象失败" if 失败 else "备份对象都上传成功了"
+    return f"{头}；" + "；".join(片段)
+
+
+def _待重填的凭据(session) -> list[str]:
+    """这些凭据现在是空的 —— 也就是运维接下来要补的。
+
+    **为什么要专门列出来。** 备份制品**有意**不带走凭据（审计 P0-1：
+    带着 AccessKey 的备份等于把凭据抄送给每一个拿到备份的人）。于是
+    恢复完之后那几个凭据是空的 —— 而恢复脚本刚打印过「恢复完成」。
+    不说清楚的话，运维看到的是"好了"，下一次备份却因为没有 AccessKey
+    而失败，那次失败又发生在没人看的凌晨。
+    """
+    from app.core.system_settings import get_value
+
+    return [k for k in sorted(export_mod.REDACTED_SETTING_KEYS)
+            if not (get_value(session, k, "") or "").strip()]
 
 
 def _restore(session, args) -> int:
@@ -137,11 +195,20 @@ def _restore(session, args) -> int:
         print("校验通过（未写库）。各表行数：")
         for name, n in counts.items():
             print(f"  {name:20} {n}")
+        print("提示：备份制品**不含凭据**（有意为之），恢复后需要在页面上重新配置。")
         return 0
     session.commit()
     print("恢复完成：")
     for name, n in counts.items():
         print(f"  {name:20} {n}")
+    待填 = _待重填的凭据(session)
+    if 待填:
+        print()
+        print("⚠️  这份归档**不含凭据**（有意为之，审计 P0-1：带着凭据的备份等于")
+        print("    把凭据抄送给每个拿到备份的人）。下面这几项需要重新配置：")
+        for key in 待填:
+            print(f"     - {key}")
+        print("    在「系统管理 → 数据安全」与「邮件通知」页重新填写即可。")
     return 0
 
 

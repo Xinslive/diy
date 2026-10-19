@@ -42,6 +42,20 @@
             </el-tag>
           </template>
         </el-table-column>
+        <!-- 锁定状态。递进式锁定下这一列要说清三件事：锁没锁、第几轮
+             （决定下次锁多久）、还剩多久 —— 只显示「已锁定」的话，
+             管理员不知道该等还是该解。 -->
+        <el-table-column label="锁定" width="160">
+          <template #default="{ row }">
+            <el-tag v-if="row.locked" size="small" type="danger">
+              第 {{ row.lock_level }} 轮 · {{ leftText(row) }}
+            </el-tag>
+            <span v-else-if="row.failed_logins" class="muted">
+              已错 {{ row.failed_logins }} 次
+            </span>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="账套授权" min-width="420">
           <template #default="{ row }">
             <template v-if="row.books.length">
@@ -55,10 +69,14 @@
             <span v-else class="muted">未授权任何账套</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="230" align="center">
+        <el-table-column label="操作" width="290" align="center">
           <template #default="{ row }">
             <el-button link type="primary" :disabled="!isAdmin" @click="openBooks(row)">授权</el-button>
             <el-button link type="primary" :disabled="!isAdmin" @click="openReset(row)">重置密码</el-button>
+            <!-- 解锁只在真的锁着时才可点：按钮常驻但置灰，比「有时突然
+                 多出一个按钮」好 —— 管理员一眼就知道这个位置管这件事。 -->
+            <el-button link type="warning" :disabled="!isAdmin || !row.locked"
+                       @click="unlock(row)">解锁</el-button>
             <el-button link type="danger" :disabled="!isAdmin || row.username === 'admin'"
                        @click="remove(row)">删除</el-button>
           </template>
@@ -312,6 +330,29 @@ async function remove(row) {
   }
   await sysApi.deleteUser(row.id)
   ElMessage.success('已删除')
+  await load()
+}
+
+// 锁定剩余时间的显示。
+//
+// **不做倒计时**：每秒刷新一次会让整张表一直在重绘，而管理员看一眼
+// 「还剩 12 分钟」已经够判断「是等一等还是解掉」。真要精确到秒，
+// 那一行信息的密度反而盖过了它要回答的问题。
+//
+// 剩余秒数是**后端算好的**（core/lockout.py::lock_summary）—— 前端不拿
+// locked_until 去和浏览器时钟比，那会是一次口径分裂（而且用的是浏览器
+// 时区，与服务端的 UTC 口径对不上）。
+function leftText(row) {
+  const sec = row.locked_left_seconds || 0
+  if (sec <= 0) return '已到期'
+  const min = Math.ceil(sec / 60)
+  if (min < 60) return `剩 ${min} 分钟`
+  return `剩 ${(min / 60).toFixed(1)} 小时`
+}
+
+async function unlock(row) {
+  await sysApi.unlockUser(row.id)
+  ElMessage.success(`已解除「${row.username}」的锁定`)
   await load()
 }
 

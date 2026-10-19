@@ -6,6 +6,11 @@ export const updateUser = (id, payload) => http.patch(`/system/users/${id}`, pay
 export const setUserBooks = (id, books) => http.put(`/system/users/${id}/books`, books).then(r => r.data)
 export const deleteUser = (id) => http.delete(`/system/users/${id}`).then(r => r.data)
 
+// 提前解除锁定。管理员在「用户与授权」页上点一下就能把被锁的账号放出来，
+// 不必等锁定自然到期 —— 递进式锁定本身是可被主动触发的拒绝服务，
+// 这一条就是那条路上的出口。
+export const unlockUser = (id) => http.post(`/system/users/${id}/unlock`).then(r => r.data)
+
 export const allBooks = () => http.get('/system/books').then(r => r.data)
 
 // 自助注册开关（存 sys_setting，改完即生效，不必重启后端）。
@@ -37,6 +42,12 @@ export const schedulerTasks = () => http.get('/system/scheduler/tasks').then(r =
 export const setSchedulerTask = (pluginId, taskName, enabled) =>
   http.put(`/system/scheduler/tasks/${pluginId}/${taskName}`, { enabled }).then(r => r.data)
 export const schedulerRuns = (limit = 50) => http.get('/system/scheduler/runs', { params: { limit } }).then(r => r.data)
+
+// 邮件通知（SMTP）。口令与 OCR token / OSS AccessKey 一样 **只写不读**：
+// GET 回来的是 password_set 与末 4 位，明文永远不在任何响应里。
+export const getNotifyConfig = () => http.get('/system/notify').then(r => r.data)
+export const saveNotifyConfig = (payload) => http.put('/system/notify', payload).then(r => r.data)
+export const testNotify = () => http.post('/system/notify/test').then(r => r.data)
 
 // 审计日志走 `@/api/book` 的 `auditLogs(bookId, limit)` —— 审计是**按账套**的，
 // 而这里原来包的是 `/system/audit-logs`（不带 book_id），两个函数**同名不同义**。

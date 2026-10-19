@@ -406,6 +406,55 @@ else
   no "关停定时备份把发版备份也一起弄没了"
 fi
 
+# --------------------------------------------------------------------------
+# 调度看门狗
+#
+# 计划任务由**外部调度服务**每分钟调一次 tick 驱动。那个服务挂了 →
+# tick 不来 → 任务不被领取 → **所有定时任务静默停摆**，而应用自己发现不了
+# （它只在被 tick 到时才醒着）。
+#
+# 看门狗是唯一能发现「应用没被叫醒」的东西，所以它必须**默认装上**。
+# --------------------------------------------------------------------------
+echo "== 10.5 调度看门狗：默认启用，关停标记 honored =="
+
+setup_sandbox
+OUT=$(run_script)
+assert_ran "全量发布" || exit 1
+if calls | grep -q "systemctl enable --now cwq-scheduler-watchdog.timer"; then
+  ok "默认会启用调度看门狗"
+else
+  no "默认没有启用调度看门狗"
+fi
+# 单元文件必须真的落到目标目录 —— 只 enable 不装 unit 等于没装
+if [[ -f "$DEPDIR/units/cwq-scheduler-watchdog.timer" \
+   && -f "$DEPDIR/units/cwq-scheduler-watchdog.service" ]]; then
+  ok "看门狗的两个 unit 文件都装到了目标目录"
+else
+  no "unit 文件没落到 ${DEPDIR}/units —— enable 了一个不存在的 unit"
+fi
+# 路径必须按本机布局渲染：第二台生产机把应用根放在别处（见 ARCHITECTURE §11.7.9）
+if grep -q "/opt/cwq" "$DEPDIR/units/cwq-scheduler-watchdog.service" 2>/dev/null; then
+  no "unit 里还留着 /opt/cwq 的硬编码路径"
+else
+  ok "unit 的路径已按本机布局渲染"
+fi
+
+# 关停标记在 → 一次 systemctl enable 都不能有，且要说清楚是「按要求关的」
+setup_sandbox
+: > "$APP/.watchdog-timer-off"
+OUT=$(run_script)
+assert_ran "带关停标记的发布" || exit 1
+if calls | grep -q "cwq-scheduler-watchdog.timer"; then
+  no "有关停标记却仍然动了看门狗 timer —— 下次发版它会自己复活"
+else
+  ok "有关停标记时不碰看门狗 timer"
+fi
+if grep -q "调度看门狗按要求保持关闭" <<<"$OUT"; then
+  ok "明确报出「按要求保持关闭」（而不是含糊成启用失败）"
+else
+  no "没有把看门狗的「按要求关闭」说清楚"
+fi
+
 echo
 echo "== 11. 回滚快照与库备份不该对本机其他账号可读 =="
 # 快照目录里躺着全量的库备份、上一版源码和产物包。这台机器跑着多个站点，

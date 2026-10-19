@@ -394,6 +394,22 @@ def test_开发库上按科目筛选的计划():
                 "SELECT subject_id FROM entry WHERE book_id = :b "
                 "GROUP BY subject_id ORDER BY count(*) DESC LIMIT 1"
             ), {"b": DEV_BOOK_ID}).scalar()
+            if sid is None:
+                # **没有数据就没有计划可验。**
+                #
+                # 这条用例的前提是「在**有真实数据**的开发库上验 EXPLAIN」。
+                # 开发库里那个账套没有分录时，``sid`` 取到 None，于是
+                # ``WHERE subject_id = NULL`` 恒不成立 —— PostgreSQL 的计划器
+                # 直接短路成一个 ``Result (cost=0.00..0.00)`` 节点，
+                # 索引根本不会出现在计划里。
+                #
+                # 那不是「索引用不上」，而是「这个查询本来就没有结果」——
+                # 两种情况长得一样，断言分不出来。与其让它红成一个
+                # 「索引没被用上」的假警报，不如按**前提不满足**跳过：
+                # 与上面那条「开发库还没 upgrade」是同一类处理。
+                pytest.skip(
+                    f"开发库的账套 {DEV_BOOK_ID} 没有分录数据，"
+                    f"无从验 EXPLAIN（该账套共 {rows} 行）")
             default_plan = "\n".join(r[0] for r in c.execute(
                 text("EXPLAIN " + SUBJECT_FILTER_SQL), {"sid": sid}))
             c.execute(text("SET enable_seqscan = off"))

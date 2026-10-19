@@ -266,6 +266,25 @@ def _cached_hash(password: str) -> str:
 # --------------------------------------------------------------------- 基础夹具
 
 
+@pytest.fixture(autouse=True)
+def _reset_notify_budget():
+    """每个用例前清空**通知发信预算**。
+
+    预算是**进程级**状态 —— 它必须跨请求生效，否则「同一个窗口内最多发
+    N 封」根本约束不住一次连打。但测试共享进程，于是上一条用例触发的
+    几十封通知会把配额吃光，让后面的用例随机失败。
+
+    那不是"偶发抖动"，是**顺序依赖**：同一份代码换台机器跑就红了。
+    所以这里在夹具层把它清掉 —— 顺序依赖的根因是共享状态，治法是隔离
+    共享状态，而不是调大阈值（调大阈值就把生产的防护调没了）。
+    """
+    from app.notify import events as notify_events
+
+    notify_events._budget.reset()
+    yield
+    notify_events._budget.reset()
+
+
 @pytest.fixture
 def db():
     s = SessionLocal()

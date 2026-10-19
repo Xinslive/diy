@@ -1,0 +1,33 @@
+[Unit]
+Description=云财务记账系统 调度看门狗（发现到点没跑的计划任务）
+Documentation=file:/opt/cwq/deploy/tuning.md
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=cwq
+Group=cwq
+WorkingDirectory=/opt/cwq/backend
+EnvironmentFile=/opt/cwq/backend/.env
+
+# 容忍期（分钟）：任务逾期多久算「没跑」。
+#
+# 30 分钟不是随手取的：tick 是**每分钟**调一次的，正常情况下任务最多晚
+# 几分钟；一次发布/维护的窗口也可能长到这个量级。取 30 分钟意味着「短暂
+# 的维护不会被误报」，而「tick 真的死了」会在半小时内被发现 —— 对每天
+# 一次的备份来说，仍是当天上午就知道，而不是几天后。
+Environment=CWQ_WATCHDOG_GRACE_MINUTES=30
+
+ExecStart=/opt/cwq/backend/.venv/bin/python scripts/scheduler_watchdog.py
+
+# ---------------------------------------------------------------------------
+# 加固：**只读**代码与配置，只连数据库、只发邮件。
+#
+# 这里**没有** ReadWritePaths —— 它一个字节都不写。写路径是备份脚本的事，
+# 那些脚本各自在 unit 里登记自己的目录（见 cwq-oss-backup.service）。
+# ---------------------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true

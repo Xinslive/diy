@@ -394,6 +394,29 @@ def _finish(claim, status_value, now, *, error_code="", message="", user_results
         row.lease_token, row.lease_until, row.current_run_id = "", None, None
 
 
+def _notify_failure(claim, error_code: str, message: str) -> None:
+    """任务失败时发一封告警邮件。
+
+    **为什么不直接在失败分支里写邮件代码**：备份任务失败时，说服力最强
+    的那句话是「备份是出事后的退路」，而对插件任务来说这句话是错的。
+    两种失败共用一条出口，所以在这里按任务种类分流。
+
+    **为什么用 async 版本**：这里本身就在后台线程里，同步发其实也不影响
+    任何请求 —— 但统一走 async 有另一个好处：**同一条路径、同一套兜底**。
+    邮件发不出去时 ``notify.events.dispatch`` 自己吞掉并记日志，绝不把
+    「邮件服务器挂了」变成「任务被判成失败之外还多了一个异常」。
+    """
+    from app.notify import events as notify_events
+
+    task_key = claim.get("task_key") or ""
+    if task_key.startswith("system:oss_backup"):
+        notify_events.backup_failed(scope="账套备份（每日 OSS）",
+                                    message=f"[{error_code}] {message}")
+    else:
+        notify_events.task_failed(task_key=task_key, error_code=error_code,
+                                  message=message)
+
+
 def execute_claim(claim, runtime=None):
     if not _renew_lease(claim):
         return
@@ -421,9 +444,15 @@ def execute_claim(claim, runtime=None):
         if outcome["status"] == "SKIPPED":
             log.warning("scheduled plugin task skipped key=%s run_id=%s code=%s",
                         claim["task_key"], claim["run_id"], outcome.get("error_code", ""))
+        if outcome["status"] == "FAILED":
+            # 任务失败是**要有人知道**的：它跑在凌晨，界面上没人盯着，
+            # 发现延迟等于「到第二天有人问为什么昨天的数据没同步」。
+            _notify_failure(claim, outcome.get("error_code", ""),
+                            outcome.get("message", ""))
     except Exception as exc:
         log.exception("scheduled task failed key=%s run_id=%s", claim["task_key"], claim["run_id"])
         _finish(claim, "FAILED", utcnow(), error_code=type(exc).__name__, message=str(exc))
+        _notify_failure(claim, type(exc).__name__, str(exc))
     finally:
         stop.set()
         heartbeat.join(timeout=2)
