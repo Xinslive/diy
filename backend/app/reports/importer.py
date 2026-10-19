@@ -68,13 +68,34 @@ def _stream(raw: bytes) -> bytes:
     return data
 
 
+def _last_used_column(grid: list[list[dict]]) -> int:
+    """最后一个真正有内容的列号（1 起）。整张表都没有内容时返回 0。
+
+    **UFO 的「列数」是网格预留的宽度，不是「用了几列」。** 从更宽的模板里
+    复制/另存出来的利润表常见 5/6/7 列，而第 5 列往后一个格子都没有内容 ——
+    那不是另一种版式，只是留白。把这种模板按「7 列」拒掉，理由（不支持）
+    站不住：它和 4 列那张在结构上完全一样。
+
+    所以判版式前先裁掉**尾部连续空列**。中间或首部的空列不裁 —— 那种模板的
+    列序里可能还夹着别的语义（比较数、上年同期），悄悄跳过一列等于丢掉一列数。
+    """
+    last = 0
+    for row in grid:
+        for index, cell in enumerate(row):
+            if cell["text"].strip() or cell["formula"].strip():
+                last = max(last, index + 1)
+    return last
+
+
 def _grid(data: bytes) -> tuple[list[list[dict]], str]:
     if len(data) < 1816:
         raise TemplateImportError("模板结构不完整")
     row_count, col_count = struct.unpack_from("<HH", data, 452)
     font_count = struct.unpack_from("<I", data, 44)[0]
-    if not (1 <= row_count <= MAX_ROWS and col_count in (4, 8) and 1 <= font_count <= 100):
-        raise TemplateImportError("当前支持 4 列利润表和 8 列资产负债表，请使用这两类 UFO 模板")
+    # 这里只挡畸形与超宽网格（下面的逐格循环要按 col_count 开数组）；
+    # 「是不是 4 列 / 8 列」要等网格解析完、裁掉尾部空列之后才能判。
+    if not (1 <= row_count <= MAX_ROWS and 1 <= col_count <= MAX_COLS and 1 <= font_count <= 100):
+        raise TemplateImportError("模板结构超出支持范围，请使用原系统导出的标准 UFO 模板")
     grid_start = 1816 + row_count * 16 + col_count * 12
     text_start = grid_start + row_count * col_count * 12 + font_count * 360
     if text_start >= len(data):
@@ -124,6 +145,12 @@ def _grid(data: bytes) -> tuple[list[list[dict]], str]:
             formula = formulas.get((ident, row, col), "") if ident and is_formula else ""
             cells.append({"text": text, "formula": formula, "missing": bool(ident and is_formula and not formula)})
         grid.append(cells)
+    # 版式判定放在解析之后：先裁掉尾部空列（见 _last_used_column 的说明）。
+    columns = _last_used_column(grid)
+    if columns not in (4, 8):
+        raise TemplateImportError("当前支持 4 列利润表和 8 列资产负债表，请使用这两类 UFO 模板")
+    if columns < col_count:
+        grid = [row[:columns] for row in grid]
     return grid, data[1:8].decode("ascii")
 
 
