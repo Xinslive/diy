@@ -41,6 +41,24 @@ const scrollClose = matchingDivClose(TEMPLATE, scrollOpen)
 const head = TEMPLATE.indexOf('<div class="vg-row vg-head">')
 const total = TEMPLATE.indexOf('<div class="vg-row vg-total">')
 
+/**
+ * 取某个 CSS 规则块的内容。
+ * 直接用 `/\.entry-scroll\s*\{[\s\S]*?flex:/` 断言是不作数的：`[\s\S]*?` 会
+ * 一路跨到后面别的规则里去，`.entry-scroll` 写着 `flex: 1` 也能靠后面某条
+ * `flex: 0 1 auto` 把断言蒙混过去。规则块必须一块一块取出来单独看。
+ */
+function cssBlock(selector) {
+  const at = SRC.indexOf(selector + ' {')
+  if (at < 0) return ''
+  const open = SRC.indexOf('{', at)
+  let depth = 0
+  for (let i = open; i < SRC.length; i++) {
+    if (SRC[i] === '{') depth++
+    else if (SRC[i] === '}') { depth--; if (depth === 0) return SRC.slice(open + 1, i) }
+  }
+  return ''
+}
+
 console.log('== 凭证分录区：固定表头/合计 + 独立滚动 ==')
 
 t('存在唯一的 entry-scroll 滚动容器', () => {
@@ -56,6 +74,23 @@ t('表头在 entry-scroll 之前，已经移出滚动区', () => {
 t('合计在 entry-scroll 的闭合标签之后，已经移出滚动区', () => {
   assert.ok(scrollClose >= 0, '找不到 entry-scroll 的闭合标签')
   assert.ok(total > scrollClose, '合计仍在 entry-scroll 内')
+})
+
+t('少量分录按内容收缩，长凭证最多显示五个完整行', () => {
+  const wrap = cssBlock('.entry-wrap')
+  const scroll = cssBlock('.entry-scroll')
+  const card = cssBlock('.voucher-page > .card')
+  assert.ok(wrap && scroll && card, '找不到 .entry-wrap / .entry-scroll / .card 的规则块')
+  assert.match(wrap, /flex:\s*0\s+1\s+auto/)
+  assert.match(scroll, /flex:\s*0\s+1\s+auto/)
+  assert.match(scroll, /max-height:\s*calc\(\(var\(--vg-row-h\)\s*\+\s*1px\)\s*\*\s*5\)/)
+  assert.match(wrap, /background:\s*#fff/)
+  assert.match(scroll, /background:\s*#fff/)
+  // 卡片按内容收口：页脚底下不该拖出一片白底
+  assert.match(card, /flex:\s*0\s+1\s+auto/)
+  // 旧的两样一起收走：撑高的「空尾巴」和按行数切换的 is-short
+  assert.doesNotMatch(TEMPLATE, /entry-tail|entryTail/)
+  assert.doesNotMatch(SRC, /is-short|syncEntryTail/)
 })
 
 t('行、表头、合计共用同一份列宽变量', () => {

@@ -77,7 +77,7 @@
 
         <!-- 这里只有分录行会滚；左右 48px / 52px 留白属于滚动区本身，
              行外的 ⊕ / ＋ / ⊗ 跟着分录一起移动，不会被裁掉。 -->
-        <div class="entry-scroll" :class="{ 'is-short': form.entries.length < 4 }" ref="entryScroll">
+        <div class="entry-scroll" ref="entryScroll">
           <div class="vgrid">
             <!-- 一行一个盒子：鼠标扫到哪一行，哪一行整行变绿，
                  ⊕ / ＋ 只在这一行左边冒出来 -->
@@ -174,9 +174,6 @@
                        title="删除这一行" @click.stop="removeRow(i)"><CircleCloseFilled /></el-icon>
             </div>
           </div>
-            <!-- 录到后面的行时给最后一行留出可滚动的尾巴，
-                 让当前录入行能稳定停在锚点；短凭证时它保持 0 高度。 -->
-            <div ref="entryTail" class="entry-tail" aria-hidden="true"></div>
           </div>
         </div>
 
@@ -834,7 +831,6 @@ const ANCHOR_ROW = 4
 
 /** 分录滚动区。表头与合计在它外面固定，只有这里的分录行会滚。 */
 const entryScroll = ref(null)
-const entryTail = ref(null)
 
 /**
  * 把当前录入行收回锚点高度。
@@ -847,26 +843,6 @@ const entryTail = ref(null)
  * 瞬时定位，不用 smooth：录入是连续快速的键盘动作，平滑动画会在一次次
  * 回车里排队，越按越滞后于手，反倒跟不上人。
  */
-/**
- * 在滚动内容末尾留出「当前行停在锚点」所需的空间。
- * 这段尾巴不属于数据行，行序号与分录顺序都不变；短凭证不需要滚动时为 0。
- */
-function syncEntryTail() {
-  const box = entryScroll.value
-  const tail = entryTail.value
-  const grid = box?.querySelector('.vgrid')
-  const row = activeRow.value && rowEls.get(activeRow.value)
-  if (!box || !tail || !grid) return
-  tail.style.height = '0px'
-  syncGridWidth()
-  const contentHeight = grid.offsetHeight
-  if (!row || !contentHeight) return
-  const rowTop = row.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop
-  const wantedScroll = Math.max(0, rowTop - ANCHOR_ROW * rowHeight())
-  const spacer = Math.max(0, box.clientHeight + wantedScroll - contentHeight)
-  tail.style.height = `${spacer}px`
-}
-
 /** 表头与分录区共用的实际内容宽度（滚动条出现时要扣掉它）。 */
 function syncGridWidth() {
   const box = entryScroll.value
@@ -883,7 +859,7 @@ function keepActiveRowAnchored() {
   if (!box || !row) return
   const el = rowEls.get(row)
   if (!el) return
-  syncEntryTail()
+  syncGridWidth()
   // 现在滚动区从第一条分录开始，当前行在内容里的位置不再包含表头高度。
   const rowTop = el.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop
   const anchorTop = ANCHOR_ROW * rowHeight()
@@ -1653,7 +1629,6 @@ onBeforeUnmount(() => {
 function reAutosizeSums() {
   cachedRowH = 0          // 窗口变了行高未必变，但量过一次就别信旧的，下回按新的算
   syncGridWidth()
-  syncEntryTail()
   const els = []
   for (const el of sumRefs.values()) if (el) els.push(el)
   if (!els.length) return
@@ -1686,7 +1661,6 @@ onMounted(async () => {
   await load()
   await nextTick(() => {
     syncGridWidth()
-    syncEntryTail()
   })
 })
 /**
@@ -1709,7 +1683,6 @@ watch(() => [store.bookId, store.periodId, route.params.id], async () => {
   await load()
   await nextTick(() => {
     syncGridWidth()
-    syncEntryTail()
   })
 })
 </script>
@@ -1721,7 +1694,7 @@ watch(() => [store.bookId, store.periodId, route.params.id], async () => {
 /* 这一页自己占满内容区：工具条、凭证卡片、卡片里的页脚各占自己那份，
    剩下多少全给分录区。外层 .content 因此不用滚 —— 一屏之内只有 .entry-scroll 滚。 */
 .voucher-page { height: 100%; display: flex; flex-direction: column; min-height: 0; }
-.voucher-page > .card { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.voucher-page > .card { flex: 0 1 auto; min-height: 0; display: flex; flex-direction: column; }
 
 /* 分录格。左右各空出一条：左边 48px 放每行的 ⊕ / ＋，右边 52px 放每行的 ⊗。
    它们都绝对定位在**自己那一行**的外头，哪一行变绿才冒出来 ——
@@ -1745,12 +1718,12 @@ watch(() => [store.bookId, store.periodId, route.params.id], async () => {
   --vg-cols: 56px minmax(170px, 1fr) minmax(230px, 1.4fr) minmax(210px, 1fr) minmax(210px, 1fr);
   --vg-row-h: 68px;
   --vg-grid-width: calc(100% - 100px);
-  flex: 1;
+  flex: 0 1 auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
   min-width: 0;
-  background: var(--vg-line);
+  background: #fff;
   border: 1px solid var(--vg-line);
   border-radius: 2px;
 }
@@ -1776,17 +1749,17 @@ watch(() => [store.bookId, store.periodId, route.params.id], async () => {
 .g-add { color: #fff; background: #409eff; border-color: #409eff; font-weight: 700; }
 .g-add:hover { background: #66b1ff; border-color: #66b1ff; color: #fff; }
 
-/* 分录区：表头与合计在滚动区外固定，只有中间的分录行滚动。
-   左右那 48 / 52 的留白是滚动盒的 padding；短于 4 行时按内容自适应，
-   4 行起占满剩余视口，避免卡片与全局 .content 出现双滚动。 */
+/* 分录区优先按内容高度排布，最多显示五个完整分录行；更多行只在这里滚动。
+   五行视窗使最后一行自然停在锚点处，不需要在表格里塞一大块空白尾垫。 */
 .entry-scroll {
-  flex: 1 1 0;
+  flex: 0 1 auto;
   min-height: 0;
   position: relative;            /* 行的 offsetParent 就在这儿，量位置才准 */
   overflow-y: auto;
   overflow-x: hidden;
-  max-height: 100%;
+  max-height: calc((var(--vg-row-h) + 1px) * 5);
   padding: 0 52px 0 48px;
+  background: #fff;
   /* 这里**故意不写** overscroll-behavior。
      写了（contain / none 都算）Chromium 就把这一盒里的 Home / End 弄坏：
      格子里的 textarea 选中一段文字后按 End，选区不收、光标也不动 ——
@@ -1796,7 +1769,6 @@ watch(() => [store.bookId, store.periodId, route.params.id], async () => {
      滚到头接着往外传不传都无所谓 —— 为了一件不要紧的事，
      坏掉一个常用的键，不划算。 */
 }
-.entry-scroll.is-short { flex: 0 1 auto; }
 
 /* 凭证格：表头、分录行、合计三段共用的列宽只写这一份。
    1px 的 gap 当格子线 —— 不用给每个单元格描边，行高也就随 grid-auto-rows 走。
@@ -1809,8 +1781,6 @@ watch(() => [store.bookId, store.periodId, route.params.id], async () => {
   border-right: 1px solid var(--vg-line);
   /* 这里原来有 overflow: hidden：会把贴在行左边的 ⊕ / ＋ 一起裁掉 */
 }
-
-.entry-tail { height: 0; pointer-events: none; }
 
 /* 一行一个盒子。原来是 display: contents —— 行没有盒子，鼠标扫过去整行不会变色，
    也没有地方挂「这一行的动作按钮」。现在行自己摆格子（列宽跟外层同一份），

@@ -1014,6 +1014,18 @@ await closeAdd()
 // ==================================================== 回车锚点：只移动视口，不重排分录
 // 这一段最后单独开一张新凭证，避免改变前面插行/删行断言依赖的行数。
 await page.goto(`${BASE}/#/vouchers/new`); await sleep(2200)
+
+// 分录区按内容排布：行不多的时候，表格里不该留一条空白带。
+// 这条必须在**加行之前**量 —— 行数一多就该滚起来，空白带本来就不该存在。
+// 早先的实现把滚动区撑满满屏，行数少时空白带有两百多像素高，白得刺眼。
+const compactBlank = await page.evaluate(() => {
+  const scroll = document.querySelector('.entry-scroll')
+  const grid = scroll?.querySelector('.vgrid')
+  if (!scroll || !grid) return null
+  return scroll.clientHeight - grid.getBoundingClientRect().height
+})
+await check('行不多时滚动区里不留空白带', compactBlank !== null && compactBlank <= 2, true)
+
 const anchorRows = () => page.locator('.vg-row:not(.vg-head):not(.vg-total)')
 const anchorSamples = []
 for (let i = 0; i < 10; i++) {
@@ -1040,8 +1052,10 @@ const anchorGeometry = await page.evaluate(() => {
   const first = document.querySelector('.vg-row:not(.vg-head):not(.vg-total)')?.getBoundingClientRect()
   const scroll = document.querySelector('.entry-scroll')
   const total = document.querySelector('.vg-total')?.getBoundingClientRect()
+  const card = document.querySelector('.voucher-page > .card')?.getBoundingClientRect()
+  const foot = document.querySelector('.vfoot')?.getBoundingClientRect()
   const content = document.querySelector('.content')
-  if (!head || !first || !scroll || !total || !content) return null
+  if (!head || !first || !scroll || !total || !card || !foot || !content) return null
   const rowHeight = first.height
   return {
     anchorY: head.bottom + 4 * rowHeight,
@@ -1053,6 +1067,8 @@ const anchorGeometry = await page.evaluate(() => {
     clientHeight: scroll.clientHeight,
     totalTop: total.top,
     totalBottom: total.bottom,
+    cardBottom: card.bottom,
+    footBottom: foot.bottom,
     viewportHeight: window.innerHeight,
     contentScrollHeight: content.scrollHeight,
     contentClientHeight: content.clientHeight,
@@ -1073,6 +1089,8 @@ await check('表头仍固定在分录区顶部',
 await check('合计行固定在分录区下方且仍可见',
   anchorGeometry && Math.abs(anchorGeometry.totalTop - anchorGeometry.scrollBottom) <= 1
     && anchorGeometry.totalTop >= 0 && anchorGeometry.totalBottom <= anchorGeometry.viewportHeight, true)
+await check('卡片不越出页脚（页脚底下不留白底）',
+  anchorGeometry && anchorGeometry.cardBottom - anchorGeometry.footBottom <= 16, true)
 await check('外层 .content 没有出现第二条滚动区',
   anchorGeometry && anchorGeometry.contentScrollHeight <= anchorGeometry.contentClientHeight + 1, true)
 
