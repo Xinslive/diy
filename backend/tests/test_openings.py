@@ -13,6 +13,7 @@ from decimal import Decimal
 
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import select
+from tests.accounting_helpers import close_any
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -38,9 +39,9 @@ def test_round_trip_preserves_reverse_balance(client, auth, book_id, subjects):
     就被洗成借方正数，导出再导入也对不回来。
     """
     rows = [
-        {"subject_id": subjects["100201"].id, "amount": "100000"},   # 银行存款 借
+        {"subject_id": subjects["1121"].id, "amount": "100000"},   # 应收票据 借
         {"subject_id": subjects["1122"].id, "amount": "-30000"},     # 应收账款 **贷**
-        {"subject_id": subjects["4001"].id, "amount": "-70000"},     # 实收资本 贷
+        {"subject_id": subjects["4001"].id, "amount": "-70000"},     # 生产成本 贷
     ]
     r = client.post(f"/api/books/{book_id}/periods", headers=auth, json=rows)
     assert r.status_code == 200, r.text
@@ -55,14 +56,14 @@ def test_round_trip_preserves_reverse_balance(client, auth, book_id, subjects):
     assert Decimal(ar["amount"]) == Decimal("30000"), ar
     assert ar["natural_side"] == "借", ar          # 科目属性仍是借，界面据此提示「反」
 
-    bank = by_code["100201"]
+    bank = by_code["1121"]
     assert Decimal(bank["signed"]) == Decimal("100000") and bank["side"] == "借"
 
 
 def test_round_trip_keeps_balance_ledger_consistent(client, auth, book_id, subjects):
     """期初平了，往后每个月也必须平 —— 从账簿侧独立验一次。"""
     rows = [
-        {"subject_id": subjects["100201"].id, "amount": "500000"},
+        {"subject_id": subjects["1121"].id, "amount": "500000"},
         {"subject_id": subjects["4001"].id, "amount": "-500000"},
     ]
     assert client.post(f"/api/books/{book_id}/periods", headers=auth, json=rows).status_code == 200
@@ -78,15 +79,15 @@ def test_round_trip_keeps_balance_ledger_consistent(client, auth, book_id, subje
 def test_can_reenter_and_overwrite(client, auth, book_id, subjects):
     """没有凭证之前，期初允许反复改（整体重建，不是追加）。"""
     assert client.post(f"/api/books/{book_id}/periods", headers=auth, json=[
-        {"subject_id": subjects["100201"].id, "amount": "100"},
+        {"subject_id": subjects["1121"].id, "amount": "100"},
         {"subject_id": subjects["4001"].id, "amount": "-100"},
     ]).status_code == 200
     r = client.post(f"/api/books/{book_id}/periods", headers=auth,
-                    json=[{"subject_id": subjects["100201"].id, "amount": "250"},
+                    json=[{"subject_id": subjects["1121"].id, "amount": "250"},
                           {"subject_id": subjects["4001"].id, "amount": "-250"}])
     assert r.status_code == 200
     got = client.get(f"/api/books/{book_id}/openings", headers=auth).json()
-    assert Decimal(next(s for s in got["subjects"] if s["code"] == "100201")["signed"]) == Decimal("250")
+    assert Decimal(next(s for s in got["subjects"] if s["code"] == "1121")["signed"]) == Decimal("250")
 
 
 # ------------------------------------------------------------------ 校验红线
@@ -94,18 +95,21 @@ def test_can_reenter_and_overwrite(client, auth, book_id, subjects):
 
 def test_unbalanced_openings_rejected(client, auth, book_id, subjects):
     r = client.post(f"/api/books/{book_id}/periods", headers=auth,
-                    json=[{"subject_id": subjects["100201"].id, "amount": "1000"}])
+                    json=[{"subject_id": subjects["1121"].id, "amount": "1000"}])
     assert r.status_code == 400
     assert "试算不平" in r.json()["detail"], r.json()
 
     # 不平就不该落库：确认没写进去脏数据
     got = client.get(f"/api/books/{book_id}/openings", headers=auth).json()
-    assert next(s for s in got["subjects"] if s["code"] == "100201")["signed"] == "0"
+    assert next(s for s in got["subjects"] if s["code"] == "1121")["signed"] == "0"
 
 
 def test_non_leaf_subject_rejected(client, auth, book_id, subjects):
-    """1002 银行存款是父科目，余额必须落在 100201/100202 明细上。"""
-    parent = subjects["1002"]
+    """1101 短期投资是父科目，余额必须落在 110101/110102 等明细上。
+
+    父级取 1101：1002 在 4-2-2 表里已经是末级了，压根不是父级。
+    """
+    parent = subjects["1101"]
     assert parent.is_leaf is False
     r = client.post(f"/api/books/{book_id}/periods", headers=auth,
                     json=[{"subject_id": parent.id, "amount": "1000"}])
@@ -130,8 +134,8 @@ def test_cross_book_subject_rejected(client, auth, db, book, subjects, admin_use
     db.add(UserBook(user_id=admin_user.id, book_id=other.id, role="OWNER"))
     db.commit()
     other_subject = db.scalar(
-        select(Subject).where(Subject.book_id == other.id, Subject.code == "100201"))
-    assert other_subject.id != subjects["100201"].id
+        select(Subject).where(Subject.book_id == other.id, Subject.code == "1121"))
+    assert other_subject.id != subjects["1121"].id
 
     r = client.post(f"/api/books/{book.id}/periods", headers=auth,
                     json=[{"subject_id": other_subject.id, "amount": "1"}])
@@ -141,7 +145,7 @@ def test_cross_book_subject_rejected(client, auth, db, book, subjects, admin_use
 
 def test_openings_locked_after_voucher(client, auth, book_id, make_voucher):
     """账上有了业务数据，期初就是历史事实，不能再回头改。"""
-    make_voucher("2026-01-15", dr=[("100201", 100, "买货")], cr=[("4001", 100, "买货")])
+    make_voucher("2026-01-15", dr=[("1121", 100, "买货")], cr=[("4001", 100, "买货")])
 
     got = client.get(f"/api/books/{book_id}/openings", headers=auth).json()
     assert got["editable"] is False
@@ -171,7 +175,7 @@ def test_openings_follow_selected_period(client, auth, book_id, periods, subject
     于是顶栏停在 2027 年、那边一张凭证都没有，屏幕上也还是 2026-01 那份
     锁死的数，用户只会以为页面坏了。
     """
-    make_voucher("2026-01-15", dr=[("100201", 100000, "存钱")],
+    make_voucher("2026-01-15", dr=[("1121", 100000, "存钱")],
                  cr=[("4001", 100000, "存钱")], posted=True)
 
     first = client.get(f"/api/books/{book_id}/openings", headers=auth).json()
@@ -185,7 +189,7 @@ def test_openings_follow_selected_period(client, auth, book_id, periods, subject
     assert feb["reason"] is None, feb
     # 2 月本来就没有快照（快照只有启用和年度结转两处产生），页面上要显示的是
     # 账簿真正在用的那个数 —— 上期期末 —— 而不是一片 0，否则对不上总账
-    bank = next(s for s in feb["subjects"] if s["code"] == "100201")
+    bank = next(s for s in feb["subjects"] if s["code"] == "1121")
     assert Decimal(bank["signed"]) == Decimal("100000"), bank
 
 
@@ -194,12 +198,12 @@ def test_save_later_period_opening_and_ledger_follows(
     """改了后续期间的期初，账簿立刻按新数算；启用期间那份不动。"""
     from app.ledger.engine import LedgerEngine
 
-    make_voucher("2026-01-15", dr=[("100201", 100000, "存钱")],
+    make_voucher("2026-01-15", dr=[("1121", 100000, "存钱")],
                  cr=[("4001", 100000, "存钱")], posted=True)
     feb = periods[2]
 
     r = client.post(f"/api/books/{book_id}/periods?period_id={feb.id}", headers=auth, json=[
-        {"subject_id": subjects["100201"].id, "amount": "120000"},
+        {"subject_id": subjects["1121"].id, "amount": "120000"},
         {"subject_id": subjects["1122"].id, "amount": "-120000"},
     ])
     assert r.status_code == 200, r.text
@@ -207,10 +211,10 @@ def test_save_later_period_opening_and_ledger_follows(
 
     got = client.get(f"/api/books/{book_id}/openings?period_id={feb.id}",
                      headers=auth).json()
-    bank = next(s for s in got["subjects"] if s["code"] == "100201")
+    bank = next(s for s in got["subjects"] if s["code"] == "1121")
     assert Decimal(bank["signed"]) == Decimal("120000"), bank
 
-    sid = subjects["100201"].id
+    sid = subjects["1121"].id
     assert LedgerEngine(db, book_id).compute([sid], up_to_ord=feb.ord)[sid].opening \
         == Decimal("120000")
     # 启用期间是另一份快照，不该被这次保存顺手改掉
@@ -221,10 +225,10 @@ def test_save_later_period_opening_and_ledger_follows(
 def test_openings_locked_only_from_the_period_with_vouchers(
         client, auth, book_id, periods, subjects, make_voucher):
     """锁的是「从这一期往后有没有凭证」，不是整个账套。"""
-    make_voucher("2026-03-05", dr=[("100201", 100, "买货")], cr=[("4001", 100, "买货")])
+    make_voucher("2026-03-05", dr=[("1121", 100, "买货")], cr=[("4001", 100, "买货")])
 
     r = client.post(f"/api/books/{book_id}/periods?period_id={periods[2].id}", headers=auth,
-                    json=[{"subject_id": subjects["100201"].id, "amount": "1"}])
+                    json=[{"subject_id": subjects["1121"].id, "amount": "1"}])
     assert r.status_code == 400 and "业务数据" in r.json()["detail"], r.json()
 
     mar = client.get(f"/api/books/{book_id}/openings?period_id={periods[3].id}",
@@ -238,7 +242,7 @@ def test_openings_locked_only_from_the_period_with_vouchers(
 def test_export_follows_selected_period(client, auth, book_id, periods, subjects):
     """导出的是屏幕上那一期 —— 否则备份下来的数跟眼前看到的对不上。"""
     client.post(f"/api/books/{book_id}/periods?period_id={periods[5].id}", headers=auth, json=[
-        {"subject_id": subjects["100201"].id, "amount": "5000"},
+        {"subject_id": subjects["1121"].id, "amount": "5000"},
         {"subject_id": subjects["1122"].id, "amount": "-5000"},
     ])
     r = client.get(f"/api/books/{book_id}/openings.xlsx?period_id={periods[5].id}",
@@ -247,7 +251,7 @@ def test_export_follows_selected_period(client, auth, book_id, periods, subjects
     ws = load_workbook(io.BytesIO(r.content)).active
     assert "2026年5月" in ws["A2"].value, ws["A2"].value
     exported = {row[0]: row[3] for row in ws.iter_rows(min_row=5, values_only=True)}
-    assert exported["100201"] == 5000, exported["100201"]
+    assert exported["1121"] == 5000, exported["1121"]
 
 
 # ------------------------------------------------------------------ Excel
@@ -257,7 +261,7 @@ def test_export_then_parse_round_trip_preserves_reverse_balance(
     client, auth, book_id, subjects):
     """导出 → 再导入，必须原样回来。反方向余额是最容易被洗掉的那个。"""
     client.post(f"/api/books/{book_id}/periods", headers=auth, json=[
-        {"subject_id": subjects["100201"].id, "amount": "100000"},
+        {"subject_id": subjects["1121"].id, "amount": "100000"},
         {"subject_id": subjects["1122"].id, "amount": "-30000"},
         {"subject_id": subjects["4001"].id, "amount": "-70000"},
     ])
@@ -271,7 +275,7 @@ def test_export_then_parse_round_trip_preserves_reverse_balance(
     ws = load_workbook(io.BytesIO(r.content)).active
     exported = {row[0]: (row[2], row[3]) for row in ws.iter_rows(min_row=2, values_only=True)}
     assert exported["1122"][0] == "贷", exported["1122"]
-    assert exported["100201"][0] == "借"
+    assert exported["1121"][0] == "借"
 
     # 再喂回 parse 端点，方向与金额都要对得上
     p = client.post(f"/api/books/{book_id}/openings/parse", headers=auth,
@@ -282,7 +286,10 @@ def test_export_then_parse_round_trip_preserves_reverse_balance(
     assert res["balanced"] is True, res
     assert res["errors"] == [], res["errors"]
     row = next(x for x in res["rows"] if x["code"] == "1122")
-    assert row["signed"] == "-30000", row
+    # 用 Decimal 比而不是比字符串：解析侧现在按库的 Numeric(20,2) 口径量化，
+    # 「-30000」与「-30000.00」是同一个数，而断言字符串会把「量化了没」写成
+    # 一条与本用例真正要验的东西（反向余额往返不丢方向）无关的契约
+    assert Decimal(row["signed"]) == Decimal("-30000"), row
     assert row["display_side"] == "贷", row
 
 
@@ -290,7 +297,7 @@ def test_parse_does_not_write_anything(client, auth, book_id, subjects):
     """parse 只是解析，落库由前端确认后单独提交 —— 这里确认它没偷偷写。"""
     before = client.get(f"/api/books/{book_id}/openings", headers=auth).json()
     client.post(f"/api/books/{book_id}/openings/parse", headers=auth, files={
-        "file": ("o.xlsx", _xlsx([("100201", "银行存款-工商银行", "借", 88888)]),
+        "file": ("o.xlsx", _xlsx([("1121", "银行存款-工商银行", "借", 88888)]),
                  XLSX_MIME)})
     after = client.get(f"/api/books/{book_id}/openings", headers=auth).json()
     assert before["subjects"] == after["subjects"]
@@ -299,11 +306,11 @@ def test_parse_does_not_write_anything(client, auth, book_id, subjects):
 def test_parse_reports_errors_without_crashing(client, auth, book_id):
     """三种典型坏数据各自给出可读的原因，而不是 500 或静默跳过。"""
     bad = _xlsx([
-        ("100201", "银行存款-工商银行", "借", 1000),   # 正常
-        ("9999", "不存在的科目", "借", 500),           # 本账套没有
-        ("1002", "银行存款", "借", 300),               # 非明细
-        ("100202", "银行存款-建设银行", "借", "abc"),  # 金额不是数
-        ("100203", "银行存款-微信支付", "借", None),   # 金额空 = 0，可接受
+        ("1121", "应收票据", "借", 1000),       # 正常
+        ("9999", "不存在的科目", "借", 500),      # 本账套没有
+        ("1101", "短期投资", "借", 300),          # 非明细（1101 下挂 110101 等）
+        ("1012", "其他货币资金", "借", "abc"),    # 金额不是数
+        ("1001", "库存现金", "借", None),        # 金额空 = 0，可接受
     ])
     r = client.post(f"/api/books/{book_id}/openings/parse", headers=auth,
                     files={"file": ("o.xlsx", bad, XLSX_MIME)})
@@ -320,13 +327,17 @@ def test_parse_reports_errors_without_crashing(client, auth, book_id):
 
 
 def test_parse_matches_by_name_when_code_blank(client, auth, book_id):
-    """很多人拿到的表只有名称没有编码，按名称兜住。"""
+    """很多人拿到的表只有名称没有编码，按名称兜住。
+
+    名称是**精确匹配**（by_name 是按科目名建的下标），所以这里得用账套里
+    真有的科目名。4-2-2 表里没有「银行存款-工商银行」这种带银行后缀的明细了。
+    """
     r = client.post(f"/api/books/{book_id}/openings/parse", headers=auth, files={
-        "file": ("o.xlsx", _xlsx([(None, "银行存款-工商银行", "借", 4321)]), XLSX_MIME)})
+        "file": ("o.xlsx", _xlsx([(None, "库存现金", "借", 4321)]), XLSX_MIME)})
     assert r.status_code == 200, r.text
     row = r.json()["rows"][0]
     assert row["subject_id"] is not None, row
-    assert row["signed"] == "4321", row
+    assert Decimal(row["signed"]) == Decimal("4321"), row
 
 
 def test_parse_default_side_follows_subject_when_column_blank(client, auth, book_id):
@@ -338,8 +349,8 @@ def test_parse_default_side_follows_subject_when_column_blank(client, auth, book
         ]), XLSX_MIME)})
     rows = r.json()["rows"]
     by_side = {x["natural"]: x for x in rows}
-    assert by_side[""]["signed"] == "500", rows
-    assert by_side["贷"]["signed"] == "-500", rows
+    assert Decimal(by_side[""]["signed"]) == Decimal("500"), rows
+    assert Decimal(by_side["贷"]["signed"]) == Decimal("-500"), rows
 
 
 def test_parse_rejects_garbage_and_empty(client, auth, book_id):
@@ -373,7 +384,7 @@ def test_账套列表一行一个账套并带年度列表(client, auth, book, db
 
 
 def test_年度结转后列表仍是同一行年度变多(client, auth, db, book, periods, make_voucher, admin_user):
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("1121", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
 
     from app.accounting.periods import carry_forward_profit, close_period
     from app.models import Voucher
@@ -382,7 +393,7 @@ def test_年度结转后列表仍是同一行年度变多(client, auth, db, book
         if db.scalar(select(Voucher.id).where(
                 Voucher.book_id == book.id, Voucher.period_id == periods[m].id)):
             carry_forward_profit(db, book.id, periods[m], admin_user)
-        close_period(db, periods[m], admin_user)
+        close_any(db, book, periods[m], admin_user)
 
     r = client.post(f"/api/books/{book.id}/year-end", json={}, headers=auth)
     assert r.status_code == 200, r.text
@@ -435,11 +446,11 @@ def test_科目级次不能调到比已有科目还浅(client, db, book, auth, s
 
     deep = Subject(book_id=book.id, code="10020101", name="三级科目",
                    category="ASSET", direction="DEBIT", is_leaf=True, level=3,
-                   parent_id=subjects["100201"].id, active=True)
+                   parent_id=subjects["1121"].id, active=True)
     # 同样是「构造底层状态」：父科目 100201 此刻是末级，直接挂下级会让
     # trg_subject_leaf_parent_guard 在提交时拒绝（审计 P2-04 收尾）。
     # 真实接口会顺手把父级改成非末级，这里显式补上，让库自洽。
-    subjects["100201"].is_leaf = False
+    subjects["1121"].is_leaf = False
     db.add(deep)
     db.commit()
 

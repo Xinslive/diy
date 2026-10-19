@@ -130,10 +130,10 @@ def test_批量删除混入不存在的ID整批拒绝(client, auth, db, book):
 
 def test_批量删除里混了已记账凭证则整批不动(client, auth, db, book, make_voucher):
     """已记账的删不掉 —— 拦截之后，同批的其它凭证也一张都不该少。"""
-    ok1 = make_voucher("2026-01-05", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
-    ok2 = make_voucher("2026-01-06", dr=[("100201", 100, "x")], cr=[("600101", 100, "x")])
-    posted = make_voucher("2026-01-07", dr=[("100201", 100, "x")],
-                          cr=[("600101", 100, "x")], posted=True)
+    ok1 = make_voucher("2026-01-05", dr=[("1002", 100, "x")], cr=[("5001", 100, "x")])
+    ok2 = make_voucher("2026-01-06", dr=[("1002", 100, "x")], cr=[("5001", 100, "x")])
+    posted = make_voucher("2026-01-07", dr=[("1002", 100, "x")],
+                          cr=[("5001", 100, "x")], posted=True)
 
     r = client.post(f"/api/books/{book.id}/vouchers/batch-delete", headers=auth,
                     json={"ids": [ok1.id, ok2.id, posted.id]})
@@ -173,7 +173,7 @@ def test_三位小数落库后仍然借贷平衡(client, auth, db, book, subject
         库里实际和 = 0.01，接口却返回 200。
       · 量化后：0.01+0.01 = 0.02 ≠ 0.01 → 拒绝。
     """
-    a, b, c = subjects["100201"], subjects["100202"], subjects["4001"]
+    a, b, c = subjects["1002"], subjects["1012"], subjects["4001"]
     r = _post_openings(client, auth, book, [
         {"subject_id": a.id, "amount": "0.005"},
         {"subject_id": b.id, "amount": "0.005"},
@@ -188,7 +188,7 @@ def test_三位小数落库后仍然借贷平衡(client, auth, db, book, subject
 
 def test_量化后恰好平的期初可以落库(client, auth, db, book, subjects):
     """收紧不能误伤：量化后正好平的照常录入，且落库值就是校验用的那个值。"""
-    a, b = subjects["100201"], subjects["4001"]
+    a, b = subjects["1002"], subjects["4001"]
     r = _post_openings(client, auth, book, [
         {"subject_id": a.id, "amount": "100.004"},
         {"subject_id": b.id, "amount": "-100.004"},
@@ -205,7 +205,7 @@ def test_量化后恰好平的期初可以落库(client, auth, db, book, subject
 
 
 def test_非法金额给出明确拒绝(client, auth, db, book, subjects):
-    a = subjects["100201"]
+    a = subjects["1002"]
     r = _post_openings(client, auth, book, [{"subject_id": a.id, "amount": "金额待定"}])
     # 数字类型的字段由 Pydantic 先挡（422），非数字进不到量化那一步；
     # 两条路都得是「明确拒绝」而不是静默当成 0。
@@ -214,7 +214,7 @@ def test_非法金额给出明确拒绝(client, auth, db, book, subjects):
 
 def test_被拒的期初不会留下半截记录(client, auth, db, book, subjects):
     """整体重建的逻辑遇到不平就退出，库里不能剩下被删一半的期初。"""
-    a, b = subjects["100201"], subjects["4001"]
+    a, b = subjects["1002"], subjects["4001"]
     ok = _post_openings(client, auth, book, [
         {"subject_id": a.id, "amount": "50"},
         {"subject_id": b.id, "amount": "-50"},

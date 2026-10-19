@@ -43,8 +43,20 @@ from app.models import (
 )
 from app.models.book import period_ord
 
-PROFIT_SUBJECT_CODE = "4103"     # 本年利润
-RETAINED_SUBJECT_CODE = "4104"   # 利润分配 — 未分配利润
+#: 本年利润 / 未分配利润的候选编码，按优先级排。
+#:
+#: **为什么是「候选」而不是一个码。** 内置科目表换过一套编号：现在默认的是
+#: 用友 4-2-2（3103 / 3104 利润分配 → 310415 未分配利润），而存量账套里仍是
+#: 上一版《企业会计准则》编号（4103 / 4104 利润分配-未分配利润）。两边的
+#: **科目名一样**、**编码不一样**，而这份表已经切换过一次了。
+#:
+#: 写死一个码的代价是另一套账套直接结不了：年度结转里 ``if profit and retained``
+#: 找不到就整段跳过 —— **不报错，本年利润就是不冲平**，比报错难查得多。
+#: 所以按顺序试，第一个存在的为准。
+PROFIT_SUBJECT_CODES = ("3103", "4103")            # 本年利润
+#: 310415 未分配利润是**末级**，能直接记账；3104 利润分配是它的上级，
+#: 往非末级科目记账会被凭证接口拒掉，所以顺序不能反。
+RETAINED_SUBJECT_CODES = ("310415", "3104", "4104")  # 未分配利润
 
 
 # --------------------------------------------------------------------- 乐观锁
@@ -123,6 +135,15 @@ def _subject_by_code(db: Session, book_id: int, code: str) -> Optional[Subject]:
     return db.scalar(select(Subject).where(Subject.book_id == book_id, Subject.code == code))
 
 
+def _subject_by_any_code(db: Session, book_id: int, codes: tuple[str, ...]) -> Optional[Subject]:
+    """按候选编码依次查找，取第一个存在的。"""
+    for code in codes:
+        found = _subject_by_code(db, book_id, code)
+        if found is not None:
+            return found
+    return None
+
+
 # --------------------------------------------------------------------- 结账
 
 
@@ -134,6 +155,8 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
 
     ``expected_version`` 是乐观锁（P1-19）：调用方把页面上看到的
     ``period.version`` 传进来，不一致就抛 :class:`PeriodVersionConflict`。
+
+    **一张凭证都没有的期间结不了账**，没有旁路 —— 理由与后果见下面那道闸门。
     """
     # P1-19：locked 与 version 都从**库里**读，不读传入对象上的旧值。
     target, locked_now, version_now = _fresh_period(db, period.id)
@@ -143,18 +166,61 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
 
     # 锁链上每一期。列查询拿 locked / version：identity map 里可能是别人读进来
     # 的旧值，直接读属性会把「别人已经结过了」当成没结过。
+    #
+    # 行锁就是这一句拿的 —— ``FOR UPDATE`` 按**本次查询命中的行**加锁，
+    # 锁一直持有到事务结束（不是到这条语句结束）。所以下面那条补 ORM 对象的
+    # 查询不需要（也不能）再加 ``with_for_update()``：同一事务里对同一批行
+    # 重复加锁只会自查自锁，那是另一种死锁。
     chain_rows = db.execute(
         select(Period.id, Period.locked, Period.version)
         .where(Period.book_id == target.book_id, Period.ord <= target.ord)
         .order_by(Period.ord)
         .with_for_update()
     ).all()
-    chain = [db.get(Period, r[0]) for r in chain_rows]
     fresh = {r[0]: (bool(r[1]), int(r[2])) for r in chain_rows}
+    # 一条查询补齐整条链的 ORM 对象，替代原来逐个 ``db.get`` 的 N 次往返
+    # （十年账套结一次 12 月就是 24 次）。
+    #
+    # ``populate_existing`` 不能省：``db.get`` 遇到 identity map 里已有的对象
+    # 直接原样返回、不发 SQL，而那个对象可能是路由层早先读进来的**旧值**。
+    # 列查询不填充 identity map 正是 ``_fresh_period`` 那段注释要绕开的坑，
+    # 这里补对象时得主动把它填上，否则绕一圈又踩回去。
+    #
+    # 也正因为 populate_existing 是「用库里的值盖掉会话里的」，这一句必须待在
+    # 任何期间写入之前 —— 放在上锁循环之后就变成拿自己刚写的值盖自己。
+    chain = list(db.scalars(
+        select(Period)
+        .where(Period.id.in_(list(fresh)))
+        .order_by(Period.ord)
+        .execution_options(populate_existing=True)
+    ).all())
 
     # 整条链都要先过一遍「整理就绪」：断号、时序不对的月份一旦封进历史，
     # 纸质凭证按号装订就跟系统对不上，再想改只能作废重记。
     svc_organize.assert_tidy(db, chain)
+
+    # 空月份不许结账，没有旁路。
+    #
+    # 以前一张凭证都没有的期间也能结，而且三道闸门**恰好都对它放行**：整理
+    # 体检对空集通过，自动记账记 0 张，损益检查因为余额全为零也通过。于是
+    # 「这个月的账忘了录」被静默封进历史 —— 期间一锁，补凭证就得反结账，
+    # 而反结账会连带把后面已经结好的月份全部退回，一笔糊涂账就是这么来的。
+    #
+    # 曾经想过留一个「我确认本月无业务」的旁路，否掉了：那个确认拦不住它 ——
+    # 人会点确定，而点确定的人多半正是没意识到自己漏录了的人。
+    # 真的要表达「本月无业务」，办法是录入凭证（哪怕只是一张说明凭证），
+    # 那张凭证本身就是「这个月我看过、是空的」的记录。
+    #
+    # **只卡被结的那一期**：链上更早的空月份照旧顺带结掉。年度结转要求
+    # 12 期全部结完，所以一个账套里若有整月无业务，会在结到 12 月的路上
+    # 被挡住 —— 这是有意的：先把这个月处理成「有凭证」再往下走。
+    if not db.scalar(
+        select(func.count()).select_from(Voucher).where(Voucher.period_id == target.id)
+    ):
+        raise ValueError(
+            f"{target.code} 没有任何凭证，不能结账。"
+            "请确认本期凭证是否漏录；若本月确实没有业务，请录入凭证（哪怕只是一张说明凭证）后再结账。"
+        )
 
     auto_closed, auto_posted = [], 0
     pending = []
@@ -207,6 +273,8 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
         p.closed_at = func.now()
         p.closed_by = user.username
         p.version = fresh[p.id][1] + 1
+        from app.plugins.hooks import period_closed
+        period_closed(db, user_id=user.id, book_id=p.book_id, period_id=p.id)
 
     log(
         db, action="CLOSE", entity="period", entity_id=target.id, user=user,
@@ -297,14 +365,23 @@ def batch_unclose(
     target, _locked, version_now = _fresh_period(db, period.id)
     assert_version(expected_version, version_now, target.code)
 
+    # 行锁在下面这条 ``FOR UPDATE`` 上就已拿住整批已锁期间，持有到事务结束，
+    # 所以补 ORM 对象时同样不需要再加锁（理由见 close_period 里的同一段注释）。
     locked_rows = db.execute(
         select(Period.id, Period.version)
         .where(Period.book_id == book_id, Period.locked.is_(True), Period.ord >= target.ord)
         .order_by(Period.ord)
         .with_for_update()
     ).all()
-    locked = [db.get(Period, r[0]) for r in locked_rows]
     chain_version = {r[0]: int(r[1]) for r in locked_rows}
+    # 一条查询补齐整批期间对象，替代逐个 ``db.get``（N 次往返）。
+    # populate_existing 同 close_period：identity map 里可能是旧值。
+    locked = list(db.scalars(
+        select(Period)
+        .where(Period.id.in_(list(chain_version)))
+        .order_by(Period.ord)
+        .execution_options(populate_existing=True)
+    ).all())
     if not locked:
         raise ValueError(f"{target.code} 及其之后的期间都未结账，无需反结账")
 
@@ -374,14 +451,81 @@ def _carry_forward_vouchers(db: Session, period: Period) -> list[Voucher]:
     )
 
 
+def _is_system_carry_forward(v: Voucher, period: Period) -> bool:
+    """这张 CARRY_FORWARD 凭证是不是**系统自己生成**的那一张。
+
+    ``source == "CARRY_FORWARD"`` 这个标记**不是**「系统生成」的充分条件。
+    它曾经是客户端可提交的（``VoucherIn.source`` 的 Literal 里就有），于是
+    任何有写权限的人都能造一张挂上这个标记的凭证；而 ``_drop_carry_forward``
+    原来只按这个标记删、且不看状态，于是「自己造一张 → 记上账 → 点重新结转」
+    能把一张**已记账的**凭证悄悄删掉。正常删除路径（``vouchers.delete_voucher``）
+    是拒绝删已记账凭证的，数据库触发器也专门给 CARRY_FORWARD 开了口子让
+    「重新结转」能删 —— 也就是说这条例外是**整个删除保护网唯一的缺口**。
+
+    现在从两头堵：
+
+    * **源头**：客户端的 ``source`` 里已经没有 CARRY_FORWARD
+      （``api/schemas.py``），写权限只由 ``create_voucher(internal=True)`` 发放。
+    * **兜底**：本函数。判据是「签名」—— 系统生成方写死的 remark 尾部，
+      加上每条分录都写死的摘要（``_CARRY_FORWARD_SIGNATURES``）。
+      两个生成方对签名负责，见 ``carry_forward_profit`` 的 ``SUMMARY``
+      与 ``year_end_carry`` 的 ``YEAR_END_SUMMARY``。
+
+    说清楚它的分量：remark 与摘要**不是密码学意义上的防伪标记**，一个铁了心
+    伪造的人照样能写对。它挡的是「随手打一个 source」和**修复之前就躺在库里**
+    的伪造行 —— 那些行的摘要是人自己写的摘要，签不上。真正的边界是第一条
+    （客户端压根提交不了这个 source）。之所以还要它：删除是不可逆的，
+    而本系统的凭证号可复用、删掉只能靠审计快照追溯，宁可多认一道。
+
+    认不出来就返回 False，调用方 **fail closed**：不删，报错让人来看。
+    绝不「就删有把握的那几张、其余留着」 —— 那等于告诉用户
+    「重新结转完成了」，而他的一张已记账凭证还在原地，下次重结转再被拦一次。
+    """
+    for prefix in (f"{period.code} ", f"{period.year}年 "):
+        for suffix, summary in _CARRY_FORWARD_SIGNATURES.items():
+            if v.remark == prefix + suffix and v.entries and all(
+                e.summary == summary for e in v.entries
+            ):
+                return True
+    return False
+
+
+#: 结转凭证的系统签名：{remark 尾部: 每条分录都该写的摘要}。
+#: remark 前缀由生成场景决定（期间 ``2026-09`` / 年度 ``2026年``），
+#: 见 ``_is_system_carry_forward`` 里的两个 prefix。
+_CARRY_FORWARD_SIGNATURES = {
+    "结转损益（收入类）": "期间损益结转",
+    "结转损益（成本费用类）": "期间损益结转",
+    "结转本年利润": "结转本年利润",
+}
+
+
 def _drop_carry_forward(db: Session, period: Period, existing: list[Voucher],
                         user: SysUser) -> list[str]:
     """删掉本期已生成的结转凭证，为重新结转腾位置。
 
-    只删 ``source == "CARRY_FORWARD"`` 的凭证：同期的手工凭证哪怕金额一样也
-    不该被牵连。每张都留下审计快照 —— 凭证号可复用，删掉就再也查不回来了。
+    两道范围限制，缺一不可：
+
+    * ``source == "CARRY_FORWARD"``：同期的手工凭证哪怕金额一样也不该被牵连。
+    * **签名对得上**（``_is_system_carry_forward``）：这一层才是防伪造的 ——
+      标记是客户端曾经能自己写的，只认标记等于「谁都能指定哪张被删」。
+
+    **已记账照样删**，这是本函数存在的理由（``keep_posted`` 那段逻辑要靠它
+    重做记账状态；数据库触发器也专门为 CARRY_FORWARD 留了这个口子）。删除
+    保护网在这里开口子的安全性，现在完全押在上面的签名检查上 —— 这也是
+    它必须 fail closed 的原因。
+
+    每张都留下审计快照 —— 凭证号可复用，删掉就再也查不回来了。
     """
     from app.accounting.audit_helper import voucher_snapshot
+
+    unknown = [v for v in existing if not _is_system_carry_forward(v, period)]
+    if unknown:
+        raise ValueError(
+            f"{period.code} 有一张来源不明的结转凭证（{'、'.join(v.voucher_no for v in unknown)}），"
+            "已停止结转、什么都没删。这类凭证不是系统生成的（见「结转凭证的删除保护」），"
+            "请先到凭证列表确认它的来历，手工处理后再结转。"
+        )
 
     removed = []
     for v in existing:
@@ -397,13 +541,21 @@ def _drop_carry_forward(db: Session, period: Period, existing: list[Voucher],
     return removed
 
 
-def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUser,
-                         replace: bool = True) -> dict:
+def carry_forward_profit(db: Session, book_id: int, period: Period,
+                         user: SysUser) -> dict:
     """月末结转损益：把损益类科目余额结转到「本年利润」。
 
     永远「先删旧、再重算」：本期只要已经有结转凭证，就删掉重新生成。
     财务最常见的动作就是「结完发现金额不对，改完再结一次」，
     让人自己去凭证列表里找出来删，既啰嗦又容易漏。
+
+    P2-3：这里原来有个 ``replace: bool = True`` 形参。它**从未被函数体读过**
+    —— 无论传什么都是「先删旧再重算」。而 API 层 ``books.py`` 一路把
+    ``payload.replace`` 传了下来，于是 ``replace=false`` 的调用方拿到的是
+    「旧凭证已被删除」的结果，与它要的相反，却什么错都没报。
+
+    形参已删：留着它就是在对外承诺一个这个函数从不兑现的开关。请求体里
+    那个 ``replace`` 字段也一并降级为「收下但不用」的兼容项（见 schemas）。
     """
     period = db.execute(select(Period).where(Period.id == period.id).with_for_update()).scalar_one()
     if period.locked:
@@ -439,9 +591,11 @@ def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUse
         # 旧凭证已经 flush 掉，下面重算余额时看到的才是「未结转」的真实损益
         db.flush()
 
-    profit = _subject_by_code(db, book_id, PROFIT_SUBJECT_CODE)
+    profit = _subject_by_any_code(db, book_id, PROFIT_SUBJECT_CODES)
     if profit is None:
-        raise ValueError(f"账套缺少「本年利润」科目（编码 {PROFIT_SUBJECT_CODE}）")
+        raise ValueError(
+            f"账套缺少「本年利润」科目（编码 {'、'.join(PROFIT_SUBJECT_CODES)} 都不是）"
+        )
 
     # 结转损益的科目集合同样不过滤 active：停用的收入/费用科目如果被排除，
     # 它的本年累计就不会被结走，损益永远留在科目上，本年利润也算不对。
@@ -482,25 +636,38 @@ def carry_forward_profit(db: Session, book_id: int, period: Period, user: SysUse
     last_day = date(period.year, period.month, _days_in_month(period.year, period.month))
     created = []
 
+    # 摘要**不写期间**：这些分录是一个月一笔的动作，凭证日期已经落在月末那天，
+    # 期间在凭证头上摆着，摘要再抄一遍「结转 2026-09 损益」只是把同一句话说两遍
+    # —— 而且那张凭证日后是要打印出来给人核对的，一行摘要挤掉半个字都不值当。
+    # 写死成「期间损益结转」：全仓凡是这一类分录都长这样，肉眼一眼分得出
+    # 「这张是系统结转出来的」，不用先去凭证头确认它是哪一期结的。
+    #
+    # 这行摘要连同下面的 remark 一起构成结转凭证的**系统签名**，
+    # ``_is_system_carry_forward`` 靠它把「系统自己生成的」和
+    # 「客户端伪造的 CARRY_FORWARD」分开（见那里的说明）。改这里就得同步改那里。
+    SUMMARY = "期间损益结转"
+
     # 两张凭证一起提交，不各自 commit：replace 模式下旧凭证已经删掉了，
     # 中途失败若留下「删了旧的、只生成一半新的」，比直接报错糟糕得多。
     if income:
         entries = [{"subject_id": s.id, "direction": "DEBIT", "amount": amt,
-                    "summary": f"结转{period.code}损益"} for s, amt in income]
+                    "summary": SUMMARY} for s, amt in income]
         entries.append({"subject_id": profit.id, "direction": "CREDIT",
-                        "amount": sum(a for _, a in income), "summary": f"结转{period.code}损益"})
+                        "amount": sum(a for _, a in income), "summary": SUMMARY})
         created.append(create_voucher(
             db, book_id=book_id, user=user, voucher_date=last_day, entries=entries,
-            source="CARRY_FORWARD", remark=f"{period.code} 结转损益（收入类）", commit=False))
+            source="CARRY_FORWARD", remark=f"{period.code} 结转损益（收入类）",
+            internal=True, commit=False))
 
     if expense:
         entries = [{"subject_id": profit.id, "direction": "DEBIT",
-                    "amount": sum(a for _, a in expense), "summary": f"结转{period.code}损益"}]
+                    "amount": sum(a for _, a in expense), "summary": SUMMARY}]
         entries += [{"subject_id": s.id, "direction": "CREDIT", "amount": amt,
-                     "summary": f"结转{period.code}损益"} for s, amt in expense]
+                     "summary": SUMMARY} for s, amt in expense]
         created.append(create_voucher(
             db, book_id=book_id, user=user, voucher_date=last_day, entries=entries,
-            source="CARRY_FORWARD", remark=f"{period.code} 结转损益（成本费用类）", commit=False))
+            source="CARRY_FORWARD", remark=f"{period.code} 结转损益（成本费用类）",
+            internal=True, commit=False))
 
     nos = [v.voucher_no for v in created]
     if created and keep_posted:
@@ -678,8 +845,8 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
     #    这张凭证必须落在本年最后一个月，若该期已结账则先解锁再补做 ——
     #    年度结转是一键动作，不该要求用户手动反结账一次。
     unlocked_for_carry = False
-    profit = _subject_by_code(db, book.id, PROFIT_SUBJECT_CODE)
-    retained = _subject_by_code(db, book.id, RETAINED_SUBJECT_CODE)
+    profit = _subject_by_any_code(db, book.id, PROFIT_SUBJECT_CODES)
+    retained = _subject_by_any_code(db, book.id, RETAINED_SUBJECT_CODES)
     if profit and retained:
         eng = LedgerEngine(db, book.id)
         bal = eng.figures(profit.id, last.ord).closing
@@ -710,6 +877,12 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
 
             # 冲平本年利润 = 往它余额的反方向记一笔同额分录。
             # 盈利在贷方（负）→ 借方冲平；亏损在借方（正）→ 贷方冲平。
+            #
+            # 摘要与 remark 一起是这张凭证的**系统签名**
+            # （``_CARRY_FORWARD_SIGNATURES``）—— 「重新结转」时
+            # ``_drop_carry_forward`` 靠它认出这张是系统生成的才肯删。
+            # 改这两处字面量必须同步改签名表，否则第二次年度结转会
+            # 撞上「来源不明的结转凭证」而拒绝执行。
             amt = abs(bal)
             profit_dir = "DEBIT" if bal < 0 else "CREDIT"
             entries = [
@@ -722,7 +895,7 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
             v = create_voucher(db, book_id=book.id, user=user,
                                voucher_date=date(current_year, 12, 31), entries=entries,
                                source="CARRY_FORWARD", remark=f"{current_year}年 结转本年利润",
-                               commit=False)
+                               internal=True, commit=False)
 
             # 追加凭证后 12 月又变成未记账，重新记账并结账
             post_vouchers(db, book.id, [v.id], user, commit=False)

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -51,10 +51,10 @@ def get_current_user(
     return user
 
 
-def get_my_book(book_id: int, db: Session = Depends(get_db), user: SysUser = Depends(get_current_user)) -> Book:
-    link = db.scalar(select(UserBook).where(UserBook.user_id == user.id, UserBook.book_id == book_id))
-    if link is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "没有该账套的访问权限")
+def get_my_book(book_id: int, db: Session = Depends(get_db),
+                user: SysUser = Depends(get_current_user),
+                request: Request = None) -> Book:  # type: ignore[assignment]
+    _link_or_403(request, db, user.id, book_id)
     book = db.get(Book, book_id)
     if book is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "账套不存在")
@@ -115,15 +115,15 @@ def require_write(book: Book, user: SysUser, link: UserBook) -> None:
             "已按只读处理，请联系管理员修正")
 
 
-def get_book_link(book_id: int, db: Session = Depends(get_db), user: SysUser = Depends(get_current_user)) -> UserBook:
-    link = db.scalar(select(UserBook).where(UserBook.user_id == user.id, UserBook.book_id == book_id))
-    if link is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "没有该账套的访问权限")
-    return link
+def get_book_link(book_id: int, db: Session = Depends(get_db),
+                  user: SysUser = Depends(get_current_user),
+                  request: Request = None) -> UserBook:  # type: ignore[assignment]
+    return _link_or_403(request, db, user.id, book_id)
 
 
 def require_book_write(book_id: int, db: Session = Depends(get_db),
-                       user: SysUser = Depends(get_current_user)) -> UserBook:
+                       user: SysUser = Depends(get_current_user),
+                       request: Request = None) -> UserBook:  # type: ignore[assignment]
     """**账套写操作统一依赖**：既要归属这个账套，又要能写。
 
     为什么抽成依赖：权限校验散在各路由里，历史上就这么漏过。
@@ -137,16 +137,49 @@ def require_book_write(book_id: int, db: Session = Depends(get_db),
 
     返回 ``UserBook``：调用方通常已经通过 ``get_my_book`` 拿到账套了，
     两个依赖可以并排挂，不冲突。
+
+    这里**不再自己查一遍** ``UserBook``（审计中等 4）：``get_my_book`` /
+    ``get_book_link`` / ``require_book_write`` 发的是同一条查询，而几乎所有写接口
+    把它们并排挂着（``vouchers.py:119``、``printing.py:236``），于是每个写请求在
+    业务逻辑开始前就有 4 次串行往返。现在统一走 :func:`_link_or_403`，
+    同一个请求内只发一条。
     """
     # 直接调函数体而不是再挂一次 Depends：这里三个参数都由外层依赖注入了，
     # 走 get_book_link() 等于再查一次 UserBook。
-    link = _link_or_403(db, user.id, book_id)
+    link = _link_or_403(request, db, user.id, book_id)
     require_write(None, user, link)  # type: ignore[arg-type]
     return link
 
 
-def _link_or_403(db: Session, user_id: int, book_id: int) -> UserBook:
-    link = db.scalar(select(UserBook).where(UserBook.user_id == user_id, UserBook.book_id == book_id))
+def _link_or_403(request: Optional[Request], db: Session,
+                 user_id: int, book_id: int) -> UserBook:
+    """查「这个用户在这个账套里的授权」，没有就 403。**同一个请求内只查一次。**
+
+    复用是**请求内**的，不是跨请求缓存（审计中等 4 明确要求不做跨请求缓存：
+    改密、停用、换角色必须立刻生效）。载体是 ``request.state`` —— 它随这一个请求
+    的生命周期存在，下一个请求重新查。
+    查询的键是 ``(user_id, book_id)`` 而不是只按账套，所以一个请求里碰多个账套
+    也不会串。
+
+    没有 ``request``（比如被当成普通函数直接调用）时退化成每次都查：
+    少一次优化，但不会因为拿不到 request 就崩。
+    """
+    cache = None
+    if request is not None:
+        cache = getattr(request.state, "_cwq_book_links", None)
+        if cache is None:
+            cache = {}
+            request.state._cwq_book_links = cache
+    key = (user_id, book_id)
+    if cache is not None and key in cache:
+        link = cache[key]
+    else:
+        link = db.scalar(select(UserBook).where(
+            UserBook.user_id == user_id, UserBook.book_id == book_id))
+        if cache is not None:
+            # None 也记下来：「没有授权」同样是这个请求里已经查明的事实，
+            # 第二个依赖再问一遍不会得到别的答案。
+            cache[key] = link
     if link is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "没有该账套的访问权限")
     return link

@@ -19,11 +19,27 @@
 ----
     科目(编码, 取数口径[, 期间])   取数口径 ∈ 期初 / 借方累计 / 贷方累计 / 期末
                                           / 本期借方 / 本期贷方
+    ("编码", 取数口径)            同上，**省掉函数名**的简写（见下）
     合计(区域) / SUM(区域)         区域求和
     上期(单元格)                   同一行的上一列
     IF(条件, 真值, 假值)
     四舍五入(值, 位数) / ROUND(值, 位数)
     ABS(x) / MAX(...) / MIN(...)
+
+编码
+----
+    **可以写上级科目**（如 ``1002 银行存款``），取的是它下面所有末级科目的合计。
+    凭证只记到末级，上级科目自己身上永远是 0，所以这一步的汇总由求值上下文做
+    （``ReportContext.subject_scope``），不是账簿引擎的现成能力。
+
+省掉函数名
+----------
+    ``("1001","期末余额")`` 与 ``科目("1001","期末余额")`` 完全等价。第三个
+    参数照旧可写，``("1001","期末余额","{{上期}}")`` 也认。
+
+    判据是「``(`` 后紧跟字符串，且括号里有**顶层逗号**」—— 分组表达式里出现
+    逗号本来就是语法错误，所以这条分支不改变任何一条现有公式的含义。
+    ``("1001")`` 没有逗号，仍按分组处理，仍报「公式结果是文本」。
 
 期间写法
 --------
@@ -47,9 +63,25 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, DecimalException
+from functools import lru_cache
 from typing import Any, Callable, Iterator, Optional
 
 ZERO = Decimal("0")
+
+#: **不带取数口径**的列类型：内容不来自科目，也不写公式。
+#:
+#: * ``STATIC`` —— 项目标题列（资产负债表的「资产」「负债和所有者权益」，
+#:   利润表的「项目」）。内容是 ``ReportRow.label`` 或
+#:   ``ReportRow.style["label_right"]``。
+#: * ``LINE_NO`` —— 行次列（《小企业会计准则》规定的 1~53）。内容是
+#:   ``ReportRow.style["line_left" / "line_right"]``。
+#:
+#: 它们放在这里而不是各自的模块里，是因为**三处都要用同一个口径**：
+#: 播种时不写公式（``app/seed/builtin_reports.py``）、求值时不当数值列
+#: （``app/reports/evaluate.py``）、设计器里不继承取数口径
+#: （``app/api/reports.py``）。少一处，多一处就会把「行次」当成一个能取数的
+#: 列，于是新插的列继承到 LINE_NO 口径、报一个用户看不懂的错。
+NON_FORMULA_KINDS = frozenset({"STATIC", "LINE_NO"})
 
 # 标识符首字符与后续字符分开判断；用带锚点的整串正则会让 B2 只吃下 B
 IDENT_START = re.compile(r"[一-鿿A-Za-z_]")
@@ -92,6 +124,17 @@ MAX_RANGE_CELLS = 20_000
 # Excel 自己把四舍五入位数限制在 15 位以内，这里沿用同一个口径。
 MIN_ROUND_DIGITS = -15
 MAX_ROUND_DIGITS = 15
+# AST 缓存的条目上限。
+#
+# 为什么需要上限：模板是会被改的（插行删列、改公式），每次改动都是一批
+# 新公式串。缓存按公式串做键，没有上限就是一个只增不减的内存池 ——
+# 而公式串是用户输入，长度上限 4000 字。
+#
+# 为什么 512 够：一张报表的格子数就是这个量级（资产负债表 60 行 × 12 列
+# 的公式串也就几百条），而它命中的场景是「同一张模板反复渲染」——
+# 翻页、切期间、导出，都在跑同一批公式串。取这个量级是宁可多解析一次，
+# 也不要把进程内存和一个纯性能优化绑在一起。
+MAX_AST_CACHE = 512
 
 
 class FormulaError(Exception):
@@ -261,7 +304,14 @@ class Parser:
     def parse(self):
         if not self.src.strip():
             return None
-        # parse() 可能被多次调用，__init__ 里已经去掉过 "="
+        # 节点里没有 "="（__init__ 里已经去掉过），所以 parse() 之后还能
+        # 拿 self.src 去做「公式尾部有多余内容」的报错。
+        #
+        # **但 parse() 本身是消耗式的，实例不能复用**：``self.pos`` 不会自己
+        # 复位，同一个实例第二次 parse() 会从 EOF 继续，报「无法解析的记号: None」。
+        # 要再解析一条公式就新建一个 Parser —— 真正值得缓存的是**结果**（AST），
+        # 见 ``parse_formula``。
+        #
         # 入口取**最松**的那条规则（比较）：比较号两边才能各含加减。
         node = self.compare()
         if self.cur.kind != "EOF":
@@ -360,24 +410,121 @@ class Parser:
             return ("cell", tok.value)
         if tok.kind == "IDENT":
             self.pos += 1
-            self.eat("PUNCT", "(")
-            args = []
-            # 实参同样从最松的规则起步：IF(1+2>5,100,200) 里那个
-            # 比较号必须能在实参内部被吃掉，否则会一路冒泡成
-            # 「公式尾部有多余内容」。
-            if not (self.cur.kind == "PUNCT" and self.cur.value == ")"):
-                args.append(self.compare())
-                while self.cur.kind == "PUNCT" and self.cur.value == ",":
-                    self.pos += 1
-                    args.append(self.compare())
-            self.eat("PUNCT", ")")
-            return ("call", tok.value, args)
+            return ("call", tok.value, self._args())
         if tok.kind == "PUNCT" and tok.value == "(":
+            # 裸括号两种读法：分组 ``(1+2)``，或者省掉函数名的科目取数
+            # ``("1001","期末余额")``。
+            #
+            # 判据是「``(`` 后面紧跟字符串，**且**括号里有顶层逗号」。分组里
+            # 出现逗号本来就是语法错误，所以这条分支不会改变任何一条现有公式
+            # 的含义 —— 它只把今天解析不过去的写法接住。
+            if self._is_subject_args():
+                return ("call", "科目", self._args())
             self.pos += 1
             node = self.compare()
             self.eat("PUNCT", ")")
             return node
         raise FormulaError(f"无法解析的记号: {tok.value}")
+
+    def _is_subject_args(self) -> bool:
+        """当前位置是 ``(``，且它包住的是「字符串, 字符串, …」这种实参表。
+
+        必须先看清**有没有顶层逗号**才能决定读法：``("1001")`` 只有一层括号、
+        没有逗号，那是分组，走老路仍然报「公式结果是文本」；真当成科目取数会
+        把一句写错的话默默算成一个数。
+        """
+        i = self.pos + 1
+        if i >= len(self.tokens) or self.tokens[i].kind != "STRING":
+            return False
+        depth = 0
+        while i < len(self.tokens):
+            t = self.tokens[i]
+            if t.kind == "PUNCT":
+                if t.value == "(":
+                    depth += 1
+                elif t.value == ")":
+                    if depth == 0:
+                        return False      # 括号在逗号之前就闭合了
+                    depth -= 1
+                elif t.value == "," and depth == 0:
+                    return True
+            i += 1
+        return False
+
+    def _args(self) -> list:
+        """吃掉 ``实参, 实参, …)``。调用方已经站在 ``(`` 上。"""
+        self.eat("PUNCT", "(")
+        args = []
+        # 实参同样从最松的规则起步：IF(1+2>5,100,200) 里那个
+        # 比较号必须能在实参内部被吃掉，否则会一路冒泡成
+        # 「公式尾部有多余内容」。
+        if not (self.cur.kind == "PUNCT" and self.cur.value == ")"):
+            args.append(self.compare())
+            while self.cur.kind == "PUNCT" and self.cur.value == ",":
+                self.pos += 1
+                args.append(self.compare())
+        self.eat("PUNCT", ")")
+        return args
+
+
+# --------------------------------------------------------------------- 解析缓存
+
+
+def _freeze(node: Any) -> Any:
+    """把 AST 里的可变容器（函数实参 list）换成 tuple。
+
+    **缓存里必须是不可变的**：``lru_cache`` 交出去的是**同一个对象**，
+    将来任何一处「就地改一下 AST」的写法都会污染后面所有格子的求值，
+    而且这种串味只在特定模板下出现、极难定位。
+
+    节点形状里**只有** ``("call", 名, 实参表)`` 的第三位是 list，其余节点装的都是
+    子节点或标量 —— 但「只有 call 节点要改」不等于「只看根节点就够」：
+    ``IF(...) + 合计(...)`` 的根是 ``bin``，两个 call 藏在它底下，
+    所以整棵树都要走一遍。
+
+    **没有变化就返回原对象**，不重建：绝大多数节点（num / str / bin / cell）
+    原地不动，一次缓存省下的正是重新分配它们。
+    实参里可能还有嵌套的 call，所以要递归。
+
+    ``Parser(src).parse()``（校验接口与既有测试用的那条路径）拿到的形状
+    一个字没动 —— ``tests/test_formula_precedence.py`` 断言的正是
+    实参表仍是 list。**冻结只发生在缓存这一侧。**
+    """
+    if type(node) is not tuple:
+        return node
+    if node and node[0] == "call":
+        return (node[0], node[1], tuple(_freeze(a) for a in node[2]))
+    parts = [_freeze(x) for x in node]
+    # 全都还是原对象就没必要重建这个 tuple
+    return node if all(p is o for p, o in zip(parts, node)) else tuple(parts)
+
+
+@lru_cache(maxsize=MAX_AST_CACHE)
+def parse_formula(src: str):
+    """把公式串解析成 AST；同一条公式只解析一次。
+
+    **Parser 实例本身不可复用**：``self.pos`` 是实例状态，而 ``parse()``
+    走完不会把它复位（``depth`` 倒是有 finally 复位），所以同一个实例第二次
+    parse() 会从 EOF 继续、报「无法解析的记号: None」——实测如此。
+    因此每次未命中都新建一个 Parser，省下的是 ``tokenize`` 加递归下降那一整趟，
+    不是实例的构造。
+    ``lru_cache`` 只在**未命中**时调用函数体，命中时直接返回上次那棵 AST，
+    Parser 一次都不会建。
+
+    为什么可以缓存（求值路径逐条核对过）：
+
+    * AST 由 ``src`` 唯一决定，是纯函数；
+    * ``Evaluator.run`` / ``_eval`` 对节点**只读**：没有一处赋值、下标赋值、
+      ``append`` 或 ``pop``；
+    * 求值状态全在 ``Evaluator`` / ctx 上（``self.ctx``、``_visiting``），
+      不在节点上，所以同一棵 AST 在不同请求、不同账套上复用是安全的。
+
+    异常**不进缓存**（``lru_cache`` 不缓存异常），所以「公式太复杂 /
+    语法错 / 除零」这类结果每次都重新解析并报同一句文案 —— 用户改完公式
+    不会一直看到旧报错。``MAX_FORMULA_LEN`` / ``MAX_NEST_DEPTH`` /
+    ``MAX_CHAIN_OPS`` 这些解析期上限同理，仍然每次都拦得住。
+    """
+    return _freeze(Parser(src).parse())
 
 
 # --------------------------------------------------------------------- 求值
@@ -411,8 +558,12 @@ class Evaluator:
         # 不是 FormulaError，evaluate 逐格只捕 FormulaError，它们一路穿出去
         # 就是 HTTP 500（审计 P1-12）。上层宽泛兜底会把「公式太复杂」和
         # 「数据库断了」混成同一种失败，所以兜在引擎内部。
+        # 走 parse_formula：同一批公式串在一张报表里被反复用到，
+        # 词法 + 语法分析只做一次（见 parse_formula 的注释）。
+        # 护栏**不能因为有缓存就省掉**：未命中时 parse 仍在里面，
+        # 而 MAX_FORMULA_LEN 之类的上限必须每条公式都过一遍。
         with formula_guard():
-            node = Parser(src).parse()
+            node = parse_formula(src)
             if node is None:
                 return ZERO
             value = self._eval(node)
@@ -515,7 +666,8 @@ class Evaluator:
         }
         if kind not in m:
             raise FormulaError(f"未知取数口径: {kind}（可用：{'、'.join(m)}）")
-        return getattr(self.ctx, m[kind])(sid, period)
+        # 引用上级科目时由 ctx 取整棵子树（见 ReportContext.subject_scope）
+        return self.ctx.measure(sid, m[kind], period)
 
     def _f_sum(self, args: list) -> Decimal:
         return sum((D(self._eval(a)) for a in args), ZERO)

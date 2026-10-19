@@ -1,6 +1,7 @@
 """业务层通用工具。"""
 from __future__ import annotations
 
+import re
 from datetime import date
 from decimal import Decimal, DecimalException, ROUND_HALF_UP
 
@@ -54,6 +55,38 @@ def money(value) -> Decimal:
 
 def period_label(year: int, month: int) -> str:
     return f"{year}-{month:02d}"
+
+
+#: 汇总行标签（审计 P2-13）。
+#:
+#: 放在 util 而不是各自留在导入器里，是因为**两个导入器都需要它**：
+#: 期初余额导入早就做了标签过滤，凭证导入却只有结构性判据，于是同一份
+#: 用友表，期初能剔干净、凭证会漏 —— 漏掉的那一行会把
+#: 「找不到科目「合计」」挂到**前一张真实凭证**头上，而那张凭证因此被判
+#: 不通过、静默地不进库。各写一份迟早会再次对不上。
+SUMMARY_LABELS = frozenset({
+    "资产小计", "负债小计", "权益小计", "损益小计",
+    "合计", "总计", "本页合计", "累计", "本年累计",
+})
+
+
+def is_summary_label(*texts: str | None) -> bool:
+    """这一行是不是「资产小计 / 合计 / 本年累计」这类汇总行。
+
+    两列都判一遍：真实文件里标签常写在「科目编码」列、名称列留空，
+    但别的版本会写进名称列。
+
+    **必须整行剔除、不能当普通数据行**：这些行是**已经加总过的数**
+    （合计行的借贷 = 明细行加总），当成科目会重复计入，合计直接翻倍。
+    **也不能报成错误**：它不是用户的错，报错等于让人去改一张没错的表。
+
+    匹配前先去空白 —— 表里写「本页 合计」也是同一行。
+    """
+    for text in texts:
+        compact = re.sub(r"\s+", "", text or "")
+        if compact and compact in SUMMARY_LABELS:
+            return True
+    return False
 
 
 def constraint_name(exc: Exception) -> str:

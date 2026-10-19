@@ -15,16 +15,13 @@
                    哪份是给这台打印机准备的。这里不用自定义插槽 —— el-option 一旦
                    给了插槽，收起时显示的也是插槽内容，两处排版就得各写一遍，
                    改一处忘一处就出现「下拉里带纸型、收起后不带」。 -->
+              <!-- 标记与设计器同一份口径（utils/printTemplate.js::templateTags）：
+                   只标「默认」= 不指定模板直接打印真正会用的那一份；私有副本不标。
+                   两处各写一份就会出现「弹窗里说默认是 A、设计器里说默认是 B」。 -->
               <el-option
                 v-for="t in tplList" :key="t.id" :value="t.id"
-                :label="`${t.name}（${paperOf(t)}${t.is_default ? ' · 默认' : ''}）`"
+                :label="`${t.name}（${templateTags(t, defId).join(' · ') || 'A4'}）`"
               />
-            </el-select>
-          </el-form-item>
-
-          <el-form-item label="纸型">
-            <el-select v-model="paper" style="width: 100%" @change="onPaperChange">
-              <el-option v-for="p in papers" :key="p.key" :value="p.key" :label="paperLabel(p.key)" />
             </el-select>
           </el-form-item>
 
@@ -41,15 +38,14 @@
         <!-- 说明沉到栏底：设置项只有三行，撑不满 60vh 高的预览区，
              留一大片空在下面会让人以为左侧没加载出来。 -->
         <div class="note">
-          <p class="note-tip">纸型与方向只对本次打印生效，不会改动模板。</p>
-          <p v-if="isVoucher" class="note-sub">A4 每页 2 张凭证，A5 每页 1 张。</p>
-          <p v-if="dirty" class="note-warn">纸型已与所选模板不同，按当前选择打印。</p>
+          <p class="note-tip">方向只对本次打印生效，不会改动模板；纸张一律 A4。</p>
+          <p v-if="isVoucher" class="note-sub">一页放几张凭证由所选模板决定，在模板设计器里改。</p>
         </div>
       </div>
 
       <div class="stage-wrap">
         <el-alert v-if="error" type="error" :closable="false" :title="error" show-icon />
-        <PrintPreview v-else :html="html" :paper="paper" :orientation="orientation" :papers="papers" />
+        <PrintPreview v-else :html="html" :paper="PAPER" :orientation="orientation" :papers="papers" />
       </div>
     </div>
 
@@ -78,9 +74,10 @@ import { ElMessage } from 'element-plus'
 import { Printer } from '@element-plus/icons-vue'
 import PrintPreview from '@/components/PrintPreview.vue'
 import { loadPrintHtml, openPrintWindow, printWindow, templateMeta, templates as loadTemplates } from '@/api/print'
+import { pickPapers } from '@/utils/paper'
 import {
-  DEFAULT_ORIENTATION, normalizePaper, paperLabel as labelPaper, pickPapers,
-} from '@/utils/paper'
+  effectiveDefaultId as sharedEffectiveDefault, showBuiltinTemplate, templateTags,
+} from '@/utils/printTemplate'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
@@ -103,8 +100,11 @@ const visible = computed({
 })
 
 const templateId = ref(null)
+/** 生效的默认模板 id —— 标签上「· 默认」标的就是它，不是 is_default 直接取。 */
+const defId = ref(null)
 const defaultTemplates = ref({})
-const paper = ref('A4')
+/** 纸张恒为 A4（见 utils/paper.js），预览和请求都要一个具体的值。 */
+const PAPER = 'A4'
 const orientation = ref('portrait')
 const papers = ref([])
 const tplList = ref([])
@@ -113,30 +113,14 @@ const error = ref('')
 const loading = ref(false)
 const printing = ref(false)
 
-/** 选中模板自带的那份纸型，用来判断用户是不是临时改过。 */
-const templatePaper = ref('')
-
 /**
  * report.html 的两个 id 是反的：它的 template_id 指**报表**模板，
  * 版式模板走 print_template_id。其余四个接口都是 template_id 直接指版式。
  */
 const templateKey = computed(() => (props.scope === 'REPORT' ? 'print_template_id' : 'template_id'))
 
-function paperLabel(key) {
-  return labelPaper(key, isVoucher.value)
-}
-
 const isVoucher = computed(() => props.scope === 'VOUCHER')
-const dirty = computed(() => !!templatePaper.value && templatePaper.value !== paper.value)
 
-/**
- * 模板的纸型以 content 为准：paper 列只是保存时顺手冗余的一份拷贝。
- * 落到界面上再收敛一次：模板是老的、纸型早就不是 A4/A5 时，兜回 A4，
- * 否则下拉框会停在一个选项列表里根本不存在的值上。
- */
-function paperOf(t) {
-  return normalizePaper(t?.content?.paper || t?.paper)
-}
 function orientationOf(t) {
   return t?.content?.orientation || 'portrait'
 }
@@ -144,7 +128,6 @@ function orientationOf(t) {
 function buildParams() {
   const p = { ...props.params }
   if (templateId.value !== null) p[templateKey.value] = templateId.value
-  if (paper.value) p.paper = paper.value
   if (orientation.value) p.orientation = orientation.value
   return p
 }
@@ -157,7 +140,7 @@ async function init() {
     // meta 是公开字典，缓存一份即可，不必每次开弹窗都拉。
     if (!papers.value.length) {
       const meta = await templateMeta(props.bookId)
-      // 后端仍下发全部纸型，这里只留系统对外提供的两种。
+      // 后端 PAPERS 仍保留老纸型（渲染层要认它们），这里只留对外提供的那一种。
       papers.value = pickPapers(meta?.papers || [])
       defaultTemplates.value = meta?.defaults || {}
     }
@@ -167,19 +150,24 @@ async function init() {
     return
   }
   const list = tplList.value.filter((t) => t.scope === props.scope)
+  defId.value = sharedEffectiveDefault(list)
   const builtin = { id: 0, name: '内置默认', content: defaultTemplates.value[props.scope] || {} }
-  tplList.value = [builtin, ...list]
+  // 「内置默认」只在没有已保存模板时才是唯一选项，凭证范围已有基线模板（口径见
+  // utils/printTemplate.js，与设计器同一份判断）。留着它，列表里就出现第三种
+  // 版式说法 —— 用户打印前要先分清「基线模板」和「内置」到底是什么关系。
+  tplList.value = showBuiltinTemplate(props.scope, list) ? [builtin, ...list] : list
   // 设计器传入的 0 明确指内置版式；其它入口仍优先使用账套默认模板。
+  // 注意「默认」按生效的那一份算，不是按 is_default 字段直接取 —— 同范围里
+  // 我的私有副本、本账套模板、全局基线可能都带着默认标记，只有排最前的那份
+  // 会被真正印出来（后端 _template() 的 ORDER BY）。
   const def = tplList.value.find((t) => t.id === props.initialTemplateId) ||
-    list.find((t) => t.is_default) || list[0] || builtin
+    list.find((t) => t.id === defId.value) || list[0] || builtin
   if (def) {
     // **必须等选项先渲染出来再赋值**。el-select 是靠 modelValue 去已注册的
     // 选项里反查 label 的；选项还没挂上就赋值，收起框里只能显示空。
     // 数据是异步回来的，这里天然会踩到，晚一拍 nextTick 就够了。
     await nextTick()
     templateId.value = def.id
-    templatePaper.value = paperOf(def)
-    paper.value = templatePaper.value
     orientation.value = orientationOf(def)
   }
   await refreshPreview()
@@ -188,15 +176,7 @@ async function init() {
 function onTemplateChange() {
   const t = tplList.value.find((x) => x.id === templateId.value)
   if (!t) return
-  templatePaper.value = paperOf(t)
-  paper.value = templatePaper.value
   orientation.value = orientationOf(t)
-  refreshPreview()
-}
-
-/** 换纸型就把方向带到该纸型的惯用值，否则 A5 沿用 A4 的纵向，横向小册子排不出来。 */
-function onPaperChange() {
-  orientation.value = DEFAULT_ORIENTATION[paper.value] || 'portrait'
   refreshPreview()
 }
 

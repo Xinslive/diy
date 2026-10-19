@@ -84,9 +84,29 @@ export function matchSubject(s, kw) {
     || initials(s.name).includes(k)
 }
 
+/**
+ * 科目类别的**唯一**中文名。
+ *
+ * 五个类别用的是**简称**（EQUITY → 「权益」），不是准则里的正式表述
+ * 「所有者权益」。它们只出现在科目选择器页签、科目树/导入表的类别列、
+ * 新增科目的类别下拉和期初分组上 —— 全是页面上空间紧张的地方，
+ * 「所有者权益」四个字会把页签撑得比别的宽一大截。
+ *
+ * **正式表述另有其人，别在这里统一。** 资产负债表里的
+ * 「负债和所有者权益（或股东权益）总计」是《小企业会计准则》的行次名称，
+ * 由 `reports/builtin_reports.py` 写死，走的是另一套文案（见 ReportView
+ * 的注释）。所以同一个类别在「选科目的页签」上叫权益、在「报表的行次」
+ * 上叫所有者权益，是**有意如此**，不是没统一的漏网之鱼。
+ *
+ * 这里曾经反过来统一成「所有者权益」（就为了消掉上面那个「两个名字」），
+ * 结果是页签变宽、ui_subject.mjs 里按「权益」断言的那条验收一直是红的。
+ * 代价选小的那个：要窄就窄，报表里的正式名称一个字不动。
+ */
 export const CATEGORY_LABEL = {
   ASSET: '资产', LIABILITY: '负债', EQUITY: '权益', COST: '成本', PROFIT: '损益'
 }
+/** 类别在页面上出现的顺序（会计恒等式：资产 = 负债 + 所有者权益 + 损益） */
+export const CATEGORY_ORDER = ['ASSET', 'LIABILITY', 'EQUITY', 'COST', 'PROFIT']
 /** 类别 → 该类科目的常规余额方向，顶层新增科目时给个默认值 */
 export const CATEGORY_DEFAULT_DIRECTION = {
   ASSET: 'DEBIT', COST: 'DEBIT', LIABILITY: 'CREDIT', EQUITY: 'CREDIT', PROFIT: 'CREDIT'

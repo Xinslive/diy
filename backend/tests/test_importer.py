@@ -53,7 +53,7 @@ def test_缺必需表头报错(db, book):
 
 
 def test_缺金额列报错(db, book):
-    data = _xlsx(["日期", "科目编码", "摘要"], [["2026-01-05", "100201", "x"]])
+    data = _xlsx(["日期", "科目编码", "摘要"], [["2026-01-05", "1001", "x"]])
     with pytest.raises(ValueError, match="缺少金额列"):
         parse_workbook(data, book.id, db)
 
@@ -68,10 +68,10 @@ def test_空文件报错(db, book):
 
 def _good_rows():
     return [
-        ["2026-01-05", "记-1", "收租金", "100201", 1000, 0],
-        [None, None, "收租金", "600101", 0, 1000],
-        ["2026-01-06", "记-2", "付水电", "6602", 200, 0],
-        [None, None, "付水电", "100201", 0, 200],
+        ["2026-01-05", "记-1", "收租金", "1001", 1000, 0],
+        [None, None, "收租金", "5001", 0, 1000],
+        ["2026-01-06", "记-2", "付水电", "560206", 200, 0],
+        [None, None, "付水电", "1001", 0, 200],
     ]
 
 
@@ -87,8 +87,8 @@ def test_日期或凭证号为空视为接上一张(db, book):
 
 def test_借贷不平衡被标为不通过(db, book):
     data = _xlsx(["日期", "凭证号", "摘要", "科目编码", "借方", "贷方"], [
-        ["2026-01-05", "记-1", "x", "100201", 1000, 0],
-        [None, None, "x", "600101", 0, 999],
+        ["2026-01-05", "记-1", "x", "1001", 1000, 0],
+        [None, None, "x", "5001", 0, 999],
     ])
     r = parse_workbook(data, book.id, db)
     v = r["vouchers"][0]
@@ -99,7 +99,7 @@ def test_借贷不平衡被标为不通过(db, book):
 def test_科目不存在被标为不通过(db, book):
     data = _xlsx(["日期", "凭证号", "摘要", "科目编码", "借方", "贷方"], [
         ["2026-01-05", "记-1", "x", "999999", 1000, 0],
-        [None, None, "x", "600101", 0, 1000],
+        [None, None, "x", "5001", 0, 1000],
     ])
     r = parse_workbook(data, book.id, db)
     assert r["vouchers"][0]["ok"] is False
@@ -107,22 +107,22 @@ def test_科目不存在被标为不通过(db, book):
 
 
 def test_上级科目被标为不通过(db, book, subjects):
-    """表里写「1002 银行存款」这种上级科目，必须当场挑明，不是默默记到它头上。
+    """表里写「1101 短期投资」这种上级科目，必须当场挑明，不是默默记到它头上。
 
     它在账套里明明存在，所以不能报「找不到科目」—— 那会让人以为是编码写错了，
     去改表里的编码，越改越离谱。得说清是「不是明细科目」。
     """
-    assert subjects["1002"].is_leaf is False      # 前提：这本账里它真的是上级科目
+    assert subjects["1101"].is_leaf is False      # 前提：这本账里它真的是上级科目
     data = _xlsx(["日期", "凭证号", "摘要", "科目编码", "借方", "贷方"], [
-        ["2026-01-05", "记-1", "x", "1002", 1000, 0],
-        [None, None, "x", "600101", 0, 1000],
+        ["2026-01-05", "记-1", "x", "1101", 1000, 0],
+        [None, None, "x", "5001", 0, 1000],
     ])
     r = parse_workbook(data, book.id, db)
     v = r["vouchers"][0]
     assert v["ok"] is False
-    assert any("1002" in e and "不是明细科目" in e for e in v["errors"]), v["errors"]
+    assert any("1101" in e and "不是明细科目" in e for e in v["errors"]), v["errors"]
     # 而且这条分录根本不该被拼进去：拼进去了，落库时它就成了挂在上级科目上的分录
-    assert [e["subject_code"] for e in v["entries"]] == ["600101"], v["entries"]
+    assert [e["subject_code"] for e in v["entries"]] == ["5001"], v["entries"]
 
 
 def test_解析阶段不写库(db, book, admin_user):
@@ -135,8 +135,8 @@ def test_解析阶段不写库(db, book, admin_user):
 
 def test_单列金额靠方向列判断借贷(db, book):
     data = _xlsx(["日期", "凭证号", "摘要", "科目编码", "金额", "方向"], [
-        ["2026-01-05", "记-1", "x", "100201", 500, "借"],
-        [None, None, "x", "600101", 500, "贷"],
+        ["2026-01-05", "记-1", "x", "1001", 500, "借"],
+        [None, None, "x", "5001", 500, "贷"],
     ])
     r = parse_workbook(data, book.id, db)
     assert r["vouchers"][0]["ok"] is True
@@ -155,8 +155,8 @@ def test_单列金额没有方向列必须报错而不是猜(db, book):
     拒绝的口径没变（仍然 ok=False），只是把「症状」换成了「病因」。
     """
     data = _xlsx(["日期", "凭证号", "摘要", "科目编码", "金额"], [
-        ["2026-01-05", "记-1", "x", "100201", 500],
-        [None, None, "x", "600101", 500],
+        ["2026-01-05", "记-1", "x", "1001", 500],
+        [None, None, "x", "5001", 500],
     ])
     r = parse_workbook(data, book.id, db)
     assert r["vouchers"][0]["ok"] is False
@@ -215,10 +215,10 @@ def test_作废不写库(db, book, admin_user):
 def test_有问题的凭证不会入库(db, book, admin_user):
     """通过的进、不通过的不进 —— 而不是整批卡死。"""
     data = _xlsx(["日期", "凭证号", "摘要", "科目编码", "借方", "贷方"], [
-        ["2026-01-05", "记-1", "好的", "100201", 1000, 0],
-        [None, None, "好的", "600101", 0, 1000],
-        ["2026-01-06", "记-2", "坏的", "100201", 1000, 0],
-        [None, None, "坏的", "600101", 0, 999],
+        ["2026-01-05", "记-1", "好的", "1001", 1000, 0],
+        [None, None, "好的", "5001", 0, 1000],
+        ["2026-01-06", "记-2", "坏的", "1001", 1000, 0],
+        [None, None, "坏的", "5001", 0, 999],
     ])
     batch = stage(db, book.id, admin_user, "导入.xlsx", data)
     r = commit(db, batch, admin_user)
@@ -235,9 +235,9 @@ def test_提交时的意外失败整体回滚(db, book, admin_user, subjects):
 
     # 1 月造一笔已记账的业务并结转结账，让 1 月进入已结账状态
     v = create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 10),
-                       entries=[{"subject_id": subjects["100201"].id, "direction": "DEBIT",
+                       entries=[{"subject_id": subjects["1001"].id, "direction": "DEBIT",
                                  "amount": "10", "summary": "x"},
-                                {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+                                {"subject_id": subjects["5001"].id, "direction": "CREDIT",
                                  "amount": "10", "summary": "x"}])
     post_vouchers(db, book.id, [v.id], admin_user)
     jan = db.scalar(select(Period).where(Period.book_id == book.id, Period.month == 1))
@@ -245,10 +245,10 @@ def test_提交时的意外失败整体回滚(db, book, admin_user, subjects):
     close_period(db, jan, admin_user)
 
     data = _xlsx(["日期", "凭证号", "摘要", "科目编码", "借方", "贷方"], [
-        ["2026-03-05", "记-1", "能进", "100201", 100, 0],
-        [None, None, "能进", "600101", 0, 100],
-        ["2026-01-15", "记-2", "进不去", "100201", 50, 0],
-        [None, None, "进不去", "600101", 0, 50],
+        ["2026-03-05", "记-1", "能进", "1001", 100, 0],
+        [None, None, "能进", "5001", 0, 100],
+        ["2026-01-15", "记-2", "进不去", "1001", 50, 0],
+        [None, None, "进不去", "5001", 0, 50],
     ])
     batch = stage(db, book.id, admin_user, "导入.xlsx", data)
     r = commit(db, batch, admin_user)
@@ -299,8 +299,8 @@ def test_入库时间与记账时间同一时源(db, book, admin_user, make_vouc
     data = _xlsx(["日期", "凭证号", "摘要", "科目编码", "借方", "贷方"], _good_rows())
     batch = stage(db, book.id, admin_user, "t.xlsx", data)
     commit(db, batch, admin_user)
-    posted = make_voucher("2026-02-10", dr=[("100201", 100, "x")],
-                          cr=[("600101", 100, "x")], posted=True)
+    posted = make_voucher("2026-02-10", dr=[("1001", 100, "x")],
+                          cr=[("5001", 100, "x")], posted=True)
 
     db.refresh(batch)
     assert batch.committed_at.tzinfo == _tz.utc

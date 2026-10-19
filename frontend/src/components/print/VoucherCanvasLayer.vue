@@ -77,6 +77,7 @@
  * 所以这里不做任何 mm/px 换算 —— 换算就是错位的来源。
  */
 import { computed, nextTick, onBeforeUnmount, ref, useTemplateRef, watch } from 'vue'
+import { rafThrottle } from '@/utils/frame'
 
 const props = defineProps({
   elements: { type: Array, default: () => [] },
@@ -154,7 +155,15 @@ function startDrag(e, el, mode) {
   window.addEventListener('pointerup', onUp)
 }
 
-function onMove(e) {
+/**
+ * 拖动期间把写操作按帧合并（节流器见 utils/frame.js）。
+ *
+ * pointermove 一秒能来几十次，而每一下都在**直接写响应式**（props.elements 里的
+ * x/y/w/h），每一次写都要排一次渲染。emit 那头有 200ms 防抖，救不了这条渲染路径。
+ * 按帧合并后一帧只写一次：中间那些位置没人看得见，松手时的落点也不变
+ * —— 松手前 flush()，最后一帧不会丢。
+ */
+const onMove = rafThrottle(function (e) {
   const d = drag
   if (!d || e.pointerId !== d.pointerId || !(e.buttons & 1)) return
   if (!d.moved && Math.hypot(e.clientX - d.sx, e.clientY - d.sy) < 3) return
@@ -180,7 +189,7 @@ function onMove(e) {
     }
   }
   emit('change')
-}
+})
 
 /**
  * 贴边吸附：左/中/右对槽位的左/中/右，上/中/下对槽位的上/中/下。
@@ -202,6 +211,9 @@ function snap(x, y, el) {
 
 function onUp() {
   const changed = drag?.moved
+  // 先把欠着的最后一帧跑掉 —— 必须在 drag = null 之前跑，
+  // 否则最后那一下拖动的位置会被丢掉（元素停在倒数第二个位置）。
+  onMove.flush()
   drag = null
   window.removeEventListener('pointermove', onMove)
   window.removeEventListener('pointerup', onUp)
@@ -224,7 +236,7 @@ function startColDrag(e, el, idx) {
   window.addEventListener('pointerup', onColUp)
 }
 
-function onColMove(e) {
+const onColMove = rafThrottle(function (e) {
   if (!colDrag || e.pointerId !== colDrag.pointerId || !(e.buttons & 1)) return
   const { idx, widths } = colDrag
   const MIN = 4
@@ -234,9 +246,11 @@ function onColMove(e) {
   props.columns[idx].width = Math.round((widths[idx] + dx) * 10) / 10
   props.columns[idx + 1].width = Math.round((widths[idx + 1] - dx) * 10) / 10
   emit('change')
-}
+})
 
 function onColUp() {
+  // 跟 onUp 一个道理：先把欠着的最后一帧落地，再作废拖动状态
+  onColMove.flush()
   colDrag = null
   window.removeEventListener('pointermove', onColMove)
   window.removeEventListener('pointerup', onColUp)
@@ -277,6 +291,8 @@ watch(() => props.elements.map((el) => el.id), (ids) => {
   if (editingTextId.value && !ids.includes(editingTextId.value)) cancelTextEdit()
 })
 onBeforeUnmount(() => {
+  onMove.cancel()
+  onColMove.cancel()
   window.removeEventListener('pointermove', onMove)
   window.removeEventListener('pointerup', onUp)
   window.removeEventListener('pointermove', onColMove)

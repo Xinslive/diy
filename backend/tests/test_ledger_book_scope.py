@@ -76,14 +76,14 @@ def test_明细账拒绝本账套的非明细科目也不报错(client, auth, db
 
 def test_本账套科目的明细账照常能查(client, auth, db, book, subjects, make_voucher):
     """收紧不能误伤正常路径。"""
-    make_voucher("2026-04-10", dr=[("100201", 300, "x")],
-                 cr=[("600101", 300, "x")], posted=True)
-    sid_ = subjects["100201"].id
+    make_voucher("2026-04-10", dr=[("1002", 300, "x")],
+                 cr=[("5001", 300, "x")], posted=True)
+    sid_ = subjects["1002"].id
 
     r = client.get(f"/api/books/{book.id}/ledger/detail?subject_id={sid_}", headers=auth)
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["subject"]["code"] == "100201"
+    assert body["subject"]["code"] == "1002"
     assert any(row.get("voucher_no") for row in body["rows"]), "分录没出现在明细账里"
 
 

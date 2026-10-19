@@ -1,0 +1,24 @@
+[Unit]
+Description=每天触发一次云财务记账系统 数据库备份
+Documentation=file:/opt/cwq/deploy/tuning.md
+
+[Timer]
+# 凌晨 3:17 —— 不是整点。
+#
+# 整点是所有定时任务扎堆的时刻（同机器上的日志轮转、别的系统的备份）。
+# 备份要跑 pg_dump，是重 IO 的活，错开几分钟对备份新鲜度毫无影响，
+# 却能避开最坏情况（磁盘正忙时备份超时或被别的任务挤掉）。
+OnCalendar=*-*-* 03:17:00
+
+# **关机/停机期间错过的要补跑。**
+#
+# 机器维护完重启后，如果错过的备份不补跑，那么「最近一次备份」可能停在
+# 几天前 —— 而这段时间里恰好刚做完迁移（迁移是最需要退路的时候）。
+# Persistent=true 让它开机后立刻补一次。
+Persistent=true
+
+# 随机延迟最多 10 分钟，进一步错开与同机器其它任务的峰值。
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

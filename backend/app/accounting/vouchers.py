@@ -1,17 +1,17 @@
 """凭证服务：新增 / 修改 / 删除 / 记账 / 反记账 / 查询 / 批量。"""
 from __future__ import annotations
 
+import re
 from collections import Counter
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import Integer, Select, and_, func, or_, select
+from sqlalchemy import Integer, Numeric, Select, and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.accounting import organize as svc_organize
-from app.accounting.organize import split_no
 from app.accounting.audit_helper import log, voucher_snapshot
 from app.accounting.util import constraint_name, find_period, money, period_label
 from app.models import Book, Entry, Period, Subject, SysUser, Voucher
@@ -40,6 +40,29 @@ def _is_no_collision(exc: IntegrityError) -> bool:
 # --------------------------------------------------------------------- 编号
 
 
+# NO_PATTERN 的前缀组约束，逐字照抄（organize.py:39）。前缀不合这个形状时，
+# **任何**凭证号都拆不出这个前缀，于是答案与库里有哪些号无关，恒为 001。
+_PREFIX_SHAPE = re.compile(r"^[^\d]{1,4}$")
+
+
+def _prefix_seq_expr(prefix: str):
+    """「前缀 + 纯数字序号」整体的序号列；不匹配的行给 NULL。
+
+    等价于应用层 ``split_no(no)`` 在 ``prefix == 前缀`` 那一支的行为：
+    ``split_no`` 先 ``strip()`` 再要求整体匹配 ``^{prefix}(\\d+)$``，所以正则
+    两头留 ``\\s*``、中间**不留** ——「记 005」里那个空格在 Python 侧会被吃进
+    前缀组（前缀变成「记 」，不等于「记」）因而落选，这里同样落选。
+
+    用 ``substring(no, pattern)`` 而不是 ``substring(no, 固定偏移)``：偏移量
+    依赖「凭证字恰好几个汉字」这个假设，当年就是这么错的（见下面 docstring）。
+    PostgreSQL 的两参 ``substring(text, text)`` 在正则含括号子表达式时返回
+    **第一个括号子表达式**，于是这里拿到的就是纯数字那段，不需要在 Python
+    侧再抠一次。
+    """
+    pattern = rf"^\s*{re.escape(prefix)}(\d+)\s*$"
+    return func.cast(func.substring(Voucher.voucher_no, pattern), Numeric)
+
+
 def next_voucher_no(db: Session, period: Period, prefix: str = "记") -> str:
     """期间内顺序编号。凭证号允许回收复用，因此取「当前最大值 + 1」即可。
 
@@ -61,64 +84,106 @@ def next_voucher_no(db: Session, period: Period, prefix: str = "记") -> str:
 
     两个缺陷叠在一起，探针 13 组里 10 组结果是错的。
 
-    改成把该期间的号全取出来，用 ``organize.split_no`` 在**应用层**按
-    整数求最大值：前缀按传入的 prefix 走，序号按数值比。
+    第一版修复改对了方向（必须按**整数**比），但落成了「把该期间全部凭证号
+    拉回 Python 求 max」。单张创建是 4 次 SELECT，可批量导入在一个事务里
+    逐张 ``create_voucher``（``import_max_vouchers`` 允许 5000 张），
+    于是 N 张累计读回约 N(N-1)/2 行。
+
+    现在把「按前缀分组取该前缀最大序号」下推成 SQL 聚合：**正确性决策
+    （按整数比）原样保留，退回字典序 max 的路被正则 + cast 堵死**，
+    而回传的只有一行。
+
+    与原实现逐条等价的地方：
+
+    * 序号 0（如「记0」）仍可能进 ``max``，但原实现把 ``n <= 0`` 过滤掉后
+      缺省值就是 0，两边对「只存在记0」与「记0 + 记005」都给 0 / 5 ——
+      max 的候选里放不放 0 不改变结果。
+    * 前缀组只有 1~4 个非数字字符，且序号必须 ``\\d+``（至少一位），这两条
+      约束由正则承担，与 ``NO_PATTERN`` 同源；前缀本身不合这个形状时直接
+      短路成 001，省掉一次注定为空的查询。
+    * cast 用 Numeric 而不是 Integer：Python 的 ``int()`` 不溢出，
+      Integer 到 2147483647 就报错，用户自带「记99999999999999」不该让
+      发号整个炸掉。
+
+    剩下的代价：PG 侧仍要对本期每一行算一次正则（没有匹配表达式的索引），
+    单次发号是 O(本期凭证数)。真要把它也压成 O(1)，得在 ``period`` 上维护
+    一个发号计数器列 —— 那要动模型和迁移，不在本文件范围内。
     """
-    nos = db.scalars(
-        select(Voucher.voucher_no).where(Voucher.period_id == period.id)
-    ).all()
-    # 只看**与本次前缀相同**的号。这不是额外的洁癖，organize 里
-    # ``_check``/``_dominant_prefix`` 本来就是按前缀分组的：凭证字不同
-    # 就是不同的号段，跨前缀比序号没有意义。
-    #
-    # 否则「记-2」会被解析成 (前缀「记-」, 序号 2)，把「记」的下一个号
-    # 顶到 003 —— 用户看着 记001/记002 空着，发号却说 记003。
-    # 同理「记-年结」这类解析不出序号的返回 0，本来就不该参与递增。
-    seq = max((n for no in nos
-               if (n := split_no(no)[1]) > 0 and split_no(no)[0] == prefix),
-              default=0) + 1
-    # 三位数够一个月的凭证用。四位（记0022）看着像系统自动加的零，反而难扫。
-    return f"{prefix}{seq:03d}"
+    if not _PREFIX_SHAPE.match(prefix):
+        return f"{prefix}{1:0{svc_organize.NO_WIDTH}d}"
+    top = db.scalar(
+        select(func.coalesce(func.max(_prefix_seq_expr(prefix)), 0)).where(
+            Voucher.period_id == period.id
+        )
+    )
+    # 补零位数只有 organize.NO_WIDTH 一个数说了算，别在这儿另写一份。
+    return f"{prefix}{int(top or 0) + 1:0{svc_organize.NO_WIDTH}d}"
 
 
 # --------------------------------------------------------------------- 插入位
 
 
-def insert_slot(db: Session, anchor: Voucher) -> dict:
-    """插入凭证要占的那个号：参照凭证自己的号，参照及以后的号整体顺延 +1。
+def insert_slot(db: Session, anchor: Voucher, position: str = "before") -> dict:
+    """插入凭证要占的那个号，以及谁要顺位。
 
-    记001..记010，打开记006 插入 —— 存下去之后新凭证拿记006，
-    原记006..记010 变成记007..记011。顺延按**号**算，不按日期：
-    凭证号才是这个期间里的顺序，日期排出来的次序交给「整理凭证」管。
+    ``position="before"``（**插入凭证** = 向前插入）：新凭证占参照凭证自己的号，
+    参照及以后的号整体顺延 +1。
+
+        记0001..记0005，打开记0003 插入 —— 新凭证拿记0003，
+        原记0003..记0005 变成记0004..记0006。
+
+    ``position="after"``（**增加凭证** = 向后插入，用户 2026-10-19 定的口径）：
+    新凭证拿参照号 **+1**，只把比它大的往后顺延，参照自己原地不动。
+
+        记0001..记0005，打开记0003 增加 —— 新凭证拿记0004，
+        原记0004..记0005 变成记0005..记0006。
+
+    顺延按**号**算，不按日期：凭证号才是这个期间里的顺序，日期排出来的次序
+    交给「整理凭证」管。
 
     这里只算不改。改号和建凭证必须落在同一个事务里：中途放弃一张空凭证，
     后面那叠号就该原封不动 —— 空凭证占着号、把别的凭证顶走，才是真事故。
     """
-    prefix, seq = svc_organize.split_no(anchor.voucher_no)
+    if position not in ("before", "after"):
+        raise ValueError("插入位置只能是 before 或 after")
+    # 参照凭证自己的号先归一：库里有历史遗留的「记-0003」时，顺延出来的号
+    # 也必须是「记0004」，不能一半新形态一半旧形态。比较用的序号来自归一后的号，
+    # 所以下面每张参与比较的凭证也要归一 —— 否则「记-」和「记」是两个不相等的
+    # 前缀，那几张根本不会被顺延，会当场撞 uq_voucher_period_no。
+    canon_anchor = svc_organize.normalize_no(anchor.voucher_no)
+    prefix, seq = svc_organize.split_no(canon_anchor or anchor.voucher_no)
     if seq == 0:
         raise ValueError(
             f"凭证号 {anchor.voucher_no} 不是「凭证字 + 序号」，插入凭证要照着它顺位，请先整理凭证"
         )
+    if position == "after":
+        seq += 1
     rows = list(db.scalars(
         select(Voucher).where(Voucher.period_id == anchor.period_id)
     ).all())
     moved = []
     for v in rows:
-        p, s = svc_organize.split_no(v.voucher_no)
+        canon = svc_organize.normalize_no(v.voucher_no)
+        p, s = svc_organize.split_no(canon or v.voucher_no)
+        # before 顺延「参照及其以后」；after 顺延「>= 新号」，而新号已经
+        # 比参照大 1，所以参照自己（s = 原序号）不满足 s >= seq，天然不动。
         if p == prefix and s >= seq:
-            moved.append({"id": v.id, "from": v.voucher_no, "to": f"{prefix}{s + 1:03d}"})
+            moved.append({"id": v.id, "from": v.voucher_no,
+                          "to": f"{prefix}{s + 1:0{svc_organize.NO_WIDTH}d}"})
     moved.sort(key=lambda m: m["from"])
-    return {"prefix": prefix, "seq": seq, "no": anchor.voucher_no, "moved": moved}
+    return {"prefix": prefix, "seq": seq,
+            "no": f"{prefix}{seq:0{svc_organize.NO_WIDTH}d}",
+            "anchor_no": anchor.voucher_no, "position": position, "moved": moved}
 
 
-def _apply_shift(db: Session, anchor: Voucher) -> list[dict]:
+def _apply_shift(db: Session, anchor: Voucher, position: str = "before") -> list[dict]:
     """把参照凭证及其后面的号整体 +1。两阶段改号，避开即时唯一约束。
 
     直接把 记006 改成 记007 会当场撞上原来那张记007 —— ``uq_voucher_period_no``
     是即时约束，不像平衡检查那样延迟到提交。所以先整体挪到 ∥<id> 临时号再写最终号，
     跟整理凭证用的是同一套路子。
     """
-    plan = insert_slot(db, anchor)
+    plan = insert_slot(db, anchor, position)
     moved = plan["moved"]
     if not moved:
         return moved
@@ -170,6 +235,12 @@ def side_totals(entries: list[dict]) -> tuple[Decimal, Decimal]:
 # 系统自己生成的凭证：结转损益、年度结转。
 # 它们搬的是**已经存在**的余额，不是「给这个科目记一笔新账」，
 # 所以不受「停用科目不能新记」的闸门约束（审计 P2-08）。
+#
+# **这个标记必须由服务端自己给。** 客户端曾经能在 ``VoucherIn.source`` 里
+# 提交 CARRY_FORWARD，于是「停用科目可豁免」这道闸对任何有写权限的人都开着，
+# 而 ``periods._drop_carry_forward`` 又会不看状态地删掉本期全部 CARRY_FORWARD
+# 凭证 —— 自己造的凭证、记上账、再点一次重新结转就没了。现在写权限来自
+# ``create_voucher(internal=True)``，客户端那份 ``Literal`` 里已经没有它。
 SYSTEM_SOURCES = ("CARRY_FORWARD",)
 
 
@@ -253,21 +324,10 @@ def _validate_entries(db: Session, book_id: int, entries: list[dict],
 # --------------------------------------------------------------------- 写操作
 
 
-def create_voucher(
-    db: Session,
-    *,
-    book_id: int,
-    user: SysUser,
-    voucher_date: date,
-    entries: list[dict],
-    remark: str = "",
-    attachments: int = 0,
-    source: str = "MANUAL",
-    voucher_no: str | None = None,
-    period_id: int | None = None,
-    insert_after_id: int | None = None,
-    commit: bool = True,
-) -> Voucher:
+def validate_new_voucher(db: Session, *, book_id: int, voucher_date: date,
+                         entries: list[dict], period_id: int | None = None,
+                         insert_after_id: int | None = None, internal: bool = False):
+    """无写入地校验新凭证，返回期间、标准化分录和插入锚点。"""
     period = db.get(Period, period_id) if period_id else find_period(db, book_id, voucher_date)
     if period is None:
         raise ValueError("会计期间不存在")
@@ -298,18 +358,62 @@ def create_voucher(
         }
         for e in entries
     ]
-    _validate_entries(db, book_id, payload, allow_inactive=source in SYSTEM_SOURCES)
+    # allow_inactive 只认 internal —— 见函数 docstring。原来是
+    # ``source in SYSTEM_SOURCES``，而 source 由客户端提交。
+    _validate_entries(db, book_id, payload, allow_inactive=internal)
 
-    # 插入位上号沿用参照凭证的号（页面预填的就是它），后面的整体顺延。
-    # 人要是自己改过号，以人填的为准 —— 顺位照做，占的是那个号。
+    return period, payload, anchor
+
+
+def create_voucher(
+    db: Session,
+    *,
+    book_id: int,
+    user: SysUser,
+    voucher_date: date,
+    entries: list[dict],
+    remark: str = "",
+    attachments: int = 0,
+    source: str = "MANUAL",
+    voucher_no: str | None = None,
+    period_id: int | None = None,
+    insert_after_id: int | None = None,
+    insert_position: str = "before",
+    commit: bool = True,
+    internal: bool = False,
+) -> Voucher:
+    """建一张凭证。
+
+    ``internal=True`` 是「这是系统自己生成的凭证」（结转损益、年度结转）的
+    **唯一**正规声明，也是 ``allow_inactive`` 唯一的来源 —— 它过去是
+    ``source in SYSTEM_SOURCES``，而 source 曾经由客户端提交，等于把这道
+    「停用科目也能记账」的豁免开给了所有人。现在豁免跟着调用方走：
+    客户端能构造的 source（MANUAL/IMPORT/INVOICE）拿不到它，
+    ``SYSTEM_SOURCES`` 只由 ``app/accounting/periods.py`` 那两个生成方使用。
+
+    刻意**不**在这里对 ``source in SYSTEM_SOURCES`` 再抛一次错：内部代码
+    （测试夹具 ``make_voucher`` 等）也会造 CARRY_FORWARD 凭证来验证查询口径，
+    而那条路上真正要守的不变量已经守住了 ——
+    ① 豁免拿不到，② ``_drop_carry_forward`` 只删签名对得上的系统凭证，
+    伪造一张出来既没有特权、也不会被悄悄删掉。
+    """
+    period, payload, anchor = validate_new_voucher(
+        db, book_id=book_id, voucher_date=voucher_date, entries=entries,
+        period_id=period_id, insert_after_id=insert_after_id, internal=internal)
+
+    # 上号的三个来源：插入位（占参照的号）、自动发号、以及**导入时表里带的号**。
+    # 三者都要过 require_no 归一 + 校验：用户 2026-10-19 定的是「凭证号一律
+    # 自动生成」，但导入是另一个入口（Excel 里带什么号就带什么号），不归一
+    # 的话「记-0001」会和自动发的「记0002」混在一个期间里，把发号正则打瞎。
     moved: list[dict] = []
     moving_ids: set[int] = set()
     if anchor is not None:
-        moved = insert_slot(db, anchor)["moved"]
+        slot = insert_slot(db, anchor, insert_position)
+        moved = slot["moved"]
         moving_ids = {m["id"] for m in moved}
-        no = voucher_no or insert_slot(db, anchor)["no"]
+        no = svc_organize.require_no(voucher_no) or slot["no"]
     else:
-        no = voucher_no or next_voucher_no(db, period)
+        no = svc_organize.require_no(voucher_no) or next_voucher_no(db, period)
 
     # 页面上会预填下一个号（/vouchers/next），两个人同时开一张就会撞号。
     # 撞了就报人话 —— 数据库只会说「违反唯一约束 uq_voucher_period_no」，
@@ -324,7 +428,7 @@ def create_voucher(
         raise ValueError(f"凭证号 {no} 在 {period.code} 已经有一张了，请改一个号")
 
     if moved:
-        moved = _apply_shift(db, anchor)
+        moved = _apply_shift(db, anchor, insert_position)
 
     voucher = Voucher(
         book_id=book_id,
@@ -385,7 +489,11 @@ def create_voucher(
         user=user,
         book_id=book_id,
         detail=f"新增凭证 {voucher.voucher_no}",
-        after=voucher_snapshot(voucher),
+        # 分录是拿外键建的，backref 不会回填 voucher.entries —— 不把
+        # payload 递进去，下面这行就会为了拿「刚写进去的这些分录」再查一次库。
+        after=voucher_snapshot(
+            voucher, entries=[dict(e, line_no=i) for i, e in enumerate(payload, start=1)]
+        ),
     )
     if commit:
         db.commit()
@@ -412,11 +520,42 @@ def update_voucher(
             f"凭证 {voucher.voucher_no} 已记账，不能修改。"
             f"请到「期末结账」对本期执行「反结账」后再改。")
 
+    # ``insert_after`` 同属「以前静默丢弃」的那一类（P2-2）。它与 voucher_no
+    # 不同：改号是业务上允许的（凭证号可回收复用），而「插在谁后面、把后面
+    # 整体顺位」是**建凭证**独有的动作，对一张已存在的凭证说这句话没有意义 ——
+    # 照着办要动别的凭证的号，而那张凭证属于另一条业务规则。
+    #
+    # 与其又一次「返回成功但什么都没做」，不如明确拒绝并说清为什么。
+    if payload.get("insert_after"):
+        raise ValueError(
+            "insert_after 只在新增凭证时有效（「插在谁后面、后面的号顺位」）；"
+            "修改已存在的凭证请直接填 voucher_no。")
+
     if "voucher_date" in payload and payload["voucher_date"]:
         new_date = payload["voucher_date"]
         new_period = find_period(db, voucher.book_id, new_date)
         voucher.voucher_date = new_date
         voucher.period_id = new_period.id
+
+    # 凭证号不再允许人工改（用户 2026-10-19 定的：新增 / 插入 / 修改三处
+    # 一律只读，只能用系统自动生成的号）。
+    #
+    # 这里原本是 P2-2 那个「静默丢弃」的修复 —— 客户端 PUT 一个新号会拿到 200、
+    # 号却没变，所以当年人把它**实现**掉了。但实现出来的是一把没有护栏的刀：
+    # 号段是期间的顺序，手改一个号既可能撞唯一约束，也可能把整段号打乱。
+    # 生产上就是这么出的事 —— 优境 9 月那张 18 条分录的工资凭证，凭证号被人
+    # 在这个页面上改成 "wochakan"，凭证列表四种排序全部 500（排序键要对凭证号
+    # 做 CAST AS INTEGER），整月打不开，排查花了半小时才定位到一行脏数据。
+    #
+    # **明确拒绝**而不是静默忽略：静默忽略会让人以为改成功了（这正是 P2-2
+    # 当初要消灭的那种"返回成功却什么都没做"）。要改号请走「整理凭证」，
+    # 它会整体重排并留下审计。
+    new_no = svc_organize.normalize_no(payload.get("voucher_no"))
+    if new_no and new_no != voucher.voucher_no:
+        raise ValueError(
+            f"凭证号不能手工修改（{voucher.voucher_no} → {new_no}）。"
+            "凭证号由系统按期间自动生成；要调整号段请用「整理凭证」重排。"
+        )
 
     if "entries" in payload:
         entries = [
@@ -524,10 +663,19 @@ def _resolve_vouchers(db: Session, book_id: int, voucher_ids: list[int]) -> list
     另外顺带解决 P1-08：原来查不到就直接访问 ``vouchers[0]``，
     传不存在的 ID → IndexError → HTTP 500。500 会掩盖真实原因
     （是不存在？是无权？还是服务端坏了？），也不符合 API 契约。
+
+    ``selectinload(Voucher.entries)``：批量记账按 ``v.entries`` 逐张求借贷合计
+    （``post_vouchers``），裸 select 会让每张各发一条 ``SELECT ... WHERE
+    voucher_id=?`` —— 一次批量记账 = N 次往返。与凭证列表查询是同一个坑，
+    那边早就补过了（``query_vouchers`` 里的 selectinload，200 次往返的注释
+    还记着）。预载对不读分录的调用方（``unpost_vouchers``）只是多传一份
+    数据，语义不变：这里返回的还是同一批凭证对象，分录还是各自的那几条。
     """
     wanted = sorted(set(voucher_ids))
     rows = list(db.scalars(
-        select(Voucher).where(Voucher.id.in_(wanted), Voucher.book_id == book_id)
+        select(Voucher)
+        .options(selectinload(Voucher.entries))
+        .where(Voucher.id.in_(wanted), Voucher.book_id == book_id)
     ).all())
     found = {v.id for v in rows}
     missing = [i for i in wanted if i not in found]
@@ -656,8 +804,21 @@ DEFAULT_SORT = "no_desc"
 
 
 def _no_seq():
-    """凭证号里的序号，按整数排序用。解析不出序号时给 -1，让它排最前。"""
-    digits = func.regexp_replace(Voucher.voucher_no, "^[^\d]*(\d+)$", r"\1")
+    r"""凭证号里的序号，按整数排序用。解析不出序号时给 -1，让它排最前。
+
+    原来这里是 ``regexp_replace(no, '^[^\d]*(\d+)$', '\\1')``，看着有
+    ``coalesce`` 兜底，实际上**兜底是死的**：PostgreSQL 的 ``regexp_replace``
+    在**无匹配时返回原字符串**，不是 NULL。所以对 "wochakan" 这种一个数字
+    都没有的号，它原样返回 "wochakan"，紧接着 ``CAST(... AS INTEGER)`` 抛
+    ``invalid input syntax for type integer`` —— 外层的 coalesce 永远等不到
+    NULL。2026-10-19 生产事故：优境 9 月有一张凭证号被人工改成 "wochakan"，
+    凭证列表的**四种排序全部 500**（四种都带这个排序键），整月打不开。
+
+    ``substring(no from '(\d+)$')`` 才是这里该用的：它无匹配时返回 NULL，
+    ``cast`` 得到 NULL，``coalesce`` 终于能把它收成 -1。于是脏号只是排到
+    最前面（而且 create_voucher 已经在入口拦住了新脏号），不再拖垮整个列表。
+    """
+    digits = func.substring(Voucher.voucher_no, r"(\d+)$")
     return func.coalesce(func.cast(digits, Integer), -1)
 
 
@@ -725,6 +886,21 @@ def query_vouchers(
             )
         )
     if subject_id:
+        # **这里刻意只按 subject_id 过滤，不补 book_id。**
+        #
+        # 迁移 0011 的 docstring 建议补上 ``Entry.book_id == book_id``，
+        # 好让这条查询复用 ``ix_entry_subject_ord``（book_id, subject_id,
+        # period_ord）的前导列、从而不再需要 ``ix_entry_subject_voucher``。
+        # 那个建议**实测是错的**（见 0011 docstring 里补记的对照数据）：
+        # 外层是「账套下全部凭证」，内层这个子查询被当半连接探测 15,000 次。
+        #   * ``ix_entry_subject_voucher``（subject_id, voucher_id）
+        #     是 **Index Only Scan**，探测一次命中一条记录页，且能整体
+        #     物化成哈希半连接 → 17.3 ms
+        #   * ``ix_entry_subject_ord`` 是普通 **Index Scan**，每次探测都要
+        #     多走一次索引项比较（loops=15000） → **395.4 ms（慢 23 倍）**
+        #
+        # 「能复用别的索引」不等于「用那个索引更快」—— 半连接探测次数
+        # 才是这里的主导成本。
         stmt = stmt.where(Voucher.id.in_(select(Entry.voucher_id).where(Entry.subject_id == subject_id)))
     if min_amount is not None or max_amount is not None:
         # 「金额」筛的是**某一条分录**的金额，不是整张凭证的合计 ——

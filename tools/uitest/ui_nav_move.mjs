@@ -10,6 +10,9 @@ const step = async (n, f) => { try { await f(); console.log('✓', n) } catch (e
 await page.goto(BASE, { waitUntil: 'networkidle' })
 if (await page.locator('input[type=password]').count()) {
   await step('登录', async () => {
+    // 口令不再预填（见 LoginView.vue：生产登录页预填演示口令那次修复），
+    // 只点「登录」会停在登录页，.sidebar 永远等不到。
+    await page.fill('input[type=password]', process.env.CWQ_PASSWORD || '123456')
     await page.click('button:has-text("登录")')
     await page.waitForSelector('.sidebar', { timeout: 20000 })
     await page.waitForTimeout(800)

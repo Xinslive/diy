@@ -20,7 +20,7 @@ ALTER TABLE entry   ADD  CONSTRAINT ck_entry_direction CHECK (direction IN ('DEB
 ALTER TABLE voucher DROP CONSTRAINT IF EXISTS ck_voucher_status;
 ALTER TABLE voucher ADD  CONSTRAINT ck_voucher_status CHECK (status IN ('UNPOSTED','POSTED'));
 ALTER TABLE voucher DROP CONSTRAINT IF EXISTS ck_voucher_source;
-ALTER TABLE voucher ADD  CONSTRAINT ck_voucher_source CHECK (source IN ('MANUAL','IMPORT','CARRY_FORWARD'));
+ALTER TABLE voucher ADD  CONSTRAINT ck_voucher_source CHECK (source IN ('MANUAL','IMPORT','INVOICE','CARRY_FORWARD'));
 
 -- ---------- 1. 分录冗余列同步 ----------
 -- entry.book_id / entry.period_ord 由凭证派生，保证账簿聚合只需扫单表
@@ -980,3 +980,108 @@ BEGIN
         ADD CONSTRAINT fk_period_opening_subject
         FOREIGN KEY (subject_id) REFERENCES subject(id) ON DELETE RESTRICT;
 END $$;
+
+
+-- =====================================================================
+-- 账套数据版本号（2026-10 性能收尾 P0，与迁移 0015 同源）
+--
+-- **本段幂等**。
+--
+-- `LedgerEngine` 的聚合结果要被跨请求复用，就必须知道什么时候过期了。
+-- 判据是 `book.data_version`：任何影响聚合的写都在**同一个事务里**把它 +1，
+-- 引擎构造时**先读版本号**再拿它当缓存键。版本号只增不减，所以旧版本的
+-- 缓存键一旦失效就再也不会被读到 —— 于是「写提交之后开始的请求一定读到新数」
+-- 这个保证成立，且多个 worker 之间天然一致（版本号在库里，不在进程里）。
+--
+-- **为什么不用 TTL**：TTL 会让「用户刚记完账、刷新总账看到的还是旧数」
+-- 成为可能。README 的核心承诺是不存在报表与总账对不上的情况，
+-- 这条不能在缓存上打折。理由的完整版见
+-- `migrations/versions/0015_book_data_version.py` 的 docstring。
+--
+-- **为什么必须语句级**：行级触发器会在每写一行时执行一次，而 `book` 行
+-- 是整个账套共用的那一行 —— 一次 5000 行导入就是 5000 次排队等同一把锁。
+-- 语句级 + 过渡表是每条语句一次。
+--
+-- 每个 (表, 事件) 三个触发器不是啰嗦：INSERT 只能引 NEW TABLE、
+-- DELETE 只能引 OLD TABLE、UPDATE 两者皆可。过渡表在三个触发器里
+-- 都叫 `book_impact`，函数体因此可以只写一份。
+-- =====================================================================
+ALTER TABLE book ADD COLUMN IF NOT EXISTS data_version bigint NOT NULL DEFAULT 0;
+
+CREATE OR REPLACE FUNCTION fn_bump_book_data_version() RETURNS trigger AS $$
+DECLARE
+    v_book bigint;
+BEGIN
+    -- 一条语句理论上可以影响多个账套（跨账套批量操作），所以是 DISTINCT + 循环。
+    FOR v_book IN SELECT DISTINCT book_id FROM book_impact LOOP
+        UPDATE book SET data_version = data_version + 1 WHERE id = v_book;
+    END LOOP;
+    RETURN NULL;   -- 语句级触发器返回 NULL 表示「不中断」
+END;
+$$ LANGUAGE plpgsql;
+
+-- 幂等：先 DROP 再 CREATE，跑第二遍结果一致。
+DROP TRIGGER IF EXISTS trg_voucher_dv_ins ON voucher;
+DROP TRIGGER IF EXISTS trg_voucher_dv_upd ON voucher;
+DROP TRIGGER IF EXISTS trg_voucher_dv_del ON voucher;
+CREATE TRIGGER trg_voucher_dv_ins AFTER INSERT ON voucher
+    REFERENCING NEW TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+CREATE TRIGGER trg_voucher_dv_upd AFTER UPDATE ON voucher
+    REFERENCING OLD TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+CREATE TRIGGER trg_voucher_dv_del AFTER DELETE ON voucher
+    REFERENCING OLD TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+
+DROP TRIGGER IF EXISTS trg_entry_dv_ins ON entry;
+DROP TRIGGER IF EXISTS trg_entry_dv_upd ON entry;
+DROP TRIGGER IF EXISTS trg_entry_dv_del ON entry;
+CREATE TRIGGER trg_entry_dv_ins AFTER INSERT ON entry
+    REFERENCING NEW TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+CREATE TRIGGER trg_entry_dv_upd AFTER UPDATE ON entry
+    REFERENCING OLD TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+CREATE TRIGGER trg_entry_dv_del AFTER DELETE ON entry
+    REFERENCING OLD TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+
+DROP TRIGGER IF EXISTS trg_subject_dv_ins ON subject;
+DROP TRIGGER IF EXISTS trg_subject_dv_upd ON subject;
+DROP TRIGGER IF EXISTS trg_subject_dv_del ON subject;
+CREATE TRIGGER trg_subject_dv_ins AFTER INSERT ON subject
+    REFERENCING NEW TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+CREATE TRIGGER trg_subject_dv_upd AFTER UPDATE ON subject
+    REFERENCING OLD TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+CREATE TRIGGER trg_subject_dv_del AFTER DELETE ON subject
+    REFERENCING OLD TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+
+DROP TRIGGER IF EXISTS trg_period_opening_dv_ins ON period_opening;
+DROP TRIGGER IF EXISTS trg_period_opening_dv_upd ON period_opening;
+DROP TRIGGER IF EXISTS trg_period_opening_dv_del ON period_opening;
+CREATE TRIGGER trg_period_opening_dv_ins AFTER INSERT ON period_opening
+    REFERENCING NEW TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+CREATE TRIGGER trg_period_opening_dv_upd AFTER UPDATE ON period_opening
+    REFERENCING OLD TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+CREATE TRIGGER trg_period_opening_dv_del AFTER DELETE ON period_opening
+    REFERENCING OLD TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+
+DROP TRIGGER IF EXISTS trg_period_dv_ins ON period;
+DROP TRIGGER IF EXISTS trg_period_dv_upd ON period;
+DROP TRIGGER IF EXISTS trg_period_dv_del ON period;
+CREATE TRIGGER trg_period_dv_ins AFTER INSERT ON period
+    REFERENCING NEW TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+CREATE TRIGGER trg_period_dv_upd AFTER UPDATE ON period
+    REFERENCING OLD TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();
+CREATE TRIGGER trg_period_dv_del AFTER DELETE ON period
+    REFERENCING OLD TABLE AS book_impact FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_bump_book_data_version();

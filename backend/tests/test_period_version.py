@@ -27,6 +27,7 @@ from app.accounting.periods import (PeriodVersionConflict, batch_unclose,
                                     close_period, ensure_periods)
 from app.core.db import SessionLocal
 from app.models import Period, Subject, Voucher
+from tests.accounting_helpers import close_any
 
 
 def _period(db, book, month):
@@ -59,7 +60,7 @@ def test_版本不匹配时结账被拒且什么都没改(db, book, periods, adm
 
     before = _state(db, book)
     with pytest.raises(PeriodVersionConflict, match="已被他人操作"):
-        close_period(db, p, admin_user, expected_version=stale_version)
+        close_any(db, book, p, admin_user, expected_version=stale_version)
 
     db.rollback()
     assert _state(db, book) == before, "冲突之后数据库被改了"
@@ -73,9 +74,9 @@ def test_版本不匹配时反结账被拒且凭证不回退(db, book, periods, 
     """
     # 只用资产负债表科目（银行存款内部转账），不产生损益余额 ——
     # 否则结账会先被「还没结转损益」挡掉，测的就不是乐观锁了。
-    make_voucher("2026-03-10", dr=[("100201", 100, "x")],
-                 cr=[("100202", 100, "x")], posted=True)
-    close_period(db, _period(db, book, 3), admin_user)
+    make_voucher("2026-03-10", dr=[("1002", 100, "x")],
+                 cr=[("1012", 100, "x")], posted=True)
+    close_any(db, book, _period(db, book, 3), admin_user)
     db.commit()
     p = _period(db, book, 3)
     stale_version = p.version - 1
@@ -98,7 +99,7 @@ def test_版本不匹配时反结账被拒且凭证不回退(db, book, periods, 
 def test_版本一致时正常结账并递增(db, book, periods, admin_user):
     p = db.get(Period, periods[11].id)
     v = p.version
-    close_period(db, p, admin_user, expected_version=v)
+    close_any(db, book, p, admin_user, expected_version=v)
     db.expire_all()
     p2 = _period(db, book, 11)
     assert p2.locked is True
@@ -129,7 +130,7 @@ def test_结账读的是库里的状态而不是会话缓存(db, book, periods, 
     assert db.get(Period, p.id).locked is False, "前置：会话里应当是旧值"
 
     with pytest.raises(ValueError, match="已经结账"):
-        close_period(db, p, admin_user)
+        close_any(db, book, p, admin_user)
 
 
 def test_版本递增按库里的值算而不是会话缓存(db, book, periods, admin_user):
@@ -153,7 +154,7 @@ def test_版本递增按库里的值算而不是会话缓存(db, book, periods, 
     mid = _version(db, pid)
     assert mid == base + 1, "前置：别的会话已经 +1 过一次"
 
-    close_period(db, p, admin_user)
+    close_any(db, book, p, admin_user)
     after = _version(db, pid)
     assert after == base + 2, f"版本被覆盖了，期望 {base + 2}，实际 {after}"
 
@@ -161,7 +162,7 @@ def test_版本递增按库里的值算而不是会话缓存(db, book, periods, 
 def test_没带版本时不拦老调用方(db, book, periods, admin_user):
     """默认 None = 不比对：现有接口还没传这个参数，不能因此全打成 400。"""
     p = db.get(Period, periods[10].id)
-    close_period(db, p, admin_user)
+    close_any(db, book, p, admin_user)
     db.expire_all()
     assert _period(db, book, 10).locked is True
 

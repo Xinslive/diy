@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -18,6 +18,18 @@ from app.models.base import Base, TimestampMixin
 
 class ImportBatch(Base, TimestampMixin):
     __tablename__ = "import_batch"
+    __table_args__ = (
+        # 导入历史列表（api/vouchers.py：`WHERE book_id = ? ORDER BY id DESC
+        # LIMIT 100`）。等值列在前、排序/游标列在后，LIMIT 可以直接顺着
+        # 索引取满 100 行就停。
+        Index("ix_import_batch_book_id", "book_id", "id"),
+        # 过期批次清理（accounting/importer.py::purge_stale_batches）：
+        # `WHERE status = 'PENDING' AND created_at < ?`。
+        # 同样是等值在前、范围在后 —— 列序反过来就成了「扫 status 再滤时间」。
+        # 这张表单调增长（COMMITTED / DISCARDED 永不清理，为了留追溯），
+        # 清理入口每次都要在整张表上找陈年 PENDING。
+        Index("ix_import_batch_status_created_at", "status", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     book_id: Mapped[int] = mapped_column(ForeignKey("book.id", ondelete="CASCADE"), nullable=False)

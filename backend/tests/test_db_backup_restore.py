@@ -275,3 +275,121 @@ def test_roundtrip_recovers_actual_data(scratch_db):
         with src_eng.begin() as conn:
             conn.execute(text("DROP TABLE IF EXISTS restore_probe"))
         src_eng.dispose()
+
+# ---------------------------------------------------------------------------
+# 定时备份（2026-10 上线安全收尾）
+#
+# 原来备份只在发布流程里跑，于是「一个月不发版 = 一个月没有新备份」。
+# 加上 systemd timer 之后，dump 从「发布的一个步骤」变成了「每天都做的事」，
+# 而**每天都做的事必须自己管住自己** —— 这是下面这组用例的由来。
+# ---------------------------------------------------------------------------
+
+
+def test_备份失败时不留下会被误当成备份的文件(tmp_path, monkeypatch):
+    """**半截文件是最阴的那种失败。**
+
+    shell 重定向 `pg_dump > backup.sql` 会先把文件建出来，pg_dump 随后才跑。
+    客户端没装 / 口令错 / 磁盘满时，那个文件已经躺在目录里了：0 字节或半截，
+    文件名完全正常。保留策略一开，它就一直留到被轮转掉 ——
+    而某天有人拿它恢复，恢复「成功」了，库里是空的。
+
+    这与 --restore 那侧的 RestoreRefused 是同一个担心，所以两头都得防。
+    """
+    def boom(fh):
+        raise RuntimeError("pg_dump 根本没起来")
+
+    monkeypatch.setattr(db_backup, "dump_to", boom)
+    out = tmp_path / "db-2026-10-15.sql"
+    with pytest.raises(RuntimeError):
+        db_backup.dump_to_file(out)
+    assert not out.exists(), "备份失败了却留下了一个空壳文件冒充备份"
+    assert not list(tmp_path.glob("*.part")), "临时文件没清掉"
+
+
+def test_dump失败时退出码非零且不留临时文件(tmp_path, monkeypatch):
+    rc_holder = {}
+
+    def fake_dump_to(fh):
+        fh.write(b"-- partial dump")
+        rc_holder["rc"] = 1
+        return 1
+
+    monkeypatch.setattr(db_backup, "dump_to", fake_dump_to)
+    out = tmp_path / "db-2026-10-15.sql"
+    assert db_backup.dump_to_file(out) == 1
+    assert not out.exists()
+    assert not list(tmp_path.glob("*.part")), "临时文件没清掉 —— 下次会被当成备份"
+
+
+def test_成功时产出的是完整文件且无临时文件(tmp_path, monkeypatch):
+    payload = b"-- PostgreSQL database dump\n" + b"x" * 2000
+    monkeypatch.setattr(db_backup, "dump_to",
+                        lambda fh: (fh.write(payload), 0)[1])
+
+    out = tmp_path / "db-2026-10-15.sql"
+    assert db_backup.dump_to_file(out) == 0
+    assert out.read_bytes() == payload
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_产出文件权限是600(tmp_path, monkeypatch):
+    """备份是全量账务数据，不该对本机其他账号可读。
+
+    原来靠 umask 兜底 —— 而 umask 是调用方的运行环境决定的，默认 022
+    会把它落成 644。这台机器上跑着多个站点，任何本地账号（包括别的站点
+    的服务账号）都能读到凭证、科目和金额。所以权限要由备份自己钉死，
+    不能指望运行环境碰巧给个严的 umask。
+
+    断言的是**改名之后**的最终文件：``.part`` 改名成正式备份时是保留权限
+    位的，所以最终文件才是真正会被拿去恢复的那一份。
+    """
+    monkeypatch.setattr(db_backup, "dump_to",
+                        lambda fh: (fh.write(b"-- PostgreSQL database dump\n"), 0)[1])
+
+    out = tmp_path / "db-2026-10-17.sql"
+    assert db_backup.dump_to_file(out) == 0
+    mode = out.stat().st_mode & 0o777
+    assert mode == 0o600, f"备份落成了 {mode:o}，本机其他账号可读"
+
+
+def test_产出0字节按失败处理(tmp_path, monkeypatch):
+    """pg_dump 返回 0 却什么都没写 —— 极少发生，但发生时它返回 0。
+
+    只看退出码的话，这份「成功的 0 字节备份」会正常留在目录里，
+    名字规规矩矩，体积 0。恢复侧会拒掉它，但到那时数据已经没了。
+    """
+    monkeypatch.setattr(db_backup, "dump_to", lambda fh: (fh.write(b""), 0)[1])
+    out = tmp_path / "db-2026-10-16.sql"
+    assert db_backup.dump_to_file(out) != 0, "0 字节备份被当成成功了"
+    assert not out.exists()
+
+
+def test_保留策略只留最近N份(tmp_path, monkeypatch):
+    """没有保留策略的每日备份会慢慢把磁盘写满。
+
+    而磁盘写满之后下一个失败的就是**备份本身** —— 一个把自己搞挂的策略。
+    """
+    for d in range(1, 6):
+        p = tmp_path / f"db-2026-10-0{d}.sql"
+        p.write_bytes(b"dump")
+        # 显式设 mtime，保证排序稳定、不受文件系统时间精度影响
+        os.utime(p, (1_700_000_000 + d * 86400, 1_700_000_000 + d * 86400))
+
+    monkeypatch.setattr(db_backup, "dump_to", lambda fh: (fh.write(b"new"), 0)[1])
+    db_backup.dump_to_file(tmp_path / "db-2026-10-06.sql", keep=3)
+
+    left = sorted(p.name for p in tmp_path.glob("*.sql"))
+    assert left == ["db-2026-10-04.sql", "db-2026-10-05.sql", "db-2026-10-06.sql"], left
+
+
+def test_保留策略不删别的文件(tmp_path, monkeypatch):
+    """只删自己管的 .sql。备份目录里若有 backup.log，
+    按名字删的时候很容易把它一起清掉 —— 那正是唯一的历史记录。"""
+    (tmp_path / "backup.log").write_text("以前的日志，不能动")
+    for d in range(1, 4):
+        (tmp_path / f"db-2026-10-0{d}.sql").write_bytes(b"dump")
+
+    monkeypatch.setattr(db_backup, "dump_to", lambda fh: (fh.write(b"new"), 0)[1])
+    db_backup.dump_to_file(tmp_path / "db-2026-10-04.sql", keep=1)
+
+    assert (tmp_path / "backup.log").exists(), "保留策略把日志删了"

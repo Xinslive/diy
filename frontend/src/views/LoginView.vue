@@ -4,7 +4,7 @@
       <h1>财务记账系统</h1>
       <p class="muted">多账套 · 凭证 · 账簿 · 报表</p>
 
-      <el-tabs v-model="tab" stretch>
+      <el-tabs v-model="tab" stretch :class="{ 'tabs-single': !gate.showTabs }">
         <!-- ------------------------------------------------ 登录 -->
         <el-tab-pane label="登录" name="login">
           <el-form @submit.prevent="submitLogin">
@@ -19,18 +19,33 @@
               登录
             </el-button>
           </el-form>
-          <p class="hint muted">演示账号 admin / 123456</p>
+          <!-- 演示账号提示**只在开发构建里出现**。
+               它原先是无条件渲染的，于是生产站点 acct.xins.live 的登录页
+               公开写着「演示账号 admin / 123456」——等于替攻击者
+               念出管理员用户名，还顺带告诉他们这个站点的口令强度
+               就是六个数字。import.meta.env.DEV 由 vite 在
+               `vite build`（生产构建）时置为 false。
+
+               实测（构建后查 dist）：`isDev` 这个标识符被完全折掉，
+               产物里是 `username:""`，即预填也没有了；而那段提示文字
+               **仍然留在 chunk 里** —— vue 的模板编译把 `v-if` 编成
+               条件表达式，terser 不会把这个常量假分支删掉。
+               它不会被渲染（运行时恒为 false），但「产物里搜不到
+               演示口令」这句话是不成立的，别据它下结论。要连字面量
+               一起消失，得把提示文字挪出组件（例如放进 .env.local
+               之类的构建期变量），那是另一件事。 -->
+          <p v-if="isDev" class="hint muted">演示账号 admin / 123456</p>
         </el-tab-pane>
 
         <!-- ------------------------------------------------ 注册 -->
-        <el-tab-pane label="注册" name="register">
+        <!-- v-if 而不是只藏页签：管理员关掉自助注册后，页签栏里那个「注册」
+             必须整个消失，而不是留在那儿让人点了撞 403。判定见
+             utils/registration.js，后端闸门在 /api/auth/register。 -->
+        <el-tab-pane v-if="gate.showRegister" label="注册" name="register">
           <el-form @submit.prevent="submitRegister">
             <el-form-item>
-              <el-input v-model="reg.username" placeholder="用户名（3-32 位字母、数字或下划线）"
+              <el-input v-model="reg.username" placeholder="手机号（11 位）"
                         size="large" @keyup.enter="submitRegister" />
-            </el-form-item>
-            <el-form-item>
-              <el-input v-model="reg.real_name" placeholder="姓名（选填）" size="large" />
             </el-form-item>
             <el-form-item>
               <el-input v-model="reg.password" type="password" placeholder="密码（至少 8 位）"
@@ -44,9 +59,6 @@
               注册
             </el-button>
           </el-form>
-          <p class="hint muted">
-            注册只开账号，账套需要管理员在「用户与授权」里分配。
-          </p>
         </el-tab-pane>
       </el-tabs>
     </div>
@@ -54,11 +66,12 @@
 </template>
 
 <script setup>
-import { reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import * as authApi from '@/api/auth'
 import { useSessionStore } from '@/stores/session'
+import { registrationView } from '@/utils/registration'
 
 const store = useSessionStore()
 const router = useRouter()
@@ -66,10 +79,37 @@ const router = useRouter()
 const tab = ref('login')
 const busy = ref(false)
 
-const username = ref('admin')
-const password = ref('123456')
+// 自助注册是否开放。**初值是 false**：接口还没回来之前（或者请求失败），
+// 登录页只显示登录。反过来先显示再撤，页面会闪一下，而且网络抖动时可能闪完
+// 就留在那儿 —— 一个没人确认过状态的安全相关入口，不该先亮出来。
+const registrationEnabled = ref(false)
+const gate = computed(() => registrationView(registrationEnabled.value, tab.value))
 
-const reg = reactive({ username: '', real_name: '', password: '', confirm: '' })
+// 管理员把开关关掉时，正停在「注册」页的人要立刻被拉回登录页，
+// 否则他会看到一张没有页签栏的空白注册表单。
+watch(() => gate.value.tab, (t) => { if (t !== tab.value) tab.value = t })
+
+// 开发构建才有的便利（预填演示账号 + 显示提示）。
+// 生产构建里 isDev 恒为 false，于是：用户名不预填、口令不预填、提示不渲染。
+//
+// **口令原来无条件预填 `123456`。** 生产站点的登录框打开就是
+// 「admin / ••••••」，点一下登录按钮就等于把这套弱口令递出去。
+// 就算部署时把口令改掉了，这个预填仍然在替攻击者省掉输入成本，
+// 而且任何一次「重置成默认值」都会直接变成一次公网沦陷。
+const isDev = import.meta.env.DEV
+
+const username = ref(isDev ? 'admin' : '')
+const password = ref('')
+
+// 自助注册的「用户名」就是手机号：11 位大陆号码（1 开头，第二位 3-9）。
+//
+// 这条**只是前端的约定，不是服务端强制的**：后端 `RegisterIn.username`
+// 仍然是 `^[A-Za-z0-9_]{3,32}$`，手机号本来就落在里面，所以以前后不用改
+// 接口就能收号码。别把这里的正则当成安全边界 —— 真要只收手机号，得在
+// schemas.py 里收紧 pattern，那会连带改掉若干以用户名当标识的测试。
+const PHONE_RE = /^1[3-9]\d{9}$/
+
+const reg = reactive({ username: '', password: '', confirm: '' })
 
 const err = (e, fallback) => e?.response?.data?.detail || fallback
 
@@ -87,9 +127,10 @@ async function submitLogin() {
 }
 
 async function submitRegister() {
-  // 前端先拦一道：后端 pydantic 也会校验，但当场提示比等一次往返舒服
-  if (!/^[A-Za-z0-9_]{3,32}$/.test(reg.username))
-    return ElMessage.warning('用户名需为 3-32 位字母、数字或下划线')
+  // 前端先拦一道：当场提示比等一次往返舒服
+  const phone = reg.username.trim()
+  if (!PHONE_RE.test(phone))
+    return ElMessage.warning('请输入 11 位手机号')
   if (reg.password.length < 8)
     return ElMessage.warning('密码至少 8 位')
   if (reg.password !== reg.confirm)
@@ -97,16 +138,17 @@ async function submitRegister() {
 
   busy.value = true
   try {
+    // 刻意不发 real_name：空姓名由后端兜成「会计」（见 app/api/auth.py
+    // 的 register）。默认值放在服务端，脚本和将来的调用方拿到同一个口径。
     await authApi.register({
-      username: reg.username,
-      password: reg.password,
-      real_name: reg.real_name.trim()
+      username: phone,
+      password: reg.password
     })
     ElMessage.success('注册成功，请登录；登录后联系管理员分配账套')
     // 切回登录页并把用户名带过去，省得再输一遍
-    username.value = reg.username
+    username.value = phone
     password.value = ''
-    Object.assign(reg, { username: '', real_name: '', password: '', confirm: '' })
+    Object.assign(reg, { username: '', password: '', confirm: '' })
     tab.value = 'login'
   } catch (e) {
     ElMessage.error(err(e, '注册失败'))
@@ -114,6 +156,16 @@ async function submitRegister() {
     busy.value = false
   }
 }
+onMounted(async () => {
+  try {
+    const cfg = await authApi.publicConfig()
+    registrationEnabled.value = !!cfg?.registration_enabled
+  } catch {
+    // 保持 false。登录不受影响 —— 注册入口少一个，总比在没确认过状态时
+    // 把一个匿名入口亮出来要好。
+    registrationEnabled.value = false
+  }
+})
 </script>
 
 <style scoped>
@@ -129,4 +181,7 @@ h1 { font-size: 22px; margin: 0 0 4px; }
 p { margin: 0 0 12px; font-size: 13px; }
 .hint { text-align: center; font-size: 12px; margin: 12px 0 0; line-height: 1.6; }
 :deep(.el-tabs__header) { margin-bottom: 18px; }
+/* 关掉自助注册后只剩「登录」一个页签，那一行页签栏没有信息量，
+   去掉它，登录表单直接顶上来（见 utils/registration.js 的 showTabs）。 */
+.tabs-single :deep(.el-tabs__header) { display: none; }
 </style>

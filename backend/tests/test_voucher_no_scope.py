@@ -24,6 +24,10 @@
 被吃掉的就是实打实的一位数字，于是 ``int("00") + 1 = 1`` → 记001。
 
 所以这条不是「需复核」，是**确认缺陷**，而且审计低估了范围。
+
+补零位数 2026-10-16 由三位改回四位（``organize.NO_WIDTH``），所以**发出去的号**
+现在是「记0001」这一路；下面表格里的期望值是当年（三位）的记录，留着是为了对照
+「修复前发错成什么样」—— 现在同样的输入会发成记0010、记0100 这样。
 """
 from __future__ import annotations
 
@@ -66,19 +70,19 @@ def _sid(db, book, code):
 
 
 @pytest.mark.parametrize("existing,expect", [
-    ([], "记001"),
-    (["记001"], "记002"),
-    (["记009"], "记010"),            # 审计里「看起来对」的那行
-    (["记099"], "记100"),
-    (["记100"], "记101"),            # ← 修复前发出 记001
-    (["记199"], "记200"),            # ← 修复前发出 记100
-    (["记998"], "记999"),
-    (["记999"], "记1000"),           # ← 修复前发出 记100
+    ([], "记0001"),
+    (["记001"], "记0002"),
+    (["记009"], "记0010"),           # 审计里「看起来对」的那行
+    (["记099"], "记0100"),
+    (["记100"], "记0101"),           # ← 修复前发出 记001
+    (["记199"], "记0200"),           # ← 修复前发出 记100
+    (["记998"], "记0999"),
+    (["记999"], "记1000"),           # ← 修复前发出 记100（1000 本来就够四位）
     (["记1000"], "记1001"),          # ← 修复前发出 记001
-    (["记001", "记002", "记010"], "记011"),
-    (["记100", "记99"], "记101"),    # ← 修复前发出 记010
-    (["记009", "记0100"], "记101"),  # 混宽度：按数值取最大，不是按字符串
-    (["记007", "记008", "记009"], "记010"),   # 删过中间的号，仍按最大值续
+    (["记001", "记002", "记010"], "记0011"),
+    (["记100", "记99"], "记0101"),   # ← 修复前发出 记010
+    (["记009", "记0100"], "记0101"), # 混宽度：按数值取最大，不是按字符串
+    (["记007", "记008", "记009"], "记0010"), # 删过中间的号，仍按最大值续
 ])
 def test_按数值取下一个号(db, seed, period, existing, expect):
     seed(existing)
@@ -96,13 +100,13 @@ def test_各种前缀宽度都按传入的前缀发号(db, seed, period, prefix)
     自带凭证号 —— 非标准前缀在真实数据里确实存在。
     """
     seed([f"{prefix}009"])
-    assert next_voucher_no(db, period, prefix) == f"{prefix}010"
+    assert next_voucher_no(db, period, prefix) == f"{prefix}0010"
 
 
 def test_前缀一字且序号三位时不丢位(db, seed, period):
     """修复前：``银100`` → substring 得 "00" → 发出 银001。"""
     seed(["银100"])
-    assert next_voucher_no(db, period, "银") == "银101"
+    assert next_voucher_no(db, period, "银") == "银0101"
 
 
 # --------------------------------------------------------------------- 手工号
@@ -115,12 +119,12 @@ def test_手工号不参与发号(db, seed, period):
     但 ``记-2`` 会被当成序号 2 → 发出 记003。
     """
     seed(["记-2", "记-年结"])
-    assert next_voucher_no(db, period) == "记001"
+    assert next_voucher_no(db, period) == "记0001"
 
 
 def test_手工号与自动号混存时以自动号为准(db, seed, period):
     seed(["记-9", "记005", "2026年终"])
-    assert next_voucher_no(db, period) == "记006"
+    assert next_voucher_no(db, period) == "记0006"
 
 
 # --------------------------------------------------------------------- 与落库一致
@@ -141,14 +145,14 @@ def test_连续发号不撞号(db, book, period, admin_user):
         used.append(no)
         v = create_voucher(db, book_id=book.id, user=admin_user,
                            voucher_date=date(2026, 2, 10), entries=[
-                               {"subject_id": _sid(db, book, "100201"),
+                               {"subject_id": _sid(db, book, "1002"),
                                 "direction": "DEBIT", "amount": "10", "summary": "x"},
-                               {"subject_id": _sid(db, book, "600101"),
+                               {"subject_id": _sid(db, book, "5001"),
                                 "direction": "CREDIT", "amount": "10", "summary": "x"},
                            ], voucher_no=no, commit=True)
         assert v.voucher_no == no
-    assert used[:3] == ["记001", "记002", "记003"]
-    assert used[-1] == "记012"
+    assert used[:3] == ["记0001", "记0002", "记0003"]
+    assert used[-1] == "记0012"
 
 
 def test_只发号不落库不会跳号(db, period):
@@ -157,5 +161,5 @@ def test_只发号不落库不会跳号(db, period):
     前端「下一个号码」预览和真正落库走的是同一个函数（api/vouchers.py），
     用户在预览和保存之间再点一次别的菜单是很常见的。
     """
-    assert next_voucher_no(db, period) == "记001"
-    assert next_voucher_no(db, period) == "记001"
+    assert next_voucher_no(db, period) == "记0001"
+    assert next_voucher_no(db, period) == "记0001"

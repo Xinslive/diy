@@ -8,20 +8,115 @@ Type=simple
 User=cwq
 Group=cwq
 WorkingDirectory=/opt/cwq/backend
+# worker 进程数。**默认值 = 2**，与这里原来写死的 `--workers 2` 完全一致 ——
+# 这次只是让它可配，容量要不要动是另一件事（要拿 CPU 核数与并发数据说话）。
+#
+# 为什么写成变量而不是把它留在 ExecStart 里：同一个数在 deploy/systemd 和
+# backend/Dockerfile 里各写死一份，改一处忘一处就会出现「systemd 4 个、
+# Docker 2 个」，而两边连的是同一个 uvicorn 进程模型。
+#
+# **ExecStart 不走 shell**，所以 `${VAR:-2}` 那种「带兜底值」的写法不存在 ——
+# systemd 只认自己的变量展开，而**未定义的变量会展开成空字符串**（不是保留
+# 原样）。所以这里用 Environment= 给死默认值，再用 EnvironmentFile 让运维覆盖：
+#   * Environment= 必须写在 EnvironmentFile= **之前**。systemd >= 250 是
+#     「后写的覆盖先写的」，< 250 是「文件无条件覆盖 Environment=」——
+#     放在前面，两种版本下结论一致：都是 .env 说了算。
+#   * .env 里没有这一项时，用的仍然是这里的 2，不会展开成空。
+# 名字带 CWQ_ 前缀是为了和 .env 里其它应用侧配置区分开：这个变量是
+# **给 systemd 读的**，config.py 里没有、也不应该有对应字段（Python 那边
+# 读不到它，留一个读不到的配置项比没有更危险）。
+Environment=CWQ_API_WORKERS=2
 EnvironmentFile=/opt/cwq/backend/.env
 Environment=TZ=Asia/Shanghai
-ExecStart=/opt/cwq/backend/.venv/bin/uvicorn app.main:app \
-    --host 127.0.0.1 --port 8000 \
-    --workers 2 --timeout-keep-alive 120
+# 只做一件事：把「.env 里把这一项清空了」这种手滑，从「uvicorn 收到空的
+# --workers 参数、Restart=always 无限重启刷日志」变成一条看得懂的启动失败。
+ExecStartPre=/bin/sh -c 'case "$CWQ_API_WORKERS" in ""|*[!0-9]*|0) echo "CWQ_API_WORKERS 必须是正整数（.env 里不能把它清空）" >&2; exit 1;; esac'
+# schema/数据库预检，与开发环境 dev.sh 调的是**同一个入口**。
+#
+# 为什么生产也要有这一道（2026-10-17）：开发环境用 --reload，schema 闸门在
+# uvicorn 的 startup 里拦人，拦下来的形态是「reloader 父进程还握着 :8000 的
+# LISTEN 套接字、worker 已退出、于是没人 accept」—— 连接能建、请求永不
+# 应答、SIGTERM 还杀不掉它（父进程阻塞在 os_waitpid，收不到那个让它退出的
+# Event）。那个形态在日志里只有一行 SchemaVersionError，而在外面看就是
+# 「服务挂了但端口还在」。
+#
+# 生产这里虽然**没有 --reload**（走 --workers），但闸门放在 startup 里仍有一个
+# 真实的代价：失败时 systemd 看到的是「进程反复退出」，配 Restart=always
+# 就是每 3 秒刷一轮，而真实原因埋在日志中段。放在 ExecStartPre 里，失败会
+# 变成一条明确的启动失败，日志里紧挨着原因与该执行的命令。
+#
+# 退出码是有含义的，systemd 的日志能直接分辨处置方向：
+#   3 = schema 版本对不上 → 跑 alembic upgrade head（或 stamp，见报错文案）
+#   4 = 数据库连不上     → 查 postgresql.service / 网络 / 连接串
+# 它**不执行任何 DDL**：建表改表只由 Alembic 负责，启动路径只做版本检查。
+ExecStartPre=/opt/cwq/backend/.venv/bin/python scripts/preflight.py
+ExecStart=/opt/cwq/backend/.venv/bin/python scripts/start_server.py \
+    --server uvicorn --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=3
 
-# 财务系统只读自己的代码目录，能写的地方只有日志
+# ---------------------------------------------------------------------------
+# 文件描述符上限（2026-10-15 压测基线后补）
+# ---------------------------------------------------------------------------
+# 这个数**不是随手写的**，它要同时盖住三样东西，取它们的最大值再加余量：
+#   * nginx upstream keepalive 32（cwq.conf 里每个 worker 进程持有）
+#   * 数据库连接 2 ×(pool_size 5 + max_overflow 10) = 30
+#   * 每个入站 HTTP 连接本身也要占一个 fd
+# systemd 的默认值是 1024，而 **LimitNOFILE 是硬上限，不是软限**：
+# 超了进程报 EMFILE，日志里表现为
+# ``OSError: [Errno 24] Too many open files`` 或 uvicorn 直接退出重启，
+# 很容易被误判成「服务不稳定」而查不到根因。
+#
+# **这里原来还有一行 LimitNOFILESoft=8192，它在 systemd 上是「未知键、
+# 静默忽略」** —— systemd-analyze verify 会报
+# ``Unknown key 'LimitNOFILESoft' in section [Service], ignoring.``，
+# 而 `systemctl show` 一切正常，于是没人会发现。
+#
+# 不需要它：**LimitNOFILE= 在 systemd < 254 上同时设置软限与硬限**。
+# 本机（Debian 12 / systemd 252.39）实测，cwq-api 进程的
+# ``/proc/<pid>/limits`` 是 ``Max open files 8192 8192`` —— 两档都是 8192。
+# 原文注释里「要调软限得在 Limits 里一起给 LimitNOFILE= 与 LimitNOFILESoft=」
+# 这条说法对 systemd 252 是错的，删掉这个键没有损失任何东西。
+LimitNOFILE=8192
+
+# 内存软上限：让 cgroup 的内存压力先在 API 上表现出来（内核回收、
+# 分配失败），而不是整机耗尽后由 OOM killer 在**几个进程里随机挑一个**杀。
+# 挑到 postgresql 后果更糟：数据库被杀会让未提交事务回滚、连接被断开，
+# 而挑到 API 只是 503。设一个明显高于实测（API 稳态约 220 MB）的上限，
+# 目的不是限流，而是让「要出事时先出谁」这件事是确定的。
+#
+# 注意：OOM 优先杀的是 cgroup 内 **占用最多的**进程，所以这个值必须留够
+# 余量，否则它挡不住 OOM killer 去动 PG —— 真要保护 PG，正确的做法是
+# 给 postgres 单独的 systemd 单元加 MemoryMax，而不是给 API 加。
+# 见 deploy/tuning.md。
+# MemoryMax=768M
+
+# 财务系统只读代码目录；运行时目录包含发票和可信插件包、journal 备份。
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/cwq/backend/logs
+# ---- 可写白名单：加一个配置项就可能要动这一行（2026-10-19 补 backups） ----
+#
+# `ProtectSystem=strict` 把整棵 /opt 挂成只读，本行是**例外清单**。
+# 规则只有一条，且与写的是相对路径还是绝对路径有关：
+#
+#   * **相对路径**（如 INVOICE_STORAGE_DIR=data/invoices）落在 WorkingDirectory
+#     之下，即 backend/data —— 已被本行覆盖，**加配置时不用动这里**。
+#   * **绝对路径且在应用树之外**（如 CWQ_BACKUP_WORK_DIR=/opt/cwq/backups/work）
+#     —— **必须在这里显式列出**，漏了就是只读文件系统。
+#
+# 漏掉之后的形态特别难认，所以这一行值得写清楚：它在**写文件那一刻**才失败，
+# 而那一刻鉴权、解析、落库都已经过了。更糟的是它发生在凌晨定时任务里 ——
+# OSS 备份是应用内调度器（task_key=system:oss_backup）在**这个进程里**跑的，
+# 不是另一个 systemd 单元，于是 journal 里只有一条 OSError，没人看；
+# 从外面看是「页面一切正常，只是备份静悄悄地不产出了」。
+# 判据只能是在服务自己的 mount 命名空间里试写（服务外写总是成功）：
+#   PID=$(systemctl show -p MainPID --value cwq-api)
+#   nsenter -t "$PID" -m -- mount | grep -E 'ro|rw'
+#
+# **同一个键只能写一次**（重复赋值是后者覆盖前者），所以所有路径写在同一行。
+ReadWritePaths=/opt/cwq/backend/logs /opt/cwq/backend/data /opt/cwq/backups
 StandardOutput=append:/opt/cwq/backend/logs/api.log
 StandardError=append:/opt/cwq/backend/logs/api.err.log
 

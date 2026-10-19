@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -137,8 +137,14 @@ def drop_demo(db) -> None:
 
 def build(db, user: SysUser) -> Book:
     # start_year 是这套账的**起始**年度（年度结转只往后追加，不新建账套）
+    # init_subjects_at 直接给上：这个脚本造的账套是「已经装好标准科目表、
+    # 也已经有期初」的完成态。不给的话，界面上它会挂着一个「待初始化」标记，
+    # 而点进去会发现第 2 步早就做完了 —— 状态与事实对不上。
     book = Book(company_name="启明物业管理有限公司", name=BOOK_NAME,
-                start_year=YEAR, start_month=1)
+                start_year=YEAR, start_month=1,
+                init_subjects_at=datetime.now(timezone.utc),
+                init_subjects_source="CHART",
+                init_openings_at=datetime.now(timezone.utc))
     db.add(book)
     db.flush()
     create_periods(db, book)

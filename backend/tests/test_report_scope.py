@@ -32,6 +32,11 @@ def _tpl_id(db, code: str) -> int:
 
 
 def cells(data: dict) -> dict[str, list]:
+    """利润表这类**单栏**表用：label -> [项目, 本期金额, 本年累计]。
+
+    资产负债表是一行两栏（左右各一个项目），这张字典会把两半撞进同一个 key，
+    取值必须按列号 + 那一半的项目名来 —— 见 test_builtin_reports.py 里的 at()。
+    """
     return {r["label"]: [c["value"] for c in r["cells"]] for r in data["rows"]}
 
 
@@ -50,8 +55,8 @@ def _carry_forward_january(db, book, periods, subjects, admin_user, make_voucher
     from app.accounting.vouchers import post_vouchers
     from app.models import Voucher
 
-    make_voucher("2026-01-10", dr=[("100201", 10000, "收租")],
-                 cr=[("600101", 10000, "收租")], posted=True)
+    make_voucher("2026-01-10", dr=[("1002", 10000, "收租")],
+                 cr=[("5001", 10000, "收租")], posted=True)
     carry_forward_profit(db, book.id, periods[1], admin_user)
     ids = [x.id for x in db.scalars(select(Voucher).where(
         Voucher.book_id == book.id, Voucher.source == "CARRY_FORWARD",
@@ -77,7 +82,7 @@ def test_利润表本期金额与总账本期贷方差一个结转全额(
 
     _carry_forward_january(db, book, periods, subjects, admin_user, make_voucher)
     sid = db.scalar(select(Subject.id).where(
-        Subject.book_id == book.id, Subject.code == "600101"))
+        Subject.book_id == book.id, Subject.code == "5001"))
 
     ledger = LedgerEngine.for_ledger(db, book.id, False).figures(sid, periods[1].ord)
     report = LedgerEngine.for_report(db, book.id, False).figures(sid, periods[1].ord)
@@ -99,7 +104,7 @@ def test_利润表本期金额与总账本期贷方差一个结转全额(
 
 def test_结转之前两个口径完全相等(db, book, periods, subjects, admin_user, make_voucher):
     """没结转就没有差额 —— 标注必须只在真有差额时出现，否则是噪音。"""
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")],
+    make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")],
                  posted=True)
     data = evaluate(db, _tpl_id(db, "INCOME_SHEET"), book, periods[1], False)
     assert data["carry_forward_period_amount"] is None
@@ -126,8 +131,9 @@ def test_输出带上前端标注所需的口径信号(db, book, periods, subjec
     assert pf_cols == [2, 3], pf_cols
     assert data["notices"][0]["cols"] == [2, 3]
 
-    # 资产负债表只有余额口径，不该被标成「排除结转」
+    # 资产负债表只有余额口径（双栏 8 列，左右各一对期末/年初），不该被标成「排除结转」
     bs = evaluate(db, _tpl_id(db, "BALANCE_SHEET"), book, periods[1], False)
+    assert len(bs["cols"]) == 8, [c["col_no"] for c in bs["cols"]]
     assert [c["col_no"] for c in bs["cols"] if c["excludes_carry_forward"]] == []
 
 
@@ -135,7 +141,7 @@ def test_未记账的结转凭证不计入损益(db, book, periods, subjects, ad
     """已结转但**没记账**的结转凭证仍然不进报表 —— 与总账口径保持一致。"""
     from app.accounting.periods import carry_forward_profit
 
-    make_voucher("2026-01-10", dr=[("100201", 1000, "x")], cr=[("600101", 1000, "x")],
+    make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")],
                  posted=True)
     carry_forward_profit(db, book.id, periods[1], admin_user)   # 故意不记账
     db.commit()
@@ -159,20 +165,34 @@ def test_会让渲染500的公式存不进去(client, auth, book, db, bad):
 
     现在在**保存**这一层就变成 400 + 一句能照着改的中文 ——
     语法检查放在写入口，而不是指望渲染期逐格兜住。
+
+    写坏公式的格子选第 2 行 / 第 3 列：双栏版式里第 2 列是**行次**列
+    （LINE_NO，本来就不该有公式），只有数值列才是这条护栏真正的对象。
+
+    先 fork 一份归属 ``book``：模板按账套隔离（迁移 0020）之后内置基线
+    是**只读**的，直接拿它当靶子会拿到 404 —— 那条用例要验的是「语法检查
+    拦不拦」，不是「基线能不能改」，靶子必须换成账套自己的副本。
     """
-    tpl = db.scalar(select(ReportTemplate).where(ReportTemplate.code == "BALANCE_SHEET"))
+    baseline = db.scalar(select(ReportTemplate).where(
+        ReportTemplate.code == "BALANCE_SHEET", ReportTemplate.book_id.is_(None)))
+    forked = client.post(f"/api/reports/templates/{baseline.id}/fork?book_id={book.id}",
+                         headers=auth)
+    assert forked.status_code == 201, forked.text
+    tpl_id = forked.json()["id"]
+
+    tpl = db.get(ReportTemplate, tpl_id)
     cell = db.scalar(select(ReportCell).where(
-        ReportCell.template_id == tpl.id, ReportCell.row_no == 2, ReportCell.col_no == 2))
+        ReportCell.template_id == tpl.id, ReportCell.row_no == 2, ReportCell.col_no == 3))
     old = cell.formula
     try:
         r = client.put(f"/api/reports/{tpl.id}/cells?book_id={book.id}", headers=auth,
-                       json=[{"row_no": 2, "col_no": 2, "formula": bad}])
+                       json=[{"row_no": 2, "col_no": 3, "formula": bad}])
         assert r.status_code == 400, f"拿到 {r.status_code}，这正是审计说的 500 前身"
         detail = r.json()["detail"]
-        assert "第 2 行 / 2 列" in detail and len(detail) > 12, detail
+        assert "第 2 行 / 3 列" in detail and len(detail) > 12, detail
         db.expire_all()
         again = db.scalar(select(ReportCell).where(
-            ReportCell.template_id == tpl.id, ReportCell.row_no == 2, ReportCell.col_no == 2))
+            ReportCell.template_id == tpl.id, ReportCell.row_no == 2, ReportCell.col_no == 3))
         assert again.formula == old, "400 了却还是把坏公式存了进去"
     finally:
         cell.formula = old
@@ -188,7 +208,7 @@ def test_位数离谱的四舍五入存得进但渲染时报人话(client, auth,
     """
     tpl = db.scalar(select(ReportTemplate).where(ReportTemplate.code == "BALANCE_SHEET"))
     cell = db.scalar(select(ReportCell).where(
-        ReportCell.template_id == tpl.id, ReportCell.row_no == 2, ReportCell.col_no == 2))
+        ReportCell.template_id == tpl.id, ReportCell.row_no == 2, ReportCell.col_no == 3))
     old = cell.formula
     cell.formula = "四舍五入(1,999999999)"
     db.commit()
@@ -200,10 +220,12 @@ def test_位数离谱的四舍五入存得进但渲染时报人话(client, auth,
         assert data["formula_error_free"] is False
         assert any("位数 999999999 超出范围（-15 ~ 15）" in e for e in data["errors"]), \
             data["errors"]
-        # 受影响的那一格显示 null + 文案，其余格子照常有数
-        row2 = data["rows"][1]
-        assert row2["cells"][1]["value"] is None
-        assert "超出范围" in row2["cells"][1]["error"]
+        # 受影响的那一格显示 null + 文案，其余格子照常有数。
+        # 按 col_no 找而不是按下标：第 3 列在下标 2，0 基下标早晚会跟列号错开一格。
+        row2 = next(r for r in data["rows"] if r["row_no"] == 2)
+        bad_cell = next(c for c in row2["cells"] if c["col_no"] == 3)
+        assert bad_cell["value"] is None
+        assert "超出范围" in bad_cell["error"]
     finally:
         cell.formula = old
         db.commit()
@@ -216,7 +238,7 @@ def test_渲染期遇到坏公式是那一格报错而不是整张表500(client,
     """
     tpl = db.scalar(select(ReportTemplate).where(ReportTemplate.code == "BALANCE_SHEET"))
     cell = db.scalar(select(ReportCell).where(
-        ReportCell.template_id == tpl.id, ReportCell.row_no == 2, ReportCell.col_no == 2))
+        ReportCell.template_id == tpl.id, ReportCell.row_no == 2, ReportCell.col_no == 3))
     old = cell.formula
     cell.formula = "四舍五入(1,999999999)"
     db.commit()
@@ -227,8 +249,9 @@ def test_渲染期遇到坏公式是那一格报错而不是整张表500(client,
     data = r.json()
     assert data["formula_error_free"] is False
     assert any("位数" in e for e in data["errors"]), data["errors"]
-    # 其余格子照常有数
-    assert data["rows"] and len(data["rows"][0]["cells"]) == 3
+    # 其余格子照常有数。资产负债表是双栏 8 列（一行两栏），不是当年那张 3 列的竖排表
+    assert data["rows"] and len(data["rows"][0]["cells"]) == 8
+    assert len(data["cols"]) == 8
 
     cell.formula = old
     db.commit()
@@ -256,7 +279,9 @@ def test_首期的上期必须报错而不是静默返回本期(db, book, period
     try:
         data = evaluate(db, tpl.id, book, periods[1], False)
         row = next(r for r in data["rows"] if r["row_no"] == 2)
-        target = row["cells"][2]
+        # 第 3 列 = 资产侧的「期末余额」。按 col_no 找而不是按下标：
+        # 资产负债表已经是一行两栏的 8 列了，靠下标猜列迟早会猜错半边。
+        target = next(c for c in row["cells"] if c["col_no"] == 3)
         assert target["value"] is None
         assert "没有「上期」可取" in target["error"], target["error"]
         # 其余格子不受影响
@@ -272,9 +297,9 @@ def test_非首期的上期照常取上一期(db, book, periods, subjects, make_
     """第二期起 {{上期}} 指向第一期 —— 修首期不能把正常的上期也修坏。"""
     from app.reports.evaluate import EvalContext
 
-    make_voucher("2026-01-10", dr=[("1001", 500, "x")], cr=[("600101", 500, "x")],
+    make_voucher("2026-01-10", dr=[("1001", 500, "x")], cr=[("5001", 500, "x")],
                  posted=True)
-    make_voucher("2026-02-10", dr=[("1001", 700, "x")], cr=[("600101", 700, "x")],
+    make_voucher("2026-02-10", dr=[("1001", 700, "x")], cr=[("5001", 700, "x")],
                  posted=True)
 
     ctx = EvalContext(db, book, periods[2], {})
@@ -300,7 +325,7 @@ def test_不再叫balanced_改叫formula_error_free(db, book, periods):
 
     # 有公式出错时它必须是 false —— 语义确实是「无公式错误」而不是「两平」
     cell = db.scalar(select(ReportCell).where(
-        ReportCell.template_id == tid, ReportCell.row_no == 2, ReportCell.col_no == 2))
+        ReportCell.template_id == tid, ReportCell.row_no == 2, ReportCell.col_no == 3))
     old = cell.formula
     cell.formula = "科目(\"不存在的科目\",\"期末\",{{本期}})"
     db.commit()

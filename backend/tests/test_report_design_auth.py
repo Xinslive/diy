@@ -20,29 +20,75 @@
 """
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from fastapi.routing import APIRoute
 from sqlalchemy import select
 
 from app.core.deps import get_current_user
-from app.models import ReportTemplate
+from app.models import ReportCell, ReportCol, ReportRow, ReportTemplate
 
 _REPORTS_PREFIX = "/api/reports"
 
 
 # ------------------------------------------------------------------ 夹具
+#
+# 这里有两种模板，**别混用**：
+#
+# * ``tpl_id`` —— 官方内置基线（``book_id IS NULL``）。所有账套共看同一份，
+#   而且只读。它是「读」这件事的正当对象，也是 400「内置报表不能直接改」
+#   的触发对象。
+# * ``owned_tpl_id`` —— 归属 ``book`` 的副本。写接口只认这一种。
+#
+# 写接口拿基线去调会拿到 400（基线是公开的，回一句「去设计模式改副本」
+# 不泄露任何新信息）。但对「验证门禁**放行**」的用例来说那仍然是「什么都没
+# 验成」，所以验放行必须用 ``owned_tpl_id``。
 
 @pytest.fixture
 def tpl_id(db, book):
-    """拿一张真实存在的内置模板 id。
+    """一张真实存在的**官方内置基线** id。
 
     用真实 id 是为了让「匿名 200」这条复现有意义：拿不存在的 id 时，
     鉴权没过会返回 401、过了才返回 404，两条路径容易混。
+
+    显式按 ``book_id IS NULL`` 取，别只按 code：某个账套 fork 之后库里
+    会有同 code 的副本，按 code 取可能拿到副本，测的就不是基线版式了。
     """
-    _ = book  # 写接口那条用例要用写权限，这里先把账套准备好
-    tid = db.scalar(select(ReportTemplate.id).where(ReportTemplate.code == "BALANCE_SHEET"))
+    _ = book  # 读接口现在必须带 book_id，这里先把账套准备好
+    tid = db.scalar(select(ReportTemplate.id).where(
+        ReportTemplate.code == "BALANCE_SHEET", ReportTemplate.book_id.is_(None)))
     assert tid, "内置资产负债表模板没建出来，种子数据有问题"
     return tid
+
+
+@pytest.fixture
+def owned_tpl_id(db, book, tpl_id):
+    """一张归属 ``book`` 的资产负债表副本，供写接口使用。
+
+    模板按账套隔离（迁移 0020）之后，写路径只接受归属当前账套的模板，
+    所以**造夹具时必须带上 ``book_id=book.id``** —— 不带的话造出来的是
+    只读基线，后续每一步写操作都会 404。
+    """
+    tag = uuid.uuid4().hex[:8]
+    t = ReportTemplate(code=f"TEST_{tag}", book_id=book.id, name=f"测试报表{tag}",
+                       type="CUSTOM", remark="")
+    db.add(t)
+    db.flush()
+    # 骨架照抄基线：门禁用例只关心「能不能改」，不关心表长什么样，
+    # 但沿用真实版式能让坐标（行 2 / 列 3 是数值列）读起来不费解释。
+    for r in db.scalars(select(ReportRow).where(ReportRow.template_id == tpl_id)).all():
+        db.add(ReportRow(template_id=t.id, row_no=r.row_no, label=r.label,
+                         indent=r.indent, bold=r.bold, hidden=r.hidden, style=r.style))
+    for c in db.scalars(select(ReportCol).where(ReportCol.template_id == tpl_id)).all():
+        db.add(ReportCol(template_id=t.id, col_no=c.col_no, label=c.label,
+                         kind=c.kind, hidden=c.hidden, width=c.width))
+    for c in db.scalars(select(ReportCell).where(ReportCell.template_id == tpl_id)).all():
+        db.add(ReportCell(template_id=t.id, row_no=c.row_no, col_no=c.col_no,
+                          formula=c.formula))
+    db.commit()
+    db.refresh(t)
+    return t.id
 
 
 # ------------------------------------------------------- 静态守卫：漏挂就红
@@ -129,15 +175,16 @@ def test_无效令牌同样读不到(client, db, tpl_id):
 
 # ------------------------------------------------------ 动态：登录后照常
 
-def test_登录后仍然能读模板列表(client, auth, db, tpl_id):
-    r = client.get("/api/reports/templates", headers=auth)
-    assert r.status_code == 200
+def test_登录后仍然能读模板列表(client, auth, db, book, tpl_id):
+    """``book_id`` 现在是**必填**：列表靠它判断哪些模板对这个账套可见。"""
+    r = client.get(f"/api/reports/templates?book_id={book.id}", headers=auth)
+    assert r.status_code == 200, r.text
     assert any(x["code"] == "BALANCE_SHEET" for x in r.json())
 
 
-def test_登录后仍然能读模板设计(client, auth, db, tpl_id):
-    r = client.get(f"/api/reports/{tpl_id}/design", headers=auth)
-    assert r.status_code == 200
+def test_登录后仍然能读模板设计(client, auth, db, book, tpl_id):
+    r = client.get(f"/api/reports/{tpl_id}/design?book_id={book.id}", headers=auth)
+    assert r.status_code == 200, r.text
     data = r.json()
     assert data["rows"] and data["cols"], "登录后却读不到行列，矫枉过正把功能也堵了"
     assert any(c["formula"] for c in data["cells"]), "单元格公式读不到了"
@@ -171,18 +218,23 @@ def test_只要有一个账套授权就能读(client, plain_auth, db, book, plai
 
     db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="VIEWER"))
     db.commit()
-    assert client.get("/api/reports/templates", headers=plain_auth).status_code == 200
-    assert client.get(f"/api/reports/{tpl_id}/design", headers=plain_auth).status_code == 200
+    assert client.get(f"/api/reports/templates?book_id={book.id}",
+                      headers=plain_auth).status_code == 200
+    assert client.get(f"/api/reports/{tpl_id}/design?book_id={book.id}",
+                      headers=plain_auth).status_code == 200
 
 
-# ---------------------------------------------- P1-5：全局模板写入 fail-closed
+# ---------------------------------------------- P1-5：模板写入 fail-closed
 #
 # 审计场景：用户在账套 B 是会计、在账套 A 是**只读**。
-# 报表模板没有 book_id、却是所有账套共用的，而旧的 ``_can_write`` 在
+# 报表模板当时没有 book_id、却是所有账套共用的，而旧的 ``_can_write`` 在
 # **缺省 book_id** 时退化成「该用户在任意账套非 VIEWER」——
 # 于是不带 book_id 就能改写出账套 A 也在用的公式与打印模板。
 #
-# 现在两道闸都必须是 fail-closed 的：显式目标账套 + 该账套 OWNER。
+# 迁移 0020 之后模板有了归属，门禁多了一条：**写路径只接受归属当前账套的
+# 模板**（基线只读、回 400 讲清怎么改，别人的模板一律 404）。但底下那两道
+# 闸没变，也仍然必须 fail-closed：显式目标账套 + 该账套 OWNER。
+# 「收紧不许收紧到把账锁死」——OWNER 显式指定账套必须照常能改。
 
 
 def _two_books(client, auth, db, plain_user):
@@ -212,38 +264,60 @@ def _two_books(client, auth, db, plain_user):
 
 
 def test_不带账套不能建模板(client, plain_auth, db, plain_user, auth, tpl_id):
-    """审计的复现路径：不带 book_id 就该被挡下，而不是「任一可写账套」放行。"""
+    """审计的复现路径：不带 book_id 就该被挡下，而不是「任一可写账套」放行。
+
+    状态码是 422 而不是 400，原因值得记一笔：``create_template`` 挂着
+    ``get_my_book``，而它把 ``book_id`` 声明成必填查询参数，于是请求在
+    **进函数体之前**就被 FastAPI 挡下了 —— 函数体里那句带解释文案的 400
+    （``_require_template_write``）在这条路由上压根走不到。
+    不挂 ``get_my_book`` 的写路由（cells / rows / patch / import…）拿到的是 400。
+    两种都算「被挡下」，所以这里按集合断言；真正不能松的是「一个都没建出来」。
+    """
     a_id, b_id = _two_books(client, auth, db, plain_user)
     before = len(db.scalars(select(ReportTemplate)).all())
 
     r = client.post("/api/reports/templates", headers=plain_auth,
                     json={"name": "跨账套偷改", "base_code": "BALANCE_SHEET"})
-    assert r.status_code == 400, (
+    assert r.status_code in (400, 422), (
         f"拿到 {r.status_code}：全局模板的门只看了一个无关账套的角色")
-    assert "book_id" in r.json()["detail"], r.json()
+    assert "book_id" in str(r.json()["detail"]), r.json()
     db.expire_all()
     assert len(db.scalars(select(ReportTemplate)).all()) == before, "居然真的建出来了"
 
 
 def test_只读账套不能建模板(client, plain_auth, db, plain_user, auth, tpl_id):
-    """显式指向只读的那个账套 —— 必须 403，且理由说清是全局口径。"""
+    """显式指向只读的那个账套 —— 必须 403，且理由说清是**本账套的口径**。
+
+    文案随隔离改过：模板不再是全局口径，所以说的是「本账套的口径，
+    只有账套所有者或管理员可以修改」。断言跟着改，但 403 本身没变。
+    """
     a_id, b_id = _two_books(client, auth, db, plain_user)
     r = client.post(f"/api/reports/templates?book_id={a_id}", headers=plain_auth,
                     json={"name": "改只读账套的表", "base_code": "BALANCE_SHEET"})
     assert r.status_code == 403, f"拿到 {r.status_code}：{r.text[:200]}"
-    assert "全局口径" in r.json()["detail"], r.json()
+    assert "本账套的口径" in r.json()["detail"], r.json()
 
 
-def test_会计在B也不能改全局模板(client, plain_auth, db, plain_user, auth, tpl_id):
-    """会计改全局公式也不行 —— 与打印侧（OWNER 才放行）对齐。"""
+def test_会计在B也不能建模板(client, plain_auth, db, plain_user, auth, tpl_id):
+    """会计建模板也不行 —— 与打印侧（OWNER 才放行）对齐。
+
+    以前这条叫「会计改全局模板」；模板有了归属之后要改的始终是
+    **本账套自己那份**，所以「改全局」这个说法已经不成立，名字一并改掉 ——
+    留着会让人以为这里还有一张全局表。
+    """
     a_id, b_id = _two_books(client, auth, db, plain_user)
     r = client.post(f"/api/reports/templates?book_id={b_id}", headers=plain_auth,
-                    json={"name": "会计改全局表", "base_code": "BALANCE_SHEET"})
+                    json={"name": "会计建表", "base_code": "BALANCE_SHEET"})
     assert r.status_code == 403, f"拿到 {r.status_code}：{r.text[:200]}"
 
 
 def test_所有者显式指定账套就能改(client, plain_auth, db, plain_user, auth, tpl_id):
-    """收紧只针对「全局且无主」：OWNER 显式指定账套必须照常能改，否则等于把账锁死。"""
+    """收紧只针对「无归属却无主」：OWNER 显式指定账套必须照常能改，否则等于把账锁死。
+
+    注意「改公式」那一步打的是**刚建出来的那张**（它一出生就归属
+    ``own_book``），不是内置基线：基线只读，打它只会拿到 400，
+    那样这条用例就变成在验「基线不可写」，而它本来要验的是「OWNER 能写」。
+    """
     r = client.post("/api/books", headers=plain_auth,
                     json={"company_name": "自有公司", "name": "自有账套", "start_year": 2026})
     assert r.status_code == 201, r.text   # 自己建的账套自动是 OWNER
@@ -252,20 +326,28 @@ def test_所有者显式指定账套就能改(client, plain_auth, db, plain_user
     r = client.post(f"/api/reports/templates?book_id={own_book}", headers=plain_auth,
                     json={"name": "所有者建表", "base_code": "BALANCE_SHEET"})
     assert r.status_code == 201, f"OWNER 也被挡住了：{r.status_code} {r.text[:200]}"
+    own_tpl = r.json()["id"]
 
     # 改了公式同样放行
-    r = client.put(f"/api/reports/{tpl_id}/cells?book_id={own_book}", headers=plain_auth,
-                   json=[{"row_no": 2, "col_no": 2, "formula": "1+1"}])
+    r = client.put(f"/api/reports/{own_tpl}/cells?book_id={own_book}", headers=plain_auth,
+                   json=[{"row_no": 2, "col_no": 3, "formula": "1+1"}])
     assert r.status_code == 200, f"OWNER 改不了公式：{r.status_code} {r.text[:200]}"
 
 
-def test_改公式同样要求显式账套(client, plain_auth, db, plain_user, auth, tpl_id):
-    """门禁覆盖**每一个**写入口，不只是新建。"""
-    before = client.get(f"/api/reports/{tpl_id}/design", headers=auth).json()["cells"]
+def test_改公式同样要求显式账套(client, plain_auth, db, plain_user, auth, book, tpl_id):
+    """门禁覆盖**每一个**写入口，不只是新建。
+
+    拿 ``book`` 归属的那张副本当靶子：门禁的作用发生在查模板之前，
+    所以「不带 book_id 就该 400」这条与靶子归属无关，但带上 ``book_id``
+    去读前后公式才读得到，才能验「公式真的没被改」。
+    """
+    before = client.get(f"/api/reports/{tpl_id}/design?book_id={book.id}",
+                        headers=auth).json()["cells"]
     r = client.put(f"/api/reports/{tpl_id}/cells", headers=plain_auth,
-                   json=[{"row_no": 2, "col_no": 2, "formula": "1"}])
+                   json=[{"row_no": 2, "col_no": 3, "formula": "1"}])
     assert r.status_code == 400, f"拿到 {r.status_code}：{r.text[:200]}"
-    after = client.get(f"/api/reports/{tpl_id}/design", headers=auth).json()["cells"]
+    after = client.get(f"/api/reports/{tpl_id}/design?book_id={book.id}",
+                       headers=auth).json()["cells"]
     assert before == after, "公式居然被改了"
 
 
@@ -273,7 +355,7 @@ def test_改公式同样要求显式账套(client, plain_auth, db, plain_user, a
 
 def test_匿名改不了公式(client, db, tpl_id):
     r = client.put(f"/api/reports/{tpl_id}/cells",
-                   json=[{"row_no": 2, "col_no": 2, "formula": "=A1+1"}])
+                   json=[{"row_no": 2, "col_no": 3, "formula": "=A1+1"}])
     assert r.status_code == 401, f"匿名改公式拿到 {r.status_code}"
 
 

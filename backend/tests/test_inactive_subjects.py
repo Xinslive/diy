@@ -21,6 +21,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
+from tests.accounting_helpers import close_any
 from app.accounting.periods import (carry_forward_profit, close_period,
                                     year_end_carry)
 from app.ledger import queries
@@ -37,7 +38,7 @@ def _close_year(db, book, periods, admin_user):
             carry_forward_profit(db, book.id, period, admin_user)
         except ValueError:
             pass          # 该月没损益，跳过
-        close_period(db, period, admin_user)
+        close_any(db, book, period, admin_user)
 
 
 def _deactivate(db, subject):
@@ -72,9 +73,9 @@ def test_停用科目年度结转后次年期初仍有余额(db, book, periods, 
     前置条件先钉死：停用前该科目 12 月确实有 300 的借方余额。
     少了这一步，结转没带上余额也会「因为本来就是 0」而通过。
     """
-    make_voucher("2026-03-10", dr=[("100201", 300, "x")],
-                 cr=[("600101", 300, "x")], posted=True)
-    target = subjects["100201"]
+    make_voucher("2026-03-10", dr=[("1002", 300, "x")],
+                 cr=[("5001", 300, "x")], posted=True)
+    target = subjects["1002"]
     assert _closing(db, book, target.id, _dec26_ord(db, book)) == Decimal("300"), \
         "前置条件不成立：停用前该科目应当有 300 余额"
 
@@ -90,16 +91,16 @@ def test_停用科目年度结转后次年期初仍有余额(db, book, periods, 
 def test_停用科目次年账簿余额连续(db, book, periods, subjects,
                                 admin_user, make_voucher):
     """不止期初快照：次年账簿算出来的期初也必须连得上。"""
-    make_voucher("2026-03-10", dr=[("100201", 300, "x")],
-                 cr=[("600101", 300, "x")], posted=True)
-    _deactivate(db, subjects["100201"])
+    make_voucher("2026-03-10", dr=[("1002", 300, "x")],
+                 cr=[("5001", 300, "x")], posted=True)
+    _deactivate(db, subjects["1002"])
     _close_year(db, book, periods, admin_user)
 
     year_end_carry(db, book, admin_user, from_year=2026, new_year=2027)
 
     jan27 = db.scalar(select(Period).where(
         Period.book_id == book.id, Period.year == 2027, Period.month == 1))
-    figures = LedgerEngine(db, book.id).figures(subjects["100201"].id, jan27.ord)
+    figures = LedgerEngine(db, book.id).figures(subjects["1002"].id, jan27.ord)
     assert figures.opening == Decimal("300")
 
 
@@ -108,21 +109,21 @@ def test_停用科目次年账簿余额连续(db, book, periods, subjects,
 
 def test_科目树包含停用科目(db, book, subjects):
     """历史余额得在树上看得见，否则用户以为账丢了。"""
-    _deactivate(db, subjects["100201"])
+    _deactivate(db, subjects["1002"])
     codes = {s.code for s in queries.subject_tree(db, book.id)}
-    assert "100201" in codes, "停用科目从科目树里消失了，历史余额在界面上查不到"
+    assert "1002" in codes, "停用科目从科目树里消失了，历史余额在界面上查不到"
 
 
 def test_账簿引擎默认科目集包含停用科目(db, book, subjects, make_voucher):
     """不指定科目集合时，引擎默认只算在用科目 —— 报表总额会偏小。"""
-    make_voucher("2026-03-10", dr=[("100201", 300, "x")],
-                 cr=[("600101", 300, "x")], posted=True)
-    _deactivate(db, subjects["100201"])
+    make_voucher("2026-03-10", dr=[("1002", 300, "x")],
+                 cr=[("5001", 300, "x")], posted=True)
+    _deactivate(db, subjects["1002"])
     db.expire_all()
 
     figures = LedgerEngine(db, book.id).compute(None, _dec26_ord(db, book))
-    assert subjects["100201"].id in figures, "引擎默认科目集漏掉了停用科目"
-    assert figures[subjects["100201"].id].closing == Decimal("300")
+    assert subjects["1002"].id in figures, "引擎默认科目集漏掉了停用科目"
+    assert figures[subjects["1002"].id].closing == Decimal("300")
 
 
 # ---------------------------------------------- 结账校验与损益结转
@@ -134,23 +135,23 @@ def test_停用的损益科目有余额时不允许结账(db, book, periods, sub
 
     后果是账结平了、期间锁了，损益却还留在科目上跨年。
     """
-    make_voucher("2026-05-10", dr=[("6602", 500, "x")],
-                 cr=[("100201", 500, "x")], posted=True)
-    _deactivate(db, subjects["6602"])
+    make_voucher("2026-05-10", dr=[("560206", 500, "x")],
+                 cr=[("1002", 500, "x")], posted=True)
+    _deactivate(db, subjects["560206"])
 
     dec = db.get(Period, periods[12].id)
     with pytest.raises(ValueError) as e:
-        close_period(db, dec, admin_user)
-    assert "6602" in str(e.value), (
+        close_any(db, book, dec, admin_user)
+    assert "560206" in str(e.value), (
         f"报错里应当点名那个停用但仍有余额的损益科目，实际：{e}")
 
 
 def test_停用的收入科目仍然参与结转损益(db, book, periods, subjects,
                                        admin_user, make_voucher):
     """结转损益的科目集合漏掉停用收入 → 收入留在科目上不结转，本年利润算错。"""
-    make_voucher("2026-05-10", dr=[("100201", 800, "x")],
-                 cr=[("600101", 800, "x")], posted=True)
-    _deactivate(db, subjects["600101"])
+    make_voucher("2026-05-10", dr=[("1002", 800, "x")],
+                 cr=[("5001", 800, "x")], posted=True)
+    _deactivate(db, subjects["5001"])
     may = db.get(Period, periods[5].id)
 
     carry_forward_profit(db, book.id, may, admin_user)
@@ -160,7 +161,7 @@ def test_停用的收入科目仍然参与结转损益(db, book, periods, subjec
     # 只查 period_cr 会被「结转凭证没生成」和「生成方向反了」一起放过去，
     # 所以查净额。
     figures = LedgerEngine(db, book.id, include_unposted=True).figures(
-        subjects["600101"].id, may.ord)
+        subjects["5001"].id, may.ord)
     assert figures.closing == Decimal("0"), (
         f"停用收入科目没被结转，期末仍挂着 {figures.closing}"
         f"（借 {figures.period_dr} / 贷 {figures.period_cr}）")
@@ -173,14 +174,14 @@ def test_停用的收入科目仍然参与结转损益(db, book, periods, subjec
 
 def test_期初页要能看见停用科目(client, auth, db, book, periods, subjects):
     """否则年度结转刷出来的次年期初，用户在页面上根本看不到。"""
-    _deactivate(db, subjects["100201"])
+    _deactivate(db, subjects["1002"])
     p1 = db.get(Period, periods[1].id)
 
     r = client.get(f"/api/books/{book.id}/openings?period_id={p1.id}", headers=auth)
     assert r.status_code == 200, r.text
 
     codes = {s["code"] for s in r.json()["subjects"]}
-    assert "100201" in codes, (
+    assert "1002" in codes, (
         "期初页看不到停用科目，年度结转刷出来的期初在界面上是隐形的")
 
 
@@ -192,11 +193,11 @@ def test_期初页加载再保存不会删掉停用科目的期初(client, auth,
     """
     p1 = db.get(Period, periods[1].id)
     db.add(PeriodOpening(book_id=book.id, period_id=p1.id,
-                         subject_id=subjects["100201"].id, amount=Decimal("100")))
+                         subject_id=subjects["1002"].id, amount=Decimal("100")))
     db.add(PeriodOpening(book_id=book.id, period_id=p1.id,
-                         subject_id=subjects["600101"].id, amount=Decimal("-100")))
+                         subject_id=subjects["5001"].id, amount=Decimal("-100")))
     db.commit()
-    _deactivate(db, subjects["100201"])
+    _deactivate(db, subjects["1002"])
 
     r = client.get(f"/api/books/{book.id}/openings?period_id={p1.id}", headers=auth)
     assert r.status_code == 200, r.text
@@ -213,7 +214,7 @@ def test_期初页加载再保存不会删掉停用科目的期初(client, auth,
 
     amt = db.scalar(select(PeriodOpening.amount).where(
         PeriodOpening.period_id == p1.id,
-        PeriodOpening.subject_id == subjects["100201"].id))
+        PeriodOpening.subject_id == subjects["1002"].id))
     assert amt == Decimal("100"), (
         f"停用科目的期初在「加载→保存」往返后变成了 {amt}，100 不见了")
 
@@ -223,15 +224,15 @@ def test_期初页加载再保存不会删掉停用科目的期初(client, auth,
 
 def test_停用科目不能记新凭证(client, auth, db, book, periods, subjects):
     """读路径放开 ≠ 写路径放开。停用科目的闸门一旦撤掉，这个修复就是反的。"""
-    _deactivate(db, subjects["100201"])
+    _deactivate(db, subjects["1002"])
     p = db.get(Period, periods[3].id)
 
     r = client.post(f"/api/books/{book.id}/vouchers", headers=auth, json={
         "period_id": p.id, "voucher_date": "2026-03-15",
         "entries": [
-            {"subject_id": subjects["100201"].id, "direction": "DEBIT",
+            {"subject_id": subjects["1002"].id, "direction": "DEBIT",
              "amount": "50", "summary": "x"},
-            {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+            {"subject_id": subjects["5001"].id, "direction": "CREDIT",
              "amount": "50", "summary": "x"},
         ]})
     assert r.status_code == 400, f"停用科目竟然能记新凭证：{r.status_code} {r.text}"
@@ -242,11 +243,11 @@ def test_期初余额导出与页面口径一致(client, auth, db, book, periods
     """页面看得见、导出看不见 → 用户核对时只会以为导出坏了。"""
     p1 = db.get(Period, periods[1].id)
     db.add(PeriodOpening(book_id=book.id, period_id=p1.id,
-                         subject_id=subjects["100201"].id, amount=Decimal("100")))
+                         subject_id=subjects["1002"].id, amount=Decimal("100")))
     db.add(PeriodOpening(book_id=book.id, period_id=p1.id,
-                         subject_id=subjects["600101"].id, amount=Decimal("-100")))
+                         subject_id=subjects["5001"].id, amount=Decimal("-100")))
     db.commit()
-    _deactivate(db, subjects["100201"])
+    _deactivate(db, subjects["1002"])
 
     r = client.get(f"/api/books/{book.id}/openings.xlsx?period_id={p1.id}", headers=auth)
     assert r.status_code == 200, r.text
@@ -255,7 +256,7 @@ def test_期初余额导出与页面口径一致(client, auth, db, book, periods
     from openpyxl import load_workbook
     ws = load_workbook(io.BytesIO(r.content)).active
     codes = [str(row[0].value) for row in ws.iter_rows(min_row=2) if row[0].value]
-    assert "100201" in codes, f"期初导出少了停用科目：{codes}"
+    assert "1002" in codes, f"期初导出少了停用科目：{codes}"
 
 
 def test_期初余额导出再解析能认回停用科目(client, auth, db, book, periods, subjects):
@@ -266,11 +267,11 @@ def test_期初余额导出再解析能认回停用科目(client, auth, db, book
     """
     p1 = db.get(Period, periods[1].id)
     db.add(PeriodOpening(book_id=book.id, period_id=p1.id,
-                         subject_id=subjects["100201"].id, amount=Decimal("100")))
+                         subject_id=subjects["1002"].id, amount=Decimal("100")))
     db.add(PeriodOpening(book_id=book.id, period_id=p1.id,
-                         subject_id=subjects["600101"].id, amount=Decimal("-100")))
+                         subject_id=subjects["5001"].id, amount=Decimal("-100")))
     db.commit()
-    _deactivate(db, subjects["100201"])
+    _deactivate(db, subjects["1002"])
 
     xlsx = client.get(f"/api/books/{book.id}/openings.xlsx?period_id={p1.id}",
                       headers=auth).content
@@ -281,7 +282,7 @@ def test_期初余额导出再解析能认回停用科目(client, auth, db, book
     assert r.status_code == 200, r.text
     body = r.json()
 
-    row = next((x for x in body["rows"] if x["code"] == "100201"), None)
+    row = next((x for x in body["rows"] if x["code"] == "1002"), None)
     assert row is not None, f"导出的文件解析不回来，停用科目被当成不存在：{body['rows']}"
     assert not row["error"], f"停用科目被误判为错误：{row['error']}"
-    assert row["subject_id"] == subjects["100201"].id
+    assert row["subject_id"] == subjects["1002"].id

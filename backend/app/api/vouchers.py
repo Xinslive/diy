@@ -21,18 +21,21 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import func, select, tuple_
+from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.accounting import importer as svc_import
 from app.accounting import organize as svc_organize
 from app.accounting import vouchers as svc
-from app.accounting.util import find_period
+from app.accounting.util import find_period, money
 from app.api.schemas import BatchIds, VoucherIn
 from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
-from app.core.uploads import UploadTooLarge, read_upload
+# 本地别名保持函数名 ``read_upload`` 不变：``tests/test_upload_capacity_matrix.py``
+# 按这个名字守「每个上传入口都调了共享容量闸」，而这里要的其实是它的同步版
+# ``uploads.read_upload_sync``（端点已改成同步 ``def``，不能再 await）。
+from app.core.uploads import UploadTooLarge, read_upload_sync as read_upload
 from app.models import (Book, Entry, ImportBatch, Period, Subject, SysUser,
                      UserBook, Voucher)
 
@@ -123,7 +126,22 @@ def create(payload: VoucherIn, book: Book = Depends(get_my_book), db: Session = 
             db, book_id=book.id, user=user, voucher_date=payload.voucher_date,
             entries=[e.model_dump() for e in payload.entries], remark=payload.remark,
             attachments=payload.attachments, source=payload.source,
-            voucher_no=payload.voucher_no, insert_after_id=payload.insert_after,
+            # ``voucher_no`` 刻意**不传**。用户 2026-10-19 定的口径是凭证号
+            # 一律自动生成：新增页、插入页、修改页三处都只读。号由服务端决定
+            # —— 插入走 ``insert_slot``（占参照的号或参照号 +1），普通新增走
+            # ``next_voucher_no``。客户端传什么都不采信，光改前端等于没关。
+            #
+            # 导入是**另一个入口**（``importer.commit`` 直接调服务层，不经过
+            # 这里），那里的号来自 Excel，经 ``require_no`` 归一后入库。
+            voucher_no=None,
+            insert_after_id=payload.insert_after,
+            insert_position=payload.insert_position,
+            # ``internal`` 刻意**不传**：它是「系统自己生成的凭证」的唯一入口
+            # （结转损益 / 年度结转在 periods.py 里以 internal=True 调本函数）。
+            # 这里传下去的任何东西都来自请求体，所以 source 只能取
+            # ``VoucherIn`` 那个封闭的 Literal —— CARRY_FORWARD 已经不在里面，
+            # 客户端提交它会直接 422。更新走 PUT 的那条路同样改不了 source：
+            # ``update_voucher`` 只认日期、分录、备注、附单据数。
         )
     except (ValueError, ArithmeticError) as e:
         db.rollback()
@@ -303,12 +321,24 @@ def import_template(book: Book = Depends(get_my_book)):
 
 
 @router.post("/import")
-async def upload_import(file: UploadFile = File(...), book: Book = Depends(get_my_book),
-                        db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
-                        user: SysUser = Depends(get_current_user)):
-    """上传并解析，暂存待确认。不写任何凭证。"""
-    if not (file.filename or "").lower().endswith((".xlsx", ".xlsm")):
-        raise HTTPException(400, "只支持 .xlsx 格式（另存为 xlsx 后重试）")
+def upload_import(file: UploadFile = File(...), book: Book = Depends(get_my_book),
+                  db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
+                  user: SysUser = Depends(get_current_user)):
+    """上传并解析，暂存待确认。不写任何凭证。
+
+    **同步端点，刻意如此**（审计严重 1）：全仓 100+ 个端点里只有它和
+    ``openings/parse`` 是 ``async def``。``async def`` 端点直接跑在事件循环线程上，
+    而这里是**同步**的 openpyxl（``svc_import.stage`` → ``load_workbook``）加
+    **同步**的 psycopg Session —— 一次 20MB / 2 万行的导入能把整个 worker 的
+    事件循环堵死数秒，期间该 worker 上所有请求（含所有同步端点的依赖解析）一起排队，
+    而 CPU 占用并不高。改成 ``def`` 之后 FastAPI 把它丢进 anyio 线程池，
+    阻塞的是线程池线程，全仓其余端点本来就是这么跑的。
+    """
+    # .xls 是用友等旧系统导出的 OLE 复合文档，openpyxl 读不了 —— service 层按
+    # 文件内容把它分流给 xlrd（和科目表、期初余额表共用同一个分流器）。这里只
+    # 挡明显不是表格的后缀，真正读不读得开由解析器说了算。
+    if not (file.filename or "").lower().endswith((".xls", ".xlsx", ".xlsm")):
+        raise HTTPException(400, "只支持 .xls 或 .xlsx 格式的凭证表（用友导出的 .xls 可直接导入）")
     # 容量闸住在共享工具里（审计 P1-4 / P2-02）。原来是 ``file.file.read()`` ——
     # 无参数意味着「有多少读多少」，Nginx 那条 50m 只是最后一道闸，而它是**请求体**
     # 限制：压缩过的上传、拆成多次的请求都能绕过，而且解析器拿到之后
@@ -317,7 +347,7 @@ async def upload_import(file: UploadFile = File(...), book: Book = Depends(get_m
     # 第二、三道闸（zip 中央目录声明的解压体积、遍历过程中的行数）在 service 层，
     # 与期初余额解析共用同一套 —— 两处曾是同一种入口的两种长法。
     try:
-        data = await read_upload(file)
+        data = read_upload(file)
         batch = svc_import.stage(db, book.id, user, file.filename, data)
     except UploadTooLarge as e:
         # 413 而不是 400：文件太大是「换个更小的再来」，不是参数写错了。
@@ -331,6 +361,10 @@ async def upload_import(file: UploadFile = File(...), book: Book = Depends(get_m
         "errors": batch.payload.get("errors", []),
         "unknown_subjects": batch.payload.get("unknown_subjects", {}),
         "unknown_headers": batch.payload.get("unknown_headers", []),
+        # 这份表是不是按用友序时账的排版读的、有没有跳过表尾的合计行。
+        # 「合计」行被跳过时用户该知道 —— 否则他会以为表里没这行数据。
+        "journal": bool(batch.payload.get("journal")),
+        "footer_rows": int(batch.payload.get("footer_rows") or 0),
     }
 
 
@@ -369,8 +403,35 @@ def list_imports(book: Book = Depends(get_my_book), db: Session = Depends(get_db
 @router.post("/import/{batch_id}/commit")
 def commit_import(batch_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                   _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
-    batch = db.get(ImportBatch, batch_id)
-    if batch is None or batch.book_id != book.id:
+    """确认入库。**批次行必须锁住再读状态** —— 这是并发提交的唯一闸门。
+
+    原来这里是裸的 ``db.get(ImportBatch, batch_id)``：无锁，读出来的
+    ``status`` 是**那一刻**的快照。两个并发的 ``POST /import/{id}/commit``
+    （用户手快按了两次双击；或者一个人提交、另一个人同时点了确认）会双双读到
+    PENDING，双双通过 ``importer.commit`` 里的 ``status != "PENDING"`` 检查。
+
+    表里**带凭证号**时，``uq_voucher_period_no`` 会把第二边顶回去（响亮地失败，
+    至少不会脏）；但工作簿常常不带号（``importer`` 里是
+    ``row_no or None``），这时两边各自 ``next_voucher_no`` 取「本期最大号 +1」。
+    READ COMMITTED 下第二个事务看得见第一个刚提交的凭证，于是拿到**另一个**号
+    —— 约束不触发，两批凭证安静地重复入库，而 ``committed_count`` 还各自
+    报「成功导入 N 张」。用户点一次确认，账上多出两份。
+
+    ``with_for_update()`` 把两个提交在**同一个事务里**串起来：后到的那个
+    一直等到前一个提交完，锁释放时重新读到 COMMITTED，
+    ``importer.commit`` 抛的 ValueError 由下面的 except 翻成 400
+    「该导入批次已是「COMMITTED」状态，不能重复提交」。锁一直持有到
+    ``importer.commit`` 内部的 ``db.commit()``（失败路径是 ``db.rollback()``），
+    正是本路由稍后提交的那一个事务 —— 锁提前释放或释放得太晚都不对。
+
+    与 ``periods.py`` / ``organize.py`` 的写法一致：先锁后算。
+    """
+    batch = db.scalar(
+        select(ImportBatch)
+        .where(ImportBatch.id == batch_id, ImportBatch.book_id == book.id)
+        .with_for_update()
+    )
+    if batch is None:
         raise HTTPException(404, "导入批次不存在")
     try:
         result = svc_import.commit(db, batch, user)
@@ -427,24 +488,29 @@ def next_voucher(period_id: Optional[int] = None, book: Book = Depends(get_my_bo
 
 
 @router.get("/insert-preview")
-def insert_preview(after_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+def insert_preview(after_id: int, position: str = "before",
+                   book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                    _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
-    """「插入凭证」页面要预填的东西：插在谁后面、这张拿哪个号、谁要顺位。
+    """「插入凭证」/「增加凭证」页面要预填的东西：插在谁前面或后面、这张拿哪个号、谁要顺位。
 
     跟 `/vouchers/next` 一个道理 —— 号码口径只有后端一份，页面自己猜就一定会猜错。
     这里只算不改：顺延跟建凭证在同一个事务里，空着退出不会顶走谁的号。
+
+    ``position`` ：``before`` = 向前插入（占参照自己的号），``after`` = 向后插入
+    （拿参照号 +1，只有更大的号顺位）。
     """
     v = db.get(Voucher, after_id)
     if v is None or v.book_id != book.id:
         raise HTTPException(404, "参照凭证不存在")
     period = db.get(Period, v.period_id)
     try:
-        slot = svc.insert_slot(db, v)
+        slot = svc.insert_slot(db, v, position)
     except (ValueError, ArithmeticError) as e:
         raise HTTPException(400, str(e))
     return {
         "anchor_id": v.id,
         "anchor_no": v.voucher_no,
+        "position": slot["position"],
         "voucher_no": slot["no"],
         "voucher_date": v.voucher_date.isoformat(),
         "period_id": v.period_id,
@@ -469,6 +535,38 @@ def period_check(period_id: Optional[int] = None, book: Book = Depends(get_my_bo
     return svc_organize.check_period(db, period)
 
 
+def _filtered_scope(db: Session, book_id: int, *, keyword: Optional[str] = None,
+                    min_amount: Optional[Decimal] = None,
+                    max_amount: Optional[Decimal] = None) -> tuple:
+    """``neighbour`` 的筛选条件，与 ``svc.query_vouchers`` 的同名参数**逐条对齐**。
+
+    对齐是硬要求：这里翻的是「列表筛出来的那个结果集」，两处口径一旦漂移，
+    用户在列表里看到的顺序和「前一张/后一张」跳过去的就不一样。
+    测试 ``tests/test_perf_api_layer.py`` 里有一条按 ``query_vouchers`` 的
+    count 对齐 ``total`` 的用例盯着这件事。
+
+    （口径相同不等于共用函数：``query_vouchers`` 还会拼排序与分页，
+    这里只需要 WHERE 条件。改动 ``query_vouchers`` 的筛选时两处要一起看。）
+    """
+    conds = [Voucher.book_id == book_id]
+    if keyword:
+        like = f"%{keyword}%"
+        conds.append(or_(
+            Voucher.voucher_no.ilike(like),
+            Voucher.remark.ilike(like),
+            Voucher.id.in_(select(Entry.voucher_id).where(Entry.summary.ilike(like))),
+        ))
+    if min_amount is not None or max_amount is not None:
+        # 「金额」筛的是**某一条分录**的金额，不是整张凭证的合计（与列表一致）。
+        amt = select(Entry.voucher_id).where(Entry.book_id == book_id)
+        if min_amount is not None:
+            amt = amt.where(Entry.amount >= money(min_amount))
+        if max_amount is not None:
+            amt = amt.where(Entry.amount <= money(max_amount))
+        conds.append(Voucher.id.in_(amt))
+    return tuple(conds)
+
+
 @router.get("/{voucher_id}/neighbour")
 def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
               _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user),
@@ -485,35 +583,45 @@ def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = 
     不带条件时同样按 (日期, id) 升序，只把范围收在同期间内，
     连续录一叠凭证时「后一张」该是接下来要填的那张。
 
-    结果集可能跨很多页，`page_size` 上限 200，所以要翻页收齐再定位。
+    带筛选的分支也走**单条 SQL**（审计严重 5）。原来为了「前后各一张」把整个
+    结果集按 200 一页翻到收齐再 ``ids.index(...)``：最多 100 轮 × (1 次 count
+    子查询 + 1 次分页查询) ≈ 200 条 SQL，并把最多两万张凭证实例化进 identity map。
+    现在前后各取一条、index 用一次条件聚合数出来 —— 返回体一个字没变。
     """
     v = db.get(Voucher, voucher_id)
     if v is None or v.book_id != book.id:
         raise HTTPException(404, "凭证不存在")
 
     if keyword or min_amount is not None or max_amount is not None:
-        ids: list[int] = []
-        total = 0
-        for page in range(1, 101):           # 封顶 20000 张，够用了，也防死循环
-            rows, total = svc.query_vouchers(
-                db, book.id, keyword=keyword, min_amount=min_amount, max_amount=max_amount,
-                page=page, page_size=200)
-            ids.extend(r.id for r in rows)
-            if len(ids) >= total or not rows:
-                break
-        # query_vouchers 是倒序（新的在前），这里翻过来成正序。
-        # 顺带把日期相同那批的先后也一起翻了：倒序是 id 降，翻过来正好是 id 升，
-        # 跟不带条件时 `tuple_(date, id)` 升序的那条路对得上。
-        ids.reverse()
-        try:
-            i = ids.index(voucher_id)
-        except ValueError:                   # 这张不在结果集里（比如筛选条件刚改过）
-            return {"prev_id": None, "next_id": None, "scope": "filtered", "index": -1, "total": len(ids)}
-        return {
-            "prev_id": ids[i - 1] if i > 0 else None,
-            "next_id": ids[i + 1] if i < len(ids) - 1 else None,
-            "scope": "filtered", "index": i, "total": len(ids),
-        }
+        scope = _filtered_scope(
+            db, book.id, keyword=keyword, min_amount=min_amount, max_amount=max_amount)
+        # 一次聚合问清三件事：结果集多大、这张在不在里面、它前面有几个。
+        # 「在不在里面」不能拿「前后都查不到」来代替 —— 结果集的第一张就是
+        # prev=None 却 index=0，靠「查不到邻票」判断会把它误判成不在结果集里。
+        total, hits, before = db.execute(
+            select(
+                func.count(),
+                func.count().filter(Voucher.id == voucher_id),
+                func.count().filter(
+                    tuple_(Voucher.voucher_date, Voucher.id) < (v.voucher_date, v.id)),
+            ).select_from(Voucher).where(*scope)).one()
+        if not hits:                          # 这张不在结果集里（比如筛选条件刚改过）
+            return {"prev_id": None, "next_id": None, "scope": "filtered",
+                    "index": -1, "total": total}
+        prev_id = db.scalar(
+            select(Voucher.id).where(
+                *scope, tuple_(Voucher.voucher_date, Voucher.id) < (v.voucher_date, v.id))
+            .order_by(Voucher.voucher_date.desc(), Voucher.id.desc()).limit(1)
+        )
+        next_id = db.scalar(
+            select(Voucher.id).where(
+                *scope, tuple_(Voucher.voucher_date, Voucher.id) > (v.voucher_date, v.id))
+            .order_by(Voucher.voucher_date, Voucher.id).limit(1)
+        )
+        # index 是「时间正序结果集里的位置」（0 基）—— 与不带条件时
+        # `tuple_(voucher_date, id)` 升序那一条是同一个口径。
+        return {"prev_id": prev_id, "next_id": next_id, "scope": "filtered",
+                "index": before, "total": total}
 
     scope = (Voucher.book_id == book.id, Voucher.period_id == v.period_id)
     prev_id = db.scalar(

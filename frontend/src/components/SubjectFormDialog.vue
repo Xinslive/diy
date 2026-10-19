@@ -56,6 +56,7 @@ import { ElMessage } from 'element-plus'
 import * as api from '@/api/subject'
 import { useSessionStore } from '@/stores/session'
 import { CATEGORY_DEFAULT_DIRECTION, CATEGORY_LABEL, nextCode, segmentOf } from '@/utils/subjectCode'
+import { validateSubjectForm } from '@/composables/useSubjectForm'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
@@ -201,9 +202,8 @@ async function submit() {
   // 别的入口（科目余额表的「下级」），VIEWER 照样能走到这里 ——
   // 挡在发请求之前，别让人白等一趟 403。
   // 认的是 store 那份写权限白名单，与后端的 ROLES 是同一份名单。
-  if (!store.canWrite) return ElMessage.warning('这个账套是只读的，不能新增科目')
-  if (!form.code.trim()) return ElMessage.warning('科目编码不能为空')
-  if (!form.name.trim()) return ElMessage.warning('科目名称不能为空')
+  const bad = validateSubjectForm(store, form, '这个账套是只读的，不能新增科目')
+  if (bad !== true) return ElMessage.warning(bad)
   saving.value = true
   try {
     const created = await api.createSubject(store.bookId, {
@@ -217,6 +217,10 @@ async function submit() {
     ElMessage.success(`已新增科目 ${created.code} ${created.name}`)
     visible.value = false
     emit('saved', created)
+  } catch (error) {
+    // 与编辑弹窗同一句。原来这里只有 finally：新增失败时除了 axios 拦截器
+    // 兜底之外什么都不说，而编辑失败是有提示的 —— 同一个失败，两种体验。
+    if (!error.response?.data?.detail) ElMessage.error('新增科目失败')
   } finally {
     saving.value = false
   }

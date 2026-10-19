@@ -1,38 +1,134 @@
 <template>
-  <div class="page">
-    <div class="page-head"><h2 class="page-title">报表</h2></div>
-    <div class="card">
-      <p class="muted" style="margin-top:0">
-        报表模板与账套无关，公式里引用的是科目编码，因此一份模板可直接用于所有账套。
-        点击报表进入后，可在单元格上直接改公式。
-      </p>
-      <el-table :data="templates" border style="margin-top:12px">
-        <el-table-column label="报表名称" min-width="200">
+  <div class="page report-list-page">
+    <div class="page-head report-head">
+      <div>
+        <h2 class="page-title">报表</h2>
+        <p class="page-subtitle">查看账套报表，或把其他系统的报表模板迁移进来继续使用。</p>
+      </div>
+      <el-button type="primary" :disabled="!store.canWrite || !store.bookId" @click="showImport = true">
+        <el-icon><Upload /></el-icon>
+        导入模板
+      </el-button>
+    </div>
+
+    <div class="card report-card">
+      <div class="section-heading">
+        <div>
+          <h3>报表模板</h3>
+        </div>
+        <span class="template-count">{{ templates.length }} 张</span>
+      </div>
+
+      <el-table v-loading="loading" :data="templates" border class="report-table">
+        <el-table-column label="报表名称" min-width="280">
           <template #default="{ row }">
-            <router-link :to="`/reports/${row.id}`" style="color:var(--cwq-primary);text-decoration:none">
-              {{ row.name }}
-            </router-link>
+            <router-link :to="`/reports/${row.id}`" class="report-name">{{ row.name }}</router-link>
+            <div class="report-meta">
+              <el-tag v-if="row.is_builtin" size="small" effect="plain" type="info">内置</el-tag>
+              <el-tag v-else-if="row.code?.startsWith('IMPORTED_')" size="small" effect="plain" type="success">已导入</el-tag>
+              <span>{{ typeName(row.type) }}</span>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="编码" width="160" prop="code" />
-        <el-table-column label="类型" width="140">
+        <el-table-column label="操作" width="280" align="right">
           <template #default="{ row }">
-            <el-tag size="small">{{ typeLabel(row.type) }}</el-tag>
+            <el-button link type="primary" @click="openReport(row)">打开</el-button>
+            <el-button link type="primary" :disabled="!store.canWrite" @click="renameTemplate(row)">
+              <el-icon><EditPen /></el-icon>重命名
+            </el-button>
+            <el-button link type="danger" :disabled="!store.canWrite || row.is_builtin"
+                       :title="row.is_builtin ? '内置报表不能删除' : '删除报表'" @click="removeTemplate(row)">
+              <el-icon><Delete /></el-icon>删除
+            </el-button>
           </template>
         </el-table-column>
-        <el-table-column label="内置" width="90" align="center">
-          <template #default="{ row }">{{ row.is_builtin ? '是' : '否' }}</template>
-        </el-table-column>
+        <template #empty>
+          <el-empty description="还没有报表模板" />
+        </template>
       </el-table>
     </div>
+
+    <ReportImportDialog v-model="showImport" @imported="load" />
   </div>
 </template>
 
 <script setup>
 import { onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Delete, EditPen, Upload } from '@element-plus/icons-vue'
 import * as api from '@/api/report'
+import { useSessionStore } from '@/stores/session'
+import ReportImportDialog from '@/components/ReportImportDialog.vue'
+import { visibleTemplates } from '@/utils/reportTemplates'
 
 const templates = ref([])
-const typeLabel = (t) => ({ BALANCE_SHEET: '资产负债表', INCOME_SHEET: '利润表', CUSTOM: '自定义' }[t] || t)
-onMounted(async () => { templates.value = await api.templates() })
+const loading = ref(false)
+const showImport = ref(false)
+const store = useSessionStore()
+const router = useRouter()
+
+const typeName = type => ({
+  BALANCE_SHEET: '资产负债表',
+  INCOME_SHEET: '利润表',
+  CUSTOM: '自定义报表',
+}[type] || '报表')
+
+async function load() {
+  loading.value = true
+  try {
+    // 导入了自家的模板后，同类的内置模板不再列出来（口径以导入的为准）
+    templates.value = visibleTemplates(await api.templates(store.bookId))
+  } finally {
+    loading.value = false
+  }
+}
+
+function openReport(row) {
+  router.push(`/reports/${row.id}`)
+}
+
+async function renameTemplate(row) {
+  if (!store.canWrite) return
+  const result = await ElMessageBox.prompt('输入新的报表名称', '重命名报表', {
+    inputValue: row.name,
+    confirmButtonText: '保存',
+    cancelButtonText: '取消',
+    inputValidator: value => value.trim() ? true : '报表名称不能为空',
+  }).catch(() => null)
+  const name = result?.value?.trim()
+  if (!name || name === row.name) return
+  await api.updateTemplate(row.id, { name }, store.bookId)
+  row.name = name
+  ElMessage.success('报表名称已更新')
+}
+
+async function removeTemplate(row) {
+  if (!store.canWrite || row.is_builtin) return
+  const confirmed = await ElMessageBox.confirm(
+    `确定删除「${row.name}」？删除后该报表的行、列和公式都会一并删除。`,
+    '删除报表', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+  ).then(() => true).catch(() => false)
+  if (!confirmed) return
+  await api.deleteTemplate(row.id, store.bookId)
+  await load()
+  ElMessage.success('报表已删除')
+}
+
+onMounted(load)
 </script>
+
+<style scoped>
+.report-head { align-items: flex-start; }
+.page-subtitle { margin: 7px 0 0; color: #8b98aa; font-size: 12px; line-height: 1.5; }
+.report-head > .el-button { margin-top: 1px; }
+.report-head > .el-button :deep(.el-icon) { margin-right: 5px; }
+.report-card { padding-top: 18px; }
+.section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
+.section-heading h3 { margin: 0; color: #33435a; font-size: 15px; font-weight: 600; }
+.template-count { color: #8c9aae; font-size: 12px; white-space: nowrap; }
+.report-name { color: var(--cwq-primary); text-decoration: none; font-weight: 500; }
+.report-name:hover { text-decoration: underline; }
+.report-meta { display: flex; align-items: center; gap: 7px; margin-top: 7px; color: #9aa5b5; font-size: 11px; }
+.report-meta :deep(.el-tag) { height: 20px; line-height: 18px; }
+</style>

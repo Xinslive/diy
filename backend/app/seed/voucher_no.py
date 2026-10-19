@@ -1,11 +1,12 @@
 """凭证号补零位数的一次性对齐（幂等）。
 
-发号口径从四位（记0022）改成三位（记022），把**还没结账的期间**里已有的号一起收窄，
-不然同一个月的列表里上半截 记0022、下半截 记023，两种宽度混排比全是四位还难看。
+位数跟着 `organize.NO_WIDTH` 走（2026-10-16 由三位改回四位）。改位数时把
+**还没结账的期间**里已有的号一起对齐，不然同一个月的列表里上半截 记-0057、
+下半截 记-058，两种宽度混排比全是四位还难看。
 
 两条硬规矩：
 
-1. **只补零，不改数字**：`记0007 → 记007`、`记0022 → 记022`。
+1. **只补零，不改数字**：`记007 → 记0007`、`记-058 → 记-0058`。
    号码的大小关系、期间的先后顺序都不变，补零在整数上是一一对应的，
    所以不会出现两张凭证撞成同一个号。
 
@@ -27,19 +28,36 @@ from app.models import Period, Voucher
 
 log = logging.getLogger("cwq.init")
 
-WIDTH = 3
+from app.accounting.organize import NO_WIDTH
+
+# 缺省宽度跟着发号口径走（organize.NO_WIDTH）：这里干的事是「把已经在库里的号
+# 补到同一个宽度」，不是另立一套宽度 —— 两处各写一个数字，改一处就又混排了。
+WIDTH = NO_WIDTH
 NO_RE = re.compile(r"^(?P<prefix>[^\d]{1,4})(?P<seq>\d+)$")
 
 
-def repad_voucher_numbers(db: Session, width: int = WIDTH) -> tuple[int, int]:
-    """把**开着的**期间里位数不足的凭证号补到 `width` 位。
+def repad_voucher_numbers(db: Session, width: int = WIDTH,
+                          book_id: int | None = None) -> tuple[int, int]:
+    """把**开着的**期间里位数不足的凭证号补到 ``width`` 位。
 
     返回 `(改了多少张, 因为已结账而跳过了多少张)`。
+
+    ``book_id`` 给了就只动那一个账套，不给就是全库 —— 全库是维护脚本的口径
+    （「上线时把历史数据一次性对齐」），但它同时意味着这个函数的返回值**依赖
+    库里此刻有什么**。测试库里各用例的账套是逐个累积的（见 conftest 里
+    ``db`` 夹具为什么没有 savepoint），于是「本次改了几张」这种断言会被别的
+    用例留下的凭证污染 —— 单跑绿、全量红。加一个作用域参数既符合直觉
+    （修一个账套的数据凭什么要动全库），也让这个函数的返回值变成可确定断言的。
     """
+    def _scope(stmt):
+        return stmt.where(Voucher.book_id == book_id) if book_id is not None else stmt
+
     changed = 0
     for v in db.scalars(
-        select(Voucher).join(Period, Voucher.period_id == Period.id)
-        .where(Period.locked.is_(False))
+        _scope(
+            select(Voucher).join(Period, Voucher.period_id == Period.id)
+            .where(Period.locked.is_(False))
+        )
     ).all():
         m = NO_RE.match(v.voucher_no or "")
         if not m:
@@ -54,9 +72,11 @@ def repad_voucher_numbers(db: Session, width: int = WIDTH) -> tuple[int, int]:
         changed += 1
 
     skipped = db.scalar(
-        select(func.count()).select_from(Voucher)
-        .join(Period, Voucher.period_id == Period.id)
-        .where(Period.locked.is_(True))
+        _scope(
+            select(func.count()).select_from(Voucher)
+            .join(Period, Voucher.period_id == Period.id)
+            .where(Period.locked.is_(True))
+        )
     ) or 0
     if changed:
         db.commit()

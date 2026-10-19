@@ -3,11 +3,25 @@ import { useSessionStore } from '@/stores/session'
 
 const routes = [
   { path: '/login', name: 'login', component: () => import('@/views/LoginView.vue'), meta: { public: true } },
+  // 插件开发文档：全站**唯一**免登录的页面，也是全站**唯一没有入口**的页面。
+  //
+  // 「没有入口」不是靠自觉，而是靠它不在 nav.js 的 NAV 里 —— 不在 NAV
+  // 就不会出现在侧栏和顶部模块，tabs.js 的 KNOWN_KEYS（由 NAV 派生）也
+  // 自动不含它，于是标签页和 localStorage 同样不会记它。任何页面、README、
+  // ARCHITECTURE 都不放它的链接；tests/docs_page.test.mjs 会把这条钉死。
+  //
+  // 放成顶层路由而不是 '/' 的 children，正是为了不经过 MainLayout：
+  // 不创建标签页，也不用它的账套/期间选择器。
+  { path: '/docs', name: 'docs', component: () => import('@/views/docs/DocsView.vue'), meta: { public: true, title: '插件开发文档' } },
   {
     path: '/',
+    name: 'workspace',
     component: () => import('@/layouts/MainLayout.vue'),
     redirect: '/books',
     children: [
+      { path: 'plugin/:pluginId/:rest(.*)*', name: 'plugin-entry', component: () => import('@/plugins/unavailable').then(m => m.PluginUnavailable) },
+      { path: 'plugins', name: 'plugins', component: () => import('@/views/system/PluginManager.vue'), meta: { title: '扩展管理', adminOnly: true } },
+      { path: 'scheduler-tasks', name: 'scheduler-tasks', component: () => import('@/views/system/SchedulerTasks.vue'), meta: { title: '计划任务', adminOnly: true } },
       { path: 'books', name: 'books', component: () => import('@/views/book/BookManager.vue'), meta: { title: '账套管理' } },
       { path: 'openings', name: 'openings', component: () => import('@/views/book/OpeningBalance.vue'), meta: { title: '期初余额' } },
       { path: 'vouchers', name: 'vouchers', component: () => import('@/views/voucher/VoucherList.vue'), meta: { title: '凭证' } },
@@ -23,8 +37,11 @@ const routes = [
       { path: 'audit', name: 'audit', component: () => import('@/views/system/AuditLog.vue'), meta: { title: '操作日志', adminOnly: true } },
       { path: 'vouchers/organize', name: 'voucher-organize', component: () => import('@/views/voucher/VoucherOrganize.vue'), meta: { title: '整理凭证' } },
       { path: 'vouchers/import', name: 'voucher-import', component: () => import('@/views/voucher/VoucherImport.vue'), meta: { title: '凭证导入' } },
+      { path: 'vouchers/invoices', name: 'invoice-import', component: () => import('@/views/voucher/InvoiceImport.vue'), meta: { title: '发票导入' } },
       { path: 'print-templates', name: 'print-templates', component: () => import('@/views/print/PrintTemplate.vue'), meta: { title: '打印模板' } },
-      { path: 'users', name: 'users', component: () => import('@/views/system/UserAdmin.vue'), meta: { title: '用户与授权', adminOnly: true } }
+      { path: 'users', name: 'users', component: () => import('@/views/system/UserAdmin.vue'), meta: { title: '用户与授权', adminOnly: true } },
+      { path: 'ocr-settings', name: 'ocr-settings', component: () => import('@/views/system/OcrSettings.vue'), meta: { title: '外部服务', adminOnly: true } },
+      { path: 'data-security', name: 'data-security', component: () => import('@/views/system/DataSecurity.vue'), meta: { title: '数据安全', adminOnly: true } }
     ]
   },
   { path: '/:pathMatch(.*)*', redirect: '/books' }

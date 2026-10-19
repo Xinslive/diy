@@ -27,6 +27,7 @@ from app.accounting.periods import (carry_forward_profit, close_period,
                                     year_end_carry)
 from app.ledger.engine import LedgerEngine
 from app.models import Entry, Period, PeriodOpening, Subject, Voucher
+from tests.accounting_helpers import close_any
 
 
 def sid(subjects, code):
@@ -46,9 +47,9 @@ def _seed_2027_placeholder(db, book, subjects, admin_user):
     jan27 = new_periods[0]
     create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2027, 1, 15),
                    entries=[
-                       {"subject_id": sid(subjects, "100201"), "direction": "DEBIT",
+                       {"subject_id": sid(subjects, "1002"), "direction": "DEBIT",
                         "amount": Decimal("5"), "summary": "占位"},
-                       {"subject_id": sid(subjects, "600101"), "direction": "CREDIT",
+                       {"subject_id": sid(subjects, "5001"), "direction": "CREDIT",
                         "amount": Decimal("5"), "summary": "占位"},
                    ], period_id=jan27.id, commit=True)
     return jan27
@@ -63,7 +64,7 @@ def _close_year(db, book, periods, admin_user):
             carry_forward_profit(db, book.id, p, admin_user)
         except ValueError:
             pass
-        close_period(db, p, admin_user)
+        close_any(db, book, p, admin_user)
 
 
 def _snapshot(db, book, subjects):
@@ -76,8 +77,8 @@ def _snapshot(db, book, subjects):
             Voucher.book_id == book.id,
             Voucher.remark == "2026年 结转本年利润")).all())
     return {
-        "profit": eng.closing(sid(subjects, "4103"), dec_ord),
-        "retained": eng.closing(sid(subjects, "4104"), dec_ord),
+        "profit": eng.closing(sid(subjects, "3103"), dec_ord),
+        "retained": eng.closing(sid(subjects, "3104"), dec_ord),
         "carry_ids": carry,
         "dec_locked": bool(db.scalar(select(Period.locked).where(
             Period.book_id == book.id, Period.year == 2026, Period.month == 12))),
@@ -95,8 +96,8 @@ def test_结转中途失败时数据库与调用前一致(
 ):
     """审计 P1-04 的核心场景：刷新期初那一步失败，前面几步必须一起回滚。"""
     # 亏损年度：本年利润落在借方，结转会把它冲平
-    make_voucher("2026-01-10", dr=[("6602", 100, "x")],
-                 cr=[("100201", 100, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("560206", 100, "x")],
+                 cr=[("1002", 100, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
 
     # 先手工把 2027 年铺出来并塞一张凭证，让「刷新期初」那步必然失败
@@ -122,8 +123,8 @@ def test_结转中途失败时数据库与调用前一致(
 
 def test_结转失败不留残留凭证(db, book, periods, subjects, admin_user, make_voucher):
     """失败后不能有「结转凭证已经生成却没记完」的半成品。"""
-    make_voucher("2026-01-10", dr=[("6602", 100, "x")],
-                 cr=[("100201", 100, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("560206", 100, "x")],
+                 cr=[("1002", 100, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
 
     _seed_2027_placeholder(db, book, subjects, admin_user)
@@ -148,15 +149,15 @@ def test_结转失败不留残留凭证(db, book, periods, subjects, admin_user,
 
 def test_结转失败不动本年利润(db, book, periods, subjects, admin_user, make_voucher):
     """本年利润不能被冲平一半 —— 这是审计里最刺眼的那条。"""
-    make_voucher("2026-01-10", dr=[("6602", 100, "x")],
-                 cr=[("100201", 100, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("560206", 100, "x")],
+                 cr=[("1002", 100, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
 
     eng = LedgerEngine(db, book.id)
     dec_ord = db.scalar(select(Period.ord).where(
         Period.book_id == book.id, Period.year == 2026, Period.month == 12))
-    before = eng.closing(sid(subjects, "4103"), dec_ord)
-    retained_before = eng.closing(sid(subjects, "4104"), dec_ord)
+    before = eng.closing(sid(subjects, "3103"), dec_ord)
+    retained_before = eng.closing(sid(subjects, "3104"), dec_ord)
 
     _seed_2027_placeholder(db, book, subjects, admin_user)
 
@@ -166,16 +167,16 @@ def test_结转失败不动本年利润(db, book, periods, subjects, admin_user,
     db.expire_all()
 
     eng = LedgerEngine(db, book.id)
-    assert eng.closing(sid(subjects, "4103"), dec_ord) == before, \
-        f"本年利润被改了：{before} → {eng.closing(sid(subjects, '4103'), dec_ord)}"
-    assert eng.closing(sid(subjects, "4104"), dec_ord) == retained_before, \
+    assert eng.closing(sid(subjects, "3103"), dec_ord) == before, \
+        f"本年利润被改了：{before} → {eng.closing(sid(subjects, '3103'), dec_ord)}"
+    assert eng.closing(sid(subjects, "3104"), dec_ord) == retained_before, \
         "未分配利润被改了"
 
 
 def test_成功的结转一次提交(db, book, periods, subjects, admin_user, make_voucher):
     """修好原子性不能把正常路径搞坏：成功的结转照常完成全部步骤。"""
-    make_voucher("2026-01-10", dr=[("6602", 100, "x")],
-                 cr=[("100201", 100, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("560206", 100, "x")],
+                 cr=[("1002", 100, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
 
     r = year_end_carry(db, book, admin_user)
@@ -188,10 +189,10 @@ def test_成功的结转一次提交(db, book, periods, subjects, admin_user, ma
     eng = LedgerEngine(db, book.id)
     dec_ord = db.scalar(select(Period.ord).where(
         Period.book_id == book.id, Period.year == 2026, Period.month == 12))
-    assert eng.closing(sid(subjects, "4103"), dec_ord) == Decimal("0")
+    assert eng.closing(sid(subjects, "3103"), dec_ord) == Decimal("0")
     bank_opening = db.scalar(select(PeriodOpening).where(
         PeriodOpening.period_id == jan27.id,
-        PeriodOpening.subject_id == sid(subjects, "100201")))
+        PeriodOpening.subject_id == sid(subjects, "1002")))
     # 银行存款期初：dr 6602 / cr 1002，现金实际是减少的，导出/期初存的是实际方位
     assert bank_opening is not None, "2027-01 缺少 1002 的期初"
     assert bank_opening.amount == Decimal("-100")
@@ -200,8 +201,8 @@ def test_成功的结转一次提交(db, book, periods, subjects, admin_user, ma
 def test_HTTP层失败也是原子的(client, db, book, periods, subjects, admin_user,
                              make_voucher, auth):
     """接口层：返回 400 之后，库里必须什么都没变。"""
-    make_voucher("2026-01-10", dr=[("6602", 100, "x")],
-                 cr=[("100201", 100, "x")], posted=True)
+    make_voucher("2026-01-10", dr=[("560206", 100, "x")],
+                 cr=[("1002", 100, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
     _seed_2027_placeholder(db, book, subjects, admin_user)
     before = _snapshot(db, book, subjects)

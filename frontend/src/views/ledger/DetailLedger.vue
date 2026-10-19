@@ -22,19 +22,18 @@
       <div class="ledger-toolbar__row ledger-toolbar__row--period">
         <div class="ledger-toolbar__group">
           <span class="ledger-toolbar__label">会计期间</span>
-          <el-select v-model="fromId" class="ledger-period-select" @change="load">
+          <el-select v-model="fromId" class="ledger-period-select" @change="onFilterChange">
             <el-option v-for="p in yearPeriods" :key="p.id" :label="p.code" :value="p.id" />
           </el-select>
           <span class="ledger-toolbar__separator">至</span>
-          <el-select v-model="toId" class="ledger-period-select" @change="load">
+          <el-select v-model="toId" class="ledger-period-select" @change="onFilterChange">
             <el-option v-for="p in yearPeriods" :key="p.id" :label="p.code" :value="p.id" />
           </el-select>
         </div>
-        <el-checkbox v-model="includeUnposted" label="包含未记账凭证" @change="load" />
+        <el-checkbox v-model="includeUnposted" label="包含未记账凭证" @change="onFilterChange" />
         <div class="ledger-toolbar__actions">
-          <el-button @click="previewHtml">模板预览/打印</el-button>
-          <el-button @click="window.print()">打印本页</el-button>
-          <el-button type="primary" @click="exportXlsx">导出 Excel</el-button>
+          <el-button @click="previewHtml">打印预览</el-button>
+              <el-button type="primary" @click="exportXlsx">导出 Excel</el-button>
         </div>
       </div>
     </div>
@@ -51,17 +50,17 @@
         </div>
       </div>
       <!-- 明细账是唯一逐笔列凭证的账簿，所以只有它的凭证行能点。 -->
-      <el-table :data="data.rows" border size="small" v-loading="loading"
+      <el-table :data="viewRows" border size="small" v-loading="loading"
                 :row-class-name="rowClass" @row-click="openVoucher">
         <el-table-column :label="`${store.currentYear}年`" align="center">
-          <el-table-column label="月" width="48" align="center">
-            <template #default="{ row }">{{ monthOf(row) }}</template>
-          </el-table-column>
-          <el-table-column label="日" width="48" align="center">
-            <template #default="{ row }">{{ dayOf(row) }}</template>
-          </el-table-column>
+          <el-table-column label="月" width="48" align="center" prop="month" />
+          <el-table-column label="日" width="48" align="center" prop="day" />
         </el-table-column>
-        <el-table-column label="凭证号" width="95">
+        <!-- 凭证号是「记 + 3 位数字」（记001），内容本身很窄。
+             原来给到 95，标题「凭证号」三个字撑满、左右各空一截，
+             而同级的月/日两列各只有 48，横向被这一列拉得松垮。
+             收到 72：标题与内容都不折行，还比原来省出 23px 给摘要。 -->
+        <el-table-column label="凭证号" width="72">
           <template #default="{ row }">
             <button v-if="row.voucher_id" type="button" class="vno-link"
                     :title="`打开凭证 ${row.voucher_no}`"
@@ -70,17 +69,30 @@
         </el-table-column>
         <template v-if="data.comprehensive">
           <el-table-column prop="subject_code" label="科目编码" width="105" />
-          <el-table-column label="科目名称" width="180">
-            <template #default="{ row }">{{ indentedSubjectName(row) }}</template>
-          </el-table-column>
+          <!-- 科目名有长有短（「银行存款—中国工商银行基本户」这类），
+               固定宽度下只能截断。截断成省略号、悬停出全称，
+               与全站其它表格一致（见 VoucherList 的摘要列）。 -->
+          <el-table-column label="科目名称" width="180" prop="subjectText" show-overflow-tooltip />
         </template>
-        <el-table-column label="摘要" min-width="240"><template #default="{ row }">{{ summaryOf(row) }}</template></el-table-column>
-        <el-table-column label="借方" width="120" align="right"><template #default="{ row }">{{ amount(row.debit) }}</template></el-table-column>
-        <el-table-column label="贷方" width="120" align="right"><template #default="{ row }">{{ amount(row.credit) }}</template></el-table-column>
-        <el-table-column label="方向" width="60" align="center"><template #default="{ row }">{{ row.direction }}</template></el-table-column>
-        <el-table-column label="余额" width="130" align="right"><template #default="{ row }"><b>{{ amount(row.balance) }}</b></template></el-table-column>
+        <el-table-column label="摘要" min-width="240" prop="summary" />
+        <el-table-column label="借方" width="120" align="right" prop="debitText" />
+        <el-table-column label="贷方" width="120" align="right" prop="creditText" />
+        <el-table-column label="方向" width="60" align="center" prop="direction" />
+        <el-table-column label="余额" width="130" align="right">
+          <template #default="{ row }"><b>{{ row.balanceText }}</b></template>
+        </el-table-column>
         <template #empty><span class="muted">请先选择科目</span></template>
       </el-table>
+
+      <div class="ledger-pager no-print">
+        <el-pagination
+          layout="total, sizes, prev, pager, next"
+          :total="totalRows"
+          v-model:current-page="page"
+          v-model:page-size="pageSize"
+          :page-sizes="[20, 50, 100, 200]"
+        />
+      </div>
     </div>
 
     <PrintDialog v-model="printVisible" :book-id="store.bookId" :path="printPath"
@@ -96,6 +108,7 @@ import * as subjectApi from '@/api/subject'
 import { downloadFile } from '@/api/print'
 import PrintDialog from '@/components/PrintDialog.vue'
 import SubjectPicker from '@/components/SubjectPicker.vue'
+import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 
@@ -111,15 +124,31 @@ function rowClass({ row }) {
   if (row.kind === 'YTD_TOTAL') return 'row-ytd-total'
   return ''
 }
-function summaryOf(row) {
-  return row.kind === 'YTD_TOTAL' ? '累\u3000\u3000计' : row.summary || ''
-}
-function monthOf(row) {
-  const date = row.voucher_date || row.period || ''
-  return String(date).slice(5, 7)
-}
-function dayOf(row) { return row.voucher_date ? String(row.voucher_date).slice(8, 10) : '' }
-function amount(value) { return value == null ? '' : fmt(value) }
+/**
+ * 每格都调一次的函数，砍到一处算好。
+ *
+ *  以前月/日/摘要/借贷/余额/科目名全是模板里的函数调用 —— 一个来回刷新、
+ * 一个勾选切换，都要按「行数 × 列数」重算一遍，其中科目名还要现拼全角空格。
+ * 现在一次性算成视图行，computed 只在数据或页码真的变了时才重算。
+ * 同时按页切片：一页 50 行，别把整段明细一次性铺进 DOM。
+ */
+const page = ref(1)
+const pageSize = ref(50)
+const totalRows = computed(() => data.value.rows.length)
+const viewRows = computed(() => {
+  const base = data.value.subject?.level || 1
+  const start = (page.value - 1) * pageSize.value
+  return data.value.rows.slice(start, start + pageSize.value).map((row) => ({
+    ...row,
+    month: String(row.voucher_date || row.period || '').slice(5, 7),
+    day: row.voucher_date ? String(row.voucher_date).slice(8, 10) : '',
+    summary: row.kind === 'YTD_TOTAL' ? '累\u3000\u3000计' : row.summary || '',
+    debitText: row.debit == null ? '' : fmt(row.debit),
+    creditText: row.credit == null ? '' : fmt(row.credit),
+    balanceText: row.balance == null ? '' : fmt(row.balance),
+    subjectText: `${'　'.repeat(Math.max(0, (row.subject_level || 1) - base))}${row.subject_name || ''}`,
+  }))
+})
 function openVoucher(row) {
   if (!clickable(row)) return
   router.push({ name: 'voucher-edit', params: { id: row.voucher_id } })
@@ -131,7 +160,6 @@ const toSubjectId = ref(null)
 const fromId = ref(store.periodId)
 const toId = ref(store.periodId)
 const data = ref({ rows: [] })
-const loading = ref(false)
 const selectedSubject = computed(() => subjects.value.find((s) => s.id === subjectId.value))
 const rangeSubjects = computed(() => selectedSubject.value?.children || [])
 const isComprehensive = computed(() => rangeSubjects.value.length > 0)
@@ -141,10 +169,6 @@ const periodLabel = computed(() => {
   if (!from || !to) return ''
   return from === to ? `${from}月` : `${from}月 至 ${to}月`
 })
-function indentedSubjectName(row) {
-  const depth = Math.max(0, (row.subject_level || 1) - (data.value.subject?.level || 1))
-  return `${'　'.repeat(depth)}${row.subject_name || ''}`
-}
 /** 未记账凭证也参与计算 —— 默认开。
  *
  *  月底集中记账之前，账上几乎全是未记账凭证；默认排除的话，
@@ -171,24 +195,32 @@ function anchorPeriods() {
   if (!pool.some((p) => p.id === toId.value)) toId.value = cur
 }
 
+/** 只认最新一趟：期间/科目下拉连点时，旧响应不许覆盖新数据。 */
+const { loading, run, isStale } = useLatestLoad('ledger/detail')
+
 async function load() {
   if (!store.bookId || !subjectId.value) return
   // 期间还没灌完就查，后端会拿**它自己默认的那一期**当上下界 ——
   // 请求里压根没有 from/to，回来的数是另一段区间，页面上看着还像那么回事。
   // 与其先显示一个错的再纠正，不如等 store.periods 到位（下面的 watch 会再触发一次）。
   if (!yearPeriods.value.length) return
-  loading.value = true
-  try {
-    data.value = await api.detail(store.bookId, {
-      subject_id: subjectId.value, from_period_id: fromId.value, period_id: toId.value,
-      from_subject_id: isComprehensive.value ? fromSubjectId.value : undefined,
-      to_subject_id: isComprehensive.value ? toSubjectId.value : undefined,
-      include_unposted: includeUnposted.value
-    })
-  } finally {
-    loading.value = false
-  }
+  const d = await run(() => api.detail(store.bookId, {
+    subject_id: subjectId.value, from_period_id: fromId.value, period_id: toId.value,
+    from_subject_id: isComprehensive.value ? fromSubjectId.value : undefined,
+    to_subject_id: isComprehensive.value ? toSubjectId.value : undefined,
+    include_unposted: includeUnposted.value
+  }))
+  // 过期的那一趟：条件早就被改掉了，写进去就是「表里的数对不上顶栏的期间」。
+  if (isStale(d)) return
+  data.value = d
+  // 换到行数更少的区间时，原来那页可能已经不存在了 —— 停在越界的页码上
+  // 就是一张空表，看着像「这个期间一笔都没有」。
+  const maxPage = Math.max(1, Math.ceil(d.rows.length / pageSize.value))
+  if (page.value > maxPage) page.value = maxPage
 }
+
+/** 条件变了就回第一页：停在原来那页会看着像「明细少了」。 */
+function onFilterChange() { page.value = 1; load() }
 
 function resetSubjectRange() {
   fromSubjectId.value = rangeSubjects.value[0]?.id ?? null
@@ -197,21 +229,21 @@ function resetSubjectRange() {
 
 function onSubjectChange() {
   resetSubjectRange()
-  load()
+  page.value = 1; load()
 }
 
 function onFromSubjectChange() {
   const start = rangeSubjects.value.findIndex((s) => s.id === fromSubjectId.value)
   const end = rangeSubjects.value.findIndex((s) => s.id === toSubjectId.value)
   if (start > end) toSubjectId.value = fromSubjectId.value
-  load()
+  page.value = 1; load()
 }
 
 function onToSubjectChange() {
   const start = rangeSubjects.value.findIndex((s) => s.id === fromSubjectId.value)
   const end = rangeSubjects.value.findIndex((s) => s.id === toSubjectId.value)
   if (end < start) fromSubjectId.value = toSubjectId.value
-  load()
+  page.value = 1; load()
 }
 
 async function loadSubjects() {
@@ -221,30 +253,50 @@ async function loadSubjects() {
     return [item, ...flatten(node.children || [], node.id)]
   })
   subjects.value = flatten(tree)
-  const preferred = subjects.value.find((s) => s.is_leaf && s.active)
-  subjectId.value = preferred?.id ?? subjects.value[0]?.id ?? null
+  /** 默认落在 **1001 库存现金**。
+   *
+   *  翻明细账十有八九是先看「钱搁在哪儿」，1001 是这张表的头一条。
+   *  以前取的是「第一个启用末级」—— 那取决于科目表怎么排，翻开就看到一个
+   *  莫名其妙的末级科目（截图里是 1007），还得先换一趟才看得到账。 */
+  const preferred = subjects.value.find((s) => s.code === '1001' && s.active)
+    ?? subjects.value.find((s) => s.is_leaf && s.active)
+    ?? subjects.value[0]
+  subjectId.value = preferred?.id ?? null
   resetSubjectRange()
 }
+
+/** 科目树是**按账套**的：当前这份 subjects 是哪个账套的。
+ *  换账套必须重拉 —— 否则选的是上一本账的科目，明细账查的是外账套的数。 */
+let subjectsBookId = 0
 
 onMounted(async () => {
   toId.value = store.periodId
   anchorPeriods()
+  subjectsBookId = store.bookId
   await loadSubjects()
   load()
 })
-watch(() => store.bookId, async () => {
+// **单一数据源**：账套 + 顶栏年份 + 该年份的期间数。
+//
+//  以前是两个 watch：bookId 一个（里面还 await loadSubjects()）、
+//  年份/期间数一个。store.setBook() 是「先改 bookId、再 await loadPeriods()
+//  灌 periods」，两条依次触发，同一份查询发两趟 —— 这页更重，因为它那条
+//  bookId 的 watch 里还夹着一次科目树请求。
+//
+//  合成一条之后，「换账套要重拉科目树」这条语义一条没丢：靠 subjectsBookId
+//  认出这是换账套了才重拉，期间/年份变化不重拉。
+watch(() => [store.bookId, store.currentYear, store.periods.length], async () => {
   anchorPeriods()
-  await loadSubjects()
+  if (subjectsBookId !== store.bookId) {
+    subjectsBookId = store.bookId
+    await loadSubjects()
+    // 换账套时期间多半还在路上（setBook 是先改 bookId 再灌 periods）。
+    // 这时 load() 会因为 yearPeriods 还是空的自己返回，等下面那条 watch
+    // 到位再发真正的那一趟 —— 别在这里把同一份查询发两遍。
+    if (!yearPeriods.value.length) return
+  }
   load()
 })
-// 年份一变，起止跟着重新落在新年份里。
-// 也顺带接住「页面比 store.periods 先加载完」那一路：periods 到位后 currentYear
-// 才从 0 变成真值，这时才谈得上「只列这一年」。
-// 盯着**年份和期间数**，不是只盯年份：
-// store.loadBooks() 先灌 books、再灌 periods，currentYear 会先从 books 的
-// latest_year 变成真值，那一刻 periods 还是空的。只盯年份的话 watcher 只响一次，
-// 打在空列表上，之后 periods 到位也不再响 —— 起止就一直停在 null 上。
-watch(() => [store.currentYear, store.periods.length], () => { anchorPeriods(); load() })
 
 function previewHtml() {
   printVisible.value = true
@@ -347,6 +399,8 @@ function exportXlsx() {
 .report-head { text-align: center; margin-bottom: 12px; }
 .report-title { margin: 0 0 4px; font-size: 19px; letter-spacing: 6px; }
 .report-sub { font-size: 13px; color: var(--cwq-muted); }
+/* 分页靠右，与 VoucherList 一致；no-print 让它不进纸面。 */
+.ledger-pager { display: flex; justify-content: flex-end; margin-top: 12px; }
 
 /* 凭证号做成按钮但长得像字 —— 用户要的是「一列凭证号」，
    不是「一列按钮」。 */

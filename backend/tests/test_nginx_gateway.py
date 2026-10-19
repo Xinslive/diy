@@ -177,7 +177,8 @@ def test_安全头用always():
     （而且带 hash 的静态资源本来就是 200），不该混进这条断言。
     """
     security = ("Content-Security-Policy", "X-Content-Type-Options",
-                "Referrer-Policy", "X-Frame-Options")
+                "Referrer-Policy", "X-Frame-Options",
+                "Strict-Transport-Security")
     blocks = _blocks(_conf())
     for kind, pattern, body in blocks:
         for line in re.findall(r"add_header\s+[^\n]+", body):
@@ -198,3 +199,86 @@ def test_没有靠继承来加头():
             continue
         assert "X-Content-Type-Options" in headers, (
             f"{pattern} 写了 {headers} 却没写 nosniff —— 上面那些头在它这里不生效")
+
+
+# --------------------------------------------------------------- HSTS（P2-08）
+
+
+def test_每个发头的location都带HSTS():
+    """HSTS 与 CSP 同级：写在一个 location 里，其余 location 不会继承。
+
+    少写一条的后果很具体 —— 那一块资源第一次仍可能被明文取到，
+    而整套安全头看上去又是「配了」的。
+    """
+    blocks = _blocks(_conf())
+    checked = 0
+    for kind, pattern, body in blocks:
+        headers = re.findall(r"add_header\s+([A-Za-z-]+)", body)
+        if not headers:
+            continue
+        checked += 1
+        assert "Strict-Transport-Security" in headers, (
+            f"{pattern} 发了安全头却没发 HSTS（{headers}）")
+    assert checked >= 4, f"只检查到 {checked} 个 location，正则匹配多半失效了"
+
+
+def test_HSTS不乱加子域():
+    """``includeSubDomains`` 是替所有子域做主，且用户绕不过。
+
+    有一个子域漏证书就会把它整个钉死在 HTTPS 上 —— 那是部署时按实际
+    证书情况决定的事，不该由这份模板替他决定。
+    """
+    for line in re.findall(r"add_header\s+Strict-Transport-Security[^\n]+", _conf()):
+        assert "includeSubDomains" not in line, (
+            f"HSTS 不该带 includeSubDomains：{line.rstrip()}")
+
+
+def test_不暴露服务器版本():
+    assert re.search(r"^\s*server_tokens\s+off\s*;", _conf(), re.M), (
+        "没关 server_tokens —— nginx/内核版本会写进每个 4xx/5xx 响应头")
+
+
+# --------------------------------------------------- 80 端口跳转白名单（P2-09）
+
+HOST_MAP = CONF.parent / "cwq-host-map.conf"
+
+
+def test_跳转不再直接信任Host头():
+    """``return 301 https://$host$request_uri`` 就是开放重定向。
+
+    ``$host`` 取自客户端的 Host 头，而 80 端口那个 server 的 server_name
+    是 ``_``（兜底匹配一切），nginx 不会拿它核对任何白名单。
+    """
+    body = _port80_block(_conf())
+    assert "return 301" in body, "80 端口没有跳转逻辑了？本用例需要跟着调整"
+    assert "$host$request_uri" not in body, (
+        "跳转目标仍然直接用 $host —— Host: evil.example 会拿到 "
+        "301 https://evil.example/...，是开放重定向")
+
+
+def test_未知Host被拒绝而不是跳走():
+    body = _port80_block(_conf())
+    assert "$cwq_https_redirect" in body, "跳转目标没有走白名单 map"
+    assert "444" in body, "未知 Host 没有被拒绝 —— map 查不到时的兜底不见了"
+
+
+def test_白名单文件存在且默认拒绝():
+    assert HOST_MAP.exists(), (
+        f"缺少 {HOST_MAP.name} —— 80 端口的 server 引用了它，"
+        "nginx 会因「未知变量 $cwq_https_redirect」启动失败")
+    text = HOST_MAP.read_text(encoding="utf-8")
+    assert re.search(r"^\s*map\s+\$host\s+\$cwq_https_redirect\s*\{", text, re.M), (
+        "cwq-host-map.conf 里没有声明 map $host $cwq_https_redirect")
+    assert re.search(r'default\s+""\s*;', text), (
+        'map 的 default 必须留空 —— 它就是「未知 Host 不跳转」这条规则的实现')
+
+
+def _port80_block(text: str) -> str:
+    m = re.search(r"server\s*\{[^}]*?listen\s+80\s*;.*?\n\}", text, re.S)
+    assert m, "配置里没有 listen 80 的 server 块"
+    # **去掉注释再断言**：这一段本来就在注释里把旧的错误写法完整抄了一遍
+    # （说明为什么不能那么写），不剥掉的话断言会命中注释而非真实指令。
+    return "\n".join(
+        line for line in m.group(0).splitlines()
+        if not line.lstrip().startswith("#")
+    )

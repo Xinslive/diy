@@ -1,18 +1,15 @@
-import { http, apiUrl } from './client'
+import { http } from './client'
 import { ElMessage } from 'element-plus'
 
-export const vouchersXlsx = (bookId, params) => apiUrl(`/books/${bookId}/print/vouchers.xlsx`, params)
-export const balanceXlsx = (bookId, params) => apiUrl(`/books/${bookId}/print/balance.xlsx`, params)
-export const generalXlsx = (bookId, params) => apiUrl(`/books/${bookId}/print/general-ledger.xlsx`, params)
-export const reportXlsx = (bookId, templateId, periodId) =>
-  apiUrl(`/books/${bookId}/print/report.xlsx`, { template_id: templateId, period_id: periodId })
-
 // ---- HTML 预览（所见即所得，与打印同一份渲染）----
-export const vouchersHtml = (bookId, params) => apiUrl(`/books/${bookId}/print/vouchers.html`, params)
-export const balanceHtml = (bookId, params) => apiUrl(`/books/${bookId}/print/balance.html`, params)
-export const generalHtml = (bookId, params) => apiUrl(`/books/${bookId}/print/general-ledger.html`, params)
-export const detailHtml = (bookId, params) => apiUrl(`/books/${bookId}/print/detail-ledger.html`, params)
-export const reportHtml = (bookId, params) => apiUrl(`/books/${bookId}/print/report.html`, params)
+//
+// 这里**不再**提供一批 `xxxHtml` / `xxxXlsx` 的 URL 构造器。
+// 它们以前是这么用的：`window.open(apiUrl('/books/1/print/vouchers.html'))`。
+// 那条路走不通 —— token 存在 localStorage、由 axios 拦截器注入请求头，
+// `window.open` 发出去的裸请求没有 Authorization，后端直接 401，
+// 用户看到的是一个装着 JSON 错误的新标签页。
+// 现在统一走下面的 `downloadFile()` / `loadPrintHtml()`，由它们带鉴权。
+// 所以那些构造器留着只会让人以为还能用 —— 删掉。
 
 /**
  * 按**草稿**模板渲染一页预览 HTML。
@@ -40,8 +37,8 @@ export const copyTemplate = (bookId, id) => http.post(`/books/${bookId}/print/te
 // localStorage，由 axios 拦截器注入），后端会直接返回 401。
 // ---------------------------------------------------------------------
 
-/** 取回打印页的 HTML 源码 */
-export const fetchPrintHtml = (path, params = {}) =>
+/** 取回打印页的 HTML 源码（**本文件内部用**，不走 window.open —— 那样不带鉴权） */
+const fetchPrintHtml = (path, params = {}) =>
   http.get(path, { params, responseType: 'text' }).then((r) => r.data)
 
 /**
@@ -91,20 +88,9 @@ export function printWindow(w) {
 }
 
 /**
- * 「打开并立刻打印」的旧入口，保留给**没有预览环节**的场合。
- *
- * 凡是让人能先看一眼的打印（凭证、账簿、报表）都应改用 PrintDialog ——
- * 直接 print() 会把一整叠纸塞进打印机，而用户还没确认过纸型和模板。
- */
-export async function openPrint(path, params = {}) {
-  const html = await loadPrintHtml(path, params)
-  if (html) printWindow(openPrintWindow(html))
-}
-
-/**
  * 带鉴权下载文件。
  *
- * **不能用 `window.open(apiUrl(...))`**：token 存在 localStorage，由 axios 拦截器
+ * **不能用 `window.open(拼接出来的 URL)`**：token 存在 localStorage，由 axios 拦截器
  * 注入到请求头，`window.open` 发出去的裸请求没有 Authorization，后端直接 401，
  * 用户看到的是新标签页里一个 JSON 错误，而不是文件。
  */

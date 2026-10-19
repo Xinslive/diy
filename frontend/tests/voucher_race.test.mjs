@@ -59,6 +59,7 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
   const savedAt = { value: '' }
   const insertCtx = { value: null }
   const subjectRefs = { clear() {} }
+  const rowEls = { clear() {} }
   // load() 换凭证时会把它整套清掉：标记状态拿分录对象当键，分录对象刚被换了一整套
   const markingRows = { value: new Set() }
   const voucherPeriod = { value: null }
@@ -72,7 +73,7 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
   const ctx = {
     route: { params: { id: '0' }, query: {} },
     form: {},
-    voucherId, savedAt, insertCtx, subjectRefs, markingRows, voucherPeriod, voucherPeriodId,
+    voucherId, savedAt, insertCtx, subjectRefs, rowEls, markingRows, voucherPeriod, voucherPeriodId,
     lastSaved, prevId, nextId, neighbourScope,
     store: { bookId: 1, periods: [] },
     listFilter: { value: {} },
@@ -95,7 +96,7 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
   const factory = new Function(
     'ctx',
     `
-    const { route, form, voucherId, savedAt, insertCtx, subjectRefs, markingRows, voucherPeriod,
+    const { route, form, voucherId, savedAt, insertCtx, subjectRefs, rowEls, markingRows, voucherPeriod,
             voucherPeriodId, lastSaved, prevId, nextId, neighbourScope, store, listFilter, entrySig,
             api, loadSubjects, ensureRows, loadInsertPreview, loadNextDefaults,
             defaultDate, ElMessage, router, history, location } = ctx

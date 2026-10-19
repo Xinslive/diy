@@ -40,7 +40,7 @@ def test_期初余额写入要留审计(client, auth, db, book, subjects):
         book_id=book.id, month=1).one()
 
     r = client.post(f"/api/books/{book.id}/periods?period_id={p1.id}", headers=auth, json=[
-        {"subject_id": subjects["100201"].id, "amount": "1000"},
+        {"subject_id": subjects["1002"].id, "amount": "1000"},
         {"subject_id": subjects["4001"].id, "amount": "-1000"},
     ])
     assert r.status_code == 200, r.text
@@ -57,12 +57,12 @@ def test_期初改写要留改前值(client, auth, db, book, subjects):
     from app.models import Period
 
     p1 = db.query(Period).filter_by(book_id=book.id, month=1).one()
-    payload = [{"subject_id": subjects["100201"].id, "amount": "1000"},
+    payload = [{"subject_id": subjects["1002"].id, "amount": "1000"},
                {"subject_id": subjects["4001"].id, "amount": "-1000"}]
     assert client.post(f"/api/books/{book.id}/periods?period_id={p1.id}",
                        headers=auth, json=payload).status_code == 200
 
-    payload2 = [{"subject_id": subjects["100201"].id, "amount": "500"},
+    payload2 = [{"subject_id": subjects["1002"].id, "amount": "500"},
                 {"subject_id": subjects["4001"].id, "amount": "-500"}]
     assert client.post(f"/api/books/{book.id}/periods?period_id={p1.id}",
                        headers=auth, json=payload2).status_code == 200
@@ -84,7 +84,7 @@ def test_试算不平被拒时不留审计(client, auth, db, book, subjects):
     before = len(_logs(db, book, "SET_OPENINGS"))
 
     r = client.post(f"/api/books/{book.id}/periods?period_id={p1.id}", headers=auth, json=[
-        {"subject_id": subjects["100201"].id, "amount": "1000"},
+        {"subject_id": subjects["1002"].id, "amount": "1000"},
     ])
     assert r.status_code == 400
     assert len(_logs(db, book, "SET_OPENINGS")) == before, "被拒绝的期初写入留下了审计"
@@ -95,20 +95,20 @@ def test_试算不平被拒时不留审计(client, auth, db, book, subjects):
 
 def test_新建科目要留审计(client, auth, db, book):
     r = client.post(f"/api/books/{book.id}/subjects", headers=auth, json={
-        "code": "1901", "name": "测试用科目", "category": "ASSET",
+        "code": "1905", "name": "测试用科目", "category": "ASSET",
         "direction": "DEBIT", "is_leaf": True, "carry_forward": True,
         "qty_calc": False, "aux_calc": False, "fx_calc": False, "sort_no": 99,
     })
     assert r.status_code == 201, r.text
 
     entry = _last(db, book, "CREATE_SUBJECT")
-    assert "1901" in entry.detail
+    assert "1905" in entry.detail
 
 
 def test_改科目要留改前改后(client, auth, db, book, subjects):
-    sid_ = subjects["100201"].id
+    sid_ = subjects["1002"].id
     payload = {
-        "code": "100201", "name": "改过的名字", "category": "ASSET",
+        "code": "1002", "name": "改过的名字", "category": "ASSET",
         "direction": "DEBIT", "is_leaf": True, "carry_forward": True,
         "qty_calc": False, "aux_calc": False, "fx_calc": False, "sort_no": 0,
     }
@@ -123,9 +123,9 @@ def test_改科目要留改前改后(client, auth, db, book, subjects):
 
 def test_停用科目要留审计(client, auth, db, book, subjects):
     """停用是个安全动作但影响面很大（老凭证还在用它），必须留痕。"""
-    sid_ = subjects["100201"].id
+    sid_ = subjects["1002"].id
     payload = {
-        "code": "100201", "name": "银行存款", "category": "ASSET",
+        "code": "1002", "name": "银行存款", "category": "ASSET",
         "direction": "DEBIT", "is_leaf": True, "carry_forward": True,
         "qty_calc": False, "aux_calc": False, "fx_calc": False, "sort_no": 0,
         "active": False,
@@ -163,23 +163,85 @@ def test_改报表公式要留审计(client, auth, db, book):
     公式写错一个字符，资产负债表就会悄无声息地少算一列 —— 而且报表照样
     渲染得出来。所以事后必须能查到「这个格子的公式原来是什么」。
     """
-    from app.models import ReportCell, ReportTemplate
+    from app.models import ReportCell, ReportCol, ReportTemplate
 
     tpl = db.scalar(select(ReportTemplate).where(ReportTemplate.code == "BALANCE_SHEET"))
-    cell = db.scalar(select(ReportCell).where(
-        ReportCell.template_id == tpl.id).limit(1))
+
+    # **只挑数值列，且排序确定。**
+    #
+    # 原来这里是 ``select(ReportCell).where(template_id == tpl.id).limit(1)`` ——
+    # 无排序，拿到哪一格取决于数据库返回顺序，而那个顺序取决于**别的测试
+    # 在这个库里留下了什么**。于是它有时抓到数值列、有时抓到 STATIC 固定列。
+    #
+    # 抓到 STATIC 列是要出事的：固定列放的是行标签/行次，不走取数，
+    # 往里写公式等于把「行次 31」当成金额渲染。而下面那条
+    # ``test_资产负债表的静态列与行次列没有公式`` 断言的正是「静态列没有
+    # 公式」—— 它一抓到固定列就红。
+    #
+    # 于是表现为一条**与本用例毫无关系的用例在并行下时红时绿**，
+    # 而真正的原因隔了两个文件、两百行。往 STATIC 列写公式本身也是错的做法，
+    # 所以这里从源头上就不该选它。
+    numeric_cols = db.scalars(
+        select(ReportCol.col_no).where(
+            ReportCol.template_id == tpl.id, ReportCol.kind != "STATIC")
+    ).all()
+    assert numeric_cols, "资产负债表里没有数值列，这条用例的前提不成立"
+    cell = db.scalar(
+        select(ReportCell)
+        .where(ReportCell.template_id == tpl.id,
+               ReportCell.col_no.in_(numeric_cols))
+        .order_by(ReportCell.row_no, ReportCell.col_no)   # 确定性
+    )
+    assert cell is not None, "资产负债表里没有数值列的单元格"
     old_formula = cell.formula
 
-    r = client.put(f"/api/reports/{tpl.id}/cells?book_id={book.id}", headers=auth,
-                   json=[{"row_no": cell.row_no, "col_no": cell.col_no,
-                          "formula": "科目(\"1001\",\"期末余额\",{{本期}})*999"}])
-    assert r.status_code == 200, r.text
+    # 先 fork 一份归属 book 的副本再改：模板按账套隔离（迁移 0020）之后
+    # 内置基线是只读的，往它身上写只会拿到 404 —— 那条用例要验的是
+    # 「改公式留不留 before」，靶子必须是账套改得动的那一份。
+    baseline = db.scalar(select(ReportTemplate).where(
+        ReportTemplate.code == "BALANCE_SHEET", ReportTemplate.book_id.is_(None)))
+    forked = client.post(f"/api/reports/templates/{baseline.id}/fork?book_id={book.id}",
+                         headers=auth)
+    assert forked.status_code == 201, forked.text
+    tpl = db.get(ReportTemplate, forked.json()["id"])
+    cell = db.scalar(
+        select(ReportCell)
+        .where(ReportCell.template_id == tpl.id,
+               ReportCell.col_no.in_(numeric_cols))
+        .order_by(ReportCell.row_no, ReportCell.col_no)
+    )
+    assert cell is not None, "fork 出来的副本里没有数值列的单元格"
+    old_formula = cell.formula
 
-    entry = _last(db, book, "UPDATE_REPORT_CELLS")
-    blob = str(entry.before) + str(entry.after)
-    assert old_formula[:20] in blob, (
-        f"公式审计里没有原公式（{old_formula[:40]}…）：{entry.before} / {entry.after}")
-    assert "999" in blob, f"新公式没进审计：{entry.before} / {entry.after}"
+    # **改完必须还原。**
+    #
+    # 经 client 的写入走的是 API 自己的 Session 并且 commit，而 conftest 的
+    # ``db`` 夹具只 rollback **它自己那个** session —— 所以 API 写进去的东西
+    # 不会被夹具撤销（审计已记录的既有设计：「db 夹具的 rollback 被夹具内部
+    # 的 commit 架空」）。这条毒公式因此会活过本用例，去污染后面读同一张
+    # 模板的用例。放到 finally 里，是为了让**断言失败时也照样还原** ——
+    # 一次红掉的用例不该顺手再弄坏另外一条。
+    try:
+        r = client.put(f"/api/reports/{tpl.id}/cells?book_id={book.id}", headers=auth,
+                       json=[{"row_no": cell.row_no, "col_no": cell.col_no,
+                              "formula": "科目(\"1001\",\"期末余额\",{{本期}})*999"}])
+        assert r.status_code == 200, r.text
+
+        entry = _last(db, book, "UPDATE_REPORT_CELLS")
+        blob = str(entry.before) + str(entry.after)
+        assert old_formula[:20] in blob, (
+            f"公式审计里没有原公式（{old_formula[:40]}…）：{entry.before} / {entry.after}")
+        assert "999" in blob, f"新公式没进审计：{entry.before} / {entry.after}"
+    finally:
+        # 还原本身也要验：还原失败会让毒公式活过本用例，而**症状出现在别的
+        # 文件里**（读同一张模板的用例红）。这里不响亮地失败，那条毒就会
+        # 以「与本用例无关的用例随机变红」的形式回来 —— 也就是它现在的样子。
+        back = client.put(f"/api/reports/{tpl.id}/cells?book_id={book.id}", headers=auth,
+                          json=[{"row_no": cell.row_no, "col_no": cell.col_no,
+                                 "formula": old_formula}])
+        assert back.status_code == 200, (
+            f"还原单元格公式失败（HTTP {back.status_code}）：{back.text}\n"
+            f"毒公式会留在这个账套里，后面读同一张模板的用例会莫名其妙地红。")
 
 
 # --------------------------------------------------------------------- 授权
@@ -219,9 +281,9 @@ def _snapshot_of(client, auth, db, book, subjects, amount: str):
     r = client.post(f"/api/books/{book.id}/vouchers", headers=auth, json={
         "voucher_date": "2026-01-15",
         "entries": [
-            {"subject_id": subjects["100201"].id, "direction": "DEBIT",
+            {"subject_id": subjects["1002"].id, "direction": "DEBIT",
              "amount": amount, "summary": "精度"},
-            {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+            {"subject_id": subjects["5001"].id, "direction": "CREDIT",
              "amount": amount, "summary": "精度"},
         ],
     })
@@ -264,9 +326,9 @@ def test_百万级也原样留存(client, auth, db, book, subjects):
     r = client.post(f"/api/books/{book.id}/vouchers", headers=auth, json={
         "voucher_date": "2026-01-15",
         "entries": [
-            {"subject_id": subjects["100201"].id, "direction": "DEBIT",
+            {"subject_id": subjects["1002"].id, "direction": "DEBIT",
              "amount": amount, "summary": "精度"},
-            {"subject_id": subjects["600101"].id, "direction": "CREDIT",
+            {"subject_id": subjects["5001"].id, "direction": "CREDIT",
              "amount": amount, "summary": "精度"},
         ],
     })

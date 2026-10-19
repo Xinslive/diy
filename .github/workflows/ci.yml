@@ -15,11 +15,13 @@
 #      以后谁想用 -k 悄悄把范围收窄，这一步会先红。
 # 想改这三处，请连带在 PR 描述里说清楚理由。
 #
-# 三条 job：
-#   backend   —— 全量 pytest（PostgreSQL 服务 + 真实 pg_dump/psql）
-#   frontend  —— node --test 与 vite build
-#   docker    —— 镜像必须真的构建得出来，且 alembic.ini / migrations/ 在镜像里
-#   deploy    —— 发布脚本沙箱演练（deploy/tests/test_deploy.sh）
+# 六条 job：
+#   backend          —— 全量 pytest（PostgreSQL 服务 + 真实 pg_dump/psql）
+#   frontend         —— node --test 与 vite build
+#   docker           —— 镜像必须真的构建得出来，且 alembic.ini / migrations/ 在镜像里
+#   deploy           —— 发布脚本沙箱演练（deploy/tests/test_deploy.sh）
+#   plugin-browser   —— 生产构建/CSP、签名安装、两 worker 重启、用户授权闭环
+#   build-artifacts  —— 出部署产物；依赖 backend、frontend、plugin-browser 全部成功
 
 name: CI
 
@@ -94,30 +96,114 @@ jobs:
 
       - name: 全量 pytest（不加 -k，不加 -m，不跳过任何用例）
         working-directory: backend
-        run: python -m pytest -rA
+        shell: bash
+        # -n 3 覆盖 pytest.ini 里的 -n 6。两个原因：
+        #   * pytest.ini 的 6 是按**本机 10 核**调出来的，它的注释里明写「8/10
+        #     实测反而更慢」—— 因为用例大量走磁盘和 PostgreSQL，瓶颈是 IO。
+        #     CI 跑在 ubuntu-latest（4 vCPU）上，照抄 6 只会让 6 个 worker 互相
+        #     抢那 4 个核。给 3 是**略低于核数**，留一个核给 PostgreSQL 服务容器。
+        #   * 刻意**不用 -n auto**：那条「IO 瓶颈」的结论是在 10 核机上测出来的，
+        #     4 核机上未必成立，而 auto 会让并行度跟着 runner 的规格漂 ——
+        #     同一个 commit 在不同 runner 上跑出不同的并行度，没法比较。
+        #     命令行参数优先级高于 pytest.ini 的 addopts，所以这里的 3 会生效。
+        run: |
+          set -euo pipefail
+          # tee 到文件：下一步的护栏校验解析这份报告，而不是重跑一遍护栏。
+          # set -o pipefail 保证 pytest 失败时这一步照样失败（tee 自己是 0）。
+          python -m pytest -rA -n 3 2>&1 | tee pytest-report.txt
 
-      - name: 护栏测试必须真的被执行
+      - name: 护栏测试必须真的被执行（读上面那次全量的报告，不重跑）
         working-directory: backend
+        shell: bash
         # 这一步是整个 workflow 的重点。上面那次全量跑里如果有人加了
         # `-k "not guardrail"` 或者给护栏打了 skip mark，pytest 依然会全绿 ——
         # 而护栏恰恰是最容易被「静默绕过」的那部分。
+        #
+        # **为什么不自己再跑一遍**（原来这里是另起一个 pytest 进程跑这两个文件）：
+        # tests/conftest.py 的 _test_database 是 session 级夹具，每个 pytest
+        # 进程启动都会做一次 CREATE DATABASE + DROP SCHEMA public CASCADE +
+        # 跑完整条迁移链。全量跑一次 = 6 套（-n 6，worker 各自建库），护栏再跑
+        # 一遍 = 第 7 套。护栏那两条已经在第 95 行那次全量里跑过了 —— 同一批
+        # 用例同一套迁移，白建一次库、白跑一遍迁移链。
+        #
+        # 现在改成解析上一步 `-rA` 已经打印出来的 short test summary。
+        # **全程 fail-closed**，五条退出条件逐条都验过：
+        #   1. 报告文件不存在（上一步没落盘）
+        #   2. 报告里找不到 short test summary 段（截断 / 格式变了）
+        #   3. 某个护栏文件一条 PASSED 都没有（被人用 -k 收窄了范围）
+        #   4. 某个护栏文件 PASSED 少于下限 3 条
+        #   5. 护栏出现任何非 PASSED 状态（FAILED/ERROR/SKIPPED/**XFAIL/XPASS**）
+        # 宁可误报红，也不放过「护栏其实没跑」。比原来更严的一处是第 5 条：
+        # 原来只挡 SKIPPED，现在把 xfail 也算失败 —— 给护栏打 xfail 正是不该
+        # 悄悄发生的那类改动，它必须留在一张被人看见的 PR 上。
         run: |
           set -euo pipefail
-          out=$(python -m pytest -rA --no-header \
-                  tests/test_test_db_guardrail.py \
-                  tests/test_migration_guardrails.py 2>&1) || {
-            echo "$out"; echo "❌ 护栏测试本身没过"; exit 1; }
-          echo "$out"
-          passed=$(grep -cE '^PASSED tests/' <<<"$out" || true)
-          if [ "${passed:-0}" -lt 3 ]; then
-            echo "❌ 护栏测试只跑出 ${passed:-0} 条 PASSED —— 护栏等于没上锁"
-            exit 1
-          fi
-          if grep -E '^SKIPPED tests/(test_test_db_guardrail|test_migration_guardrails)' <<<"$out"; then
-            echo "❌ 护栏测试被跳过了 —— 删掉或跳过护栏不该让流水线变绿"
-            exit 1
-          fi
-          echo "✅ ${passed} 条护栏用例真的执行了"
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          REPORT = pathlib.Path("pytest-report.txt")
+          GUARDRAILS = ("tests/test_test_db_guardrail.py", "tests/test_migration_guardrails.py")
+          MIN_PASSED = 3
+
+          def die(msg):
+              print("❌ " + msg)
+              sys.exit(1)
+
+          if not REPORT.is_file():
+              die(f"找不到 {REPORT} —— 上一步的全量报告没有落盘，"
+                  "护栏是否真的被执行无从确认。")
+
+          text = REPORT.read_text(encoding="utf-8", errors="replace")
+
+          # 只解析 short test summary 段。整份报告里还有 PASSES 段和被捕获的
+          # stderr，那些地方同样可能出现 PASSED/FAILED 字样 —— 全文件 grep 会误判。
+          idx = text.find("short test summary info")
+          if idx < 0:
+              die(f"{REPORT} 里找不到 short test summary 段 —— "
+                  "报告被截断或 pytest 输出格式变了，不能靠猜。")
+          summary = []
+          for line in text[idx:].splitlines():
+              if re.match(r"^=+ .* =+$", line):
+                  break                       # 进入下一段，停止收集
+              summary.append(line)
+
+          # 形如：PASSED tests/test_test_db_guardrail.py::test_开发库名被拦下
+          status_re = re.compile(
+              r"^(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\s+(\S+?\.py)(?:::|$)")
+
+          counts = {g: {} for g in GUARDRAILS}
+          for line in summary:
+              m = status_re.match(line.strip())
+              if not m:
+                  continue
+              status, path = m.group(1), m.group(2)
+              for g in GUARDRAILS:
+                  if path == g or path.endswith("/" + g):
+                      counts[g][status] = counts[g].get(status, 0) + 1
+
+          problems = []
+          for g in GUARDRAILS:
+              c = counts[g]
+              passed = c.get("PASSED", 0)
+              others = {k: v for k, v in c.items() if k != "PASSED"}
+              if passed == 0:
+                  problems.append(f"{g}：报告里一条 PASSED 都没有"
+                                  f"（该文件的状态统计：{c or '完全没出现'}）"
+                                  "—— 护栏等于没上锁")
+              elif passed < MIN_PASSED:
+                  problems.append(f"{g}：只跑出 {passed} 条 PASSED，"
+                                  f"下限是 {MIN_PASSED} 条")
+              for k, v in sorted(others.items()):
+                  problems.append(f"{g}：有 {v} 条 {k} —— 护栏必须真的 PASSED，"
+                                  "删掉或跳过护栏不该让流水线变绿")
+          if problems:
+              die("；".join(problems))
+
+          print("✅ 护栏用例真的执行了：" + "；".join(
+              f"{g} {counts[g]['PASSED']} 条 PASSED" for g in GUARDRAILS))
+          PY
 
       - name: 用例数下限（防止有人用 -k 把范围悄悄收窄）
         working-directory: backend
@@ -141,7 +227,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           # CI 固定在 LTS 上，不追开发机的新版本 —— 流水线要的是可复现。
-          # 本地开发机跑的是 Node 26，两边都验证过（见 PR 里手工核对的结果）。
+          # 本地开发机跑的是 Node 26。
+          #
+          # **代价是两者对 `node --test` 的参数解析不一样**（这行注释原来写的是
+          # 「两边都验证过」，并没有）：Node 26 能把 `tests/` 当目录展开，Node 22
+          # 会把它当成一个模块去 require，直接
+          # `Cannot find module '.../frontend/tests'` 而失败。
+          # 所以 package.json 的 test 脚本传的是**展开后的文件列表**而不是目录
+          # （见 frontend/package.json），两边行为就一致了。
+          # 要改 node-version，先把这条一起改掉，别只改一半。
           node-version: '22'
 
       - uses: pnpm/action-setup@v4
@@ -184,6 +278,56 @@ jobs:
         working-directory: frontend
         run: npm run build
 
+  # 独立数据库、临时签名密钥、生产构建/CSP，实际重启两 worker。
+  plugin-browser:
+    name: 签名插件安装与授权浏览器演练
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cwq
+          POSTGRES_PASSWORD: cwq123
+          POSTGRES_DB: cwq_plugin_browser_test
+        ports:
+          - '5432:5432'
+        options: >-
+          --health-cmd "pg_isready -U cwq"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CWQ_PLUGIN_E2E_DATABASE_URL: postgresql+psycopg://cwq:cwq123@127.0.0.1:5432/cwq_plugin_browser_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+      - name: 安装锁定依赖与 Chromium
+        run: |
+          python -m pip install -r backend/requirements-dev.lock
+          npm ci
+          pnpm --dir frontend install --frozen-lockfile
+          npx playwright install --with-deps chromium
+      - name: 构建并执行真实浏览器演练
+        run: |
+          pnpm --dir frontend build
+          python backend/scripts/plugin_e2e.py
+      - name: 保留浏览器截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-browser-screenshots
+          path: output/playwright/
+          if-no-files-found: warn
+
   # ------------------------------------------------------------------ 镜像
   docker:
     name: 镜像能构建且迁移文件在镜像里
@@ -207,7 +351,9 @@ jobs:
           # 闸门本身也要能算出 head
           docker run --rm --entrypoint alembic cwq-api:ci heads \
             || { echo "❌ 镜像里 alembic 算不出 head"; exit 1; }
-          echo "✅ 迁移文件在镜像里"
+          docker run --rm --entrypoint python cwq-api:ci -c "import os; from pathlib import Path; from app.core.config import settings; assert os.geteuid() != 0; assert os.access('/app/data/plugins', os.W_OK); assert Path('/app/scripts/start_server.py').is_file(); assert not settings.plugin_enabled"
+          docker image inspect cwq-api:ci --format '{{json .Config}}' | python -c "import json, sys; c=json.load(sys.stdin); assert '/app/data' in c['Volumes']; assert 'scripts/start_server.py' in ' '.join(c['Cmd'])"
+          echo "✅ 迁移、非 root 运行目录、持久化卷与 supervisor 入口均有效"
 
   # ------------------------------------------------------------------ 发布脚本
   deploy:
@@ -220,3 +366,150 @@ jobs:
       # 守卫，专门防「脚本压根没跑起来却一片绿」。
       - name: 跑沙箱演练
         run: bash deploy/tests/test_deploy.sh
+
+  # ------------------------------------------------------------------ 构建产物
+  #
+  # **这条 job 存在的理由：让生产机不必再当构建机。**
+  #
+  # 原来的 deploy.sh 在生产机上跑全量 pytest（-n 6，6 个并行 worker 各自
+  # 建独立 PG 库）加 pnpm install 加 vite build。那是生产机上最重的一步 ——
+  # 比运行时重得多，且要求生产机常驻 Node.js / pnpm / pytest 三套工具链，
+  # 只为了发一次版。
+  #
+  # 改成「CI 出产物、生产机只取产物重启」之后，生产机不再需要这三样，
+  # 发版尖峰也随之消失。
+  #
+  # **「测试闸门」没有被削弱，只是换了位置。** deploy.sh 原来的第一条铁律是
+  # 「先跑测试再切流量」。现在这个闸门由 `needs:` 承担：本 job 必须等
+  # backend、frontend 与 plugin-browser 都成功才会跑，所以**产物存在即代表后端全量
+  # pytest、前端测试/构建和真实插件浏览器演练都过了**。生产机「能不能取到产物」就是新的闸门 ——
+  # 取不到就不会重启服务。
+  #
+  # 护栏校验（护栏必须真的被执行、用例数下限，见 backend job 里的说明）
+  # **在 backend job 里生效**，而本 job `needs: backend`，所以它同样是上线
+  # 前置条件，不是在本地跑跑就算的那道闸。
+  build-artifacts:
+    name: 构建可部署产物
+    runs-on: ubuntu-latest
+    needs: [backend, frontend, plugin-browser]
+
+    # **services 必须挂在 job 上，不能挂在 step 上。**
+    #
+    # 它原先写在下面「验证 schema 自洽」那个 step 里面，而 step 的 schema 里
+    # 根本没有 services 这个键。GitHub 校验工作流文件时不认，于是**整个工作流
+    # 被判为非法**：一次 job 都不会创建，运行直接失败，而且界面只给一句
+    # "This run likely failed because of a workflow file issue" —— 没有任何
+    # 行号、没有任何原因。
+    #
+    # 后果不是「这一步没跑」，而是**整条流水线自 2026-10-13 起从未创建过任何一个
+    # job**：backend / frontend / docker / deploy / build-artifacts 一条都没跑过。
+    # 顺带也意味着 build-artifacts 从没产出过产物，deploy.sh 取产物的第一道闸门
+    # 在此之前根本不可能通过。
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cwq
+          POSTGRES_PASSWORD: cwq123
+          POSTGRES_DB: cwq_artifacts
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U cwq"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'   # 与 Dockerfile / systemd / CI backend 一致
+
+      - name: 按锁定版本装运行时依赖（不是 requirements-dev.lock）
+        working-directory: backend
+        # **只装 requirements.lock**：生产机拿到这个产物后装的就是同一套。
+        # 这里若用了 dev 锁（带 pytest / httpx），产物里就会混入生产用不到的
+        # 东西，而「产物里跑的是哪一版」又变成看构建那天的心情。
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+
+      - name: 验证 schema 自洽（空库跑完整迁移链）
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+psycopg://cwq:cwq123@127.0.0.1:5432/cwq_artifacts
+        # 产物里带了 migrations/ 却不保证它能 upgrade，生产机上就是
+        # 「代码已切、schema 没升」—— 服务起不来，或者更糟：起得来但读的是旧表。
+        # 这里在 CI 里先跑一遍，失败就不该有产物。
+        run: |
+          set -euo pipefail
+          python -m alembic upgrade head
+          echo "schema 版本：$(python -m alembic current | tail -1)"
+
+      # 与 frontend job **完全同一套** Node/pnpm 接入。
+      #
+      # 原来这里是裸的 ``corepack enable``：package.json 里没有 packageManager
+      # 字段，corepack 就按「它当前认为的最新版」装 pnpm —— 实测当天给的是
+      # 12.14.0，而 frontend job 用 pnpm/action-setup 钉的是 10.x。**同一个
+      # workflow 里两个 job 用了两个不同的 pnpm**，于是 frontend 验过的构建，
+      # 产物 job 未必跑得通；而 corepack 装哪个版本还会随时间漂移。
+      #
+      # 换成显式 setup 后两边锁死在同一个大版本，构建产物与被验证过的行为一致。
+      # 要改版本，这里和 frontend job 的 pnpm/action-setup 一起改。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+
+      - name: 构建前端
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile --silent
+          pnpm run build
+
+      - name: 打包产物
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA::12}"
+          OUT="dist-artifacts"
+          mkdir -p "$OUT"
+
+          # 后端：源码 + 运行时锁 + 迁移文件。**不含** tests / .venv /
+          # requirements-dev.* —— 生产机不需要测试框架（那是「机器上装的
+          # 东西到底是给谁用的」说不清的老问题）。
+          tar -czf "$OUT/cwq-backend-${SHA}.tar.gz" \
+            -C backend \
+            --exclude='tests' --exclude='.venv' --exclude='__pycache__' \
+            --exclude='*.pyc' --exclude='logs' \
+            app scripts migrations alembic.ini requirements.lock pytest.ini
+
+          # 前端：只有产物目录，不含 src / node_modules
+          tar -czf "$OUT/cwq-frontend-${SHA}.tar.gz" -C frontend dist
+
+          # 清单：版本 + 构件名。生产机据此确认「拿到的是 CI 出品的那一份」。
+          {
+            echo "sha=${SHA}"
+            echo "commit=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF_NAME}"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "backend=cwq-backend-${SHA}.tar.gz"
+            echo "frontend=cwq-frontend-${SHA}.tar.gz"
+          } > "$OUT/manifest.txt"
+          ( cd "$OUT" && sha256sum ./*.tar.gz > SHA256SUMS )
+
+          cat "$OUT/manifest.txt"
+          ls -lh "$OUT"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: cwq-deploy-${{ github.sha }}
+          path: dist-artifacts/
+          retention-days: 30
+          if-no-files-found: error   # 产物没生成出来就不许「成功」

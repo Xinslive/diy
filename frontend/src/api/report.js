@@ -1,7 +1,23 @@
-import { http, apiUrl } from './client'
-export const templates = () => http.get('/reports/templates').then(r => r.data)
-export const design = (id) => http.get(`/reports/${id}/design`).then(r => r.data)
-export const render = (id, params) => http.get(`/reports/${id}/render`, { params }).then(r => r.data)
+import { http, getLatest } from './client'
+// 列表必须带 book_id：服务端要靠它判断「这张模板对当前账套可见吗」，
+// 并按 code 去重（官方内置基线 vs 本账套副本并存时，副本优先）。
+export const templates = (bookId) =>
+  http.get('/reports/templates', { params: { book_id: bookId } }).then(r => r.data)
+export const design = (id, bookId) =>
+  http.get(`/reports/${id}/design`, { params: { book_id: bookId } }).then(r => r.data)
+
+/**
+ * 把一张报表复制一份归属当前账套（后端的「写时复制」）。
+ *
+ * 只有进入设计模式时才会真的复制：系统内置的资产负债表/利润表是所有账套
+ * 共用的原版，直接改会立刻扩散到别的账套，所以先复制一份到本账套再改。
+ * 已经在本账套的报表原样返回同一个 id，不做任何事 —— 反复进设计模式不会
+ * 复制出一堆副本。
+ */
+export const forkTemplate = (id, bookId) =>
+  http.post(`/reports/templates/${id}/fork`, null, { params: { book_id: bookId } }).then(r => r.data)
+// 跟着期间/账套/模板走，切换时同样会连点 —— 走 getLatest 让上一趟直接 abort。
+export const render = (id, params) => getLatest('report/render', `/reports/${id}/render`, params)
 // 公式语法错现在**当场 400**（以前是 200 存进去、等渲染时某一格蹦红字）。
 // 整批拒收、一格不存，所以调用方要把 detail 弹给人看，并保留未保存的改动。
 export const saveCells = (id, cells, bookId) => http.put(`/reports/${id}/cells`, cells, { params: { book_id: bookId } }).then(r => r.data)
@@ -39,3 +55,12 @@ export const updateCol = (id, colNo, payload, bookId) =>
   http.patch(`/reports/templates/${id}/cols/${colNo}`, payload, { params: { book_id: bookId } }).then(r => r.data)
 export const deleteCol = (id, colNo, bookId) =>
   http.delete(`/reports/templates/${id}/cols/${colNo}`, { params: { book_id: bookId } }).then(r => r.data)
+
+export const previewTemplateImport = (file, bookId) => {
+  const form = new FormData()
+  form.append('file', file)
+  return http.post('/reports/templates/import/preview', form, { params: { book_id: bookId } }).then(r => r.data)
+}
+export const importTemplates = (templates, bookId, acceptWarnings = false) =>
+  http.post('/reports/templates/import', { templates, accept_warnings: acceptWarnings },
+    { params: { book_id: bookId } }).then(r => r.data)

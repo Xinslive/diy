@@ -21,8 +21,15 @@ await step('打开登录页', async () => {
 await page.screenshot({ path: `${out}/01-login.png` })
 
 await step('登录', async () => {
+  // 用户名在 dev 下预填成 admin，但**口令不再预填**（见 LoginView.vue 的注释：
+  // 生产构建连用户名预填也去掉了）。原来这里只点「登录」，于是从那一刻起
+  // 整个脚本全在登录页上空转，后面每一步都超时 —— 看起来像十几处功能坏了。
+  await page.fill('input[type=password]', process.env.CWQ_PASSWORD || '123456')
   await page.click('button:has-text("登录")')
-  await page.waitForSelector('.el-aside', { timeout: 15000 })
+  // 主布局里那个侧栏是 `<aside class="sidebar">`（MainLayout.vue），不是
+  // element-plus 的 .el-aside —— 等一个不存在的类，这一步必然超时，
+  // 后面每一步跟着一起报错，看着像十几处功能坏了。
+  await page.waitForSelector('.sidebar', { timeout: 15000 })
   await page.waitForTimeout(800)
 })
 await page.screenshot({ path: `${out}/02-books.png` })
@@ -140,9 +147,9 @@ await page.screenshot({ path: `${out}/13-import.png` })
 
 await step('打印模板设计器（含实时预览）', async () => {
   await page.goto(BASE + '/#/print-templates', { waitUntil: 'networkidle' })
-  await page.waitForSelector('iframe.preview', { timeout: 15000 })
+  await page.waitForSelector('iframe.frame', { timeout: 15000 })
   await page.waitForTimeout(2500)
-  const frame = page.frameLocator('iframe.preview')
+  const frame = page.frameLocator('iframe.frame')
   await frame.locator('table.grid').first().waitFor({ timeout: 15000 })
   const rows = await frame.locator('table.grid tr').count()
   if (rows === 0) throw new Error('预览里没有表格内容')
@@ -150,16 +157,31 @@ await step('打印模板设计器（含实时预览）', async () => {
 })
 await page.screenshot({ path: `${out}/14-print-designer.png` })
 
-await step('改纸型后预览跟着变', async () => {
-  await page.locator('.el-form-item').filter({ hasText: '纸型' }).locator('.el-select').first().click()
+await step('设计器里没有纸型选择，改的是「每页凭证数」', async () => {
+  // 纸型全局只剩 A4，页面上不该再有一个能选纸的下拉框。留着一个只有一个选项的
+  // 下拉框，用户会以为还能换，得点开才发现不能。
+  const paperSel = page.locator('.ti-page .fl').filter({ hasText: '纸型' }).locator('.el-select')
+  if (await paperSel.count()) throw new Error('设计器仍有纸型下拉框')
+
+  // 断言落在预览真实渲染出来的 class 上，而不是「点击后没有报错」——
+  // 一页两张的标记是 slots-2，一页一张是 slots-1。
+  const slotsClass = async () => {
+    const html = await page.frameLocator('iframe.frame').locator('body').innerHTML()
+    return (html.match(/slots-[12]/) || [''])[0]
+  }
+  const before = await slotsClass()
+  if (!before) throw new Error('预览里找不到每页张数的标记')
+  const next = before === 'slots-2' ? 1 : 2
+
+  await page.locator('.ti-page .fl').filter({ hasText: '每页凭证数' }).locator('.el-select').click()
   await page.waitForTimeout(700)
   // 所有 el-select 的选项都会提前渲染进 DOM（合计 100+ 个隐藏项），必须先限 :visible
-  await page.locator('.el-select-dropdown__item:visible').filter({ hasText: /^A5$/ }).first().click()
+  await page.locator('.el-select-dropdown__item:visible').filter({ hasText: `每页 ${next} 张` }).first().click()
   await page.waitForTimeout(1800)
-  const css = await page.frameLocator('iframe.preview').locator('style').first().textContent()
-  if (!css.includes('A5')) throw new Error('预览仍是旧纸型，实际：' + css.slice(0, 80))
+  const after = await slotsClass()
+  if (after === before) throw new Error(`改每页凭证数后预览没变：${before} → ${after}`)
 })
-await page.screenshot({ path: `${out}/15-print-a5.png` })
+await page.screenshot({ path: `${out}/15-print-slots.png` })
 
 await step('管理员能看到「用户与授权」', async () => {
   const n = await page.locator('.el-menu-item:has-text("用户与授权")').count()

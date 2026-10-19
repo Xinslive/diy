@@ -152,6 +152,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import create_engine, select, text, update  # noqa: E402
 
 from app.core.db import SessionLocal, engine  # noqa: E402
+
+
 from app.core.schema_version import upgrade_to_head  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402
 from app.models import Book, Period, Subject, SysUser, UserBook  # noqa: E402
@@ -176,6 +178,28 @@ def _test_database():
             ).scalar()
             if not exists:
                 conn.execute(text(f'CREATE DATABASE "{name}"'))
+            # 把时区钉在**库**上，而不是靠连接事件逐个 SET。
+            #
+            # PostgreSQL 的 TimeZone GUC 决定 TIMESTAMPTZ 取回来时带什么 tzinfo：
+            # 字面量恰好是 `UTC` 时 psycopg 交出 datetime.timezone.utc；写成
+            # `Etc/UTC`（GitHub 的 postgres:16 服务容器默认）或 `Asia/Shanghai`
+            # （生产机实测就是这个）它交出对应的 ZoneInfo。两者是**同一时刻**，
+            # utcoffset 都是 0，但 `== timezone.utc` 为 False。
+            #
+            # 之前用 `event.listens_for(engine, "connect")` 在每个新连接上 SET。
+            # 那个办法**不可靠**：套件里到处是 commit → 归还连接 → 再取一条，
+            # 一旦某条物理连接是在监听器生效之前建好并留在池里，之后所有复用
+            # 它的用例都拿到 Etc/UTC —— 表现为同一个提交 CI 上时绿时红
+            # （6e5fc0e 提交后 293a435 绿、0a57860 红，两次只差前端与产物 job）。
+            # 而且本机 PG 默认就是 UTC，**本地怎么跑都绿**，等于从未验证过。
+            #
+            # 库级默认不依赖连接的创建时机：连到这个库的每一条连接、任何时刻、
+            # 任何引擎拿到的都是 UTC。顺带这也是「测试库本来就应该配成 UTC」
+            # 这件事的正面表达，而不是在测试代码里打补丁。
+            #
+            # 注意这条 ALTER 必须在**建库之后**、每次都执行：库是复用的，
+            # 上一轮留下的设置也得被重新确认一遍。
+            conn.execute(text(f"""ALTER DATABASE "{name}" SET TimeZone TO 'UTC'"""))
     finally:
         admin.dispose()
 
@@ -211,9 +235,10 @@ def _test_database():
 # --------------------------------------------------------------------- 口令哈希缓存
 #
 # hash_password 是 pbkdf2-sha256 / 24 万轮，**一次 21ms**。而下面两个用户夹具
-# 用的口令是写死的字符串（admin123 / staff123），于是 1004 条测试要为两个
-# 固定口令反复算 2000 次哈希 —— 实测约 42s，占全量 194s 的 22%，
-# 是这套夹具里最大的一笔冤枉开销。
+# 用的口令是写死的字符串（admin123 / staff123），于是上千条测试要为两个
+# 固定口令反复算 2000 次哈希 —— 实测约 42s，占优化前全量 178s 的 24%
+# （基线数字与 pytest.ini 统一；这一段曾写着 194s，与 pytest.ini 的 178s
+# 对不上，两个数字各说各话，已并成一处），是这套夹具里最大的一笔冤枉开销。
 #
 # 为什么缓存安全：
 #   · 存进 sys_user 的还是**真哈希**，登录走的是真的 verify_password，
@@ -325,12 +350,21 @@ def book(db, admin_user):
     """一个全新的空账套：12 个期间 + 标准科目表。
 
     每个测试拿一个干净的账套，测试之间不会因为上一条用例留下的凭证而互相干扰。
+
+    ``init_subjects_at`` 直接给上：这个夹具造的是「已经装好标准科目表」的账套，
+    等价于初始化第 1 步已经完成。生产上新账套这一列是空的（要走初始化向导），
+    而期初余额的导入与保存都挂在这道闸门上 —— 夹具不给的话，下面每一条
+    写期初的用例都会被 409 拒掉，测的就不再是它本来的意思。
+    需要「未初始化」账套的用例自己建，不要改这里。
     """
+    from datetime import datetime, timezone
+
     from app.accounting.periods import create_periods
     from app.seed.chart_of_accounts import install_chart
 
     tag = uuid.uuid4().hex[:8]
-    b = Book(company_name=f"测试公司{tag}", name=f"账套{tag}", start_year=2026, start_month=1)
+    b = Book(company_name=f"测试公司{tag}", name=f"账套{tag}", start_year=2026, start_month=1,
+             init_subjects_at=datetime.now(timezone.utc), init_subjects_source="CHART")
     db.add(b)
     db.flush()
     create_periods(db, b)

@@ -408,7 +408,7 @@ def test_叶子护栏_挡住了_true到true_这个漏网方向(db, book):
     from sqlalchemy.exc import DBAPIError
 
     parent = _subject(db, book.id, "1900", is_leaf=False)
-    child = _subject(db, book.id, "1901", parent=parent)
+    child = _subject(db, book.id, "1905", parent=parent)
     db.commit()
 
     # 造出「is_leaf=true 却有下级」的存量脏状态（这正是 P1-01 之前的老库会有的）。
@@ -446,13 +446,13 @@ def test_插子科目不动父节点_提交时被拒(db, book):
     db.commit()
     db.execute(text("INSERT INTO subject (book_id, code, name, parent_id, level, "
                     "category, direction, is_leaf, ext_attrs, created_at, updated_at) "
-                    "VALUES (:b, '1901', '1901', :p, 2, 'ASSET', 'DEBIT', true, "
+                    "VALUES (:b, '1905', '1905', :p, 2, 'ASSET', 'DEBIT', true, "
                     "'{}'::jsonb, now(), now())"),
                {"b": book.id, "p": parent})
     with pytest.raises(DBAPIError, match="末级"):
         db.commit()
     db.rollback()
-    assert db.execute(text("SELECT count(*) FROM subject WHERE book_id = :b AND code = '1901'"),
+    assert db.execute(text("SELECT count(*) FROM subject WHERE book_id = :b AND code = '1905'"),
                       {"b": book.id}).scalar() == 0, "被拒之后子科目不该留在库里"
 
 
@@ -467,21 +467,21 @@ def test_同一事务里改父节点_不挡(db, book):
     db.commit()
     db.execute(text("INSERT INTO subject (book_id, code, name, parent_id, level, "
                     "category, direction, is_leaf, ext_attrs, created_at, updated_at) "
-                    "VALUES (:b, '1901', '1901', :p, 2, 'ASSET', 'DEBIT', true, "
+                    "VALUES (:b, '1905', '1905', :p, 2, 'ASSET', 'DEBIT', true, "
                     "'{}'::jsonb, now(), now())"),
                {"b": book.id, "p": parent})
     db.execute(text("UPDATE subject SET is_leaf = false WHERE id = :p"), {"p": parent})
     db.commit()
     rows = db.execute(text("SELECT code, is_leaf FROM subject WHERE book_id = :b "
-                           "AND code IN ('1900', '1901') ORDER BY code"),
+                           "AND code IN ('1900', '1905') ORDER BY code"),
                       {"b": book.id}).all()
-    assert rows == [("1900", False), ("1901", True)], rows
+    assert rows == [("1900", False), ("1905", True)], rows
 
 
 def test_父节点护栏不挡_挂到本来就非末级的父级(db, book):
     parent = _subject(db, book.id, "1900", is_leaf=False)
     db.commit()
-    _subject(db, book.id, "1901", parent=parent)
+    _subject(db, book.id, "1905", parent=parent)
     db.commit()
     assert db.execute(text("SELECT count(*) FROM subject WHERE book_id = :b"),
                       {"b": book.id}).scalar() >= 1
@@ -846,14 +846,22 @@ def test_模型与库的外键零差异(db):
             Base.metadata)
 
     offenders: list[str] = []
-    for table, ops in diffs:
-        for outer in ops:
-            for item in getattr(outer, "ops", None) or [outer]:
-                if type(item).__name__ in CONSTRAINT_OPS:
-                    offenders.append(
-                        f"{table.name}: {type(item).__name__} "
-                        f"{getattr(item, 'constraint_name', '') or ''} "
-                        f"{getattr(item, 'constraint', '') or ''}")
+    # ``compare_metadata`` 返回的是 **DiffResult**：``[(op 代码, 对象), ...]``。
+    # ``add_table`` 给 Table、``add_index`` 给 Index、约束类改动给约束对象，
+    # 表级改动则装在 ModifyTableOps 容器里。
+    #
+    # 早年的写法按 ``[(表, ops 容器), ...]`` 解包。Table 恰好可迭代
+    # （迭代出的是列对象），于是它从没匹配上过 CONSTRAINT_OPS —— 这条
+    # 断言一直是**空转**的绿。0020 给 report_template 加上部分唯一索引之后，
+    # ``add_index`` 那条上的 Index 不可迭代，才把潜伏的形状错误翻成 TypeError。
+    # 形状修正之后它才真的在比较约束 —— 下面那句 assert 从此有意义。
+    for _code, obj in diffs:
+        for item in getattr(obj, "ops", None) or [obj]:
+            if type(item).__name__ in CONSTRAINT_OPS:
+                offenders.append(
+                    f"{getattr(obj, 'name', '') or ''}: {type(item).__name__} "
+                    f"{getattr(item, 'constraint_name', '') or ''} "
+                    f"{getattr(item, 'constraint', '') or ''}")
     assert not offenders, (
         "模型与库在约束上不一致 —— 照模型跑一次 autogenerate 就会把它们改回去：\n"
         + "\n".join(offenders)
@@ -891,6 +899,24 @@ def test_head_是本文件认识的那一版():
         "0008_login_ip_throttle",           # P2-11 的 IP 维度节流状态表
         "0009_subject_year_code_edit",      # 科目编码：本年度无发生额即可改
         "0010_subject_year_code_subtree",   # 同上，但「发生额」按整棵子树判（汇总级也算有记账）
+        "0011_subject_and_batch_indexes",   # 性能审计：entry.subject_id 与 import_batch 的查询索引
+        "0012_balance_sheet_dual_sided",    # 资产负债表改成会小企01表的双栏 8 列版式
+        "0013_sme_chart_accounts",       # 补齐《小企业会计准则》科目，让会小企01表每行挂得上科目
+        "0014_official_template",            # 按官方空白模板纠正左右两半的行配对与底纹
+        "0015_book_data_version",            # 账套数据版本号：跨请求聚合缓存的失效依据
+        "0016_invoice_import",               # 发票导入、OCR 结果留存与自动凭证生成
+        "0017_system_settings",               # 系统级键值配置：第三方服务凭据从 .env 搬进库
+        "0018_book_initialization",            # 账套初始化两步的状态（第 1 步科目、第 2 步期初余额）
+        "0019_book_order",                     # 账套磁贴的**个人**排序：每个用户各一份磁贴顺序
+        "0020_report_template_book_scope",     # 报表模板按账套隔离（book_id 可空 = 官方内置基线）
+        "0021_youyou_chart_of_accounts",       # 内置科目表换成用友 4-2-2 的 140 个科目
+        "0022_voucher_baseline_templates",     # 凭证模板基线入库（种子数据迁移）
+        "0023_print_template_private_copy",    # 打印模板的按用户私有副本（写时复制，粒度到人）
+        "0024_paper_a4_only",                  # 纸型只留 A4；A5 模板的「一页一张」意图落成 voucher.slots_per_page
+        "0025_backup_run",                     # 数据安全：OSS 备份运行记录（分级判重与「退路在不在」都问它）
+        "0027_plugin_imports",           # 宿主导入批次、源文件及凭证来源
+        "0026_plugin_registry",                # 插件宿主管理、授权与 worker barrier
+        "0028_scheduled_tasks",                # 外部 tick 驱动的应用级计划任务
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")

@@ -44,6 +44,7 @@ class BookIn(BaseModel):
 
 class BookEditIn(BaseModel):
     """改账套的属性：只允许动名字和科目编码规则，不动账上的任何数字。"""
+
     company_name: Optional[str] = Field(default=None, min_length=1, max_length=128)
     name: Optional[str] = Field(default=None, min_length=1, max_length=128)
     # 改了规则只影响**今后**新增科目的自动接号，已有科目的编码一律不动
@@ -51,6 +52,19 @@ class BookEditIn(BaseModel):
 
     def changes(self) -> dict:
         return {k: v for k, v in self.model_dump().items() if v is not None}
+
+
+class BookOrderIn(BaseModel):
+    """账套磁贴的**个人**排序：按用户想要的先后给一份账套 id。
+
+    传的是**相对顺序**，不是「第 2 本写在第 1 位」这样的绝对序号 ——
+    拖动只改变谁在谁前面，写死序号的话每次拖动都要重算全部，
+    而且中间新建的账套会把后面的序号全顶掉。
+    """
+
+    # 上限不是业务规则，是防御：真有人一次几千个账套时，
+    # 那不是「排个序」而是别的东西，不该由这个接口默默接下
+    book_ids: list[int] = Field(min_length=0, max_length=500)
 
 
 class OpeningIn(BaseModel):
@@ -115,10 +129,31 @@ class VoucherIn(BaseModel):
     remark: str = ""
     attachments: int = 0
     voucher_no: Optional[str] = None
-    source: Literal["MANUAL", "IMPORT", "CARRY_FORWARD"] = "MANUAL"
+    # **客户端不能指定 CARRY_FORWARD（审计 P1-02）。**
+    #
+    # 它原来和 MANUAL/IMPORT/INVOICE 一起写在 Literal 里，于是任何有账套写权限
+    # 的人都能直接调接口把一张自己的凭证标成「系统结转」。这个标记不是装饰：
+    #
+    #   * ``create_voucher`` 过去按 ``source in SYSTEM_SOURCES`` 放开「停用科目
+    #     也能记账」这道闸（系统结转搬的是**已经存在**的余额，不该被拦）；
+    #   * ``periods._drop_carry_forward`` 删本期全部 CARRY_FORWARD 凭证时**不看
+    #     状态**，而正常删除路径（``vouchers.delete_voucher``）是拒绝删已记账凭证的。
+    #
+    # 两条叠起来就是：自己造一张 CARRY_FORWARD、记账、再点一次「重新结转损益」，
+    # 这张**已记账的**凭证被悄悄删掉，库里还不留任何提示（凭证号可复用）。
+    #
+    # 所以它从客户端可选值里拿掉，成为服务端内部值（``create_voucher`` 的
+    # ``internal=True`` 是唯一的正规入口）。前端只用它显示标签
+    # （``VoucherOrganize.vue`` 的 sourceLabel），从不提交这个值，不受影响。
+    source: Literal["MANUAL", "IMPORT", "INVOICE"] = "MANUAL"
     # 「插入凭证」告诉后端插在谁的后面：新凭证拿这个号，后面的号整体顺位。
     # 留空就是普通的新增凭证（取期间内最大号 +1）。
     insert_after: Optional[int] = None
+    # 插在参照凭证的前面还是后面（用户 2026-10-19 定的口径）：
+    #   before —— 「插入凭证」= 向前插入，占参照自己的号，参照及以后顺位；
+    #   after  —— 「增加凭证」= 向后插入，拿参照号 +1，只有更大的号顺位。
+    # 只在 ``insert_after`` 有值时才有意义。
+    insert_position: Literal["before", "after"] = "before"
 
 
 class VoucherOut(BaseModel):
@@ -141,12 +176,59 @@ class BatchIds(BaseModel):
     ids: list[int]
 
 
+# ---- 发票导入 ----
+class InvoiceConfigIn(BaseModel):
+    """发票自动制证的账套级配置。
+
+    没有「进项税额」科目：小微企业不做进项抵扣，进项发票的税额直接计入成本
+    费用（并入第一条明细行），不需要单独一个应交税费明细科目。
+    """
+
+    taxpayer_id: str = Field(default="", max_length=32)
+    output_tax_subject_id: Optional[int] = None
+    input_credit_subject_id: Optional[int] = None
+    output_debit_subject_id: Optional[int] = None
+
+
+class InvoiceRuleIn(BaseModel):
+    match_type: Literal["SELLER", "ITEM"]
+    invoice_type: Literal["INPUT", "OUTPUT", "BOTH"] = "BOTH"
+    keyword: str = Field(min_length=1, max_length=128)
+    subject_id: int
+    priority: int = Field(default=0, ge=-1000, le=1000)
+    active: bool = True
+
+
+class InvoiceRulePatch(BaseModel):
+    match_type: Optional[Literal["SELLER", "ITEM"]] = None
+    invoice_type: Optional[Literal["INPUT", "OUTPUT", "BOTH"]] = None
+    keyword: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    subject_id: Optional[int] = None
+    priority: Optional[int] = Field(default=None, ge=-1000, le=1000)
+    active: Optional[bool] = None
+
+
+class InvoicePreviewIn(BaseModel):
+    """批次预览的人工覆盖项。
+
+    动态字典保持前端可逐张修正，不把发票明细硬编码成固定列数。
+    key 为 InvoiceRecord.id，value 允许包含 invoice_type、line_subjects、
+    tax_subject_id、settlement_subject_id。
+    """
+
+    overrides: dict[str, dict] = Field(default_factory=dict)
+
+
 # ---- 期间 ----
 class CarryForwardIn(BaseModel):
     """结转损益的入参。
 
-    结转永远是「有旧凭证就删掉重算」，这个字段保留只是为了兼容旧前端调用，
-    不再影响行为。
+    结转永远是「有旧凭证就删掉重算」，没有第二种模式。
+
+    ``replace`` 保留只是为了兼容旧前端调用（它还在发这个字段），**完全被忽略** ——
+    传 false 拿到的仍是「旧凭证已删除并重算」的结果。P2-3 修掉了服务层那个
+    从不生效的同名形参（那才是真正在骗人的地方：它对外承诺了一个这个函数
+    从不兑现的开关）；这里留着字段只是为了让旧调用不报 422。
     """
     replace: bool = True
 
@@ -160,6 +242,10 @@ class CloseIn(BaseModel):
     # 乐观锁的期望版本（审计 P1-19）。值来自 ``GET /periods`` 返回的
     # ``version``；留空表示「老调用方，不比对」。
     version: Optional[int] = None
+    # **没有 allow_empty**：空月份一律不许结账，不留「我知道、我确认」的旁路。
+    # 一张凭证都没有的月份能穿过整理体检、自动记账和损益结平三道闸门，
+    # 「这个月忘录了账」于是被静默封进历史，而补录就得反结账、反结账会连带把
+    # 后面已结的月份全部退回。确认弹窗挡不住它 —— 人会点「确定」。
 
 
 class UncloseIn(BaseModel):

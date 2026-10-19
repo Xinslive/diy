@@ -37,6 +37,7 @@ from app.accounting.periods import (carry_forward_profit, close_period,
                                     year_end_carry)
 from app.ledger.engine import LedgerEngine
 from app.models import Entry, Period, PeriodOpening, Subject
+from tests.accounting_helpers import close_any
 
 ZERO = Decimal("0")
 
@@ -50,7 +51,7 @@ def _close_year(db, book, periods, admin_user):
             carry_forward_profit(db, book.id, p, admin_user)
         except ValueError:
             pass
-        close_period(db, p, admin_user)
+        close_any(db, book, p, admin_user)
 
 
 def _payload(**kw):
@@ -101,9 +102,9 @@ def _make_child_directly(db, book, parent_id, code="10020101", name="工行-基�
 
 def test_父科目有分录时不能建子科目(client, auth, db, book, subjects, make_voucher):
     """闸门的第一半：父科目自身挂着分录，就不许在它下面长出子科目。"""
-    bank = subjects["100201"]
-    make_voucher("2026-01-10", dr=[("100201", 1000, "存入")],
-                 cr=[("600101", 1000, "收入")], posted=True)
+    bank = subjects["1001"]
+    make_voucher("2026-01-10", dr=[("1001", 1000, "存入")],
+                 cr=[("5001", 1000, "收入")], posted=True)
     db.expire_all()
 
     r = client.post(f"/api/books/{book.id}/subjects", headers=auth,
@@ -111,7 +112,7 @@ def test_父科目有分录时不能建子科目(client, auth, db, book, subject
     assert r.status_code == 400, f"应当拒绝，实际 {r.status_code}：{r.text}"
     msg = r.json()["detail"]
     # 错误信息要能指导用户，而不是只说「不允许」
-    assert "100201" in msg and "分录" in msg, msg
+    assert "1001" in msg and "分录" in msg, msg
     assert "改挂" in msg, f"没告诉用户该怎么处理：{msg}"
     db.expire_all()
     assert db.get(Subject, bank.id).is_leaf is True, "被拒之后父科目不该变成汇总级"
@@ -123,7 +124,7 @@ def test_父科目有期初余额时也不能建子科目(client, auth, db, book
     年度结转写下的期初**大量处于「有余额、无分录」状态**，
     只查 Entry 会漏掉它。
     """
-    bank = subjects["100201"]
+    bank = subjects["1001"]
     p1 = periods[1]
     db.add(PeriodOpening(book_id=book.id, period_id=p1.id,
                          subject_id=bank.id, amount=Decimal("500")))
@@ -137,7 +138,7 @@ def test_父科目有期初余额时也不能建子科目(client, auth, db, book
 
 def test_零额期初不算余额(client, auth, db, book, subjects, periods):
     """零额期初行不构成余额 —— 否则系统自己写出来的 0 也会把闸门堵死。"""
-    bank = subjects["100201"]
+    bank = subjects["1001"]
     p1 = periods[1]
     db.add(PeriodOpening(book_id=book.id, period_id=p1.id,
                          subject_id=bank.id, amount=Decimal("0")))
@@ -150,7 +151,7 @@ def test_零额期初不算余额(client, auth, db, book, subjects, periods):
 
 def test_父科目没有余额时正常建子科目(client, auth, db, book, subjects):
     """闸门不能变成拦路虎：干净科目下面照常建子科目。"""
-    bank = subjects["100201"]
+    bank = subjects["1001"]
     r = client.post(f"/api/books/{book.id}/subjects", headers=auth,
                     json=_payload(parent_id=bank.id))
     assert r.status_code == 201, r.text
@@ -160,12 +161,12 @@ def test_父科目没有余额时正常建子科目(client, auth, db, book, subj
 
 def test_改父级时父科目有分录被拒(client, auth, db, book, subjects, make_voucher):
     """改父级是同一个洞的另一半：把有余额的科目挂到别人下面也一样丢余额。"""
-    make_voucher("2026-01-10", dr=[("100201", 1000, "存入")],
-                 cr=[("600101", 1000, "收入")], posted=True)
+    make_voucher("2026-01-10", dr=[("1001", 1000, "存入")],
+                 cr=[("5001", 1000, "收入")], posted=True)
     child = _make_child_directly(db, book, subjects["1002"].id, code="100299",
                                  name="待挂科目")
     db.expire_all()
-    bank = db.get(Subject, subjects["100201"].id)
+    bank = db.get(Subject, subjects["1001"].id)
 
     r = client.patch(
         f"/api/books/{book.id}/subjects/{child}", headers=auth,
@@ -190,7 +191,7 @@ def test_把有分录的叶子科目改挂到父下也被拒(client, auth, db, b
     sid_new = r.json()["id"]
     db.expire_all()
     make_voucher("2026-01-10", dr=[(sid_new, 1000, "记在这条一级科目上")],
-                 cr=[("600101", 1000, "收入")], posted=True)
+                 cr=[("5001", 1000, "收入")], posted=True)
     db.expire_all()
     new_subject = db.get(Subject, sid_new)
     assert new_subject.parent_id is None and new_subject.is_leaf is True, "前置"
@@ -213,9 +214,9 @@ def test_端到端_历史升格的余额被结转到次年(
     db, book, periods, subjects, admin_user, make_voucher
 ):
     """P1-1 的核心验收点：1000 元不许在年度结转里凭空消失。"""
-    bank = subjects["100201"]
-    make_voucher("2026-05-10", dr=[("100201", 1000, "存入")],
-                 cr=[("600101", 1000, "收入")], posted=True)
+    bank = subjects["1001"]
+    make_voucher("2026-05-10", dr=[("1001", 1000, "存入")],
+                 cr=[("5001", 1000, "收入")], posted=True)
     # 6 月在它下面挂了个子科目并录了 0 期初 —— 存量数据里就是这样
     child_id = _make_child_directly(db, book, bank.id)
     db.expire_all()
@@ -251,14 +252,14 @@ def test_端到端_父与子都有余额时总额守恒且不重复计数(
     写重了和写漏了同样要命：余额翻倍与余额消失，从账面上看是同一件事 ——
     「下年期初 ≠ 上年期末」。
     """
-    bank = subjects["100201"]
+    bank = subjects["1001"]
     # 顺序要紧：父级自己的分录必须发生在「挂子科目」之前 ——
     # 挂上之后它就不是末级了，凭证校验会拒收挂到它上面的新分录。
-    make_voucher("2026-03-10", dr=[("100201", 1000, "父级历史分录")],
-                 cr=[("600101", 1000, "收入")], posted=True)
+    make_voucher("2026-03-10", dr=[("1001", 1000, "父级历史分录")],
+                 cr=[("5001", 1000, "收入")], posted=True)
     child_id = _make_child_directly(db, book, bank.id)
     make_voucher("2026-04-10", dr=[(child_id, 300, "子级分录")],
-                 cr=[("640101", 300, "成本")], posted=True)
+                 cr=[("5401", 300, "成本")], posted=True)
 
     _close_year(db, book, periods, admin_user)
     year_end_carry(db, book, admin_user, 2026, 2027)
@@ -283,8 +284,8 @@ def test_端到端_零余额科目不写期初行(
     db, book, periods, subjects, admin_user, make_voucher
 ):
     """兜底不是「全科目都写一遍」：没余额的科目仍然不落行。"""
-    make_voucher("2026-05-10", dr=[("100201", 1000, "存入")],
-                 cr=[("600101", 1000, "收入")], posted=True)
+    make_voucher("2026-05-10", dr=[("1001", 1000, "存入")],
+                 cr=[("5001", 1000, "收入")], posted=True)
     _close_year(db, book, periods, admin_user)
     year_end_carry(db, book, admin_user, 2026, 2027)
     jan27 = db.scalar(select(Period).where(
@@ -298,9 +299,9 @@ def test_端到端_停用科目余额照样结转(
     db, book, periods, subjects, admin_user, make_voucher
 ):
     """结转侧的选取条件里不能出现 ``active``：停用 ≠ 删除（ARCHITECTURE §9.6）。"""
-    bank = subjects["100201"]
-    make_voucher("2026-05-10", dr=[("100201", 1000, "存入")],
-                 cr=[("600101", 1000, "收入")], posted=True)
+    bank = subjects["1001"]
+    make_voucher("2026-05-10", dr=[("1001", 1000, "存入")],
+                 cr=[("5001", 1000, "收入")], posted=True)
     bank.active = False
     db.commit()
 
@@ -313,9 +314,9 @@ def test_端到端_停用科目余额照样结转(
 
 def test_升格科目上的分录仍然可查(db, book, subjects, admin_user, make_voucher):
     """升格本身没被禁止（那是存量数据），要保证这类账仍然查得到数。"""
-    bank = subjects["100201"]
-    make_voucher("2026-05-10", dr=[("100201", 1000, "存入")],
-                 cr=[("600101", 1000, "收入")], posted=True)
+    bank = subjects["1001"]
+    make_voucher("2026-05-10", dr=[("1001", 1000, "存入")],
+                 cr=[("5001", 1000, "收入")], posted=True)
     _make_child_directly(db, book, bank.id)
     db.expire_all()
     n = db.scalar(select(Entry).where(

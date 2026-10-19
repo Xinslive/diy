@@ -11,13 +11,25 @@
       <div class="head-actions">
         <el-button @click="downloadTpl">下载空白模板</el-button>
         <el-button @click="exportXlsx">导出当前</el-button>
-        <el-upload :show-file-list="false" accept=".xlsx" :before-upload="onFile">
-          <el-button :loading="parsing">从 Excel 导入</el-button>
-        </el-upload>
-        <el-button type="primary" :loading="saving" :disabled="!data.editable || !dirty || !balanced"
+        <el-button :disabled="initBlocking" @click="importVisible = true">
+          从 Excel 导入
+        </el-button>
+        <el-button type="primary" :loading="saving"
+                   :disabled="!data.editable || !dirty || !balanced || initBlocking"
                    @click="save">保存期初余额</el-button>
       </div>
     </div>
+
+    <!-- 第 1 步没做完时，期初根本无处可挂：导入进来的余额找不到科目可落，
+         手录也是一样的结果。拦在这里比让用户填完 40 行再吃后端一句 409 好 ——
+         以前这页完全不提示，用户是在保存失败之后才知道账套没初始化。 -->
+    <el-alert v-if="initBlocking" type="error" :closable="false" show-icon class="mb">
+      <template #title>这个账套还没完成初始化第 1 步</template>
+      <div>期初余额要挂在科目上，科目还没定下来就无法导入也无法保存。请先完成第 1 步。</div>
+      <el-button size="small" type="danger" class="mt" @click="initVisible = true">
+        去完成第 1 步
+      </el-button>
+    </el-alert>
 
     <el-alert v-if="!data.editable" type="warning" :closable="false" class="mb">
       {{ data.reason }}。如需调整，先在「期末结账」反结账，或直接改该期间的凭证。
@@ -58,6 +70,11 @@
                 :type="sideOf(s) === '借' ? 'primary' : 'warning'"
                 size="small"
                 :class="{ flip: s.is_leaf }"
+                :role="s.is_leaf ? 'button' : undefined"
+                :tabindex="s.is_leaf ? 0 : undefined"
+                @click="flip(s)"
+                @keydown.enter.prevent="flip(s)"
+                @keydown.space.prevent="flip(s)"
                 :title="s.is_leaf ? flipHint(s) : '上级科目：方位和金额都是下面这些明细的合计'"
               >{{ sideOf(s) }}</el-tag>
               <el-tooltip v-if="reverse(s)" content="与科目默认方向相反" placement="top">
@@ -95,20 +112,28 @@
         </tbody>
       </table>
     </div>
+
+    <BookInitDialog v-model="initVisible" @updated="onInitUpdated" />
+    <OpeningImportDialog v-model="importVisible" @imported="applyImport" />
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import * as api from '@/api/book'
 import { useSessionStore } from '@/stores/session'
+import BookInitDialog from '@/components/BookInitDialog.vue'
+import OpeningImportDialog from '@/components/OpeningImportDialog.vue'
 import { downloadFile } from '@/api/print'
 import { amountInputText, amountToNumber, sanitizeAmount, sanitizeAmountDetailed } from '@/utils/amountGrid'
+import { CATEGORY_LABEL } from '@/utils/subjectCode'
+import { hasInit, importSummaryText, subjectsReady } from '@/utils/bookInit'
 
 const store = useSessionStore()
 const router = useRouter()
+const route = useRoute()
 const data = ref({ period: '', editable: false, reason: '', subjects: [] })
 const amounts = reactive({})
 /** 每行期初的「实际方位」。科目属性只是通常方向，允许逐行翻转 —— 应收账款出现
@@ -120,15 +145,39 @@ const sides = reactive({})
 const drafts = reactive({})
 const dirty = ref(false)
 const saving = ref(false)
-const parsing = ref(false)
 const keyword = ref('')
+const importVisible = ref(false)
+const initVisible = ref(false)
 
-const CATEGORIES = [
-  { key: 'ASSET', label: '资产' },
-  { key: 'LIABILITY', label: '负债' },
-  { key: 'EQUITY', label: '所有者权益' },
-  { key: 'PROFIT', label: '损益' }
-]
+/**
+ * 第 1 步没做完时这一页不许动。
+ *
+ *  显示上**必须有 init 才拦**（hasInit）：拿不到状态不等于「没做」，
+ *  直接当成没做会对着一个后端还没上线/请求失败的账套弹一条红色拦截条 —— 那是替后端下结论。
+ *  真去导入/保存时后端还有一道 409 兜着，两边对不上时以后端为准。
+ */
+const initBlocking = computed(() => hasInit(store.initOf(store.bookId)) && !subjectsReady(store.initOf(store.bookId)))
+
+/** 向导里做完第 1 步：刷新状态并把表格重读一遍 —— 科目变了，这张表已经不是刚才那张了 */
+async function onInitUpdated() {
+  await store.loadInit(store.bookId)
+  await load()
+}
+
+/**
+ * 分组渲染的类别，顺序即会计恒等式的顺序。
+ *
+ * 文案一律取自 `@/utils/subjectCode` 的 CATEGORY_LABEL —— 原来这里另存了
+ * 一份自己的 EQUITY 标签，于是同一个类别在不同页面显示不同。现在只有一份
+ * 来源，取的是简称「权益」（准则里的「所有者权益」只出现在报表行次上，
+ * 那里才是它该在的地方，见 subjectCode.js 的说明）。
+ *
+ * COST 不在这张表里：期初录入按四类分组，成本类目前走不到这里
+ * （`v-show` 会把空的分组藏掉，所以留着也无妨，但那样会让人以为
+ * 成本类期初是被支持的 —— 与其含糊，不如明确排除）。
+ */
+const CATEGORIES = ['ASSET', 'LIABILITY', 'EQUITY', 'PROFIT']
+  .map((key) => ({ key, label: CATEGORY_LABEL[key] }))
 
 const money = (v) => (Number(v || 0)).toLocaleString('zh-CN', { minimumFractionDigits: 2 })
 
@@ -186,13 +235,62 @@ function signedOf(s) {
  *  「银行存款」到底装了多少钱就成了问不出来的事 —— 而这恰恰是翻这张表的目的。
  *  合计按带符号加，方向相反的余额会自己抵掉，不会两行都往上堆。
  */
-const subTotal = (s) => {
-  if (s.is_leaf) return signedOf(s)
-  let total = 0
-  for (const c of childrenOf(s.id)) total += subTotal(c)
-  return total
-}
-const childrenOf = (id) => data.value.subjects.filter((x) => x.parent_id === id)
+/**
+ * 科目表是**平的**（每行带 parent_id），树要自己搭 —— 一次搭好，按 parent_id 存。
+ *
+ * 以前 childrenOf() 每次都把全表 filter 一遍，而 subTotal() 在递归里逐个调它：
+ * 每算一个后代节点就扫一遍全表，一行渲染 O(N)，整张表 O(N²)。而 amounts/drafts
+ * 是 reactive 的，打字时这套东西一直在渲染路径上跑。
+ * 写法照抄 SubjectPicker.vue 里那份 byId：computed 里建一次 Map，之后都是 O(1) 取。
+ */
+const childrenByParent = computed(() => {
+  const m = new Map()
+  for (const s of data.value.subjects) {
+    const list = m.get(s.parent_id)
+    if (list) list.push(s)
+    else m.set(s.parent_id, [s])
+  }
+  return m
+})
+
+/**
+ * 全部合计：**一次自底向上遍历**算完，按 id 缓存。
+ *
+ * 用显式栈做后序遍历，而不是递归，也不靠「后端一定把父排在子前面」——
+ * 顺序一旦变了，父先落定就会把下级漏掉，算出来的上级合计是 0，而页面上看不出来。
+ * 依赖 amounts/sides，所以改一个格子只重算一趟 O(N)，不是每行各递归一次。
+ */
+const subTotals = computed(() => {
+  const subs = data.value.subjects
+  const kids = childrenByParent.value
+  const out = new Map()
+  // 全部科目都进栈，不预先分根：谁先算到全看顺序，而 out 本身保证
+  // 「非末级一定等所有子节点都落定才收自己」，所以后端把父子排成什么样都对。
+  const stack = [...subs]
+  while (stack.length) {
+    const s = stack[stack.length - 1]
+    if (out.has(s.id)) { stack.pop(); continue }
+    // is_leaf 先判，与老口径同序：末级只认自己的数，哪怕数据里它底下还挂着行
+    // （自相矛盾时以末级为准，别把上一版「先看有没有孩子」的顺序偷换成另一套口径）
+    const children = s.is_leaf ? [] : (kids.get(s.id) || [])
+    if (children.length) {
+      let pushed = false
+      for (const c of children) if (!out.has(c.id)) { stack.push(c); pushed = true }
+      if (pushed) continue                       // 回来时子节点都算完了，再收自己
+      let total = 0
+      for (const c of children) total += out.get(c.id) || 0
+      out.set(s.id, total)
+      stack.pop()
+      continue
+    }
+    // 末级记自己的数；**非末级却没有任何子节点**仍然是 0（与老口径一致）
+    out.set(s.id, s.is_leaf ? signedOf(s) : 0)
+    stack.pop()
+  }
+  return out
+})
+
+const subTotal = (s) => subTotals.value.get(s.id) ?? 0
 
 /** 上级的方位跟着这一支的合计走：正的在借方、负的在贷方；
  *  加起来正好 0 就没方位可言，退回科目本身的自然方向。 */
@@ -204,6 +302,9 @@ function sideOf(s) {
 
 const reverse = (s) => s.is_leaf && sides[s.id] !== s.natural_side
 const flipHint = (s) => `点击切换为${sides[s.id] === '借' ? '贷' : '借'}（科目默认 ${s.natural_side}）`
+// 这一格**以前根本点不动**：标签上写着「点击切换为…」、样式里也给了 pointer 光标，
+// 模板却没挂 @click，翻转函数写在脚本里从没被调用过 ——
+// 反方向余额（应收账款挂客户预收）就没法录，而界面一直在暗示它可以。
 
 function flip(s) {
   if (!data.value.editable || !s.is_leaf) return
@@ -264,7 +365,12 @@ async function save() {
   }
   saving.value = true
   try {
-    await api.setOpenings(store.bookId, rows, store.periodId)
+    const res = await api.setOpenings(store.bookId, rows, store.periodId)
+    // 后端在同一次事务里把初始化第 2 步标成了完成，顺手把最新的 init 带回来。
+    // **必须写回 store**：第 2 步是在**另一个页面**（账套管理）上显示的，
+    // 不写回去的话，用户从这儿回到账套管理，向导和卡片都还在说「还没做」——
+    // 而那一步他明明刚刚做完了。
+    store.markInit(store.bookId, res?.init)
     ElMessage.success(`已保存 ${rows.length} 条期初余额`)
     await load()
   } catch (e) {
@@ -274,34 +380,32 @@ async function save() {
   }
 }
 
-async function onFile(file) {
-  parsing.value = true
-  try {
-    const fd = new FormData()
-    fd.append('file', file)
-    const res = await api.parseOpenings(store.bookId, fd)
-    const ok = res.rows.filter((r) => !r.error)
-    for (const r of ok) {
-      if (!r.subject_id) continue
-      // 方向列在文件里已经定过了（缺省才由后端按科目属性推），这里照搬，
-      // 不能只取绝对值 —— 那样反方向余额会被无声地洗成正的
-      const signed = Number(r.signed ?? 0)
-      sides[r.subject_id] = r.display_side || (signed < 0 ? '贷' : '借')
-      // 文件里的数字同样过一遍净化：Excel 里全角、带「元」字、带货币符号的
-      // 都不稀奇，照搬进来会让这一行变成算不出数的那一行
-      amounts[r.subject_id] = sanitizeAmount(String(Math.abs(signed || Number(r.amount || 0))))
-      delete drafts[r.subject_id]
-    }
-    dirty.value = true
-    if (res.balanced) ElMessage.success(`已读入 ${ok.length} 条，借贷平衡`)
-    else ElMessage.warning(`已读入 ${ok.length} 条，但借贷不平：差 ${money(res.total_debit - res.total_credit)}`)
-    if (res.errors.length) ElMessage.warning(res.errors.slice(0, 3).join('；'))
-  } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || '解析失败')
-  } finally {
-    parsing.value = false
+/**
+ * 导入弹窗确认后把结果填进表格。
+ *
+ *  **这里只填表，不落库** —— 落库是下面那个「保存期初余额」按钮的事。
+ *  用户还可以在表格里逐行改，改完再存；弹窗直接写库就把这最后一道人工检查拿掉了。
+ *
+ *  填表口径照旧（sides 取 display_side、金额过一遍 sanitizeAmount），
+ *  这两处不是顺手写的：方向在文件里已经定过，照搬才能保住反方向余额；
+ *  文件里的数字不净化就可能把这一行变成算不出数的那一行。
+ */
+function applyImport(res) {
+  const ok = (res.rows || []).filter((r) => !r.error)
+  let filled = 0
+  for (const r of ok) {
+    if (!r.subject_id) continue
+    const signed = Number(r.signed ?? 0)
+    sides[r.subject_id] = r.display_side || (signed < 0 ? '贷' : '借')
+    amounts[r.subject_id] = sanitizeAmount(String(Math.abs(signed || Number(r.amount || 0))))
+    delete drafts[r.subject_id]
+    filled++
   }
-  return false
+  dirty.value = true
+  // 计数话术在导入弹窗的完成页也有一份（能一直看着），这里再报一句短的，
+  // 因为用户这时候的注意力在这张表上，不在刚刚关掉的弹窗上
+  ElMessage.success(`${importSummaryText(res)}，请检查后点「保存期初余额」落库`)
+  if (filled === 0) ElMessage.warning('一条都没填进来，表格没有被改动')
 }
 
 function exportXlsx() {
@@ -316,13 +420,27 @@ function downloadTpl() {
 watch(() => store.bookId, load)
 // 顶栏换月/换年，这一页也得跟着换 —— 换个空月份进来还锁着，用户只会以为坏了
 watch(() => store.periodId, load)
-onMounted(load)
+onMounted(async () => {
+  // 初始化向导第 2 步是**跳到这里**再导的（向导里没有这张表）：
+  // 它带着 ?import=1 过来，把导入弹窗直接弹出来。
+  // 消费掉就把 query 换掉 —— 留着的话每次刷新都会再弹一次，
+  // 而用户刷新多半是因为他以为没点上。replace 而不是 push：不留历史记录，
+  // 浏览器「后退」回得来就不会又弹一次。
+  if (route.query.import === '1') {
+    importVisible.value = true
+    router.replace({ path: '/openings' })
+  }
+  // 账套列表行里自带 init，但可能旧了；拉一份准的再决定要不要拦这一页
+  await store.loadInit(store.bookId)
+  load()
+})
 </script>
 
 <style scoped>
 .page-title { margin: 0 0 2px; font-size: 18px; }
 .head-actions { display: flex; gap: 8px; align-items: center; }
 .mb { margin-bottom: 12px; }
+.mt { margin-top: 8px; }
 .check { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
 .check .tag { font-weight: 700; }
 .check b { font-size: 15px; }

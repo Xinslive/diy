@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer,
-                        String, UniqueConstraint, func)
+                        String, Text, UniqueConstraint, func)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
@@ -103,6 +103,37 @@ class LoginIpThrottle(Base, TimestampMixin):
     blocked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
 
 
+class SystemSetting(Base, TimestampMixin):
+    """系统级键值配置 —— 目前只放第三方服务的凭据与端点。
+
+    与 ``InvoiceConfig`` 那类账套配置分开：这里的东西**全系统一份**。PaddleOCR
+    的服务账号不是按账套分的，换一本账也不该换一套 token。
+
+    为什么要从 .env 搬进库：改一个 token 要重启后端、要改部署机上的文件、
+    还要有人会 ssh 上去。凭据是会过期、要轮换的东西，让它只能靠重启来改，
+    结果就是没人改 —— 于是扫描件这条路在某天悄悄失效，而配置「明明配过」。
+    搬进库之后，管理员在界面上改完即生效，且留下一条「谁改的」。
+
+    **关于明文存储。** token 必须能还原成原文才能去调对方接口，所以哈希掉没有
+    用（对比 ``SysUser.password_hash``：那个只需要比对，不需要还原）。这里等价于
+    .env 文件本身 —— 能读到这个数据库的人，本来也能读到那个文件。真正的防线是
+    **不往外发**：接口只回 ``token_set`` 与末 4 位，明文一律不出现在任何响应里
+    （见 ``app/api/system.py``）。
+
+    没有引入加密库是刻意的：为一个 token 拉进 ``cryptography`` 这种重量级依赖，
+    加密密钥最终仍得存在某处，威胁面没变小，复杂度却实打实涨了。真要多一层，
+    正确做法是 KMS / secret manager，那是部署形态的决定，不是加个依赖。
+    """
+
+    __tablename__ = "sys_setting"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # 谁最后改的。凭据类配置必须能追溯到人：token 外泄时要查的不只是
+    # 「现在配的是谁的」，还有「谁把它换掉的、什么时候换的」。
+    updated_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+
 class UserBook(Base, TimestampMixin):
     """账套授权。role 决定该用户在此账套内的权限范围。
 
@@ -140,6 +171,16 @@ class UserBook(Base, TimestampMixin):
     book_id: Mapped[int] = mapped_column(ForeignKey("book.id", ondelete="CASCADE"), nullable=False)
     # OWNER / ACCOUNTANT(可制单记账) / VIEWER(只读)
     role: Mapped[str] = mapped_column(String(16), default="ACCOUNTANT", nullable=False)
+    # 这个**用户**把账套磁贴排在第几位（迁移 0019）。
+    #
+    # 放在授权行上而不是 book 上：磁贴先后是每个人的工作台布局，
+    # 同一个账套甲排第一、乙排最后都很正常。写进 book 就成了
+    # 「甲拖一下，乙的页面跟着变」。
+    #
+    # NULL = 没排过，列表回落到 company_name/name —— 对从不拖动的用户
+    # 完全不可见。建新账套不写这一列，新账套因此落在已排序的末尾，
+    # 而不是把用户排好的布局顶开。
+    sort_order: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     user: Mapped["SysUser"] = relationship()
     book: Mapped["Book"] = relationship()

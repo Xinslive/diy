@@ -2,7 +2,7 @@
   <div class="pt">
     <!-- ── 顶部工具条 ────────────────────────────────────────────
          只有真正每天都要用的动作留在明面上（换范围、换模板、刷新、打印、保存），
-         重命名/复制/删除这类低频动作收进「更多」，工具条因此不会被一排按钮撑满。 -->
+         重命名/设为默认/删除这类低频动作收进「更多」，工具条因此不会被一排按钮撑满。 -->
     <header class="pt-bar">
       <div class="bar-l">
         <span class="pt-title">打印模板</span>
@@ -10,21 +10,31 @@
           <el-option v-for="(label, key) in SCOPES" :key="key" :label="label" :value="key" />
         </el-select>
         <el-select v-model="templateId" class="sel sel-tpl" @change="loadTemplate">
-          <el-option label="（内置默认）" :value="0" />
-          <el-option v-for="t in listOfScope" :key="t.id" :label="t.name" :value="t.id" />
+          <el-option v-if="showBuiltin" label="（内置默认）" :value="0" />
+          <el-option v-for="t in listOfScope" :key="t.id" :label="tplLabel(t)" :value="t.id" />
         </el-select>
-        <el-button :disabled="!store.canWrite" @click="doCreate"><el-icon><Plus /></el-icon>&nbsp;新建</el-button>
+        <el-button :disabled="!canCreate" @click="doCreate"><el-icon><Plus /></el-icon>&nbsp;新建</el-button>
         <el-dropdown trigger="click" @command="onMore">
           <el-button title="更多操作"><el-icon><MoreFilled /></el-icon></el-button>
           <template #dropdown>
+            <!-- 每项的可用性各按各的判据（utils/printTemplate.js，与后端同一套）：
+                 改「系统基线」或「我的私有副本」只要能写这个账套就行（改动只对我
+                 一人可见），改「账套模板」要 OWNER，基线不能删。统一按
+                 store.canWrite 一把梭的后果是：会计点的每一下都要吃一个后端 403。 -->
             <el-dropdown-menu>
-              <el-dropdown-item command="rename" :disabled="!templateId || !store.canWrite">
+              <el-dropdown-item command="rename" :disabled="!canEditSelected">
                 <el-icon><EditPen /></el-icon>重命名
               </el-dropdown-item>
-              <el-dropdown-item command="copy" :disabled="!templateId || !store.canWrite">
-                <el-icon><CopyDocument /></el-icon>复制一份
+              <!-- 这里曾有两项：「复制一份」与「新建个人版式（只有你可见）」，
+                   已按需求撤掉。两条都是「拿屏幕上的东西再生成一份模板」，而顶栏
+                   的「新建」已经覆盖了这三件事里唯一还需要留的那件（建一份给同事
+                   用的账套模板）—— 菜单里三选一反而让人先想「该点哪个」。
+                   会计要的「只有我可见的版式」没少：选中系统基线直接保存即可，
+                   后端写时复制成私有副本（见 utils/printTemplate.js 的说明）。 -->
+              <el-dropdown-item command="default" :disabled="!canEditSelected" divided>
+                <el-icon><Star /></el-icon>{{ isCurrentDefault ? '取消默认' : '设为默认' }}
               </el-dropdown-item>
-              <el-dropdown-item command="delete" :disabled="!templateId || !store.canWrite" divided>
+              <el-dropdown-item command="delete" :disabled="!canDeleteSelected" divided>
                 <el-icon><Delete /></el-icon>删除
               </el-dropdown-item>
             </el-dropdown-menu>
@@ -42,7 +52,7 @@
             : '打开后可在预览纸的四条边上直接拖动页边距'"
           placement="bottom"
         >
-          <el-button :type="guideMode ? 'primary' : ''" :disabled="!store.canWrite" @click="toggleGuides">
+          <el-button :type="guideMode ? 'primary' : ''" :disabled="!canEditDraft" @click="toggleGuides">
             <el-icon><Crop /></el-icon>&nbsp;边距
           </el-button>
         </el-tooltip>
@@ -51,7 +61,7 @@
           <el-button @click="refreshPreview"><el-icon><Refresh /></el-icon></el-button>
         </el-tooltip>
         <el-button @click="doPrint"><el-icon><Printer /></el-icon>&nbsp;打印</el-button>
-        <el-button type="primary" :loading="saving" :disabled="!store.canWrite || !templateId" @click="save">
+        <el-button type="primary" :loading="saving" :disabled="!canEditSelected || !templateId" @click="save">
           保存
         </el-button>
       </div>
@@ -74,7 +84,7 @@
           :tpl="tpl"
           :is-voucher="isVoucher"
           :selected-id="selectedId"
-          :can-write="store.canWrite"
+          :can-write="canEditDraft"
           :paper-options="paperOptions"
           @change="onEdit"
           @select="selectedId = $event"
@@ -94,16 +104,16 @@
           <template v-if="scope === 'DETAIL_LEDGER'">
             <label>科目</label>
             <el-select v-model="previewSubjectId" size="small" class="opt" @change="onPreviewSubjectChange">
-              <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
+              <el-option v-for="o in subjectOptions" :key="o.id" :label="o.label" :value="o.id" />
             </el-select>
             <template v-if="previewRangeSubjects.length">
               <label>科目起</label>
               <el-select v-model="previewFromSubjectId" size="small" class="opt" @change="onPreviewFromSubjectChange">
-                <el-option v-for="s in previewRangeSubjects" :key="s.id" :label="`${s.code} ${s.name}`" :value="s.id" />
+                <el-option v-for="o in rangeSubjectOptions" :key="o.id" :label="o.label" :value="o.id" />
               </el-select>
               <label>止</label>
               <el-select v-model="previewToSubjectId" size="small" class="opt" @change="onPreviewToSubjectChange">
-                <el-option v-for="s in previewRangeSubjects" :key="s.id" :label="`${s.code} ${s.name}`" :value="s.id" />
+                <el-option v-for="o in rangeSubjectOptions" :key="o.id" :label="o.label" :value="o.id" />
               </el-select>
             </template>
           </template>
@@ -116,7 +126,7 @@
 
           <span class="spacer" />
           <span class="hint">
-            <template v-if="isVoucher && store.canWrite">
+            <template v-if="isVoucher && canEditDraft">
               直接在纸上拖动控件即可改版式 · 双击文字就地编辑
             </template>
             <template v-else-if="isVoucher">当前模板预览</template>
@@ -135,17 +145,17 @@
             :key="scope + ':' + templateId"
             ref="stage"
             :html="previewHtml"
-            :paper="tpl.paper"
+            :paper="PAPER"
             :orientation="tpl.orientation"
             :papers="meta.papers || []"
             :margins="tpl.margins"
             :slots="isVoucher ? voucherSlots : 1"
-            :editing="store.canWrite || !isVoucher"
+            :editing="canEditDraft || !isVoucher"
             :error="previewError"
             :footer-format="tpl.footer?.format"
           >
             <template #tools>
-              <div v-if="isVoucher && voucherSlots > 1 && store.canWrite" class="slot-switch" aria-label="当前编辑的凭证槽位">
+              <div v-if="isVoucher && voucherSlots > 1 && canEditDraft" class="slot-switch" aria-label="当前编辑的凭证槽位">
                 <button v-for="n in voucherSlots" :key="n" type="button"
                         :class="{ on: activeSlot === n - 1 }" :aria-pressed="activeSlot === n - 1"
                         @click="activeSlot = n - 1">第 {{ n }} 张</button>
@@ -154,14 +164,14 @@
             <template #default="{ page, content, slots: slotRects, hotspots: spots, scale: stageScale }">
               <!-- 凭证：元素框直接压在真预览上，能拖能缩 -->
               <VoucherCanvasLayer
-                v-if="isVoucher && store.canWrite"
+                v-if="isVoucher && canEditDraft"
                 :elements="tpl.elements"
                 :columns="tpl.columns"
                 :slot-rects="slotRects"
                 :slots="voucherSlots"
                 :active-slot="activeSlot"
                 :selected-id="selectedId"
-                :can-write="store.canWrite"
+                :can-write="canEditDraft"
                 :scale="stageScale"
                 @change="onEdit"
                 @select="selectElement"
@@ -169,7 +179,7 @@
 
               <!-- 页边距：拖纸的四条边 -->
               <PaperGuides v-if="guideMode" :page="page" :content="content"
-                           :margins="tpl.margins" :can-write="store.canWrite" :scale="stageScale"
+                           :margins="tpl.margins" :can-write="canEditDraft" :scale="stageScale"
                            @change="onEdit" />
 
               <!-- 非凭证：在真预览上量出来的可点区块 -->
@@ -187,7 +197,7 @@
           <el-button @click="loadTemplate(templateId)" :disabled="!dirty">放弃改动</el-button>
           <span class="save-tip">{{ saveHint }}</span>
           <span class="spacer" />
-          <el-button type="primary" :loading="saving" :disabled="!store.canWrite || !templateId || !dirty" @click="save">
+          <el-button type="primary" :loading="saving" :disabled="!canEditSelected || !templateId || !dirty" @click="save">
             保存模板
           </el-button>
         </div>
@@ -216,8 +226,8 @@
 import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  CopyDocument, Crop, DArrowLeft, DArrowRight, Delete, EditPen,
-  InfoFilled, MoreFilled, Plus, Printer, Refresh,
+  Crop, DArrowLeft, DArrowRight, Delete, EditPen,
+  InfoFilled, MoreFilled, Plus, Printer, Refresh, Star,
 } from '@element-plus/icons-vue'
 import PrintStage from '@/components/print/PrintStage.vue'
 import VoucherCanvasLayer from '@/components/print/VoucherCanvasLayer.vue'
@@ -228,7 +238,11 @@ import * as printApi from '@/api/print'
 import * as reportApi from '@/api/report'
 import * as subjectApi from '@/api/subject'
 import { useSessionStore } from '@/stores/session'
-import { TWO_UP_PAPERS, pickPapers } from '@/utils/paper'
+import { pickPapers, slotsPerPage } from '@/utils/paper'
+import {
+  effectiveDefaultId as sharedEffectiveDefault, showBuiltinTemplate,
+  templateTags, canEditTemplate, canDeleteTemplate, canCreateTemplate,
+} from '@/utils/printTemplate'
 
 const clone = (o) => JSON.parse(JSON.stringify(o))
 
@@ -236,8 +250,11 @@ const store = useSessionStore()
 
 /** 骨架：首屏渲染发生在模板数据回来之前，模板里到处是 tpl.margins.top 这类深层访问，
  *  必须给一份完整默认值，否则 setup 阶段就会抛 "reading 'top'"。 */
+/** 纸张恒为 A4（见 utils/paper.js）。画布要一个具体的值来算纸面尺寸。 */
+const PAPER = 'A4'
+
 const EMPTY_TPL = {
-  paper: 'A4',
+  paper: PAPER,
   orientation: 'portrait',
   margins: { top: 10, right: 10, bottom: 10, left: 10 },
   title: { text: '', size: 16, bold: true, align: 'center' },
@@ -297,12 +314,50 @@ const HOT_CN = {
   title: '主标题', subtitle: '副标题', meta: '页眉信息',
   table: '数据表格', footer: '页脚',
 }
-/** 纸型下拉只给系统对外提供的两种，与打印弹窗共用同一份口径。 */
+/** 纸型只给系统对外提供的那一种，与打印弹窗共用同一份口径。 */
 const paperOptions = computed(() => pickPapers(meta.value.papers || []))
 
 const listOfScope = computed(() => list.value.filter((t) => t.scope === scope.value))
+
+/** 生效的默认模板（口径见 utils/printTemplate.js，与打印弹窗共用一份）。 */
+const effectiveDefaultId = computed(() => sharedEffectiveDefault(listOfScope.value))
+/** 内置版式只在没有任何已保存模板时才是唯一选项 —— 凭证范围已有基线模板。 */
+const showBuiltin = computed(() => showBuiltinTemplate(scope.value, listOfScope.value))
+/** 当前这份模板。列表里找不到它时是 null（内置版式，或刚被删掉）。 */
+const selectedTpl = computed(() => listOfScope.value.find((t) => t.id === templateId.value) || null)
+/** 身份。判「能不能改哪一层」要用角色，光有 canWrite 分不出 OWNER 与会计。 */
+const whoami = computed(() => ({ role: store.currentBook?.role || '', isAdmin: !!store.isAdmin }))
+/** 改 / 删 / 新建各按各的判据（口径在 utils/printTemplate.js，与后端一致）。 */
+const canEditSelected = computed(() => canEditTemplate(selectedTpl.value, whoami.value))
+const canDeleteSelected = computed(() => canDeleteTemplate(selectedTpl.value, whoami.value))
+const canCreate = computed(() => canCreateTemplate(whoami.value))
+/**
+ * 检查器/画布能不能编辑 —— 与「能不能存」分开两件事。
+ *
+ * 选的是「（内置默认）」时 selectedTpl 为 null（它是后端的兜底版式，不是某一行
+ * 模板记录），canEditSelected 因此是 false。但这一档恰恰是最需要随手调的时候：
+ * 总账/明细账/余额表/报表这四个范围眼下没有已保存模板，内置版式是**唯一**选项，
+ * 照 canEditSelected 一刀切下去，这四个范围的检查器会整片变只读 —— 而实际上
+ * 这份草稿随便调，只是存不进去（要存得先「新建」，见 saveHint）。
+ *
+ * 所以编辑看 canEditDraft，写库看 canEditSelected。
+ */
+const canEditDraft = computed(() => (templateId.value ? canEditSelected.value : store.canWrite))
+/** 菜单那一句跟着 is_default 走 —— 它切换的就是这个标记本身，
+    即便当前这份被同范围的另一份盖着，清掉它仍然是个有效动作。 */
+const isCurrentDefault = computed(() => !!selectedTpl.value?.is_default)
+/** 下拉里给生效的那一份加后缀。不加的话「默认」这件事在页面上完全不见：
+    既不知道现在这份是不是默认，也不知道切过去的那份是不是。 */
+const tplLabel = (t) => {
+  // 只标「默认」（口径见 utils/printTemplate.js::templateTags）；私有副本不标。
+  const tags = templateTags(t, effectiveDefaultId.value)
+  return tags.length ? `${t.name}（${tags.join(' · ')}）` : t.name
+}
 const isVoucher = computed(() => scope.value === 'VOUCHER')
-const voucherSlots = computed(() => (TWO_UP_PAPERS.includes(tpl.value.paper) ? 2 : 1))
+// 一页几张凭证读模板自己的 slots_per_page（缺省 2，与后端一致）。
+// 画布按它切槽位、检查器按它算毫米 —— 两边必须读同一个字段，否则用户会看到
+// 「检查器说一页一张、画布上却并排放两张」。
+const voucherSlots = computed(() => slotsPerPage(tpl.value))
 watch(voucherSlots, (slots) => { activeSlot.value = Math.min(activeSlot.value, slots - 1) })
 const tab = computed({
   get: () => inspectorTab.value,
@@ -321,6 +376,11 @@ const dirty = computed(() => !!templateId.value && JSON.stringify(tpl.value) !==
 const saveHint = computed(() => {
   if (!templateId.value) return '内置默认版式，改动需要先新建模板才能保存'
   if (!store.canWrite) return '只读账套，改动无法保存'
+  if (!canEditSelected.value) return '账套共用的模板，只有账套所有者或管理员能改'
+  // 改基线时后端会写时复制成私有副本，但那是实现细节：底部这行只回答
+  // 「我现在能不能存、存了会怎样」，而答案对两种模板都是一样的 —— 能存。
+  // 原来这里对基线另说一句「保存后会变成只有你可见的个人版式」，
+  // 每次改内置模板都要先被提醒一遍，用户并没有因此多做任何事。
   if (dirty.value) return '有未保存的改动'
   return '已是最新'
 })
@@ -341,7 +401,7 @@ function onEdit() {
 /** 新增元素：id 必须唯一，且父组件持有数组，所以在这里生成。 */
 let seq = 0
 function addElement(kind) {
-  if (!store.canWrite) return
+  if (!canEditDraft.value) return
   const id = 'el-' + Date.now().toString(36) + '-' + (seq++)
   const base = { id, x: 10, y: 10, w: 40, h: 6, font_size: 9, bold: false,
                  align: 'left', visible: true, border: true }
@@ -480,7 +540,10 @@ async function loadPreviewData() {
     previewSubjectId.value = subjects.value.find((s) => s.is_leaf && s.active)?.id || subjects.value[0]?.id || null
   }
   resetPreviewSubjectRange()
-  reports.value = await reportApi.templates()
+  // 必须带 book_id：/api/reports/templates 挂着 get_my_book，而它把 book_id
+  // 声明成必填的 query 参数（端点签名上那个 Optional[int] 是骗人的，依赖照样
+  // 强制要求）。漏掉它就是 422 Field required，整个预览面板跟着挂。
+  reports.value = await reportApi.templates(store.bookId)
   if (!previewReportId.value && reports.value.length) previewReportId.value = reports.value[0].id
 }
 
@@ -498,6 +561,21 @@ function resetPreviewSubjectRange() {
 
 const selectedPreviewSubject = computed(() => subjects.value.find((s) => s.id === previewSubjectId.value))
 const previewRangeSubjects = computed(() => selectedPreviewSubject.value?.children || [])
+
+/**
+ * 下拉选项的 label 提前算好，别留在模板里。
+ *
+ * 以前 `v-for="s in subjects" :label="subjectLabel(s)"` —— 每渲染一次，
+ * 每个选项就现拼一遍全角缩进（''.repeat）。这张页面渲染得并不少（拖一下纸
+ * 预览就重渲染一次），科目一多就是几百次字符串拼接 × 每帧。
+ *
+ * 起止两个下拉更该合：它们是**同一批**子科目，label 各写了一份一模一样的
+ * 模板串，算两遍。现在共用 rangeSubjectOptions 这一份。
+ */
+const subjectOptions = computed(() => subjects.value.map((s) => ({ id: s.id, label: subjectLabel(s) })))
+const rangeSubjectOptions = computed(
+  () => previewRangeSubjects.value.map((s) => ({ id: s.id, label: `${s.code} ${s.name}` }))
+)
 
 function onPreviewSubjectChange() {
   resetPreviewSubjectRange()
@@ -596,14 +674,30 @@ function doPrint() {
 }
 
 // ------------------------------------------------------------------ 模板增删改存
+
+/**
+ * 写完之后把「选中的模板」对齐到服务端返回的那一份。
+ *
+ * **id 真的会变**：目标是系统基线时，后端先把基线整份复制成只有我可见的私有
+ * 副本，改动落在副本上（见 api/printing.py::update_template），返回的是副本的
+ * 新 id。不跟着切的后果是下一次保存又拿旧 id（基线）再复制一份，攒出一串同名
+ * 私有副本，而真正在改的那一份没人选中 —— 表现是「改了没生效」。
+ */
+async function applyWriteResult(res, { relaunch = true } = {}) {
+  const forked = !!res.forked
+  if (res.id && res.id !== templateId.value) templateId.value = res.id
+  await loadTemplates()
+  if (relaunch) await loadTemplate(templateId.value)
+  return forked
+}
+
 async function save() {
-  if (!store.canWrite || !templateId.value) return
+  if (!canEditSelected.value || !templateId.value) return
   saving.value = true
   try {
-    await printApi.updateTemplate(store.bookId, templateId.value, { content: tpl.value })
+    const res = await printApi.updateTemplate(store.bookId, templateId.value, { content: tpl.value })
+    await applyWriteResult(res)
     ElMessage.success('模板已保存')
-    await loadTemplates()
-    await loadTemplate(templateId.value)      // 重新取回服务端归一化后的内容
   } finally {
     saving.value = false
   }
@@ -614,8 +708,8 @@ async function save() {
  * 改名不该动版式，也不该把「未保存」这个提示点出来（它只比对 tpl）。
  */
 async function doRename() {
-  if (!store.canWrite || !templateId.value) return
-  const cur = listOfScope.value.find((t) => t.id === templateId.value)
+  if (!canEditSelected.value || !templateId.value) return
+  const cur = selectedTpl.value
   if (!cur) return
   let name
   try {
@@ -628,22 +722,20 @@ async function doRename() {
   }
   const next = name.trim()
   if (next === cur.name) return
-  await printApi.updateTemplate(store.bookId, cur.id, { name: next })
+  const res = await printApi.updateTemplate(store.bookId, cur.id, { name: next })
+  await applyWriteResult(res, { relaunch: false })
   ElMessage.success(`已改名为「${next}」`)
-  await loadTemplates()
 }
 
-async function doCopy() {
-  if (!store.canWrite || !templateId.value) return
-  const t = await printApi.copyTemplate(store.bookId, templateId.value)
-  ElMessage.success(`已复制为「${t.name}」`)
-  await loadTemplates()
-  templateId.value = t.id
-  await loadTemplate(t.id)
-}
-
+/**
+ * 顶栏「新建」：把屏幕上这份版式另存为**账套模板**（同账套的同事也看得见），
+ * 所以门禁是 OWNER（后端 `_require_global_template_write`）。
+ *
+ * 这里**不传 `private`**。后端 `TemplateIn.private` 默认 False（fail-closed），
+ * 不传就是账套模板 —— 少一个字段就少一处能出错的地方，要私有的那条路不在这里。
+ */
 async function doCreate() {
-  if (!store.canWrite) return
+  if (!canCreate.value) return
   let name
   try {
     ;({ value: name } = await ElMessageBox.prompt('新模板名称', '新建打印模板', {
@@ -666,7 +758,7 @@ async function doCreate() {
 }
 
 async function doDelete() {
-  if (!store.canWrite || !templateId.value) return
+  if (!canDeleteSelected.value || !templateId.value) return
   try {
     await ElMessageBox.confirm('删除后无法恢复，确定删除该打印模板吗？', '删除模板', { type: 'warning' })
   } catch {
@@ -679,9 +771,37 @@ async function doDelete() {
   await loadTemplate(templateId.value)
 }
 
+/**
+ * 设为默认 / 取消默认。
+ *
+ * 默认模板是**不指定模板直接打印时**兜底取的那一份（见 api/printing.py::_template），
+ * 所以这是一次会影响此后每一次打印的选择 —— 设之前说清楚会发生什么，
+ * 而不是让人点完才发现以后所有凭证都换了版式。
+ *
+ * 只发 is_default，不带 content：改名和设默认都不该顺带把版式重写一遍。
+ */
+async function doToggleDefault() {
+  if (!canEditSelected.value || !templateId.value) return
+  const cur = selectedTpl.value
+  if (!cur) return
+  const next = !cur.is_default
+  if (next) {
+    try {
+      await ElMessageBox.confirm(
+        `设为默认后，不指定模板直接打印${SCOPES[scope.value]}时会用这一份版式。`,
+        `将「${cur.name}」设为默认模板`, { type: 'warning' })
+    } catch {
+      return                        // 点了取消
+    }
+  }
+  const res = await printApi.updateTemplate(store.bookId, cur.id, { is_default: next })
+  await applyWriteResult(res, { relaunch: false })
+  ElMessage.success(`「${cur.name}」${next ? '设为默认模板' : '取消默认'}`)
+}
+
 function onMore(cmd) {
   if (cmd === 'rename') doRename()
-  else if (cmd === 'copy') doCopy()
+  else if (cmd === 'default') doToggleDefault()
   else if (cmd === 'delete') doDelete()
 }
 

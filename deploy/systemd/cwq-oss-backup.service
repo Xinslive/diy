@@ -1,0 +1,40 @@
+[Unit]
+Description=云财务记账系统 账套数据备份到阿里云 OSS
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=cwq
+Group=cwq
+WorkingDirectory=/opt/cwq/backend
+
+EnvironmentFile=/opt/cwq/backend/.env
+
+# 产物只在本地临时落盘，上传完即删（见 app/backup/service.py::_workdir）。
+# 这里给一个**明确的**目录而不是让它用 /tmp：/tmp 是全机共享的，而备份产物
+# 是全量账务数据 —— 落到一个别的账号能列出来的目录里，是在给备份本身制造风险。
+Environment=CWQ_BACKUP_WORK_DIR=/opt/cwq/backups/work
+
+# 数据库口令不靠 argv：db_backup.py 把口令放进子进程的 PGPASSWORD，
+# 直接写进连接串的话 `ps` 对同机器上任何用户都看得见（见该脚本开头的说明）。
+#
+# 这里**没有** --no-prune：清理是这套策略的一半。留着的过期产物不只是浪费
+# 存储费，它们还让人误以为「回溯窗口比实际更长」—— 你以为能翻到 60 天前，
+# 实际上 45 天前那份已经在上个月被删了。
+ExecStart=/opt/cwq/backend/.venv/bin/python scripts/backup_to_oss.py
+
+# ---------------------------------------------------------------------------
+# 加固项**不能照抄 cwq-api.service**：那个 unit 的 ReadWritePaths 只有
+# logs 一个目录，而这里要写备份工作目录。照抄的话备份写不进去，
+# 而 systemd 只报一个含糊的失败码 —— 表现是「每天定时跑、每天都失败、
+# 没人看 journal」，比没有定时备份更危险，因为它看起来是有的。
+# ---------------------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cwq/backups
+
+StandardOutput=append:/opt/cwq/backups/oss-backup.log
+StandardError=append:/opt/cwq/backups/oss-backup.log

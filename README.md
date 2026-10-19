@@ -75,14 +75,24 @@ npm run dev        # http://localhost:5173
 > 连接串里的端口是 **15432**，与上面 `docker run -p 15432:5432` 一致；
 > `backend/.env.example` 里也是这个端口。
 
-登录页的**注册**页签存在，但**自助注册默认是关的**：
+登录页的**注册**页签默认**不显示**：自助注册默认是关的，
 `config.py` 里 `registration_enabled: bool = False`，`REGISTRATION_ENABLED` 没配或
-配成 false 时，调注册接口直接 **403**。公司内部要开，在 `backend/.env` 里显式
-`REGISTRATION_ENABLED=true` 并重启后端。
+配成 false 时，调注册接口直接 **403**。
 
-> 三处必须一致，改任何一处都要同步另两处：`config.py` 的默认值、
-> `backend/.env.example`、`ARCHITECTURE.md` §9.5。默认值是 `False`（默认关闭），
-> **不要为了「让文档说得通」去改成 True** —— 那等于把刚收掉的口子重新打开。
+开关有三个来源，**库里优先、env 兜底**（与 OCR、OSS 备份同一套约定）：
+
+| 来源 | 用途 |
+|---|---|
+| 「系统管理 → 用户与授权」页的**允许自助注册**开关 | 日常开关，管理员点一下即生效 |
+| `sys_setting.registration_enabled` | 上面那个开关落库的那一行 |
+| `backend/.env` 的 `REGISTRATION_ENABLED` | 库里没有那一行时的兜底默认值 |
+
+关着的时候登录页会把「注册」页签整个去掉，**不只是点了撞 403**。库里没有那一行时读 env，
+所以服务器上原有的 `REGISTRATION_ENABLED=false` 会继续生效，升级不会把注册意外打开。
+
+> 兜底默认值仍然是 `False`，它与 `backend/.env.example`、`ARCHITECTURE.md` §9.5
+> 必须保持一致，改任何一处都要同步另两处。**不要为了「让文档说得通」去改成 True** ——
+> 那等于把刚收掉的口子重新打开。
 
 注册只创建账号，**不授予任何账套**，注册成功也不签发 token ——
 需要管理员在「用户与授权」里分配账套。用户名限 3-32 位字母/数字/下划线，密码至少 8 位。
@@ -153,6 +163,47 @@ cd backend
 | 期末结账 | `/periods` | 结转损益 / 结账 / **批量反结账** / 年度结转 |
 | 科目表 | `/subjects` | 树形维护，**每账套独立** |
 | 系统 | `/users` `/audit` | 用户授权（OWNER / ACCOUNTANT / VIEWER）、审计日志。仅管理员可见 |
+| 扩展 | `/plugins` / `/plugin/{id}` | 管理员安装签名插件、重启生效、指定使用用户；能力与用户授权分别检查。默认关闭 |
+| 数据安全 | `/data-security` | 阿里云 OSS 备份：配置 / 连通性测试 / 立即备份 / 运行历史。**仅管理员可见** |
+
+---
+
+## 受信任插件（默认关闭）
+
+系统支持签名 `.cwp` 全栈扩展，包括后端 API、预编译前端和独立迁移。插件与宿主同进程、同操作系统权限，**没有沙箱**；只安装经人工审阅、受信任发布者签名的代码。扫描用于拦截明显危险行为，不保证任意代码安全。规范、限制和验收记录分别见 [插件规范](docs/plugin-spec.md)、[风险记录](docs/plugin-risk.md)、[验证记录](docs/plugin-verification.md)。
+
+首次启用前先执行主迁移 `alembic upgrade head`（当前 head 为 `0028_scheduled_tasks`，包含注册表、导入批次和计划任务），在服务环境中配置 `PLUGIN_ENABLED=true`、`PLUGIN_TRUSTED_KEYS`（`key_id → base64 Ed25519 公钥` 的 JSON），并设置持久化的 `PLUGIN_ROOT`。systemd 默认工作目录下为 `backend/data/plugins`，Docker 为 `/app/data/plugins`；部署产物不包含、也不覆盖这个运行目录。Docker 应持久化挂载 `/app/data`。配置项及配额见根目录 `.env.example`。
+
+从仓库根目录可生成仅供本地演示的签名包；生产私钥应保存在独立签名环境，不能复制进服务器或插件目录：
+
+```bash
+mkdir -p /tmp/cwq-plugin-demo
+backend/.venv/bin/python backend/scripts/plugin_package.py keygen \
+  --key-id demo-local --private /tmp/cwq-plugin-demo/signing.pem \
+  > /tmp/cwq-plugin-demo/public-keys.json
+backend/.venv/bin/python backend/scripts/plugin_package.py build docs/plugin-example \
+  --private /tmp/cwq-plugin-demo/signing.pem --key-id demo-local \
+  --output /tmp/cwq-plugin-demo/periodnote.cwp
+backend/.venv/bin/python backend/scripts/plugin_package.py verify \
+  /tmp/cwq-plugin-demo/periodnote.cwp \
+  --public-keys /tmp/cwq-plugin-demo/public-keys.json
+```
+
+启用插件时必须使用 supervisor 入口，使同一批 worker 继承同一个随机 generation。不要为每个 worker 各自设置 generation。systemd 和 Docker 已接入，手动演练可在 `backend/` 下运行：
+
+```bash
+CWQ_API_WORKERS=2 .venv/bin/python scripts/start_server.py --port 8000
+# 在另一个终端检查整个 worker 屏障；失败返回非零
+.venv/bin/python scripts/plugin_status.py --wait 30
+```
+
+管理员在「系统管理 → 扩展管理」上传包，安装结果是“等待重启”。**安装后默认无人获得使用授权，安装者和管理员也不例外**；通过“管理用户”搜索并选择使用者。重启整个服务并通过屏障后，已授权用户才会看到扩展。授权和撤销无需重启，后端按每次请求的当前数据库记录检查；账套读写仍检查原有账套角色。
+
+停用也需要重启。升级、卸载和清理表之前，先停用并重启全部 worker，确认没有旧 lease。升级前生成校验过的本地数据快照，成功后保持停用并保留授权；卸载撤销授权、保留业务表。表清理是单独确认操作。代码/数据库/文件系统没有跨资源原子事务，未完成操作由 journal + reconcile 检测和恢复。恢复必须保留匹配版本的签名包、公钥、registry/迁移现场及数据备份，不能把新版本快照强灌到旧版本。
+
+前端代码资产为不含业务数据、带 digest 的同源只读资源，原生 `import()` 不带 Bearer；manifest 和业务 API 则实时鉴权。不通过 query string 传 token，也不放宽现有 CSP。插件模块加载失败会展示降级页，核心记账页面仍可使用。
+
+SDK 1.2.0 支持由用户在插件页面选择目标账套、保存账套配置、上传文件、持久预览、人工确认和整批原子制证，并增加由宿主调度器按当前有效授权逐用户执行的插件定时任务。可签名运行的示例为 `docs/plugin-import-example/`；契约见 [插件规范](docs/plugin-spec.md) 和 [数据接口](docs/plugin-data.md)。
 
 ---
 
@@ -174,22 +225,168 @@ cd backend
 
 ---
 
+## 数据安全：备份到阿里云 OSS
+
+界面在 **系统管理 → 数据安全**（`/data-security`，仅管理员可见）。填 OSS 参数并点「测试连接」验通后，由应用级调度器执行备份。外部调度服务每分钟调用一次 tick 接口，应用再按数据库中的计划领取到期任务。
+
+### 备份的是什么
+
+每个账套一份 **gzip JSON 逻辑快照**，外加一份系统级快照（用户、授权、审计日志、
+系统参数等不属于任何账套的表）。不用 `pg_dump` 分表，因为要的是「能把某一本书原样
+搬走」，不是「把整个库搬走」。
+
+产物长这样：
+
+```json
+{"header": {"format": "cwq-book-backup", "version": 1,
+            "scope": "book", "book_id": 3, "book_label": "某某公司/2026 年度",
+            "exported_at": "2026-10-17T03:47:12+08:00"},
+ "tables": {"entry": {"columns": [...], "rows": [{...}, ...]}, ...}}
+```
+
+对应的对象键是 `acct-backup/monthly/book-3/20261001-031700.json.gz` ——
+**档位必须是第一层目录**，因为按档位清理和按目录清理是同一件事。
+键里刻意不含中文（公司名写在归档头和运行记录里，界面上看得到），
+非 ASCII 键在 `ossutil` 和各种第三方工具的日志里反复出问题。
+
+取的是哪几张表不是「有 book_id 列就算」，而是**沿外键递归到闭包**
+（`app/backup/export.py::build_table_scopes`）。原因：`report_row` / `report_col` /
+`report_cell` 自己没有 `book_id`，只有 `template_id → report_template.id`。按
+book_id 筛表的话，用户设计的那套报表版式**不在任何一个备份里，而且不报错**。
+现在账套级 = book + direct + indirect 共 19 张表，系统级 = 其余全部
+（direct 取 `book_id IS NULL`，global 取全表）。
+
+`sys_backup_run` 在排除表里（`EXCLUDED_TABLES`），避免运行记录递归膨胀。插件 registry、安装 journal、cohort 和 worker lease 也不作为可移植业务行恢复；用户插件授权仍属于 SYSTEM 快照。
+
+没有插件元数据时继续写 v1；包含插件元数据/表时写 v2，增加 digest、独立迁移 head 和实时表结构。v1 reader 保留。插件数据只在目标库已安装完全匹配的代码、迁移和表结构时允许恢复，未知插件、卸载状态及任何漂移均在写入前拒绝。详见[插件备份约束](docs/plugin-spec.md#备份与恢复)。
+
+### 分级：够格的最高一档
+
+```
+这个月还没成功过月度  ->  monthly（永久保留）
+本周里还没成功过周备份 ->  weekly （保留 365 天）
+其余                 ->  daily  （保留 30 天）
+```
+
+判重只看 `status='success'` —— **失败不算占位**。一次失败的月度备份如果算成
+「本月已留档」，接下来一个月都不会再补，月度档就悄悄空了一个月。
+
+判重用 `Asia/Shanghai`（`tier.BUSINESS_TZ`），不依赖部署机的 TZ：机器在 UTC 上
+跑，周一 00:00 UTC 是周日的 8 点，按机器时区判会整周错位。
+
+### 保留：月度是结构性的，不是配出来的
+
+`.env` 里只有 `BACKUP_KEEP_DAILY_DAYS` / `BACKUP_KEEP_WEEKLY_DAYS`，
+**月度备份没有对应配置项**。`app/backup/retention.py` 对 `tier == monthly`
+直接 `continue`（连对象列表都不列），`plan_deletions` 入口再挡一次 ——
+将来谁新写一条清理路径，也碰不到月度档。
+
+做成「保留天数 = 一个很大的数」是危险的：哪天有人觉得 3650 太大改成 1095，
+「永久」就悄悄变成了 3 年，而且没人会发现。
+
+清理按 `daily/` `weekly/` 前缀 + 对象修改时间判定，**跑完当轮备份立即执行**
+（不单独排一个清理任务）。systemd unit 里那个 `--no-prune` 不是可选的 ——
+留着过期产物不只是浪费存储费，还让人以为回溯窗口比实际更长。
+
+### 凭据只写不读
+
+`GET /system/backup` 永远不返回 AccessKey 明文，只回 `…EYID` / `…0000`
+这样的 mask 提示。改密钥只能整份重填，没有「回显」这条路
+（和「系统管理 → 外部服务」里的 OCR token 同一套规矩）。
+`OSS_PUBLIC_KEYS` 里根本没有那两个键。
+
+### 出事了怎么恢复
+
+```bash
+# 1. 先干跑：只校验归档并报行数，一个字节都不写库
+.venv/bin/python scripts/backup_to_oss.py \
+    --restore /tmp/book-3-20261001.json.gz --restore-dry-run
+
+# 2. 确认无误再灌（整批一个事务，中途失败整体回滚）
+.venv/bin/python scripts/backup_to_oss.py \
+    --restore /tmp/book-3-20261001.json.gz
+```
+
+`read_snapshot` 先验后跑：format / version 不认、tables 为空，一律拒绝。
+恢复是**灾难恢复，不是覆盖写** —— 往一个有数据的库里灌会撞主键并整体回滚
+（有测试锁住这个行为）。也就是说「恢复」永远是「恢复到一个空库/新环境」。
+
+恢复完 `_reset_sequence` 会把序列推到当前最大值之后，不然恢复之后第一张
+新凭证就会撞主键；`_ordered_rows` 会对自引用外键（`subject.parent_id`）
+做表内拓扑排序，否则多行 INSERT 逐行校验 FK 时父行还没插进去。
+
+### 启用定时调度
+
+```bash
+# 先把主迁移升级到 0028_scheduled_tasks
+cd backend
+.venv/bin/alembic upgrade head
+```
+
+然后用管理员令牌调用 `POST /api/system/scheduler/secret/rotate`，将响应中的明文密钥只保存到外部调度服务的密钥配置中。外部服务每分钟请求：
+
+```text
+GET https://<域名>/api/scheduler/tick?key=<调度密钥>
+```
+
+接口只接受当前密钥或轮换期间保留的上一把密钥；数据库只保存 SHA-256 摘要，轮换完成后用 `DELETE /api/system/scheduler/secret/previous` 关闭旧密钥。提供的 Nginx 配置会关闭该路径及其末尾斜杠形式的访问日志，但云负载均衡、CDN、外部调度平台仍可能记录 URL，必须在这些位置开启查询参数脱敏。不要把密钥放进普通脚本、聊天或监控标签。
+
+tick 返回 `202` 表示本次任务领取已接受，最终结果通过 `GET /api/system/scheduler/runs` 查看。内置 OSS 备份每天北京时间 03:47 执行，沿用数据安全页面的 `backup_enabled` 开关、OSS 参数和保留策略；插件导入过期文件每小时清理一次。每次最多领取 20 个任务，同一任务租约有效时不会重复领取，错过的周期合并执行。
+
+插件任务默认关闭，管理员可通过 `GET /api/system/scheduler/tasks` 查看，并用 `PUT /api/system/scheduler/tasks/{plugin_id}/{task_name}` 传入 `{"enabled": true}` 启用。启用是全局开关；每次运行按当时仍 active 且未撤销插件授权的用户逐个执行。旧的 `cwq-oss-backup.timer` 不应再启用，否则会产生重复备份；旧的本地 pg_dump timer 仍保持禁用。
+
+### 手动跑一轮
+
+```bash
+cd backend
+.venv/bin/python scripts/backup_to_oss.py --dry-run    # 只打印会传什么、会删什么
+.venv/bin/python scripts/backup_to_oss.py              # 真跑
+.venv/bin/python scripts/backup_to_oss.py --book 3 --tier monthly   # 补一份永久档
+```
+
+退出码：`0` 至少一本成功；`2` 配置不全 / 没东西可备；`4` 一本都没成功。
+一轮全灭必须是非零 —— 返回 0 的表现就是「定时任务每天都是绿的」。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/system/backup` | 读配置（**无 AccessKey 明文**）+ 开关 + 保留天数 |
+| PUT | `/api/system/backup` | 改配置（凭据留空 = 不动已存的值） |
+| POST | `/api/system/backup/test` | 连通性测试：上传一个探针对象再删掉 |
+| POST | `/api/system/backup/run` | 立即备份（后台任务 + 轮询历史，页面不靠超时猜） |
+| GET | `/api/scheduler/tick?key=...` | 外部每分钟触发应用级计划任务 |
+| GET | `/api/system/scheduler/tasks` | 管理员查看内置与插件计划任务 |
+| PUT | `/api/system/scheduler/tasks/{plugin_id}/{task_name}` | 管理员启用/停用插件计划任务 |
+| GET | `/api/system/scheduler/runs` | 管理员查看计划任务运行记录与逐用户结果 |
+| GET | `/api/system/backup/runs` | 运行历史（状态 / OSS key / 字节数 / SHA256 / 行数 / 错误全文） |
+
+五个都要求管理员。
+
+「测试连接」是**写探针再删**，不是 `head_bucket`：只读权限的 Key 在
+`head_bucket` 上是绿的，真备份时却写不进去 —— 那才是最难在事后发现的形态。
+
+---
+
 ## 测试
 
 ```bash
 cd backend
 
-.venv/bin/python -m pytest                      # 995 个单元/接口测试（53 个测试文件，实测 `--collect-only`）
+.venv/bin/python -m pytest                      # 全量单元/接口测试；当前数量以收集与验证记录为准
 .venv/bin/python scripts/demo_e2e.py            # 69 项端到端流程
 .venv/bin/python scripts/demo_modules.py        # 53 项模块冒烟
-node onboard.mjs                                # 12 步浏览器开户全流程（需前后端都起着）
+node onboard.mjs                                # 19 步浏览器开户全流程（需前后端都起着）
 node report_design.mjs                          # 7 步浏览器报表设计器（需前后端都起着）
+
+cd ../frontend && npm run test                  # 全量前端测试（node --test）
 ```
 
+- 插件专项及完整回归命令见 [验证记录](docs/plugin-verification.md)。真实浏览器演练使用专用 `*_plugin_browser_test` 库和临时签名密钥，不能传业务库连接串。
 - pytest 用**独立测试库** `cwq_test`，每个用例一个全新账套，绝不碰开发库
 - 两个 demo 脚本每次运行自建 uuid 账套，可以反复跑
-- `onboard.mjs` 跑真实浏览器：新建账套 → 录期初（含反方向余额）→ 试算平衡 →
-  保存回读 → 导出再导入 → 下载文件鉴权
+- `onboard.mjs` 跑真实浏览器：新建账套 → 初始化两步向导 → 录期初（含反方向余额）
+  → 试算平衡 → 保存回读 → 导出再导入 → 下载文件鉴权 → 拖拽磁贴排序并验证刷新后仍在
 - 跑完用 `seed_demo.py --clean` 收掉测试账套
 
 ---
@@ -209,11 +406,14 @@ backend/
       queries.py    #   总账 / 明细账 / 余额表 / 试算平衡
     reports/        # 报表公式引擎（自由配公式）
     printing/       # 打印模板引擎（HTML+CSS @page）
+    backup/         # 账套快照 → OSS：分级 / 保留清理 / v1、v2 导出与恢复
+    plugins/        # 签名、安装 journal、worker 屏障、SDK、授权、独立迁移
     api/            # HTTP 层，只做参数转换和错误翻译
-    models/         # 17 张表
+    models/         # 宿主 ORM 和插件注册/授权/运行记录
     core/           # 配置、连接、鉴权、初始化 SQL
     seed/           # 标准科目表、内置报表模板
   scripts/          # seed_demo.py 演示数据 + demo_e2e/demo_modules 端到端脚本
+                   # + db_backup.py（pg_dump）+ backup_to_oss.py（账套快照）
   tests/            # pytest
 frontend/
   src/views/        # 按业务模块分目录

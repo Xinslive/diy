@@ -32,6 +32,7 @@
  * 单位换算按后端 @page 用的毫米，范围沿用后端 MARGIN_RANGE 的 0–100。
  */
 import { computed, onBeforeUnmount, ref } from 'vue'
+import { rafThrottle } from '@/utils/frame'
 
 const props = defineProps({
   page: { type: Object, required: true },
@@ -84,7 +85,9 @@ function startDrag(e, key) {
   window.addEventListener('pointerup', onUp)
 }
 
-function onMove(e) {
+// 按帧合并：pointermove 一秒几十次，每一下都在写 props.margins（响应式），
+// 每一写都要排一次渲染。松手前会 flush()，最后那一下不会丢。
+const onMove = rafThrottle(function (e) {
   const d = drag
   if (!d) return
   // 右/下边距往外拖 = 数值变大，往里拖 = 变小，和左/上边距是同一个方向感：
@@ -96,9 +99,11 @@ function onMove(e) {
   const v = Math.round(Math.max(MIN, Math.min(MAX, d.base + raw / MM2PX)) * 10) / 10
   if (props.margins) props.margins[d.key] = v
   emit('change')
-}
+})
 
 function onUp() {
+  // 先把欠着的最后一帧落地，再作废拖动状态 —— 反了就停在倒数第二个位置
+  onMove.flush()
   drag = null
   nearEdge.value = null
   window.removeEventListener('pointermove', onMove)
@@ -106,6 +111,7 @@ function onUp() {
   emit('change')
 }
 onBeforeUnmount(() => {
+  onMove.cancel()
   window.removeEventListener('pointermove', onMove)
   window.removeEventListener('pointerup', onUp)
 })

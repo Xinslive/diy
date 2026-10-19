@@ -129,6 +129,17 @@ class Entry(Base, TimestampMixin):
         Index("ix_entry_book_period", "book_id", "period_ord",
               postgresql_include=["subject_id", "direction", "amount"]),
         Index("ix_entry_voucher", "voucher_id"),
+        # **以 subject_id 打头**的索引（0011）。下面两条都打不成：
+        #   ix_entry_subject_ord 的首列是 book_id —— 没有 book_id 约束就用不上；
+        #   ix_entry_book_period 是账簿聚合的覆盖索引（0006），拿来做
+        #   「这个科目出现在哪些凭证里」只会退化成扫索引再 Filter。
+        # 凭证列表的「按科目筛选」（accounting/vouchers.py::list_vouchers
+        # 里的 `Voucher.id.in_(select(Entry.voucher_id).where(
+        # Entry.subject_id == ?))`）只按 subject_id 过滤，是全系统唯一一处
+        # 以科目为入口、却没带 book_id 的查询。
+        # 第二列带上 voucher_id 是为了让这个子查询 Index Only：
+        # 它要的输出就是 voucher_id，带上就不用回堆。
+        Index("ix_entry_subject_voucher", "subject_id", "voucher_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

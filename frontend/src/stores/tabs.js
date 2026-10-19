@@ -53,7 +53,7 @@ function savedUserId() {
  * localStorage 可能整个不可用（隐私模式 / 测试环境 / 被禁），那就只存不读 ——
  * 标签页照常能用，关掉浏览器就没了。存储失败绝不能带崩界面。
  */
-function readTabs() {
+function readTabs(plugins = false) {
   try {
     const raw = globalThis.localStorage?.getItem(TABS_KEY)
     if (!raw) return []
@@ -66,7 +66,7 @@ function readTabs() {
       .map((t) => Object.fromEntries(TAB_FIELDS.map((k) => [k, typeof t[k] === 'string' ? t[k] : ''])))
       // 认不出的 key（菜单改名 / 下线了）直接丢：标签栏里摆一条点进去 404 的标签，
       // 比少摆一条难看得多
-      .filter((t) => KNOWN_KEYS.has(t.key))
+      .filter((t) => KNOWN_KEYS.has(t.key) || (plugins && t.key.startsWith("plugin:")))
   } catch {
     return []      // 存了坏数据 / 存不下：当作没有，重新开
   }
@@ -85,14 +85,17 @@ function saveTabs(opened) {
 
 export const useTabsStore = defineStore('tabs', {
   state: () => ({
+    pluginItems: [],
+    pendingPluginTabs: readTabs(true).filter(t => t.key.startsWith("plugin:")),
     opened: readTabs(), // [{ key, title, path }]
     sidebarCollapsed: false,
   }),
   getters: {
     /** 菜单项 -> 标签页 key 的反查表，用来把标题从 nav 那边借过来 */
-    titles: () => {
+    titles: (s) => {
       const m = {}
       for (const mod of NAV) for (const it of mod.items) m[it.name] = it.title
+      for (const p of s.pluginItems) m[p.menu.name] = p.menu.title
       return m
     },
     /** 当前标签在标签栏里的位置，-1 表示还没打开（理论上不会发生） */
@@ -100,6 +103,15 @@ export const useTabsStore = defineStore('tabs', {
     canClosePrev: (s) => s.opened.length > 1,
   },
   actions: {
+    setPluginEntries(entries) {
+      this.pluginItems = entries
+      const allowed = new Map(entries.map(p => [p.menu.name, p.menu.route]))
+      this.opened = this.opened.filter(t => KNOWN_KEYS.has(t.key) || allowed.get(t.key) === t.path)
+      // 只在当前用户 manifest 校验后恢复保存的插件标签。
+      for (const t of this.pendingPluginTabs) if (allowed.get(t.key) === t.path && !this.opened.some(x => x.key === t.key)) this.opened.push({ ...t, title: entries.find(p => p.menu.name === t.key).menu.title })
+      this.pendingPluginTabs = []
+      saveTabs(this.opened)
+    },
     /**
      * 切路由时调用：开着就只激活，没开就补一个。
      *
@@ -113,6 +125,7 @@ export const useTabsStore = defineStore('tabs', {
     open(route) {
       const key = menuKeyOf(route?.name)
       if (!key || typeof route?.path !== 'string' || !route.path.startsWith('/')) return
+      if (String(key).startsWith('plugin:') && !this.pluginItems.some(p => p.menu.name === key && p.menu.route === route.path)) return
       const hit = this.opened.find((t) => t.key === key)
       if (hit) {
         // 地址没变就**连存储都不写**：调用方是路由 watcher，翻页、筛选、后退
@@ -167,6 +180,8 @@ export const useTabsStore = defineStore('tabs', {
      */
     reset() {
       this.opened = []
+      this.pluginItems = []
+      this.pendingPluginTabs = []
       saveTabs(this.opened)
     },
   },

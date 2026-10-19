@@ -11,14 +11,20 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.accounting import periods as svc
+from app.accounting.initialization import (OPENINGS_SOURCE_IMPORT, blocked_reason,
+                                           init_state, init_states, mark_openings_ready,
+                                           mark_subjects_ready)
 from app.accounting.util import money
-from app.api.schemas import (BookEditIn, BookIn, CarryForwardIn, CloseIn, OpeningIn,
-                           UncloseIn, YearEndIn)
+from app.api.schemas import (BookEditIn, BookIn, BookOrderIn, CarryForwardIn, CloseIn,
+                           OpeningIn, UncloseIn, YearEndIn)
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import (get_book_link, get_current_user, get_my_book, require_admin,
                         require_book_write)
-from app.core.uploads import RowBudget, UploadTooLarge, check_archive_size, read_upload
+from app.core.uploads import RowBudget, UploadTooLarge, check_archive_size
+# 本地别名保持函数名 ``read_upload`` 不变（守卫测试按这个名字认共享容量闸），
+# 指向的其实是同步版 —— 端点已改成同步 ``def``，不能再 await。
+from app.core.uploads import read_upload_sync as read_upload
 from app.ledger.engine import LedgerEngine
 from app.models import Book, Period, PeriodOpening, Subject, SysUser, UserBook, Voucher
 
@@ -75,8 +81,15 @@ def list_my_books(user: SysUser = Depends(get_current_user), db: Session = Depen
         select(Book, UserBook.role)
         .join(UserBook, UserBook.book_id == Book.id)
         .where(UserBook.user_id == user.id)
-        .order_by(Book.company_name, Book.name)
+        # 先按**这个人自己排的顺序**，没排过的（NULL）沉到最后，
+        # 最后再退回 company_name/name —— 那个子句同时管住两件事：
+        # 从不拖动的用户看到的顺序和以前一模一样；同一个用户里多个
+        # NULL（新账套）之间也有稳定的次序，不会每次刷新都在跳。
+        .order_by(UserBook.sort_order.asc().nulls_last(),
+                  Book.company_name, Book.name)
     ).all()
+    # 一次算完所有账套的初始化状态（四条 group by），不给每个账套单开一轮 count
+    inits = init_states(db, [b for b, _role in rows])
     out = []
     for b, role in rows:
         years = _years_of(db, b.id)
@@ -88,6 +101,9 @@ def list_my_books(user: SysUser = Depends(get_current_user), db: Session = Depen
             # 年度是账套的属性，列表一行一个账套，年度由前端下拉选
             "years": years,
             "latest_year": years[-1]["year"] if years else b.start_year,
+            # 初始化进度：卡片上那个「待初始化」标记就靠它，
+            # 点「继续初始化」时前端不用再为每个账套多发一次请求
+            "init": inits[b.id],
         })
     return out
 
@@ -161,6 +177,60 @@ def _check_code_rule(db: Session, book: Book, rule: str) -> str:
     return rule
 
 
+@router.put("/order")
+def reorder_books(payload: BookOrderIn, user: SysUser = Depends(get_current_user),
+                  db: Session = Depends(get_db)):
+    """把账套磁贴排成用户给的顺序（每人一份，见 UserBook.sort_order）。
+
+    **为什么只读账号也能调。** 这条写的是「我这个人的磁贴怎么排」，
+    不是账上的任何东西 —— 相当于拖了一下窗口的侧边栏。它不碰凭证、
+    科目、期初，也不影响别的用户，所以在这里挂 ``require_book_write``
+    反而是错的：只读同事打开自己的账套列表，一样有权把它排顺眼。
+    这也是它被 tests/test_viewer_matrix.py 的豁免清单放出来的原因。
+
+    **为什么不写审计。** 审计表按账套记，磁贴排序既不改变任何账面数据，
+    也没有「谁排的」这种需要追责的事；真要记，它只会往每一本账的
+    审计里塞一堆与账无关的行，把真正的改动淹没掉。
+
+    **提交的是相对顺序，不是绝对序号。** 客户端拖完把当前看到的账套 id
+    按新顺序整体发过来；这里再把「没出现在提交里」的账套按它们现有的
+    顺序接在后面，重新编成 0..n-1 的连续序号。这样序号永远稠密，
+    也不会因为别人在这期间新建了账套，就把这一串序号顶歪。
+    """
+    ids = payload.book_ids
+    if len(set(ids)) != len(ids):
+        raise HTTPException(400, "账套列表里有重复项")
+    if not ids:
+        return {"ok": True, "book_ids": []}
+
+    # 这个用户**当前**看到的顺序，和列表接口同一套口径（含 NULL 沉底）
+    current = list(db.scalars(
+        select(Book.id)
+        .join(UserBook, UserBook.book_id == Book.id)
+        .where(UserBook.user_id == user.id)
+        .order_by(UserBook.sort_order.asc().nulls_last(), Book.company_name, Book.name)
+    ).all())
+
+    # 提交里出现、但不属于这个用户的 id 一律拒掉：不然就成了
+    # 「拿别人的账套 id 探自己有没有权限」的探测口。
+    mine = set(current)
+    alien = [i for i in ids if i not in mine]
+    if alien:
+        raise HTTPException(400, f"有 {len(alien)} 个账套不在你的列表里")
+
+    final = ids + [i for i in current if i not in set(ids)]
+    links = {
+        link.book_id: link
+        for link in db.scalars(
+            select(UserBook).where(UserBook.user_id == user.id)
+        ).all()
+    }
+    for pos, book_id in enumerate(final):
+        links[book_id].sort_order = pos
+    db.commit()
+    return {"ok": True, "book_ids": final}
+
+
 @router.get("/{book_id}")
 def get_book(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     return {
@@ -170,7 +240,103 @@ def get_book(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
         "subject_max_level": _max_subject_level(db, book.id),
         "start_year": book.start_year, "start_month": book.start_month,
         "status": book.status, "years": _years_of(db, book.id),
+        "init": init_state(db, book),
     }
+
+
+@router.get("/{book_id}/init")
+def get_book_init(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
+    """账套初始化进度。向导弹窗开起来时先拿它，决定第 2 步锁不锁。
+
+    只读接口：谁都能看自己账套的初始化到哪一步了，**写**那一步才要权限。
+    """
+    return init_state(db, book)
+
+
+@router.post("/{book_id}/init/subjects/keep")
+def keep_chart_subjects(
+    book_id: int,
+    book: Book = Depends(get_my_book),
+    db: Session = Depends(get_db),
+    user: SysUser = Depends(get_current_user),
+    _link: UserBook = Depends(require_book_write),
+):
+    """确认「沿用系统标准科目表」，也就是把初始化第 1 步标记为完成。
+
+    为什么要这条**只写一个时间戳**的接口：新建账套时系统已经装好标准科目表，
+    对「从零开始记账」的用户来说第 1 步就是「确认一下就用它」。
+    没有这条路，界面上就只能强制所有人去导入一份外部科目表 ——
+    而一份标准科目表对一个刚开始记 2026 年账的公司本来就在账上，
+    要求他为了走流程去找一份并不存在的文件。
+
+    幂等：已经确认过再点一次不会重写时间戳，也不会多一条审计
+    （时间戳只在第一次落地时写，「这一步是什么时候完成的」因此只有一个答案）。
+    """
+    from app.accounting.audit_helper import log
+    from app.accounting.initialization import subject_import_state
+
+    counts = subject_import_state(db, book.id)
+    if counts["subject_count"] == 0:
+        raise HTTPException(
+            400,
+            "账套里还没有任何科目，无法确认沿用标准科目表；"
+            "请先导入一份外部科目表，或新建账套让它自动装载标准科目表",
+        )
+    changed = mark_subjects_ready(db, book, "CHART")
+    if changed:
+        log(db, action="INIT_SUBJECTS", entity="book", entity_id=book.id, user=user,
+            book_id=book.id,
+            detail=f"初始化第 1 步：沿用系统标准科目表（{counts['subject_count']} 个科目）",
+            before={"init_subjects_at": None, "init_subjects_source": None},
+            after={"init_subjects_at": book.init_subjects_at.isoformat(),
+                   "init_subjects_source": "CHART",
+                   "subject_count": counts["subject_count"]})
+        db.commit()
+        db.refresh(book)
+    return {"ok": True, "changed": changed, "init": init_state(db, book)}
+
+
+@router.post("/{book_id}/init/openings/skip")
+def skip_openings(
+    book_id: int,
+    book: Book = Depends(get_my_book),
+    db: Session = Depends(get_db),
+    user: SysUser = Depends(get_current_user),
+    _link: UserBook = Depends(require_book_write),
+):
+    """声明「本期本来就没有期初余额」，把初始化第 2 步标记为完成。
+
+    **为什么必须有这条路。** 新公司第一年、上一年度本来就是空账，期初该是 0。
+    界面上只有「导入期初余额」一个出口时，这类账套的初始化永远停在第 2 步：
+    账套卡片上那个「待初始化」摘不掉，向导每次弹出来都在催一件他根本不需要做的事。
+    而「没做」与「确认过没有」在库里必须有区别 —— 前者是要提醒的隐患，
+    后者是已经核对过的事实。
+
+    已经有期初余额的账套不给跳过：那种情况下「无期初」与「把期初清空了」
+    是两回事，不能用一个声明糊弄过去。
+    """
+    from app.accounting.audit_helper import log
+    from app.accounting.initialization import (OPENINGS_SOURCE_NONE,
+                                               subject_import_state)
+
+    counts = subject_import_state(db, book.id)
+    if counts["opening_count"] > 0:
+        raise HTTPException(
+            409,
+            f"账套已经有 {counts['opening_count']} 条期初余额，不能再声明「无期初余额」"
+            "（那与「把期初清空」不是一回事）",
+        )
+    changed = mark_openings_ready(db, book, OPENINGS_SOURCE_NONE)
+    if changed:
+        log(db, action="INIT_OPENINGS", entity="book", entity_id=book.id, user=user,
+            book_id=book.id,
+            detail="初始化第 2 步：声明本期无期初余额（不导入任何期初数据）",
+            before={"init_openings_at": None, "init_openings_source": None},
+            after={"init_openings_at": book.init_openings_at.isoformat(),
+                   "init_openings_source": OPENINGS_SOURCE_NONE})
+        db.commit()
+        db.refresh(book)
+    return {"ok": True, "changed": changed, "init": init_state(db, book)}
 
 
 @router.put("/{book_id}")
@@ -337,6 +503,9 @@ def get_openings(book_id: int, period_id: int | None = None,
         "month": period.month,
         "editable": editable,
         "reason": reason,
+        # 初始化进度随这一份一起下发：页面上「第 1 步没做完就别录期初」
+        # 那道拦截条要的就是它，单独再发一次请求没有意义
+        "init": init_state(db, book),
         "subjects": [
             {
                 "id": s_.id, "code": s_.code, "name": s_.name,
@@ -394,91 +563,63 @@ def export_openings(book_id: int, period_id: int | None = None,
 
 
 @router.post("/{book_id}/openings/parse")
-async def parse_openings(book_id: int, file: UploadFile = File(...),
-                         book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
+def parse_openings(book_id: int, file: UploadFile = File(...),
+                   basis: str = Query("opening", pattern="^(opening|closing)$"),
+                   book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     """解析期初余额 Excel，**只解析不落库** —— 前端先给用户预览，确认后才写。
 
     虽然是 POST，但它**不改任何数据**：只解析出一个 preview 返回给前端。
     真正落库的是 ``set_openings``（那里挂了 require_book_write）。
     所以这里不挂写依赖 —— 只读账号也该能预览自己账上的期初表。
 
+    **同步端点，刻意如此**（审计严重 1）：它和 ``vouchers/import`` 曾是全仓仅有的两个
+    ``async def`` 端点，而 ``async def`` 端点直接跑在事件循环线程上 ——
+    这里的解析（同步 openpyxl / xlrd）与 ``get_db`` 给的同步 Session
+    会原地堵死整个 worker 的事件循环，连 ``/api/health`` 一起排队，
+    而 CPU 占用并不高。改成 ``def`` 后由 FastAPI 丢进 anyio 线程池，
+    与全仓其余端点一致。
+
     但「只读」只免的是**写权限**，不免**容量**（审计 P1-4）：这个入口曾经
     一道闸都没有。``raw = await file.read()`` 无上限整体读进内存，
-    紧接着 ``grid = [list(r) for r in ws.iter_rows(...)]`` 把整个工作表
-    一次性物化成二维列表 —— 凭证导入那边有三道闸，这里一道都没有，
-    而只读账号就能打。它还被 ``tests/test_viewer_matrix.py`` 按
+    紧接着把整个工作表一次性物化成二维列表 —— 凭证导入那边有三道闸，
+    这里一道都没有，而只读账号就能打。它还被 ``tests/test_viewer_matrix.py`` 按
     「不落库」列进写接口豁免清单，于是守卫测试也照不到它。
     现在与凭证导入共用 ``app/core/uploads.py``：先看 ``file.size`` 预检、
     再按上限 +1 读一次、读进来之后按 zip 目录声明的解压体积预检、
-    物化工作表时逐行计数。
+    物化工作表时逐行计数（第三道在解析模块里）。
 
-    为什么不按「第 1 行是表头」写死：导出的模板自己就带两行大标题，而且用户
-    从别处抄来的表几乎不可能是干净的四列。这里改成**认表头** —— 扫前若干行找到
-    那一行，再按表头文字定位各列。这样既能吃回自己导出的文件，也能吃用户自己
-    整理过的表；认不出表头时才退回按位置取 A/B/C/D。
+    ``basis`` 决定取哪一套数：用友余额表同一张表里期初与期末分列，
+    选错了不会报错、只会让用户对着一个对不上的差额发呆，所以做成参数交给界面选。
 
     容错：科目可按编码或名称匹配；方向列可省（按科目属性推）。借贷不平在这里
     就报出来，不等到入库才发现。
+
+    **用友导出的 .xls 余额表也吃**（2026-10）：`.xls` 是 OLE 复合文档，
+    openpyxl 只认 .xlsx，原来这条路拿 openpyxl 硬读，用友文件到这儿必然
+    「无法读取 Excel 文件」。解析本身已经搬去
+    ``app.accounting/opening_importer.py``，这里只留容量闸与状态码翻译。
     """
-    from openpyxl import load_workbook
+    from app.accounting.opening_importer import parse_opening_workbook
+
+    # 初始化第 1 步（确定科目）没做完，就不让碰第 2 步（期初）。
+    # 这一道拦的是**数据依赖**而不是流程偏好：期初挂在科目上，
+    # 科目还没定下来时解析出来的每一条都挂不到账上，用户只会看到
+    # 「读进来 N 条，全是『科目在本账套不存在』」。
+    reason = blocked_reason(book)
+    if reason:
+        raise HTTPException(409, reason)
 
     # 容量三道闸的前两道在共享工具里（与凭证导入同一把尺，见 app/core/uploads.py）。
     # 413：文件太大是「换个更小的再来」，不是参数写错了。
     try:
-        raw = await read_upload(file, label="期初余额文件",
-                                hint="请拆成多份分别导入，或先删除无关工作表")
+        raw = read_upload(file, label="期初余额文件",
+                          hint="请拆成多份分别导入，或先删除无关工作表")
     except UploadTooLarge as e:
         raise HTTPException(413, str(e))
     try:
         check_archive_size(raw, label="期初余额表")
     except UploadTooLarge as e:
         raise HTTPException(413, str(e))
-    try:
-        wb = load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(400, f"无法读取 Excel 文件：{exc}") from exc
-    ws = wb.active
-    if ws is None:
-        raise HTTPException(400, "Excel 里没有工作表")
-
-    def _find_header(grid):
-        """返回 (表头行号, {列序号: 角色})；认不出就返回 (None, {})。"""
-        roles = {"code": None, "name": None, "direction": None, "amount": None}
-        for idx, row in enumerate(grid[:15], start=1):
-            texts = [str(c).strip() for c in row if c not in (None, "")]
-            if not any("科目" in t for t in texts):
-                continue
-            if not any(("方向" in t) or ("余额" in t) or ("金额" in t) for t in texts):
-                continue
-            for col, cell in enumerate(row):
-                t = str(cell).strip() if cell not in (None, "") else ""
-                if not t:
-                    continue
-                if ("编码" in t) or ("代码" in t):
-                    roles["code"] = col
-                elif "名称" in t:
-                    roles["name"] = col
-                elif ("方向" in t) or ("借贷" in t):
-                    roles["direction"] = col
-                elif ("余额" in t) or ("金额" in t) or ("数" in t):
-                    roles["amount"] = col
-            if roles["amount"] is not None:
-                return idx, roles
-        return None, roles
-
-    # 第三道闸：物化工作表时逐行计数（审计 P1-4）。
-    # 这一行是这里唯一的容量兜底 —— 上面两道都能被伪造（zip 中央目录里的
-    # file_size 可以随便写），行数不会。而且**必须边读边数**：先 count 一遍
-    # 照样要把整个工作表读进内存，那正是要防的事。
-    try:
-        grid = RowBudget(settings.import_max_rows,
-                         hint="请拆成多份分别导入，或先删除无关工作表").guard_rows(
-            list(r) for r in ws.iter_rows(values_only=True))
-    except UploadTooLarge as e:
-        raise HTTPException(413, str(e))
-    head_idx, cols = _find_header(grid)
-    if head_idx is None:
-        head_idx, cols = 0, {"code": 0, "name": 1, "direction": 2, "amount": 3}
 
     # 解析不过滤 active：导出那一侧已经含停用科目了，这侧再过滤就
     # 造出一个「导得出来、导不回去」的坑 —— 用户只能手工改表。
@@ -488,79 +629,20 @@ async def parse_openings(book_id: int, file: UploadFile = File(...),
         by_code[s_.code] = s_
         by_name[s_.name] = s_
 
-    rows, errors = [], []
-    dr = cr = Decimal("0")
-    # head_idx 是表头的 Excel 行号（1 基），数据从它的下一行开始；
-    # 起始行号同样 1 基，所以是 head_idx + 1 —— 报给用户的行号要能在 Excel 里对上
-    # head_idx 是表头的 Excel 行号（1 基）。grid 是 0 基列表，表头占了下标
-    # head_idx - 1，所以第一条数据的下标正好是 head_idx —— 切片和行号都用它，
-    # 差一个格就会静默吞掉第一行数据。
-    for i, raw_row in enumerate(grid[head_idx:], start=head_idx + 1):
-        if raw_row is None or all(c in (None, "") for c in raw_row):
-            continue
-
-        def cell(role):
-            c = cols.get(role)
-            return raw_row[c] if c is not None and c < len(raw_row) else None
-
-        code, name, direction, amount = cell("code"), cell("name"), cell("direction"), cell("amount")
-        if code in (None, "") and name in (None, ""):
-            continue
-        subject = by_code.get(str(code).strip() or "") or by_name.get(str(name).strip() or "")
-        entry = {
-            "line": i,
-            "code": str(code or "").strip(),
-            "name": str(name or (subject.name if subject else "")).strip(),
-            "amount": str(amount if amount not in (None, "") else ""),
-            "subject_id": subject.id if subject else None,
-            "direction": subject.direction if subject else None,
-            "natural": str(direction or "").strip(),
-            "error": "",
-        }
-        if subject is None:
-            entry["error"] = "科目在本账套不存在"
-        elif not subject.is_leaf:
-            entry["error"] = "不是明细科目，期初应录在明细级"
-        else:
-            try:
-                amt = Decimal(str(amount or 0))
-            except Exception:  # noqa: BLE001
-                entry["error"] = f"金额无法识别：{amount!r}"
-                amt = None
-            if amt is not None:
-                if amt == 0:
-                    entry["error"] = ""
-                    entry["amount"] = "0"
-                else:
-                    # 方向以「表里写的」为准，缺省才按科目属性推：
-                    # 同一科目做反向调整是常事，按属性强推会把红字余额记反。
-                    nat = entry["natural"]
-                    if nat in ("借", "DEBIT", "D"):
-                        signed = abs(amt)
-                    elif nat in ("贷", "CREDIT", "C"):
-                        signed = -abs(amt)
-                    else:
-                        signed = abs(amt) if subject.direction == "DEBIT" else -abs(amt)
-                    entry["signed"] = str(signed)
-                    entry["display_side"] = "借" if signed > 0 else "贷"
-                    if signed > 0:
-                        dr += abs(signed)
-                    else:
-                        cr += abs(signed)
-        rows.append(entry)
-        if entry["error"]:
-            errors.append(f"第{i}行 {entry['code'] or entry['name']}：{entry['error']}")
-
-    if not rows:
-        raise HTTPException(400, "没有解析出任何数据行")
-
-    return {
-        "rows": rows,
-        "errors": errors,
-        "total_debit": str(dr),
-        "total_credit": str(cr),
-        "balanced": dr == cr,
-    }
+    try:
+        return parse_opening_workbook(
+            raw,
+            file.filename or "期初余额表",
+            subjects_by_code=by_code,
+            subjects_by_name=by_name,
+            basis=basis,
+        )
+    except UploadTooLarge as e:
+        raise HTTPException(413, str(e))
+    except ValueError as e:
+        # 上传太限是 ValueError 的子类，所以这条必须排在它后面 ——
+        # 否则容量拒绝会被当成 400「参数写错了」，提示方向完全相反
+        raise HTTPException(400, str(e))
 
 
 @router.post("/{book_id}/periods")
@@ -574,6 +656,13 @@ def set_openings(book_id: int, payload: list[OpeningIn], period_id: int | None =
     上一年结转过来的数要是对不上，改这一期比去翻上一年的凭证省事得多。
     """
     from app.accounting.audit_helper import log
+
+    # 初始化第 1 步没做完就写不了期初，与 openings/parse 是同一道闸。
+    # 两处都要：只拦解析的话，用户仍可以手一把数 POST 进来 ——
+    # 而那正是最需要拦住的路径（期初一旦存歪，之后每个月都跟着歪）。
+    gate = blocked_reason(book)
+    if gate:
+        raise HTTPException(409, gate)
 
     period = _openings_period(db, book, period_id)
     editable, reason = _openings_editable(db, period)
@@ -652,8 +741,21 @@ def set_openings(book_id: int, payload: list[OpeningIn], period_id: int | None =
                   + ("…" if len(changed) > 10 else "") + "）" if changed else ""),
         before=before,
         after={str(subject_id): str(amount) for subject_id, amount in planned})
+    # 第一次真正写进期初 = 初始化第 2 步完成。
+    # 口径是「存进库了」，不是「预览里读进来一堆数」—— 用户看一眼没保存
+    # 就走，账上并没有期初，初始化就该还停在第 2 步上。
+    #
+    # 与 SET_OPENINGS 同一次事务：状态与数据要么一起成立，要么一起回滚。
+    # 单独提交会出现「期初写失败了但向导显示已完成」的反过来情形。
+    first_openings = mark_openings_ready(db, book, OPENINGS_SOURCE_IMPORT)
     db.commit()
-    return {"ok": True, "count": len(payload), "period": period.code}
+    # **把最新的 init 一并带回来。** keep/skip/导入科目这几个口子都这么做，
+    # 只有保存期初没有 —— 于是前端只能靠「保存完再发一次 GET /init」才知道
+    # 第 2 步做完了，而那一发的结果没有任何人写回 store：
+    # 用户从期初页回到账套管理，看到的仍是「第 2 步还没做」。
+    # 顺手带上，跨页面那条链就不用多绕一圈、也不会漏。
+    return {"ok": True, "count": len(payload), "period": period.code,
+            "init_step_done": first_openings, "init": init_state(db, book)}
 
 
 @router.get("/{book_id}/periods/{period_id}/carry-forward")
@@ -675,7 +777,7 @@ def carry_forward(book_id: int, period_id: int,
     try:
         # 永远「先删旧结转凭证再重算」，payload 只为兼容旧前端保留
         return svc.carry_forward_profit(
-            db, book.id, period, user, replace=bool(payload.replace) if payload else True
+            db, book.id, period, user
         )
     except ValueError as e:
         db.rollback()

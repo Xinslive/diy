@@ -69,7 +69,7 @@ def test_有期初引用的科目不能删(client, auth, db, book, subjects):
     """只有期初、没有凭证引用 —— 原来这一条恰恰能删掉，删完余额就没了。"""
     from app.models import Subject
 
-    s = db.get(Subject, subjects["100201"].id)
+    s = db.get(Subject, subjects["1001"].id)
     _seed_opening(db, book, s, "500.00")
     n_before = db.scalar(select(PeriodOpening).where(PeriodOpening.subject_id == s.id)
                          .with_only_columns(__import__("sqlalchemy").func.count()))
@@ -90,7 +90,7 @@ def test_期初金额没被级联抹掉(client, auth, db, book, subjects):
     """审计记录的原始形态：余额 0 → -100。"""
     from app.models import Subject
 
-    s = db.get(Subject, subjects["100201"].id)
+    s = db.get(Subject, subjects["1001"].id)
     _seed_opening(db, book, s, "100.00")
     client.delete(f"/api/books/{book.id}/subjects/{s.id}", headers=auth)
     db.expire_all()
@@ -109,7 +109,7 @@ def test_数据库层也拦一道(db, book, subjects):
     from app.models import Subject
     from sqlalchemy.exc import DBAPIError
 
-    s = db.get(Subject, subjects["100201"].id)
+    s = db.get(Subject, subjects["1001"].id)
     _seed_opening(db, book, s, "100.00")
 
     with pytest.raises(DBAPIError):
@@ -138,7 +138,7 @@ def test_停用是期初科目的正确出路(client, auth, db, book, subjects):
     """报错文案指向的出路必须真的可行。"""
     from app.models import Subject
 
-    s = db.get(Subject, subjects["100201"].id)
+    s = db.get(Subject, subjects["1001"].id)
     _seed_opening(db, book, s, "100.00")
 
     r = client.patch(f"/api/books/{book.id}/subjects/{s.id}", headers=auth,
@@ -156,7 +156,7 @@ def test_跨账套设置父科目被拒(client, auth, db, book, other_book, subj
     """P1-06 的原始场景：HTTP 200，科目变孤儿。"""
     from app.models import Subject
 
-    victim = db.get(Subject, subjects["100202"].id)
+    victim = db.get(Subject, subjects["1012"].id)
     foreign_parent = db.scalar(select(Subject).where(Subject.book_id == other_book.id).limit(1))
 
     r = client.patch(f"/api/books/{book.id}/subjects/{victim.id}", headers=auth,
@@ -173,7 +173,7 @@ def test_改科目科目不会从本账套树里消失(client, auth, db, book, o
     """孤儿节点 = UI 上看不见但账还在，最难排查。直接查列表来证明。"""
     from app.models import Subject
 
-    victim = db.get(Subject, subjects["100202"].id)
+    victim = db.get(Subject, subjects["1012"].id)
     foreign_parent = db.scalar(select(Subject).where(Subject.book_id == other_book.id).limit(1))
     client.patch(f"/api/books/{book.id}/subjects/{victim.id}", headers=auth,
                  json=_payload(code=victim.code, name=victim.name,
@@ -196,7 +196,7 @@ def test_改科目科目不会从本账套树里消失(client, auth, db, book, o
 def test_父节点设为自身被拒(client, auth, db, book, subjects):
     from app.models import Subject
 
-    s = db.get(Subject, subjects["100201"].id)
+    s = db.get(Subject, subjects["1001"].id)
     r = client.patch(f"/api/books/{book.id}/subjects/{s.id}", headers=auth,
                      json=_payload(code=s.code, name=s.name, category=s.category,
                                    direction=s.direction, parent_id=s.id))
@@ -205,11 +205,15 @@ def test_父节点设为自身被拒(client, auth, db, book, subjects):
 
 
 def test_父节点设为自己的下级被拒(client, auth, db, book, subjects):
-    """环路：1002 -> 100201 -> 100202，再把 1002 的父设成 100202。"""
+    """环路：2221 -> 222101 -> 22210101，再把 2221 的父设成 22210101。
+
+    必须用全表唯一的三层链：换成 1002/1012 这种平级科目就构不成环，
+    改父本身是合法的（返回 200），这条护栏就测不到了。
+    """
     from app.models import Subject
 
-    top = db.get(Subject, subjects["1002"].id)
-    grandchild = db.get(Subject, subjects["100202"].id)
+    top = db.get(Subject, subjects["2221"].id)
+    grandchild = db.get(Subject, subjects["22210101"].id)
 
     r = client.patch(f"/api/books/{book.id}/subjects/{top.id}", headers=auth,
                      json=_payload(code=top.code, name=top.name, category=top.category,
@@ -228,13 +232,13 @@ def test_合法改父后父节点is_leaf跟着变(client, auth, db, book, subjec
                              json=_payload(code="1900", name="新的一级科目",
                                            is_leaf=True)).json()["id"]
     child = client.post(f"/api/books/{book.id}/subjects", headers=auth,
-                        json=_payload(code="1901", name="新的一级下的明细",
+                        json=_payload(code="1905", name="新的一级下的明细",
                                       is_leaf=True)).json()["id"]
     db.expire_all()
     assert db.get(Subject, new_parent).is_leaf is True
 
     r = client.patch(f"/api/books/{book.id}/subjects/{child}", headers=auth,
-                     json=_payload(code="1901", name="新的一级下的明细", is_leaf=True,
+                     json=_payload(code="1905", name="新的一级下的明细", is_leaf=True,
                                    parent_id=new_parent))
     assert r.status_code == 200, r.text
     db.expire_all()
@@ -248,13 +252,13 @@ def test_移出下级后父节点恢复is_leaf(client, auth, db, book, subjects)
                              json=_payload(code="1900", name="容器",
                                            is_leaf=True)).json()["id"]
     child = client.post(f"/api/books/{book.id}/subjects", headers=auth,
-                        json=_payload(code="1901", name="明细", is_leaf=True,
+                        json=_payload(code="1905", name="明细", is_leaf=True,
                                       parent_id=new_parent)).json()["id"]
     db.expire_all()
     assert db.get(Subject, new_parent).is_leaf is False
 
     r = client.patch(f"/api/books/{book.id}/subjects/{child}", headers=auth,
-                     json=_payload(code="1901", name="明细", is_leaf=True, parent_id=None))
+                     json=_payload(code="1905", name="明细", is_leaf=True, parent_id=None))
     assert r.status_code == 200, r.text
     db.expire_all()
     assert db.get(Subject, new_parent).is_leaf is True, "下级都移走了，父节点仍是叶子"
@@ -267,12 +271,12 @@ def test_改父后level跟随(client, auth, db, book, subjects):
                              json=_payload(code="1900", name="一级容器", is_leaf=False)
                              ).json()["id"]
     child = client.post(f"/api/books/{book.id}/subjects", headers=auth,
-                        json=_payload(code="1901", name="二级明细", is_leaf=True)).json()["id"]
+                        json=_payload(code="1905", name="二级明细", is_leaf=True)).json()["id"]
     db.expire_all()
     assert db.get(Subject, child).level == 1
 
     r = client.patch(f"/api/books/{book.id}/subjects/{child}", headers=auth,
-                     json=_payload(code="1901", name="二级明细", is_leaf=True,
+                     json=_payload(code="1905", name="二级明细", is_leaf=True,
                                    parent_id=new_parent))
     assert r.status_code == 200, r.text
     db.expire_all()

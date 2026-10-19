@@ -45,23 +45,23 @@ def _balances(client, auth, book, period, **params):
 
 def test_借方余额是正数(client, auth, db, book, periods, subjects, make_voucher):
     """1001 这类资产科目：钱在借方，就显示成正数。"""
-    make_voucher("2026-01-10", dr=[("100201", 800, "存")],
-                 cr=[("600101", 800, "存")], posted=True)
+    make_voucher("2026-01-10", dr=[("1001", 800, "存")],
+                 cr=[("5001", 800, "存")], posted=True)
     b = _balances(client, auth, book, periods[1])
-    assert Decimal(b[str(subjects["100201"].id)]) == Decimal("800")
+    assert Decimal(b[str(subjects["1001"].id)]) == Decimal("800")
 
 
 def test_资产科目出现贷方余额时是负数(client, auth, db, book, periods, subjects, make_voucher):
     """用户点名的那条：1001 这类科目余额本该在借方，一旦落在贷方就显示成负的。
 
-    这条钉的是「按符号判方向，不按科目属性」：1002 是资产，
+    这条钉的是「按符号判方向，不按科目属性」：1001 是资产，
     按科目属性判的话这里会被显示成正的 800，跟试算平衡自相矛盾。
     """
-    # 收预收款：贷 100201（银行存款），钱在贷方
-    make_voucher("2026-01-10", dr=[("6051", 800, "x")],
-                 cr=[("100201", 800, "收预收")], posted=True)
+    # 收预收款：贷 1001（库存现金），钱在贷方
+    make_voucher("2026-01-10", dr=[("5051", 800, "x")],
+                 cr=[("1001", 800, "收预收")], posted=True)
     b = _balances(client, auth, book, periods[1])
-    assert Decimal(b[str(subjects["100201"].id)]) == Decimal("-800")
+    assert Decimal(b[str(subjects["1001"].id)]) == Decimal("-800")
 
 
 def test_负债科目的正常贷方余额同样是负数(client, auth, db, book, periods, subjects, make_voucher):
@@ -70,17 +70,17 @@ def test_负债科目的正常贷方余额同样是负数(client, auth, db, book
     把这条和上一条并排钉住，是为了防止有人把负号理解成「异常/红字」，
     哪天给负债余额也改成正数显示。
     """
-    make_voucher("2026-01-10", dr=[("100201", 800, "x")],
+    make_voucher("2026-01-10", dr=[("1001", 800, "x")],
                  cr=[("2001", 800, "借入")], posted=True)
     b = _balances(client, auth, book, periods[1])
     assert Decimal(b[str(subjects["2001"].id)]) == Decimal("-800")
-    assert Decimal(b[str(subjects["100201"].id)]) == Decimal("800")  # 资产这边是正的
+    assert Decimal(b[str(subjects["1001"].id)]) == Decimal("800")  # 资产这边是正的
 
 
 def test_零余额就是零不是负零(client, auth, db, book, periods, subjects):
     """没动过的科目返回 "0"，不是 "-0" —— 前端靠它判断「不显示」。"""
     b = _balances(client, auth, book, periods[1])
-    assert Decimal(b[str(subjects["100201"].id)]) == 0
+    assert Decimal(b[str(subjects["1001"].id)]) == 0
 
 
 def test_余额与科目余额表口径一致(client, auth, db, book, periods, subjects, make_voucher):
@@ -88,8 +88,8 @@ def test_余额与科目余额表口径一致(client, auth, db, book, periods, s
 
     钉的是「不许出现第二套余额计算」：录入页的余额是为了方便，不是为了另立一套口径。
     """
-    make_voucher("2026-03-10", dr=[("100201", 1234.56, "x")],
-                 cr=[("600101", 1234.56, "x")], posted=True)
+    make_voucher("2026-03-10", dr=[("1001", 1234.56, "x")],
+                 cr=[("5001", 1234.56, "x")], posted=True)
     r = client.get(f"/api/books/{book.id}/ledger/balance",
                    params={"period_id": periods[3].id}, headers=auth)
     rows = {row["subject_id"]: row for row in r.json()["rows"]}
@@ -106,12 +106,12 @@ def test_余额与科目余额表口径一致(client, auth, db, book, periods, s
 def test_本张凭证不计入自己的余额(client, auth, db, book, periods, subjects, make_voucher):
     """正在编辑的这张要被剔掉。
 
-    它会边填边自动保存：算进去的话，往 1002 里填 500，余额就 +500，
+    它会边填边自动保存：算进去的话，往 1001 里填 500，余额就 +500，
     看着像「刚存的已经进账了」，其实是在跟自己说话。剔掉之后这个数在录入全程是稳的。
     """
-    v = make_voucher("2026-02-10", dr=[("100201", 5000, "收")],
-                     cr=[("600101", 5000, "收")], posted=False)
-    sid_ = str(subjects["100201"].id)
+    v = make_voucher("2026-02-10", dr=[("1001", 5000, "收")],
+                     cr=[("5001", 5000, "收")], posted=False)
+    sid_ = str(subjects["1001"].id)
 
     # 不传 voucher_id：这张在账上，余额含它
     assert Decimal(_balances(client, auth, book, periods[2])[sid_]) == Decimal("5000")
@@ -121,11 +121,11 @@ def test_本张凭证不计入自己的余额(client, auth, db, book, periods, s
 
 def test_剔除只影响本张不影响别的凭证(client, auth, db, book, periods, subjects, make_voucher):
     """闸门不能开过头：另一张凭证的分录照常计入。"""
-    make_voucher("2026-02-10", dr=[("100201", 700, "a")],
-                 cr=[("600101", 700, "a")], posted=False)
-    other = make_voucher("2026-02-11", dr=[("100201", 300, "b")],
-                         cr=[("600101", 300, "b")], posted=False)
-    sid_ = str(subjects["100201"].id)
+    make_voucher("2026-02-10", dr=[("1001", 700, "a")],
+                 cr=[("5001", 700, "a")], posted=False)
+    other = make_voucher("2026-02-11", dr=[("1001", 300, "b")],
+                         cr=[("5001", 300, "b")], posted=False)
+    sid_ = str(subjects["1001"].id)
     assert Decimal(_balances(client, auth, book, periods[2], voucher_id=other.id)[sid_]) \
         == Decimal("700")
 
@@ -139,9 +139,9 @@ def test_默认含未记账凭证(client, auth, db, book, periods, subjects, mak
     月底集中记账之前，账上几乎全是未记账凭证；默认排除的话余额整月都是空的，
     这个提示就白做了。
     """
-    make_voucher("2026-01-10", dr=[("100201", 900, "x")],
-                 cr=[("600101", 900, "x")], posted=False)
-    assert Decimal(_balances(client, auth, book, periods[1])[str(subjects["100201"].id)]) \
+    make_voucher("2026-01-10", dr=[("1001", 900, "x")],
+                 cr=[("5001", 900, "x")], posted=False)
+    assert Decimal(_balances(client, auth, book, periods[1])[str(subjects["1001"].id)]) \
         == Decimal("900")
 
 
@@ -150,19 +150,22 @@ def test_默认含未记账凭证(client, auth, db, book, periods, subjects, mak
 
 def test_按期间取余额(client, auth, db, book, periods, subjects, make_voucher):
     """余额是「到哪一期为止」，不是「这一期发生多少」：1 月那笔在 3 月也还在。"""
-    make_voucher("2026-01-10", dr=[("100201", 400, "x")],
-                 cr=[("600101", 400, "x")], posted=False)
-    sid_ = str(subjects["100201"].id)
+    make_voucher("2026-01-10", dr=[("1001", 400, "x")],
+                 cr=[("5001", 400, "x")], posted=False)
+    sid_ = str(subjects["1001"].id)
     assert Decimal(_balances(client, auth, book, periods[1])[sid_]) == Decimal("400")
     assert Decimal(_balances(client, auth, book, periods[3])[sid_]) == Decimal("400")
 
 
 def test_上级科目一并给出(client, auth, db, book, periods, subjects, make_voucher):
-    """凭证只挂在末级上，但排凭证时非末级也可能被临时选上去看一眼余额。"""
-    make_voucher("2026-01-10", dr=[("100201", 600, "x")],
-                 cr=[("600101", 600, "x")], posted=False)
+    """凭证只挂在末级上，但排凭证时非末级也可能被临时选上去看一眼余额。
+
+    上级取 1101 短期投资：1002 在 4-2-2 表里已是末级，没有下级可卷。
+    """
+    make_voucher("2026-01-10", dr=[("110101", 600, "x")],
+                 cr=[("5001", 600, "x")], posted=False)
     b = _balances(client, auth, book, periods[1])
-    assert Decimal(b[str(subjects["1002"].id)]) == Decimal("600")
+    assert Decimal(b[str(subjects["1101"].id)]) == Decimal("600")
 
 
 def test_跨账套的凭证id被忽略而不是报错(client, auth, db, book, other_book, periods, admin_user):
@@ -177,9 +180,9 @@ def test_跨账套的凭证id被忽略而不是报错(client, auth, db, book, ot
         select(Subject).where(Subject.book_id == other_book.id)).all()}
     v = create_voucher(
         db, book_id=other_book.id, user=admin_user, voucher_date=date(2026, 1, 10),
-        entries=[{"subject_id": subs["100201"].id, "direction": "DEBIT",
+        entries=[{"subject_id": subs["1001"].id, "direction": "DEBIT",
                   "amount": "400", "summary": "x"},
-                 {"subject_id": subs["600101"].id, "direction": "CREDIT",
+                 {"subject_id": subs["5001"].id, "direction": "CREDIT",
                   "amount": "400", "summary": "x"}],
         voucher_no=None, source="MANUAL", remark="", commit=False)
     db.commit()

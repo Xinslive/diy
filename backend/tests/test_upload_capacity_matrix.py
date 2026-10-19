@@ -84,7 +84,7 @@ def test_每个上传入口都调了共享容量闸():
             node.func.id for node in ast.walk(ast.parse(inspect.cleandoc(src)))
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         }
-        gated = {"read_upload", "check_archive_size", "RowBudget"} & calls
+        gated = {"read_upload", "read_upload_sync", "check_archive_size", "RowBudget"} & calls
         if not gated:
             missing.append(f"{sorted(set(r.methods))[0]:6} {r.path}")
     assert not missing, (
@@ -98,6 +98,9 @@ def test_每个上传入口都调了共享容量闸():
 def test_期初解析与凭证导入共用同一套闸():
     """两处是**同一个函数对象**，不是两份长得一样的代码。"""
     from app.accounting import importer
+    from app.plugins import api as plugin_api
+
+    assert plugin_api.read_upload_sync is uploads.read_upload_sync
 
     # 1) 字节数 / 解压体积 / 行数 走的是同一个模块
     assert importer.check_archive_size is uploads.check_archive_size
@@ -122,7 +125,7 @@ def _opening_xlsx(rows: int) -> bytes:
     ws = wb.active
     ws.append(["科目编码", "科目名称", "方向", "期初余额"])
     for i in range(rows):
-        ws.append(["100201", "银行存款", "借", 100])
+        ws.append(["1002", "银行存款", "借", 100])
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

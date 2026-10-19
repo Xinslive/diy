@@ -1,5 +1,6 @@
 <template>
-  <div ref="rootEl" class="sp" :class="{ 'is-nonleaf': isNonLeaf }"
+  <div ref="rootEl" class="sp"
+       :class="{ 'is-nonleaf': isNonLeaf, 'is-wrap': wraps && hasBottomHint }"
        :title="isNonLeaf ? '这不是末级科目，凭证要记在末级上' : ''"
        @mousedown.self.prevent
        @click="onCellClick">
@@ -45,7 +46,7 @@
                 :style="{ paddingLeft: `${12 + n.depth * 16}px` }"
                 :title="hasKids(n) ? (selectParents ? '点击选择，点箭头展开下级科目' : '点开看下面的明细科目') : ''"
                 @click="onRow(n, $event)" @mouseenter="onHover($event, i)">
-          <span class="sp-caret">{{ !hasKids(n) ? '' : isOpen(n) ? '▾' : '▸' }}</span>
+          <span class="sp-caret">{{ !hasKids(n) ? '' : isOpen(n, n.depth) ? '▾' : '▸' }}</span>
           <span class="sp-code">{{ n.code }}</span>
           <span class="sp-name">{{ n.name }}</span>
         </button>
@@ -62,6 +63,8 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { CATEGORY_LABEL, ensurePinyin, matchSubject } from '@/utils/subjectCode'
+import { rowOpen, searchHitIds } from '@/utils/subjectSearch'
+import { perFrame, rafThrottle } from '@/utils/frame'
 
 const props = defineProps({
   modelValue: { type: [Number, String], default: null },
@@ -71,6 +74,16 @@ const props = defineProps({
   allowAdd: { type: Boolean, default: true },
   /** 默认只选末级；综合账等场景可同时选择上级科目。 */
   selectParents: { type: Boolean, default: false },
+  /**
+   * 这一格**左下角压着别的东西**（凭证页的科目余额）。
+   *
+   *  只管一件事：「科目名折成两行时贴着上沿，还是照常居中」。
+   *  居中的两行正好压住左下角那个余额，所以有余额时得贴上沿；
+   *  **没有余额就别装** —— 只读/已记账的凭证、以及余额为 0 的科目都不显示它，
+   *  那些格子里的名字就该居中：旁边摘要和金额都是居中的，唯独科目名顶在
+   *  上边，一屏看过去像没对齐（2026-10-16 用户报）。
+   */
+  hasBottomHint: { type: Boolean, default: false },
   placeholder: { type: String, default: '科目编码或名称' }
 })
 const emit = defineEmits(['update:modelValue', 'change', 'add', 'editing', 'enter', 'picked', 'left', 'right'])
@@ -86,6 +99,8 @@ const tab = ref('all')
 const cursor = ref(0)
 /** 展开了哪些上级科目。默认一个都不展开：面板打开就是一张一级目录。 */
 const expanded = ref(new Set())
+/** 被点着收起来的。搜索时一级是**自动**摊开的，不另记一份就点不回去 */
+const collapsed = ref(new Set())
 const inputEl = ref(null)
 const panelEl = ref(null)
 const rootEl = ref(null)
@@ -154,6 +169,8 @@ const marking = computed(() => focused.value
   && text.value.trim() !== editing.value.trim())
 watch(marking, (v) => emit('editing', v), { immediate: true })
 const isNonLeaf = computed(() => !props.selectParents && !!current.value && current.value.is_leaf === false)
+/** 科目名已经折成两行（autosize 量出来的）。折没折、贴不贴上沿是两件事，见 hasBottomHint。 */
+const wraps = ref(false)
 
 // 外面改了选中科目（打开一张老凭证、回车加行自动带过去），格子里的字跟着走。
 // immediate 是必须的：打开老凭证时首帧 display 就已经是科目名，
@@ -185,31 +202,27 @@ const roots = computed(() => {
   return tab.value === 'all' ? all : all.filter((s) => s.category === tab.value.toUpperCase())
 })
 
-/**
- * 打上关键字之后摆哪几行：命中的那条，**加上从一级到它的整条路**。
- * 只摆命中项的话搜「工商银行」会凭空冒出一条没有上级的 100202，看着像孤儿科目。
- */
-function matchSet(nodes) {
-  const kw = keyword.value
-  if (!kw.trim()) return null
-  const hit = new Set()
-  const walk = (list) => {
-    for (const n of list) {
-      if (matchSubject(n, kw)) hit.add(n.id)
-      walk(kidsOf(n.id))
-    }
-  }
-  walk(props.options)
-  return hit
-}
+/** 在不在搜：没有关键字就没有筛选，面板上摆的是目录（只画人点开的那几支）。 */
+const searching = computed(() => !!keyword.value.trim())
+/** 筛选后留下哪几条（命中的 + 从一级到它的整条路）。判定在 utils/subjectSearch.js */
+const hit = computed(() => (searching.value ? searchHitIds(props.options, keyword.value) : null))
 
 /**
- * 搜的时候整条路都摊开，不搜的时候只画展开了的那一支。
- * 两者的结果放在一处算，面板上那个 ▸/▾ 才不会跟画出来的东西对不上
- * （搜「1002」时下级明明在，箭头还说「收着」，人只会以为是坏的）。
+ * 这一支摊不摊开 —— 面板上那个 ▸ / ▾ 就读它，两边得一处算：
+ * 箭头说「收着」而下级明明在，人只会以为是坏的。
+ *
+ *  搜索时**只自动摊到第二级**：编码是前缀命中，搜「5001」时 500101、50010101、
+ *  5001010101 一个个全算命中，整条链一路摊开就推出几十行，要找的那条末级
+ *  反而淹在里头。更深的照旧摆 ▸，人自己点下去。
  */
-const hit = computed(() => matchSet(roots.value))
-const isOpen = (n) => hasKids(n) && (hit.value !== null || expanded.value.has(n.id))
+// depth 从外面传进来，不从 n 上读：visible 里那圈 walk 手里的是 options 里的**原始**
+// 科目（没带 depth），照着 n.depth 读会一律当成 0 —— 面板上看着箭头都收着了，
+// 下级却还一条条摊在那儿。
+const isOpen = (n, depth = 0) => rowOpen({
+  hasKids: hasKids(n), depth,
+  searching: searching.value, expanded: expanded.value,
+  collapsed: collapsed.value, id: n.id
+})
 
 const kidsOf2 = (id) => tree.value.get(id) || []
 
@@ -245,14 +258,14 @@ const visible = computed(() => {
   const walk = (nodes, depth) => {
     for (const n of nodes) {
       const kids = kidsOf(n.id)
-      // 搜的时候，祖先靠「底下有命中的」留下；收窄的时候只留那一支；
-      // 都不适用时，摆在哪个一级目录下就画哪一支
-      const keep = h ? h.has(n.id) || kids.some((k) => h.has(k.id))
+      // 搜的时候只留命中那条连同它的整条路（hit 里已经带上了各级祖先）；
+      // 收窄的时候只留那一支；都不适用时，摆在哪个一级目录下就画哪一支
+      const keep = h ? h.has(n.id)
         : br ? br.keep.has(n.id)
           : true
       if (!keep) continue
       out.push({ ...n, depth })
-      if (kids.length && isOpen(n)) walk(kids, depth + 1)
+      if (kids.length && isOpen(n, depth)) walk(kids, depth + 1)
     }
   }
   walk(roots.value, 0)
@@ -276,15 +289,43 @@ function expand(id, on) {
   if (on) next.add(id); else next.delete(id)
   expanded.value = next
 }
-function toggle(n) {
+function collapse(id, on) {
+  const next = new Set(collapsed.value)
+  if (on) next.add(id); else next.delete(id)
+  collapsed.value = next
+}
+/**
+ * 点那个箭头：**翻面板上画出来的那个样子** —— 画着 ▾ 就收起来。
+ *
+ *  翻面看的是画出来的那张脸，不是「有没有在 expanded 里」：搜索时一级是
+ *  自动摊开的（压根没进 expanded），照 expanded 翻就变成点了没反应，
+ *  那个画着 ▾ 的箭头成了摆设（人只会以为自己没点中）。
+ *  收起来的那一笔记进 collapsed，它压过「按级数自动摊开」这条默认规矩。
+ */
+function flipRow(n) {
   if (!hasKids(n)) return
-  expand(n.id, !expanded.value.has(n.id))
+  if (isOpen(n, n.depth ?? 0)) { collapse(n.id, true); expand(n.id, false) }
+  else { expand(n.id, true); collapse(n.id, false) }
+}
+
+/**
+ * 回车停在上级上：**让它摊着**。回车说的是「我要看下级」，不是「我要收起」。
+ *
+ *  搜索时一级本来就被自动摊开着，这一下只把它记成显式摊开，画面不动 ——
+ *  早先 `expanded` 在搜索时被忽略，回车点完什么都不变，钻取照样走得通；
+ *  现在 expanded/collapsed 说了算，就必须真记上，不然会把自动摊开的收起来，
+ *  下级反而没了：凭证页「打编码 → 回车 → ↓ → 回车选末级」这条链就断在这儿。
+ */
+function toggleRow(n) {
+  if (!hasKids(n)) return
+  if (searching.value && !collapsed.value.has(n.id)) { expand(n.id, true); return }
+  flipRow(n)
 }
 
 /** 点一行：带下级的只是展开，不带下级的（末级）才算选中 */
 function onRow(n, event) {
   if (hasKids(n) && (!props.selectParents || event?.target.closest('.sp-caret'))) {
-    toggle(n)
+    flipRow(n)
     return
   }
   pick(n)
@@ -336,6 +377,9 @@ function openPanel({ reset = true } = {}) {
   if (!open.value) lastHover = null
   if (!open.value && reset) {
     keyword.value = ''
+    // 「点着收起来的」是上一趟搜索留下的，不跟着带到这一趟：
+    // expanded 这边紧接着就按当前科目重铺了，两边得同步作废
+    collapsed.value = new Set()
     // 选中的那一支先展开：老凭证 / 回车带过来的科目在几层下面，
     // 目录全收着的话打开面板看不见自己选的是什么
     for (const id of pathTo(props.modelValue)) expand(id, true)
@@ -397,14 +441,18 @@ function onFocus() {
 function autosize() {
   const el = inputEl.value
   if (!el) return
-  const lh = parseFloat(getComputedStyle(el).lineHeight) || 22
+  // 同一张凭证上挂着 8~20 个本组件，resize 时每个都被叫一遍 —— 但量的是
+  // 同一个 CSS 类定出来的 line-height。同帧内共用一份（perFrame），别量 20 遍。
+  const lh = perFrame('SubjectPicker.lineHeight',
+    () => parseFloat(getComputedStyle(el).lineHeight)) || 22
   const max = lh * 2
   el.style.height = 'auto'
   const need = el.scrollHeight
   el.style.height = Math.min(need, max) + 'px'
   el.style.overflowY = need > max ? 'auto' : 'hidden'
-  // 一行就跟着摘要格一起居中，两行贴上沿 —— 居中的两行会压到左下角的科目余额
-  rootEl.value?.classList.toggle('is-wrap', need > lh)
+  // 一行就跟着摘要格一起居中；折成两行时贴上沿 —— 但**只在这一格左下角真的有余额时**，
+  // 没有余额就照常居中（贴上沿在一屏里看着像没对齐，见 hasBottomHint）
+  wraps.value = need > lh
 }
 
 /** 点这一格。e.target 必须是格子自己 —— 点在框上、面板上，都不算这一手 */
@@ -509,15 +557,16 @@ function onKeydown(e) {
   // 展开/收起交给点 ▸ 或 →、↑↓ 走到那一行再回车。
   if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
     const at = visible.value[cursor.value]
-    if (props.selectParents && open.value && at && hasKids(at) && !hit.value) {
-      if (e.key === 'ArrowRight' && !expanded.value.has(at.id)) {
+    // 搜索时也放行：那阵 expanded/collapsed 记着人点过的，←/→ 跟点箭头是同一件事
+    if (props.selectParents && open.value && at && hasKids(at)) {
+      if (e.key === 'ArrowRight' && !isOpen(at, at.depth)) {
         e.preventDefault()
-        toggle(at)
+        toggleRow(at)          // →：没摊开就摊开
         return
       }
-      if (e.key === 'ArrowLeft' && expanded.value.has(at.id)) {
+      if (e.key === 'ArrowLeft' && isOpen(at, at.depth)) {
         e.preventDefault()
-        toggle(at)
+        flipRow(at)             // ←：摊着就收起来
         return
       }
     }
@@ -556,7 +605,7 @@ function onKeydown(e) {
   } else if (e.key === 'Enter') {
     e.preventDefault()
     // 停在上级科目上：展开它，别急着当成选中
-    if (at && hasKids(at) && !props.selectParents) { toggle(at); return }
+    if (at && hasKids(at) && !props.selectParents) { toggleRow(at); return }
     if (at) { pick(at, true); return }
     // 一条都没有：没打关键字就是把面板收了让路；打了关键字还没匹配上，
     // 字留在格子里继续改 —— 什么都不做才是对的
@@ -605,14 +654,19 @@ watch(visible, () => {
   setCursor(i >= 0 ? i : 0)
 })
 
-// 列宽跟着窗口走，窗口一改折行位置就变了，高度得跟着重量一遍
-function onResize() { autosize() }
+// 列宽跟着窗口走，窗口一改折行位置就变了，高度得跟着重量一遍。
+//
+// resize 一秒能来 60 次，而 autosize() 里是「写 height:auto → 读 scrollHeight」
+// 一写一读，中间要把布局同步刷一遍。按帧合并：两次绘制之间缩多少次，
+// 量一趟就够 —— 中间那些中间态没人看得见。
+const onResize = rafThrottle(() => autosize())
 onMounted(() => {
   document.addEventListener('mousedown', onDocClick)
   window.addEventListener('resize', onResize)
   autosize()
 })
 onBeforeUnmount(() => {
+  onResize.cancel()          // 还挂着的那一帧别再对着已卸载的 DOM 跑
   document.removeEventListener('mousedown', onDocClick)
   window.removeEventListener('resize', onResize)
 })
@@ -628,7 +682,9 @@ defineExpose({
 /* flex: 1 —— 格子有多宽，输入框就铺多宽。少了它，框会被撑成刚好放得下占位符的宽度 */
 /* 框在格子里**居中**，跟摘要格（td-sum 也是 align-items:center）落在同一条基线上 ——
    改成一个写满一行贴上沿，科目名会比同一行的摘要高一截，整张表看着就歪了。
-   折成两行时改回上沿：居中的两行正好压住左下角那个科目余额。 */
+   折成两行**且左下角有余额**时才贴上沿：居中的两行正好压住那个余额。
+   条件在模板上（wraps && hasBottomHint），不在这里 —— 没有余额的两行
+   照样居中，跟摘要格、金额格落在同一条基线上。 */
 .sp { position: relative; display: flex; align-items: center; flex: 1; height: 100%; min-width: 0; }
 .sp.is-wrap { align-items: flex-start; }
 
@@ -707,13 +763,32 @@ defineExpose({
 }
 /* 上级科目：点它是展开，不是选中，箭头得留出固定的位置，
    不然下级跟着往左挪，整棵树每深一级就错开一格 */
+/* 箭头是一个**能点的按钮**，不是那个字形本身。
+   早先它就 12px 宽的一个字，行高也就 11px —— 人瞄半天点不着，
+   而点歪了是整行：selectParents 的场景（明细账）里点行是**选中**，
+   一下点歪就把科目换了，手比眼睛快的时候净是误选。
+   20×20 是最小能舒服点中的尺寸（负边距把这个盒子撑大，
+   编码列的位置一格不动，行高也不变 —— 里面还是那个 11px 的小箭头）。 */
 .sp-caret {
   flex: none;
-  width: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin: -2px 0 -2px -8px;
+  border-radius: 3px;
   color: #a8abb2;
   font-size: 11px;
   line-height: 1;
+  user-select: none;
+  transition: background-color .12s, color .12s;
 }
+/* 手型和悬停底色只给**有下级**的那几行（跟 .is-parent 一起判，
+   不靠 :empty —— 末级那格里 Vue 仍会插一个空文本节点，
+   浏览器认不认它是 :empty 各家不一样）。 */
+.sp-item.is-parent .sp-caret { cursor: pointer; }
+.sp-item.is-parent:hover .sp-caret { background: #ebeef5; color: #409eff; }
 .sp-item.is-parent { cursor: pointer; }
 .sp-item.is-parent .sp-name { color: #303133; font-weight: 600; }
 .sp-item.is-cursor { background: #f5f7fa; }

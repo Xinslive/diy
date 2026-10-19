@@ -29,7 +29,7 @@ def _voucher(no: str, amount: str, summary: str = "测试") -> dict:
         "entries": [
             {"summary": summary, "subject_code": "1001", "subject_name": "库存现金",
              "direction": "DEBIT", "amount": amount},
-            {"summary": summary, "subject_code": "6001", "subject_name": "主营业务收入",
+            {"summary": summary, "subject_code": "5001", "subject_name": "主营业务收入",
              "direction": "CREDIT", "amount": amount},
         ],
         "total_debit": amount, "total_credit": amount,
@@ -301,6 +301,10 @@ def test_各导出接口都有行数上限():
         lambda: report_excel(
             {"period": "2026-01", "name": "报表", "cols": [{"label": "项目", "width": 100}],
              "rows": too_many}, company="甲", book_name="乙"),
+        # 凭证这一路原先漏了：它的行数是**分录数**，一张凭证写几行就占几行，
+        # 按凭证数卡等于把上限放大了一倍（每张 8 行时就是 8 倍）。
+        # 调用方一次取 5000 张凭证，最坏情况 4 万行，而每格都要写 border。
+        lambda: vouchers_excel([_voucher("记-1", 1)] * (MAX_EXPORT_ROWS + 1)),
     ]
     for fn in cases:
         with pytest.raises(ExportTooLarge):

@@ -900,8 +900,14 @@ await page.screenshot({ path: OUT + 'ui-voucher-edit.png' })
 if (old.posted) {
   await page.goto(`${BASE}/#/vouchers/${old.posted}`); await sleep(2000)
   await check('已记账凭证只读', await page.locator('.amt-input').first().isDisabled(), true)
+  // 只读的是「改」，不是「读」：已记账恰恰是最该打得出来的那一类（归档）。
+  // 后端 GET /print/vouchers.html 本来就没有写门禁，所以这里不该有任何禁用。
+  await check('已记账凭证仍能打印预览',
+    await page.locator('.toolbar button').filter({ hasText: '打印预览' }).isEnabled(), true)
   await page.screenshot({ path: OUT + 'ui-voucher-posted.png' })
 }
+// 「附件」输入框撤掉了，但附件数还在 load/save 里来回搬（存量不能被清零）
+await check('工具条上没有附件输入框', await page.locator('.toolbar .el-input-number').count(), 0)
 
 // ==================================================== 标记科目时的余额 / 新增科目预填
 // 这两段跑在一张全新凭证上：前面那几百行断言的状态别让它们碰坏
@@ -1004,6 +1010,71 @@ await page.locator('.el-tree-node:visible', { hasText: '1002 银行存款' }).fi
 await sleep(600)
 await check('再换一个上级：还是那串', await dlgField('科目编码'), '100204')
 await closeAdd()
+
+// ==================================================== 回车锚点：只移动视口，不重排分录
+// 这一段最后单独开一张新凭证，避免改变前面插行/删行断言依赖的行数。
+await page.goto(`${BASE}/#/vouchers/new`); await sleep(2200)
+const anchorRows = () => page.locator('.vg-row:not(.vg-head):not(.vg-total)')
+const anchorSamples = []
+for (let i = 0; i < 10; i++) {
+  const row = anchorRows().nth(i)
+  await pickSubject(i, '100201')
+  // 金额格仍遵守「聚焦 → 全选 → 键入」，不用 fill()。
+  await fillAmt(row.locator('.td-amt.d .amt-input'), '1')
+  await row.locator('.td-amt.c .amt-input').click(); await sleep(150)
+  await page.keyboard.press('Enter'); await sleep(450)
+  if (i >= 6) {
+    const sample = await page.evaluate(() => {
+      const row = document.activeElement?.closest('.vg-row')
+      if (!row) return null
+      return {
+        number: Number(row.querySelector('.td-idx')?.textContent.trim()),
+        y: row.getBoundingClientRect().y,
+      }
+    })
+    if (sample) anchorSamples.push(sample)
+  }
+}
+const anchorGeometry = await page.evaluate(() => {
+  const head = document.querySelector('.vg-head')?.getBoundingClientRect()
+  const first = document.querySelector('.vg-row:not(.vg-head):not(.vg-total)')?.getBoundingClientRect()
+  const scroll = document.querySelector('.entry-scroll')
+  const total = document.querySelector('.vg-total')?.getBoundingClientRect()
+  const content = document.querySelector('.content')
+  if (!head || !first || !scroll || !total || !content) return null
+  const rowHeight = first.height
+  return {
+    anchorY: head.bottom + 4 * rowHeight,
+    headTop: head.top,
+    headBottom: head.bottom,
+    scrollTop: scroll.getBoundingClientRect().top,
+    scrollBottom: scroll.getBoundingClientRect().bottom,
+    scrollHeight: scroll.scrollHeight,
+    clientHeight: scroll.clientHeight,
+    totalTop: total.top,
+    totalBottom: total.bottom,
+    viewportHeight: window.innerHeight,
+    contentScrollHeight: content.scrollHeight,
+    contentClientHeight: content.clientHeight,
+  }
+})
+await check('连续回车后当前录入行稳定在第 4 行下方锚点',
+  anchorGeometry && anchorSamples.every(({ y }) => Math.abs(y - anchorGeometry.anchorY) <= 2), true)
+await check('当前录入行不会随行号增大而继续下移',
+  anchorSamples.length > 1
+    && Math.max(...anchorSamples.map(({ y }) => y)) - Math.min(...anchorSamples.map(({ y }) => y)) <= 2, true)
+await check('回车只移动视口，分录序号仍按 1..N 递增',
+  await anchorRows().evaluateAll(rows => rows.map(row => Number(row.querySelector('.td-idx')?.textContent.trim()))),
+  Array.from({ length: 11 }, (_, i) => i + 1))
+await check('录到第 8 行以上后 entry-scroll 出现纵向溢出',
+  anchorGeometry && anchorGeometry.scrollHeight > anchorGeometry.clientHeight, true)
+await check('表头仍固定在分录区顶部',
+  anchorGeometry && Math.abs(anchorGeometry.headBottom - anchorGeometry.scrollTop) <= 1, true)
+await check('合计行固定在分录区下方且仍可见',
+  anchorGeometry && Math.abs(anchorGeometry.totalTop - anchorGeometry.scrollBottom) <= 1
+    && anchorGeometry.totalTop >= 0 && anchorGeometry.totalBottom <= anchorGeometry.viewportHeight, true)
+await check('外层 .content 没有出现第二条滚动区',
+  anchorGeometry && anchorGeometry.contentScrollHeight <= anchorGeometry.contentClientHeight + 1, true)
 
 console.log(fails.length ? `\n${fails.length} 项没过：\n- ` + fails.join('\n- ') : '\n全部通过')
 await browser.close()

@@ -23,6 +23,29 @@ const choose = async (selector, name) => {
   await settle()
 }
 const pageTab = () => page.getByRole('tab', { name: '页面', exact: true }).click()
+/**
+ * 回到第 1 页。上一个用例结束时设计器停在**最后一页**（它在验「编辑第 2 页时
+ * 不该跳回第 1 页」），而紧接着的用例要点「下一页」—— 不先回去的话，点不动
+ * 不是功能坏了，是本来就在最后一页，而报错会指向按钮，看起来像功能坏了。
+ */
+const gotoFirstPage = async () => {
+  for (let i = 0; i < 12 && !(await page.locator('.page-no').innerText()).startsWith('1 /'); i++) {
+    await page.locator('.stage-tools .tool-group').first().locator('button').first().click()
+    await settle()
+  }
+  const now = await page.locator('.page-no').innerText()
+  if (!now.startsWith('1 /')) throw new Error(`回到第一页失败，仍在 ${now}`)
+}
+/**
+ * 改「每页凭证数」。定位方式是「标签含『每页凭证数』的那一行」而不是
+ * `.ti-page .el-select` —— 页面标签里将来还会长出别的下拉框，用序号去点
+ * 迟早点错，而点错之后这里只是断言失败，看不出是哪一项被改错了。
+ */
+const setSlots = async (n) => {
+  await page.locator('.ti-page .fl').filter({ hasText: '每页凭证数' }).locator('.el-select').click()
+  await page.locator('.el-select-dropdown__item:visible').filter({ hasText: `每页 ${n} 张` }).first().click()
+  await settle()
+}
 const selectTable = async () => {
   await page.getByRole('tab', { name: '元素', exact: true }).click()
   await page.locator('.elist li').filter({ hasText: '分录表格' }).first().click()
@@ -73,6 +96,9 @@ let api, bookId
 try {
   await page.goto(BASE, { waitUntil: 'networkidle' })
   if (await page.locator('input[type=password]').count()) {
+    // 口令不再预填（见 LoginView.vue：生产登录页预填演示口令那次修复），
+    // 只点「登录」会停在登录页，.sidebar 永远等不到。
+    await page.fill('input[type=password]', process.env.CWQ_PASSWORD || '123456')
     await page.getByRole('button', { name: '登录', exact: true }).click()
     await page.waitForSelector('.sidebar', { timeout: 20000 })
   }
@@ -95,7 +121,10 @@ try {
   const name = `__pt_geometry_${Date.now()}`
   const text = { type: 'text', visible: true, font_size: 9, align: 'left', last_page_only: false }
   const fixture = {
-    paper: 'A5', orientation: 'landscape', margins: { top: 10, right: 8, bottom: 10, left: 8 },
+    // A4 横向 + 每页一张（老 A5 横向模板归一化后的样子）。「一页几张」现在
+    // 由 slots_per_page 说，纸型不再兼职表达它。
+    paper: 'A4', orientation: 'landscape', margins: { top: 10, right: 8, bottom: 10, left: 8 },
+    voucher: { slots_per_page: 1 },
     elements: [
       { ...text, id: 'title', bind: 'title', text: '记 账 凭 证', x: 32, y: 3, w: 36, h: 8, font_size: 18, align: 'center' },
       { ...text, id: 'company', bind: 'company', text: '单位：{company}', x: 3, y: 12, w: 32, h: 5 },
@@ -114,13 +143,13 @@ try {
   await settle()
   await choose('.pt-bar .sel-tpl', name)
 
-  await step('A5：实际表格与编辑框屏幕对齐', async () => {
+  await step('每页一张：实际表格与编辑框屏幕对齐', async () => {
     const result = await assertAligned()
     console.log(`  ${result.real.length} 个控件，最大屏幕偏差 ${result.worst.toFixed(2)}px`)
     const paper = await page.locator('.paper').boundingBox()
-    if (paper.width < 550) throw new Error('A5 预览过小')
+    if (paper.width < 550) throw new Error('预览过小')
   })
-  await page.screenshot({ path: '.shots/pt-new-a5.png' })
+  await page.screenshot({ path: '.shots/pt-new-slots1.png' })
 
   await step('纸面选中表格能直接打开对应属性', async () => {
     await table().click()
@@ -186,13 +215,24 @@ try {
     await assertAligned()
     await page.locator('.save-bar button').filter({ hasText: '放弃改动' }).click(); await settle()
   })
+  // 两张时的槽位高度，留给「一张时不该变大」那条比。
+  let slotHTwo = 0
   await step('A4 纵向两个槽位、第二页及横向槽位全部对齐', async () => {
-    await pageTab(); await choose('.ti-page .el-select', 'A4')
+    await pageTab(); await setSlots(2)
     for (const slot of [0, 1]) {
       await page.locator('.slot-switch button').nth(slot).click(); await assertAligned()
     }
+    slotHTwo = (await page.locator('.slot').first().boundingBox()).height
     await page.locator('.slot-switch button').first().click()
+    // 一页两张之后总页数会减半，可能只剩一页 —— 那时「下一页」本来就该是灰的。
+    // 所以先确认真有两页，再去点它，断言才在测「翻页」而不是在测「按钮亮着」。
+    await gotoFirstPage()
+    const total = Number((await page.locator('.page-no').innerText()).split('/')[1])
+    if (total < 2) throw new Error(`一页两张后只剩 ${total} 页，翻页无从验起`)
     await page.locator('.stage-tools .tool-group').first().locator('button').last().click()
+    if (!(await page.locator('.page-no').innerText()).startsWith('2 /')) {
+      throw new Error('点了下一页但没翻过去')
+    }
     await assertAligned()
     await page.locator('.ti-page .el-radio-button').filter({ hasText: '横向' }).click()
     await settle()
@@ -200,8 +240,21 @@ try {
       await page.locator('.slot-switch button').nth(slot).click(); await assertAligned()
     }
     await page.screenshot({ path: '.shots/pt-new-a4.png' })
-    await choose('.ti-page .el-select', 'A5')
+    // 「每页凭证数」就是当年纸型下拉干的活：A4 换成一张也必须排得下。
+    await setSlots(1)
     await assertAligned()
+    // 断言落在画布上真的摆了几个槽位，而不是槽位切换按钮有几个 ——
+    // 切换按钮是 `v-if="voucherSlots > 1"`，改成一张时它整个消失（0 个），
+    // 数它的话「1 张」和「2 张」会数出同一个结果，断言等于没写。
+    const drawn = await page.locator('.slot').count()
+    if (drawn !== 1) throw new Error(`每页一张时画布摆了 ${drawn} 个槽位`)
+    // **槽位高度必须与两张时一模一样。** 元素坐标是槽位内的百分比，槽位一旦
+    // 跟着张数撑大，整张凭证就被纵向抻开 —— 而模板里一个坐标都没改过。
+    // 这条是「每页一张 = 两张里去掉一张」这句话的字面含义。
+    const hOne = (await page.locator('.slot').first().boundingBox()).height
+    if (Math.abs(hOne - slotHTwo) > 1.5) {
+      throw new Error(`每页一张把凭证抻开了：槽位高 ${slotHTwo.toFixed(1)} → ${hOne.toFixed(1)}`)
+    }
   })
   await step('页边距范围与后端一致，拖动距离换算正确', async () => {
     await pageTab()
@@ -275,7 +328,10 @@ try {
   await step('打印入口优先使用当前已保存模板与期间', async () => {
     const selected = name + '_roundtrip'
     const requests = []
-    const capture = (r) => { if (r.url().includes('/print/vouchers.html')) requests.push(r.url()) }
+    // 收全部打印 HTML 端点，不只 vouchers.html —— 这条用例后面会切到总账去验
+    // 「显式选内置版式」，总账走的是 general-ledger.html，只认 vouchers 会收不到
+    // 新请求，at(-1) 拿到的是上一次凭证的地址，于是断言读到一个不相干的 template_id。
+    const capture = (r) => { if (/\/print\/[^/?]+\.html/.test(r.url())) requests.push(r.url()) }
     page.on('request', capture)
     await page.locator('.pt-bar button').filter({ hasText: '打印' }).click()
     await page.locator('.print-dialog .side .el-select').first().waitFor({ state: 'visible' })
@@ -285,6 +341,10 @@ try {
     if (Number(request.searchParams.get('template_id')) !== cleanup.at(-1) ||
         Number(request.searchParams.get('period_id')) !== period.id) throw new Error('打印模板或期间与编辑页面不同')
     await page.locator('.print-dialog button').filter({ hasText: '取消' }).click()
+    // 「显式选内置版式 → template_id=0」这条口径在凭证范围已经无从触发：
+    // 凭证有一对基线模板，内置版式不再出现在列表里（见 utils/printTemplate.js）。
+    // 所以改到总账验 —— 那边一份保存的模板都没有，内置版式正是唯一选项。
+    await choose('.pt-bar .sel:not(.sel-tpl)', '总账')
     await choose('.pt-bar .sel-tpl', '（内置默认）')
     await page.locator('.pt-bar button').filter({ hasText: '打印' }).click()
     await page.locator('.print-dialog .side .el-select').first().waitFor({ state: 'visible' })
@@ -370,7 +430,7 @@ try {
       if (await page.locator('.pt-bar button').filter({ hasText: text }).last().isEnabled()) throw new Error(text + ' 仍可操作')
     }
     await page.locator('.pt-bar .el-dropdown').click()
-    for (const text of ['重命名', '复制一份', '删除']) {
+    for (const text of ['重命名', '删除']) {
       if (await page.locator('.el-dropdown-menu__item:visible').filter({ hasText: text }).isEnabled()) throw new Error(text + ' 仍可操作')
     }
     await page.keyboard.press('Escape')

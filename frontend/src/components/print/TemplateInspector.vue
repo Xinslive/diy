@@ -19,9 +19,10 @@
             <div class="f1">
               <div class="fl">
                 <span class="lb">纸型</span>
-                <el-select v-model="tpl.paper" size="small" :disabled="ro" @change="onPaperChange">
-                  <el-option v-for="p in paperOptions" :key="p.key" :value="p.key" :label="paperLabel(p.key)" />
-                </el-select>
+                <!-- 只读而不是 select：全局只剩 A4（见 utils/paper.js）。留着一个
+                     只有一个选项的下拉框，用户会以为还能换，得点开才发现不能 ——
+                     而「原来能选、现在不能」这件事该写在标签上，不该让人去点。 -->
+                <span class="lb-v">{{ paperLabel(tpl.paper) }}</span>
               </div>
               <div class="fl">
                 <span class="lb">方向</span>
@@ -29,6 +30,15 @@
                   <el-radio-button value="portrait">纵向</el-radio-button>
                   <el-radio-button value="landscape">横向</el-radio-button>
                 </el-radio-group>
+              </div>
+              <!-- 一页几张凭证只在凭证模板里有意义；账簿报表放这句是噪音。 -->
+              <div v-if="isVoucher" class="fl">
+                <span class="lb">每页凭证数</span>
+                <el-select :model-value="slots" size="small" :disabled="ro"
+                           class="w-full" @change="setSlots">
+                  <el-option v-for="n in SLOTS_OPTIONS" :key="n" :value="n"
+                             :label="`每页 ${n} 张`" />
+                </el-select>
               </div>
             </div>
           </section>
@@ -434,7 +444,7 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import { Delete, Document, Hide, Minus, Plus, Top, Bottom, Tickets, View, Crop } from '@element-plus/icons-vue'
-import { DEFAULT_ORIENTATION, TWO_UP_PAPERS, paperLabel as labelPaper } from '@/utils/paper'
+import { SLOTS_OPTIONS, paperLabel as labelPaper, slotsPerPage } from '@/utils/paper'
 
 const props = defineProps({
   activeTab: { type: String, default: 'page' },
@@ -448,6 +458,9 @@ const props = defineProps({
   paperOptions: { type: Array, default: () => [] },
 })
 const emit = defineEmits(['update:activeTab', 'change', 'select', 'add-element'])
+
+/** A4 的毫米尺寸。meta 没加载出来时 slotMm 也得有尺寸可用。 */
+const PAPER_SPEC = { A4: { w: 210, h: 297 } }
 
 const SIDES = ['top', 'right', 'bottom', 'left']
 const SIDE_CN = { top: '上', right: '右', bottom: '下', left: '左' }
@@ -572,7 +585,7 @@ const splitExample = computed(() => {
   const width = Math.max(3, String(total).length)
   const z = (n) => String(n).padStart(width, '0')
   return fmt.replace(/\{(\w+)\}/g, (_, k) =>
-    ({ voucher_no: '记001号', page: z(1), pages: z(total),
+    ({ voucher_no: '记0001号', page: z(1), pages: z(total),
        first: z(1), last: z(rowCount.value), lines: z(12) }[k] ?? ''))
 })
 
@@ -616,9 +629,10 @@ function normalizeWidths() {
   cols.forEach((c) => { c.width = round((Number(c.width) || 0) / total * 100) })
 }
 
-function onPaperChange() {
-  // 换纸型就把方向带到该纸型的默认值，否则 A5 沿用 A4 的纵向，横向小册子排不出来。
-  props.tpl.orientation = DEFAULT_ORIENTATION[props.tpl.paper] || 'portrait'
+function setSlots(n) {
+  // 改「一页几张」要同时落到 voucher.slots_per_page —— 渲染层只读这一个字段
+  // （slotMm 的毫米换算也跟着它走），写到别处等于改了没改。
+  props.tpl.voucher = { ...(props.tpl.voucher || {}), slots_per_page: n }
   commit()
 }
 
@@ -732,12 +746,14 @@ function setLineStyle(v) { if (cur.value) { cur.value.line_style = v || 'solid';
 
 // ------------------------------------------------------------------ 表格毫米换算
 /**
- * 一页几张凭证由纸型决定（与后端 TWO_UP_PAPERS 一致），
- * 一个槽位的真实毫米尺寸 = 纸面减页边距，再减掉两张之间的缝。
+ * 一页几张凭证由模板自己说（``voucher.slots_per_page``），缺省 2 ——
+ * 与后端 ``validate_template`` 取同一个缺省，见 utils/paper.js::slotsPerPage。
  */
-const slots = computed(() => (TWO_UP_PAPERS.includes(props.tpl.paper) ? 2 : 1))
+const slots = computed(() => slotsPerPage(props.tpl))
 const slotMm = computed(() => {
-  const spec = props.paperOptions.find((p) => p.key === props.tpl.paper)
+  // 纸型恒为 A4；paperOptions 为空时（比如 meta 还没回来）退回 A4 尺寸，
+  // 不能让 slotMm 变成 NaN —— 毫米换算一旦出 NaN，整张凭证的元素高度全废。
+  const spec = props.paperOptions.find((p) => p.key === props.tpl.paper) || PAPER_SPEC.A4
   const pw = spec?.w || 210
   const ph = spec?.h || 297
   const land = props.tpl.orientation === 'landscape'
@@ -746,8 +762,10 @@ const slotMm = computed(() => {
   const m = props.tpl.margins || {}
   const cw = w - (Number(m.left) || 0) - (Number(m.right) || 0)
   const ch = h - (Number(m.top) || 0) - (Number(m.bottom) || 0)
-  const gap = slots.value === 2 ? SLOT_GAP : 0
-  if (slots.value === 1) return { w: cw, h: ch, gap }
+  // **槽位尺寸与「放几张」无关。** 「每页一张」= 两张里去掉一张，不是把剩下
+  // 那张拉到整页高：行高是从槽位高度反推的（rowMm），槽位一变高行高跟着变，
+  // 一张凭证就被纵向抻开，而模板里一个坐标都没改过。这里恒按两张算。
+  const gap = SLOT_GAP
   return land ? { w: (cw - gap) / 2, h: ch, gap } : { w: cw, h: (ch - gap) / 2, gap }
 })
 /**
@@ -890,6 +908,9 @@ function setColWidth(i, v) {
 .f1 { display: grid; gap: 8px; }
 .fl { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .lb { font-size: 12px; color: var(--cwq-muted); }
+/* 纸型只有一个值，按可编辑控件的尺寸摆出来，标签和控件左边缘才对得齐。 */
+.lb-v { font-size: 13px; line-height: 24px; color: var(--cwq-text); }
+.w-full { width: 100%; }
 .ops { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
 .tip {
   margin: 6px 0 0;

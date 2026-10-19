@@ -57,8 +57,8 @@ def _voucher_in(db, book, admin_user, subjects_by_book, day="2026-01-05"):
         db, book_id=book.id, user=admin_user,
         voucher_date=_date.fromisoformat(day),
         entries=[
-            {"subject_id": subs["100201"].id, "direction": "DEBIT", "amount": "100", "summary": "x"},
-            {"subject_id": subs["600101"].id, "direction": "CREDIT", "amount": "100", "summary": "x"},
+            {"subject_id": subs["1002"].id, "direction": "DEBIT", "amount": "100", "summary": "x"},
+            {"subject_id": subs["5001"].id, "direction": "CREDIT", "amount": "100", "summary": "x"},
         ], commit=True)
 
 
@@ -122,7 +122,7 @@ def test_批次里混了一个越权ID就整批拒绝(db, book, other_book, admi
 
 def test_重复ID不会重复计数(db, book, make_voucher, admin_user):
     """[id, id, id] 应当只算一张 —— 去重后再比数量，否则计数会虚高。"""
-    v = make_voucher("2026-01-05", dr=[("100201", 10, "x")], cr=[("600101", 10, "x")])
+    v = make_voucher("2026-01-05", dr=[("1002", 10, "x")], cr=[("5001", 10, "x")])
     assert post_vouchers(db, book.id, [v.id, v.id, v.id], admin_user) == 1
 
 
@@ -130,7 +130,7 @@ def test_审计日志的book_id是请求的账套(db, book, make_voucher, admin_
     """审计记录的归属不能靠「批次里第一张是谁」。"""
     from app.models import AuditLog
 
-    v = make_voucher("2026-01-05", dr=[("100201", 10, "x")], cr=[("600101", 10, "x")])
+    v = make_voucher("2026-01-05", dr=[("1002", 10, "x")], cr=[("5001", 10, "x")])
     post_vouchers(db, book.id, [v.id], admin_user)
 
     row = db.scalars(select(AuditLog).where(

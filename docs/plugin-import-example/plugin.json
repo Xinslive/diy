@@ -1,0 +1,38 @@
+{
+  "format_version": 1,
+  "id": "com.cwq.csvvoucher",
+  "name": "CSV 转凭证",
+  "version": "1.0.0",
+  "api_version": ">=1.1.0 <2.0.0",
+  "description": "用户选择目标账套，预览并人工确认后整批提交。",
+  "permissions": [
+    "book:read",
+    "subject:read",
+    "import:rw",
+    "voucher:write",
+    "plugin_data:rw"
+  ],
+  "access": {
+    "assignment": "admin_users",
+    "default": "none"
+  },
+  "contributes": {
+    "backend_entry": "backend/main.py",
+    "frontend_entry": "frontend/index.js",
+    "menu": {
+      "module": "extensions",
+      "title": "CSV 转凭证",
+      "icon": "Document",
+      "route": "/plugin/com.cwq.csvvoucher",
+      "order": 20
+    }
+  },
+  "hooks": [],
+  "tables": [
+    {
+      "name": "plugin_25ac53a1cf75_config",
+      "schema": "public",
+      "scope": "book"
+    }
+  ]
+}

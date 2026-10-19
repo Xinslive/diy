@@ -162,20 +162,23 @@ const contentBox = computed(() => {
 
 /**
  * 凭证槽位矩形，与后端 render_voucher_sheet 的 grid 完全同构：
- *   两张 + 横向 → 左右排列；两张 + 纵向 → 上下排列；一张 → 占满内容区。
+ *   横向 → 左右两个格子；纵向 → 上下两个格子。
  * 槽位之间固定 3mm 缝（后端 .voucher-sheet 的 gap），少算这 3mm，
  * 第二张凭证的元素框就会整体偏 3mm，拖哪儿都对不上。
+ *
+ * **格子尺寸恒按「一页两张」算，放几张只决定返回前几个。**
+ * 「每页一张」是两份里去掉一份，不是把剩下一份撑满整页：槽位一旦跟着张数
+ * 变大，里面每个元素的百分比坐标就跟着放大，凭证被纵向抻开，而用户一个坐标
+ * 都没改过。之前这里写着 `if (slots <= 1) return [c]`，正是那个抻开的来源 ——
+ * 而且它只在设计器里抻、真打印时后端另算一套，两者对不上，拖动还会存下错坐标。
  */
 const slotRects = computed(() => {
   const c = contentBox.value
-  if (props.slots <= 1) return [c]
   const gap = mm(3)
-  if (props.orientation === 'landscape') {
-    const w = (c.w - gap) / 2
-    return [0, 1].map((i) => ({ x: c.x + i * (w + gap), y: c.y, w, h: c.h }))
-  }
-  const h = (c.h - gap) / 2
-  return [0, 1].map((i) => ({ x: c.x, y: c.y + i * (h + gap), w: c.w, h }))
+  const cells = props.orientation === 'landscape'
+    ? (() => { const w = (c.w - gap) / 2; return [0, 1].map((i) => ({ x: c.x + i * (w + gap), y: c.y, w, h: c.h })) })()
+    : (() => { const h = (c.h - gap) / 2; return [0, 1].map((i) => ({ x: c.x, y: c.y + i * (h + gap), w: c.w, h })) })()
+  return cells.slice(0, Math.max(1, Number(props.slots) || 1))
 })
 
 const docH = computed(() => Math.max(pageH.value, contentH.value || pageH.value))
@@ -281,11 +284,24 @@ const HOTSPOT_SELECTORS = {
 }
 const hotspots = ref([])
 
+/** 同一批热点、同一批坐标就别换新数组（换引用 = 模板全量重渲染）。 */
+function sameHotspots(a, b) {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]
+    const y = b[i]
+    if (x === y) continue
+    if (!x || !y) return false
+    if (x.key !== y.key || x.x !== y.x || x.y !== y.y || x.w !== y.w || x.h !== y.h) return false
+  }
+  return true
+}
+
 function readHotspots(d) {
-  if (props.slots > 1) { hotspots.value = []; return }   // 凭证走元素层
+  if (props.slots > 1) { if (hotspots.value.length) hotspots.value = []; return }   // 凭证走元素层
   const pages = [...d.querySelectorAll('.page')]
   const pageEl = pages[activePage.value - 1]
-  if (!pageEl) { hotspots.value = []; return }
+  if (!pageEl) { if (hotspots.value.length) hotspots.value = []; return }
   const pr = pageEl.getBoundingClientRect()
   const out = []
   for (const [key, sel] of Object.entries(HOTSPOT_SELECTORS)) {
@@ -301,7 +317,7 @@ function readHotspots(d) {
       h: Math.round(r.height),
     })
   }
-  hotspots.value = out
+  if (!sameHotspots(hotspots.value, out)) hotspots.value = out
 }
 
 /**
@@ -311,9 +327,31 @@ function readHotspots(d) {
 function readPages(d) {
   const pages = [...d.querySelectorAll('.page')]
   if (!pages.length) return { count: 1, tops: [0], heights: [] }
-  const tops = pages.map((p) => Math.max(0, p.getBoundingClientRect().top
-    + (d.defaultView.scrollY || 0)))
-  return { count: pages.length, tops, heights: pages.map((p) => p.getBoundingClientRect().height) }
+  const scrollY = d.defaultView.scrollY || 0
+  const tops = []
+  const heights = []
+  // 每个 .page **量一次**，两趟 map 各调一次 getBoundingClientRect 的话，
+  // 同一批元素会被量两遍 —— 而 measure() 是被 iframe 内的 ResizeObserver
+  // 拖着跑的，文档一动就重跑一趟。
+  for (const p of pages) {
+    const r = p.getBoundingClientRect()
+    tops.push(Math.max(0, r.top + scrollY))
+    heights.push(r.height)
+  }
+  return { count: pages.length, tops, heights }
+}
+
+/**
+ * 内容没变就别换新数组。
+ *
+ * 这三个数组喂给的是模板里的 v-for / :style，换一个引用就是一次全量重渲染，
+ * 哪怕里面每个数都一模一样。measure() 由 ResizeObserver 拖着跑，
+ * 「量了但其实没变」是常态。
+ */
+function sameList(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+  return true
 }
 
 /**
@@ -458,8 +496,8 @@ function measure() {
         activePage.value = Math.min(activePage.value, count)
         emit('pages', count)
       }
-      if (tops.length) pageTops.value = tops
-      pageHeights.value = heights
+      if (tops.length && !sameList(pageTops.value, tops)) pageTops.value = tops
+      if (!sameList(pageHeights.value, heights)) pageHeights.value = heights
       readHotspots(d)
     }
     apply()

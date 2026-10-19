@@ -16,6 +16,12 @@ import fs from 'node:fs'
 
 const SRC = fs.readFileSync(
   new URL('../src/views/period/PeriodPanel.vue', import.meta.url), 'utf8')
+// 结账请求的路径与 body 构造现在在 api/book.js 里（PeriodPanel 自己拼 URL
+// 是 2026-10 清掉的死写法：同一段路径写在两个文件里，改后端路由必然漏改一处）。
+// 所以乐观锁这条断言要**连着两个文件一起看**：页面把 p.version 递下去，
+// api 层把它放进 body。少看一个文件，就有一半的链子是断的也照样绿。
+const API = fs.readFileSync(
+  new URL('../src/api/book.js', import.meta.url), 'utf8')
 
 let pass = 0, fail = 0
 const tests = []
@@ -69,15 +75,27 @@ const errOf = (status, detail) => ({ response: { status, data: detail === undefi
 console.log('== 请求必须带上期间版本 ==')
 
 t('close 带上 version（不传 = 不比对，等于没有乐观锁）', () => {
-  assert.ok(/periods\/\$\{p\.id\}\/close`,\s*\{\s*version: p\.version\s*\}/.test(SRC),
-    '结账请求没带 version —— 等于告诉后端「别比」')
+  assert.ok(/periods\/\$\{pid\}\/close`,\s*\{\s*version\s*\}/.test(API),
+    'api/book.js 的 closePeriod 没把 version 放进 body —— 等于告诉后端「别比」')
+  assert.ok(/api\.closePeriod\(\s*store\.bookId,\s*p\.id,\s*p\.version\s*\)/.test(SRC),
+    'PeriodPanel 没把期间版本号递给 api.closePeriod')
 })
 t('unclose 也带上 version（它会把区间内凭证批量退回未记账，更不能按陈旧状态做）', () => {
-  assert.ok(/revert_posting: true,\s*version: p\.version/.test(SRC))
+  assert.ok(/periods\/\$\{pid\}\/unclose`,\s*\{\s*revert_posting: revertPosting,\s*version\s*\}/.test(API),
+    'api/book.js 的 unclose 没带 version')
+  assert.ok(/api\.unclose\(\s*store\.bookId,\s*p\.id,\s*p\.version/.test(SRC),
+    'PeriodPanel 没把期间版本号递给 api.unclose')
 })
 t('版本号来自 GET /periods 的那一项，不另存一份（两处版本号迟早对不上）', () => {
-  assert.ok(/version: p\.version/.test(SRC))
-  assert.ok(!/versionOf|myVersion|localVersion/.test(SRC), '页面上自己存了一份版本号')
+  assert.ok(/\bp\.version\b/.test(SRC),
+    '结账用的不是期间对象上那个 p.version —— 它必须来自 GET /periods 的返回')
+  assert.ok(!/versionOf|myVersion|localVersion/.test(SRC + API), '页面上自己存了一份版本号')
+})
+t('PeriodPanel 不再绕过 api 层自己拼结账路径（路径只写一份）', () => {
+  assert.ok(!/http\.post\(`\/books\/\$\{store\.bookId\}\/periods/.test(SRC),
+    'PeriodPanel 又开始直接 import 共享 http 手写路径了')
+  assert.ok(!/from '@\/api\/client'/.test(SRC) || !/\{ http \}/.test(SRC),
+    'PeriodPanel 还在 import 共享 http —— 结账应当走 api/book.js')
 })
 
 console.log('')
@@ -105,6 +123,19 @@ t('其他失败（500 / 断网）：也走普通错误，不假装是版本冲�
   const { said } = await runHandlePeriodError(errOf(500, undefined))
   assert.equal(said.errors[0], '结账失败', '后端没给 detail 时的兜底文案')
   assert.equal(said.warnings.length, 0)
+})
+
+t('空月份不能结账：按钮禁用，且接口不带任何「确认空月」的旁路', () => {
+  // 后端已经硬拒（app/accounting/periods.py：一张凭证都没有就不结账）。
+  // 这里守的是**前端没有偷偷开旁路**：曾经有过一个 allow_empty 开关，
+  // 靠一个确认弹窗放行 —— 而空月份恰好能穿过整理体检、自动记账和损益结平
+  // 三道闸门，「忘录账」会被静默封进历史，补录得反结账、反结账会连带把
+  // 后面已结的月份全部退回。
+  assert.match(SRC, /const emptyPeriod = computed/, '空月份判定没了')
+  assert.match(SRC, /:disabled="[^"]*emptyPeriod[^"]*"/, '结账按钮没有把空月份算进 disabled')
+  assert.match(SRC, /无凭证，不能结账/, '按钮上应当直接说明为什么不能结')
+  assert.doesNotMatch(API, /allow_empty/, '接口层出现了 allow_empty —— 后端不认这个字段，会被静默忽略')
+  assert.doesNotMatch(SRC, /allowEmpty/, '前端还在传「确认空月」，等于把硬闸门又开了个口子')
 })
 
 console.log('')
