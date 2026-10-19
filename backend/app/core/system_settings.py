@@ -1,7 +1,8 @@
-"""系统级配置的读取与写入（第三方服务凭据）。
+"""系统级配置的读取与写入（第三方服务凭据、自助注册开关）。
 
-数据在 ``sys_setting`` 表里，key 是纯文本、value 是字符串。**只有这里**允许
-直接把 value 当凭据用；往外发的地方一律走 :func:`mask_secret`。
+数据在 ``sys_setting`` 表里，key 是纯文本、value 是字符串。**凭据类的 key**
+才允许直接把 value 当凭据用，且往外发的地方一律走 :func:`mask_secret`；
+非凭据类（本文件末尾的自助注册开关）返回的是布尔，天然没有明文问题。
 
 为什么库里没有就退回环境变量：容器部署仍会用 ``.env`` 注入，凭据不必搬进库
 就能跑。两侧同时存在时**库优先** —— 界面是运维真正会用的那个入口，让它说了算，
@@ -80,6 +81,46 @@ def ocr_config_public(db: Session) -> dict[str, Any]:
         "token_set": bool(token),
         "token_hint": f"…{token[-4:]}" if len(token) >= 4 else ("已设置" if token else ""),
     }
+
+
+# --------------------------------------------------------------- 自助注册开关
+#
+# 与 OCR / 备份同一个约定：**库里优先，env 兜底**。原来这个开关只在 env 里
+# （``REGISTRATION_ENABLED``），于是「关掉自助注册」在生产上意味着：登进服务器、
+# 改 .env、重启后端 —— 一件需要服务器权限的动作。实际部署里它常年关着，
+# 于是这个开关「有用」这件事没人说得清，而登录页上的「注册」页签一直在
+# （前端不知道这个开关存在，见 frontend/src/views/LoginView.vue）。
+#
+# 放进库里之后，管理员在「用户与授权」页上点一下就能改，改完立即生效。
+#
+# **布尔值的解析与 backup/config.py 保持同一套写法**（1/true/yes/on 为真）：
+# 这张表的值全是文本，同一个 key 用两套解析方式，迟早出现「界面上显示关着、
+# 接口却开着」这种自己都解释不了的错位。
+
+#: 库里存这个开关的 key。与 env 的名字一致，省掉一次映射。
+REGISTRATION_KEY = "registration_enabled"
+
+_TRUTHY = ("1", "true", "yes", "on")
+
+
+def registration_enabled(db: Session) -> bool:
+    """自助注册当前是否开放。**库里优先，env 兜底。**
+
+    库里没有这一行时读 ``settings.registration_enabled``（默认 False），
+    所以升级到这一版之后，服务器上原有的 ``REGISTRATION_ENABLED=false``
+    立刻继续生效 —— 不需要谁去库里补一行，注册也不会在升级过程中被打开。
+    """
+    from app.core.config import settings
+
+    raw = get_value(db, REGISTRATION_KEY, "")
+    if not raw:
+        return bool(settings.registration_enabled)
+    return raw.strip().lower() in _TRUTHY
+
+
+def set_registration_enabled(db: Session, value: bool, *, updated_by: str | None = None) -> None:
+    """写这个开关。只存文本，与同表其它配置一致。"""
+    set_value(db, REGISTRATION_KEY, "1" if value else "0", updated_by=updated_by)
 
 
 def mask_secret(value: str) -> str:

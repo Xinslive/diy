@@ -4,7 +4,7 @@
       <h1>财务记账系统</h1>
       <p class="muted">多账套 · 凭证 · 账簿 · 报表</p>
 
-      <el-tabs v-model="tab" stretch>
+      <el-tabs v-model="tab" stretch :class="{ 'tabs-single': !gate.showTabs }">
         <!-- ------------------------------------------------ 登录 -->
         <el-tab-pane label="登录" name="login">
           <el-form @submit.prevent="submitLogin">
@@ -38,7 +38,10 @@
         </el-tab-pane>
 
         <!-- ------------------------------------------------ 注册 -->
-        <el-tab-pane label="注册" name="register">
+        <!-- v-if 而不是只藏页签：管理员关掉自助注册后，页签栏里那个「注册」
+             必须整个消失，而不是留在那儿让人点了撞 403。判定见
+             utils/registration.js，后端闸门在 /api/auth/register。 -->
+        <el-tab-pane v-if="gate.showRegister" label="注册" name="register">
           <el-form @submit.prevent="submitRegister">
             <el-form-item>
               <el-input v-model="reg.username" placeholder="手机号（11 位）"
@@ -63,17 +66,28 @@
 </template>
 
 <script setup>
-import { reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import * as authApi from '@/api/auth'
 import { useSessionStore } from '@/stores/session'
+import { registrationView } from '@/utils/registration'
 
 const store = useSessionStore()
 const router = useRouter()
 
 const tab = ref('login')
 const busy = ref(false)
+
+// 自助注册是否开放。**初值是 false**：接口还没回来之前（或者请求失败），
+// 登录页只显示登录。反过来先显示再撤，页面会闪一下，而且网络抖动时可能闪完
+// 就留在那儿 —— 一个没人确认过状态的安全相关入口，不该先亮出来。
+const registrationEnabled = ref(false)
+const gate = computed(() => registrationView(registrationEnabled.value, tab.value))
+
+// 管理员把开关关掉时，正停在「注册」页的人要立刻被拉回登录页，
+// 否则他会看到一张没有页签栏的空白注册表单。
+watch(() => gate.value.tab, (t) => { if (t !== tab.value) tab.value = t })
 
 // 开发构建才有的便利（预填演示账号 + 显示提示）。
 // 生产构建里 isDev 恒为 false，于是：用户名不预填、口令不预填、提示不渲染。
@@ -142,6 +156,16 @@ async function submitRegister() {
     busy.value = false
   }
 }
+onMounted(async () => {
+  try {
+    const cfg = await authApi.publicConfig()
+    registrationEnabled.value = !!cfg?.registration_enabled
+  } catch {
+    // 保持 false。登录不受影响 —— 注册入口少一个，总比在没确认过状态时
+    // 把一个匿名入口亮出来要好。
+    registrationEnabled.value = false
+  }
+})
 </script>
 
 <style scoped>
@@ -157,4 +181,7 @@ h1 { font-size: 22px; margin: 0 0 4px; }
 p { margin: 0 0 12px; font-size: 13px; }
 .hint { text-align: center; font-size: 12px; margin: 12px 0 0; line-height: 1.6; }
 :deep(.el-tabs__header) { margin-bottom: 18px; }
+/* 关掉自助注册后只剩「登录」一个页签，那一行页签栏没有信息量，
+   去掉它，登录表单直接顶上来（见 utils/registration.js 的 showTabs）。 */
+.tabs-single :deep(.el-tabs__header) { display: none; }
 </style>

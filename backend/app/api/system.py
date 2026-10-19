@@ -340,6 +340,53 @@ def audit_logs(limit: int = 100, user: SysUser = Depends(get_current_user),
              "before": r.before, "after": r.after} for r in rows]
 
 
+# ------------------------------------------------------------ 自助注册开关
+
+
+class RegistrationPatch(BaseModel):
+    """自助注册开关。
+
+    ``StrictBool``：这里不接受 ``"false"`` 这种字符串。布尔开关最常见的事故
+    不是写错值，而是**写了个非布尔值然后被当成真**（``bool("false") is True``）。
+    用严格布尔把它挡在入口，报错也比事后发现「明明关了却还能注册」清楚。
+    """
+
+    enabled: StrictBool
+
+
+def _registration_view(db: Session) -> dict:
+    return {"registration_enabled": system_settings.registration_enabled(db)}
+
+
+@router.get("/registration")
+def get_registration(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require_admin(user)
+    return _registration_view(db)
+
+
+@router.put("/registration")
+def put_registration(payload: RegistrationPatch, user: SysUser = Depends(get_current_user),
+                     db: Session = Depends(get_db)):
+    """改自助注册开关。**留痕**：这个开关决定「陌生人能不能往 sys_user 里加行」，
+    打开它的那一次必须有据可查（谁、何时、从关到开）。
+    """
+    _require_admin(user)
+    before = system_settings.registration_enabled(db)
+    system_settings.set_registration_enabled(db, payload.enabled, updated_by=user.username)
+    log(
+        db,
+        action="SYSTEM_REGISTRATION_UPDATE",
+        entity="system_setting",
+        entity_id=system_settings.REGISTRATION_KEY,
+        user=user,
+        detail=("开放" if payload.enabled else "关闭") + "自助注册",
+        before={"registration_enabled": before},
+        after={"registration_enabled": payload.enabled},
+    )
+    db.commit()
+    return _registration_view(db)
+
+
 # ------------------------------------------------------------ 外部服务（OCR）
 
 

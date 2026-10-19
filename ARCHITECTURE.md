@@ -2035,18 +2035,33 @@ token 在 localStorage 由 axios 拦截器注入，所以 `iframe.src` / `window
 
 ### 自助注册：**默认关闭**
 
-**代码里的默认值是关的**：`config.py` 里 `registration_enabled: bool = False`。
-`REGISTRATION_ENABLED` 没配、或配成 false 时，`POST /api/auth/register` 直接 **403**
+**兜底默认值是关的**：`config.py` 里 `registration_enabled: bool = False`。
+库里没有 `sys_setting.registration_enabled` 那一行、`REGISTRATION_ENABLED` 也没配或配成
+false 时，`POST /api/auth/register` 直接 **403**
 （`api/auth.py`，router prefix 是 `/api/auth`；用户与授权那批接口才在 `/api/system` 下）。
-公司内部要开，显式 `REGISTRATION_ENABLED=true` 并重启。
+
+**生效值：库里优先，env 兜底**（与 `core/system_settings.py` 里 OCR、OSS 备份同一套约定）。
+日常开关在「系统管理 → 用户与授权」页上，管理员拨一下即生效，不必 ssh、不必重启。
+
+| 层 | 位置 | 作用 |
+|---|---|---|
+| 界面 | `views/system/UserAdmin.vue` 的**允许自助注册** | 日常开关 |
+| 存储 | `sys_setting.registration_enabled`（`"1"`/`"0"`） | 上面那一下落的那一行 |
+| 兜底 | `app/core/config.py` → `backend/.env` | 库里没有那一行时读它 |
+
+**登录页随开关走。** `GET /api/auth/config` 匿名可读（只回一个布尔），登录页在
+**还没有令牌**的时候就要知道要不要显示「注册」——所以它不能挂在带鉴权的接口下。
+关着的时候整个「注册」页签 `v-if` 掉，页签栏也一并去掉（只剩登录一个页签时那一行
+没有信息量）。判定在 `frontend/src/utils/registration.js`，只认严格 `true`
+（`!!'false'` 是 true —— 后端对开关用 `StrictBool` 就是同一个理由）。
 
 三处必须一致 —— `config.py` 的默认值、`backend/.env.example`、`README.md`：
 
 | 位置 | 说法 |
 |---|---|
-| `app/core/config.py` | `registration_enabled: bool = False`（**权威**）|
+| `app/core/config.py` | `registration_enabled: bool = False`（**兜底的权威**）|
 | `backend/.env.example` | `REGISTRATION_ENABLED=false`，注释「默认关闭」 |
-| `README.md` 快速开始 | 注册页签存在，但默认关、403 |
+| `README.md` 快速开始 | 注册页签默认不显示、默认关、403 |
 
 > ⚠️ **不要为了「让文档说得通」去改 `config.py` 的默认值。** 这条文档缺陷的危险不在于
 > 描述错了，而在于它会诱导下一个人「修好注册」：把 `False` 改成 `True`，
@@ -2055,6 +2070,9 @@ token 在 localStorage 由 axios 拦截器注入，所以 `iframe.src` / `window
 >
 > 这条曾经被文档写成「自助注册已经开着」并据此论证了一整套权限设计，
 > 而那时代码早就是 `False` 了 —— 论证的前提与现实脱节。改文档，不要改代码。
+>
+> 同理，**不要把兜底默认值改成 True 来「让登录页显示注册」**。要显示就动界面上的开关，
+> 那是有人负责、留了审计的那条路。
 
 **注册只开账号，不发 token。** 没有账套的用户登录后是一片空白，
 自己点「新建账套」就能开工，也可以请管理员把已有账套授权过来。
@@ -2845,9 +2863,24 @@ head -c 60 <dump>                                                      # -- Post
 
 | 东西 | 写死处 | 处理 |
 |---|---|---|
-| `deploy/systemd/cwq-api.service` | `WorkingDirectory`/`EnvironmentFile`/`ExecStart`/`ReadWritePaths`/日志 | 按主机渲染 |
-| `deploy/systemd/cwq-backup.service` | 同上 | 按主机渲染 |
-| `deploy/nginx/acct.xins.live.conf` | `root` 指向 `frontend/dist` | 按主机渲染 |
+| `deploy/systemd/cwq-api.service` | `WorkingDirectory`/`EnvironmentFile`/`ExecStart`/`ReadWritePaths`/日志 | 仍需按主机渲染；2026-10-19 起 `deploy.sh` **不装**它，故手工安装后不会被发版覆盖 |
+| `deploy/systemd/cwq-backup.service` | 同上 | **已做**：2026-10-19 起 `deploy.sh` 按 `APP_DIR`/`BACKUP_DIR` 渲染后再装（见下） |
+| `deploy/nginx/acct.xins.live.conf` | `root` 指向 `frontend/dist` | 仍需按主机渲染 |
+
+**`cwq-backup.*` 的渲染已进仓库（2026-10-19）。** 原来是原样 `cp`，后果不是
+「路径不对」而是**每次发版把手工修对的路径打回模板旧值**：生产机应用根是
+`/www/wwwroot/acct.xins.live`，而 `cp` 会把 `/opt/cwq` 一起灌进去，于是
+2026-10-19 00:05 那次发布覆盖掉手工修正的 `cwq-backup.service`，
+`cwq-backup.timer` 从此每天 `Failed to load environment files: No such file or
+directory`——active 且 enabled，看起来是有的，实际一次都没产出。
+现在 `deploy.sh` 的 `render_unit()` 只替换两个前缀，且**必须先长后短**
+（`/opt/cwq/backups` 在 `/opt/cwq` 之前，否则备份目录会被渲染成 `$APP/backups`
+而不是运维单独给定的 `BACKUP_DIR`）。沙箱演练第 15 节钉住这件事，且做过反向对照：
+退回原样 `cp` 时该节 8 条断言变红。
+
+`cwq-api.service` 与 nginx 配置**仍然**要手工渲染。deploy.sh 至今不安装
+`cwq-api.service`——这既是它手工修正能长期存活的原因，也意味着新机部署仍需
+按本节命令自行渲染。
 
 判据（渲染后逐条核对，漏一条症状都是「服务起了但不写日志」或「前端 404」）：
 
@@ -2857,11 +2890,13 @@ grep -n 'WorkingDirectory\|ReadWritePaths' /etc/systemd/system/cwq-api.service
 grep -n 'root ' /www/server/panel/vhost/nginx/acct.xins.live.conf
 ```
 
-**本次刻意没有改仓库里的模板。** 产物是 CI 按 commit 出的，改了 `deploy/` 模板
-再发版，装上去的代码就与「测试通过的那一版」对不上号了。所以模板保持 `/opt/cwq`
-（老机仍按它发布），新机用 `sed` 按 `APP_DIR` 渲染出主机专用副本。代价是
-「改路径」目前不在版本控制里、只存在于渲染命令里；后续若要把它做进发布脚本，
-应作为独立提交单独走一遍 CI，而不是夹带在某次发版里。
+**模板曾刻意不改，2026-10-19 起这个限制只对 `cwq-api.service` 与 nginx 生效。**
+当时的理由是「产物是 CI 按 commit 出的，改了 `deploy/` 模板再发版，装上去的代码
+就与测试通过的那一版对不上号」——这个顾虑本身成立，所以改模板仍应作为独立提交
+单独走一遍 CI。它挡不住的是另一件事：`cwq-backup.*` **本来就每次发版被原样拷进去**，
+模板里的 `/opt/cwq` 是活的、会覆盖现网手工修正的，所以那一处不能一直不改。
+现在 `deploy.sh` 渲染它，模板里的 `/opt/cwq` 对它而言只是默认布局；
+`cwq-api.service` 仍保持 `/opt/cwq` 默认 + 手工渲染。
 
 首次上线仍要按 §11.7.1 预置（venv、后端解压、`frontend/dist`）——参数化并没有
 让 `deploy.sh` 变成能装到空机器上的引导脚本。
@@ -2989,6 +3024,52 @@ SchemaVersionError: 数据库停在 0021，代码要求 0027
 之间，服务进程跑的还是上一版代码、库已经是新的。这个窗口在改动前就存在
 （迁移一直排在重启之前），本次改动没有引入它，也没有缩小它。`schema_version.py`
 在启动时 fail-closed，所以真出了不一致是**启动即报错**，不会静默带病运行。
+
+### 11.7.12 `ProtectSystem=strict` 的可写白名单：绝对路径配置必须显式登记
+
+2026-10-19 生产 OSS 备份静默停摆的原因，已在 `cwq-api.service` 修掉并补进模板。
+
+`cwq-api.service` 开了 `ProtectSystem=strict`：服务自己的 mount 命名空间里，
+整个 `/opt` 是 `ro`，`ReadWritePaths=` 是例外清单。生产应用的备份工作目录
+`CWQ_BACKUP_WORK_DIR=/www/wwwroot/acct.xins.live/backups/work` 不在清单里，于是
+2026-10-19 03:47 的定时备份报
+`OSError: [Errno 30] Read-only file system: .../backups/work`。
+
+**为什么它特别难认，有三点，都是机制决定的：**
+
+1. **失败点在写文件那一刻**，不在入口。鉴权、解析、调度全都过了，
+   从外面看像是「备份功能坏了」，而页面与账务功能一切正常。
+2. **它不是另一个 systemd 单元。** OSS 备份是应用内调度器
+   （`task_key=system:oss_backup`）在 API 进程里跑的，所以 journal 归 `cwq-api`，
+   混在业务日志中间；`cwq-api` 本身 `NRestarts=0`、健康检查 200，没有任何告警。
+3. **服务外的写入测试一定是绿的。** root 或 `cwq` 在命名空间外写
+   `backups/` 成功——那条路径根本没被挂成只读。唯一可靠的判据是进命名空间试写：
+
+   ```bash
+   PID=$(systemctl show -p MainPID --value cwq-api)
+   nsenter -t "$PID" -m -- mount | grep wwwroot          # 期望能看到 rw 的那几条
+   nsenter -t "$PID" -m -- su -s /bin/sh cwq \
+     -c 'mkdir -p <path> && touch <path>/.probe && rm -f <path>/.probe'
+   ```
+
+**规则本身只有一条，分岔在相对路径还是绝对路径：**
+
+| 配置 | 写法 | 落在哪 | 要不要动 `ReadWritePaths` |
+|---|---|---|---|
+| `INVOICE_STORAGE_DIR` | `data/invoices`（相对） | `backend/data` | 不用，已被覆盖 |
+| `CWQ_BACKUP_WORK_DIR` | `/opt/cwq/backups/work`（绝对） | 应用树之外 | **要**，漏了即只读 |
+
+相对路径在 `WorkingDirectory` 之下，天然被 `backend/data` 覆盖；**绝对路径
+且在应用树之外的每一个新增配置，都必须在 `cwq-api.service` 的 `ReadWritePaths=`
+里显式登记**。同一个键只能写一次（重复赋值后者覆盖前者），所以所有路径同一行。
+
+**这次没有加自动检测（用户决定）。** 也就是说上面这张表目前只靠注释与
+`ARCHITECTURE.md` 约束，**没有任何测试或运行期探针在守它**——新加一个绝对路径
+配置而忘了改 unit，仍然会重演同样的静默失败。真要防回归，位置很清楚：
+`backend/scripts/preflight.py` 里加一次真实写入探测（它跑在 `ExecStartPre=`，
+天然在服务自己的命名空间内，是唯一可靠的判据），并把失败**只报成告警、不阻断
+服务启动**——备份目录不可写不该升级成全站不可用。`deploy.sh` 在服务外的写入
+测试则是假阳性，不能拿来当闸门。
 
 ---
 

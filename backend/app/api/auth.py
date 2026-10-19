@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session
 
 from app.accounting.audit_helper import log as write_audit
 from app.api.schemas import LoginIn, RegisterIn, TokenOut
+from app.core import system_settings
 from app.core.config import is_trusted_proxy, settings
 from app.core.db import get_db
 from app.core.deps import get_current_user
@@ -169,6 +170,23 @@ def _audit_login(ok: bool, db: Session, ip: str, user: SysUser | None,
 # --------------------------------------------------------------------- 注册
 
 
+@router.get("/config")
+def public_config(db: Session = Depends(get_db)):
+    """登录页在**还没有令牌**的时候要知道「自助注册开没开」。
+
+    匿名可读，而且只回一个布尔。它本来就不是秘密：注册开着的话任何人点一下
+    就有分晓，关着的话也只有管理员看这个值有意义。
+
+    这里不给令牌，是因为登录页此刻确实没有令牌 —— 把它做成登录后才能读，
+    登录页就只能「先显示、再自己判断要不要藏」，于是注册按钮闪一下才消失，
+    或者更糟：一直不消失，因为那条请求根本发不出去。
+
+    **顺带提醒（前端要照着做）**：客户端拿到失败时应当按「关着」处理。
+    接口挂了就藏掉注册入口，比把它显示出来再去撞一个 403 好。
+    """
+    return {"registration_enabled": system_settings.registration_enabled(db)}
+
+
 @router.post("/register", status_code=201)
 def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db)):
     """自助注册：**只建账号，不授予任何账套**。
@@ -179,8 +197,11 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     登记注册要留痕（P1-6）：自助注册是**唯一一条**不经过管理员就能往
     ``sys_user`` 里加行的路径，自助注册开着时它就是「谁进过这个系统」
     的完整名单。不留痕的话，被拿来自助建号进来的账号无法追认。
+
+    闸门读的是**库里的开关**（库里没有则退回 env），管理员在界面上改完
+    立即生效，不需要重启后端。
     """
-    if not settings.registration_enabled:
+    if not system_settings.registration_enabled(db):
         raise HTTPException(403, "系统未开放自助注册，请联系管理员开号")
     if db.scalar(select(SysUser).where(SysUser.username == payload.username)):
         raise HTTPException(400, f"用户名「{payload.username}」已被占用")

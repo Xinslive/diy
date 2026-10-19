@@ -4,6 +4,18 @@ export const register = (payload) => http.post('/auth/register', payload).then(r
 export const me = () => http.get('/auth/me').then(r => r.data)
 
 /**
+ * 登录页用的匿名配置：自助注册开没开。
+ *
+ * 必须在**还没有令牌**时就能读，所以它不能挂在带鉴权的接口下 —— 登录页正是
+ * 最没有令牌的那一刻。回执里只有一个布尔，别往里加任何别的字段：这个接口对
+ * 匿名开放。
+ *
+ * **失败要按「关着」处理**（调用方负责）：接口挂了就先不显示注册入口，好过
+ * 先亮出来再撞一个 403。
+ */
+export const publicConfig = () => http.get('/auth/config').then(r => r.data)
+
+/**
  * 登出留痕。
  *
  *  后端这个接口**只留痕、不撤销**（令牌是自签 JWT、服务端不存会话，

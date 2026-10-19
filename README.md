@@ -75,14 +75,24 @@ npm run dev        # http://localhost:5173
 > 连接串里的端口是 **15432**，与上面 `docker run -p 15432:5432` 一致；
 > `backend/.env.example` 里也是这个端口。
 
-登录页的**注册**页签存在，但**自助注册默认是关的**：
+登录页的**注册**页签默认**不显示**：自助注册默认是关的，
 `config.py` 里 `registration_enabled: bool = False`，`REGISTRATION_ENABLED` 没配或
-配成 false 时，调注册接口直接 **403**。公司内部要开，在 `backend/.env` 里显式
-`REGISTRATION_ENABLED=true` 并重启后端。
+配成 false 时，调注册接口直接 **403**。
 
-> 三处必须一致，改任何一处都要同步另两处：`config.py` 的默认值、
-> `backend/.env.example`、`ARCHITECTURE.md` §9.5。默认值是 `False`（默认关闭），
-> **不要为了「让文档说得通」去改成 True** —— 那等于把刚收掉的口子重新打开。
+开关有三个来源，**库里优先、env 兜底**（与 OCR、OSS 备份同一套约定）：
+
+| 来源 | 用途 |
+|---|---|
+| 「系统管理 → 用户与授权」页的**允许自助注册**开关 | 日常开关，管理员点一下即生效 |
+| `sys_setting.registration_enabled` | 上面那个开关落库的那一行 |
+| `backend/.env` 的 `REGISTRATION_ENABLED` | 库里没有那一行时的兜底默认值 |
+
+关着的时候登录页会把「注册」页签整个去掉，**不只是点了撞 403**。库里没有那一行时读 env，
+所以服务器上原有的 `REGISTRATION_ENABLED=false` 会继续生效，升级不会把注册意外打开。
+
+> 兜底默认值仍然是 `False`，它与 `backend/.env.example`、`ARCHITECTURE.md` §9.5
+> 必须保持一致，改任何一处都要同步另两处。**不要为了「让文档说得通」去改成 True** ——
+> 那等于把刚收掉的口子重新打开。
 
 注册只创建账号，**不授予任何账套**，注册成功也不签发 token ——
 需要管理员在「用户与授权」里分配账套。用户名限 3-32 位字母/数字/下划线，密码至少 8 位。

@@ -19,6 +19,19 @@
         </el-button>
       </div>
 
+      <!-- 自助注册开关。放这一页是因为它回答的就是「谁能建号」，
+           与上面的用户表是同一件事的两端：管理员开号，或者放开门让本人开。
+           关掉时登录页上的「注册」页签整个消失（前端只藏入口，
+           真正的闸门在 /api/auth/register，见 backend/app/api/auth.py）。 -->
+      <div class="row mb reg-row">
+        <span class="title">允许自助注册</span>
+        <el-switch v-model="registration" :loading="regBusy" :disabled="!isAdmin"
+                   @change="toggleRegistration" />
+        <span class="hint">
+          {{ registration ? '任何人都能用手机号自行建号，建号后仍需管理员分配账套' : '关闭，登录页不显示注册入口' }}
+        </span>
+      </div>
+
       <el-table :data="users" border size="default">
         <el-table-column prop="username" label="用户名" width="130" />
         <el-table-column prop="real_name" label="姓名" width="130" />
@@ -145,6 +158,11 @@ const users = ref([])
 const books = ref([])
 const busy = ref(false)
 
+// 自助注册开关。开关拨动即保存，没有「保存」按钮 —— 一个开关多一次提交就多
+// 一次「我以为改了其实没保存」的机会。失败时回滚到后端的真实值。
+const registration = ref(false)
+const regBusy = ref(false)
+
 const ROLES = ['OWNER', 'ACCOUNTANT', 'VIEWER']
 const ROLE_CN = { OWNER: '负责人', ACCOUNTANT: '会计', VIEWER: '只读' }
 const ROLE_TAG = { OWNER: 'danger', ACCOUNTANT: 'primary', VIEWER: 'info' }
@@ -177,6 +195,29 @@ function blankGrant() {
 async function load() {
   users.value = await sysApi.users()
   books.value = await sysApi.allBooks()
+  try {
+    const reg = await sysApi.getRegistration()
+    registration.value = !!reg?.registration_enabled
+  } catch {
+    // 读不到就当作关闭：这一行控制的是一个安全相关开关，
+    // 显示成「开」而后端其实关着，比反过来更危险。
+    registration.value = false
+  }
+}
+
+async function toggleRegistration(value) {
+  regBusy.value = true
+  try {
+    const reg = await sysApi.setRegistration(value)
+    registration.value = !!reg?.registration_enabled
+    ElMessage.success(value ? '已开放自助注册' : '已关闭自助注册')
+  } catch (e) {
+    // 拨回去：让界面回到后端确认过的那个状态，而不是停在没保存上的假象。
+    registration.value = !value
+    ElMessage.error(e?.response?.data?.detail || '保存失败')
+  } finally {
+    regBusy.value = false
+  }
 }
 
 function openCreate() {
@@ -278,7 +319,8 @@ onMounted(load)
 </script>
 
 <style scoped>
-.row { display: flex; gap: 10px; }
+.row { display: flex; gap: 10px; align-items: center; }
+.reg-row { gap: 12px; }
 .mb { margin-bottom: 14px; }
 .mt { margin-top: 14px; }
 .mr { margin-right: 6px; }

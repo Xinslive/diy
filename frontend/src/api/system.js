@@ -8,6 +8,13 @@ export const deleteUser = (id) => http.delete(`/system/users/${id}`).then(r => r
 
 export const allBooks = () => http.get('/system/books').then(r => r.data)
 
+// 自助注册开关（存 sys_setting，改完即生效，不必重启后端）。
+// 关闭后登录页不再显示「注册」，注册接口本身也拒绝请求 —— 前端只是不给出入口，
+// 真正的闸门在后端。
+export const getRegistration = () => http.get('/system/registration').then(r => r.data)
+export const setRegistration = (enabled) =>
+  http.put('/system/registration', { enabled }).then(r => r.data)
+
 // 外部识别服务（发票 OCR）。token 只写不读：GET 回来的是 token_set 与末 4 位，
 // 明文永远不在任何响应里。
 export const getOcrConfig = () => http.get('/system/ocr').then(r => r.data)
