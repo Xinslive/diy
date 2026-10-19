@@ -623,16 +623,75 @@ def test_拿别的账套的期间问不出号(client, auth, db, book):
     assert r.status_code == 404, r.text
 
 
-def test_凭证号撞了报人话(client, auth, book, subjects, make_voucher):
-    """页面上预填了号，两个人同时开一张就会撞。撞了要说清改哪个字段。"""
+def test_新增凭证不采信客户端传的凭证号(client, auth, book, subjects, make_voucher):
+    """凭证号一律自动生成（用户 2026-10-19 定的规则）。
+
+    原来这里是「客户端传一个已被占用的号 → 400 说清撞了哪张」。现在客户端
+    在新增时不传号（``api/vouchers.py`` 的 create 刻意不取 ``payload.voucher_no``），
+    所以那个前提不存在了 —— 但**服务端不采信**这一条更要守住：只改前端等于没关。
+    """
     v = make_voucher("2026-01-05", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
     r = client.post(f"/api/books/{book.id}/vouchers", headers=auth, json={
         "voucher_no": v.voucher_no, "voucher_date": "2026-01-06",
         "entries": _entries(subjects, [("1001", 1, "x")], [("5001", 1, "x")]),
     })
-    assert r.status_code == 400, r.text
-    assert v.voucher_no in r.json()["detail"]      # 把撞上的号说清楚
-    assert "唯一约束" not in r.json()["detail"]     # 而不是甩一个约束名出来
+    assert r.status_code == 201, r.text
+    got = r.json()["voucher_no"]
+    assert got != v.voucher_no, f"客户端传的号被照单收下了：{got}"
+    # 自动发的号要接着本期号段往下走，不能因为被忽略就跳回 1
+    assert got == "记0002", f"自动发号不对：{got}"
+
+
+def test_导入带重号仍然报人话(db, book, admin_user, subjects):
+    """撞 ``uq_voucher_period_no`` 要给人话，不能甩一个约束名出来。
+
+    导入是唯一还能指定凭证号的入口（Excel 里带什么号就带什么号），所以撞号
+    在这条路上依然可能发生，这道闸也必须留在这儿。
+    """
+    from app.accounting.vouchers import create_voucher as _create
+    ents = _entries(subjects, [("1001", 100, "x")], [("5001", 100, "x")])
+    _create(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 5),
+            entries=ents, voucher_no="记0050")
+    db.commit()
+    with pytest.raises(ValueError) as exc:
+        _create(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 6),
+                entries=ents, voucher_no="记0050")
+    detail = str(exc.value)
+    assert "记0050" in detail, detail
+    assert "唯一约束" not in detail, detail
+    db.rollback()
+
+
+def test_导入的凭证号会被归一(db, book, admin_user, subjects):
+    """Excel 里带的是「记-0050」，落库必须是「记0050」。
+
+    不归一的后果不是"看着不齐"：发号正则要求凭证字后**紧跟**数字，带横杠的
+    那几张它一条都看不见，``next_voucher_no`` 于是当成空期间，从 1 重新发号
+    —— 2026-10-19 生产事故就是这么来的。
+    """
+    from app.accounting.vouchers import create_voucher as _create
+    _create(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 5),
+            entries=_entries(subjects, [("1001", 100, "x")], [("5001", 100, "x")]),
+            voucher_no="记-0050")
+    db.commit()
+    got = db.scalars(select(Voucher).where(Voucher.book_id == book.id)).first()
+    assert got.voucher_no == "记0050", f"没归一，落库是 {got.voucher_no}"
+
+
+def test_非法凭证号在入口就被挡下(db, book, admin_user, subjects):
+    """2026-10-19 那张把列表打成 500 的凭证，号是 "wochakan"。
+
+    排序键要对凭证号做 ``CAST(... AS INTEGER)``，一个解析不出序号的脏号能让
+    **整个期间的凭证列表四种排序全部 500**。所以必须在入口拒绝，不能指望排序时
+    兜底 —— 兜底（``_no_seq`` 的 coalesce）曾经就是失效的。
+    """
+    from app.accounting.vouchers import create_voucher as _create
+    with pytest.raises(ValueError) as exc:
+        _create(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 5),
+                entries=_entries(subjects, [("1001", 100, "x")], [("5001", 100, "x")]),
+                voucher_no="wochakan")
+    assert "记0001" in str(exc.value), str(exc.value)
+    db.rollback()
 
 
 def test_别的账套的凭证查不到前后张(client, auth, db, book, make_voucher):
@@ -656,6 +715,57 @@ def _stack(make_voucher, n=10, month=3):
                          dr=[("1001", 100, "收入")], cr=[("5001", 100, "收入")])
         out.append(v)
     return out
+
+
+def test_增加凭证向后插入_拿参照号加一(db, book, periods, admin_user, subjects, make_voucher):
+    """用户 2026-10-19 定的口径：插入凭证 = 向前，增加凭证 = 向后。
+
+    记0001..记0005，打开记0002「增加」→ 新凭证拿记0003，原记0003..记0005
+    变成记0004..记0006，而**参照那张记0002 原地不动**（向前插入时它会被顶走）。
+    """
+    stack = _stack(make_voucher, n=5)
+    anchor = stack[1]                       # 记0002
+
+    new = create_voucher(
+        db, book_id=book.id, user=admin_user,
+        voucher_date=date(2026, 3, 2),
+        entries=_entries(subjects, [("1001", 50, "增加")], [("5001", 50, "增加")]),
+        insert_after_id=anchor.id,
+        insert_position="after",
+    )
+
+    assert new.voucher_no == "记0003"
+    db.refresh(anchor)
+    assert anchor.voucher_no == "记0002", "向后插入不该动参照自己"
+    assert [db.get(Voucher, v.id).voucher_no for v in stack] == [
+        "记0001", "记0002", "记0004", "记0005", "记0006",
+    ]
+
+
+def test_增加凭证在最后一张时直接接号(db, book, periods, admin_user, subjects, make_voucher):
+    """参照是期间最后一张时，没有要顺延的号，新凭证就是下一个。"""
+    stack = _stack(make_voucher, n=3)
+    new = create_voucher(
+        db, book_id=book.id, user=admin_user,
+        voucher_date=date(2026, 3, 3),
+        entries=_entries(subjects, [("1001", 50, "增加")], [("5001", 50, "增加")]),
+        insert_after_id=stack[2].id,
+        insert_position="after",
+    )
+    assert new.voucher_no == "记0004"
+    assert [db.get(Voucher, v.id).voucher_no for v in stack] == [
+        "记0001", "记0002", "记0003",
+    ]
+
+
+def test_增加凭证的预填不落库也不会顶走号(db, book, periods, admin_user, subjects, make_voucher):
+    """向后插入的预填只算不改：空着退出，号原封不动。"""
+    stack = _stack(make_voucher, n=4)
+    before = [db.get(Voucher, v.id).voucher_no for v in stack]
+    slot = insert_slot(db, stack[1], "after")
+    assert slot["no"] == "记0003"
+    assert [m["from"] for m in slot["moved"]] == ["记0003", "记0004"]
+    assert [db.get(Voucher, v.id).voucher_no for v in stack] == before
 
 
 def test_插入凭证拿到参照的号_后面的整体顺位(db, book, periods, admin_user, subjects, make_voucher):
@@ -1238,17 +1348,62 @@ def test_排序_凭证号跨期间先按期间再按号段(db, book, periods, ad
 
 
 def test_排序_凭证号按整数比不是按字典序(db, book, periods, admin_user, subjects):
-    """记099 与 记100：字典序下 "记100" < "记099"，整数序才是 099 < 100。"""
-    create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 1),
-                   voucher_no="记100",
-                   entries=_entries(subjects, [("1001", 100, "x")], [("5001", 100, "x")]))
-    create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2026, 1, 1),
-                   voucher_no="记099",
-                   entries=_entries(subjects, [("1001", 100, "y")], [("5001", 100, "y")]))
+    """记099 与 记100：字典序下 "记100" < "记099"，整数序才是 099 < 100。
+
+    这两个号**故意绕开** ``create_voucher`` 直接写库。入口现在有归一
+    （``require_no`` 把序号补到 ``NO_WIDTH`` 位），走正常流程拿到的是
+    「记0099」「记0100」—— 同宽之后字典序和整数序恰好一致，这条断言就什么也
+    证明不了了。而 ``_no_seq`` 按整数比这件事本身仍然要保：库里可能有归一之前
+    落进来的、或别的系统写进去的宽度不一的号（``uq_voucher_period_no`` 只管
+    字符串唯一，不管宽度）。所以这里直接写库造出那个场景。
+    """
+    from app.accounting.util import find_period
+
+    period = find_period(db, book.id, date(2026, 1, 1))
+    for no, sid_ in (("记100", "1001"), ("记099", "1002")):
+        db.add(Voucher(
+            book_id=book.id, period_id=period.id, voucher_no=no,
+            voucher_date=date(2026, 1, 1), status="UNPOSTED", source="MANUAL",
+            created_by=admin_user.username,
+        ))
     db.commit()
+
+    stored = sorted(v.voucher_no for v in db.scalars(
+        select(Voucher).where(Voucher.period_id == period.id)).all())
+    assert stored == ["记099", "记100"], "造出来的场景不对，宽度没混上"
 
     rows, _ = query_vouchers(db, book.id, sort="no_asc")
     assert [v.voucher_no for v in rows] == ["记099", "记100"]
+
+
+def test_排序_解析不出序号的脏号不拖垮列表(db, book, periods, admin_user, subjects):
+    """一个解析不出序号的号，最多排到最前，**不能**让整个列表 500。
+
+    回归点：``_no_seq`` 原来是 ``regexp_replace`` + ``coalesce(... AS INTEGER, -1)``，
+    而 PostgreSQL 的 ``regexp_replace`` 无匹配时返回**原字符串**不是 NULL，
+    所以 coalesce 永远等不到 NULL —— ``CAST('wochakan' AS INTEGER)`` 直接抛
+    22P02。2026-10-19 生产事故：优境 9 月一张凭证号被人工改成 "wochakan"，
+    四种排序全部 500，整月打不开。入口那道 ``require_no`` 是第一道防线，
+    这条是第二道：万一脏号还是进来了，列表必须还能打开。
+    """
+    from app.accounting.util import find_period
+
+    period = find_period(db, book.id, date(2026, 1, 1))
+    for no, day in (("记0002", 2), ("wochakan", 3), ("记0001", 1)):
+        db.add(Voucher(
+            book_id=book.id, period_id=period.id, voucher_no=no,
+            voucher_date=date(2026, 1, day), status="UNPOSTED", source="MANUAL",
+            created_by=admin_user.username,
+        ))
+    db.commit()
+
+    for sort in ("no_asc", "no_desc", "date_asc", "date_desc"):
+        rows, total = query_vouchers(db, book.id, sort=sort)
+        assert total == 3, f"{sort} 少算了"
+    # 解析不出序号的给 -1，no_asc 时排最前
+    rows, _ = query_vouchers(db, book.id, sort="no_asc")
+    assert rows[0].voucher_no == "wochakan"
+    assert [v.voucher_no for v in rows[1:]] == ["记0001", "记0002"]
 
 
 def test_排序_日期两档与凭证号无关(db, book, periods, admin_user, subjects):

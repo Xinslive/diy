@@ -575,6 +575,91 @@ else
   ok "目标库不确定时 alembic upgrade head 一次都没跑"
 fi
 
+# --------------------------------------------------------------------------
+# unit 按本机布局渲染
+#
+# 这一段对应的是一个**每次发版都会重演**的生产故障，而不是一次性的笔误：
+# deploy.sh 原来把 deploy/systemd/ 原样 cp 过去，而模板里的路径写死
+# /opt/cwq。于是 APP_DIR / BACKUP_DIR 明明是可配的，手工修对的路径却会在
+# 下一次发版被打回旧值（2026-10-19 生产上 cwq-backup.* 就是这么被覆盖坏的，
+# timer 从此每天 Failed to load environment files）。
+#
+# 沙箱本来就把 APP_DIR / BACKUP_DIR 指到 /tmp 下的路径，所以判据不需要额外造主机：
+# 装出来的 unit 里只要还剩一个 /opt/cwq，原样拷贝就立刻现形。
+#
+# 断言的是**内容**而不是「文件存在」—— 第 10 节只断言了后者，
+# 所以这个 bug 从来没被测出来过。
+# --------------------------------------------------------------------------
+echo
+echo "== 15. 定时备份 unit 按本机布局渲染，不把 /opt/cwq 灌回来 =="
+setup_sandbox
+OUT=$(run_script)
+assert_ran "全量发布" || exit 1
+
+UNIT_S="$DEPDIR/units/cwq-backup.service"
+UNIT_T="$DEPDIR/units/cwq-backup.timer"
+# BACKUP_DIR 只在 run_script 的子 shell 里传给 deploy.sh，本层拿不到它；
+# 这里用同一个来源重新拼一份，否则断言会去比对一个空字符串而恒真。
+BKDIR="$DEPDIR/backups"
+
+if [[ ! -f "$UNIT_S" || ! -f "$UNIT_T" ]]; then
+  no "unit 没装到 ${DEPDIR}/units —— 渲染断言无从谈起"
+else
+  for u in "$UNIT_S" "$UNIT_T"; do
+    if grep -q '/opt/cwq' "$u"; then
+      no "$(basename "$u") 里还留着 /opt/cwq —— 原样拷贝会把旧布局灌回本机"
+    else
+      ok "$(basename "$u") 里没有 /opt/cwq"
+    fi
+  done
+
+  # WorkingDirectory / EnvironmentFile / ExecStart 都应指向本机应用根。
+  for key in WorkingDirectory EnvironmentFile ExecStart; do
+    ln=$(grep -m1 "^${key}=" "$UNIT_S" || true)
+    if [[ "$ln" == *"$APP"* ]]; then
+      ok "${key} 已渲染为本机应用根"
+    else
+      no "${key} 没指向本机应用根（实际：${ln:-<无该行>}）"
+    fi
+  done
+
+  # ReadWritePaths 必须落到 BACKUP_DIR。**不能是 $APP/backups** ——
+  # 替换 /opt/cwq/backups 时若把更短的 /opt/cwq 先替换掉，结果就是后者，
+  # 运维单独配的 BACKUP_DIR 会被悄悄忽略，而备份目录写在 unit 的日志重定向里，
+  # 表现是 unit 加载失败而不是写错地方，更难一眼看出来。
+  rwp=$(grep -m1 '^ReadWritePaths=' "$UNIT_S" || true)
+  if [[ "$rwp" == *"$BKDIR"* && "$rwp" != *"$APP/backups"* ]]; then
+    ok "ReadWritePaths 用的是运维给的 BACKUP_DIR"
+  else
+    no "ReadWritePaths 不是 BACKUP_DIR（实际：${rwp:-<无该行>}）"
+  fi
+
+  # 日志重定向同样落在备份目录上：渲染漏掉它，unit 会因为父目录不可写而加载失败。
+  if grep -q "StandardOutput=append:$BKDIR/" "$UNIT_S"; then
+    ok "备份日志重定向也渲染到了 BACKUP_DIR"
+  else
+    no "备份日志重定向没有跟着渲染（实际：$(grep -m1 '^StandardOutput=' "$UNIT_S" || echo '<无该行>')）"
+  fi
+
+  # timer 的 Documentation=file:... 指向 tuning.md，同样是写死的应用根。
+  if grep -q "Documentation=file:$APP/deploy/tuning.md" "$UNIT_T"; then
+    ok "timer 的 Documentation 也渲染到了本机应用根"
+  else
+    no "timer 的 Documentation 没渲染（实际：$(grep -m1 '^Documentation=' "$UNIT_T" || echo '<无该行>')）"
+  fi
+
+  # 关停标记必须**在渲染之前**短路：标记在时连 unit 都不该写，
+  # 写过就等于「只 stop 没 disable」，重启后 timer 照样自己起来。
+  setup_sandbox
+  : > "$APP/.backup-timer-off"
+  run_script >/dev/null
+  if [[ -f "$DEPDIR/units/cwq-backup.service" ]]; then
+    no "有关停标记却仍然写了 unit —— 重启后 timer 会自己复活"
+  else
+    ok "有关停标记时 unit 没被写入（渲染前就短路了）"
+  fi
+fi
+
 echo
 echo "通过 $PASS / 失败 $FAIL"
 [[ "$FAIL" == "0" ]]

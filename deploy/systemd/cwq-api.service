@@ -96,12 +96,27 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-# 发票原件也要落盘（INVOICE_STORAGE_DIR）。ProtectSystem=strict 把整个 /opt
-# 挂成只读，**没列进这里的话上传会以只读文件系统失败** —— 而且它失败在写文件
-# 那一刻，前面鉴权、解析、落库都已经过了，从外面看像是「上传功能坏了」。
-# 同一个键只能写一次（重复赋值是后者覆盖前者），所以两个路径写在同一行。
-# 两处要同步改：.env 的 INVOICE_STORAGE_DIR 与本行，缺一个就不通。
-ReadWritePaths=/opt/cwq/backend/logs /opt/cwq/backend/data
+# ---- 可写白名单：加一个配置项就可能要动这一行（2026-10-19 补 backups） ----
+#
+# `ProtectSystem=strict` 把整棵 /opt 挂成只读，本行是**例外清单**。
+# 规则只有一条，且与写的是相对路径还是绝对路径有关：
+#
+#   * **相对路径**（如 INVOICE_STORAGE_DIR=data/invoices）落在 WorkingDirectory
+#     之下，即 backend/data —— 已被本行覆盖，**加配置时不用动这里**。
+#   * **绝对路径且在应用树之外**（如 CWQ_BACKUP_WORK_DIR=/opt/cwq/backups/work）
+#     —— **必须在这里显式列出**，漏了就是只读文件系统。
+#
+# 漏掉之后的形态特别难认，所以这一行值得写清楚：它在**写文件那一刻**才失败，
+# 而那一刻鉴权、解析、落库都已经过了。更糟的是它发生在凌晨定时任务里 ——
+# OSS 备份是应用内调度器（task_key=system:oss_backup）在**这个进程里**跑的，
+# 不是另一个 systemd 单元，于是 journal 里只有一条 OSError，没人看；
+# 从外面看是「页面一切正常，只是备份静悄悄地不产出了」。
+# 判据只能是在服务自己的 mount 命名空间里试写（服务外写总是成功）：
+#   PID=$(systemctl show -p MainPID --value cwq-api)
+#   nsenter -t "$PID" -m -- mount | grep -E 'ro|rw'
+#
+# **同一个键只能写一次**（重复赋值是后者覆盖前者），所以所有路径写在同一行。
+ReadWritePaths=/opt/cwq/backend/logs /opt/cwq/backend/data /opt/cwq/backups
 StandardOutput=append:/opt/cwq/backend/logs/api.log
 StandardError=append:/opt/cwq/backend/logs/api.err.log
 

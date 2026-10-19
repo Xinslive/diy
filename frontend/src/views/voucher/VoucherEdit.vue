@@ -4,11 +4,13 @@
       <el-button @click="backToList">← 返回</el-button>
       <el-divider direction="vertical" />
       <span class="muted">凭证号</span>
-      <!-- 号已经预填好了（见 /vouchers/next），placeholder 要说清「还能怎么用」：
-           清空它就退回后端发号。手填一个已存在的号会被挡下来并把号报给你。
-           插入模式下清空不是发下一个号，而是照着插入位发 —— 位置是这次的重点。 -->
-      <el-input v-model="form.voucher_no" style="width: 110px"
-                :placeholder="insertCtx ? '留空按插入位发号' : '留空自动发号'" />
+      <!-- 只读：号由系统按期间自动生成，新增 / 插入 / 修改三处都不许手工改
+           （用户 2026-10-19 定的）。这里保留一个可点的框而不是纯文字，
+           是为了跟右边日期框对齐；readonly 而非 disabled，禁用态会连背景一起
+           变灰，读起来像"这张不能看"，实际上号是照常显示的。
+           插入/增加模式下预填的就是后端算好的那个号（见 insert-preview），
+           保存时服务端重新算一次，页面上的号只是给人看的。 -->
+      <el-input v-model="form.voucher_no" readonly style="width: 110px" />
       <span class="muted">日期</span>
       <el-date-picker v-model="form.voucher_date" type="date" value-format="YYYY-MM-DD" style="width: 150px" />
       <span class="spacer" />
@@ -244,7 +246,8 @@ const voucherId = ref(0)
 const saving = ref(false)
 const subjects = ref([])
 const subjectTree = ref([])
-// 「插入凭证」这一次的目标：插在谁后面、这张拿哪个号、谁要顺位。
+// 「插入凭证」/「增加凭证」这一次的目标：参照是谁、这张拿哪个号、谁要顺位。
+// position 区分前后（before = 向前占参照的号，after = 向后拿参照号 +1）。
 // 只在 voucher-new 且带 ?after= 时有值；存下去就清掉（那时候它已经是张普通凭证了）。
 const insertCtx = ref(null)
 // 前一张 / 后一张：带着列表筛选条件时翻结果集，没有条件时翻同期间
@@ -1090,7 +1093,8 @@ function goNeighbour(which) {
   router.push({ name: 'voucher-edit', params: { id }, query: route.query || {} })
 }
 
-/** 插入凭证：接着当前这张开一张新的，日期沿用当前凭证的日期。
+/** 插入凭证：**向前**插入 —— 接着当前这张开一张新的，占当前这张的号，
+ *  当前及以后的号整体顺延。日期沿用当前凭证的日期。
  *
  *  `after` 是参照凭证的 id —— 新页拿它去后端问「这张占哪个号、谁要顺位」，
  *  顺延跟建凭证在同一个事务里做。所以这里只跳页、什么也不改：
@@ -1099,22 +1103,33 @@ function insertVoucher() {
   if (!voucherId.value) return
   router.push({
     name: 'voucher-new',
-    query: { date: form.voucher_date, after: voucherId.value }
+    query: { date: form.voucher_date, after: voucherId.value, position: 'before' }
   })
 }
 
 /** 问后端要插入位的预填值。拿不到就退回普通新开一张 —— 别把整页卡住。 */
-async function loadInsertPreview(afterId) {
+async function loadInsertPreview(afterId, position = 'before') {
   try {
-    return await api.insertPreview(store.bookId, afterId)
+    return await api.insertPreview(store.bookId, afterId, position)
   } catch {
     return null
   }
 }
 
-/** 增加凭证：不受当前凭证日期影响，按所在期间的默认日期另起一张。 */
+/** 增加凭证：**向后**插入（用户 2026-10-19 定的口径）——
+ *  在当前这张**后面**接着记：新凭证拿当前号 +1，比它大的号往后顺延。
+ *  日期沿用当前凭证的日期（「接着上一张往下记」）。
+ *
+ *  原来这里只是 `router.push({name:'voucher-new'})`，不带任何参照：落到的
+ *  是期间末尾的下一个号，在哪张凭证上点都一样 —— 与「向后插入」是两件事。
+ *  而且没有参照凭证就没有号可算，`/vouchers/next` 拿到的还是「期间最大号 +1」。
+ */
 function addVoucher() {
-  router.push({ name: 'voucher-new' })
+  if (!voucherId.value) return
+  router.push({
+    name: 'voucher-new',
+    query: { date: form.voucher_date, after: voucherId.value, position: 'after' }
+  })
 }
 
 // 打印不直接出纸：先弹窗选模板和纸型、看预览，确认了才打。
@@ -1283,7 +1298,7 @@ async function load() {
     // 这里只是先把号码和「谁要顺位」摆在页面上，让人看清再动手。
     const after = Number(route.query.after || 0)
     if (after) {
-      const ip = await loadInsertPreview(after)
+      const ip = await loadInsertPreview(after, route.query.position === 'after' ? 'after' : 'before')
       if (stale(seq)) return
       insertCtx.value = ip
       if (ip) {
@@ -1377,7 +1392,10 @@ async function save() {
     voucher_date: form.voucher_date, entries, remark: form.remark,
     attachments: form.attachments, voucher_no: form.voucher_no || null,
     // 只有新凭证 + 还在插入模式里才带：更新老凭证时带了会把号再顺位一次
-    insert_after: !voucherId.value && insertCtx.value ? insertCtx.value.anchor_id : null
+    insert_after: !voucherId.value && insertCtx.value ? insertCtx.value.anchor_id : null,
+    // 向前（占参照的号）还是向后（拿参照号 +1）。与 insert_after 同生共死。
+    insert_position: !voucherId.value && insertCtx.value
+      ? (insertCtx.value.position === 'after' ? 'after' : 'before') : 'before'
   }
   // 记下**发出去的那一版**：请求在路上时人可能还在改，回来后要把水位定在发出去的那版，
   // 否则这几秒里敲的东西会被当成「已保存」丢掉

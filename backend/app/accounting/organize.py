@@ -50,6 +50,62 @@ NO_PATTERN = re.compile(r"^(?P<prefix>[^\d]{1,4})(?P<seq>\d+)$")
 #   扫一眼数不出号断在哪 —— 四位给「一个月要记几百张」留出余量。
 NO_WIDTH = 4
 PARK_PREFIX = "∥"  # ∥ 临时占位前缀，保证永不与真实凭证号冲突
+
+# ------------------------------------------------------------------ 凭证号归一
+#
+# 用户 2026-10-19 定的形态是「记0001」——凭证字后面**不带任何分隔符**。
+# 而导入的用友序时账是「记-0001」，导入环节原先原样入库，于是同一个期间里
+# 两种形态并存。后果不是"看着不整齐"，是**发号失明**：
+# ``vouchers._prefix_seq_expr`` 的正则是 ``^记(\d+)$``，要求凭证字后紧跟数字，
+# 带横杠的那几张一条都不匹配 → ``next_voucher_no`` 的 max 得 NULL → 兜底成 0
+# → 在一个已经记到 0004 的期间里重新发出「记0001」。实测（迁移前优境 9 月）：
+# ``/vouchers/next`` 返回 记0001，存下去就成了同期间里第二个「序号 1」。
+#
+# 所以分隔符必须在**入口**剥掉，而不是在读取时兼容。这个函数幂等：
+# 记-0001 和 记0001 都归一成 记0001，反复调用不会变形。
+#
+# 前缀长度刻意不设上限（``NO_PATTERN`` 限 4 个字是给**解析**用的，
+# 这里只需要切出「非数字部分 + 尾部数字」）：宁可放过一个长凭证字，
+# 也不要因为前缀多一个字就把原本能导进来的表整批判失败。
+_NO_SPLIT = re.compile(r"^(?P<prefix>[^\d]+)(?P<seq>\d+)$")
+_NO_SEPARATOR = re.compile(r"[-_‐‑‒–—−－·•.、/\\|]+$")
+
+
+def normalize_no(voucher_no: str | None) -> str | None:
+    """归一成「凭证字 + 补零序号」。空或解析不出序号时返回 ``None``（不抛）。
+
+    调用方分两种：入口校验用 ``require_no``（解析不出要报错给人看），
+    读存量数据用本函数（解析不出就当它没有序号，交给各自的兜底）。
+    """
+    s = (voucher_no or "").strip()
+    if not s:
+        return None
+    m = _NO_SPLIT.match(s)
+    if not m:
+        return None
+    prefix = _NO_SEPARATOR.sub("", m.group("prefix"))
+    if not prefix:
+        return None
+    return f"{prefix}{int(m.group('seq')):0{NO_WIDTH}d}"
+
+
+def require_no(voucher_no: str | None, *, field: str = "凭证号") -> str | None:
+    """入参校验。空值放行（那表示"走自动发号"），非空必须能归一。
+
+    没有这道闸时，任何字符串都能落库，而凭证列表的排序键要对凭证号做
+    ``CAST(... AS INTEGER)`` —— 一个脏号就能让**整个期间的凭证列表 500**
+    （2026-10-19 生产事故：人工把凭证号改成 "wochakan"，四种排序全部报错）。
+    """
+    s = (voucher_no or "").strip()
+    if not s:
+        return None
+    out = normalize_no(s)
+    if out is None:
+        raise ValueError(
+            f"{field}「{s}」不是「凭证字 + 序号」，"
+            f"请写成 记0001 这样：凭证字后直接跟数字，中间不要符号"
+        )
+    return out
 # 与 accounting/vouchers.py 同一份判据：撞号要认约束，不能「凡 IntegrityError
 # 都当撞号」（util.constraint_name 的注释里写了为什么）。
 _NO_UNIQUE = "uq_voucher_period_no"
@@ -67,6 +123,11 @@ class Change:
     voucher_date: str
     status: str
     source: str
+    # 是不是期末结转损益（见 is_carry_forward）。**构造时就定下来**，
+    # 不能等到给页面的那个排序里再去查凭证 —— 那时手上只有一个 Change，
+    # 摘要和分录都拿不到，只剩 source，而导入进来的结转凭证 source 是 IMPORT。
+    # 结果就是「号排对了、页面显示的顺序不对」，两套口径打架。
+    tail: bool = False
 
     @property
     def changed(self) -> bool:
@@ -311,13 +372,41 @@ def build_income_lookup(db, book_id: int):
     return income_of
 
 
+# 结转损益凭证的识别标记（用户 2026-10-19 给的：摘要写着「期间损益结转」）。
+#
+# 只写「结转」两个字太宽 —— 手工凭证里「结转上月的余额」这类摘要会被误判，
+# 把一张正常凭证扔到号段末尾。命中最长的那个短语，边界最窄。
+_CARRY_FORWARD_MARKERS = ("期间损益结转", "结转损益")
+
+
+def is_carry_forward(voucher: Voucher) -> bool:
+    """这张是不是期末结转损益的凭证。
+
+    原来只认 ``source == "CARRY_FORWARD"``，也就是只认**系统**生成的那些。
+    但用户是把别的账套导进来的：那些结转凭证 ``source`` 是 ``IMPORT``
+    （实测生产库里 CARRY_FORWARD 凭证数为 0，优境 9 个月每月一张的结转凭证
+    全是导入的），于是 tail 恒为 0，整理时结转凭证被排进号段中间，
+    一眼认不出期末那几张 —— 用户 2026-10-19 要求它们一律垫底。
+
+    所以补一条按摘要认的口径。``source`` 仍然是首选判据：它是系统给的标记，
+    比文本可靠；文本只是给导入的那批兜底。
+    """
+    if voucher.source == "CARRY_FORWARD":
+        return True
+    if any(m in (voucher.remark or "") for m in _CARRY_FORWARD_MARKERS):
+        return True
+    return any(m in (e.summary or "") for e in voucher.entries
+               for m in _CARRY_FORWARD_MARKERS)
+
+
 def _sort_key(voucher: Voucher, strategy: str, income_of=None):
     """排序键。最高一位永远是「是不是结转损益」：1 排最后。
 
     月末的结转凭证是系统生成的，收入类、成本费用类各一张，落在最后两个号上，
-    一眼就能在号段末尾认出期末那几张，不必去翻摘要。
+    一眼就能在号段末尾认出期末那几张，不必去翻摘要。导入进来的结转凭证同样
+    适用（见 ``is_carry_forward``）。
     """
-    tail = 1 if voucher.source == "CARRY_FORWARD" else 0
+    tail = 1 if is_carry_forward(voucher) else 0
     if strategy == "SORT_DATE":
         # 同一天内按「先收后付再转账」排（用户 2026-10-13 定的口径）：
         # 这一天钱先怎么进来、再怎么出去、最后才是内部划转 —— 这正是
@@ -517,22 +606,25 @@ def plan_organize(
                 n += 1
             plan.changes.append(
                 Change(v.id, v.voucher_no, f"{prefix}{n:0{NO_WIDTH}d}",
-                       v.voucher_date.isoformat(), v.status, v.source)
+                       v.voucher_date.isoformat(), v.status, v.source,
+                       tail=is_carry_forward(v))
             )
         for v in rows:
             if v.status == "POSTED":
                 plan.changes.append(
                     Change(v.id, v.voucher_no, v.voucher_no,
-                           v.voucher_date.isoformat(), v.status, v.source)
+                           v.voucher_date.isoformat(), v.status, v.source,
+                           tail=is_carry_forward(v))
                 )
 
         # 交给页面的顺序 = 整理完之后的号段顺序，而不是「先排可动的、最后补已记账的」。
         # 这两件事在混合场景下不是一回事：整月的凭证都记完账时，可动的那批是空的，
         # 页面拿到的就成了数据库的原始存储顺序 —— 日期是乱的、结转损益夹在中间，
         # 看着像整理排错了，其实只是列表没排。结转损益仍旧压在最末尾。
-        plan.changes.sort(key=lambda c: (
-            1 if c.source == "CARRY_FORWARD" else 0, _seq_of(c.new_no)
-        ))
+        #
+        # 排的是 ``c.tail``（构造时按 is_carry_forward 定的），**不是** ``c.source``：
+        # 导入进来的结转凭证 source 是 IMPORT，只认 source 的话这一处照样漏。
+        plan.changes.sort(key=lambda c: (1 if c.tail else 0, _seq_of(c.new_no)))
 
         plans.append(plan)
 
@@ -540,10 +632,17 @@ def plan_organize(
 
 
 def _dominant_prefix(rows: list[Voucher]) -> str:
-    """取出现次数最多的前缀，保证重编号后仍是原来的凭证字。"""
+    """取出现次数最多的前缀，保证重编号后仍是原来的凭证字。
+
+    计数走的是**归一后**的前缀。这样库里混着「记-0001」和「记0002」时，
+    两边都算作「记」，重编号的结果是清一色的「记000X」—— 整理顺带把
+    历史遗留的分隔符形态收敛掉，而不是让它继续繁殖（记- 票数占优时，
+    原来这里会把「记-」当成凭证字原样保留下来）。
+    """
     counts: dict[str, int] = {}
     for v in rows:
-        p, _ = split_no(v.voucher_no)
+        canon = normalize_no(v.voucher_no)
+        p, _ = split_no(canon) if canon else split_no(v.voucher_no)
         counts[p] = counts.get(p, 0) + 1
     if not counts:
         return "记"

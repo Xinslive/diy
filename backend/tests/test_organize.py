@@ -260,6 +260,53 @@ def test_时序不对的月份不许结账(db, book, periods, subjects, admin_us
 # --------------------------------------------------------------------- 护栏
 
 
+def test_导入进来的损益结转凭证也垫底(db, book, periods, subjects, admin_user):
+    """用户 2026-10-19：摘要写着「期间损益结转」的凭证，整理时要排在最后。
+
+    原来只认 ``source == "CARRY_FORWARD"``，也就是只认**系统**生成的那些。
+    但用户的结转凭证是从别的账套导进来的，``source`` 是 ``IMPORT`` ——
+    实测生产库里 CARRY_FORWARD 凭证数为 0，优境 9 个月每月各有一张结转凭证
+    全是导入的，于是 tail 恒为 0，结转凭证被排进号段中间，一眼认不出期末那几张。
+
+    这里刻意把结转凭证排在**中间**（记0002，日期也在中间），确保测的是
+    「它被拉到末尾」而不是「它本来就在末尾」。
+    """
+    from app.models import Entry
+
+    m1 = _mk(db, book, admin_user, subjects, "2026-01-05", no="记0001")
+    cf = _mk(db, book, admin_user, subjects, "2026-01-20", no="记0002")
+    m3 = _mk(db, book, admin_user, subjects, "2026-01-25", no="记0003")
+    cf.source = "IMPORT"          # 导入进来的结转凭证就是这样
+    cf.entries[0].summary = "期间损益结转"
+    db.commit()
+    assert cf.source != "CARRY_FORWARD", "这个用例的前提就是它不是系统生成的"
+
+    plans = plan_organize(db, book_id=book.id, period_id=periods[1].id,
+                          strategy="SORT_DATE")
+    new_no = {c.voucher_id: c.new_no for c in plans[0].changes}
+    assert new_no[cf.id] == "记0003", f"结转凭证没垫底，拿到了 {new_no[cf.id]}"
+    assert {new_no[m1.id], new_no[m3.id]} == {"记0001", "记0002"}
+
+
+def test_普通凭证里带结转二字的不算结转(db, book, periods, subjects, admin_user):
+    """标记词只认「期间损益结转」「结转损益」两个完整短语。
+
+    只写「结转」两个字太宽：手工凭证里「结转上月的余额」这种摘要会被误判，
+    把一张正常凭证扔到号段末尾。
+    """
+    from app.models import Entry
+
+    a = _mk(db, book, admin_user, subjects, "2026-01-05", no="记0001")
+    b = _mk(db, book, admin_user, subjects, "2026-01-06", no="记0002")
+    b.entries[0].summary = "结转上月的余额"
+    db.commit()
+
+    plans = plan_organize(db, book_id=book.id, period_id=periods[1].id,
+                          strategy="SORT_DATE")
+    new_no = {c.voucher_id: c.new_no for c in plans[0].changes}
+    assert new_no[b.id] == "记0002", "普通凭证被误判成结转凭证了"
+
+
 def test_结转凭证垫底_录入单在前(db, book, periods, subjects, admin_user):
     """结转损益也参与重编号，但排序键里它排在最后 —— 所以永远拿到末尾的号。
 

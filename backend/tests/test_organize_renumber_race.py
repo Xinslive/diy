@@ -48,10 +48,10 @@ def _mk(db, book, admin_user, subjects, no: str, day: int = 5):
 def test_整理会锁住期间行(db, book, admin_user, subjects, make_voucher, monkeypatch):
     """锁的是**期间**行：整理是逐期发号的，锁期间就够把同一个号段串行化。
 
-    必须造出一次**真的改号**（断号 记003 → 压紧成 记001）：号段本来就整齐时
+    必须造出一次**真的改号**（断号 记0003 → 压紧成 记0001）：号段本来就整齐时
     没有任何改动、没有锁，这条测试就变成在空集上跑。
     """
-    _mk(db, book, admin_user, subjects, "记003")
+    _mk(db, book, admin_user, subjects, "记0003")
     db.commit()
 
     seen: list[str] = []
@@ -86,7 +86,7 @@ def test_锁必须在算方案之前拿到(db, book, admin_user, subjects, make_
     做法：记录 execute 的调用序列，把那条锁语句和 plan_organize 的读语句
     各标一个序号，比较谁在前。
     """
-    _mk(db, book, admin_user, subjects, "记003")
+    _mk(db, book, admin_user, subjects, "记0003")
     db.commit()
 
     order: list[str] = []
@@ -123,7 +123,7 @@ def test_指定期间时只锁那一期(db, book, admin_user, subjects, make_vou
     不指定期间时锁全部（那是「哪些期会改动」在读凭证之前无从得知的代价），
     但指定了期间就该只锁那一期 —— 不同期间的整理仍然可以并行。
     """
-    _mk(db, book, admin_user, subjects, "记003")
+    _mk(db, book, admin_user, subjects, "记0003")
     db.commit()
 
     seen: list[str] = []
@@ -148,8 +148,8 @@ def test_指定期间时只锁那一期(db, book, admin_user, subjects, make_vou
 
 def test_目标号被占时报人话而不是裸异常(db, book, admin_user, subjects):
     """兜底路径：数据库拒了也要说清是什么冲突、该怎么办。"""
-    a = _mk(db, book, admin_user, subjects, "记001")
-    b = _mk(db, book, admin_user, subjects, "记002")
+    a = _mk(db, book, admin_user, subjects, "记0001")
+    b = _mk(db, book, admin_user, subjects, "记0002")
     db.commit()
 
     plan = svc.PeriodPlan(period_id=a.period_id, label="2026-01")
@@ -169,8 +169,8 @@ def test_目标号被占时报人话而不是裸异常(db, book, admin_user, sub
 
 def test_撞号不会把库里原有的号改坏(db, book, admin_user, subjects):
     """savepoint 回滚之后，库里的凭证号必须还是原来那张。"""
-    a = _mk(db, book, admin_user, subjects, "记001")
-    b = _mk(db, book, admin_user, subjects, "记002")
+    a = _mk(db, book, admin_user, subjects, "记0001")
+    b = _mk(db, book, admin_user, subjects, "记0002")
     db.commit()
 
     plan = svc.PeriodPlan(period_id=a.period_id, label="2026-01")
@@ -183,8 +183,8 @@ def test_撞号不会把库里原有的号改坏(db, book, admin_user, subjects)
     db.rollback()
 
     db.expire_all()
-    assert db.get(Voucher, a.id).voucher_no == "记001"
-    assert db.get(Voucher, b.id).voucher_no == "记002"
+    assert db.get(Voucher, a.id).voucher_no == "记0001"
+    assert db.get(Voucher, b.id).voucher_no == "记0002"
     # 也不能留下 ∥<id> 这种临时占位号 —— 它本来就不该出现在库里
     assert db.scalars(select(Voucher).where(
         Voucher.voucher_no.like(f"{svc.PARK_PREFIX}%"))).all() == []
@@ -192,8 +192,8 @@ def test_撞号不会把库里原有的号改坏(db, book, admin_user, subjects)
 
 def test_撞号之后同一个会话还能继续改号(db, book, admin_user, subjects):
     """回滚的只是这一批改号，不是调用方的整个事务。"""
-    a = _mk(db, book, admin_user, subjects, "记001")
-    b = _mk(db, book, admin_user, subjects, "记002")
+    a = _mk(db, book, admin_user, subjects, "记0001")
+    b = _mk(db, book, admin_user, subjects, "记0002")
     db.commit()
 
     plan = svc.PeriodPlan(period_id=a.period_id, label="2026-01")
@@ -207,10 +207,10 @@ def test_撞号之后同一个会话还能继续改号(db, book, admin_user, sub
     # 同一个会话接着来一次正常改号：必须成功
     ok = svc.PeriodPlan(period_id=a.period_id, label="2026-01")
     ok.changes = [
-        svc.Change(a.id, a.voucher_no, "记005",
+        svc.Change(a.id, a.voucher_no, "记0005",
                    a.voucher_date.isoformat(), a.status, a.source),
     ]
     svc._renumber(db, ok)
     db.commit()
     db.expire_all()
-    assert db.get(Voucher, a.id).voucher_no == "记005"
+    assert db.get(Voucher, a.id).voucher_no == "记0005"

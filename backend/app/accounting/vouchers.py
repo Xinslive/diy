@@ -123,42 +123,67 @@ def next_voucher_no(db: Session, period: Period, prefix: str = "记") -> str:
 # --------------------------------------------------------------------- 插入位
 
 
-def insert_slot(db: Session, anchor: Voucher) -> dict:
-    """插入凭证要占的那个号：参照凭证自己的号，参照及以后的号整体顺延 +1。
+def insert_slot(db: Session, anchor: Voucher, position: str = "before") -> dict:
+    """插入凭证要占的那个号，以及谁要顺位。
 
-    记0001..记0010，打开记0006 插入 —— 存下去之后新凭证拿记0006，
-    原记0006..记0010 变成记0007..记0011。顺延按**号**算，不按日期：
-    凭证号才是这个期间里的顺序，日期排出来的次序交给「整理凭证」管。
+    ``position="before"``（**插入凭证** = 向前插入）：新凭证占参照凭证自己的号，
+    参照及以后的号整体顺延 +1。
+
+        记0001..记0005，打开记0003 插入 —— 新凭证拿记0003，
+        原记0003..记0005 变成记0004..记0006。
+
+    ``position="after"``（**增加凭证** = 向后插入，用户 2026-10-19 定的口径）：
+    新凭证拿参照号 **+1**，只把比它大的往后顺延，参照自己原地不动。
+
+        记0001..记0005，打开记0003 增加 —— 新凭证拿记0004，
+        原记0004..记0005 变成记0005..记0006。
+
+    顺延按**号**算，不按日期：凭证号才是这个期间里的顺序，日期排出来的次序
+    交给「整理凭证」管。
 
     这里只算不改。改号和建凭证必须落在同一个事务里：中途放弃一张空凭证，
     后面那叠号就该原封不动 —— 空凭证占着号、把别的凭证顶走，才是真事故。
     """
-    prefix, seq = svc_organize.split_no(anchor.voucher_no)
+    if position not in ("before", "after"):
+        raise ValueError("插入位置只能是 before 或 after")
+    # 参照凭证自己的号先归一：库里有历史遗留的「记-0003」时，顺延出来的号
+    # 也必须是「记0004」，不能一半新形态一半旧形态。比较用的序号来自归一后的号，
+    # 所以下面每张参与比较的凭证也要归一 —— 否则「记-」和「记」是两个不相等的
+    # 前缀，那几张根本不会被顺延，会当场撞 uq_voucher_period_no。
+    canon_anchor = svc_organize.normalize_no(anchor.voucher_no)
+    prefix, seq = svc_organize.split_no(canon_anchor or anchor.voucher_no)
     if seq == 0:
         raise ValueError(
             f"凭证号 {anchor.voucher_no} 不是「凭证字 + 序号」，插入凭证要照着它顺位，请先整理凭证"
         )
+    if position == "after":
+        seq += 1
     rows = list(db.scalars(
         select(Voucher).where(Voucher.period_id == anchor.period_id)
     ).all())
     moved = []
     for v in rows:
-        p, s = svc_organize.split_no(v.voucher_no)
+        canon = svc_organize.normalize_no(v.voucher_no)
+        p, s = svc_organize.split_no(canon or v.voucher_no)
+        # before 顺延「参照及其以后」；after 顺延「>= 新号」，而新号已经
+        # 比参照大 1，所以参照自己（s = 原序号）不满足 s >= seq，天然不动。
         if p == prefix and s >= seq:
             moved.append({"id": v.id, "from": v.voucher_no,
                           "to": f"{prefix}{s + 1:0{svc_organize.NO_WIDTH}d}"})
     moved.sort(key=lambda m: m["from"])
-    return {"prefix": prefix, "seq": seq, "no": anchor.voucher_no, "moved": moved}
+    return {"prefix": prefix, "seq": seq,
+            "no": f"{prefix}{seq:0{svc_organize.NO_WIDTH}d}",
+            "anchor_no": anchor.voucher_no, "position": position, "moved": moved}
 
 
-def _apply_shift(db: Session, anchor: Voucher) -> list[dict]:
+def _apply_shift(db: Session, anchor: Voucher, position: str = "before") -> list[dict]:
     """把参照凭证及其后面的号整体 +1。两阶段改号，避开即时唯一约束。
 
     直接把 记006 改成 记007 会当场撞上原来那张记007 —— ``uq_voucher_period_no``
     是即时约束，不像平衡检查那样延迟到提交。所以先整体挪到 ∥<id> 临时号再写最终号，
     跟整理凭证用的是同一套路子。
     """
-    plan = insert_slot(db, anchor)
+    plan = insert_slot(db, anchor, position)
     moved = plan["moved"]
     if not moved:
         return moved
@@ -353,6 +378,7 @@ def create_voucher(
     voucher_no: str | None = None,
     period_id: int | None = None,
     insert_after_id: int | None = None,
+    insert_position: str = "before",
     commit: bool = True,
     internal: bool = False,
 ) -> Voucher:
@@ -375,16 +401,19 @@ def create_voucher(
         db, book_id=book_id, voucher_date=voucher_date, entries=entries,
         period_id=period_id, insert_after_id=insert_after_id, internal=internal)
 
-    # 插入位上号沿用参照凭证的号（页面预填的就是它），后面的整体顺延。
-    # 人要是自己改过号，以人填的为准 —— 顺位照做，占的是那个号。
+    # 上号的三个来源：插入位（占参照的号）、自动发号、以及**导入时表里带的号**。
+    # 三者都要过 require_no 归一 + 校验：用户 2026-10-19 定的是「凭证号一律
+    # 自动生成」，但导入是另一个入口（Excel 里带什么号就带什么号），不归一
+    # 的话「记-0001」会和自动发的「记0002」混在一个期间里，把发号正则打瞎。
     moved: list[dict] = []
     moving_ids: set[int] = set()
     if anchor is not None:
-        moved = insert_slot(db, anchor)["moved"]
+        slot = insert_slot(db, anchor, insert_position)
+        moved = slot["moved"]
         moving_ids = {m["id"] for m in moved}
-        no = voucher_no or insert_slot(db, anchor)["no"]
+        no = svc_organize.require_no(voucher_no) or slot["no"]
     else:
-        no = voucher_no or next_voucher_no(db, period)
+        no = svc_organize.require_no(voucher_no) or next_voucher_no(db, period)
 
     # 页面上会预填下一个号（/vouchers/next），两个人同时开一张就会撞号。
     # 撞了就报人话 —— 数据库只会说「违反唯一约束 uq_voucher_period_no」，
@@ -399,7 +428,7 @@ def create_voucher(
         raise ValueError(f"凭证号 {no} 在 {period.code} 已经有一张了，请改一个号")
 
     if moved:
-        moved = _apply_shift(db, anchor)
+        moved = _apply_shift(db, anchor, insert_position)
 
     voucher = Voucher(
         book_id=book_id,
@@ -508,32 +537,25 @@ def update_voucher(
         voucher.voucher_date = new_date
         voucher.period_id = new_period.id
 
-    # P2-2：``voucher_no`` 以前是**静默丢弃**的。API 层把整个
-    # ``payload.model_dump()`` 递进来，而这个函数从头到尾没读过 voucher_no ——
-    # 于是客户端 PUT 一个新凭证号会拿到 200、审计日志写「修改凭证」，
-    # 而号一个字都没变。返回成功却什么都没做，比报错更难查。
+    # 凭证号不再允许人工改（用户 2026-10-19 定的：新增 / 插入 / 修改三处
+    # 一律只读，只能用系统自动生成的号）。
     #
-    # 「凭证号可回收复用」这件事是 next_voucher_no 取 max+1 的前提，所以
-    # 改号本身是业务上允许的 —— 那就把它实现掉，而不是假装没这个字段。
-    new_no = (payload.get("voucher_no") or "").strip()
+    # 这里原本是 P2-2 那个「静默丢弃」的修复 —— 客户端 PUT 一个新号会拿到 200、
+    # 号却没变，所以当年人把它**实现**掉了。但实现出来的是一把没有护栏的刀：
+    # 号段是期间的顺序，手改一个号既可能撞唯一约束，也可能把整段号打乱。
+    # 生产上就是这么出的事 —— 优境 9 月那张 18 条分录的工资凭证，凭证号被人
+    # 在这个页面上改成 "wochakan"，凭证列表四种排序全部 500（排序键要对凭证号
+    # 做 CAST AS INTEGER），整月打不开，排查花了半小时才定位到一行脏数据。
+    #
+    # **明确拒绝**而不是静默忽略：静默忽略会让人以为改成功了（这正是 P2-2
+    # 当初要消灭的那种"返回成功却什么都没做"）。要改号请走「整理凭证」，
+    # 它会整体重排并留下审计。
+    new_no = svc_organize.normalize_no(payload.get("voucher_no"))
     if new_no and new_no != voucher.voucher_no:
-        # 目标期间以**改完之后**的期间为准：改了日期就等于换了号段，
-        # uq_voucher_period_no 是 (period_id, voucher_no) 上的。
-        target_period = db.get(Period, voucher.period_id)
-        # 锁期间行：查占用与写入之间必须串行，否则并发改号会双双查到
-        # 「没被占」。与 create_voucher 的做法一致（那边靠 DB 约束兜底，
-        # 这里同理 —— 约束仍在，只是早一步报人话）。
-        db.execute(
-            select(Period.id).where(Period.id == target_period.id).with_for_update())
-        taken = db.scalar(select(Voucher.id).where(
-            Voucher.period_id == target_period.id,
-            Voucher.voucher_no == new_no,
-            Voucher.id != voucher.id,
-        ))
-        if taken is not None:
-            raise ValueError(
-                f"凭证号 {new_no} 在 {target_period.code} 已经有一张了，请改一个号")
-        voucher.voucher_no = new_no
+        raise ValueError(
+            f"凭证号不能手工修改（{voucher.voucher_no} → {new_no}）。"
+            "凭证号由系统按期间自动生成；要调整号段请用「整理凭证」重排。"
+        )
 
     if "entries" in payload:
         entries = [
@@ -782,8 +804,21 @@ DEFAULT_SORT = "no_desc"
 
 
 def _no_seq():
-    """凭证号里的序号，按整数排序用。解析不出序号时给 -1，让它排最前。"""
-    digits = func.regexp_replace(Voucher.voucher_no, "^[^\d]*(\d+)$", r"\1")
+    r"""凭证号里的序号，按整数排序用。解析不出序号时给 -1，让它排最前。
+
+    原来这里是 ``regexp_replace(no, '^[^\d]*(\d+)$', '\\1')``，看着有
+    ``coalesce`` 兜底，实际上**兜底是死的**：PostgreSQL 的 ``regexp_replace``
+    在**无匹配时返回原字符串**，不是 NULL。所以对 "wochakan" 这种一个数字
+    都没有的号，它原样返回 "wochakan"，紧接着 ``CAST(... AS INTEGER)`` 抛
+    ``invalid input syntax for type integer`` —— 外层的 coalesce 永远等不到
+    NULL。2026-10-19 生产事故：优境 9 月有一张凭证号被人工改成 "wochakan"，
+    凭证列表的**四种排序全部 500**（四种都带这个排序键），整月打不开。
+
+    ``substring(no from '(\d+)$')`` 才是这里该用的：它无匹配时返回 NULL，
+    ``cast`` 得到 NULL，``coalesce`` 终于能把它收成 -1。于是脏号只是排到
+    最前面（而且 create_voucher 已经在入口拦住了新脏号），不再拖垮整个列表。
+    """
+    digits = func.substring(Voucher.voucher_no, r"(\d+)$")
     return func.coalesce(func.cast(digits, Integer), -1)
 
 

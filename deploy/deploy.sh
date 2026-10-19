@@ -466,6 +466,35 @@ log "7/7 发布后体检"
 #
 # 产物是 CI 打的 tar，deploy/systemd/ 不在其中，所以先看这台机器上有没有：
 # 没有就把两条命令原样打出来（不猜路径、不静默跳过）。
+#
+# ---------------------------------------------------------------------------
+# unit 按本机布局渲染（2026-10-19）
+#
+# **以前这里是原样 `cp`，而模板里的路径是写死的 /opt/cwq。** 这不是洁癖问题，
+# 它是一个每次发版都会重演的生产故障：`APP_DIR` / `BACKUP_DIR` 从来就是可配的
+# （见文件头部），但原样拷贝会把 /opt/cwq 一起灌到这台机器上，于是
+# **任何一次手工修对的路径，都会在下一次发版被打回模板里的旧值**。
+# 2026-10-19 在生产上就是这个形态：手工修好的 cwq-backup.* 被 00:05 那次发布
+# 原样覆盖回 /opt/cwq，timer 随后每天报
+# ``Failed to load environment files: No such file or directory``。
+#
+# 替换只有两个前缀，且**必须先长后短**（/opt/cwq/backups 在 /opt/cwq 之前）——
+# 反过来的话第一步就把更长的那个吃掉了，备份目录会被替换成
+# `$APP/backups` 而不是运维给定的 `$BACKUP_DIR`。这正是这两条路径要分开配的原因。
+#
+# 替换值来自环境变量，而路径里可能有 `&` `|` `\`（sed 的特殊字符），所以先转义。
+# 未定义的变量在 ``set -u`` 下会直接让发布失败 —— 那正是它该有的形态：
+# 渲染不出正确路径时宁可不装，也不要装一个指向不存在目录的 unit。
+# ---------------------------------------------------------------------------
+sed_repl_escape(){ printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
+
+render_unit(){
+  local src="$1" dst="$2"
+  sed -e "s|/opt/cwq/backups|$(sed_repl_escape "$BACKUP_DIR")|g" \
+      -e "s|/opt/cwq|$(sed_repl_escape "$APP")|g" \
+      "$src" > "$dst"
+}
+
 enable_backup_timer() {
   # 关停标记（2026-10-17 起）。存在即跳过，且**连 unit 都不复制**。
   #
@@ -488,10 +517,13 @@ enable_backup_timer() {
 
   if [ -n "$src" ]; then
     mkdir -p "$BACKUP_DIR"
+    # 渲染而不是 cp —— 理由见 render_unit 上面的注释。
     # daemon-reload 必须排在 enable 之前，否则 systemd 认的还是旧缓存 ——
     # 首次安装时 unit 名不存在，enable 会报「unit not found」。
-    cp "$src/cwq-backup.service" "$src/cwq-backup.timer" "$SYSTEMD_UNIT_DIR/" \
-      || return 1
+    local u
+    for u in cwq-backup.service cwq-backup.timer; do
+      render_unit "$src/$u" "$SYSTEMD_UNIT_DIR/$u" || return 1
+    done
     systemctl daemon-reload || return 1
   fi
 
@@ -512,11 +544,14 @@ elif [[ "$backup_timer_rc" -eq 0 ]]; then
   log "  定时备份已启用${next_run:+（下次：${next_run}）}，备份目录 ${BACKUP_DIR}"
 else
   log "  ⚠️  定时备份启用失败 —— 当前备份仍然只发生在发版时"
-  log "     手动补一次（把 deploy/systemd/ 两个文件拷过去）："
+  log "     手动补一次。**不要直接 cp 模板**（会带着 /opt/cwq 回到这台机器），"
+  log "     按本机布局渲染后装过去："
   log "       mkdir -p ${BACKUP_DIR}"
-  log "       cp deploy/systemd/cwq-backup.{service,timer} ${SYSTEMD_UNIT_DIR}/"
+  log "       for u in cwq-backup.service cwq-backup.timer; do \\"
+  log "         sed -e \"s|/opt/cwq/backups|${BACKUP_DIR}|g\" -e \"s|/opt/cwq|${APP}|g\" \\"
+  log "           deploy/systemd/\$u > ${SYSTEMD_UNIT_DIR}/\$u; done"
   log "       systemctl daemon-reload && systemctl enable --now cwq-backup.timer"
-  log "     然后验证真的产出文件：systemctl start cwq-backup.service && ls -l /opt/cwq/backups/"
+  log "     然后验证真的产出文件：systemctl start cwq-backup.service && ls -l ${BACKUP_DIR}/"
 fi
 
 # (2) TRUSTED_PROXIES 没配 → IP 维度的登录节流形同虚设

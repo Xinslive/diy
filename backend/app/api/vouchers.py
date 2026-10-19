@@ -126,7 +126,16 @@ def create(payload: VoucherIn, book: Book = Depends(get_my_book), db: Session = 
             db, book_id=book.id, user=user, voucher_date=payload.voucher_date,
             entries=[e.model_dump() for e in payload.entries], remark=payload.remark,
             attachments=payload.attachments, source=payload.source,
-            voucher_no=payload.voucher_no, insert_after_id=payload.insert_after,
+            # ``voucher_no`` 刻意**不传**。用户 2026-10-19 定的口径是凭证号
+            # 一律自动生成：新增页、插入页、修改页三处都只读。号由服务端决定
+            # —— 插入走 ``insert_slot``（占参照的号或参照号 +1），普通新增走
+            # ``next_voucher_no``。客户端传什么都不采信，光改前端等于没关。
+            #
+            # 导入是**另一个入口**（``importer.commit`` 直接调服务层，不经过
+            # 这里），那里的号来自 Excel，经 ``require_no`` 归一后入库。
+            voucher_no=None,
+            insert_after_id=payload.insert_after,
+            insert_position=payload.insert_position,
             # ``internal`` 刻意**不传**：它是「系统自己生成的凭证」的唯一入口
             # （结转损益 / 年度结转在 periods.py 里以 internal=True 调本函数）。
             # 这里传下去的任何东西都来自请求体，所以 source 只能取
@@ -479,24 +488,29 @@ def next_voucher(period_id: Optional[int] = None, book: Book = Depends(get_my_bo
 
 
 @router.get("/insert-preview")
-def insert_preview(after_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+def insert_preview(after_id: int, position: str = "before",
+                   book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                    _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
-    """「插入凭证」页面要预填的东西：插在谁后面、这张拿哪个号、谁要顺位。
+    """「插入凭证」/「增加凭证」页面要预填的东西：插在谁前面或后面、这张拿哪个号、谁要顺位。
 
     跟 `/vouchers/next` 一个道理 —— 号码口径只有后端一份，页面自己猜就一定会猜错。
     这里只算不改：顺延跟建凭证在同一个事务里，空着退出不会顶走谁的号。
+
+    ``position`` ：``before`` = 向前插入（占参照自己的号），``after`` = 向后插入
+    （拿参照号 +1，只有更大的号顺位）。
     """
     v = db.get(Voucher, after_id)
     if v is None or v.book_id != book.id:
         raise HTTPException(404, "参照凭证不存在")
     period = db.get(Period, v.period_id)
     try:
-        slot = svc.insert_slot(db, v)
+        slot = svc.insert_slot(db, v, position)
     except (ValueError, ArithmeticError) as e:
         raise HTTPException(400, str(e))
     return {
         "anchor_id": v.id,
         "anchor_no": v.voucher_no,
+        "position": slot["position"],
         "voucher_no": slot["no"],
         "voucher_date": v.voucher_date.isoformat(),
         "period_id": v.period_id,

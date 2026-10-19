@@ -149,6 +149,11 @@ class VoucherIn(BaseModel):
     # 「插入凭证」告诉后端插在谁的后面：新凭证拿这个号，后面的号整体顺位。
     # 留空就是普通的新增凭证（取期间内最大号 +1）。
     insert_after: Optional[int] = None
+    # 插在参照凭证的前面还是后面（用户 2026-10-19 定的口径）：
+    #   before —— 「插入凭证」= 向前插入，占参照自己的号，参照及以后顺位；
+    #   after  —— 「增加凭证」= 向后插入，拿参照号 +1，只有更大的号顺位。
+    # 只在 ``insert_after`` 有值时才有意义。
+    insert_position: Literal["before", "after"] = "before"
 
 
 class VoucherOut(BaseModel):

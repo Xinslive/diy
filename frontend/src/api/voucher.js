@@ -5,9 +5,11 @@ export const getVoucher = (bookId, id) => http.get(`/books/${bookId}/vouchers/${
 export const nextVoucher = (bookId, periodId) =>
   http.get(`/books/${bookId}/vouchers/next`, { params: periodId ? { period_id: periodId } : {} }).then(r => r.data)
 
-/** 「插入凭证」的预填：插在谁后面、这张拿哪个号、谁要顺位。只算不改。 */
-export const insertPreview = (bookId, afterId) =>
-  http.get(`/books/${bookId}/vouchers/insert-preview`, { params: { after_id: afterId } }).then(r => r.data)
+/** 插入位的预填：插在谁前面/后面、这张拿哪个号、谁要顺位。只算不改。
+ *  position：before = 向前插入（占参照自己的号），after = 向后插入（拿参照号 +1）。 */
+export const insertPreview = (bookId, afterId, position = 'before') =>
+  http.get(`/books/${bookId}/vouchers/insert-preview`,
+    { params: { after_id: afterId, position } }).then(r => r.data)
 
 export const neighbour = (bookId, id, params) =>
   http.get(`/books/${bookId}/vouchers/${id}/neighbour`, { params }).then(r => r.data)

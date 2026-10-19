@@ -388,7 +388,12 @@ def test_xls走完暂存到入库(db, book, admin_user):
     assert r["created"] == 2
 
     vs = db.scalars(select(Voucher).where(Voucher.book_id == book.id)).all()
-    assert sorted(v.voucher_no for v in vs) == ["记-0001", "记-0001"]
+    # 表里写的是「记-0001」，落库是「记0001」—— 导入**做格式归一**（用户
+    # 2026-10-19 定的形态）。不归一的后果不是"看着不齐"：发号正则要求凭证字后
+    # **紧跟**数字，带横杠的那几张它一条都看不见，next_voucher_no 于是把这个
+    # 已记到 0004 的期间当成空期间，从 1 重新发号。2026-10-19 生产事故就是这么
+    # 来的（那次还叠加了一张号被改成 "wochakan" 的脏数据，四种排序全部 500）。
+    assert sorted(v.voucher_no for v in vs) == ["记0001", "记0001"]
     assert sorted(v.period_id for v in vs)[0] != sorted(v.period_id for v in vs)[1]
     assert all(v.source == "IMPORT" for v in vs)
     # 两张各两条分录；合计行的 987654.32 没有变成第 5、6 条分录
