@@ -7,13 +7,13 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.accounting import vouchers as voucher_service
 from app.accounting.audit_helper import log
-from app.accounting.util import money
+from app.accounting.util import constraint_name, money
 from app.core.config import settings
 from app.core.system_settings import ocr_config
 from app.invoice import storage
@@ -27,6 +27,30 @@ from app.models import (
     Subject,
     SysUser,
 )
+
+
+class BatchConflict(ValueError):
+    """批次状态冲突：同一个批次的第二次「确认生成」，或发票已被别的批次认领。
+
+    单独一个类型是为了让接口层能翻成 **409**（冲突）而不是 400
+    （请求不合法）—— 同一个批次的第二次确认是**正常的并发行为**
+    （用户双击了按钮、网络重试），不是用户的请求有问题。
+    """
+
+
+class _DuplicateInvoice(Exception):
+    """内部信号：同一张发票被并发传了两遍（撞了唯一约束）。
+
+    它**不**直接给用户看 —— 用户该看到的是「发票已存在，不能重复导入：
+    号码（来自哪个文件）」，而那要等事务回滚之后才能查得出来。
+    """
+
+
+#: 发票号码在账套内唯一的那个约束。并发上传同一份发票时撞的是它。
+#:
+#: 约束名**只用来判断**「这是不是重复上传」，**绝不进响应** ——
+#: 约束名属于库结构，回给客户端等于抄送内部数据模型。
+INVOICE_NO_UNIQUE_CONSTRAINT = "uq_invoice_record_book_no"
 
 
 # 账套配置里可指定科目的那几个字段。**刻意不带默认值。**
@@ -594,6 +618,29 @@ def _duplicate_detail(spans: list[tuple[str, int, int]], pages: list[int],
     return "、".join(detail)
 
 
+def _existing_invoice_numbers(db: Session, book_id: int, numbers: set[str]) -> set[str]:
+    """这个账套里已经存在的发票号码（已作废的批次不算）。
+
+    只认「还会变成凭证」的那些：已确认的（PENDING 还没确认，COMMITTED 已生成）
+    都要挡住重复上传，已**作废**的批次不算 —— 用户点「作废批次」的意思就是
+    「这批不要」，转头上传同一份 PDF 却一直被拦，等于这个功能没法用
+    （commit_batch 那边的判重同样只看 COMMITTED，两边口径必须一致）。
+    """
+    if not numbers:
+        return set()
+    return {
+        number for number in db.scalars(
+            select(InvoiceRecord.invoice_no)
+            .join(InvoiceBatch, InvoiceBatch.id == InvoiceRecord.batch_id)
+            .where(
+                InvoiceRecord.book_id == book_id,
+                InvoiceRecord.invoice_no.in_(numbers),
+                InvoiceBatch.status != "DISCARDED",
+            )
+        ).all() if number
+    }
+
+
 def create_batch(db: Session, book_id: int, user: SysUser, files: list[tuple[str, bytes]]) -> InvoiceBatch:
     """一次上传 1..N 个文件，落成一个批次；非 PDF 在这里被忽略。
 
@@ -645,21 +692,11 @@ def create_batch(db: Session, book_id: int, user: SysUser, files: list[tuple[str
         if duplicate_in_file:
             raise ValueError("本次上传中有重复发票号码，无法导入："
                              + _duplicate_detail(spans, page_of_invoice, invoice_numbers, duplicate_in_file))
-        # 只认「还会变成凭证」的那些：已确认的（PENDING 还没确认，COMMITTED 已生成）
-        # 都要挡住重复上传，已**作废**的批次不算 —— 用户点「作废批次」的意思就是
-        # 「这批不要」，转头上传同一份 PDF 却一直被拦，等于这个功能没法用
-        # （commit_batch 那边的判重同样只看 COMMITTED，两边口径必须一致）。
-        existing_numbers = {
-            number for number in db.scalars(
-                select(InvoiceRecord.invoice_no)
-                .join(InvoiceBatch, InvoiceBatch.id == InvoiceRecord.batch_id)
-                .where(
-                    InvoiceRecord.book_id == book_id,
-                    InvoiceRecord.invoice_no.in_({number for number in invoice_numbers if number}),
-                    InvoiceBatch.status != "DISCARDED",
-                )
-            ).all() if number
-        }
+        # 判重（口径见 _existing_invoice_numbers）。这是**无锁的先读后写**，
+        # 并发下必然有洞 —— 洞被踩到时靠下面那条唯一约束兜住，
+        # 并把数据库异常翻成同一句人话（审计 P1-3）。
+        existing_numbers = _existing_invoice_numbers(
+            db, book_id, {number for number in invoice_numbers if number})
         if existing_numbers:
             raise ValueError("发票已存在，不能重复导入："
                              + _duplicate_detail(spans, page_of_invoice, invoice_numbers,
@@ -682,13 +719,42 @@ def create_batch(db: Session, book_id: int, user: SysUser, files: list[tuple[str
             )
             db.add(record)
             records.append(record)
-        db.flush()
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            # 并发上传同一份发票：上面那次判重是**无锁的先读后写**，两个请求
+            # 都可能通过判重，第二个在唯一约束上撞了（审计 P1-3）。
+            #
+            # 这里**不把数据库异常带进响应**（它含整条 SQL、绑定参数与约束名），
+            # 只记下「是这张发票重复了」；回滚之后再查一次，把到底是哪一张、
+            # 来自哪个文件说清楚 —— 事务已经失败的时候是查不了的。
+            if constraint_name(exc) != INVOICE_NO_UNIQUE_CONSTRAINT:
+                raise
+            raise _DuplicateInvoice() from exc
         batch.total = len(records) if records else len(invoices)
         batch.ocr_used = ocr_used
         batch.message = message
         # 解析时只写暂存记录；预览接口再按最新规则计算，允许先维护规则再回来看批次。
         batch.status = "PENDING"
         db.commit()
+    except _DuplicateInvoice as dup:
+        for relative in staged:
+            storage.delete(relative)
+        if saved_path:
+            storage.delete(saved_path)
+        db.rollback()
+        # 回滚之后再查：并发的另一个请求这时已经提交了，于是能点出到底是
+        # 哪张发票重复、来自哪个文件 —— 和非并发路径上那句人话一模一样。
+        try:
+            existing = _existing_invoice_numbers(
+                db, book_id, {number for number in invoice_numbers if number})
+        except Exception:  # noqa: BLE001 - 查不到就退回一句不带细节的提示
+            existing = set()
+        if existing:
+            raise ValueError("发票已存在，不能重复导入："
+                             + _duplicate_detail(spans, page_of_invoice, invoice_numbers,
+                                                 sorted(existing))) from dup
+        raise ValueError("发票已存在，不能重复导入（这份文件与已上传的发票重复）") from dup
     except Exception:
         for relative in staged:
             storage.delete(relative)
@@ -730,8 +796,29 @@ def preview_batch(db: Session, batch: InvoiceBatch, overrides: dict[str, dict] |
 
 
 def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, Any]:
+    """把批次里通过校验的发票生成凭证。
+
+    **锁顺序：批次锁 → 记录锁。**
+
+    批次锁由接口层取得（``api/invoices.py::_batch`` 的 ``SELECT … FOR UPDATE``），
+    **一直持有到本函数末尾的 ``db.commit()``**；失败路径上的 ``db.rollback()``
+    会随事务回滚把锁释放掉。锁提前释放（提交之前）或释放得太晚都不对。
+
+    顺序是**写死的**：先锁批次行，再锁记录行（下面那条条件写 UPDATE 会取到
+    记录行的行锁）。将来若有人在别的路径上按**相反**顺序加锁
+    （先记录后批次），两个事务各持一把锁、互相等对方 —— 死锁。
+    要在这条路上加锁的，请照这个顺序来。
+
+    为什么需要它（审计 P0-1）：原来这里三道检查全是「先读后写」的**无锁读**
+    （``batch.status``、``existing`` 判重、``create_voucher`` 取号），两个并发的
+    「确认生成」各自读到「还没人提交过」，于是双双建了一套凭证 —— 同一张
+    发票的费用/收入被**重复入账**，而批次摘要还少报一张、发票侧只追溯得到
+    第 2 张，三处都看不出异常。
+    """
+    # 这一条读的是**锁内**的状态：后到的那个请求会阻塞到前一个提交完，
+    # 锁释放时重新读到 COMMITTED，于是确定性地失败（而不是各建一套）。
     if batch.status != "PENDING":
-        raise ValueError(f"该批次已是「{batch.status}」状态，不能确认")
+        raise BatchConflict(f"该批次已是「{batch.status}」状态，不能确认")
     records = db.scalars(select(InvoiceRecord).where(InvoiceRecord.batch_id == batch.id).order_by(InvoiceRecord.page_index)).all()
     if not records:
         raise ValueError("批次没有发票")
@@ -739,6 +826,8 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
     if any(record.status not in ("READY", "IGNORED") for record in records):
         raise ValueError("仍有发票未通过校验，请处理红色异常后再确认")
     targets = [record for record in records if record.status == "READY"]
+    # 判重**在锁内**重读一次（第二道兜底）。第一道是批次锁本身：
+    # 同一张发票若已被**别的**批次确认过，这里会挡住。
     existing = {
         value for value in db.scalars(select(InvoiceRecord.invoice_no).where(
             InvoiceRecord.book_id == batch.book_id,
@@ -753,6 +842,23 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
     created = 0
     try:
         for record in targets:
+            # **条件写**：只有 READY 的记录能被认领。
+            #
+            # 这是第二道兜底（第一道是批次锁）：万一将来有别的路径绕过批次锁
+            # 直接改这张记录，``rowcount != 1`` 就说明它已经不是 READY 了
+            # （被别的批次确认过，或已被作废），这里必须停下 ——
+            # 否则同一张发票会生成第二张凭证。
+            claimed = db.execute(
+                update(InvoiceRecord)
+                .where(InvoiceRecord.id == record.id, InvoiceRecord.status == "READY")
+                .values(status="COMMITTED")
+                .execution_options(synchronize_session=False)
+            )
+            if claimed.rowcount != 1:
+                raise BatchConflict("该发票已被其它批次确认，不能重复生成凭证")
+            # 上面那条 UPDATE 已经把库里的状态改掉了；ORM 这边还拿着旧值，
+            # 手动同步一份，免得随后的 flush 又按旧值写回去。
+            record.status = "COMMITTED"
             resolution = (record.payload or {}).get("resolution") or {}
             voucher = voucher_service.create_voucher(
                 db,
@@ -766,11 +872,22 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
                 commit=False,
             )
             record.voucher_id = voucher.id
-            record.status = "COMMITTED"
             created += 1
-    except (ValueError, ArithmeticError, IntegrityError) as exc:
+    except BatchConflict:
+        db.rollback()
+        raise
+    except (ValueError, ArithmeticError) as exc:
+        # 这里是**业务**异常（ValueError / Decimal 异常族）：文案是应用自己
+        # 写的（「凭证号已经有一张了」之类），可以给人看。数据库异常走下面
+        # 单独一条原样抛出去，不会混进响应。
         db.rollback()
         raise ValueError(f"自动生成凭证失败，已整体回滚：{exc}") from exc
+    except IntegrityError:
+        # 数据库异常**原样抛出去**：接口层会把它翻成脱敏的 500（带请求号）。
+        # 它的 str() 里有整条 SQL 与绑定参数（科目、金额、摘要、发票号码），
+        # 拼进给人看的文案等于把账务数据抄送给调用方（审计 P1-2）。
+        db.rollback()
+        raise
     batch.status = "COMMITTED"
     batch.committed_count = created
     batch.committed_at = datetime.now(timezone.utc)

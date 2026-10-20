@@ -42,13 +42,13 @@ from __future__ import annotations
 
 import math
 import re
-import unicodedata
 from decimal import Decimal
 from typing import Any, Iterable, Sequence
 
+from app.accounting import amounts
 from app.accounting.subject_importer import iter_workbook_rows
 from app.accounting.util import SUMMARY_LABELS as util_summary_labels
-from app.accounting.util import is_summary_label, money
+from app.accounting.util import is_summary_label
 from app.core.config import settings
 from app.core.uploads import RowBudget, check_archive_size
 
@@ -80,8 +80,6 @@ ERR_SUBJECT_MISSING = "科目在本账套不存在"
 ERR_NOT_LEAF = "不是明细科目，期初应录在明细级"
 ERR_BOTH_SIDES = "借方和贷方同时有金额"
 
-_CURRENCY_PREFIX = re.compile(r"^[¥￥]|^(人民币|rmb)", re.IGNORECASE)
-
 
 def _cell_text(value: Any) -> str:
     """把单元格稳定转成文本。
@@ -108,24 +106,17 @@ def _header_key(value: Any) -> str:
 def _amount(raw: Any) -> Decimal:
     """把一个金额单元格归一到两位小数。
 
-    外部表的金额形态比本系统导出脏得多，实测见过：``None`` / ``""`` / ``0`` /
-    ``0.0`` / ``3056.43`` / ``-598.50`` / ``"3,056.43"`` / ``"￥598.5"`` /
-    全角数字。NFKC 一次性把全角数字与 ``￥`` 转成半角（比逐字符映射表好维护），
-    千分位逗号与货币前缀再单独去掉，然后交给 ``util.money()`` —— **精度口径
-    必须是全系统唯一的那一份**（两位小数、四舍五入、NaN/无穷/超量级一律拒），
-    在这里另写一套 Decimal 解析只会多一个和库里对不上的地方。
+    **写法归一交给共享解析器** :mod:`app.accounting.amounts`：全角数字、
+    全角小数点、全角逗号、空格当千分位、U+2212 减号、括号负数在那里
+    **一次**认全；凭证导入那边用的是**同一个函数**（审计 P2-3）——
+    之前两边各写一份，于是同一张表走凭证导入整批被拒、走期初导入却能
+    读进来，用户会认为「期初能导，凭证不能导，是凭证导入坏了」。
+
+    **精度口径仍然是全系统唯一的那一份**：两位小数、四舍五入、
+    NaN/无穷/超量级一律拒，都由 ``util.money()`` 负责，在别处另写一套
+    Decimal 解析只会多一个和库里对不上的地方。
     """
-    if raw is None:
-        return Decimal("0")
-    if isinstance(raw, bool):
-        raise ValueError(f"{raw!r} 不是合法金额")
-    if isinstance(raw, (int, float, Decimal)):
-        return money(raw)
-    text = unicodedata.normalize("NFKC", _cell_text(raw))
-    text = _CURRENCY_PREFIX.sub("", text.replace(",", "").replace(" ", "")).strip()
-    if not text:
-        return Decimal("0")
-    return money(text)
+    return amounts.parse_amount(raw)
 
 
 def _amount_text(value: Decimal) -> str:

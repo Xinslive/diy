@@ -21,8 +21,14 @@
 
 断行规则
 --------
-日期或凭证号为空时视为「接上一张凭证」，这正好对应
-Excel 里一张凭证连着几行分录的常见排版。
+**普通表**（一张凭证几行分录，凭证头一行填日期与凭证号、后续行留空）：
+日期或凭证号**非空**就算新的一张凭证，**留空**才算「接上一张」——
+这正好对应 Excel 里一张凭证连着几行分录的常见排版。
+（实现是 :func:`_parse_rows` 里的 ``starts_voucher``；这一段文档曾经
+写反了 —— 写成「为空时接上一张」，与实现正好相反，审计 P3-1。）
+
+**用友序时账**例外：它每行都重复完整的日期与凭证号数，所以那一排里
+**日期与凭证号都和当前这张相同**才算接上一张（见下）。
 
 用友序时账
 ----------
@@ -65,7 +71,7 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from app.accounting import subject_importer
+from app.accounting import amounts, subject_importer
 from app.accounting.audit_helper import log
 from app.accounting.util import is_summary_label, money
 from app.core.config import settings
@@ -186,6 +192,11 @@ def _parse_amount(value: Any) -> tuple[Decimal, str | None]:
 
     所以规则改成：**解析不了必须说出来**。金额按 0 参与后续计算只是为了让
     流程继续走完，真正的处置权在调用方 —— 它必须把这条错误挂到凭证上。
+
+    **写法归一交给共享解析器** :mod:`app.accounting.amounts`：全角数字、
+    空格当千分位、U+2212 减号、括号负数在这里**一次**认全，凭证导入与
+    期初导入走的是**同一份**代码（审计 P2-3）—— 之前两边各写一份，
+    同一张表走凭证导入被拒、走期初导入却能读进来。
     """
     if value in (None, ""):
         return Decimal("0"), None
@@ -194,13 +205,12 @@ def _parse_amount(value: Any) -> tuple[Decimal, str | None]:
             return money(value), None
         except Exception as exc:
             return Decimal("0"), f"{value!r} 不是合法金额（{exc}）"
-    text = str(value).strip().replace(",", "").replace("，", "")
-    text = text.replace("¥", "").replace("￥", "").strip()
+    text = amounts.normalize_amount_text(value)
     if text.endswith("%"):
         # 原来直接返回 0。金额列写百分比，99% 的可能是从别处粘串了整列。
         return Decimal("0"), f"{text!r} 是百分比，金额列不该出现百分号"
     try:
-        return money(text), None
+        return amounts.parse_amount(value), None
     except Exception:
         return Decimal("0"), f"{text!r} 无法解析为金额"
 

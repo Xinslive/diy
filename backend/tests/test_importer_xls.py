@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import io
+from datetime import date as date_type
 from decimal import Decimal
 
 import pytest
@@ -69,6 +70,36 @@ def _xlsx(header: list[str], rows: list[list]) -> bytes:
         ws.append(r)
     buf = io.BytesIO()
     wb.save(buf)
+    return buf.getvalue()
+
+
+def _xls_with_date_cell(header: list[str], rows: list[list], date_col: int = 0) -> bytes:
+    """写一个 .xls，日期列是**真的日期单元格**。
+
+    用友导出的序时账里日期列是日期单元格，不是文本 —— 而 xlrd 对 .xls 的
+    日期单元格返回的是**浮点序列号**（46037.0），``row_values()`` 只给原始
+    值、不看单元格类型。于是 .xls 路径与 .xlsx 路径（openpyxl 会自己转成
+    datetime）的日期类型不一致，**整份用友序时账一张凭证都导不进去**
+    （每张都挂「日期无法识别：46037.0」）。审计 P1-4。
+    """
+    import xlwt
+
+    book = xlwt.Workbook(encoding="utf-8")
+    sheet = book.add_sheet("UFPrn")
+    for col, name in enumerate(header):
+        sheet.write(0, col, name)
+    date_style = xlwt.XFStyle()
+    date_style.num_format_str = "YYYY-MM-DD"
+    for r, row in enumerate(rows, start=1):
+        for col, value in enumerate(row):
+            if value is None:
+                continue
+            if col == date_col and isinstance(value, date_type):
+                sheet.write(r, col, value, date_style)
+            else:
+                sheet.write(r, col, value)
+    buf = io.BytesIO()
+    book.save(buf)
     return buf.getvalue()
 
 
@@ -127,6 +158,31 @@ def test_普通模板不被当成序时账(db, book):
 
 
 # --------------------------------------------------------------------- 断行
+
+
+def test_xls的日期单元格被还原成日期(db, book):
+    """xlrd 把 .xls 的日期单元格读成**浮点序列号** —— 用友序时账整份导不进。
+
+    审计 P1-4：修复前 ``_as_date(46037.0)`` → ``None`` → 该行报
+    「日期无法识别：46037.0」→ 这张凭证 ok=False → **.xls 里的每一张凭证
+    都被拒**，整份文件导进来 0 张。
+
+    数据本身没坏（xlrd 的 ``xldate_as_datetime`` 能还原），坏的是读取器
+    没做这次类型判断 —— .xlsx 那条路（openpyxl）会自己转，两条路径因此
+    不一致。
+    """
+    rows = [
+        _line(date_type(2026, 1, 15), "记-0001", _DR[0], _DR[1], "收租", "借", 1000),
+        _line(date_type(2026, 1, 15), "记-0001", _CR[0], _CR[1], "收租", "贷", 1000),
+    ]
+    data = _xls_with_date_cell(JOURNAL_HEADER, rows)
+    parsed = parse_workbook(data, book.id, db)
+
+    assert len(parsed["vouchers"]) == 1, parsed["vouchers"]
+    voucher = parsed["vouchers"][0]
+    assert voucher["voucher_date"] == "2026-01-15", voucher
+    assert not any("日期无法识别" in e for e in voucher["errors"]), voucher["errors"]
+    assert voucher["ok"] is True, voucher["errors"]
 
 
 def test_相同日期与凭证号并成一张(db, book):
@@ -338,13 +394,6 @@ def test_非表格文件的报错不叠罗汉(db, book):
     msg = _safe_parse(b"not-an-excel-file", book, db)
     assert msg.count("无法读取") == 1, msg
     assert msg.startswith("无法读取 Excel 文件："), msg
-
-
-def test_非表格文件的报错不叠罗汉(db, book):
-    """分流器的两个 reader 各自报「无法读取 .xls/.xlsx 文件：…」，
-    对外要合成一句，不能出现「无法读取 Excel 文件：无法读取 .xlsx 文件：…」。"""
-    msg = _safe_parse(b"not-an-excel-file", book, db)
-    assert msg.count("无法读取") == 1, msg
 
 
 # --------------------------------------------------------------------- 接口层

@@ -105,7 +105,23 @@ RE_AMOUNT = re.compile(r"(?:¥|￥)\s*(\d+(?:\.\d+)?)")
 RE_ISSUER = re.compile(r"开票人[:：]\s*(\S+)")
 RE_TABLE_HEADER = re.compile(r"项目名称\s*规\s*格\s*型\s*号")
 RE_BIG_AMOUNT_HEADER = re.compile(r"价税合计（大写）\s*（小写）")
-RE_BIG_AMOUNT_LINE = re.compile(r"([零壹贰叁肆伍陆柒捌玖拾佰仟万亿圆角分整]+)\s*¥\d+(?:\.\d+)?")
+# 大写金额（「价税合计（大写）」那一行）。
+#
+# 原来是一条正则 ``([零壹…整]+)\s*¥\d+(?:\.\d+)?`` 直接 search 全文，而那条
+# 写法是**二次回溯**的：载荷是「N 个中文数字 + N 个空白 + 没有 ¥」时，正则
+# 先贪婪吃掉 N 个中文数字、再吃掉 N 个空白、然后要求 ¥ 失败；回溯时 ``\s*``
+# 逐个退格，而 ``search()`` 会在**每一个起始位置**重试整段匹配 —— 于是总代价
+# 是 O(n²)。一次 20MB 的上传能烧掉约 9.7 分钟 CPU（审计 P2-1）。
+#
+# 现在拆成两步：先用 finditer 找出**极大**的中文数字串（单字符类没有回溯
+# 歧义，线性），再在每个串的**末尾**往后看是不是「空白 + ¥ + 数字」。
+# 空白段在各个数字串之间互不重叠，总代价 O(n)。
+#
+# 语义与原来那条正则**完全一致**：原来那条的 ``+`` 也不需要回溯就能匹配
+# （极大串的下一个字符必然还是数字类字符，不可能是 ¥），所以「最靠前的
+# 那个匹配」在两种写法下是同一个。
+RE_BIG_AMOUNT_DIGITS = re.compile(r"[零壹贰叁肆伍陆柒捌玖拾佰仟万亿圆角分整]+")
+RE_BIG_AMOUNT_TAIL = re.compile(r"\s*¥\d+(?:\.\d+)?")
 END_MARKERS = ("合 计", "价税合计", "合计：", "价税合计（大写）")
 # 末尾：金额 + 税率（不征税/免税/%）+ 可选税额
 TAIL_RE = re.compile(
@@ -208,6 +224,19 @@ def _norm_date(y: str, m: str, d: str) -> str:
     return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
 
 
+def find_big_amount(text: str) -> str:
+    """找出「价税合计（大写）」那一行的大写金额，返回中文数字串；没有就空串。
+
+    拆成「找极大中文数字串 + 看它后面是不是 ¥金额」两步之后，整段文本的
+    处理代价是**线性**的（审计 P2-1：原来那条正则对 20MB 的恶意载荷
+    要烧掉约 9.7 分钟 CPU）。
+    """
+    for match in RE_BIG_AMOUNT_DIGITS.finditer(text):
+        if RE_BIG_AMOUNT_TAIL.match(text, match.end()):
+            return match.group(0)
+    return ""
+
+
 def extract_meta(text: str) -> InvoiceMeta:
     meta = InvoiceMeta()
 
@@ -264,9 +293,7 @@ def extract_meta(text: str) -> InvoiceMeta:
     if meta.total_incl_tax is None and floats:
         meta.total_incl_tax = floats[-1]
 
-    m = RE_BIG_AMOUNT_LINE.search(text)
-    if m:
-        meta.total_in_c_c = m.group(1)
+    meta.total_in_c_c = find_big_amount(text)
 
     m_remark = re.search(r"备\s*注[：:](.*?)(?=开票人|$)", text, re.S)
     if m_remark:

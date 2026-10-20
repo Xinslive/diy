@@ -101,6 +101,34 @@ def _is_blank(row: Iterable[Any]) -> bool:
     return all(_text(value) == "" for value in row)
 
 
+def _xls_row(sheet, row_no: int) -> list[Any]:
+    """一行 .xls 单元格，**日期单元格还原成 datetime**。
+
+    xlrd 对 .xls 的日期单元格返回的是**浮点序列号**（``46027.0``），
+    而 ``row_values()`` 只给原始值、不看单元格类型；.xlsx 那条路
+    （openpyxl）会自己把日期转成 ``datetime``。两条路径的日期类型因此
+    不一致 —— 用友导出的 .xls 序时账**整份导不进**：每一张凭证都报
+    「日期无法识别：46027.0」（审计 P1-4）。
+
+    还原要按**工作簿的 datemode**：1900 系统与 1904 系统差 1462 天，
+    照搬序列号会把日期整整差四年。
+
+    数据本身没坏，坏的是读取器没做这次类型判断 —— 所以这里补的就是
+    这一次判断，不改任何别的行为（非日期单元格的取值与
+    ``row_values()`` 完全一致）。
+    """
+    import xlrd
+
+    row: list[Any] = []
+    for col in range(sheet.ncols):
+        cell = sheet.cell(row_no, col)
+        if cell.ctype == xlrd.XL_CELL_DATE:
+            row.append(xlrd.xldate_as_datetime(cell.value, sheet.book.datemode))
+        else:
+            row.append(cell.value)
+    return row
+
+
 def _iter_xls(data: bytes):
     try:
         import xlrd
@@ -118,7 +146,7 @@ def _iter_xls(data: bytes):
     def rows():
         try:
             for row_no in range(sheet.nrows):
-                yield sheet.row_values(row_no)
+                yield _xls_row(sheet, row_no)
         finally:
             workbook.release_resources()
 
