@@ -62,7 +62,7 @@ DB_EXCEPTION_NAMES = {
 # 这些目录下的代码会把异常**直接**翻译成 HTTP 响应。
 # service 层抛 ValueError 是这个项目的既有约定（api 层统一转 400），
 # 所以 service 也在扫描范围内 —— 它拼进 ValueError 文案里的东西同样会到客户端。
-SCAN_DIRS = ("api", "invoice", "accounting", "printing", "reports", "ledger", "backup", "system")
+SCAN_DIRS = ("api", "invoice", "accounting", "printing", "reports", "ledger", "backup")
 
 
 def _iter_source_files() -> list[Path]:

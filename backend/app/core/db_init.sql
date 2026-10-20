@@ -339,7 +339,24 @@ BEGIN
             WHERE e.book_id = OLD.book_id
               AND e.subject_id IN (SELECT id FROM sub)
               AND e.amount <> 0
-              AND p.year = EXTRACT(YEAR FROM CURRENT_DATE)::int
+              -- 「本年度」= **账套的会计年度**，不是服务器日历年（2026-10-20 修）。
+              --
+              -- 口径与 ``app/accounting/periods.py::current_accounting_year``
+              -- **逐字一致**：最近一期有凭证的期间所在的年度；一张凭证都没有
+              -- 时退回账套的启用年度（``book.start_year``）。
+              --
+              -- 原来这里是 ``EXTRACT(YEAR FROM CURRENT_DATE)`` —— 服务器当前
+              -- 日期加上**连接会话时区**（本项目的连接池把时区钉死成 UTC）。
+              -- 于是两层口径不同：应用层判「2026 年」（账套在记的那一年），
+              -- 库层判「服务器今年」。给一本 2026 年建的账补录 2025 年的分录
+              -- 时，库层判的是 2026 —— **用错年份拒绝一次合法的改编码**，
+              -- 报错文案还写着「本年度已有发生额」，用户完全看不懂。
+              AND p.year = COALESCE(
+                  (SELECT max(p2.year)
+                     FROM period p2
+                     JOIN voucher v ON v.period_id = p2.id
+                    WHERE p2.book_id = OLD.book_id),
+                  (SELECT b.start_year FROM book b WHERE b.id = OLD.book_id))
         ) THEN
             RAISE EXCEPTION '科目 % 本年度已有发生额，不能修改编码', OLD.code
                 USING ERRCODE = 'check_violation';

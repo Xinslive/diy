@@ -331,6 +331,18 @@ def validate_new_voucher(db: Session, *, book_id: int, voucher_date: date,
     period = db.get(Period, period_id) if period_id else find_period(db, book_id, voucher_date)
     if period is None:
         raise ValueError("会计期间不存在")
+    # **期间必须属于本账套**（审查报告 P2-2）。
+    #
+    # ``db.get(Period, period_id)`` 是**按主键取**，不带任何账套过滤 ——
+    # 拿别家账套的期间 id 进来，会得到一个「属于别的账套」的期间对象，
+    # 而 ``period.ord`` 是**账套内**的相对序号：于是这张凭证被记到
+    # 「本账套的某一期」上，而挂着别家的期间标签。
+    #
+    # 这条校验与 ``api/vouchers.py``、``api/reports.py``、``api/printing.py``
+    # 里的写法是**同一句话** —— 本仓里「期间必须属于本账套」这条规则早就存在，
+    # 漏掉的只是这第四处。
+    if period.book_id != book_id:
+        raise ValueError("会计期间不属于本账套")
     if period.locked:
         raise ValueError(f"{period.code} 已结账，不能新增凭证")
 

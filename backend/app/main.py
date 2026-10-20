@@ -154,6 +154,34 @@ for r in (auth.router, system.router, scheduler.router, books.router, subjects.r
     app.include_router(r)
 
 
+def _is_own_guardrail_text(message: str) -> bool:
+    """这句违例文案是不是**我们自己写的中文护栏文案**。
+
+    判据是「里面有没有汉字」：
+
+    * ``db_init.sql`` 里的 ``RAISE EXCEPTION '已记账的凭证不允许删除'``
+      —— 有汉字 ⇒ 是写给人看的提示，可以回给客户端；
+    * PG 自带的违例文案（``duplicate key value violates unique constraint
+      "uq_..."``）—— 纯英文 ⇒ 里面带的是**表名与约束名**，是库结构，
+      不能回给客户端。
+
+    为什么用「有没有汉字」而不是「sqlstate 白名单」：sqlstate 是有限的几个，
+    而**文案来源**才是真正要管的东西（我们写的 vs PG 写的）。文案判据在
+    新增一条约束时不需要同步维护一张表 —— 忘了维护，就会重新开始泄露。
+    """
+    return any("一" <= ch <= "鿿" for ch in message)
+
+
+def _generic_constraint_detail(sqlstate: str | None) -> str:
+    """PG 自带违例文案的**脱敏替身**：只说「哪一类问题」，不说库结构。"""
+    return {
+        "23505": "数据已存在或被引用（违反唯一性约束），请检查是否重复提交。",
+        "23503": "引用了不存在的关联数据，请检查所选科目/账套是否仍然有效。",
+        "23502": "必填字段缺失（违反非空约束）。",
+        "23514": "数据不满足数据库层的业务约束，请检查输入内容。",
+    }.get(sqlstate or "", "数据不满足数据库层的约束，请检查输入内容。")
+
+
 @app.exception_handler(DBAPIError)
 async def dbapi_error_handler(request, exc: DBAPIError):
     """把数据库护栏抛出的错误翻译成用户能看懂的中文提示。
@@ -163,13 +191,26 @@ async def dbapi_error_handler(request, exc: DBAPIError):
 
     分两种回法（P2-24）：
 
-    * **约束类 4xx**：把 message_primary 回给客户端。它是 ``db_init.sql`` 里
-      人工写的中文文案（"已记账的凭证不允许删除"之类），本来就是要给人看的；
-      400 不是「出事了」，是「你这次请求不合法」。
+    * **约束类 4xx**：把 message_primary 回给客户端 —— **但只在它是
+      「我们自己写的中文护栏文案」时**。``db_init.sql`` 里那些
+      ``RAISE EXCEPTION`` 写的是中文（"已记账的凭证不允许删除"之类），
+      本来就是要给人看的；400 不是「出事了」，是「你这次请求不合法」。
     * **其它（500）**：**不回原文**。``str(orig)`` 里是表名、列名、约束名、
       有时还有数据片段（唯一冲突会把重复键的值带出来）—— 把它回给调用方
       等于把库结构抄送给未授权方。改成一句脱敏提示 + 请求号：
       排查靠服务端日志（那里有完整异常栈），用户那边有可报障的凭据。
+
+    **但「4xx 就回原文」这条曾经漏了半边**（2026-10-20 修）：PG **自己**的
+    约束违例文案是英文的，里面带着**表名与约束名** ——
+    ``insert or update on table "entry" violates foreign key constraint
+    "fk_entry_subject"``、``duplicate key value violates unique constraint
+    "uq_invoice_record_book_no"``。那不是我们写的中文文案，是**库结构**，
+    回给客户端等于把结构抄送出去。
+
+    所以判据不能是「是不是约束错误」，而必须是「**这句文案是不是我们自己
+    写的**」。我们写的中文护栏文案里必然有汉字，PG 自带的英文文案里没有 ——
+    用这一点区分，比维护一张 sqlstate 白名单可靠（sqlstate 是有限的，
+    而文案来源才是真正要管的东西）。
 
     两条路都要**记日志**。护栏被绕过（有人绕过 API 直接改库、或有 bug
     打到了不该打的地方）是最该留痕的路径之一，过去它一条日志都不产生 ——
@@ -188,8 +229,11 @@ async def dbapi_error_handler(request, exc: DBAPIError):
         # 护栏拒绝也要留痕：谁、在什么时候、想干什么被挡下来了。
         # 日志里不记 message 全文（可能含重复键的值），只记状态码与截断摘要。
         log.warning("数据库约束拒绝 %s sqlstate=%s %s", where, sqlstate, message[:200])
+        # **只有我们自己写的中文文案才回给客户端**（见 docstring）。
+        # PG 自带的英文违例文案里带着表名与约束名 —— 那是库结构，不是提示。
+        detail = message[:500] if _is_own_guardrail_text(message) else _generic_constraint_detail(sqlstate)
         return JSONResponse(status_code=400,
-                            content={"detail": message[:500]},
+                            content={"detail": detail},
                             headers={"X-Request-ID": rid})
 
     log.exception("数据库异常 %s sqlstate=%s：%s", where, sqlstate, str(orig)[:500])
