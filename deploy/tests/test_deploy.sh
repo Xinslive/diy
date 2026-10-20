@@ -455,6 +455,64 @@ else
   no "没有把看门狗的「按要求关闭」说清楚"
 fi
 
+# --------------------------------------------------------------------------
+# 10.6 用**相对路径**调用时，脚本仍要能找到自己的 systemd 目录
+# --------------------------------------------------------------------------
+# 这条是 2026-10-20 生产上真实踩到的坑。
+#
+# 脚本原来用 ``$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/systemd`` 找 unit
+# 模板。那是**调用时刻**才求值的：``dirname`` 拿到相对路径（``bash ./deploy.sh``）
+# 时，``cd . && pwd`` 落到的是**当时的工作目录** —— 而脚本第 3 步 cd 过
+# $APP、第 4 步又 cd 到 $APP/backend，于是它找的是 ``$APP/backend/systemd``，
+# 不存在，模板没找到，unit 一个都没装。
+#
+# 后果比「看门狗没装上」严重：每日备份的 timer 在**全新主机**上同样装不上，
+# 而且**不报错**（老主机上旧 unit 还在，enable 照样成功）—— 那台机器从上线
+# 起就一直没有自动备份。
+#
+# 为什么沙箱之前一直是绿的：它用**绝对路径**调脚本（``bash "$SCRIPT"``），
+# 那种调用方式恰好是对的。所以这条用例必须专门用相对路径调，才钉得住。
+run_script_staged_relative(){
+  # 照抄生产上的摆放：deploy.sh 与 systemd/ 放在暂存目录里，
+  # 从那个目录用相对路径调用。
+  local STAGE="$DEPDIR/stage"
+  rm -rf "$STAGE"
+  mkdir -p "$STAGE/systemd"
+  cp "$SCRIPT" "$STAGE/deploy.sh"
+  cp "$(dirname "$SCRIPT")"/systemd/* "$STAGE/systemd/"
+  ( cd "$STAGE" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+    SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+    LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash ./deploy.sh 2>&1 )
+}
+
+echo "== 10.6 相对路径调用时仍要找到 unit 模板 =="
+
+setup_sandbox
+OUT=$(run_script_staged_relative)
+assert_ran "相对路径调用的发布" || exit 1
+for u in cwq-scheduler-watchdog.timer cwq-scheduler-watchdog.service \
+         cwq-backup.timer cwq-backup.service; do
+  if [[ -f "$DEPDIR/units/$u" ]]; then
+    ok "$u 装到了目标目录"
+  else
+    no "$u 没装到目标目录 —— 相对路径调用时脚本找不到自己的 systemd 目录"
+  fi
+done
+# 装到了还得是对的内容：路径必须按本机布局渲染，不能留着 /opt/cwq
+#
+# **注意别写成空过的断言**：文件不存在时 grep 找不到东西会返回非零，
+# 于是「文件根本没装上」会被判成「路径已正确渲染」。所以先确认文件在，
+# 再谈内容 —— 缺文件是更严重的问题，不能被后一条盖过去。
+for u in cwq-scheduler-watchdog.service cwq-backup.service; do
+  if [[ ! -f "$DEPDIR/units/$u" ]]; then
+    no "$u 根本没装上 —— 路径无从谈起（这一条不能被「没有 /opt/cwq」盖过去）"
+  elif grep -q "/opt/cwq" "$DEPDIR/units/$u"; then
+    no "$u 里还留着 /opt/cwq 的硬编码路径"
+  else
+    ok "$u 的路径已按本机布局渲染"
+  fi
+done
+
 echo
 echo "== 11. 回滚快照与库备份不该对本机其他账号可读 =="
 # 快照目录里躺着全量的库备份、上一版源码和产物包。这台机器跑着多个站点，

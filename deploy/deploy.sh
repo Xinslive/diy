@@ -32,6 +32,31 @@
 # 只有 pg_dump（备份用）与 git（可选，仅用于记录版本）还需要。
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# 脚本自身的目录：**必须在任何 cd 之前定死**。
+# ---------------------------------------------------------------------------
+# 为什么要专门记这个：后面要找 unit 模板（deploy/systemd/）时，用的曾经是
+# ``$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/systemd``。那个写法**在调用
+# 时刻**才求值，而 `dirname` 拿到的是**相对路径**时（`bash ./deploy.sh`），
+# `cd . && pwd` 落到的是**当时的工作目录** —— 脚本第 3 步 `cd "$APP"`、
+# 第 4 步 `cd "$APP/backend"` 早就把 CWD 改掉了，于是它去找的是
+# ``$APP/backend/systemd``（不存在）。
+#
+# 后果不是「unit 没装上」这么轻描淡写的一件事：
+#   * 调度看门狗的 timer 装不上 —— 外部调度服务停掉时没有任何通知；
+#   * **每日备份的 timer 在全新主机上装不上** —— 而它装不上时**不报错**
+#     （老主机上旧 unit 还在，enable 照样成功），于是那台机器从上线起
+#     就一直没有自动备份，直到有人手工发现。
+#     2026-10-20 生产上就撞上了：发布日志说「定时备份已启用」，而
+#     /etc/systemd/system 里那个 unit 的时间戳还是前一天的 —— 它压根没被
+#     重装过，只是碰巧还在。
+#
+# 绝对路径调用时这个写法恰好是对的，所以沙箱（用绝对路径）一直是绿的，
+# 缺陷只在生产上以相对路径调用时才现形。修法是**一次定死、提前取**：
+# 此刻 CWD 还是调用者所在目录，`dirname ./deploy.sh` 解析出来的就是脚本
+# 真正所在的地方。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 APP=${APP_DIR:-/opt/cwq}
 # 服务账号：产物解压之后归位给谁。跟 unit 文件里的 User= 保持一致。
 : "${SERVICE_USER:=cwq}"
@@ -511,7 +536,7 @@ enable_backup_timer() {
   fi
 
   local src=""
-  for d in "$APP/deploy/systemd" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/systemd"; do
+  for d in "$APP/deploy/systemd" "$SCRIPT_DIR/systemd"; do
     if [ -f "$d/cwq-backup.timer" ]; then src="$d"; break; fi
   done
 
@@ -546,7 +571,7 @@ enable_watchdog_timer() {
   fi
 
   local src=""
-  for d in "$APP/deploy/systemd" "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/systemd"; do
+  for d in "$APP/deploy/systemd" "$SCRIPT_DIR/systemd"; do
     if [ -f "$d/cwq-scheduler-watchdog.timer" ]; then src="$d"; break; fi
   done
 
