@@ -108,8 +108,13 @@
         <el-form-item label="账套名称" required>
           <el-input v-model="form.name" />
         </el-form-item>
+        <!-- 起始年度：候选年份铺满整个可用区间，再配一个能搜的下拉。
+             以前只有 6 个写死的候选（去年到四年后），想建一本 1998 年起步的账
+             在界面上选不出来。 -->
         <el-form-item label="起始年度" required>
-          <el-select v-model="form.start_year" style="width: 100%">
+          <el-select v-model="form.start_year" style="width: 100%"
+                     filterable default-first-option
+                     placeholder="输入年份，如 2026">
             <el-option v-for="y in yearOptions" :key="y" :label="y + ' 年'" :value="y" />
           </el-select>
         </el-form-item>
@@ -189,6 +194,7 @@ import { useSessionStore } from '@/stores/session'
 import BookInitDialog from '@/components/BookInitDialog.vue'
 import { hasInit, initStep, STEP_DONE } from '@/utils/bookInit'
 import { dropInto, moveBy, moveDelta, moveTo, orderIds, sameOrder } from '@/utils/bookOrder'
+import { startYearOptions } from '@/utils/startYear'
 
 const store = useSessionStore()
 const router = useRouter()
@@ -292,7 +298,10 @@ async function onTileKeydown(row, event) {
   }
 }
 
-const yearOptions = Array.from({ length: 6 }, (_, i) => new Date().getFullYear() - 1 + i)
+/** 候选年份：1900 年到今年往后 5 年，倒序。
+ *  每个年份都是**真实选项**，所以下拉里选中的一定是合法年份 ——
+ *  不需要「手输了半截年份」那一套收口。 */
+const yearOptions = startYearOptions()
 const form = reactive({
   company_name: '', name: '', start_year: new Date().getFullYear(), start_month: 1
 })

@@ -31,12 +31,23 @@ class RegisterIn(BaseModel):
 
 
 # ---- 账套 ----
+# 起始会计年度的合法范围。前端 `utils/startYear.js` 用的是同一套边界：
+# 界面上能选出来的年份，这里一定收得下。
+# 界面本身只给得出合法年份，但这条接口是开放的 —— 越界的年份要在这里挡回去。
+START_YEAR_MIN = 1900
+START_YEAR_MAX = 2100
+
+
 class BookIn(BaseModel):
     # 公司名只是账套的一个文本属性，没有独立的「公司」实体
     company_name: str = Field(min_length=1, max_length=128)
     name: str = Field(min_length=1, max_length=128)
     # 账套的起始会计年度。一个账套跨多个年度，这里填「从哪一年开始记」
-    start_year: int
+    # 范围放开是有意为之：建一本 1998 年起步的账是常事，
+    # 界面上选不出来就只剩「去改库」这一条路，那不是产品该有的出口。
+    # 但**边界要有** —— 越界的年份会一路写进期间表（ord 按 start_year 推算），
+    # 到那时再回头改就不是改一个字段的事了。
+    start_year: int = Field(ge=START_YEAR_MIN, le=START_YEAR_MAX)
     start_month: int = Field(1, ge=1, le=12)
     # 科目编码规则，如「4-2-2-2」；决定新增科目自动接几位号
     subject_code_rule: str = Field("4-2-2-2", pattern=r"^\d+(-\d+)*$")
