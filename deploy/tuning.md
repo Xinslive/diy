@@ -279,3 +279,65 @@ cd backend
 ```
 
 写场景**自建临时账套、跑完自动删除**，不会碰演示数据。
+
+---
+
+## 十、限流开关（nginx 侧）与前端产物的目录布局（2026-10-20 补）
+
+### 10.1 限流：两段文件，缺一不可
+
+限流**默认关闭**，而且**刻意不给默认阈值** —— 阈值只能用业务峰值定，
+而这套系统的真实峰值没有任何测量数据（月结日与平日的并发能差一个数量级，
+凭空写一个数上去，要么形同虚设，要么在月结那天把全公司挡在门外）。
+
+**开限流要建两个文件，指令上下文不同，不能只写一半：**
+
+```bash
+# 1) http 级：定义 zone（limit_req_zone 的合法上下文只有 http）
+mkdir -p /etc/nginx/cwq-include
+cat > /etc/nginx/cwq-include/cwq-rl-zone.conf <<'EOF'
+limit_req_zone  $binary_remote_addr zone=cwq_api:10m rate=<阈值>;
+limit_conn_zone $binary_remote_addr zone=cwq_api_conn:10m;
+EOF
+
+# 2) location 级：引用 zone
+cat > /etc/nginx/cwq-include/cwq-rl-api.conf <<'EOF'
+limit_req  zone=cwq_api burst=<突发量> nodelay;
+limit_conn cwq_api_conn <并发连接数>;
+EOF
+
+# 然后：
+nginx -t && systemctl reload nginx    # 宝塔上用 nginx -s reload
+```
+
+**删掉这两个文件即关闭。** 两个 include 都是**通配**（`cwq-rl-zone*.conf` /
+`cwq-rl-api*.conf`），通配 include 在没有匹配文件时**不报错** ——
+「文件不存在」就是干净的关闭状态。
+
+> **以前这里只实现了一半。** 宝塔形态的 vhost
+> （`deploy/nginx/acct.xins.live.conf`）只有 location 级那一半，
+> 缺 http 级的 zone 定义 —— 照着建好文件去 reload，`nginx -t` 直接失败
+> （`unknown limit_req_zone "cwq_api"`），**限流在这个部署形态下永远开不了**。
+> 现在两份 vhost（`cwq.conf` 与 `acct.xins.live.conf`）都有这两半，
+> 并且 `deploy/tests/nginx_conf_check.py` 每次 CI 都会**真的建出这两个文件
+> 再跑一次 `nginx -t`** —— 「按文档启用」这条路径本身必须能过。
+
+> **两种 nginx 形态只能选一种。** 独立 nginx（`cwq.conf`）与宝塔
+> （`acct.xins.live.conf`）各自都声明了同名 zone，同时加载会报
+> `limit_req_zone "cwq_api" is already bound to key ...`（直接 emerg）。
+
+### 10.2 前端产物现在是「版本化目录 + 软链」
+
+```
+/opt/cwq/frontend/releases/dist-<commit>-<时间戳>/   真正的前端内容（一份一版）
+/opt/cwq/frontend/dist -> releases/dist-<commit>-<时间戳>   nginx 的 root 指这里
+```
+
+- **nginx 的 `root` 路径没变**，所以这次改造不需要 reload nginx。
+- 换版 = 把 `dist` 这个软链指向新的 release 目录（一次 `rename`），
+  中间**没有「目录整个不存在」的窗口**（原来的两次 `mv` 有）。
+- 上一版的 release 目录还在盘上（保留最近 3 份），所以回退之后
+  旧前端引用的 `/assets/*` 仍然打得开。
+
+运维要动前端时，改的是 `releases/dist-<commit>-<时间戳>/` 里的内容 ——
+**不要直接改 `dist/`**（那是软链，改的是当前这一份，改完下次发布就没了）。

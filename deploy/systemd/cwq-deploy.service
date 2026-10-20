@@ -1,15 +1,43 @@
-# 发布脚本：rsync 代码 -> 重启 API -> 跑测试 -> 失败自动回滚
+# 发布单元：**只能手工 `systemctl start`，不装成开机自启**。
+#
+# 原来这份 unit 的 Description 写的是「rsync 代码 -> 重启 API -> 跑测试 ->
+# 失败自动回滚」—— 这四项当前**一项都不成立**：
+#   * rsync：脚本里零命中（现在的流程是从 CI 取产物、校验 sha256）
+#   * 跑测试：闸门在 CI（build-artifacts 的 needs），生产机不再跑测试
+#   * 失败自动回滚：脚本原来一个 trap 都没有（2026-10-20 才补上）
+#   * 重启 API：有，但顺序不同（备份 -> 迁移 -> 切产物 -> 重启 -> 探活）
+#
+# 更要紧的是原来那行 `[Install] WantedBy=multi-user.target`：发布单元一旦被
+# `systemctl enable`，**每次开机都会跑一次 /usr/local/bin/deploy.sh** ——
+# 即「机器一重启就自动从 GitHub Actions 取默认分支的最近一次 CI 产物
+# 并上线」。发布不是该由机器自己决定的事（取哪条线、什么时候取、失败
+# 怎么办，都是人的决定）。
+#
+# 所以这里**删掉 [Install] 段**：没有可安装的目标，`systemctl enable`
+# 会直接报错而不是悄悄生效，这份 unit 只能 `systemctl start` 触发。
+#
+# 用法：
+#   systemctl start cwq-deploy.service
+#   journalctl -u cwq-deploy.service -n 200 --no-pager
+#
+# 日常发布直接 `bash /usr/local/bin/deploy.sh` 也一样；用这一份的好处是
+# 失败时 systemd 会把退出码记进 journal（`systemctl status` 直接看得到）。
 [Unit]
-Description=发布云财务记账系统
-After=network.target
+Description=发布云财务记账系统（取 CI 产物 -> 校验 -> 备份 -> 迁移 -> 切产物 -> 重启 -> 探活）
+# 迁移要连数据库、产物要从 GitHub Actions 拉，所以排在网络就绪之后。
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
 User=root
 WorkingDirectory=/opt/cwq
 
+# --check-only 先做一次只读体检（不发布、不重启）；体检不过就别往下走。
 ExecStartPre=/usr/local/bin/deploy.sh --check-only
 ExecStart=/usr/local/bin/deploy.sh
 
-[Install]
-WantedBy=multi-user.target
+# 发版是重活：给足超时，别让 systemd 在最不该掐断的地方掐断。
+# （掐断 = 脚本停在半路。脚本现在有 trap 能退回去上一版，但退回去
+# 不等于发成功 —— 看 journal 里的实际结果。）
+TimeoutStartSec=1800

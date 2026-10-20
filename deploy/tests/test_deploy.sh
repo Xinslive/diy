@@ -34,10 +34,14 @@ FAKE_SHA="abc123def456"
 # --------------------------------------------------------------------------
 make_artifacts(){
   local out="$1"
+  # 内容里**带 sha**：这样「线上到底是哪一版」才断言得出来。
+  # 所有产物内容都一样的话，「回退到上一版」根本分不出「退回去了」
+  # 与「压根没换过」。
+  local sha="${2:-$FAKE_SHA}"
   mkdir -p "$out"
   local be="$DEPDIR/stage-backend" fe="$DEPDIR/stage-frontend"
   mkdir -p "$be/app" "$be/scripts" "$be/migrations/versions" "$fe/dist"
-  echo "NEW backend code" > "$be/app/main.py"
+  echo "NEW backend code $sha" > "$be/app/main.py"
   echo "# new" > "$be/app/__init__.py"
   echo "print('backup')" > "$be/scripts/db_backup.py"
   echo "print('plugin status')" > "$be/scripts/plugin_status.py"
@@ -50,19 +54,29 @@ make_artifacts(){
   echo "rfc8785==0.1.4" > "$be/requirements.lock"
   echo "SQLAlchemy==2.1.4" >> "$be/requirements.lock"
   echo "[pytest]" > "$be/pytest.ini"
-  echo "<html>new frontend</html>" > "$fe/dist/index.html"
-  tar -czf "$out/cwq-backend-${FAKE_SHA}.tar.gz" -C "$be" .
-  tar -czf "$out/cwq-frontend-${FAKE_SHA}.tar.gz" -C "$fe" dist
+  echo "<html>new frontend $sha</html>" > "$fe/dist/index.html"
+  tar -czf "$out/cwq-backend-${sha}.tar.gz" -C "$be" .
+  tar -czf "$out/cwq-frontend-${sha}.tar.gz" -C "$fe" dist
   {
-    echo "sha=${FAKE_SHA}"
-    echo "commit=${FAKE_SHA}fullsha"
+    echo "sha=${sha}"
+    echo "commit=${sha}fullsha"
     echo "ref=main"
     echo "built_at=2026-10-15T00:00:00Z"
-    echo "backend=cwq-backend-${FAKE_SHA}.tar.gz"
-    echo "frontend=cwq-frontend-${FAKE_SHA}.tar.gz"
+    echo "backend=cwq-backend-${sha}.tar.gz"
+    echo "frontend=cwq-frontend-${sha}.tar.gz"
   } > "$out/manifest.txt"
-  ( cd "$out" && sha256sum ./cwq-backend-${FAKE_SHA}.tar.gz \
-                        ./cwq-frontend-${FAKE_SHA}.tar.gz > SHA256SUMS )
+  ( cd "$out" && sha256sum ./cwq-backend-${sha}.tar.gz \
+                        ./cwq-frontend-${sha}.tar.gz > SHA256SUMS )
+}
+
+# 换一版产物（内容与文件名都带新的 sha）。
+# 用于「回退到上一版」这类断言：两次发布的 sha 必须不同，否则它们落在
+# 同一个 release 目录里，「退回去了」与「压根没换过」长得一模一样。
+use_sha(){
+  local sha="$1"
+  rm -rf "$DEPDIR/artifacts"
+  mkdir -p "$DEPDIR/artifacts"
+  make_artifacts "$DEPDIR/artifacts" "$sha"
 }
 
 setup_sandbox(){
@@ -85,9 +99,51 @@ setup_sandbox(){
   echo "DATABASE_URL=postgresql+psycopg://cwq:pw@127.0.0.1:15432/cwq" > "$APP/backend/.env"
   make_artifacts "$DEPDIR/artifacts"
 
-  for c in systemctl curl; do
-    printf '#!/bin/sh\necho "%s $*" >> "$DEPDIR/calls"\nexit 0\n' "$c" > "$DEPDIR/bin/$c"
-  done
+  # systemctl 桩：**只有 restart 能被单独打挂**（STUB_RESTART_RC）。
+  # 「重启失败」是唯一能触发 trap 自动回退的注入点 —— 别的步骤失败时
+  # 要么还没动现网，要么已经过了「可以回退」的阶段。
+  cat > "$DEPDIR/bin/systemctl" <<'STUB'
+#!/bin/sh
+echo "systemctl $*" >> "$DEPDIR/calls"
+case "$*" in
+  *restart*) exit ${STUB_RESTART_RC:-0} ;;
+esac
+exit 0
+STUB
+  printf '#!/bin/sh\necho "curl $*" >> "$DEPDIR/calls"\nexit 0\n' > "$DEPDIR/bin/curl"
+
+  # mv 桩：**能把「把内容挪到线上那个 dist 路径上」这一步打挂**
+  # （STUB_MV_FAIL_SWAP=1）。
+  #
+  # 判据：目标 basename 是 dist、且源**不是** dist-legacy-*。
+  #   * 新代码：换软链那一步的源是 dist.swap.<pid> → 打挂 ✓（注入点）
+  #   * 新代码：回退时把旧目录搬回原位，源是 dist-legacy-* → 放行 ✓
+  #   * **旧代码**（两次 mv）：`mv "$FRONT_IN/dist" "$APP/frontend/dist"`
+  #     正好命中 → 打挂 → 而旧代码没有 trap → dist 就此不存在 →
+  #     断言「dist 仍然指得到内容」会红。**这就是「两次 mv 之间有窗口」
+  #     这个回归的行为级钉子。**
+  REAL_MV="$(command -v mv)"
+  cat > "$DEPDIR/bin/mv" <<STUB
+#!/bin/sh
+if [ "\${STUB_MV_FAIL_SWAP:-0}" = "1" ]; then
+  last=""
+  prev=""
+  for a in "\$@"; do prev="\$last"; last="\$a"; done
+  case "\$last" in
+    */dist)
+      case "\$prev" in
+        */dist-legacy-*) : ;;   # 回退时把旧目录搬回去，放行
+        *)
+          echo "mv \$*" >> "\$DEPDIR/calls"
+          echo "mv: 模拟故障（把内容挪到线上 dist 这一步失败）" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+  esac
+fi
+exec "$REAL_MV" "\$@"
+STUB
   # pip 桩：把「-r 指向的那份锁文件的第一行」记进 calls。
   # 2026-10-18 那次事故里 pip **返回成功**，装的是旧锁；只记「跑过 pip」
   # 等于把那次失败判成绿灯。
@@ -141,6 +197,15 @@ run_script_no_db_url(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
     env -u DATABASE_URL LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
+}
+# 显式给 DATABASE_URL：用来验证「.env 不存在」这条路径 —— 那条路径是
+# 合法的（deploy.sh 第 3 步只在 .env 与 DATABASE_URL **都**没有时才拦），
+# 而它正是 TRUSTED_PROXIES 告警方向反了的触发场景。
+run_script_with_db_url(){
+  ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+    SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+    DATABASE_URL="postgresql+psycopg://cwq:pw@127.0.0.1:15432/cwq" \
+    LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 calls(){ cat "$DEPDIR/calls" 2>/dev/null; }
 
@@ -765,6 +830,262 @@ else
   else
     ok "有关停标记时 unit 没被写入（渲染前就短路了）"
   fi
+fi
+
+echo
+echo "== 16. 前端切换是**一次 rename**（原子），不是「旧的让开、新的顶上」 =="
+# --------------------------------------------------------------------------
+# 这一组是 P2-2 的回归测试。
+#
+# 原来的写法是两次 mv：
+#     mv "$APP/frontend/dist" "$FRONT_OLD"     # 旧的让开
+#     mv "$FRONT_IN/dist" "$APP/frontend/dist" # 新的顶上
+# 两次 rename(2) 之间 dist **整个不存在** —— nginx 的 root 指的就是它，
+# 那段时间里所有静态资源返回 404。而脚本当时**一个 trap 都没有**，
+# 被打断（SSH 断连、systemd 超时）落在两行之间就是整站白屏，且没有
+# 任何自动恢复路径。
+#
+# 现在改成「版本化目录 + 一次 rename 换软链」。断言分三层：
+#   1. 结构：dist 是软链，指向 releases/dist-<sha>-<时间戳>；
+#   2. 静态：脚本里**不再有**「把 dist 挪走」这种写法，也不再用
+#      非原子的 ln -sfn；
+#   3. 行为：切换失败时 trap 把上一版换回去（见第 17 组）。
+# --------------------------------------------------------------------------
+setup_sandbox
+OUT=$(run_script)
+assert_ran "全量发布" || exit 1
+
+if [[ -L "$APP/frontend/dist" ]]; then
+  ok "前端 dist 是软链（版本化布局）"
+else
+  no "前端 dist 不是软链 —— 用的还是「两次 mv」的老写法"
+fi
+DIST_LINK=$(readlink "$APP/frontend/dist" 2>/dev/null || echo "")
+if [[ "$DIST_LINK" == releases/dist-* ]]; then
+  ok "dist 指向 releases/ 下的版本目录（${DIST_LINK}）"
+else
+  no "dist 指向的不是版本目录：${DIST_LINK:-<读不到>}"
+fi
+if grep -q "new frontend" "$APP/frontend/dist/index.html" 2>/dev/null; then
+  ok "软链指过去的那份就是新产物"
+else
+  no "软链指过去的内容不是新产物"
+fi
+# 上一版的 release 目录必须还在：回退靠它，而且旧前端引用的
+# /assets/* 只有它还在盘上才打得开。
+if ls -d "$APP/frontend/releases"/dist-* >/dev/null 2>&1; then
+  ok "版本化目录已建立（releases/dist-*）"
+else
+  no "releases/ 下没有任何版本目录"
+fi
+
+# **静态断言**：这几条是「回归也抓得住」的关键。
+# 行为断言只能证明「这一次切换是对的」，静态断言能证明「写法本身
+# 不会退化回两次 mv」。
+#
+# **只看真正的命令（去掉注释行）**：注释里写着「为什么不用 ln -sfn」
+# 本身不该被判成「用了 ln -sfn」。
+#
+# **用 `grep -c` 而不是 `grep -q`**：管道 + `set -o pipefail` 下，
+# `grep -q` 一匹配就退出 → 上游的 grep 收到 SIGPIPE → 整条管道返回非零 →
+# 「匹配到了」反而被判成「没匹配」。`-c` 会把输入读完，没有这个问题。
+code_only(){ grep -vE '^[[:space:]]*#' "$SCRIPT"; }
+code_count(){ code_only | grep -cE "$1" || true; }
+
+if [[ "$(code_count 'mv[[:space:]]+"\$FRONT_IN/dist"[[:space:]]+"\$APP/frontend/dist"')" != "0" ]]; then
+  no "脚本里仍有「把新内容 mv 进线上 dist」的写法（两次 mv = 中间有窗口）"
+else
+  ok "脚本里没有「把新内容 mv 进线上 dist」的写法"
+fi
+# **只查换软链的那个函数**：脚本里另有一处 ln -sfn（给暂存目录链 .env），
+# 那一处链的不是对外服务的路径，语义完全不同，不能混为一谈。
+swap_body=$(awk '/^atomic_symlink_swap\(\)/,/^}/' "$SCRIPT")
+if grep -cE 'ln[[:space:]]+-[a-zA-Z]*f' <<<"$swap_body" | grep -qv '^0$'; then
+  no "换软链用了 ln -f —— 那是 unlink + symlink，中间链接是空的，不是原子的"
+else
+  ok "换软链没有用非原子的 ln -f/-n"
+fi
+if [[ "$(code_count 'atomic_symlink_swap')" == "0" ]]; then
+  no "脚本里找不到原子换软链的实现"
+else
+  ok "脚本用一次 rename 完成软链切换（atomic_symlink_swap）"
+fi
+if code_only | grep -qE '^[[:space:]]*trap[[:space:]]'; then
+  ok "脚本装了 trap（被打断时能退回去）"
+else
+  no "脚本一个 trap 都没有 —— 被打断就停在半路"
+fi
+
+echo
+echo "== 17. 切换失败 / 重启失败时，trap 把上一版换回去 =="
+# --------------------------------------------------------------------------
+# 「有 trap」不等于「trap 管用」。这一组真的把切换打挂（mv 桩在换软链
+# 那一步失败），然后断言线上仍然是上一版。
+# --------------------------------------------------------------------------
+# 情形一：第一次发布（旧布局：dist 是真实目录）切换失败
+setup_sandbox
+OUT=$(STUB_MV_FAIL_SWAP=1 run_script); RC=$?
+if [[ "$RC" != "0" ]]; then
+  ok "切换失败以非零退出（${RC}）"
+else
+  no "切换失败却返回成功"
+fi
+if grep -q "old frontend" "$APP/frontend/dist/index.html" 2>/dev/null; then
+  ok "切换失败后线上仍是上一版前端（trap 退回去了）"
+else
+  no "切换失败后前端不是上一版：$(cat "$APP/frontend/dist/index.html" 2>/dev/null || echo '<dist 不存在>')"
+fi
+if [[ -e "$APP/frontend/dist/index.html" ]]; then
+  ok "切换失败后 dist 仍然指得到内容（没有留下「dist 整个不存在」）"
+else
+  no "切换失败后 dist 不存在 —— 整站 404"
+fi
+if grep -q "OLD backend content" "$APP/backend/app.py" 2>/dev/null; then
+  ok "切换失败后后端代码是上一版"
+else
+  no "切换失败后后端代码不是上一版"
+fi
+if grep -q "回退" <<<"$OUT"; then
+  ok "明确报出了回退动作"
+else
+  no "没有报出回退动作"
+fi
+
+# 情形二：已经是版本化布局，再发一版（sha 不同）且切换失败 → 退回上一版
+setup_sandbox
+run_script >/dev/null
+assert_ran "首次发布" || exit 1
+FIRST_LINK=$(readlink "$APP/frontend/dist" 2>/dev/null || echo "")
+use_sha "def456abc123"
+OUT=$(STUB_MV_FAIL_SWAP=1 run_script); RC=$?
+if [[ "$RC" != "0" ]]; then
+  ok "第二次发布切换失败以非零退出（${RC}）"
+else
+  no "第二次发布切换失败却返回成功"
+fi
+NOW_LINK=$(readlink "$APP/frontend/dist" 2>/dev/null || echo "")
+if [[ "$NOW_LINK" == "$FIRST_LINK" ]]; then
+  ok "切换失败后软链指回上一版（${NOW_LINK}）"
+else
+  no "切换失败后软链指向 ${NOW_LINK:-<读不到>}，不是上一版 ${FIRST_LINK}"
+fi
+if grep -q "new frontend abc123def456" "$APP/frontend/dist/index.html" 2>/dev/null; then
+  ok "切换失败后线上跑的是上一版的内容（不是这一版的）"
+else
+  no "切换失败后线上内容不对：$(cat "$APP/frontend/dist/index.html" 2>/dev/null || echo '<读不到>')"
+fi
+
+# 情形三：重启失败（服务起不来）→ 代码与前端都退回上一版
+setup_sandbox
+run_script >/dev/null
+assert_ran "首次发布" || exit 1
+use_sha "aaa111bbb222"
+OUT=$(STUB_RESTART_RC=1 run_script); RC=$?
+if [[ "$RC" != "0" ]]; then
+  ok "重启失败以非零退出（${RC}）"
+else
+  no "重启失败却返回成功"
+fi
+if grep -q "new frontend abc123def456" "$APP/frontend/dist/index.html" 2>/dev/null; then
+  ok "重启失败后前端退回上一版"
+else
+  no "重启失败后前端不是上一版"
+fi
+if grep -q "OLD backend content" "$APP/backend/app.py" 2>/dev/null; then
+  ok "重启失败后后端代码退回上一版"
+else
+  no "重启失败后后端代码不是上一版"
+fi
+# 库已经迁移过 → 回退报告必须**说清楚**库没有回退，以及为什么
+if grep -q "没有回退" <<<"$OUT"; then
+  ok "明确说明「库已迁移但没有回退」"
+else
+  no "没有说明库的状态（运维会以为库也退回去了）"
+fi
+if grep -q "不要直接重启服务" <<<"$OUT"; then
+  ok "明确警告「不要直接重启服务」（上一版代码拒绝在新 schema 上启动）"
+else
+  no "没有警告重启的风险"
+fi
+
+# 情形四：同一份产物**再发一次**（上次发布失败后重跑）——
+# 不能把当前正在服务的那份 release 删掉。
+#
+# **这条钉的是一个真实会踩的坑**：版本目录如果只按 sha 命名（dist-<sha>），
+# 第二次发布开头的 `rm -rf` 就会把**正在服务的那一份**删掉 —— 而切换还没
+# 发生，dist 软链指着一个不存在的目录 → 整站 404；这次发布要是又失败在
+# 前半段，站点就一直白着。目录名带时间戳之后就不会。
+setup_sandbox
+run_script >/dev/null
+assert_ran "首次发布" || exit 1
+FIRST_LINK=$(readlink "$APP/frontend/dist" 2>/dev/null || echo "")
+export STUB_ALEMBIC_RC=1
+OUT=$(run_script); RC=$?
+unset STUB_ALEMBIC_RC
+if [[ -n "$FIRST_LINK" && ! -e "$APP/frontend/$FIRST_LINK" ]]; then
+  no "重发同一份产物把正在服务的那份 release 删掉了 —— dist 软链指空，整站 404"
+else
+  ok "重发同一份产物没有动正在服务的那份 release"
+fi
+if grep -q "new frontend" "$APP/frontend/dist/index.html" 2>/dev/null; then
+  ok "重发失败后线上仍然是上一版前端"
+else
+  no "重发失败后线上前端不见了：$(cat "$APP/frontend/dist/index.html" 2>/dev/null || echo '<dist 不存在>')"
+fi
+
+echo
+echo "== 18. TRUSTED_PROXIES 的告警方向不能反 =="
+# --------------------------------------------------------------------------
+# 原来的检查只有两分（空 / 非空），而 grep 在**文件不存在**时退出码是 2
+# → 走 else → 打印「已配置」。于是「.env 根本不存在」这个更糟的状态
+# 被报成了「已处理」—— 运维以为配了、其实没配，IP 维度节流退化成一个
+# 全站共用的桶。
+# --------------------------------------------------------------------------
+setup_sandbox
+echo "TRUSTED_PROXIES=127.0.0.1" >> "$APP/backend/.env"
+OUT=$(run_script)
+assert_ran "全量发布" || exit 1
+if grep -q "TRUSTED_PROXIES 已配置" <<<"$OUT"; then
+  ok "配了值就报「已配置」"
+else
+  no "配了值却没报「已配置」"
+fi
+
+setup_sandbox
+echo "TRUSTED_PROXIES=" >> "$APP/backend/.env"
+OUT=$(run_script)
+assert_ran "全量发布" || exit 1
+if grep -q "TRUSTED_PROXIES 是空的" <<<"$OUT"; then
+  ok "配成空值就报「是空的」"
+else
+  no "空值没被识别出来"
+fi
+
+setup_sandbox
+grep -v "DATABASE_URL" "$APP/backend/.env" > "$APP/backend/.env.tmp" || true
+mv "$APP/backend/.env.tmp" "$APP/backend/.env"
+OUT=$(run_script)
+assert_ran "全量发布" || exit 1
+if grep -q "没有.*TRUSTED_PROXIES" <<<"$OUT"; then
+  ok ".env 里没有这一项时报「没有 TRUSTED_PROXIES」"
+else
+  no ".env 里没有这一项时没有告警"
+fi
+
+# **关键的一条**：.env 不存在时必须说「无法确认」，**不能**说「已配置」。
+setup_sandbox
+rm -f "$APP/backend/.env"
+OUT=$(run_script_with_db_url)
+assert_ran "全量发布" || exit 1
+if grep -q "无法确认" <<<"$OUT"; then
+  ok ".env 不存在时报「无法确认」"
+else
+  no ".env 不存在时没有说「无法确认」"
+fi
+if grep -q "TRUSTED_PROXIES 已配置" <<<"$OUT"; then
+  no ".env 不存在却报「已配置」—— 把更糟的状态报成了已处理"
+else
+  ok ".env 不存在没有误报「已配置」"
 fi
 
 echo

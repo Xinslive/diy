@@ -71,9 +71,24 @@ jobs:
       CWQ_REQUIRE_PG_CLIENT: '1'
 
     steps:
-      - uses: actions/checkout@v4
+      # ------------------------------------------------------------------------
+      # **所有 action 都 pin 到 commit SHA**（2026-10-20 补）
+      # ------------------------------------------------------------------------
+      # 标签（@v4 / @v5）指向的是**可变引用**：仓库可以把 v4 重新指向另一个
+      # commit，于是「昨天还干净的 action」今天就能在流水线里跑完全不同的代码
+      # —— 而流水线里跑的是有 token 权限的代码。pin 到 SHA 之后，那段代码就
+      # 冻结了；要升级就改 SHA（并写清版本）。
+      #
+      # 括号里是 pin 住的版本号，方便下次升级时对照。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # 浅克隆：CI 用不到历史，而完整克隆在这个仓库上是几十兆的浪费。
+          # persist-credentials 设 false：checkout 完就把 token 从 git config
+          # 里拿掉 —— 后面任何一步（跑测试、跑脚本）都不该带着这个权限。
+          fetch-depth: 1
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           # 与 backend/Dockerfile 和本地 .venv 一致（3.11）
           python-version: '3.11'
@@ -88,11 +103,16 @@ jobs:
 
       - name: 装锁定版本的依赖
         working-directory: backend
-        # 装 requirements-dev.lock（逐包定版），不是 requirements-dev.txt。
+        # 装 requirements-dev.lock（逐包定版 + **逐包哈希**），不是 requirements-dev.txt。
         # 这样「CI 跑测试的那套依赖」和「本地跑测试的那套依赖」逐包相同。
+        #
+        # **--require-hashes 是这道闸的一半**（2026-10-20 补）：锁文件里的
+        # 每一行都带 sha256，装的时候必须逐个核对 —— 对不上就失败。
+        # 以前锁文件零哈希，于是同一个版本号的任何 wheel/sdist 都能装上，
+        # 镜像站还可能就地重打包：供应链上没有第二道闸。
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.lock
+          pip install --require-hashes -r requirements-dev.lock
 
       - name: 全量 pytest（不加 -k，不加 -m，不跳过任何用例）
         working-directory: backend
@@ -106,11 +126,16 @@ jobs:
         #     4 核机上未必成立，而 auto 会让并行度跟着 runner 的规格漂 ——
         #     同一个 commit 在不同 runner 上跑出不同的并行度，没法比较。
         #     命令行参数优先级高于 pytest.ini 的 addopts，所以这里的 3 会生效。
+        #
+        # **--cov=app 是覆盖率门槛那道闸的数据来源**（见下一步）。
+        # 它测的是 app/（生产代码），不含 tests/ 与 scripts/。
         run: |
           set -euo pipefail
           # tee 到文件：下一步的护栏校验解析这份报告，而不是重跑一遍护栏。
           # set -o pipefail 保证 pytest 失败时这一步照样失败（tee 自己是 0）。
-          python -m pytest -rA -n 3 2>&1 | tee pytest-report.txt
+          python -m pytest -rA -n 3 \
+            --cov=app --cov-report=xml:coverage.xml --cov-report=term \
+            2>&1 | tee pytest-report.txt
 
       - name: 护栏测试必须真的被执行（读上面那次全量的报告，不重跑）
         working-directory: backend
@@ -205,15 +230,64 @@ jobs:
               f"{g} {counts[g]['PASSED']} 条 PASSED" for g in GUARDRAILS))
           PY
 
+      - name: 覆盖率门槛（不许低于基线）
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import sys
+          import xml.etree.ElementTree as ET
+
+          # **下限 88%**：基线是 2026-10-20 实测的 **89.6%**
+          # （`pytest --cov=app`：app/ 共 14656 行、覆盖 13135 行）。
+          # 取 88% 是给正常波动留 1.6 个点：新写的代码暂时没配套用例、
+          # 平台差异带来的行覆盖抖动 —— 这些都不该让流水线红。
+          #
+          # **为什么不直接卡基线**：卡死基线会让「先写实现、后补用例」的
+          # 正常节奏变成红灯，而红灯会被人用「把下限调低」来消掉 ——
+          # 那就把这道闸本身废掉了。88% 仍然远高于「没有闸」，且任何
+          # 大幅删测试的行为都会被它抓住（删 200 条用例 ≈ 掉 1 个点以上）。
+          FLOOR = 88.0
+
+          REPORT = pathlib.Path("coverage.xml")
+          if not REPORT.is_file():
+              print("❌ 找不到 coverage.xml —— 上一步的覆盖率数据没落盘，"
+                    "这道闸无从判断（不能当成通过）。")
+              sys.exit(1)
+
+          root = ET.parse(REPORT).getroot()
+          # coverage 的 XML 有两种写法：行覆盖率是根元素的属性
+          # （coverage 7.x 的默认），旧格式里是 <coverage><line-rate/></coverage>
+          # 的子元素。两种都认，但**都认不到就当失败**（不能靠猜）。
+          rate = root.get("line-rate")
+          if rate is None:
+              node = root.find("./line-rate")
+              rate = node.get("rate") if node is not None else None
+          if rate is None:
+              print("❌ coverage.xml 里找不到 line-rate —— 格式不对，不能靠猜。")
+              sys.exit(1)
+          pct = float(rate) * 100.0
+          print(f"app/ 的行覆盖率：{pct:.2f}%（下限 {FLOOR}%）")
+          if pct < FLOOR:
+              print(f"❌ 覆盖率 {pct:.2f}% 低于下限 {FLOOR}% —— "
+                    "新增的代码没有配套用例？")
+              sys.exit(1)
+          print("✅ 覆盖率不低于下限")
+          PY
+
       - name: 用例数下限（防止有人用 -k 把范围悄悄收窄）
         working-directory: backend
         run: |
           set -euo pipefail
           n=$(python -m pytest --collect-only 2>&1 | sed -nE 's/^([0-9]+) tests collected.*/\1/p' | tail -1)
           echo "收集到 ${n:-0} 条用例"
-          # 下限 900（当前约 960）。要往下调，先想清楚是不是在拿 CI 换绿灯。
-          if [ -z "${n:-}" ] || [ "$n" -lt 900 ]; then
-            echo "❌ 只收集到 ${n:-0} 条用例（下限 900）—— 测试范围被收窄了？"
+          # 下限 2000（2026-10-20 实测 2169 条）。以前是 900、注释写「当前约
+          # 960」—— 那时确实有 960 条，但后来一路涨到 2169，下限没跟着抬，
+          # 于是这道闸**只及实数的四成**：把范围收窄一半都不会触发。
+          # 要往下调，先想清楚是不是在拿 CI 换绿灯。
+          if [ -z "${n:-}" ] || [ "$n" -lt 2000 ]; then
+            echo "❌ 只收集到 ${n:-0} 条用例（下限 2000）—— 测试范围被收窄了？"
             exit 1
           fi
 
@@ -222,9 +296,9 @@ jobs:
     name: 前端测试与构建
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           # CI 固定在 LTS 上，不追开发机的新版本 —— 流水线要的是可复现。
           # 本地开发机跑的是 Node 26。
@@ -238,7 +312,7 @@ jobs:
           # 要改 node-version，先把这条一起改掉，别只改一半。
           node-version: '22'
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: '10'
 
@@ -300,19 +374,19 @@ jobs:
     env:
       CWQ_PLUGIN_E2E_DATABASE_URL: postgresql+psycopg://cwq:cwq123@127.0.0.1:5432/cwq_plugin_browser_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: '10'
       - name: 安装锁定依赖与 Chromium
         run: |
-          python -m pip install -r backend/requirements-dev.lock
+          python -m pip install --require-hashes -r backend/requirements-dev.lock
           npm ci
           pnpm --dir frontend install --frozen-lockfile
           npx playwright install --with-deps chromium
@@ -322,7 +396,7 @@ jobs:
           python backend/scripts/plugin_e2e.py
       - name: 保留浏览器截图
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: plugin-browser-screenshots
           path: output/playwright/
@@ -333,7 +407,7 @@ jobs:
     name: 镜像能构建且迁移文件在镜像里
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: 构建镜像
         # 这条路径以前**从来没被打通过**（P2-32）：镜像里没有 alembic.ini 和
@@ -360,12 +434,31 @@ jobs:
     name: 发布脚本沙箱演练
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # deploy.sh 是 bash 脚本，用假的 git/pip/pytest/pnpm/systemctl/curl
       # 在临时目录里真跑一遍再断言它做了什么。这条测试里有一条 assert_ran
       # 守卫，专门防「脚本压根没跑起来却一片绿」。
       - name: 跑沙箱演练
         run: bash deploy/tests/test_deploy.sh
+
+      # ------------------------------------------------------------------------
+      # nginx 配置校验：**真的跑一次 nginx -t**
+      # ------------------------------------------------------------------------
+      # 为什么必须装 nginx：限流开关以前只实现了一半（宝塔形态缺 http 级
+      # 的 limit_req_zone 定义），而那种配置**只有真的 nginx -t 才看得出来**
+      # —— 它报 unknown limit_req_zone，运维按文档启用限流就会 reload 失败。
+      # 静态检查能发现「引用了没定义的 zone」，但真正决定成败的是 nginx 自己。
+      - name: 装 nginx（限流开关必须真的能过 nginx -t）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nginx
+          nginx -v
+
+      - name: nginx 配置校验（结构 + 真的 nginx -t）
+        # 这个脚本会：把两份配置改写成自包含的临时配置（证书/日志/include
+        # 目录都指到临时目录）→ **按文档建出限流那两个文件** → nginx -t。
+        # 「按文档启用限流」这条路径本身必须能过。
+        run: python3 deploy/tests/nginx_conf_check.py
 
   # ------------------------------------------------------------------ 构建产物
   #
@@ -420,9 +513,9 @@ jobs:
           --health-retries 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'   # 与 Dockerfile / systemd / CI backend 一致
 
@@ -434,7 +527,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.lock
+          pip install --require-hashes -r requirements.lock
 
       - name: 验证 schema 自洽（空库跑完整迁移链）
         working-directory: backend
@@ -458,11 +551,11 @@ jobs:
       #
       # 换成显式 setup 后两边锁死在同一个大版本，构建产物与被验证过的行为一致。
       # 要改版本，这里和 frontend job 的 pnpm/action-setup 一起改。
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: '10'
 
@@ -507,7 +600,7 @@ jobs:
           ls -lh "$OUT"
 
       - name: 上传产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cwq-deploy-${{ github.sha }}
           path: dist-artifacts/

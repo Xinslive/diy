@@ -20,6 +20,16 @@ pytest>=9.1.1
 # 否则 session 级 DROP SCHEMA 会让 worker 之间互相删表。
 pytest-xdist>=3.8.0
 
+# 覆盖率：CI 的「覆盖率门槛」那道闸靠它。
+#
+# **为什么现在才加。** 以前 CI 只有三道闸，全是**结构性**的（护栏必须真的
+# 被执行、用例数下限、前端测试文件数）—— 没有任何一条衡量「代码被测到多少」。
+# 于是「新增 3000 行代码、0 条新用例」在流水线上一片绿。
+#
+# **它只装在开发/测试环境**，不进 requirements.lock：生产机不需要覆盖率数据，
+# 多一个包就多一份供应链面（这正是 runtime 与 dev 两份清单分开的意义）。
+pytest-cov>=7.0.0
+
 # fastapi.testclient 底下是 httpx。app/ 自己不 import 它，
 # 但 scripts/demo_e2e.py 用它跑端到端演示，所以算开发依赖而不是运行时。
 httpx>=0.28.1

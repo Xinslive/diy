@@ -6,6 +6,12 @@
 #   4. 备份失败就不迁移
 #   5. 依赖与迁移的依据必须是**这一版**的代码，不是上一版留在现网的文件
 #
+# 第 6 条铁律（2026-10-20 补）：
+#   6. **切换必须原子，被打断必须能退回去** —— 换产物是一次 rename，
+#      不是「旧的让开、新的顶上」两次 rename；脚本全程有 trap，
+#      出事把代码与前端产物换回上一版。
+#      详见下面「出事时的自动回退」那一段。
+#
 # ---------------------------------------------------------------------------
 # **第 1 条的铁律变了，闸门没变弱。**
 # ---------------------------------------------------------------------------
@@ -113,6 +119,120 @@ fi
 log() { echo "[$(date '+%F %T')] $*"; }
 
 die() { echo "[$(date '+%F %T')] ❌ $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# 出事时的自动回退（trap）
+# ---------------------------------------------------------------------------
+# 脚本原来**一个 trap 都没有**（``grep -n 'trap' deploy.sh`` 零命中）。
+# 发布被打断时（SSH 断连、systemd TimeoutStartSec、Ctrl-C），脚本停在半路，
+# 而现网停在半路的状态是：
+#   * 前端：旧的让开了、新的还没顶上 → **整站 404**（不是「旧版」，是「没有」）；
+#   * 后端：tar 解到一半 → 旧代码与新代码混在一起；
+#   * 库：可能已经迁了一半。
+# 下面这套 trap 把「停在哪一步」变成「回到哪一步」。
+#
+# **回退的范围是刻意划的**：代码与前端产物回退（无损、几秒），
+# **库不回退**。库的回退是「把 dump 灌回去」，而 db_backup.py 的
+# --restore 是**往一个空库里灌**（pg_dump 的 plain 格式不带 DROP，
+# 往现有库上灌会撞 "relation already exists"）—— 真要回退必须先清空
+# schema，那是一次不可逆的、会把备份之后的写入全部丢掉的操作，
+# 不该由脚本在失败现场自动做。脚本只把该做的命令原样打出来。
+#
+# 回退到什么程度由 ROLLBACK_SCOPE 决定（每个阶段自己开/关）：
+#   none     —— 不回退（服务已经起来了：新版本已经上线，回退是另一件事）
+#   frontend —— 回退前端产物
+#   code     —— 回退前端产物 + 后端代码
+ROLLBACK_SCOPE=none
+FRONT_PREV_LINK=""     # 切换前 dist 软链指向的相对路径（空 = 之前不是软链）
+FRONT_PREV_DIR=""      # 切换前 dist 是真实目录时的落点（首次改造用）
+DB_MIGRATED=0          # 迁移是否已经成功过（决定回退报告里怎么措辞）
+
+# 原子换软链：一次 rename(2)，中间没有「目标不存在」的窗口。
+#
+# **不用 `ln -sfn`**：它是 unlink + symlink 两步，两步之间链接是空的 ——
+# 正是这里要消灭的那种窗口。
+# **不用裸 `mv`**：目标是**指向目录的软链**时，BSD 与 GNU 的 mv 都会把源
+# 移进那个目录里（落成 dist/dist/index.html），而不是替换掉软链 ——
+# 本脚本原来踩的就是这一类坑的同类。
+# GNU 用 `mv -T`（--no-target-directory），BSD 用 `mv -h`：两者都是
+# 「把源改名覆盖到目标上」，一次 rename，原子。
+atomic_symlink_swap() {
+  local target="$1" link="$2"
+  local tmp="${link}.swap.$$"
+  rm -f "$tmp"
+  ln -s "$target" "$tmp"
+  if mv -T "$tmp" "$link" 2>/dev/null; then
+    return 0
+  fi
+  mv -h "$tmp" "$link"
+}
+
+rollback_frontend() {
+  # 情形一：旧布局转换到一半（真实目录已经挪走、软链还没就位）
+  if [[ -n "${FRONT_PREV_DIR:-}" && -d "${FRONT_PREV_DIR}" && ! -e "$APP/frontend/dist" ]]; then
+    log "  ↩ 回退前端：把真实目录搬回原位（${FRONT_PREV_DIR}）"
+    mv "${FRONT_PREV_DIR}" "$APP/frontend/dist" && FRONT_PREV_DIR=""
+    return $?
+  fi
+  # 情形二：正常布局 —— 把软链指回上一版（同样是一次 rename，仍然原子）
+  if [[ -n "${FRONT_PREV_LINK:-}" ]]; then
+    log "  ↩ 回退前端：dist 软链指回 ${FRONT_PREV_LINK}"
+    atomic_symlink_swap "${FRONT_PREV_LINK}" "$APP/frontend/dist"
+    return $?
+  fi
+  return 0
+}
+
+rollback_code() {
+  # 从本次快照里把后端代码换回上一版。
+  #
+  # **只换产物里有的那几样**（app/scripts/migrations/alembic.ini/
+  # requirements.lock/pytest.ini）：.env、.venv、logs/、data/plugins
+  # 是运行时状态，产物里根本没有，也不该被一次回退抹掉。
+  local snap="${RELEASES:-}/${STAMP:-}/backend"
+  [[ -n "${STAMP:-}" && -d "$snap" ]] || return 0
+  log "  ↩ 回退后端代码：从 ${snap} 恢复"
+  local p
+  for p in app scripts migrations alembic.ini requirements.lock pytest.ini; do
+    [[ -e "$snap/$p" ]] || continue
+    rm -rf "${APP:?}/backend/$p"
+    cp -a "$snap/$p" "$APP/backend/$p"
+  done
+  return 0
+}
+
+on_exit() {
+  local rc=$?
+  # 成功退出、或本阶段明确不回退 → 原样退出，别碰现网。
+  [[ $rc -eq 0 || "${ROLLBACK_SCOPE}" == "none" ]] && return $rc
+  # 回退过程本身不许再失败：trap 里的一次失败会把原始退出码吃掉，
+  # 而「发布失败」这个信号比「回退也失败」更重要。
+  set +e
+  trap - EXIT
+  log "❌ 发布中断（退出码 ${rc}）—— 开始回退"
+  rollback_frontend || log "  ⚠️ 前端回退失败：$APP/frontend/dist 现在是 $(readlink "$APP/frontend/dist" 2>/dev/null || echo '<不存在>')"
+  if [[ "$ROLLBACK_SCOPE" == "code" ]]; then
+    rollback_code || log "  ⚠️ 后端代码回退失败"
+  fi
+  if [[ "$DB_MIGRATED" == "1" ]]; then
+    log "  ⚠️ 库**已经迁到新版本**（迁移成功过），**没有回退**。"
+    log "     库的回退是「清空 schema 再把 dump 灌回去」，会丢掉备份之后的写入，"
+    log "     不该由脚本在失败现场自动做。"
+    log "     代码与前端已换回上一版，而**上一版代码拒绝在新 schema 上启动**"
+    log "     （启动闸门 fail-closed）—— **不要直接重启服务**。"
+    log "     两个出路："
+    log "       1) 修好之后重新发布一次（迁移幂等，alembic 会从当前 revision 接着走）—— 推荐"
+    log "       2) 回退库（先清空 schema，会丢掉备份之后的写入）："
+    log "          cd $APP/backend && .venv/bin/python scripts/db_backup.py --restore --file ${RELEASES:-<无>}/${STAMP:-<无>}/database-before-migration.sql"
+  fi
+  log "   现场保留在 ${RELEASES:-<无>}/${STAMP:-<无>} 与 ${APP}/.incoming.*"
+  exit $rc
+}
+trap on_exit EXIT
+# INT/TERM 转成退出码，让 EXIT trap 统一处理（默认行为是直接死掉，
+# trap 一次都不会跑 —— 那正是「停在一半」的原因）。
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # --------------------------------------------------------------------------
 # 产物的取得与校验
@@ -232,7 +352,18 @@ log "2/7 备份当前版本"
 install -d -m 700 "$RELEASES"
 install -d -m 700 "$RELEASES/$STAMP"
 for d in backend frontend/dist; do
-  if [[ -e "$APP/$d" ]]; then
+  if [[ -L "$APP/$d" ]]; then
+    # **dist 是软链**（版本化布局，见第 5 步）：备份的必须是它**指向的那份
+    # 真实内容**，而不是软链本身。``cp -a`` 会原样复制软链，于是快照里
+    # 躺着一个指向 releases/ 的悬空链接 —— 看着像备份了，回滚时才发现
+    # 什么都没有。
+    real=$(cd "$APP/$d" 2>/dev/null && pwd -P) || real=""
+    if [[ -n "$real" && -d "$real" ]]; then
+      cp -a "$real" "$RELEASES/$STAMP/$(basename "$d")"
+    else
+      log "  ⚠️  $APP/$d 是软链但指不到真实目录，跳过备份这一项"
+    fi
+  elif [[ -e "$APP/$d" ]]; then
     cp -a "$APP/$d" "$RELEASES/$STAMP/$(basename "$d")"
   fi
 done
@@ -286,6 +417,9 @@ tar --no-same-owner -xzf "$STAGE/cwq-backend-${SHA}.tar.gz" -C "$INCOMING"
 #
 # 所以这里显式把现网的 .env 链过去：**一份真源**，不复制、不生成、不猜。
 if [[ -f "$APP/backend/.env" ]]; then
+  # 这一处 ln -sfn 与前端的换软链**不是一回事**：这里链的是暂存目录里
+  # 的一次性 .env（给 alembic 读），不是对外服务的路径，没有「链接为空
+  # 的窗口」那种风险。前端那次换软链必须原子，见 atomic_symlink_swap。
   ln -sfn "$APP/backend/.env" "$INCOMING/.env"
 elif [[ -z "${DATABASE_URL:-}" ]]; then
   die "找不到 ${APP}/backend/.env，环境里也没有 DATABASE_URL。
@@ -355,16 +489,39 @@ log "  万一要退：cd $APP/backend && .venv/bin/python scripts/db_backup.py -
 #   ``prepend_sys_path = .`` 把 ``app`` 包也解析到这一版 ——
 #     迁移脚本里 ``from app...`` 拿到的是新代码而不是旧的。
 # 于是 head 是「这一版要求的 head」，而不是「上一版知道的最大 head」。
-# 数据库在迁移后确实是新的、而**服务还没重启**（跑的还是上一版），
-# 这与改动前完全一致：迁移一直就排在重启之前，不是这次引入的窗口。
+#
+# ---------------------------------------------------------------------------
+# **为什么迁移仍然排在切产物之前（这是有意的，不是疏忽）**
+# ---------------------------------------------------------------------------
+# 顺序反过来（先切代码、再迁移）并不会让「库与代码不一致」消失，只会让
+# 它换一个形状出现：切完代码但还没迁移时，磁盘上是新代码、库里是旧
+# schema，而跑的仍是上一版 —— 那时按新代码的启动闸门去重启会直接被拒
+# （schema_version.py 是 fail-closed 的：库比代码旧 → 拒绝启动）。
+#
+# **真正决定顺序的是启动闸门**：新代码要求库停在 head，新代码启动前
+# 数据库必须已经是 head。所以库必须先到位。代价是「库已迁移、代码没换」
+# 这个窗口存在 —— 脚本对此的处理不是假装它不存在，而是：
+#   1. 失败时**如实说明**当前处在什么状态（见下面的失败分支）；
+#   2. 给出两条明确的出路：重新发布（迁移幂等，会接着往下走）
+#      或回退库（不可逆、会丢写入，所以只打印命令，不自动做）；
+#   3. 之后任何一步失败，trap 把代码与前端产物换回上一版（见文件头
+#      「出事时的自动回退」），所以现网不会停在「新旧混在一起」的状态。
+#
+# 「库已迁移、代码没换」不是本脚本能消灭的状态 —— 消灭它需要停服迁移
+# 或多阶段发布，那是另一个量级的改动。这里做的是：**窗口尽量短、
+# 状态如实、自动退回到可重发的状态**。
 if ! ( cd "$INCOMING" && "$VENV/bin/alembic" upgrade head ); then
   log "❌ 数据库迁移失败"
   log "   现网代码、前端产物与服务**都未改动**（线上跑的仍是上一版）"
-  log "   库可能已经迁了一半 —— 退路在 ${DUMP}"
+  log "   **但库可能已经迁了一半** —— 这是本次发布唯一动过的东西"
+  log "     退路在 ${DUMP}"
   log "     cd $APP/backend && .venv/bin/python scripts/db_backup.py --restore --file ${DUMP}"
+  log "   多数情况下**不需要动库**：迁移是幂等的，修好之后重新发布一次，"
+  log "   alembic 会从当前 revision 接着往下走。"
   log "   修好 revision 后重新发布即可；新代码留在 ${INCOMING}"
   exit 1
 fi
+DB_MIGRATED=1
 log "  schema 版本：$( cd "$INCOMING" && "$VENV/bin/alembic" current 2>/dev/null | tail -1 )"
 
 chown_if_possible() {
@@ -409,22 +566,48 @@ tar --no-same-owner -xzf "$STAGE/cwq-backend-${SHA}.tar.gz" -C "$APP/backend"
 # 看着成功，实则不对。所以这里 --no-same-owner 解压（不让归档改属主），
 # 再显式 chown 给 SERVICE_USER。
 chown_if_possible "$APP/backend"
+# 从这里起，出事就要把代码换回上一版（见文件头「出事时的自动回退」）。
+ROLLBACK_SCOPE=code
 log "  代码已切到 ${SHA}"
 
-# 前端：解压到暂存名，再**换名**换上。
+# ---------------------------------------------------------------------------
+# 前端产物：**版本化目录 + 一次 rename 换软链**
+# ---------------------------------------------------------------------------
+# **原来这里是两次 mv，中间 dist 整个不存在。**
 #
-# **这里踩过一个坑，值得写下来。** 直觉写法是
-# ``mv "$STAGE/dist" "$APP/frontend/dist"`` —— 但目标 dist **已经存在**，
-# ``mv`` 对已存在的目录是「移进去」而不是「替换掉」，于是产物落成
-# ``dist/dist/index.html``，而根目录那份旧 index.html 还在原地。
-# 脚本一路绿灯、服务照常起来、探活照常通过 —— 前端却还是旧的。
-# 沙箱演练（deploy/tests/test_deploy.sh 第 7 组）就是为这条加的断言。
+#     mv "$APP/frontend/dist" "$FRONT_OLD"     # 旧的让开
+#     mv "$FRONT_IN/dist" "$APP/frontend/dist" # 新的顶上
 #
-# 所以顺序必须是：旧的让开 → 新的顶上 → 再删旧的。
-FRONT_IN="$APP/frontend/.dist.incoming"
-FRONT_OLD="$APP/frontend/.dist.old"
-rm -rf "$FRONT_IN" "$FRONT_OLD"
-mkdir -p "$FRONT_IN"
+# 两次 rename(2) 之间，``$APP/frontend/dist`` **不存在**（新的还在暂存目录，
+# 旧的已改名）。nginx 的 ``root /opt/cwq/frontend/dist;``（cwq.conf:161、
+# acct.xins.live.conf:123）在这段时间里对**所有静态资源**返回 404 ——
+# 不是「旧版」，是「没有」。脚本被 SIGINT/SIGTERM 打断（SSH 断连、
+# systemd TimeoutStartSec）恰好落在两行之间就是整站白屏，而且**没有任何
+# 自动恢复路径**：旧的那份躺在 $FRONT_OLD 里没人管，脚本也不会把它移回去。
+#
+# **现在改成一次 rename。** 布局：
+#
+#     $APP/frontend/releases/dist-<sha>-<时间戳>/   真正的前端内容（一份一版）
+#     $APP/frontend/dist -> releases/dist-<sha>-<时间戳>   nginx 的 root 指这里
+#
+# 切换 = 把 ``dist`` 这个软链指向新的 release 目录，**一次 rename(2)**：
+# rename 原子替换软链本身（不跟随软链、不把它当目录），中间没有
+# 「目标不存在」的窗口。nginx 的 root 路径**不变**，所以这次改造
+# **不需要 reload nginx**，也不需要运维改任何配置。
+#
+# 顺带解决两件事：
+#   * 回滚变成一次 rename（指回上一版 release），而不是「把删掉的东西
+#     捡回来」；
+#   * 上一版的静态资源**还在盘上**（旧 release 目录保留到清理为止），
+#     所以回退后旧前端引用的 /assets/* 仍然打得开 —— 旧布局下那些文件
+#     在切换那一刻就没了，回滚回去也是一堆 404。
+FRONT_ROOT="$APP/frontend"
+FRONT_RELEASES="$FRONT_ROOT/releases"
+FRONT_DIST="$FRONT_ROOT/dist"
+FRONT_IN="$FRONT_ROOT/.dist.incoming"
+
+rm -rf "$FRONT_IN"
+mkdir -p "$FRONT_IN" "$FRONT_RELEASES"
 tar --no-same-owner -xzf "$STAGE/cwq-frontend-${SHA}.tar.gz" -C "$FRONT_IN"
 if [[ ! -d "$FRONT_IN/dist" ]]; then
   die "前端产物里没有 dist/ —— 解压出来的东西不对。**前端产物没切、代码没重启。**"
@@ -432,9 +615,38 @@ fi
 # 理由同后端那一步：--no-same-owner 挡住 CI runner 的 uid，chown 把属主
 # 显式交给服务账号。nginx 以 root 读它，两种属主都读得到，但只有后者是对的。
 chown_if_possible "$FRONT_IN/dist"
-mv "$APP/frontend/dist" "$FRONT_OLD"
-mv "$FRONT_IN/dist" "$APP/frontend/dist"
-rm -rf "$FRONT_OLD" "$FRONT_IN"
+# **目录名带 sha 也带时间戳**，不是只有 sha。
+#
+# 理由：同一份产物可能被**再发一次**（上次发布失败了，运维重跑）。
+# 如果目录名只有 sha，第二次发布开头的 `rm -rf` 会把**当前正在服务的那份**
+# 删掉 —— 而那时切换还没发生，dist 软链就指着一个不存在的目录 →
+# 整站 404，而且这次发布要是又失败在前半段，站点就一直白着。
+# 带时间戳之后，每次发布都落到一个**新目录**，旧的那份永远不动。
+NEW_RELEASE="$FRONT_RELEASES/dist-${SHA}-${STAMP}"
+rm -rf "$NEW_RELEASE"
+# 同分区内改名：先让新内容在 releases/ 下**完整就位**，最后一步才换软链。
+# 这一步是 rename(2)，不是复制 —— 所以不存在「拷到一半被切上去」的状态。
+mv "$FRONT_IN/dist" "$NEW_RELEASE"
+
+# 记下切换前的指向（回退要用）
+if [[ -L "$FRONT_DIST" ]]; then
+  FRONT_PREV_LINK="$(readlink "$FRONT_DIST")"
+elif [[ -d "$FRONT_DIST" ]]; then
+  # **旧布局首次转换**：dist 是真实目录。目录没法被软链原地替换
+  # （rename 覆盖一个目录会失败），所以这里必须「旧的让开、新的顶上」——
+  # 全流程里**唯一**还存在窗口的地方，只有两次 rename 之间那一下，
+  # 而且由 trap 兜底：被打断就把旧目录搬回原位。
+  LEGACY_RELEASE="$FRONT_RELEASES/dist-legacy-${STAMP}"
+  mv "$FRONT_DIST" "$LEGACY_RELEASE"
+  FRONT_PREV_DIR="$LEGACY_RELEASE"
+  FRONT_PREV_LINK="releases/$(basename "$LEGACY_RELEASE")"
+  log "  旧布局已转换为版本化目录（dist -> ${FRONT_PREV_LINK}）"
+fi
+
+# **原子换软链**：一次 rename，中间没有「目标不存在」的窗口。
+atomic_symlink_swap "releases/$(basename "$NEW_RELEASE")" "$FRONT_DIST"
+rm -rf "$FRONT_IN"
+log "  前端产物已切到 ${SHA}（dist -> releases/$(basename "$NEW_RELEASE")）"
 
 log "6/7 重启服务"
 systemctl restart cwq-api
@@ -453,6 +665,11 @@ for _ in $(seq 1 60); do
 done
 
 if [ "$health_ok" -ne 1 ]; then
+  # **这一步不回退。** 新版本已经起来了（迁移已执行、产物已切换、服务已
+  # 重启），把它撤掉不是「回滚」，是「把正在跑的版本换掉」—— 而新版本
+  # 可能只是慢、可能只是探活口径不对。所以明确关掉自动回退，让 trap
+  # 不动现网，改为把现场与处置方式说清楚。
+  ROLLBACK_SCOPE=none
   log "❌ 发布后 30 秒内 /api/health 没有给出 2xx/3xx"
   log "   ⚠️  此时**新版本已经上线**：迁移已执行、产物已切换、服务已重启。"
   log "      这次发布不是「没发生」，不要直接当作「什么都没上线」。"
@@ -469,10 +686,15 @@ log "  /api/health 应答"
 # 主探活成功不代表插件 worker barrier 已完成；单独核验后才报告发布成功。
 # 失败时新版本已经启动，保留现场、日志与备份，不能盲目反向迁移。
 if ! (cd "$APP/backend" && .venv/bin/python scripts/plugin_status.py --wait 30); then
+  ROLLBACK_SCOPE=none
   log "❌ 主服务存活，但插件 worker barrier 未通过；请检查插件状态与 api.err.log。"
   log "   新版本已启动；可关闭 PLUGIN_ENABLED 并重启以恢复核心服务，保留插件目录和表。"
   exit 1
 fi
+
+# 到这里新版本已经确认可用：**自动回退就此关闭**。此后脚本里的任何失败
+# 都不该把已经在跑的版本换掉 —— 那是「发布后体检」那一段的语义。
+ROLLBACK_SCOPE=none
 
 # ---------------------------------------------------------------------------
 # 7/7 发布后体检。三项都只提醒、不阻断 ——
@@ -648,7 +870,26 @@ fi
 # 它与 nginx 侧的 proxy_set_header X-Forwarded-For 是**一对**：
 # 只配一边等于没配（配了 app 侧而 nginx 不发头 → 全是直连 IP；
 # nginx 发了头而 app 不配 → 头被忽略）。
-if grep -qE '^[[:space:]]*TRUSTED_PROXIES[[:space:]]*=[[:space:]]*"?[[:space:]]*"?[[:space:]]*$' "$APP/backend/.env" 2>/dev/null; then
+#
+# **三种情况必须分开说，宁可漏报也不要误报。**
+# 原来的写法只有两分（空 / 非空），而 grep 在**文件不存在**时退出码是 2
+# （非 0）→ 走 else → 打印「已配置」。于是「.env 根本不存在」这个
+# **更糟**的状态被报成了「已处理」：运维以为配了、其实没配，
+# IP 维度节流退化成一个全站共用的桶。
+#
+# 触发路径不是假设：`deploy.sh` 第 3 步的 die 只在 `DATABASE_URL`
+# 环境变量**也**为空时才拦，所以「DATABASE_URL=… deploy.sh」这条
+# 完全合法的路径下 .env 可以压根不存在。
+ENV_FILE="$APP/backend/.env"
+if [[ ! -f "$ENV_FILE" ]]; then
+  log "  ⚠️  ${ENV_FILE} 不存在 —— **无法确认** TRUSTED_PROXIES 是否配置"
+  log "     读不到配置文件却报「已配置」，是比误报更糟的方向："
+  log "     生产上会以为配了、其实没配，IP 维度节流退化成一个全站共用的桶。"
+  log "     配法见 deploy/tuning.md 第八节。改完要重启 cwq-api 才生效。"
+elif ! grep -qE '^[[:space:]]*TRUSTED_PROXIES[[:space:]]*=' "$ENV_FILE"; then
+  log "  ⚠️  ${ENV_FILE} 里**没有** TRUSTED_PROXIES 这一项 —— IP 维度登录节流当前形同虚设（全站共用一个桶）"
+  log "     配法见 deploy/tuning.md 第八节。改完要重启 cwq-api 才生效。"
+elif grep -qE '^[[:space:]]*TRUSTED_PROXIES[[:space:]]*=[[:space:]]*"?[[:space:]]*"?[[:space:]]*$' "$ENV_FILE"; then
   log "  ⚠️  TRUSTED_PROXIES 是空的 —— IP 维度登录节流当前形同虚设（全站共用一个桶）"
   log "     配法见 deploy/tuning.md 第八节。改完要重启 cwq-api 才生效。"
 else
@@ -666,3 +907,12 @@ rm -rf "$STAGE" "$INCOMING"
 
 # 只保留最近 KEEP 份备份
 ls -dt "$RELEASES"/*/ 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -rf
+
+# 前端的版本化目录同理只留 KEEP 份。
+#
+# **保留的那几份不是「垃圾」**：上一版 release 目录还在，回退（trap 里
+# 把 dist 软链指回去）之后，旧前端引用的 /assets/* 仍然打得开 ——
+# 旧布局下那些文件在切换那一刻就没了，回退回去也是一堆 404。
+if [[ -n "${FRONT_RELEASES:-}" && -d "$FRONT_RELEASES" ]]; then
+  ls -dt "$FRONT_RELEASES"/dist-* 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -rf
+fi
