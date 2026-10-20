@@ -850,6 +850,42 @@ def _form_header_html(tpl: dict, ctx: dict) -> str:
     return f'<div class="doc-form-head">{"".join(cells)}</div>'
 
 
+# --------------------------------------------------------------------- 报表列
+
+#: 报表列的两种「不带公式」类型：项目名列（STATIC）与行次列（LINE_NO）。
+#: 与 ``app/reports/formula.NON_FORMULA_KINDS`` 是同一组 kind。
+REPORT_STATIC = "STATIC"
+REPORT_LINE_NO = "LINE_NO"
+
+
+def report_column_sides(cols: list[dict]) -> dict[int, int]:
+    """列号 -> 这一列属于**左半（0）还是右半（1）**。
+
+    **判据只有一条：STATIC 列开启的分块。** STATIC 是每一半的首列，从它到
+    下一个 STATIC 之间的所有列（含行次列与金额列）都属于同一半。
+
+    为什么必须是这一条：会小企01表是**一行两栏**（左边资产、右边负债和所有者
+    权益，各带一个行次列）。两侧的行性质不同 —— 第 16 行左边是「流动资产
+    合计」（要加粗、压灰），右边是「递延收益」（普通项目）。判错半，合计行
+    的加粗与底纹就只在一侧生效。
+
+    **这一份实现是 Excel 导出与 HTML 打印共用的**（以前两边各写一套：Excel
+    侧按「第几个 STATIC / 第几个 LINE_NO」两个独立计数器，HTML 侧按 STATIC
+    分块）。两套实现迟早分叉 —— 相邻两个 STATIC 列时，Excel 侧会把后面的
+    行次列算成左半、HTML 侧算成右半，纸上两条通道的版式就不一样了。
+
+    一个 STATIC 都没有时（老形状 / 调用方自己拼的精简 payload）全部落在左半，
+    单栏表（利润表）正是如此。
+    """
+    sides: dict[int, int] = {}
+    side = -1
+    for col in cols:
+        if col.get("kind") == REPORT_STATIC:
+            side += 1
+        sides[col.get("col_no")] = max(side, 0)
+    return sides
+
+
 def render_table_page(tpl: dict, ctx: dict, rows: list[dict], page: int, total: int) -> str:
     """通用表格页：总账 / 明细账 / 余额表 / 报表共用。"""
     cols = tpl["columns"]

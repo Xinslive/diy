@@ -425,6 +425,11 @@ def balance_sheet_of_accounts(
 
     rows = []
     total_open_dr = total_open_cr = total_dr = total_cr = total_close_dr = total_close_cr = ZERO
+    # 本年累计（ytd）也要在叶子级累计一次。``dr_cum`` / ``cr_cum`` 是**本年**
+    # 累计发生额（每年 1 月归零），与「本期」那一列不是一回事 —— 期初/期末/
+    # 本期三个维度都从 check 里取，唯独本年不在，合计行的「本年借方/贷方」
+    # 就只能回退去表体里自己加，于是它随「科目范围」档位变（审计 P1-4）。
+    total_ytd_dr = total_ytd_cr = ZERO
 
     for s in subjects:
         f = fmap[s.id]
@@ -436,6 +441,7 @@ def balance_sheet_of_accounts(
         rows.append(
             {
                 "subject_id": s.id,
+                "parent_id": s.parent_id,
                 "code": s.code,
                 "name": s.name,
                 "level": s.level,
@@ -460,15 +466,25 @@ def balance_sheet_of_accounts(
             total_open_cr += -o_signed if o_signed < 0 else ZERO
             total_dr += m_dr
             total_cr += m_cr
+            total_ytd_dr += f.dr_cum
+            total_ytd_cr += f.cr_cum
             total_close_dr += c_signed if c_signed > 0 else ZERO
             total_close_cr += -c_signed if c_signed < 0 else ZERO
 
+    # 试算合计的**八个**维度都在这里了：期初借/贷、本期借/贷、本年借/贷、
+    # 期末借/贷。合计行（Excel 导出、HTML 打印）**只认这份 check** ——
+    # 它是叶子级、与档位无关的唯一一份实现。少了哪一维，哪一维就会退回去
+    # 「按表体自己加」，于是合计随「科目范围」档位变（审计 P1-4 / 工程 P1-1）。
     check = {
         "period_balanced": total_dr == total_cr,
         "closing_balanced": total_close_dr == total_close_cr,
         "opening_balanced": total_open_dr == total_open_cr,
         "total_debit": total_dr,
         "total_credit": total_cr,
+        "total_ytd_debit": total_ytd_dr,
+        "total_ytd_credit": total_ytd_cr,
+        "total_opening_debit": total_open_dr,
+        "total_opening_credit": total_open_cr,
         "total_closing_debit": total_close_dr,
         "total_closing_credit": total_close_cr,
     }

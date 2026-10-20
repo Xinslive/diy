@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import re
 from datetime import date
+from decimal import Decimal
 
 from openpyxl import load_workbook
 
@@ -190,3 +191,43 @@ def test_三个通道同一档位答案一致(client, auth, db, book, make_vouch
 
     missing = {c for c in screen_top if c not in _paper_codes(paper)}
     assert not missing, f"屏幕上「仅一级」有、纸上没有：{sorted(missing)}"
+
+
+def test_三个通道同一档位的金额也一致(client, auth, db, book, make_voucher, periods):
+    """**要比的是金额，不只是编码集合。**
+
+    上一条只比编码：屏幕与纸面的**数**不一致时它照样绿 —— 而「合计随档位
+    变」正是数不一致（一级科目行 ``is_leaf=False``，以前被合计行整行丢掉，
+    纸上「本年借方」写 0、屏幕上写 100）。
+
+    这里比的是**纸面合计行**与**屏幕试算 check** 的每一个数。
+    """
+    _mv(make_voucher, periods[1])
+    screen = client.get(f"/api/books/{book.id}/ledger/balance",
+                        params={"period_id": periods[1].id}, headers=auth).json()
+    check = screen["check"]
+
+    r = client.get(f"/api/books/{book.id}/print/balance.xlsx",
+                   params={"period_id": periods[1].id, "subject_scope": "top"},
+                   headers=auth)
+    assert r.status_code == 200, r.text
+    ws = load_workbook(io.BytesIO(r.content)).active
+
+    total_row = None
+    for row in range(1, ws.max_row + 1):
+        if ws.cell(row=row, column=2).value == "合计":
+            total_row = row
+            break
+    assert total_row is not None, "导出件里没有合计行"
+
+    def cell(col):
+        return Decimal(str(ws.cell(row=total_row, column=col).value))
+
+    assert cell(5) == check["total_debit"], "纸面合计本期借方与屏幕试算不一致"
+    assert cell(6) == check["total_credit"], "纸面合计本期贷方与屏幕试算不一致"
+    assert cell(10) == check["total_closing_debit"], "纸面合计期末与屏幕试算不一致"
+    # 本年累计两列以前不在 check 里，纸面自己算 —— 那一档正是随档位变的两列
+    assert cell(7) == check["total_ytd_debit"], "纸面合计本年借方与屏幕试算不一致"
+    assert cell(8) == check["total_ytd_credit"], "纸面合计本年贷方与屏幕试算不一致"
+    # 期初这一维以前 check 没给，纸面自己加 —— 「仅一级」档位下加出来是 0
+    assert cell(4) == check["total_opening_debit"], "纸面合计期初与屏幕试算不一致"

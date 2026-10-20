@@ -17,8 +17,8 @@
 另外，合计里最后一个数以前写在了**第 9 列（方向）**上，而真正的「期末」列
 空着 —— 一格方向列里躺着一个金额。
 
-这个文件钉：合计 = 叶子级、按方向归过边的试算合计；它与 ``check`` 里的四个
-数字一致，且**与科目范围档位无关**。
+这个文件钉：合计 = 叶子级、按方向归过边的试算合计；它与 ``check`` 里的八个数
+（期初借/贷、本期借/贷、本年借/贷、期末借/贷）一致，且**与科目范围档位无关**。
 """
 from __future__ import annotations
 
@@ -211,17 +211,35 @@ def test_合计行的表头与列宽没被动过():
 # ------------------------------------------------------- ④ 真账走一遍接口
 
 
-def test_导出接口的合计与试算一致且与档位无关(client, auth, db, book, periods, make_voucher):
+def test_导出接口的合计与试算一致且与档位无关(client, auth, db, book, periods, subjects,
+                                        make_voucher):
     """真凭证走一遍 ``balance.xlsx``：合计 = check，且三档档位打出来一样。
 
     档位无关是这次改动的核心承诺：屏幕上「仅一级科目」与默认的「全部科目」
     行数差几十倍，纸上那一份合计不该跟着变（``filter_balance_rows`` 的
     docstring 讲的就是这件事 —— 屏幕一份、纸上一份，用户只会把纸上的当成对的）。
+
+    **断言元组必须把合计行的六列全带上**（期初 / 本期借 / 本期贷 /
+    本年借 / 本年贷 / 期末）。以前这条断言只比了四列，本年那两列根本没进
+    元组 —— 而它们恰恰是实际会变的那两列（``check`` 当时不覆盖本年累计，
+    合计只能回退去表体里自己加，于是按档位变）。
+
+    **账套必须有期初余额**：没有期初的话期初那一列三档都是 0，「相等」是
+    0 == 0 的恒真，证明不了任何事。
     """
     from datetime import date
 
+    # 期初：应收票据 500（借）/ 主营业务收入 500（贷）。两边都有，合计行的
+    # 归边才真的在做功 —— 只有借方余额的话，「期初合计」取哪一边都看不出来。
+    r = client.post(f"/api/books/{book.id}/periods", headers=auth, json=[
+        {"subject_id": subjects["1121"].id, "amount": "500"},
+        {"subject_id": subjects["5001"].id, "amount": "-500"},
+    ])
+    assert r.status_code == 200, r.text
+
     # 5602 管理费用是带下级的一级科目，560206 水电费是它的明细 ——
-    # 父子同时出现在「全部」那一档里，重复计数才显形。
+    # 父子同时出现在「全部」那一档里，重复计数才显形；而「仅一级」那一档
+    # 只有 5602（``is_leaf=False``），它以前被整行丢掉。
     make_voucher(date(2026, 1, 5), dr=[("560206", 100, "水电费")],
                  cr=[("1002", 100, "水电费")], posted=True)
 
@@ -237,12 +255,22 @@ def test_导出接口的合计与试算一致且与档位无关(client, auth, db
                        headers=auth)
         assert r.status_code == 200, r.text
         ws = _sheet(r.content)
-        totals[scope] = (_total(ws, COL_PDR), _total(ws, COL_PCR),
-                         _total(ws, COL_CLOSING), _total(ws, COL_OPENING))
+        totals[scope] = (_total(ws, COL_OPENING), _total(ws, COL_PDR), _total(ws, COL_PCR),
+                         _total(ws, COL_YDR), _total(ws, COL_YCR), _total(ws, COL_CLOSING))
 
     assert totals["all"] == totals["leaf"] == totals["top"], (
         f"合计随科目档位变了：{totals}")
-    assert totals["all"] == (check["total_debit"].quantize(Decimal("0.01")),
-                             check["total_credit"].quantize(Decimal("0.01")),
-                             check["total_closing_debit"].quantize(Decimal("0.01")),
-                             Decimal("0.00")), f"合计与试算 check 不一致：{totals} / {check}"
+    # 合计 = 试算 check 的那八个数（期初/本期/本年/期末，各分借贷两边）。
+    # 合计行放不下两边，期初与期末取**借方合计**（试算平衡时两边同值）。
+    assert totals["all"] == (
+        check["total_opening_debit"].quantize(Decimal("0.01")),
+        check["total_debit"].quantize(Decimal("0.01")),
+        check["total_credit"].quantize(Decimal("0.01")),
+        check["total_ytd_debit"].quantize(Decimal("0.01")),
+        check["total_ytd_credit"].quantize(Decimal("0.01")),
+        check["total_closing_debit"].quantize(Decimal("0.01")),
+    ), f"合计与试算 check 不一致：{totals} / {check}"
+    # 绝对数字：期初这一维必须**非零**，否则上面那条「三档相等」是 0 == 0 的恒真
+    assert totals["all"][0] == Decimal("500.00"), totals
+    assert totals["all"][3] == Decimal("100.00"), totals
+    assert totals["all"][5] == Decimal("600.00"), totals

@@ -3,18 +3,44 @@
 模板里的列 key 是稳定的语义名（date / subject / debit ...），
 这里负责把各查询结果翻译成这些 key。以后新增账簿，只要在这里补一个
 ``to_rows_xxx``，模板引擎和前端设计器都不用改。
+
+**科目余额表的合计行也在这里算**（``balance_totals`` / ``balance_verdict``）：
+Excel 导出与 HTML 打印是两条通道，但它们印的是**同一张纸** ——
+合计与试算必须一份实现、一套数字。以前 Excel 通道自己算、HTML 通道压根
+没有合计行，于是「打出来的表」与「导出来的表」对不上。
 """
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.models import Book, Period, Subject
+from app.printing.template import REPORT_LINE_NO, REPORT_STATIC, report_column_sides
 
 _CATEGORY_CN = {"ASSET": "资产", "LIABILITY": "负债", "EQUITY": "所有者权益",
                 "COST": "成本", "PROFIT": "损益"}
+
+ZERO = Decimal("0")
+CENT = Decimal("0.01")
+
+#: 合计行用到的八个「按方向归过边」的数。键名与 ``queries.balance_sheet_of_accounts``
+#: 的 ``check`` 一一对应（``check`` 里的键多一个 ``total_`` 前缀），别再另立一套叫法。
+BALANCE_TOTAL_KEYS = ("opening_debit", "opening_credit", "period_debit", "period_credit",
+                      "ytd_debit", "ytd_credit", "closing_debit", "closing_credit")
+
+#: ``check`` 的键 -> 合计行的键。两边一一对应。
+_CHECK_TO_TOTAL = {
+    "total_opening_debit": "opening_debit",
+    "total_opening_credit": "opening_credit",
+    "total_debit": "period_debit",
+    "total_credit": "period_credit",
+    "total_ytd_debit": "ytd_debit",
+    "total_ytd_credit": "ytd_credit",
+    "total_closing_debit": "closing_debit",
+    "total_closing_credit": "closing_credit",
+}
 
 
 def context(db: Session, book: Book, period: Period | None = None, /, **extra: Any) -> dict:
@@ -57,8 +83,99 @@ def voucher_rows(db: Session, book: Book, vouchers: list) -> list[dict]:
     return [_serialize(db, v, subs) for v in vouchers]
 
 
-def balance_rows(rows: list[dict]) -> list[dict]:
-    """科目余额表 -> 打印行。带「上期末」「本期发生」两类分栏。"""
+def _counted_rows(rows: list[dict]) -> list[dict]:
+    """这批行里**每棵子树只算一次**的那些行。
+
+    判据是「在这批行里不是别的行的下级」：父级行本身就是下级的上卷，
+    两边都加进去就是同一笔钱数两遍。
+
+    * 「仅一级」档位：表体里只有一级行，它们互不为下级 → 全部参与；
+    * 「全部」档位：父级行被丢掉 → 每棵子树只留根上那一行；
+    * 「仅明细」档位：全是末级 → 全部参与。
+
+    **不能按 ``is_leaf`` 筛**：「仅一级」档位下，带下级的一级科目
+    ``is_leaf=False``，按 is_leaf 筛会把**整行丢掉** —— 那笔钱从合计里
+    彻底消失，而同一行的「期末」来自 check、还在纸面上，于是合计行内部
+    自相矛盾（审计 P1-4 / 工程 P1-1）。
+    """
+    if rows and all(r.get("subject_id") is not None for r in rows):
+        parents = {r.get("parent_id") for r in rows if r.get("parent_id") is not None}
+        return [r for r in rows if r.get("subject_id") not in parents]
+    # 没有科目 id（老调用方手工构的行）：退回按 is_leaf 判定
+    return [r for r in rows if r.get("is_leaf", True)]
+
+
+def balance_totals(rows: list[dict], check: dict | None = None) -> dict[str, Decimal]:
+    """科目余额表合计行 = **试算合计**，不是纸上那几行的算术和。
+
+    以前这里是 ``for row in rows: totals[idx] += _d(row.get(key))``，两个错叠在
+    一起，都落在同一张交给客户和审计的纸面上：
+
+    1. **方向被吃掉了。** 行里的 ``opening`` / ``closing`` 来自
+       ``display_side()``，是**绝对值** —— 贷方余额同样存正数（它靠旁边的
+       「方向」列区分）。借方余额合计 1000 + 贷方余额合计 1000 直接相加，
+       合计「期初」写成 2000，而下面两行试算还打着「期末余额平衡 ✓」：
+       同一张纸上两处结论互相打脸，而 2000 不等于任何一边的合计。
+       归边口径必须与 ``app/ledger/queries.py::balance_sheet_of_accounts``
+       一致 —— 那边按 ``o_signed`` / ``c_signed`` 的符号拆借贷、只累计叶子，
+       行里的「方向」列就是那次拆分的结果，所以这里按方向列归边即同一个口径。
+    2. **重复计数。** 行是**过滤之后**的（``filter_balance_rows``：仅一级 /
+       仅明细 / 全部）。默认「全部」时父子同在一张表上，父级行本身就是下级的
+       上卷，逐行相加等于把同一笔钱数了两遍。
+
+    **有 check 就用 check。** 它是叶子级、按符号拆好边的八个数，是这套系统里
+    唯一一份试算口径的实现；本函数退化成「同样的算法」只为了在没有 check 的
+    旧调用方（以及直接调本函数的测试）下仍然给出正确的数。
+
+    **Excel 导出与 HTML 打印共用这一份**（以前 Excel 通道自己算、HTML 通道
+    压根没有合计行，于是打出来的表与导出来的表对不上）。
+    """
+    totals = dict.fromkeys(BALANCE_TOTAL_KEYS, ZERO)
+    for row in _counted_rows(rows):
+        # Decimal 累加，不退回 float（见 excel._num 的说明）。逐格 round 也不能
+        # 替代：round 是「四舍五入到分」，累加是「先加后舍」，两者在长表上不等价。
+        if row.get("opening_direction") == "借":
+            totals["opening_debit"] += _d(row.get("opening"))
+        else:
+            totals["opening_credit"] += _d(row.get("opening"))
+        totals["period_debit"] += _d(row.get("period_debit"))
+        totals["period_credit"] += _d(row.get("period_credit"))
+        totals["ytd_debit"] += _d(row.get("ytd_debit"))
+        totals["ytd_credit"] += _d(row.get("ytd_credit"))
+        if row.get("direction") == "借":
+            totals["closing_debit"] += _d(row.get("closing"))
+        else:
+            totals["closing_credit"] += _d(row.get("closing"))
+
+    for check_key, total_key in _CHECK_TO_TOTAL.items():
+        value = (check or {}).get(check_key)
+        if value is not None:
+            totals[total_key] = _d(value)
+    return totals
+
+
+def balance_verdict(check: dict, key: str, label: str,
+                    debit: Decimal, credit: Decimal) -> str:
+    """试算行：「平衡 ✓ / 不平衡 ✗」+ 两边的数。
+
+    只打 ✓ 不打数，等于让读纸面的人自己回头把几百行加一遍 —— 而这份表
+    的用途正是**免去**加法（交给审计方逐格核对）。不平衡时两边的差额一眼可见。
+    """
+    def money(v: Decimal) -> str:
+        return f"{v.quantize(CENT, rounding=ROUND_HALF_UP):,.2f}"
+
+    mark = "平衡 ✓" if (check or {}).get(key) else "不平衡 ✗"
+    return f"{label}{mark}（借 {money(debit)} / 贷 {money(credit)}）"
+
+
+def balance_rows(rows: list[dict], check: dict | None = None) -> list[dict]:
+    """科目余额表 -> 打印行。带「上期末」「本期发生」两类分栏。
+
+    **末尾带合计行与两行试算**（口径与 Excel 导出同一份实现，见
+    ``balance_totals``）。以前 HTML 打印通道只有明细行、没有合计 —— 于是
+    「打出来的那张」与「导出来的那张」对不上，而余额表正是交给客户和审计的
+    纸面数（审计 P3-3）。
+    """
     out = []
     for r in rows:
         out.append(
@@ -79,6 +196,40 @@ def balance_rows(rows: list[dict]) -> list[dict]:
                 "__kind": "SUBTOTAL" if not r["is_leaf"] else "",
             }
         )
+    totals = balance_totals(rows, check)
+    out.append({
+        "code": "", "name": "合计", "level": "",
+        "opening_direction": "", "opening": "",
+        "opening_debit": totals["opening_debit"],
+        "opening_credit": totals["opening_credit"],
+        "period_debit": totals["period_debit"],
+        "period_credit": totals["period_credit"],
+        "closing_direction": "", "closing": "",
+        "closing_debit": totals["closing_debit"],
+        "closing_credit": totals["closing_credit"],
+        "__kind": "TOTAL",
+    })
+    # 试算两行。文案放在**名称列**（左对齐、可折行）而不是金额列 ——
+    # 金额列是右对齐且不折行（``td.num`` 的 white-space:nowrap），长句会横着
+    # 压到旁边的格子上。
+    out.append({
+        "code": "", "name": "试算平衡：" + balance_verdict(
+            check or {}, "period_balanced", "本期发生额",
+            totals["period_debit"], totals["period_credit"]),
+        "level": "", "opening_debit": "", "opening_credit": "",
+        "period_debit": "", "period_credit": "",
+        "closing_debit": "", "closing_credit": "",
+        "__kind": "CHECK",
+    })
+    out.append({
+        "code": "", "name": "试算平衡：" + balance_verdict(
+            check or {}, "closing_balanced", "期末余额",
+            totals["closing_debit"], totals["closing_credit"]),
+        "level": "", "opening_debit": "", "opening_credit": "",
+        "period_debit": "", "period_credit": "",
+        "closing_debit": "", "closing_credit": "",
+        "__kind": "CHECK",
+    })
     return out
 
 
@@ -165,8 +316,9 @@ def visible_report_payload(payload: dict) -> dict:
 #: STATIC 是项目标题列、LINE_NO 是行次列（见 ``seed/builtin_reports.py`` 的
 #: ``NON_FORMULA_KINDS``）。这两列在 evaluate() 里恒为 ``value: None``，
 #: 所以打印时必须按 kind 改从行上取数 —— 照抄 cell.value 只会印出一片空白。
-REPORT_STATIC = "STATIC"
-REPORT_LINE_NO = "LINE_NO"
+#:
+#: 常量本身住在 ``app.printing.template`` —— **Excel 导出与 HTML 打印共用**，
+#: 「列属于哪一半」的判据也只有那一份（``report_column_sides``）。
 
 
 def report_rows(payload: dict) -> list[dict]:
@@ -194,18 +346,18 @@ def report_rows(payload: dict) -> list[dict]:
     """
     out = []
     cols = payload.get("cols", [])
-    # 每一列属于左半还是右半，由**STATIC 列开启的分块**决定：STATIC 是每一半的
-    # 首列，从它到下一个 STATIC 之间的所有列（含行次列与金额列）都属于同一半。
+    # 每一列属于左半还是右半：**共享实现**（``app.printing.template``）。
+    #
+    # 判据是「STATIC 列开启的分块」：STATIC 是每一半的首列，从它到下一个
+    # STATIC 之间的所有列（含行次列与金额列）都属于同一半。
     #
     # 只给 STATIC/LINE_NO 编号是不够的 —— 金额列取不到 side，就会一律落到左半，
     # 于是「非流动资产合计」那一行右半的两个空金额格也印成合计（加粗）。
     # 单栏表只有一个 STATIC，全表都落在左半，同理不需要分支。
-    side_of: dict[Any, int] = {}
-    side = -1
-    for c in cols:
-        if c.get("kind") == REPORT_STATIC:
-            side += 1
-        side_of[c.get("col_no")] = max(side, 0)
+    #
+    # Excel 导出那条通道也调它 —— 以前两边各写一套（Excel 侧是两个独立
+    # 计数器），两套实现迟早分叉（审计 P3-2）。
+    side_of: dict[Any, int] = report_column_sides(cols)
 
     for row in payload.get("rows", []):
         style = row.get("style") or {}
@@ -256,7 +408,12 @@ def report_rows(payload: dict) -> list[dict]:
                 item[key] = "" if no is None else str(no)
             else:
                 cell = by_no.get(col_no) or {}
-                item[key] = cell.get("value", "")
+                # **公式出错的格子印出错误文案**，不是一个空格。
+                #
+                # 空格子在纸上与「这一项真的是 0」长得一模一样，而后者是账、
+                # 是结论。一格公式写坏了（期间字面量畸形、科目编码打错…），
+                # 印出来却是一个空格子，读者只会以为那项没有数。
+                item[key] = cell.get("error") or cell.get("value", "")
             # 单栏表（利润表）没有 kind_left/kind_right，回落到行级 kind。
             col_kind[key] = _print_kind(
                 style.get(kind_key) if side_filled.get(side, True) else None,

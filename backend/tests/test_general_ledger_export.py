@@ -104,8 +104,18 @@ def test_不存在的起始期间返回404(client, auth, db, book, periods):
     assert r.status_code == 404, f"不存在的起始期间应 404，实际 {r.status_code}"
 
 
-def test_起始晚于结束时自动纠正(client, auth, db, book, periods, subjects):
-    """用户把起止月选反了，不该导出空表。"""
-    ws = _export(client, auth, book,
-                 period_id=periods[2].id, from_period_id=periods[8].id)
-    assert ws.max_row > 1, "起止选反导出成了空表"
+def test_起始晚于结束时返回400而不是自动纠正(client, auth, db, book, periods, subjects):
+    """**倒置区间必须报错，不能悄悄交换起止期。**
+
+    以前这里是「起止选反了就交换一下继续跑」：同一组参数在余额表导出、
+    总账打印、明细账导出上都是 400「起始期间不能晚于结束期间」，唯独总账
+    Excel 导出给一份文件 —— 同一件事，三种结果。
+
+    用户若在页面上看到过那句报错，改走导出却拿到文件，会以为页面报错是多余
+    的；反过来，先导出、再在页面上核对时，两边对不上。
+    """
+    r = client.get(f"/api/books/{book.id}/print/general-ledger.xlsx"
+                   f"?period_id={periods[2].id}&from_period_id={periods[8].id}",
+                   headers=auth)
+    assert r.status_code == 400, f"倒置区间应当回 400，实际 {r.status_code}：{r.text[:200]}"
+    assert "起始期间不能晚于结束期间" in r.text, r.text[:200]

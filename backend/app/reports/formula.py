@@ -28,9 +28,10 @@
 
 编码
 ----
-    **可以写上级科目**（如 ``1002 银行存款``），取的是它下面所有末级科目的合计。
-    凭证只记到末级，上级科目自己身上永远是 0，所以这一步的汇总由求值上下文做
-    （``ReportContext.subject_scope``），不是账簿引擎的现成能力。
+    **可以写上级科目**（如 ``1002 银行存款``），取的是**账簿引擎上卷后**的
+    那个值 —— 与总账、科目余额表、打印导出看到的是同一个数。汇总由引擎做
+    （``app/ledger/engine.py`` 的分录上卷与期初上卷规则），报表层不再自己
+    加一遍子树：两套算法必然在「先做末级、后来挂下级」这种状态上分叉。
 
 省掉函数名
 ----------
@@ -157,6 +158,16 @@ def formula_guard() -> Iterator[None]:
     解析期与求值期都已经有前置上限（MAX_NEST_DEPTH / MAX_CHAIN_OPS /
     MAX_RANGE_CELLS / MAX_ROUND_DIGITS），这里是最后一道网 ——
     上限将来被调大时，这里保证异常仍然是那支带文案的 FormulaError。
+
+    **``ValueError`` / ``TypeError`` 也在这里兜住。** 这两类是「用户写进去的
+    值解析不了」最常见的表现（``int("")`` / ``int("ab")`` / ``None.something``），
+    而它们既不是 FormulaError 也不是上面那两类 —— 穿出去就是 **HTTP 500**，
+    整张报表（几十格已经算好的数）一起丢掉。2026-10-20 审计 P1-1 记的就是
+    「期间字面量 ``"2026-"`` 让整张报表渲染 500」。
+
+    刻意**不**在这里兜 ``ArithmeticError``：``decimal.InvalidOperation`` 是
+    ``DecimalException`` 族的一员，提示文案完全不同（见上面那条分支），
+    两者的文案不能混成一句。
     """
     try:
         yield
@@ -169,6 +180,14 @@ def formula_guard() -> Iterator[None]:
             f"公式算出数值超范围（{e.__class__.__name__}）："
             f"请检查四舍五入的位数（限 {MIN_ROUND_DIGITS}~{MAX_ROUND_DIGITS} 位）"
             f"或参与运算的金额") from None
+    except ValueError as e:
+        raise FormulaError(
+            f"公式里的取值无法解析（{e}）："
+            f"请检查期间、科目编码等参数的写法") from None
+    except TypeError as e:
+        raise FormulaError(
+            f"公式里的参数类型不对（{e}）："
+            f"请检查期间、科目编码等参数的写法") from None
 
 
 # --------------------------------------------------------------------- 词法
@@ -666,7 +685,7 @@ class Evaluator:
         }
         if kind not in m:
             raise FormulaError(f"未知取数口径: {kind}（可用：{'、'.join(m)}）")
-        # 引用上级科目时由 ctx 取整棵子树（见 ReportContext.subject_scope）
+        # 引用上级科目时由账簿引擎上卷（见 ReportContext.measure）
         return self.ctx.measure(sid, m[kind], period)
 
     def _f_sum(self, args: list) -> Decimal:

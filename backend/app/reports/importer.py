@@ -169,7 +169,12 @@ def _grid(data: bytes) -> tuple[list[list[dict]], str]:
     # 版式判定放在解析之后：先裁掉尾部空列（见 _last_used_column 的说明）。
     columns = _last_used_column(grid)
     if columns not in (4, 8):
-        raise TemplateImportError("当前支持 4 列利润表和 8 列资产负债表，请使用这两类 UFO 模板")
+        # **把这份模板的实际列数写进文案**：多一个金额列的利润表（5 列）
+        # 正是最常见的一种，而「当前支持 4 列利润表和 8 列资产负债表」只说了
+        # 支持什么、没说这份是几列，用户对不上号。
+        raise TemplateImportError(
+            f"这份模板有 {columns} 列，当前只支持 4 列利润表和 8 列资产负债表，"
+            f"请使用这两类 UFO 模板")
     if columns < col_count:
         grid = [row[:columns] for row in grid]
     return grid, data[1:8].decode("ascii")
@@ -285,6 +290,15 @@ def _amount_cell_has_content(cell: dict) -> bool:
     return _is_amount_text(cell["text"])
 
 
+def _cols_text(cols) -> str:
+    """列号集合 -> 「3、4、5」这样的可读串（按列号升序）。
+
+    报错文案必须给出**实际列号**：「多于两个金额列」不指明是哪几列，
+    用户还是得自己回头数格子 —— 而他真正要改的就是那几列。
+    """
+    return "、".join(str(c) for c in sorted(cols))
+
+
 def parse_ufo_report(raw: bytes, filename: str) -> dict[str, Any]:
     filename = (filename or "").replace("\\", "/").split("/")[-1]
     if Path(filename).suffix.lower() not in (".rep", ".rbk"):
@@ -336,18 +350,35 @@ def parse_ufo_report(raw: bytes, filename: str) -> dict[str, Any]:
         # 的那一列；再认不出来才回落 UFO 固定位置。金额列同理，认不满两列就拒收。
         amount_like = {column for column, label in header_labels.items()
                        if column != 1 and any(word in label for word in _AMOUNT_HEADER_WORDS)}
+        # **先判金额列的数量，再判行次列。**
+        #
+        # 顺序反了的时候，用户看到的引导指向错误的列：模板多一个金额列
+        # （如「上年同期金额」）时，``line_source_cols`` 会被算成两个 →
+        # 先抛「无法确定利润表的行次列，请检查模板版式」，而**真正的原因**
+        # （金额列多了一个）那条更准的文案永远轮不到。用户照着提示去检查
+        # 行次列怎么改都改不对 —— 行次列没问题。
+        if len(amount_like) == 1:
+            raise TemplateImportError(
+                f"模板只有一个金额列（第 {_cols_text(amount_like)} 列），"
+                f"当前系统的利润表需要本期与本年累计两列")
+        if len(amount_like) > 2:
+            raise TemplateImportError(
+                f"模板有多于两个金额列（第 {_cols_text(amount_like)} 列），"
+                f"无法确定哪两列导入当前系统")
         line_source_cols = {column for column in header_line_cols if column != 1}
         if not line_source_cols and len(amount_like) == 2:
+            # 表头一个行次字眼都没有时（整列是空的行次列，或多出来一列「备注」），
+            # 取「不是项目列、也不是金额列」的那一列。
+            #
+            # **判据仍然是「恰好两个金额列」**：金额列一个都没有时，老模板的
+            # 列头可能压根不写「金额」字样（项目/行次/第1期/第2期），那时按
+            # 固定位置回落成第 2 列 —— 那是既有行为，不能因为改了顺序就拒收。
             line_source_cols = ({column for column in header_labels if column != 1} - amount_like)
         if not line_source_cols:
             line_source_cols = {2}
         if len(line_source_cols) != 1:
             raise TemplateImportError("无法确定利润表的行次列，请检查模板版式")
         line_column = next(iter(line_source_cols))
-        if len(amount_like) == 1:
-            raise TemplateImportError("模板只有一个金额列，当前系统的利润表需要本期与本年累计两列")
-        if len(amount_like) > 2:
-            raise TemplateImportError("模板有多于两个金额列，无法确定哪两列导入当前系统")
         amount_source_cols = sorted({column for column in range(1, col_count + 1)
                                      if column != 1 and column != line_column})
         if len(amount_source_cols) != 2:

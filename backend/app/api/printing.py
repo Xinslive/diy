@@ -74,9 +74,28 @@ def _filename(name: str) -> str:
 
 
 def _period(db: Session, book_id: int, period_id: int | None) -> Period:
-    stmt = select(Period).where(Period.book_id == book_id)
-    p = db.get(Period, period_id) if period_id else db.scalar(
-        stmt.order_by(Period.ord.desc()).limit(1))
+    """取**本账套**的会计期间；给了 id 而不属于本账套 → 404。
+
+    **归属校验必须在这一处。** ``period_id`` 是前端传来的任意整数，不是授权
+    凭据：``Period.ord`` 是**账套内**相对序号，别家的期间拿过来会被当成
+    「本账套的某一期」去取数 —— 于是「按本账套的某一期取数、贴上别家的期间
+    标签」（HTTP 200 + 错数据），顺带泄露别家账套的期间码（存在了、启用到哪
+    年哪月）。
+
+    这条通道是 **9 个**打印/导出端点共用的（凭证 / 余额表 / 总账 / 明细账 /
+    报表的打印与导出），所以校验收在这里 —— 逐个端点补一遍，早晚有一处漏。
+
+    与 ``app/api/reports.py`` 的写法一致：不存在与不是你的落在同一句 404 上，
+    这条接口才不是跨账套的存在性探测器。
+    """
+    if period_id:
+        p = db.get(Period, period_id)
+        if p is None or p.book_id != book_id:
+            raise HTTPException(404, "会计期间不存在")
+        return p
+    p = db.scalar(
+        select(Period).where(Period.book_id == book_id)
+        .order_by(Period.ord.desc()).limit(1))
     if p is None:
         raise HTTPException(404, "会计期间不存在")
     return p
@@ -273,8 +292,18 @@ SELECTABLE_PAPERS = ("A4",)
 
 
 @router.get("/templates/meta")
-def template_meta():
-    """设计器需要的元信息：可选纸型、字段字典、默认模板。"""
+def template_meta(book: Book = Depends(get_my_book)):
+    """设计器需要的元信息：可选纸型、字段字典、默认模板。
+
+    **挂 ``get_my_book``**：这条路由在 ``/api/books/{book_id}/print`` 前缀下，
+    路径里带着账套 id。它返回的是**设计器**要用的元信息（纸型白名单、字段
+    字典、内置默认版式），而没有认证依赖时，任何人都能拿任意账套 id 取到
+    内置版式的结构 —— 既没有权限门槛，也把「这个账套存在」这件事泄了出去。
+
+    依赖挂在**函数**上而不是路径上：路径里那个 ``{book_id}`` 由前缀提供，
+    ``get_my_book`` 读的是同一个 Path 参数（见 ``app/core/deps.py``），
+    两边对得上。
+    """
     return {
         "scopes": list(SCOPES),
         "papers": [{"key": k, **PAPERS[k], "landscape": k.endswith("_LANDSCAPE")}
@@ -884,12 +913,15 @@ def _render_scope(
             bal_from = _period(db, book.id, from_period_id)
             if bal_from.ord > period.ord:
                 raise HTTPException(400, "起始期间不能晚于结束期间")
-        rows, _check = queries.balance_sheet_of_accounts(
+        rows, check = queries.balance_sheet_of_accounts(
             db, book.id, subjects, period, include_unposted, from_period=bal_from)
         # 范围跟屏幕上的三档单选一致，别让纸上多出一千多行明细
         rows = queries.filter_balance_rows(rows, subject_scope)
+        # **check 一起传下去**：合计行与试算行按它算（叶子级、与档位无关），
+        # 与 Excel 导出同一份实现 —— 打印件与导出件必须是同一张纸。
         doc = render_table_page(tpl, pv.context(db, book, period),
-                                _check_print_rows(pv.balance_rows(rows), "科目余额表"), 1, 1)
+                                _check_print_rows(pv.balance_rows(rows, check),
+                                                  "科目余额表"), 1, 1)
         return _with_note(doc, note)
 
     to_period = period
@@ -1220,8 +1252,17 @@ def export_general(book_id: int, period_id: Optional[int] = None,
         from_period = db.get(Period, from_period_id)
         if from_period is None or from_period.book_id != book.id:
             raise HTTPException(404, "起始期间不存在")
+        # **区间倒置 → 400，与另外三条通道一致。**
+        #
+        # 以前这里是「交换起止期后继续跑」：同一组参数在余额表导出、总账打印、
+        # 明细账导出上都是 400「起始期间不能晚于结束期间」，唯独总账 Excel
+        # 导出给一份文件。用户若在页面上看到过那句报错，改走导出却拿到文件，
+        # 会以为页面报错是多余的；反过来，先导出再在页面核对时两边对不上。
+        #
+        # 闸门在共享实现里也有（``queries.balance_sheet_of_accounts`` 比 ord），
+        # 但这里**先交换**了，共享层看到的就是正序 —— 所以必须在这条路上先挡。
         if from_period.ord > to_period.ord:
-            from_period, to_period = to_period, from_period
+            raise HTTPException(400, "起始期间不能晚于结束期间")
     else:
         from_period = to_period
 

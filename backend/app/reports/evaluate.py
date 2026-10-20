@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from typing import Optional
 
@@ -31,8 +32,16 @@ from sqlalchemy.orm import Session
 
 from app.ledger.engine import ZERO, LedgerEngine
 from app.models import Book, Entry, Period, ReportCell, ReportCol, ReportRow, Subject, Voucher
-from app.models.book import book_first_ord, period_ord, year_start_ord
+from app.models.book import book_first_ord, year_start_ord
 from app.reports.formula import D, Evaluator, FormulaError, formula_guard
+
+#: 期间字面量里的**纯 ASCII 数字**。
+#:
+#: 刻意不用 ``str.isdigit()``：它对全角「２０２６」也返回 True，而
+#: ``int("２０２６")`` 恰好能算 —— 于是全角年份会被当成合法期间静默折算；
+#: 更糟的是 ``"²".isdigit()`` 也是 True 而 ``int("²")`` 抛 ValueError，
+#: 那条异常不是 FormulaError，会一路穿出去变成 HTTP 500。
+_DIGITS = re.compile(r"[0-9]+")
 
 # 列类型 -> (取数口径, 期间占位符)
 COL_KINDS = {
@@ -87,9 +96,8 @@ class ReportContext:
         # 一次性建好 id -> Subject 的索引：以前每格都 db.get() 一次，
         # 一张几十行的报表就是几十次多余的往返。
         self._subjects_by_id = {s.id: s for s in self.subjects.values()}
-        # 父 -> 子。公式可以引用**上级科目**（见 subject_scope），而账簿引擎
-        # 只认单个 subject_id —— 上级科目自己身上没有分录（凭证只记到末级），
-        # 直接取数会得到一串 0。所以这里先建好树，取数时自己往下卷。
+        # 父 -> 子。用来判断「这个科目是不是上级科目」—— 上级科目的取数口径
+        # 由账簿引擎上卷（见 measure），报表层不再自己加一遍子树。
         self._subject_children: dict[int, list[int]] = {}
         for s in self.subjects.values():
             if s.parent_id is not None:
@@ -97,6 +105,9 @@ class ReportContext:
         self.formulas: dict[tuple[int, int], str] = {}
         self._cells: dict[tuple[int, int], Decimal] = {}
         self._visiting: set[tuple[int, int]] = set()
+        # 账套里真实存在的会计期间：(年, 月) -> Period。期间字面量必须指向
+        # 其中一个（见 resolve_period）。
+        self._known_periods_cache: Optional[dict[tuple[int, int], Period]] = None
         self._load_formulas()
 
     # -- 科目范围（末级 / 整棵子树）--
@@ -104,42 +115,34 @@ class ReportContext:
     #: 这些口径走 ``eng_pf``（for_report，排除结转凭证）。
     _PF_KINDS = frozenset({"period_amount", "period_amt", "ytd_amount", "ytd_amt"})
 
-    def subject_scope(self, sid: int) -> list[int]:
-        """sid 自己 + 它下面**全部末级后代**；sid 是末级时就是 ``[sid]``。
-
-        凭证只允许记到末级（``vouchers._validate_entries`` 的硬闸），所以上级
-        科目自己身上永远是 0 —— 取它的数必须等于把整棵子树加总，否则报表上
-        就会出现一行恒为 0 的「银行存款」，而且不报任何错。
-        """
-        if sid not in self._subject_children:
-            return [sid]
-        out: list[int] = []
-        stack = [sid]
-        seen: set[int] = set()
-        while stack:
-            cur = stack.pop()
-            if cur in seen:      # 科目树理论上无环，脏数据下别死循环
-                continue
-            seen.add(cur)
-            kids = self._subject_children.get(cur)
-            if kids:
-                stack.extend(kids)
-            else:
-                out.append(cur)
-        return sorted(out)
-
     def measure(self, sid: int, kind_key: str, period) -> Decimal:
-        """按某个口径取数；引用上级科目时取整棵子树之和。"""
+        """按某个口径取数。
+
+        **上级科目直接取账簿引擎上卷后的值**，报表层不再重算「整棵子树之和」。
+
+        为什么不能自己加：账簿引擎早就把分录与期初快照上卷到父科目了
+        （``_query_movements_uncached`` / ``_roll_up_openings``），而且它对
+        期初有一条明确规则 —— **「自身快照是基准，下级只补增量」**：一个科目
+        先做末级、后来又挂了子科目时，它自己身上那张快照**已经含着**下级的
+        余额，是总数不是增量。
+
+        报表层按「末级相加」算，得到的是另一个数：那个科目的数会随末级后代的
+        个数而变（1 个末级后代时走引擎值、2 个及以上走末级之和），而账簿引擎
+        始终给同一个数。同一条公式两个答案，就是「报表和总账对不上」。
+
+        统一到引擎那一侧（而不是反过来改引擎）有两个理由：引擎是账簿的既有
+        语义（总账、科目余额表、打印导出都按它算），而「末级相加」那条路
+        建立在一个**已经不成立**的前提上 —— 「凭证只记到末级，上级科目身上
+        永远是 0」。
+        """
         fn = getattr(self, kind_key)
-        ids = self.subject_scope(sid)
-        if len(ids) == 1:
-            return fn(sid, period)
-        # 整棵子树**一次**算完。逐条取数会各自触发一次聚合（figures() 在缓存
-        # 未命中时退化成全账套扫描），一个 30 个明细的上级科目就是 30 次。
-        self.eng.compute(ids, period.ord)
-        if kind_key in self._PF_KINDS:
-            self.eng_pf.compute(ids, period.ord)
-        return sum((fn(s, period) for s in ids), ZERO)
+        if sid in self._subject_children:
+            # 上级科目：先把整棵子树在引擎里算出来（一次聚合，与末级逐个取
+            # 同一量级），再取它自己的上卷值。
+            self.eng.compute([sid], period.ord)
+            if kind_key in self._PF_KINDS:
+                self.eng_pf.compute([sid], period.ord)
+        return fn(sid, period)
 
     # -- 模板 --
     def _load_formulas(self) -> None:
@@ -161,7 +164,48 @@ class ReportContext:
         y, m = self._ym(ord_)
         return Period(book_id=self.book.id, year=y, month=m, ord=ord_)
 
+    def _known_periods(self) -> dict[tuple[int, int], Period]:
+        """账套里真实存在的会计期间：(年, 月) -> Period。
+
+        走引擎的期间表（跨请求缓存，键里带 data_version）—— 期间是低频变更的，
+        这里是纯读，不会拿到过期数据。
+        """
+        if self._known_periods_cache is None:
+            self._known_periods_cache = {
+                (p.year, p.month): p for p in self.eng.periods()
+            }
+        return self._known_periods_cache
+
+    def _period_literal(self, year: int, month: int, expr) -> Period:
+        """期间字面量 -> 账套里真实存在的那个会计期间。**越界即公式错误。**
+
+        这里绝不「折算」：一个月份 13 折成次年 1 月、一个月份 00 折成首期、
+        一个 1900 年折成首期，取到的都是**另一个期间**的数 —— 而且那个数
+        长得完全正常（不是 0、不是空、不是红字），财务不会怀疑它。宁可这一格
+        报一行红字，也不要整张表印着一个看着没问题的错数。
+        """
+        if not 1 <= month <= 12:
+            raise FormulaError(f"无法识别的期间: {expr}（月份必须是 1~12）")
+        known = self._known_periods()
+        years = {y for (y, _m) in known}
+        if years and not (min(years) <= year <= max(years)):
+            raise FormulaError(
+                f"无法识别的期间: {expr}"
+                f"（本账套的会计期间在 {min(years)}~{max(years)} 年之间）")
+        p = known.get((year, month))
+        if p is None:
+            raise FormulaError(
+                f"无法识别的期间: {expr}"
+                f"（本账套没有 {year} 年 {month} 月这个会计期间）")
+        return p
+
     def resolve_period(self, expr) -> Period | None:
+        """把公式里的期间字面量解析成一个会计期间。
+
+        **解析不出来就是公式错误，绝不折算成别的期间。** 这一条是硬约束：
+        报表页、报表打印、报表 Excel 导出、报表结果落库四个入口共用这里，
+        一次「静默折算」就是四个通道同时印出错期间。
+        """
         if expr in (None, "", "{{本期}}", "{{期末}}"):
             return self.period
         if expr == "{{上期}}":
@@ -180,14 +224,20 @@ class ReportContext:
         if expr == "{{年初}}":
             return self._synthetic(self.start_ord)
         text = str(expr).strip()
+        # 只认 ASCII 数字：``str.isdigit()`` 对 "２０２６"（全角）也返回 True，
+        # 而 ``int("²")`` 直接抛 ValueError —— 那条异常不是 FormulaError，
+        # 会一路穿出去变成 HTTP 500（整张表都渲染不出来，不止那一格）。
         if "-" in text:
-            y, m = text.split("-", 1)
-            y, m = int(y), int(m)
-            return self._synthetic(period_ord(y, m, self.book.start_year))
-        if text.isdigit():
-            y = int(text)
-            return self._synthetic(period_ord(y, 12, self.book.start_year))
-        raise FormulaError(f"无法识别的期间: {expr}")
+            y_text, m_text = text.split("-", 1)
+            if not (_DIGITS.fullmatch(y_text) and _DIGITS.fullmatch(m_text)):
+                raise FormulaError(f"无法识别的期间: {expr}")
+            year, month = int(y_text), int(m_text)
+        elif _DIGITS.fullmatch(text):
+            # 裸年份 = 那一年的 12 期（口径见 formula.py 的「期间写法」）。
+            year, month = int(text), 12
+        else:
+            raise FormulaError(f"无法识别的期间: {expr}")
+        return self._period_literal(year, month, expr)
 
     # -- 账簿原语 --
     def opening(self, sid, period):

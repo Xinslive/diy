@@ -221,85 +221,15 @@ def vouchers_excel(rows: list[dict], *, title: str = "记账凭证", period: str
 
 # --------------------------------------------------------------------- 科目余额表
 
-#: 合计行用到的八个「按方向归过边」的数。键名与 ``queries.balance_sheet_of_accounts``
-#: 的 ``check`` 一一对应，别再另立一套叫法。
-_TOTAL_KEYS = ("opening_debit", "opening_credit", "period_debit", "period_credit",
-               "ytd_debit", "ytd_credit", "closing_debit", "closing_credit")
-
-
-def _balance_totals(rows: list[dict], check: dict) -> dict[str, Decimal]:
-    """科目余额表合计行 = **试算合计**，不是纸上那几行的算术和。
-
-    以前这里是 ``for row in rows: totals[idx] += _d(row.get(key))``，两个错叠在
-    一起，导出的余额表正好是交给客户和审计的纸面数：
-
-    1. **方向被吃掉了。** 行里的 ``opening`` / ``closing`` 来自
-       ``display_side()``，是**绝对值** —— 贷方余额同样存正数（它靠旁边的
-       「方向」列区分）。借方余额合计 1000 + 贷方余额合计 1000 直接相加，
-       合计「期初」写成 2000，而下面两行试算还打着「期末余额平衡 ✓」：
-       同一张纸上两处结论互相打脸，而 2000 不等于任何一边的合计。
-       归边口径必须与 ``app/ledger/queries.py::balance_sheet_of_accounts``
-       一致 —— 那边按 ``o_signed`` / ``c_signed`` 的符号拆借贷、只累计叶子，
-       行里的「方向」列就是那次拆分的结果，所以这里按方向列归边即同一个口径。
-    2. **重复计数。** 行是**过滤之后**的（``filter_balance_rows``：仅一级 /
-       仅明细 / 全部）。默认「全部」时父子同在一张表上，父级行本身就是下级的
-       上卷，逐行相加等于把同一笔钱数了两遍。``filter_balance_rows`` 的
-       docstring 明说它**不动 check** —— 那条 check 是叶子级算的，与档位无关，
-       屏幕上的加总也就与档位无关。合计必须跟 check 同源，否则「仅一级」与
-       「全部」打出来的合计不一样。
-
-    **有 check 就用 check。** 它是叶子级、按符号拆好边的四个数，是这套系统里
-    唯一一份试算口径的实现；本函数退化成「同样的算法」只为了在没有 check 的
-    旧调用方（以及直接调本函数的测试）下仍然给出正确的数。
-    期初的拆边 check 没给（那边只落了 ``opening_balanced`` 一个布尔），
-    只能从叶子行算 —— 这是本次不扩到 ledger 层的唯一遗留缺口。
-    """
-    # 叶子优先。``is_leaf`` 缺失（老调用方 / 直接构 payload）按叶子算，
-    # 宁可与 check 的口径同向，也不要把父子算两遍。
-    leaves = [row for row in rows if row.get("is_leaf", True)]
-    if not leaves:
-        # 「仅一级」档位下 payload 里一行叶子都没有。一级行是下级的上卷，
-        # 对发生额（借贷方、本年累计）来说它就是一次不重不漏的划分，按它算
-        # 与按叶子算同值；余额绝对值只在同一父级内部正负相抵时才会偏低，
-        # 那种行在导出纸上另有「方向」列可核对。
-        leaves = list(rows)
-
-    totals = dict.fromkeys(_TOTAL_KEYS, ZERO)
-    for row in leaves:
-        # Decimal 累加，不退回 float（见 _num 的说明）。逐格 round 也不能替代：
-        # round 是「四舍五入到分」，累加是「先加后舍」，两者在长表上不等价。
-        if row.get("opening_direction") == "借":
-            totals["opening_debit"] += _d(row.get("opening"))
-        else:
-            totals["opening_credit"] += _d(row.get("opening"))
-        totals["period_debit"] += _d(row.get("period_debit"))
-        totals["period_credit"] += _d(row.get("period_credit"))
-        totals["ytd_debit"] += _d(row.get("ytd_debit"))
-        totals["ytd_credit"] += _d(row.get("ytd_credit"))
-        if row.get("direction") == "借":
-            totals["closing_debit"] += _d(row.get("closing"))
-        else:
-            totals["closing_credit"] += _d(row.get("closing"))
-
-    for key, check_key in (("period_debit", "total_debit"), ("period_credit", "total_credit"),
-                           ("closing_debit", "total_closing_debit"),
-                           ("closing_credit", "total_closing_credit")):
-        if check.get(check_key) is not None:
-            totals[key] = _d(check[check_key])
-    return totals
-
-
-def _verdict(check: dict, key: str, label: str, debit: Decimal, credit: Decimal) -> str:
-    """试算行：「平衡 ✓ / 不平衡 ✗」+ 两边的数。
-
-    只打 ✓ 不打数，等于让读纸面的人自己回头把几百行加一遍 —— 而这份文件
-    的用途正是**免去**加法（交给审计方逐格核对）。不平衡时两边的差额一眼可见。
-    """
-    def money(v: Decimal) -> str:
-        return f"{v.quantize(CENT, rounding=ROUND_HALF_UP):,.2f}"
-
-    mark = "平衡 ✓" if check.get(key) else "不平衡 ✗"
-    return f"{label}{mark}（借 {money(debit)} / 贷 {money(credit)}）"
+#: 合计行用到的八个「按方向归过边」的数，以及试算行的文案 —— **都在
+#: ``app.printing.preview`` 里**（``balance_totals`` / ``balance_verdict``）。
+#:
+#: 合计与试算是**纸面口径**，Excel 导出与 HTML 打印印的是同一张纸：一份
+#: 实现、一个数字。以前 Excel 通道自己算、HTML 通道压根没有合计行 ——
+#: 「打出来的那张」与「导出来的那张」对不上（审计 P1-4 / P3-3）。
+from app.printing.preview import balance_totals as _balance_totals  # noqa: F401
+from app.printing.preview import balance_verdict as _verdict  # noqa: F401
+from app.printing.template import REPORT_LINE_NO, REPORT_STATIC, report_column_sides
 
 
 def balance_excel(payload: dict, *, book_name: str) -> bytes:
@@ -570,21 +500,25 @@ def report_excel(payload: dict, *, book_name: str) -> bytes:
     # label 和 width，没有 kind），把**第 1 列**当标题列。否则行标签根本没
     # 人写 —— 那不只是少一列：行标签是用户可控文本，漏掉它等于让
     # test_excel_export 里那批「标签不注入公式」的用例失去被测对象。
-    has_static = any(c.get("kind") == "STATIC" for c in cols)
-    static_seen = line_seen = 0
+    has_static = any(c.get("kind") == REPORT_STATIC for c in cols)
+    # 「这一列属于左半还是右半」：**共享实现**（``app.printing.template``）。
+    #
+    # 判据是「STATIC 列开启的分块」：STATIC 是每一半的首列，从它到下一个
+    # STATIC 之间的所有列（含行次列与金额列）都属于同一半。
+    #
+    # 以前这条通道按「第几个 STATIC / 第几个 LINE_NO」两个**互相独立**的
+    # 计数器算，HTML 打印那条通道按 STATIC 分块算 —— 两套实现。分叉的后果
+    # 是右半的**金额列**在 Excel 侧落到了左半（用的是 ``kind_left`` 而不是
+    # ``kind_right``），于是「流动资产合计」那行的右半（递延收益）被当成合计
+    # 加粗压灰；相邻两个 STATIC 列时行次列也会判错半。同一张表在两条通道上
+    # 版式不一样（审计 P3-2）。
+    side_of = report_column_sides(cols)
     col_plan: list[tuple[dict, str, int]] = []
     for idx, col in enumerate(cols):
         kind = col.get("kind")
         if not kind and idx == 0 and not has_static:
-            kind = "STATIC"
-        side = 0
-        if kind == "STATIC":
-            side = static_seen
-            static_seen += 1
-        elif kind == "LINE_NO":
-            side = line_seen
-            line_seen += 1
-        col_plan.append((col, kind or "", side))
+            kind = REPORT_STATIC
+        col_plan.append((col, kind or "", side_of.get(col.get("col_no"), 0)))
 
     r = 4
     for idx, col in enumerate(cols, start=1):
@@ -616,7 +550,7 @@ def report_excel(payload: dict, *, book_name: str) -> bytes:
             sk = _side_kind(side) if _side_filled(side) else ""
             # 官方表通篇没有粗体（大标题除外），表体一律不加粗。
             row_bold = bool(row.get("bold") if side == 0 else style.get("bold_right"))
-            if kind == "STATIC":
+            if kind == REPORT_STATIC:
                 # 项目名是用户可控文本：绕过了 _text 就能把报表名/项目名写成公式
                 if side:
                     label = style.get("label_right") or ""
@@ -639,7 +573,7 @@ def report_excel(payload: dict, *, book_name: str) -> bytes:
                 c.alignment = LEFT
                 c.font = Font(bold=bold)
                 c.fill = cell_fill
-            elif kind == "LINE_NO":
+            elif kind == REPORT_LINE_NO:
                 # 行次是法定固定编号，写成字符串：openpyxl 见到纯数字字符串无所谓，
                 # 但它可能带 '-'（占位），转成 int 会在这种行上直接抛异常。
                 no = style.get("line_right" if side else "line_left")
@@ -657,7 +591,9 @@ def report_excel(payload: dict, *, book_name: str) -> bytes:
     if payload.get("errors"):
         r += 2
         ws.cell(row=r, column=1, value="公式错误：").font = Font(bold=True, color="CC0000")
-        for i, e in enumerate(payload["errors"][:20]):
+        # 错误清单不截断：JSON 通道（api/reports.py）和 HTML 通道都给出全量，
+        # 这里若只写前 20 条，Excel 上其余出错格就被静默藏起来了。
+        for i, e in enumerate(payload["errors"]):
             ws.cell(row=r + i + 1, column=1, value=_text(e)).font = Font(color="CC0000")
 
     buf = io.BytesIO()
