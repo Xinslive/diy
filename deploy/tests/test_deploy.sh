@@ -463,7 +463,7 @@ fi
 # 脚本原来用 ``$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/systemd`` 找 unit
 # 模板。那是**调用时刻**才求值的：``dirname`` 拿到相对路径（``bash ./deploy.sh``）
 # 时，``cd . && pwd`` 落到的是**当时的工作目录** —— 而脚本第 3 步 cd 过
-# $APP、第 4 步又 cd 到 $APP/backend，于是它找的是 ``$APP/backend/systemd``，
+# ${APP}、第 4 步又 cd 到 ${APP}/backend，于是它找的是 ``${APP}/backend/systemd``，
 # 不存在，模板没找到，unit 一个都没装。
 #
 # 后果比「看门狗没装上」严重：每日备份的 timer 在**全新主机**上同样装不上，
