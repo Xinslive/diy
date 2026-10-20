@@ -362,3 +362,242 @@ def test_右栏表头写法不同也保得住右边的行次(monkeypatch):
     style = parsed["rows"][0]["style"]
     assert style["line_left"] == "1"
     assert style["line_right"] == "32"
+
+
+# ------------------------------------------- 表体边界：金额列有内容就算表体
+#
+# 行次从来不是表体的可靠边界：UFO 的大类行走中文数字，自建模板的行次列常常整列空着。
+# 真正说了算的是**金额列有没有内容** —— 有公式算，有手填的数也算。
+#
+# 下面这组用例直接给网格，不走二进制：它们要钉的是「表体边界怎么定」，
+# 不是「UFO 字节怎么读」。二进制那一层的用例在上面。
+
+
+def _filled_income_grid(body: list[tuple[str, str, str, str]]) -> list[list[dict]]:
+    """按行拼一张 4 列利润表：每行是（项目, 行次, 本月金额, 本年累计金额）。
+
+    金额写成文本就是「手填的数」（格子里没有公式对象），空字符串就是空格子。
+    """
+    grid = [[_cell("项     目"), _cell("行次"), _cell("本月金额"), _cell("本年累计金额")]]
+    for label, line, month, total in body:
+        grid.append([_cell(label), _cell(line), _cell(month), _cell(total)])
+    return grid
+
+
+def test_行次整列为空且金额是手填数时表体不被切掉(monkeypatch):
+    """行次列一个行号都没填、金额格是手填的数 —— 以前直接报错，现在照常导进表体。
+
+    以前只认「金额格有公式」，这种模板一行都定位不到，报的还是
+    「报表没有可识别的项目行次」—— 跟行次毫无关系，纯粹误导。
+    """
+    import app.reports.importer as importer
+
+    grid = _filled_income_grid([
+        ("房租收入", "", "1234.00", "2,468.00"),
+        ("水电费", "", "300.00", "600.00"),
+        ("合计", "", "1534.00", "3068.00"),
+    ])
+    monkeypatch.setattr(importer, "_stream", lambda raw: b"fixture")
+    monkeypatch.setattr(importer, "_grid", lambda data: (grid, "UFO8.00"))
+
+    parsed = parse_ufo_report(b"fixture", "手填利润表.rep")
+
+    assert parsed["stats"]["rows"] == 3
+    assert [row["label"] for row in parsed["rows"]] == ["房租收入", "水电费", "合计"]
+    # 手填的数没有公式可迁，导入后留空并逐格记一条待检查项 —— 不能悄悄当成 0
+    assert parsed["stats"]["unsupported_formulas"] == 6
+    assert {issue["reason"] for issue in parsed["issues"]} == {"原模板金额格没有可读取的公式，导入后留空"}
+
+
+def test_表尾手填的合计行也算表体(monkeypatch):
+    """行次只填到上一行、合计行是手填的数 —— 合计行不能被切掉。
+
+    以前 `row_end` 取「最后一个带行次的行」和「最后一个带金额公式的行」里靠后的那个，
+    手填的合计行两条判据都不沾，整行凭空消失。
+    """
+    import app.reports.importer as importer
+
+    cells = {
+        (1, 1): ("项     目", ""), (1, 2): ("行次", ""),
+        (1, 3): ("本月金额", ""), (1, 4): ("本年累计金额", ""),
+        (2, 1): ("房租收入", ""), (2, 2): ("1", ""),
+        (2, 3): ("", 'fs(500101,月,"贷",,年)'), (2, 4): ("", 'lfs(500101,月,"贷",,年)'),
+        (3, 1): ("合计", ""), (3, 2): ("", ""),
+        (3, 3): ("100.00", ""), (3, 4): ("200.00", ""),
+    }
+
+    stream = _ufo_stream(cells, rows=3, cols=4)
+    monkeypatch.setattr(importer, "_stream", lambda raw: stream)
+
+    parsed = parse_ufo_report(b"fixture", "带合计的利润表.rep")
+
+    assert parsed["stats"]["rows"] == 2
+    assert [row["label"] for row in parsed["rows"]] == ["房租收入", "合计"]
+    assert parsed["stats"]["unsupported_formulas"] == 2
+
+
+def test_金额格里的数值认得各种写法(monkeypatch):
+    """手填的数什么写法都有：千分位、货币符号、全角、括号负数。
+
+    认得太死会切掉真行，认得太宽会把表尾的签字说明卷进来 —— 所以只认「像数字的」。
+    """
+    import app.reports.importer as importer
+
+    grid = _filled_income_grid([
+        ("房租收入", "", "￥1,234.56", "（2,468.00）"),
+        ("水电费", "", "-300.00", "1 200.50"),
+        ("合计", "", "934.56", "3,668.50"),
+    ])
+    monkeypatch.setattr(importer, "_stream", lambda raw: b"fixture")
+    monkeypatch.setattr(importer, "_grid", lambda data: (grid, "UFO8.00"))
+
+    parsed = parse_ufo_report(b"fixture", "各种写法的利润表.rep")
+
+    assert parsed["stats"]["rows"] == 3
+    assert [row["label"] for row in parsed["rows"]] == ["房租收入", "水电费", "合计"]
+
+
+def test_金额列里的文字说明不会被当成表体(monkeypatch):
+    """表尾写在金额列里的说明文字不是金额，不能把它当成表体的一行。"""
+    import app.reports.importer as importer
+
+    cells = {
+        (1, 1): ("项     目", ""), (1, 2): ("行次", ""),
+        (1, 3): ("本月金额", ""), (1, 4): ("本年累计金额", ""),
+        (2, 1): ("房租收入", ""), (2, 2): ("1", ""),
+        (2, 3): ("", 'fs(500101,月,"贷",,年)'), (2, 4): ("", 'lfs(500101,月,"贷",,年)'),
+        (3, 1): ("单位负责人：  会计主管：", ""), (3, 2): ("", ""),
+        (3, 3): ("以下略", ""), (3, 4): ("", ""),
+    }
+
+    stream = _ufo_stream(cells, rows=3, cols=4)
+    monkeypatch.setattr(importer, "_stream", lambda raw: stream)
+
+    parsed = parse_ufo_report(b"fixture", "带表尾说明的利润表.rep")
+
+    assert parsed["stats"]["rows"] == 1
+    assert [row["label"] for row in parsed["rows"]] == ["房租收入"]
+
+
+def test_行次写成序号点或括号形态照样认得出(monkeypatch):
+    """行次是模板作者手写的：「1.」「1、」「（1）」都得认。"""
+    import app.reports.importer as importer
+
+    grid = _filled_income_grid([
+        ("房租收入", "1.", "100.00", "200.00"),
+        ("水电费", "（2）", "300.00", "400.00"),
+        ("合计", "3、", "400.00", "600.00"),
+    ])
+    monkeypatch.setattr(importer, "_stream", lambda raw: b"fixture")
+    monkeypatch.setattr(importer, "_grid", lambda data: (grid, "UFO8.00"))
+
+    parsed = parse_ufo_report(b"fixture", "异体行次利润表.rep")
+
+    assert parsed["stats"]["rows"] == 3
+    assert [row["style"]["line_left"] for row in parsed["rows"]] == ["1.", "（2）", "3、"]
+
+
+def test_表体里既没行次也没金额时报错说清楚(monkeypatch):
+    """报错文案要指向真正的原因 —— 以前一律说「没有可识别的项目行次」，跟行次无关。"""
+    import app.reports.importer as importer
+
+    grid = [[_cell("项     目"), _cell("行次"), _cell("本月金额"), _cell("本年累计金额")]]
+    monkeypatch.setattr(importer, "_stream", lambda raw: b"fixture")
+    monkeypatch.setattr(importer, "_grid", lambda data: (grid, "UFO8.00"))
+
+    with pytest.raises(TemplateImportError, match="行次列、金额公式和金额数值都是空的"):
+        parse_ufo_report(b"fixture", "空表.rep")
+
+
+# --------------------------------------------- 列的含义：按表头认，不按固定位置
+
+
+def test_行次列表头是空白的模板照样认出版式(monkeypatch):
+    """行次列连表头都没写（自建模板常见）—— 版式仍要认得出来。"""
+    import app.reports.importer as importer
+
+    cells = {
+        (1, 1): ("项     目", ""), (1, 2): ("", ""),
+        (1, 3): ("本月金额", ""), (1, 4): ("本年累计金额", ""),
+        (2, 1): ("房租收入", ""), (2, 2): ("", ""),
+        (2, 3): ("", 'fs(500101,月,"贷",,年)'), (2, 4): ("", 'lfs(500101,月,"贷",,年)'),
+    }
+
+    stream = _ufo_stream(cells, rows=2, cols=4)
+    monkeypatch.setattr(importer, "_stream", lambda raw: stream)
+
+    parsed = parse_ufo_report(b"fixture", "空行次表头利润表.rep")
+
+    assert parsed["stats"]["rows"] == 1
+    assert [(c["col_no"], c["label"], c["kind"]) for c in parsed["cols"]] == [
+        (1, "项     目", "STATIC"), (2, "本月金额", "FORMULA"), (3, "本年累计金额", "FORMULA")
+    ]
+
+
+def test_行次列表头写成行号也能认出版式(monkeypatch):
+    """行次列表头未必写「行次」，「行号」「序号」一样。"""
+    import app.reports.importer as importer
+
+    cells = {
+        (1, 1): ("项     目", ""), (1, 2): ("行号", ""),
+        (1, 3): ("本月金额", ""), (1, 4): ("本年累计金额", ""),
+        (2, 1): ("房租收入", ""), (2, 2): ("1", ""),
+        (2, 3): ("", 'fs(500101,月,"贷",,年)'), (2, 4): ("", 'lfs(500101,月,"贷",,年)'),
+    }
+
+    stream = _ufo_stream(cells, rows=2, cols=4)
+    monkeypatch.setattr(importer, "_stream", lambda raw: stream)
+
+    parsed = parse_ufo_report(b"fixture", "行号表头利润表.rep")
+
+    assert parsed["stats"]["rows"] == 1
+    assert parsed["rows"][0]["style"]["line_left"] == "1"
+
+
+def test_行次列写在别的列时按表头重新映射(monkeypatch):
+    """行次列不在源第 2 列时，金额列必须跟着重映射 —— 否则少一列数还不报错。
+
+    照固定位置（行次=源第 2 列）映射，这里会把真正的金额列当行次丢掉。
+    """
+    import app.reports.importer as importer
+
+    cells = {
+        (1, 1): ("项     目", ""), (1, 2): ("本月金额", ""),
+        (1, 3): ("本年累计金额", ""), (1, 4): ("行次", ""),
+        (2, 1): ("房租收入", ""), (2, 2): ("", 'fs(500101,月,"贷",,年)'),
+        (2, 3): ("", 'lfs(500101,月,"贷",,年)'), (2, 4): ("1", ""),
+    }
+
+    stream = _ufo_stream(cells, rows=2, cols=4)
+    monkeypatch.setattr(importer, "_stream", lambda raw: stream)
+
+    parsed = parse_ufo_report(b"fixture", "行次在末列的利润表.rep")
+
+    assert [(c["col_no"], c["label"], c["kind"]) for c in parsed["cols"]] == [
+        (1, "项     目", "STATIC"), (2, "本月金额", "FORMULA"), (3, "本年累计金额", "FORMULA")
+    ]
+    assert parsed["cells"][0] == {"row_no": 1, "col_no": 2, "formula": '科目("500101","本期贷方",{{本期}})'}
+    assert parsed["cells"][1] == {"row_no": 1, "col_no": 3, "formula": '科目("500101","贷方累计",{{本期}})'}
+    # 行次要挂在界面的行次列上，不能跟着金额列跑
+    assert parsed["rows"][0]["style"]["line_left"] == "1"
+
+
+def test_行次列里有公式时拒收而不是丢一列(monkeypatch):
+    """被当成行次的那一列里居然有公式 —— 说明列的含义认错了。
+
+    照着行次丢掉就是在静默丢一列数，宁可拒收让人把模板改对。
+    """
+    import app.reports.importer as importer
+
+    cells = {
+        (1, 1): ("项     目", ""), (1, 2): ("行次", ""),
+        (1, 3): ("本月金额", ""), (1, 4): ("本年累计金额", ""),
+        (2, 1): ("房租收入", ""), (2, 2): ("", 'fs(500101,月,"贷",,年)'),
+        (2, 3): ("", 'fs(5001,月,"贷",,年)'), (2, 4): ("", 'lfs(5001,月,"贷",,年)'),
+    }
+
+    stream = _ufo_stream(cells, rows=2, cols=4)
+    monkeypatch.setattr(importer, "_stream", lambda raw: stream)
+
+    with pytest.raises(TemplateImportError, match="列的含义认不准"):
+        parse_ufo_report(b"fixture", "行次列有公式的利润表.rep")

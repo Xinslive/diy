@@ -4,10 +4,11 @@ OLE 的 UFO~REP 流包含主网格、字体、文本对象、公式对象及历�
 必须用网格内的对象 ID 和坐标定位当前公式，不能从二进制中搜索到一条就导入。
 只迁移结构和公式；历史金额、编制单位及打印说明不成为新账套的财务数据。
 
-表体的边界有两条互相独立的判据（见 parse_ufo_report 里的注释）：列按尾部空列裁剪，
-行按「最后一个带行次的行」与「最后一个带金额公式的行」取靠后者。行次列里大类行走的是
-中文数字（「一、二、三、四」），只认阿拉伯数字会把「四、利润总额」那一行整行切掉 ——
-而且不报错，导进来的是半张表。
+表体的边界有三条互相独立的判据（见 parse_ufo_report 里的注释）：列按尾部空列裁剪，
+行按「最后一个带行次的行」「最后一个带金额公式的行」「最后一个带金额数值的行」取靠后者。
+行次列里大类行走的是中文数字（「一、二、三、四」），只认阿拉伯数字会把「四、利润总额」
+那一行整行切掉 —— 而且不报错，导进来的是半张表；行次列整列是空的模板更常见，
+光认行次连表体到哪儿都定位不到。所以边界最终落在「金额列有没有内容」上。
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import io
 import json
 import re
 import struct
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +34,17 @@ _UFO_CALL = re.compile(r"(?<![A-Za-z0-9_])(QC|QM|FS|LFS)\(([^()]*)\)", re.I)
 # 行次列里的行号标记。明细行用阿拉伯数字，**大类行用中文数字**（「一、二、三、四」），
 # 所以两种写法都得认 —— 只认阿拉伯数字会把最后一行大类（通常是「四、利润总额」）
 # 连同它后面的行一起切掉，导进来只剩半张表。
-_LINE_NO = re.compile(r"[（(]?\s*(?:\d+|[〇零一二三四五六七八九十百千]+)\s*[)）]?")
+#
+# 写法上还有一堆变体：带括号「（1）」、带序号点「1.」「1、」、带子项号「1-1」。
+# 行次列是模板作者手写的，认得越宽，表体边界越不容易被切错。
+_LINE_NO = re.compile(r"[（(]?\s*(?:\d+(?:[-—]\d+)*|[〇零一二三四五六七八九十百千]+)\s*[)）]?[\.、,，:：]?")
+# 金额格里的数值文本。表体边界要认「有内容」，而内容有两种来源：公式和手填的数。
+_AMOUNT_TEXT = re.compile(r"[+-]?\d+(?:\.\d+)?")
+# 列名里的字眼。行次列的表头未必写「行次」（也有「行号」「序号」），金额列的表头
+# 未必写「金额」（也有「本期数」「本年累计数」）。认字眼比死认位置宽，
+# 但认不准时宁可拒收 —— 宁可人拿不到模板，也不能让人拿着对不上的报表去做账。
+_LINE_HEADER_WORDS = ("行次", "行号", "序号")
+_AMOUNT_HEADER_WORDS = ("金额", "余额", "累计", "本期", "本月", "数量", "合计")
 
 
 class TemplateImportError(ValueError):
@@ -234,6 +246,45 @@ def _side(text: str) -> tuple[str, int, bool, str]:
     return label, indent, bold, kind
 
 
+def _is_header_label(text: str) -> bool:
+    """表头格里是不是列名。
+
+    认「行次类」或「金额类」的字眼，用来确认这一行确实是表头。
+    死认「行次」两个字太窄：行次列表头写成「行号」「序号」，或者整列空着
+    （自建模板常见），都会让整张模板在进入表体判定之前就被拒掉。
+    """
+    label = re.sub(r"\s+", "", text)
+    return any(word in label for word in _LINE_HEADER_WORDS + _AMOUNT_HEADER_WORDS)
+
+
+def _is_amount_text(text: str) -> bool:
+    """金额格里的文本是不是一个数。
+
+    UFO 的格分两种：**标了公式的**（内容在公式对象里）和**没标公式的**（内容是一段文本）。
+    导入只迁公式，但表体边界不能因此把没公式的行切掉 —— 自建模板的金额多半是手填的数，
+    那也是表体的一部分。所以边界判定要认数值文本。
+
+    认「像数字的」而不是「非空的」：表尾的签字说明（「单位负责人：会计主管：」）也在格子里，
+    那是文字不是金额，认进来表体就会多出一行假行。数值要容忍千分位、货币符号、
+    全角字符和括号负数 —— 模板里手填的数什么写法都有。
+    """
+    raw = unicodedata.normalize("NFKC", text).strip()
+    if not raw:
+        return False
+    negative = raw.startswith("(") and raw.endswith(")")
+    if negative:
+        raw = raw[1:-1].strip()
+    raw = raw.lstrip("¥$").replace(",", "").replace(" ", "").rstrip("元").strip()
+    return bool(_AMOUNT_TEXT.fullmatch(raw))
+
+
+def _amount_cell_has_content(cell: dict) -> bool:
+    """金额格算不算「有内容」。公式、数值、以及标了公式但没读出公式的格都算。"""
+    if cell["formula"].strip() or cell["missing"]:
+        return True
+    return _is_amount_text(cell["text"])
+
+
 def parse_ufo_report(raw: bytes, filename: str) -> dict[str, Any]:
     filename = (filename or "").replace("\\", "/").split("/")[-1]
     if Path(filename).suffix.lower() not in (".rep", ".rbk"):
@@ -241,22 +292,31 @@ def parse_ufo_report(raw: bytes, filename: str) -> dict[str, Any]:
     grid, version = _grid(_stream(raw))
     col_count = len(grid[0])
     report_type = "BALANCE_SHEET" if col_count == 8 else "INCOME_SHEET"
+    # 表头行：第一列写着「项目」或「资产」，而且这一行带着列名。
+    #
+    # 死认「行次」两个字太窄：行次列表头写成「行号」「序号」，或者整列空着
+    # （自建模板常见），都会让整张模板在进入表体判定之前就被拒掉。
     header_index = next((index for index, row in enumerate(grid[:12])
                          if re.sub(r"\s+", "", row[0]["text"]) in ("资产", "项目")
-                         and any(cell["text"].strip() == "行次" for cell in row)), None)
+                         and any(_is_header_label(cell["text"]) for cell in row)), None)
     if header_index is None:
         raise TemplateImportError("未找到项目/行次表头，无法可靠识别报表主体")
     row_start = header_index + 2
-    # 主体由固定行次定位，空的分节行会一起保留；表尾说明及缓存数据不导入。
-    # 行次列：优先认表头里写着「行次」的列，认不到就按 UFO 版式的固定位置回落
-    # （左栏第 2 列；资产负债表右栏第 6 列）。两处取并集 —— 只认表头的话，
-    # 右边栏表头写法稍有出入就会连右边的行次一起丢掉。
-    header_line_cols = {index for index, cell in enumerate(grid[header_index])
-                        if re.sub(r"\s+", "", cell["text"]) == "行次"}
-    line_cols = tuple(sorted(header_line_cols | ({1, 5} if col_count == 8 else {1})))
-    numbered = [index + 1 for index, row in enumerate(grid)
-                if index > header_index and any(_LINE_NO.fullmatch(row[col]["text"].strip()) for col in line_cols)]
+    # 主体由表体的内容定位，空的分节行会一起保留；表尾说明及缓存数据不导入。
+    header = grid[header_index]
+    header_labels = {column: re.sub(r"\s+", "", header[column - 1]["text"])
+                     for column in range(1, col_count + 1)}
+    # 行次列（界面上那一列行号）：资产负债表的位置是固定的（源第 2、6 列），
+    # 利润表靠表头认 —— 见下面的说明。
+    header_line_cols = {column for column, label in header_labels.items()
+                        if column != 1 and any(word in label for word in _LINE_HEADER_WORDS)}
     if col_count == 8:
+        # 资产负债表是固定的双栏版式：左栏 1..4（资产/行次/期末/年初）、
+        # 右栏 5..8（负债/行次/期末/年初），位置不随模板变。
+        line_source_cols = {2, 6}
+        amount_source_cols = {3, 4, 7, 8}
+        # 两处取并集 —— 只认表头的话，右边栏表头写成「行号」就会连右边的行次一起丢掉。
+        line_cols = tuple(sorted({column - 1 for column in header_line_cols} | {1, 5}))
         source_to_target = {column: column for column in range(1, 9)}
         cols = []
         for index, cell in enumerate(grid[header_index], 1):
@@ -265,30 +325,67 @@ def parse_ufo_report(raw: bytes, filename: str) -> dict[str, Any]:
             cols.append({"col_no": index, "label": cell["text"].strip() or no_to_col(index), "kind": kind,
                          "width": 250 if kind == "STATIC" else 56 if kind == "LINE_NO" else 140, "hidden": False})
     else:
-        # UFO 损益表的 B 列只是行次；当前系统的利润表没有这列，金额列要左移。
-        source_to_target = {1: 1, 3: 2, 4: 3}
-        header = grid[header_index]
+        # 利润表 4 列：项目 / 行次 / 本期 / 累计。
+        #
+        # **三列的语义不能按固定位置写死**。照 UFO 固定位置（行次=源第 2 列、
+        # 金额=源第 3、4 列）映射，遇到把「行次」写在别的列的模板，会把真正的金额列
+        # 当行次丢掉：少一列数，而且不报任何错。
+        #
+        # 所以按表头认：写着「行次/行号/序号」的那列是行次列；表头一个行次字眼都没有
+        # 时（整列是空的行次列，或多出来一列「备注」），取「不是项目列、也不是金额列」
+        # 的那一列；再认不出来才回落 UFO 固定位置。金额列同理，认不满两列就拒收。
+        amount_like = {column for column, label in header_labels.items()
+                       if column != 1 and any(word in label for word in _AMOUNT_HEADER_WORDS)}
+        line_source_cols = {column for column in header_line_cols if column != 1}
+        if not line_source_cols and len(amount_like) == 2:
+            line_source_cols = ({column for column in header_labels if column != 1} - amount_like)
+        if not line_source_cols:
+            line_source_cols = {2}
+        if len(line_source_cols) != 1:
+            raise TemplateImportError("无法确定利润表的行次列，请检查模板版式")
+        line_column = next(iter(line_source_cols))
+        if len(amount_like) == 1:
+            raise TemplateImportError("模板只有一个金额列，当前系统的利润表需要本期与本年累计两列")
+        if len(amount_like) > 2:
+            raise TemplateImportError("模板有多于两个金额列，无法确定哪两列导入当前系统")
+        amount_source_cols = sorted({column for column in range(1, col_count + 1)
+                                     if column != 1 and column != line_column})
+        if len(amount_source_cols) != 2:
+            raise TemplateImportError("无法确定利润表的两个金额列，请检查模板版式")
+        line_cols = (line_column - 1,)
+        source_to_target = {1: 1, amount_source_cols[0]: 2, amount_source_cols[1]: 3}
         cols = [
             {"col_no": 1, "label": header[0]["text"].strip() or "项目", "kind": "STATIC", "width": 250, "hidden": False},
-            {"col_no": 2, "label": header[2]["text"].strip() or "本期金额", "kind": "FORMULA", "width": 140, "hidden": False},
-            {"col_no": 3, "label": header[3]["text"].strip() or "本年累计", "kind": "FORMULA", "width": 140, "hidden": False},
+            {"col_no": 2, "label": header[amount_source_cols[0] - 1]["text"].strip() or "本期金额", "kind": "FORMULA", "width": 140, "hidden": False},
+            {"col_no": 3, "label": header[amount_source_cols[1] - 1]["text"].strip() or "本年累计", "kind": "FORMULA", "width": 140, "hidden": False},
         ]
-    # 表体到哪儿为止：取「最后一个带行次的行」和「最后一个带金额公式的行」里靠后的那个。
+    # 行次列里出现公式，说明这一列其实是金额列 —— 照着行次丢掉就是在静默丢一列数。
+    # 宁可拒收让人把模板改对，也不能让人拿着一张少了一列的报表去做账。
+    for source_col in sorted(line_source_cols):
+        if any(row[source_col - 1]["formula"].strip() for row in grid):
+            raise TemplateImportError(f"第 {source_col} 列被当成了行次列，可列里有公式，列的含义认不准，请检查模板版式")
+    # 表体到哪儿为止：三条互相独立的判据，取靠后的那个。
     #
-    # 只看行次是不够的 —— UFO 的行次列里，**大类行走中文数字**（「一、二、三、四」），
-    # 明细行才走阿拉伯数字。标准《会小企02表 利润表》的大类行（一、主营业务收入 /
-    # 减：1、管理费用 / 减：2、财务费用 / 四、利润总额）全是中文数字，只认 `\d+`
-    # 的话，末行大类落在 row_end 之后，会被整行切掉 —— 「利润总额」那一行凭空消失，
-    # 导进来的是半张表，而且**不报任何错**。
+    # 1) 行次列里有行号标记的行；
+    # 2) 金额列里有公式的行；
+    # 3) 金额列里有数值的行（手填的数）。
     #
-    # 再加一道「最后一个带金额公式的行」兜底：有些模板行次列整列是空的，
-    # 金额公式的位置才是表体的真实边界。
-    value_cols = {source for source, target in source_to_target.items()
-                  if cols[target - 1]["kind"] not in ("STATIC", "LINE_NO")}
+    # **行次从来不是表体的可靠边界**。UFO 的行次列里大类行走中文数字
+    # （「一、二、三、四」），明细行才走阿拉伯数字；标准《会小企02表 利润表》的大类行
+    # （一、主营业务收入 / 减：1、管理费用 / 减：2、财务费用 / 四、利润总额）全是中文数字，
+    # 只认 `\d+` 的话末行大类落在 row_end 之后，会被整行切掉 —— 「利润总额」那一行凭空消失，
+    # 导进来的是半张表，而且**不报任何错**。自建模板更常见：行次列整列是空的。
+    #
+    # 只认公式也不够。UFO 的格分两种：标了公式的（内容在公式对象里）和没标公式的
+    # （内容是一段文本）。自建模板的金额格常常是**手填的数**，没有公式可读 ——
+    # 光看 formula 会把这类整行切掉，连表尾手填的合计行一起丢掉。
+    # 所以边界必须以「**金额列有内容**」为准：有公式、有数值、或标了公式但没读出公式，都算。
+    numbered = [index + 1 for index, row in enumerate(grid)
+                if index > header_index and any(_LINE_NO.fullmatch(row[col]["text"].strip()) for col in line_cols)]
     with_amount = [index + 1 for index, row in enumerate(grid)
-                   if index + 1 >= row_start and any(row[col - 1]["formula"].strip() for col in value_cols)]
+                   if index + 1 >= row_start and any(_amount_cell_has_content(row[col - 1]) for col in amount_source_cols)]
     if not numbered and not with_amount:
-        raise TemplateImportError("报表没有可识别的项目行次")
+        raise TemplateImportError("没有找到报表内容行：行次列、金额公式和金额数值都是空的")
     row_end = max(numbered + with_amount)
     rows, cells, issues = [], [], []
     source_count = 0
