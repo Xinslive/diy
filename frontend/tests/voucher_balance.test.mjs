@@ -16,6 +16,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { computed, reactive } from 'vue'
 import { fmt } from '../src/utils/format.js'
+import { centsToText, moneyCents } from '../src/utils/amountGrid.js'
 
 const SRC = fs.readFileSync(
   new URL('../src/views/voucher/VoucherEdit.vue', import.meta.url), 'utf8')
@@ -46,12 +47,20 @@ const BLOCK = amountBlock()
  * 用真实的金额实现搭一套判平状态。form 是 reactive 的，所以改一条分录之后
  * 再读 balanced / diffTag 会重新算 —— 补差那条路（补完必须变平）才测得动。
  */
+/**
+ * 用真实的金额实现搭一套判平状态。form 是 reactive 的，所以改一条分录之后
+ * 再读 balanced / diffTag 会重新算 —— 补差那条路（补完必须变平）才测得动。
+ *
+ * 整数分是 **BigInt**（与期初页同一份 moneyCents）：18 位整数折成分是 20 位，
+ * 早就越过 Number 的安全整数范围 —— 浮点会把 999999999999999999.99
+ * 变成 1000000000000000000（审查 P0-1）。所以下面那些断言里的分是 BigInt。
+ */
 function state(entries) {
   const form = reactive({ entries: entries.map((e) => ({ subject_id: 1, summary: '', ...e })) })
-  const factory = new Function('computed', 'fmt', 'form', `${BLOCK}
+  const factory = new Function('computed', 'fmt', 'form', 'moneyCents', 'centsToText', `${BLOCK}
     return { form, totals, total, signedTotals, diffCents, balanced, diffTag, blank,
              centsOf, centsText, voucherTotals, voucherSignedTotals, autoBalanceNeed }`)
-  return factory(computed, fmt, form)
+  return factory(computed, fmt, form, moneyCents, centsToText)
 }
 
 /** 页脚那一行文案。照抄模板里的优先级：还没录 → 平 → 差额（VoucherEdit.vue:179-181）。 */
@@ -76,8 +85,8 @@ t('浮点残差确实存在（测试前提，不是被测行为）', () => {
 
 t('借 100.10 + 借 200.20 / 贷 300.30 → 平', () => {
   const s = state([D('100.10'), D('200.20'), C('300.30')])
-  assert.equal(s.totals.value.debit, 30030)
-  assert.equal(s.totals.value.credit, 30030)
+  assert.equal(s.totals.value.debit, 30030n)
+  assert.equal(s.totals.value.credit, 30030n)
   assert.equal(s.balanced.value, true, '两借一贷约 22% 的凭证本来被判成不平')
   assert.equal(s.blank.value, false)
   assert.equal(footerTag(s), '借贷平衡 ✓')
@@ -85,7 +94,7 @@ t('借 100.10 + 借 200.20 / 贷 300.30 → 平', () => {
 
 t('借 0.1 + 借 0.2 / 贷 0.3 → 平', () => {
   const s = state([D('0.1'), D('0.2'), C('0.3')])
-  assert.equal(s.totals.value.debit, 30)
+  assert.equal(s.totals.value.debit, 30n)
   assert.equal(s.balanced.value, true)
   assert.equal(footerTag(s), '借贷平衡 ✓')
 })
@@ -93,8 +102,8 @@ t('借 0.1 + 借 0.2 / 贷 0.3 → 平', () => {
 t('红字凭证 借 −300 / 贷 −300 → 平（红字照存，语义不许破）', () => {
   const s = state([D('-300'), C('-300')])
   // 负数算到对面去：两边各摆 300.00
-  assert.equal(s.totals.value.debit, 30000)
-  assert.equal(s.totals.value.credit, 30000)
+  assert.equal(s.totals.value.debit, 30000n)
+  assert.equal(s.totals.value.credit, 30000n)
   assert.equal(s.balanced.value, true, '红字冲销的老凭证必须照存')
   assert.equal(footerTag(s), '借贷平衡 ✓')
 })
@@ -102,8 +111,8 @@ t('红字凭证 借 −300 / 贷 −300 → 平（红字照存，语义不许破
 t('正负相抵 借 111 / 借 −111 → 平（按平处理，语义不许破）', () => {
   const s = state([D('111'), D('-111')])
   // 红字把 −111 搬去了对面，两栏一样大
-  assert.equal(s.totals.value.debit, 11100)
-  assert.equal(s.totals.value.credit, 11100)
+  assert.equal(s.totals.value.debit, 11100n)
+  assert.equal(s.totals.value.credit, 11100n)
   assert.equal(s.balanced.value, true, '冲销凭证被当成不平了')
   assert.equal(footerTag(s), '借贷平衡 ✓')
 })
@@ -118,7 +127,7 @@ t('空表 → 「还没录金额」，不是「平」也不是红字差额', () 
 t('真的差钱时页脚说的是差多少、哪一边大', () => {
   const s = state([D('100.10'), C('200.20')])
   assert.equal(s.balanced.value, false)
-  assert.equal(s.diffCents.value, -10010)
+  assert.equal(s.diffCents.value, -10010n)
   assert.equal(footerTag(s), '贷方大 100.10')
   // 借方大那一侧也说清楚
   assert.equal(state([D('200.20'), C('100.10')]).diffTag.value, '借方大 100.10')
@@ -163,13 +172,13 @@ t('红字写进对面那一栏，不是相减', () => {
   // 借方红字落到贷方栏、贷方红字落到借方栏 —— 红字的本意（冲销同一笔），
   // 不是「贷方减了 300」。要是照带符号显示，这一格会摆出负数，
   // 页脚的差额也就凭空多出一份。
-  assert.deepEqual(state([D('-100.10')]).totals.value, { debit: 0, credit: 10010 },
+  assert.deepEqual(state([D('-100.10')]).totals.value, { debit: 0n, credit: 10010n },
     '借方红字没搬到贷方那一栏')
-  assert.deepEqual(state([C('-300')]).totals.value, { debit: 30000, credit: 0 },
+  assert.deepEqual(state([C('-300')]).totals.value, { debit: 30000n, credit: 0n },
     '贷方红字没搬到借方那一栏')
   // 带符号的合计仍然照减 —— 补差要的是这个，不是搬过栏的那个
   assert.deepEqual(state([D('-100.10'), C('-100.10')]).signedTotals.value,
-    { debit: -10010, credit: -10010 })
+    { debit: -10010n, credit: -10010n })
   assert.equal(state([D('-100.10'), C('-100.10')]).balanced.value, true)
 })
 
@@ -183,7 +192,7 @@ t('借 −100.10 / 贷 +100.10 是不平的（别把它当成红字冲销）', (
 
 t('落格用的真正减号 U+2212 也认成红字', () => {
   const s = state([D('−300'), C('−300')])
-  assert.equal(s.totals.value.debit, 30000, 'U+2212 被当成垃圾字符剔掉的话会变成正的 300')
+  assert.equal(s.totals.value.debit, 30000n, 'U+2212 被当成垃圾字符剔掉的话会变成正的 300')
   assert.equal(s.balanced.value, true)
 })
 
@@ -195,7 +204,7 @@ t('只敲了一个负号 / 空格子 → 0，不是 NaN', () => {
 
 t('带符号合计：借 100 / 借 −100 两边都归零（补差靠这个口径）', () => {
   const s = state([D('100'), D('-100')])
-  assert.deepEqual(s.signedTotals.value, { debit: 0, credit: 0 })
+  assert.deepEqual(s.signedTotals.value, { debit: 0n, credit: 0n })
   assert.equal(s.balanced.value, true, '正负相抵按平处理（2026-10-12 用户明确要求）')
 })
 
@@ -215,15 +224,22 @@ t('接口给的 number 金额按同一套定点化处理', () => {
 
 t('小数只取到分（金额列就是两位，多余的位次静默截断）', () => {
   const s = state([])
-  assert.equal(s.centsOf('1.005'), 100, '1.005 应截成 1.00')
-  assert.equal(s.centsOf('1.999'), 199, '1.999 应截成 1.99')
-  assert.equal(s.centsOf('.5'), 50)
-  assert.equal(s.centsOf('300'), 30000)
+  assert.equal(s.centsOf('1.005'), 100n, '1.005 应截成 1.00')
+  assert.equal(s.centsOf('1.999'), 199n, '1.999 应截成 1.99')
+  assert.equal(s.centsOf('.5'), 50n)
+  assert.equal(s.centsOf('300'), 30000n)
+})
+
+t('18 位整数不许被当成 0（以前 Number.isSafeInteger 判负，存库会写成 "0.00"）', () => {
+  const s = state([])
+  assert.equal(s.centsOf('999999999999999999.99'), 99999999999999999999n,
+    '14 位以上的金额被当成 0 —— 存库那一步就会把它写成 0.00')
+  assert.equal(s.centsText(s.centsOf('999999999999999999.99')), '999999999999999999.99')
 })
 
 t('centsText 与 centsOf 互为逆运算', () => {
   const s = state([])
-  for (const c of [0, 1, -1, 99, 100, -30050, 99999999999, -99999999999]) {
+  for (const c of [0n, 1n, -1n, 99n, 100n, -30050n, 99999999999n, -99999999999n]) {
     assert.equal(s.centsOf(s.centsText(c)), c, `${c} 往返不回来`)
   }
   assert.equal(s.centsText(-30050), '-300.50')
@@ -234,7 +250,7 @@ t('认不出来的输入一律当 0，不许把 NaN 放进合计', () => {
   const s = state([])
   for (const v of ['', '   ', '-', 'abc', null, undefined, NaN, {}, []]) {
     const c = s.centsOf(v)
-    assert.equal(Number.isFinite(c), true, `centsOf(${JSON.stringify(v)}) = ${c}，不是有限整数`)
+    assert.equal(typeof c, 'bigint', `centsOf(${JSON.stringify(v)}) = ${c}，不是整数分`)
   }
 })
 
@@ -275,7 +291,7 @@ t('浮点残差那一组：补出来的正好是 300.30，补完真的存得下'
   // 老口径在 float 上算出来是 300.29999999999995 —— 写进格子还是存不了。
   const s = state([D('100.10'), D('200.20'), D('300.30')])
   const need = needFor(s, 2, 'c')
-  assert.equal(need, 30030, `补差算出了 ${need} 分，不是整数分 —— 还在用 float`)
+  assert.equal(need, 30030n, `补差算出了 ${need} 分，不是整数分 —— 还在用 float`)
   assert.equal(s.centsText(need), '300.30')
   s.form.entries[2].direction = 'CREDIT'
   s.form.entries[2].amount = s.centsText(need)
@@ -303,7 +319,7 @@ t('已经平了的时候，空格按「=」算出来是 0（提示「这一格�
   // 不是真的 0。现在是在整数分上算出来的，两边一分不差。
   const s = state([D('0.1'), D('0.2'), C('0.15'), C('0.15'), { direction: 'DEBIT', amount: '' }])
   assert.equal(s.balanced.value, true)
-  assert.equal(needFor(s, 4, 'c'), 0, '平着的凭证，空格按「=」该得 0')
+  assert.equal(needFor(s, 4, 'c'), 0n, '平着的凭证，空格按「=」该得 0')
 })
 
 let i = 0

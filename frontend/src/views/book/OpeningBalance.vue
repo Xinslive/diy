@@ -31,17 +31,27 @@
       </el-button>
     </el-alert>
 
-    <el-alert v-if="!data.editable" type="warning" :closable="false" class="mb">
+    <!-- 拉数失败（或年份还没定）时**这一页是空的**。
+         以前 load() 没有 try/catch，失败后 data 留着上一份 —— 顶栏的年份已经切走，
+         屏幕上摆着旧年份的数，保存时还把旧数据存进了新年份（审查 P2-2）。
+         这种「数字对不上」最难自查：人只看见自己录进去的那些格子。 -->
+    <el-alert v-if="loadError" type="error" :closable="false" show-icon class="mb">
+      <template #title>期初余额没有加载出来</template>
+      <div>{{ loadError }}。这一页现在是空的 —— 留着上一份的话，标题是新年份、
+        内容却是旧年份的数，保存时会把旧数据存进新年份。请重试。</div>
+    </el-alert>
+
+    <el-alert v-if="!data.editable && data.reason && !loadError" type="warning" :closable="false" class="mb">
       {{ data.reason }}。如需调整，先处理该年度的凭证：在「期末结账」里反结账，
       或把该年度已记账的凭证改掉。
     </el-alert>
 
     <div class="card mb" :class="balanced ? 'ok' : 'bad'">
       <div class="check">
-        <span class="tag">{{ balanced ? '✓ 借贷平衡' : '✗ 借贷不平' }}</span>
+        <span class="tag">{{ balanced ? '借贷平衡 ✓' : '借贷不平' }}</span>
         <span>借方合计 <b class="money">{{ money(dr) }}</b></span>
         <span>贷方合计 <b class="money">{{ money(cr) }}</b></span>
-        <span v-if="!balanced" class="diff">差额 <b class="money">{{ money(dr - cr) }}</b></span>
+        <span v-if="!balanced" class="diff">{{ diffTag }}</span>
         <span class="muted">共 {{ filledCount }} 个科目有余额</span>
       </div>
     </div>
@@ -102,7 +112,7 @@
                    写法也跟着下面一样：两位小数、不加千分位。 -->
               <el-input
                 v-else
-                :model-value="Number(subTotal(s)).toFixed(2)"
+                :model-value="centsToText(subTotal(s))"
                 disabled
                 size="small"
                 class="money sub-total"
@@ -128,7 +138,9 @@ import { useSessionStore } from '@/stores/session'
 import BookInitDialog from '@/components/BookInitDialog.vue'
 import OpeningImportDialog from '@/components/OpeningImportDialog.vue'
 import { downloadFile } from '@/api/print'
-import { amountInputText, amountToNumber, sanitizeAmount, sanitizeAmountDetailed } from '@/utils/amountGrid'
+import {
+  absMoneyText, amountInputText, centsToText, moneyCents, sanitizeAmountDetailed,
+} from '@/utils/amountGrid'
 import { CATEGORY_LABEL } from '@/utils/subjectCode'
 import { hasInit, importSummaryText, subjectsReady } from '@/utils/bookInit'
 
@@ -145,6 +157,8 @@ const sides = reactive({})
  *  跟凭证页 AmountGrid 里 amountInputText 一个道理（同一套净化、同一套规矩）。 */
 const drafts = reactive({})
 const dirty = ref(false)
+/** 这一页没有数据可看的原因（拉数失败 / 年份还没定）。空着比摆着上一份强。 */
+const loadError = ref('')
 const saving = ref(false)
 const keyword = ref('')
 const importVisible = ref(false)
@@ -180,7 +194,14 @@ async function onInitUpdated() {
 const CATEGORIES = ['ASSET', 'LIABILITY', 'EQUITY', 'PROFIT']
   .map((key) => ({ key, label: CATEGORY_LABEL[key] }))
 
-const money = (v) => (Number(v || 0)).toLocaleString('zh-CN', { minimumFractionDigits: 2 })
+/**
+ * 合计栏的金额文字：带千分位。
+ *
+ * 以前是 `(Number(v || 0)).toLocaleString(...)` —— 浮点。18 位整数在浮点里
+ * 已经不是原来那个数了（999999999999999999.99 → 1000000000000000000），
+ * 于是「借方合计」显示的会比存的少。现在统一走整数分（BigInt），一分不差。
+ */
+const money = (cents) => moneyText(cents)
 
 /* ── 金额净化（审计 P2-20）─────────────────────────────────────────
  * 这一页以前直接 `Number(框里的字)`：脏输入（「abc」「1。5」「-」「１00」）
@@ -189,15 +210,86 @@ const money = (v) => (Number(v || 0)).toLocaleString('zh-CN', { minimumFractionD
  * 库里却存着 0。人以为存了 100，其实存了 0，期初表从此对不上总账。
  *
  * 现在净化走**凭证金额格那一份**（utils/amountGrid.js）：全角数字、
- * 中文句点、各种减号都折回半角，只有「超出 亿…分 的位次」才截，
- * 而且截了要说出来。别在这一页另写一套净化 —— 两页两套规矩，
- * 迟早在某个角落各说各话。 */
+ * 中文句点、各种减号都折回半角；小数只到分；**整数位一个都不截**
+ * （格子只有 9 个整数位是**显示**的事，超出模型上限 18 位才拒绝，
+ * 见下面那段「金额：一律整数分」的说明）。
+ * 别在这一页另写一套净化 —— 两页两套规矩，迟早在某个角落各说各话。 */
+
+// ---- 金额：一律整数分（判平、合计、保存共用这一份量化结果）----
+//
+// 与凭证页**同一套口径**：借贷是否平 = 整数分**完全相等**，没有容差。
+// 期初页以前是「浮点 + 0.005 容差」，凭证页是「整数分严格相等」——
+// 同一件事两套算法（审查 P3-3）。现在两边都是整数分严格相等，
+// 提示文案也统一成「借贷平衡 ✓ / 借方大 X / 贷方大 X」。
+//
+// 为什么这一页用 BigInt（凭证页用 Number）：期初能读到 **18 位整数**
+// （后端 Numeric(20,2) 的上限），折成分就是 20 位，早就越过了 Number 的
+// 安全整数范围 —— 浮点会把 999999999999999999.99 变成 1000000000000000000，
+// 那正是「读回来的金额被改小」的另一种形态。BigInt 一路定点，18 位也不掉精度。
+//
+// **读回来的数一个字符都不动**（审查 P0-1）：load() 直接用后端给的字符串，
+// 存回去时用同一串拼出带方向的字符串 —— 全程不经过浮点、不经过截断。
+
+/** 一行期初的数额（不带符号），单位：分。 */
+function centsOfRow(s) {
+  return moneyCents(amounts[s.id])
+}
+
+/** 一行期初的带符号金额（借正贷负），单位：分。 */
+function signedCents(s) {
+  const c = centsOfRow(s)
+  if (!c) return 0n
+  return sides[s.id] === '贷' ? -c : c
+}
+
+/**
+ * 一行期初的带符号金额，**字符串形态**（存回去的就是它）。
+ *
+ * 存库走字符串而不是浮点：浮点在 17 位以后会把 12345678901234567
+ * 变成 12345678901234568 —— 那一分就是另一笔钱。
+ * 往返一次就把余额改小，是这一页以前最贵的一个错（审查 P0-1）。
+ */
+function signedText(s) {
+  const abs = absMoneyText(amounts[s.id])
+  if (!abs) return '0'
+  return sides[s.id] === '贷' ? `-${abs}` : abs
+}
+
+/** 借贷合计（单位：分）：两边各加各的，方向相反的余额自己抵掉。 */
+function totalsCents(subjects) {
+  let dr = 0n, cr = 0n
+  for (const s of subjects) {
+    if (!s.is_leaf) continue
+    const c = signedCents(s)
+    if (c > 0n) dr += c
+    else if (c < 0n) cr -= c
+  }
+  return { dr, cr }
+}
+
+/** 合计栏的金额文字：带千分位。定点出来的，一分不差。 */
+function moneyText(cents) {
+  const neg = cents < 0n
+  const a = neg ? -cents : cents
+  const yuan = (a / 100n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  return `${neg ? '-' : ''}${yuan}.${String(a % 100n).padStart(2, '0')}`
+}
+// ---- 金额段结束（tests/opening_balance.test.mjs 从这里头抠实现跑）----
 
 /** 框里该显示的：正在敲的那串原文（可能带着一个刚敲下的小数点），否则是净化后的值 */
 const shown = (id) => (drafts[id] !== undefined ? drafts[id] : (amounts[id] ?? ''))
 
 function typeAmount(s, typed) {
   const { value, notices } = sanitizeAmountDetailed(typed)
+  // 超出**数据模型上限**（18 位整数，后端也存不下）：**不收**。
+  // 这一类不是「丢了几位」，是「这个数根本不认」——
+  // 悄悄截成 18 位会让人以为那就是这笔钱。原值一个字都不动。
+  if (notices.some((n) => n.code === 'MONEY_LIMIT')) {
+    for (const n of notices) {
+      ElMessage.error(`${s.code} ${s.name}：${n.text}`, { grouping: true, duration: 4000 })
+    }
+    return
+  }
   amounts[s.id] = value
   drafts[s.id] = amountInputText(typed, value)
   for (const n of notices) {
@@ -206,28 +298,23 @@ function typeAmount(s, typed) {
 }
 
 /**
- * 一行期初的数额（不带符号）。
+ * 一行期初的数额（不带符号），单位：**分**。
  *
- *  先净化、再解析 —— 而且「认不出来的串」一律当空格子，绝不产生 NaN：
- *  NaN 有两个坏脾气，`NaN !== 0` 为真（会被「哪些行有余额」的过滤选中），
- *  又能把整列合计污染掉 —— 脏输入那一行既进了保存名单、存进去的却是 0，
- *  人还得到一句「已保存 N 条」（审计 P2-20）。
- * amountToNumber 就是那份净化 + 「认不出当空格子」的解析，与凭证金额格同源。
+ *  定点解析（moneyCents），不是浮点 —— 「认不出来的串」一律当空格子，
+ *  绝不产生 NaN：NaN 有两个坏脾气，`NaN !== 0` 为真（会被「哪些行有余额」
+ *  的过滤选中），又能把整列合计污染掉 —— 脏输入那一行既进了保存名单、
+ *  存进去的却是 0，人还得到一句「已保存 N 条」（审计 P2-20）。
+ *
+ *  定点还有第二层要紧：18 位整数折成分是 20 位，浮点早就超出安全范围了
+ *  （`String(999999999999999999.99)` = "1000000000000000000"）。
  */
 function amountOf(s) {
-  return amountToNumber(amounts[s.id])
+  return centsOfRow(s)
 }
 
 const filledCount = computed(
-  () => data.value.subjects.filter((s) => s.is_leaf && amountOf(s) !== 0).length
+  () => data.value.subjects.filter((s) => s.is_leaf && amountOf(s) !== 0n).length
 )
-
-/** 一行的带符号金额：借正贷负，与后端存储口径一致。 */
-function signedOf(s) {
-  const v = Math.abs(amountOf(s))
-  if (!v) return 0
-  return sides[s.id] === '贷' ? -v : v
-}
 
 /**
  * 上级科目的期初 = 它这一支所有末级科目的合计（借正贷负，逐层往下加）。
@@ -278,27 +365,27 @@ const subTotals = computed(() => {
       let pushed = false
       for (const c of children) if (!out.has(c.id)) { stack.push(c); pushed = true }
       if (pushed) continue                       // 回来时子节点都算完了，再收自己
-      let total = 0
-      for (const c of children) total += out.get(c.id) || 0
+      let total = 0n
+      for (const c of children) total += out.get(c.id) || 0n
       out.set(s.id, total)
       stack.pop()
       continue
     }
     // 末级记自己的数；**非末级却没有任何子节点**仍然是 0（与老口径一致）
-    out.set(s.id, s.is_leaf ? signedOf(s) : 0)
+    out.set(s.id, s.is_leaf ? signedCents(s) : 0n)
     stack.pop()
   }
   return out
 })
 
-const subTotal = (s) => subTotals.value.get(s.id) ?? 0
+const subTotal = (s) => subTotals.value.get(s.id) ?? 0n
 
 /** 上级的方位跟着这一支的合计走：正的在借方、负的在贷方；
  *  加起来正好 0 就没方位可言，退回科目本身的自然方向。 */
 function sideOf(s) {
   if (s.is_leaf) return sides[s.id]
   const t = subTotal(s)
-  return t ? (t > 0 ? '借' : '贷') : s.natural_side
+  return t ? (t > 0n ? '借' : '贷') : s.natural_side
 }
 
 const reverse = (s) => s.is_leaf && sides[s.id] !== s.natural_side
@@ -313,19 +400,27 @@ function flip(s) {
   dirty.value = true
 }
 
-/** 借贷合计：两边加起来必须是 0。 */
-const totals = computed(() => {
-  let dr = 0, cr = 0
-  for (const s of data.value.subjects) {
-    if (!s.is_leaf) continue
-    const signed = signedOf(s)
-    if (signed > 0) dr += signed; else if (signed < 0) cr += -signed
-  }
-  return { dr, cr }
-})
+/**
+ * 借贷合计：两边加起来必须是 0。
+ *
+ *  整数分（BigInt）上算，判平是**完全相等** —— 与凭证页同一套口径
+ *  （审查 P3-3：以前这一页是「浮点 + 0.005 容差」，凭证页是「整数分严格相等」，
+ *  同一件事两套算法）。差一分就是不平：后端 Decimal 也是这么判的。
+ */
+const totals = computed(() => totalsCents(data.value.subjects))
 const dr = computed(() => totals.value.dr)
 const cr = computed(() => totals.value.cr)
-const balanced = computed(() => Math.abs(dr.value - cr.value) < 0.005)
+const balanced = computed(() => dr.value === cr.value)
+
+/**
+ *  差额要说清是**哪一边大** —— 与凭证页的页脚同一套说法
+ *  （「借方大 100.10」/「贷方大 100.10」）。
+ *  只写「差额 90.00」，人还得回头数一遍才知道自己错在哪。
+ */
+const diffTag = computed(() => {
+  const d = dr.value - cr.value
+  return d > 0n ? `借方大 ${moneyText(d)}` : `贷方大 ${moneyText(-d)}`
+})
 
 function rowsOf(cat) {
   const kw = keyword.value.trim().toLowerCase()
@@ -334,24 +429,64 @@ function rowsOf(cat) {
   )
 }
 
+/**
+ * 拉数失败时把这一页**清空**。
+ *
+ * 以前 load() 没有 try/catch：请求一抛错，data.value 留着**上一份**，
+ * 而顶栏的年份已经切走了 —— 屏幕上摆着 2026 的数，标题写着 2027，
+ * 点「保存期初余额」还把旧数据存进了新年份（审查 P2-2）。
+ * 这种「数字对不上」最难自查：人只看见自己录进去的那些格子。
+ */
+function clearData() {
+  data.value = {
+    period: '', year: store.currentYear ?? '', editable: false, reason: '', subjects: []
+  }
+  for (const k of Object.keys(amounts)) delete amounts[k]
+  for (const k of Object.keys(sides)) delete sides[k]
+  for (const k of Object.keys(drafts)) delete drafts[k]
+  dirty.value = false
+}
+
 async function load() {
   if (!store.bookId) return router.push('/books')
   // 跟顶栏的**年度**走：期初是「这一年开始时账上该有多少钱」，问的是一年，
   // 不是问某个月、更不是问整个账套。切到 2026 年的哪个月都是同一份数；
   // 换一年（2027）才是另一份。以前这个页面永远拿启用期间，2027 年一个凭证
   // 都没有，屏幕上也还是 2026-01 那份锁死的数，看着像坏了。
-  data.value = await api.getOpenings(store.bookId, store.currentYear)
-  for (const k of Object.keys(amounts)) delete amounts[k]
-  for (const k of Object.keys(sides)) delete sides[k]
-  for (const k of Object.keys(drafts)) delete drafts[k]
-  for (const s of data.value.subjects) {
-    // side 来自库里实际存的方位；没录过时退回科目自然方向
-    sides[s.id] = Number(s.signed) !== 0 ? s.side : s.natural_side
-    // 存回来的也过一遍净化：库里那份是别人（或上一次的手滑）写进去的，
-    // 页面不认脏串 —— 认了就等于把脏东西又带回来让人「照着改」。
-    amounts[s.id] = s.is_leaf ? sanitizeAmount(s.amount) : ''
+  //
+  // **年份还没定下来就别问**：不传年份问回去的是「启用期间那一份」，
+  // 拿回来摆在另一个年份的标题底下，比报错还糟。
+  if (store.currentYear === undefined || store.currentYear === null) {
+    clearData()
+    loadError.value = '还没有选定年度'
+    return
   }
-  dirty.value = false
+  try {
+    const res = await api.getOpenings(store.bookId, store.currentYear)
+    data.value = res
+    for (const k of Object.keys(amounts)) delete amounts[k]
+    for (const k of Object.keys(sides)) delete sides[k]
+    for (const k of Object.keys(drafts)) delete drafts[k]
+    for (const s of data.value.subjects) {
+      // side 来自库里实际存的方位；没录过时退回科目自然方向。
+      // 「有没有数」用定点分判断，不用浮点：18 位整数在浮点里已经不是原来那个数了。
+      sides[s.id] = moneyCents(s.signed) !== 0n ? s.side : s.natural_side
+      // **直接用后端给的字符串，一个字符都不动**（审查 P0-1）。
+      // 以前这里过了一遍 sanitizeAmount，于是 10 位以上的合法金额被静默截成 9 位：
+      // 打开这一页 → 点保存 → 库里那个数被改小，界面全程显示「借贷平衡」。
+      // 放不下 11 格是**显示**的事（AmountCells 摆原值 + 角标），不是改数的理由。
+      amounts[s.id] = s.is_leaf ? String(s.amount ?? '') : ''
+    }
+    dirty.value = false
+  } catch (e) {
+    // 拉数失败：**清空**这一页，绝不留着上一份数据。
+    // 留着的话，屏幕上摆的是旧年份的数，标题写的是新年份 ——
+    // 在那个状态下点「保存期初余额」，存的是旧数据。
+    clearData()
+    const detail = e?.response?.data?.detail || e?.message || '请稍后重试'
+    loadError.value = detail
+    ElMessage.error(`期初余额加载失败：${detail}`)
+  }
 }
 
 async function save() {
@@ -360,10 +495,12 @@ async function save() {
     // `Number(框里的字) !== 0`，NaN 也算「有余额」，于是脏输入的行被算进
     // 「已保存 N 条」，实际存进去的是 0。现在 amountOf 认不出的串一律当空格子，
     // 报出来的条数与真正写进库的条数必然一致。
-    .filter((s) => s.is_leaf && amountOf(s) !== 0)
-    .map((s) => ({ subject_id: s.id, amount: String(signedOf(s)) }))
+    .filter((s) => s.is_leaf && amountOf(s) !== 0n)
+    // 存回去的就是**原值**（字符串）：往返一次不改一个字符（审查 P0-1）。
+    // 浮点会在 17 位以后把 12345678901234567 变成 12345678901234568。
+    .map((s) => ({ subject_id: s.id, amount: signedText(s) }))
   if (!balanced.value) {
-    return ElMessage.error(`借贷不平：差额 ${money(dr.value - cr.value)}，不能保存`)
+    return ElMessage.error(`借贷不平：${diffTag.value}，不能保存`)
   }
   saving.value = true
   try {
@@ -388,20 +525,42 @@ async function save() {
  *  **这里只填表，不落库** —— 落库是下面那个「保存期初余额」按钮的事。
  *  用户还可以在表格里逐行改，改完再存；弹窗直接写库就把这最后一道人工检查拿掉了。
  *
- *  填表口径照旧（sides 取 display_side、金额过一遍 sanitizeAmount），
- *  这两处不是顺手写的：方向在文件里已经定过，照搬才能保住反方向余额；
+ *  填表口径（sides 取 display_side、金额过一遍净化）不是顺手写的：
+ *  方向在文件里已经定过，照搬才能保住反方向余额；
  *  文件里的数字不净化就可能把这一行变成算不出数的那一行。
+ *
+ *  但净化**不许截断整数位**（审查 P0-1）：文件里写的是多少就是多少，
+ *  放不下 11 格是显示的事。超容量只**提示**（哪几行超出了），
+ *  值照原样填进去 —— 悄悄截小的话，用户看不出是哪一处被改了。
  */
 function applyImport(res) {
   const ok = (res.rows || []).filter((r) => !r.error)
   let filled = 0
+  const over = []
   for (const r of ok) {
     if (!r.subject_id) continue
-    const signed = Number(r.signed ?? 0)
-    sides[r.subject_id] = r.display_side || (signed < 0 ? '贷' : '借')
-    amounts[r.subject_id] = sanitizeAmount(String(Math.abs(signed || Number(r.amount || 0))))
+    // 后端给的是**字符串**（`str(Decimal)`），别再过一遍浮点 ——
+    // 浮点会把 18 位金额改掉（那正是 P0-1 那一类错）。
+    const raw = String(r.signed ?? r.amount ?? '0')
+    const neg = raw.trim().startsWith('-')
+    sides[r.subject_id] = r.display_side || (neg ? '贷' : '借')
+    // 导入的值也得走净化（文件里的脏串不能直接进表），但**不许截断整数位**：
+    // 截了就等于把文件里的数改小了，而用户看不出是哪一处。
+    const { value, notices } = sanitizeAmountDetailed(absMoneyText(raw))
+    if (notices.some((n) => n.code === 'MONEY_LIMIT')) {
+      over.push(`${r.code || r.name || r.subject_id}（超出可表示范围，未填入）`)
+      continue
+    }
+    for (const n of notices) {
+      if (n.code === 'INT_OVERFLOW') over.push(`${r.code || r.name || r.subject_id}（${n.text}）`)
+    }
+    amounts[r.subject_id] = value
     delete drafts[r.subject_id]
     filled++
+  }
+  if (over.length) {
+    ElMessage.warning(`有 ${over.length} 行超出可表示范围：${over.slice(0, 3).join('；')}` +
+      `${over.length > 3 ? ' 等' : ''}。放得下的按原值填入，请核对后再保存`, { duration: 6000 })
   }
   dirty.value = true
   // 计数话术在导入弹窗的完成页也有一份（能一直看着），这里再报一句短的，

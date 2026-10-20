@@ -183,8 +183,8 @@
                  （打印的「合计大写」由后端出），纸上那张凭证才留得住这张老规矩 -->
             <div class="vg-cell td td-sumcell">合计</div>
             <!-- 合计是 0 就不往格子里塞「0」：空格子比一个孤零零的 0 干净 -->
-            <div class="vg-cell td td-total d"><AmountCells :value="money2(total.debit)" /></div>
-            <div class="vg-cell td td-total c"><AmountCells :value="money2(total.credit)" /></div>
+            <div class="vg-cell td td-total d"><AmountCells :value="total.debit" /></div>
+            <div class="vg-cell td td-total c"><AmountCells :value="total.credit" /></div>
           </div>
       </div>
 
@@ -227,6 +227,7 @@ import * as ledgerApi from '@/api/ledger'
 import { useSessionStore } from '@/stores/session'
 import { useTabsStore } from '@/stores/tabs'
 import { fmt } from '@/utils/format'
+import { centsToText, moneyCents } from '@/utils/amountGrid'
 import { displayBalance } from '@/utils/balanceSign'
 import { findFirstProblem } from '@/utils/voucherRows'
 import AmountGrid from '@/components/AmountGrid.vue'
@@ -585,9 +586,8 @@ const num = (v) => {
   const n = Number(v)
   return Number.isFinite(n) ? n : 0
 }
-/** 合计是算出来的数，落格前补上角分：分录行写的是「2180504.00」，
- *  合计格却只剩「2180504」，同一张纸上两种写法，看着像少了两位。 */
-const money2 = (v) => (num(v) ? num(v).toFixed(2) : '')
+/* 合计以前走 money2（浮点 toFixed(2)），现在走整数分直接落成字符串（见上面的 total）：
+ * 浮点在 14 位以上就会把金额改掉，而合计与分录必须是**同一个数**。 */
 // ---- 金额：一律整数分（判平、差额、补差三处共用这一份量化结果）----
 //
 //  原来是 JS number 累加 + 严格相等判平，而 `100.10 + 200.20 = 300.29999999999995`
@@ -612,30 +612,19 @@ const money2 = (v) => (num(v) ? num(v).toFixed(2) : '')
  *    把其中一个当成正数，冲销就成了再记一遍，方向刚好反。
  */
 function centsOf(v) {
-  if (v === '' || v === null || v === undefined) return 0
-  const raw = String(v).trim()
-  if (!raw) return 0
-  const neg = raw[0] === '-' || raw[0] === '\u2212'
-  const body = (neg ? raw.slice(1) : raw).replace(/[^0-9.]/g, '')
-  const dot = body.indexOf('.')
-  const int = (dot === -1 ? body : body.slice(0, dot)) || '0'
-  const dec = dot === -1 ? '' : body.slice(dot + 1)
-  const yuan = Number(int)
-  if (!Number.isFinite(yuan)) return 0
-  const fen = Number(dec.slice(0, 2).padEnd(2, '0'))
-  const cents = yuan * 100 + fen
-  // 整数分再大也越不过 2^53；越界说明这不是一笔金额，宁可当 0 也不能让它进合计
-  if (!Number.isSafeInteger(cents)) return 0
-  return neg ? -cents : cents
+  // 定点折成分，**BigInt**（与期初页同一份 moneyCents）。
+  //
+  // 以前这里是 Number：整数分越过 2^53 之后 `Number.isSafeInteger` 判负，
+  // 于是**这笔钱被当成 0** —— 存库那一步 `centsText(centsOf(e.amount))`
+  // 就把一个 14 位以上的金额写成了 "0.00"（金额格以前把输入截到 9 位，
+  // 所以够不着；金额格不再截断之后够得着了，这条路必须一起修）。
+  return moneyCents(v)
 }
 
 /** 整数分落成字符串（不带千分位）。补差写回格子、发给后端都走它 ——
  *  所以页面上看见的数、判平用的数、后端收到的数，是同一个数。 */
 function centsText(c) {
-  const n = Number.isFinite(c) ? Math.trunc(c) : 0
-  const neg = n < 0
-  const a = Math.abs(n)
-  return `${neg ? '-' : ''}${Math.floor(a / 100)}.${String(a % 100).padStart(2, '0')}`
+  return centsToText(c)
 }
 
 /**
@@ -651,13 +640,13 @@ function centsText(c) {
  *  判平用它也准：借方合计 = 贷方合计 ⟺ 带符号借方 = 带符号贷方，两种口径完全等价。
  */
 function voucherTotals(entries) {
-  let debit = 0, credit = 0
+  let debit = 0n, credit = 0n
   for (const e of entries || []) {
     const c = centsOf(e.amount)
-    if (c > 0) {
+    if (c > 0n) {
       if (e.direction === 'DEBIT') debit += c
       else credit += c
-    } else if (c < 0) {
+    } else if (c < 0n) {
       // 红字：写到对面去
       if (e.direction === 'DEBIT') credit += -c
       else debit += -c
@@ -669,7 +658,7 @@ function voucherTotals(entries) {
 /** 带符号的合计（借正贷负，负数照减），「=」补差用这一份。
  *  显示用的合计把负数搬去了对面，拿它当差额会把补出来的数翻一倍。 */
 function voucherSignedTotals(entries) {
-  let debit = 0, credit = 0
+  let debit = 0n, credit = 0n
   for (const e of entries || []) {
     const c = centsOf(e.amount)
     if (e.direction === 'DEBIT') debit += c
@@ -685,8 +674,14 @@ function autoBalanceNeed({ opposite, same, mine, mineSide, side }) {
 
 /** 判平、差额、合计三处共用的那一份量化结果（单位：分）。 */
 const totals = computed(() => voucherTotals(form.entries))
-/** 显示用的合计：格子里落的那两行。从整数分换算回来，不再自己累加一遍。 */
-const total = computed(() => ({ debit: totals.value.debit / 100, credit: totals.value.credit / 100 }))
+/**
+ * 显示用的合计：格子里落的那两行。**单位是分**（与 totals 同源，不再自己除一次 100）——
+ * 除以 100 走浮点的话，18 位整数会在这一步掉精度。
+ */
+const total = computed(() => ({
+  debit: totals.value.debit ? centsText(totals.value.debit) : '',
+  credit: totals.value.credit ? centsText(totals.value.credit) : ''
+}))
 /** 补差用的带符号合计 */
 const signedTotals = computed(() => voucherSignedTotals(form.entries))
 /** 差额（分）。借方大就是正的 —— 方向和大小在同一个数上，不用分两处判断。 */
@@ -705,7 +700,7 @@ const diffCents = computed(() => totals.value.debit - totals.value.credit)
  *
  *  一条都还没录是另一回事：那走 `blank`，页脚说「还没录金额」，不是「平」。
  */
-const balanced = computed(() => diffCents.value === 0)
+const balanced = computed(() => diffCents.value === 0n)
 /**
  * 差额要说清是**哪一边大**。
  *
@@ -716,11 +711,11 @@ const balanced = computed(() => diffCents.value === 0)
  *  金额从整数分直接落成字符串：不平的时候至少差一分，
  * 所以这里**不可能再出现「贷方大 0.00」**那种看不懂的话。
  */
-const diffTag = computed(() => `${diffCents.value > 0 ? '借方大' : '贷方大'} ${
-  fmt(centsText(Math.abs(diffCents.value)))}`)
+const diffTag = computed(() => `${diffCents.value > 0n ? '借方大' : '贷方大'} ${
+  fmt(centsText(diffCents.value < 0n ? -diffCents.value : diffCents.value))}`)
 
 // 一分钱都还没录的时候别急着报红字，那是噪音不是提示
-const blank = computed(() => totals.value.debit === 0 && totals.value.credit === 0)
+const blank = computed(() => totals.value.debit === 0n && totals.value.credit === 0n)
 // ---- 金额段结束（tests/voucher_balance.test.mjs 从这里头抠实现跑）----
 
 // 「这张凭证现在长什么样」：自动保存靠它判断有没有改动。没动过就不重存。
@@ -1021,7 +1016,7 @@ function autoBalance(i, side) {
 
   // 补出来是 0：这一格该空着。空着本来就没错，说一声已经平了；
   // 不空着（前面有一笔同方向的数）就得清掉 —— 留着它反而不平。
-  if (need === 0) {
+  if (need === 0n) {
     if (!mine) return ElMessage.info('这张凭证已经平了，不用补')
     if (side === 'd') setDebit(row, '')
     else setCredit(row, '')
@@ -1035,7 +1030,7 @@ function autoBalance(i, side) {
   if (side === 'd') setDebit(row, text)
   else setCredit(row, text)
   activeRow.value = row
-  ElMessage.success(need < 0
+  ElMessage.success(need < 0n
     ? `已按差额补上 ${fmt(text)}（红字冲销）`
     : `已按差额补上 ${fmt(text)}`)
 }

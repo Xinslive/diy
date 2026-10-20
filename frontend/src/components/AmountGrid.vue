@@ -8,7 +8,7 @@
        只是叠上一根会眨的光标，让人知道下一个数字落在第几格。
        真要是聚焦时把落格层藏掉、换成一块白底大字，这一格就退化成
        一个普通大输入框，11 条线和它们代表的记账口径全白画了。 -->
-  <div class="amt" :class="{ 'is-focus': focused, 'is-ro': readonly, 'is-clip': clipNote }">
+  <div class="amt" :class="{ 'is-focus': focused, 'is-ro': readonly, 'is-warn': note }">
     <AmountCells class="amt-bg" :value="shown" :caret="caret" :sel="sel" />
 
     <!-- 透明输入层：键盘行为完全按普通数字输入框来，只是把结果显示成分栏的样子。
@@ -35,11 +35,14 @@
       @keydown.up.prevent="$emit('up')"
       @keydown.down.prevent="$emit('down')"
     />
-    <!-- 截断提示：角上一个小三角 + 一条提示说清楚丢的是哪几位。
-         这一格只有 11 个数位的位置，值再长也落不下（钱没有第 10 个「元」位），
-         所以超出来的部分只能丢 —— 但**必须让人看见丢了**（审计 P2-19）：
-         悄悄截断的代价是这笔数看着对、其实少了几位，而且已经跟着自动保存存进账里。 -->
-    <span v-if="clipNote" class="amt-clip" :title="clipNote" />
+    <!-- 超位提示：角上一个小三角 + 一条提示说清楚这一格怎么了。
+         这一格只有 11 个数位的位置，值再长也落不下（钱没有第 10 个「元」位）。
+         但**落不下的是格子，不是那个数**：
+           · 超过 9 位整数 → 值原样保留，界面显示**原值** + 这个角标
+             （显示一个被改小的数，用户会以为库里存的就是它 —— 审查 P0-1）
+           · 超过 18 位整数 → 数据模型装不下，**不收**，输入框里那串字恢复原样
+         两种都要让人看见（审计 P2-19：悄悄截断的代价是这笔数看着对、其实少了几位）。 -->
+    <span v-if="note" class="amt-clip" :title="note" />
 
   </div>
 </template>
@@ -49,7 +52,8 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import AmountCells from './AmountCells.vue'
 import {
-  amountInputText, caretBoundary, sanitizeAmount, sanitizeAmountDetailed, toggleAmountSign,
+  amountInputText, caretBoundary, inspectAmount, MAX_INT_DIGITS,
+  sanitizeAmount, sanitizeAmountDetailed, toggleAmountSign,
 } from '@/utils/amountGrid'
 
 const props = defineProps({
@@ -63,25 +67,59 @@ const focused = ref(false)
 /** 光标 / 选中落在第几条格缝（0-11）；-1 = 不画 */
 const caret = ref(-1)
 const sel = ref(null)
-/** 这次净化丢了东西的话（一行字），角上挂个标、弹一条提示。null = 没有 */
+/** 这次**输入**丢了东西 / 装不下的话（一行字），角上挂个标、弹一条提示。null = 没有 */
 const clipNote = ref(null)
 
 /**
- * 把「丢了几位」说出来。
+ * 载入态的提示：值本身就放不进 11 格。
  *
- *  净化照丢不误 —— 11 根格线摆在那儿，第 10 个整数位无处可落 ——
- * 但不能让人以为那几位是自己没敲（值看着对、其实少了几位，
- * 而这一格会跟着自动保存存进账里）。角标标在这一格上，提示说清楚丢的是哪几位。
+ *  以前角标只在**用户输入**时挂得上，于是「载入一个 10 位金额」这件事
+ *  一声不吭 —— 界面显示的还是那个被截小的数（P1-1 的根）。
+ *  现在载入态也挂角标：这一格装不下，**显示的是原值**，角标把话说清楚。
+ */
+const overNote = computed(() => {
+  const info = inspectAmount(props.modelValue)
+  if (!info.overGrid) return null
+  return `金额格只有 ${MAX_INT_DIGITS} 位整数位（亿…元），这一格放不下 ${info.intDigits} 位的金额；` +
+    '显示的是原值，没有改动，请用其它方式录入'
+})
+
+/** 角标上挂的那句话：输入态的提示优先，没有就看载入态的。 */
+const note = computed(() => clipNote.value || overNote.value)
+
+/**
+ * 把「这一格怎么了」说出来。
+ *
+ *  · 装不下（超过 9 位整数）→ 值原样保留，角标 + 提示说清楚放不下
+ *  · 收不了（超过 18 位整数）→ **不收**，红字提示（这一类不是「丢了几位」，是「不认」）
+ *
+ *  11 根格线摆在那儿，第 10 个整数位无处可落 —— 但**落不下的是格子，不是那个数**：
+ *  不能让人以为那几位是自己没敲（值看着对、其实少了几位，
+ *  而这一格会跟着自动保存存进账里）。角标标在这一格上。
  * 重新敲成不超长的值就撤掉，走了这一格也撤掉 —— 提示只对当下这笔负责。
  */
 function reportClipping(notices) {
   clipNote.value = notices.length ? notices.map((n) => n.text).join('；') : null
   for (const n of notices) {
     // grouping：连续敲第 10、11 位弹的是同一条，合并成一条，别刷屏
-    ElMessage.warning(`金额超位：${n.text}`, { grouping: true, duration: 2600 })
+    if (n.code === 'MONEY_LIMIT') {
+      ElMessage.error(`金额超限：${n.text}`, { grouping: true, duration: 4000 })
+    } else {
+      ElMessage.warning(`金额超位：${n.text}`, { grouping: true, duration: 2600 })
+    }
   }
 }
 
+/**
+ * 框里摆的值 —— **原值，一个字符都不改**。
+ *
+ *  这里以前是「显示也过一遍输入净化」，于是读回来的 10 位金额被截成 9 位：
+ *  分录格里显示 123456789.12、合计行显示 1234567890.12，同一屏上差 10 倍（P1-1），
+ *  而用户只要碰一下那一格，被改小的数还会被写回状态里存进账（P0-1）。
+ *
+ *  净化只该发生在**用户敲进去**的那条路上（onInput）；显示一律用原值。
+ *  放不下 11 格时由 AmountCells 改用「原值 + 角标」摆出来。
+ */
 const raw = computed(() => sanitizeAmount(props.modelValue))
 
 /**
@@ -140,10 +178,20 @@ function onInput(e) {
     return
   }
   const pos = e.target.selectionStart ?? typed.length
-  // 净化把「丢过东西」的地方一并说出来：钱只有 亿…分 那么多格，超出的位
+  // 净化把「动过手」的地方一并说出来：钱只有 亿…分 那么多格，超出的位
   // 落不下只能丢，但丢了就得有人知道（审计 P2-19）。提示挂在这一格的角上，
   // 同时弹一条 —— grouping 让连续敲第 10、11 位只弹一条，不会刷屏。
   const { value: next, notices } = sanitizeAmountDetailed(typed)
+  // 超出**数据模型上限**（18 位整数，后端也存不下）：**不收**。
+  // 这一类不是「丢了几位」，是「这个数根本不认」——
+  // 悄悄截成 18 位会让人以为那就是这笔钱（差一分就是另一笔钱）。
+  // 框里的字恢复成原来的那个数，不发 update（原来的值一个字都不动）。
+  if (notices.some((n) => n.code === 'MONEY_LIMIT')) {
+    e.target.value = props.modelValue ?? ''
+    reportClipping(notices)
+    nextTickSelection(pos)
+    return
+  }
   reportClipping(notices)
   // 小数点刚敲下去、角分还没跟上来的那一瞬，框里得**留着那个点**
   const shownNext = amountInputText(typed, next)
@@ -350,12 +398,12 @@ defineExpose({ focus: () => el.value?.focus() })
 /* 聚焦：绿框套住整格，但**不铺白底**。铺了就把这一行的淡绿底和落格线盖掉，
    而这一格在纸面上本来就不是一块白板 —— 它是 11 个数位挨着排的一格。 */
 .amt.is-focus { box-shadow: inset 0 0 0 2px #44b44a; }
-/* 超位被截断：框上再套一道琥珀色，角上挂一个小三角。
+/* 超位/超容量：框上再套一道琥珀色，角上挂一个小三角。
    三角压在**最左**（亿位那一格）—— 绝大多数金额右对齐，左边是空的，
    摆在这儿不会盖住任何一个已经落好的数位。
    完整的话在 title 和那条提示里，三角只负责说「是这一格」。 */
-.amt.is-clip { box-shadow: inset 0 0 0 2px #e6a23c; }
-.amt.is-clip.is-focus { box-shadow: inset 0 0 0 2px #e6a23c; }
+.amt.is-warn { box-shadow: inset 0 0 0 2px #e6a23c; }
+.amt.is-warn.is-focus { box-shadow: inset 0 0 0 2px #e6a23c; }
 
 .amt-clip {
   position: absolute;

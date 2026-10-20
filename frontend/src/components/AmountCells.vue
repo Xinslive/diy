@@ -11,19 +11,28 @@
     <!-- 选中范围画在数字**底下**，而且是半透明的。
          先铺一层实色再把数字盖上去的话，聚焦整格选中时数字会被整片吃掉 ——
          恰恰是最该看清「我要重打的是这几个数」的时候，一个数都看不见。 -->
-    <span v-if="sel" class="amt-sel"
+    <span v-if="sel && !over" class="amt-sel"
           :style="{ left: pct(sel[0]), width: pct(sel[1] - sel[0]) }" />
-    <span v-for="(t, i) in cells" :key="i" class="amt-cell" :class="AMOUNT_SEPS[i]">
-      {{ t }}
-    </span>
+    <!-- 放不进 11 格：**显示原值**，不落格。
+         这一格只有 亿…元 9 个整数位，10 位以上的金额落不下 ——
+         但落不下的是**格子**，不是那个数（审查 P0-1）。
+         以前这里落的是「被改小的那个数」：库里存着 1241610200.12，
+         屏幕上显示 124161020.12，人会以为库里存的就是那个小的。
+         现在原值原样摆出来，角标（AmountGrid 那一层）说明这一格放不下。 -->
+    <span v-if="over" class="amt-over" :title="overText">{{ overText }}</span>
+    <template v-else>
+      <span v-for="(t, i) in cells" :key="i" class="amt-cell" :class="AMOUNT_SEPS[i]">
+        {{ t }}
+      </span>
+    </template>
     <!-- 光标压在数字上头：它只有 2px，压的是格缝，本来就碰不到字 -->
-    <span v-if="caret >= 0" class="amt-caret" :style="{ left: pct(caret) }" />
+    <span v-if="caret >= 0 && !over" class="amt-caret" :style="{ left: pct(caret) }" />
   </div>
 </template>
 
 <script setup>
 import { computed } from 'vue'
-import { AMOUNT_SEPS, distributeAmount, isNegativeAmount } from '@/utils/amountGrid'
+import { AMOUNT_SEPS, amountDisplayText, distributeAmount, inspectAmount, isNegativeAmount } from '@/utils/amountGrid'
 
 const props = defineProps({
   value: { type: [String, Number], default: '' },
@@ -33,7 +42,11 @@ const props = defineProps({
   sel: { type: Array, default: null }
 })
 
-const cells = computed(() => distributeAmount(props.value))
+/** 这个数放不放得进 11 格（亿…元 9 格 + 角分 2 格）。 */
+const over = computed(() => inspectAmount(props.value).overGrid)
+/** 放不下时显示的**原值**（负号换成落格用的真正减号 U+2212）。 */
+const overText = computed(() => amountDisplayText(props.value))
+const cells = computed(() => (over.value ? [] : distributeAmount(props.value)))
 const red = computed(() => isNegativeAmount(props.value))
 /** 11 格等分，所以「第 k 条缝」就是 k/11 —— 不用去量 DOM，改个数宽度就跟着变 */
 const pct = (k) => `${(k / 11) * 100}%`
@@ -56,6 +69,23 @@ const pct = (k) => `${(k / 11) * 100}%`
    复核时不用把数倒过来再算一遍符号。 */
 .is-red .amt-cell { color: #d93025; font-weight: 600; }
 .is-red .amt-caret { background: #d93025; }
+.is-red .amt-over { color: #d93025; font-weight: 600; }
+
+/* 放不进 11 格时显示的原值：贴右摆，跟金额列的读法一致。
+   一格放不下就换一种摆法 —— 但摆的必须是**原值**，
+   一个被改小的数摆在这儿，人会以为库里存的就是它（审查 P0-1）。 */
+.amt-over {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  width: 100%;
+  padding: 0 10px;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .plain { border-left: 1px solid #ededed; }
 .blue { border-left: 1px solid #bde3f7; }

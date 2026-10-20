@@ -17,7 +17,7 @@ import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url))
-const { amountToNumber, sanitizeAmount } = await createServer({
+const { amountToNumber, sanitizeAmount, moneyCents, absMoneyText } = await createServer({
   root: ROOT, logLevel: 'error', server: { middlewareMode: true }
 }).then(s => s.ssrLoadModule('/src/utils/amountGrid.js'))
 
@@ -71,7 +71,7 @@ t('页面不再出现 `Number(amounts[...)` 这种裸解析', () => {
 })
 t('页面用的是 amountGrid 那一份净化，不另写一套', () => {
   assert.ok(/from '@\/utils\/amountGrid'/.test(SRC), '没有引入金额格净化')
-  assert.ok(/amountToNumber/.test(SRC), '行金额没有走 amountToNumber')
+  assert.ok(/moneyCents/.test(SRC), '行金额没有走定点分（moneyCents）')
   assert.ok(/sanitizeAmountDetailed/.test(SRC), '输入没有过净化（脏串会直接进库）')
 })
 t('输入那一刻就净化并提示：截断/丢位看得见', () => {
@@ -81,6 +81,116 @@ t('输入那一刻就净化并提示：截断/丢位看得见', () => {
 t('刚敲下的小数点留在框里（跟凭证金额格同一个规矩）', () => {
   assert.ok(/amountInputText/.test(SRC), '输入时没留那个刚敲下的小数点，「1234.5」会打成 12345')
   assert.equal(sanitizeAmount('1234.5'), '1234.5', '净化本身不该动小数')
+})
+
+console.log('')
+console.log('== P0-1 读回来的金额不许被改小 ==')
+//
+// 这一节以前**一条断言都没有** —— 缺口就在这儿：
+// 页面里的净化函数测得很细（「脏串当空格子」那些），但**没人测「谁在什么时候调用它」**，
+// 于是读库路径（load()）过了一遍净化这件事谁也没发现：
+// 打开期初页 → 点保存 → 库里那个 10 位金额被改小，界面全程显示「借贷平衡」。
+//
+// 下面几条从**页面源码**里抠出金额那一段来跑：测的是页面上真在用的那份代码。
+
+const START = '// ---- 金额：一律整数分'
+const END = '// ---- 金额段结束'
+
+/** 抠出金额那一段，并自检抠到的是它（抠空了就让断言失败，别让测试空转）。 */
+function amountBlock() {
+  const a = SRC.indexOf(START)
+  const b = SRC.indexOf(END)
+  assert.ok(a !== -1, `源码里找不到标记 ${START}`)
+  assert.ok(b > a, `源码里找不到结束标记 ${END}`)
+  const block = SRC.slice(a, b)
+  for (const fn of ['centsOfRow', 'signedCents', 'signedText', 'totalsCents', 'moneyText']) {
+    assert.ok(block.includes(`function ${fn}(`), `抠出来的段里没有 ${fn}() —— 标记挪位置了？`)
+  }
+  return block
+}
+const BLOCK = amountBlock()
+
+/**
+ * 用真实的金额实现搭一套页面状态。
+ * amounts / sides 就是页面里那两个 reactive 对象（读回路径写进去的那两个）。
+ */
+function pageState(amounts, sides) {
+  const factory = new Function('amounts', 'sides', 'moneyCents', 'absMoneyText', `${BLOCK}
+    return { centsOfRow, signedCents, signedText, totalsCents, moneyText }`)
+  return factory(amounts, sides, moneyCents, absMoneyText)
+}
+
+t('load() 不用净化：读回来的数直接用后端给的字符串', () => {
+  // 这一行以前是 `sanitizeAmount(s.amount)` —— 10 位以上的合法金额被静默截成 9 位。
+  assert.ok(SRC.includes("amounts[s.id] = s.is_leaf ? String(s.amount"),
+    '读回路径又改回净化了 —— 读回来的数会被改小')
+  // load() 那一段里不许再出现 sanitizeAmount
+  const a = SRC.indexOf('async function load()')
+  const b = SRC.indexOf('async function save()')
+  assert.ok(a !== -1 && b > a, '源码里找不到 load()')
+  // 只看**代码**（注释里可以写「以前这里过了一遍 sanitizeAmount」）
+  const code = SRC.slice(a, b).split('\n')
+    .filter((line) => !line.trim().startsWith('//'))
+    .join('\n')
+  assert.ok(!code.includes('sanitizeAmount'), 'load() 里还有净化 —— 读回来的数会被改小')
+})
+
+t('端到端（同构模拟）：载入 10 位金额 → 保存回去，一个字符都不变', () => {
+  // 后端 GET /openings 返回 "1241610200.12" → 页面 → 点保存 → 发出去的还是它。
+  const amounts = { 1: '1241610200.12' }
+  const sides = { 1: '借' }
+  const p = pageState(amounts, sides)
+  const row = { id: 1, is_leaf: true }
+  assert.equal(p.signedText(row), '1241610200.12', '往返一次把余额改小了')
+  assert.equal(p.centsOfRow(row), 124161020012n, '定点也不许掉精度')
+})
+
+t('模型上限（18 位整数）往返也不变', () => {
+  const amounts = { 1: '999999999999999999.99' }
+  const sides = { 1: '贷' }
+  const p = pageState(amounts, sides)
+  const row = { id: 1, is_leaf: true }
+  assert.equal(p.signedText(row), '-999999999999999999.99', '往返一次把余额改小了')
+  assert.equal(p.centsOfRow(row), 99999999999999999999n)
+  // 浮点会把它改小 —— 这正是 P0-1 的另一种形态
+  assert.notEqual(String(Number('999999999999999999.99')), '999999999999999999.99')
+})
+
+t('判平口径与凭证页一致：整数分严格相等（浮点残差那一组必须判平）', () => {
+  const p = pageState(
+    { 1: '100.10', 2: '200.20', 3: '300.30' },
+    { 1: '借', 2: '借', 3: '贷' }
+  )
+  const subjects = [{ id: 1, is_leaf: true }, { id: 2, is_leaf: true }, { id: 3, is_leaf: true }]
+  const t = p.totalsCents(subjects)
+  assert.equal(t.dr, 30030n)
+  assert.equal(t.cr, 30030n)
+  assert.equal(t.dr === t.cr, true, '100.10+200.20 对 300.30 必须判平（浮点残差那一组）')
+})
+
+t('差一分钱就是不平（不再有 0.005 的浮点容差）', () => {
+  const p = pageState({ 1: '100.10', 2: '200.21' }, { 1: '借', 2: '贷' })
+  const subjects = [{ id: 1, is_leaf: true }, { id: 2, is_leaf: true }]
+  const t = p.totalsCents(subjects)
+  assert.equal(t.dr === t.cr, false, '差 0.11 还判成平了')
+  assert.equal(t.dr, 10010n)
+  assert.equal(t.cr, 20021n)
+})
+
+t('拉数失败时不留上一份数据（不能出现「顶栏 2027、内容 2026」）', () => {
+  const a = SRC.indexOf('async function load()')
+  const b = SRC.indexOf('async function save()')
+  const load = SRC.slice(a, b)
+  assert.ok(load.includes('try {'), 'load() 没有 try/catch —— 失败后留着上一份数据')
+  assert.ok(load.includes('clearData()'), 'load() 失败时没有清空这一页')
+  assert.ok(SRC.includes('loadError'), '没有把失败这件事说出来')
+})
+
+t('年份没定下来就不去问后端（问回来的是启用期间那一份）', () => {
+  const a = SRC.indexOf('async function load()')
+  const b = SRC.indexOf('async function save()')
+  const load = SRC.slice(a, b)
+  assert.ok(load.includes('store.currentYear === undefined'), 'currentYear 没定也去问后端')
 })
 
 console.log('')

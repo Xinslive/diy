@@ -15,6 +15,8 @@ const ROOT = fileURLToPath(new URL('../', import.meta.url))
 const {
   toggleAmountSign, sanitizeAmount, sanitizeAmountDetailed, amountInputText,
   amountToNumber, caretBoundary, distributeAmount,
+  MAX_INT_DIGITS, MAX_MONEY_INT_DIGITS, inspectAmount,
+  moneyCents, centsToText, absMoneyText,
 } = await createServer({
   root: ROOT, logLevel: 'error', server: { middlewareMode: true }
 }).then(s => s.ssrLoadModule('/src/utils/amountGrid.js'))
@@ -94,13 +96,17 @@ t('U+2212 也认得出「整格翻负」：翻一次回正，再翻一次回负'
 console.log('')
 console.log('== P2-19 超长输入必须给出可见反馈 ==')
 
-t('10 位整数照样截到 9 位（格只有 亿…元 九格），但**必须说出来**', () => {
-  assert.equal(sanitizeAmount('1234567890'), '123456789')
+t('10 位整数**不再被截短**：值原样保留，只说「这一格放不下」', () => {
+  // 这一条以前断言的是「10 位照样截到 9 位」—— 把**截断**当成了规范。
+  // 那正是 P0-1 能活到今天的原因：金额格只有 9 格是**画格子**的事，
+  // 而「把读回来的数改小」是**改数** —— 期初余额往返一次就把余额改小了。
+  // 截断不能是期望行为：值必须原样保留，由界面说清楚放不下。
   const { value, notices } = sanitizeAmountDetailed('1234567890')
-  assert.equal(value, '123456789')
-  assert.equal(notices.length, 1, '截断了却一声不吭 —— 人按回车才发现少了几位')
-  assert.equal(notices[0].code, 'INT_CLIPPED')
-  assert.ok(notices[0].text.includes('10'), '提示里要出现被丢的那一位：' + notices[0].text)
+  assert.equal(value, '1234567890', '值不许被改小')
+  assert.equal(sanitizeAmount('1234567890'), '1234567890')
+  assert.equal(notices.length, 1)
+  assert.equal(notices[0].code, 'INT_OVERFLOW', '这是「放不下」，不是「丢了几位」')
+  assert.ok(notices[0].text.includes('9'), '提示里要说出格子的容量：' + notices[0].text)
 })
 t('小数超过分位：截断 + 说明', () => {
   const { value, notices } = sanitizeAmountDetailed('1234.5678')
@@ -112,6 +118,76 @@ t('没截断时不啰嗦（提示只对真丢了东西的时候说话）', () =>
   assert.deepEqual(sanitizeAmountDetailed('１２３').notices, [], '全角归一化没丢东西，不该报警')
   assert.deepEqual(sanitizeAmountDetailed('').notices, [])
   assert.deepEqual(sanitizeAmountDetailed('-').notices, [])
+})
+
+console.log('')
+console.log('== P0-1 读回来的金额不许被改小（截断不能是期望行为）==')
+//
+// 这一节以前**一条断言都没有** —— 缺口就在这儿：
+// 上面那条「10 位照样截到 9 位」守的是**输入路径的提示**，
+// 而**读库路径**（期初页 load()、凭证金额格的显示）从来没被测过，
+// 于是「读回来的合法值被改小」一路畅通（审查 P0-1 / P-43）。
+//
+// 下面每一条都是读库路径的契约：值原样留着，改小一个字符都不行。
+
+t('带小数的 10 位整数原样保留（P0-1 的核心断言）', () => {
+  assert.equal(sanitizeAmountDetailed('1234567890.12').value, '1234567890.12')
+  assert.equal(sanitizeAmount('1234567890.12'), '1234567890.12')
+  assert.equal(sanitizeAmount('1000000000.00'), '1000000000.00')
+})
+
+t('模型上限（18 位整数）以内一个字符都不动', () => {
+  assert.equal(sanitizeAmountDetailed('999999999999999999.99').value, '999999999999999999.99')
+  assert.equal(sanitizeAmount('999999999.99'), '999999999.99', '9 位是安全线')
+})
+
+t('超过模型上限（18 位整数）才拒绝：不进值 + MONEY_LIMIT', () => {
+  const tooBig = '1' + '0'.repeat(20)
+  const { value, notices } = sanitizeAmountDetailed(tooBig)
+  assert.notEqual(value, tooBig, '超限的数不许进值')
+  assert.equal(value, '', '超限的值一律不进（拒绝，不是截断）')
+  assert.ok(notices.some((n) => n.code === 'MONEY_LIMIT'), '必须说清是超了模型上限')
+})
+
+t('两个上限各管各的：格容量 9 位、模型上限 18 位', () => {
+  assert.equal(MAX_INT_DIGITS, 9, '金额格的物理容量（亿…元 九格）')
+  assert.equal(MAX_MONEY_INT_DIGITS, 18, '数据模型上限（与后端 MONEY_LIMIT 对齐）')
+  assert.equal(inspectAmount('123456789.12').overGrid, false)
+  assert.equal(inspectAmount('1234567890.12').overGrid, true)
+  assert.equal(inspectAmount('1234567890.12').overModel, false)
+  assert.equal(inspectAmount('999999999999999999.99').overGrid, true)
+  assert.equal(inspectAmount('999999999999999999.99').overModel, false)
+  assert.equal(inspectAmount('1' + '0'.repeat(20)).overModel, true)
+})
+
+t('显示层不许再给出第二个（被改小的）数：放不下就不落格', () => {
+  // 落格层以前会把 1234567890.12 摆成另一个数（截小的或截尾的）——
+  // 同一屏上分录格与合计行差 10 倍，人只能靠猜哪个对（审查 P1-1）。
+  // 现在放不下就**不落格**（由显示层改用「原值 + 角标」摆出来）。
+  const cells = distributeAmount('1234567890.12')
+  assert.equal(cells.length, 11)
+  assert.ok(cells.every((c) => c === ''), '放不下就不落格 —— 宁可不摆，也不摆一个错的数')
+  assert.equal(cells[0], '', '第 0 格留空，不显示改小的数')
+})
+
+t('定点：一分不差，18 位也不掉精度（浮点会改小）', () => {
+  assert.equal(moneyCents('1234567890.12'), 123456789012n)
+  assert.equal(moneyCents('1241610200.12'), 124161020012n)
+  assert.equal(moneyCents('999999999999999999.99'), 99999999999999999999n)
+  assert.equal(moneyCents('0.05'), 5n)
+  assert.equal(moneyCents('abc'), 0n)
+  assert.equal(moneyCents('-'), 0n)
+  assert.equal(centsToText(moneyCents('1234567890.12')), '1234567890.12')
+  assert.equal(centsToText(moneyCents('-0.05')), '-0.05')
+  // 浮点会把同一个数改小 —— 这正是 P0-1 的另一种形态
+  assert.notEqual(String(Number('999999999999999999.99')), '999999999999999999.99')
+})
+
+t('绝对值走字符串：原值一个字符都不动', () => {
+  assert.equal(absMoneyText('-1241610200.12'), '1241610200.12')
+  assert.equal(absMoneyText('1241610200.12'), '1241610200.12')
+  assert.equal(absMoneyText('999999999999999999.99'), '999999999999999999.99')
+  assert.equal(absMoneyText(''), '')
 })
 
 console.log('')
