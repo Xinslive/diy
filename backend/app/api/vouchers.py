@@ -22,7 +22,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import func, or_, select, tuple_
-from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.accounting import importer as svc_import
@@ -95,6 +95,30 @@ def _serialize(db: Session, v: Voucher, subs: dict[int, Subject] | None = None) 
     }
 
 
+def _book_period(db: Session, book: Book, period_id: int | None, label: str) -> Period | None:
+    """按 id 取期间，并核对它**属于本账套**（审计 P2-1）。
+
+    跨账套的 ``period_id`` 不能放行：``ord`` 是**账套内相对序号**
+    （``(year - start_year) * 12 + month``），两个账套的同一个 ord 含义
+    完全不同。放行的后果是「**结果是错的而不是空的**」——
+
+      · 外账套的 ord=1   → 本账套返回「ord >= 1」的全部凭证；
+      · 外账套的 ord=2400 → 本账套返回空集。
+
+    用户以为在看「某个期间之后」，实际拿到的是完全另一个区间。
+    同一套参数在 ``api/ledger.py`` 的三个端点里都是 404（那里是正确口径），
+    这里跟过去才是全系统一致。
+
+    消息沿用 ledger.py 的说法（「起始期间不存在」），免得同一件事有两种措辞。
+    """
+    if not period_id:
+        return None
+    p = db.get(Period, period_id)
+    if p is None or p.book_id != book.id:
+        raise HTTPException(404, f"{label}期间不存在")
+    return p
+
+
 @router.get("")
 def query(book: Book = Depends(get_my_book), db: Session = Depends(get_db),
           from_period_id: Optional[int] = None, to_period_id: Optional[int] = None,
@@ -104,8 +128,8 @@ def query(book: Book = Depends(get_my_book), db: Session = Depends(get_db),
           max_amount: Optional[Decimal] = None, subject_id: Optional[int] = None,
           sort: str = Query(svc.DEFAULT_SORT, pattern="^(no_asc|no_desc|date_asc|date_desc)$"),
           page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200)):
-    fp = db.get(Period, from_period_id) if from_period_id else None
-    tp = db.get(Period, to_period_id) if to_period_id else None
+    fp = _book_period(db, book, from_period_id, "起始")
+    tp = _book_period(db, book, to_period_id, "结束")
     rows, total = svc.query_vouchers(
         db, book.id, from_period=fp, to_period=tp, date_from=date_from, date_to=date_to,
         status=status, source=source, keyword=keyword, min_amount=min_amount,
@@ -149,6 +173,43 @@ def create(payload: VoucherIn, book: Book = Depends(get_my_book), db: Session = 
     return _serialize(db, v)
 
 
+def _target_period_code(db: Session, v: Voucher, voucher_date: date | None) -> str | None:
+    """改凭证日期跨期时，目标期间是否已经被**同号凭证**占了（审计 P2-3）。
+
+    凭证号是**按期间唯一**的（``uq_voucher_period_no``），而每个月的号都从
+    「记0001」重新开始 —— 所以「把 9 月的记0001 改成 10 月」是最自然的用户
+    动作，而 10 月几乎必然已经有记0001。
+
+    以前这条路径**没有任何占用检查**：改期 → flush → 撞唯一约束 → 裸的
+    ``UniqueViolation``，全局处理器把**数据库英文原文**回给用户
+    （``duplicate key value violates unique constraint "uq_voucher_period_no"``），
+    既看不懂，又带出了表名、列名、约束名。同一张唯一约束，``create_voucher``
+    走的是「先占用检查 + savepoint + 翻成人话」，改期这边一条都没有。
+
+    这里提前一步查出来，翻成 422 + 人话。返回目标期间的编码（没有改期时
+    返回 None），供并发兜底那条路径拼消息用。
+    """
+    if not voucher_date:
+        return None
+    target = find_period(db, v.book_id, voucher_date)
+    if target.id == v.period_id:
+        return None
+    taken = db.scalar(
+        select(Voucher.id).where(
+            Voucher.period_id == target.id,
+            Voucher.voucher_no == v.voucher_no,
+            Voucher.id != v.id,
+        ).limit(1)
+    )
+    if taken is not None:
+        raise HTTPException(
+            422,
+            f"{target.code} 已经有凭证号 {v.voucher_no}，不能把凭证改到那一期"
+            f"（凭证号在期间内唯一）。请换一个号，或者把凭证日期改回原期间。"
+        )
+    return target.code
+
+
 @router.put("/{voucher_id}")
 def update(voucher_id: int, payload: VoucherIn, book: Book = Depends(get_my_book),
            db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
@@ -156,6 +217,13 @@ def update(voucher_id: int, payload: VoucherIn, book: Book = Depends(get_my_book
     v = db.get(Voucher, voucher_id)
     if v is None or v.book_id != book.id:
         raise HTTPException(404, "凭证不存在")
+    # 撞号检查放在服务层调用**之前**（人话在这里出，而不是在 flush 之后
+    # 让数据库的英文原文冒出来）。find_period 抛的 ValueError 与服务层
+    # 那条同义，所以这里翻成 400，行为不变。
+    try:
+        target_code = _target_period_code(db, v, payload.voucher_date)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     try:
         data = payload.model_dump()
         data["entries"] = [e.model_dump() for e in payload.entries]
@@ -163,7 +231,61 @@ def update(voucher_id: int, payload: VoucherIn, book: Book = Depends(get_my_book
     except (ValueError, ArithmeticError) as e:
         db.rollback()
         raise HTTPException(400, str(e))
+    except IntegrityError:
+        # 兜底：占用检查与 flush 之间还有窗口（别人同一刻把同号的号占了）。
+        # 库里的唯一约束是最后一道防线，撞出来的是一条裸 IntegrityError ——
+        # 翻成人话，**不把数据库原文漏给客户端**。
+        db.rollback()
+        where = f"{target_code} " if target_code else "目标期间 "
+        raise HTTPException(
+            422,
+            f"凭证号 {v.voucher_no} 在{where}已经被另一张凭证占用"
+            f"（可能刚被另一条记录占用）。请换一个号再试。"
+        )
     return _serialize(db, v)
+
+
+def _assert_no_dead_gap(db: Session, book: Book, rows: list[Voucher]) -> None:
+    """删掉这些凭证之后，号段会不会变成**「整理凭证」也补不回来**的死路
+    （审计 P1-3）。
+
+    死路长这样：期间里有「记0001（未记账） + 记0003（已记账）」，中间那张
+    被删了 → 记0002 空出来。整理只给**未记账**的凭证重新发号，0003 已经
+    记账、动不了，于是整理**改 0 张**、洞一直在原地。而
+    ``accounting/organize.assert_tidy`` 又拦着断号不让记账、不让结账 ——
+    该月在界面上就无路可走了（以前那句报错还让人「去整理凭证」，
+    正是那个无效动作）。
+
+    所以在**删除的入口**就把它拦下来，并说清真正的出路：先反结账，
+    把已记账的凭证退回未记账，整理才排得动。
+
+    删一张和删一批走同一道闸（批量那几行更要命：一次删 3 张能一次性
+    把整段号打乱）。判据在 ``accounting/organize.irreparable_gaps`` 里，
+    与整理自己用的是**同一份**号段语义。
+    """
+    by_period: dict[int, list[Voucher]] = {}
+    for v in rows:
+        # 已记账的凭证本来就删不掉（服务层会先拒），那时的号段分析没有意义 ——
+        # 而且该给用户看的是「已记账的凭证不能删除」，不是号段那一套。
+        if v.status == "POSTED":
+            return
+        by_period.setdefault(v.period_id, []).append(v)
+    for period_id, victims in by_period.items():
+        period = db.get(Period, period_id)
+        if period is None:
+            continue
+        gaps = svc_organize.irreparable_gaps(
+            db, book.id, period, {v.id for v in victims})
+        if not gaps:
+            continue
+        raise HTTPException(
+            400,
+            f"删掉之后 {period.code} 的号段会断在 {'、'.join(gaps)}，"
+            f"而这个洞「整理凭证」补不上（它只给未记账的凭证重新发号，"
+            f"已记账的那些号动不了）—— 那样这个月就既不能记账也不能结账了。"
+            f"请先到「期末结账」对 {period.code} 执行「反结账」"
+            f"（把已记账的凭证退回未记账），再删这几张。"
+        )
 
 
 @router.delete("/{voucher_id}")
@@ -172,6 +294,7 @@ def remove(voucher_id: int, book: Book = Depends(get_my_book), db: Session = Dep
     v = db.get(Voucher, voucher_id)
     if v is None or v.book_id != book.id:
         raise HTTPException(404, "凭证不存在")
+    _assert_no_dead_gap(db, book, [v])
     try:
         svc.delete_voucher(db, v, user)
     except (ValueError, ArithmeticError) as e:
@@ -227,6 +350,7 @@ def batch_delete(payload: BatchIds, book: Book = Depends(get_my_book), db: Sessi
         raise HTTPException(
             400, f"已记账的凭证不能删除，请到「期末结账」反结账后再删：{'、'.join(posted[:10])}"
                  + ("…" if len(posted) > 10 else ""))
+    _assert_no_dead_gap(db, book, rows)
     try:
         # 一批要么全删要么一张不删。逐张各自 commit 的话，删到第 5 张失败时
         # 前 4 张已经落在库里，回滚也回滚不回来 —— 用户收到 400，

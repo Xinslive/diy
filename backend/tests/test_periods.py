@@ -24,6 +24,7 @@ from app.accounting.periods import (
 from app.accounting.vouchers import create_voucher, post_vouchers
 from app.ledger.engine import LedgerEngine
 from app.models import Book, Entry, Period, PeriodOpening, Subject, Voucher
+from tests.accounting_helpers import close_any
 
 
 def sid(subjects, code):
@@ -289,20 +290,37 @@ def test_已结账期间不能结转(db, book, periods, subjects, admin_user, ma
 def test_结账级联关闭之前所有期间(db, book, periods, admin_user, make_voucher):
     """不允许出现「3 月已结账、1 月还开着」—— 否则已结账期间的累计数会随上游改动漂移。
 
-    3 月必须有凭证：空月份现在会被结账闸门挡下（见 test_无凭证的月份不能结账），
-    而 1、2 月留着空正好演示另一条口径 —— **被结的那一期要有凭证，更早的空月
-    照旧顺带结掉**。
+    3 月必须有凭证；1、2 月的空月份由 ``close_any`` 补上中性凭证
+    （**空月份不许被顺带封进历史**，见 ``test_链上有空月份时结账被拒``），
+    级联本身照旧：被一起锁上的期间仍然列在 ``auto_closed_periods`` 里。
     """
     # 用资产类科目对冲，别用损益科目 —— 否则这张凭证本身就让 3 月「损益未结平」
     make_voucher("2026-03-05", dr=[("1002", 10, "x")], cr=[("1001", 10, "x")])
 
-    r = close_period(db, periods[3], admin_user)
+    r = close_any(db, book, periods[3], admin_user)
 
     assert r["period"] == "2026-03"
     assert r["auto_closed_periods"] == ["2026-01", "2026-02"]
     for m in (1, 2, 3):
         assert db.get(Period, periods[m].id).locked is True
     assert db.get(Period, periods[4].id).locked is False
+
+
+def test_链上有空月份时结账被拒(db, book, periods, admin_user, make_voucher):
+    """级联不许把**更早的空月份**静默封进历史（审计 P2-1）。
+
+    以前那道闸只看被结的那一期：1~11 月一张凭证都没有、只有 12 月有，
+    点「结账 12 月」会把 11 个空月份一起锁上 —— 补录就得反结账，
+    而反结账会连带把后面已结好的月份全部退回，工作量比直接结那个空月还大。
+    """
+    make_voucher("2026-03-05", dr=[("1002", 10, "x")], cr=[("1001", 10, "x")])
+    with pytest.raises(ValueError) as ei:
+        close_period(db, periods[3], admin_user)
+    db.rollback()
+    msg = str(ei.value)
+    assert "2026-01" in msg and "2026-02" in msg, msg
+    # 被拒之后哪一期都不许被锁上
+    assert [db.get(Period, periods[m].id).locked for m in (1, 2, 3)] == [False] * 3
 
 
 def test_无凭证的月份不能结账(db, book, periods, admin_user):

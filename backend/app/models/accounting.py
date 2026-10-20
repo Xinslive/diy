@@ -10,6 +10,7 @@ from typing import Optional
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -66,6 +67,21 @@ class Voucher(Base, TimestampMixin):
     __tablename__ = "voucher"
     __table_args__ = (
         UniqueConstraint("period_id", "voucher_no", name="uq_voucher_period_no"),
+        # **库级 CHECK 约束，模型侧必须同名同义**（审计 P3-2）。
+        #
+        # 这条约束由 ``db_init.sql`` 交付（迁移 0005/0007/0009/0010 重放），
+        # 库里是活的：服务层传 ``status="FOO"`` 会被它挡下
+        # （sqlstate 23514 check_violation）。
+        #
+        # 以前模型侧没有声明它，于是「模型 == 库」这条判据（``models/book.py``
+        # 里专门写了一段说明为什么必须一致）对 CHECK 约束**结构性失效**：
+        # Alembic 1.20 的 ``compare_metadata`` 根本不比较 CHECK 约束，
+        # 缺了不会报、补了也不会报 —— 两条路都看不见。
+        # 现在按「同名同义」补齐，换用会比较 CHECK 约束的工具时也不会
+        # 把这条护栏当成「库里没有、模型里有」而删掉。
+        #
+        # 约束名与表达式**必须与库里逐字一致**，否则 autogenerate 会误报。
+        CheckConstraint("status IN ('UNPOSTED','POSTED')", name="ck_voucher_status"),
         Index("ix_voucher_book_date", "book_id", "voucher_date"),
         Index("ix_voucher_book_status", "book_id", "status"),
     )
@@ -118,6 +134,18 @@ class Entry(Base, TimestampMixin):
             ["book_id", "period_ord"], ["period.book_id", "period.ord"],
             name="fk_entry_book_period", ondelete="CASCADE",
         ),
+        # **库级 CHECK 约束，模型侧必须同名同义**（审计 P3-2）。
+        #
+        # 两条都是真的在拦东西的活约束（实测过）：
+        #   · ck_entry_direction      —— direction 只能是 DEBIT / CREDIT
+        #   · ck_entry_amount_nonzero —— 金额不能是 0（0 金额是「没填」，
+        #     不是「记了 0 块」；放进去报表上会凭空多一张凭证）
+        #
+        # 名字与表达式逐字对齐 ``db_init.sql``（迁移 0005/0007/0009/0010 交付），
+        # 理由同 ``Voucher.ck_voucher_status`` 那条注释：Alembic 不比较 CHECK
+        # 约束，模型侧缺不缺它都看不出来，所以只能靠「同名同义」这条人工约定。
+        CheckConstraint("direction IN ('DEBIT','CREDIT')", name="ck_entry_direction"),
+        CheckConstraint("amount <> 0", name="ck_entry_amount_nonzero"),
         # 明细账逐科目取数靠它；保留，不能被下面的宽索引取代。
         Index("ix_entry_subject_ord", "book_id", "subject_id", "period_ord"),
         # 账簿最热的聚合（ledger/engine._query_movements：WHERE book_id = ?

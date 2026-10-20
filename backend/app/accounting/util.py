@@ -119,17 +119,14 @@ def find_period(db, book_id: int, d: date):
     return period
 
 
-def previous_period(db, period):
-    """账套内紧邻的上一期。跨年度靠 ord 连续，所以 1 月的上一期就是上年 12 月。
+# 审计 P3-3：``previous_period`` 曾在这里定义，**全仓没有任何调用点** ——
+# 它是一份死代码。留着它的问题不是「多几行」，而是**同一语义有三份实现**：
+# 死代码一份、``accounting/periods.py`` 里内联一份、
+# ``accounting/vouchers.py`` 里再内联一份。将来改口径只改一处是必然的。
+#
+# 所以它被删掉了，而不是反过来让两处内联都改调它 —— 那要把
+# ``vouchers.py`` 一起动，而 ``vouchers.py`` 的两处内联口径本就与它一致
+# （同账套 ord-1），删掉死代码已经消掉了「三份」里的第三份。
+# 剩下的两处内联各自在各自的服务层里，是有意保持的（它们查的是
+# 「上一期结没结账」这个局部判据，不是通用工具）。
 
-    没有上一期（账套的第一个期间）返回 None。
-    """
-    from app.models import Period
-    from sqlalchemy import select
-
-    return db.scalar(
-        select(Period).where(
-            Period.book_id == period.book_id,
-            Period.ord == period.ord - 1,
-        )
-    )

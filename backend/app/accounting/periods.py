@@ -144,6 +144,76 @@ def _subject_by_any_code(db: Session, book_id: int, codes: tuple[str, ...]) -> O
     return None
 
 
+# --------------------------------------------------------------------- 结转科目集合
+#
+# 「哪些科目参与结转损益」**只有这一份定义**（审计 P1-1 / P1-2）。
+#
+# 以前有两份，而且口径不同：
+#   · ``carry_forward_profit``：carry_forward=True + is_leaf=True + 排除本年利润
+#   · ``close_period`` 的结平校验：carry_forward=True + is_leaf=True（**不排除本年利润**）
+# 两份不一致的直接后果：**本年利润一旦被标成结转科目，该期间永远结不了账** ——
+# 结转集合里根本没有它，它永远结不平，而结平校验又一直盯着它。
+#
+# 收口之后两条路径用同一个 helper，判据也统一成三条：
+#   ① carry_forward is True   —— 用户可以关掉某个损益科目的结转（这一条不能少！
+#                                 少了它，「故意不结转」就会失效，损益永远挂着）
+#   ② is_leaf is True         —— 汇总级科目不参与
+#   ③ category == "PROFIT"    —— **只有损益类科目才能结转**（这一条是 P1-1 的要害）
+# 并且**永远排除本年利润** —— 它是结转的**目的科目**，不是被结转的对象。
+#
+# ③ 这条为什么必须在服务端：科目表导入按外部表的「类型」列自动置
+# ``carry_forward``（``accounting/subject_importer.py``），那张表的「类型」列
+# 写错一个词，资产科目就被标成结转科目，随后任何一次月末结转都会把它的余额
+# 整体搬进本年利润 —— 钱凭空消失，而**借贷仍然平衡，系统自检抓不到**。
+# 写侧有校验（``api/subjects.py``）拦一道，读侧再按 category 过滤一次，
+# 两道都留着：写侧拦新数据，读侧兜住**修复之前就已经躺在库里**的脏标记。
+def carry_forward_subjects(db: Session, book_id: int, *,
+                            exclude_profit: bool = True) -> list[Subject]:
+    """参与结转损益的科目集合。**结转与结平校验共用这一份定义。**
+
+    ``exclude_profit=True``（唯一正确的用法）把本年利润排除在外。
+    传 False 只会得到一个自相矛盾的集合（本年利润会把它自己结给自己），
+    留着这个参数只是为了把「排除本年利润」这件事写成显式契约。
+    """
+    stmt = select(Subject).where(
+        Subject.book_id == book_id,
+        Subject.carry_forward.is_(True),
+        Subject.is_leaf.is_(True),
+        Subject.category == "PROFIT",
+    )
+    if exclude_profit:
+        profit = _subject_by_any_code(db, book_id, PROFIT_SUBJECT_CODES)
+        if profit is not None:
+            stmt = stmt.where(Subject.id != profit.id)
+    return list(db.scalars(stmt.order_by(Subject.code)).all())
+
+
+def current_accounting_year(db: Session, book: Book) -> int:
+    """这个账套**当前在记的那一个会计年度**（审计 P2-5）。
+
+    口径：**最近一期有凭证的期间所在的年度**；一张凭证都没有时退回账套的
+    启用年度（``book.start_year``）。
+
+    为什么不是「服务器当前日历年」：系统的会计年度是**账套的属性**
+    （``book.start_year`` + ``period.year``，见 06a97b4「期初余额改成
+    会计年度口径」），而 ``CURRENT_DATE`` 是**服务器当前日期**加上
+    **连接会话时区**（本项目的连接池把时区钉死成 UTC）。于是：
+      · 每年 1 月 1 日的 8 小时窗口里，北京时间已经跨年、UTC 还没跨年；
+      · 给一本 2026 年建的账补录 2025 年的分录时，「本年」算的是 2026，
+        而用户正在操作的是 2025 —— 守卫判的是错的那个年。
+
+    这里取「有凭证的最近年度」，是因为它就是**用户正在记的那一年**：
+    账上一有动静，它立刻跟着走；老账套补录旧年度时，它也不会被服务器的
+    日历年带偏。
+    """
+    year = db.scalar(
+        select(func.max(Period.year))
+        .join(Voucher, Voucher.period_id == Period.id)
+        .where(Period.book_id == book.id)
+    )
+    return int(year) if year is not None else int(book.start_year)
+
+
 # --------------------------------------------------------------------- 结账
 
 
@@ -199,34 +269,51 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
     # 纸质凭证按号装订就跟系统对不上，再想改只能作废重记。
     svc_organize.assert_tidy(db, chain)
 
-    # 空月份不许结账，没有旁路。
+    # 链上**将被新锁上**的期间。已结账的跳过 —— 它们早就封存了，
+    # 里面有没有凭证是既成事实，拦不住也不该拦。
+    to_lock = [p for p in chain if not fresh[p.id][0]]
+
+    # 空月份不许结账，没有旁路。**而且是对链上每一期**（审计 P2-1）。
     #
-    # 以前一张凭证都没有的期间也能结，而且三道闸门**恰好都对它放行**：整理
-    # 体检对空集通过，自动记账记 0 张，损益检查因为余额全为零也通过。于是
-    # 「这个月的账忘了录」被静默封进历史 —— 期间一锁，补凭证就得反结账，
+    # 以前一张凭证都没有的期间也能结，而且三道闸门**恰好都对它放行**：
+    # 整理体检对空集通过，自动记账记 0 张，损益检查因为余额全为零也通过。
+    # 于是「这个月的账忘了录」被静默封进历史 —— 期间一锁，补凭证就得反结账，
     # 而反结账会连带把后面已经结好的月份全部退回，一笔糊涂账就是这么来的。
+    #
+    # 以前这道闸**只看被结的那一期**，于是「1~11 月一张凭证都没有、只有
+    # 12 月有」时，点「结账 12 月」会把 11 个空月份**静默封进历史** ——
+    # 后果与这道闸要防的一模一样，工作量还更大（要连带反结账 12 个月、
+    # 批量退回所有已记账凭证）。闸门挡住了「直接结那个空月」，却没挡住
+    # 「结后面的月时把空月顺带封掉」。
     #
     # 曾经想过留一个「我确认本月无业务」的旁路，否掉了：那个确认拦不住它 ——
     # 人会点确定，而点确定的人多半正是没意识到自己漏录了的人。
     # 真的要表达「本月无业务」，办法是录入凭证（哪怕只是一张说明凭证），
     # 那张凭证本身就是「这个月我看过、是空的」的记录。
     #
-    # **只卡被结的那一期**：链上更早的空月份照旧顺带结掉。年度结转要求
-    # 12 期全部结完，所以一个账套里若有整月无业务，会在结到 12 月的路上
-    # 被挡住 —— 这是有意的：先把这个月处理成「有凭证」再往下走。
-    if not db.scalar(
-        select(func.count()).select_from(Voucher).where(Voucher.period_id == target.id)
-    ):
+    # 一条 group by 拿到链上各期的凭证数，不是一期一条。
+    counts: dict[int, int] = {}
+    if to_lock:
+        counts = dict(
+            db.execute(
+                select(Voucher.period_id, func.count())
+                .where(Voucher.period_id.in_([p.id for p in to_lock]))
+                .group_by(Voucher.period_id)
+            ).all()
+        )
+    empty = [p for p in to_lock if not counts.get(p.id)]
+    if empty:
         raise ValueError(
-            f"{target.code} 没有任何凭证，不能结账。"
-            "请确认本期凭证是否漏录；若本月确实没有业务，请录入凭证（哪怕只是一张说明凭证）后再结账。"
+            f"{'、'.join(p.code for p in empty)} 没有任何凭证，不能结账。"
+            "结账会把这些月份一起锁上，而期间一锁，补凭证就得反结账"
+            "（连带把后面已经结好的月份全部退回）。"
+            "请确认这些月份是不是漏录了；若确实没有业务，"
+            "请录入凭证（哪怕只是一张说明凭证）后再结账。"
         )
 
     auto_closed, auto_posted = [], 0
     pending = []
-    for p in chain:
-        if fresh[p.id][0]:
-            continue
+    for p in to_lock:
         posted = _auto_post(db, p, user) if auto_post else _check_unposted(db, p)
         auto_posted += posted
         pending.append(p)
@@ -239,16 +326,14 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
     # 的收入一并扫进本年利润，于是 11 月的钱出现在 12 月的凭证里，
     # 两边都「结账成功」，账面却已经错了，而且再也查不出来是谁动的手。
     eng = LedgerEngine(db, target.book_id)
-    # 结账校验只取「要结转的末级科目」，但**不过滤 active**：
-    # 停用 ≠ 删除。一个挂着余额的停用损益科目若被过滤掉，
+    # 结账校验取的是**「要结转的末级科目」**—— 与结转损益用的是**同一个
+    # helper**（``carry_forward_subjects``，审计 P1-1 / P1-2）。以前这里是
+    # 另写一份（不排除本年利润、也不看 category），两份口径不一致的直接
+    # 后果就是「本年利润一旦被标成结转科目，该期间永远结不了账」。
+    #
+    # 不过滤 active：停用 ≠ 删除。一个挂着余额的停用损益科目若被过滤掉，
     # 就能被直接结过去 —— 期间锁了、损益却留在科目上跨年，而且没有任何报错。
-    subjects = db.scalars(
-        select(Subject).where(
-            Subject.book_id == target.book_id,
-            Subject.carry_forward.is_(True),
-            Subject.is_leaf.is_(True),
-        )
-    ).all()
+    subjects = carry_forward_subjects(db, target.book_id)
     # 一次算到最后一期，中间每一期的中间结果都会留在缓存里
     eng.compute([s.id for s in subjects], max(p.ord for p in pending))
     unsettled = []
@@ -597,18 +682,16 @@ def carry_forward_profit(db: Session, book_id: int, period: Period,
             f"账套缺少「本年利润」科目（编码 {'、'.join(PROFIT_SUBJECT_CODES)} 都不是）"
         )
 
-    # 结转损益的科目集合同样不过滤 active：停用的收入/费用科目如果被排除，
+    # 结转损益的科目集合 = **共享 helper**（``carry_forward_subjects``）。
+    #
+    # 以前这里是另写一份：carry_forward=True + is_leaf=True + 排除本年利润。
+    # 现在连「只看损益类科目」也一起收进来了 —— 读侧不再信任 ``carry_forward``
+    # 这个标记，**只认真正的损益类科目**（审计 P1-1）。于是库里已经存在的
+    # 脏标记（资产科目被勾成结转科目）不会再把它的余额搬进本年利润。
+    #
+    # 不过滤 active：停用的收入/费用科目如果被排除，
     # 它的本年累计就不会被结走，损益永远留在科目上，本年利润也算不对。
-    subjects = list(
-        db.scalars(
-            select(Subject).where(
-                Subject.book_id == book_id,
-                Subject.carry_forward.is_(True),
-                Subject.is_leaf.is_(True),
-                Subject.id != profit.id,
-            ).order_by(Subject.code)
-        ).all()
-    )
+    subjects = carry_forward_subjects(db, book_id)
 
     # 口径：**含未记账**。账簿默认只统计已记账凭证，可反结账会把区间内的凭证
     # 全部退回未记账 —— 那一刻按已记账口径算出来的损益全是 0，

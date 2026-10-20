@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.accounting.audit_helper import log
 from app.accounting.initialization import init_state, mark_subjects_ready
+from app.accounting.periods import current_accounting_year
 from app.accounting.subject_importer import parse_subject_workbook
 from app.api.schemas import SubjectEditIn, SubjectIn
 from app.core.db import get_db
@@ -15,6 +16,36 @@ from app.core.uploads import UploadTooLarge, read_upload_sync as read_upload
 from app.models import Book, Entry, Period, PeriodOpening, Subject, SysUser, UserBook, Voucher
 
 router = APIRouter(prefix="/api/books/{book_id}/subjects", tags=["科目"])
+
+#: 科目类别的中文名。报错里用它，不用英文枚举 —— 用户看的是「资产类」，
+#: 不是「ASSET」。
+_CATEGORY_LABELS = {
+    "ASSET": "资产类",
+    "LIABILITY": "负债类",
+    "EQUITY": "所有者权益类",
+    "COST": "成本类",
+    "PROFIT": "损益类",
+}
+
+
+def _reject_carry_forward(code: str, name: str, category: str) -> None:
+    """「结转科目」这个标记只许落在**损益类**科目上（审计 P1-1）。
+
+    标错了的后果不是「多一个开关」：月末结转会把带这个标记的科目余额
+    **整体搬进「本年利润」** —— 资产科目的钱凭空消失，而**借贷仍然相等**，
+    试算平衡与系统自检全都发现不了，账实不符还会顺着期初滚到以后每一个月。
+
+    所以这是 422（参数不合法）而不是 400：请求本身违反了科目语义，
+    换个号、改个名都解决不了，必须把类别改对。
+    """
+    raise HTTPException(
+        422,
+        f"只有损益类科目可以参与月末结转：{code} {name} 是"
+        f"{_CATEGORY_LABELS.get(category, category)}，不能标成「结转科目」。"
+        f"标错了的话，月末结转会把它的余额整体搬进「本年利润」——"
+        f"钱凭空消失，而借贷仍然平衡，系统自检查不出来。"
+        f"如果它确实是损益类科目，请先把科目类别改成「损益类」再勾选。"
+    )
 
 
 def _subject_snapshot(s: Subject) -> dict:
@@ -60,11 +91,15 @@ def list_subjects(book: Book = Depends(get_my_book), db: Session = Depends(get_d
     if not include_inactive:
         stmt = stmt.where(Subject.active.is_(True))
     rows = list(db.scalars(stmt.order_by(Subject.code)).all())
+    # 「本年」= **账套当前在记的那个会计年度**（审计 P2-5）。
+    # 以前这里用服务器当前日历年 + 连接会话时区（UTC）：北京时间的跨年
+    # 8 小时窗口里算的是上一年，给老账套补录旧年度时算的也是错的年份。
+    year = current_accounting_year(db, book)
     current_year_activity = set(db.scalars(
         select(Entry.subject_id)
         .join(Period, and_(Period.book_id == Entry.book_id, Period.ord == Entry.period_ord))
         .where(Entry.book_id == book.id,
-               Period.year == func.extract("year", func.current_date()),
+               Period.year == year,
                Entry.amount != 0)
         .distinct()
     ).all())
@@ -315,6 +350,12 @@ def create_subject(payload: SubjectIn, book: Book = Depends(get_my_book),
     if parent is not None:
         _assert_no_own_balance(db, parent, action=f"在它下面新建子科目 {payload.code}")
 
+    # P1-1：只有**损益类**科目能参与月末结转。资产科目被标成结转科目，
+    # 月末结转会把它的余额整体搬进「本年利润」——钱凭空消失，而借贷仍然
+    # 平衡，系统自检查不出来。
+    if payload.carry_forward and payload.category != "PROFIT":
+        _reject_carry_forward(payload.code, payload.name, payload.category)
+
     s = Subject(
         book_id=book.id, code=payload.code, name=payload.name, category=payload.category,
         direction=payload.direction, parent_id=payload.parent_id,
@@ -562,6 +603,23 @@ def update_subject(subject_id: int, payload: SubjectEditIn, book: Book = Depends
     if not changed:
         return {"id": s.id, "code": s.code, "name": s.name}
 
+    # P1-1：「结转科目」这个标记只许落在**损益类**科目上。
+    #
+    # 写侧这道闸是必须的：结转损益会把带这个标记的科目余额整体搬进
+    # 「本年利润」——资产科目的钱凭空消失，而**借贷仍然平衡**，
+    # 试算平衡与系统自检全都发现不了。
+    #
+    # **只在「本次改动会造成违规」时报错**：库里早就存在的脏数据
+    # （资产科目 + carry_forward=True）不该把人卡死 —— 改个名字、
+    # 停用它都得还能做。读侧（``accounting/periods.carry_forward_subjects``）
+    # 已经按 category 过滤，脏数据不会再被结走。
+    new_category = changes.get("category", s.category)
+    new_carry = changes.get("carry_forward", s.carry_forward)
+    if "carry_forward" in changes and changes["carry_forward"] and new_category != "PROFIT":
+        _reject_carry_forward(s.code, s.name, new_category)
+    if "category" in changes and new_category != "PROFIT" and new_carry:
+        _reject_carry_forward(s.code, s.name, new_category)
+
     # **口径必须覆盖整棵子树，不能只看它自己身上的分录。**
     #
     # 账簿引擎把分录上卷到各级父科目（``ledger/engine.py::_ancestor_map``），
@@ -579,11 +637,12 @@ def update_subject(subject_id: int, payload: SubjectEditIn, book: Book = Depends
     # 取子树而不是取祖先：判断的是「这个科目**当前**管着的钱」，
     # 而 parent_id 的改动在下面才生效（改挂时不该用改挂后的子树来判）。
     scope_ids = {subject_id} | _descendant_ids(db, subject_id)
+    # 「本年」= 账套当前在记的会计年度（审计 P2-5），与上面科目列表同口径。
     current_year_activity = db.scalar(
         select(Entry.id)
         .join(Period, and_(Period.book_id == Entry.book_id, Period.ord == Entry.period_ord))
         .where(Entry.book_id == book.id, Entry.subject_id.in_(scope_ids),
-               Period.year == func.extract("year", func.current_date()), Entry.amount != 0)
+               Period.year == current_accounting_year(db, book), Entry.amount != 0)
         .limit(1)
     ) is not None
     # 只挡 **code**，和 db_init.sql 的 fn_subject_guard 同口径。

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -11,8 +11,18 @@ Direction = Literal["DEBIT", "CREDIT"]
 
 # ---- 认证 ----
 class LoginIn(BaseModel):
-    username: str
-    password: str
+    # **长度上限是防御，不是业务规则**（审计 P2-6，2026-10-19 那份报告的
+    # 同一条，多轮没闭环）。
+    #
+    # nginx 的 ``client_max_body_size`` 允许 21 MB 的请求体，于是：
+    # 21 MB 的口令 → ``password.encode()`` 产生一份 21 MB 的副本 → 进 PBKDF2；
+    # 21 MB 的用户名 → 进 ``WHERE username = :u`` 的索引比较。
+    # 一次请求就能换来几十 MB 量级的内存分配，放大明显而成本极低。
+    #
+    # 同一个文件里 ``RegisterIn`` 早就按同一条原则加了上限（用户名 32 /
+    # 口令 128 / 姓名 64），登录这一条被漏下了。现在补齐。
+    username: str = Field(max_length=256)
+    password: str = Field(max_length=1024)
 
 
 class TokenOut(BaseModel):
@@ -50,7 +60,13 @@ class BookIn(BaseModel):
     start_year: int = Field(ge=START_YEAR_MIN, le=START_YEAR_MAX)
     start_month: int = Field(1, ge=1, le=12)
     # 科目编码规则，如「4-2-2-2」；决定新增科目自动接几位号
-    subject_code_rule: str = Field("4-2-2-2", pattern=r"^\d+(-\d+)*$")
+    #
+    # ``max_length=32`` 与 ``book.subject_code_rule`` 的列宽一致（审计 P1-3）。
+    # 以前只有 pattern 没有长度上限，而 pattern 里的 ``\d+`` 允许任意长的
+    # 数字串 —— 超长值一路走到 INSERT 才被 PostgreSQL 截断（sqlstate 22001
+    # StringDataRightTruncation），全局处理器把它翻成 **500**，
+    # 用户看到的是「数据库内部错误」而不是「编码规则太长」。
+    subject_code_rule: str = Field("4-2-2-2", max_length=32, pattern=r"^\d+(-\d+)*$")
 
 
 class BookEditIn(BaseModel):
@@ -59,7 +75,9 @@ class BookEditIn(BaseModel):
     company_name: Optional[str] = Field(default=None, min_length=1, max_length=128)
     name: Optional[str] = Field(default=None, min_length=1, max_length=128)
     # 改了规则只影响**今后**新增科目的自动接号，已有科目的编码一律不动
-    subject_code_rule: Optional[str] = Field(default=None, pattern=r"^\d+(-\d+)*$")
+    # （长度上限同 ``BookIn.subject_code_rule``，理由见那里）
+    subject_code_rule: Optional[str] = Field(
+        default=None, max_length=32, pattern=r"^\d+(-\d+)*$")
 
     def changes(self) -> dict:
         return {k: v for k, v in self.model_dump().items() if v is not None}
@@ -83,10 +101,29 @@ class OpeningIn(BaseModel):
     amount: Decimal = Decimal("0")
 
 
+#: 写期初一次最多多少行科目。
+#:
+#: 上限不是业务规则，是防御：一次请求写 N 行 = N 条数据库行，而请求体大小
+#: 只受 nginx 的 ``client_max_body_size`` 约束（那是**请求体**限制，压缩过的
+#: 上传能绕过）。科目表本身只有几百条，2000 已经远超正常需要。
+MAX_OPENING_ROWS = 2000
+
+#: 写期初的入参（裸数组）。用 ``Annotated`` + ``Field(max_length=...)``
+#: 而不是包一层模型：接口的请求体形状是**数组**，包一层就改了契约
+#: （老前端会直接 422）。
+OpeningListIn = Annotated[list[OpeningIn], Field(max_length=MAX_OPENING_ROWS)]
+
+
 # ---- 科目 ----
 class SubjectIn(BaseModel):
-    code: str
-    name: str
+    # 长度上限与列宽逐字一致（审计 P1-3）：
+    # ``subject.code varchar(32)`` / ``subject.name varchar(128)``。
+    # 以前只有类型没有上限，超长值走到 INSERT 才被 PostgreSQL 截断
+    # （22001 StringDataRightTruncation）→ 全局处理器翻成 **500**，
+    # 用户看到「数据库内部错误」而不是「编码太长」。
+    # 同一个业务概念，PATCH 走 ``SubjectEditIn`` 一直是 422 —— 这是漏写。
+    code: str = Field(min_length=1, max_length=32)
+    name: str = Field(min_length=1, max_length=128)
     category: Literal["ASSET", "LIABILITY", "EQUITY", "COST", "PROFIT"]
     direction: Direction = "DEBIT"
     parent_id: Optional[int] = None
@@ -136,10 +173,18 @@ class EntryIn(BaseModel):
 
 class VoucherIn(BaseModel):
     voucher_date: date
-    entries: list[EntryIn]
+    # 单张凭证的分录行数上限（审计 P2-2）。不是业务规则，是防御：
+    # 没有上限时「1 份请求体 → N 条数据库行」的放大器一直开着
+    # （实测一次 POST 收 5001 条分录，全部落库）。
+    # 500 行远超正常需要（工资凭证 18 条已经很大了）。
+    entries: list[EntryIn] = Field(max_length=500)
     remark: str = ""
-    attachments: int = 0
-    voucher_no: Optional[str] = None
+    # ``voucher.attachments`` 是 smallint，最大 32767。以前没有取值范围，
+    # 传 70000 一路走到 INSERT 才被 PostgreSQL 拒（22003
+    # NumericValueOutOfRange）→ 全局处理器翻成 **500**。
+    attachments: int = Field(default=0, ge=0, le=32767)
+    # 与 ``voucher.voucher_no varchar(32)`` 对齐（审计 P1-3）。
+    voucher_no: Optional[str] = Field(default=None, max_length=32)
     # **客户端不能指定 CARRY_FORWARD（审计 P1-02）。**
     #
     # 它原来和 MANUAL/IMPORT/INVOICE 一起写在 Literal 里，于是任何有账套写权限
@@ -184,7 +229,15 @@ class VoucherOut(BaseModel):
 
 
 class BatchIds(BaseModel):
-    ids: list[int]
+    # 批量入参的长度上限（审计 P2-2）。
+    #
+    # 以前没有上限，而 ``batch_delete`` 把整个数组塞进
+    # ``Voucher.id.in_(payload.ids)`` → 绑定参数超过 PostgreSQL 的 65535 上限
+    # → psycopg 抛 ``OperationalError`` → 全局处理器翻成 **500**
+    # （实测 70000 个 id 必现）。同一个模型也被 ``/post`` 与 ``/unpost`` 用。
+    #
+    # 2000 张一批远超正常需要（批量记账/反记账通常是几十张）。
+    ids: list[int] = Field(max_length=2000)
 
 
 # ---- 发票导入 ----

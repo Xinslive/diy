@@ -96,7 +96,7 @@ def test_试算不平被拒时不留审计(client, auth, db, book, subjects):
 def test_新建科目要留审计(client, auth, db, book):
     r = client.post(f"/api/books/{book.id}/subjects", headers=auth, json={
         "code": "1905", "name": "测试用科目", "category": "ASSET",
-        "direction": "DEBIT", "is_leaf": True, "carry_forward": True,
+        "direction": "DEBIT", "is_leaf": True, "carry_forward": False,
         "qty_calc": False, "aux_calc": False, "fx_calc": False, "sort_no": 99,
     })
     assert r.status_code == 201, r.text
@@ -109,7 +109,7 @@ def test_改科目要留改前改后(client, auth, db, book, subjects):
     sid_ = subjects["1002"].id
     payload = {
         "code": "1002", "name": "改过的名字", "category": "ASSET",
-        "direction": "DEBIT", "is_leaf": True, "carry_forward": True,
+        "direction": "DEBIT", "is_leaf": True, "carry_forward": False,
         "qty_calc": False, "aux_calc": False, "fx_calc": False, "sort_no": 0,
     }
     r = client.patch(f"/api/books/{book.id}/subjects/{sid_}", headers=auth, json=payload)
@@ -126,7 +126,7 @@ def test_停用科目要留审计(client, auth, db, book, subjects):
     sid_ = subjects["1002"].id
     payload = {
         "code": "1002", "name": "银行存款", "category": "ASSET",
-        "direction": "DEBIT", "is_leaf": True, "carry_forward": True,
+        "direction": "DEBIT", "is_leaf": True, "carry_forward": False,
         "qty_calc": False, "aux_calc": False, "fx_calc": False, "sort_no": 0,
         "active": False,
     }
@@ -141,7 +141,7 @@ def test_停用科目要留审计(client, auth, db, book, subjects):
 def test_删科目要留审计(client, auth, db, book):
     r = client.post(f"/api/books/{book.id}/subjects", headers=auth, json={
         "code": "1999", "name": "待删除科目", "category": "ASSET",
-        "direction": "DEBIT", "is_leaf": True, "carry_forward": True,
+        "direction": "DEBIT", "is_leaf": True, "carry_forward": False,
         "qty_calc": False, "aux_calc": False, "fx_calc": False, "sort_no": 98,
     })
     sid_ = r.json()["id"]

@@ -16,11 +16,11 @@ from app.accounting.initialization import (OPENINGS_SOURCE_IMPORT, blocked_reaso
                                            mark_subjects_ready)
 from app.accounting.util import money
 from app.api.schemas import (BookEditIn, BookIn, BookOrderIn, CarryForwardIn, CloseIn,
-                           OpeningIn, UncloseIn, YearEndIn)
+                           OpeningListIn, UncloseIn, YearEndIn)
 from app.core.config import settings
 from app.core.db import get_db
-from app.core.deps import (get_book_link, get_current_user, get_my_book, require_admin,
-                        require_book_write)
+from app.core.deps import (get_book_link, get_current_user, get_my_book, normalize_role,
+                        require_admin, require_book_write)
 from app.core.uploads import RowBudget, UploadTooLarge, check_archive_size
 # 本地别名保持函数名 ``read_upload`` 不变（守卫测试按这个名字认共享容量闸），
 # 指向的其实是同步版 —— 端点已改成同步 ``def``，不能再 await。
@@ -39,40 +39,53 @@ def _xlsx_name(name: str) -> str:
     return f"attachment; filename*=UTF-8''{quote(name)}"
 
 
-def _years_of(db: Session, book_id: int) -> list[dict]:
-    """账套下每个会计年度的结账进度。
+def _years_of(db: Session, book_ids: list[int]) -> dict[int, list[dict]]:
+    """一批账套下每个会计年度的结账进度。**一次查询算完所有账套**（审计 P2-3）。
 
     账套列表要显示「已结账 n/12 期」「使用中/已结转」，而这两个数都是
     **按年度**算的 —— 2026 年结完了不代表 2027 年也结完了。
+
+    以前这里是「每本账调一次、每次 2 条 SQL」：12 本账 = 30 条 SQL，
+    其中 24 条是同一对查询重复 12 遍。往返数随账套数线性增长，而
+    ``POST /api/books`` 对任何登录用户开放（自助注册开着），一个人
+    建几十上百本账是现实场景。
+
+    现在改成「一次 group by 带 book_id → 在 Python 里按 book_id 归拢」，
+    与同文件里 ``init_states`` 的写法一致（那个函数当初就是为了
+    同样的理由抽出来的）。**不引入跨请求缓存** —— 改密、停用、换角色
+    必须立刻生效（审计中等 4）。
     """
+    if not book_ids:
+        return {}
     rows = db.execute(
         select(
+            Period.book_id,
             Period.year,
             func.count(Period.id),
             func.count(Period.id).filter(Period.locked.is_(True)),
         )
-        .where(Period.book_id == book_id)
-        .group_by(Period.year)
-        .order_by(Period.year)
+        .where(Period.book_id.in_(book_ids))
+        .group_by(Period.book_id, Period.year)
+        .order_by(Period.book_id, Period.year)
     ).all()
-    vouchers = dict(
-        db.execute(
-            select(Period.year, func.count(Voucher.id))
-            .join(Voucher, Voucher.period_id == Period.id)
-            .where(Period.book_id == book_id)
-            .group_by(Period.year)
-        ).all()
-    )
-    return [
-        {
+    vouchers: dict[tuple[int, int], int] = {}
+    for book_id, year, n in db.execute(
+        select(Period.book_id, Period.year, func.count(Voucher.id))
+        .join(Voucher, Voucher.period_id == Period.id)
+        .where(Period.book_id.in_(book_ids))
+        .group_by(Period.book_id, Period.year)
+    ).all():
+        vouchers[(book_id, year)] = n
+    out: dict[int, list[dict]] = {}
+    for book_id, year, total, closed in rows:
+        out.setdefault(book_id, []).append({
             "year": year,
             "total": total,
             "closed": closed,
-            "vouchers": vouchers.get(year, 0),
+            "vouchers": vouchers.get((book_id, year), 0),
             "carried": closed >= total,
-        }
-        for year, total, closed in rows
-    ]
+        })
+    return out
 
 
 @router.get("")
@@ -90,9 +103,11 @@ def list_my_books(user: SysUser = Depends(get_current_user), db: Session = Depen
     ).all()
     # 一次算完所有账套的初始化状态（四条 group by），不给每个账套单开一轮 count
     inits = init_states(db, [b for b, _role in rows])
+    # 年度进度同理：一次算完所有账套，不给每个账套单开一轮两条查询
+    years_by_book = _years_of(db, [b.id for b, _role in rows])
     out = []
     for b, role in rows:
-        years = _years_of(db, b.id)
+        years = years_by_book.get(b.id, [])
         out.append({
             "id": b.id, "name": b.name, "company_name": b.company_name,
             "start_year": b.start_year, "start_month": b.start_month,
@@ -239,7 +254,7 @@ def get_book(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
         # 前端据此把不该选的级次直接置灰 —— 只在编辑弹窗里要，别塞进账套列表
         "subject_max_level": _max_subject_level(db, book.id),
         "start_year": book.start_year, "start_month": book.start_month,
-        "status": book.status, "years": _years_of(db, book.id),
+        "status": book.status, "years": _years_of(db, [book.id]).get(book.id, []),
         "init": init_state(db, book),
     }
 
@@ -353,7 +368,7 @@ def update_book(book_id: int, payload: BookEditIn, book: Book = Depends(get_my_b
     的不变量（tests/test_viewer_matrix.py 遍历路由表检查），而不是靠人记得。
     它比下面的 OWNER 判断更宽松，叠加不会改变实际口径，只是把基础那道门先关上。
     """
-    if link.role != "OWNER":
+    if normalize_role(link.role) != "OWNER":
         raise HTTPException(403, "只有账套所有者可以修改账套名和单位名")
     changes = payload.changes()
     if not changes:
@@ -680,7 +695,7 @@ def parse_openings(book_id: int, file: UploadFile = File(...),
 
 
 @router.post("/{book_id}/periods")
-def set_openings(book_id: int, payload: list[OpeningIn], year: int | None = None,
+def set_openings(book_id: int, payload: OpeningListIn, year: int | None = None,
                  period_id: int | None = None,
                  book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                  user: SysUser = Depends(get_current_user),
@@ -692,6 +707,9 @@ def set_openings(book_id: int, payload: list[OpeningIn], year: int | None = None
 
     不传年度/期间就是账套的启用年度（老行为）。``period_id`` 仍收（老调用方），
     但只用来定年度。
+
+    入参是裸数组，行数上限在 ``schemas.OpeningListIn`` 上（审计 P2-2）——
+    没有上限时「1 份请求体 → N 条数据库行」的放大器一直开着。
     """
     from app.accounting.audit_helper import log
 
@@ -719,10 +737,23 @@ def set_openings(book_id: int, payload: list[OpeningIn], year: int | None = None
 
     # 先在内存里过一遍校验并试算平衡，确认没问题再落库：
     # 期初一旦存歪，后面每个月的账都跟着歪，而且很难看出是哪一步错的。
+    #
+    # 科目**一次取齐**（审计 P2-3）：以前每个科目一次 ``db.get``，
+    # 129 个科目 = 143 条 SQL。往返数线性于科目数，而期初录入页
+    # 摆的正是整张科目表。
+    subject_ids = {item.subject_id for item in payload}
+    subjects: dict[int, Subject] = {}
+    if subject_ids:
+        subjects = {
+            s.id: s for s in db.scalars(
+                select(Subject).where(
+                    Subject.book_id == book.id, Subject.id.in_(subject_ids))
+            ).all()
+        }
     planned, dr, cr = [], Decimal("0"), Decimal("0")
     for item in payload:
-        subject = db.get(Subject, item.subject_id)
-        if subject is None or subject.book_id != book.id:
+        subject = subjects.get(item.subject_id)
+        if subject is None:
             raise HTTPException(400, f"科目不存在: {item.subject_id}")
         # 「借正贷负」是全系统内部口径，期初也照此存。
         # 刻意**不**按 subject.direction 纠正符号：科目属性是「通常方向」，

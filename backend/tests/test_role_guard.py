@@ -83,9 +83,12 @@ def linked(db, plain_user, book):
 
 
 def _建科目(client, book, headers, code, name):
+    # ``carry_forward`` 必须是 False：只有**损益类**科目才能被标成结转科目
+    # （审计 P1-1，服务端会 422 拒掉资产科目带这个标记）。这个用例测的是
+    # 「角色能不能写」，科目载荷里的那个标记与它无关。
     return client.post(f"/api/books/{book.id}/subjects", headers=headers, json={
         "code": code, "name": name, "category": "ASSET",
-        "direction": "DEBIT", "is_leaf": True, "carry_forward": True,
+        "direction": "DEBIT", "is_leaf": True, "carry_forward": False,
         "qty_calc": False, "aux_calc": False, "fx_calc": False, "sort_no": 71,
     })
 

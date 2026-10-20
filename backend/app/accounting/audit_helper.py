@@ -6,6 +6,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.accounting.util import money
 from app.models import AuditLog, Entry, Voucher
 
 
@@ -70,9 +71,33 @@ def voucher_snapshot(voucher: Voucher, entries: Any = None) -> dict:
     ``entries`` 不给时读 ORM 关系（修改/删除路径就是靠关系里那份集合）。
     给了就用它，且**不再碰 ``voucher.entries``**：新建凭证的分录是刚 ``db.add``
     进去的、关系上还没有，不显式传就会白发一次懒加载。
+
+    **借贷合计与界面同口径**（审计 P3-3）。这里的 ``debit`` / ``credit`` 走的是
+    ``accounting/vouchers.py::side_totals`` 那套算法：**红字算到对面**，
+    两栏只摆正数 —— 与凭证列表、凭证编辑页显示的合计一模一样。
+
+    以前这里是**带符号**求和，于是同一张含红字分录的凭证，审计快照说
+    ``debit=100.00, credit=-100.00``，界面说 ``借 200 / 贷 0``。
+    两种算法各自自洽，但审计快照是「凭证号可复用」场景下**唯一**的事后追溯
+    依据，两处口径不一致，复盘时对不上数，还容易被当成「库里算错了」。
+
+    带符号的原值没有丢：另存成 ``debit_signed`` / ``credit_signed``，
+    需要看「这一栏的净数」时用它（红字冲销的原始方向就靠它还原）。
     """
     rows = [_entry_dict(e) for e in (voucher.entries if entries is None else entries)]
     rows.sort(key=lambda r: r["line_no"])
+    # 金额先按统一精度量化（两位小数），两套合计用的是同一批数 ——
+    # 否则「界面合计」与「快照合计」还会在第 3 位小数上分道扬镳。
+    for r in rows:
+        r["amount"] = money(r["amount"])
+    dr_signed = sum((r["amount"] for r in rows if r["direction"] == "DEBIT"), Decimal("0"))
+    cr_signed = sum((r["amount"] for r in rows if r["direction"] == "CREDIT"), Decimal("0"))
+    # ``side_totals`` 住在 ``accounting/vouchers.py``，而那个文件在模块级
+    # import 了本文件（``from app.accounting.audit_helper import log,
+    # voucher_snapshot``）—— 模块级 import 会成环，所以这里函数内 import。
+    from app.accounting.vouchers import side_totals
+
+    dr_total, cr_total = side_totals(rows)
     return {
         "id": voucher.id,
         "voucher_no": voucher.voucher_no,
@@ -81,8 +106,12 @@ def voucher_snapshot(voucher: Voucher, entries: Any = None) -> dict:
         "source": voucher.source,
         "remark": voucher.remark,
         "attachments": voucher.attachments,
-        "debit": _jsonable(sum(r["amount"] for r in rows if r["direction"] == "DEBIT")),
-        "credit": _jsonable(sum(r["amount"] for r in rows if r["direction"] == "CREDIT")),
+        # 界面口径：红字算到对面，两栏都是正数
+        "debit": _jsonable(dr_total),
+        "credit": _jsonable(cr_total),
+        # 带符号口径：这一栏的净数（红字冲销的方向靠它还原）
+        "debit_signed": _jsonable(dr_signed),
+        "credit_signed": _jsonable(cr_signed),
         "entries": [{**r, "amount": _jsonable(r["amount"])} for r in rows],
     }
 
