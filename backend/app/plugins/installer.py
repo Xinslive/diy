@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -21,6 +22,13 @@ from app.plugins.migrations import migrate
 from app.plugins.models import PluginInstallAttempt, PluginRegistry, PluginWorkerRuntime
 from app.plugins.security import verify_archive
 from app.plugins.workers import require_stopped
+
+#: 不计入插件代码配额的运行时目录：备份、隔离区与暂存区。
+RESERVED_DIRS = (".backups", ".quarantine", ".staging")
+#: 无引用的备份保留多久（秒）。超过后才允许被清理。
+BACKUP_RETENTION_SECONDS = 7 * 86400
+#: 卸载后隔离代码保留多久（秒）。它是人工恢复的证据，不是无限期垃圾。
+QUARANTINE_RETENTION_SECONDS = 30 * 86400
 
 
 def root_path() -> Path:
@@ -61,8 +69,105 @@ def installation_lock(plugin_id: str):
             conn.commit()
 
 
-def disk_usage(root: Path):
-    return sum(p.stat().st_size for p in root.rglob("*") if p.is_file() and not p.is_symlink())
+def disk_usage(root: Path, *, include_reserved: bool = True) -> int:
+    total = 0
+    for path in root.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        if not include_reserved and _is_reserved(root, path):
+            continue
+        total += path.stat().st_size
+    return total
+
+
+def code_usage(root: Path) -> int:
+    """插件**代码**占用：不含备份、隔离与暂存区。
+
+    配额只管代码：备份与隔离区是「变更前证据」，它们涨满时如果和代码共用
+    一个闸门，插件管理会被永久锁死（装不进去也卸不掉，因为卸载也要写备份）。
+    """
+    return disk_usage(root, include_reserved=False)
+
+
+def reserved_usage(root: Path) -> int:
+    """备份、隔离与暂存区占用：单独计量、单独额度。"""
+    total = 0
+    for name in RESERVED_DIRS:
+        folder = root / name
+        if folder.is_symlink() or not folder.is_dir():
+            continue
+        for path in folder.rglob("*"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            total += path.stat().st_size
+    return total
+
+
+def reserved_quota() -> int:
+    """备份与隔离区的独立额度。
+
+    配置里只有一个 ``plugin_disk_quota_bytes``（config.py 不在插件模块的改动
+    范围内），所以这里复用同一个数值但**单独判定**：备份区到顶只会卡住备份
+    流程并提示清理，不会把插件管理的四条路径一起锁死。
+    """
+    return settings.plugin_disk_quota_bytes
+
+
+def _is_reserved(root: Path, path: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    return bool(relative.parts) and relative.parts[0] in RESERVED_DIRS
+
+
+def prune_reserved(root: Path, *, force: bool = False, now=None) -> list[str]:
+    """清理不再被引用的备份与过期隔离目录。
+
+    安全规则（宁可少删）：
+    - ``.backups/<attempt>``：仍被 registry 的 ``backup_path`` 或**未失败**的
+      安装尝试引用的一律保留；其余只在超过保留期后才删（``force=True`` 时
+      立即删掉无引用的孤儿备份）。
+    - ``.quarantine/<名字>``：插件仍处于已登记（未卸载）状态时保留；卸载后
+      它只是人工恢复的证据，超过保留期才删。
+
+    返回被删除的路径列表。
+    """
+    now = time.time() if now is None else now
+    removed: list[str] = []
+    with SessionLocal() as db:
+        keep = {row.backup_path for row in db.scalars(select(PluginRegistry)) if row.backup_path}
+        for attempt in db.scalars(select(PluginInstallAttempt)):
+            if attempt.status != "FAILED" and attempt.backup_path:
+                keep.add(attempt.backup_path)
+        registered = {row.plugin_id for row in db.scalars(select(PluginRegistry))}
+        active = {row.plugin_id for row in db.scalars(select(PluginRegistry).where(PluginRegistry.deleted_at.is_(None)))}
+    backups = root / ".backups"
+    if backups.is_dir() and not backups.is_symlink():
+        for entry in sorted(backups.iterdir()):
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if str(entry) in keep:
+                continue
+            if not force and now - entry.lstat().st_mtime < BACKUP_RETENTION_SECONDS:
+                continue
+            shutil.rmtree(entry)
+            removed.append(str(entry))
+    quarantine = root / ".quarantine"
+    if quarantine.is_dir() and not quarantine.is_symlink():
+        for entry in sorted(quarantine.iterdir()):
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            plugin_id = entry.name.rsplit("-", 1)[0]
+            if plugin_id in active:
+                continue
+            if plugin_id in registered and not force:
+                continue
+            if not force and now - entry.lstat().st_mtime < QUARANTINE_RETENTION_SECONDS:
+                continue
+            shutil.rmtree(entry)
+            removed.append(str(entry))
+    return removed
 
 
 def make_backup(plugin_id: str, attempt_id: str) -> str:
@@ -86,8 +191,11 @@ def make_backup(plugin_id: str, attempt_id: str) -> str:
             os.fsync(handle.fileno())
     _sync_directory(destination)
     _sync_directory(destination.parent)
-    if disk_usage(root_path()) > settings.plugin_disk_quota_bytes:
-        raise UploadTooLarge("插件备份后超过存储配额；保留备份，停止变更")
+    # 备份区有自己的额度：到顶时先清理无引用的旧备份，再决定是否中止。
+    if reserved_usage(root_path()) > reserved_quota():
+        prune_reserved(root_path())
+        if reserved_usage(root_path()) > reserved_quota():
+            raise UploadTooLarge("插件备份区超过独立配额；已清理无引用备份仍不足，请检查 .backups 与 .quarantine")
     return str(destination)
 
 
@@ -150,12 +258,13 @@ def install(data: bytes, user, *, upgrade_id=None):
         if upgrade_id and pid != upgrade_id:
             raise PluginError("PLUGIN_ID_MISMATCH", "升级包 id 与目标插件不一致")
         root = root_path()
-        if disk_usage(root) + sum(map(len, verified.files.values())) > settings.plugin_disk_quota_bytes:
+        # 配额只管插件代码：备份与隔离区涨满时不应该让插件装不进去。
+        if code_usage(root) + sum(map(len, verified.files.values())) > settings.plugin_disk_quota_bytes:
             raise UploadTooLarge("插件存储配额不足")
         staging = root / ".staging" / attempt_id
         verified.extract(staging)
         with installation_lock(pid):
-            if disk_usage(root) > settings.plugin_disk_quota_bytes:
+            if code_usage(root) > settings.plugin_disk_quota_bytes:
                 raise UploadTooLarge("插件存储配额不足")
             with SessionLocal() as db:
                 old = db.get(PluginRegistry, pid)

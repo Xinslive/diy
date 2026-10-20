@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
+from datetime import date, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy import MetaData, Table, select
+from sqlalchemy import MetaData, Table, func, select
 from app.core.db import SessionLocal
 from app.core.deps import WRITE_ROLES, get_my_book, require_book_write
 from app.models.book import Book
@@ -27,6 +29,89 @@ def request_user(db, pid):
         raise HTTPException(401, "用户已停用")
     require_plugin_access(db, pid, user, generation=value[2])
     return user
+
+
+#: 受限过滤 DSL 支持的操作符。刻意没有「原始表达式」这一类入口。
+FILTER_OPERATORS = ("eq", "ne", "lt", "lte", "gt", "gte", "in", "like", "is_null")
+#: 过滤值允许的标量类型：插件只能按值过滤，不能拼 SQL。
+FILTER_SCALARS = (str, int, float, bool, Decimal, datetime, date)
+
+
+def _filter_scalar(value):
+    if value is None or isinstance(value, FILTER_SCALARS):
+        return value
+    raise HTTPException(400, "插件过滤值只能是标量")
+
+
+def _filter_clauses(table, where):
+    """把 ``where`` 翻译成 SQLAlchemy 条件。
+
+    字段必须是本表真实列，值只能是标量；账套范围由调用方另行附加，
+    过滤条件**改不掉**它。
+    """
+    if where is None:
+        return []
+    if not isinstance(where, dict):
+        raise HTTPException(400, "插件过滤条件必须是对象")
+    clauses = []
+    for field, condition in where.items():
+        if not isinstance(field, str) or field not in table.c:
+            raise HTTPException(400, "插件过滤字段不存在")
+        column = table.c[field]
+        if isinstance(condition, dict):
+            if not condition:
+                raise HTTPException(400, "插件过滤条件不能为空")
+            for operator, operand in condition.items():
+                if operator not in FILTER_OPERATORS:
+                    raise HTTPException(400, "插件过滤操作符不受支持")
+                if operator == "in":
+                    if not isinstance(operand, (list, tuple)) or not operand or len(operand) > 200:
+                        raise HTTPException(400, "插件过滤集合无效")
+                    clauses.append(column.in_([_filter_scalar(item) for item in operand]))
+                elif operator == "like":
+                    if not isinstance(operand, str) or len(operand) > 200:
+                        raise HTTPException(400, "插件模糊匹配条件无效")
+                    clauses.append(column.like(operand))
+                elif operator == "is_null":
+                    if not isinstance(operand, bool):
+                        raise HTTPException(400, "插件空值判断条件无效")
+                    clauses.append(column.is_(None) if operand else column.isnot(None))
+                elif operator == "ne":
+                    clauses.append(column != _filter_scalar(operand))
+                elif operator == "lt":
+                    clauses.append(column < _filter_scalar(operand))
+                elif operator == "lte":
+                    clauses.append(column <= _filter_scalar(operand))
+                elif operator == "gt":
+                    clauses.append(column > _filter_scalar(operand))
+                elif operator == "gte":
+                    clauses.append(column >= _filter_scalar(operand))
+                else:
+                    clauses.append(column == _filter_scalar(operand))
+        else:
+            clauses.append(column == _filter_scalar(condition))
+    return clauses
+
+
+def _order_clauses(table, order_by):
+    if order_by is None:
+        return list(table.primary_key.columns)
+    if isinstance(order_by, str):
+        order_by = [order_by]
+    if not isinstance(order_by, (list, tuple)) or not order_by:
+        raise HTTPException(400, "插件排序字段无效")
+    columns = []
+    for item in order_by:
+        if not isinstance(item, str):
+            raise HTTPException(400, "插件排序字段无效")
+        field, _, direction = item.strip().partition(" ")
+        if field not in table.c:
+            raise HTTPException(400, "插件排序字段不存在")
+        direction = (direction or "asc").strip().lower()
+        if direction not in {"asc", "desc"}:
+            raise HTTPException(400, "插件排序方向无效")
+        columns.append(table.c[field].desc() if direction == "desc" else table.c[field].asc())
+    return columns
 
 
 
@@ -195,15 +280,45 @@ def context_for(manifest):
         table = Table(name, MetaData(), autoload_with=db.connection(), schema="public")
         return table
 
-    def data_read(name: str, *, book_id=None, limit=100):
+    def data_read(name: str, *, book_id=None, limit=100, offset=0, where=None, order_by=None):
+        """读插件自有表的一页。
+
+        旧契约只有「按主键顺序 + 最多 500 行」，长期运行的插件只能把整表读进
+        内存自己过滤。这里补上**受限过滤**、**分页**和**计数**：
+
+        - ``where``：``{"字段": 值}`` 或 ``{"字段": {"gte": 值}}``。字段必须是
+          本表真实列，值只能是标量 —— 没有任何拼 SQL 的入口。
+        - ``offset``/``limit``：分页；``limit`` 仍然夹在 1..500。
+        - ``order_by``：``"字段"`` 或 ``"字段 desc"``，默认按主键。
+
+        账套范围（book scope）永远由宿主附加，过滤条件改不掉它。
+        返回值仍是行列表 —— 与旧契约一致，新增能力都是可选参数。
+        """
         with SessionLocal() as db:
             user = principal(db)
             table = table_access(db, user, name, book_id)
             stmt = select(table)
             if declarations[name] == "book":
                 stmt = stmt.where(table.c.book_id == book_id)
-            stmt = stmt.order_by(*table.primary_key.columns).limit(max(1, min(int(limit), 500)))
+            stmt = stmt.where(*_filter_clauses(table, where))
+            stmt = stmt.order_by(*_order_clauses(table, order_by))
+            stmt = stmt.offset(max(0, int(offset))).limit(max(1, min(int(limit), 500)))
             return [dict(row) for row in db.execute(stmt).mappings()]
+
+    def data_count(name: str, *, book_id=None, where=None):
+        """符合条件的行数。
+
+        与 :func:`data_read` 用同一套受限过滤条件；单独提供而不是把
+        ``data.read`` 的返回值改成字典，是为了不破坏既有插件的调用契约。
+        """
+        with SessionLocal() as db:
+            user = principal(db)
+            table = table_access(db, user, name, book_id)
+            stmt = select(func.count()).select_from(table)
+            if declarations[name] == "book":
+                stmt = stmt.where(table.c.book_id == book_id)
+            stmt = stmt.where(*_filter_clauses(table, where))
+            return int(db.scalar(stmt) or 0)
 
     def data_insert(name: str, values: dict, *, book_id=None):
         with SessionLocal.begin() as db:
@@ -287,7 +402,8 @@ def context_for(manifest):
     if "plugin_data:rw" in permissions:
         from app.plugins.configuration import service as configuration_service
         exposed["config"] = configuration_service(manifest, principal)
-        exposed["data"] = SimpleNamespace(read=data_read, insert=data_insert, update=data_update, delete=data_delete)
+        exposed["data"] = SimpleNamespace(read=data_read, count=data_count, insert=data_insert,
+                                          update=data_update, delete=data_delete)
     if "settings:rw" in permissions:
         exposed["settings"] = SimpleNamespace(get=setting_get, put=setting_put)
     if "import:rw" in permissions:

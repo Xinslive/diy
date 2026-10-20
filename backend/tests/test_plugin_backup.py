@@ -49,8 +49,19 @@ def test_v2_real_roundtrip_and_live_metadata_drift(plugin_env, admin_user, book,
         assert conn.scalar(text(f'SELECT label FROM "{name}"')) == '保留的插件账套数据'
     with engine.begin() as conn:
         conn.execute(text(f'ALTER TABLE "{name}" ADD COLUMN drift TEXT'))
-    with SessionLocal() as db, pytest.raises(ExportRefused):
+    # 一个插件的表漂移**不再让整轮备份失败**（分域隔离）：导出降级继续，
+    # 归档头里留下这条漂移记录 —— 数据没有被静默省略，运维看得见少了谁。
+    with SessionLocal() as db:
         export_scope(db, scope=SCOPE_BOOK, book_id=book.id, book_label=book.name, out_path=tmp_path / 'drift.gz')
+    drift = read_snapshot(tmp_path / 'drift.gz')
+    assert drift['header']['version'] == 2
+    assert drift['header']['plugins'][0]['drifted'] is True
+    assert drift['header']['plugins'][0]['error_code'] == 'TABLE_METADATA_MISMATCH'
+    assert drift['header']['plugins'][0]['tables'] == []
+    assert name not in drift['tables']
+    # 但这份归档**不能恢复**：它缺了漂移插件的数据，写入前必须拒绝。
+    with SessionLocal() as db, pytest.raises(ExportRefused, match="插件结构核验失败"):
+        restore(db, tmp_path / 'drift.gz')
 
 
 @pytest.mark.parametrize('mutation', ['digest', 'version', 'migration_head', 'unknown', 'metadata', 'scope', 'missing_table', 'v1'])

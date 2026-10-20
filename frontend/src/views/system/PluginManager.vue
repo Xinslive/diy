@@ -5,7 +5,7 @@
   <div class="page">
     <div class="heading">
       <div><h2>扩展管理</h2><p>安装、运行状态和使用授权分别管理。安装后需重启服务，且默认没有可使用的用户。</p></div>
-      <div class="tools"><el-button :loading="loading" @click="load">刷新状态</el-button><el-button type="primary" :disabled="!enabled || busy" @click="chooseFile()">安装扩展</el-button></div>
+      <div class="tools"><el-button :loading="loading" @click="load">刷新状态</el-button><el-button :loading="busy" @click="openDiagnostics">恢复 / 诊断</el-button><el-button type="primary" :disabled="!enabled || busy" @click="chooseFile()">安装扩展</el-button></div>
     </div>
     <el-alert v-if="!enabled" title="扩展平台未开启。请由运维配置受信任签名公钥及运行目录，再开启 PLUGIN_ENABLED 并重启服务。" type="info" :closable="false" show-icon />
     <el-alert v-else title="扩展在服务进程内运行。只安装经审查、由受信任发布者签名的代码；签名与扫描不能隔离恶意代码。" type="warning" :closable="false" show-icon />
@@ -38,6 +38,30 @@
       </el-table>
       <p class="muted">卸载保留业务表。升级、卸载与清理前会生成并校验备份；恢复操作由运维按对应版本执行。</p>
     </el-dialog>
+
+    <!-- 恢复 / 诊断：安装中断后的现场、安装尝试记录、备份区清理与密钥封禁。 -->
+    <el-dialog v-model="diagDialog" title="恢复 / 诊断" width="820px" destroy-on-close>
+      <p class="muted">「恢复」会处理安装中断留下的现场：已提交迁移的继续完成，未提交的隔离保留证据。正在运行的插件代码不会被远程停掉。</p>
+      <div class="row-tools">
+        <el-button size="small" :loading="diagBusy" @click="reconcile">执行恢复</el-button>
+        <el-button size="small" :loading="diagBusy" @click="loadAttempts">刷新尝试记录</el-button>
+        <el-button size="small" :loading="diagBusy" @click="pruneBackups">清理备份与隔离区</el-button>
+      </div>
+      <el-alert v-if="diagMessage" :title="diagMessage" type="info" :closable="false" show-icon class="diag-alert" />
+      <el-table v-loading="diagLoading" :data="attempts" row-key="attempt_id" empty-text="没有安装尝试记录" class="attempt-table">
+        <el-table-column prop="plugin_id" label="扩展" min-width="180" />
+        <el-table-column prop="operation" label="操作" width="80" />
+        <el-table-column prop="status" label="状态" width="110" />
+        <el-table-column label="错误码" min-width="150"><template #default="{ row }">{{ row.error_code || '—' }}</template></el-table-column>
+        <el-table-column prop="created_at" label="时间" min-width="180" />
+      </el-table>
+      <el-divider content-position="left">签名密钥封禁</el-divider>
+      <p class="muted">撤销后，这把密钥签发的新包装不进来，已安装的插件在下次重启 worker 时也会被拒绝加载。运行中的代码需要重启才会停。</p>
+      <div class="row-tools">
+        <el-input v-model="revokeKeyId" placeholder="密钥标识（key_id）" style="max-width: 260px" />
+        <el-button size="small" type="danger" plain :loading="diagBusy" :disabled="!revokeKeyId" @click="revokeKey">封禁并停用</el-button>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -45,12 +69,15 @@
 import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as api from '@/plugins/api'
+import { http } from '@/api/client'
 
 const plugins = ref([]), enabled = ref(false), loading = ref(false), busy = ref(false)
 const fileInput = ref(null), upgradeTarget = ref(null), target = ref(null)
 const usersDialog = ref(false), usersLoading = ref(false), eligible = ref([]), selected = reactive(new Map())
 const query = ref(''), page = ref(1), total = ref(0)
 const tablesDialog = ref(false), tablesLoading = ref(false), tableRows = ref([]), backupPath = ref('')
+const diagDialog = ref(false), diagBusy = ref(false), diagLoading = ref(false), diagMessage = ref('')
+const attempts = ref([]), revokeKeyId = ref('')
 const labels = { READY: '可用', DISABLED: '已禁用', PENDING_RESTART: '等待重启', LOADING: '正在加载', FAILED: '加载失败', ORPHANED: '需要检查' }
 const statusLabel = value => labels[value] || value
 const statusType = row => row.runtime_status === 'READY' ? 'success' : ['FAILED', 'ORPHANED'].includes(row.runtime_status) ? 'danger' : 'info'
@@ -108,6 +135,52 @@ async function cleanup(row) {
   try { await api.cleanupPlugin(row.id); ElMessage.success('已备份并清理保留表'); await load() } catch { /* 已显示请求错误 */ }
   finally { busy.value = false }
 }
+
+// —— 恢复 / 诊断 ——
+// 安装中断后管理员需要三件事：把现场处理掉、看清每次安装尝试的结果、
+// 把不再被引用的备份与隔离目录清掉。管理接口在 /api/system/plugins/* 下。
+async function openDiagnostics() {
+  diagDialog.value = true
+  diagMessage.value = ''
+  await loadAttempts()
+}
+async function loadAttempts() {
+  diagLoading.value = true
+  try { attempts.value = (await http.get('/system/plugins/attempts')).data.attempts } catch { attempts.value = [] }
+  finally { diagLoading.value = false }
+}
+async function reconcile() {
+  diagBusy.value = true
+  try {
+    const result = (await http.post('/system/plugins/reconcile')).data
+    const done = (result.completed || []).length, held = (result.quarantined || []).length, bad = (result.unavailable || []).length
+    diagMessage.value = `恢复完成：向前完成 ${done} 项，隔离保留 ${held} 项，仍需人工处理 ${bad} 项。`
+    ElMessage.success('恢复已执行')
+    await loadAttempts()
+    await load()
+  } catch { /* 已显示请求错误 */ }
+  finally { diagBusy.value = false }
+}
+async function pruneBackups() {
+  diagBusy.value = true
+  try {
+    const result = (await http.post('/system/plugins/maintenance/prune', { force: true })).data
+    diagMessage.value = `已清理 ${result.removed.length} 个不再被引用的备份或隔离目录。`
+    ElMessage.success('备份区已清理')
+  } catch { /* 已显示请求错误 */ }
+  finally { diagBusy.value = false }
+}
+async function revokeKey() {
+  diagBusy.value = true
+  try {
+    const result = (await http.post('/system/plugins/revoke-key', { key_id: revokeKeyId.value.trim() })).data
+    revokeKeyId.value = ''
+    diagMessage.value = `密钥 ${result.key_id} 已封禁；受影响的扩展：${result.disabled_plugins.join('、') || '无'}。请重启全部 worker 让停用生效。`
+    ElMessage.success('密钥已封禁')
+    await load()
+  } catch { /* 已显示请求错误 */ }
+  finally { diagBusy.value = false }
+}
 let timer
 onMounted(() => { void load(); timer = setInterval(() => { if (!busy.value) void load() }, 15000) })
 onUnmounted(() => clearInterval(timer))
@@ -121,4 +194,5 @@ h2 { margin: 0 0 8px; } p { color: var(--el-text-color-secondary); line-height: 
 .digest, .error-code, .metadata { font-family: ui-monospace, monospace; } .error-code { color: var(--el-color-danger); font-size: 12px; margin-top: 5px; }
 .selected-users { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 20px; } .el-pagination { margin-top: 16px; }
 .metadata { white-space: pre-wrap; max-height: 320px; overflow: auto; padding: 16px; font-size: 12px; } .backup-path { overflow-wrap: anywhere; }
+.attempt-table { margin-top: 14px; } .diag-alert { margin-top: 14px; }
 </style>

@@ -109,10 +109,14 @@ def _with_body_payload(endpoint, path=None, methods=None):
 
     dict_params = [p for p in body_params if _is_dict_annotation(p.annotation)]
     new_params = list(head)
+    carrier_required = False
     if dict_params:
         # 第一个 ``dict`` 参数就是整个请求体：既是文档里的 ``def save_note(payload:
         # dict)``，也是 ``def save_rule(book_id: int, payload: dict)`` 里 payload 的本意。
         carrier = dict_params[0].name
+        # 载体形参自己也是「必填」的：原签名没给默认值，就意味着调用方必须给整个
+        # 请求体。少了它时给中文 422，而不是把 None 塞进插件函数让它在半路炸成 500。
+        carrier_required = dict_params[0].default is pyinspect.Parameter.empty
         new_params.append(dict_params[0].replace(default=Body(default=None)))
         rest = [p for p in body_params if p.name != carrier]
     else:
@@ -145,6 +149,10 @@ def _with_body_payload(endpoint, path=None, methods=None):
     @wraps(endpoint)
     def wrapper(*args, **kwargs):
         raw = kwargs.get(carrier)
+        if carrier_required and (not isinstance(raw, dict) or not raw):
+            # 载体是必填形参：缺 body（或 body 不是对象）是调用方的错，给 422，
+            # 不让插件在函数内部炸成 PLUGIN_EXECUTION_FAILED(500)。
+            raise HTTPException(422, "缺少请求体：%s" % carrier)
         body = raw if isinstance(raw, dict) else {}
         call = {param.name: kwargs.get(param.name) for param in head}
         for param in body_params:
@@ -207,8 +215,14 @@ class Registrar:
     def post(self, path, endpoint):
         self.add(path, endpoint, ["POST"])
 
-    def route(self, router, *, namespace):
-        if namespace != self._plugin_id or not isinstance(router, APIRouter) or router.on_startup or router.on_shutdown or router.dependencies:
+    def route(self, router, *, namespace=None):
+        """把插件自己组装好的 router 挂到宿主命名空间下。
+
+        ``namespace`` 可以省略：Registrar 知道自己的插件 id，默认就用它。
+        显式传入且不等于插件 id 时拒绝 —— 插件只能往自己的命名空间里挂路由。
+        """
+        expected = self._plugin_id if namespace is None else namespace
+        if expected != self._plugin_id or not isinstance(router, APIRouter) or router.on_startup or router.on_shutdown or router.dependencies:
             raise PluginError("INVALID_PLUGIN_ROUTER", "插件只能提交无生命周期/依赖的命名空间 router")
         for route in router.routes:
             if not isinstance(route, APIRoute) or route.dependencies or route.callbacks:

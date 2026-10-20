@@ -1,14 +1,26 @@
-"""安装前的包完整性及明显危险代码检查。静态扫描不是沙箱。"""
+"""安装前的包完整性及明显危险代码检查。静态扫描不是沙箱。
+
+扫描策略是**能力面收敛**：只允许 :mod:`app.plugins.scan_policy` 里列出的模块
+import，其余一律拒绝；并按「Name 引用形态」「Subscript 调用形态」「属性访问
+形态」判定危险的内建能力。黑名单是无穷枚举，已核实至少漏 18 个等价入口，
+详见 scan_policy 的模块说明。
+
+签名校验的撤销名单在**安装期和加载期都生效**：``historical`` 只放行
+``plugin_historical_keys``（历史包继续可校验），``plugin_revoked_keys`` 与运行时
+封禁名单一律拒绝。
+"""
 from __future__ import annotations
 
 import ast
 import base64
 import hashlib
+import hmac
 import io
 import json
 import os
 import re
 import stat
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,12 +32,20 @@ from app.core.config import settings
 from app.core.uploads import RowBudget, UploadTooLarge, check_archive_size
 from app.plugins.errors import PluginError
 from app.plugins.manifest import canonical_payload, parse_manifest, plugin_digest, safe_path
+from app.plugins.scan_policy import (
+    BACKEND_MODULES,
+    DENIED_ATTRIBUTES,
+    DENIED_NAMES_ON_CALL,
+    DENIED_NAMES_ON_LOAD,
+    MIGRATION_MODULES,
+)
 
 TEXT_TYPES = {".py", ".js", ".json", ".css", ".sql", ".md", ".txt"}
 IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".webp"}
-BAD_IMPORTS = {"subprocess", "socket", "ctypes", "pickle", "marshal", "shelve", "dill", "multiprocessing", "importlib", "builtins", "os", "sys", "shutil", "pathlib", "urllib", "requests", "http", "psycopg"}
-BAD_CALLS = {"eval", "exec", "compile", "__import__", "open", "getattr", "setattr", "delattr", "globals", "locals", "breakpoint", "input"}
-BAD_ATTRIBUTES = {"write", "write_text", "write_bytes", "unlink", "rmdir", "mkdir", "system", "popen", "connect", "load_library", "autocommit_block", "execution_options", "commit", "rollback"}
+#: 插件前端资产的签名票据前缀（URL 路径段，见 :func:`asset_token`）。
+ASSET_TICKET_SEGMENT = "_t"
+#: 资产票据默认有效期（秒）。票据只覆盖「一个已安装包的静态资产」。
+ASSET_TICKET_TTL = 3600
 
 
 @dataclass
@@ -77,14 +97,67 @@ def trusted_keys() -> dict:
         raise PluginError("INVALID_TRUST_CONFIGURATION", "插件可信密钥配置错误", 503) from exc
 
 
+def _runtime_revoked_keys() -> set[str]:
+    """运行时封禁名单：``plugin_root/.revoked-keys``（管理动作写，一行一个 key_id）。
+
+    与 ``PLUGIN_REVOKED_KEYS`` 环境变量并存：环境变量要改配置并重启，这份名单
+    由管理接口当场写入，**当次生效**。两条路径都在安装期和加载期判定。
+    """
+    try:
+        root = Path(settings.plugin_root).absolute()
+        path = root / ".revoked-keys"
+        if path.is_symlink() or not path.is_file():
+            return set()
+        return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+    except (OSError, UnicodeError):
+        return set()
+
+
+def revoked_key_ids() -> set[str]:
+    ids = {k.strip() for k in settings.plugin_revoked_keys.split(",") if k.strip()}
+    return ids | _runtime_revoked_keys()
+
+
+def historical_key_ids() -> set[str]:
+    return {k.strip() for k in settings.plugin_historical_keys.split(",") if k.strip()}
+
+
+def add_revoked_key(key_id: str) -> set[str]:
+    """把 key_id 写进运行时封禁名单，返回封禁后的完整名单。"""
+    from app.plugins.installer import root_path
+    key_id = key_id.strip()
+    if not key_id or len(key_id) > 64 or not re.fullmatch(r"[A-Za-z0-9._-]+", key_id):
+        raise PluginError("INVALID_KEY_ID", "签名密钥标识无效")
+    root = root_path()
+    path = root / ".revoked-keys"
+    current = _runtime_revoked_keys()
+    current.add(key_id)
+    payload = "".join(sorted(current)) + "\n"
+    temporary = root / ".revoked-keys.tmp"
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    path.chmod(0o600)
+    return current
+
+
 def verify_signature(manifest: dict, keys=None, *, historical=False):
+    """校验插件签名。
+
+    ``historical=True`` 只放行 ``plugin_historical_keys``（历史包保留校验公钥），
+    **不再跳过撤销判定**：撤销名单在安装期与加载期一律拒绝。
+    """
     keys = trusted_keys() if keys is None else keys
     sig = manifest["signature"]
     key = keys.get(sig["key_id"])
-    revoked = {k.strip() for k in settings.plugin_revoked_keys.split(",") if k.strip()}
-    historical_ids = {k.strip() for k in settings.plugin_historical_keys.split(",") if k.strip()}
-    if key is None or (not historical and (sig["key_id"] in revoked or sig["key_id"] in historical_ids)):
-        raise PluginError("UNTRUSTED_SIGNATURE", "签名密钥不受信任或已撤销")
+    if key is None:
+        raise PluginError("UNTRUSTED_SIGNATURE", "签名密钥不受信任")
+    if sig["key_id"] in revoked_key_ids():
+        raise PluginError("KEY_REVOKED", "签名密钥已撤销，插件不再被信任")
+    if not historical and sig["key_id"] in historical_key_ids():
+        raise PluginError("UNTRUSTED_SIGNATURE", "签名密钥不受信任")
     try:
         public = Ed25519PublicKey.from_public_bytes(base64.b64decode(key, validate=True))
         public.verify(base64.b64decode(sig["value"], validate=True), canonical_payload(manifest))
@@ -92,7 +165,92 @@ def verify_signature(manifest: dict, keys=None, *, historical=False):
         raise PluginError("INVALID_SIGNATURE", "插件签名校验失败") from exc
 
 
-def scan_file(path: str, data: bytes) -> list[dict]:
+def _rules_for(path: str) -> dict:
+    normalized = path.replace("\\", "/")
+    rules = dict(BACKEND_MODULES)
+    if normalized.startswith("migrations/"):
+        rules.update(MIGRATION_MODULES)
+    return rules
+
+
+def _scan_python(path: str, tree: ast.AST, permissions) -> list[dict]:
+    findings: list[dict] = []
+    rules = _rules_for(path)
+    granted = set(permissions or ())
+    bindings: dict[str, tuple] = {}
+
+    def finding(rule, line):
+        findings.append({"file": path, "line": line, "rule": rule})
+
+    # 第一遍：收集 import。必须先收齐再判定属性访问 —— 名字在 Python 里是
+    # 作用域绑定，不是按出现顺序解析的；只按遍历顺序绑定会让「先使用、
+    # 后 import」的写法绕过检查。
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                rule = rules.get(alias.name)
+                if rule is None:
+                    # 不在白名单：不管它是不是「危险模块」，一律拒绝。
+                    finding("PY_IMPORT", node.lineno)
+                    continue
+                if rule.symbols is not None:
+                    # 受限模块必须逐个 from-import 受控符号，裸 import 会拿到整个命名空间。
+                    finding("PY_IMPORT", node.lineno)
+                    continue
+                if rule.requires_any and not granted.intersection(rule.requires_any):
+                    finding("PY_IMPORT", node.lineno)
+                    continue
+                bindings[alias.asname or alias.name.split(".")[0]] = (rule, None)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                # 相对导入：插件包内也没有可导入的兄弟模块。
+                finding("PY_IMPORT", node.lineno)
+                continue
+            rule = rules.get(node.module or "")
+            if rule is None:
+                finding("PY_IMPORT", node.lineno)
+                continue
+            if rule.requires_any and not granted.intersection(rule.requires_any):
+                finding("PY_IMPORT", node.lineno)
+                continue
+            for alias in node.names:
+                name = alias.name
+                if name == "*" or name in rule.denied:
+                    finding("PY_IMPORT", node.lineno)
+                    continue
+                if rule.symbols is not None and name not in rule.symbols:
+                    finding("PY_IMPORT", node.lineno)
+                    continue
+                bindings[alias.asname or name] = (rule, name)
+
+    # 第二遍：危险形态。
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("__"):
+                finding("PY_REFLECTION", node.lineno)
+                continue
+            if node.attr in DENIED_ATTRIBUTES:
+                finding("PY_ATTRIBUTE", node.lineno)
+                continue
+            base = node.value
+            if isinstance(base, ast.Name) and base.id in bindings:
+                rule, symbol = bindings[base.id]
+                if rule.denies(symbol, node.attr):
+                    finding("PY_ATTRIBUTE", node.lineno)
+        elif isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Load) and node.id in DENIED_NAMES_ON_LOAD:
+                # 「取名后调用」的第一环：imp = __import__ / e = eval / f = open。
+                finding("PY_CALL", node.lineno)
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Subscript):
+                # func["eval"](...)：下标取函数一律拒绝。
+                finding("PY_SUBSCRIPT", node.lineno)
+            elif isinstance(node.func, ast.Name) and node.func.id in DENIED_NAMES_ON_CALL:
+                finding("PY_CALL", node.lineno)
+    return findings
+
+
+def scan_file(path: str, data: bytes, *, permissions=None) -> list[dict]:
     suffix = Path(path).suffix.lower()
     findings = []
     def finding(rule, line=1):
@@ -120,18 +278,7 @@ def scan_file(path: str, data: bytes) -> list[dict]:
         except (SyntaxError, RecursionError):
             finding("PY_SYNTAX")
             return findings
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                names = [n.name for n in node.names] if isinstance(node, ast.Import) else [node.module or ""]
-                if any(n.split(".")[0] in BAD_IMPORTS or n == "app" or n.startswith("app.") for n in names):
-                    finding("PY_IMPORT", node.lineno)
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in BAD_CALLS:
-                    finding("PY_CALL", node.lineno)
-                if isinstance(node.func, ast.Attribute) and node.func.attr in BAD_ATTRIBUTES:
-                    finding("PY_CALL", node.lineno)
-            if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
-                finding("PY_REFLECTION", node.lineno)
+        findings.extend(_scan_python(path, tree, permissions))
     elif suffix in {".js", ".css", ".sql"}:
         patterns = {
             ".js": [(r"\b(?:eval\s*\(|(?:new\s+)?Function\s*\(|import\s*\(|import\s+|export\s+[^;]*?\sfrom\s|require\s*\(|WebSocket\s*\(|Worker\s*\()", "JS_DYNAMIC_CODE"),
@@ -191,7 +338,9 @@ def verify_archive(data: bytes, *, keys=None) -> VerifiedPackage:
         if len(content) != item["size"] or hashlib.sha256(content).hexdigest() != item["sha256"]:
             raise PluginError("FILE_DIGEST_MISMATCH", "插件文件完整性校验失败")
     verify_signature(manifest, keys)
-    findings = [finding for path, content in files.items() for finding in scan_file(path, content)]
+    permissions = manifest.get("permissions")
+    findings = [finding for path, content in files.items()
+                for finding in scan_file(path, content, permissions=permissions)]
     if findings:
         raise PluginError("STATIC_SCAN_REJECTED", "插件包含不允许的代码或资源", findings=findings)
     return VerifiedPackage(manifest, plugin_digest(manifest), files, hashlib.sha256(data).hexdigest())
@@ -206,6 +355,7 @@ def verify_directory(directory: Path, expected_digest: str, *, keys=None) -> Ver
     manifest = parse_manifest(manifest_path.read_bytes())
     if plugin_digest(manifest) != expected_digest:
         raise PluginError("FILE_DIGEST_MISMATCH", "插件目录 digest 不一致")
+    # historical 只放行历史密钥；**撤销的密钥在这里同样被拒绝** —— 加载期必须查撤销名单。
     verify_signature(manifest, keys, historical=True)
     files = {}
     actual = set()
@@ -228,3 +378,36 @@ def verify_directory(directory: Path, expected_digest: str, *, keys=None) -> Ver
             raise PluginError("FILE_DIGEST_MISMATCH", "插件目录文件被修改")
         files[item["path"]] = content
     return VerifiedPackage(manifest, expected_digest, files)
+
+
+def _ticket_key() -> bytes:
+    secret = settings.jwt_secret or ""
+    return hashlib.sha256(("cwq.plugin.asset." + secret).encode()).digest()
+
+
+def asset_token(plugin_id: str, digest: str, *, ttl: int = ASSET_TICKET_TTL) -> str:
+    """给「一个已安装包的静态资产」签发短期票据。
+
+    浏览器原生 ``import()`` 不带 Authorization 头（前端契约不允许把令牌放进
+    URL），所以插件前端资源不能走 Bearer。折中办法是发一张**只覆盖该包静态
+    资产**的短期票据，随 manifest 一起交给已登录用户；没有票据的匿名请求一律
+    401。票据不含用户身份，泄露也只等于读到那一份已签名、可公开的静态文件。
+    """
+    expires = int(time.time()) + max(60, int(ttl))
+    payload = f"{plugin_id}|{digest}|{expires}"
+    signature = hmac.new(_ticket_key(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{expires}.{signature}"
+
+
+def verify_asset_token(plugin_id: str, digest: str, token: str) -> bool:
+    if not token or not isinstance(token, str):
+        return False
+    expires_text, _, signature = token.partition(".")
+    if not signature or not expires_text.isdigit():
+        return False
+    expires = int(expires_text)
+    if expires < int(time.time()):
+        return False
+    payload = f"{plugin_id}|{digest}|{expires}"
+    expected = hmac.new(_ticket_key(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)

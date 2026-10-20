@@ -138,6 +138,10 @@ def register(registrar, ctx):
 | `registrar.hook(name, handler)` | 注册已声明的 hook |
 | `registrar.task(name, handler)` | 注册 manifest 声明的同步定时任务 |
 
+`registrar.route(router)` 直接可用：`Registrar` 知道自己的插件 id，默认就用它作为命名空间。也可以显式写 `registrar.route(router, namespace="<插件 id>")`；传入的 `namespace` 与插件自己的 id 不一致时会被拒绝。router 必须是 `fastapi.APIRouter`，且不能带生命周期回调、依赖或自定义依赖项。
+
+POST 处理函数按请求体收字段：签名里第一个 `dict` 形参就是整个请求体（`def save_note(payload: dict)`），其余标量形参仍可从查询串或请求体的同名字段取。**请求体是必填的**：载体形参没有默认值时，调用方必须给出 JSON 对象；缺 body 或 body 为空对象一律返回 `422`（`{"detail": "缺少请求体：payload"}`），不会把 `None` 塞进插件函数让它变成 500。
+
 `ctx` 的能力由 manifest 决定。handler 内部使用普通类型、字典和宿主支持的上传对象；不要依赖宿主的 FastAPI app、Request、Response、Session 或 WebSocket。
 
 凭证写入有两种事务语义：`voucher_create` 每次调用单独提交；`voucher_batch_create` 把整批放在同一个事务里，任意一张失败时整批回滚。需要文件、人工预览、幂等和来源追溯时，使用 `import:rw` 的导入流程，不要循环调用单张创建。
@@ -149,9 +153,45 @@ rows = ctx.data.read(TABLE, book_id=book_id, limit=100)
 created = ctx.data.insert(TABLE, {"label": "月末检查"}, book_id=book_id)
 changed = ctx.data.update(TABLE, row_id, {"label": "已完成"}, book_id=book_id)
 removed = ctx.data.delete(TABLE, row_id, book_id=book_id)
+total = ctx.data.count(TABLE, book_id=book_id, where={"label": "已完成"})
 ```
 
 `data.read` 最多返回 500 行；`update` 和 `delete` 要求表有 `id` 主键，不能修改 `id` 或 `book_id`。这些助手彼此不提供跨调用事务；跨步骤的文件导入应使用宿主导入服务。
+
+### 读表的过滤、分页与计数
+
+`data.read` 支持受限过滤、分页和计数，插件不必把整表读进内存自己筛：
+
+```python
+# 等值过滤
+ctx.data.read(TABLE, book_id=book_id, where={"label": "已完成"})
+# 比较操作符：eq / ne / lt / lte / gt / gte / in / like / is_null
+ctx.data.read(TABLE, book_id=book_id, where={"amount": {"gte": 100}})
+# 分页与排序（默认按主键）
+ctx.data.read(TABLE, book_id=book_id, limit=50, offset=100, order_by="id desc")
+# 计数
+ctx.data.count(TABLE, book_id=book_id, where={"label": "已完成"})
+```
+
+规则：过滤字段必须是本表真实列，值只能是标量；`in` 最多 200 个元素；没有任何拼 SQL 的入口。**账套范围永远由宿主附加**，过滤条件改不掉它。`data.count` 与 `data.read` 用同一套过滤条件；`data.read` 的返回值仍是行列表（旧契约不变），计数单独走 `data.count`。
+
+### 导入白名单
+
+安装时的静态扫描按**白名单**收敛插件的 import：只有下列模块可以 import，其余一律拒绝安装。
+
+| 用途 | 允许的模块 |
+|---|---|
+| 纯计算与容器 | `abc`、`collections`、`collections.abc`、`contextlib`、`csv`、`dataclasses`、`datetime`、`decimal`、`difflib`、`enum`、`fractions`、`functools`、`itertools`、`json`、`math`、`operator`、`re`、`statistics`、`string`、`textwrap`、`typing`、`unicodedata`、`uuid` |
+| 内存缓冲 | `io`（`BytesIO`/`StringIO`；`io.open` 会被属性规则拒绝） |
+| 框架类型 | `fastapi` 的 `HTTPException`、`File`、`UploadFile`、`Form`、`Body`、`Query`、`APIRouter`、`status` |
+| 用户上传的 xlsx | `openpyxl.load_workbook`（需声明 `upload:read` 或 `import:rw`） |
+| 插件迁移 | `alembic.op`、`sqlalchemy` 的列类型构造器、`sqlalchemy.dialects.postgresql` 的 `JSONB` 等 |
+
+同时被拒绝的形态：非白名单模块 import、相对 import、`import *`；`eval`/`exec`/`compile`/`__import__`/`getattr`/`setattr`/`delattr`/`globals`/`locals`/`open` 的**任何引用**（不只是调用）；`input`/`breakpoint`/`vars` 的调用；下标取函数（`func["eval"](...)`）；`posix.execv`、`pty.spawn` 这类危险属性访问；迁移里的 `op.execute`、`op.get_bind` 与 `sa.create_engine`。
+
+白名单是**第一道防线，不是沙箱**：它拦明显等价入口，不等价价（编码混淆、宿主依赖漏洞）仍可能绕过，插件与宿主同进程同权限。需要新模块时，由宿主评审后统一加入清单。
+
+清单的唯一事实来源是仓库里的 `backend/app/plugins/scan_policy.py`：每个允许的模块都写明了**为什么**允许（纯计算？内存缓冲？用户上传文件解析？），宿主据此评审新增项。
 
 ## 前端运行时
 
@@ -199,6 +239,43 @@ export default function createPlugin(host) {
 升级必须使用更高的插件版本。宿主会重新检查签名、迁移和已登记表结构；升级成功后插件通常保持禁用，启用新版本前需要再次重启。插件应通过新增 revision 迁移数据，不要依赖降级或重放旧 revision。
 
 卸载会撤销用户授权并隔离插件代码，但默认保留插件数据表，避免把业务数据和卸载操作绑在一起。删除表是独立的管理员操作，只有在确认不再需要数据并完成备份后才执行。
+
+## 管理 API
+
+以下接口都属于管理员面（需要管理员登录；未登录 `401`，非管理员 `403`），路径前缀 `/api/system/plugins`。插件作者调试时可以对照这份清单。
+
+| 方法与路径 | 请求 | 返回要点 |
+|---|---|---|
+| `GET /api/system/plugins` | — | `{enabled, plugins[]}`：每个插件的版本、digest、期望状态、运行状态、错误码、迁移 head、表数量、备份路径与授权人数 |
+| `POST /api/system/plugins/install` | multipart：`file` | `{plugin_id, status, attempt_id}`；`status` 为 `pending_restart`（新装）或 `disabled`（升级后保持禁用） |
+| `POST /api/system/plugins/{id}/upgrade` | multipart：`file` | 同上；版本必须更高，否则 `409` |
+| `POST /api/system/plugins/{id}/enable` | — | `{status: "pending_restart", plugin_id}`；需重启全部 worker 才生效 |
+| `POST /api/system/plugins/{id}/disable` | — | 同上；停用后再重启，已加载的插件才会真正退出 |
+| `DELETE /api/system/plugins/{id}` | — | `{status: "orphaned", retained_tables[], backup_path}`；撤销授权、保留数据表、隔离代码 |
+| `GET /api/system/plugins/{id}/tables` | — | 表结构与行数、`backup_path` |
+| `POST /api/system/plugins/{id}/tables/cleanup` | `{confirmation: "<插件 id>"}` | `{status: "tables_removed", backup_path}`；只允许在保留表卸载后执行，确认串必须等于插件 id |
+| `GET /api/system/plugins/{id}/users` | — | 当前授权名单 |
+| `PUT /api/system/plugins/{id}/users` | `{user_ids: [...]}` | 全量替换授权名单 |
+| `POST /api/system/plugins/{id}/users/{user_id}` | — | 追加一个授权 |
+| `DELETE /api/system/plugins/{id}/users/{user_id}` | — | 撤销一个授权 |
+| `GET /api/system/plugins/eligible-users` | query：`query`、`page` | 可被授权的启用用户 |
+| `POST /api/system/plugins/reconcile` | — | `{completed[], quarantined[], unavailable[]}`：处理安装中断留下的现场 |
+| `GET /api/system/plugins/attempts` | — | 最近 50 次安装尝试：状态、错误码、迁移 head、digest 与备份路径 |
+| `POST /api/system/plugins/revoke-key` | `{key_id}` | `{status, key_id, revoked_keys[], disabled_plugins[], restart_required}`：封禁签名密钥并停用受影响的插件 |
+| `POST /api/system/plugins/maintenance/prune` | `{force: bool}` | `{status, removed[]}`：清理不再被引用的备份与过期隔离目录 |
+| `GET /api/plugins/manifest` | — | 当前用户可用插件的清单与**带票据**的前端资产地址 |
+
+错误码以 `{"code": ..., "message": ...}` 返回。常见的有 `PLATFORM_DISABLED`（平台未开启）、`UNTRUSTED_SIGNATURE` / `KEY_REVOKED`（签名密钥不受信任或已撤销）、`STATIC_SCAN_REJECTED`（静态扫描拒绝，附 `findings` 列表）、`FILE_DIGEST_MISMATCH`（包或目录被改动）、`PLUGIN_ALREADY_EXISTS`、`DOWNGRADE_OR_REPLAY_REJECTED`、`PLUGIN_BUSY`（有未完成操作，稍后重试）、`DISABLE_AND_RESTART_REQUIRED`（必须先停用并重启全部 worker）。
+
+## 备份与恢复
+
+插件数据表与宿主数据一起备份。包含插件元数据或插件表的归档写为 v2（v1 仍可读）：归档头记录每个插件的 id、version、digest、迁移 head 和表结构。
+
+- **备份**：账套备份只含该账套的 book-scoped 插件表，系统备份只含 global 插件表。
+- **降级而不是整体失败**：某个插件的表结构漂移（被人工改过、被外部清理、跨版本恢复失败）时，备份**不会**让全部账套与系统备份一起失败；漂移的插件被跳过，并在归档头的 `plugins` 段留下一条带 `drifted: true` 与 `error_code` 的记录 —— 数据没有被静默省略，运维在归档里能看见少了谁。
+- **恢复**：含漂移记录的归档**不能恢复**（写入前拒绝），必须先修复漂移再重新备份。恢复还要求目标库已安装完全匹配的插件代码、迁移与表结构；未知插件、卸载状态和任何漂移都在写入前拒绝。
+- **备份前置**：升级、卸载与清理保留表之前，宿主会生成并校验一份备份（系统 + 全部账套）。备份写在插件运行目录的 `.backups/` 下，**不计入插件代码配额**，有独立额度与清理入口（`POST /api/system/plugins/maintenance/prune`）；仍被 registry 或未完成的安装尝试引用的备份一律不会被清理。
+- **资产**：插件前端资源由 `GET /api/plugins/assets/{插件 id}/{digest}/frontend/...` 提供，凭**短期票据**访问（票据随 `/api/plugins/manifest` 一起发给已登录用户），匿名请求返回 `401`。
 
 ## 运行时权限结果
 

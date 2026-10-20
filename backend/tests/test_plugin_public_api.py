@@ -270,3 +270,62 @@ def test_批量与科目能力不随权限漏出():
     ctx = context_for(manifest)
     assert not hasattr(ctx, 'subject_read')
     assert not hasattr(ctx, 'voucher_batch_create')
+
+
+def test_plugin_data_read_supports_filter_paging_and_count(plugin_env, client, auth, plain_auth, plain_user, book, db):
+    """过滤 + 分页 + count：插件不必把整表读进内存自己筛。"""
+    build, restart = plugin_env
+    pid = 'com.test.paged'
+    name = table_prefix(pid) + 'items'
+    code = f'''def register(registrar, ctx):
+    def rows(book_id: int, payload: dict):
+        return ctx.data.read("{name}", book_id=book_id, limit=payload.get("limit", 100),
+            offset=payload.get("offset", 0), where=payload.get("where"), order_by=payload.get("order_by"))
+    def count(book_id: int, payload: dict):
+        return ctx.data.count("{name}", book_id=book_id, where=payload.get("where"))
+    def insert(book_id: int, payload: dict):
+        return ctx.data.insert("{name}", payload, book_id=book_id)
+    registrar.post("/rows", rows)
+    registrar.post("/count", count)
+    registrar.post("/insert", insert)
+'''.encode()
+    raw, manifest, _, _ = build(plugin_id=pid, tables=True,
+        files={'backend/main.py': code, 'frontend/index.js': b'export default host => ({render: () => host.h("div")});'},
+        edit=lambda m: m.update(permissions=['plugin_data:rw', 'book:read']))
+    assert client.post('/api/system/plugins/install', files={'file': ('paged.cwp', raw)}, headers=auth).status_code == 200
+    restart()
+    assert client.put(f'/api/system/plugins/{pid}/users', headers=auth, json={'user_ids': [plain_user.id]}).status_code == 200
+    link = UserBook(user_id=plain_user.id, book_id=book.id, role='ACCOUNTANT')
+    db.add(link); db.commit()
+
+    for label in ('alpha', 'beta', 'gamma'):
+        r = client.post(f'/api/plugins/{pid}/insert', params={'book_id': book.id}, json={'label': label}, headers=plain_auth)
+        assert r.status_code == 200, r.text
+
+    path = f'/api/plugins/{pid}'
+    # 等值过滤 + 计数。
+    r = client.post(path + '/rows', params={'book_id': book.id}, json={'where': {'label': 'beta'}}, headers=plain_auth)
+    assert r.status_code == 200, r.text
+    assert [row['label'] for row in r.json()] == ['beta']
+    r = client.post(path + '/count', params={'book_id': book.id}, json={'where': {'label': 'beta'}}, headers=plain_auth)
+    assert r.json() == 1
+    r = client.post(path + '/count', params={'book_id': book.id}, json={'where': None}, headers=plain_auth)
+    assert r.json() == 3
+    # 载体形参必填：空 body 是调用方的错，给 422 而不是让插件在半路炸成 500。
+    r = client.post(path + '/count', params={'book_id': book.id}, json={}, headers=plain_auth)
+    assert r.status_code == 422
+    # 比较操作符与 in。
+    r = client.post(path + '/rows', params={'book_id': book.id}, json={'where': {'label': {'in': ['alpha', 'gamma']}}}, headers=plain_auth)
+    assert sorted(row['label'] for row in r.json()) == ['alpha', 'gamma']
+    # 分页与排序。
+    r = client.post(path + '/rows', params={'book_id': book.id}, json={'limit': 2, 'order_by': 'id desc'}, headers=plain_auth)
+    assert [row['label'] for row in r.json()] == ['gamma', 'beta']
+    r = client.post(path + '/rows', params={'book_id': book.id}, json={'limit': 2, 'offset': 2}, headers=plain_auth)
+    assert [row['label'] for row in r.json()] == ['gamma']
+    # 未知字段、非法操作符与非法值都被拒绝（没有拼 SQL 的入口）。
+    for where in ({'nope': 1}, {'label': {'raw': '1=1'}}, {'label': {'in': 'not-a-list'}}):
+        r = client.post(path + '/rows', params={'book_id': book.id}, json={'where': where}, headers=plain_auth)
+        assert r.status_code == 400, (where, r.text)
+    # 过滤条件改不掉账套范围。
+    r = client.post(path + '/rows', params={'book_id': book.id}, json={'where': {'book_id': book.id + 1}}, headers=plain_auth)
+    assert r.json() == []

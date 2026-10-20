@@ -2,6 +2,55 @@
 
 日期：2026-10-18。最新一轮为 SDK 1.2 应用级定时调度，对应 [plugin-roadmap.md](plugin-roadmap.md)；下方保留 SDK 1.1 导入闭环和最初 `plan.md` P0–P4 的验收历史。各轮结果分别记录，历史表中的 SDK、迁移和测试数量不代表当前版本。本次未部署生产、未修改业务数据库和生产配置，插件及插件定时任务仍默认关闭。实际发布者及实际插件包的人工风险接受见 [plugin-risk.md](plugin-risk.md)。
 
+## 2026-10-20 插件系统审查修复轮验收
+
+本轮针对《项目审查报告_2026-10-20》「六、插件系统与扩展能力」逐条修复。API 版本仍为 1.2.0，CWP 格式保持 1；**本轮没有新增或修改任何主迁移**（当前 head 为 `0031_subject_guard_year`，由本轮之外的提交引入）。本轮未部署生产、未修改业务数据库，插件平台仍默认关闭。
+
+| 检查 | 本轮结果 |
+|---|---|
+| 后端全量 `pytest tests/ -p no:warnings -n 2` | **2367 项通过，4 项跳过，0 失败**（退出码 0；4 项跳过由本地环境触发，见该文件原有说明） |
+| 插件专项（`tests/test_plugin_*.py`：安全扫描、撤销、备份、配额、维护、公开 API、资产、加载、迁移、导入、worker、supervisor、打包 CLI） | **195 项通过，0 失败，0 跳过** |
+| 前端全量 `node --test` | **77 项中 76 项通过、1 项失败**；失败项是 `tests/nav_tabs.test.mjs`「管理员侧栏是 18 项」，实际 19 —— 由本轮之外的提交 `47ab3c6`（新增二次验证设置页菜单项）造成，与插件改动无关，修复方式是把该断言的期望数改成 19 |
+| 前端生产构建 `npx vite build` | 通过 |
+
+### 逐条结果
+
+| 报告条目 | 处理 | 验收证据 |
+|---|---|---|
+| [P1-1] 静态扫描黑名单遗漏等价入口 | 改为**导入白名单**（新增 `app/plugins/scan_policy.py`，每条写明允许理由）；按 Name 引用、Subscript 调用、属性访问三种形态判定危险能力 | `test_plugin_security_scan.py`：报告实测表里的每个模块（`posix`/`pty`/`signal`/`code`/`runpy`/`sqlalchemy`/`httpx`/`inspect`/`base64` 等 33 项）全部被拒；`imp = __import__`、`e = eval`、`f = open`、`func["eval"](...)` 全部被拒；`os`/`subprocess`/`socket` 仍被拒；两个真实插件与两个文档示例的源码通过 |
+| [P1-2] 撤销对已安装插件无效 | `verify_signature` 的 `historical` 只放行历史密钥，**撤销一律拒**；加载期 `verify_directory` 与资产路由同样判定；新增 `POST /api/system/plugins/revoke-key` 一键封禁并停用 | `test_plugin_security_scan.py`：撤销后 `verify_directory` 抛 `KEY_REVOKED`，重启后插件状态 `UNAVAILABLE/KEY_REVOKED`；管理动作把插件置为停用并落盘运行时封禁名单 |
+| [P2-1] 文档承诺了没兑现的隔离 | 公开文档页改写为据实描述：白名单是第一道防线、不是沙箱；插件迁移是例外且只开放 `op` 的 DDL | `docs/plugin-overview.md`「后端代码到底能拿到什么」 |
+| [P2-2] 备份/隔离区计入配额 | 配额只管插件代码；备份与隔离区单独计量、单独额度；新增清理入口，只删无引用的备份 | `test_plugin_maintenance.py`：备份区撑满时安装仍可用；`prune` 删掉无引用备份、保留被 registry 引用的备份 |
+| [P2-3] 备份 catalog 全局单点 | 漂移插件被跳过并在归档头留 `drifted` 记录，其余照常备份；恢复路径仍严格拒绝 | `test_plugin_backup.py`、`test_plugin_maintenance.py`：漂移后账套与系统备份都能导出，含漂移记录的归档恢复被拒 |
+| [P2-4] `registrar.route(router)` 必崩 | **实现**而非改文档：`namespace` 变为可选，默认取插件自己的 id；显式传入且不符仍拒绝 | `test_plugin_security_scan.py`：`registrar.route(router)` 注册的路由返回 200 |
+| [P2-5] 缺 body 返回 500 | 载体形参纳入必填判定：缺 body 或空对象返回 422「缺少请求体：payload」 | `test_plugin_security_scan.py`：无 body → 422，`{}` → 422，正常 body → 200 |
+| [P3-1] 规范缺管理 API 清单、README 死链 | `docs/plugin-spec.md` 新增「管理 API」清单与「备份与恢复」一节（README 指向的锚点由此接上） | 文档 |
+| [P3-2] 管理页没有 reconcile / 诊断入口 | 管理页新增「恢复 / 诊断」：执行 reconcile、查看安装尝试记录、清理备份区、一键封禁密钥 | 前端构建通过；`GET /api/system/plugins/attempts`、`POST /api/system/plugins/reconcile`、`POST /api/system/plugins/maintenance/prune` |
+| [P3-3] 公开页不内联风险与验收 | `docs/plugin-overview.md` 内联「安全边界速查」与「验收登记册（摘要）」 | 文档 |
+| [P3-4] 资产每次重算整包哈希 + 匿名可读 | 按 digest 缓存核验结果（键含目录状态，文件被改动即失效）；资产改为凭**短期票据**访问，匿名请求 401 | `test_plugin_assets.py`、`test_plugin_security_scan.py` |
+| [P3-5] `ctx.data.read` 只能前缀范围 + 500 行 | 补**受限过滤 + 分页 + 计数**：`where`（eq/ne/lt/lte/gt/gte/in/like/is_null）、`limit`/`offset`/`order_by`，另加 `ctx.data.count`；账套范围仍由宿主强制附加 | `test_plugin_public_api.py`：过滤、计数、分页排序、非法条件 400、跨账套过滤无效 |
+
+### 本轮新增与变更的接口
+
+| 方法与路径 | 用途 |
+|---|---|
+| `POST /api/system/plugins/revoke-key` | 按 key_id 封禁签名密钥并停用受影响插件 |
+| `GET /api/system/plugins/attempts` | 安装尝试记录（状态、错误码、迁移 head、备份路径） |
+| `POST /api/system/plugins/maintenance/prune` | 清理不再被引用的备份与过期隔离目录 |
+
+### 重跑命令
+
+```bash
+cd backend && .venv/bin/python -m pytest tests/ -p no:warnings -n 2
+cd backend && .venv/bin/python -m pytest tests/test_plugin_*.py -p no:warnings -n 2
+cd frontend && node --test
+```
+
+### 未计入本轮范围
+
+- 本轮未重跑真实浏览器演练（`backend/scripts/plugin_e2e.py`）、Docker 镜像构建与远程 CI；插件前端资产改为凭票据访问，浏览器演练需要重跑一次才能作为证据（CI 的 `plugin-browser` job 会覆盖）。
+- 本轮未启用任何生产插件、未修改业务数据库与生产配置。
+
 
 ## SDK 1.2 定时调度追加验收
 
