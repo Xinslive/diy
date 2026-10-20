@@ -5,7 +5,7 @@
 
 ## SDK 1.2 定时调度追加验收
 
-当前 API 版本为 1.2.0，CWP 格式保持 1；主迁移 head 为 `0028_scheduled_tasks`。宿主提供受密钥保护的 `GET /api/scheduler/tick?key=...`，供外部服务每分钟调用，统一领取 OSS 备份、插件导入清理和插件声明的到期任务。插件新增 `tasks` 声明与 `registrar.task()` 注册能力，管理员开启任务后，按当前有效授权逐用户执行，继续使用原有账套权限。
+当前 API 版本为 1.2.0，CWP 格式保持 1；主迁移 head 为 `0030_admin_email_mfa`。宿主提供受密钥保护的 `GET /api/scheduler/tick?key=...`，供外部服务每分钟调用，统一领取 OSS 备份、插件导入清理和插件声明的到期任务。插件新增 `tasks` 声明与 `registrar.task()` 注册能力，管理员开启任务后，按当前有效授权逐用户执行，继续使用原有账套权限。
 
 | 检查 | 本轮结果 |
 |---|---|
@@ -42,7 +42,7 @@ bash deploy/tests/test_deploy.sh
 
 尚未纳入版本管理的周期记账插件测试已单独诊断：创建规则请求返回 `422`（缺少 query 中的 `book_id`），随后 fixture 清理插件表遇到数据库锁等待。这发生在插件业务接口阶段，未计作调度器通过证据，也未覆盖该工作区插件的业务实现。
 
-本轮未重跑真实浏览器、Docker 镜像构建或远程 CI，也未创建外部一分钟调用任务。上线需先迁移到 `0028_scheduled_tasks`，生成调度密钥并配置外部调用；旧 `cwq-oss-backup.timer` 不应同时启用，既有本地 pg_dump 定时器继续保持关闭。部署步骤见 [README](../README.md#启用定时调度)。
+本轮未重跑真实浏览器、Docker 镜像构建或远程 CI，也未创建外部一分钟调用任务。上线需先迁移到 `0030_admin_email_mfa`，生成调度密钥并配置外部调用；旧 `cwq-oss-backup.timer` 不应同时启用，既有本地 pg_dump 定时器继续保持关闭。部署步骤见 [README](../README.md#启用定时调度)。
 
 ## SDK 1.1 导入闭环追加验收
 

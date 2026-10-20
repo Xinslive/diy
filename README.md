@@ -173,7 +173,7 @@ cd backend
 
 系统支持签名 `.cwp` 全栈扩展，包括后端 API、预编译前端和独立迁移。插件与宿主同进程、同操作系统权限，**没有沙箱**；只安装经人工审阅、受信任发布者签名的代码。扫描用于拦截明显危险行为，不保证任意代码安全。规范、限制和验收记录分别见 [插件规范](docs/plugin-spec.md)、[风险记录](docs/plugin-risk.md)、[验证记录](docs/plugin-verification.md)。
 
-首次启用前先执行主迁移 `alembic upgrade head`（当前 head 为 `0028_scheduled_tasks`，包含注册表、导入批次和计划任务），在服务环境中配置 `PLUGIN_ENABLED=true`、`PLUGIN_TRUSTED_KEYS`（`key_id → base64 Ed25519 公钥` 的 JSON），并设置持久化的 `PLUGIN_ROOT`。systemd 默认工作目录下为 `backend/data/plugins`，Docker 为 `/app/data/plugins`；部署产物不包含、也不覆盖这个运行目录。Docker 应持久化挂载 `/app/data`。配置项及配额见根目录 `.env.example`。
+首次启用前先执行主迁移 `alembic upgrade head`（当前 head 为 `0030_admin_email_mfa`，包含注册表、导入批次和计划任务），在服务环境中配置 `PLUGIN_ENABLED=true`、`PLUGIN_TRUSTED_KEYS`（`key_id → base64 Ed25519 公钥` 的 JSON），并设置持久化的 `PLUGIN_ROOT`。systemd 默认工作目录下为 `backend/data/plugins`，Docker 为 `/app/data/plugins`；部署产物不包含、也不覆盖这个运行目录。Docker 应持久化挂载 `/app/data`。配置项及配额见根目录 `.env.example`。
 
 从仓库根目录可生成仅供本地演示的签名包；生产私钥应保存在独立签名环境，不能复制进服务器或插件目录：
 
@@ -330,7 +330,7 @@ AccessKey 的备份等于把凭据抄送给了每个拿到备份的人（审计 
 ### 启用定时调度
 
 ```bash
-# 先把主迁移升级到 0028_scheduled_tasks
+# 先把主迁移升级到 0030_admin_email_mfa
 cd backend
 .venv/bin/alembic upgrade head
 ```

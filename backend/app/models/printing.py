@@ -49,6 +49,17 @@ class PrintTemplate(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_print_template_book_scope", "book_id", "scope"),
         Index("ix_print_template_user_scope", "user_id", "scope"),
+        # 兜底基线仍按 (scope, name, book_id IS NULL) 查存在性（0022 的 upgrade），
+        # 这条索引让它别退化成顺序扫。
+        #
+        # **这一条以前是「库里有、模型里没有」的漂移**（审查报告 P2-4）：
+        # Alembic 的 autogenerate **不比较索引**，但它会拿库里的实际结构与
+        # 模型声明求差 —— 模型没声明这条索引，于是下一次 autogenerate 会生成
+        # 一条 ``DROP INDEX ix_print_template_scope_name``。
+        # 迁移 0023 特意建的索引就这样在一次「例行的 autogenerate」里被悄悄
+        # 丢掉，而丢掉之后基线查找退化成顺序扫 —— 表现是「模板一多就变慢」，
+        # 没有任何报错。
+        Index("ix_print_template_scope_name", "scope", "name"),
         # 同一个人对同一份基线只许有一份副本（NULL 不参与，故基线与账套模板
         # 不受影响）。应用里已先查后插，这条是并发的背书。
         Index("uq_print_template_user_fork", "user_id", "forked_from_id", unique=True),

@@ -10,6 +10,8 @@ from app.models.invoice import InvoiceBatch, InvoiceConfig, InvoiceRecord, Invoi
 from app.models.audit import AuditLog
 from app.models.backup import (BackupRun, KEEP_DAYS, SCOPE_BOOK, SCOPE_SYSTEM, STATUS_FAILED,
                           STATUS_SUCCESS, TIER_DAILY, TIER_MONTHLY, TIERS, TIER_WEEKLY)
+from app.models.mfa import (MFA_STATUSES, STATUS_CONSUMED, STATUS_EXPIRED,
+                            STATUS_PENDING, STATUS_VERIFIED, AdminMfaChallenge)
 
 __all__ = [
     "Base", "SysUser", "UserBook", "SystemSetting",
@@ -22,6 +24,8 @@ __all__ = [
     "BackupRun", "TIERS", "KEEP_DAYS",
     "TIER_DAILY", "TIER_WEEKLY", "TIER_MONTHLY",
     "STATUS_SUCCESS", "STATUS_FAILED", "SCOPE_BOOK", "SCOPE_SYSTEM",
+    "AdminMfaChallenge", "MFA_STATUSES",
+    "STATUS_PENDING", "STATUS_VERIFIED", "STATUS_CONSUMED", "STATUS_EXPIRED",
 ]
 
 # Import for schema discovery; runtime packages never join Base.metadata.

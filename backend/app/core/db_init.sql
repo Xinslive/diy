@@ -546,8 +546,57 @@ END $$;
 ALTER TABLE book ALTER COLUMN start_year SET NOT NULL;
 
 -- ---------- 迁移：管理员从「用户名叫 admin」改成独立字段 ----------
-ALTER TABLE sys_user ADD COLUMN IF NOT EXISTS is_admin boolean NOT NULL DEFAULT false;
-UPDATE sys_user SET is_admin = true WHERE username = 'admin';
+--
+-- **这里曾经是一条提权后门，2026-10-20 修掉了。**
+--
+-- 原来写的是两行：
+--     ALTER TABLE sys_user ADD COLUMN IF NOT EXISTS is_admin boolean NOT NULL DEFAULT false;
+--     UPDATE sys_user SET is_admin = true WHERE username = 'admin';
+--
+-- 第二行是「**把叫 admin 的账号一律提成系统管理员**」。而自助注册允许任何人
+-- 注册 —— 于是「注册一个叫 admin 的账号」这件事，等于「把自己变成系统管理员」。
+-- 这条路是**可达的**：一次例行的 db_init.sql 重放（迁移 0005 在存量库上重放
+-- 整份文件）就完成提权，而重放是升级流程里必然会发生的动作。
+--
+-- **为什么原来这么写。** is_admin 这个字段是后加的（原来管理员靠「用户名
+-- 恰好叫 admin」判定）。加字段那一刻，存量库里那个叫 admin 的账号**就是**
+-- 原来的系统管理员，所以要把它的标记补上。那是一次性的、只对存量老库
+-- 有意义的动作 —— 而原来写成了**每次重放都执行**，于是语义从「补一次」滑成了
+-- 「永久按用户名提权」。
+--
+-- **现在怎么修。** 只在「这一列是本次脚本刚加上去的」时候才补标记：
+-- 列已经存在 ⇒ 上一轮已经补过 ⇒ 任何人都不再按用户名提权。
+-- 这既保住了老库的一次性迁移语义，又让「重放」变成真正的幂等且无副作用。
+--
+-- 另外加一道保险：**只认库里最早创建的那个账号**。即使列是刚加的，
+-- 也不给「后来才出现的、id 更大的同名账号」提权 ——
+-- 那正是自助注册造出来的冒牌货。
+DO $$
+DECLARE
+    v_col_exists boolean;
+    v_promoted    integer;
+BEGIN
+    SELECT count(*) > 0 INTO v_col_exists
+      FROM information_schema.columns
+     WHERE table_name = 'sys_user' AND column_name = 'is_admin';
+
+    IF NOT v_col_exists THEN
+        ALTER TABLE sys_user ADD COLUMN is_admin boolean NOT NULL DEFAULT false;
+
+        -- 只给「全表最早创建的那个账号」补管理员标记（若它恰好叫 admin）。
+        UPDATE sys_user SET is_admin = true
+         WHERE id = (SELECT min(id) FROM sys_user)
+           AND username = 'admin';
+
+        GET DIAGNOSTICS v_promoted = ROW_COUNT;
+        IF v_promoted > 0 THEN
+            RAISE NOTICE '已把最早的 admin 账号标记为系统管理员（一次性迁移）。';
+        END IF;
+    ELSE
+        -- 列已存在：管理员标记由应用层维护，**绝不**按用户名回填。
+        RAISE NOTICE 'is_admin 列已存在，跳过按用户名的管理员回填（防提权）。';
+    END IF;
+END $$;
 
 -- =====================================================================
 -- 科目体系的两处补充（幂等）：账套的科目编码规则 + 科目的三个核算开关
@@ -841,144 +890,6 @@ BEGIN
         CREATE INDEX IF NOT EXISTS ix_print_template_book_scope
             ON print_template (book_id, scope);
     END IF;
-END $$;
-
--- =====================================================================
--- 迁移：取消「公司」实体，公司名下沉为账套属性
---
--- 公司表不持有任何账簿数据 —— 没有科目、没有凭证、没有期间、没有权限，
--- 唯一职责就是一个名字。把它建模成实体的代价是：建账套前必须先建公司、
--- 报表/打印再多一次外键查询、年度结转还要跨实体复制一条没有信息量的关联。
--- 账套本身才是会计上自洽的单元，公司名降级成 company_name 文本即可。
---
--- 本段幂等：新建的库跳过，老库执行一次，之后每次 init 都不再动。
--- =====================================================================
-DO $$
-BEGIN
-    IF to_regclass('sys_company') IS NOT NULL THEN
-        ALTER TABLE book ADD COLUMN IF NOT EXISTS company_name varchar(128);
-
-        -- 先把公司名抄进账套，再拆外键
-        UPDATE book b SET company_name = c.name
-          FROM sys_company c
-         WHERE c.id = b.company_id AND b.company_name IS NULL;
-
-        ALTER TABLE book DROP CONSTRAINT IF EXISTS book_company_id_fkey;
-        ALTER TABLE book DROP COLUMN IF EXISTS company_id;
-        DROP TABLE IF EXISTS sys_company CASCADE;
-    END IF;
-
-    -- 账套唯一性：同一单位、同一账套名、同一年度只能有一个账套
-    IF EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'book' AND column_name = 'company_name') THEN
-        UPDATE book SET company_name = '未命名单位'
-         WHERE company_name IS NULL OR btrim(company_name) = '';
-        ALTER TABLE book ALTER COLUMN company_name SET NOT NULL;
-
-        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_book') THEN
-            ALTER TABLE book ADD CONSTRAINT uq_book UNIQUE (company_name, name, year);
-        END IF;
-    END IF;
-END $$;
-
--- =====================================================================
--- 迁移：年度从「账套的身份」降级为「账套的属性」
---
--- 旧模型：book 表一行 = 一个「公司 + 账套名 + 年度」三元组，年度结转时
--- 整套复制出下一年的账套。结果是账套列表一年一行，同一家单位被拆成
--- 「租金账套037569」「租金账套037569 2027」两条，用户得自己记哪个在用。
---
--- 新模型：book 表一行 = 一个账套，start_year 是它的起始年度，
--- 会计期间（period）按 ord = (year - start_year) * 12 + month 跨年度连续铺开。
--- 科目表、权限、期初录入都只跟账套走，年度结转只是「追加下一年的 12 个期间」。
---
--- 本段幂等：新库跳过，老库执行一次。
--- =====================================================================
-DO $$
-DECLARE
-    v_old_year boolean;
-    v_dupes   integer;
-BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'book' AND column_name = 'year') THEN
-        ALTER TABLE book RENAME COLUMN year TO start_year;
-    END IF;
-
-    -- ord 现在要跨年度连续：单年度账套的 ord 本来就等于月份，重排是恒等变换；
-    -- 已经被合并过的多年度账套会在合并脚本里算好，这里只处理单年度的
-    UPDATE period p
-       SET ord = (p.year - b.start_year) * 12 + p.month
-      FROM book b
-     WHERE b.id = p.book_id
-       AND p.ord <> (p.year - b.start_year) * 12 + p.month;
-
-    -- 唯一键去掉年度。老库里可能已经有「一个年度一个账套」留下的重复行，
-    -- 这时不能建约束（否则服务起不来），只警告，等合并脚本跑完再建。
-    SELECT count(*) INTO v_dupes FROM (
-        SELECT company_name, name FROM book GROUP BY company_name, name HAVING count(*) > 1
-    ) d;
-    IF v_dupes = 0 THEN
-        ALTER TABLE book DROP CONSTRAINT IF EXISTS uq_book;
-        ALTER TABLE book ADD CONSTRAINT uq_book UNIQUE (company_name, name);
-    ELSE
-        RAISE WARNING
-            '检测到 % 组同名账套（如「租金账套037569」与「租金账套037569 2027」是同一年代结转留下的）。'
-            '请运行 python scripts/merge_book_years.py --apply 合并成「一个账套多个年度」。', v_dupes;
-    END IF;
-END $$;
-
-ALTER TABLE book ALTER COLUMN start_year SET NOT NULL;
-
--- ---------- 迁移：管理员从「用户名叫 admin」改成独立字段 ----------
-ALTER TABLE sys_user ADD COLUMN IF NOT EXISTS is_admin boolean NOT NULL DEFAULT false;
-UPDATE sys_user SET is_admin = true WHERE username = 'admin';
-
--- =====================================================================
--- 科目体系的两处补充（幂等）：账套的科目编码规则 + 科目的三个核算开关
--- =====================================================================
-ALTER TABLE book    ADD COLUMN IF NOT EXISTS subject_code_rule varchar(32) NOT NULL DEFAULT '4-2-2-2';
-ALTER TABLE subject ADD COLUMN IF NOT EXISTS qty_calc boolean NOT NULL DEFAULT false;
-ALTER TABLE subject ADD COLUMN IF NOT EXISTS aux_calc boolean NOT NULL DEFAULT false;
-ALTER TABLE subject ADD COLUMN IF NOT EXISTS fx_calc  boolean NOT NULL DEFAULT false;
-
-UPDATE book SET subject_code_rule = '4-2-2-2'
- WHERE subject_code_rule IS NULL OR btrim(subject_code_rule) = '';
-
--- =====================================================================
--- 迁移：period_opening.subject_id 改成 RESTRICT（审计 P1-05）
---
--- 原来是 ON DELETE CASCADE。应用层删科目时只检查了 Entry 引用和下级科目，
--- 没检查期初，于是「只被期初引用、没有凭证引用」的科目一删，
--- 期初记录随之级联消失，余额凭空漂移（实测：2 条期初删成 1 条，0 → -100）。
--- 没有任何报错或审计线索 —— 属于静默数据损失。
---
--- 改完之后数据库层也兜底：即使将来有人绕过应用层直接删，
--- 有期初引用的科目删不掉。这是本项目护栏的一贯做法
--- （结账、凭证编辑、期初不可变都由触发器挡）。
---
--- 幂等：先删旧约束再加新的，跑第二遍结果一致。
--- 已有脏数据（期初引用了已不存在的科目）不会被这条 ALTER 影响 —— 外键
--- 从 CASCADE 改 RESTRICT 不校验存量行。
--- =====================================================================
-DO $$
-DECLARE
-    v_old text;
-BEGIN
-    SELECT conname INTO v_old
-      FROM pg_constraint
-     WHERE conrelid = 'period_opening'::regclass
-       AND contype = 'f'
-       AND conkey = ARRAY[(SELECT attnum FROM pg_attribute
-                            WHERE attrelid = 'period_opening'::regclass
-                              AND attname = 'subject_id')];
-
-    IF v_old IS NOT NULL THEN
-        EXECUTE format('ALTER TABLE period_opening DROP CONSTRAINT %I', v_old);
-    END IF;
-
-    ALTER TABLE period_opening
-        ADD CONSTRAINT fk_period_opening_subject
-        FOREIGN KEY (subject_id) REFERENCES subject(id) ON DELETE RESTRICT;
 END $$;
 
 
