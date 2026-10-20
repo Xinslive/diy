@@ -179,6 +179,7 @@ def _generic_constraint_detail(sqlstate: str | None) -> str:
         "23503": "引用了不存在的关联数据，请检查所选科目/账套是否仍然有效。",
         "23502": "必填字段缺失（违反非空约束）。",
         "23514": "数据不满足数据库层的业务约束，请检查输入内容。",
+        "22001": "提交的内容超出了字段允许的长度，请缩短后再试。",
     }.get(sqlstate or "", "数据不满足数据库层的约束，请检查输入内容。")
 
 
@@ -223,9 +224,14 @@ async def dbapi_error_handler(request, exc: DBAPIError):
     rid = getattr(request.state, "request_id", "-")
     where = f"rid={rid} {request.method} {request.url.path}"
 
-    if sqlstate in ("23514", "23505", "23503", "23502"):
+    if sqlstate in ("23514", "23505", "23503", "23502", "22001"):
         if sqlstate == "23505":
             message = f"数据已存在或被引用，违反唯一约束：{message}"
+        elif sqlstate == "22001":
+            # **值太长**（string_data_right_truncation）。PG 的原文是
+            # "value too long for type character varying(64)" —— 它带着**列宽**，
+            # 同样属于库结构，不回给客户端。
+            message = "提交的内容超出了字段允许的长度"
         # 护栏拒绝也要留痕：谁、在什么时候、想干什么被挡下来了。
         # 日志里不记 message 全文（可能含重复键的值），只记状态码与截断摘要。
         log.warning("数据库约束拒绝 %s sqlstate=%s %s", where, sqlstate, message[:200])

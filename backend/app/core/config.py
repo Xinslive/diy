@@ -446,8 +446,16 @@ class Settings(BaseSettings):
     # env 存在的意义是容器首次启动时还没建过库 —— 那时界面上什么都填不了，
     # 总得有一条路先把凭据放进去。
     #
-    # endpoint 写不写 https:// 都行（oss_client 归一化），但**要写区域**：
-    # oss-cn-hangzhou.aliyuncs.com 而不是裸的 xxx.oss.aliyuncs.com，
+    # endpoint **必须写 https://**（2026-10-20 修）：原来这里写的是
+    # 「写不写 https:// 都行（oss_client 归一化）」，而 oss_client 的归一化
+    # **把 scheme 剥掉了** —— oss2 看到裸 host 就自己补 ``http://``。
+    # 于是照着文档写 ``https://oss-cn-hangzhou.aliyuncs.com`` 的运维，
+    # 实际拿到的是**明文过网**：备份制品正文（全账套凭证、金额、用户口令散列）
+    # 明文，``Authorization`` 头里的 AccessKey ID 与请求签名也明文 ——
+    # 捕获后可**重放**同一个 PUT，攻击者能覆盖/替换 OSS 上的备份对象。
+    #
+    # 现在 oss_client 保留 scheme（缺省 https），并拒绝显式的 ``http://``。
+    # **要写区域**：oss-cn-hangzhou.aliyuncs.com 而不是裸的 xxx.oss.aliyuncs.com，
     # 后者会解析到内网地址。
     oss_endpoint: str = ""
     oss_access_key_id: str = ""

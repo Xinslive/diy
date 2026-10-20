@@ -43,7 +43,8 @@ const routes = [
       { path: 'users', name: 'users', component: () => import('@/views/system/UserAdmin.vue'), meta: { title: '用户与授权', adminOnly: true } },
       { path: 'ocr-settings', name: 'ocr-settings', component: () => import('@/views/system/OcrSettings.vue'), meta: { title: '外部服务', adminOnly: true } },
       { path: 'notify-settings', name: 'notify-settings', component: () => import('@/views/system/NotifySettings.vue'), meta: { title: '邮件通知', adminOnly: true } },
-      { path: 'data-security', name: 'data-security', component: () => import('@/views/system/DataSecurity.vue'), meta: { title: '数据安全', adminOnly: true } }
+      { path: 'data-security', name: 'data-security', component: () => import('@/views/system/DataSecurity.vue'), meta: { title: '数据安全', adminOnly: true } },
+      { path: 'mfa-settings', name: 'mfa-settings', component: () => import('@/views/system/MfaSettings.vue'), meta: { title: '二次验证', adminOnly: true } }
     ]
   },
   { path: '/:pathMatch(.*)*', redirect: '/books' }

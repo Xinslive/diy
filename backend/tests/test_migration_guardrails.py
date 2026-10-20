@@ -919,6 +919,7 @@ def test_head_是本文件认识的那一版():
         "0028_scheduled_tasks",                # 外部 tick 驱动的应用级计划任务
         "0029_progressive_lockout",            # 递进式登录锁定：sys_user.lock_level（锁定轮次）
         "0030_admin_email_mfa",                # 管理员二次验证（邮箱链接）：admin_mfa_challenge 表
+        "0031_subject_guard_year",             # 库层「本年」口径改成账套会计年度（重放 db_init.sql）
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")
