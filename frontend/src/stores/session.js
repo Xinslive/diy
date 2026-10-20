@@ -10,6 +10,13 @@ export const useSessionStore = defineStore('session', {
     token: localStorage.getItem('cwq_token') || '',
     user: JSON.parse(localStorage.getItem('cwq_user') || 'null'),
     books: [],
+    // 账套列表**问过了没有**。
+    //
+    // 空数组有两种完全不同的含义：「一个账套都没有」和「还没去问」。
+    // 路由守卫要据此决定「没有账套就把人送回账套管理」—— 拿「还没问」当成
+    // 「没有」，会把有账套的用户在打开深链接的那一瞬间踢回账套管理。
+    // 所以这里记一份「问过了」的事实，而不是从 books.length 里反推。
+    booksLoaded: false,
     bookId: Number(localStorage.getItem('cwq_book') || 0),
     periods: [],
     periodId: Number(localStorage.getItem('cwq_period') || 0),
@@ -123,6 +130,8 @@ export const useSessionStore = defineStore('session', {
       this.token = ''
       this.user = null
       this.books = []
+      // 下一个人的账套列表还没问过 —— 别拿这一份空列表去判「这个人没有账套」
+      this.booksLoaded = false
       // 期间跟账套是一对：书留着的账套 id（下次登录还能落回去），
       // 但**期间必须清** —— 上一个用户停在哪一期跟下一个用户无关，
       // 留着就可能让新用户一进来顶着一个不属于他的期间。periods 一并清掉，
@@ -146,6 +155,9 @@ export const useSessionStore = defineStore('session', {
      *  没人收拾 —— 表现就是顶栏期间下拉点开只有「无数据」。 */
     async loadBooks() {
       this.books = await bookApi.listBooks()
+      // 问过了 —— 这一句必须紧跟在列表接口后面，不能挪到 loadPeriods 之后：
+      // 期间接口失败不该把「账套列表问过了」这个事实也一起抹掉。
+      this.booksLoaded = true
       // 列表里的 init 是**刚取回来的**，比 initByBook 里的任何一份都新，
       // 所以要顺手覆盖掉那份缓存。
       //
