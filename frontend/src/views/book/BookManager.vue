@@ -98,11 +98,6 @@
           </el-tooltip>
         </div>
       </article>
-
-      <el-empty
-        v-if="!loading && !store.books.length"
-        description="还没有账套，点右上角「新建账套」自己开一个；也可以请管理员在「用户与授权」里把已有账套授权给你"
-      />
     </section>
 
     <el-dialog v-model="visible" title="新建账套" width="520px">
