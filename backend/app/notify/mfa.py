@@ -72,7 +72,7 @@ _TRUTHY = ("1", "true", "yes", "on")
 _SECRET_BYTES = 32
 
 #: 同时最多几封二次验证邮件在发。与 :mod:`app.notify.events` 的口径一致：
-#: 发信的并发成本是真的（每封一��� SMTP 连接），而登录路径上的每一次尝试
+#: 发信的并发成本是真的（每封一个 SMTP 连接），而登录路径上的每一次尝试
 #: 都在攻击者的放大器射程之内。
 _MAX_CONCURRENT = 4
 _slots = threading.BoundedSemaphore(_MAX_CONCURRENT)
@@ -329,7 +329,7 @@ def link_base(request) -> str:
     """验证链接的站点前缀。
 
     **优先用配置里的** ``admin_mfa_link_base``。留空时退回**请求的
-    base_url** —— 那���是**客户端给的 Host 头**，拼出来的链接可能指向
+    base_url** —— 那是**客户端给的 Host 头**，拼出来的链接可能指向
     攻击者控制的域名（钓鱼链接的经典做法，而信还是系统自己发的）。
     所以留空时记一条 **warning**，提醒生产环境必须显式配置。
     """
