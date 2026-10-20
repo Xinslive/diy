@@ -94,6 +94,35 @@ def _note_for(bucket) -> str:
 
 
 # ---------------------------------------------------------------------------
+# scheme：**只走 https**
+# ---------------------------------------------------------------------------
+#
+# **这里曾经把备份制品放在明文上。** 原来的归一化把 ``https://`` / ``http://``
+# 一起剥掉，交给 oss2 的是裸 host；而 oss2 看到没有 scheme 会**自己补
+# ``http://``**（``oss2/api.py::_normalize_endpoint``）。于是配置里明明写着
+# ``https://oss-cn-hangzhou.aliyuncs.com``，实际发出去的是
+# ``http://...``：备份正文（全账套凭证、金额、用户口令散列）明文过网，
+# ``Authorization`` 头里的 AccessKey ID 与请求签名也明文过网 —— 而那个签名
+# 是针对该请求算的，捕获之后可以**重放同一个 PUT**，覆盖 OSS 上的备份对象。
+#
+# 归一化因此**保留 scheme**：缺省按 :data:`DEFAULT_ENDPOINT_SCHEME` 处理，
+# 显式写了 ``http://`` 的**拒绝**（见 :func:`ensure_secure_endpoint`）。
+# 拒绝而不是「告警后放行」：告警是给人看的，而这一条拦的是**制品过网**，
+# 放行的话每一次备份都还在明文上走。
+DEFAULT_ENDPOINT_SCHEME = "https://"
+
+#: 显式写了 ``http://`` 时给运维看的文案。必须自带「改成什么」，
+#: 否则这条报错只会被当成「配置坏了」。
+INSECURE_ENDPOINT_NOTE = (
+    "OSS endpoint 必须是 https://。备份制品里是全账套凭证、金额与用户口令散列，"
+    "而 Authorization 头里的 AccessKey ID 与请求签名也会跟着明文过网 —— "
+    "捕获后可重放同一个 PUT，覆盖 OSS 上的备份对象。\n"
+    "  请把 endpoint 改成带 https:// 的形式，例如："
+    "https://oss-cn-shanghai.aliyuncs.com"
+)
+
+
+# ---------------------------------------------------------------------------
 # last_modified：SDK 给的类型不止一种
 # ---------------------------------------------------------------------------
 #
@@ -144,19 +173,52 @@ def _import_oss2():
 
 
 def normalize_endpoint(endpoint: str) -> str:
-    """把用户填的 endpoint 归一化成 oss2 要的形状（``host[:port]``，无 scheme）。
+    """把用户填的 endpoint 归一化成 oss2 要的形状（**带 scheme**）。
 
     界面上有人会照着阿里云控制台抄 ``https://oss-cn-hangzhou.aliyuncs.com``，
     有人会抄不带协议的。两种都要能活 —— 归一化放在这里，而不是让用户去猜
-    哪一种才对。**只去协议，不去区域**：``oss-cn-hangzhou.aliyuncs.com`` 里的
+    哪一种才对。
+
+    **scheme 必须留下**（审计 P1-1）。原来这里把 ``https://`` 与 ``http://``
+    一起剥掉，交给 oss2 的是裸 host，而 oss2 看到没有 scheme 会**自己补
+    ``http://``**（``oss2/api.py::_normalize_endpoint``）—— 配置里明明写着
+    ``https://``，实际发出去的是明文 ``http://``。
+
+    缺省按 :data:`DEFAULT_ENDPOINT_SCHEME`（https）处理；显式写了 ``http://``
+    的**原样保留**，由 :func:`ensure_secure_endpoint` 拒绝 —— 归一化只管
+    「形状」，「能不能这么用」是另一件事。
+
+    **只去协议、不去区域**：``oss-cn-hangzhou.aliyuncs.com`` 里的
     ``cn-hangzhou`` 是寻址的一部分，去掉它会连到内网地址上去。
     """
     ep = (endpoint or "").strip()
-    for scheme in ("https://", "http://"):
-        if ep.lower().startswith(scheme):
-            ep = ep[len(scheme):]
-            break
-    return ep.rstrip("/")
+    if not ep:
+        return ""
+    lowered = ep.lower()
+    if lowered.startswith("https://"):
+        scheme, rest = "https://", ep[len("https://"):]
+    elif lowered.startswith("http://"):
+        scheme, rest = "http://", ep[len("http://"):]
+    else:
+        scheme, rest = DEFAULT_ENDPOINT_SCHEME, ep
+    return scheme + rest.rstrip("/")
+
+
+def ensure_secure_endpoint(endpoint: str) -> str:
+    """归一化 endpoint，并**拒绝明文 http://**。
+
+    抛 :class:`OssError`（消息自带「改成什么」），不静默降级也不放行 ——
+    放行的代价是**每一次备份都在明文上走**，而它不会报错。
+    """
+    ep = normalize_endpoint(endpoint)
+    if not ep:
+        raise OssError(
+            "还没有配置 OSS endpoint。请到「系统管理 → 数据安全」填写，"
+            "格式为 https://oss-cn-shanghai.aliyuncs.com。"
+        )
+    if ep.lower().startswith("http://"):
+        raise OssError(INSECURE_ENDPOINT_NOTE)
+    return ep
 
 
 def make_bucket(cfg: dict[str, Any], *, timeout: tuple[float, float] = OSS_TIMEOUT):
@@ -166,10 +228,15 @@ def make_bucket(cfg: dict[str, Any], *, timeout: tuple[float, float] = OSS_TIMEO
     等于默认 60 秒** —— 理由见文件头那段。探针类调用（:func:`check_connection`）
     要显式传短一点的 :data:`OSS_PROBE_TIMEOUT`。
 
+    **endpoint 在这里被校验成 https**（:func:`ensure_secure_endpoint`）——
+    这是所有出网路径的**唯一收口**：``put_bytes`` / ``iter_objects`` /
+    ``delete_object`` / ``check_connection`` 全都经过 ``make_bucket``，
+    所以不存在「某条路忘了校验」。
+
     拿到句柄之后**必须**配一个 :func:`close_bucket`，否则连接池不会关。
     """
+    endpoint = ensure_secure_endpoint(cfg.get("endpoint", ""))
     oss2 = _import_oss2()
-    endpoint = normalize_endpoint(cfg.get("endpoint", ""))
     note = INTERNAL_ENDPOINT_NOTE if is_internal_endpoint(endpoint) else ""
     try:
         auth = oss2.Auth(cfg["access_key_id"].strip(), cfg["access_key_secret"].strip())

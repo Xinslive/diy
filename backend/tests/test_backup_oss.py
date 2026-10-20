@@ -1440,3 +1440,88 @@ def test_整轮失败记录要带上真实原因(db, client, auth, monkeypatch):
     assert row is not None, "整轮失败没有落记录"
     assert "tzinfo" in row.message, row.message
     assert "见服务端日志" not in row.message, row.message
+
+
+# ------------------------------------------------------- 传输必须是 https（P1-1）
+#
+# **这里曾经把整份备份放在明文上。** 原来的归一化把 ``https://`` 与
+# ``http://`` 一起剥掉，交给 oss2 的是裸 host；而 oss2 看到没有 scheme
+# 会**自己补 ``http://``**（``oss2/api.py::_normalize_endpoint``）。
+# 于是配置里明明写着 ``https://``，实际发出去的是明文 ``http://``：
+# 备份正文（全账套凭证、金额、用户口令散列）明文过网，``Authorization``
+# 头里的 AccessKey ID 与请求签名也明文过网 —— 而那个签名是针对该请求
+# 算的，捕获之后可以**重放同一个 PUT**，覆盖 OSS 上的备份对象。
+#
+# 所以这里的断言对象是**实际请求 URL 的 scheme**，不是配置里的字符串：
+# 配置字符串对了不代表发出去的对。
+
+
+def test_归一化保留scheme并默认https():
+    """缺省按 https 处理；**只去协议、不去区域**。"""
+    assert oss_mod.normalize_endpoint("oss-cn-hangzhou.aliyuncs.com") == \
+        "https://oss-cn-hangzhou.aliyuncs.com"
+    assert oss_mod.normalize_endpoint("https://oss-cn-hangzhou.aliyuncs.com") == \
+        "https://oss-cn-hangzhou.aliyuncs.com"
+    # 区域是寻址的一部分：去掉 ``cn-hangzhou`` 会连到别的地址上去。
+    assert "cn-hangzhou" in oss_mod.normalize_endpoint("https://oss-cn-hangzhou.aliyuncs.com")
+    assert oss_mod.normalize_endpoint("https://oss-cn-hangzhou.aliyuncs.com/") == \
+        "https://oss-cn-hangzhou.aliyuncs.com"
+    # 显式写了 http:// 的**原样保留**（由 ensure_secure_endpoint 去拒）
+    assert oss_mod.normalize_endpoint("http://oss-cn-hangzhou.aliyuncs.com") == \
+        "http://oss-cn-hangzhou.aliyuncs.com"
+
+
+def test_实际请求走https():
+    """**用假 session 拦截请求**，断言实际 URL 的 scheme 是 https。
+
+    断言的对象是**真正会发出去的那个请求**，不是配置 —— 配置对了、发出去
+    的不对，是这类缺陷最常见的形态（原来的 bug 正是这样：配置写着 https，
+    代码把它降级成了 http）。
+    """
+    import oss2
+
+    seen: dict = {}
+
+    class _FakeSession:
+        def do_request(self, req, timeout=None, **kw):
+            seen["url"] = req.url
+            seen["method"] = req.method
+            raise RuntimeError("测试到此为止：不发真的请求")
+
+    bucket = oss2.Bucket(
+        oss2.Auth("ak", "sk"),
+        oss_mod.normalize_endpoint("oss-cn-hangzhou.aliyuncs.com"),
+        "example-bucket",
+        session=_FakeSession(),
+    )
+    with pytest.raises(Exception):
+        bucket.put_object("acct-backup/daily/x.json.gz", b"payload")
+
+    assert seen, "请求根本没发出去 —— 这个用例没有测到任何东西"
+    assert seen["url"].startswith("https://"), (
+        f"实际请求走的是明文：{seen['url']} —— "
+        "备份正文与 Authorization 头都会明文过网")
+
+
+def test_显式http的endpoint被拒绝():
+    """**明确拒绝**明文 endpoint，并给出「改成什么」的迁移提示。"""
+    with pytest.raises(oss_mod.OssError) as ei:
+        oss_mod.ensure_secure_endpoint("http://oss-cn-hangzhou.aliyuncs.com")
+    msg = str(ei.value)
+    assert "https" in msg, msg
+
+
+def test_make_bucket拒绝明文endpoint():
+    """出网路径的**唯一收口** —— 建句柄时就拒，不会等到数据已经传出去。"""
+    cfg = {"endpoint": "http://oss-cn-hangzhou.aliyuncs.com", "bucket": "b",
+           "access_key_id": "k", "access_key_secret": "s"}
+    with pytest.raises(oss_mod.OssError) as ei:
+        oss_mod.make_bucket(cfg)
+    assert "https" in str(ei.value)
+
+
+def test_内网端点提示在带scheme之后仍然有效():
+    """``-internal`` 的判断要看**主机名**，加了 scheme 之后不能失效。"""
+    assert oss_mod.is_internal_endpoint("oss-cn-heyuan-internal.aliyuncs.com")
+    assert oss_mod.is_internal_endpoint("https://oss-cn-heyuan-internal.aliyuncs.com")
+    assert not oss_mod.is_internal_endpoint("oss-cn-heyuan.aliyuncs.com")

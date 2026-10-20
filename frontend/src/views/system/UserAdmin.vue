@@ -32,6 +32,17 @@
         </span>
       </div>
 
+      <!-- 登录防护的形态：把「所有请求算作同一个来源」这件事**显式化**。
+           平时它是隐形的（代码是 fail-closed 的，配错的后果不是报错而是
+           误伤），没人知道就没人能修。 -->
+      <el-alert
+        v-if="protection && protection.source_bucketing && protection.source_bucketing.shared_bucket"
+        type="warning" :closable="false" show-icon class="mb"
+        title="登录的 IP 节流当前是「全站一个桶」"
+        :description="protection.source_bucketing.shared_bucket_reason +
+          ' 改法：' + (protection.source_bucketing.fix_hint || '')"
+      />
+
       <el-table :data="users" border size="default">
         <el-table-column prop="username" label="用户名" width="130" />
         <el-table-column prop="real_name" label="姓名" width="130" />
@@ -87,10 +98,15 @@
     <!-- 新建用户 -->
     <el-dialog v-model="dlgUser" title="新建用户" width="520px">
       <el-form :model="userForm" label-width="86px">
-        <el-form-item label="用户名"><el-input v-model="userForm.username" /></el-form-item>
-        <el-form-item label="姓名"><el-input v-model="userForm.real_name" /></el-form-item>
+        <el-form-item label="用户名">
+          <el-input v-model="userForm.username" :maxlength="USERNAME_MAX" show-word-limit />
+        </el-form-item>
+        <el-form-item label="姓名">
+          <el-input v-model="userForm.real_name" :maxlength="REAL_NAME_MAX" show-word-limit />
+        </el-form-item>
         <el-form-item label="初始密码">
-          <el-input v-model="userForm.password" type="password" show-password placeholder="至少 6 位" />
+          <el-input v-model="userForm.password" type="password" show-password
+                    :placeholder="`至少 ${PASSWORD_MIN} 位，且包含两类字符`" />
         </el-form-item>
       </el-form>
       <el-divider content-position="left">账套授权</el-divider>
@@ -144,7 +160,8 @@
           <span>{{ target?.real_name || target?.username }}</span>
         </el-form-item>
         <el-form-item label="新密码">
-          <el-input v-model="newPassword" type="password" show-password placeholder="至少 6 位" />
+          <el-input v-model="newPassword" type="password" show-password
+                    :placeholder="`至少 ${PASSWORD_MIN} 位，且包含两类字符`" />
         </el-form-item>
       </el-form>
       <!-- 重置口令 = 撤销该账号的全部在用令牌（审计 P2-01）。
@@ -181,9 +198,48 @@ const busy = ref(false)
 const registration = ref(false)
 const regBusy = ref(false)
 
+// 登录防护的当前形态。**读不到就当作没有提示**（不是「没有风险」）——
+// 拿不到状态时不该在界面上断言任何事。
+const protection = ref(null)
+
 const ROLES = ['OWNER', 'ACCOUNTANT', 'VIEWER']
 const ROLE_CN = { OWNER: '负责人', ACCOUNTANT: '会计', VIEWER: '只读' }
 const ROLE_TAG = { OWNER: 'danger', ACCOUNTANT: 'primary', VIEWER: 'info' }
+
+// 入参约束 —— **与后端同一套口径**（backend/app/api/system.py）。
+//
+// 为什么前端也要写一遍：后端的 422 说的是「字段太长」，而管理员看到的是
+// 一句「数据库内部错误」或者一个看不懂的校验数组（审计 P2-6）。
+// **前端先挡住并说人话**，后端那份是最后一道网。
+const USERNAME_MAX = 64        // 与 sys_user.username 的列宽一致
+const REAL_NAME_MAX = 64       // 与 sys_user.real_name 的列宽一致
+const PASSWORD_MIN = 8         // 与后端 PASSWORD_MIN_LENGTH 一致
+const USERNAME_MIN = 2
+
+// 用户名的形状约束：不能有空白与控制字符（换行会写进审计日志与告警邮件，
+// 把一行撑成两行 —— 看起来像多了一条记录）。
+const USERNAME_BAD = new RegExp('[\\s\\x00-\\x1f\\x7f]')
+
+// 口令策略：**长度 + 至少两类字符**（大写 / 小写 / 数字 / 符号）。
+// 单类字符（「aaaaaaaa」）看着长，字典一撞就开；要求四类齐备又太苛刻。
+function passwordProblem(password) {
+  if (!password) return '口令不能为空'
+  if (password.length < PASSWORD_MIN) return `口令至少 ${PASSWORD_MIN} 位`
+  const classes = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/]
+    .filter(re => re.test(password)).length
+  if (classes < 2) return '口令至少要包含两类字符（大写 / 小写 / 数字 / 符号）'
+  return ''
+}
+
+function usernameProblem(username) {
+  if (!username) return '用户名不能为空'
+  if (username.length < USERNAME_MIN) return `用户名至少 ${USERNAME_MIN} 位`
+  if (username.length > USERNAME_MAX) return `用户名最长 ${USERNAME_MAX} 位`
+  if (USERNAME_BAD.test(username)) {
+    return '用户名不能包含空格、换行或控制字符（它会写进审计日志与告警邮件）'
+  }
+  return ''
+}
 
 const isAdmin = computed(() => store.isAdmin)
 
@@ -221,6 +277,12 @@ async function load() {
     // 显示成「开」而后端其实关着，比反过来更危险。
     registration.value = false
   }
+  try {
+    protection.value = await sysApi.getLoginProtection()
+  } catch {
+    // 拿不到就**什么都不显示** —— 界面不该在没确认过状态时断言任何事。
+    protection.value = null
+  }
 }
 
 async function toggleRegistration(value) {
@@ -246,8 +308,20 @@ function openCreate() {
 }
 
 async function saveUser() {
-  if (!userForm.username || userForm.password.length < 6) {
-    ElMessage.warning('用户名不能为空，密码至少 6 位')
+  // 前端先挡并说人话。后端那份是最后一道网（审计 P2-6/P2-7：
+  // 超长与畸形输入在后端是 422，但把 422 原样弹给管理员并不能告诉她怎么改）。
+  const nameProblem = usernameProblem(userForm.username)
+  if (nameProblem) {
+    ElMessage.warning(nameProblem)
+    return
+  }
+  if (userForm.real_name.length > REAL_NAME_MAX) {
+    ElMessage.warning(`姓名最长 ${REAL_NAME_MAX} 位`)
+    return
+  }
+  const pwdProblem = passwordProblem(userForm.password)
+  if (pwdProblem) {
+    ElMessage.warning(pwdProblem)
     return
   }
   busy.value = true
@@ -263,6 +337,8 @@ async function saveUser() {
     ElMessage.success('已创建')
     dlgUser.value = false
     await load()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '创建失败')
   } finally {
     busy.value = false
   }
@@ -302,12 +378,19 @@ const resetHint = computed(() =>
 )
 
 async function savePassword() {
-  if (newPassword.value.length < 6) {
-    ElMessage.warning('密码至少 6 位')
+  // **与建号同一个下限**（后端两条路径共用一套判据，审计 P2-1）。
+  const pwdProblem = passwordProblem(newPassword.value)
+  if (pwdProblem) {
+    ElMessage.warning(pwdProblem)
     return
   }
   const isSelf = target.value?.id === store.user?.id
-  await sysApi.updateUser(target.value.id, { password: newPassword.value })
+  try {
+    await sysApi.updateUser(target.value.id, { password: newPassword.value })
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '重置失败')
+    return
+  }
   ElMessage.success(
     isSelf
       ? '密码已重置。你的登录状态已失效，正在跳转到登录页…'
@@ -328,7 +411,15 @@ async function remove(row) {
   } catch {
     return
   }
-  await sysApi.deleteUser(row.id)
+  try {
+    await sysApi.deleteUser(row.id)
+  } catch (e) {
+    // **把后端的话原样透出来**：删不掉时最常见的原因是「这是最后一个系统
+    // 管理员」—— 那句话自带处置动作（先建一个管理员），比一句「删除失败」
+    // 有用得多。
+    ElMessage.error(e?.response?.data?.detail || '删除失败')
+    return
+  }
   ElMessage.success('已删除')
   await load()
 }

@@ -19,6 +19,17 @@
 别人录了一张凭证 —— 出来的快照是一个**从未存在过的状态**：分录在、凭证不在。
 拼不出来的备份比没有更糟，因为它看起来是完整的。所以这里显式把事务提到
 REPEATABLE READ（见 :func:`export_scope`）。
+
+**制品里不带走什么。** 备份制品会离开这台机器（传到 OSS、落在运维的笔记本
+上、塞进别人手里），所以「拿起来就能用」的值一律不带走：``sys_setting`` 里
+那几个凭据（见 :data:`REDACTED_SETTING_KEYS`），以及**全体账号的口令散列**
+（见 :data:`REDACTED_COLUMNS`，审计 P1-2）。两处都是**白名单式**的 ——
+多脱一个是把业务数据也毁了，而后者更隐蔽。
+
+**恢复出来之后，所有账号都要重置口令。** 脱敏只管住**新的**制品，而 OSS 上
+躺着的历史归档里仍然带着当年的真实散列 —— 所以恢复这一步不信任归档里的
+``password_hash``（见 :func:`_force_password_reset`）。代价是恢复后的系统
+暂时没有人能登录：运维要先给一个管理员重置口令，管理员再逐个重置其余账号。
 """
 from __future__ import annotations
 
@@ -27,6 +38,7 @@ import re
 import gzip
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -203,6 +215,27 @@ REDACTED_SETTING_KEYS = frozenset({
     "ocr_api_token",
     "smtp_password",
 })
+
+#: 备份制品里**不带走**的**列**（按表精确到列）。
+#:
+#: **为什么需要这一张表**（审计 P1-2）：``REDACTED_SETTING_KEYS`` 只管
+#: ``sys_setting`` 一张表，而 ``sys_user``（无 ``book_id`` ⇒ 判为 global ⇒
+#: 进 ``SCOPE_SYSTEM`` 备份）带着完整的 ``password_hash``。于是**系统级备份
+#: 制品里含全体用户（含管理员）的口令散列** —— 拿到桶读权限（或在链路上
+#: 截获，见 P1-1）就等于拿到一份离线爆破素材（PBKDF2-240k 对 6 位及以下
+#: 的口令只是约 20ms/次）。
+#:
+#: 项目自己在 ``api/system.py::_user_snapshot`` 写过同一条判据（「散列落进去
+#: 等于给每个管理员送一份爆破素材」）—— 审计表用这条判据做了防护，备份表
+#: 没有。**同一个判据在一个仓库里只对一张表生效**，这是漏做而不是取舍。
+#:
+#: **仍然是白名单式的**：只列「值本身即可用」的**列**，精确到列名。
+#: 写成「``sys_user`` 整行清空」会把 ``username`` / ``is_admin`` /
+#: ``real_name`` 一起毁掉 —— 那是把业务数据也毁了（而后者更隐蔽：数据少了
+#: 没人知道）。所以是「表 → 列」的精确映射。
+REDACTED_COLUMNS: dict[str, frozenset[str]] = {
+    "sys_user": frozenset({"password_hash"}),
+}
 
 #: 每批取多少行就往 gzip 里写多少。1 千行是个平衡点：再大则一次 flush 的
 #: 内存峰值高，再小则 flush 次数多、gzip 窗口利用率低。
@@ -390,14 +423,25 @@ def rows_of(conn, ts: TableScope, scope: str,
 def _redact(table_name: str, record: dict) -> dict:
     """把这一行里**不能进备份制品**的值写空。
 
-    只认一张表、一组键：``sys_setting`` 里那几个**值本身即可用**的凭据。
+    两张表、两种判据，但**都是白名单式的**：
+
+    * ``sys_setting`` —— 按**键名**（``REDACTED_SETTING_KEYS``）：那几个键的
+      值本身即可用（AccessKey 能往桶里写，token 能调 OCR，SMTP 口令能发信）。
+    * ``sys_user`` —— 按**列名**（``REDACTED_COLUMNS``）：``password_hash`` 是
+      全体账号的离线爆破素材（审计 P1-2）。
+
     别的表别的列不碰 —— 脱敏必须是**白名单**式的：漏掉一个键是漏一个
     凭据，多脱一个是把业务数据也毁了（而后者更隐蔽：数据少了没人知道）。
     """
-    if table_name != "sys_setting":
+    if table_name == "sys_setting":
+        if record.get("key") in REDACTED_SETTING_KEYS:
+            record["value"] = ""
         return record
-    if record.get("key") in REDACTED_SETTING_KEYS:
-        record["value"] = ""
+    columns = REDACTED_COLUMNS.get(table_name)
+    if columns:
+        for column in columns:
+            if column in record:
+                record[column] = ""
     return record
 
 
@@ -666,6 +710,38 @@ def read_snapshot(path: Path) -> dict:
     return reader(data, path)
 
 
+def _force_password_reset(payloads: list[dict]) -> int:
+    """恢复出来的账号**一律重置口令**（审计 P1-2 的另一半）。
+
+    脱敏只保证「**新的**备份不带散列」，而 OSS 上躺着的历史归档一个也没少
+    —— 脱敏是后来才加的，那些归档里仍然带着当年全体账号的真实散列。所以
+    这一步**不信任归档里的 ``password_hash``**：不管它写的是空还是一串真
+    散列，恢复出来的账号一律置成「无口令 + 停用」。
+
+    为什么还要置 ``active=False``：空口令的账号本来也登不进去（口令校验必然
+    失败），但它在用户列表里显示成「启用」，管理员看不出「这个账号处于待
+    重置状态」，于是既不会去重置、也以为它能用。置成停用之后，账号名册上
+    一眼就看得出来哪些人等着被重置口令并启用。
+
+    **代价（刻意）：恢复后的系统暂时没有人能登录。** 这是要写下来的 ——
+    恢复出来的口令散列本来就不该被继续使用（它可能已经躺在别人的硬盘上、
+    在 OSS 桶里躺了好几个月）。运维需要给一个管理员重置口令（``scripts/
+    init_db.py`` 或直接改库），再由管理员在「用户与授权」页上逐个重置其余
+    账号的口令并启用它们。
+
+    返回被重置的账号数，供调用方写进恢复记录。
+    """
+    count = 0
+    for payload in payloads:
+        # 归档里压根没这一列（很老的归档）时补一个空串 ——
+        # 那一列是 NOT NULL，不给值整批插入会失败，而我们要的正是「空的」。
+        payload["password_hash"] = ""
+        if "active" in payload:
+            payload["active"] = False
+        count += 1
+    return count
+
+
 def restore(db: Session, path: Path, *, dry_run: bool = False,
             _retained_backup_validation: bool = False) -> dict[str, int]:
     """把一份快照灌回数据库。**全有或全无**。
@@ -732,6 +808,14 @@ def restore(db: Session, path: Path, *, dry_run: bool = False,
                       for k, v in record.items() if k in table.c}
             # 归档里有、当前库里也有的列才插；缺的那些列留给默认值。
             payloads.append({c: values[c] for c in cols if c in values})
+        if table.name == "sys_user":
+            # 恢复出来的账号一律重置口令 —— 见 _force_password_reset 的说明。
+            reset = _force_password_reset(payloads)
+            if reset:
+                logging.getLogger("cwq.backup.export").warning(
+                    "恢复的 %d 个账号已置为「无口令 + 停用」：备份制品不带口令散列，"
+                    "恢复后必须逐个重置口令并启用（先给一个管理员重置口令，"
+                    "否则没有人能登录）。", reset)
         db.execute(table.insert(), _ordered_rows(table, payloads))
         counts[table.name] = len(payloads)
         _reset_sequence(db, table)

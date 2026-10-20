@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import re
+import string
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -27,7 +29,7 @@ from app.backup import service as backup_service
 from app.core import system_settings
 from app.core import lockout
 from app.core.db import SessionLocal, get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, require_admin, require_recent_admin_mfa
 from app.core.security import hash_password
 from app.models import (SCOPE_SYSTEM, STATUS_FAILED, TIER_DAILY, AuditLog,
                         BackupRun, Book, SysUser, UserBook)
@@ -35,11 +37,30 @@ from app.models.scheduler import ScheduledTask, ScheduledTaskRun
 from app.notify import config as notify_config
 from app.notify import events as notify_events
 from app.notify import mailer as notify_mailer
+from app.notify import mfa as mfa_service
 from app.scheduler import service as scheduler_service
 from app.plugins.workers import status as plugin_status
 from app.models.plugin import PluginRegistry
 
-router = APIRouter(prefix="/api/system", tags=["系统管理"])
+router = APIRouter(
+    prefix="/api/system", tags=["系统管理"],
+    # **路由级管理员门禁**（审计 P3-1）。
+    #
+    # 这一层的意义是「**新增端点时不会漏挂**」：门禁进依赖图之后，
+    # FastAPI 在**校验请求体之前**就会先求依赖，于是非管理员在任何一条
+    # 路由上都拿不到 200 —— 哪怕它的请求体根本填不对。
+    #
+    # 过去这条门禁只写在**函数体第一行**（``_require_admin(user)``），于是：
+    #   * 新加一条路由忘了写那一行 ⇒ 门禁整个不存在，CI 全绿；
+    #   * 门禁在请求体校验**之后** ⇒ 一个畸形请求体先吃 422，
+    #     「非管理员访问」这件事根本走不到判定。
+    #
+    # 函数体里的 ``_require_admin(user)`` **保留**：它是第二层（有人在
+    # 依赖注入上做了手脚时仍然有效），而且它让每条路由**自己**说清
+    # 「这条要管理员」。两处的判据是同一个（``core/deps.require_admin``
+    # 与 ``_require_admin`` 都只看 ``user.is_admin``）。
+    dependencies=[Depends(require_admin)],
+)
 
 ROLES = ("OWNER", "ACCOUNTANT", "VIEWER")
 
@@ -84,6 +105,25 @@ def _links_by_user(db: Session) -> dict[int, dict[int, str]]:
     return out
 
 
+def _active_admin_count(db: Session, *, exclude_id: Optional[int] = None) -> int:
+    """库里还有几个**能登录**的管理员（``is_admin`` 且 ``active``）。
+
+    **判据只收在这里**（审计 R2-1）—— 「能不能删最后一个管理员」这个判断
+    只应该有一份实现。散在别处再写一份，迟早会对不上（而对不上的后果是
+    「有的路径拦得住、有的路径拦不住」）。
+
+    **为什么只数 ``active`` 的**：``active=False`` 的管理员**登不进去**
+    （``core/deps.py::get_current_user`` 会拒），所以它算不上「管理面还有人」。
+    把停用的管理员算进去，等于让一个已经锁死的系统看起来还有人能用 ——
+    而那正是这条守卫要防的那件事本身。
+    """
+    stmt = select(func.count()).select_from(SysUser).where(
+        SysUser.is_admin.is_(True), SysUser.active.is_(True))
+    if exclude_id is not None:
+        stmt = stmt.where(SysUser.id != exclude_id)
+    return int(db.scalar(stmt) or 0)
+
+
 # --------------------------------------------------------------------- 用户
 
 
@@ -104,18 +144,131 @@ class BookLinkIn(BaseModel):
     role: str
 
 
+# --------------------------------------------------------------------- 入参形状
+#
+# **用户名**：允许字母、数字、下划线、连字符、点，以及**中文等非 ASCII 文字**；
+# 拒绝**空白与控制字符**。
+#
+# 拒绝控制字符（尤其 ``\r`` / ``\n``）是**安全要求**，不是洁癖：用户名会原样
+# 进审计行的正文与告警邮件的正文（下面 ``create_user`` 的 detail、``app/
+# notify/events.py::account_locked``），一个换行就能把一行撑成两行 —— 看起来
+# 像多了一条记录。审计 P2-7 说的就是这个。
+#
+# **放行中文**：这套系统里中文姓名是常态，而「用户名必须是 ASCII」没有任何
+# 业务依据。把中文挡在门外只会逼管理员起拼音缩写 —— 那是把「防日志注入」
+# 做成了「防中文」。
+#
+# **不放行空格**：它同样没有业务用途，却会让人分不清「张三」与「张三 」。
+USERNAME_PATTERN = re.compile(r"^[^\s\x00-\x1f\x7f]+$")
+
+USERNAME_SHAPE_NOTE = (
+    "用户名不能包含空格、换行或控制字符"
+    "（用户名会写进审计日志与告警邮件，换行会伪造出多出来的记录）"
+)
+
+#: 姓名的长度上限，**与列宽一致**（``sys_user.real_name`` 是 ``String(64)``）。
+#:
+#: 不加这个上限，超长时数据库抛 ``StringDataRightTruncation``（sqlstate
+#: ``22001``）⇒ 接口回 **500「数据库内部错误」** —— 那是一句纯入参问题，
+#: 却长得像数据库故障，把排障方向整个带偏（审计 P2-6）。加了它就是 422，
+#: 与同一批接口里 ``username`` 的处理一致。
+REAL_NAME_MAX_LENGTH = 64
+
+# --------------------------------------------------------------------- 口令策略
+#
+# **口径只收在这里**（审计 P2-1）。建号与重置两条路径**共用**下面这几个值 ——
+# 过去是三套不同的下限（建号 6 位、重置**没有**下限、自助注册 8 位），
+# 而最危险的那条（管理员重置）恰恰是唯一一条没有下限的：把账号口令重置成
+# 1 个字符，系统照收，而且那个口令**立即可用**。
+#
+# **下限 8 位**：与自助注册（``api/schemas.py::RegisterIn``）对齐。6 位在今天
+# 的算力下已经不够 —— PBKDF2 只把**在线**猜测抬到约 20ms/次，而口令散列
+# 还会随备份外流（审计 P1-2），离线爆破一个 6 位口令是常规操作。
+#
+# **复杂度：至少 2 类字符**（大写 / 小写 / 数字 / 符号）。
+# 单类字符（「aaaaaaaa」）看着长，字典与规则化爆破一撞就开；而要求 4 类
+# 齐备又会把「顺手敲出来的口令」挡掉 —— 那是把「难猜」换成了「难记」，
+# 而难记的口令会被写在便利贴上贴在显示器旁，净损失。
+#
+# **存量用户不受影响**：口令策略**只在真的要设新口令时**校验。改姓名、改
+# 状态、走一遍「改别的字段」都**不**触发它 —— 否则历史口令只有 6 位的用户
+# 在管理员想给他改个电话时会被卡住，而「改别的字段也要重设口令」正是把
+# 存量用户逼着改口令的最坏理由。
+PASSWORD_MIN_LENGTH = 8
+PASSWORD_MAX_LENGTH = 128
+PASSWORD_MIN_CHAR_CLASSES = 2
+
+
+def password_policy_error(password: str) -> Optional[str]:
+    """口令不合策略时返回一句**给管理员看**的话；合规返回 ``None``。
+
+    建号与重置共用这一个判断 —— 别两处各写一遍（写两遍就会改一处漏一处，
+    而「最危险的那条没有下限」正是这么来的）。
+    """
+    if password is None:
+        return None
+    if len(password) < PASSWORD_MIN_LENGTH:
+        return f"口令至少 {PASSWORD_MIN_LENGTH} 位"
+    if len(password) > PASSWORD_MAX_LENGTH:
+        return f"口令最长 {PASSWORD_MAX_LENGTH} 位"
+    classes = 0
+    if any(c.islower() for c in password):
+        classes += 1
+    if any(c.isupper() for c in password):
+        classes += 1
+    if any(c.isdigit() for c in password):
+        classes += 1
+    if any(c in string.punctuation for c in password):
+        classes += 1
+    if classes < PASSWORD_MIN_CHAR_CLASSES:
+        return (f"口令至少要包含两类字符"
+                f"（大写 / 小写 / 数字 / 符号），当前只有 {classes} 类")
+    return None
+
+
 class UserIn(BaseModel):
     username: str = Field(min_length=2, max_length=64)
-    password: str = Field(min_length=6, max_length=128)
-    real_name: str = ""
+    password: str = Field(min_length=PASSWORD_MIN_LENGTH, max_length=PASSWORD_MAX_LENGTH)
+    real_name: str = Field(default="", max_length=REAL_NAME_MAX_LENGTH)
     active: bool = True
     books: list[BookLinkIn] = Field(default_factory=list)
 
+    @field_validator("username")
+    @classmethod
+    def _check_username_shape(cls, v: str) -> str:
+        if not USERNAME_PATTERN.match(v):
+            raise ValueError(USERNAME_SHAPE_NOTE)
+        return v
+
+    @field_validator("password")
+    @classmethod
+    def _check_password_strength(cls, v: str) -> str:
+        problem = password_policy_error(v)
+        if problem:
+            raise ValueError(problem)
+        return v
+
 
 class UserPatch(BaseModel):
-    real_name: Optional[str] = None
-    password: Optional[str] = None
+    real_name: Optional[str] = Field(default=None, max_length=REAL_NAME_MAX_LENGTH)
+    password: Optional[str] = Field(default=None, min_length=PASSWORD_MIN_LENGTH,
+                                    max_length=PASSWORD_MAX_LENGTH)
     active: Optional[bool] = None
+
+    @field_validator("password")
+    @classmethod
+    def _check_password_strength(cls, v: Optional[str]) -> Optional[str]:
+        """**只在真的要设新口令时**才校验（``None`` ⇒ 这一条没传）。
+
+        「改个姓名也要重设口令」是把存量用户逼着改口令的最坏理由 ——
+        历史口令可能只有 6 位，那种账号在管理员想改它别的字段时必须还能被改。
+        """
+        if v is None:
+            return v
+        problem = password_policy_error(v)
+        if problem:
+            raise ValueError(problem)
+        return v
 
 
 class SchedulerTaskPatch(BaseModel):
@@ -185,12 +338,38 @@ def create_user(payload: UserIn, user: SysUser = Depends(get_current_user),
 
 @router.patch("/users/{user_id}")
 def update_user(user_id: int, payload: UserPatch, user: SysUser = Depends(get_current_user),
-                db: Session = Depends(get_db)):
+                db: Session = Depends(get_db),
+                _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """改他人口令 / 改账号状态 —— **高危动作**，要求「近期重新认证」。
+
+    二次验证开关关着时这个依赖**不拦人**（见
+    ``core/deps.py::require_recent_admin_mfa``），所以挂着它不影响现有用户；
+    开关开着而通道坏了时它**一律拒绝**（fail-closed）—— 那时管理员本来就
+    换不到新令牌，高危动作同样不该放行。
+    """
     _require_admin(user)
     target = db.get(SysUser, user_id)
     if target is None:
         raise HTTPException(404, "用户不存在")
     before = _user_snapshot(target)
+    # R2-1：**停用**一个管理员与删掉它一样能锁死管理面 ——
+    # 「最后一个能登录的管理员」被停用 ⇒ 没有人能开号、改口令、授权，
+    # 而停用账号**登不进去**（``core/deps.py::get_current_user`` 会拒）。
+    #
+    # **这一条才是真正可达的那条路**：删除时执行者自己就是一个在用的管理员，
+    # 算上他永远还剩至少一个，所以删除路径上那个守卫是**第二层**
+    # （见 ``delete_user``）；而「把自己停用」可以把系统推到 0 个在用的
+    # 管理员 —— 就在这一条路上。
+    #
+    # 判据与删除路径**共用同一个**（:func:`_active_admin_count`，只收一处）。
+    if payload.active is False and target.is_admin and target.active:
+        if _active_admin_count(db, exclude_id=target.id) == 0:
+            raise HTTPException(
+                409,
+                "不能停用最后一个系统管理员：停用之后没有人能开号、改口令与授权，"
+                "系统管理面将无人可用（唯一出口是运维跑脚本）。"
+                "请先启用另一个管理员，再停用这一个。",
+            )
     if payload.real_name is not None:
         target.real_name = payload.real_name
     if payload.active is not None:
@@ -243,8 +422,9 @@ def update_user(user_id: int, payload: UserPatch, user: SysUser = Depends(get_cu
 
 @router.put("/users/{user_id}/books")
 def set_books(user_id: int, books: list[BookLinkIn], user: SysUser = Depends(get_current_user),
-              db: Session = Depends(get_db)):
-    """整份替换某用户的账套授权列表。"""
+              db: Session = Depends(get_db),
+              _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """整份替换某用户的账套授权列表。**高危动作**，要求「近期重新认证」。"""
 
     _require_admin(user)
     target = db.get(SysUser, user_id)
@@ -286,13 +466,30 @@ def set_books(user_id: int, books: list[BookLinkIn], user: SysUser = Depends(get
 
 @router.delete("/users/{user_id}")
 def delete_user(user_id: int, user: SysUser = Depends(get_current_user),
-                db: Session = Depends(get_db)):
+                db: Session = Depends(get_db),
+                _mfa: SysUser = Depends(require_recent_admin_mfa)):
     _require_admin(user)
     if user_id == user.id:
         raise HTTPException(400, "不能删除当前登录的用户")
     target = db.get(SysUser, user_id)
     if target is None:
         raise HTTPException(404, "用户不存在")
+    # R2-1：**最后一个管理员不许删**。
+    #
+    # 删掉之后，建号、改口令、授权、读全量审计全部要管理员权限 ——
+    # 而管理员已经没有了，**系统管理面就此锁死**：界面点不动、接口 403，
+    # 唯一出口是运维跑脚本直接改库。
+    #
+    # **只挡管理员**：删一个**普通**账号不影响管理员的数量，那是允许的
+    # （「删到只剩一个管理员」与「这个账号是不是管理员」是两件事）。
+    # 判据在 :func:`_active_admin_count`（只收一处）。
+    if target.is_admin and _active_admin_count(db, exclude_id=target.id) == 0:
+        raise HTTPException(
+            409,
+            "不能删除最后一个系统管理员：删掉之后没有人能开号、改口令与授权，"
+            "系统管理面将无人可用（唯一出口是运维跑脚本）。"
+            "请先新建另一个管理员并给它授权，再删这一个。",
+        )
     # P2-03：删除过去不留痕。删完之后连「曾经有过这么一个账号」都没地方查 ——
     # 而账号名册是要用来回答「这个账上的人都有谁」的。快照必须在 delete 之前取。
     before = _user_snapshot(target)
@@ -386,6 +583,119 @@ def audit_logs(limit: int = 100, user: SysUser = Depends(get_current_user),
              "before": r.before, "after": r.after} for r in rows]
 
 
+# ------------------------------------------------------------ 管理员二次验证
+#
+# 底座在 ``app/notify/mfa.py``（开关 / 通道 / 挑战状态机），判定在
+# ``core/deps.py::require_recent_admin_mfa``。本节只做两件事：
+#
+# 1. **让管理员能看见当前状态并开关它**（``GET/PUT /api/system/mfa``）。
+# 2. **把高危动作挂上「近期重新认证」**（见下面各路由的 ``_mfa`` 依赖）。
+#
+# **响应里绝不含任何口令/密钥**：只有「开没开」「窗口多少分钟」「SMTP 通道
+# 就绪没有」「收件人数量」「脱敏后的收件地址」这类可展示信息。
+
+
+class MfaConfigPatch(BaseModel):
+    """二次验证开关。``StrictBool`` —— 与自助注册开关同一口径。"""
+
+    enabled: StrictBool
+
+
+def _mfa_view(db: Session) -> dict:
+    """二次验证的**可展示状态**。
+
+    三个判定口径不要混用（见 ``app/notify/mfa.py``）：
+    ``enabled`` 是**开关**，``smtp_ready`` 是**通道**，
+    ``active`` 是「此刻真的生效」（开关 **且** 通道）。
+    """
+    enabled = mfa_service.mfa_enabled(db)
+    ready = mfa_service.smtp_ready(db)
+    recipients = notify_config.recipients(db)
+    return {
+        "enabled": enabled,
+        "active": bool(enabled and ready),
+        "grace_minutes": mfa_service.grace_seconds() // 60,
+        "smtp_ready": ready,
+        "recipient_count": len(recipients),
+        # 脱敏后的第一个收件地址（``a***@x.com``）—— 只为让管理员确认
+        # 「信会发到哪儿」，不泄露完整地址。
+        "recipient_hint": mfa_service.email_hint(db),
+        # 「开关开着但通道没配好」时的一段人话；一切正常时是空串。
+        "channel_error": mfa_service.channel_error(db),
+    }
+
+
+@router.get("/mfa")
+def get_mfa_config(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    """二次验证的当前状态。**只读，不含任何凭据。**"""
+    _require_admin(user)
+    return _mfa_view(db)
+
+
+@router.put("/mfa")
+def put_mfa_config(payload: MfaConfigPatch, user: SysUser = Depends(get_current_user),
+                    db: Session = Depends(get_db),
+                    _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """开关管理员二次验证。
+
+    **开关打开而 SMTP 通道没就绪 ⇒ 明确拒绝（409）**，不让管理员点一下开关
+    就把所有管理员锁在门外：二次验证的邮件发不出去 ⇒ 管理员登不进来 ⇒
+    管理面锁死 —— 与 R2-1 是同一种后果，而且发作得更快（当场）。
+    界面据此劝阻管理员「先配 SMTP」。
+
+    **关掉在业务规则上永远允许** —— 那是从「上锁」回到「不上锁」，是安全
+    方向的退让，不该被任何**通道**条件挡住。但「近期重新认证」那道依赖
+    仍然在：刚登录完（那次登录带二次验证）就能关；超过验证窗口还想关，
+    走 ``scripts/mfa_admin.py --disable``（明确关掉，而不是假装开着）。
+    """
+    _require_admin(user)
+    before = _mfa_view(db)
+    if payload.enabled and not mfa_service.smtp_ready(db):
+        raise HTTPException(
+            409,
+            "SMTP 通道还没配好，开不了二次验证：验证链接要发到管理员邮箱，"
+            "而现在「" + (before["channel_error"] or "SMTP 不可用") + "」。"
+            "请先到「邮件通知」配好 SMTP 服务器与收件人，再来开这个开关。",
+        )
+    mfa_service.set_mfa_enabled(db, payload.enabled, updated_by=user.username)
+    # 必须 flush 之后才能取到改后的值（见 put_ocr_config 里的同一段）。
+    db.flush()
+    after = _mfa_view(db)
+    log(
+        db,
+        action="SYSTEM_MFA_CONFIG_UPDATE",
+        entity="system_setting",
+        entity_id=mfa_service.MFA_ENABLED_KEY,
+        user=user,
+        detail=("开启" if payload.enabled else "关闭") + "管理员二次验证",
+        before={"enabled": before["enabled"], "smtp_ready": before["smtp_ready"]},
+        after={"enabled": after["enabled"], "smtp_ready": after["smtp_ready"]},
+    )
+    db.commit()
+    return after
+
+
+# ------------------------------------------------------- 登录防护状态（可观测）
+#
+# 审计 P2-3：「``TRUSTED_PROXIES`` 没配 ⇒ IP 维度节流退化成全站一个桶」。
+# 那个状态**本来就存在**（代码是 fail-closed 的：不配就不信代理头），问题在于
+# 它是**隐形的** —— 没人知道当前部署里「所有请求都算作同一个来源」。
+#
+# 这里把它**显式化**：管理员在界面上能直接看到「当前节流按什么分桶」，
+# 以及「是不是全站一个桶」。口径在 ``core/lockout.py``（只收一处）。
+
+
+@router.get("/login-protection")
+def get_login_protection(user: SysUser = Depends(get_current_user),
+                         db: Session = Depends(get_db)):
+    """登录防护的当前形态（分桶口径、账号锁定阶梯、是否共享一个桶）。
+
+    **只读**，不含任何凭据。它回答的是「这套系统现在防得住什么、防不住什么」。
+    """
+    _require_admin(user)
+    return lockout.protection_summary()
+
+
 # ------------------------------------------------------------ 自助注册开关
 
 
@@ -412,9 +722,18 @@ def get_registration(user: SysUser = Depends(get_current_user), db: Session = De
 
 @router.put("/registration")
 def put_registration(payload: RegistrationPatch, user: SysUser = Depends(get_current_user),
-                     db: Session = Depends(get_db)):
+                     db: Session = Depends(get_db),
+                     _mfa: SysUser = Depends(require_recent_admin_mfa)):
     """改自助注册开关。**留痕**：这个开关决定「陌生人能不能往 sys_user 里加行」，
     打开它的那一次必须有据可查（谁、何时、从关到开）。
+
+    **这是一个高危动作**（审计 P2-2），所以要「近期重新认证」：开关一开，
+    任何人都能往账号表里加行，而注册接口**目前没有独立的节流**（节流与
+    「用户名已存在 / 注册成功」的文案抹平都要落在 ``api/auth.py`` 上，不在
+    本文件里）。一个被别人拿到的管理员令牌就能把这扇门打开。
+
+    **开关关着时，注册端点应当根本不存在而不是拒绝** —— 那一半在
+    ``api/auth.py``（路由注册与否），本文件只负责把开关的口径收紧到这里。
     """
     _require_admin(user)
     before = system_settings.registration_enabled(db)
@@ -697,8 +1016,21 @@ def get_backup_config(user: SysUser = Depends(get_current_user),
 
 @router.put("/backup")
 def put_backup_config(payload: BackupConfigPatch, user: SysUser = Depends(get_current_user),
-                      db: Session = Depends(get_db)):
+                      db: Session = Depends(get_db),
+                      _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """写 OSS 配置（含 AccessKey）。**高危动作**，要求「近期重新认证」。
+
+    **为什么这一条是高危**：AccessKey 能写桶，而桶里放着**全部**备份制品
+    —— 拿到它就等于拿到全公司账务数据。写错一个字符也足以把备份导到别处去。
+    """
     _require_admin(user)
+    # P1-1：**保存时就拒掉明文 endpoint**，不要等到凌晨三点备份失败才发现。
+    # 归一化只管「形状」，「能不能这么用」在这里判 —— 报错文案自带改成什么。
+    if payload.endpoint is not None:
+        try:
+            oss_client.ensure_secure_endpoint(payload.endpoint)
+        except oss_client.OssError as exc:
+            raise HTTPException(400, str(exc)) from exc
     before = _backup_view(db)
     updates: dict[str, str] = {}
     for field, key in (("endpoint", "oss_endpoint"), ("bucket", "oss_bucket"),
@@ -919,7 +1251,13 @@ def list_scheduler_runs(limit: int = 50, user: SysUser = Depends(get_current_use
 
 
 @router.post("/scheduler/secret/rotate")
-def rotate_scheduler_secret(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+def rotate_scheduler_secret(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
+                             _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """轮换外部调度触发密钥。**高危动作**，要求「近期重新认证」。
+
+    轮换之后旧的密钥立刻失效，外部调度服务在改配置之前**全部调不动** ——
+    这是一个「按错了就整条链路停摆」的动作，所以要一道二次验证。
+    """
     _require_admin(user)
     scheduler_service.lock_scheduler_sync(db)
     value = scheduler_service.rotate_trigger_secret(db, updated_by=user.username)

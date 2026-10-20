@@ -49,6 +49,19 @@ export const getNotifyConfig = () => http.get('/system/notify').then(r => r.data
 export const saveNotifyConfig = (payload) => http.put('/system/notify', payload).then(r => r.data)
 export const testNotify = () => http.post('/system/notify/test').then(r => r.data)
 
+// 管理员二次验证（邮箱链接）。**可选功能**，默认关闭。
+//
+// GET 回来的只有可展示信息：开没开、窗口多少分钟、SMTP 通道就绪没有、
+// 收件人数量与脱敏后的收件地址 —— **没有任何口令/密钥**。
+// 开关打开而 SMTP 没就绪时，后端会明确拒绝（409）而不是让人点一下就把
+// 所有管理员锁在门外。
+export const getMfaConfig = () => http.get('/system/mfa').then(r => r.data)
+export const setMfaConfig = (payload) => http.put('/system/mfa', payload).then(r => r.data)
+
+// 登录防护的当前形态（按什么分桶、账号锁定阶梯、是不是「全站一个桶」）。
+// 用来把「TRUSTED_PROXIES 没配」这件事**显式化**给管理员看。
+export const getLoginProtection = () => http.get('/system/login-protection').then(r => r.data)
+
 // 审计日志走 `@/api/book` 的 `auditLogs(bookId, limit)` —— 审计是**按账套**的，
 // 而这里原来包的是 `/system/audit-logs`（不带 book_id），两个函数**同名不同义**。
 // `AuditLog.vue` 实际 import 的是 `@/api/book`，这个从未被调用，留着只会让
