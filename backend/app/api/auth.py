@@ -25,33 +25,94 @@ SAVEPOINT 里（见 :func:`_audit`），失败只打应用日志、不影响本�
 """
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
+import html
 import logging
+import re
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import case, delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.accounting.audit_helper import log as write_audit
 from app.api.schemas import LoginIn, RegisterIn, TokenOut
+from app.core import audit as core_audit
 from app.core import system_settings
 from app.core import lockout
 from app.core.config import is_trusted_proxy, settings
 from app.core.db import get_db
 from app.core.deps import get_current_user
 from app.core.security import create_access_token, hash_password, verify_password
-from app.models import SysUser, UserBook
+from app.models import AdminMfaChallenge, SysUser, UserBook
 # LoginIpThrottle 直接从定义模块导入而没有走 app.models 的导出桶：
 # 那个桶不属于本条工作线的改动范围，而漏登记的实际后果只是「别人
 # from app.models import * 时拿不到这个类」—— 全仓没有任何地方这么用。
 from app.models.system import LoginIpThrottle
+from app.notify import mfa as mfa_service
 
 log = logging.getLogger("cwq")
 
 router = APIRouter(prefix="/api/auth", tags=["认证"])
+
+
+# --------------------------------------------------- 管理员二次验证：响应模型
+#
+# **这几个模型定义在本文件里，不在 api/schemas.py。**
+# schemas.py 那一层是「通用接口的入参/出参」，而二次验证的形状是
+# 「一次登录有三种可能的结局」（直接给令牌 / 要二次验证 / 报错），
+# 把它混进通用层会让那个文件同时承担两件事。
+#
+# **回执里没有 access_token —— 这是这套接口存在的全部意义。**
+# 邮件链接那串东西绝不能直接当会话令牌（它会被网关扫描、被手机锁屏
+# 预览、被 IT 留档），理由见 app/models/mfa.py 的模块注释。
+
+class MfaRequiredOut(BaseModel):
+    """「口令对了，但还要再验一次」的回执。"""
+
+    mfa_required: bool = True
+    challenge_id: int
+    # 只发给**发起登录的那个客户端**，库里只存它的散列。
+    client_secret: str
+    # 链接有效期（秒）。
+    expires_in: int
+    # 收件地址的**脱敏**形态（本地部分只留首尾各一位）。
+    email_hint: str
+
+
+class MfaPollOut(BaseModel):
+    """轮询结果。待验证时只有 ``status``；换到令牌时多几个字段。"""
+
+    status: str
+    access_token: Optional[str] = None
+    token_type: str = "bearer"
+    expires_at: Optional[int] = None
+    user: Optional[dict] = None
+
+
+class MfaChallengeIn(BaseModel):
+    """「用 challenge_id + client_secret 证明我是发起方」的入参。"""
+
+    challenge_id: int = Field(ge=1)
+    client_secret: str = Field(min_length=1, max_length=256)
+    # 应急口令。**只在进程环境里配了 ADMIN_MFA_EMERGENCY_CODE 时才有用**，
+    # 用一次即废。它绝不出现在任何响应里，也绝不写日志。
+    emergency_code: Optional[str] = Field(default=None, max_length=256)
+
+
+class MfaChallengeOut(BaseModel):
+    """「重新发送」与「重新认证」的回执。"""
+
+    challenge_id: int
+    client_secret: str
+    expires_in: int
+    email_hint: str = ""
+    # 距离下一次可以「重新发送」还有几秒。
+    resend_after: int = 0
 
 
 # --------------------------------------------------------------------- 审计
@@ -188,6 +249,45 @@ def public_config(db: Session = Depends(get_db)):
     return {"registration_enabled": system_settings.registration_enabled(db)}
 
 
+#: 自助注册的用户名与口令的长度边界。
+#:
+#: **这里再写一遍是有意的。** ``RegisterIn`` 的定义在 ``api/schemas.py``，
+#: 那份文件正由另一条工作线改动；而这一条边界（用户名 3-32 位、口令
+#: 至少 8 位）**不该只由那一处来守** —— 一个「注册接口的口令下限」是
+#: 安全边界，不是接口形状。把它就地再校一遍，schemas.py 那边将来放宽
+#: 了，这里仍然拦得住。
+#:
+#: 与 ``RegisterIn`` 当前的口径一致（见 api/schemas.py），所以正常请求
+#: 不会因为这段多出来的检查而改变结果。
+_REGISTER_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_REGISTER_USERNAME_MIN = 3
+_REGISTER_USERNAME_MAX = 32
+_REGISTER_PASSWORD_MIN = 8
+_REGISTER_PASSWORD_MAX = 128
+
+
+def _validate_registration(payload: RegisterIn) -> None:
+    """自助注册的入参就地校验。**不合规抛 422。**
+
+    与 Pydantic 的 422 同一个状态码 —— 对调用方来说「参数不合法」就是
+    参数不合法，不该因为校验发生在哪一层而给出两种形状的失败。
+    """
+    username = (payload.username or "").strip()
+    if not (_REGISTER_USERNAME_MIN <= len(username) <= _REGISTER_USERNAME_MAX):
+        raise HTTPException(
+            422,
+            f"用户名长度必须在 {_REGISTER_USERNAME_MIN} 到 "
+            f"{_REGISTER_USERNAME_MAX} 位之间")
+    if not _REGISTER_USERNAME_RE.match(username):
+        raise HTTPException(422, "用户名只能包含字母、数字与下划线")
+    if not (_REGISTER_PASSWORD_MIN <= len(payload.password or "")
+            <= _REGISTER_PASSWORD_MAX):
+        raise HTTPException(
+            422,
+            f"密码长度必须在 {_REGISTER_PASSWORD_MIN} 到 "
+            f"{_REGISTER_PASSWORD_MAX} 位之间")
+
+
 @router.post("/register", status_code=201)
 def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db)):
     """自助注册：**只建账号，不授予任何账套**。
@@ -204,6 +304,7 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     """
     if not system_settings.registration_enabled(db):
         raise HTTPException(403, "系统未开放自助注册，请联系管理员开号")
+    _validate_registration(payload)
     if db.scalar(select(SysUser).where(SysUser.username == payload.username)):
         raise HTTPException(400, f"用户名「{payload.username}」已被占用")
     # real_name **不再让自助注册的用户填**（前端那个输入框已去掉），空值兜底成
@@ -615,8 +716,19 @@ def _dummy_hash() -> str:
     return hash_password("cwq-dummy-password-for-constant-time-login")
 
 
-@router.post("/login", response_model=TokenOut)
+@router.post("/login", response_model=TokenOut | MfaRequiredOut)
 def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
+    """登录。
+
+    **口令校验这一段一个字都没改** —— 时序等价、账号锁定、IP 软节流、
+    审计留痕，全部保持原样（审计 P2-11 / P1-6 的那些结论不许被这次
+    整改顺手弄丢）。
+
+    变的只有**口令正确之后**：管理员且二次验证生效时**不发令牌**，改为
+    走一次邮箱确认（见 :func:`_start_admin_mfa`）。二次验证没生效时，
+    行为与改动前**完全一致** —— 回归测试（``tests/test_auth_permissions.py``
+    / ``tests/test_auth_audit.py``）必须全绿。
+    """
     ip = _client_ip(request)          # 审计口径（见 _client_ip 的 docstring）
     src = _throttle_ip(request)       # 判定口径，两者故意不同
     now = _utcnow()
@@ -715,6 +827,19 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
     user.failed_logins = 0
     user.locked_until = None
     user.lock_level = 0
+
+    # ---- 管理员二次验证的分叉 ------------------------------------------
+    #
+    # 口令到这里已经验过了。**从这里开始，管理员多一道邮箱确认**，
+    # 而且**不发访问令牌** —— 令牌要等挑战被验证之后由客户端来换。
+    #
+    # 判定用 ``mfa_enabled``（**开关**）而不是 ``mfa_active``（开关+通道）：
+    # 开关开着而通道没配好时，下面会**明确报错**，而不是悄悄放行 ——
+    # 后者等于把一个安全开关变成一个假开关（界面上写着「已开启」，
+    # 实际一个字节都没生效）。
+    if user.is_admin and mfa_service.mfa_enabled(db):
+        return _start_admin_mfa(db, user, request, ip)
+
     _audit_login(True, db, ip, user, payload.username,
                  is_admin=bool(user.is_admin))
     db.commit()
@@ -731,6 +856,322 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
             "is_admin": user.is_admin,
             "books": [{"id": b.book_id, "role": b.role} for b in books],
         },
+    )
+
+
+# --------------------------------------------------- 管理员二次验证：实现
+#
+# 形态：**邮箱链接**。复用项目已有的 SMTP 通道（app/notify/mailer.py），
+# 不引第三方依赖。整体设计与状态机见 app/notify/mfa.py 与 app/models/mfa.py。
+
+
+def _mfa_audit(db: Session, action: str, user, detail: str, **extra) -> None:
+    """写一条二次验证的审计。**写失败绝不能影响主流程**（见 core/audit.py）。"""
+    core_audit.log_admin_mfa(db, action=action, user=user, detail=detail, **extra)
+
+
+def _mfa_user_payload(db: Session, user: SysUser) -> dict:
+    """令牌里带回的用户信息（与 /login 的 TokenOut.user 同构）。"""
+    books = db.scalars(select(UserBook).where(UserBook.user_id == user.id)).all()
+    return {
+        "id": user.id,
+        "username": user.username,
+        "real_name": user.real_name,
+        "is_admin": user.is_admin,
+        "books": [{"id": b.book_id, "role": b.role} for b in books],
+    }
+
+
+def _start_admin_mfa(db: Session, user: SysUser, request: Request,
+                     ip: str) -> MfaRequiredOut:
+    """口令验过之后：**造挑战、发信、但不发令牌**。
+
+    这一步是整条链路的分叉点。它返回的回执里**没有 access_token** ——
+    令牌要等邮件里的链接被点开、客户端再来换，才发得出去。
+    """
+    error = mfa_service.channel_error(db)
+    if error:
+        # **开关开着但通道没配好 → 明确报错，绝不静默放行。**
+        # 放行等于把一个安全开关变成一个假开关：界面上写着「已开启
+        # 二次验证」，实际却一个字节都没生效。
+        log.error("管理员二次验证通道未配置，登录被拒：user=%s ip=%s 原因=%s",
+                  user.username, ip, error)
+        _mfa_audit(db, core_audit.MFA_ACTION_FAILED, user,
+                   f"二次验证通道未配置，登录被拒：{user.username}（{ip}）",
+                   username=user.username[:64], ip=ip,
+                   reason="channel_not_configured")
+        db.commit()
+        raise HTTPException(503, error)
+
+    challenge, email_token, client_secret = mfa_service.create_challenge(
+        db, user, reason="login", ip=ip,
+        user_agent=request.headers.get("user-agent", ""))
+    _mfa_audit(db, core_audit.MFA_ACTION_SENT, user,
+               f"口令已通过，已向通知邮箱发送二次验证链接：{user.username}（{ip}）",
+               username=user.username[:64], ip=ip, challenge_id=challenge.id,
+               reason="login")
+    db.commit()
+    # 旁路发信：发不出去也不该让登录失败（那是一次可用性事故）。
+    mfa_service.send_challenge_email(
+        user=user, challenge=challenge, email_token=email_token,
+        link_base=mfa_service.link_base(request), reason="login")
+    return MfaRequiredOut(
+        mfa_required=True,
+        challenge_id=challenge.id,
+        client_secret=client_secret,
+        expires_in=mfa_service.ttl_seconds(),
+        email_hint=mfa_service.email_hint(db),
+    )
+
+
+_VERIFY_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  body {{ margin: 0; min-height: 100vh; display: flex; align-items: center;
+         justify-content: center; background: #f1f5f9;
+         font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         color: #0f172a; }}
+  .card {{ background: #fff; padding: 40px 32px; border-radius: 12px;
+           max-width: 420px; text-align: center;
+           box-shadow: 0 12px 40px rgba(15, 23, 42, .10); }}
+  h1 {{ font-size: 20px; margin: 0 0 12px; }}
+  p {{ font-size: 14px; line-height: 1.8; margin: 0; color: #334155; }}
+  .ok h1 {{ color: #047857; }}
+  .bad h1 {{ color: #b91c1c; }}
+</style>
+</head>
+<body>
+  <div class="card {cls}">
+    <h1>{title}</h1>
+    <p>{message}</p>
+  </div>
+</body>
+</html>
+"""
+
+
+def _verify_page(ok: bool) -> str:
+    """点链接之后的那一页。
+
+    **这一页里不能出现任何用户输入**，也不能出现访问令牌 —— 页面里
+    只有两句固定文案（都要转义，虽然它们是常量）。
+
+    为什么不让点链接直接给令牌：邮件链接会被网关扫描、被手机锁屏预览、
+    被 IT 留档。让它直接等于会话令牌，等于「谁截获了那封信谁就是
+    管理员」。
+    """
+    if ok:
+        title = "验证成功"
+        message = ("二次验证已完成。请回到发起登录的那个浏览器窗口，"
+                   "点击「我已验证」继续登录。")
+        cls = "ok"
+    else:
+        title = "验证链接无效"
+        message = ("这个链接无效、已经被用过，或者已经过期。"
+                   "请回到登录窗口重新登录，或点击「重新发送」获取新链接。")
+        cls = "bad"
+    return _VERIFY_PAGE.format(
+        title=html.escape(title),
+        message=html.escape(message),
+        cls=html.escape(cls),
+    )
+
+
+@router.get("/mfa/verify")
+def mfa_verify(token: str = Query("", max_length=512),
+               db: Session = Depends(get_db)):
+    """点邮件里的验证链接。**只置状态，不发令牌。**
+
+    返回一个极简页面（人能读懂），而不是 JSON —— 收件人是在浏览器里
+    点开的，他要看的是「成没成」，不是一段机器才能解析的东西。
+
+    **失败时也不泄露任何内部细节**：文案里没有表名、没有堆栈、没有
+    「token 不存在」这种可供区分的信息（区分了就能拿来数库里有多少
+    挑战）。
+    """
+    ok, reason, row = mfa_service.verify_email_token(db, token)
+    if row is not None:
+        # 只给「确实对得上某条挑战」的点击留痕。随机 token 的点击**不留**
+        # —— 这个链接是公共的，每次都留一条等于给审计表灌水。
+        user = db.get(SysUser, row.user_id)
+        if ok:
+            _mfa_audit(db, core_audit.MFA_ACTION_VERIFIED, user or _UnknownUser(""),
+                       f"二次验证链接已点开：{row.reason}",
+                       username=(user.username[:64] if user else ""),
+                       challenge_id=row.id, reason=row.reason)
+        else:
+            _mfa_audit(db, core_audit.MFA_ACTION_FAILED, user or _UnknownUser(""),
+                       f"二次验证链接无效：{reason}",
+                       username=(user.username[:64] if user else ""),
+                       challenge_id=row.id, reason=reason)
+        db.commit()
+    return HTMLResponse(_verify_page(ok))
+
+
+@router.post("/mfa/poll", response_model=MfaPollOut, response_model_exclude_none=True)
+def mfa_poll(payload: MfaChallengeIn, request: Request,
+             db: Session = Depends(get_db)):
+    """轮询挑战状态；验证通过后**原子地**换到访问令牌。
+
+    **必须同时有 ``challenge_id`` 和 ``client_secret``** —— 少一个都不行：
+    只有 challenge_id 的话，任何人猜到/枚举一个 id 就能把别人的挑战
+    换走。
+
+    **换令牌是原子的**（条件写 + 查 rowcount）—— 同一个挑战只能换出
+    一个令牌，第二次来拿不到。
+
+    ``response_model_exclude_none``：待验证时只回 ``{"status":"PENDING"}``，
+    **不要回一个 ``"access_token": null``** —— 那会让「响应里有没有
+    令牌」这件事变得没法一眼看清（``"access_token" in body`` 为真，
+    而它其实什么都没给）。
+    """
+    allowed, retry_after = mfa_service.poll_guard(payload.challenge_id)
+    if not allowed:
+        raise HTTPException(
+            429, f"验证状态轮询过于频繁，请 {retry_after} 秒后再试",
+            headers={"Retry-After": str(retry_after)})
+
+    result = mfa_service.consume_challenge(
+        db, payload.challenge_id, payload.client_secret,
+        emergency_code=payload.emergency_code)
+
+    if result.row is None:
+        # 找不到 / secret 不对 / 已用过 / 已过期 —— **同一句文案**。
+        # 区分它们等于告诉别人「这个 id 存在」，那是信息泄露。
+        reason = "expired" if result.state == "expired" else "invalid"
+        user = db.get(SysUser, result.row.user_id) if result.row else None
+        _mfa_audit(db, core_audit.MFA_ACTION_FAILED, user or _UnknownUser(""),
+                   f"二次验证请求被拒：{reason}",
+                   challenge_id=payload.challenge_id, reason=reason,
+                   ip=_client_ip(request))
+        db.commit()
+        if reason == "expired":
+            raise HTTPException(410, "验证链接已过期，请重新登录")
+        raise HTTPException(401, "验证请求无效，请重新登录")
+
+    user = db.get(SysUser, result.row.user_id)
+    if user is None or not user.active:
+        raise HTTPException(401, "用户不存在或已停用")
+
+    if result.state == "pending":
+        # 还没点链接 —— 这是**正常状态**，不是错误。
+        return MfaPollOut(status="PENDING")
+
+    # ---- 换令牌 ------------------------------------------------------
+    now = mfa_service.now_utc()
+    token, expires = create_access_token(
+        user.id, user.username, is_admin=bool(user.is_admin),
+        token_version=user.token_version or 0,
+        mfa_at=int(now.timestamp()))
+    _mfa_audit(db, core_audit.MFA_ACTION_CONSUMED, user,
+               f"二次验证通过，已签发访问令牌：{user.username}"
+               f"（{_client_ip(request)}）",
+               username=user.username[:64], ip=_client_ip(request),
+               challenge_id=result.row.id, reason=result.row.reason,
+               emergency=bool(result.emergency))
+    db.commit()
+    return MfaPollOut(status="VERIFIED", access_token=token, expires_at=expires,
+                      user=_mfa_user_payload(db, user))
+
+
+@router.post("/mfa/resend", response_model=MfaChallengeOut)
+def mfa_resend(payload: MfaChallengeIn, request: Request,
+               db: Session = Depends(get_db)):
+    """重新发送验证邮件。
+
+    **受最短间隔约束**（``admin_mfa_resend_interval_seconds``）：超间隔
+    回 429 并带 ``Retry-After``。没有它，一次误点「登录」就能把收件箱
+    刷满几十封信 —— 而收件箱**就是通知通道本身**，把它刷爆等于把
+    告警通道一起刷爆了。
+
+    **重发会换新的挑战**（新的 email_token 与新的 client_secret），
+    旧的链接当场作废 —— 一封还在别人收件箱里的旧信不该还能用。
+    """
+    row = db.get(AdminMfaChallenge, payload.challenge_id)
+    if row is None or not mfa_service.secret_matches(
+            payload.client_secret, row.client_secret_hash):
+        raise HTTPException(401, "验证请求无效，请重新登录")
+
+    now = mfa_service.now_utc()
+    interval = mfa_service.resend_interval_seconds()
+    last_sent = row.last_sent_at
+    if last_sent is not None and last_sent.tzinfo is None:
+        last_sent = last_sent.replace(tzinfo=timezone.utc)
+    if last_sent is not None:
+        elapsed = (now - last_sent).total_seconds()
+        if elapsed < interval:
+            wait = int(interval - elapsed) + 1
+            raise HTTPException(
+                429, f"发送过于频繁，请 {wait} 秒后再试",
+                headers={"Retry-After": str(wait)})
+
+    user = db.get(SysUser, row.user_id)
+    if user is None:
+        raise HTTPException(401, "验证请求无效，请重新登录")
+
+    new_row, email_token, client_secret = mfa_service.create_challenge(
+        db, user, reason=row.reason or "login", ip=row.ip,
+        user_agent=row.user_agent)
+    _mfa_audit(db, core_audit.MFA_ACTION_SENT, user,
+               f"重新发送二次验证链接：{user.username}（{_client_ip(request)}）",
+               username=user.username[:64], ip=_client_ip(request),
+               challenge_id=new_row.id, reason=new_row.reason, resent=True)
+    db.commit()
+    mfa_service.send_challenge_email(
+        user=user, challenge=new_row, email_token=email_token,
+        link_base=mfa_service.link_base(request), reason=new_row.reason)
+    return MfaChallengeOut(
+        challenge_id=new_row.id,
+        client_secret=client_secret,
+        expires_in=mfa_service.ttl_seconds(),
+        email_hint=mfa_service.email_hint(db),
+        resend_after=interval,
+    )
+
+
+@router.post("/mfa/reauth", response_model=MfaChallengeOut)
+def mfa_reauth(request: Request, user: SysUser = Depends(get_current_user),
+               db: Session = Depends(get_db)):
+    """已登录的管理员请求「重新验证」。
+
+    **挑战的 user_id 来自当前登录用户**，不能由请求方指定 —— 否则
+    「为另一个账号发起验证」就成了一条越权路径。
+
+    走完这一套之后，客户端用**同一个 poll 接口**换到一个**新的**令牌
+    （新令牌带新鲜的 ``mfa_at``），再用新令牌重试那个高危动作。
+    """
+    if not user.is_admin:
+        raise HTTPException(403, "只有系统管理员可以执行该操作")
+    if not mfa_service.mfa_enabled(db):
+        raise HTTPException(400, "二次验证未启用，无需重新验证")
+    error = mfa_service.channel_error(db)
+    if error:
+        log.error("管理员二次验证通道未配置，无法重新验证：user=%s 原因=%s",
+                  user.username, error)
+        raise HTTPException(503, error)
+
+    ip = _client_ip(request)
+    row, email_token, client_secret = mfa_service.create_challenge(
+        db, user, reason="reauth", ip=ip,
+        user_agent=request.headers.get("user-agent", ""))
+    _mfa_audit(db, core_audit.MFA_ACTION_SENT, user,
+               f"已请求重新验证：{user.username}（{ip}）",
+               username=user.username[:64], ip=ip, challenge_id=row.id,
+               reason="reauth")
+    db.commit()
+    mfa_service.send_challenge_email(
+        user=user, challenge=row, email_token=email_token,
+        link_base=mfa_service.link_base(request), reason="reauth")
+    return MfaChallengeOut(
+        challenge_id=row.id,
+        client_secret=client_secret,
+        expires_in=mfa_service.ttl_seconds(),
+        email_hint=mfa_service.email_hint(db),
+        resend_after=mfa_service.resend_interval_seconds(),
     )
 
 

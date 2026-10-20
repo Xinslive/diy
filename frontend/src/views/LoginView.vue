@@ -4,7 +4,32 @@
       <h1>财务记账系统</h1>
       <p class="muted">多账套 · 凭证 · 账簿 · 报表</p>
 
-      <el-tabs v-model="tab" stretch :class="{ 'tabs-single': !gate.showTabs }">
+      <!-- ------------------------------------------------ 二次验证：等邮件 -->
+      <!-- v-if 而不是 v-else 的一层：二次验证进行中时，登录表单整个收起 ——
+           留着它等于让人在「等邮件」的半路上又点一次登录（那会再造一个
+           挑战、把上一封邮件作废）。 -->
+      <div v-if="store.mfa" class="mfa-box">
+        <h2>请查收验证邮件</h2>
+        <p class="muted">
+          我们已经往 <strong>{{ store.mfa.emailHint || '通知邮箱' }}</strong>
+          发了一封带验证链接的邮件。点开链接完成验证后，**回到这个窗口**
+          点「我已验证」。
+        </p>
+        <p class="muted countdown">验证链接 {{ mfaLeft }} 秒后过期</p>
+        <el-button type="primary" size="large" style="width: 100%"
+                   :loading="polling" @click="submitPoll">
+          我已验证
+        </el-button>
+        <el-button size="large" style="width: 100%; margin-top: 10px"
+                   :disabled="resendWait > 0" :loading="resending" @click="submitResend">
+          {{ resendWait > 0 ? `重新发送（${resendWait} 秒后可用）` : '重新发送验证邮件' }}
+        </el-button>
+        <el-button link type="info" class="exit-btn" @click="backToLogin">
+          退出，重新登录
+        </el-button>
+      </div>
+
+      <el-tabs v-else v-model="tab" stretch :class="{ 'tabs-single': !gate.showTabs }">
         <!-- ------------------------------------------------ 登录 -->
         <el-tab-pane label="登录" name="login">
           <el-form @submit.prevent="submitLogin">
@@ -66,7 +91,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import * as authApi from '@/api/auth'
@@ -113,17 +138,79 @@ const reg = reactive({ username: '', password: '', confirm: '' })
 
 const err = (e, fallback) => e?.response?.data?.detail || fallback
 
+// ---- 二次验证：等邮件那一屏 ------------------------------------------------
+//
+// **「等邮件」不是「登录失败」。** 所以从进这一屏到验证通过，界面上
+// **不出现任何一条错误提示** —— 一条红字会让人以为口令错了，转头去
+// 重输一遍（那只会再造一个挑战、把上一封邮件作废）。
+//
+// 倒计时靠一个每秒跳一次的时钟驱动。直接读 Date.now() 的话 Vue 察觉不到
+// 时间变了，界面上的数字会一直停在同一个数。
+const polling = ref(false)
+const resending = ref(false)
+const now = ref(Date.now())
+let ticker = null
+
+const mfaLeft = computed(() => store.mfaExpiresIn(now.value))
+const resendWait = computed(() => store.mfaResendWait(now.value))
+
+onMounted(() => { ticker = setInterval(() => { now.value = Date.now() }, 1000) })
+onUnmounted(() => { if (ticker) clearInterval(ticker) })
+
 async function submitLogin() {
   if (!username.value || !password.value) return ElMessage.warning('请填写用户名和密码')
   busy.value = true
   try {
-    await store.login(username.value, password.value)
+    const r = await store.login(username.value, password.value)
+    if (r && r.mfa_required) {
+      // 二次验证：**没有令牌**（服务端压根没发），切到「等邮件」那一屏。
+      // 口令从内存里清掉 —— 它已经在服务端校验过了，留着没用。
+      password.value = ''
+      return
+    }
     router.push('/books')
   } catch (e) {
     ElMessage.error(err(e, '登录失败'))
   } finally {
     busy.value = false
   }
+}
+
+/** 点「我已验证」：问一次服务端。**没验证成功不算错误** —— 那只是「还没点链接」。 */
+async function submitPoll() {
+  polling.value = true
+  try {
+    const r = await store.pollMfa()
+    if (r.status === 'VERIFIED') {
+      ElMessage.success('二次验证已完成')
+      router.push('/books')
+    } else {
+      ElMessage.info('还没验证成功，请先点开邮件里的链接')
+    }
+  } catch (e) {
+    ElMessage.error(err(e, '读取验证状态失败'))
+  } finally {
+    polling.value = false
+  }
+}
+
+async function submitResend() {
+  resending.value = true
+  try {
+    const r = await store.resendMfa()
+    if (r.ok) ElMessage.success('验证邮件已重新发送')
+    else if (r.reason === 'too_soon') ElMessage.warning(`请 ${r.wait} 秒后再试`)
+  } catch (e) {
+    ElMessage.error(err(e, '重新发送失败'))
+  } finally {
+    resending.value = false
+  }
+}
+
+/** 退出等待，回到登录表单。**不清令牌** —— 此刻本来就没有令牌。 */
+function backToLogin() {
+  store.cancelMfa()
+  password.value = ''
 }
 
 async function submitRegister() {
@@ -180,6 +267,11 @@ onMounted(async () => {
 h1 { font-size: 22px; margin: 0 0 4px; }
 p { margin: 0 0 12px; font-size: 13px; }
 .hint { text-align: center; font-size: 12px; margin: 12px 0 0; line-height: 1.6; }
+.mfa-box { text-align: center; }
+.mfa-box h2 { font-size: 16px; margin: 4px 0 10px; }
+.mfa-box p { line-height: 1.8; }
+.countdown { font-size: 12px; margin: 0 0 14px; }
+.exit-btn { margin-top: 10px; width: 100%; }
 :deep(.el-tabs__header) { margin-bottom: 18px; }
 /* 关掉自助注册后只剩「登录」一个页签，那一行页签栏没有信息量，
    去掉它，登录表单直接顶上来（见 utils/registration.js 的 showTabs）。 */

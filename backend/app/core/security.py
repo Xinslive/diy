@@ -48,7 +48,8 @@ def token_minutes_for(is_admin: bool) -> int:
 
 
 def create_access_token(user_id: int, username: str, is_admin: bool = False,
-                        token_version: int = 0) -> tuple[str, int]:
+                        token_version: int = 0,
+                        mfa_at: int | None = None) -> tuple[str, int]:
     """签发访问令牌。
 
     ``token_version`` 写进载荷（``tv``），由 :func:`app.core.deps.get_current_user`
@@ -57,10 +58,26 @@ def create_access_token(user_id: int, username: str, is_admin: bool = False,
 
     默认值 0 是为了让不关心这件事的调用方不用改签名；真正的签发入口
     （``/api/auth/login``）一定会把库里的值传进来。
+
+    ``mfa_at``：**只在真的过了邮箱二次验证时传**（epoch 秒）。
+
+    传了就多签两个字段：
+
+    * ``amr`` —— 认证方法（``"pwd+mfa"``）。``amr`` 是 OAuth 语义里的
+      「这次会话是怎么来的」，用它就能一眼看出「这个会话过了二次验证」。
+    * ``mfa_at`` —— 二次验证通过的时刻。高危动作的「近期重新认证」
+      （:func:`app.core.deps.require_recent_admin_mfa`）就是拿它跟
+      ``admin_mfa_grace_minutes`` 比。
+
+    **不传时载荷与改动前逐字一致**（一个字段都不多不少）—— 这样普通用户
+    的登录路径、已签发的老令牌、以及所有断言载荷形状的回归测试都不受影响。
     """
     expires = datetime.now(timezone.utc) + timedelta(minutes=token_minutes_for(is_admin))
     payload = {"sub": str(user_id), "username": username,
                "exp": expires, "tv": int(token_version or 0)}
+    if mfa_at is not None:
+        payload["amr"] = "pwd+mfa"
+        payload["mfa_at"] = int(mfa_at)
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm), int(
         expires.timestamp()
     )

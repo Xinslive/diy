@@ -26,7 +26,16 @@ export const useSessionStore = defineStore('session', {
     lastCreatedBookId: 0,
     // 每个账套的初始化状态（两步向导要的那份 init）。账套列表行里已经自带 init，
     // 这里存的是**比列表更新的那份**：向导里刚做完一步时，列表还没重新拉过。
-    initByBook: {}
+    initByBook: {},
+    // 管理员二次验证**进行中**的状态。**null = 没有在进行中。**
+    //
+    // 形状：
+    //   { challengeId, clientSecret, expiresIn, emailHint, resendAfter, sentAt }
+    //
+    // **这里绝不能出现访问令牌。** 二次验证没完成之前，令牌还不存在 ——
+    // 它要等邮件里的链接被点开、服务端把挑战标成已验证之后，才由**发起
+    // 登录的这台机器**（凭 challenge_id + client_secret）换回来。
+    mfa: null
   }),
   getters: {
     isAuthed: (s) => !!s.token,
@@ -65,16 +74,117 @@ export const useSessionStore = defineStore('session', {
       ?? s.books.find((b) => b.id === s.bookId)?.latest_year ?? 0,
     /** 当前年度的期间，页面上按年度分组用 */
     periodsOfYear: (s) => (y) => s.periods.filter((p) => p.year === y),
-    yearsOfBook: (s) => (b) => (b?.years || []).map((y) => y.year).sort((x, y) => y - x)
+    yearsOfBook: (s) => (b) => (b?.years || []).map((y) => y.year).sort((x, y) => y - x),
+    /**
+     * 距离下一次可以「重新发送验证邮件」还有几秒。
+     *
+     * 传一个 ``now`` 进来（组件里那个每秒跳一次的时钟）是为了让倒计时
+     * 真的会走 —— 直接在 getter 里读 ``Date.now()`` 的话，Vue 察觉不到
+     * 时间变了，界面上的倒计时会一直停在同一个数。
+     */
+    mfaResendWait: (s) => (now = Date.now()) => {
+      const m = s.mfa
+      if (!m) return 0
+      const after = (m.resendAfter || 60) * 1000
+      return Math.max(0, Math.ceil((m.sentAt + after - now) / 1000))
+    },
+    /** 验证链接还剩几秒过期。 */
+    mfaExpiresIn: (s) => (now = Date.now()) => {
+      const m = s.mfa
+      if (!m) return 0
+      return Math.max(0, Math.ceil((m.sentAt + (m.expiresIn || 0) * 1000 - now) / 1000))
+    }
   },
   actions: {
+    /**
+     * 登录。
+     *
+     * **返回 `{mfa_required}`**：管理员且服务端开着二次验证时，服务端
+     * **不发令牌**，只回一个挑战。这一刻**不能写任何令牌进 localStorage** ——
+     * 令牌还不存在，它要等邮件里的链接被点开之后才换得回来。写了就等于
+     * 「绕过二次验证也拿到了会话」。
+     */
     async login(username, password) {
       const data = await authApi.login(username, password)
+      if (data && data.mfa_required) {
+        this.mfa = {
+          challengeId: data.challenge_id,
+          clientSecret: data.client_secret,
+          expiresIn: data.expires_in,
+          emailHint: data.email_hint || '',
+          resendAfter: 60,
+          sentAt: Date.now()
+        }
+        return { mfa_required: true }
+      }
+      await this.applySession(data)
+      return { mfa_required: false }
+    },
+
+    /**
+     * 把一份「登录成功」的回执写进本地状态。**登录与二次验证换到令牌
+     * 之后走的是同一条路** —— 界面上的后续行为（跳首页、拉账套）不该
+     * 因为「这次是二次验证过来的」而有一份单独的代码。
+     */
+    async applySession(data) {
       this.token = data.access_token
       this.user = data.user
       localStorage.setItem('cwq_token', data.access_token)
       localStorage.setItem('cwq_user', JSON.stringify(data.user))
       await this.loadBooks()
+    },
+
+    /**
+     * 问一次「验证通过了吗」。
+     *
+     * 返回 `{status}`：``PENDING`` = 还没点链接（**这是正常状态，不是错误**）；
+     * ``VERIFIED`` = 通过了，令牌已经写进本地。
+     *
+     * **轮询失败不能把用户判成「登录失败」** —— 等待邮件期间网络抖一下、
+     * 或者链接还没点，都是常事。真正的失败（链接过期、挑战作废）由服务端
+     * 用明确的文案说出来，前端照原样显示。
+     */
+    async pollMfa() {
+      const m = this.mfa
+      if (!m) return { status: 'IDLE' }
+      const data = await authApi.mfaPoll(m.challengeId, m.clientSecret)
+      if (data && data.access_token) {
+        this.mfa = null
+        await this.applySession({ access_token: data.access_token, user: data.user })
+        return { status: 'VERIFIED' }
+      }
+      return { status: (data && data.status) || 'PENDING' }
+    },
+
+    /**
+     * 重新发送验证邮件。
+     *
+     * **本地也拦一道最短间隔**：服务端会拦（429 + Retry-After），但让人
+     * 一次次点一个注定失败的按钮，只是在制造挫败感。
+     *
+     * **重发会换一个新的挑战**（新的 challenge_id 与 client_secret），
+     * 所以这里用返回值覆盖手里那一对 —— 旧的那对已经作废。
+     */
+    async resendMfa() {
+      const m = this.mfa
+      if (!m) return { ok: false, reason: 'no_challenge' }
+      const wait = this.mfaResendWait()
+      if (wait > 0) return { ok: false, reason: 'too_soon', wait }
+      const data = await authApi.mfaResend(m.challengeId, m.clientSecret)
+      this.mfa = {
+        challengeId: data.challenge_id,
+        clientSecret: data.client_secret,
+        expiresIn: data.expires_in,
+        emailHint: data.email_hint || m.emailHint,
+        resendAfter: data.resend_after || 60,
+        sentAt: Date.now()
+      }
+      return { ok: true, data }
+    },
+
+    /** 放弃这次二次验证，回到登录表单。**不清令牌** —— 此刻本来就没有令牌。 */
+    cancelMfa() {
+      this.mfa = null
     },
     /** 重新拉一次登录态。
      *  localStorage 里的 user 是登录那一刻的快照：老版本缓存的 user 没有
@@ -130,6 +240,9 @@ export const useSessionStore = defineStore('session', {
       this.token = ''
       this.user = null
       this.books = []
+      // 二次验证进行中的状态也是**这个人的账**：上一个用户停在「等邮件」
+      // 的时候，下一个人不该接着用他那个挑战。
+      this.mfa = null
       // 下一个人的账套列表还没问过 —— 别拿这一份空列表去判「这个人没有账套」
       this.booksLoaded = false
       // 期间跟账套是一对：书留着的账套 id（下次登录还能落回去），

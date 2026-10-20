@@ -1,6 +1,7 @@
 """FastAPI 依赖：当前用户、账套授权。"""
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Request, status
@@ -26,6 +27,7 @@ READ_ONLY_ROLES = frozenset({"VIEWER"})
 def get_current_user(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
     db: Session = Depends(get_db),
+    request: Request = None,  # type: ignore[assignment]
 ) -> SysUser:
     if creds is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "缺少访问令牌")
@@ -33,6 +35,11 @@ def get_current_user(
         payload = decode_access_token(creds.credentials)
     except Exception:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "访问令牌无效或已过期")
+    # 把载荷挂到 request.state 上，供下游依赖读取（见
+    # require_recent_admin_mfa）。**不要重新解一遍 JWT** —— 那既慢，
+    # 又会出现「解两次得到两份载荷」的不一致窗口。
+    if request is not None:
+        request.state.auth_payload = payload
     user = db.get(SysUser, int(payload["sub"]))
     if user is None or not user.active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户不存在或已停用")
@@ -69,6 +76,64 @@ def require_admin(user: SysUser = Depends(get_current_user)) -> SysUser:
     """
     if not user.is_admin:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "只有系统管理员可以访问")
+    return user
+
+
+def require_recent_admin_mfa(
+    user: SysUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    request: Request = None,  # type: ignore[assignment]
+) -> SysUser:
+    """高危动作的「近期重新认证」依赖。
+
+    **语义**：当前用户必须是管理员，**且**令牌的 ``mfa_at`` 落在
+    ``admin_mfa_grace_minutes`` 分钟内 —— 否则 403，并明确告诉用户
+    「需要在 X 分钟内完成邮箱二次验证」以及去哪儿做（``POST
+    /api/auth/mfa/reauth``）。
+
+    **为什么令牌里没有 ``mfa_at`` 就一律拒绝**（fail-closed）：那意味着
+    这个会话是「没经过二次验证」来的 —— 老令牌、或者二次验证开着但
+    这个会话是关着的时候签发的。两种都不该被当成「刚验过」。
+
+    **开关关着时这个依赖不拦人**。理由是可用性：二次验证是**可选的
+    组织决策**，默认关闭（见 ``admin_mfa_enabled`` 的注释）—— 若「没开
+    二次验证」就等于「所有管理员都做不了高危动作」，那么这个功能的
+    默认状态会变成一次全站事故。
+
+    但**开关开着而通道坏了的时候一律拒绝**（fail-closed）—— 那时管理员
+    本来就换不到新令牌（连登录都过不去），高危动作同样不该放行。
+    真正的逃生口是 ``scripts/mfa_admin.py --disable``（明确关掉）与
+    进程环境里的 ``ADMIN_MFA_EMERGENCY_CODE``。
+
+    **父会话接线点**：``api/system.py`` 的高危子集挂这个依赖即可，
+    不必再判断开关 —— 判定在这里。
+    """
+    from app.notify import mfa as mfa_service
+
+    if not user.is_admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "只有系统管理员可以访问")
+    if not mfa_service.mfa_enabled(db):
+        return user
+
+    grace = mfa_service.grace_seconds()
+    payload = None
+    if request is not None:
+        payload = getattr(request.state, "auth_payload", None)
+    mfa_at = (payload or {}).get("mfa_at")
+    if not mfa_at:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"该操作需要近期完成邮箱二次验证：请在 {grace // 60} 分钟内通过 "
+            "POST /api/auth/mfa/reauth 重新验证后再试")
+    try:
+        age = time.time() - float(mfa_at)
+    except (TypeError, ValueError):
+        age = None
+    if age is None or age > grace:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"该操作需要近期完成邮箱二次验证：请在 {grace // 60} 分钟内通过 "
+            "POST /api/auth/mfa/reauth 重新验证后再试")
     return user
 
 
