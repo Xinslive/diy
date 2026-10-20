@@ -29,6 +29,10 @@ from email import policy
 import pytest
 
 from app.core.config import settings
+from app.core.db import SessionLocal
+from app.notify import config as notify_config
+from app.notify import events as notify_events
+from app.notify import mailer
 
 
 class _SMTP服务器:
@@ -43,6 +47,20 @@ class _SMTP服务器:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(4)
+        # **accept 必须带超时。**
+        #
+        # 理由是"把这个服务器掐掉"这件事在两个平台上的行为不一样：
+        # Linux 上另一个线程正阻塞在 accept() 时，close(fd) **不会**让那个
+        # accept 返回 —— 内核仍然持有 listening socket 的引用，那个 socket
+        # 还在 LISTEN、照样接受连接。于是"服务器已经关了"成了一句假话：
+        # 应用真把信送到了一个"死人"服务器，断言反而挂掉。
+        #
+        # macOS 上 close 会真的拆掉 socket 并唤醒 accept，所以本地一直绿、
+        # Linux CI 一直红 —— **这不是 flaky，是平台差异**。
+        #
+        # 改成超时轮询 + 停止标志之后，关停就是真的：accept 定期醒来看到
+        # 标志就退出，端口随之释放，连接被拒。
+        self.sock.settimeout(0.1)
         self.port = self.sock.getsockname()[1]
         self.认证声明 = ["PLAIN"] if 认证声明 is None else 认证声明
 
@@ -52,86 +70,153 @@ class _SMTP服务器:
         self.data = b""
         self.收到 = threading.Event()
 
+        self._停 = threading.Event()
+        self._连接: socket.socket | None = None
         self._线程 = threading.Thread(target=self._跑, daemon=True)
         self._线程.start()
 
+    # ------------------------------------------------------------- 关停
+    def 关闭(self) -> None:
+        """真把这个服务器关掉：端口不再接受连接。
+
+        **不能只 close(fd)。** 见 ``__init__`` 里关于 accept 超时的说明 ——
+        Linux 上 close 一个正被 accept 阻塞的 listening socket 并不会让那个
+        accept 返回，socket 还在 LISTEN，"关了"是假的。所以这里先把停止
+        标志立起来（accept 循环下一轮就退出），再关 fd，顺手把已建立的
+        连接也关掉，让服务线程不必等它的 30 秒读超时。
+        """
+        self._停.set()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        连接 = self._连接
+        if 连接 is not None:
+            try:
+                连接.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                连接.close()
+            except OSError:
+                pass
+
+    def 等端口关死(self, 超时=5.0) -> None:
+        """等到这个端口**真的**不再接受连接为止。
+
+        close(fd) 之后内核可能还短暂地留着那个 socket（正在退出的 accept
+        还持有引用），那一小段时间里连接仍会被接受。直接接着发信就会撞上
+        那个窗口，于是"服务器已经关了"又是假的。这里主动连一下，
+        **明确被拒**才算真关。
+        """
+        截止 = time.monotonic() + 超时
+        while time.monotonic() < 截止:
+            try:
+                with socket.create_connection(("127.0.0.1", self.port), timeout=0.3):
+                    pass
+            except ConnectionRefusedError:
+                return                       # 明确拒了 —— 端口真的空了
+            except OSError:
+                pass                         # 连不上但不是"拒"，继续等
+            time.sleep(0.05)
+        raise AssertionError(f"端口 {self.port} 还在接受连接，服务器没关掉")
+
     # ------------------------------------------------------------- 协议
     def _跑(self):
-        try:
-            conn, _ = self.sock.accept()
-        except OSError:
+        conn = None
+        while not self._停.is_set():
+            try:
+                conn, _ = self.sock.accept()
+                break
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+        if conn is None:
             return
+        self._连接 = conn
         with conn:
-            conn.settimeout(30)
-            f = conn.makefile("rb")
-            w = conn.makefile("wb")
-            w.write(b"220 cwq-test ESMTP\r\n")
-            w.flush()
-            while True:
-                line = f.readline()
-                if not line:
-                    return
-                命令 = line.decode("utf-8", "replace").rstrip("\r\n")
-                大写 = 命令.upper()
-                if 大写.startswith("EHLO") or 大写.startswith("HELO"):
-                    # **不** advertise SIZE：smtplib 看到它就会在 MAIL FROM
-                    # 上带 size= 参数，那与本文件要验的东西无关。
-                    #
-                    # **也不** advertise STARTTLS：于是配成「587 + STARTTLS」
-                    # 的管理员会真的撞上 smtplib 的 SMTPNotSupportedError
-                    # —— 那是最常见的误配，报错必须指向那个方向。
-                    w.write(b"250-cwq-test\r\n")
-                    if self.认证声明:
-                        w.write(f"250 AUTH {' '.join(self.认证声明)}\r\n".encode())
-                    else:
-                        w.write(b"250 HELP\r\n")
-                elif 大写.startswith("AUTH PLAIN"):
-                    片段 = 命令.split(" ", 2)
-                    负载 = 片段[2] if len(片段) > 2 else ""
-                    if not 负载:
-                        w.write(b"334 \r\n")
-                        负载 = f.readline().decode("ascii", "replace").strip()
-                    try:
-                        解 = base64.b64decode(负载).decode("utf-8", "replace")
-                    except Exception:  # noqa: BLE001
-                        w.write(b"535 5.7.8 bad base64\r\n")
-                        w.flush()
-                        continue
-                    # PLAIN 的载荷是 \0user\0password
-                    段 = 解.split("\x00")
-                    self.auth = (段[1] if len(段) > 1 else "", 段[2] if len(段) > 2 else "")
-                    w.write(b"235 2.7.0 Authentication successful\r\n")
-                elif 大写.startswith("MAIL FROM"):
-                    self.mail_from = 命令.split(":", 1)[-1].strip().strip("<>")
-                    w.write(b"250 2.1.0 Ok\r\n")
-                elif 大写.startswith("RCPT TO"):
-                    self.rcpts.append(命令.split(":", 1)[-1].strip().strip("<>"))
-                    w.write(b"250 2.1.5 Ok\r\n")
-                elif 大写.startswith("DATA"):
-                    w.write(b"354 End data with <CR><LF>.<CR><LF>\r\n")
-                    w.flush()
-                    块 = []
-                    while True:
-                        数据行 = f.readline()
-                        if not 数据行:
-                            break
-                        if 数据行 == b".\r\n":
-                            break
-                        if 数据行.startswith(b".."):
-                            数据行 = 数据行[1:]
-                        块.append(数据行)
-                    self.data = b"".join(块)
-                    w.write(b"250 2.0.0 Ok: queued\r\n")
-                    self.收到.set()
-                elif 大写.startswith("RSET") or 大写.startswith("NOOP"):
-                    w.write(b"250 2.0.0 Ok\r\n")
-                elif 大写.startswith("QUIT"):
-                    w.write(b"221 2.0.0 Bye\r\n")
-                    w.flush()
-                    return
+            try:
+                self._会话(conn)
+            except OSError:
+                # 客户端挂断（或者关停时我们自己掐断了这条连接）都会走到这里。
+                # 这不是错误，是一次对话正常结束 —— 但它不能以「未处理的线程异常」
+                # 冒出去：pytest 会把它报成 PytestUnhandledThreadExceptionWarning，
+                # 而哪天有人给 pytest 加了 -W error，它就变成一条与被测逻辑毫无
+                # 关系的红灯。
+                return
+
+    def _会话(self, conn):
+        conn.settimeout(30)
+        f = conn.makefile("rb")
+        w = conn.makefile("wb")
+        w.write(b"220 cwq-test ESMTP\r\n")
+        w.flush()
+        while True:
+            line = f.readline()
+            if not line:
+                return
+            命令 = line.decode("utf-8", "replace").rstrip("\r\n")
+            大写 = 命令.upper()
+            if 大写.startswith("EHLO") or 大写.startswith("HELO"):
+                # **不** advertise SIZE：smtplib 看到它就会在 MAIL FROM
+                # 上带 size= 参数，那与本文件要验的东西无关。
+                #
+                # **也不** advertise STARTTLS：于是配成「587 + STARTTLS」
+                # 的管理员会真的撞上 smtplib 的 SMTPNotSupportedError
+                # —— 那是最常见的误配，报错必须指向那个方向。
+                w.write(b"250-cwq-test\r\n")
+                if self.认证声明:
+                    w.write(f"250 AUTH {' '.join(self.认证声明)}\r\n".encode())
                 else:
-                    w.write(b"502 5.5.1 Command not implemented\r\n")
+                    w.write(b"250 HELP\r\n")
+            elif 大写.startswith("AUTH PLAIN"):
+                片段 = 命令.split(" ", 2)
+                负载 = 片段[2] if len(片段) > 2 else ""
+                if not 负载:
+                    w.write(b"334 \r\n")
+                    负载 = f.readline().decode("ascii", "replace").strip()
+                try:
+                    解 = base64.b64decode(负载).decode("utf-8", "replace")
+                except Exception:  # noqa: BLE001
+                    w.write(b"535 5.7.8 bad base64\r\n")
+                    w.flush()
+                    continue
+                # PLAIN 的载荷是 \0user\0password
+                段 = 解.split("\x00")
+                self.auth = (段[1] if len(段) > 1 else "", 段[2] if len(段) > 2 else "")
+                w.write(b"235 2.7.0 Authentication successful\r\n")
+            elif 大写.startswith("MAIL FROM"):
+                self.mail_from = 命令.split(":", 1)[-1].strip().strip("<>")
+                w.write(b"250 2.1.0 Ok\r\n")
+            elif 大写.startswith("RCPT TO"):
+                self.rcpts.append(命令.split(":", 1)[-1].strip().strip("<>"))
+                w.write(b"250 2.1.5 Ok\r\n")
+            elif 大写.startswith("DATA"):
+                w.write(b"354 End data with <CR><LF>.<CR><LF>\r\n")
                 w.flush()
+                块 = []
+                while True:
+                    数据行 = f.readline()
+                    if not 数据行:
+                        break
+                    if 数据行 == b".\r\n":
+                        break
+                    if 数据行.startswith(b".."):
+                        数据行 = 数据行[1:]
+                    块.append(数据行)
+                self.data = b"".join(块)
+                w.write(b"250 2.0.0 Ok: queued\r\n")
+                self.收到.set()
+            elif 大写.startswith("RSET") or 大写.startswith("NOOP"):
+                w.write(b"250 2.0.0 Ok\r\n")
+            elif 大写.startswith("QUIT"):
+                w.write(b"221 2.0.0 Bye\r\n")
+                w.flush()
+                return
+            else:
+                w.write(b"502 5.5.1 Command not implemented\r\n")
+            w.flush()
 
     def 等一封(self, 超时=15.0) -> bytes:
         assert self.收到.wait(超时), "超时：服务端没有收到任何邮件"
@@ -145,7 +230,26 @@ class _SMTP服务器:
 def smtp服务器():
     服务器 = _SMTP服务器()
     yield 服务器
-    服务器.sock.close()
+    服务器.关闭()
+
+
+@pytest.fixture(autouse=True)
+def _收尾清掉通知配置(client, auth):
+    """每个用例结束后把通知配置清回「什么都没配」。
+
+    **为什么这个文件需要它。** ``sys_setting`` 里的行是**跨用例存活**的：
+    接口里 ``db.commit()`` 提交了，测试夹具的 rollback 只回滚它自己那个
+    会话里未提交的改动。所以本文件里配过的 SMTP（连着一个用完就掐掉的
+    端口）会留给后面跑的用例 —— 而那些用例看到的配置指向一个死端口，
+    「发不出去」就成了它们的常态，测出来的东西不对。
+
+    这不是洁癖：它正是「配置是全局的」这件事在测试里的表现。
+    """
+    yield
+    client.put("/api/system/notify", headers=auth, json={
+        "host": "", "username": "", "from_address": "",
+        "recipients": "", "enabled": True, "clear_password": True,
+    })
 
 
 def _配好通知(client, auth, 端口: int, 收件人="ops@x.com,boss@x.com"):
@@ -249,9 +353,17 @@ def test_发不出去时登录流程照常_不抛异常也不卡住(smtp服务�
 
     这条是"通知是旁路"的最后一层验证：前面几次都是在真服务器活着的时候
     验的；现在把服务器掐了，登录路径不能变成 500、也不能卡住。
+
+    **「掐掉」必须是真的掐掉。** 这里踩过一个平台差异的坑：原来只
+    close 了监听 socket 的 fd，而 Linux 上另一个线程正阻塞在 accept()
+    时，close 不会让那个 accept 返回 —— 内核仍持有 listening socket 的
+    引用，socket 还在 LISTEN、照样收连接。于是"服务器已经关了"是句假话：
+    应用真把信送到了这个"死人"服务器，断言反而挂掉；macOS 上 close 会
+    拆掉 socket，所以本地一直绿、Linux CI 一直红。**这不是 flaky。**
     """
     端口 = smtp服务器.port
-    smtp服务器.sock.close()          # 掐掉：连不上
+    smtp服务器.关闭()
+    smtp服务器.等端口关死()      # 端口真的空了才算数
 
     _配好通知(client, auth, 端口)
 
@@ -260,7 +372,19 @@ def test_发不出去时登录流程照常_不抛异常也不卡住(smtp服务�
         响应 = client.post("/api/auth/login", json=凭据)
         assert 响应.status_code == 401, f"登录的失败形态变了：{响应.status_code}"
 
-    # 等一会儿，确认后台线程确实试过并且**没有把主流程带崩**
+    # **正面断言「确实试了、也确实失败了」。**
+    # 只断言"没收到信"是不够的 —— 投递压根没触发过时它同样成立，
+    # 等于什么都没验。所以这里先证明连不上（SMTP 服务器真的不在了），
+    # 再证明投递被尝试过且失败被吞掉。
+    with SessionLocal() as s:
+        配置 = notify_config.smtp_config(s)
+    with pytest.raises(mailer.MailError) as 失败:
+        mailer.send_mail(配置, ["ops@x.com"], "标题", "正文")
+    assert "连不上" in str(失败.value), f"失败原因不是连不上：{失败.value}"
+    assert notify_events.dispatch("ACCOUNT_LOCKED", "标题", "正文") is False, \
+        "服务器都不在了，投递居然报成功"
+
+    # 后台线程那次投递也不能把主流程带崩，更不能有信落地
     time.sleep(0.5)
     assert smtp服务器.收到.is_set() is False, "服务器都掐了还收到了信？"
 
@@ -309,4 +433,4 @@ def test_认证方式不兼容时报错要说清方向(client, auth):
         assert "GSSAPI" in 文案, f"报错里没有服务器声明的认证方式：{文案}"
         assert "PLAIN" in 文案, f"报错里没有本客户端支持的方式：{文案}"
     finally:
-        服务器.sock.close()
+        服务器.关闭()
