@@ -145,9 +145,15 @@ const router = useRouter()
 const nav = computed(() => visibleNav(store.isAdmin, pluginEntries.value))
 
 // 宿主页面按账套/期间重新取数；插件保留自己选择的目标账套和未保存预览。
-const viewKey = computed(() => route.meta.pluginId
-  ? `plugin-${route.meta.pluginId}`
-  : `${route.name}-${store.bookId}-${store.periodId}`)
+//
+// **期初余额页例外**：它的口径是**年度**，跟月份无关。所以它的 key 用年度
+// 而不是期间 —— 否则顶栏切一下月份就重挂整页，用户刚录了一半的数直接没了，
+// 而页面上摆的还是同一份数（换了页还得重新拉一次，白白闪一下）。
+const viewKey = computed(() => {
+  if (route.meta.pluginId) return `plugin-${route.meta.pluginId}`
+  const scope = route.name === 'openings' ? store.currentYear : store.periodId
+  return `${route.name}-${store.bookId}-${scope}`
+})
 
 /** 当前标签页 / 侧栏高亮的 key —— 凭证三种路由共用一个入口，所以不能直接用 route.name */
 const activeKey = computed(() => menuKeyOf(route.name))

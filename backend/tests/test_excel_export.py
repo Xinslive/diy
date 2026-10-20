@@ -387,12 +387,19 @@ def test_报表抬头只有账套名和期间():
     assert ws.cell(row=2, column=1).value == "乙 · 期间 2026-01"
 
 
-def test_期初余额表抬头只有账套名和年月():
-    ws = _sheet(opening_balance_excel([], book_name="乙", year=2026, month=1))
-    assert ws.cell(row=1, column=1).value == "乙　期初余额表　2026年1月"
+def test_期初余额表抬头只有账套名和年度():
+    """期初是**年度**口径的，抬头写年度，不写月份。"""
+    ws = _sheet(opening_balance_excel([], book_name="乙", year=2026))
+    assert ws.cell(row=1, column=1).value == "乙　期初余额表　2026年度"
     # 单位名那一行整行删掉了，标题上提：表头从第 4 行变成第 3 行
     assert ws.cell(row=3, column=1).value == "科目编码"
     assert ws.cell(row=2, column=1).value in (None, ""), "抬头与表头之间不该夹着内容"
+
+
+def test_期初余额表保留月份写法给老调用方():
+    """``month`` 给了就退回「{年}年{月}月」—— 留着是不让老调用方炸掉。"""
+    ws = _sheet(opening_balance_excel([], book_name="乙", year=2026, month=1))
+    assert ws.cell(row=1, column=1).value == "乙　期初余额表　2026年1月"
 
 
 def test_所有Excel导出件里都不出现单位名(client, auth, book, periods, subjects):

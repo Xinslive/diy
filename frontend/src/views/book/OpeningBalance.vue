@@ -4,7 +4,7 @@
       <div>
         <h2 class="page-title">期初余额</h2>
         <div class="muted">
-          {{ store.currentBook?.name }} · {{ data.period }} 期初余额
+          {{ store.currentBook?.name }} · {{ data.year }} 年度期初余额
           <template v-if="!data.editable">（{{ data.reason }}）</template>
         </div>
       </div>
@@ -32,7 +32,8 @@
     </el-alert>
 
     <el-alert v-if="!data.editable" type="warning" :closable="false" class="mb">
-      {{ data.reason }}。如需调整，先在「期末结账」反结账，或直接改该期间的凭证。
+      {{ data.reason }}。如需调整，先处理该年度的凭证：在「期末结账」里反结账，
+      或把该年度已记账的凭证改掉。
     </el-alert>
 
     <div class="card mb" :class="balanced ? 'ok' : 'bad'">
@@ -134,7 +135,7 @@ import { hasInit, importSummaryText, subjectsReady } from '@/utils/bookInit'
 const store = useSessionStore()
 const router = useRouter()
 const route = useRoute()
-const data = ref({ period: '', editable: false, reason: '', subjects: [] })
+const data = ref({ period: '', year: '', editable: false, reason: '', subjects: [] })
 const amounts = reactive({})
 /** 每行期初的「实际方位」。科目属性只是通常方向，允许逐行翻转 —— 应收账款出现
  *  贷方余额、应交税费为负都是真实业务，强按属性纠正会把余额方向洗掉。 */
@@ -335,10 +336,11 @@ function rowsOf(cat) {
 
 async function load() {
   if (!store.bookId) return router.push('/books')
-  // 跟顶栏那一期走：期初是「这一期开始时账上该有多少钱」，问的是某个月，
-  // 不是问整个账套。以前这个页面永远拿启用期间，2027 年一个凭证都没有，
-  // 屏幕上也还是 2026-01 那份锁死的数，看着像坏了。
-  data.value = await api.getOpenings(store.bookId, store.periodId)
+  // 跟顶栏的**年度**走：期初是「这一年开始时账上该有多少钱」，问的是一年，
+  // 不是问某个月、更不是问整个账套。切到 2026 年的哪个月都是同一份数；
+  // 换一年（2027）才是另一份。以前这个页面永远拿启用期间，2027 年一个凭证
+  // 都没有，屏幕上也还是 2026-01 那份锁死的数，看着像坏了。
+  data.value = await api.getOpenings(store.bookId, store.currentYear)
   for (const k of Object.keys(amounts)) delete amounts[k]
   for (const k of Object.keys(sides)) delete sides[k]
   for (const k of Object.keys(drafts)) delete drafts[k]
@@ -365,7 +367,7 @@ async function save() {
   }
   saving.value = true
   try {
-    const res = await api.setOpenings(store.bookId, rows, store.periodId)
+    const res = await api.setOpenings(store.bookId, rows, store.currentYear)
     // 后端在同一次事务里把初始化第 2 步标成了完成，顺手把最新的 init 带回来。
     // **必须写回 store**：第 2 步是在**另一个页面**（账套管理）上显示的，
     // 不写回去的话，用户从这儿回到账套管理，向导和卡片都还在说「还没做」——
@@ -410,7 +412,7 @@ function applyImport(res) {
 
 function exportXlsx() {
   downloadFile(`/books/${store.bookId}/openings.xlsx`,
-    store.periodId ? { period_id: store.periodId } : {}, '期初余额.xlsx')
+    store.currentYear ? { year: store.currentYear } : {}, '期初余额.xlsx')
 }
 function downloadTpl() {
   // 模板就是「导出当前」——科目已经在库里，导出来填金额即可
@@ -418,8 +420,9 @@ function downloadTpl() {
 }
 
 watch(() => store.bookId, load)
-// 顶栏换月/换年，这一页也得跟着换 —— 换个空月份进来还锁着，用户只会以为坏了
-watch(() => store.periodId, load)
+// 顶栏换**年**，这一页才跟着换。换成另一年就是另一份期初（2027 年的起点），
+// 换月份这一页纹丝不动 —— 期初是年度口径的，月份对它没有意义。
+watch(() => store.currentYear, load)
 onMounted(async () => {
   // 初始化向导第 2 步是**跳到这里**再导的（向导里没有这张表）：
   // 它带着 ?import=1 过来，把导入弹窗直接弹出来。

@@ -666,7 +666,7 @@ def report_excel(payload: dict, *, book_name: str) -> bytes:
 
 
 def opening_balance_excel(rows: list[dict], *, book_name: str, year: int,
-                          month: int) -> bytes:
+                          month: int | None = None) -> bytes:
     """期初余额表（导入模板 / 导出当前录入值 共用一份格式）。
 
     列刻意做成「财务系统间最好抄」的样子：科目编码、科目名称、方向、期初余额。
@@ -677,13 +677,18 @@ def opening_balance_excel(rows: list[dict], *, book_name: str, year: int,
     一行摆单位名，那一行整行删掉、标题上提，于是表头从第 4 行变成第 3 行、
     数据从第 5 行变成第 4 行。表头仍落在解析端的前 15 行扫描范围里，
     往返导入（导出 → 再喂回解析）不受影响。
+
+    **抬头是年度，不是月份**（2026-10-20）：期初余额是一个会计年度的起点，
+    不再按月分份。``month`` 不给就是年度口径（``{年}年度``）；给了才退回到
+    旧的「{年}年{月}月」写法 —— 留着是为了那份参数化调用不炸。
     """
     wb = Workbook()
     ws = wb.active
     ws.title = "期初余额"
 
+    scope = f"{year}年度" if month is None else f"{year}年{month}月"
     ws.merge_cells("A1:D1")
-    ws["A1"] = _text(f"{book_name}　期初余额表　{year}年{month}月")
+    ws["A1"] = _text(f"{book_name}　期初余额表　{scope}")
     ws["A1"].font = Font(size=13, bold=True)
     ws["A1"].alignment = Alignment(horizontal="center")
 

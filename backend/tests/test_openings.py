@@ -12,7 +12,7 @@ import io
 from decimal import Decimal
 
 from openpyxl import Workbook, load_workbook
-from sqlalchemy import select
+from sqlalchemy import func, select
 from tests.accounting_helpers import close_any
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -143,18 +143,24 @@ def test_cross_book_subject_rejected(client, auth, db, book, subjects, admin_use
     assert "科目不存在" in r.json()["detail"], r.json()
 
 
-def test_openings_locked_after_voucher(client, auth, book_id, make_voucher):
-    """账上有了业务数据，期初就是历史事实，不能再回头改。"""
-    make_voucher("2026-01-15", dr=[("1121", 100, "买货")], cr=[("4001", 100, "买货")])
+def test_openings_locked_after_posted_voucher(client, auth, book_id, make_voucher):
+    """年度里有**已记账**凭证，期初就是历史事实，不能再回头改。
+
+    判据是「已记账」而不是「有凭证」：账簿只统计已记账凭证
+    （``LedgerEngine._status_filter``），未记账的那张还没进账，
+    改年度期初跟它不冲突。
+    """
+    make_voucher("2026-01-15", dr=[("1121", 100, "买货")], cr=[("4001", 100, "买货")],
+                 posted=True)
 
     got = client.get(f"/api/books/{book_id}/openings", headers=auth).json()
     assert got["editable"] is False
-    assert got["reason"]
+    assert "已记账凭证" in got["reason"], got
 
     r = client.post(f"/api/books/{book_id}/periods", headers=auth,
                     json=[{"subject_id": got["subjects"][0]["id"], "amount": "1"}])
     assert r.status_code == 400
-    assert "业务数据" in r.json()["detail"], r.json()
+    assert "已记账凭证" in r.json()["detail"], r.json()
 
 
 def test_openings_not_editable_for_other_user_book(client, auth, book_id):
@@ -165,92 +171,131 @@ def test_openings_not_editable_for_other_user_book(client, auth, book_id):
         assert r.status_code in (401, 403, 404), (path, r.status_code)
 
 
-# ------------------------------------------------ 期初跟着顶栏那一期走
+# ------------------------------------------------ 期初跟着顶栏的**年度**走
 
 
-def test_openings_follow_selected_period(client, auth, book_id, periods, subjects, make_voucher):
-    """切到空的后续期间，期初就该能改。
+def test_openings_follow_selected_year(client, auth, book_id, periods, subjects, make_voucher):
+    """期初是**一个会计年度**的起点：切到这一年的哪个月都是同一份数。
 
-    以前这个页面永远显示启用期间，还用「账套里有没有凭证」一句话判死 ——
-    于是顶栏停在 2027 年、那边一张凭证都没有，屏幕上也还是 2026-01 那份
-    锁死的数，用户只会以为页面坏了。
+    以前这个页面按月分份，2026-05 与 2026-11 各有一份期初，
+    「这一年的起点」这件事在界面上根本问不出来。
     """
     make_voucher("2026-01-15", dr=[("1121", 100000, "存钱")],
                  cr=[("4001", 100000, "存钱")], posted=True)
 
     first = client.get(f"/api/books/{book_id}/openings", headers=auth).json()
-    assert first["period"] == "2026-01"
-    assert first["editable"] is False and "业务数据" in first["reason"], first
+    # 快照落在年度的**第一个期间**上
+    assert first["period"] == "2026-01", first
+    assert first["year"] == 2026, first
+    assert first["editable"] is False and "已记账凭证" in first["reason"], first
 
-    feb = client.get(f"/api/books/{book_id}/openings?period_id={periods[2].id}",
-                     headers=auth).json()
-    assert feb["period"] == "2026-02", feb
-    assert feb["editable"] is True, feb
-    assert feb["reason"] is None, feb
-    # 2 月本来就没有快照（快照只有启用和年度结转两处产生），页面上要显示的是
-    # 账簿真正在用的那个数 —— 上期期末 —— 而不是一片 0，否则对不上总账
-    bank = next(s for s in feb["subjects"] if s["code"] == "1121")
-    assert Decimal(bank["signed"]) == Decimal("100000"), bank
+    # 同一年里的另一个月：拿到的还是同一份（快照还是同一期）
+    nov = client.get(f"/api/books/{book_id}/openings?year=2026", headers=auth).json()
+    assert nov["period"] == "2026-01", nov
+    assert nov["year"] == 2026, nov
+    assert nov["editable"] is False, nov
+
+    # 老参数（period_id）也按年度解析：2026-11 与 2026-01 指向同一份
+    legacy = client.get(f"/api/books/{book_id}/openings?period_id={periods[11].id}",
+                        headers=auth).json()
+    assert legacy["period"] == "2026-01", legacy
+    assert legacy["year"] == 2026, legacy
 
 
-def test_save_later_period_opening_and_ledger_follows(
-        client, db, auth, book_id, periods, subjects, make_voucher):
-    """改了后续期间的期初，账簿立刻按新数算；启用期间那份不动。"""
-    from app.ledger.engine import LedgerEngine
+def test_openings_switch_year_switches_the_numbers(
+        client, db, auth, book, periods, subjects, make_voucher):
+    """换一年 = 换一份期初；换月份 = 纹丝不动。"""
+    from app.accounting.periods import ensure_periods
+
+    ensure_periods(db, book, 2027)
+    db.commit()
 
     make_voucher("2026-01-15", dr=[("1121", 100000, "存钱")],
                  cr=[("4001", 100000, "存钱")], posted=True)
-    feb = periods[2]
 
-    r = client.post(f"/api/books/{book_id}/periods?period_id={feb.id}", headers=auth, json=[
+    y2026 = client.get(f"/api/books/{book.id}/openings?year=2026", headers=auth).json()
+    y2027 = client.get(f"/api/books/{book.id}/openings?year=2027", headers=auth).json()
+
+    assert y2026["year"] == 2026 and y2026["editable"] is False, y2026
+    assert y2027["year"] == 2027 and y2027["editable"] is True, y2027
+    # 2027 年还没有自己的期初快照时，页面上要显示账簿实际在用的那个数
+    # —— 上一年期末滚过来的数，而不是一片 0，否则对不上总账
+    bank = next(s for s in y2027["subjects"] if s["code"] == "1121")
+    assert Decimal(bank["signed"]) == Decimal("100000"), bank
+
+
+def test_year_with_only_unposted_vouchers_is_still_editable(
+        client, auth, book_id, subjects, make_voucher):
+    """未记账的凭证不进账簿，年度期初就还没被引用过 —— 还能改。"""
+    make_voucher("2026-01-15", dr=[("1121", 100, "买货")], cr=[("4001", 100, "买货")])
+
+    got = client.get(f"/api/books/{book_id}/openings", headers=auth).json()
+    assert got["editable"] is True, got
+    assert got["reason"] is None, got
+
+
+def test_save_year_opening_lands_on_the_first_period_of_that_year(
+        client, db, auth, book, periods, subjects):
+    """保存的是**年度**期初：落在该年度的第一个期间上，之后每月从它往下滚。"""
+    from app.accounting.periods import ensure_periods
+    from app.ledger.engine import LedgerEngine
+    from app.models import Period, PeriodOpening
+
+    ensure_periods(db, book, 2027)
+    db.commit()
+    jan27 = db.scalar(select(Period).where(
+        Period.book_id == book.id, Period.year == 2027, Period.month == 1))
+
+    r = client.post(f"/api/books/{book.id}/periods?year=2027", headers=auth, json=[
         {"subject_id": subjects["1121"].id, "amount": "120000"},
         {"subject_id": subjects["1122"].id, "amount": "-120000"},
     ])
     assert r.status_code == 200, r.text
-    assert r.json()["period"] == "2026-02", r.json()
+    assert r.json()["year"] == 2027, r.json()
 
-    got = client.get(f"/api/books/{book_id}/openings?period_id={feb.id}",
-                     headers=auth).json()
-    bank = next(s for s in got["subjects"] if s["code"] == "1121")
-    assert Decimal(bank["signed"]) == Decimal("120000"), bank
+    # 快照落在 2027 年 1 月（年度的第一个期间），不是 12 月也不是启用月
+    assert db.scalar(select(func.count()).select_from(PeriodOpening).where(
+        PeriodOpening.period_id == jan27.id)) == 2
 
+    # 账簿立刻按新数算：2027 年 1 月的期初就是它
     sid = subjects["1121"].id
-    assert LedgerEngine(db, book_id).compute([sid], up_to_ord=feb.ord)[sid].opening \
+    assert LedgerEngine(db, book.id).compute([sid], up_to_ord=jan27.ord)[sid].opening \
         == Decimal("120000")
-    # 启用期间是另一份快照，不该被这次保存顺手改掉
-    assert LedgerEngine(db, book_id).compute([sid], up_to_ord=periods[1].ord)[sid].opening \
-        == Decimal("0")
+    # 再翻到 2027 年 5 月，期初仍然从这一份往下滚
+    may27 = db.scalar(select(Period).where(
+        Period.book_id == book.id, Period.year == 2027, Period.month == 5))
+    assert LedgerEngine(db, book.id).compute([sid], up_to_ord=may27.ord)[sid].opening \
+        == Decimal("120000")
 
 
-def test_openings_locked_only_from_the_period_with_vouchers(
-        client, auth, book_id, periods, subjects, make_voucher):
-    """锁的是「从这一期往后有没有凭证」，不是整个账套。"""
-    make_voucher("2026-03-05", dr=[("1121", 100, "买货")], cr=[("4001", 100, "买货")])
+def test_save_year_opening_is_blocked_by_that_year_posted_vouchers(
+        client, auth, book_id, subjects, make_voucher):
+    """锁的是**这一年**：2026 年有已记账凭证，就写不了 2026 年的期初。"""
+    make_voucher("2026-03-05", dr=[("1121", 100, "买货")], cr=[("4001", 100, "买货")],
+                 posted=True)
 
-    r = client.post(f"/api/books/{book_id}/periods?period_id={periods[2].id}", headers=auth,
-                    json=[{"subject_id": subjects["1121"].id, "amount": "1"}])
-    assert r.status_code == 400 and "业务数据" in r.json()["detail"], r.json()
-
-    mar = client.get(f"/api/books/{book_id}/openings?period_id={periods[3].id}",
-                     headers=auth).json()
-    assert mar["editable"] is False, mar
-    apr = client.get(f"/api/books/{book_id}/openings?period_id={periods[4].id}",
-                     headers=auth).json()
-    assert apr["editable"] is True, apr
+    r = client.post(f"/api/books/{book_id}/periods?year=2026", headers=auth, json=[
+        {"subject_id": subjects["1121"].id, "amount": "1"},
+        {"subject_id": subjects["4001"].id, "amount": "-1"},
+    ])
+    assert r.status_code == 400 and "已记账凭证" in r.json()["detail"], r.json()
 
 
-def test_export_follows_selected_period(client, auth, book_id, periods, subjects):
-    """导出的是屏幕上那一期 —— 否则备份下来的数跟眼前看到的对不上。"""
-    client.post(f"/api/books/{book_id}/periods?period_id={periods[5].id}", headers=auth, json=[
+def test_export_follows_selected_year(client, db, auth, book, periods, subjects):
+    """导出的是屏幕上那**一年** —— 抬头写年度，不是月份。"""
+    from app.accounting.periods import ensure_periods
+
+    ensure_periods(db, book, 2027)
+    db.commit()
+    client.post(f"/api/books/{book.id}/periods?year=2027", headers=auth, json=[
         {"subject_id": subjects["1121"].id, "amount": "5000"},
         {"subject_id": subjects["1122"].id, "amount": "-5000"},
     ])
-    r = client.get(f"/api/books/{book_id}/openings.xlsx?period_id={periods[5].id}",
-                   headers=auth)
+    r = client.get(f"/api/books/{book.id}/openings.xlsx?year=2027", headers=auth)
     assert r.status_code == 200, r.text
     ws = load_workbook(io.BytesIO(r.content)).active
     # 单位名那一行删掉之后，标题上提到 A1，表头在第 3 行、数据从第 4 行起
-    assert "2026年5月" in ws["A1"].value, ws["A1"].value
+    assert "2027年度" in ws["A1"].value, ws["A1"].value
     exported = {row[0]: row[3] for row in ws.iter_rows(min_row=4, values_only=True)}
     assert exported["1121"] == 5000, exported["1121"]
 

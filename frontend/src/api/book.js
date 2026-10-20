@@ -13,9 +13,10 @@ export const saveBookOrder = (ids) => http.put('/books/order', { book_ids: ids }
 export const getBook = (id) => http.get(`/books/${id}`).then(r => r.data)
 export const updateBook = (id, payload) => http.put(`/books/${id}`, payload).then(r => r.data)
 export const listPeriods = (id) => http.get(`/books/${id}/periods`).then(r => r.data)
-// 期初跟着顶栏那一期走：不传 period_id 就是启用期间
-export const setOpenings = (id, rows, periodId) =>
-  http.post(`/books/${id}/periods`, rows, { params: periodId ? { period_id: periodId } : {} }).then(r => r.data)
+// 期初跟着顶栏的**年度**走：一笔期初 = 一个会计年度的起点，
+// 切到哪个月都不影响它指向哪一份数。不传就是账套的启用年度。
+export const setOpenings = (id, rows, year) =>
+  http.post(`/books/${id}/periods`, rows, { params: year ? { year } : {} }).then(r => r.data)
 export const carryForwardInfo = (id, pid) =>
   http.get(`/books/${id}/periods/${pid}/carry-forward`).then(r => r.data)
 // 结转损益永远是「有旧凭证就删掉、按最新余额重算」，replace 只为兼容旧调用
@@ -46,8 +47,9 @@ export const unclose = (id, pid, version, revertPosting = true) =>
 export const yearEnd = (id, fromYear, newYear) => http.post(`/books/${id}/year-end`, { from_year: fromYear || null, new_year: newYear || null }).then(r => r.data)
 export const auditLogs = (id, limit = 100) => http.get(`/books/${id}/audit-logs`, { params: { limit } }).then(r => r.data)
 
-export const getOpenings = (id, periodId) =>
-  http.get(`/books/${id}/openings`, { params: periodId ? { period_id: periodId } : {} }).then(r => r.data)
+// 期初余额是**年度**口径：传的是年度，不是期间
+export const getOpenings = (id, year) =>
+  http.get(`/books/${id}/openings`, { params: year ? { year } : {} }).then(r => r.data)
 /**
  * 解析期初余额文件，**只解析不落库** —— 返回行、匹配情况、借贷是否平衡，
  *  让人先看清读进来什么再决定要不要填进表（落库仍是 setOpenings 那一步）。

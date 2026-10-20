@@ -416,57 +416,86 @@ def list_periods(book: Book = Depends(get_my_book), db: Session = Depends(get_db
     ]
 
 
-def _openings_period(db: Session, book: Book, period_id: int | None) -> Period:
-    """期初页面对齐顶栏：要看哪一期，就返回哪一期。
+def _openings_period(db: Session, book: Book, year: int | None = None,
+                     period_id: int | None = None) -> Period:
+    """期初余额是**一个会计年度**的期初：返回该年度的第一个会计期间。
+
+    期初快照挂在这个年度的**第一个期间**上（年度结转就是把本年期末写成
+    次年 1 月的快照），所以「年度」和「年度的第一个期间」是同一份数据的
+    两种说法。页面按年取数，月份对它没有意义。
+
+    - ``year`` 明确给出就用它；
+    - 只给 ``period_id``（老调用方）就取那一期**所在的年度** ——
+      2026-05 与 2026-11 拿到的都是 2026 年度那份数；
+    - 都没有就用账套的启用年度。
 
     以前这里永远返回「第一个期间」，页面也不带参数 —— 于是顶栏切到 2027 年，
     屏幕上摆的还是 2026-01 那份数，还配一句「账套已有业务数据」。
     用户看到的和顶栏选的对不上，怎么改都像是在跟一个不认识的页面较劲。
     """
     stmt = select(Period).where(Period.book_id == book.id)
+    if year is not None:
+        first = db.scalar(stmt.where(Period.year == year).order_by(Period.ord).limit(1))
+        if first is None:
+            raise HTTPException(404, f"账套没有 {year} 年的会计期间")
+        return first
     if period_id is not None:
         period = db.scalar(stmt.where(Period.id == period_id))
         if period is None:
             raise HTTPException(404, "会计期间不存在或不属于该账套")
-        return period
+        first = db.scalar(stmt.where(Period.year == period.year).order_by(Period.ord).limit(1))
+        if first is not None:
+            return first
     first = db.scalar(stmt.order_by(Period.ord).limit(1))
     if first is None:
         raise HTTPException(400, "账套还没有会计期间")
     return first
 
 
-def _openings_editable(db: Session, period: Period) -> tuple[bool, str | None]:
-    """这一期的期初还能不能改，以及为什么不能。
+def _openings_editable(db: Session, book: Book, first: Period) -> tuple[bool, str | None]:
+    """这一**年度**的期初还能不能改，以及为什么不能。
 
-    判据是「**从这一期往后**有没有落到业务数据」，不是「整个账套有没有凭证」。
-    改的是这一期的期初，前面已经封账的期间动不了；而只要这一期及其之后
-    一个凭证都没有，这笔期初就还没被任何账簿、报表引用过 —— 换句话说，
-    用户切到一个空年份时看到的那份期初，本来就是可以改的。
+    判据是「这个年度里有没有**已记账**的凭证」：
+
+    - 账簿只统计已记账凭证（``LedgerEngine._status_filter``），所以年度内
+      一张已记账凭证都没有时，这笔期初就还没被任何账簿、报表引用过 ——
+      改它动不了任何已经算出来的数。
+    - 未记账的凭证**不算**：它们不进账簿，改年度期初跟它们不冲突。
+    - 改的是**年度**期初，所以年度里任何一期结过账都要挡住：那一期的
+      数已经封存，动年度期初就是动已封账的账。
     """
+    year = first.year
     n = db.scalar(
         select(func.count()).select_from(Voucher).where(
+            Voucher.book_id == book.id,
+            Voucher.status == "POSTED",
             Voucher.period_id.in_(
-                select(Period.id).where(
-                    Period.book_id == period.book_id, Period.ord >= period.ord)
-            )
+                select(Period.id).where(Period.book_id == book.id, Period.year == year)
+            ),
         )
     ) or 0
     if n:
-        return False, f"{period.code} 及其之后的期间已有业务数据（{n} 张凭证），期初余额不能再改"
-    # 兜底：结账必然已经把凭证记账了，走不到这里；留着是为了万一将来出现
-    # 「无凭证结账」的路径，别让它悄悄变成可写。
-    if period.locked:
-        return False, f"{period.code} 已结账，期初余额不能再改"
+        return False, f"{year} 年度已有 {n} 张已记账凭证，期初余额不能再改"
+    # 期间代码（2026-03）是模型上的**属性**而不是列，不能直接 select ——
+    # 取月份自己拼，顺序按 ord 走。
+    locked = list(db.scalars(
+        select(Period.month).where(
+            Period.book_id == book.id, Period.year == year, Period.locked.is_(True)
+        ).order_by(Period.ord)
+    ).all())
+    if locked:
+        codes = "、".join(f"{year}-{m:02d}" for m in locked)
+        return False, f"{year} 年度已结账（{codes}），期初余额不能再改"
     return True, None
 
 
 def _openings_amounts(db: Session, book: Book, period: Period,
                       subjects: list[Subject]) -> dict[int, Decimal]:
-    """这一期的期初：优先取快照，没有快照就按账簿实际在用的那个数算。
+    """这一**年度**的期初：优先取快照，没有快照就按账簿实际在用的那个数算。
 
-    快照只在两个地方产生 —— 账套启用、年度结转。所以 2027 年 2 月往后的
-    期间本来就没有快照，账簿里的期初是由上一期期末实时推导的。
-    页面如果一律显示 0，用户对不上总账，还以为账空了。
+    ``period`` 是该年度的第一个期间。快照只在两个地方产生 —— 账套启用、
+    年度结转。所以 2027 年度本来就没有快照时，账簿里的年度期初是由
+    上一年期末实时推导的。页面如果一律显示 0，用户对不上总账，还以为账空了。
     """
     snap = {
         o.subject_id: o.amount
@@ -483,11 +512,15 @@ def _openings_amounts(db: Session, book: Book, period: Period,
 
 
 @router.get("/{book_id}/openings")
-def get_openings(book_id: int, period_id: int | None = None,
+def get_openings(book_id: int, year: int | None = None, period_id: int | None = None,
                  book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    """期初余额录入页用：一次拿全科目树 + 这一期的期初 + 是否还能改。"""
-    period = _openings_period(db, book, period_id)
-    editable, reason = _openings_editable(db, period)
+    """期初余额录入页用：一次拿全科目树 + **这一年度**的期初 + 是否还能改。
+
+    口径是**年度**，不是期间：切到 2026 年的哪个月，拿到的都是 2026 年度
+    那一份数。``period_id`` 仍收（老调用方），但只用来定年度。
+    """
+    first = _openings_period(db, book, year=year, period_id=period_id)
+    editable, reason = _openings_editable(db, book, first)
     # 不过滤 active。年度结转会把**全部末级科目**的期末余额刷成次年期初，
     # 页面却把停用科目藏起来的话，那些期初在界面上是隐形的 ——
     # 用户看到「这个科目没有期初」，实际库里有。口径必须两边一致。
@@ -495,12 +528,13 @@ def get_openings(book_id: int, period_id: int | None = None,
         select(Subject).where(Subject.book_id == book.id)
         .order_by(Subject.code)
     ).all()
-    saved = _openings_amounts(db, book, period, subjects)
+    saved = _openings_amounts(db, book, first, subjects)
     return {
-        "period_id": period.id,
-        "period": period.code,
-        "year": period.year,
-        "month": period.month,
+        "period_id": first.id,
+        # 快照所在的那一期（年度的第一个期间）。保留是为了老调用方还能读懂。
+        "period": first.code,
+        "year": first.year,
+        "month": first.month,
         "editable": editable,
         "reason": reason,
         # 初始化进度随这一份一起下发：页面上「第 1 步没做完就别录期初」
@@ -529,14 +563,14 @@ def get_openings(book_id: int, period_id: int | None = None,
 
 
 @router.get("/{book_id}/openings.xlsx")
-def export_openings(book_id: int, period_id: int | None = None,
+def export_openings(book_id: int, year: int | None = None, period_id: int | None = None,
                     book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     """导出成可再导入的 Excel —— 既是备份，也是给下一个人填的模板。"""
     from app.printing import excel as xl
 
-    # 导的必须是屏幕上那一期：页面跟着顶栏走，导出还停在第一期的话，
+    # 导的必须是屏幕上那**一年**：页面跟着顶栏的年度走，导出还停在启用年的话，
     # 备份下来的数字和眼前看到的对不上，出了错根本查不出是哪一份。
-    first = _openings_period(db, book, period_id)
+    first = _openings_period(db, book, year=year, period_id=period_id)
     # 与录入页同一口径（含停用）。导少了行，用户核对时会以为账丢了；
     # 更糟的是导出的文件再导入回来会平白少一笔。
     subjects = db.scalars(
@@ -556,7 +590,7 @@ def export_openings(book_id: int, period_id: int | None = None,
         [{"code": s_.code, "name": s_.name,
           "direction": ("借" if st > 0 else "贷") if st != 0 else ("借" if s_.direction == "DEBIT" else "贷"),
           "amount": abs(st)} for s_ in subjects for st in [saved.get(s_.id, Decimal("0"))]],
-        book_name=book.name, year=first.year, month=first.month,
+        book_name=book.name, year=first.year,
     )
     return Response(content=data, media_type=XLSX_MIME,
                     headers={"Content-Disposition": _xlsx_name(f"期初余额_{book.name}.xlsx")})
@@ -646,14 +680,18 @@ def parse_openings(book_id: int, file: UploadFile = File(...),
 
 
 @router.post("/{book_id}/periods")
-def set_openings(book_id: int, payload: list[OpeningIn], period_id: int | None = None,
+def set_openings(book_id: int, payload: list[OpeningIn], year: int | None = None,
+                 period_id: int | None = None,
                  book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                  user: SysUser = Depends(get_current_user),
                  _link: UserBook = Depends(require_book_write)):
-    """录入**某一期**的期初余额。
+    """录入**某一年度**的期初余额。
 
-    不传 period_id 就是启用期间（老行为）。传了就写那一期：跨年记账时，
-    上一年结转过来的数要是对不上，改这一期比去翻上一年的凭证省事得多。
+    口径是**年度**：一笔期初就是一个会计年度的起点，落在该年度的第一个
+    期间上。之后每个月的期初都由它往下滚，不再一月期初、二月期初各录一份。
+
+    不传年度/期间就是账套的启用年度（老行为）。``period_id`` 仍收（老调用方），
+    但只用来定年度。
     """
     from app.accounting.audit_helper import log
 
@@ -664,15 +702,15 @@ def set_openings(book_id: int, payload: list[OpeningIn], period_id: int | None =
     if gate:
         raise HTTPException(409, gate)
 
-    period = _openings_period(db, book, period_id)
-    editable, reason = _openings_editable(db, period)
+    first = _openings_period(db, book, year=year, period_id=period_id)
+    editable, reason = _openings_editable(db, book, first)
     if not editable:
         raise HTTPException(400, reason)
 
     # 期初快照有数据库触发器保护（禁止 UPDATE），这里整体重建。
     # 旧值必须**先取出来**：整体重建之后原值就没了，而审计恰恰要靠它。
     before_rows = db.scalars(select(PeriodOpening).where(
-        PeriodOpening.period_id == period.id)).all()
+        PeriodOpening.period_id == first.id)).all()
     before = {str(o.subject_id): str(o.amount) for o in before_rows}
 
     for row in before_rows:
@@ -722,7 +760,7 @@ def set_openings(book_id: int, payload: list[OpeningIn], period_id: int | None =
             400, f"期初试算不平：借方合计 {dr}，贷方合计 {cr}，差额 {dr - cr}")
 
     for subject_id, amount in planned:
-        db.add(PeriodOpening(book_id=book.id, period_id=period.id,
+        db.add(PeriodOpening(book_id=book.id, period_id=first.id,
                              subject_id=subject_id, amount=amount))
 
     # P3-10：期初写入过去完全不留痕。期初是账面数字的起点，
@@ -733,9 +771,9 @@ def set_openings(book_id: int, payload: list[OpeningIn], period_id: int | None =
         for subject_id, amount in planned
         if before.get(str(subject_id), "0") != str(amount)
     ]
-    log(db, action="SET_OPENINGS", entity="period_opening", entity_id=period.id,
+    log(db, action="SET_OPENINGS", entity="period_opening", entity_id=first.id,
         user=user, book_id=book.id,
-        detail=f"录入 {period.code} 期初：{len(planned)} 个科目"
+        detail=f"录入 {first.year} 年度期初：{len(planned)} 个科目"
                + (f"，变动 {len(changed)} 项" if changed else "")
                + (f"（{'；'.join(changed[:10])}"
                   + ("…" if len(changed) > 10 else "") + "）" if changed else ""),
@@ -754,7 +792,8 @@ def set_openings(book_id: int, payload: list[OpeningIn], period_id: int | None =
     # 第 2 步做完了，而那一发的结果没有任何人写回 store：
     # 用户从期初页回到账套管理，看到的仍是「第 2 步还没做」。
     # 顺手带上，跨页面那条链就不用多绕一圈、也不会漏。
-    return {"ok": True, "count": len(payload), "period": period.code,
+    return {"ok": True, "count": len(payload), "period": first.code,
+            "year": first.year,
             "init_step_done": first_openings, "init": init_state(db, book)}
 
 

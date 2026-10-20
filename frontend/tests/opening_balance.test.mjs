@@ -84,5 +84,29 @@ t('刚敲下的小数点留在框里（跟凭证金额格同一个规矩）', ()
 })
 
 console.log('')
+console.log('== 期初是**年度**口径（2026-10-20 改） ==')
+
+t('页面按**年度**取数，不按期间', () => {
+  assert.ok(/store\.currentYear/.test(SRC), '期初页没跟着顶栏的年度走')
+  assert.ok(!/getOpenings\(store\.bookId,\s*store\.periodId\)/.test(SRC),
+    '还在按期间取数 —— 切一个月换一份期初，这条老口径已经废了')
+})
+t('标题写的是「年度期初余额」', () => {
+  assert.ok(/年度期初余额/.test(SRC), '标题没写年度')
+  assert.ok(!/data\.period\}\s*期初余额/.test(SRC), '标题还在按期间写')
+})
+t('保存与导出也按年度', () => {
+  assert.ok(/setOpenings\(store\.bookId,\s*rows,\s*store\.currentYear\)/.test(SRC),
+    '保存还在按期间写')
+  assert.ok(/year:\s*store\.currentYear/.test(SRC), '导出还在按期间导')
+})
+t('换月份不重挂这一页（否则刚录了一半的数就没了）', () => {
+  const LAYOUT = fs.readFileSync(
+    new URL('../src/layouts/MainLayout.vue', import.meta.url), 'utf8')
+  assert.ok(/route\.name === 'openings'/.test(LAYOUT),
+    '期初页的 viewKey 没有按年度走 —— 切一下月份整页重挂，用户录的数直接没了')
+})
+
+console.log('')
 console.log(`通过 ${pass} / 失败 ${fail}`)
 process.exit(fail === 0 ? 0 : 1)

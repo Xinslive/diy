@@ -287,26 +287,33 @@ await step('期初余额页的上级科目做成小计行', async () => {
   }
 })
 
-// 期初余额必须跟着顶栏那一期走：切到空月份就该能改，不能被
-// 「账套里有过凭证」一句话判死（这个月到底有没有账，是看它自己，不是看整本账）
-await step('期初余额跟着顶栏那一期', async () => {
-  // 登录后的默认账套未必同时有「有凭证」和「没凭证」的月份，
+// 期初余额是**一个会计年度**的期初：跟着顶栏的**年度**走，
+// 切到哪个月都不变；年度里有已记账凭证就锁住，没有就还能改。
+await step('期初余额跟着顶栏的年度', async () => {
+  // 尺子要「有已记账凭证的年度」和「一张都没有的年度」各一个。
   // 挨个账套找一个两样都齐的，找不到就明说，不硬跑一条空转的断言
   const pick = await page.evaluate(async () => {
     const h = { Authorization: 'Bearer ' + localStorage.getItem('cwq_token') }
     const books = await (await fetch('/api/books', { headers: h })).json()
     for (const b of books) {
       const ps = await (await fetch(`/api/books/${b.id}/periods`, { headers: h })).json()
-      const busy = ps.filter(p => p.vouchers > 0).pop()
-      const free = ps.filter(p => p.vouchers === 0).pop()
-      if (busy && free) return { bookId: b.id, book: b.name,
-                                  busy: busy.code, busyId: busy.id,
-                                  free: free.code, freeId: free.id }
+      const years = [...new Set(ps.map(p => p.year))]
+      for (const y of years) {
+        const inYear = ps.filter(p => p.year === y)
+        const busy = inYear.find(p => p.posted > 0)
+        const free = years.find(o => o !== y && !ps.some(p => p.year === o && p.posted > 0))
+        if (busy && free) {
+          const other = ps.find(p => p.year === free)
+          return { bookId: b.id, book: b.name,
+                   busyYear: y, busyPeriod: busy.code, busyId: busy.id,
+                   freeYear: free, freeId: other.id }
+        }
+      }
     }
     return null
   })
-  if (!pick) throw new Error('没有一个账套同时含「有凭证」和「没凭证」的月份，这两条没法验')
-  console.log(`   （尺子：${pick.book} ${pick.busy} 有凭证、${pick.free} 一张没有）`)
+  if (!pick) throw new Error('没有一个账套同时含「有已记账凭证的年度」和「空的年度」，这两条没法验')
+  console.log(`   （尺子：${pick.book} ${pick.busyYear} 年度有已记账凭证、${pick.freeYear} 年度一张没有）`)
   await page.evaluate(p => {
     localStorage.setItem('cwq_book', String(p.bookId))
     localStorage.setItem('cwq_period', String(p.busyId))
@@ -322,17 +329,49 @@ await step('期初余额跟着顶栏那一期', async () => {
     return page.evaluate(() => ({
       head: document.querySelector('.page-head .muted')?.innerText || '',
       alert: !!document.querySelector('.el-alert'),
-      editable: !!document.querySelector('.grid input:not([disabled])')
+      editable: !!document.querySelector('.grid input:not([disabled])'),
+      amounts: [...document.querySelectorAll('table.grid tbody tr')].slice(0, 5)
+        .map(tr => [...tr.querySelectorAll('td')].map(td => td.innerText.trim()).join('|'))
+        .join(' / ')
     }))
   }
 
+  // ① 有已记账凭证的年度：锁住
   const onBusy = await openAs(pick.busyId)
-  if (!onBusy.head.includes(pick.busy)) throw new Error('标题没跟着期间走：' + onBusy.head)
-  if (!onBusy.alert || onBusy.editable) throw new Error(`${pick.busy} 明明有凭证，却还能改`)
+  if (!onBusy.head.includes(`${pick.busyYear} 年度`)) {
+    throw new Error('标题没写成年度：' + onBusy.head)
+  }
+  if (!onBusy.alert || onBusy.editable) {
+    throw new Error(`${pick.busyYear} 年度明明有已记账凭证，却还能改`)
+  }
 
+  // ② 空的年度：能改
   const onFree = await openAs(pick.freeId)
-  if (!onFree.head.includes(pick.free)) throw new Error('标题没跟着期间走：' + onFree.head)
-  if (onFree.alert || !onFree.editable) throw new Error(`${pick.free} 一张凭证没有，却不让改`)
+  if (!onFree.head.includes(`${pick.freeYear} 年度`)) {
+    throw new Error('标题没跟着年度走：' + onFree.head)
+  }
+  if (onFree.alert || !onFree.editable) {
+    throw new Error(`${pick.freeYear} 年度一张凭证没有，却不让改`)
+  }
+
+  // ③ 同一年内换月份：这一页纹丝不动（标题、能不能改、数都不变）
+  const sameYearOther = await page.evaluate(async (arg) => {
+    const h = { Authorization: 'Bearer ' + localStorage.getItem('cwq_token') }
+    const ps = await (await fetch(`/api/books/${arg.bookId}/periods`, { headers: h })).json()
+    const other = ps.find(p => p.year === arg.year && p.id !== arg.id)
+    return other ? other.id : null
+  }, { bookId: pick.bookId, year: pick.freeYear, id: pick.freeId })
+  if (!sameYearOther) throw new Error('这一年里找不到第二个月来验「换月不动」')
+  const onOther = await openAs(sameYearOther)
+  if (onOther.head !== onFree.head) {
+    throw new Error(`同一年换月份，标题变了：${onFree.head} → ${onOther.head}`)
+  }
+  if (onOther.editable !== onFree.editable) {
+    throw new Error('同一年换月份，能不能改变了')
+  }
+  if (onOther.amounts !== onFree.amounts) {
+    throw new Error('同一年换月份，金额变了：' + onFree.amounts + ' → ' + onOther.amounts)
+  }
 })
 await page.screenshot({ path: `${out}/17-openings.png` })
 
