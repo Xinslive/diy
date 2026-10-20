@@ -3,6 +3,11 @@
 OLE 的 UFO~REP 流包含主网格、字体、文本对象、公式对象及历史/缓存对象。
 必须用网格内的对象 ID 和坐标定位当前公式，不能从二进制中搜索到一条就导入。
 只迁移结构和公式；历史金额、编制单位及打印说明不成为新账套的财务数据。
+
+表体的边界有两条互相独立的判据（见 parse_ufo_report 里的注释）：列按尾部空列裁剪，
+行按「最后一个带行次的行」与「最后一个带金额公式的行」取靠后者。行次列里大类行走的是
+中文数字（「一、二、三、四」），只认阿拉伯数字会把「四、利润总额」那一行整行切掉 ——
+而且不报错，导进来的是半张表。
 """
 from __future__ import annotations
 
@@ -24,6 +29,10 @@ MAX_COLS = 32
 _ALLOWED_FUNCTIONS = {"科目", "合计", "SUM", "上期", "单元格", "IF", "四舍五入", "ROUND", "ABS", "MAX", "MIN", "绝对值"}
 _SUBJECT = re.compile(r'科目\("([^"\\]+)",')
 _UFO_CALL = re.compile(r"(?<![A-Za-z0-9_])(QC|QM|FS|LFS)\(([^()]*)\)", re.I)
+# 行次列里的行号标记。明细行用阿拉伯数字，**大类行用中文数字**（「一、二、三、四」），
+# 所以两种写法都得认 —— 只认阿拉伯数字会把最后一行大类（通常是「四、利润总额」）
+# 连同它后面的行一起切掉，导进来只剩半张表。
+_LINE_NO = re.compile(r"[（(]?\s*(?:\d+|[〇零一二三四五六七八九十百千]+)\s*[)）]?")
 
 
 class TemplateImportError(ValueError):
@@ -239,12 +248,14 @@ def parse_ufo_report(raw: bytes, filename: str) -> dict[str, Any]:
         raise TemplateImportError("未找到项目/行次表头，无法可靠识别报表主体")
     row_start = header_index + 2
     # 主体由固定行次定位，空的分节行会一起保留；表尾说明及缓存数据不导入。
-    line_cols = (1, 5) if col_count == 8 else (1,)
+    # 行次列：优先认表头里写着「行次」的列，认不到就按 UFO 版式的固定位置回落
+    # （左栏第 2 列；资产负债表右栏第 6 列）。两处取并集 —— 只认表头的话，
+    # 右边栏表头写法稍有出入就会连右边的行次一起丢掉。
+    header_line_cols = {index for index, cell in enumerate(grid[header_index])
+                        if re.sub(r"\s+", "", cell["text"]) == "行次"}
+    line_cols = tuple(sorted(header_line_cols | ({1, 5} if col_count == 8 else {1})))
     numbered = [index + 1 for index, row in enumerate(grid)
-                if index > header_index and any(re.fullmatch(r"\d+", row[col]["text"].strip()) for col in line_cols)]
-    if not numbered:
-        raise TemplateImportError("报表没有可识别的项目行次")
-    row_end = max(numbered)
+                if index > header_index and any(_LINE_NO.fullmatch(row[col]["text"].strip()) for col in line_cols)]
     if col_count == 8:
         source_to_target = {column: column for column in range(1, 9)}
         cols = []
@@ -262,17 +273,36 @@ def parse_ufo_report(raw: bytes, filename: str) -> dict[str, Any]:
             {"col_no": 2, "label": header[2]["text"].strip() or "本期金额", "kind": "FORMULA", "width": 140, "hidden": False},
             {"col_no": 3, "label": header[3]["text"].strip() or "本年累计", "kind": "FORMULA", "width": 140, "hidden": False},
         ]
+    # 表体到哪儿为止：取「最后一个带行次的行」和「最后一个带金额公式的行」里靠后的那个。
+    #
+    # 只看行次是不够的 —— UFO 的行次列里，**大类行走中文数字**（「一、二、三、四」），
+    # 明细行才走阿拉伯数字。标准《会小企02表 利润表》的大类行（一、主营业务收入 /
+    # 减：1、管理费用 / 减：2、财务费用 / 四、利润总额）全是中文数字，只认 `\d+`
+    # 的话，末行大类落在 row_end 之后，会被整行切掉 —— 「利润总额」那一行凭空消失，
+    # 导进来的是半张表，而且**不报任何错**。
+    #
+    # 再加一道「最后一个带金额公式的行」兜底：有些模板行次列整列是空的，
+    # 金额公式的位置才是表体的真实边界。
+    value_cols = {source for source, target in source_to_target.items()
+                  if cols[target - 1]["kind"] not in ("STATIC", "LINE_NO")}
+    with_amount = [index + 1 for index, row in enumerate(grid)
+                   if index + 1 >= row_start and any(row[col - 1]["formula"].strip() for col in value_cols)]
+    if not numbered and not with_amount:
+        raise TemplateImportError("报表没有可识别的项目行次")
+    row_end = max(numbered + with_amount)
     rows, cells, issues = [], [], []
     source_count = 0
     for source_row in range(row_start, row_end + 1):
         row_no = source_row - row_start + 1
         raw_row = grid[source_row - 1]
         label, indent, bold, kind = _side(raw_row[0]["text"])
-        style: dict[str, Any] = {"line_left": raw_row[1]["text"].strip() or None, "kind": kind, "source_row_no": source_row}
+        style: dict[str, Any] = {"line_left": raw_row[line_cols[0]]["text"].strip() or None,
+                                 "kind": kind, "source_row_no": source_row}
         if col_count == 8:
             right, right_indent, right_bold, right_kind = _side(raw_row[4]["text"])
             style.update(label_right=right, indent_right=right_indent, bold_right=right_bold,
-                         kind_left=kind, kind_right=right_kind, line_right=raw_row[5]["text"].strip() or None)
+                         kind_left=kind, kind_right=right_kind,
+                         line_right=raw_row[line_cols[1]]["text"].strip() or None)
         rows.append({"row_no": row_no, "label": label, "indent": indent, "bold": bold, "hidden": False, "style": style})
         for source_col_no, raw_cell in enumerate(raw_row, 1):
             target_col_no = source_to_target.get(source_col_no)

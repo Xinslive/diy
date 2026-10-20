@@ -230,3 +230,135 @@ def test_有内容的第5列仍然拒收不静默丢列(monkeypatch):
 
     with pytest.raises(TemplateImportError, match="4 列利润表和 8 列资产负债表"):
         parse_ufo_report(b"fixture", "带比较列的利润表.rep")
+
+
+# ------------------------------------------- 末行大类行：行次列走的是中文数字
+
+
+def _chinese_line_income_cells() -> dict:
+    """一张行次列**大类走中文数字**的利润表 —— 标准《会小企02表》的真实版式。
+
+    大类行：一、主营业务收入 / 减：1、管理费用 / 减：2、财务费用 / 四、利润总额
+    明细行：1、2、3 ……
+    """
+    return {
+        (1, 1): ("项     目", ""), (1, 2): ("行次", ""),
+        (1, 3): ("本月金额", ""), (1, 4): ("本年累计金额", ""),
+        (2, 1): ("一、主营业务收入", ""), (2, 2): ("一", ""),
+        (2, 3): ("", 'fs(5001,月,"贷",,年)'), (2, 4): ("", 'lfs(5001,月,"贷",,年)'),
+        (3, 1): ("       携程收入", ""), (3, 2): ("1", ""),
+        (3, 3): ("", 'fs(500101,月,"贷",,年)'), (3, 4): ("", 'lfs(500101,月,"贷",,年)'),
+        (4, 1): ("  减：1、管理费用", ""), (4, 2): ("二", ""),
+        (4, 3): ("", 'fs(5602,月,"借",,年)'), (4, 4): ("", 'lfs(5602,月,"借",,年)'),
+        (5, 1): ("  减：2、财务费用", ""), (5, 2): ("三", ""),
+        (5, 3): ("", 'fs(5603,月,"借",,年)'), (5, 4): ("", 'lfs(5603,月,"借",,年)'),
+        (6, 1): ("四、利润总额（亏损总额以“-”号填列）", ""), (6, 2): ("四", ""),
+        (6, 3): ("", 'fs(5001,月,"贷",,年)-fs(5602,月,"借",,年)'),
+        (6, 4): ("", 'lfs(5001,月,"贷",,年)-lfs(5602,月,"借",,年)'),
+    }
+
+
+def test_末行大类行走中文行次时不被切掉(monkeypatch):
+    """UFO 行次列里**大类行走中文数字**（「一、二、三、四」），明细行才走阿拉伯数字。
+
+    真实来源：用户的《2025开元寺店（优境）+利润表格式.rep》。那张表的大类行全是
+    「一、二、三、四」，只认 `\\d+` 的话，末行大类落在表体范围之外会被整行切掉 ——
+    「减：2、财务费用」和「四、利润总额」两行凭空消失，导进来只剩 23 行的半张表，
+    而且**不报任何错**。人只会以为「模板就这么多行」。
+    """
+    import app.reports.importer as importer
+
+    stream = _ufo_stream(_chinese_line_income_cells(), rows=6, cols=4)
+    monkeypatch.setattr(importer, "_stream", lambda raw: stream)
+
+    parsed = parse_ufo_report(b"fixture", "开元寺店利润表.rep")
+
+    assert parsed["stats"]["rows"] == 5
+    assert [row["label"] for row in parsed["rows"]] == [
+        "一、主营业务收入", "携程收入", "减：1、管理费用", "减：2、财务费用",
+        "四、利润总额（亏损总额以“-”号填列）",
+    ]
+    # 末行的行次也要落进 style（界面上的行次列）
+    assert parsed["rows"][-1]["style"]["line_left"] == "四"
+    assert parsed["rows"][-1]["bold"] is True
+    # 末行两个金额格都得有公式，别只导进来一个空壳
+    assert [cell["formula"] for cell in parsed["cells"] if cell["row_no"] == 5] == [
+        '科目("5001","本期贷方",{{本期}})-科目("5602","本期借方",{{本期}})',
+        '科目("5001","贷方累计",{{本期}})-科目("5602","借方累计",{{本期}})',
+    ]
+    assert parsed["issues"] == []
+
+
+def test_行次列整列为空时按金额公式定位表体(monkeypatch):
+    """行次列有表头、正文却一个行号都没填的模板（自己做的表常见）。
+
+    表体的真实边界是「最后一个带金额公式的行」，不是行次。
+    """
+    import app.reports.importer as importer
+
+    cells = {
+        (1, 1): ("项     目", ""), (1, 2): ("行次", ""),
+        (1, 3): ("本月金额", ""), (1, 4): ("本年累计金额", ""),
+        (2, 1): ("房租收入", ""), (2, 2): ("", ""),
+        (2, 3): ("", 'fs(500101,月,"贷",,年)'), (2, 4): ("", 'lfs(500101,月,"贷",,年)'),
+        (3, 1): ("合计", ""), (3, 2): ("", ""),
+        (3, 3): ("", 'fs(5001,月,"贷",,年)'), (3, 4): ("", 'lfs(5001,月,"贷",,年)'),
+    }
+
+    stream = _ufo_stream(cells, rows=3, cols=4)
+    monkeypatch.setattr(importer, "_stream", lambda raw: stream)
+
+    parsed = parse_ufo_report(b"fixture", "无行次利润表.rep")
+
+    assert parsed["stats"]["rows"] == 2
+    assert [row["label"] for row in parsed["rows"]] == ["房租收入", "合计"]
+
+
+def test_表尾说明不会被当成表体(monkeypatch):
+    """表尾的「单位负责人 / 会计主管」是文本行，没有金额公式 —— 不进表体。
+
+    它也不带行次标记，所以行次与公式两条判据都不会把它捞进来。
+    """
+    import app.reports.importer as importer
+
+    cells = _chinese_line_income_cells()
+    cells[(7, 1)] = ("单位负责人：  会计主管：", "")
+
+    stream = _ufo_stream(cells, rows=7, cols=4)
+    monkeypatch.setattr(importer, "_stream", lambda raw: stream)
+
+    parsed = parse_ufo_report(b"fixture", "带表尾的利润表.rep")
+
+    assert parsed["stats"]["rows"] == 5
+    assert all("单位负责人" not in row["label"] for row in parsed["rows"])
+
+
+def test_右栏表头写法不同也保得住右边的行次(monkeypatch):
+    """资产负债表右栏的行次列表头未必写「行次」。
+
+    定位行次列不能只认表头文字 —— 认不到就按 UFO 版式的固定位置回落
+    （左栏第 2 列、右栏第 6 列），否则右边那半张表的行次会整列丢掉。
+    """
+    import app.reports.importer as importer
+
+    cells = {
+        (1, 1): ("资  产", ""), (1, 2): ("行次", ""),
+        (1, 3): ("期末余额", ""), (1, 4): ("年初余额", ""),
+        (1, 5): ("负债和所有者权益", ""), (1, 6): ("行号", ""),
+        (1, 7): ("期末余额", ""), (1, 8): ("年初余额", ""),
+        (2, 1): ("库存现金", ""), (2, 2): ("1", ""),
+        (2, 3): ("", 'QM("1001",月,,,年,,)'), (2, 4): ("", 'QC("1001",全年,,,年,,)'),
+        (2, 5): ("应付账款", ""), (2, 6): ("32", ""),
+        (2, 7): ("", 'QM("2001",月,,,年,,)'), (2, 8): ("", 'QC("2001",全年,,,年,,)'),
+    }
+
+    stream = _ufo_stream(cells, rows=2, cols=8)
+    monkeypatch.setattr(importer, "_stream", lambda raw: stream)
+
+    parsed = parse_ufo_report(b"fixture", "右栏表头异体.rep")
+
+    assert parsed["type"] == "BALANCE_SHEET"
+    assert parsed["stats"]["rows"] == 1
+    style = parsed["rows"][0]["style"]
+    assert style["line_left"] == "1"
+    assert style["line_right"] == "32"
