@@ -448,17 +448,64 @@ jobs:
       # 的 limit_req_zone 定义），而那种配置**只有真的 nginx -t 才看得出来**
       # —— 它报 unknown limit_req_zone，运维按文档启用限流就会 reload 失败。
       # 静态检查能发现「引用了没定义的 zone」，但真正决定成败的是 nginx 自己。
+      #
+      # **版本必须是 >= 1.25.1，而且必须是与生产同一条版本线的 nginx。**
+      # 仓库的配置里写的是 ``http2 on;`` —— 这个独立指令 1.25.1 才引入
+      # （1.25.1 之前只有 ``listen 443 ssl http2`` 老写法，老写法 1.25.1 起
+      # 弃用、1.27 起移除）。而 Ubuntu 24.04 的 apt nginx 是 **1.24.0**：
+      # 装它等于拿一把版本不对的尺子量配置，nginx -t 报的
+      # ``unknown directive "http2"`` 与配置本身无关 —— 2026-10-21 的 CI
+      # 就是这么红的（5 条断言全红，而同一份配置在生产机的 nginx 1.31.3
+      # 上加载正常）。
+      #
+      # 所以这里装 **nginx.org 官方源的 mainline**（生产机跑的 1.31.3 就是
+      # mainline），并且把签名公钥的指纹钉死 —— 供应链上多一道核验，
+      # 与本仓库「action 一律 pin SHA、依赖一律 --require-hashes」的规矩
+      # 是同一件事。指纹不匹配就**直接失败**，不许「先跑着看看」。
       - name: 装 nginx（限流开关必须真的能过 nginx -t）
         run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl gnupg ca-certificates
+          curl -fsSL https://nginx.org/keys/nginx_signing.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
+          # nginx 官方 keyring 里现有三把签名密钥（官方轮换过两次）。
+          # **至少一把要在清单里**；官方将来再加一把时，这一步会红 ——
+          # 那时要人工确认新指纹后更新这里，而不是把检查删掉。
+          ALLOWED="8540A6F18833A80E9C1653A42FD21310B49F6B46 573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62 9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3"
+          FPRS=$(gpg --show-keys --with-colons /usr/share/keyrings/nginx-archive-keyring.gpg \
+                 | awk -F: '/^fpr:/{print $10}')
+          echo "nginx 公钥指纹：${FPRS}"
+          MATCHED=0
+          for f in ${FPRS}; do
+            for a in ${ALLOWED}; do
+              if [ "$f" = "$a" ]; then MATCHED=1; fi
+            done
+          done
+          if [ "$MATCHED" != "1" ]; then
+            echo "::error::nginx 签名公钥指纹不在允许清单里（官方轮换了密钥？）—— 人工确认后更新 ci.yml 的 ALLOWED"
+            exit 1
+          fi
+          echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/ubuntu noble nginx" \
+            | sudo tee /etc/apt/sources.list.d/nginx.list > /dev/null
           sudo apt-get update
           sudo apt-get install -y nginx
           nginx -v
+          # 版本不够就直接红：配置用了 http2 on;，旧 nginx 根本加载不了
+          V=$(nginx -v 2>&1 | sed -n 's#.*nginx/\([0-9][0-9.]*\).*#\1#p')
+          LOWEST=$(printf '%s\n' 1.25.1 "$V" | sort -V | sed -n '1p')
+          if [ "$LOWEST" != "1.25.1" ]; then
+            echo "::error::nginx 版本 $V < 1.25.1（这份配置用了 http2 on;）"
+            exit 1
+          fi
 
       - name: nginx 配置校验（结构 + 真的 nginx -t）
         # 这个脚本会：把两份配置改写成自包含的临时配置（证书/日志/include
         # 目录都指到临时目录）→ **按文档建出限流那两个文件** → nginx -t。
         # 「按文档启用限流」这条路径本身必须能过。
-        run: python3 deploy/tests/nginx_conf_check.py
+        # --require-nginx：没装 nginx 就判失败 —— 否则这道闸会「跳过 → 全绿」，
+        # 变成一道什么也没验的假闸。
+        run: python3 deploy/tests/nginx_conf_check.py --require-nginx
 
   # ------------------------------------------------------------------ 构建产物
   #

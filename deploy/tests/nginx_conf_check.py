@@ -22,6 +22,15 @@
 用法
 ----
     python deploy/tests/nginx_conf_check.py [仓库根目录]
+    python deploy/tests/nginx_conf_check.py --require-nginx   # CI 用
+
+``--require-nginx``：**必须真的装上 nginx 并跑一遍 nginx -t**，没装就判失败。
+CI 的 deploy job 传这个开关 —— 否则 CI 上万一 nginx 没装上，这道闸会
+「跳过 → 全绿 → 什么也没验」，变成一道假闸。
+
+**版本闸**：本仓库的配置用了 ``http2 on;``（1.25.1 才引入的独立指令），
+所以 nginx 必须 **>= 1.25.1**。版本不够时脚本**明确报错并说明
+「nginx -t 的失败与配置无关」**，而不是拿旧 nginx 的报错去指认配置。
 
 退出码 0 = 全过；非 0 = 有问题（CI 会红）。
 """
@@ -248,12 +257,66 @@ def find_nginx() -> str | None:
     return None
 
 
-def check_real_nginx(root: Path) -> None:
+#: 本仓库的 nginx 配置要求 nginx >= 1.25.1。
+#:
+#: 原因是配置里写了 ``http2 on;`` —— 这个**独立指令**是 1.25.1 才引入的
+#: （1.25.1 之前只有 ``listen 443 ssl http2`` 这种老写法，而老写法从 1.25.1
+#: 起弃用、1.27 起被移除）。
+#:
+#: **为什么这条闸必须存在。** 2026-10-21 的 CI 就是被它绊倒的：CI runner
+#: 装的是 Ubuntu 24.04 的 apt nginx（**1.24.0**），它不认 ``http2 on;`` →
+#: ``nginx -t`` 报 ``unknown directive "http2"`` → 5 条断言全红。
+#: 那 5 条红**与配置本身无关** —— 同一份配置在生产机（nginx 1.31.3）上
+#: 加载得好好的。用一把版本不对的尺子量东西，量出来的结论当然是假的。
+#:
+#: 所以这里不是「跳过就完事」，而是**版本不够就明确报错**：报错的人
+#: 知道该换 nginx，而不是去改配置 —— 配置是对的。
+NGINX_MIN_VERSION = (1, 25, 1)
+
+
+def nginx_version(nginx: str) -> tuple[int, ...] | None:
+    """取 nginx 的版本号。
+
+    ``nginx -v`` 把版本号打在 **stderr** 上（nginx 1.25 之前也是）。
+    """
+    proc = subprocess.run([nginx, "-v"], capture_output=True, text=True)
+    out = (proc.stdout or "") + (proc.stderr or "")
+    m = re.search(r"nginx/(\d+(?:\.\d+)*)", out)
+    if not m:
+        return None
+    return tuple(int(part) for part in m.group(1).split("."))
+
+
+def _fmt_ver(ver: tuple[int, ...]) -> str:
+    return ".".join(str(part) for part in ver)
+
+
+def check_real_nginx(root: Path, *, require_nginx: bool = False) -> None:
     nginx = find_nginx()
     if nginx is None:
-        print("== 真实 nginx -t：本机没装 nginx，跳过（结构校验仍然有效） ==")
-        print("     CI 的 deploy job 会装 nginx 并真的跑一遍")
+        if require_nginx:
+            no("本机没装 nginx —— CI 必须真的跑一遍 nginx -t（装 nginx 再验）")
+        else:
+            print("== 真实 nginx -t：本机没装 nginx，跳过（结构校验仍然有效） ==")
+            print("     CI 的 deploy job 会装 nginx 并真的跑一遍")
         return
+
+    # ---- 版本闸：先确认这把尺子够长，再开始量 ----
+    need = _fmt_ver(NGINX_MIN_VERSION)
+    ver = nginx_version(nginx)
+    if ver is None:
+        no(f"读不出 nginx 的版本（{nginx} -v 没输出版本号）—— "
+           "无法判断这份配置能不能被它加载")
+        return
+    if ver < NGINX_MIN_VERSION:
+        no(f"装着的 nginx 是 {_fmt_ver(ver)}，低于 {need} —— "
+           "这份配置里的 `http2 on;` 是 1.25.1 才引入的独立指令，"
+           "旧版 nginx 报的是 unknown directive \"http2\"，"
+           "**与配置本身无关**（同一份配置在生产机的 nginx 1.31.3 上加载正常）。"
+           f"装一个 >= {need} 的 nginx 再验。")
+        print("     （版本不够时 nginx -t 的结果说明不了配置对错，因此不跑）")
+        return
+    ok(f"nginx 版本 {_fmt_ver(ver)} >= {need}（这份配置里的 http2 on; 需要它）")
 
     print("== 真实 nginx -t ==")
     configs = [
@@ -270,6 +333,23 @@ def check_real_nginx(root: Path) -> None:
                 continue
 
             body = rewrite(conf.read_text(encoding="utf-8"), tmp)
+
+            # **独立形态的前置条件**：host-map（80 端口跳转白名单）。
+            #
+            # cwq.conf 里写的是 ``$cwq_https_redirect``，而这个变量由
+            # cwq-host-map.conf 的 ``map`` 生成 —— 那份配置里明写着
+            # 「这份配置若整个缺失，nginx 会带着『$cwq_https_redirect 未定义』
+            # 启动失败 —— **这是故意的**」。
+            #
+            # 所以 host-map 是**前置条件**，不是可选增强：先装上，再跑下面
+            # 那两条限流用例。以前脚本把它放在最后才装，于是前两条是在验一个
+            # **刻意损坏**的状态（2026-10-21 在 nginx 1.31.7 上暴露：
+            # ``unknown "cwq_https_redirect" variable``，两条假红）。
+            host_map = tmp / "include" / "cwq-host-map.conf"
+            if conf.name == "cwq.conf":
+                host_map.write_text(
+                    (root / "deploy/nginx/cwq-host-map.conf").read_text(encoding="utf-8"),
+                    encoding="utf-8")
 
             # (1) 限流**关闭**（默认状态）：两个限流文件都不存在。
             #     通配 include 在没有匹配文件时不报错 —— 这一条必须成立，
@@ -291,20 +371,27 @@ def check_real_nginx(root: Path) -> None:
                 no(f"{label}：按文档启用限流后 nginx -t 失败 —— "
                    "限流开关在这一形态下开不了\n{out}")
 
-            # (3) 独立 nginx 形态还要 host-map（缺了它 nginx 故意起不来）。
+            # (3) 独立形态：**拿掉 host-map，nginx 必须起不来**。
+            #     这是配置刻意设计的 fail-closed —— 少了跳转白名单就宁可
+            #     不服务，也不给开放重开口子。这条断言锁住这个设计：
+            #     将来谁把「缺了也能起」改成默认（为了「更宽容」），这里会红。
             if conf.name == "cwq.conf":
-                (tmp / "include" / "cwq-host-map.conf").write_text(
-                    (root / "deploy/nginx/cwq-host-map.conf").read_text(encoding="utf-8"),
-                    encoding="utf-8")
+                host_map.unlink()
                 passed, out = run_nginx_t(nginx, body, tmp)
-                if passed:
-                    ok(f"{label}：装上 host-map 后 nginx -t 通过")
+                if not passed:
+                    ok(f"{label}：缺 host-map 时 nginx 拒绝启动（配置刻意 fail-closed）")
                 else:
-                    no(f"{label}：装上 host-map 后 nginx -t 失败\n{out}")
+                    no(f"{label}：缺 host-map 时 nginx 竟然通过了 —— "
+                       "少了 80 端口跳转白名单，等于开了开放重定向的口子")
 
 
 def main() -> int:
-    root = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else \
+    # ``--require-nginx``：**必须真的装上 nginx 并跑一遍 nginx -t**。
+    # CI 的 deploy job 传这个开关 —— 没有它的话，CI 上万一 nginx 没装上，
+    # 这道闸会「跳过 → 全绿 → 什么也没验」，变成一道假闸。
+    require_nginx = "--require-nginx" in sys.argv[1:]
+    root = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 and \
+        not sys.argv[1].startswith("--") else \
         Path(__file__).resolve().parents[2]
     for name in ("cwq.conf", "acct.xins.live.conf"):
         conf = root / "deploy/nginx" / name
@@ -312,7 +399,7 @@ def main() -> int:
             no(f"找不到 {conf}")
             continue
         check_structure(conf)
-    check_real_nginx(root)
+    check_real_nginx(root, require_nginx=require_nginx)
 
     print()
     print(f"通过 {PASS} / 失败 {FAIL}")
