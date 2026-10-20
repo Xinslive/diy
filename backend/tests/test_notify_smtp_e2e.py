@@ -262,7 +262,7 @@ def _配好通知(client, auth, 端口: int, 收件人="ops@x.com,boss@x.com"):
     assert r.status_code == 200, r.text
 
 
-def test_真的把信发出去而且服务端收到的是合规报文(smtp服务器, client, admin_user, auth):
+def test_真的把信发出去而且服务端收到的是合规报文(smtp服务器, client, admin_user, auth, db):
     """**整条链路**：登录失败 → 触发锁定 → 真的 SMTP 会话 → 服务端收到字节。
 
     这条用例的每一步都是真的：真的 socket、真的 AUTH、真的 MIME 序列化。
@@ -270,9 +270,11 @@ def test_真的把信发出去而且服务端收到的是合规报文(smtp服务
     """
     _配好通知(client, auth, smtp服务器.port)
 
-    凭据 = {"username": admin_user.username, "password": "错三次"}
-    for _ in range(settings.login_max_failures):
-        client.post("/api/auth/login", json=凭据)
+    from tests.auth_helpers import 打到硬锁
+
+    # **只有硬锁才发通知**（审查报告安全域 P2-4）：递增延迟只有几秒，
+    # 每次撞库口令都发一封的话，收件箱会被刷爆 —— 而收件箱是**通知通道本身**。
+    打到硬锁(client, db, admin_user.username, password="错三次")
 
     原始 = smtp服务器.等一封()
     assert 原始, "服务端一字节都没收到"
@@ -299,7 +301,7 @@ def test_真的把信发出去而且服务端收到的是合规报文(smtp服务
     assert "smtp-secret" not in 正文
 
 
-def test_整封信必须是7位的(smtp服务器, client, admin_user, auth):
+def test_整封信必须是7位的(smtp服务器, client, admin_user, auth, db):
     """**整封报文不能含裸的非 ASCII 字节。**
 
     主题行与 From 的显示名是 RFC 2047 编码字（那是 7 位的），正文也一样 ——
@@ -312,9 +314,11 @@ def test_整封信必须是7位的(smtp服务器, client, admin_user, auth):
     """
     _配好通知(client, auth, smtp服务器.port)
 
-    凭据 = {"username": admin_user.username, "password": "错三次"}
-    for _ in range(settings.login_max_failures):
-        client.post("/api/auth/login", json=凭据)
+    from tests.auth_helpers import 打到硬锁
+
+    # **只有硬锁才发通知**（审查报告安全域 P2-4）：递增延迟只有几秒，
+    # 每次撞库口令都发一封的话，收件箱会被刷爆 —— 而收件箱是**通知通道本身**。
+    打到硬锁(client, db, admin_user.username, password="错三次")
 
     原始 = smtp服务器.等一封()
     非ASCII = [b for b in 原始 if b >= 128]
@@ -324,7 +328,7 @@ def test_整封信必须是7位的(smtp服务器, client, admin_user, auth):
         "报文的传输编码不是 7 位安全的"
 
 
-def test_多个收件人时信封有全部地址而报文里没有别人的地址(smtp服务器, client, admin_user, auth):
+def test_多个收件人时信封有全部地址而报文里没有别人的地址(smtp服务器, client, admin_user, auth, db):
     """**收件人之间互相看不见地址** —— 这条在真实报文上验。
 
     信封（RCPT TO）里要有全部收件人，否则第二个人收不到；报文里（头与正文）
@@ -332,9 +336,11 @@ def test_多个收件人时信封有全部地址而报文里没有别人的地�
     """
     _配好通知(client, auth, smtp服务器.port, 收件人="ops@x.com,boss@x.com")
 
-    凭据 = {"username": admin_user.username, "password": "错三次"}
-    for _ in range(settings.login_max_failures):
-        client.post("/api/auth/login", json=凭据)
+    from tests.auth_helpers import 打到硬锁
+
+    # **只有硬锁才发通知**（审查报告安全域 P2-4）：递增延迟只有几秒，
+    # 每次撞库口令都发一封的话，收件箱会被刷爆 —— 而收件箱是**通知通道本身**。
+    打到硬锁(client, db, admin_user.username, password="错三次")
 
     原始 = smtp服务器.等一封()
     信 = smtp服务器.解析()
@@ -370,7 +376,10 @@ def test_发不出去时登录流程照常_不抛异常也不卡住(smtp服务�
     凭据 = {"username": admin_user.username, "password": "错三次"}
     for _ in range(settings.login_max_failures):
         响应 = client.post("/api/auth/login", json=凭据)
-        assert 响应.status_code == 401, f"登录的失败形态变了：{响应.status_code}"
+        # 阈值内是 401，达阈值那一次起进入**递增延迟**（429）——
+        # 两种都是「这次登录没成」，SMTP 挂不挂都该是这两种之一。
+        assert 响应.status_code in (401, 429), (
+            f"登录的失败形态变了：{响应.status_code}")
 
     # **正面断言「确实试了、也确实失败了」。**
     # 只断言"没收到信"是不够的 —— 投递压根没触发过时它同样成立，

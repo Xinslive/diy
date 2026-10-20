@@ -272,19 +272,27 @@ def test_账号维度的锁定本身没有因为IP节流而失效(client, db, th
     """加了一层节流不等于把原来那层弄丢了。
 
     刻意用**另一个来源**去试那把锁：同源的话，IP 节流（429）会先于账号锁定
-    （423）返回，而那正是下面那条用例要单独验证的排序问题。
+    返回，而那正是下面那条用例要单独验证的排序问题。
+
+    **这一条断言以前是「达阈值 → 423 硬锁」** —— 那正是审查报告安全域 P2-4
+    点的缺陷（连错三次就能把别人的账号挡在门外十分钟，时长还逐轮递增）。
+    现在账号维度的防护是**递增延迟**（429 + Retry-After），第 3 轮起才升级
+    成硬锁 —— 所以这里断言的是「**另一个来源也拿不到 200**」，而不是具体的
+    状态码：**账号层的那道闸还在**，只是形态变了。
     """
     victim = make_user(1)[0]
     with peer(uniq_ip()) as c:
         for _ in range(5):
             _fail(c, victim.username)
     db.refresh(victim)
-    assert victim.locked_until is not None, "账号锁定被这一层改动弄丢了"
+    assert victim.locked_until is not None, "账号级防护被这一层改动弄丢了"
 
     with peer(uniq_ip()) as other:
         r = other.post("/api/auth/login",
                        json={"username": victim.username, "password": "pw123456"})
-    assert r.status_code == 423, f"账号锁定失效，返回 {r.status_code}"
+    assert r.status_code != 200, f"账号级防护失效，返回 {r.status_code}"
+    # 具体形态：账号层是**递增延迟**（429），不是硬锁。
+    assert r.status_code == 429, f"账号级应当是递增延迟，实际 {r.status_code}"
 
 
 def test_节流先于账号锁定返回_且不泄漏账号存在性(client, db, throttle, make_user):

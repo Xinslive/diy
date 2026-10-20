@@ -203,12 +203,14 @@ def test_账号锁定会发通知(client, db, admin_user, creds, monkeypatch):
     monkeypatch.setattr(notify_events, "dispatch_async",
                         lambda event, subject, body: sent.append((event, subject, body)))
 
-    from app.core.config import settings
+    from tests.auth_helpers import 打到硬锁
 
-    for _ in range(settings.login_max_failures):
-        client.post("/api/auth/login", json={**creds, "password": "错的"})
+    # **只有硬锁才发通知**（审查报告安全域 P2-4）：递增延迟只有几秒，
+    # 每次撞库口令都发一封的话，收件箱会被刷爆 —— 而收件箱是**通知通道本身**，
+    # 真告警会淹没在里面。
+    打到硬锁(client, db, admin_user.username, password="错的")
 
-    assert len(sent) == 1, f"账号被锁了却没有发通知：{sent}"
+    assert len(sent) == 1, f"账号被硬锁了却没有发通知：{sent}"
     event, subject, body = sent[0]
     assert event == "ACCOUNT_LOCKED"
     assert admin_user.username in subject
@@ -228,14 +230,15 @@ def test_通知发不出去不影响锁定(client, db, admin_user, creds, monkey
 
     monkeypatch.setattr(notify_events, "dispatch_async", _boom)
 
-    from app.core.config import settings
+    from tests.auth_helpers import 打到递增延迟
 
-    for _ in range(settings.login_max_failures):
-        r = client.post("/api/auth/login", json={**creds, "password": "错的"})
-        assert r.status_code == 401, f"通知炸了导致登录接口行为变了：{r.status_code}"
+    打到递增延迟(client, admin_user.username, password="错的")
+    r = client.post("/api/auth/login", json={**creds, "password": "错的"})
+    assert r.status_code in (401, 429), (
+        f"通知炸了导致登录接口行为变了：{r.status_code}")
 
     db.refresh(admin_user)
-    assert admin_user.locked_until is not None, "通知发不出去时账号竟然没锁"
+    assert admin_user.locked_until is not None, "通知发不出去时账号竟然没限流"
 
 
 def test_dispatch_永不抛异常(db, monkeypatch):
@@ -290,12 +293,14 @@ def test_通知正文不含任何凭据(db, admin_user, client, creds, auth, mon
     monkeypatch.setattr(notify_events, "dispatch_async",
                         lambda event, subject, body: sent.append((event, subject, body)))
 
-    from app.core.config import settings
+    from tests.auth_helpers import 打到硬锁
 
-    for _ in range(settings.login_max_failures):
-        client.post("/api/auth/login", json={**creds, "password": "错的"})
+    # **只有硬锁才发通知**（审查报告安全域 P2-4）：递增延迟只有几秒，
+    # 每次撞库口令都发一封的话，收件箱会被刷爆 —— 而收件箱是**通知通道本身**，
+    # 真告警会淹没在里面。
+    打到硬锁(client, db, admin_user.username, password="错的")
 
-    assert len(sent) == 1, f"账号被锁了却没有发通知：{sent}"
+    assert len(sent) == 1, f"账号被硬锁了却没有发通知：{sent}"
     _, subject, body = sent[0]
 
     # SMTP 口令、口令散列、令牌 —— 一个都不许出现

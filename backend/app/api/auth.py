@@ -301,12 +301,59 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
 
     闸门读的是**库里的开关**（库里没有则退回 env），管理员在界面上改完
     立即生效，不需要重启后端。
+
+    **「用户名已被占用」不再是一个可区分的响应**（审查报告安全域 P2-2）。
+    原来三种输入给三种可区分的响应：
+
+        已存在用户名 → 400「用户名『victim』已被占用」
+        不存在用户名 → 201 {"ok": true, ...}
+        注册关闭时    → 403「系统未开放自助注册」
+
+    第一条就是一条**用户名枚举信道** —— 而登录路径本来是靠「用户名不存在
+    也走完一次 PBKDF2」堵住枚举的（``_dummy_hash``），注册路径把它敞开了。
+    攻击者只要注册一下就能筛出所有有效用户名，再拿去登录爆破。
+
+    现在：**重名与成功返回完全相同的响应**（201 + 同一个 body），只是
+    **不建号**。于是 201 与 403 的差别只说明「自助注册开着没有」——
+    那是公开信息（``GET /api/auth/config`` 已经暴露它），**不泄漏任何
+    关于某个用户名是否存在的信息**。
+
+    重名这件事不是消失，而是**挪到了管理员看得见的地方**：审计表里记一条
+    ``REGISTER_DUPLICATE``，管理员看得到「有人在试这个手机号」。
     """
     if not system_settings.registration_enabled(db):
+        # 关闭时对**所有人**是同一个响应 —— 这条是公开信息，不构成枚举信道。
         raise HTTPException(403, "系统未开放自助注册，请联系管理员开号")
+
+    src = _throttle_ip(request)
+    now = _utcnow()
+    # **节流判定放在入参校验之前**：被节流的请求不必付校验的代价。
+    _reject_if_register_throttled(db, payload.username, src, now)
+
     _validate_registration(payload)
+
+    # **IP 桶**记每一次尝试 —— 枚举与批量建号都撞在这里（枚举者试的是
+    # **不同的**名字，每次都是「成功」响应，所以这个桶必须统计成功）。
+    _bump_register_bucket(db, _register_ip_bucket(src), now)
+
     if db.scalar(select(SysUser).where(SysUser.username == payload.username)):
-        raise HTTPException(400, f"用户名「{payload.username}」已被占用")
+        # **用户名桶只在重名时记** —— 「反复占用一个已经存在的账号」才是
+        # 该被限流的事。成功注册不记：一次正常的注册不该给用户名攒计数
+        # （那个用户名可能是用户自己在用，攒到阈值反而把本人挡在外面）。
+        _bump_register_bucket(db, _register_user_bucket(payload.username), now)
+        # **重名：不建号，但回成功一样的响应。** 响应里不出现「已被占用」。
+        _audit(
+            db,
+            action="REGISTER_DUPLICATE",
+            entity="user",
+            entity_id=payload.username[:64],
+            user=None,
+            detail=f"自助注册命中已存在的用户名（未建号）：{payload.username[:64]}（{src}）",
+            after={"username": payload.username[:64], "ip": src},
+        )
+        db.commit()
+        return {"ok": True, "username": payload.username}
+
     # real_name **不再让自助注册的用户填**（前端那个输入框已去掉），空值兜底成
     # 「会计」。原先的兜底是 ``payload.username``，那是「用户名即身份标识」时代
     # 的做法；注册改成手机号之后，它会把一串号码当人的名字存进库，界面上就出现
@@ -335,6 +382,111 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     )
     db.commit()
     return {"ok": True, "username": u.username}
+
+
+# --------------------------------------------------------------------- 注册节流
+#
+# **为什么注册路径要单开一套计数。**
+#
+# 登录的 IP 桶与注册共用一个键会互相污染阈值：登录失败会涨计数、注册成功
+# 也涨计数，两种流量混在一个数里，谁也调不准那个阈值（「用自己日志污染的
+# 阈值没有人调得准」是这条桶从一开始就写下的告诫）。
+#
+# 所以这里用**同一个表**（``login_ip_throttle``）、**不同的桶键前缀**：
+#     ri:<ip>   这个来源在批量试
+#     ru:<name> 这个用户名被反复试
+# 前缀带在键里，于是两套计数在物理上分开，判定与计数仍共用同一份实现
+# （一条 upsert，原子）。
+#
+# **键长。** ``login_ip_throttle.ip`` 是 ``VARCHAR(45)``，而 IPv6 最长 39
+# 个字符 —— 所以前缀只能有 6 个字符以内。``ri:`` / ``ru:`` 都是 3 个，
+# 加 39 = 42，留够。
+
+def _register_ip_bucket(src: str) -> str:
+    return f"ri:{src}"[:45]
+
+
+def _register_user_bucket(username: str) -> str:
+    return f"ru:{(username or '').strip()}"[:45]
+
+
+def _register_window() -> timedelta:
+    return timedelta(seconds=max(60, int(settings.register_window_seconds)))
+
+
+def _bump_register_bucket(db: Session, bucket: str, now: datetime) -> int:
+    """给注册桶记一次，返回窗口内的计数。**一条语句、原子。**
+
+    与 :func:`_bump_ip_failure` 同一个形状（``ON CONFLICT DO UPDATE``），
+    只是阈值与窗口不同、且不做硬锁 —— 注册路径只需要**软节流**：
+    拒绝一段时间就行，不该有「这个 IP 被锁死」这种可被主动触发的状态。
+    """
+    stale = LoginIpThrottle.last_failed_at <= (now - _register_window())
+    new_count = case((stale, 1), else_=LoginIpThrottle.failures + 1)
+    stmt = (
+        pg_insert(LoginIpThrottle)
+        .values(ip=bucket, failures=1, window_started_at=now, last_failed_at=now,
+                blocked_until=None, created_at=now, updated_at=now)
+        .on_conflict_do_update(
+            index_elements=[LoginIpThrottle.ip],
+            set_={
+                "failures": new_count,
+                "window_started_at": case((stale, now),
+                                          else_=LoginIpThrottle.window_started_at),
+                "last_failed_at": now,
+                "updated_at": func.now(),
+            },
+        )
+    )
+    db.execute(stmt)
+    db.flush()
+    row = db.scalar(select(LoginIpThrottle).where(LoginIpThrottle.ip == bucket))
+    if row is None:
+        return 0
+    if row.last_failed_at is None or (now - row.last_failed_at) >= _register_window():
+        return 0
+    return int(row.failures or 0)
+
+
+def _reject_if_register_throttled(db: Session, username: str, src: str,
+                                   now: datetime) -> None:
+    """两个桶都判一次；超阈值就 429。**一定抛异常。**
+
+    先留痕再拒绝：证据比响应时间重要。
+    """
+    checks = (
+        (_register_ip_bucket(src), int(settings.register_ip_max_attempts), "来源"),
+        (_register_user_bucket(username), int(settings.register_username_max_attempts),
+         "用户名"),
+    )
+    for bucket, threshold, kind in checks:
+        row = db.scalar(select(LoginIpThrottle).where(LoginIpThrottle.ip == bucket))
+        if row is None or row.last_failed_at is None:
+            continue
+        if (now - row.last_failed_at) >= _register_window():
+            continue
+        failures = int(row.failures or 0)
+        if failures < threshold:
+            continue
+        retry = max(1, int(_register_window().total_seconds()
+                           - (now - row.last_failed_at).total_seconds()))
+        _audit(
+            db,
+            action="REGISTER_THROTTLED",
+            entity="user",
+            entity_id=(username or "")[:64],
+            user=None,
+            detail=f"自助注册被节流（{kind}维度）：用户名「{(username or '')[:64]}」"
+                   f"窗口内 {failures} 次，阈值 {threshold}，请 {retry // 60 + 1} 分钟后再试",
+            after={"username": (username or "")[:64], "ip": src,
+                   "failures": failures, "threshold": threshold},
+        )
+        db.commit()
+        raise HTTPException(
+            429,
+            f"请求过于频繁，请 {retry // 60 + 1} 分钟后再试",
+            headers={"Retry-After": str(retry)},
+        )
 
 
 def _utcnow() -> datetime:
@@ -388,12 +540,35 @@ def _record_failure(db: Session, user: SysUser) -> dict | None:
     if user.failed_logins >= settings.login_max_failures:
         # 轮次 +1，**不重置**：这正是递进式的「连续」所在。
         user.lock_level = (user.lock_level or 0) + 1
-        minutes = lock_duration_minutes(user.lock_level)
-        user.locked_until = _utcnow() + timedelta(minutes=minutes)
-        # 这一轮内重新计数：从现在起又要错够阈值才会再次触发。
+        # **阈值达成不等于「锁死」**（审查报告安全域 P2-4）。
+        #
+        # 原来这里直接写 ``locked_until = now + 10 分钟``，于是「知道用户名
+        # 的人连错 3 次」就能把**别人的**账号挡在门外 10 分钟，时长还随轮次
+        # 递增（10 → 20 → … → 1 天）—— 攻击成本极低，收益是让特定人在整段
+        # 时间里进不去。月结期尤其致命。
+        #
+        # 现在：**前两轮是「递增延迟」，第三轮起才升级成硬锁**。
+        #   轮次 1 → 延迟 5 秒；轮次 2 → 延迟 10 秒；轮次 ≥3 → 硬锁（423）。
+        # 一次性 DoS 因此**不成立**（受害者等几秒就能继续干活），而持续撞库
+        # 的速率逐轮塌下去。算法与权衡见 ``app/core/lockout.py``。
+        if lockout.should_hard_lock(user.lock_level):
+            minutes = lock_duration_minutes(user.lock_level)
+            user.locked_until = _utcnow() + timedelta(minutes=minutes)
+            # 硬锁这一轮内重新计数：从现在起又要错够阈值才会再次触发。
+            user.failed_logins = 0
+            return {"minutes": minutes, "level": user.lock_level,
+                    "locked_until": user.locked_until, "hard": True}
+        seconds = lockout.account_delay_seconds(user.lock_level)
+        user.locked_until = _utcnow() + timedelta(seconds=seconds)
+        # **这一轮内重新计数**：从现在起又要错够阈值才会再次触发。
+        #
+        # 这一条对**正常用户**很重要：不清零的话，延迟期过后**再错一次**
+        # 就直接进下一轮、再错一次就硬锁 —— 一个手滑连错四次的人会被锁
+        # 半小时。清零之后每一轮都要错够 ``login_max_failures`` 次，
+        # 而延迟本身又把人劝退了。
         user.failed_logins = 0
-        return {"minutes": minutes, "level": user.lock_level,
-                "locked_until": user.locked_until}
+        return {"minutes": 0, "seconds": seconds, "level": user.lock_level,
+                "locked_until": user.locked_until, "hard": False}
     return None
 
 
@@ -755,23 +930,46 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
     if user is not None:
         left = _lock_left(user)
         if left > 0:
-            # 锁定期间也**不**去校验口令：校验了就等于告诉攻击者
-            # 「密码猜对了，只是被锁着」，把口令空间又缩掉一层。
+            # **「延迟」与「硬锁」是两件事**（审查报告安全域 P2-4）。
             #
-            # 这是唯一保留的时序/状态差异，它换来的是「锁定期内不泄漏口令」，
-            # 两者不能兼得，取更严的一侧（423 只在**已经锁定过的账号**上出现，
+            # * 硬锁（第 3 轮起）：423，锁几分钟到一天，等或让管理员解封。
+            # * 延迟（第 1-2 轮）：429 + Retry-After，**等几秒就能继续用
+            #   正确口令登录** —— 一次性把别人挡在门外的 DoS 因此不成立。
+            #
+            # 两种状态下都**不**校验口令：校验了就等于告诉攻击者
+            # 「密码猜对了，只是被限着」，把口令空间又缩掉一层。
+            #
+            # 这是唯一保留的时序/状态差异，它换来的是「限定期内不泄漏口令」，
+            # 两者不能兼得，取更严的一侧（423 只在**已经硬锁过的账号**上出现，
             # 攻击者仍然可以靠它确认「这个账号存在且被锁过」，但拿不到任何
-            # 口令信息）。锁定本身留痕，见下。
+            # 口令信息）。限流本身留痕，见下。
+            state = lockout.delay_state(user)
+            if state["hard_locked"]:
+                _audit_login(False, db, ip, user, payload.username,
+                             f"账号锁定中，剩余 {left // 60 + 1} 分钟",
+                             locked_until=user.locked_until.isoformat() if user.locked_until else None,
+                             lock_level=user.lock_level or 0)
+                # 锁定中的尝试照样计入来源计数：它同样是一次未经认证的尝试，
+                # 而「有人在猛敲一个已锁定的账号」正是这一层要看的东西。
+                # （不计入的话，攻击者只要等账号被锁住就自动获得无限额度。）
+                _note_source_failure(db, payload, src, now)
+                db.commit()
+                raise HTTPException(423, f"账号已锁定，请 {left // 60 + 1} 分钟后再试")
+
+            # **递增延迟**：回 429 + Retry-After，让客户端等一会儿自己重试。
+            # **不在服务端 sleep** —— 占住一个 worker 线程正是这个项目在
+            # IP 维度节流上刻意避开的东西（那里也是把惩罚交给 Retry-After）。
             _audit_login(False, db, ip, user, payload.username,
-                         f"账号锁定中，剩余 {left // 60 + 1} 分钟",
+                         f"连续失败过多，暂时限流 {left} 秒",
                          locked_until=user.locked_until.isoformat() if user.locked_until else None,
                          lock_level=user.lock_level or 0)
-            # 锁定中的尝试照样计入来源计数：它同样是一次未经认证的尝试，
-            # 而「有人在猛敲一个已锁定的账号」正是这一层要看的东西。
-            # （不计入的话，攻击者只要等账号被锁住就自动获得无限额度。）
             _note_source_failure(db, payload, src, now)
             db.commit()
-            raise HTTPException(423, f"账号已锁定，请 {left // 60 + 1} 分钟后再试")
+            raise HTTPException(
+                429,
+                f"连续登录失败次数过多，请 {left} 秒后重试",
+                headers={"Retry-After": str(left)},
+            )
 
     if user is None:
         # 等量计算：不存在的用户名也要走完一次口令校验（见 _dummy_hash）。
@@ -789,9 +987,14 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
         # 四条失败路径共用一个入口，少一条就等于给攻击者留了一条免费的路。
         _note_source_failure(db, payload, src, now)
         locked = _record_failure(db, user)
-        if locked:
+        if locked and locked.get("hard"):
             # 锁定单独记一条：它是「这台系统在主动拒绝这个账号」的信号，
             # 事后第一眼要看的也是它（谁被锁了、锁到什么时候）。
+            #
+            # **只有硬锁才记**（审查报告安全域 P2-4）：递增延迟只有几秒，
+            # 每次都记一条 ACCOUNT_LOCKED + 发一封告警邮件的话，
+            # 一次撞库口令就能把收件箱刷满 —— 而收件箱是**通知通道本身**，
+            # 把它刷爆等于把真告警一起刷爆了。
             _audit(
                 db,
                 action="ACCOUNT_LOCKED",
@@ -805,8 +1008,23 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
                        "lock_level": locked["level"],
                        "locked_until": user.locked_until.isoformat()},
             )
+        elif locked:
+            # 递增延迟也留痕，但**不**发邮件（见上）。
+            _audit(
+                db,
+                action="ACCOUNT_DELAYED",
+                entity="user",
+                entity_id=user.id,
+                user=user,
+                detail=f"连续登录失败达到阈值，暂时限流 {locked['seconds']} 秒"
+                       f"（第 {locked['level']} 轮）：{user.username}（{ip}）",
+                after={"username": user.username, "ip": ip,
+                       "delay_seconds": locked["seconds"],
+                       "lock_level": locked["level"],
+                       "locked_until": user.locked_until.isoformat()},
+            )
         db.commit()
-        if locked:
+        if locked and locked.get("hard"):
             # **通知在提交之后发**：状态与审计先落库，邮件是旁路。
             # 发不出去也不该有任何后果（notify.events.dispatch 自己兜住）。
             # 异步发：登录路径上多等一毫秒，都是攻击者能免费放大的。

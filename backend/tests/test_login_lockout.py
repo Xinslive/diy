@@ -112,45 +112,95 @@ def test_用户名不存在不建计数(client, db, admin_user, creds):
 
 # ------------------------------------------------------------------ 锁定本身
 
-def test_连续失败达阈值后账号被锁(client, db, admin_user, creds):
-    """阈值以内的失败全是 401，达阈值那一次之后账号被锁。
+def test_连续失败达阈值后账号进入递增延迟(client, db, admin_user, creds):
+    """阈值以内的失败全是 401，达阈值那一次之后账号进入**递增延迟**。
 
-    注意「阈值以内」这三个字：前 N 次失败都还没锁，所以它们必须回 401
+    注意「阈值以内」这三个字：前 N 次失败都还没限流，所以它们必须回 401
     而不是 423 —— 否则就成了「用 423 宣告账号存在」的信道。
+
+    **这一条断言以前是「达阈值 → 423 硬锁 10 分钟」** —— 那正是审查报告
+    安全域 P2-4 点的缺陷：知道用户名的人连错 3 次就能把**别人的**账号挡在
+    门外 10 分钟，而时长还随轮次递增（10 → 20 → … → 1 天）。
+    攻击成本极低，收益是让特定人整段时间进不去 —— 月结期尤其致命。
+
+    现在前两轮是**递增延迟**（429 + Retry-After）：等几秒就能用正确口令
+    继续登录，一次性 DoS 因此不成立；持续撞库的速率逐轮塌下去。
     """
     threshold = _threshold()
     codes = _fail(client, creds, threshold)
     assert codes == [401] * threshold, f"阈值内的失败应当都是 401，实际 {codes}"
     db.refresh(admin_user)
-    assert admin_user.locked_until is not None, f"失败了 {threshold} 次还没锁"
+    assert admin_user.locked_until is not None, f"失败了 {threshold} 次还没限流"
 
-    # 锁着的时候**正确口令也进不去**
+    # **限流期间正确口令进不去** —— 但返回的是 429（等一会儿再来），
+    # 不是 423（被判成「锁死」）。
     r = client.post("/api/auth/login", json=creds)
-    assert r.status_code == 423, f"锁着却还能登录，返回 {r.status_code}"
+    assert r.status_code == 429, f"限流期间应当是 429，实际 {r.status_code}"
+    assert r.headers.get("Retry-After"), "限流必须给 Retry-After"
+
+
+def test_递增延迟到期后正确口令能登进去(client, db, admin_user, creds):
+    """**这一条是 P2-4 的核心**：限流不是锁死 —— 等几秒，受害者照常干活。
+
+    原来的行为是「锁 10 分钟，谁也进不去」，而唯一出口是管理员手动解封。
+    """
+    _fail(client, creds, _threshold())
+    db.refresh(admin_user)
+    # 把限流时间往回拨，模拟「延迟过去了」
+    admin_user.locked_until = _now() - timedelta(seconds=1)
+    db.commit()
+    r = client.post("/api/auth/login", json=creds)
+    assert r.status_code == 200, f"限流到期后仍进不去：{r.text[:200]}"
+
+
+def test_持续触发会升级成硬锁(client, db, admin_user, creds):
+    """**第 3 轮起升级成硬锁**（423）—— 延迟挡不住分布式攻击。
+
+    每个来源只错几次、账号的累计失败在涨 —— 这是「同一个账号被从多个来源
+    同时打」的形态，它不是误输，所以留一个真正的硬锁给它。
+    """
+    from app.core import lockout
+
+    rounds = lockout.ACCOUNT_HARD_LOCK_AFTER_ROUNDS
+    threshold = _threshold()
+    for _ in range(rounds):
+        # 让上一轮的限流到期，好让下一轮能重新武装。
+        # **在每轮之前过期**，而不是之后 —— 之后过期会把最后一轮的硬锁也抹掉，
+        # 于是最后那次登录「成功」了，看着像硬锁没生效。
+        db.refresh(admin_user)
+        if admin_user.locked_until is not None:
+            _expire_lock(db, admin_user)
+        _fail(client, creds, threshold)
+
+    db.refresh(admin_user)
+    assert admin_user.lock_level >= rounds
+    r = client.post("/api/auth/login", json=creds)
+    assert r.status_code == 423, f"持续触发后应当硬锁，实际 {r.status_code}"
 
 
 def test_阈值内不锁定(client, db, admin_user, creds):
-    """差一次没到阈值就**不能**锁。
+    """差一次没到阈值就**不能**限流。
 
-    阈值收得太紧的代价是「正常用户输错三次就被挡 10 分钟」—— 那就把
-    防护变成了故障。这条用例钉住「还差一次时账号仍然是通的」。
+    阈值收得太紧的代价是「正常用户输错三次就被挡」—— 那就把防护变成了故障。
+    这条用例钉住「还差一次时账号仍然是通的」。
     """
     _fail(client, creds, _threshold() - 1)
     db.refresh(admin_user)
-    assert admin_user.locked_until is None, "还没到阈值就锁了"
+    assert admin_user.locked_until is None, "还没到阈值就限流了"
     assert client.post("/api/auth/login", json=creds).status_code == 200
 
 
-def test_锁定期间不校验口令(client, db, admin_user, creds):
-    """错误口令和正确口令在锁定期内的响应必须一致。
+def test_限流期间不校验口令(client, db, admin_user, creds):
+    """错误口令和正确口令在限流期的响应必须一致。
 
-    不一致就等于一个口令预言机：攻击者拿 423 和 401 去试，能确认自己猜对了。
+    不一致就等于一个口令预言机：攻击者拿 429 和 401 去试，能确认自己猜对了。
     """
     _fail(client, creds, _threshold())
     wrong = client.post("/api/auth/login", json={**creds, "password": "仍然是错的"})
     right = client.post("/api/auth/login", json=creds)
-    assert wrong.status_code == right.status_code == 423
-    assert "锁定" in wrong.json()["detail"] and "锁定" in right.json()["detail"]
+    assert wrong.status_code == right.status_code == 429
+    assert "锁定" not in wrong.json()["detail"]
+    assert "失败" in wrong.json()["detail"] and "失败" in right.json()["detail"]
 
 
 def test_锁定到期后自动解锁(client, db, admin_user, creds):
@@ -231,19 +281,23 @@ def test_阈值可配置(monkeypatch):
 # ------------------------------------------------------------------ 锁定留痕
 
 
-def test_锁定要单独留一条审计(client, db, admin_user, creds):
-    """锁定是「这个系统正在主动拒绝某个账号」的信号，事后第一眼要看的就是它。
+def test_限流要单独留一条审计(client, db, admin_user, creds):
+    """限流是「这个系统正在主动拒绝某个账号」的信号，事后第一眼要看的就是它。
 
     与「又错了一次」分开记，是因为两者的处置完全不同：前者要看来源 IP
     （是不是有人在扫），后者只是正常输错。
+
+    **首轮记 ACCOUNT_DELAYED**（只延迟几秒），**硬锁才记 ACCOUNT_LOCKED**
+    —— 两者分开，是因为处置完全不同：延迟是常态，硬锁才是「有人在扫」。
     """
+    from app.core import lockout
     from app.core.config import settings
     from app.models import AuditLog
 
     for _ in range(settings.login_max_failures):
         client.post("/api/auth/login", json={**creds, "password": "错的"})
 
-    # 查**这个账号**的锁定行，并按 id 倒序取最新的一条。
+    # 查**这个账号**的限流行，并按 id 倒序取最新的一条。
     #
     # 两个细节都不是洁癖，是这条用例曾经间歇性变红的原因：
     #   · 不按 username 过滤 —— audit_log 是整场 session 累积的（admin_user 走
@@ -253,25 +307,55 @@ def test_锁定要单独留一条审计(client, db, admin_user, creds):
     #     表大了（整场跑完几千行）物理顺序就和插入顺序分家，`rows[-1]`
     #     拿到的是随机一条，于是 detail 里没有本用例的用户名。
     entry = (db.query(AuditLog)
+             .filter(AuditLog.action == "ACCOUNT_DELAYED",
+                     AuditLog.username == admin_user.username)
+             .order_by(AuditLog.id.desc())
+             .first())
+    assert entry is not None, "账号被限流了却没有留痕 —— 事后查不到是谁在扫"
+    assert admin_user.username in entry.detail
+    assert entry.after.get("delay_seconds") == lockout.account_delay_seconds(1)
+    assert entry.after.get("locked_until")
+
+
+def test_硬锁要单独留一条审计(client, db, admin_user, creds):
+    """**硬锁**才记 ACCOUNT_LOCKED —— 只有它需要人去看。
+
+    递增延迟只有几秒，每次都记一条 ACCOUNT_LOCKED + 发一封告警邮件的话，
+    一次撞库口令就能把收件箱刷满 —— 而收件箱是**通知通道本身**。
+    """
+    from app.core import lockout
+    from app.core.config import settings
+    from app.models import AuditLog
+
+    for _ in range(lockout.ACCOUNT_HARD_LOCK_AFTER_ROUNDS):
+        db.refresh(admin_user)
+        if admin_user.locked_until is not None:
+            _expire_lock(db, admin_user)
+        for _ in range(settings.login_max_failures):
+            client.post("/api/auth/login", json={**creds, "password": "错的"})
+
+    entry = (db.query(AuditLog)
              .filter(AuditLog.action == "ACCOUNT_LOCKED",
                      AuditLog.username == admin_user.username)
              .order_by(AuditLog.id.desc())
              .first())
-    assert entry is not None, "账号被锁了却没有留痕 —— 事后查不到是谁在扫"
+    assert entry is not None, "硬锁了却没有留 ACCOUNT_LOCKED —— 事后查不到"
     assert admin_user.username in entry.detail
-    assert entry.after.get("lock_minutes") == settings.login_lock_minutes
+    # 硬锁时长按**轮次**递进：第 3 轮 = 基准 × 3（不是基准本身）。
+    assert entry.after.get("lock_minutes") == lockout.lock_duration_minutes(
+        lockout.ACCOUNT_HARD_LOCK_AFTER_ROUNDS)
     assert entry.after.get("locked_until")
 
 
-def test_锁定期内的登录尝试也要留痕(client, db, admin_user, creds):
-    """423 是攻击者唯一能拿到的「这个账号存在」信号，扫的人就在这条路径上。"""
+def test_限流期的登录尝试也要留痕(client, db, admin_user, creds):
+    """限流响应是攻击者唯一能拿到的「这个账号存在」信号，扫的人就在这条路径上。"""
     from app.models import AuditLog
 
     _fail(client, creds, _threshold())
     client.post("/api/auth/login", json=creds)
 
     rows = db.query(AuditLog).filter(AuditLog.action == "LOGIN_FAILURE").all()
-    assert any("锁定" in (x.detail or "") for x in rows), "锁定期内的尝试没有留痕"
+    assert any("限流" in (x.detail or "") for x in rows), "限流期的尝试没有留痕"
 
 
 # ------------------------------------------------------------------ 时序等价
@@ -345,37 +429,54 @@ def _expire_lock(db, user) -> None:
     db.commit()
 
 
-def test_首轮锁定是基准时长(client, db, admin_user, creds):
-    from app.core.config import settings
+def test_首轮是短延迟而不是硬锁(client, db, admin_user, creds):
+    """**首轮是几秒的延迟，不是十分钟的锁**（审查报告安全域 P2-4）。
+
+    原来的口径是「首轮锁 10 分钟」—— 那等于给攻击者一个**禁用账号**的开关：
+    连错 3 次，别人的账号就整段时间进不去。现在首轮只延迟几秒，
+    一次性 DoS 不成立；而持续撞库会逐轮把延迟拉长。
+    """
+    from app.core import lockout
 
     _fail(client, creds, _threshold())
     db.refresh(admin_user)
     assert admin_user.lock_level == 1
-    left = (admin_user.locked_until - _now()).total_seconds() / 60
-    assert abs(left - settings.login_lock_minutes) < 1, (
-        f"首轮锁了 {left:.1f} 分钟，应为 {settings.login_lock_minutes} 分钟")
+    left = (admin_user.locked_until - _now()).total_seconds()
+    expected = lockout.account_delay_seconds(1)
+    assert abs(left - expected) < 2, (
+        f"首轮限流 {left:.1f} 秒，应为 {expected} 秒")
 
 
-def test_第二轮锁定时长翻倍(client, db, admin_user, creds):
-    """连着撞锁，锁定时长逐轮递增 —— 恒定时长挡不住「故意撞锁」。"""
-    from app.core.config import settings
+def test_延迟逐轮翻倍(client, db, admin_user, creds):
+    """连着撞，延迟逐轮递增 —— 恒定延迟挡不住「故意撞锁」。
+
+    阶梯：5 → 10 → 20 …（封顶 5 分钟）。**先短后长**：一次性锁人不成立，
+    持续撞库的速率逐轮塌下去。
+    """
+    from app.core import lockout
 
     _fail(client, creds, _threshold())
     db.refresh(admin_user)
-    first = (admin_user.locked_until - _now()).total_seconds() / 60
+    first = (admin_user.locked_until - _now()).total_seconds()
 
     _expire_lock(db, admin_user)
     _fail(client, creds, _threshold())
     db.refresh(admin_user)
-    second = (admin_user.locked_until - _now()).total_seconds() / 60
+    second = (admin_user.locked_until - _now()).total_seconds()
 
-    assert admin_user.lock_level == 2, "第二轮锁定没有把轮次加一"
-    assert abs(second - first * 2) < 1, (
-        f"第二轮锁了 {second:.1f} 分钟，应为第一轮的两倍（{first * 2:.1f}）")
-    assert abs(first - settings.login_lock_minutes) < 1
+    assert admin_user.lock_level == 2, "第二轮没有把轮次加一"
+    assert abs(second - first * 2) < 2, (
+        f"第二轮限流 {second:.1f} 秒，应为第一轮的两倍（{first * 2:.1f}）")
+    assert abs(first - lockout.account_delay_seconds(1)) < 2
 
 
-def test_第三轮继续递增(client, db, admin_user, creds):
+def test_第三轮升级成硬锁(client, db, admin_user, creds):
+    """**第 3 轮起才硬锁** —— 延迟挡不住分布式攻击。
+
+    每个来源只错几次、账号的累计失败在涨 —— 那不是误输。
+    """
+    from app.core.config import settings
+
     _fail(client, creds, _threshold())
     _expire_lock(db, admin_user)
     _fail(client, creds, _threshold())
@@ -385,6 +486,7 @@ def test_第三轮继续递增(client, db, admin_user, creds):
     assert admin_user.lock_level == 3
     left = (admin_user.locked_until - _now()).total_seconds() / 60
     assert left > 20, f"第三轮应锁得更久，实际 {left:.1f} 分钟"
+    assert left > settings.login_lock_minutes, "第三轮应当是硬锁而不是短延迟"
 
 
 def test_锁定时长有上限(client, db, admin_user, creds):

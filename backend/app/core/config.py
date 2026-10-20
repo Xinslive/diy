@@ -503,6 +503,28 @@ class Settings(BaseSettings):
     # 的门槛应该是「管理员开号」。公司内部要开，显式置 true。
     registration_enabled: bool = False
 
+    # ------------------------------------------------ 自助注册的节流
+    #
+    # 审查报告安全域 P2-2：「自助注册既是用户名枚举 oracle，又完全没有节流」。
+    # 登录路径有 IP 节流、有「用户名不存在也走完一次 PBKDF2」的等量计算，
+    # 而**注册路径一条都没有** —— 于是「注册一下试试」成了一条比登录更省事的
+    # 枚举信道（登录要付 20ms 的 PBKDF2，注册不用）。
+    #
+    # 下面两个阈值给注册路径**单开一套**计数（与登录的桶分开，见
+    # ``app/api/auth.py`` 的桶前缀），免得两种流量互相污染阈值。
+    #
+    # **IP 桶**管的是「这个来源在批量试」—— 枚举与批量建号都落在这里。
+    # 取 60/10 分钟 = 每分钟 6 次：枚举一千个账号要三个多小时，够贵；
+    # 而一个办公室在同一天里给新同事注册几十个号也不会被误伤。
+    register_ip_max_attempts: int = 60
+    # **用户名桶**管的是「这个用户名被反复试」—— 同一个用户名上的多次尝试，
+    # 不管来自哪个 IP。取 3/10 分钟：正常用户不会在十分钟里把同一个
+    # 用户名试三次以上。
+    register_username_max_attempts: int = 3
+    # 注册节流的窗口（秒）。与登录的窗口分开，因为两者的「正常频率」
+    # 差着两个数量级。
+    register_window_seconds: int = 600
+
     # 日志级别（审计 P3-14）。
     #
     # 以前根日志级别完全取决于进程外面怎么配（systemd / gunicorn / shell），
@@ -722,7 +744,9 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
             "若本服务在反向代理后面（nginx → 127.0.0.1:8000），"
             "所有用户会共用同一个来源地址，节流会误伤；"
             "请设 TRUSTED_PROXIES=127.0.0.1（按实际对端）后重启。"
-            "不设也能工作 —— 节流是软节流，只回 429，不锁账号。")
+            "不设也能工作 —— 节流是软节流，只回 429，不锁账号。"
+            "当前这套分桶形态随时可查：GET /api/system/login-protection"
+            "（管理界面「用户与授权 → 登录防护」也能看到）。")
     elif not settings.login_ip_throttle_enabled:
         log.warning(
             "LOGIN_IP_THROTTLE_ENABLED=false：IP 维度登录节流已关闭，"

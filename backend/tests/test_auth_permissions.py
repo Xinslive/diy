@@ -32,15 +32,30 @@ from app.models import SysUser, SystemSetting, UserBook
 
 
 @pytest.fixture
-def registration_on():
-    """通过 **env** 打开自助注册（库里没有那一行时的老路径）。"""
-    from app.core.config import settings
+def registration_on(db):
+    """通过 **env** 打开自助注册（库里没有那一行时的老路径）。
 
+    同时清掉**注册节流桶**（``ri:`` / ``ru:`` 前缀）：节流状态存在库里而
+    xdist 按 worker 分库、同一个 worker 的所有用例共用一个库 —— 不清的话
+    前面的用例把 IP 桶涨上去，后面的用例一注册就 429，那是测试互相污染，
+    不是缺陷。
+    """
+    from app.core.config import settings
+    from app.models.system import LoginIpThrottle
+
+    def clear_buckets():
+        db.query(LoginIpThrottle).filter(
+            LoginIpThrottle.ip.like("ri:%") | LoginIpThrottle.ip.like("ru:%")
+        ).delete(synchronize_session=False)
+        db.commit()
+
+    clear_buckets()
     settings.registration_enabled = True
     try:
         yield
     finally:
         settings.registration_enabled = False
+        clear_buckets()
 
 
 @pytest.fixture
@@ -102,11 +117,35 @@ def test_注册参数被拒(client, payload, why, registration_on):
 
 
 def test_用户名不可重复(client, registration_on):
+    """**重名不再是一个可区分的响应**（审查报告安全域 P2-2）。
+
+    这条断言以前是「重名 → 400 且文案含『已被占用』」——
+    那正是这条缺陷本身：重名返回 400、成功返回 201，两种响应可区分，
+    于是「注册一下试试」成了一条比登录更省事的用户名枚举信道
+    （登录要付 20ms 的 PBKDF2，注册不用）。
+
+    现在的口径：**重名与成功的响应完全一样**（201 + 同一个 body），
+    只是**不建号**。差别只留在管理员看得见的审计里。
+    「截断行为被当成规范断言下来」是这轮审查点名的问题（P-43）——
+    这条断言当时就在把缺陷钉成规范，现在一并改掉。
+    """
     body = {"username": "dupuser01", "password": "abcd1234"}
-    assert client.post("/api/auth/register", json=body).status_code == 201
-    r = client.post("/api/auth/register", json=body)
-    assert r.status_code == 400
-    assert "已被占用" in r.json()["detail"]
+    first = client.post("/api/auth/register", json=body)
+    assert first.status_code == 201
+    again = client.post("/api/auth/register", json=body)
+
+    # **响应必须逐字相同** —— 不只是状态码相同。
+    assert again.status_code == 201, again.text
+    assert again.json() == first.json()
+    assert "已被占用" not in again.text
+
+    # 「不建号」是另一件事：它必须在**库里**看得见 —— 账号数不变。
+    from app.models import SysUser
+    rows = client.get("/api/auth/config")
+    assert rows.status_code == 200
+    # 账号仍然只能用**原来的口令**登录（重名那次没有覆盖口令）。
+    r = client.post("/api/auth/login", json=body)
+    assert r.status_code == 200, r.text
 
 
 def test_手机号能当用户名注册并登录(client, registration_on):
