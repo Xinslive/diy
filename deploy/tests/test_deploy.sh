@@ -209,9 +209,26 @@ run_script_with_db_url(){
 }
 calls(){ cat "$DEPDIR/calls" 2>/dev/null; }
 
+# **管道里的 grep 一律不用 -q**（理由见第 16 组 code_count 的注释，
+# 那里已经把同一个坑写成了规矩）：`grep -q` 一匹配就退出 → 上游的
+# cat/grep 收到 SIGPIPE → `set -uo pipefail` 下整条管道返回非零 →
+# 「匹配到了」反而被判成「没匹配」。
+#
+# 这个坑**在 macOS 上可能侥幸通过、在 Linux 上稳定复现**：上游要把
+# 几十 KB 写进管道缓冲区，下游命中第一行就退出了，谁先跑完看调度。
+# 2026-10-21 的 CI 就是这么红的：deploy.sh 明明装了 trap（231/234/235 行），
+# 断言却说「脚本一个 trap 都没有」—— 判的不是脚本，是自己的管道。
+#
+# `grep -c` 会把输入读完再退出，没有这个竞态；命中与否看退出码。
+calls_has(){ grep -cE -- "$1" "$DEPDIR/calls" >/dev/null 2>&1; }
+# 取第一行匹配：直接读文件 + `grep -m1`，不走管道。
+# （`grep ... | head -1` 里 head 先退，上游可能被 SIGPIPE 打断，
+#   那条还没写出来的匹配行就丢了 —— 断言会拿到空串。）
+calls_first(){ grep -m1 -F -- "$1" "$DEPDIR/calls" 2>/dev/null; }
+
 # 脚本必须真的跑起来了（取到了产物），否则下面全是空断言
 assert_ran(){
-  if calls | grep -q "alembic upgrade head"; then return 0; fi
+  if calls_has "alembic upgrade head"; then return 0; fi
   no "$1 —— 脚本在沙箱里没跑起来，下面的断言全部无意义"
   return 1
 }
@@ -235,7 +252,7 @@ else
   ok "--check-only 没有产生任何发布副作用"
 fi
 for tool in systemctl curl; do
-  if calls | grep -q "$tool"; then no "--check-only 仍然调了 $tool"; else ok "--check-only 没调 $tool"; fi
+  if calls_has "$tool"; then no "--check-only 仍然调了 $tool"; else ok "--check-only 没调 $tool"; fi
 done
 
 echo "== 2. 生产机不再跑测试、不再构建前端 =="
@@ -243,13 +260,13 @@ setup_sandbox
 OUT=$(run_script)
 assert_ran "全量发布" || exit 1
 # 这两条是本次改造的核心目的：把生产机从构建机上摘下来。
-if calls | grep -q "pytest"; then no "生产机仍然跑测试（pytest）"; else ok "生产机不再跑测试"; fi
-if calls | grep -q "pnpm"; then no "生产机仍然构建前端（pnpm）"; else ok "生产机不再构建前端"; fi
-if calls | grep -q "node"; then no "生产机仍然跑前端（node）"; else ok "生产机不再跑前端"; fi
+if calls_has "pytest"; then no "生产机仍然跑测试（pytest）"; else ok "生产机不再跑测试"; fi
+if calls_has "pnpm"; then no "生产机仍然构建前端（pnpm）"; else ok "生产机不再构建前端"; fi
+if calls_has "node"; then no "生产机仍然跑前端（node）"; else ok "生产机不再跑前端"; fi
 # 断言「装的锁是哪一份」，不是「有没有跑 pip」。产物里的锁第一行是
 # rfc8785（这一版新增的依赖），现网旧锁第一行是 SQLAlchemy —— 两者不同，
 # 断言才分得出来。
-PIPLINE=$(calls | grep -F 'pip install' | head -1)
+PIPLINE=$(calls_first 'pip install')
 if [[ "$PIPLINE" == *"[lock=rfc8785==0.1.4]"* ]]; then
   ok "装的是产物里的运行时锁（第一行 rfc8785；不是 dev 锁，也不是现网旧锁）"
 else
@@ -275,7 +292,7 @@ echo "== 4. 取不到产物 = 测试闸门拦住，绝不重启 =="
 setup_sandbox
 mkdir -p "$DEPDIR/empty-artifacts"
 OUT=$(run_script_no_artifacts); RC=$?
-if calls | grep -q "systemctl restart"; then
+if calls_has "systemctl restart"; then
   no "取不到产物却重启了服务 —— 测试闸门失效"
 else
   ok "取不到产物没有重启"
@@ -300,7 +317,7 @@ echo "== 5. 校验和不匹配必须拒绝发布 =="
 setup_sandbox
 echo "corrupted" >> "$DEPDIR/artifacts/cwq-backend-${FAKE_SHA}.tar.gz"
 OUT=$(run_script)
-if calls | grep -q "systemctl restart"; then
+if calls_has "systemctl restart"; then
   no "产物损坏却重启了服务"
 else
   ok "产物损坏没有重启"
@@ -370,7 +387,7 @@ echo "== 9. 迁移由发布流程执行（P3-01）=="
 setup_sandbox
 run_script >/dev/null
 assert_ran "全量发布" || exit 1
-if calls | grep -q "alembic upgrade head"; then
+if calls_has "alembic upgrade head"; then
   ok "发布流程执行了 alembic upgrade head"
 else
   no "没有执行迁移 —— 表结构变更只能靠人工，迟早会漏"
@@ -382,7 +399,7 @@ export STUB_ALEMBIC_RC=1
 OUT=$(run_script)
 unset STUB_ALEMBIC_RC
 assert_ran "迁移失败的发布流程" || exit 1
-if calls | grep -q "systemctl restart"; then
+if calls_has "systemctl restart"; then
   no "迁移失败却重启了服务"
 else
   ok "迁移失败没有重启"
@@ -406,12 +423,12 @@ setup_sandbox
 export STUB_BACKUP_RC=1
 OUT=$(run_script)
 unset STUB_BACKUP_RC
-if calls | grep -q "alembic upgrade head"; then
+if calls_has "alembic upgrade head"; then
   no "备份失败却先迁移了生产库 —— 没有退路就不该动 schema"
 else
   ok "备份失败就不迁移（schema 保持在迁移前的状态）"
 fi
-if calls | grep -q "systemctl restart"; then
+if calls_has "systemctl restart"; then
   no "备份失败却重启了服务"
 else
   ok "备份失败没有重启"
@@ -431,7 +448,7 @@ echo "== 10. 定时备份：默认启用，关停标记 honored =="
 setup_sandbox
 OUT=$(run_script)
 assert_ran "全量发布" || exit 1
-if calls | grep -q "systemctl enable --now cwq-backup.timer"; then
+if calls_has "systemctl enable --now cwq-backup.timer"; then
   ok "默认会启用定时备份"
 else
   no "默认没有启用定时备份"
@@ -449,7 +466,7 @@ setup_sandbox
 : > "$APP/.backup-timer-off"
 OUT=$(run_script)
 assert_ran "带关停标记的发布" || exit 1
-if calls | grep -q "cwq-backup.timer"; then
+if calls_has "cwq-backup.timer"; then
   no "有关停标记却仍然动了 cwq-backup.timer —— 下次发版它会自己复活"
 else
   ok "有关停标记时不碰 cwq-backup.timer"
@@ -465,7 +482,7 @@ else
   ok "按要求关闭时不出 ⚠️ 告警"
 fi
 # 关停定时**不能**连发版时的库备份一起关掉 —— 那是迁移前的唯一退路
-if calls | grep -q "alembic upgrade head"; then
+if calls_has "alembic upgrade head"; then
   ok "关停定时备份不影响发版时的库备份与迁移"
 else
   no "关停定时备份把发版备份也一起弄没了"
@@ -485,7 +502,7 @@ echo "== 10.5 调度看门狗：默认启用，关停标记 honored =="
 setup_sandbox
 OUT=$(run_script)
 assert_ran "全量发布" || exit 1
-if calls | grep -q "systemctl enable --now cwq-scheduler-watchdog.timer"; then
+if calls_has "systemctl enable --now cwq-scheduler-watchdog.timer"; then
   ok "默认会启用调度看门狗"
 else
   no "默认没有启用调度看门狗"
@@ -509,7 +526,7 @@ setup_sandbox
 : > "$APP/.watchdog-timer-off"
 OUT=$(run_script)
 assert_ran "带关停标记的发布" || exit 1
-if calls | grep -q "cwq-scheduler-watchdog.timer"; then
+if calls_has "cwq-scheduler-watchdog.timer"; then
   no "有关停标记却仍然动了看门狗 timer —— 下次发版它会自己复活"
 else
   ok "有关停标记时不碰看门狗 timer"
@@ -617,7 +634,7 @@ mkdir -p "$APP/backend/data/plugins/com.test.retained/digest"
 echo "retained plugin code" > "$APP/backend/data/plugins/com.test.retained/digest/marker"
 OUT=$(run_script); RC=$?
 assert_ran "带插件运行目录的发布" || exit 1
-if [[ "$RC" == "0" ]] && calls | grep -q "python scripts/plugin_status.py --wait 30"; then
+if [[ "$RC" == "0" ]] && calls_has "python scripts/plugin_status.py --wait 30"; then
   ok "主服务启动后核验插件屏障才报告成功"
 else
   no "没有执行插件屏障或成功发布返回非零"
@@ -633,7 +650,7 @@ export STUB_PLUGIN_STATUS_RC=1
 OUT=$(run_script); RC=$?
 unset STUB_PLUGIN_STATUS_RC
 assert_ran "插件屏障失败的发布" || exit 1
-if calls | grep -q "python scripts/plugin_status.py --wait 30" && [[ "$RC" != "0" ]]; then
+if calls_has "python scripts/plugin_status.py --wait 30" && [[ "$RC" != "0" ]]; then
   ok "插件屏障失败时发布返回非零"
 else
   no "插件屏障失败却仍然报告发布成功"
@@ -643,7 +660,7 @@ if grep -q "插件 worker barrier 未通过" <<<"$OUT" && grep -q "新版本已�
 else
   no "屏障失败没有准确报告已启动的现场"
 fi
-if calls | grep -q "systemctl enable --now cwq-backup.timer"; then
+if calls_has "systemctl enable --now cwq-backup.timer"; then
   no "屏障失败仍执行成功后的发布步骤"
 else
   ok "屏障失败停止后续发布步骤"
@@ -662,14 +679,14 @@ setup_sandbox
 OUT=$(run_script); RC=$?
 assert_ran "全量发布" || exit 1
 
-PIPLINE=$(calls | grep -F 'pip install' | head -1)
+PIPLINE=$(calls_first 'pip install')
 if [[ "$PIPLINE" == *"[lock=rfc8785==0.1.4]"* ]]; then
   ok "装依赖用的是产物里的锁文件，不是现网那份旧的"
 else
   no "装依赖的依据不对：${PIPLINE:-（根本没有 pip 调用）}"
 fi
 
-ALEM=$(calls | grep -F 'alembic upgrade head' | head -1)
+ALEM=$(calls_first 'alembic upgrade head')
 if [[ "$ALEM" == *"[chain=NEW]"* ]]; then
   ok "迁移跑的是产物里的新迁移链（head 来自这一版，不是上一版）"
 else
@@ -708,12 +725,12 @@ if [[ "$RC" != "0" ]]; then
 else
   no "装依赖失败却返回成功"
 fi
-if calls | grep -qF 'alembic upgrade head'; then
+if calls_has 'alembic upgrade head'; then
   no "依赖没装好就迁移了库 —— 迁移脚本要靠新代码跑，依赖不齐就是跑不通"
 else
   ok "依赖没装好就不迁移"
 fi
-if calls | grep -q "systemctl restart"; then
+if calls_has "systemctl restart"; then
   no "装依赖失败却重启了服务"
 else
   ok "装依赖失败没有重启"
@@ -741,7 +758,7 @@ if [[ "$RC" != "0" ]] && grep -q "无法确认迁移会打在哪个库上" <<<"$
 else
   no "没有 .env 也没有 DATABASE_URL 时仍然往下走了（RC=${RC}）"
 fi
-if calls | grep -qF 'alembic upgrade head'; then
+if calls_has 'alembic upgrade head'; then
   no "目标库不确定却仍然跑了迁移"
 else
   ok "目标库不确定时 alembic upgrade head 一次都没跑"
@@ -900,7 +917,7 @@ fi
 # **只查换软链的那个函数**：脚本里另有一处 ln -sfn（给暂存目录链 .env），
 # 那一处链的不是对外服务的路径，语义完全不同，不能混为一谈。
 swap_body=$(awk '/^atomic_symlink_swap\(\)/,/^}/' "$SCRIPT")
-if grep -cE 'ln[[:space:]]+-[a-zA-Z]*f' <<<"$swap_body" | grep -qv '^0$'; then
+if [[ "$(grep -cE 'ln[[:space:]]+-[a-zA-Z]*f' <<<"$swap_body")" != "0" ]]; then
   no "换软链用了 ln -f —— 那是 unlink + symlink，中间链接是空的，不是原子的"
 else
   ok "换软链没有用非原子的 ln -f/-n"
@@ -910,7 +927,11 @@ if [[ "$(code_count 'atomic_symlink_swap')" == "0" ]]; then
 else
   ok "脚本用一次 rename 完成软链切换（atomic_symlink_swap）"
 fi
-if code_only | grep -qE '^[[:space:]]*trap[[:space:]]'; then
+# **用 code_count 而不是 `code_only | grep -q`**（同一个 SIGPIPE 坑）：
+# code_only 要把整份 deploy.sh（50KB+）写进管道，下游 grep -q 命中第一行
+# 就退出 → 上游吃 SIGPIPE → pipefail 下整条管道非零 → 「装了 trap」被判成
+# 「一个 trap 都没有」。macOS 上可能侥幸通过，Linux CI 上稳定复现。
+if [[ "$(code_count '^[[:space:]]*trap[[:space:]]')" != "0" ]]; then
   ok "脚本装了 trap（被打断时能退回去）"
 else
   no "脚本一个 trap 都没有 —— 被打断就停在半路"
@@ -1086,6 +1107,41 @@ if grep -q "TRUSTED_PROXIES 已配置" <<<"$OUT"; then
   no ".env 不存在却报「已配置」—— 把更糟的状态报成了已处理"
 else
   ok ".env 不存在没有误报「已配置」"
+fi
+
+echo
+echo "== 19. 断言管道里不许出现 grep -q / grep|head（SIGPIPE 会把「匹配到了」判成「没匹配」）==="
+# --------------------------------------------------------------------------
+# 这条**不测 deploy.sh，测这份脚本自己**。
+#
+# 2026-10-21 的 CI 就是这么红的：deploy.sh 明明装了 trap（231/234/235 行），
+# 断言却说「脚本一个 trap 都没有」—— 判的不是脚本，是这条断言自己的管道：
+# `code_only | grep -q` 里，下游命中第一行就退出，上游 grep 写 50KB 时
+# 收到 SIGPIPE，`set -uo pipefail` 下整条管道返回非零 → 「匹配到了」
+# 被判成「没匹配」。macOS 上可能侥幸通过，Linux CI 上稳定复现。
+#
+# **守卫只查它自己之前的部分**：这条检查自己就带着 `| grep` 的形状，
+# 查全文件会自己命中自己。
+# --------------------------------------------------------------------------
+SELF=${BASH_SOURCE[0]}
+GUARD_LINE=$(grep -m1 -n "== 19. 断言管道里不许出现" "$SELF" | cut -d: -f1)
+# **只看代码行**：注释里提到 `| grep -q` 是为了说明这个坑，不该自己被算进去
+# （跟 deploy.sh 那边 code_only 剥注释是同一个道理）。
+HEAD_PART=$(awk -v lim="$GUARD_LINE" 'NR<lim' "$SELF" | grep -vE '^[[:space:]]*#')
+# 管道里出现 `grep -q`（-q 命中即退 → 上游吃 SIGPIPE）
+Q_PIPE=$(grep -cE '\|[[:space:]]*grep[[:space:]]+(-[a-zA-Z]+)*[[:space:]]*-?q' <<<"$HEAD_PART" || true)
+if [[ "$Q_PIPE" == "0" ]]; then
+  ok "断言管道里没有 grep -q（不会有「匹配到了」被判成「没匹配」）"
+else
+  no "断言管道里仍有 grep -q（第 ${Q_PIPE} 处）—— Linux 上会稳定误判"
+fi
+# `grep ... | head -1`：head 读一行就退，上游可能被 SIGPIPE 打断，
+# 那条还没写出来的匹配行就丢了（断言拿到空串）。
+G_HEAD=$(grep -cE 'grep[^|]*\|[[:space:]]*head' <<<"$HEAD_PART" || true)
+if [[ "$G_HEAD" == "0" ]]; then
+  ok "断言里没有「grep | head」（不会被 head 提前退出打断）"
+else
+  no "断言里仍有「grep | head」（第 ${G_HEAD} 处）—— 可能丢掉匹配行"
 fi
 
 echo
