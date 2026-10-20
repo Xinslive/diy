@@ -87,7 +87,7 @@ def test_合计不是借贷两侧绝对值之和():
     rows = [_row("1001", opening=1000, pdr=500, ydr=500, closing=1500),
             _row("2202", opening=1000, opening_side="贷", pcr=500, ycr=500,
                  closing=1500, closing_side="贷")]
-    ws = _sheet(balance_excel(_payload(rows), company="甲", book_name="乙"))
+    ws = _sheet(balance_excel(_payload(rows), book_name="乙"))
 
     assert _total(ws, COL_OPENING) == Decimal("1000.00"), (
         "合计期初把借方与贷方余额加在一起了")
@@ -109,7 +109,7 @@ def test_不平衡时试算行把两边和差额都写出来():
     ws = _sheet(balance_excel(_payload(
         rows, period_balanced=False, closing_balanced=False,
         total_closing_debit=Decimal("1500"), total_closing_credit=Decimal("1400")),
-        company="甲", book_name="乙"))
+        book_name="乙"))
 
     text = "\n".join(str(c.value) for row in ws.iter_rows() for c in row)
     assert "本期发生额不平衡" in text and "期末余额不平衡" in text, text
@@ -138,7 +138,7 @@ def test_合计只算叶子不把父级算两遍():
     ws = _sheet(balance_excel(_payload(
         [leaf_dr, parent, leaf_cr], total_debit=Decimal("100"),
         total_credit=Decimal("100"), total_closing_debit=Decimal("1100"),
-        total_closing_credit=Decimal("1100")), company="甲", book_name="乙"))
+        total_closing_credit=Decimal("1100")), book_name="乙"))
 
     assert _total(ws, COL_PDR) == Decimal("100.00"), "合计被父级行重复计了一次"
     assert _total(ws, COL_OPENING) == Decimal("1000.00"), (
@@ -158,7 +158,7 @@ def test_合计与check里的试算数一致():
     check = {"total_debit": Decimal("100"), "total_credit": Decimal("100"),
              "total_closing_debit": Decimal("1100"),
              "total_closing_credit": Decimal("1100")}
-    ws = _sheet(balance_excel(_payload(rows, **check), company="甲", book_name="乙"))
+    ws = _sheet(balance_excel(_payload(rows, **check), book_name="乙"))
 
     assert _total(ws, COL_PDR) == check["total_debit"]
     assert _total(ws, COL_PCR) == check["total_credit"]
@@ -177,7 +177,7 @@ def test_没有check时按同样的算法自己算():
     payload = {"period": "2026-01",
                "check": {"period_balanced": True, "closing_balanced": True},
                "rows": rows}
-    ws = _sheet(balance_excel(payload, company="甲", book_name="乙"))
+    ws = _sheet(balance_excel(payload, book_name="乙"))
 
     assert _total(ws, COL_OPENING) == Decimal("1000.00")
     assert _total(ws, COL_CLOSING) == Decimal("1500.00")
@@ -190,7 +190,7 @@ def test_期末合计写在期末列而不是方向列():
     """方向列在合计行没有方向可言。以前期末合计写进了第 9 列，
     而真正的第 10 列（期末）空着 —— 一格「方向」里躺着一个金额。"""
     rows = [_row("1001", opening=1000, pdr=500, ydr=500, closing=1500)]
-    ws = _sheet(balance_excel(_payload(rows), company="甲", book_name="乙"))
+    ws = _sheet(balance_excel(_payload(rows), book_name="乙"))
     total = _total_row(ws)
 
     assert Decimal(str(ws.cell(row=total, column=COL_CLOSING).value)) == Decimal("1500.00")
@@ -201,7 +201,7 @@ def test_期末合计写在期末列而不是方向列():
 def test_合计行的表头与列宽没被动过():
     """改的是「哪一格写哪个数」，不是版式 —— 版式另有 6 个导出共用同一套。"""
     ws = _sheet(balance_excel(_payload([_row("1001", opening=100, closing=100)]),
-                               company="甲", book_name="乙"))
+                               book_name="乙"))
     assert [ws.cell(row=4, column=c).value for c in range(1, 11)] == [
         "科目编码", "科目名称", "方向", "期初", "本期借方", "本期贷方",
         "本年借方", "本年贷方", "方向", "期末"]

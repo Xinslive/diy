@@ -1190,7 +1190,7 @@ def export_balance(book_id: int, period_id: Optional[int] = None,
     # 文件名把区间说清楚，避免一个月一份的命名习惯盖住「这是跨三个月的」
     label = f"{from_period.code}~{period.code}" if is_range else period.code
     data = xl.balance_excel({"rows": rows, "check": check, "period": label},
-                            company=book.company_name, book_name=book.name)
+                            book_name=book.name)
     return Response(content=data, media_type=XLSX_MIME,
                     headers={"Content-Disposition": _filename(f"科目余额表_{label}.xlsx")})
 
@@ -1231,7 +1231,7 @@ def export_general(book_id: int, period_id: Optional[int] = None,
     rows = queries.general_ledger(db, book.id, subjects, from_period, to_period, include_unposted)
     data = xl.general_ledger_excel(
         {"rows": rows, "from_period": from_period.code, "to_period": to_period.code},
-        company=book.company_name, book_name=book.name)
+        book_name=book.name)
     span = from_period.code if from_period.id == to_period.id else f"{from_period.code}-{to_period.code}"
     return Response(content=data, media_type=XLSX_MIME,
                     headers={"Content-Disposition": _filename(f"总账_{span}.xlsx")})
@@ -1250,7 +1250,7 @@ def export_report(book_id: int, template_id: int, period_id: int, book: Book = D
     tpl = _scoped_report_template(db, book, template_id)
     payload = pv.visible_report_payload(evaluate(db, template_id, book, period, False))
     payload["name"] = tpl.name
-    data = xl.report_excel(payload, company=book.company_name, book_name=book.name)
+    data = xl.report_excel(payload, book_name=book.name)
     return Response(content=data, media_type=XLSX_MIME,
                     headers={"Content-Disposition": _filename(f"{tpl.name}_{period.code}.xlsx")})
 

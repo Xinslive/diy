@@ -556,7 +556,7 @@ def export_openings(book_id: int, period_id: int | None = None,
         [{"code": s_.code, "name": s_.name,
           "direction": ("借" if st > 0 else "贷") if st != 0 else ("借" if s_.direction == "DEBIT" else "贷"),
           "amount": abs(st)} for s_ in subjects for st in [saved.get(s_.id, Decimal("0"))]],
-        company=book.company_name, book_name=book.name, year=first.year, month=first.month,
+        book_name=book.name, year=first.year, month=first.month,
     )
     return Response(content=data, media_type=XLSX_MIME,
                     headers={"Content-Disposition": _xlsx_name(f"期初余额_{book.name}.xlsx")})

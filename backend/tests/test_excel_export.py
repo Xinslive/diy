@@ -118,7 +118,7 @@ def test_科目余额表导出也不注入():
         "opening": "0", "period_debit": "100", "period_credit": "0",
         "ytd_debit": "100", "ytd_credit": "0", "direction": "借", "closing": "100",
     }]}
-    ws = _sheet(balance_excel(payload, company="甲", book_name="乙"))
+    ws = _sheet(balance_excel(payload, book_name="乙"))
     cells = [ws.cell(row=r, column=c)
              for r in range(1, ws.max_row + 1) for c in range(1, ws.max_column + 1)]
     assert all(c.data_type != "f" for c in cells), "科目余额表里有单元格被写成了公式"
@@ -130,7 +130,7 @@ def test_总账导出也不注入():
         "opening": "0", "period_debit": "100", "period_credit": "0",
         "ytd_debit": "100", "ytd_credit": "0", "closing": "100",
     }]}
-    ws = _sheet(general_ledger_excel(payload, company="甲", book_name="乙"))
+    ws = _sheet(general_ledger_excel(payload, book_name="乙"))
     cells = [ws.cell(row=r, column=c)
              for r in range(1, ws.max_row + 1) for c in range(1, ws.max_column + 1)]
     assert all(c.data_type != "f" for c in cells), "总账里有单元格被写成了公式"
@@ -139,7 +139,7 @@ def test_总账导出也不注入():
 def test_期初余额表导出也不注入():
     ws = _sheet(opening_balance_excel(
         [{"code": "1001", "name": "=1+1", "direction": "借", "amount": 100.0}],
-        company="甲", book_name="乙", year=2026, month=1))
+        book_name="乙", year=2026, month=1))
     cells = [ws.cell(row=r, column=c)
              for r in range(1, ws.max_row + 1) for c in range(1, ws.max_column + 1)]
     assert all(c.data_type != "f" for c in cells), "期初余额表里有单元格被写成了公式"
@@ -150,13 +150,16 @@ def test_期初余额表导出也不注入():
 # ``_text`` 本来就写了防护（openpyxl 遇到 =/+/-/@ 开头的字符串会标成公式），
 # 但它只用在数据行上。**表头区的单元格全都绕过了它**：
 #
-#   * A2 的「单位名 · 账套名 · 期间」—— company 来自 book.company_name，
-#     是建账者自己填的自由文本；
+#   * A2 的抬头「账套名 · 期间」—— 账套名是建账者自己填的自由文本；
 #   * A1 的报表名 —— 来自可 PATCH 的**全局**报表模板名；
 #   * 报表行标签 —— 来自报表公式的 label；
-#   * 期初余额表 A1 —— 同样是 company。
+#   * 期初余额表 A1 —— 同样是账套名。
 #
-# 可利用性不是理论上的：company 由建账者填写、报表名可被 PATCH，而
+# （抬头原先还印单位名，那是同一类自由文本。2026-10-20 起单位名从所有 Excel
+# 导出里去掉之后，抬头里剩下的用户可控文本就只有账套名 —— 注入防护跟着
+# 换到这个入口，**不是**跟着单位名一起消失。）
+#
+# 可利用性不是理论上的：账套名由建账者填写、报表名可被 PATCH，而
 # 导出文件是要发给客户和审计方的（这个文件自己的注释就这么写）。
 
 #: Excel/CSV 公式注入的经典载荷。=HYPERLINK 会在别人打开文件时
@@ -189,26 +192,26 @@ def _assert_payload_preserved(ws, what: str, payload: str):
 
 
 @pytest.mark.parametrize("payload", INJECTIONS)
-def test_科目余额表标题格里的单位名不注入(payload):
+def test_科目余额表抬头里的账套名不注入(payload):
     ws = _sheet(balance_excel(
         {"period": "2026-01", "check": {"period_balanced": True, "closing_balanced": True},
-         "rows": []}, company=payload, book_name="乙"))
+         "rows": []}, book_name=payload))
     _assert_no_formula(ws, "科目余额表")
     _assert_payload_preserved(ws, "科目余额表", payload)
 
 
 @pytest.mark.parametrize("payload", INJECTIONS)
-def test_总账标题格里的单位名不注入(payload):
+def test_总账抬头里的账套名不注入(payload):
     ws = _sheet(general_ledger_excel(
         {"from_period": "2026-01", "to_period": "2026-01", "rows": []},
-        company=payload, book_name="乙"))
+        book_name=payload))
     _assert_no_formula(ws, "总账")
     _assert_payload_preserved(ws, "总账", payload)
 
 
 @pytest.mark.parametrize("payload", INJECTIONS)
-def test_期初余额表标题格里的单位名不注入(payload):
-    ws = _sheet(opening_balance_excel([], company=payload, book_name="乙",
+def test_期初余额表抬头里的账套名不注入(payload):
+    ws = _sheet(opening_balance_excel([], book_name=payload,
                                        year=2026, month=1))
     _assert_no_formula(ws, "期初余额表")
     _assert_payload_preserved(ws, "期初余额表", payload)
@@ -219,7 +222,7 @@ def test_报表名不注入(payload):
     """报表名来自**可 PATCH 的全局报表模板**，是这批绕过点里最危险的一个。"""
     ws = _sheet(report_excel(
         {"period": "2026-01", "name": payload, "cols": [{"label": "项目", "width": 100}],
-         "rows": []}, company="甲", book_name="乙"))
+         "rows": []}, book_name="乙"))
     _assert_no_formula(ws, "报表")
     _assert_payload_preserved(ws, "报表", payload)
 
@@ -231,7 +234,7 @@ def test_报表行标签不注入(payload):
         {"period": "2026-01", "name": "利润表",
          "cols": [{"label": "项目", "width": 100}],
          "rows": [{"indent": 2, "label": payload, "bold": False, "cells": []}]},
-        company="甲", book_name="乙"))
+        book_name="乙"))
     _assert_no_formula(ws, "报表")
     _assert_payload_preserved(ws, "报表", payload)
 
@@ -255,7 +258,7 @@ def test_含非法字符的报表名不会500(name):
     """
     ws = _sheet(report_excel(
         {"period": "2026-01", "name": name, "cols": [{"label": "项目", "width": 100}],
-         "rows": []}, company="甲", book_name="乙"))
+         "rows": []}, book_name="乙"))
     assert ws.title                      # 一定拿到一个可用名字
     assert len(ws.title) <= 31           # Excel 上限
     assert not (set("[]:*?/\\") & set(ws.title))
@@ -264,14 +267,14 @@ def test_含非法字符的报表名不会500(name):
 def test_报表名全是非法字符时退回默认名():
     ws = _sheet(report_excel(
         {"period": "2026-01", "name": "[[[", "cols": [{"label": "项目", "width": 100}],
-         "rows": []}, company="甲", book_name="乙"))
+         "rows": []}, book_name="乙"))
     assert ws.title == "报表"
 
 
 def test_正常报表名原样保留():
     ws = _sheet(report_excel(
         {"period": "2026-01", "name": "利润表", "cols": [{"label": "项目", "width": 100}],
-         "rows": []}, company="甲", book_name="乙"))
+         "rows": []}, book_name="乙"))
     assert ws.title == "利润表"
 
 
@@ -294,13 +297,13 @@ def test_各导出接口都有行数上限():
     cases = [
         lambda: detail_ledger_excel({"rows": too_many}, book_name="乙"),
         lambda: balance_excel({"rows": too_many, "check": check, "period": "2026-01"},
-                              company="甲", book_name="乙"),
+                              book_name="乙"),
         lambda: general_ledger_excel(
             {"rows": too_many, "from_period": "2026-01", "to_period": "2026-01"},
-            company="甲", book_name="乙"),
+            book_name="乙"),
         lambda: report_excel(
             {"period": "2026-01", "name": "报表", "cols": [{"label": "项目", "width": 100}],
-             "rows": too_many}, company="甲", book_name="乙"),
+             "rows": too_many}, book_name="乙"),
         # 凭证这一路原先漏了：它的行数是**分录数**，一张凭证写几行就占几行，
         # 按凭证数卡等于把上限放大了一倍（每张 8 行时就是 8 倍）。
         # 调用方一次取 5000 张凭证，最坏情况 4 万行，而每格都要写 border。
@@ -335,7 +338,7 @@ def test_合计用Decimal累加不漂移():
                    "ytd_debit": "0", "ytd_credit": "0",
                    "direction": "借", "closing": "0",
                } for i in range(10)]}
-    ws = _sheet(balance_excel(payload, company="甲", book_name="乙"))
+    ws = _sheet(balance_excel(payload, book_name="乙"))
     total_row = [r for r in range(1, ws.max_row + 1)
                  if ws.cell(row=r, column=2).value == "合计"][0]
     assert Decimal(str(ws.cell(row=total_row, column=5).value)) == Decimal("1.00")
@@ -350,5 +353,106 @@ def test_导出金额不经过float中转():
                    "opening": big, "period_debit": big, "period_credit": "0",
                    "ytd_debit": "0", "ytd_credit": "0", "direction": "借",
                    "closing": big}]},
-        company="甲", book_name="乙"))
+        book_name="乙"))
     assert Decimal(str(ws.cell(row=5, column=4).value)) == Decimal(big)
+
+
+# ===================================================================== 抬头一律不带单位名
+#
+# 单位名（``book.company_name``）是账套的属性，不是这张纸的抬头。以前每一份
+# 导出件的抬头都印一遍「单位名 · 账套名 · 期间」，同一套账的多个导出件摆在
+# 一起看上去像不同单位的账 —— 而这些文件是要发给客户和审计方的。
+#
+# 去掉的是**单位名那一段**：账套名、期间、区间照旧留着。少了它们，纸面上就
+# 分不清是哪本账的哪一段，那比多印一个单位名更糟。
+
+
+def test_科目余额表抬头只有账套名和期间():
+    ws = _sheet(balance_excel(
+        {"period": "2026-01", "check": {"period_balanced": True, "closing_balanced": True},
+         "rows": []}, book_name="乙"))
+    assert ws.cell(row=2, column=1).value == "乙 · 期间 2026-01"
+
+
+def test_总账抬头只有账套名和区间():
+    ws = _sheet(general_ledger_excel(
+        {"from_period": "2026-01", "to_period": "2026-05", "rows": []}, book_name="乙"))
+    assert ws.cell(row=2, column=1).value == "乙 · 2026-01 至 2026-05"
+
+
+def test_报表抬头只有账套名和期间():
+    ws = _sheet(report_excel(
+        {"period": "2026-01", "name": "利润表", "cols": [{"label": "项目", "width": 100}],
+         "rows": []}, book_name="乙"))
+    assert ws.cell(row=2, column=1).value == "乙 · 期间 2026-01"
+
+
+def test_期初余额表抬头只有账套名和年月():
+    ws = _sheet(opening_balance_excel([], book_name="乙", year=2026, month=1))
+    assert ws.cell(row=1, column=1).value == "乙　期初余额表　2026年1月"
+    # 单位名那一行整行删掉了，标题上提：表头从第 4 行变成第 3 行
+    assert ws.cell(row=3, column=1).value == "科目编码"
+    assert ws.cell(row=2, column=1).value in (None, ""), "抬头与表头之间不该夹着内容"
+
+
+def test_所有Excel导出件里都不出现单位名(client, auth, book, periods, subjects):
+    """兜底：单位名不出现在任何一张导出件的任何一格里。
+
+    走 HTTP 层而不是直接调导出函数：导出件是**发给客户和审计方**的东西，
+    中间任何一层（路由、参数、模板求值）把单位名塞回去，这条都会红。
+
+    上面几条钉住的是每张表抬头的**具体格式**；这一条钉住的是**覆盖范围**
+    —— 将来新增一个导出器时很容易顺手把单位名带上，而这类疏漏用户不会
+    当成 bug，只会把纸面那份当成对的。
+    """
+    company = book.company_name
+    assert company, "夹具没给单位名，这条用例就测不到东西"
+
+    pid = periods[5].id
+    tpls = client.get("/api/reports/templates", params={"book_id": book.id}, headers=auth)
+    assert tpls.status_code == 200, tpls.text
+    templates = tpls.json()
+    assert templates, "账套里一份报表模板都没有，报表导出这一路就没法测"
+    leaf = next(s for s in subjects.values() if s.is_leaf)
+
+    urls = [
+        f"/api/books/{book.id}/print/vouchers.xlsx?period_id={pid}",
+        f"/api/books/{book.id}/print/balance.xlsx?period_id={pid}",
+        f"/api/books/{book.id}/print/general-ledger.xlsx?period_id={pid}",
+        f"/api/books/{book.id}/print/report.xlsx"
+        f"?template_id={templates[0]['id']}&period_id={pid}",
+        f"/api/books/{book.id}/print/detail-ledger.xlsx?subject_id={leaf.id}&period_id={pid}",
+        f"/api/books/{book.id}/openings.xlsx?period_id={pid}",
+        f"/api/books/{book.id}/vouchers/import-template.xlsx",
+    ]
+    for url in urls:
+        r = client.get(url, headers=auth)
+        assert r.status_code == 200, f"{url} → {r.status_code} {r.text[:300]}"
+        wb = load_workbook(io.BytesIO(r.content))
+        for ws in wb.worksheets:
+            blob = " ".join(str(c.value) for row in ws.iter_rows()
+                            for c in row if c.value is not None)
+            assert company not in blob, (
+                f"{url} 的工作表「{ws.title}」里出现了单位名 {company!r}：{blob[:300]}")
+
+
+def test_期初余额表导出后还能被解析回来():
+    """期初余额表是**可再导入的往返文件**（备份，也是给下一个人填的模板）。
+
+    删掉单位名那一行之后表头上移了一行。表头仍在解析端的前 15 行扫描范围
+    里，但「行号对不对」是另一回事 —— 解析端报给用户的「第几行」必须对得上
+    源文件里的真实行号，否则用户照着改会改错行。
+    """
+    from app.accounting.opening_importer import parse_opening_rows
+
+    rows = [{"code": "1001", "name": "库存现金", "direction": "借", "amount": 100.0},
+            {"code": "2202", "name": "应付账款", "direction": "贷", "amount": 100.0}]
+    data = opening_balance_excel(rows, book_name="乙", year=2026, month=1)
+    grid = list(load_workbook(io.BytesIO(data)).active.iter_rows(values_only=True))
+
+    result = parse_opening_rows(grid, subjects_by_code={}, subjects_by_name={})
+    got = [(r["code"], r["name"], r["amount"], r["line"]) for r in result["rows"]]
+    assert got == [("1001", "库存现金", "100", 4), ("2202", "应付账款", "100", 5)], (
+        f"往返导回来对不上：{got}")
+    # 抬头行没被当成数据读进来（以前 A1 是单位名，删掉后 A1 是标题行）
+    assert result["header_row"] == 3, result["header_row"]

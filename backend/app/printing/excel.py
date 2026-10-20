@@ -2,6 +2,12 @@
 
 浏览器打印走 HTML+CSS（前端负责），Excel 导出覆盖 A5 记账凭证、
 连续打印纸这类需要二次加工的场景。
+
+**抬头一律不带单位名**（2026-10-20 起）。单位名是账套的属性，不是这张纸的
+抬头；每份导出件上都印一遍，只会让同一套账的多个导出件看上去像不同单位的
+账。账套名、期间、区间照旧留着 —— 少了它们，纸面上就分不清是哪本账的哪一段。
+本模块的六个生成器里只有 `detail_ledger_excel` 与 `vouchers_excel` 本来就没有
+单位名，现在六个一致。
 """
 from __future__ import annotations
 
@@ -296,7 +302,7 @@ def _verdict(check: dict, key: str, label: str, debit: Decimal, credit: Decimal)
     return f"{label}{mark}（借 {money(debit)} / 贷 {money(credit)}）"
 
 
-def balance_excel(payload: dict, *, company: str, book_name: str) -> bytes:
+def balance_excel(payload: dict, *, book_name: str) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = "科目余额表"
@@ -309,10 +315,14 @@ def balance_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     ws.row_dimensions[1].height = 28
 
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=10)
-    # 单位名（book.company_name）是建账时填的自由文本，与摘要同一类输入。
-    # 以前这四处标题格绕过了 _text：openpyxl 见到以 = 开头就标成公式，
-    # 导出表里就多了一格可执行公式，而这份文件是要发给客户和审计方的。
-    ws["A2"] = _text(f"{company} · {book_name} · 期间 {payload['period']}")
+    # 抬头只带账套名与期间，**不带单位名**（2026-10-20 起所有 Excel 导出一致）。
+    # 单位名是账套的属性而不是这张纸的抬头，出现在每份导出件上只会让
+    # 同一套账的多个导出件看上去像不同单位的账。
+    #
+    # 账套名同样是建账时填的自由文本，与摘要同一类输入。以前这四处标题格
+    # 绕过了 _text：openpyxl 见到以 = 开头就标成公式，导出表里就多了一格
+    # 可执行公式，而这份文件是要发给客户和审计方的。
+    ws["A2"] = _text(f"{book_name} · 期间 {payload['period']}")
     ws["A2"].alignment = CENTER
 
     headers = ["科目编码", "科目名称", "方向", "期初", "本期借方", "本期贷方",
@@ -379,7 +389,7 @@ def balance_excel(payload: dict, *, company: str, book_name: str) -> bytes:
 # --------------------------------------------------------------------- 总账
 
 
-def general_ledger_excel(payload: dict, *, company: str, book_name: str) -> bytes:
+def general_ledger_excel(payload: dict, *, book_name: str) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = "总账"
@@ -392,7 +402,7 @@ def general_ledger_excel(payload: dict, *, company: str, book_name: str) -> byte
     ws.row_dimensions[1].height = 28
 
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=9)
-    ws["A2"] = _text(f"{company} · {book_name} · {payload['from_period']} 至 {payload['to_period']}")
+    ws["A2"] = _text(f"{book_name} · {payload['from_period']} 至 {payload['to_period']}")
     ws["A2"].alignment = CENTER
 
     headers = ["科目编码", "科目名称", "期初方向", "期初余额", "本期借方", "本期贷方",
@@ -524,7 +534,7 @@ def detail_ledger_excel(payload: dict, *, book_name: str) -> bytes:
 # --------------------------------------------------------------------- 报表
 
 
-def report_excel(payload: dict, *, company: str, book_name: str) -> bytes:
+def report_excel(payload: dict, *, book_name: str) -> bytes:
     wb = Workbook()
     ws = wb.active
     name = payload.get("name", "报表")
@@ -548,7 +558,7 @@ def report_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     ws.row_dimensions[1].height = 30
 
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
-    ws["A2"] = _text(f"{company} · {book_name} · 期间 {payload['period']}")
+    ws["A2"] = _text(f"{book_name} · 期间 {payload['period']}")
     ws["A2"].alignment = CENTER
 
     # 每个报表列落在**自己那一列**，不整体右移。原来是「第 1 列写行标签，
@@ -655,35 +665,36 @@ def report_excel(payload: dict, *, company: str, book_name: str) -> bytes:
     return buf.getvalue()
 
 
-def opening_balance_excel(rows: list[dict], *, company: str, book_name: str, year: int,
+def opening_balance_excel(rows: list[dict], *, book_name: str, year: int,
                           month: int) -> bytes:
     """期初余额表（导入模板 / 导出当前录入值 共用一份格式）。
 
     列刻意做成「财务系统间最好抄」的样子：科目编码、科目名称、方向、期初余额。
     方向列是必填的 —— 同一个正数在借方科目和贷方科目上存进去是不一样的，
     光看金额抄不出方向，会静默记反。
+
+    **抬头不带单位名**（2026-10-20 起所有 Excel 导出一致）：原先 A1 单独
+    一行摆单位名，那一行整行删掉、标题上提，于是表头从第 4 行变成第 3 行、
+    数据从第 5 行变成第 4 行。表头仍落在解析端的前 15 行扫描范围里，
+    往返导入（导出 → 再喂回解析）不受影响。
     """
     wb = Workbook()
     ws = wb.active
     ws.title = "期初余额"
 
     ws.merge_cells("A1:D1")
-    ws["A1"] = _text(company)
+    ws["A1"] = _text(f"{book_name}　期初余额表　{year}年{month}月")
     ws["A1"].font = Font(size=13, bold=True)
     ws["A1"].alignment = Alignment(horizontal="center")
-    ws.merge_cells("A2:D2")
-    ws["A2"] = _text(f"{book_name}　期初余额表　{year}年{month}月")
-    ws["A2"].font = Font(size=11, bold=True)
-    ws["A2"].alignment = Alignment(horizontal="center")
 
     head = ["科目编码", "科目名称", "方向", "期初余额"]
     for i, h in enumerate(head, start=1):
-        c = ws.cell(row=4, column=i, value=h)
+        c = ws.cell(row=3, column=i, value=h)
         c.font = Font(bold=True)
         c.alignment = Alignment(horizontal="center")
         c.border = Border(bottom=Side(style="thin"))
 
-    r = 5
+    r = 4
     for row in rows:
         ws.cell(row=r, column=1, value=_text(row["code"]))
         ws.cell(row=r, column=2, value=_text(row["name"]))
@@ -691,11 +702,11 @@ def opening_balance_excel(rows: list[dict], *, company: str, book_name: str, yea
         ws.cell(row=r, column=4, value=_num(row["amount"]))
         r += 1
 
-    if r > 5:
-        _money_style(ws, 4, range(4, 5))     # 列格式（作用于整个 D 列）
-        for rr in range(5, r):
+    if r > 4:
+        _money_style(ws, 3, range(4, 5))     # 列格式（作用于整个 D 列）
+        for rr in range(4, r):
             ws.cell(row=rr, column=4).number_format = "#,##0.00"
     for col, w in zip("ABCD", (14, 32, 10, 18)):
         ws.column_dimensions[col].width = w
-    ws.freeze_panes = "A5"
+    ws.freeze_panes = "A4"
     return _to_bytes(wb)

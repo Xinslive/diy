@@ -249,8 +249,9 @@ def test_export_follows_selected_period(client, auth, book_id, periods, subjects
                    headers=auth)
     assert r.status_code == 200, r.text
     ws = load_workbook(io.BytesIO(r.content)).active
-    assert "2026年5月" in ws["A2"].value, ws["A2"].value
-    exported = {row[0]: row[3] for row in ws.iter_rows(min_row=5, values_only=True)}
+    # 单位名那一行删掉之后，标题上提到 A1，表头在第 3 行、数据从第 4 行起
+    assert "2026年5月" in ws["A1"].value, ws["A1"].value
+    exported = {row[0]: row[3] for row in ws.iter_rows(min_row=4, values_only=True)}
     assert exported["1121"] == 5000, exported["1121"]
 
 
@@ -273,7 +274,8 @@ def test_export_then_parse_round_trip_preserves_reverse_balance(
 
     # 导出件本身就要把「贷」写进方向列，而不是按科目属性写「借」
     ws = load_workbook(io.BytesIO(r.content)).active
-    exported = {row[0]: (row[2], row[3]) for row in ws.iter_rows(min_row=2, values_only=True)}
+    # 数据从第 4 行起（第 1 行是标题、第 3 行是表头）
+    exported = {row[0]: (row[2], row[3]) for row in ws.iter_rows(min_row=4, values_only=True)}
     assert exported["1122"][0] == "贷", exported["1122"]
     assert exported["1121"][0] == "借"
 
