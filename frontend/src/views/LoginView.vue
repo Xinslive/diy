@@ -7,23 +7,50 @@
       <!-- ------------------------------------------------ 二次验证：等邮件 -->
       <!-- v-if 而不是 v-else 的一层：二次验证进行中时，登录表单整个收起 ——
            留着它等于让人在「等邮件」的半路上又点一次登录（那会再造一个
-           挑战、把上一封邮件作废）。 -->
+           挑战、把上一封邮件作废）。
+
+           这一屏整个是左对齐的：**卡片上方的标题与副标题本来就是左对齐的**，
+           原来这一屏却是整段居中（.mfa-box{text-align:center}）——
+           同一张卡片里两套对齐，看起来就是散的。标题、邮箱、步骤、过期提示、
+           两个按钮、退出链接现在共用同一条左边缘。 -->
       <div v-if="store.mfa" class="mfa-box">
-        <h2>请查收验证邮件</h2>
-        <p class="muted">
-          我们已经往 <strong>{{ store.mfa.emailHint || '通知邮箱' }}</strong>
-          发了一封带验证链接的邮件。点开链接完成验证后，**回到这个窗口**
-          点「我已验证」。
+        <div class="mfa-title">
+          <span class="mfa-badge"><el-icon><Message /></el-icon></span>
+          <h2>请查收验证邮件</h2>
+        </div>
+
+        <!-- 收件地址单独占一行：它是这一屏最该被一眼看到的东西，
+             埋在句子中间既扫不出来，也读不成一个地址。 -->
+        <div class="mfa-mail">
+          <span class="mfa-mail-label">验证链接已发送到</span>
+          <span class="mfa-mail-addr">{{ store.mfa.emailHint || '通知邮箱' }}</span>
+        </div>
+
+        <!-- 编号是**顺序**不是并列：先收信、再回本页，两件事有先后，
+             所以这里编号是对的（并列的操作才不该编号）。 -->
+        <ol class="mfa-steps">
+          <li v-for="(step, i) in MFA_STEPS" :key="step">
+            <span class="mfa-step-n">{{ i + 1 }}</span>
+            <span class="mfa-step-text">{{ step }}</span>
+          </li>
+        </ol>
+
+        <p class="mfa-expire" :class="{ warn: mfaLeft <= 60 }">
+          <el-icon><Clock /></el-icon>
+          <span>验证链接 {{ mfaLeft }} 秒后过期</span>
         </p>
-        <p class="muted countdown">验证链接 {{ mfaLeft }} 秒后过期</p>
-        <el-button type="primary" size="large" style="width: 100%"
-                   :loading="polling" @click="submitPoll">
-          我已验证
-        </el-button>
-        <el-button size="large" style="width: 100%; margin-top: 10px"
-                   :disabled="resendWait > 0" :loading="resending" @click="submitResend">
-          {{ resendWait > 0 ? `重新发送（${resendWait} 秒后可用）` : '重新发送验证邮件' }}
-        </el-button>
+
+        <div class="mfa-actions">
+          <el-button type="primary" size="large"
+                     :loading="polling" @click="submitPoll">
+            我已验证
+          </el-button>
+          <el-button size="large"
+                     :disabled="resendWait > 0" :loading="resending" @click="submitResend">
+            {{ resendWait > 0 ? `重新发送（${resendWait} 秒后可用）` : '重新发送' }}
+          </el-button>
+        </div>
+
         <el-button link type="info" class="exit-btn" @click="backToLogin">
           退出，重新登录
         </el-button>
@@ -94,12 +121,24 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { Clock, Message } from '@element-plus/icons-vue'
 import * as authApi from '@/api/auth'
 import { useSessionStore } from '@/stores/session'
 import { registrationView } from '@/utils/registration'
 
 const store = useSessionStore()
 const router = useRouter()
+
+/**
+ * 「等邮件」这一屏要人做的那两件事，**按顺序**。
+ *
+ * 写成数组而不是写死在模板里：两条文案要占同样宽的一列（步骤圆点右对齐、
+ * 文字左对齐），写死成两段 <li> 的话改一条就会把另一条挤歪。
+ */
+const MFA_STEPS = [
+  '打开邮件，点击里面的验证链接',
+  '回到本页，点击「我已验证」',
+]
 
 const tab = ref('login')
 const busy = ref(false)
@@ -269,17 +308,93 @@ onMounted(async () => {
   background: linear-gradient(135deg, #eef2ff, #f8fafc 60%, #ecfdf5);
 }
 .login-box {
-  width: 380px; background: #fff; padding: 32px; border-radius: 10px;
+  width: 380px;
+  /* 窄屏（375/360 的手机）上固定 380px 会横向溢出，页面被推出可视区。
+     宽度上限跟着视口走，宽屏下仍然就是 380px。 */
+  max-width: calc(100vw - 32px);
+  background: #fff; padding: 32px; border-radius: 10px;
   box-shadow: 0 12px 40px rgba(15, 23, 42, .08);
 }
 h1 { font-size: 22px; margin: 0 0 4px; }
 p { margin: 0 0 12px; font-size: 13px; }
 .hint { text-align: center; font-size: 12px; margin: 12px 0 0; line-height: 1.6; }
-.mfa-box { text-align: center; }
-.mfa-box h2 { font-size: 16px; margin: 4px 0 10px; }
-.mfa-box p { line-height: 1.8; }
-.countdown { font-size: 12px; margin: 0 0 14px; }
-.exit-btn { margin-top: 10px; width: 100%; }
+
+/* ---- 二次验证：等邮件那一屏 ------------------------------------------------
+   三件事，一件一件说清楚：
+
+   1. **左对齐**。原来这一屏整段居中（text-align:center），而卡片上方的
+      标题与副标题是左对齐的 —— 同一张卡片里两套对齐，看着就是散的。
+      现在整屏共用同一条左边缘。
+
+   2. **两个按钮等宽**。Element Plus 有 `.el-button + .el-button{margin-left:12px}`，
+      而原来两个按钮都写死 `style="width:100%"`：第二个因此被整体右推 12px，
+      左边缘对不齐（生产实测 452 vs 464，就是差这 12px）。现在改成 flex 列 +
+      stretch，宽度由容器决定，并把那条 margin 归零 —— 内联样式也一并撤掉，
+      免得下次改样式又忘了这条规则。
+
+   3. **间隔用同一条节奏**。标题、邮箱、步骤、过期提示、按钮组之间统一
+      14px，按钮之间 10px，不再是 10/14/18 随手写的。 */
+.mfa-box {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 14px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--cwq-border);
+  text-align: left;
+}
+/* 比 Element Plus 的 `.el-button + .el-button`（0,2,0）更specific，
+   所以不用赌样式的注入顺序。 */
+.mfa-box :deep(.el-button + .el-button) { margin-left: 0; }
+
+.mfa-title { display: flex; align-items: center; gap: 10px; }
+.mfa-title h2 { font-size: 16px; font-weight: 600; margin: 0; }
+.mfa-badge {
+  flex: none;
+  width: 32px; height: 32px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 8px;
+  background: #eff6ff;
+  color: var(--el-color-primary);
+  font-size: 17px;
+}
+
+/* 收件地址：标签在上、地址在下，与全局 .card 同一套 6px 圆角与 1px 边。 */
+.mfa-mail {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 10px 12px;
+  background: #f8fafc;
+  border: 1px solid var(--cwq-border);
+  border-radius: 6px;
+}
+.mfa-mail-label { font-size: 12px; color: var(--cwq-muted); }
+.mfa-mail-addr { font-size: 14px; font-weight: 600; color: var(--cwq-text); }
+
+.mfa-steps { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.mfa-steps li { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 1.7; color: #606266; }
+.mfa-step-n {
+  flex: none;
+  width: 16px; height: 16px; margin-top: 3px;
+  border-radius: 50%;
+  background: #eff6ff; color: var(--el-color-primary);
+  font-size: 11px; font-weight: 600; line-height: 16px; text-align: center;
+}
+.mfa-step-text { flex: 1; }
+
+.mfa-expire {
+  display: flex; align-items: center; gap: 6px;
+  margin: 0; font-size: 12px; color: var(--cwq-muted);
+}
+/* 快到期时提个醒 —— 用提醒色，不用错误色：这不是失败，是还剩不多时间。 */
+.mfa-expire.warn { color: var(--cwq-warn); }
+
+.mfa-actions { display: flex; flex-direction: column; gap: 10px; }
+.mfa-actions :deep(.el-button) { width: 100%; margin-left: 0; }
+
+/* 退出链接是第三档操作：贴着左边缘、内容宽度，不要占满一行。 */
+.exit-btn { align-self: flex-start; margin-top: 0; }
+
 :deep(.el-tabs__header) { margin-bottom: 18px; }
 /* 关掉自助注册后只剩「登录」一个页签，那一行页签栏没有信息量，
    去掉它，登录表单直接顶上来（见 utils/registration.js 的 showTabs）。 */

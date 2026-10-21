@@ -17,7 +17,7 @@
         <el-form-item label="接收告警">
           <el-switch v-model="form.enabled" :disabled="!isAdmin" />
           <span class="muted form-hint">
-            关掉之后配置仍然保留，随时可以再打开。告警发不出去**不会**影响业务本身。
+            关掉之后配置仍然保留，随时可以再打开。告警发不出去<b>不会</b>影响业务本身。
           </span>
         </el-form-item>
 
