@@ -777,6 +777,58 @@ enable_backup_timer() {
   systemctl enable --now cwq-backup.timer
 }
 
+# ---------------------------------------------------------------------------
+# 离站备份（阿里云 OSS）的定时器
+# ---------------------------------------------------------------------------
+# **这个 timer 以前从来没人装。** deploy/systemd/cwq-oss-backup.{service,timer}
+# 在 3ae13c1（账套数据分级压缩备份到 OSS）就进了仓库，但 enable_backup_timer
+# 只渲染并启用 cwq-backup.{service,timer} —— 离站备份那套单元从来没有被复制到
+# /etc/systemd/system。后果是**生产上离站备份从来没排过程**：只有发版时和
+# 手工触发才会备份到 OSS。
+#
+# 后果比「少一个 timer」严重。本机 dump（cwq-backup.timer）把库写成同一台机器
+# 磁盘上的一个 .sql —— 机器整盘故障时，它和账套数据一起没了。离站备份是唯一
+# 能跨机器故障活下来的那个副本，而它没跑。于是「我们有备份」这句话一直只
+# 在同一块盘上成立。
+#
+# 什么时候不装：OSS 参数没配全时不装（每天跑一次、每天失败、没人看 journal
+# —— 那比没有定时备份更危险，因为它看起来是有的）。此时给运维留一条能直接
+# 抄的命令。
+enable_oss_backup_timer() {
+  # 关停标记：与本机 dump 同一套语义 —— 一个标记关掉**所有**定时备份。
+  # 理由同 enable_backup_timer：只 stop 不 disable 的话，下次发版它自己复活。
+  if [ -f "$BACKUP_TIMER_OFF_MARKER" ]; then
+    return 2
+  fi
+
+  local src=""
+  for d in "$APP/deploy/systemd" "$SCRIPT_DIR/systemd"; do
+    if [ -f "$d/cwq-oss-backup.timer" ]; then src="$d"; break; fi
+  done
+  # 产物里没有这两个单元：不算失败（返回码 3），但也没装上。
+  [ -n "$src" ] || return 3
+
+  mkdir -p "$BACKUP_DIR"
+  local u
+  for u in cwq-oss-backup.service cwq-oss-backup.timer; do
+    render_unit "$src/$u" "$SYSTEMD_UNIT_DIR/$u" || return 1
+  done
+  systemctl daemon-reload || return 1
+
+  # OSS 参数配全了吗？**用应用自己的入口问，不另写一套判定。**
+  # backup_to_oss.py --dry-run 会先 require_ready()：缺项就退出码 2，
+  # 且一个字节都不传上去。这条命令在沙箱里是桩（退出 0），在真机上是真的。
+  local state="INCOMPLETE"
+  if state=$( cd "$APP/backend" && "$VENV/bin/python" scripts/backup_to_oss.py --dry-run >/dev/null 2>&1 ); then
+    state="OK"
+  fi
+  if [ "$state" != "OK" ]; then
+    return 5
+  fi
+
+  systemctl enable --now cwq-oss-backup.timer
+}
+
 # 调度看门狗的关停标记。存在即跳过（与定时备份同一个道理：只 stop 的话
 # 下一次发版会把它自己拉回来）。
 #
@@ -830,6 +882,38 @@ else
   log "           deploy/systemd/\$u > ${SYSTEMD_UNIT_DIR}/\$u; done"
   log "       systemctl daemon-reload && systemctl enable --now cwq-backup.timer"
   log "     然后验证真的产出文件：systemctl start cwq-backup.service && ls -l ${BACKUP_DIR}/"
+fi
+
+# (1.2) 离站备份定时器
+#
+# 与上面的本机 dump **分开说**：两者是不同的退路。本机 dump 写在同一块盘上，
+# 机器坏了它跟着坏；离站备份在阿里云 OSS，是唯一能跨机器故障活下来的副本。
+# 只有一个 timer 开着，等于只有一条退路 —— 而出事的时候才会发现是哪一条。
+oss_timer_rc=0
+enable_oss_backup_timer >/dev/null 2>&1 || oss_timer_rc=$?
+
+if [[ "$oss_timer_rc" -eq 2 ]]; then
+  # 与本机 dump 共用同一个关停标记：一个标记关掉所有定时备份。
+  log "  离站备份按要求保持关闭（标记文件：${BACKUP_TIMER_OFF_MARKER}）"
+  log "     要恢复：systemctl enable --now cwq-oss-backup.timer && 删掉那个标记文件"
+elif [[ "$oss_timer_rc" -eq 0 ]]; then
+  next_run=$(systemctl show cwq-oss-backup.timer -p NextElapseUSecRealtime --value 2>/dev/null || echo "")
+  log "  离站备份（阿里云 OSS）已启用${next_run:+（下次：${next_run}）}"
+  log "     它与本机 dump 错开半小时，两条退路都在"
+elif [[ "$oss_timer_rc" -eq 3 ]]; then
+  log "  ⚠️  产物里没有 cwq-oss-backup.* 单元，离站备份定时器没装上"
+  log "     离站备份现在只发生在发版时与手工触发时"
+elif [[ "$oss_timer_rc" -eq 5 ]]; then
+  log "  ⚠️  OSS 参数没配全，离站备份定时器没启用 —— 离站备份现在只发生在手工触发时"
+  log "     配好 endpoint / bucket / AccessKey（系统管理 → 数据安全）后："
+  log "       systemctl enable --now cwq-oss-backup.timer"
+else
+  log "  ⚠️  离站备份定时器启用失败 —— 离站备份现在只发生在手工触发时"
+  log "     手动补一次："
+  log "       for u in cwq-oss-backup.service cwq-oss-backup.timer; do \\"
+  log "         sed -e \"s|/opt/cwq/backups|${BACKUP_DIR}|g\" -e \"s|/opt/cwq|${APP}|g\" \\"
+  log "           deploy/systemd/\$u > ${SYSTEMD_UNIT_DIR}/\$u; done"
+  log "       systemctl daemon-reload && systemctl enable --now cwq-oss-backup.timer"
 fi
 
 # (1.5) 调度看门狗

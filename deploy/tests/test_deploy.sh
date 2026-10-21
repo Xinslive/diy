@@ -489,6 +489,91 @@ else
 fi
 
 # --------------------------------------------------------------------------
+# 离站备份（阿里云 OSS）的定时器
+#
+# **这个 timer 以前从来没人装。** deploy/systemd/cwq-oss-backup.{service,timer}
+# 在 3ae13c1（账套数据分级压缩备份到 OSS）就进了仓库，但 enable_backup_timer
+# 只渲染并启用 cwq-backup.{service,timer} —— 离站备份那套单元从来没被复制到
+# /etc/systemd/system，也没被 enable。于是生产上离站备份从来没排过程：只有
+# 发版时和手工触发才会备份到 OSS。
+#
+# 为什么这不是「多一个 timer」的事：本机 dump 写在同一块盘上，机器整盘故障时
+# 它和账套数据一起没了。离站备份是唯一能跨机器故障活下来的副本。少它 =
+# 只有一条退路，而出事的时候才会发现是哪一条。
+#
+# 断言覆盖四件事：默认装上、unit 真的落盘、路径按本机布局渲染、有关停标记时
+# 连 unit 都不写。
+# --------------------------------------------------------------------------
+echo "== 10.2 离站备份（OSS）定时器：装上、渲染、关停标记 honored =="
+
+setup_sandbox
+OUT=$(run_script)
+assert_ran "全量发布" || exit 1
+if calls_has "systemctl enable --now cwq-oss-backup.timer"; then
+  ok "默认会启用离站备份定时器"
+else
+  no "默认没有启用离站备份定时器 —— 离站备份在生产上等于没有"
+fi
+if grep -q "离站备份（阿里云 OSS）已启用" <<<"$OUT"; then
+  ok "明确报出离站备份已启用"
+else
+  no "没有报出离站备份定时器状态"
+fi
+if [[ -f "$DEPDIR/units/cwq-oss-backup.timer" && -f "$DEPDIR/units/cwq-oss-backup.service" ]]; then
+  ok "两个 OSS unit 文件都装到了目标目录"
+else
+  no "OSS unit 文件没落到 ${DEPDIR}/units —— enable 了一个不存在的 unit"
+fi
+
+# 渲染：路径必须落到本机布局，不能把 /opt/cwq 灌回来
+OSS_S="$DEPDIR/units/cwq-oss-backup.service"
+OSS_BKDIR="$DEPDIR/backups"
+if [[ -f "$OSS_S" ]]; then
+  if grep -q '/opt/cwq' "$OSS_S"; then
+    no "OSS unit 里还留着 /opt/cwq —— 原样拷贝会把旧布局灌回本机"
+  else
+    ok "OSS unit 里没有 /opt/cwq"
+  fi
+  for key in WorkingDirectory EnvironmentFile ExecStart; do
+    ln=$(grep -m1 "^${key}=" "$OSS_S" || true)
+    if [[ "$ln" == *"$APP"* ]]; then
+      ok "OSS unit 的 ${key} 已渲染为本机应用根"
+    else
+      no "OSS unit 的 ${key} 没指向本机应用根（实际：${ln:-<无该行>}）"
+    fi
+  done
+  rwp=$(grep -m1 '^ReadWritePaths=' "$OSS_S" || true)
+  if [[ "$rwp" == *"$OSS_BKDIR"* && "$rwp" != *"$APP/backups"* ]]; then
+    ok "OSS unit 的 ReadWritePaths 用的是运维给的 BACKUP_DIR"
+  else
+    no "OSS unit 的 ReadWritePaths 不是 BACKUP_DIR（实际：${rwp:-<无该行>}）"
+  fi
+  if grep -q "StandardOutput=append:$OSS_BKDIR/" "$OSS_S"; then
+    ok "OSS 备份日志重定向也渲染到了 BACKUP_DIR"
+  else
+    no "OSS 备份日志重定向没有跟着渲染（实际：$(grep -m1 '^StandardOutput=' "$OSS_S" || echo '<无该行>')）"
+  fi
+else
+  no "OSS unit 没装上，渲染断言全部无从谈起"
+fi
+
+# 关停标记在 → 离站备份的 timer 一个都不能动，unit 也不能写
+setup_sandbox
+: > "$APP/.backup-timer-off"
+OUT=$(run_script)
+assert_ran "带关停标记的发布" || exit 1
+if calls_has "cwq-oss-backup.timer"; then
+  no "有关停标记却仍然动了 cwq-oss-backup.timer —— 下次发版它会自己复活"
+else
+  ok "有关停标记时不碰 cwq-oss-backup.timer"
+fi
+if [[ -f "$DEPDIR/units/cwq-oss-backup.service" ]]; then
+  no "有关停标记却仍然写了 OSS unit —— 重启后 timer 会自己复活"
+else
+  ok "有关停标记时 OSS unit 没被写入（渲染前就短路了）"
+fi
+
+# --------------------------------------------------------------------------
 # 调度看门狗
 #
 # 计划任务由**外部调度服务**每分钟调一次 tick 驱动。那个服务挂了 →
