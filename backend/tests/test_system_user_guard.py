@@ -402,20 +402,49 @@ def test_中文用户名仍然允许(client, db, auth):
 
 @pytest.fixture(autouse=True)
 def _clean_mfa_setting(db):
-    """每个用例前后都清掉 ``sys_setting`` 里那个二次验证开关。
+    """每个用例前后都清掉 ``sys_setting`` 里那个二次验证开关**与 SMTP 通道状态**。
 
-    **必须清**：这个开关一开，管理员的登录与高危动作就都要走邮箱二次验证
+    **必须清开关**：这个开关一开，管理员的登录与高危动作就都要走邮箱二次验证
     —— 它会**污染同 worker 里后面的每一个用例**（xdist 按 worker 分库，
     症状与「测试自己互相污染」一模一样，但方向相反）。所以清理是每个用例
     前后各一次。
+
+    **必须清通道状态**：本文件里有两条用例会 ``set_value`` 写
+    ``smtp_host`` / ``notify_recipients`` 并 **commit** —— commit 之后夹具
+    的 rollback 撤不回来，那两行会留在会话级测试库里。而
+    ``test_通道没就绪时开不了二次验证`` 要求通道**没配**。CI 用
+    ``pytest -n 3``、本机用 ``-n 6``，用例顺序不定：写状态的那两条排在
+    前面时，后面那条就会看到「通道已就绪」，接口返回 200 而不是 409，
+    这条断言就成了掷骰子。
+
+    2026-10-21 在 CI 上真的红过一次（run 39523024253）::
+
+        FAILED tests/test_system_user_guard.py::test_通道没就绪时开不了二次验证
+        AssertionError: 没有 SMTP 却开成了：200 {... "smtp_ready": true,
+        "recipient_hint": "o***s@x.com" ...}
+
+    ``o***s@x.com`` 就是那条用例写的 ``boss@example.com`` —— 泄漏源一眼可见。
+
+    治法是**隔离共享状态**，不是调松断言（同 conftest 里
+    ``_reset_notify_budget`` 治的是同一类病，只是那里的共享状态在进程内存里、
+    这里在数据库里）。清完之后，那条用例测的才是它自己声明的性质
+    ——「通道没配时开不了」，而不是「数据库碰巧残留了什么」。
     """
-    from app.core import system_settings
+    #: 这几行合起来决定「通道就绪」：smtp_ready() = 有 host 且有收件人。
+    #: 少清一个都可能让「通道没就绪」那条用例变成掷骰子。
+    _CHANNEL_KEYS = ("smtp_host", "smtp_port", "smtp_username",
+                     "smtp_password", "smtp_from", "smtp_use_ssl",
+                     "smtp_use_tls", "notify_recipients")
 
     def wipe():
         row = db.get(SystemSetting, mfa_service.MFA_ENABLED_KEY)
         if row is not None:
             db.delete(row)
-            db.commit()
+        for key in _CHANNEL_KEYS:
+            row = db.get(SystemSetting, key)
+            if row is not None:
+                db.delete(row)
+        db.commit()
 
     wipe()
     yield
@@ -435,12 +464,29 @@ def test_二次验证状态可读且不含任何凭据(client, auth):
         assert forbidden not in raw, f"响应里出现了 {forbidden}"
 
 
-def test_通道没就绪时开不了二次验证(client, auth):
+def test_通道没就绪时开不了二次验证(client, db, auth):
     """**开关打开而 SMTP 没就绪 ⇒ 明确拒绝。**
 
     不让管理员点一下开关就把所有管理员锁在门外：验证链接发不出去 ⇒
     管理员登不进来 ⇒ 管理面锁死（而且当场就发作）。
+
+    **前提自己摆平，再自己断言一遍。** 同文件的另两条用例会 ``set_value``
+    写 SMTP 配置并 commit，那两行会跨用例存活（夹具的 rollback 只回滚它自己
+    那个会话）。CI 用 ``pytest -n 3``、本机用 ``-n 6``，用例顺序不定 ——
+    前提靠环境碰巧，这条断言就变成了掷骰子。所以这里先把通道状态清干净，
+    再断言它**确实是未就绪**，然后才测接口的拒绝：前提不成立时这句话会自己
+    喊出来，而不是让接口的 200 冒充「没有 SMTP 却开成了」。
     """
+    for key in ("smtp_host", "smtp_port", "smtp_username", "smtp_password",
+                "smtp_from", "smtp_use_ssl", "smtp_use_tls",
+                "notify_recipients"):
+        row = db.get(SystemSetting, key)
+        if row is not None:
+            db.delete(row)
+    db.commit()
+
+    assert not mfa_service.smtp_ready(db), "通道状态没清干净，前提不成立"
+
     r = client.put("/api/system/mfa", headers=auth, json={"enabled": True})
     assert r.status_code == 409, f"没有 SMTP 却开成了：{r.status_code} {r.text[:200]}"
     assert "SMTP" in r.json()["detail"]
