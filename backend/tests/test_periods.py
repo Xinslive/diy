@@ -731,7 +731,11 @@ def test_下一年没记账时可以再结转刷新期初(db, book, periods, sub
 
 
 def test_下一年已记账时拒绝刷新期初(db, book, periods, subjects, admin_user, make_voucher):
-    """下一年一旦记了凭证，它的期初就被凭证引用，不能再被悄悄改掉。"""
+    """下一年一旦有**已记账**凭证，它的期初就被账簿引用，不能再被悄悄改掉。
+
+    判据是「已记账」（POSTED），不是「有没有凭证」—— 见
+    ``accounting.periods.posted_voucher_count``，期初余额录入页用的是同一个口径。
+    """
     make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
     _voucher_every_month(periods, make_voucher)
     _close_year(db, book, periods, admin_user)
@@ -740,9 +744,69 @@ def test_下一年已记账时拒绝刷新期初(db, book, periods, subjects, ad
     make_voucher("2027-01-10", dr=[("1002", 50, "n")], cr=[("5001", 50, "n")],
                  posted=True)
 
-    with pytest.raises(ValueError, match="2027 年已经有 1 张凭证，不能再刷新期初余额"):
+    with pytest.raises(ValueError, match="2027 年已经有 1 张已记账凭证，不能再刷新期初余额"):
         year_end_carry(db, book, admin_user, 2026, 2027)
     db.rollback()
+
+
+def test_下一年只有未记账凭证时照样结转并刷新期初(
+    db, book, periods, subjects, admin_user, make_voucher
+):
+    """次年只有**未记账**凭证时，结转照做，并用本年期末**覆盖**次年的期初。
+
+    生产事故：泉州星悦荟商业管理有限公司（账套 7）2021 结转 2022，2022 年有
+    328 张导入的未记账凭证，年度结转被「2022 年已经有 328 张凭证，不能再刷新
+    期初余额」挡下 —— 那 328 张一张都没记账，2022 的期初没被任何账簿引用过，
+    改不动它才是错的。
+
+    这条用例同时守两件事：
+      1) **放行**：次年有未记账凭证不再拦结转；
+      2) **覆盖**：结转真的用本年期末把次年 1 月的期初刷掉了（1000 → 3000），
+         而不是留着旧值 —— 用户要的正是「用最新的年末数据覆盖后一年的年初数据」。
+    """
+    from app.accounting.periods import ensure_periods
+
+    make_voucher("2026-01-10", dr=[("1002", 1000, "x")], cr=[("5001", 1000, "x")], posted=True)
+    _voucher_every_month(periods, make_voucher)
+    _close_year(db, book, periods, admin_user)
+    ensure_periods(db, book, 2027)
+    db.commit()
+
+    year_end_carry(db, book, admin_user, 2026, 2027)
+
+    # 次年 1 月一张**未记账**凭证 —— 生产上就是这种整年导入的凭证
+    make_voucher("2027-01-10", dr=[("1002", 50, "n")], cr=[("5001", 50, "n")])
+    n27 = db.scalar(select(func.count()).select_from(Voucher).join(
+        Period, Period.id == Voucher.period_id).where(
+            Period.book_id == book.id, Period.year == 2027,
+            Voucher.status == "POSTED"))
+    assert n27 == 0, f"前置条件没搭对：2027 不该有已记账凭证，实际 {n27}"
+
+    # 回退重开 2026-01，再补一笔 2000（银行存款变成 3000），重新结账
+    batch_unclose(db, book.id, periods[1], admin_user)
+    make_voucher("2026-01-31", dr=[("1002", 2000, "补")], cr=[("5001", 2000, "补")],
+                 posted=True)
+    carry_forward_profit(db, book.id, periods[1], admin_user)
+    apply_organize(db, book_id=book.id, user=admin_user)
+    for m in range(1, 13):
+        close_period(db, periods[m], admin_user)
+
+    # 再结一次：次年有未记账凭证也**不拦**，并且刷新（覆盖）它的期初
+    year_end_carry(db, book, admin_user, 2026, 2027)
+
+    jan27 = db.scalar(select(Period).where(Period.book_id == book.id,
+                                           Period.year == 2027, Period.month == 1))
+    bank = _sid_of(db, book, "1002", 2027)
+    rows = db.scalars(select(PeriodOpening).where(
+        PeriodOpening.period_id == jan27.id, PeriodOpening.subject_id == bank)).all()
+    assert len(rows) == 1
+    assert rows[0].amount == Decimal("3000"), \
+        f"次年期初没有被本年期末刷新覆盖：{rows[0].amount}"
+
+    # 那张未记账凭证不该被结转碰过（结转只改期初，不动别人的凭证）
+    v = db.scalar(select(Voucher).where(
+        Voucher.book_id == book.id, Voucher.voucher_date == date(2027, 1, 10)))
+    assert v is not None and v.status == "UNPOSTED"
 
 
 def test_已结出下一年度后不能再结一次(db, book, periods, admin_user, make_voucher):

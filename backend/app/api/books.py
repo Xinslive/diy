@@ -492,15 +492,11 @@ def _openings_editable(db: Session, book: Book, first: Period) -> tuple[bool, st
       数已经封存，动年度期初就是动已封账的账。
     """
     year = first.year
-    n = db.scalar(
-        select(func.count()).select_from(Voucher).where(
-            Voucher.book_id == book.id,
-            Voucher.status == "POSTED",
-            Voucher.period_id.in_(
-                select(Period.id).where(Period.book_id == book.id, Period.year == year)
-            ),
-        )
-    ) or 0
+    # 口径与年度结转刷新期初那一步**同一个函数**（``accounting.periods``）——
+    # 两处各写一遍查询时已经漂移过一次：结转那边数了全部凭证，
+    # 于是「只有未记账凭证」的年度被拦下，用户明明还能改却收到
+    # 「不能再刷新期初余额」。
+    n = svc.posted_voucher_count(db, book.id, year)
     if n:
         return False, f"{year} 年度已有 {n} 张已记账凭证，期初余额不能再改"
     # 期间代码（2026-03）是模型上的**属性**而不是列，不能直接 select ——

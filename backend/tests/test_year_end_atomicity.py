@@ -5,8 +5,8 @@
 路由层捕获 ValueError 后 ``db.rollback()`` **只能撤销最后一次 commit 之后
 的部分**，之前已提交的留在库里。
 
-审计实测：构造「次年已有凭证」让它在刷新期初那步失败 ——
-接口明确返回 400「2027 年已经有 1 张凭证，不能再刷新期初余额」，
+审计实测：构造「次年已有**已记账**凭证」让它在刷新期初那步失败 ——
+接口明确返回 400「2027 年已经有 1 张已记账凭证，不能再刷新期初余额」，
 但本年利润已被冲平（-100 → 0）、未分配利润变成 -100、结转凭证还留着。
 
 这比报错本身危险得多：失败响应让用户以为「什么都没发生」而重试或改数，
@@ -35,7 +35,7 @@ def sid(subjects, code):
 
 
 def _seed_2027_placeholder(db, book, subjects, admin_user):
-    """预先铺好 2027 并塞一张凭证，让「刷新期初」那一步必然失败。
+    """预先铺好 2027 并塞一张**已记账**凭证，让「刷新期初」那一步必然失败。
 
     这是审计报告里复现 P1-04 的构造。不能把凭证落在 2026-12：
     那个月此时已结账，create_voucher 会先拒绝（这本身是对的）。
@@ -61,6 +61,15 @@ def _seed_2027_placeholder(db, book, subjects, admin_user):
                        {"subject_id": s2027["5001"], "direction": "CREDIT",
                         "amount": Decimal("5"), "summary": "占位"},
                    ], period_id=jan27.id, commit=True)
+    # **这张占位凭证必须记账。** 守卫只数**已记账**凭证
+    # （``accounting.periods.posted_voucher_count``）—— 未记账的凭证不进账簿，
+    # 不构成「期初已被引用」的冲突，刷新期初那一步根本不会失败，
+    # 这组原子性用例会**静默地变成「结转成功了」，什么都没测**。
+    from app.accounting.vouchers import post_vouchers
+
+    placeholder = db.scalar(select(Voucher).where(
+        Voucher.book_id == book.id, Voucher.period_id == jan27.id))
+    post_vouchers(db, book.id, [placeholder.id], admin_user, commit=True)
     return jan27
 
 
@@ -109,18 +118,18 @@ def test_结转中途失败时数据库与调用前一致(
                  cr=[("1002", 100, "x")], posted=True)
     _close_year(db, book, periods, admin_user)
 
-    # 先手工把 2027 年铺出来并塞一张凭证，让「刷新期初」那步必然失败
+    # 先手工把 2027 年铺出来并塞一张已记账凭证，让「刷新期初」那步必然失败
     _seed_2027_placeholder(db, book, subjects, admin_user)
 
     before = _snapshot(db, book, subjects)
-    # 2027 是上面刻意预铺的：它已有期间、也已有凭证，所以「刷新期初」必然被挡
+    # 2027 是上面刻意预铺的：它已有期间、也已有已记账凭证，所以「刷新期初」必然被挡
     assert before["years"] == [2026, 2027], "前置条件没搭对"
     assert before["profit"] != Decimal("0"), "前置条件：2026 应当是亏损年度，本年利润在借方"
 
     # 必须显式指定 2026 → 2027：默认口径会挑「最后一个有活动的年度」，
     # 也就是预铺出来的 2027，那样会在「2027 必须全部结账」那一步就失败 ——
     # 而那一步在任何写操作之前，测的就不是「中途失败」了。
-    with pytest.raises(ValueError, match="已经有.*张凭证"):
+    with pytest.raises(ValueError, match="已经有.*张已记账凭证"):
         year_end_carry(db, book, admin_user, 2026, 2027)
     db.rollback()
 
@@ -141,7 +150,7 @@ def test_结转失败不留残留凭证(db, book, periods, subjects, admin_user,
     n_before = db.scalar(select(Voucher).where(Voucher.book_id == book.id).with_only_columns(
         __import__("sqlalchemy").func.count()))
 
-    with pytest.raises(ValueError, match="已经有.*张凭证"):
+    with pytest.raises(ValueError, match="已经有.*张已记账凭证"):
         year_end_carry(db, book, admin_user, 2026, 2027)
     db.rollback()
     db.expire_all()
@@ -170,7 +179,7 @@ def test_结转失败不动本年利润(db, book, periods, subjects, admin_user,
 
     _seed_2027_placeholder(db, book, subjects, admin_user)
 
-    with pytest.raises(ValueError, match="已经有.*张凭证"):
+    with pytest.raises(ValueError, match="已经有.*张已记账凭证"):
         year_end_carry(db, book, admin_user, 2026, 2027)
     db.rollback()
     db.expire_all()

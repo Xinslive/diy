@@ -834,6 +834,35 @@ def _last_active_year(db: Session, book_id: int, periods: list[Period]) -> int:
     return max(active) if active else min(years)
 
 
+def posted_voucher_count(db: Session, book_id: int, year: int) -> int:
+    """某年度**已记账**（POSTED）凭证的数量。
+
+    「这一年的期初还能不能被改」只有一条判据，就是这个数：
+
+    * 账簿只统计已记账凭证（``LedgerEngine._status_filter``），所以年度内
+      一张已记账凭证都没有时，这笔期初**没被任何账簿、报表引用过** ——
+      改它动不了任何已经算出来的数。
+    * **未记账的凭证不算**：它们不进账簿，改年度期初跟它们不冲突。
+    * 已结账的年度自动被挡住：结账会把该期凭证记账（``_auto_post``），
+      所以有锁的年度必然有已记账凭证，不需要再单判一次锁。
+
+    ---- 为什么必须是这一个函数 ------------------------------------------
+    结转刷新次年期初（``_refresh_opening``）与期初余额录入页
+    （``api/books.py::_openings_editable``）问的是**同一个问题**，
+    两处各写一遍查询，口径已经漂移过一次：结转那边数了**全部**凭证，
+    于是「次年只有未记账凭证」也被拦下 —— 生产事故：泉州星悦荟商业
+    管理有限公司 2021 结转 2022，2022 年有 328 张导入的未记账凭证，
+    结转被「2022 年已经有 328 张凭证，不能再刷新期初余额」挡下，
+    而那 328 张一张都没记账，期初根本没被引用过。
+    """
+    return db.scalar(
+        select(func.count(Voucher.id))
+        .join(Period, Period.id == Voucher.period_id)
+        .where(Period.book_id == book_id, Period.year == year,
+               Voucher.status == "POSTED")
+    ) or 0
+
+
 def _refresh_opening(db: Session, book_id: int, first: Period,
                      fmap: dict, src_subjects: list[Subject],
                      dst_subjects: list[Subject]) -> int:
@@ -844,8 +873,12 @@ def _refresh_opening(db: Session, book_id: int, first: Period,
     「结完 2026 之后又回去改了 2026 的数」，改完必须能再结一次把
     2027 年 1 月的期初带过来，否则新账和旧账的年初数永远对不上。
 
-    但只要下一年已经记了账，就不能动它的期初：
-    那时的期初已经被凭证引用，硬改会让已记账的凭证和新期初对不上。
+    但只要下一年已经**记了账**，就不能动它的期初：
+    那时的期初已经被账簿引用，硬改会让已算出来的数和新期初对不上。
+
+    判据是**已记账**（POSTED）凭证，见 ``posted_voucher_count``：
+    未记账的凭证不进账簿，不构成冲突 —— 「改完上一年再结一次刷新下一年期初」
+    是常规动作，下一年堆着一堆未记账的导入凭证时同样要放行。
 
     ---- 按编码搬，而不是按 id --------------------------------------------
     **为什么必须按编码。** 年度之间是**两套不同的科目行**：2026 的 1002 和
@@ -869,14 +902,10 @@ def _refresh_opening(db: Session, book_id: int, first: Period,
     一个科目自己的快照是该科目的**基准总额**，下级只补增量，
     引擎侧的去重口径见 ``LedgerEngine._roll_up_openings`` 的 subtree_total。
     """
-    used = db.scalar(
-        select(func.count(Voucher.id))
-        .join(Period, Period.id == Voucher.period_id)
-        .where(Period.book_id == book_id, Period.year == first.year)
-    )
+    used = posted_voucher_count(db, book_id, first.year)
     if used:
         raise ValueError(
-            f"{first.year} 年已经有 {used} 张凭证，不能再刷新期初余额。"
+            f"{first.year} 年已经有 {used} 张已记账凭证，不能再刷新期初余额。"
             f"要改 {first.year - 1} 年的数，请先反结账并处理掉 {first.year} 年的凭证。")
 
     # 先配对再动数据：对不上的要在**任何写入之前**就报出来。
