@@ -46,6 +46,11 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
   }
   // 修复前组件里没有 stale()，抠不到就当没有代次机制
   const staleSrc = (SRC.match(/function stale\(seq\) \{[^}]*\}/) || [''])[0]
+  // yearOfVoucher 是 load() 的依赖：这一页用**哪一年的科目表**由它说了算
+  // （跨年凭证的科目能显示出来，全靠它取对了那张表）。
+  // 抠不到就留空 —— 那样 load() 会 ReferenceError，用例照样红，
+  // 而且红的原因一眼看得出是「少了这个依赖」，不是时序搭错了。
+  const yearSrc = (SRC.match(/function yearOfVoucher\(v\) \{[^}]*\}/) || [''])[0]
   const loadSrc = grab('load')
   const neighbourSrc = grab('loadNeighbour')
   // 自检：抠出来的必须是 load / loadNeighbour 本人，不能是 loadSubjects 之类
@@ -101,6 +106,7 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
             api, loadSubjects, ensureRows, loadInsertPreview, loadNextDefaults,
             defaultDate, ElMessage, router, history, location } = ctx
     ${staleSrc}
+    ${yearSrc}
     let loadSeq = 0
     ${neighbourSrc}
     ${loadSrc}

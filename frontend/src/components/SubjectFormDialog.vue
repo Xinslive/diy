@@ -66,7 +66,18 @@ const props = defineProps({
   parentId: { type: [Number, String], default: null },
   // 凭证里填了个查不到的编码再点「+ 点击添加」，人敲的那串字。
   // 整份表单照它铺：编码留他敲的，上级按编码的最长前缀判，类别方向跟着上级走
-  preset: { type: String, default: '' }
+  preset: { type: String, default: '' },
+  /**
+   * 新科目落在**哪一年**的科目表上。
+   *
+   * 科目表每个会计年度各有一份（后端迁移 0032），落在哪一年决定它能出现在
+   * 哪些年度的凭证里 —— 所以凭证页要传**这张凭证所属的那一年**：
+   * 往年在当前年之前时，新增的科目若落在顶栏那一年，这张往年凭证就挂不上它
+   * （后端按 `Subject.year == period.year` 校验）。
+   *
+   * 不传就退回账套当前在记的那一年（科目表页、科目余额表走的就是这个）。
+   */
+  year: { type: Number, default: 0 }
 })
 const emit = defineEmits(['update:modelValue', 'saved'])
 
@@ -83,6 +94,15 @@ const form = reactive({
 })
 
 const rule = computed(() => store.currentBook?.subject_code_rule || '4-2-2-2')
+
+/**
+ * 新科目落在**哪一年**的科目表上。
+ *
+ * 调用方说了算（凭证页传这张凭证所属的那一年）；没传就退回账套当前在记的那一年
+ * —— 后端 `resolve_year` 也是这个口径，两边对得上。
+ */
+const targetYear = computed(() =>
+  Number(props.year) || store.currentYear || store.currentBook?.latest_year || 0)
 
 /** 下拉里显示「编码 名称」：科目一多，光看名字根本分不清是哪一张 */
 const selectTree = computed(() => props.tree.map(n => ({
@@ -208,8 +228,9 @@ async function submit() {
   try {
     const created = await api.createSubject(store.bookId, {
       // **年度必带**：科目表每个年度各有一份（后端迁移 0032）——
-      // 新增的科目落在**正在看的那一年**，别的年度不受影响。
-      year: store.currentYear,
+      // 新增的科目落在**调用方指定的那一年**（凭证页是这张凭证所属的那一年），
+      // 别的年度不受影响。
+      year: targetYear.value,
       parent_id: form.parent_id || null,
       code: form.code.trim(), name: form.name.trim(),
       category: form.category, direction: form.direction,

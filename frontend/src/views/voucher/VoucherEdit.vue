@@ -141,6 +141,7 @@
                 :options="subjects"
                 :disabled="readonly || blocked(i)"
                 :has-bottom-hint="!!balanceText(row)"
+                :allow-inactive="false"
                 @focusin="activeRow = row"
                 @change="onSubject(row)"
                 @add="(kw) => openSubjectCreate(i, kw)"
@@ -218,7 +219,7 @@
       </div>
 
       <SubjectFormDialog v-model="subjectCreateOpen" :tree="subjectTree" :preset="subjectPreset"
-                        @saved="onSubjectCreated" />
+                        :year="subjectYear" @saved="onSubjectCreated" />
     </div>
 
     <PrintDialog
@@ -443,14 +444,49 @@ function openSubjectCreate(i, kw) {
   subjectCreateOpen.value = true
 }
 async function onSubjectCreated(s) {
-  await loadSubjects()
+  await loadSubjects(subjectYear.value)
   form.entries[subjectCreateRow.value].subject_id = s.id
   activeRow.value = form.entries[subjectCreateRow.value]
 }
-async function loadSubjects() {
+
+/**
+ * 这一页用的是**哪一年的科目表**。
+ *
+ * 科目表每个会计年度各有一份（后端迁移 0032），而一张凭证的分录只能挂在
+ * **它自己那一期所属年度**的科目上（后端 `accounting/vouchers._validate_entries`
+ * 按 `Subject.year == period.year` 校验）。所以这一页要看的不是顶栏那一年，
+ * 而是**这张凭证自己那一年**：拿顶栏那年的科目表去认往年凭证，往年的
+ * subject_id 在那张表里根本不存在，格子里挂的科目就全是空的
+ * （2026-10-22 用户报：搜关键词搜到以前年度的凭证，点开看不到科目）。
+ *
+ * 新凭证还没落库，期间按保存时顶栏那一期走 —— 这时用顶栏那一年。
+ */
+const subjectYear = ref(0)
+/**
+ * 科目表请求的代次。
+ *
+ * 科目表现在**跟着凭证走**了（不同年度是两张不同的表），于是「翻凭证翻得快」
+ * 时两趟取表请求会交错：先发的那一趟后到，会把**上一张**那张表换回来 ——
+ * 屏幕上这张凭证配着上一张的科目表，科目格又是空的（跟没修一样）。
+ *
+ * 与 `load()` 的代次守卫同一个道理：响应回来时先认一认自己是不是最新那趟，
+ * 不是就丢弃，一个状态都不碰。
+ */
+let subjectSeq = 0
+
+async function loadSubjects(year) {
   // **年度必带**：科目表每个年度各有一份（后端迁移 0032）——
-  // 2026 与 2027 各有自己的科目表，凭证面板要显示**正在记的那一年**那张。
-  const tree = await subjectApi.subjectTree(store.bookId, { year: store.currentYear })
+  // 2026 与 2027 各有自己的科目表，凭证面板要显示**这张凭证所属的那一年**那张。
+  const y = Number(year) || subjectYear.value || store.currentYear
+  if (!y) return
+  const seq = ++subjectSeq
+  // include_inactive=true：老凭证上挂的那个科目可能已经停用，
+  // 不返回的话格子里就空了（后端 list_subjects 的说明也是这么写的）。
+  const tree = await subjectApi.subjectTree(
+    store.bookId, { year: y, include_inactive: true })
+  // 过期的那一趟：不碰任何状态（见上面 subjectSeq 的说明）
+  if (seq !== subjectSeq) return
+  subjectYear.value = y
   subjectTree.value = tree
   // 摊平成一条条，但**父子关系要留着**：凭证面板靠 parent_id 把科目摆成一棵树，
   // 一级一级点开，最后只让末级能选。少了 parent_id 就只剩一张平表，
@@ -461,7 +497,10 @@ async function loadSubjects() {
       id: n.id, code: n.code, name: n.name, category: n.category,
       // direction 是科目表里那一列「余额方向」，科目格余额的正负就是按它定的
       direction: n.direction,
-      level: n.level, parent_id: parent, is_leaf: n.is_leaf
+      level: n.level, parent_id: parent, is_leaf: n.is_leaf,
+      // 停用科目照样**显示**（老凭证指着它），但不能再被新选中 ——
+      // 服务端建凭证时会拒（`Subject.active` 为假），让人在界面上就选不到。
+      active: n.active !== false
     })
     if (n.children?.length) walk(n.children, n.id)
   })
@@ -1381,7 +1420,7 @@ async function loadNeighbour(seq) {
 /** load() 的代次标记。
  *
  *  切换凭证只改 route.params.id，组件不重新挂载，load() 会被反复触发；
- *  而 load() 内部要先 await loadSubjects() 再 await getVoucher()，两次调用
+ *  而 load() 内部要先 await getVoucher() 再 await loadSubjects()，两次调用
  *  天然会交错。于是「先发的请求后到」时，那份**旧**响应会
  *  Object.assign(form, ...) 覆盖掉新凭证的表单 —— 页面上显示的是 A 凭证的
  *  编号配着 B 凭证的分录，而且没有任何报错。
@@ -1434,15 +1473,27 @@ function resetForm() {
   lastSaved.value = entrySig.value
 }
 
+// ---- 科目表年度：这一页用哪一年的科目表 ----
+/**
+ * 这张凭证属于哪一年 —— 决定这一页用**哪张科目表**。
+ *
+ * 服务端直接把年度随凭证给出来（凭证详情里的 `year`，取自它自己那一期）。
+ * 万一没有（旧接口、异常返回），退回本地按 period_id 反查，最后才落到顶栏那一年。
+ */
+function yearOfVoucher(v) {
+  if (v?.year) return Number(v.year)
+  const p = store.periods.find((x) => x.id === v?.period_id)
+  return p?.year || store.currentYear
+}
+// ---- 科目表年度段结束 ----
+
 async function load() {
   const seq = ++loadSeq
   const myId = Number(route.params.id || 0)
-  // 先认下路由里的 id，再去拉科目：换凭证的那一瞬间，工具栏不该还挂着上一张的打印预览
+  // 先认下路由里的 id：换凭证的那一瞬间，工具栏不该还挂着上一张的打印预览
   voucherId.value = myId
   savedAt.value = ''
   insertCtx.value = null
-  await loadSubjects()
-  if (stale(seq)) return
   subjectRefs.clear()
   rowEls.clear()          // 分录对象整套换掉了，上一张的行盒子一并扔掉
   // 标记状态是拿**分录对象**当键的，而分录对象刚被换了一整套 ——
@@ -1466,6 +1517,10 @@ async function load() {
     if (Number(route.params.id || 0) !== myId) return
     voucherPeriod.value = store.periods.find((p) => p.id === v.period_id) || null
     voucherPeriodId.value = v.period_id   // store.periods 还没灌完时也能算余额
+    // **科目表按这张凭证自己那一年取**（不是顶栏那一年）——
+    // 往年凭证的分录挂在往年的科目上，用错年度的科目表，格子里全是空的。
+    await loadSubjects(yearOfVoucher(v))
+    if (stale(seq)) return
     Object.assign(form, {
       voucher_no: v.voucher_no, voucher_date: v.voucher_date, status: v.status,
       attachments: v.attachments, remark: v.remark,
@@ -1510,6 +1565,12 @@ async function load() {
       form.voucher_no = n.voucher_no || ''
       form.voucher_date = route.query.date || n.voucher_date || defaultDate()
     }
+    // **科目表按这张新凭证要落的那一年取**：
+    //   · 「插入凭证/增加凭证」是插在**参照凭证那一期**里的（后端要求同一期间），
+    //     参照在往年、顶栏停在当前年时，用顶栏那年的科目表就是挂错表；
+    //   · 普通的「新增凭证」落在顶栏那一期，用顶栏那一年。
+    await loadSubjects(yearOfVoucher(insertCtx.value || { period_id: store.periodId }))
+    if (stale(seq)) return
     voucherPeriod.value = null   // 新凭证还没保存，期间以保存时按日期落库为准
     voucherPeriodId.value = 0    // 还没落库：期间跟顶栏（保存时也是按顶栏那期落的）
     ensureRows(4)

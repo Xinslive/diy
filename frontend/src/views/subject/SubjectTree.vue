@@ -39,7 +39,7 @@
       </el-table>
     </div>
 
-    <SubjectFormDialog v-model="visible" :tree="tree" :parent-id="parentId" />
+    <SubjectFormDialog v-model="visible" :tree="tree" :parent-id="parentId" :year="year" />
     <SubjectEditDialog v-model="editVisible" :subject="editingSubject" @saved="load" />
     <SubjectImportDialog v-model="importVisible" :year="year" @imported="onImported" />
   </div>

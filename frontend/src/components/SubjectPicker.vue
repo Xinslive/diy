@@ -42,13 +42,16 @@
 
       <div class="sp-list" @mouseleave="onHoverEnd()">
         <button v-for="(n, i) in visible" :key="n.id" class="sp-item"
-                :class="{ 'is-on': n.id === modelValue, 'is-cursor': i === cursor, 'is-parent': hasKids(n) }"
+                :class="{ 'is-on': n.id === modelValue, 'is-cursor': i === cursor,
+                          'is-parent': hasKids(n), 'is-off': isOff(n) }"
                 :style="{ paddingLeft: `${12 + n.depth * 16}px` }"
-                :title="hasKids(n) ? (selectParents ? '点击选择，点箭头展开下级科目' : '点开看下面的明细科目') : ''"
+                :title="isOff(n) ? '这个科目已停用：老凭证还指着它，但不能再挂到新的分录上'
+                        : hasKids(n) ? (selectParents ? '点击选择，点箭头展开下级科目' : '点开看下面的明细科目') : ''"
                 @click="onRow(n, $event)" @mouseenter="onHover($event, i)">
           <span class="sp-caret">{{ !hasKids(n) ? '' : isOpen(n, n.depth) ? '▾' : '▸' }}</span>
           <span class="sp-code">{{ n.code }}</span>
           <span class="sp-name">{{ n.name }}</span>
+          <span v-if="isOff(n)" class="sp-off">停用</span>
         </button>
         <p v-if="!visible.length" class="sp-empty">
           {{ allowAdd ? '没找到这个科目，可以在下面点「＋ 点击添加」' : '没有找到匹配的科目' }}
@@ -74,6 +77,19 @@ const props = defineProps({
   allowAdd: { type: Boolean, default: true },
   /** 默认只选末级；综合账等场景可同时选择上级科目。 */
   selectParents: { type: Boolean, default: false },
+  /**
+   * 允不允许选**停用**科目。
+   *
+   * 停用的语义是「不让再选它」，不是「删掉它」—— 老凭证还指着它，账还得算得出来、
+   * 还得看得见。所以停用科目照样进得来（`include_inactive=true`），只是不能新挂。
+   *
+   * 录凭证的页面传 false：在那儿选一个停用科目，服务端建凭证时会拒
+   * （`Subject.active` 为假 → 「科目不存在或已停用」），与其让人撞一次 400，
+   * 不如在界面上就选不到。
+   *
+   * 默认 true：科目余额表要**能挑**停用科目看它的明细账（那儿是只读的查询入口）。
+   */
+  allowInactive: { type: Boolean, default: true },
   /**
    * 这一格**左下角压着别的东西**（凭证页的科目余额）。
    *
@@ -112,6 +128,16 @@ const TABS = [
 
 const current = computed(() => props.options.find((s) => s.id === props.modelValue) || null)
 const byId = computed(() => new Map(props.options.map((s) => [s.id, s])))
+
+// ---- 停用科目判定 ----
+/**
+ * 这一行是**停用科目**，而且调用方不许再选它。
+ *
+ * 停用科目仍然**显示**（老凭证指着它，格子里得有名字），只是不再被选中 ——
+ * 服务端建凭证时会拒停用科目，界面上先挡住比让人撞一次 400 好。
+ */
+const isOff = (s) => s?.active === false && !props.allowInactive
+// ---- 停用科目判定段结束 ----
 /**
  * 格里显示的科目：**一级一级拼出来**，中间用「/」隔开。
  *
@@ -526,6 +552,9 @@ function onBlur() {
 }
 
 function pick(s, viaKey = false) {
+  // 停用科目不再新挂（allow-inactive=false 时）：鼠标点与键盘回车都走这一道。
+  // 它已经挂着的那张老凭证不受影响 —— 格子里的名字照旧显示。
+  if (isOff(s)) return
   emit('update:modelValue', s.id)
   emit('change', s)
   // 人还停在这一格里（多半是刚点完面板那一行）就继续写编码；
@@ -793,6 +822,19 @@ defineExpose({
 .sp-item.is-parent .sp-name { color: #303133; font-weight: 600; }
 .sp-item.is-cursor { background: #f5f7fa; }
 .sp-item.is-on { background: #f0f9eb; color: #529b2e; font-weight: 600; }
+/* 停用科目：照样列出来（它是这张表的一部分，藏起来反而看不懂树），
+   但压暗 + 一个「停用」标签，人一眼就知道它不能新挂 */
+.sp-item.is-off { color: #a8abb2; cursor: not-allowed; }
+.sp-item.is-off .sp-code { color: #c0c4cc; }
+.sp-off {
+  flex: none;
+  margin-left: auto;
+  padding: 0 5px;
+  border: 1px solid #dcdfe6;
+  border-radius: 3px;
+  font-size: 11px;
+  color: #909399;
+}
 .sp-code { color: #909399; font-variant-numeric: tabular-nums; flex: none; }
 .sp-item.is-on .sp-code { color: #67c23a; }
 .sp-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
