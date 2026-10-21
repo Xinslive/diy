@@ -247,7 +247,9 @@ function onToSubjectChange() {
 }
 
 async function loadSubjects() {
-  const tree = await subjectApi.subjectTree(store.bookId, { include_inactive: true })
+  // **年度必带**：科目表每个年度各有一份（后端迁移 0032）
+  const tree = await subjectApi.subjectTree(
+    store.bookId, { include_inactive: true, year: store.currentYear })
   const flatten = (nodes, parentId = null) => nodes.flatMap((node) => {
     const item = { ...node, parent_id: parentId }
     return [item, ...flatten(node.children || [], node.id)]

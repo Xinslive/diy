@@ -331,7 +331,9 @@ BEGIN
                 SELECT c.id, sub.depth + 1
                 FROM subject c
                 JOIN sub ON c.parent_id = sub.id
-                WHERE c.book_id = OLD.book_id AND sub.depth < 32
+                WHERE c.book_id = OLD.book_id
+                  AND c.year = OLD.year
+                  AND sub.depth < 32
             )
             SELECT 1
             FROM entry e
@@ -339,24 +341,17 @@ BEGIN
             WHERE e.book_id = OLD.book_id
               AND e.subject_id IN (SELECT id FROM sub)
               AND e.amount <> 0
-              -- 「本年度」= **账套的会计年度**，不是服务器日历年（2026-10-20 修）。
+              -- 「本年度」= **这个科目自己的年度**（``OLD.year``），迁移 0032 之后。
               --
-              -- 口径与 ``app/accounting/periods.py::current_accounting_year``
-              -- **逐字一致**：最近一期有凭证的期间所在的年度；一张凭证都没有
-              -- 时退回账套的启用年度（``book.start_year``）。
+              -- 原来这里是「账套最近一期有凭证的年度」——那是个**账套级**的口径，
+              -- 在「一个账套挂多个年度」的新模型下不再成立：2027 年那张科目表
+              -- 是另一张表，它有没有发生额要按 2027 算，而不是看账套最近记到哪年。
               --
-              -- 原来这里是 ``EXTRACT(YEAR FROM CURRENT_DATE)`` —— 服务器当前
-              -- 日期加上**连接会话时区**（本项目的连接池把时区钉死成 UTC）。
-              -- 于是两层口径不同：应用层判「2026 年」（账套在记的那一年），
-              -- 库层判「服务器今年」。给一本 2026 年建的账补录 2025 年的分录
-              -- 时，库层判的是 2026 —— **用错年份拒绝一次合法的改编码**，
-              -- 报错文案还写着「本年度已有发生额」，用户完全看不懂。
-              AND p.year = COALESCE(
-                  (SELECT max(p2.year)
-                     FROM period p2
-                     JOIN voucher v ON v.period_id = p2.id
-                    WHERE p2.book_id = OLD.book_id),
-                  (SELECT b.start_year FROM book b WHERE b.id = OLD.book_id))
+              -- 顺带修掉一个旧的口径错位：旧写法在「账套有 2026/2027 两年的
+              -- 期间、但凭证只记到 2026」时，2027 年新增的科目改编码会被
+              -- 拿 2026 年的发生额来拦 —— 判据和被改的科目根本不是同一年。
+              -- 现在判据与被改对象同年度（``OLD.year``），口径自洽。
+              AND p.year = OLD.year
         ) THEN
             RAISE EXCEPTION '科目 % 本年度已有发生额，不能修改编码', OLD.code
                 USING ERRCODE = 'check_violation';
@@ -461,6 +456,157 @@ CREATE CONSTRAINT TRIGGER trg_subject_leaf_parent_guard
     AFTER INSERT OR UPDATE OF parent_id ON subject
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION fn_subject_leaf_parent_guard();
+
+-- ---------- 5c. 年度一致性：科目、分录、期初必须在同一个年度 ----------
+--
+-- **科目表每个年度各有一份**（迁移 0032）：2026 的 1002 和 2027 的 1002
+-- 是两行不同的记录、两个 id。于是「这张分录属于哪一年」不再由科目决定，
+-- 而是由**它所在的期间**决定 —— 两者必须对上。
+--
+-- 不对上会怎样（这三条护栏各自堵住一种）：
+--
+--   · 分录的科目属于别的年度 → 账算在两张表之间。引擎按 period_ord 聚合，
+--     2027 年的凭证引用 2026 年的科目时，2027 年的科目余额是 0，
+--     而 2026 年的科目被一笔 2027 年的分录改了余额 —— **钱落在错误的那一年**，
+--     而借贷仍然平衡，系统自检查不出来。
+--   · 期初快照的科目属于别的年度 → 次年的期初挂在上一年的科目上，
+--     于是「下一年 1 月的期初 = 上一年 12 月的期末」这条不变量在数据层
+--     就对不上，报表的年初数与总账对不齐。
+--   · 科目的父节点属于别的年度 → 科目树跨了两张表，级次与上卷全乱。
+--
+-- 护栏写在库里而不是应用层（铁律 3）：应用层会被 psql、脚本、
+-- 未来的运维命令绕过去，数据库不会。
+CREATE OR REPLACE FUNCTION fn_entry_subject_year_guard() RETURNS trigger AS $$
+DECLARE
+    v_subject_year int;
+    v_period_year  int;
+BEGIN
+    SELECT s.year INTO v_subject_year FROM subject s WHERE s.id = NEW.subject_id;
+
+    -- **年度从「凭证 → 期间」取，不读 NEW.book_id / NEW.period_ord。**
+    --
+    -- 那两列是冗余列，由 fn_entry_sync（trg_entry_sync）在 BEFORE INSERT 时
+    -- 从凭证回填。而 PostgreSQL 对同一张表、同一事件的多个触发器**按名字
+    -- 字母序**执行：
+    --
+    --     trg_entry_subject_year_guard   <   trg_entry_sync
+    --     （比到第 12 个字符：'u' < 'y'）
+    --
+    -- 也就是说本守卫**先跑**，此刻 NEW.book_id / NEW.period_ord 还是 ORM
+    -- 显式写进去的 NULL —— 于是「凭证在 2026 年、科目也在 2026 年」这种
+    -- 完全正常的分录，会被判成「科目属于 2026 年度，不能记在 <NULL> 年度的
+    -- 凭证上」，**所有凭证都写不进去**。
+    --
+    -- 走 voucher_id 是唯一不受触发器顺序影响的读法：凭证的 period_id 指向
+    -- 期间，期间带 year，而 year 被 fk_period_book_year 钉在已登记的年度
+    -- 账套上 —— 判据链完整，且与谁先谁后无关。
+    SELECT p.year INTO v_period_year
+      FROM voucher v JOIN period p ON p.id = v.period_id
+     WHERE v.id = NEW.voucher_id;
+
+    -- 凭证还不存在（或科目还不存在）时不在这里下结论：
+    -- 那两条由外键与 fn_entry_sync 报更准确的错，不要拿 <NULL> 的年度
+    -- 去比一个真年度，把「凭证不存在」说成「年度不对」。
+    IF v_subject_year IS NULL OR v_period_year IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    IF v_subject_year IS DISTINCT FROM v_period_year THEN
+        RAISE EXCEPTION
+            '分录的科目属于 % 年度，不能记在 % 年度的凭证上（科目表每个年度各有一份）',
+            v_subject_year, v_period_year
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION fn_opening_subject_year_guard() RETURNS trigger AS $$
+DECLARE
+    v_subject_year int;
+    v_period_year  int;
+BEGIN
+    SELECT s.year INTO v_subject_year FROM subject s WHERE s.id = NEW.subject_id;
+    SELECT p.year INTO v_period_year FROM period p WHERE p.id = NEW.period_id;
+    IF v_subject_year IS DISTINCT FROM v_period_year THEN
+        RAISE EXCEPTION
+            '期初余额的科目属于 % 年度，不能挂在 % 年度的期间上（科目表每个年度各有一份）',
+            v_subject_year, v_period_year
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION fn_subject_parent_year_guard() RETURNS trigger AS $$
+DECLARE
+    v_parent_year int;
+BEGIN
+    -- 换年度的科目必须**没有下级**：下级还留在旧年度，科目树就劈成两半。
+    IF TG_OP = 'UPDATE' AND NEW.year IS DISTINCT FROM OLD.year
+       AND EXISTS (SELECT 1 FROM subject c WHERE c.parent_id = NEW.id) THEN
+        RAISE EXCEPTION
+            '科目 % 有下级科目，不能改到别的年度（下级还留在旧年度，科目树会劈成两半）',
+            NEW.code USING ERRCODE = 'check_violation';
+    END IF;
+
+    IF NEW.parent_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+    SELECT s.year INTO v_parent_year FROM subject s WHERE s.id = NEW.parent_id;
+    IF v_parent_year IS DISTINCT FROM NEW.year THEN
+        RAISE EXCEPTION
+            '上级科目属于 % 年度，与本科目（% 年度）不在同一张科目表上',
+            v_parent_year, NEW.year
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+
+-- **条件创建**：``subject.year`` 是迁移 0032 才加的列，而本文件会被
+-- 0001 / 0005 / 0010 / 0031 这些**更早**的 revision 重放 —— 那时列还不存在。
+-- 触发器一装上就会在每次写 entry 时执行，而函数体要读 ``subject.year``，
+-- 列不在就是一条「column does not exist」的报错，把迁移本身打断。
+--
+-- 所以：列在才装触发器。0032 之后的每次重放（含 0033）都会把它装上，
+-- 而 0032 之前那些重放会跳过它。**顺序不会漏**：本文件是这三条护栏的
+-- 唯一事实来源，装上去的时机由「列在不在」决定，不由 revision 号决定。
+--
+-- **判断的是「触发器真正要挂上去的那张 subject 表」。**
+-- 不能用 ``information_schema.columns WHERE table_name='subject'`` ——
+-- 它看得见**所有 schema** 下当前用户有权限的表：迁移测试会拿一个独立
+-- schema（search_path 只留它自己）当「另一个数据库」，而主 schema 里的
+-- subject 早就有了 year 列，于是这个判断为真；接着
+-- ``CREATE TRIGGER ... ON subject`` 挂到的是 scratch 那张**没有** year 列的
+-- 表上（ON 后面跟的是要改的表，不是被检查的表），迁移当场炸掉。
+--
+-- ``to_regclass('subject')`` 走的是与 ``CREATE TRIGGER ... ON subject``
+-- **同一套 search_path 解析** —— 两边指向的必然是同一张表。
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = to_regclass('subject')
+          AND attname = 'year'
+          AND attnum > 0
+          AND NOT attisdropped
+    ) THEN
+        DROP TRIGGER IF EXISTS trg_entry_subject_year_guard ON entry;
+        CREATE TRIGGER trg_entry_subject_year_guard BEFORE INSERT OR UPDATE ON entry
+            FOR EACH ROW EXECUTE FUNCTION fn_entry_subject_year_guard();
+
+        DROP TRIGGER IF EXISTS trg_opening_subject_year_guard ON period_opening;
+        CREATE TRIGGER trg_opening_subject_year_guard BEFORE INSERT ON period_opening
+            FOR EACH ROW EXECUTE FUNCTION fn_opening_subject_year_guard();
+
+        -- **不用 ``UPDATE OF parent_id, year``**：那会让 PostgreSQL 在
+        -- CREATE TRIGGER 的时候就把这两个列名解析一遍 —— 而这正是
+        -- 「列还在不在」这道闸门要保护的东西，一句话就把它绕过去了。
+        -- 触发时机放宽成「任何 INSERT / UPDATE」，函数体里再按需判断。
+        DROP TRIGGER IF EXISTS trg_subject_parent_year_guard ON subject;
+        CREATE TRIGGER trg_subject_parent_year_guard
+            BEFORE INSERT OR UPDATE ON subject
+            FOR EACH ROW EXECUTE FUNCTION fn_subject_parent_year_guard();
+    END IF;
+END $$;
 
 -- ---------- 6. 期初快照只读（除应用层显式写入外） ----------
 CREATE OR REPLACE FUNCTION fn_opening_guard() RETURNS trigger AS $$

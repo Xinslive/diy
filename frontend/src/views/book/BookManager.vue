@@ -347,7 +347,7 @@ async function openInit(row) {
   // —— 最典型的就是第 2 步：向导把人送去期初页导入，回来后卡片还是旧的，
   // 于是「继续初始化」点开，里面也还是「第 2 步没做」。
   // loadInit 内部会 markInit，所以卡片上的「待初始化」标签也一起变。
-  await store.loadInit(row.id)
+  await store.loadInit(row.id, store.yearOfBook(row.id))
   initVisible.value = true
 }
 

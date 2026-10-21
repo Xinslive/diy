@@ -52,7 +52,10 @@ def balance(book_id: int, period_id: Optional[int] = None,
         # 打印与导出等**所有**委托方，而以前只有这一个接口查过 ord。
         if from_period.ord > period.ord:
             raise HTTPException(400, "起始期间不能晚于结束期间")
-    subjects = queries.subject_tree(db, book.id)
+    # 科目表每个年度各有一份：跨年区间要取**区间涉及的所有年度**的并集，
+    # 只取止期那一张的话，区间发生额会少掉起始年那半截。
+    subjects = queries.subjects_for_periods(
+        db, book.id, [from_period, period] if from_period else [period])
     rows, check = queries.balance_sheet_of_accounts(
         db, book.id, subjects, period, include_unposted, from_period=from_period)
     is_range = from_period is not None and from_period.id != period.id
@@ -84,7 +87,7 @@ def general(book_id: int, period_id: Optional[int] = None, from_period_id: Optio
     else:
         from_period = to_period
 
-    subjects = queries.subject_tree(db, book.id)
+    subjects = queries.subjects_for_periods(db, book.id, [from_period, to_period])
     if leaf_only:
         subjects = [s for s in subjects if s.is_leaf]
     rows = queries.general_ledger(db, book.id, subjects, from_period, to_period, include_unposted)

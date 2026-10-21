@@ -225,12 +225,28 @@ def _as_decimal(value: Any) -> Decimal:
     return amount
 
 
-def _subject_index(db: Session, book_id: int) -> tuple[dict[str, Subject], dict[str, Subject]]:
-    """返回 (编码索引, 名称索引)。末级和上级都收进来：
+def _current_accounting_year(db: Session, book_id: int) -> int:
+    """这个账套当前在记的那一年（惰性 import，避免模块级的循环依赖）。"""
+    from app.accounting.periods import current_accounting_year
+    from app.models import Book
+
+    book = db.get(Book, book_id)
+    return current_accounting_year(db, book) if book is not None else 0
+
+
+def _subject_index(db: Session, book_id: int, year: int
+                   ) -> tuple[dict[str, Subject], dict[str, Subject]]:
+    """返回某个年度的 (编码索引, 名称索引)。末级和上级都收进来：
     匹配到上级科目时才能说清「不是明细科目」，而不是含糊地报一句「找不到科目」——
-    「1002 银行存款」在这个账套里明明存在，只是不能往它身上记。"""
+    「1002 银行存款」在这个账套里明明存在，只是不能往它身上记。
+
+    **年度是必填的**：科目表每个年度各有一份（迁移 0032），
+    同一个编码在 2026 和 2027 是两行不同的记录。按编码匹配时必须
+    先定下这一行属于哪一年 —— 序时账里跨年的分录各归各的表。
+    """
     rows = db.scalars(
-        select(Subject).where(Subject.book_id == book_id, Subject.active.is_(True))
+        select(Subject).where(
+            Subject.book_id == book_id, Subject.year == year, Subject.active.is_(True))
     ).all()
     by_code = {s.code.strip(): s for s in rows}
     by_name: dict[str, Subject] = {}
@@ -320,7 +336,19 @@ def _parse_rows(rows_iter, book_id: int, db: Session) -> dict:
     if not has_amount:
         raise ValueError("缺少金额列（借方 / 贷方 / 金额 三选一）")
 
-    by_code, by_name = _subject_index(db, book_id)
+    # 科目表每个年度各有一份 —— 一份序时账可能跨年，而每年的编码表
+    # 未必相同。所以索引**按年度建、按这一行的日期选**。
+    # 一年建一次就够：真实文件一年几十行，索引查一次是几条 SQL 的事。
+    _indexes: dict[int, tuple[dict[str, Subject], dict[str, Subject]]] = {}
+
+    def _index_for(year: int) -> tuple[dict[str, Subject], dict[str, Subject]]:
+        if year not in _indexes:
+            _indexes[year] = _subject_index(db, book_id, year)
+        return _indexes[year]
+
+    # 日期认不出来的行（日期已经报错了）退回到账套当前在记的那一年 ——
+    # 那张凭证本来就不会进库，用哪一年的表去认科目只影响多报不多报一条错。
+    _fallback_year = _current_accounting_year(db, book_id)
     unknown_subjects: dict[str, str] = {}
     journal = _looks_like_journal(header)
     footer_rows = 0
@@ -459,6 +487,10 @@ def _parse_rows(rows_iter, book_id: int, db: Session) -> dict:
         subject = None
         if row_subject not in (None, ""):
             key = str(row_subject).strip()
+            # 用**这一行所属年度**的科目表去认编码/名称
+            _vdate = current.get("voucher_date")
+            _year = int(_vdate[:4]) if _vdate else _fallback_year
+            by_code, by_name = _index_for(_year)
             subject = by_code.get(key) or by_name.get(key)
             # 序时账的「上级科目」是明细科目的完整路径，科目对不上时它就是
             # 最有用的那句线索：用户能据此判断是本账套缺了这个明细，还是

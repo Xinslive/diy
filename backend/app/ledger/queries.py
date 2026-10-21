@@ -30,8 +30,8 @@ def _entry_stmt(book_id: int, include_unposted: bool) -> Select:
     return stmt
 
 
-def subject_tree(db: Session, book_id: int) -> list[Subject]:
-    """按会计科目表顺序返回所有科目（含非明细级、**含停用**）。
+def subject_tree(db: Session, book_id: int, year: int) -> list[Subject]:
+    """按会计科目表顺序返回**某个年度**的所有科目（含非明细级、**含停用**）。
 
     刻意不过滤 ``active``：停用的语义是「不让再选它」，不是「删掉它」——
     老凭证还指着它，账还得算得出来、还得看得见。过滤掉的话，历史余额
@@ -39,12 +39,38 @@ def subject_tree(db: Session, book_id: int) -> list[Subject]:
 
     写路径另有闸门（``accounting/vouchers.py`` 建凭证时校验科目可用），
     这里是只读展示，不该再拦一道。
+
+    **年度是必填的**：科目表每个年度各有一份（迁移 0032），
+    2026 的 1002 和 2027 的 1002 是两行不同的记录。不圈定年度，
+    拿到的就是「两个年度的科目混在一起」—— 同一个编码出现两次。
     """
     return list(
         db.scalars(
             select(Subject)
-            .where(Subject.book_id == book_id)
+            .where(Subject.book_id == book_id, Subject.year == year)
             .order_by(Subject.category, Subject.code)
+        ).all()
+    )
+
+
+def subjects_for_periods(db: Session, book_id: int, periods: list[Period]) -> list[Subject]:
+    """区间涉及哪几个年度，就取哪几个年度的科目表（**并集**）。
+
+    科目表每个年度各有一份（迁移 0032），而跨年区间要报的是「同一个编码
+    在这段区间里怎么动的」—— 两个年度的编码是**两行不同的记录**，
+    只取一张表，区间发生额会凭空少掉另一年那半截。
+
+    排序按 (类别, 编码, 年度)：单年时与 ``subject_tree`` 逐字一致
+    （年度是常量），跨年时同一编码的各年度挨在一起，便于按编码归并。
+    """
+    years = sorted({int(p.year) for p in periods})
+    if not years:
+        return []
+    return list(
+        db.scalars(
+            select(Subject)
+            .where(Subject.book_id == book_id, Subject.year.in_(years))
+            .order_by(Subject.category, Subject.code, Subject.year)
         ).all()
     )
 
@@ -52,7 +78,8 @@ def subject_tree(db: Session, book_id: int) -> list[Subject]:
 # --------------------------------------------------------------------- 明细账
 
 
-def subject_of_book(db: Session, book_id: int, subject_id: int) -> Subject:
+def subject_of_book(db: Session, book_id: int, subject_id: int,
+                    year: int | None = None) -> Subject:
     """取**属于本账套**的科目，取不到就 404。
 
     以前这里是裸的 ``db.get(Subject, subject_id)``，不带 book_id 约束 ——
@@ -67,9 +94,15 @@ def subject_of_book(db: Session, book_id: int, subject_id: int) -> Subject:
 
     这里不拦 ``is_leaf``：上级科目是合法 ID，点它的小计行应当看到
     空账而不是 404。末级性由调用方在需要时自己判断。
+
+    ``year`` 给了就只认**那个年度**的科目：科目表每个年度各有一份，
+    2026 的 1002 和 2027 的 1002 是两行。不圈年度的话，
+    「看 2027 年的明细账」可以传一个 2026 年的科目 id 进来。
     """
     subject = db.get(Subject, subject_id)
     if subject is None or subject.book_id != book_id:
+        raise HTTPException(404, "科目不存在")
+    if year is not None and subject.year != year:
         raise HTTPException(404, "科目不存在")
     return subject
 
@@ -85,7 +118,9 @@ def detail_ledger(
     to_subject_id: int | None = None,
 ) -> dict:
     """明细账：末级逐笔展示；父级按科目树汇总并展开所选子科目范围。"""
-    subject = subject_of_book(db, book_id, subject_id)
+    # 科目表每个年度各有一份 —— 明细账看的是**区间所在年度**的那张表。
+    year = to_period.year
+    subject = subject_of_book(db, book_id, subject_id, year=year)
     if from_period.ord > to_period.ord:
         raise HTTPException(400, "起始期间不能晚于结束期间")
 
@@ -98,7 +133,7 @@ def detail_ledger(
     for period in periods:
         first_period_by_year.setdefault(period.year, period)
 
-    all_subjects = subject_tree(db, book_id)
+    all_subjects = subject_tree(db, book_id, year)
     children: dict[int, list[Subject]] = defaultdict(list)
     by_id = {s.id: s for s in all_subjects}
     for child in all_subjects:
@@ -111,8 +146,8 @@ def detail_ledger(
     selected_branches: list[Subject] = []
     if comprehensive:
         siblings = children[subject.id]
-        start_subject = subject_of_book(db, book_id, from_subject_id) if from_subject_id else siblings[0]
-        end_subject = subject_of_book(db, book_id, to_subject_id) if to_subject_id else siblings[-1]
+        start_subject = subject_of_book(db, book_id, from_subject_id, year=year) if from_subject_id else siblings[0]
+        end_subject = subject_of_book(db, book_id, to_subject_id, year=year) if to_subject_id else siblings[-1]
         if start_subject.parent_id != subject.id or end_subject.parent_id != subject.id:
             raise HTTPException(400, "起止科目必须是所选父科目的直接下级科目")
         sibling_index = {s.id: i for i, s in enumerate(siblings)}
@@ -147,11 +182,40 @@ def detail_ledger(
     else:
         selected_leaf_ids = [subject.id]
 
+    # ---- 跨年区间：科目表每个年度各有一份 --------------------------------
+    #
+    # 行结构用**止期**那张表（报告的「当前年」视角），而分录挂的是**各自
+    # 年度**的那一行：2026 年的分录指向 2026 年的科目 id，拿 2027 的 id
+    # 去查一条都匹配不到 —— 区间发生额会凭空少掉一整年。
+    #
+    # 所以按**编码**把各年度的科目对上：
+    #   · ``id_to_row``：任意年度的科目 id → 止期那一行的 id（上卷走止期的树）
+    #   · ``opening_id_of``：止期的科目 id → **取期初用的那一行**
+    #     （期初是区间起点的余额，还在**起始年**那张表上）
+    years_in_range = {p.year for p in range_periods}
+    id_to_row: dict[int, int] = {}
+    opening_id_of: dict[int, int] = {}
+    query_ids: set[int] = set(selected_leaf_ids)
+    if len(years_in_range) > 1:
+        from_year = min(years_in_range)
+        code_to_row = {s.code: s for s in all_subjects}
+        for y in sorted(years_in_range):
+            for s in subject_tree(db, book_id, y):
+                target = code_to_row.get(s.code)
+                if target is None:
+                    continue
+                id_to_row[s.id] = target.id
+                if target.id in query_ids:
+                    query_ids.add(s.id)
+                if y == from_year and target.id in selected_leaf_ids:
+                    opening_id_of[target.id] = s.id
+
     # 只计算本次范围内的末级科目。父级期初快照会包含所有子科目，不能直接拿来
     # 作为缩小范围后的期初余额；逐个汇总选中的末级科目才能排除范围外分支。
-    eng.compute(selected_leaf_ids, to_period.ord)
+    eng.compute(sorted(query_ids), to_period.ord)
     opening_by_leaf = {
-        leaf_id: eng.opening(leaf_id, from_period.ord) for leaf_id in selected_leaf_ids
+        leaf_id: eng.opening(opening_id_of.get(leaf_id, leaf_id), from_period.ord)
+        for leaf_id in selected_leaf_ids
     }
 
     opening_by_node: dict[int, Decimal] = {}
@@ -173,7 +237,7 @@ def detail_ledger(
     if selected_leaf_ids:
         stmt = (
             _entry_stmt(book_id, include_unposted)
-            .where(Entry.subject_id.in_(selected_leaf_ids))
+            .where(Entry.subject_id.in_(sorted(query_ids)))
             .where(Entry.period_ord >= earliest_ytd_ord, Entry.period_ord <= to_period.ord)
             .order_by(Entry.period_ord, Voucher.voucher_date, Voucher.voucher_no, Entry.line_no)
         )
@@ -181,7 +245,10 @@ def detail_ledger(
         for entry, voucher, _subj in db.execute(stmt).all():
             debit = entry.amount if entry.direction == "DEBIT" else ZERO
             credit = entry.amount if entry.direction == "CREDIT" else ZERO
-            current = entry.subject_id
+            # **折算到止期那一行的 id**（跨年区间）：分录挂的是各自年度的
+            # 科目行，上卷与展示都走止期那张树。
+            entry_id = id_to_row.get(entry.subject_id, entry.subject_id)
+            current = entry_id
             while current in included_nodes:
                 totals = monthly_moves[(current, entry.period_ord)]
                 totals[0] += debit
@@ -191,7 +258,7 @@ def detail_ledger(
                     break
                 current = parent_id
             if entry.period_ord >= from_period.ord:
-                entries_by_leaf_period[(entry.subject_id, entry.period_ord)].append((entry, voucher))
+                entries_by_leaf_period[(entry_id, entry.period_ord)].append((entry, voucher))
 
     ytd_moves: dict[tuple[int, int], tuple[Decimal, Decimal]] = {}
     ytd_by_node = {node_id: [ZERO, ZERO] for node_id in included_nodes}
@@ -411,17 +478,17 @@ def balance_sheet_of_accounts(
         raise HTTPException(400, "起始期间不能晚于结束期间")
 
     eng = LedgerEngine.for_ledger(db, book_id, include_unposted)
-    ids = [s.id for s in subjects]
-    fmap = eng.batch_figures(ids, period.ord)
-
     is_range = from_period is not None and from_period.id != period.id
-    if is_range:
-        moves = eng.range_movements(ids, from_period.ord, period.ord)
-        # 区间期初 = 起始期的上一期期末（不是止期自己的期初，理由见 docstring）
-        prev_map = eng.compute(ids, from_period.ord - 1)
-    else:
-        moves = {s.id: (fmap[s.id].period_dr, fmap[s.id].period_cr) for s in subjects}
-        prev_map = None
+
+    # **行按「编码」归并**（引擎那一层做的事，理由见
+    # ``LedgerEngine.merge_by_code``）：科目表每个年度各有一份，
+    # 跨年区间里同一个编码在两个年度是**两行不同的记录、两个 id**，
+    # 不归并的话区间发生额会凭空少掉另一年那半截。
+    #
+    # 只有一个年度时归并组里只有一行，与逐科目算逐字等价 ——
+    # 口径只有一份实现，不会出现「单年一种算法、跨年另一种算法」。
+    merged = eng.merge_by_code(subjects, period.ord,
+                               from_period.ord if is_range else None)
 
     rows = []
     total_open_dr = total_open_cr = total_dr = total_cr = total_close_dr = total_close_cr = ZERO
@@ -431,11 +498,11 @@ def balance_sheet_of_accounts(
     # 就只能回退去表体里自己加，于是它随「科目范围」档位变（审计 P1-4）。
     total_ytd_dr = total_ytd_cr = ZERO
 
-    for s in subjects:
-        f = fmap[s.id]
-        o_signed = prev_map[s.id].closing if is_range else f.opening
-        m_dr, m_cr = moves[s.id]
-        c_signed = o_signed + m_dr - m_cr
+    for mf in merged:
+        s = mf.subject
+        o_signed = mf.opening
+        m_dr, m_cr = mf.period_dr, mf.period_cr
+        c_signed = mf.closing
         o_side, o_amt = display_side(s, o_signed)
         c_side, c_amt = display_side(s, c_signed)
         rows.append(
@@ -454,8 +521,8 @@ def balance_sheet_of_accounts(
                 # 字段名不动是为了让总账、余额表共用同一份行结构。
                 "period_debit": m_dr,
                 "period_credit": m_cr,
-                "ytd_debit": f.dr_cum,
-                "ytd_credit": f.cr_cum,
+                "ytd_debit": mf.ytd_dr,
+                "ytd_credit": mf.ytd_cr,
                 "direction": c_side,
                 "closing": c_amt,
             }
@@ -466,8 +533,8 @@ def balance_sheet_of_accounts(
             total_open_cr += -o_signed if o_signed < 0 else ZERO
             total_dr += m_dr
             total_cr += m_cr
-            total_ytd_dr += f.dr_cum
-            total_ytd_cr += f.cr_cum
+            total_ytd_dr += mf.ytd_dr
+            total_ytd_cr += mf.ytd_cr
             total_close_dr += c_signed if c_signed > 0 else ZERO
             total_close_cr += -c_signed if c_signed < 0 else ZERO
 

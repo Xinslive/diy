@@ -207,6 +207,9 @@ async function submit() {
   saving.value = true
   try {
     const created = await api.createSubject(store.bookId, {
+      // **年度必带**：科目表每个年度各有一份（后端迁移 0032）——
+      // 新增的科目落在**正在看的那一年**，别的年度不受影响。
+      year: store.currentYear,
       parent_id: form.parent_id || null,
       code: form.code.trim(), name: form.name.trim(),
       category: form.category, direction: form.direction,

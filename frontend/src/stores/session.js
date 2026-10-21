@@ -24,7 +24,15 @@ export const useSessionStore = defineStore('session', {
     // bookId 会从 0 变成新账套，MainLayout 的 viewKey 一变整个页面就重新挂载，
     // 组件内的 newBookId 会被丢掉，「下一步录期初余额」的提示就没了。
     lastCreatedBookId: 0,
-    // 每个账套的初始化状态（两步向导要的那份 init）。账套列表行里已经自带 init，
+    // 每个账套**每个年度**的初始化状态（两步向导要的那份 init）。
+    // 形状是 bookId → year → init。
+    //
+    // **为什么按年度存**：初始化状态是**年度**的属性（后端迁移 0032）——
+    // 每个年度有**自己的**科目表，也各有各的「第 1 步做没做」。
+    // 账套级的那一份会把 2026 做完的状态套到 2027 上，于是 2027 年可以在
+    // **一张科目都没有**的情况下录期初、记账，期初整批挂空。
+    //
+    // 账套列表行里已经自带 init（装的是当前在记的那一年），
     // 这里存的是**比列表更新的那份**：向导里刚做完一步时，列表还没重新拉过。
     initByBook: {},
     // 管理员二次验证**进行中**的状态。**null = 没有在进行中。**
@@ -53,8 +61,16 @@ export const useSessionStore = defineStore('session', {
      * 代价是 initByBook 一旦陈旧就会盖住更新的列表数据 —— 所以 loadBooks
      * 每次都要用新列表把它冲一遍，那条纪律就写在那里。
      */
-    initOf: (s) => (bookId) =>
-      s.initByBook[bookId] ?? s.books.find((b) => b.id === bookId)?.init ?? null,
+    initOf: (s) => (bookId, year) => {
+      const byYear = s.initByBook[bookId]
+      const book = s.books.find((b) => b.id === bookId)
+      // 不指定年度时取**这个账套当前在记的那一年** ——
+      // 与后端列表接口随行带回来的那份是同一年（列表给的是「当前在记的那一年」）。
+      const wanted = year ?? book?.latest_year
+      if (wanted != null && byYear && byYear[wanted]) return byYear[wanted]
+      if (year != null) return null
+      return book?.init ?? null
+    },
     currentPeriod: (s) => s.periods.find((p) => p.id === s.periodId) || null,
     /** 当前账套能不能写。**失败时关闭（fail-closed）**。
      *
@@ -74,6 +90,22 @@ export const useSessionStore = defineStore('session', {
       ?? s.books.find((b) => b.id === s.bookId)?.latest_year ?? 0,
     /** 当前年度的期间，页面上按年度分组用 */
     periodsOfYear: (s) => (y) => s.periods.filter((p) => p.year === y),
+    /**
+     * 某个账套「当前在记的那一年」。
+     *
+     * 正在看这个账套时跟顶栏的年份一致（用户已经用顶栏表达过
+     * 「我在看哪一年」）；看别的账套时取它最新的那个年度。
+     *
+     * 初始化向导、期初页、科目表页都要用同一个年度 ——
+     * 三处各算各的就会「向导说 2026 做完了、期初页说 2027 还没做」。
+     */
+    yearOfBook() {
+      return (bookId) => {
+        const book = this.books.find((b) => b.id === bookId)
+        if (this.bookId === bookId) return this.currentYear || book?.latest_year
+        return book?.latest_year
+      }
+    },
     yearsOfBook: (s) => (b) => (b?.years || []).map((y) => y.year).sort((x, y) => y - x),
     /**
      * 距离下一次可以「重新发送验证邮件」还有几秒。
@@ -280,10 +312,21 @@ export const useSessionStore = defineStore('session', {
       // 「待初始化」），但 initByBook 还停在这个会话早些时候 loadInit 拉到的
       // 那份，点开向导仍然写着「第 2 步还没做」。而 markInit 之所以能被
       // 信任，是因为它写的本来就是服务端刚返回的值，覆盖不会丢信息。
-      this.initByBook = this.books.reduce((acc, b) => {
-        if (b.init) acc[b.id] = b.init
-        return acc
-      }, {})
+      // 列表里的 init 是**刚取回来的**，比 initByBook 里的任何一份都新 ——
+      // 但它只带**当前在记的那一年**的进度（每个年度各有一份）。
+      // 所以按年度合并，**不能整份覆盖**：整份覆盖会把别的年度的进度冲掉
+      // （用户切到 2026 做完一步，回来一看 2027 的进度被列表抹了）。
+      const merged = {}
+      for (const b of this.books) {
+        const prev = this.initByBook[b.id] || {}
+        if (!b.init) {
+          if (Object.keys(prev).length) merged[b.id] = prev
+          continue
+        }
+        const y = b.init.year
+        merged[b.id] = y != null ? { ...prev, [y]: b.init } : prev
+      }
+      this.initByBook = merged
       if (!this.books.find((b) => b.id === this.bookId)) {
         this.bookId = 0
         this.periodId = 0
@@ -372,10 +415,10 @@ export const useSessionStore = defineStore('session', {
      *  向导此时的取值动作一律 fail-closed（见 utils/bookInit），所以一次网络抖动
      *  不会变成「按钮亮着、点了被 409」。返回 null 表示这次没拿到新的。
      */
-    async loadInit(bookId) {
+    async loadInit(bookId, year) {
       if (!bookId) return null
       try {
-        const init = await bookApi.getInit(bookId)
+        const init = await bookApi.getInit(bookId, year)
         if (init) this.markInit(bookId, init)
         return init || null
       } catch (e) {
@@ -396,9 +439,19 @@ export const useSessionStore = defineStore('session', {
      */
     markInit(bookId, init) {
       if (!bookId || !init) return
-      this.initByBook = { ...this.initByBook, [bookId]: init }
+      // 按年度存：后端返回的 init 自带它属于哪一年
+      const year = init.year
+      const byYear = { ...(this.initByBook[bookId] || {}) }
+      if (year != null) byYear[year] = init
+      this.initByBook = { ...this.initByBook, [bookId]: byYear }
       if (this.books.some((b) => b.id === bookId)) {
-        this.books = this.books.map((b) => (b.id === bookId ? { ...b, init } : b))
+        this.books = this.books.map((b) => {
+          if (b.id !== bookId) return b
+          // 列表行装的是**当前在记的那一年**的那份 ——
+          // 别的年度的进度不该覆盖它（那会让卡片上的标记说错年份）。
+          if (year != null && b.latest_year != null && b.latest_year !== year) return b
+          return { ...b, init }
+        })
       }
     },
 

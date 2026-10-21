@@ -58,7 +58,9 @@ def _add_child(db, book, parent_code: str, code: str, name: str, opening: Decima
     parent_id = db.scalar(select_id(db, book, parent_code))
     parent = db.get(Subject, parent_id)
     assert parent is not None, f"父科目不存在：{parent_code}"
-    child = Subject(book_id=book.id, code=code, name=name, category="ASSET",
+    # 年度跟着父科目：父子必须在同一张科目表上（库层护栏 fn_subject_parent_year_guard）
+    child = Subject(book_id=book.id, year=parent.year, code=code, name=name,
+                    category="ASSET",
                     direction="DEBIT", level=parent_id and 3 or 2,
                     parent_id=parent_id, sort_no=99)
     db.add(child)

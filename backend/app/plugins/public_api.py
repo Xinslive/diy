@@ -181,28 +181,36 @@ def context_for(manifest):
             return balance(book_id=book_id, period_id=period_id, from_period_id=None,
                            book=book, db=db, include_unposted=False)
 
-    def subject_read(book_id: int):
-        """当前账套的科目表。插件用它把文件里的科目**编码**换成凭证要的
-        ``subject_id``。
+    def subject_read(book_id: int, year: int | None = None):
+        """当前账套**某个年度**的科目表。插件用它把文件里的科目**编码**
+        换成凭证要的 ``subject_id``。
 
         返回**全部**科目（末级与非末级、启用与停用都给），而不是像
         ``/subjects/flat`` 那样默认只给末级且启用的：插件要区分「这个编码根本
         不存在」「这个科目已停用」「这是个上级科目，不能记账」三种情况才能
         给人报出有用的错。只给可用集合的话，插件只能说「找不到」，用户拿到
         一句没有指向的错。筛选是插件自己的事，宿主不替它做这个判断。
+
+        **科目表每个年度各有一份**（迁移 0032）：2026 的 1002 和 2027 的
+        1002 是两行不同的记录、两个 id。所以要指定年度 —— 不指定就用
+        **账套当前在记的那一年**。插件要把凭证记在哪一年，就得取哪一年的表，
+        否则拿到的 id 属于另一年，凭证那一步会被库层挡下来。
         """
+        from app.accounting.years import resolve_year
         from app.models.accounting import Subject
         with SessionLocal() as db:
             user = principal(db)
             book = get_my_book(book_id, db, user)
+            resolved = resolve_year(db, book, year)
             rows = db.scalars(
                 select(Subject)
-                .where(Subject.book_id == book.id)
+                .where(Subject.book_id == book.id, Subject.year == resolved)
                 .order_by(Subject.code)
             ).all()
             return [{"id": s.id, "code": s.code, "name": s.name, "level": s.level,
                      "category": s.category, "direction": s.direction,
-                     "is_leaf": s.is_leaf, "active": s.active} for s in rows]
+                     "is_leaf": s.is_leaf, "active": s.active, "year": s.year}
+                    for s in rows]
 
     def voucher_create(book_id: int, payload: dict):
         from app.api.schemas import VoucherIn

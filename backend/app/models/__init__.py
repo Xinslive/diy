@@ -1,6 +1,6 @@
 from app.models.base import Base
 from app.models.system import SysUser, SystemSetting, UserBook
-from app.models.book import (Book, Period, PeriodOpening, book_first_ord,
+from app.models.book import (Book, BookYear, Period, PeriodOpening, book_first_ord,
                            ord_to_month, period_ord, year_start_ord)
 from app.models.accounting import Entry, Subject, Voucher
 from app.models.report import ReportCell, ReportCol, ReportResult, ReportRow, ReportTemplate
@@ -15,7 +15,7 @@ from app.models.mfa import (MFA_STATUSES, STATUS_CONSUMED, STATUS_EXPIRED,
 
 __all__ = [
     "Base", "SysUser", "UserBook", "SystemSetting",
-    "Book", "Period", "PeriodOpening",
+    "Book", "BookYear", "Period", "PeriodOpening",
     "period_ord", "year_start_ord", "ord_to_month", "book_first_ord",
     "Subject", "Voucher", "Entry",
     "ReportTemplate", "ReportRow", "ReportCol", "ReportCell", "ReportResult",

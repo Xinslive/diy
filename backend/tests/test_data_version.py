@@ -112,8 +112,11 @@ def test_版本号会被每一种写顶起来(db, book, admin_user, make_voucher
 
     # subject：新增一个科目
     before = _version(db, bid)
-    s = Subject(book_id=bid, code="9999", name="测试科目", level=1,
-                category="ASSET", direction="DEBIT", is_leaf=True, sort_no=9999)
+    # 年度必填：科目表每个年度各有一份（迁移 0032）
+    s = Subject(book_id=bid, year=db.scalar(
+        select(Book.start_year).where(Book.id == bid)),
+        code="9999", name="测试科目", level=1,
+        category="ASSET", direction="DEBIT", is_leaf=True, sort_no=9999)
     db.add(s)
     db.commit()
     assert _version(db, bid) > before, "新增科目没有顶起版本号"

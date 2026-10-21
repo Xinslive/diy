@@ -1100,13 +1100,18 @@ onMounted(async () => {
   // 否则 load() 按 id 查模板会查不到，页面标题和「是否内置」全成空。
   allTemplates.value = visibleTemplates(await api.templates(store.bookId), templateId.value)
   if (store.bookId) {
-    subjectOptions.value = await subjectApi.subjectFlat(store.bookId, { include_parents: true }).catch(() => [])
+    // **年度必带**：科目表每个年度各有一份（后端迁移 0032）
+    subjectOptions.value = await subjectApi.subjectFlat(
+      store.bookId, { include_parents: true, year: store.currentYear }).catch(() => [])
   }
   if (!templateId.value && allTemplates.value.length) templateId.value = allTemplates.value[0].id
   load()
 })
 watch(() => store.bookId, async (bookId) => {
-  if (bookId) subjectOptions.value = await subjectApi.subjectFlat(bookId, { include_parents: true }).catch(() => [])
+  if (bookId) {
+    subjectOptions.value = await subjectApi.subjectFlat(
+      bookId, { include_parents: true, year: store.currentYear }).catch(() => [])
+  }
   load()
 })
 watch(() => store.periodId, () => load())

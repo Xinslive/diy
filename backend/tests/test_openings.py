@@ -29,6 +29,19 @@ def _xlsx(rows, header=("科目编码", "科目名称", "方向", "期初余额"
     return buf.getvalue()
 
 
+def _sid_of(db, book, code, year):
+    """按 (账套, 年度, 编码) 取科目 id。
+
+    科目表每个年度各有一份（迁移 0032）：2026 的 1121 与 2027 的 1121
+    是两行不同的记录、两个 id —— 拿 2026 的 id 去写 2027 年的期初，
+    后端会判「科目不属于本年度」。
+    """
+    from app.models import Subject
+
+    return db.scalar(select(Subject.id).where(
+        Subject.book_id == book.id, Subject.year == year, Subject.code == code))
+
+
 # ------------------------------------------------------------------ 读写往返
 
 
@@ -203,23 +216,40 @@ def test_openings_follow_selected_year(client, auth, book_id, periods, subjects,
 
 
 def test_openings_switch_year_switches_the_numbers(
-        client, db, auth, book, periods, subjects, make_voucher):
-    """换一年 = 换一份期初；换月份 = 纹丝不动。"""
-    from app.accounting.periods import ensure_periods
+        client, db, auth, book, periods, subjects, admin_user, make_voucher):
+    """换一年 = 换一份期初；换月份 = 纹丝不动。
 
-    ensure_periods(db, book, 2027)
-    db.commit()
+    **次年的期初是「年度结转」写下来的显式快照**，不是从上年自动滚过去的
+    —— 新模型里跨年是硬边界（``migrations/versions/0032_book_year.py``）。
+    所以这条用例走真实的结转：2026 结完 → 2027-01 的期初 = 2026-12 的期末。
+    页面上的数与总账对得上，正是因为那一份快照是结转写进去的。
+    """
+    from app.accounting.periods import carry_forward_profit, year_end_carry
+    from app.models import Period
 
     make_voucher("2026-01-15", dr=[("1121", 100000, "存钱")],
                  cr=[("4001", 100000, "存钱")], posted=True)
+
+    # 年度结转要求本年**全部结账**
+    for m in range(1, 13):
+        p = db.scalar(select(Period).where(
+            Period.book_id == book.id, Period.year == 2026, Period.month == m))
+        if p.locked:
+            continue
+        try:
+            carry_forward_profit(db, book.id, p, admin_user)
+        except ValueError:
+            pass          # 该月没损益，跳过
+        close_any(db, book, p, admin_user)
+    db.commit()
+    year_end_carry(db, book, admin_user, 2026, 2027)
 
     y2026 = client.get(f"/api/books/{book.id}/openings?year=2026", headers=auth).json()
     y2027 = client.get(f"/api/books/{book.id}/openings?year=2027", headers=auth).json()
 
     assert y2026["year"] == 2026 and y2026["editable"] is False, y2026
     assert y2027["year"] == 2027 and y2027["editable"] is True, y2027
-    # 2027 年还没有自己的期初快照时，页面上要显示账簿实际在用的那个数
-    # —— 上一年期末滚过来的数，而不是一片 0，否则对不上总账
+    # 2027 年的期初是结转写下来的那份快照，值就是 2026-12 的期末
     bank = next(s for s in y2027["subjects"] if s["code"] == "1121")
     assert Decimal(bank["signed"]) == Decimal("100000"), bank
 
@@ -238,17 +268,20 @@ def test_save_year_opening_lands_on_the_first_period_of_that_year(
         client, db, auth, book, periods, subjects):
     """保存的是**年度**期初：落在该年度的第一个期间上，之后每月从它往下滚。"""
     from app.accounting.periods import ensure_periods
+    from app.accounting.years import copy_chart
     from app.ledger.engine import LedgerEngine
     from app.models import Period, PeriodOpening
 
     ensure_periods(db, book, 2027)
+    # 2027 年要有**自己的**科目表（科目表每个年度各有一份，迁移 0032）
+    copy_chart(db, book.id, 2026, 2027)
     db.commit()
     jan27 = db.scalar(select(Period).where(
         Period.book_id == book.id, Period.year == 2027, Period.month == 1))
 
     r = client.post(f"/api/books/{book.id}/periods?year=2027", headers=auth, json=[
-        {"subject_id": subjects["1121"].id, "amount": "120000"},
-        {"subject_id": subjects["1122"].id, "amount": "-120000"},
+        {"subject_id": _sid_of(db, book, "1121", 2027), "amount": "120000"},
+        {"subject_id": _sid_of(db, book, "1122", 2027), "amount": "-120000"},
     ])
     assert r.status_code == 200, r.text
     assert r.json()["year"] == 2027, r.json()
@@ -258,7 +291,7 @@ def test_save_year_opening_lands_on_the_first_period_of_that_year(
         PeriodOpening.period_id == jan27.id)) == 2
 
     # 账簿立刻按新数算：2027 年 1 月的期初就是它
-    sid = subjects["1121"].id
+    sid = _sid_of(db, book, "1121", 2027)
     assert LedgerEngine(db, book.id).compute([sid], up_to_ord=jan27.ord)[sid].opening \
         == Decimal("120000")
     # 再翻到 2027 年 5 月，期初仍然从这一份往下滚
@@ -284,12 +317,14 @@ def test_save_year_opening_is_blocked_by_that_year_posted_vouchers(
 def test_export_follows_selected_year(client, db, auth, book, periods, subjects):
     """导出的是屏幕上那**一年** —— 抬头写年度，不是月份。"""
     from app.accounting.periods import ensure_periods
+    from app.accounting.years import copy_chart
 
     ensure_periods(db, book, 2027)
+    copy_chart(db, book.id, 2026, 2027)
     db.commit()
     client.post(f"/api/books/{book.id}/periods?year=2027", headers=auth, json=[
-        {"subject_id": subjects["1121"].id, "amount": "5000"},
-        {"subject_id": subjects["1122"].id, "amount": "-5000"},
+        {"subject_id": _sid_of(db, book, "1121", 2027), "amount": "5000"},
+        {"subject_id": _sid_of(db, book, "1122", 2027), "amount": "-5000"},
     ])
     r = client.get(f"/api/books/{book.id}/openings.xlsx?year=2027", headers=auth)
     assert r.status_code == 200, r.text
@@ -491,8 +526,9 @@ def test_科目级次不能调到比已有科目还浅(client, db, book, auth, s
     """
     from app.models import Subject
 
-    deep = Subject(book_id=book.id, code="10020101", name="三级科目",
-                   category="ASSET", direction="DEBIT", is_leaf=True, level=3,
+    deep = Subject(book_id=book.id, year=subjects["1121"].year, code="10020101",
+                   name="三级科目", category="ASSET", direction="DEBIT",
+                   is_leaf=True, level=3,
                    parent_id=subjects["1121"].id, active=True)
     # 同样是「构造底层状态」：父科目 100201 此刻是末级，直接挂下级会让
     # trg_subject_leaf_parent_guard 在提交时拒绝（审计 P2-04 收尾）。

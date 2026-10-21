@@ -156,7 +156,7 @@ def test_余额方向只看符号不看科目属性(db, book, periods, subjects,
     assert display_side(subjects["2001"], ZERO) == ("平", Decimal("0"))
 
     # 与试算平衡口径一致：每行都只按符号归一边
-    tree = queries.subject_tree(db, book.id)
+    tree = queries.subject_tree(db, book.id, book.start_year)
     rows, check = queries.balance_sheet_of_accounts(db, book.id, tree, periods[1], False)
     by_id = {r["subject_id"]: r for r in rows}
     assert (by_id[bank]["direction"], by_id[bank]["closing"]) == ("贷", Decimal("500"))
@@ -177,7 +177,7 @@ def test_试算平衡(db, book, periods, subjects, make_voucher):
     make_voucher("2026-01-10", dr=[("1001", 5000, "收")], cr=[("5001", 5000, "收")], posted=True)
     make_voucher("2026-01-15", dr=[("560206", 800, "水电")], cr=[("1001", 800, "水电")], posted=True)
 
-    tree = queries.subject_tree(db, book.id)
+    tree = queries.subject_tree(db, book.id, book.start_year)
     rows, check = queries.balance_sheet_of_accounts(db, book.id, tree, periods[1], False)
 
     assert check["period_balanced"]
@@ -190,7 +190,7 @@ def test_试算平衡不重复计算父级(db, book, periods, subjects, make_vou
     """父级有余额但不应再和子级相加，否则合计会翻倍。"""
     make_voucher("2026-01-10",
                  dr=[("1001", 500, "a")], cr=[("5001", 500, "a")], posted=True)
-    tree = queries.subject_tree(db, book.id)
+    tree = queries.subject_tree(db, book.id, book.start_year)
     _rows, check = queries.balance_sheet_of_accounts(db, book.id, tree, periods[1], False)
     assert check["total_closing_debit"] == Decimal("500")
 

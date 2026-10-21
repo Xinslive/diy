@@ -245,6 +245,7 @@ SYSTEM_SOURCES = ("CARRY_FORWARD",)
 
 
 def _validate_entries(db: Session, book_id: int, entries: list[dict],
+                      year: int,
                       allow_inactive: bool = False,
                       legacy_non_leaf: Counter | None = None) -> int:
     """校验分录。返回**本次被豁免的历史非末级分录条数**（审计 P2-21）。
@@ -289,6 +290,7 @@ def _validate_entries(db: Session, book_id: int, entries: list[dict],
     subject_ids = {e["subject_id"] for e in entries}
     stmt = select(Subject.id, Subject.code, Subject.name, Subject.is_leaf).where(
         Subject.book_id == book_id,
+        Subject.year == year,
         Subject.id.in_(subject_ids),
     )
     if not allow_inactive:
@@ -372,7 +374,7 @@ def validate_new_voucher(db: Session, *, book_id: int, voucher_date: date,
     ]
     # allow_inactive 只认 internal —— 见函数 docstring。原来是
     # ``source in SYSTEM_SOURCES``，而 source 由客户端提交。
-    _validate_entries(db, book_id, payload, allow_inactive=internal)
+    _validate_entries(db, book_id, payload, period.year, allow_inactive=internal)
 
     return period, payload, anchor
 
@@ -590,7 +592,7 @@ def update_voucher(
             (e.subject_id, e.direction, money(e.amount)) for e in voucher.entries
         )
         grandfathered = _validate_entries(db, voucher.book_id, entries,
-                                          legacy_non_leaf=legacy)
+                                          period.year, legacy_non_leaf=legacy)
         voucher.entries.clear()
         db.flush()
         for i, e in enumerate(entries, start=1):
@@ -655,6 +657,355 @@ def delete_voucher(db: Session, voucher: Voucher, user: SysUser,
     db.delete(voucher)
     if commit:
         db.commit()
+
+
+# --------------------------------------------------------------------- 拆分凭证
+#
+# 把一张凭证在**分录边界**处切成两张：前半段留在原凭证，后半段另起一张新凭证。
+#
+# 三条硬约束（拆分的可行域就是它们划出来的）：
+#
+#   1. **两张各自必须借贷平衡**。整张平不代表切一刀之后还平 ——
+#      「借 管理费用500 / 借 管理费用800 / 贷 银行存款1300」在第 1 行后切开，
+#      前半张只有借方 500。库里那条 ``trg_entry_balance`` 是**延迟到提交时**
+#      才判的约束触发器，所以不平的两张在提交那一刻会被数据库挡下；
+#      这里提前挡，是为了给用户一句人话而不是一条 check_violation。
+#      **不平就不给拆**，并把两边的差额说清楚。
+#
+#   2. **一个事务**。「原凭证删掉后半段」与「新凭证建起后半段」必须同生共死 ——
+#      分两次提交的话，中间那一刻原凭证是残的（可能不平），新凭证还不存在。
+#
+#   3. **编号沿用「增加凭证」那套语义**（``insert_slot(position="after")``）：
+#      **原凭证继承它自己的号**（一个字符都不动 —— 它可能已经打印、已经被引用过），
+#      新凭证往后拿一个号（= 原号 +1），后面同期的号整体顺延 +1。
+#      顺延是「整体 +1」而不是「删一个补一个」，所以期间号段既不缺号也不重号，
+#      ``organize.assert_tidy`` 仍然放行记账与结账。
+
+
+def _entry_payload(e: Entry) -> dict:
+    """Entry → 校验 / 建凭证那种 dict。"""
+    return {
+        "subject_id": int(e.subject_id),
+        "direction": e.direction,
+        "amount": money(e.amount),
+        "summary": e.summary or "",
+        "aux_ref": e.aux_ref or {},
+    }
+
+
+def _split_entries(voucher: Voucher) -> list[Entry]:
+    """这张凭证的分录，按行号排好。"""
+    return sorted(voucher.entries, key=lambda e: e.line_no)
+
+
+def _assert_contiguous_line_no(entries: list[Entry]) -> None:
+    """分录行号必须是 1..n 连续，否则「在第几条之后切」这件事没有确定答案。
+
+    正常情况下它一定连续（``create_voucher`` 与 ``update_voucher`` 都是从 1
+    重排的），所以这条是**兜底**：真的不连续时（历史脏数据）宁可拒绝，
+    也不要猜一个切点出来 —— 猜错的后果是拆出来的两张张冠李戴。
+    """
+    nos = [e.line_no for e in entries]
+    if nos != list(range(1, len(nos) + 1)):
+        raise ValueError(
+            f"这张凭证的分录行号不连续（{'、'.join(str(n) for n in nos)}），拆不开。"
+            "请先修改一次这张凭证（保存后行号会重排），再拆。"
+        )
+
+
+def _half_totals(entries: list[Entry]) -> dict:
+    """一半分录的合计与判平结果。
+
+    **判平用带符号和，展示用 ``side_totals``** —— 两套口径，结论永远一致：
+    设 ``dr_side - cr_side = (Σ借正 + Σ贷负) - (Σ贷正 + Σ借负)``，
+    移项就是 ``dr_signed - cr_signed``，所以「平不平」两种算法同解，
+    差的只是红字凭证上摆出来的数（界面那一栏要的是正数）。
+
+    判平口径必须与 ``_validate_entries`` 一致（它也是带符号和），
+    否则会出现「页面说平、服务端说不平」。
+    """
+    rows = [{"direction": e.direction, "amount": e.amount} for e in entries]
+    dr_side, cr_side = side_totals(rows)
+    dr_signed = sum((money(e.amount) for e in entries if e.direction == "DEBIT"), Decimal("0"))
+    cr_signed = sum((money(e.amount) for e in entries if e.direction == "CREDIT"), Decimal("0"))
+    return {
+        "lines": len(entries),
+        # **过一遍 money()**：``side_totals`` 的零值是 ``Decimal("0")``，
+        # 直接 str() 出来是「0」而不是「0.00」—— 页面上摆的是「0.00」，
+        # 这里摆「0」，同一个数两种写法，看着像两个数。
+        "debit": str(money(dr_side)),
+        "credit": str(money(cr_side)),
+        "balanced": dr_signed == cr_signed,
+        # 差额 = 借 - 贷。正数是借方多，负数是贷方多。
+        "diff": str(money(dr_signed - cr_signed)),
+    }
+
+
+def _side_phrase(totals: dict) -> str:
+    """一半的账：借 X / 贷 Y（借方多 Z）。
+
+    **方向要说出来**，不能只给一个数 —— 只写「差额 500」的话，
+    人还得回头数一遍才知道该往哪一栏补。
+    """
+    diff = Decimal(totals["diff"])
+    base = f"借 {totals['debit']} / 贷 {totals['credit']}"
+    if diff > 0:
+        return f"{base}（借方多 {abs(diff)}）"
+    if diff < 0:
+        return f"{base}（贷方多 {abs(diff)}）"
+    return f"{base}（平）"
+
+
+def _split_message(at_line: int, first: dict, second: dict) -> str:
+    """一个候选分界处的说法。平与不平都说清楚。"""
+    head = f"在第 {at_line} 行后拆分"
+    if first["balanced"] and second["balanced"]:
+        return f"{head}：前半张 {_side_phrase(first)}；后半张 {_side_phrase(second)}（两张都平）"
+    return (f"{head}不成立：前半张 {_side_phrase(first)}；后半张 {_side_phrase(second)}。"
+            "请换一个分界处。")
+
+
+def _legacy_counter(entries: list[Entry]) -> Counter:
+    """这半分录里「历史非末级分录」的逐条计数。
+
+    与 ``update_voucher`` 里那份计数同一把尺（科目 + 方向 + 金额），
+    但**按半张分别算** —— 祖父条款（审计 P2-21）的凭据是
+    「**这一半**原本有哪些分录」，拿整张的计数去套两半，
+    会让另一半凭空多出一条豁免。
+    """
+    return Counter((e.subject_id, e.direction, money(e.amount)) for e in entries)
+
+
+def _reject_split(voucher: Voucher) -> None:
+    """两张与并发无关的硬闸：已记账、结转损益。
+
+    **结转损益为什么不能拆**：``periods._drop_carry_forward`` 在
+    「重新结转损益」时按 ``source == "CARRY_FORWARD"`` **加签名**删本期
+    结转凭证。拆一张出来，那张新凭证的 source 仍是 CARRY_FORWARD、
+    签名却对不上了 —— 重新结转时它既不会被删、也就不再是系统凭证，
+    账上会留一张半结转的孤儿。
+    """
+    if voucher.status == "POSTED":
+        raise ValueError(
+            f"凭证 {voucher.voucher_no} 已记账，不能拆分。"
+            "请到「期末结账」对本期执行「反结账」后再拆。")
+    if voucher.source == "CARRY_FORWARD":
+        raise ValueError(
+            "结转损益凭证由系统生成，不能拆分。请先到「期末结账」重新结转损益。")
+
+
+def split_preview(db: Session, voucher: Voucher) -> dict:
+    """拆分的预览：一次给出**所有**候选分界处（只算不改）。
+
+    与「整理凭证」的 preview / apply 两阶段同一个道理：拆分会改掉
+    后面同期的凭证号，而纸质凭证可能已经打印装订了 ——
+    先看清「切在哪、两张各自平不平、拆完各拿哪个号」，再确认。
+
+    一次返回全部候选，而不是让页面为每个边界发一次请求 ——
+    候选数 = 分录数 - 1，一张几十行的凭证就是几十个请求。
+    """
+    entries = _split_entries(voucher)
+    candidates = []
+    for k in range(1, len(entries)):
+        t1 = _half_totals(entries[:k])
+        t2 = _half_totals(entries[k:])
+        candidates.append({
+            "at_line": k,
+            "first": t1,
+            "second": t2,
+            "valid": bool(t1["balanced"] and t2["balanced"]),
+            "message": _split_message(k, t1, t2),
+        })
+    # **原凭证继承它自己的号**，新凭证往后拿一个（与「增加凭证」同一套语义）。
+    slot = insert_slot(db, voucher, "after")
+    return {
+        "voucher_id": voucher.id,
+        "voucher_no": voucher.voucher_no,
+        "entry_count": len(entries),
+        "candidates": candidates,
+        # 新凭证拿的号（= 原号 +1，后面同期的号整体顺延）
+        "created_no": slot["no"],
+        # 原凭证的号 —— 它不动
+        "original_no": voucher.voucher_no,
+        "moved": slot["moved"],
+    }
+
+
+def split_voucher(db: Session, voucher: Voucher, user: SysUser,
+                  at_line: int) -> dict:
+    """把一张凭证在第 ``at_line`` 条分录之后拆成两张。
+
+    返回 ``{"original": 原凭证, "created": 新凭证, "moved": 顺延清单}``。
+    原凭证的 **id 和号都不变**（只少了后半段分录），新凭证往后拿一个号，
+    后面同期的号整体顺延 +1。
+    """
+    # ---- 闸门 0：与并发无关的那两条（先挡掉，省一次锁）
+    _reject_split(voucher)
+
+    period = db.get(Period, voucher.period_id)
+    if period is None:
+        raise ValueError("会计期间不存在")
+
+    # ---- 锁：期间行 → 这张凭证行
+    #
+    # 期间行与 ``organize.apply_organize`` 用**同一把锁、同一个顺序**
+    # （期间粒度、按 ord 升序）：同期间的「拆分 / 插入 / 整理」因此互斥，
+    # 两个并发拆分别算出同一个号的事被挡在门外。
+    #
+    # 这张凭证行也要锁：它挡的是**并发改这一张**（``update_voucher`` 不走
+    # 期间锁）。锁到手后重新读一遍分录 —— 拆的是**当下**这一张，
+    # 不是进入函数时看到的那一份。
+    db.execute(
+        select(Period.id).where(Period.id == period.id).with_for_update()
+    ).all()
+    db.refresh(period)
+    db.execute(
+        select(Voucher.id).where(Voucher.id == voucher.id).with_for_update()
+    ).all()
+    db.refresh(voucher)
+    db.expire(voucher, ["entries"])
+
+    # ---- 闸门 1：以锁后重读的状态为准
+    _reject_split(voucher)
+    if period.locked:
+        raise ValueError(f"{period.code} 已结账，不能拆分凭证")
+
+    entries = _split_entries(voucher)
+    n = len(entries)
+    if n < 2:
+        raise ValueError(f"这张凭证只有 {n} 条分录，拆不开")
+    if at_line < 1 or at_line > n - 1:
+        raise ValueError(f"分界处必须在第 1 行到第 {n - 1} 行之间（当前 {n} 行）")
+    _assert_contiguous_line_no(entries)
+
+    first = entries[:at_line]
+    second = entries[at_line:]
+
+    t1 = _half_totals(first)
+    t2 = _half_totals(second)
+    if not (t1["balanced"] and t2["balanced"]):
+        raise ValueError(_split_message(at_line, t1, t2))
+
+    # 分录校验：末级科目 / 停用科目 / 零金额。
+    # **两半各自用自己的 legacy 计数** —— 见 ``_legacy_counter``。
+    for half in (first, second):
+        _validate_entries(
+            db, voucher.book_id,
+            [_entry_payload(e) for e in half],
+            period.year,
+            legacy_non_leaf=_legacy_counter(half),
+        )
+
+    # ---- 编号：**原凭证继承它自己的号**，新凭证往后拿一个
+    #
+    # 与「增加凭证」（position="after"）完全同一套语义与代码路径 ——
+    # ``insert_slot`` 算谁拿哪个号、谁顺延，``_apply_shift`` 两阶段改号
+    # （先写 ∥<id> 再写最终号），避开 uq_voucher_period_no 的即时唯一约束。
+    #
+    # 原凭证的号**一个字符都不动** —— 它可能已经打印、已经被引用过；
+    # 动它的是**后面**那几张（整体 +1，给新凭证腾出中间那个号）。
+    canon = svc_organize.normalize_no(voucher.voucher_no)
+    _prefix, seq = svc_organize.split_no(canon or voucher.voucher_no)
+    if seq == 0:
+        raise ValueError(
+            f"凭证号 {voucher.voucher_no} 不是「凭证字 + 序号」，"
+            "拆分要照着它顺位，请先整理凭证"
+        )
+    slot = insert_slot(db, voucher, "after")
+    no = slot["no"]
+    moving_ids = {m["id"] for m in slot["moved"]}
+
+    # 占用检查：新号此刻可能被**后面某张**占着（它马上要让位），
+    # 所以要把「待顺位的那几张」排除掉 —— 与 ``create_voucher`` 同一套写法。
+    taken = db.scalar(select(Voucher.id).where(
+        Voucher.period_id == period.id, Voucher.voucher_no == no))
+    if taken is not None and taken not in moving_ids:
+        raise ValueError(f"凭证号 {no} 在 {period.code} 已经有一张了，请改一个号")
+
+    # 拆分前的完整快照 —— 必须在顺延**之前**取：顺延会改掉后面那几张的号，
+    # 而「拆之前那张凭证长什么样」正是事后追溯时要对的那一份。
+    before_snapshot = voucher_snapshot(voucher)
+    old_no = voucher.voucher_no
+
+    # ---- 顺延（两阶段改号）。**原凭证不在其中** —— 它的号不动。
+    moved = _apply_shift(db, voucher, "after")
+
+    # ---- 原凭证只留前半段。
+    # 前半段的 line_no 本来就是 1..at_line（连续，上面查过了），不用重排；
+    # 后半段的行从关系里摘掉 → delete-orphan 级联删行。
+    for e in second:
+        voucher.entries.remove(e)
+    db.flush()
+
+    # ---- 新凭证：往后拿那个号；日期与摘要沿用；**附单据数留在原凭证**（不重复计数）。
+    created = Voucher(
+        book_id=voucher.book_id,
+        period_id=voucher.period_id,
+        voucher_no=no,
+        voucher_date=voucher.voucher_date,
+        status="UNPOSTED",
+        source=voucher.source,
+        remark=voucher.remark,
+        attachments=0,
+        created_by=user.username,
+    )
+    db.add(created)
+    db.flush()
+    payload: list[dict] = []
+    for i, e in enumerate(second, start=1):
+        row = _entry_payload(e)
+        payload.append(dict(row, line_no=i))
+        db.add(Entry(voucher_id=created.id, line_no=i, **row))
+    db.flush()
+
+    # ---- 审计三条：拆了什么、拆出来的是什么、谁让了位。
+    # 凭证号可回收复用，所以「拆之前那张长什么样」必须完整留在日志里。
+    log(
+        db,
+        action="SPLIT",
+        entity="voucher",
+        entity_id=voucher.id,
+        user=user,
+        book_id=voucher.book_id,
+        detail=f"拆分凭证 {old_no}：保留前 {at_line} 行，"
+               f"其余 {len(second)} 行拆成新凭证 {no}",
+        before=before_snapshot,
+        after=voucher_snapshot(voucher),
+    )
+    log(
+        db,
+        action="CREATE",
+        entity="voucher",
+        entity_id=created.id,
+        user=user,
+        book_id=voucher.book_id,
+        detail=f"由 {old_no} 拆分而来（带走后 {len(second)} 行）",
+        after=voucher_snapshot(created, entries=payload),
+    )
+    if moved:
+        log(
+            db,
+            action="RENAME",
+            entity="voucher",
+            entity_id=",".join(str(m["id"]) for m in moved),
+            user=user,
+            book_id=voucher.book_id,
+            detail="拆分凭证顺位：" + "、".join(
+                f"{m['from']}→{m['to']}" for m in moved),
+            before={"moved": [{k: str(v) for k, v in m.items()} for m in moved]},
+        )
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        if not _is_no_collision(exc):
+            raise
+        raise ValueError(
+            f"凭证号 {no} 在 {period.code} 已经有一张了（可能刚被另一条记录占用），"
+            "请刷新后重试") from exc
+    db.refresh(voucher)
+    return {"original": voucher, "created": created, "moved": moved}
 
 
 # --------------------------------------------------------------------- 记账

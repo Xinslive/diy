@@ -379,15 +379,19 @@ def book(db, admin_user):
     from datetime import datetime, timezone
 
     from app.accounting.periods import create_periods
+    from app.accounting.years import ensure_book_year
     from app.seed.chart_of_accounts import install_chart
 
     tag = uuid.uuid4().hex[:8]
-    b = Book(company_name=f"测试公司{tag}", name=f"账套{tag}", start_year=2026, start_month=1,
-             init_subjects_at=datetime.now(timezone.utc), init_subjects_source="CHART")
+    b = Book(company_name=f"测试公司{tag}", name=f"账套{tag}", start_year=2026, start_month=1)
     db.add(b)
     db.flush()
     create_periods(db, b)
     install_chart(db, b.id)
+    # 初始化第 1 步记在**年度账套**上（迁移 0032：状态跟着科目表下沉到年度）
+    by = ensure_book_year(db, b, 2026)
+    by.init_subjects_at = datetime.now(timezone.utc)
+    by.init_subjects_source = "CHART"
     db.add(UserBook(user_id=admin_user.id, book_id=b.id, role="OWNER"))
     db.commit()
     db.refresh(b)
@@ -412,8 +416,15 @@ def periods(db, book):
 
 @pytest.fixture
 def subjects(db, book):
+    """这个账套**启用年度**的科目表。
+
+    科目表每个年度各有一份（迁移 0032），所以这里必须圈定年度 ——
+    不圈的话，「有 2027 年的账套」会把两年的科目混在一个字典里。
+    """
     rows = db.scalars(
-        select(Subject).where(Subject.book_id == book.id).order_by(Subject.code)
+        select(Subject).where(
+            Subject.book_id == book.id, Subject.year == book.start_year
+        ).order_by(Subject.code)
     ).all()
     return {s.code: s for s in rows}
 
@@ -435,9 +446,21 @@ def make_voucher(db, book, admin_user):
     ):
         from app.accounting.vouchers import create_voucher
 
-        subs = {s.code: s for s in db.scalars(
-            select(Subject).where(Subject.book_id == book.id)
-        ).all()}
+        # **按凭证日期的年度取科目表**（科目表每个年度各有一份，迁移 0032）。
+        #
+        # 原来这里恒定取 ``book.start_year`` 那张表，于是「在 2027 年记一张
+        # 凭证」会拿着 2026 年的科目 id 去写 —— 2027 年的科目表是结转时克隆
+        # 出来的另一批行，id 根本不同，服务端按年度校验时直接判「科目不存在」。
+        # 夹具必须替测试作者做正确的选择：哪一年记账，就用哪一年的科目表。
+        when = d if isinstance(d, date) else date.fromisoformat(d)
+
+        def _subs_of(year: int) -> dict[str, Subject]:
+            return {s.code: s for s in db.scalars(
+                select(Subject).where(
+                    Subject.book_id == book.id, Subject.year == year)
+            ).all()}
+
+        subs = _subs_of(when.year)
 
         def conv(rows):
             out = []
@@ -445,7 +468,8 @@ def make_voucher(db, book, admin_user):
                 if isinstance(code, str):
                     subject = subs.get(code)
                     if subject is None:
-                        raise AssertionError(f"测试科目不存在：{code}")
+                        raise AssertionError(
+                            f"测试科目不存在：{code}（{when.year} 年度的科目表里没有）")
                     sid = subject.id
                 else:
                     sid = code
@@ -457,7 +481,7 @@ def make_voucher(db, book, admin_user):
 
         v = create_voucher(
             db, book_id=book.id, user=admin_user,
-            voucher_date=d if isinstance(d, date) else date.fromisoformat(d),
+            voucher_date=when,
             entries=entries, voucher_no=voucher_no, source=source,
             remark=remark or summary, commit=False,
         )

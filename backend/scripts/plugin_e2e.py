@@ -51,14 +51,18 @@ def main():
     with SessionLocal.begin() as db:
         users = [SysUser(username=name, password_hash=hash_password(password), active=True, is_admin=name=='plugin-admin', real_name=name) for name in ['plugin-admin','plugin-staff','plugin-other']]
         db.add_all(users); db.flush()
-        book = Book(company_name='浏览器测试公司', name='插件隔离演练账套', start_year=2026, start_month=1, init_subjects_at=datetime.now(timezone.utc), init_subjects_source='CHART')
+        book = Book(company_name='浏览器测试公司', name='插件隔离演练账套', start_year=2026, start_month=1)
         db.add(book); db.flush(); create_periods(db, book)
         install_chart(db, book.id)
+        # 初始化状态挂在**年度**上（book_year，迁移 0032）
+        by = ensure_book_year(db, book, 2026)
+        by.init_subjects_at = datetime.now(timezone.utc); by.init_subjects_source = 'CHART'
         db.add_all([UserBook(user_id=user.id, book_id=book.id, role='OWNER' if user.is_admin else 'ACCOUNTANT', sort_order=0) for user in users])
         book_id = book.id
-        other = Book(company_name='浏览器测试公司', name='切换演练账套', start_year=2026, start_month=1,
-                     init_subjects_at=datetime.now(timezone.utc), init_subjects_source='CHART')
+        other = Book(company_name='浏览器测试公司', name='切换演练账套', start_year=2026, start_month=1)
         db.add(other); db.flush(); create_periods(db, other); install_chart(db, other.id)
+        by2 = ensure_book_year(db, other, 2026)
+        by2.init_subjects_at = datetime.now(timezone.utc); by2.init_subjects_source = 'CHART'
         db.add_all([UserBook(user_id=user.id, book_id=other.id, role='OWNER' if user.is_admin else 'ACCOUNTANT', sort_order=1) for user in users])
         other_id = other.id
     processes, handles = [], []
@@ -142,6 +146,7 @@ def verify_data_and_retained_uninstall(api, start_backend, port, env, temporary,
 import sys
 from pathlib import Path
 from sqlalchemy import tuple_
+from app.accounting.years import ensure_book_year
 from app.core.db import SessionLocal
 from app.models.base import Base
 from app.backup.export import export_scope, read_snapshot, restore, SCOPE_BOOK

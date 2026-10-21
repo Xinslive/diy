@@ -244,7 +244,7 @@ def test_导出接口的合计与试算一致且与档位无关(client, auth, db
                  cr=[("1002", 100, "水电费")], posted=True)
 
     period = periods[1]
-    subjects = queries.subject_tree(db, book.id)
+    subjects = queries.subject_tree(db, book.id, book.start_year)
     rows, check = queries.balance_sheet_of_accounts(db, book.id, subjects, period, False)
     assert any(r["code"] == "5602" and not r["is_leaf"] for r in rows), "账套里没有父子结构"
 

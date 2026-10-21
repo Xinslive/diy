@@ -8,8 +8,14 @@
   靠 (company_name, name) 二元组区分。
 - **年度是账套的属性，一个账套有很多个年度。** 账上并没有「2026 的账套」
   和「2027 的账套」两个东西，只有「启明物业这套账，目前记到哪一年」。
-  科目表、权限、期初录入都跟着账套走；年度结转做的事是给同一个账套
+  科目表、权限跟着账套走；年度结转做的事是给同一个账套
   追加下一年的 12 个会计期间，并把本年期末余额写成下一年 1 月的期初。
+- **但「记账单位」是 (账套, 年度) 这一对，不只是账套。** 账套回答的是
+  「这是谁家的哪本账」，年度回答的是「这一年这本账长什么样」。
+  科目表、期初余额、初始化进度都是**年度**的属性 —— 2026 年和 2027 年
+  各有各的科目表、各有各的期初，就像挂在同一个账套名下的两个独立账套
+  （``book_year`` 就是这个「子账套」）。
+  权限仍然是**账套级**的：一个人对这套账有写权限，对它的每个年度都有。
 - 期间是「结账锁」的载体。locked=True 时数据库触发器拒绝一切凭证写入。
 - period_ord 是**账套内跨年度连续**的期间序号：
       ord = (year - start_year) * 12 + month
@@ -30,6 +36,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
@@ -61,28 +68,80 @@ class Book(Base, TimestampMixin):
     start_month: Mapped[int] = mapped_column(SmallInteger, default=1, nullable=False)
     # 科目编码规则：逐级几位，如「4-2-2-2」= 一级 4 位、二级 2 位……
     # 新增科目时按它自动接号（1002 银行存款 → 100204），并显示在新增科目的提示里。
-    # 这是账套自己的科目体系属性，所以挂在账套上而不是写死在前端。
+    #
+    # **账套级的是「默认」**（新年度建起来时继承它），**有效值在年度上**
+    # （``BookYear.subject_code_rule``）：2027 年换了一张结构完全不同的科目表，
+    # 它的接号规则就该跟着换，而 2026 年正在用的规则不该被带着一起变。
     subject_code_rule: Mapped[str] = mapped_column(String(32), default="4-2-2-2", nullable=False)
     # 保留字段：ACTIVE / CLOSED。年度结转不再新建账套，这里不再由结转改写，
     # 只留给「停用账套」这类运营语义使用。
     status: Mapped[str] = mapped_column(String(16), default="ACTIVE", nullable=False)
 
-    # ---- 初始化状态（迁移 0018）------------------------------------------
+    # 数据版本号：**由触发器维护**，应用层只读不写（迁移 0015）。
     #
-    # 初始化被显式拆成**有先后的两步**：先定科目，再录期初余额。
-    # 期初是挂在科目上的，所以顺序不是流程偏好而是数据依赖 —— 账上还没有
-    # 科目时录进来的期初挂不到任何科目上，只能整批丢掉。用户看不出这个
-    # 先后关系（科目表和期初余额是两个页面），所以状态记在账套上，由接口层拦。
+    # 任何影响聚合的写（凭证/分录/科目/期初/期间）都在同一个事务里把它 +1。
+    # `LedgerEngine` 构造时先读它、再用它当跨请求缓存的键的一部分，
+    # 于是「写提交之后开始的请求一定读到新数」成立，且多 worker 天然一致
+    # （版本号在库里，不在各进程手里）。
     #
-    # 两个时间戳而不是一张初始化表：两步天然有序、且与 book 1:1，
-    # 多一张表只是多一次 JOIN 和一套级联。
-    #
-    # **存量为空 = 还没做第 1 步。** 迁移把升级那一刻已存在的账套回填成
-    # CHART，否则新闸门会把正在用的老账套一起拦住（理由见迁移 docstring）。
-    #
-    # 「完成第 1 步」有两条路：从用友等外部系统导入科目表（IMPORT），
-    # 或确认沿用建账时系统装好的标准科目表（CHART）。两条路都算数 ——
-    # 强按第一条卡人，会把「就用标准科目表从零开始记账」的用户挡在门外。
+    # **不要在应用代码里写这个字段** —— 手写的赋值不会可靠地与写入同一事务，
+    # 而漏 bump 一次的后果是「用户改完账看到的还是旧余额」。规则见
+    # migrations/versions/0015_book_data_version.py。
+    data_version: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+
+    periods: Mapped[list["Period"]] = relationship(
+        back_populates="book", cascade="all, delete-orphan", order_by="Period.ord"
+    )
+    years: Mapped[list["BookYear"]] = relationship(
+        back_populates="book", cascade="all, delete-orphan", order_by="BookYear.year"
+    )
+
+
+class BookYear(Base, TimestampMixin):
+    """年度账套（子账套）：一个账套下的一个会计年度。
+
+    **它是真正的记账单位。** 账套（``Book``）回答「这是谁家的哪本账」，
+    年度账套回答「这一年这本账长什么样」—— 科目表、期初余额、初始化进度
+    都是**年度**的属性。2026 年和 2027 年各有各的科目表、各有各的期初，
+    就像挂在同一个账套名下的两个独立账套。
+
+    **为什么不是「年度 = 账套的一个整数列」。** 因为科目表是**一组行**
+    （``subject``），它得挂在某个东西下面。挂账套上就只有一个年度能用它；
+    挂年度上，每个年度各有一份，账套仍然只有一个（名字、单位、授权、
+    账套列表里的一行）—— 这正是用户要的东西。
+
+    **权限不在这里**，仍在账套上：一个人对这套账有写权限，对它的每个年度都有。
+
+    ---- 初始化状态（从 ``Book`` 挪下来，迁移 0032）----------------------
+    初始化被显式拆成**有先后的两步**：先定科目，再录期初余额。
+    期初是挂在科目上的，所以顺序不是流程偏好而是数据依赖 —— 账上还没有
+    科目时录进来的期初挂不到任何科目上，只能整批丢掉。用户看不出这个
+    先后关系（科目表和期初余额是两个页面），所以状态记在**年度**上，由接口层拦。
+
+    为什么必须是年度级而不是账套级：每个年度有**自己的**科目表，也就各有
+    各的「第 1 步做没做」。2026 年导入了科目表、2027 年还没导 —— 账套级的
+    状态会把 2027 一起标成「已完成」，于是 2027 年可以在**一张科目都没有**
+    的情况下录期初、记账，期初整批挂空。
+
+    「完成第 1 步」有两条路：从用友等外部系统导入科目表（IMPORT），
+    或确认沿用建账时系统装好的标准科目表（CHART）。两条路都算数 ——
+    强按第一条卡人，会把「就用标准科目表从零开始记账」的用户挡在门外。
+    """
+
+    __tablename__ = "book_year"
+    __table_args__ = (
+        UniqueConstraint("book_id", "year", name="uq_book_year"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    book_id: Mapped[int] = mapped_column(ForeignKey("book.id", ondelete="CASCADE"), nullable=False)
+    year: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 该年度的科目编码规则（新增科目时怎么接号）。建年度时从账套继承。
+    subject_code_rule: Mapped[str] = mapped_column(String(32), default="4-2-2-2", nullable=False)
+
+    # ---- 初始化状态 ----
+    # 第 1 步（定科目）完成的时间与来源。IMPORT = 导入了外部科目表；
+    # CHART = 确认沿用标准科目表。**存量为空 = 还没做第 1 步。**
     init_subjects_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -102,21 +161,7 @@ class Book(Base, TimestampMixin):
         String(16), nullable=True
     )
 
-    # 数据版本号：**由触发器维护**，应用层只读不写（迁移 0015）。
-    #
-    # 任何影响聚合的写（凭证/分录/科目/期初/期间）都在同一个事务里把它 +1。
-    # `LedgerEngine` 构造时先读它、再用它当跨请求缓存的键的一部分，
-    # 于是「写提交之后开始的请求一定读到新数」成立，且多 worker 天然一致
-    # （版本号在库里，不在各进程手里）。
-    #
-    # **不要在应用代码里写这个字段** —— 手写的赋值不会可靠地与写入同一事务，
-    # 而漏 bump 一次的后果是「用户改完账看到的还是旧余额」。规则见
-    # migrations/versions/0015_book_data_version.py。
-    data_version: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
-
-    periods: Mapped[list["Period"]] = relationship(
-        back_populates="book", cascade="all, delete-orphan", order_by="Period.ord"
-    )
+    book: Mapped["Book"] = relationship(back_populates="years")
 
 
 class Period(Base, TimestampMixin):
@@ -129,6 +174,20 @@ class Period(Base, TimestampMixin):
         # 也就无从被库层钉住。ord 本来就由 (year - start_year) * 12 + month
         # 唯一决定，加约束不会与存量数据冲突。
         UniqueConstraint("book_id", "ord", name="uq_period_book_ord"),
+        # **每个会计期间必须挂在一个已登记的年度账套上**（迁移 0032）。
+        #
+        # 这条组合外键把「期间属于哪个账套的哪一年」与「年度账套登记的是
+        # 哪个账套的哪一年」钉成同一件事：库里不可能出现一个
+        # 「账套 A 的 2027 年」却没有 A 的 2027 年度账套行。
+        #
+        # 为什么要它：科目表挂在年度上，而分录的科目必须与所在期间同年度
+        # （库层触发器 ``fn_entry_subject_year_guard``）。那个触发器要拿
+        # 「这个期间属于哪一年」当判据 —— 如果期间本身的年度可以是一句
+        # 没有对应行的空话，触发器的判据就成了空中楼阁。
+        ForeignKeyConstraint(
+            ["book_id", "year"], ["book_year.book_id", "book_year.year"],
+            name="fk_period_book_year", ondelete="CASCADE",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

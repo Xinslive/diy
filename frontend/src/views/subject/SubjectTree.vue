@@ -2,6 +2,7 @@
   <div class="page">
     <div class="toolbar no-print">
       <el-input v-model="keyword" placeholder="按编码或名称筛选" clearable style="width: 240px" />
+      <span class="muted">{{ year }} 年度科目表</span>
       <span class="muted">科目编码规则 {{ rule }}</span>
       <span v-if="isFiltering" class="muted">命中 {{ hitCount }} 个科目</span>
       <span class="spacer" />
@@ -40,7 +41,7 @@
 
     <SubjectFormDialog v-model="visible" :tree="tree" :parent-id="parentId" />
     <SubjectEditDialog v-model="editVisible" :subject="editingSubject" @saved="load" />
-    <SubjectImportDialog v-model="importVisible" @imported="onImported" />
+    <SubjectImportDialog v-model="importVisible" :year="year" @imported="onImported" />
   </div>
 </template>
 
@@ -64,6 +65,15 @@ const parentId = ref(null)
 const editVisible = ref(false)
 const editingSubject = ref(null)
 const importVisible = ref(false)
+
+/**
+ * **当前年度**。
+ *
+ * 科目表每个年度各有一份（后端迁移 0032）：2026 与 2027 各有自己的
+ * 科目表、各有自己的期初。这一页看的是顶栏选中的那一年 ——
+ * 「导入并覆盖」也只覆盖那一年，别的年度的科目表一行都不动。
+ */
+const year = computed(() => store.currentYear || store.currentBook?.latest_year || 0)
 
 const rule = computed(() => store.currentBook?.subject_code_rule || '4-2-2-2')
 
@@ -117,9 +127,11 @@ const hitCount = computed(() => {
 })
 
 async function load() {
-  if (!store.bookId) return
+  if (!store.bookId || !year.value) return
   loading.value = true
-  try { tree.value = await api.subjectTree(store.bookId) } finally { loading.value = false }
+  try {
+    tree.value = await api.subjectTree(store.bookId, { year: year.value })
+  } finally { loading.value = false }
 }
 
 function openCreate(parent = null) {
@@ -146,5 +158,6 @@ async function remove(row) {
 }
 
 onMounted(load)
-watch(() => store.bookId, load)
+// 换账套、换年度都要重取：另一个年度是**另一张**科目表
+watch(() => [store.bookId, year.value], load)
 </script>

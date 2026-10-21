@@ -9,7 +9,9 @@
     <el-alert type="warning" :closable="false" show-icon class="mb">
       <template #title>这是账套初始化 / 迁移操作</template>
       <div>
-        确认后会删除当前账套已有的全部科目，再写入文件中的科目。账套已有凭证或期初余额时，系统会拒绝覆盖。
+        确认后会删除 <b>{{ year }} 年度</b>已有的全部科目，再写入文件中的科目。
+        该年度已有凭证或期初余额时，系统会拒绝覆盖。
+        <b>别的年度不受影响</b> —— 每个年度各有一份科目表。
       </div>
     </el-alert>
 
@@ -65,7 +67,11 @@
         {{ result.blocked_reason }}
       </el-alert>
       <el-alert v-else type="success" :closable="false" show-icon class="mb">
-        文件校验通过，将删除当前 {{ result.current?.subject_count || 0 }} 个科目并导入 {{ result.total }} 个科目。
+        文件校验通过，将删除 {{ result.current?.year || year }} 年度的 {{ result.current?.subject_count || 0 }} 个科目并导入 {{ result.total }} 个科目。
+      </el-alert>
+
+      <el-alert v-if="result.remap_hint" type="warning" :closable="false" show-icon class="mb">
+        {{ result.remap_hint }}
       </el-alert>
 
       <el-table :data="previewRows" size="small" border max-height="420" class="preview-table">
@@ -133,12 +139,20 @@ const props = defineProps({
    * 传进去的科目表**覆盖的是当前那本账套 A**。
    * 后果不是「报错」，是 A 的科目表被无声地换掉、B 的初始化永远做不完。
    */
-  bookId: { type: [Number, String], default: 0 }
+  bookId: { type: [Number, String], default: 0 },
+  /**
+   * 导入到**哪一年**。
+   *
+   * 科目表每个年度各有一份（后端迁移 0032）—— 导入只覆盖这一年的科目表，
+   * 别的年度一行都不动。不传就是后端按「这个账套当前在记的那一年」处理。
+   */
+  year: { type: [Number, String], default: 0 }
 })
 const emit = defineEmits(['update:modelValue', 'imported'])
 const store = useSessionStore()
 
 const targetBookId = computed(() => Number(props.bookId) || store.bookId)
+const targetYear = computed(() => Number(props.year) || 0)
 
 const visible = computed({
   get: () => props.modelValue,
@@ -181,7 +195,7 @@ async function preview() {
   if (!file.value) return
   previewing.value = true
   try {
-    result.value = await api.previewSubjectImport(targetBookId.value, file.value)
+    result.value = await api.previewSubjectImport(targetBookId.value, file.value, targetYear.value)
     step.value = 'preview'
   } finally {
     previewing.value = false
@@ -189,9 +203,16 @@ async function preview() {
 }
 
 async function commit() {
+  const remap = result.value.current?.opening_remap
+    ? `该年度已有 ${result.value.current.opening_count} 条期初余额，导入后会按科目编码搬到新科目上；`
+      + `新科目表里没有的编码若还有余额，导入会被拒绝并列出差异。`
+    : ''
   try {
     await ElMessageBox.confirm(
-      `确认覆盖当前科目表？这会删除 ${result.value.current.subject_count} 个旧科目并导入 ${result.value.total} 个科目。该操作只适用于没有凭证和期初余额的初始化/迁移账套。`,
+      `确认覆盖 ${result.value.current.year ?? targetYear.value} 年度的科目表？`
+      + `这会删除该年度的 ${result.value.current.subject_count} 个旧科目并导入 `
+      + `${result.value.total} 个科目。${remap}`
+      + `该操作只适用于该年度还没有凭证和分录的时候。`,
       '确认覆盖导入',
       { type: 'warning', confirmButtonText: '确认覆盖', cancelButtonText: '返回检查' }
     )
@@ -200,7 +221,7 @@ async function commit() {
   }
   committing.value = true
   try {
-    committed.value = await api.importSubjects(targetBookId.value, file.value)
+    committed.value = await api.importSubjects(targetBookId.value, file.value, targetYear.value)
     step.value = 'done'
     emit('imported')
   } finally {

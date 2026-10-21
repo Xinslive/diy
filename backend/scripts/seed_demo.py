@@ -26,6 +26,7 @@ from app.accounting.periods import (  # noqa: E402
     carry_forward_profit, close_period, create_periods, ensure_periods,
 )
 from app.accounting.vouchers import create_voucher, post_vouchers  # noqa: E402
+from app.accounting.years import ensure_book_year  # noqa: E402
 from app.core.db import SessionLocal  # noqa: E402
 from app.ledger import queries  # noqa: E402
 from app.ledger.engine import LedgerEngine  # noqa: E402
@@ -141,18 +142,26 @@ def build(db, user: SysUser) -> Book:
     # 也已经有期初」的完成态。不给的话，界面上它会挂着一个「待初始化」标记，
     # 而点进去会发现第 2 步早就做完了 —— 状态与事实对不上。
     book = Book(company_name="启明物业管理有限公司", name=BOOK_NAME,
-                start_year=YEAR, start_month=1,
-                init_subjects_at=datetime.now(timezone.utc),
-                init_subjects_source="CHART",
-                init_openings_at=datetime.now(timezone.utc))
+                start_year=YEAR, start_month=1)
     db.add(book)
     db.flush()
     create_periods(db, book)
-    install_chart(db, book.id)
+    install_chart(db, book.id, YEAR)
+    # **初始化状态挂在年度上**（book_year，迁移 0032）：科目表、期初余额
+    # 都是**年度**的属性，账套上不再有那两对列。
+    # 这个脚本造的账套是「已经装好标准科目表、也已经有期初」的完成态 ——
+    # 不标上的话，界面上它会挂着一个「待初始化」标记，
+    # 而点进去会发现第 2 步早就做完了（状态与事实对不上）。
+    book_year = ensure_book_year(db, book, YEAR)
+    book_year.init_subjects_at = datetime.now(timezone.utc)
+    book_year.init_subjects_source = "CHART"
+    book_year.init_openings_at = datetime.now(timezone.utc)
     db.add(UserBook(user_id=user.id, book_id=book.id, role="OWNER"))
     db.commit()
 
-    S = {s.code: s.id for s in db.scalars(select(Subject).where(Subject.book_id == book.id)).all()}
+    # 科目表每个年度各有一份（迁移 0032）：这里要的是**本年**那张表
+    S = {s.code: s.id for s in db.scalars(select(Subject).where(
+        Subject.book_id == book.id, Subject.year == YEAR)).all()}
     periods = {p.month: p for p in
                db.scalars(select(Period).where(Period.book_id == book.id)).all()}
 
@@ -327,7 +336,7 @@ def verify(db, book: Book) -> bool:
     periods = {p.month: p for p in
                db.scalars(select(Period).where(Period.book_id == book.id,
                                                 Period.year == YEAR)).all()}
-    tree = queries.subject_tree(db, book.id)
+    tree = queries.subject_tree(db, book.id, YEAR)
     ok = True
 
     print("\n=== 自检 ===")
@@ -342,7 +351,8 @@ def verify(db, book: Book) -> bool:
     # 注意 12 月故意没结转，损益类科目（category=P）还有余额，
     # 它不属于资产/负债/权益任何一类，必须单独算进去，否则差一个月的损益。
     dec = periods[12]
-    S = {s.code: s for s in db.scalars(select(Subject).where(Subject.book_id == book.id)).all()}
+    S = {s.code: s for s in db.scalars(select(Subject).where(
+        Subject.book_id == book.id, Subject.year == YEAR)).all()}
     cl = eng.compute([s.id for s in S.values()], dec.ord)
     leaves = [s for s in S.values() if s.is_leaf]
 

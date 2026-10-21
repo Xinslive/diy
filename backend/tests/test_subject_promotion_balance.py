@@ -61,6 +61,25 @@ def _payload(**kw):
     return base
 
 
+def _sid_2027(db, book, subject_or_code) -> int:
+    """按**编码**找 2027 年那张科目表上的对应科目。
+
+    科目表每个年度各有一份（迁移 0032）：2026 的 1001 与 2027 的 1001
+    是两行不同的记录、两个 id —— 拿 2026 的 id 去读 2027 年的期初，
+    读到的永远是「没有这一行」。
+
+    入参可以是 2026 年的科目对象、它的 id，或者编码本身。
+    """
+    if isinstance(subject_or_code, int):
+        code = db.scalar(select(Subject.code).where(Subject.id == subject_or_code))
+    elif isinstance(subject_or_code, str):
+        code = subject_or_code
+    else:
+        code = subject_or_code.code
+    return db.scalar(select(Subject.id).where(
+        Subject.book_id == book.id, Subject.year == 2027, Subject.code == code))
+
+
 def _opening_2027(db, book, subject_id) -> Decimal:
     """2027 年 1 月该科目的期初 —— 读的是引擎口径（自身 + 子树），不是单行快照。"""
     row = db.scalar(select(Period).where(
@@ -83,7 +102,10 @@ def _make_child_directly(db, book, parent_id, code="10020101", name="工行-基�
     结转侧必须能自己救回来，否则这笔钱永远回不来。
     """
     s = Subject(
-        book_id=book.id, code=code, name=name, category="ASSET", direction="DEBIT",
+        # 年度必填：科目表每个年度各有一份（迁移 0032），
+        # 父节点也在同一张表上（库层护栏 fn_subject_parent_year_guard）
+        book_id=book.id, year=book.start_year,
+        code=code, name=name, category="ASSET", direction="DEBIT",
         parent_id=parent_id, level=3, is_leaf=True, carry_forward=False,
         qty_calc=False, aux_calc=False, fx_calc=False, sort_no=0,
         active=True, ext_attrs={},
@@ -227,14 +249,15 @@ def test_端到端_历史升格的余额被结转到次年(
     assert r["new_year"] == 2027
 
     db.expire_all()
-    opening = _opening_2027(db, book, bank.id)
+    opening = _opening_2027(db, book, _sid_2027(db, book, bank))
     assert opening == Decimal("1000"), (
         f"次年 100201 期初丢了余额：{opening}（应为 1000）"
         " —— 这就是 P1-1 的账务断层")
-    assert _opening_2027(db, book, child_id) == ZERO, "子科目本身没有余额"
+    assert _opening_2027(db, book, _sid_2027(db, book, child_id)) == ZERO, "子科目本身没有余额"
     # 总额守恒：借方那一侧一分不多一分不少
     assert _closing_2026(db, book, bank.id) == Decimal("1000")
-    assert _opening_2027(db, book, bank.id) == _closing_2026(db, book, bank.id)
+    assert (_opening_2027(db, book, _sid_2027(db, book, bank))
+            == _closing_2026(db, book, bank.id))
 
 
 def test_端到端_父与子都有余额时总额守恒且不重复计数(
@@ -266,15 +289,16 @@ def test_端到端_父与子都有余额时总额守恒且不重复计数(
     db.expire_all()
 
     assert _closing_2026(db, book, bank.id) == Decimal("1300")
-    assert _opening_2027(db, book, bank.id) == Decimal("1300"), (
+    assert _opening_2027(db, book, _sid_2027(db, book, bank)) == Decimal("1300"), (
         "父科目次年期初应当等于子树合计 1000+300，实际 "
-        f"{_opening_2027(db, book, bank.id)} —— 写重了或写漏了")
-    assert _opening_2027(db, book, child_id) == Decimal("300")
+        f"{_opening_2027(db, book, _sid_2027(db, book, bank))} —— 写重了或写漏了")
+    assert _opening_2027(db, book, _sid_2027(db, book, child_id)) == Decimal("300")
     # 快照行本身：父级写的是子树合计 1300
     jan27 = db.scalar(select(Period).where(
         Period.book_id == book.id, Period.year == 2027, Period.month == 1))
     own = db.scalar(select(PeriodOpening).where(
-        PeriodOpening.period_id == jan27.id, PeriodOpening.subject_id == bank.id))
+        PeriodOpening.period_id == jan27.id,
+        PeriodOpening.subject_id == _sid_2027(db, book, bank)))
     assert own is not None and own.amount == Decimal("1300"), (
         "父级快照应当是子树合计 1300（自身快照是引擎读期初的基准总额），"
         f"实际 {own.amount if own else None}")
@@ -308,7 +332,7 @@ def test_端到端_停用科目余额照样结转(
     _close_year(db, book, periods, admin_user)
     year_end_carry(db, book, admin_user, 2026, 2027)
     db.expire_all()
-    assert _opening_2027(db, book, bank.id) == Decimal("1000"), (
+    assert _opening_2027(db, book, _sid_2027(db, book, bank)) == Decimal("1000"), (
         "停用科目的期末余额没被结转过去 —— 结转选取里混进了 active 过滤")
 
 

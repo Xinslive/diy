@@ -134,23 +134,69 @@ def apply(db, groups) -> None:
     db.commit()
 
 
-def _subject_remap(db, donor: Book, main: Book) -> dict[int, int]:
-    """从账套科目 id → 主账套同名科目 id。
+def _ensure_book_year(db, book: Book, year: int) -> None:
+    """主账套必须**登记过**这个年度。
 
-    按**编码**配对，因为合并的正是「一年一个账套」的老模型：同一个单位在
-    跨年时被复制过一份科目表，编码是两边唯一稳定的对应关系。
+    期间与科目都有组合外键钉在 ``book_year(book_id, year)`` 上
+    （迁移 0032），库里不可能出现「主账套的 2027 年」却没有那一行。
     """
-    main_by_code = {
-        s.code: s for s in db.scalars(select(Subject).where(Subject.book_id == main.id)).all()
-    }
+    from app.models import BookYear
+
+    exists = db.scalar(
+        select(BookYear).where(BookYear.book_id == book.id, BookYear.year == year)
+    )
+    if exists is None:
+        db.add(BookYear(book_id=book.id, year=year,
+                        subject_code_rule=book.subject_code_rule))
+        db.flush()
+
+
+def _subject_remap(db, donor: Book, main: Book) -> dict[int, int]:
+    """从账套科目 id → 主账套科目 id。**按（年度, 编码）配对。**
+
+    为什么是（年度, 编码）而不是只按编码：科目表每个年度各有一份
+    （迁移 0032），2026 的 1001 与 2027 的 1001 是**两行不同的记录**。
+    只按编码配对，2027 年的科目会被错指到 2026 的那一行上 ——
+    于是 2027 年的期初挂到了 2026 年的科目上，账直接串了。
+
+    两种情形：
+
+    * 主账套**已经有**那一年的科目表 → 按编码配对到主账套**同一年度**的
+      同一编码；找不到同编码就**中止**（静默丢掉一条期初等于静默改数）。
+    * 主账套**还没有**那一年的科目表 → 从账套那张表**整体搬过来**
+      （``book_id`` 改成主账套，年度不变）。id 不变，remap 是恒等映射。
+      搬过来之后主账套就有了那一年的科目表 —— 这正是新模型的形状。
+    """
     remap: dict[int, int] = {}
     missing: list[str] = []
-    for s in db.scalars(select(Subject).where(Subject.book_id == donor.id)).all():
-        hit = main_by_code.get(s.code)
-        if hit is None:
-            missing.append(f"{s.code} {s.name}")
+    donor_subjects = list(
+        db.scalars(select(Subject).where(Subject.book_id == donor.id)).all()
+    )
+    by_year: dict[int, list[Subject]] = {}
+    for s in donor_subjects:
+        by_year.setdefault(s.year, []).append(s)
+
+    for year in sorted(by_year):
+        _ensure_book_year(db, main, year)
+        main_by_code = {
+            s.code: s for s in db.scalars(
+                select(Subject).where(
+                    Subject.book_id == main.id, Subject.year == year)).all()
+        }
+        if not main_by_code:
+            # 主账套还没有这一年的科目表 → 整张搬过来。
+            # 父指针不用改：被搬的父子一起搬，关系原样保留。
+            for s in by_year[year]:
+                s.book_id = main.id
+                remap[s.id] = s.id
+            db.flush()
             continue
-        remap[s.id] = hit.id
+        for s in by_year[year]:
+            hit = main_by_code.get(s.code)
+            if hit is None:
+                missing.append(f"{year} 年 {s.code} {s.name}")
+                continue
+            remap[s.id] = hit.id
     if missing:
         # 静默丢掉一条期初等于静默改数 —— 比合并不下去严重得多。
         raise SystemExit(
@@ -186,6 +232,8 @@ def _move_periods(db, donor: Book, main: Book) -> None:
     }
     for p in db.scalars(select(Period).where(Period.book_id == donor.id)
                         .order_by(Period.ord)).all():
+        # 组合外键：期间必须挂在一个**已登记的**年度账套上（迁移 0032）
+        _ensure_book_year(db, main, p.year)
         target = existing.get((p.year, p.month))
         if target is None:
             p.book_id = main.id
@@ -220,11 +268,23 @@ def _repoint_openings(db, from_period_id: int, to_period_id: int, to_book_id: in
     rows = db.execute(
         select(PeriodOpening).where(PeriodOpening.period_id == from_period_id)
     ).scalars().all()
-    present = {
-        r[0] for r in db.execute(
-            select(PeriodOpening.subject_id).where(PeriodOpening.period_id == keep_period_id)
-        ).all()
-    }
+    if keep_period_id == from_period_id:
+        # **期间整体搬过去**（目标期间就是它自己）：这几行就是「要改指的
+        # 那些行」，不能拿它们当「已存在、跳过」的依据 ——
+        # 拿自己当重复项，结果是每一条期初都被跳过，然后被下面的 delete
+        # 删掉：期初整条丢失，而且没有任何报错。
+        #
+        # 这在科目表按年度分开之后才露出来：新模型下主账套**没有**那一年
+        # 的科目表时，从账套那张表整体搬过来，remap 是**恒等映射** ——
+        # 新旧 subject_id 相同，于是每一条都撞上「重复」。
+        present: set[int] = set()
+    else:
+        present = {
+            r[0] for r in db.execute(
+                select(PeriodOpening.subject_id).where(
+                    PeriodOpening.period_id == keep_period_id)
+            ).all()
+        }
     to_insert: list[PeriodOpening] = []
     for row in rows:
         new_subject = remap.get(row.subject_id)

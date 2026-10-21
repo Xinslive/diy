@@ -198,14 +198,48 @@ CHART: list[tuple] = [
 ]
 
 
-def install_chart(db: Session, book_id: int, overwrite: bool = False) -> int:
-    """把标准科目表装入账套，返回新增科目数。"""
+def install_chart(db: Session, book_id: int, year: int | None = None,
+                  overwrite: bool = False) -> int:
+    """把标准科目表装入**某个年度**，返回新增科目数。
+
+    **科目表每个年度各有一份**（迁移 0032），所以这里必须说清楚装到哪一年。
+    ``year`` 不传时装到**账套的启用年度**（``book.start_year``）——
+    那是最常见的场景：新账套的第一张科目表。
+
+    装到别的年度（年度结转时给新年度铺一份）走
+    ``accounting.years.copy_chart``，它是从已有科目表**复制**而不是重装，
+    差别在于复制会带上用户自己的改动（停用、改名、子科目）。
+    """
+    if year is None:
+        from app.models import Book
+
+        book = db.get(Book, book_id)
+        if book is None:
+            raise ValueError(f"账套不存在: {book_id}")
+        year = book.start_year
+    else:
+        from app.models import Book
+
+        book = db.get(Book, book_id)
+        if book is None:
+            raise ValueError(f"账套不存在: {book_id}")
+
+    # **年度账套行必须先于科目存在**：subject 上有一条指向
+    # ``book_year(book_id, year)`` 的组合外键（迁移 0032），
+    # 年度没登记就插科目会得到一条「违反外键约束」的外键错误，
+    # 而它真正的原因是「这个年度还没登记」。
+    from app.accounting.years import ensure_book_year
+
+    ensure_book_year(db, book, year)
+
     if overwrite:
-        for s in db.scalars(select(Subject).where(Subject.book_id == book_id)).all():
+        for s in db.scalars(select(Subject).where(
+                Subject.book_id == book_id, Subject.year == year)).all():
             db.delete(s)
         db.flush()
 
-    existing = set(db.scalars(select(Subject.code).where(Subject.book_id == book_id)).all())
+    existing = set(db.scalars(select(Subject.code).where(
+        Subject.book_id == book_id, Subject.year == year)).all())
     count = 0
 
     def add(code, name, category, direction, carry, children, level, parent_id, sort_no):
@@ -213,7 +247,8 @@ def install_chart(db: Session, book_id: int, overwrite: bool = False) -> int:
         if code in existing:
             return None
         s = Subject(
-            book_id=book_id, code=code, name=name, category=category, direction=direction,
+            book_id=book_id, year=year, code=code, name=name, category=category,
+            direction=direction,
             carry_forward=carry, level=level, parent_id=parent_id, is_leaf=not children,
             sort_no=sort_no, active=True, ext_attrs={},
         )

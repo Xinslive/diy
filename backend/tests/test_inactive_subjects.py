@@ -84,7 +84,12 @@ def test_停用科目年度结转后次年期初仍有余额(db, book, periods, 
 
     year_end_carry(db, book, admin_user, from_year=2026, new_year=2027)
 
-    assert _opening_of(db, book, 2027, 1, target.id) == Decimal("300"), (
+    # 次年期初挂在**2027 年那张科目表**的科目上（科目表每个年度各有一份），
+    # 所以按 (账套, 年度, 编码) 找，不是拿 2026 年的 id 去查。
+    s2027 = db.scalar(select(Subject.id).where(
+        Subject.book_id == book.id, Subject.year == 2027,
+        Subject.code == target.code))
+    assert _opening_of(db, book, 2027, 1, s2027) == Decimal("300"), (
         "停用科目的期末余额没被带进次年期初 —— 次年账凭空少 300")
 
 
@@ -100,7 +105,10 @@ def test_停用科目次年账簿余额连续(db, book, periods, subjects,
 
     jan27 = db.scalar(select(Period).where(
         Period.book_id == book.id, Period.year == 2027, Period.month == 1))
-    figures = LedgerEngine(db, book.id).figures(subjects["1002"].id, jan27.ord)
+    # 2027 年那张表上的 1002（与 2026 的不是同一行）
+    s2027 = db.scalar(select(Subject.id).where(
+        Subject.book_id == book.id, Subject.year == 2027, Subject.code == "1002"))
+    figures = LedgerEngine(db, book.id).figures(s2027, jan27.ord)
     assert figures.opening == Decimal("300")
 
 
@@ -110,7 +118,7 @@ def test_停用科目次年账簿余额连续(db, book, periods, subjects,
 def test_科目树包含停用科目(db, book, subjects):
     """历史余额得在树上看得见，否则用户以为账丢了。"""
     _deactivate(db, subjects["1002"])
-    codes = {s.code for s in queries.subject_tree(db, book.id)}
+    codes = {s.code for s in queries.subject_tree(db, book.id, book.start_year)}
     assert "1002" in codes, "停用科目从科目树里消失了，历史余额在界面上查不到"
 
 

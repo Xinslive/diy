@@ -133,6 +133,31 @@ class Figures:
         return self.closing
 
 
+@dataclass(frozen=True)
+class MergedFigures:
+    """同一个**编码**在多个年度的科目表上合并出来的派生量。
+
+    科目表每个年度各有一份（迁移 0032），所以「一个科目」在这套模型里
+    不是一行、而是一个**编码在各年度的若干行**。跨年区间要把它们合成
+    一行来报，合成后的口径写在这里（见 :meth:`LedgerEngine.merge_by_code`）。
+    """
+
+    #: 代表科目：**区间最后一年**的那一行（报告的「当前年」视角）
+    subject: Subject
+    #: 期初（signed，借正贷负）
+    opening: Decimal
+    #: 区间（或当期）借方发生额
+    period_dr: Decimal
+    #: 区间（或当期）贷方发生额
+    period_cr: Decimal
+    #: 本年累计借方（**区间最后一年**那一行的口径）
+    ytd_dr: Decimal
+    #: 本年累计贷方（**区间最后一年**那一行的口径）
+    ytd_cr: Decimal
+    #: 期末（signed）
+    closing: Decimal
+
+
 @dataclass
 class LedgerEngine:
     db: Session
@@ -255,6 +280,16 @@ class LedgerEngine:
 
             self._period_map_cache = shared("periods", key).get_or_set(key, produce)
         return self._period_map_cache
+
+    def _year_of(self, ord_: int) -> int | None:
+        """某个连续期间序号属于哪个会计年度。
+
+        科目表现在每个年度各有一份，所以「全科目集」必须先定下**是哪一年**。
+        ord 是跨年度连续的，年度只能查表拿 —— 算术反推要拿 ``start_month``
+        修正（启用月不是 1 月时），写错一处余额就整体漂移。
+        """
+        period = self._period_map().get(ord_)
+        return period.year if period is not None else None
 
     def _book(self) -> Book:
         if self._book_cache is None:
@@ -608,11 +643,16 @@ class LedgerEngine:
             # 不过滤 active：这是**默认的全科目集**，报表总额、账簿汇总都走它。
             # 停用科目被排除的话，上级科目合计会偏小、报表总额会缺一块，
             # 而用户完全看不出少了什么。写路径的停用闸门在 vouchers.py。
-            subject_ids = list(
-                self.db.scalars(
-                    select(Subject.id).where(Subject.book_id == self.book_id)
-                ).all()
-            )
+            #
+            # **全科目集 = 目标期间所属年度的那一份科目表。**
+            # 科目表每个年度各有一份（迁移 0032），不圈定年度的话这里会把
+            # 2026 和 2027 的科目一起捞进来 —— 同一个编码出现两次，
+            # 报表按编码取数时哪一份生效就成了抛硬币。
+            year = self._year_of(top)
+            stmt = select(Subject.id).where(Subject.book_id == self.book_id)
+            if year is not None:
+                stmt = stmt.where(Subject.year == year)
+            subject_ids = list(self.db.scalars(stmt).all())
             # narrowed 保持 None：全科目集不等于「把 317 个 id 塞进 IN」。
             # 两者结果相同，但 IN 列表越长规划器越难选计划，而「不带科目
             # 条件」正是 ``ix_entry_subject_ord`` 首列 book_id 最擅长的形态。
@@ -690,6 +730,89 @@ class LedgerEngine:
         预热的好处是结果可控、不依赖求值顺序。
         """
         return self.compute(subject_ids, up_to_ord)
+
+    # ---------------- 跨年归并 ----------------
+
+    def merge_by_code(self, subjects: list[Subject], to_ord: int,
+                      from_ord: int | None = None) -> list[MergedFigures]:
+        """把**多个年度**的同一批编码合并成一行（跨年区间用）。
+
+        科目表每个年度各有一份（迁移 0032），于是同一个编码在 2026 与 2027
+        是**两行不同的记录、两个 id**。跨年区间（2026-12 → 2027-02）要回答的
+        是「这个编码在这段区间里怎么动的」，而两边的分录挂在**不同 id** 上
+        —— 拿 2027 的科目 id 去查 2026 的分录，一条都匹配不到，
+        区间发生额会凭空少掉 2026 那半截。
+
+        所以跨年区间按**编码**归并：
+
+        * **期初**取区间**第一年**那一行在 ``from_ord - 1`` 的期末
+          （与旧模型「一张科目表跨年连着算」的口径一致）；
+        * **发生额**是各年度该编码发生额的**和**；
+        * **期末** = 期初 + 借 − 贷；
+        * **本年累计**取区间**最后一年**那一行 ——「本年」= 报告结束所在的年，
+          与旧模型一致（旧模型里 dr_cum 也是每年 1 月归零的）；
+        * 行上的科目属性（名称、级次、方向、是否末级）取**最后一年**那一行，
+          即报告的「当前年」视角。
+
+        **只有一个年度时，这个方法与逐科目算完全等价**（归并组里只有一行），
+        所以单年查询也走它 —— 口径只有一份实现，不会出现「单年一种算法、
+        跨年另一种算法」的两套数。
+
+        **结构不一致时拒绝合并。** 同一个编码在一年是上级、一年是末级时，
+        把两边的数相加既不是这个编码的总额，也不是它的发生额，
+        而且试算平衡会**重复计数**（上级那年的数含它的下级，
+        下级又单独计一次）。这种情况宁可报错，让用户按年度分别查 ——
+        报一个说不清的数，比报一个错数更糟。
+        """
+        if not subjects:
+            return []
+
+        groups: dict[str, list[Subject]] = {}
+        for s in subjects:
+            groups.setdefault(s.code, []).append(s)
+        for members in groups.values():
+            members.sort(key=lambda s: s.year)
+
+        # ---- 结构一致性：同一编码的末级性必须一致 ----
+        for code, members in groups.items():
+            if len(members) < 2:
+                continue
+            leaves = {m.is_leaf for m in members}
+            if len(leaves) > 1:
+                detail = "、".join(
+                    f"{m.year} 年是{'末级' if m.is_leaf else '上级'}科目" for m in members)
+                raise ValueError(
+                    f"科目 {code} 在各年度的级次不一致（{detail}）—— "
+                    "跨年区间要求各年度的科目表结构一致，请按年度分别查询")
+
+        ids = [s.id for s in subjects]
+        fmap = self.compute(ids, to_ord)
+        if from_ord is None:
+            prev_map = None
+            moves = {sid: (fmap[sid].period_dr, fmap[sid].period_cr) for sid in ids}
+        else:
+            prev_map = self.compute(ids, from_ord - 1)
+            moves = self.range_movements(ids, from_ord, to_ord)
+
+        out: list[MergedFigures] = []
+        for _code, members in groups.items():
+            first, last = members[0], members[-1]
+            if prev_map is not None:
+                opening = prev_map[first.id].closing
+            else:
+                opening = fmap[first.id].opening
+            dr = sum((moves.get(m.id, (ZERO, ZERO))[0] for m in members), ZERO)
+            cr = sum((moves.get(m.id, (ZERO, ZERO))[1] for m in members), ZERO)
+            out.append(MergedFigures(
+                subject=last,
+                opening=opening,
+                period_dr=dr,
+                period_cr=cr,
+                ytd_dr=fmap[last.id].dr_cum,
+                ytd_cr=fmap[last.id].cr_cum,
+                closing=opening + dr - cr,
+            ))
+        return out
 
     def figures(self, subject_id: int, ord_: int) -> Figures:
         key = (subject_id, ord_)

@@ -31,7 +31,7 @@ from sqlalchemy import select, text
 
 from app.core.db import engine as app_engine
 from app.ledger.engine import ZERO, Figures, LedgerEngine
-from app.models import Book, Entry, ImportBatch, Period, PeriodOpening
+from app.models import Book, Entry, ImportBatch, Period, PeriodOpening, Subject
 from app.models.book import book_first_ord
 
 # 开发库：只读连接，仅用于末尾那条「真实数据上 EXPLAIN」的用例。
@@ -243,7 +243,12 @@ def test_跨年时本年累计归零且数值不变(db, book, subjects, make_vou
     ord 是跨年度连续的，2027 年 1 月（ord=13）的「本年累计」必须只算 2027 年。
     """
     from app.accounting.periods import ensure_periods
+    from app.accounting.years import copy_chart
     ensure_periods(db, book, 2027)
+    # **2027 年也要有自己的科目表**（科目表每个年度各有一份，迁移 0032）：
+    # 2027 年的凭证挂的是 2027 那张表上的科目，2026 年的 id 在 2027 年
+    # 根本不存在。
+    copy_chart(db, book.id, 2026, 2027)
     db.commit()
     per = {p.ord: p for p in db.scalars(
         select(Period).where(Period.book_id == book.id)
@@ -256,20 +261,29 @@ def test_跨年时本年累计归零且数值不变(db, book, subjects, make_vou
     make_voucher("2027-02-10", dr=[("5001", 300, "2027收入")],
                  cr=[("1001", 300, "2027收入")], posted=True)
 
-    sid = subjects["5001"].id
+    def sid_of(code, year):
+        return db.scalar(select(Subject.id).where(
+            Subject.book_id == book.id, Subject.year == year, Subject.code == code))
+
+    sid26 = sid_of("5001", 2026)
+    sid27 = sid_of("5001", 2027)
     dec26 = per[12].ord          # 2026-12
     jan27 = per[13].ord          # 2027-01 —— 归零就发生在这里
     feb27 = per[14].ord          # 2027-02
-    ids = [subjects[c].id for c in ("5001", "1001")]
+    ids = [sid_of(c, y) for y in (2026, 2027) for c in ("5001", "1001")]
 
     ref = _reference_all_periods(LedgerEngine(db, book.id), ids, feb27)
     eng = LedgerEngine(db, book.id)
     eng.batch_figures(ids, feb27)
 
-    assert eng.figures(sid, dec26).dr_cum == Decimal("700")
-    assert eng.figures(sid, feb27).dr_cum == Decimal("300"), \
+    assert eng.figures(sid26, dec26).dr_cum == Decimal("700")
+    # 2026 那张表上的科目在 2027 年的序上，本年累计必须**已经归零** ——
+    # 归零分支一旦失效，这里会变成 700。
+    assert eng.figures(sid26, feb27).dr_cum == Decimal("0"), \
+        "2026 那张表在 2027 年的本年累计没有归零"
+    assert eng.figures(sid27, feb27).dr_cum == Decimal("300"), \
         "2027 年 2 月的本年借方累计不是 300 —— 2026 年的 700 被算进来了"
-    assert eng.figures(sid, jan27).dr_cum == ZERO, "2027 年 1 月应归零"
+    assert eng.figures(sid27, jan27).dr_cum == ZERO, "2027 年 1 月应归零"
     for s in ids:
         for o in (dec26, jan27, feb27):
             _same(eng.figures(s, o), ref[(s, o)], f"跨年 subject={s} ord={o}")

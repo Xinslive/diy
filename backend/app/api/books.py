@@ -260,12 +260,15 @@ def get_book(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
 
 
 @router.get("/{book_id}/init")
-def get_book_init(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    """账套初始化进度。向导弹窗开起来时先拿它，决定第 2 步锁不锁。
+def get_book_init(book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                  year: int | None = Query(None, description="会计年度；不传取账套当前在记的那一年")):
+    """某个年度的初始化进度。向导弹窗开起来时先拿它，决定第 2 步锁不锁。
 
     只读接口：谁都能看自己账套的初始化到哪一步了，**写**那一步才要权限。
+
+    **按年度**：每个年度有自己的科目表，也就各有各的「第 1 步做没做」。
     """
-    return init_state(db, book)
+    return init_state(db, book, year)
 
 
 @router.post("/{book_id}/init/subjects/keep")
@@ -275,6 +278,7 @@ def keep_chart_subjects(
     db: Session = Depends(get_db),
     user: SysUser = Depends(get_current_user),
     _link: UserBook = Depends(require_book_write),
+    year: int | None = Query(None, description="会计年度；不传取账套当前在记的那一年"),
 ):
     """确认「沿用系统标准科目表」，也就是把初始化第 1 步标记为完成。
 
@@ -289,26 +293,30 @@ def keep_chart_subjects(
     """
     from app.accounting.audit_helper import log
     from app.accounting.initialization import subject_import_state
+    from app.accounting.years import ensure_book_year, resolve_year
 
-    counts = subject_import_state(db, book.id)
+    resolved = resolve_year(db, book, year)
+    counts = subject_import_state(db, book.id, resolved)
     if counts["subject_count"] == 0:
         raise HTTPException(
             400,
-            "账套里还没有任何科目，无法确认沿用标准科目表；"
+            f"{resolved} 年度还没有任何科目，无法确认沿用标准科目表；"
             "请先导入一份外部科目表，或新建账套让它自动装载标准科目表",
         )
-    changed = mark_subjects_ready(db, book, "CHART")
+    book_year = ensure_book_year(db, book, resolved)
+    changed = mark_subjects_ready(db, book_year, "CHART")
     if changed:
         log(db, action="INIT_SUBJECTS", entity="book", entity_id=book.id, user=user,
             book_id=book.id,
-            detail=f"初始化第 1 步：沿用系统标准科目表（{counts['subject_count']} 个科目）",
+            detail=f"{resolved} 年初始化第 1 步：沿用系统标准科目表"
+                   f"（{counts['subject_count']} 个科目）",
             before={"init_subjects_at": None, "init_subjects_source": None},
-            after={"init_subjects_at": book.init_subjects_at.isoformat(),
+            after={"init_subjects_at": book_year.init_subjects_at.isoformat(),
                    "init_subjects_source": "CHART",
+                   "year": resolved,
                    "subject_count": counts["subject_count"]})
         db.commit()
-        db.refresh(book)
-    return {"ok": True, "changed": changed, "init": init_state(db, book)}
+    return {"ok": True, "changed": changed, "init": init_state(db, book, resolved)}
 
 
 @router.post("/{book_id}/init/openings/skip")
@@ -318,6 +326,7 @@ def skip_openings(
     db: Session = Depends(get_db),
     user: SysUser = Depends(get_current_user),
     _link: UserBook = Depends(require_book_write),
+    year: int | None = Query(None, description="会计年度；不传取账套当前在记的那一年"),
 ):
     """声明「本期本来就没有期初余额」，把初始化第 2 步标记为完成。
 
@@ -333,25 +342,28 @@ def skip_openings(
     from app.accounting.audit_helper import log
     from app.accounting.initialization import (OPENINGS_SOURCE_NONE,
                                                subject_import_state)
+    from app.accounting.years import ensure_book_year, resolve_year
 
-    counts = subject_import_state(db, book.id)
+    resolved = resolve_year(db, book, year)
+    counts = subject_import_state(db, book.id, resolved)
     if counts["opening_count"] > 0:
         raise HTTPException(
             409,
-            f"账套已经有 {counts['opening_count']} 条期初余额，不能再声明「无期初余额」"
-            "（那与「把期初清空」不是一回事）",
+            f"{resolved} 年度已经有 {counts['opening_count']} 条期初余额，"
+            "不能再声明「无期初余额」（那与「把期初清空」不是一回事）",
         )
-    changed = mark_openings_ready(db, book, OPENINGS_SOURCE_NONE)
+    book_year = ensure_book_year(db, book, resolved)
+    changed = mark_openings_ready(db, book_year, OPENINGS_SOURCE_NONE)
     if changed:
         log(db, action="INIT_OPENINGS", entity="book", entity_id=book.id, user=user,
             book_id=book.id,
-            detail="初始化第 2 步：声明本期无期初余额（不导入任何期初数据）",
+            detail=f"{resolved} 年初始化第 2 步：声明本期无期初余额（不导入任何期初数据）",
             before={"init_openings_at": None, "init_openings_source": None},
-            after={"init_openings_at": book.init_openings_at.isoformat(),
-                   "init_openings_source": OPENINGS_SOURCE_NONE})
+            after={"init_openings_at": book_year.init_openings_at.isoformat(),
+                   "init_openings_source": OPENINGS_SOURCE_NONE,
+                   "year": resolved})
         db.commit()
-        db.refresh(book)
-    return {"ok": True, "changed": changed, "init": init_state(db, book)}
+    return {"ok": True, "changed": changed, "init": init_state(db, book, resolved)}
 
 
 @router.put("/{book_id}")
@@ -539,8 +551,10 @@ def get_openings(book_id: int, year: int | None = None, period_id: int | None = 
     # 不过滤 active。年度结转会把**全部末级科目**的期末余额刷成次年期初，
     # 页面却把停用科目藏起来的话，那些期初在界面上是隐形的 ——
     # 用户看到「这个科目没有期初」，实际库里有。口径必须两边一致。
+    # **科目表每个年度各有一份**（迁移 0032）：这一页摆的是「这一年」的
+    # 科目表，期初挂在这一年的科目上。拿别的年度的科目来，期初就挂空了。
     subjects = db.scalars(
-        select(Subject).where(Subject.book_id == book.id)
+        select(Subject).where(Subject.book_id == book.id, Subject.year == first.year)
         .order_by(Subject.code)
     ).all()
     saved = _openings_amounts(db, book, first, subjects)
@@ -554,7 +568,7 @@ def get_openings(book_id: int, year: int | None = None, period_id: int | None = 
         "reason": reason,
         # 初始化进度随这一份一起下发：页面上「第 1 步没做完就别录期初」
         # 那道拦截条要的就是它，单独再发一次请求没有意义
-        "init": init_state(db, book),
+        "init": init_state(db, book, first.year),
         "subjects": [
             {
                 "id": s_.id, "code": s_.code, "name": s_.name,
@@ -589,7 +603,7 @@ def export_openings(book_id: int, year: int | None = None, period_id: int | None
     # 与录入页同一口径（含停用）。导少了行，用户核对时会以为账丢了；
     # 更糟的是导出的文件再导入回来会平白少一笔。
     subjects = db.scalars(
-        select(Subject).where(Subject.book_id == book.id,
+        select(Subject).where(Subject.book_id == book.id, Subject.year == first.year,
                               Subject.is_leaf.is_(True)).order_by(Subject.code)
     ).all()
     saved = _openings_amounts(db, book, first, subjects)
@@ -614,7 +628,8 @@ def export_openings(book_id: int, year: int | None = None, period_id: int | None
 @router.post("/{book_id}/openings/parse")
 def parse_openings(book_id: int, file: UploadFile = File(...),
                    basis: str = Query("opening", pattern="^(opening|closing)$"),
-                   book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
+                   book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                   year: int | None = Query(None, description="会计年度；不传取账套当前在记的那一年")):
     """解析期初余额 Excel，**只解析不落库** —— 前端先给用户预览，确认后才写。
 
     虽然是 POST，但它**不改任何数据**：只解析出一个 preview 返回给前端。
@@ -654,7 +669,10 @@ def parse_openings(book_id: int, file: UploadFile = File(...),
     # 这一道拦的是**数据依赖**而不是流程偏好：期初挂在科目上，
     # 科目还没定下来时解析出来的每一条都挂不到账上，用户只会看到
     # 「读进来 N 条，全是『科目在本账套不存在』」。
-    reason = blocked_reason(book)
+    from app.accounting.years import ensure_book_year, resolve_year
+
+    resolved = resolve_year(db, book, year)
+    reason = blocked_reason(ensure_book_year(db, book, resolved))
     if reason:
         raise HTTPException(409, reason)
 
@@ -674,7 +692,7 @@ def parse_openings(book_id: int, file: UploadFile = File(...),
     # 造出一个「导得出来、导不回去」的坑 —— 用户只能手工改表。
     by_code, by_name = {}, {}
     for s_ in db.scalars(select(Subject).where(
-            Subject.book_id == book.id)).all():
+            Subject.book_id == book.id, Subject.year == resolved)).all():
         by_code[s_.code] = s_
         by_name[s_.name] = s_
 
@@ -716,11 +734,13 @@ def set_openings(book_id: int, payload: OpeningListIn, year: int | None = None,
     # 初始化第 1 步没做完就写不了期初，与 openings/parse 是同一道闸。
     # 两处都要：只拦解析的话，用户仍可以手一把数 POST 进来 ——
     # 而那正是最需要拦住的路径（期初一旦存歪，之后每个月都跟着歪）。
-    gate = blocked_reason(book)
-    if gate:
-        raise HTTPException(409, gate)
+    from app.accounting.years import ensure_book_year
 
     first = _openings_period(db, book, year=year, period_id=period_id)
+    book_year = ensure_book_year(db, book, first.year)
+    gate = blocked_reason(book_year)
+    if gate:
+        raise HTTPException(409, gate)
     editable, reason = _openings_editable(db, book, first)
     if not editable:
         raise HTTPException(400, reason)
@@ -744,10 +764,13 @@ def set_openings(book_id: int, payload: OpeningListIn, year: int | None = None,
     subject_ids = {item.subject_id for item in payload}
     subjects: dict[int, Subject] = {}
     if subject_ids:
+        # **只认本年度的科目。** 期初挂在科目上，科目属于哪一年，
+        # 这笔期初就属于哪一年 —— 挂到别的年度的科目上，账就串了。
         subjects = {
             s.id: s for s in db.scalars(
                 select(Subject).where(
-                    Subject.book_id == book.id, Subject.id.in_(subject_ids))
+                    Subject.book_id == book.id, Subject.year == first.year,
+                    Subject.id.in_(subject_ids))
             ).all()
         }
     planned, dr, cr = [], Decimal("0"), Decimal("0")
@@ -816,7 +839,7 @@ def set_openings(book_id: int, payload: OpeningListIn, year: int | None = None,
     #
     # 与 SET_OPENINGS 同一次事务：状态与数据要么一起成立，要么一起回滚。
     # 单独提交会出现「期初写失败了但向导显示已完成」的反过来情形。
-    first_openings = mark_openings_ready(db, book, OPENINGS_SOURCE_IMPORT)
+    first_openings = mark_openings_ready(db, book_year, OPENINGS_SOURCE_IMPORT)
     db.commit()
     # **把最新的 init 一并带回来。** keep/skip/导入科目这几个口子都这么做，
     # 只有保存期初没有 —— 于是前端只能靠「保存完再发一次 GET /init」才知道
@@ -825,7 +848,7 @@ def set_openings(book_id: int, payload: OpeningListIn, year: int | None = None,
     # 顺手带上，跨页面那条链就不用多绕一圈、也不会漏。
     return {"ok": True, "count": len(payload), "period": first.code,
             "year": first.year,
-            "init_step_done": first_openings, "init": init_state(db, book)}
+            "init_step_done": first_openings, "init": init_state(db, book, first.year)}
 
 
 @router.get("/{book_id}/periods/{period_id}/carry-forward")

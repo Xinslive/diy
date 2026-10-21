@@ -171,11 +171,19 @@ const initVisible = ref(false)
  *  直接当成没做会对着一个后端还没上线/请求失败的账套弹一条红色拦截条 —— 那是替后端下结论。
  *  真去导入/保存时后端还有一道 409 兜着，两边对不上时以后端为准。
  */
-const initBlocking = computed(() => hasInit(store.initOf(store.bookId)) && !subjectsReady(store.initOf(store.bookId)))
+/**
+ * 拦截条：这一年的第 1 步（确定科目）还没做，就不让录这一年的期初。
+ *
+ * **按年度取状态**：初始化状态是**年度**的属性（后端迁移 0032）——
+ * 2026 年做完了不代表 2027 年做完了。用错年度的话，2027 年会在
+ * 「一张科目都没有」的情况下被放进来，期初整批挂空。
+ */
+const initOfYear = computed(() => store.initOf(store.bookId, store.currentYear))
+const initBlocking = computed(() => hasInit(initOfYear.value) && !subjectsReady(initOfYear.value))
 
 /** 向导里做完第 1 步：刷新状态并把表格重读一遍 —— 科目变了，这张表已经不是刚才那张了 */
 async function onInitUpdated() {
-  await store.loadInit(store.bookId)
+  await store.loadInit(store.bookId, store.currentYear)
   await load()
 }
 
@@ -593,7 +601,7 @@ onMounted(async () => {
     router.replace({ path: '/openings' })
   }
   // 账套列表行里自带 init，但可能旧了；拉一份准的再决定要不要拦这一页
-  await store.loadInit(store.bookId)
+  await store.loadInit(store.bookId, store.currentYear)
   load()
 })
 </script>

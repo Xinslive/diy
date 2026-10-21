@@ -208,7 +208,9 @@ def test_插入被数据库拒绝时给的是人话而不是裸异常(db, book):
     """
     from types import SimpleNamespace
 
-    ghost = SimpleNamespace(id=book.id + 999999, start_year=2026, start_month=1)
+    # subject_code_rule 也要有：年度账套行（book_year）从账套继承它
+    ghost = SimpleNamespace(id=book.id + 999999, start_year=2026, start_month=1,
+                           subject_code_rule='4-2-2-2')
     with pytest.raises(ValueError, match="会计期间创建失败"):
         ensure_periods(db, ghost, 2027)
     db.rollback()

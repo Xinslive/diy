@@ -30,16 +30,32 @@ from app.models.base import Base, TimestampMixin
 
 
 class Subject(Base, TimestampMixin):
-    """会计科目。每个账套拥有独立的科目表。"""
+    """会计科目。**每个年度账套有一份独立的科目表。**
+
+    2026 年和 2027 年各有各的科目表 —— 两套行、两套 id、同一套编码。
+    这就是「挂着同一个账套名下的两个账套」在数据上的样子。
+    """
 
     __tablename__ = "subject"
     __table_args__ = (
-        UniqueConstraint("book_id", "code", name="uq_subject_book_code"),
-        Index("ix_subject_book_tree", "book_id", "parent_id", "sort_no"),
+        # 唯一键带上年度：同一套编码在两个年度各有一份，互不冲突。
+        # 少了 year 这一维，2027 年导入一张编码相同的科目表就会撞 2026 年的行。
+        UniqueConstraint("book_id", "year", "code", name="uq_subject_book_year_code"),
+        Index("ix_subject_book_year_tree", "book_id", "year", "parent_id", "sort_no"),
+        # 每个科目必须挂在一个已登记的年度账套上（迁移 0032）。
+        # 与 ``period`` 的那条组合外键同源：期间与科目都只能落在登记过的年度上。
+        ForeignKeyConstraint(
+            ["book_id", "year"], ["book_year.book_id", "book_year.year"],
+            name="fk_subject_book_year", ondelete="CASCADE",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     book_id: Mapped[int] = mapped_column(ForeignKey("book.id", ondelete="CASCADE"), nullable=False)
+    # 所属会计年度。**科目表的下沉维度** —— 同一个 (账套, 编码) 在不同年度
+    # 是两行不同的记录。引用它的分录/期初快照必须与它同年度，
+    # 库层由 ``fn_entry_subject_year_guard`` / ``fn_opening_subject_year_guard`` 把关。
+    year: Mapped[int] = mapped_column(Integer, nullable=False)
     code: Mapped[str] = mapped_column(String(32), nullable=False)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     parent_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subject.id"))

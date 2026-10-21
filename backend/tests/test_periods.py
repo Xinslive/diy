@@ -27,6 +27,19 @@ from app.models import Book, Entry, Period, PeriodOpening, Subject, Voucher
 from tests.accounting_helpers import close_any
 
 
+def _sid_of(db, book, code, year):
+    """按 (账套, 年度, 编码) 取科目 id。
+
+    科目表每个年度各有一份（迁移 0032）：2026 的 1002 与 2027 的 1002
+    是两行不同的记录、两个 id。跨年的断言必须**按编码**分别取两边的 id ——
+    拿 2026 的 id 去查 2027 年的期初，永远查不到。
+    """
+    from app.models import Subject
+
+    return db.scalar(select(Subject.id).where(
+        Subject.book_id == book.id, Subject.year == year, Subject.code == code))
+
+
 def sid(subjects, code):
     return subjects[code].id
 
@@ -607,7 +620,8 @@ def test_年度结转把本年期末写成下一年1月期初(db, book, periods,
 
     jan27 = db.scalar(select(Period).where(Period.book_id == book.id, Period.year == 2027,
                                           Period.month == 1))
-    bank = sid(subjects, "1002")
+    # 次年的期初挂在**次年那张科目表**的科目上（按编码找，不是按 id）
+    bank = _sid_of(db, book, "1002", 2027)
     opening = db.scalar(select(PeriodOpening).where(
         PeriodOpening.period_id == jan27.id, PeriodOpening.subject_id == bank))
     assert opening is not None and opening.amount == Decimal("1000")
@@ -627,7 +641,11 @@ def test_跨年后账簿连续且本年累计归零(db, book, periods, subjects,
                                           Period.month == 2))
     dec26 = db.scalar(select(Period).where(Period.book_id == book.id, Period.year == 2026,
                                           Period.month == 12))
-    bank, revenue = sid(subjects, "1002"), sid(subjects, "5001")
+    # **2026 与 2027 各有自己的科目表**（科目表每个年度各有一份，迁移 0032）：
+    # 2027 年的凭证挂的是 2027 那张表上的科目，2026 的 id 在 2027 年不存在。
+    bank26, revenue26 = sid(subjects, "1002"), sid(subjects, "5001")
+    bank = _sid_of(db, book, "1002", 2027)
+    revenue = _sid_of(db, book, "5001", 2027)
 
     create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2027, 2, 10),
                    entries=[
@@ -643,14 +661,16 @@ def test_跨年后账簿连续且本年累计归零(db, book, periods, subjects,
     eng = LedgerEngine(db, book.id)
     # ord 跨年度连续：2027-01 紧接 2026-12
     assert jan27.ord == dec26.ord + 1
-    # 期初断档是最致命的错：上一年期末必须等于下一年期初
-    assert eng.figures(bank, jan27.ord).opening == eng.figures(bank, dec26.ord).closing == Decimal("1000")
+    # 期初断档是最致命的错：上一年期末必须等于下一年期初。
+    # **跨的是两张科目表**：2026-12 的期末在 2026 那张表上，
+    # 2027-01 的期初在 2027 那张表上（年度结转按**编码**承接过来的）。
+    assert eng.figures(bank, jan27.ord).opening == eng.figures(bank26, dec26.ord).closing == Decimal("1000")
     assert eng.figures(bank, feb27.ord).closing == Decimal("1050")
     # 本年累计只在 2027 年里数：不能把 2026 年那 1000 也算进来
     assert eng.figures(bank, jan27.ord).dr_cum == Decimal("0")
     assert eng.figures(bank, feb27.ord).dr_cum == Decimal("50")
     # 2026 年的本年累计仍然是 1000
-    assert eng.figures(bank, dec26.ord).dr_cum == Decimal("1000")
+    assert eng.figures(bank26, dec26.ord).dr_cum == Decimal("1000")
 
 
 def test_年度结转把本年利润转到未分配利润(db, book, periods, subjects, admin_user, make_voucher):
@@ -661,7 +681,7 @@ def test_年度结转把本年利润转到未分配利润(db, book, periods, sub
 
     year_end_carry(db, book, admin_user)
 
-    retained = sid(subjects, "3104")
+    retained = _sid_of(db, book, "3104", 2027)
     jan27 = db.scalar(select(Period).where(Period.book_id == book.id, Period.year == 2027,
                                           Period.month == 1))
     opening = db.scalar(select(PeriodOpening).where(
@@ -702,7 +722,7 @@ def test_下一年没记账时可以再结转刷新期初(db, book, periods, sub
 
     jan27 = db.scalar(select(Period).where(Period.book_id == book.id,
                                            Period.year == 2027, Period.month == 1))
-    bank = sid(subjects, "1002")
+    bank = _sid_of(db, book, "1002", 2027)
     # 旧快照被覆盖，不会叠成两份 1000 + 3000
     rows = db.scalars(select(PeriodOpening).where(
         PeriodOpening.period_id == jan27.id, PeriodOpening.subject_id == bank)).all()
@@ -765,7 +785,7 @@ def test_下一年空期间已预建时仍结转本年(db, book, periods, subjec
                                            Period.year == 2027, Period.month == 1))
     opening = db.scalar(select(PeriodOpening).where(
         PeriodOpening.period_id == jan27.id,
-        PeriodOpening.subject_id == sid(subjects, "1002")))
+        PeriodOpening.subject_id == _sid_of(db, book, "1002", 2027)))
     assert opening is not None and opening.amount == Decimal("1000")
 
 

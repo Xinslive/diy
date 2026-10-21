@@ -25,7 +25,7 @@ from sqlalchemy import select
 from app.accounting.periods import (carry_forward_profit, close_period,
                                     year_end_carry)
 from app.ledger.engine import LedgerEngine
-from app.models import Period, PeriodOpening, Voucher
+from app.models import Period, PeriodOpening, Subject, Voucher
 from tests.accounting_helpers import close_any
 
 
@@ -54,9 +54,17 @@ def _closing(db, book, subject_id, ord_):
     return LedgerEngine(db, book.id).figures(subject_id, ord_).closing
 
 
-def _retained_opening_2027(db, book, subject_id):
+def _retained_opening_2027(db, book, code):
+    """次年 1 月期初里，这个**编码**的余额。
+
+    **按编码找，不按 id**：科目表每个年度各有一份（迁移 0032），
+    2026 的 3104 与 2027 的 3104 是**两行不同的记录、两个 id** ——
+    拿 2026 的 id 去查 2027 年的期初，永远查不到（会误判成「没结转」）。
+    """
     jan27 = db.scalar(select(Period).where(
         Period.book_id == book.id, Period.year == 2027, Period.month == 1))
+    subject_id = db.scalar(select(Subject.id).where(
+        Subject.book_id == book.id, Subject.year == 2027, Subject.code == code))
     o = db.scalar(select(PeriodOpening).where(
         PeriodOpening.period_id == jan27.id, PeriodOpening.subject_id == subject_id))
     return None if o is None else o.amount
@@ -72,7 +80,7 @@ def test_盈利年度结转后本年利润归零(db, book, periods, subjects, ad
 
     profit, retained = sid(subjects, "3103"), sid(subjects, "3104")
     assert _closing(db, book, profit, _dec26_ord(db, book)) == Decimal("0"), "盈利年度本年利润没冲平"
-    assert _retained_opening_2027(db, book, retained) == Decimal("-1000")   # 贷方，留存增加
+    assert _retained_opening_2027(db, book, "3104") == Decimal("-1000")   # 贷方，留存增加
 
 
 def test_亏损年度结转后本年利润归零(db, book, periods, subjects, admin_user, make_voucher):
@@ -92,7 +100,7 @@ def test_亏损年度结转后本年利润归零(db, book, periods, subjects, ad
     assert after == Decimal("0"), (
         f"亏损年度本年利润应冲平为 0，实际 {after}（结转前 {before}）")
     # 亏损 500 → 未分配利润借方 500
-    assert _retained_opening_2027(db, book, retained) == Decimal("500")
+    assert _retained_opening_2027(db, book, "3104") == Decimal("500")
 
 
 def test_亏损不是翻倍(db, book, periods, subjects, admin_user, make_voucher):
@@ -132,10 +140,10 @@ def test_重复年度结转是幂等的(db, book, periods, subjects, admin_user,
     _close_year(db, book, periods, admin_user)
 
     year_end_carry(db, book, admin_user, 2026, 2027)
-    first = _retained_opening_2027(db, book, sid(subjects, "3104"))
+    first = _retained_opening_2027(db, book, "3104")
 
     year_end_carry(db, book, admin_user, 2026, 2027)
-    second = _retained_opening_2027(db, book, sid(subjects, "3104"))
+    second = _retained_opening_2027(db, book, "3104")
 
     assert second == first, f"重复结转后留存收益变了：{first} → {second}"
     # 本年利润也不能被结第二次结出新的差额

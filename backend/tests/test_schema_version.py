@@ -525,6 +525,9 @@ def test_会计护栏触发器确实装上了(db):
         "trg_scheduled_task_touch",
         # 管理员二次验证挑战的更新时间戳（迁移 0030）
         "trg_admin_mfa_challenge_touch",
+        # 年度一致性：科目、分录、期初必须在同一个年度（迁移 0033）
+        "trg_entry_subject_year_guard", "trg_opening_subject_year_guard",
+        "trg_subject_parent_year_guard",
     }
     # 账套数据版本号（迁移 0015）：每张影响聚合的表三个（增/改/删）。
     # 必须是**语句级**而不是行级 —— 一次 5000 行导入用行级会对 book 行

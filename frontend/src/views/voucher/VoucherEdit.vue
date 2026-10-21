@@ -39,6 +39,12 @@
       </el-tooltip>
       <el-button :disabled="!canAdd" @click="insertVoucher">插入凭证</el-button>
       <el-button :disabled="!canAdd" @click="addVoucher">增加凭证</el-button>
+      <!-- 拆分凭证：把这一张按分录边界拆成两张。**写**动作，所以跟插入/增加
+           排在一组 —— 「打印预览」是读，不受「这张不能改」的三条限制影响，
+           排在它前面会让人以为拆也是只读的事。 -->
+      <el-tooltip :content="splitHint" placement="bottom">
+        <el-button :disabled="!canSplit" @click="openSplit">拆分凭证</el-button>
+      </el-tooltip>
       <!-- 打印是**读**，不是写：所以它不受「这张不能改」的三条限制
            （已记账 / 所在期间已结账 / 只读账号）影响，照样能点。
            后端那条接口（GET /print/vouchers.html）本来就没有写门禁，只挂
@@ -223,6 +229,16 @@
       :params="printParams"
       title="打印记账凭证"
     />
+
+    <!-- 拆分凭证：选一个分界处，把这张按前后两半分成两张。
+         拆完这一页要重载 —— 原凭证的行数少了（号不动），新凭证在后面。 -->
+    <VoucherSplitDialog
+      v-model="splitVisible"
+      :book-id="store.bookId"
+      :voucher-id="voucherId"
+      :entries="splitRows"
+      @confirm="onSplit"
+    />
   </div>
 </template>
 
@@ -245,6 +261,7 @@ import SubjectFormDialog from '@/components/SubjectFormDialog.vue'
 import AmountCells from '@/components/AmountCells.vue'
 import AmountUnits from '@/components/AmountUnits.vue'
 import PrintDialog from '@/components/PrintDialog.vue'
+import VoucherSplitDialog from '@/components/VoucherSplitDialog.vue'
 import { rafThrottle } from '@/utils/frame'
 import { Bottom, CircleCloseFilled, EditPen, Top } from '@element-plus/icons-vue'
 
@@ -431,7 +448,9 @@ async function onSubjectCreated(s) {
   activeRow.value = form.entries[subjectCreateRow.value]
 }
 async function loadSubjects() {
-  const tree = await subjectApi.subjectTree(store.bookId)
+  // **年度必带**：科目表每个年度各有一份（后端迁移 0032）——
+  // 2026 与 2027 各有自己的科目表，凭证面板要显示**正在记的那一年**那张。
+  const tree = await subjectApi.subjectTree(store.bookId, { year: store.currentYear })
   subjectTree.value = tree
   // 摊平成一条条，但**父子关系要留着**：凭证面板靠 parent_id 把科目摆成一棵树，
   // 一级一级点开，最后只让末级能选。少了 parent_id 就只剩一张平表，
@@ -1223,6 +1242,88 @@ function addVoucher() {
   })
 }
 
+// --------------------------------------------------------------------- 拆分凭证
+
+const splitVisible = ref(false)
+
+/** 这一页真正填了内容的分录 —— 拆分看的是这些，不是那几行空白的占位行。 */
+const filledRows = computed(() =>
+  form.entries.filter((e) => e.subject_id && num(e.amount)))
+
+/**
+ * 能不能拆：必须是**已落库**的凭证、这张还能改、且至少两条分录。
+ *
+ * 已记账的不能拆（数字已经进账簿），已结账期间的不能拆（那段账簿定稿了）——
+ * 这两条与「改」「删」是同一道闸，措辞也一致。
+ */
+const canSplit = computed(() =>
+  !!voucherId.value && !readonly.value && filledRows.value.length >= 2)
+
+/** 按钮灰着的时候，把为什么灰说出来 —— 灰按钮自己不会解释自己。 */
+const splitHint = computed(() => {
+  if (!voucherId.value) return '新凭证还没有落库，保存后才能拆'
+  if (posted.value) return '已记账凭证不能拆分，请到「期末结账」反结账后再拆'
+  if (locked.value) return '该凭证所在期间已结账，不能拆分'
+  if (!store.canWrite) return '这个账套是只读的，不能修改凭证'
+  if (filledRows.value.length < 2) return '至少要有两条分录才能拆'
+  return '在分录边界处把这一张拆成两张'
+})
+
+/**
+ * 弹窗里那两张小表要显示的分录。
+ *
+ * **行号按这里的顺序重排**（1..n），与库里那张凭证的 line_no 一致 ——
+ * 因为拆之前会先把没存上的改动冲掉（``flushIfDirty``），
+ * 存完之后两边的行号就是同一条数。
+ */
+const splitRows = computed(() => filledRows.value.map((e, i) => {
+  const sub = subjectOf(e.subject_id)
+  return {
+    line_no: i + 1,
+    summary: e.summary || '',
+    subject_text: sub ? `${sub.code} ${sub.name}` : '',
+    direction: e.direction,
+    amount: centsText(centsOf(e.amount))
+  }
+}))
+
+/**
+ * 打开拆分弹窗。
+ *
+ * **先把没存上的改动冲掉再开**：这一页是自动保存的，而拆的是**库里**那张凭证 ——
+ * 屏幕上的改动还没落库就拆，拆走的是旧内容，人却以为是刚改的那版。
+ */
+async function openSplit() {
+  if (!canSplit.value) return
+  if (!(await flushIfDirty())) {
+    ElMessage.warning('还有改动没存上，先存好再拆')
+    return
+  }
+  splitVisible.value = true
+}
+
+/**
+ * 拆完了：原凭证的行数少了（号不动）→ **必须重载**，否则页面上还摆着旧的。
+ *
+ * 凭证 id 没变（还是这一张），所以地址栏不用动。
+ */
+async function onSplit({ at_line }) {
+  // 用 store.bookId（与弹窗的预览、后面的重载同一个账套）：
+  // 拆的是当前账套里的这张凭证 —— 账套不对时后端会 404，不会写到别家账套去。
+  const bookId = store.bookId
+  try {
+    const r = await api.splitVoucher(bookId, voucherId.value, { at_line })
+    splitVisible.value = false
+    await load()
+    await loadNeighbour()
+    ElMessage.success(
+      `已拆成两张：${r.original.voucher_no}（保留前 ${at_line} 行）`
+      + ` 和 ${r.created.voucher_no}（带走后 ${r.created.entries.length} 行）`)
+  } catch (e) {
+    // 错误文案已经由 http 拦截器弹过了，这里不再重复报一遍
+  }
+}
+
 // 打印不直接出纸：先弹窗选模板和纸型、看预览，确认了才打。
 const printVisible = ref(false)
 const printPath = computed(() => `/books/${store.bookId}/print/vouchers.html`)
@@ -1676,7 +1777,8 @@ onMounted(async () => {
  *
  *  前一张/后一张只是换 route.params，组件不会重新挂载 —— 必须盯着 id。
  */
-watch(() => [store.bookId, store.periodId, route.params.id], async () => {
+// 换年度也要重取科目面板：另一个年度是**另一张**科目表
+watch(() => [store.bookId, store.periodId, store.currentYear, route.params.id], async () => {
   if (store.bookId !== formBookId.value) {
     resetForm()
     formBookId.value = store.bookId

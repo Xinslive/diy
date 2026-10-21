@@ -315,8 +315,8 @@ t('期初/期末切换走的是重新解析，不是换个标签', () => {
 })
 t('确认导入这一条走 API 层，不在组件里手拼路径', () => {
   assert.match(API, /export const parseOpenings = \(id, fd, basis = 'opening'\)/)
-  assert.match(API, /export const getInit = \(id\)/)
-  assert.match(API, /export const keepChartSubjects = \(id\)/)
+  assert.match(API, /export const getInit = \(id, year\)/)
+  assert.match(API, /export const keepChartSubjects = \(id, year\)/)
   assert.ok(!/openings\/parse/.test(WIZARD), '向导里又手拼了一次后端路径')
 })
 t('matched 为 0 时不许确认导入（没什么可导入的）', () => {
@@ -390,7 +390,7 @@ t('科目表导入弹窗必须能指定目标账套（向导可以对任意一�
 })
 
 t('向导自己的两个写接口都用目标账套，不用当前账套', () => {
-  assert.match(WIZARD, /api\.keepChartSubjects\(targetId\.value\)/)
+  assert.match(WIZARD, /api\.keepChartSubjects\(targetId\.value, year\.value\)/)
   assert.ok(!/keepChartSubjects\(store\.bookId/.test(WIZARD))
 })
 
@@ -402,7 +402,7 @@ console.log('== 本期没有期初余额，也得能把初始化做完 ==')
 
 t('第 2 步有第二条出口，不是只有「导入」', () => {
   assert.match(WIZARD, /本期无期初余额/)
-  assert.match(WIZARD, /api\.skipOpenings\(targetId\.value\)/)
+  assert.match(WIZARD, /api\.skipOpenings\(targetId\.value, year\.value\)/)
   assert.match(API, /skipOpenings/)
 })
 

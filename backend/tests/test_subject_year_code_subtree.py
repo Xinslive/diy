@@ -254,7 +254,10 @@ def _make_child_directly(db, book, parent_id, code, name) -> int:
     经接口建科目还会牵出 ``_assert_no_own_balance``、``is_leaf`` 派生等别的守卫。
     """
     s = Subject(
-        book_id=book.id, code=code, name=name, category="ASSET", direction="DEBIT",
+        # 年度必填：科目表每个年度各有一份（迁移 0032），
+        # 父节点也在同一张表上（库层护栏 fn_subject_parent_year_guard）
+        book_id=book.id, year=book.start_year,
+        code=code, name=name, category="ASSET", direction="DEBIT",
         parent_id=parent_id, level=3, is_leaf=True, carry_forward=False,
         qty_calc=False, aux_calc=False, fx_calc=False, sort_no=0,
         active=True, ext_attrs={},

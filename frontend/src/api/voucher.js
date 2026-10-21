@@ -17,6 +17,18 @@ export const createVoucher = (bookId, payload) => http.post(`/books/${bookId}/vo
 export const updateVoucher = (bookId, id, payload) => http.put(`/books/${bookId}/vouchers/${id}`, payload).then(r => r.data)
 export const deleteVoucher = (bookId, id) => http.delete(`/books/${bookId}/vouchers/${id}`).then(r => r.data)
 
+// ---- 拆分凭证 ----
+/**
+ * 拆分的预览：一次拿到**所有**候选分界处、两半各自的合计与能不能拆，
+ * 以及拆完之后各自的凭证号（号码口径只有后端一份，页面自己猜就一定会猜错）。
+ * **只算不改** —— 跟 /insert-preview、/organize/preview 同一个路子。
+ */
+export const splitPreview = (bookId, id) =>
+  http.get(`/books/${bookId}/vouchers/${id}/split-preview`).then(r => r.data)
+/** 执行拆分。at_line = 第一张凭证保留到第几条分录（1 基）。 */
+export const splitVoucher = (bookId, id, payload) =>
+  http.post(`/books/${bookId}/vouchers/${id}/split`, payload).then(r => r.data)
+
 // 记账 / 反记账不在这里 —— 走「期末结账」的结账与反结账（README 业务口径第 6 条）。
 // 后端 `/vouchers/post` 与 `/vouchers/unpost` 两个端点仍在（余额表等处会用），
 // 但前端没有、也不该在这里再包一层。

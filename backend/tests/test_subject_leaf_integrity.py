@@ -150,14 +150,16 @@ def test_数据库层也拦一道(db, book):
     护栏的意义就在「应用层哪天漏了」—— 这套系统的结账、凭证编辑、
     期初不可变都是靠触发器兜底的，同一思路。
     """
-    parent = Subject(book_id=book.id, code="1904", name="库里的汇总科目",
+    parent = Subject(book_id=book.id, year=book.start_year, code="1904",
+                     name="库里的汇总科目",
                      category="ASSET", direction="DEBIT", level=1,
                      is_leaf=False, carry_forward=False, qty_calc=False,
                      aux_calc=False, fx_calc=False, sort_no=0, active=True,
                      ext_attrs={})
     db.add(parent)
     db.flush()
-    db.add(Subject(book_id=book.id, code="190401", name="它的明细",
+    db.add(Subject(book_id=book.id, year=book.start_year, code="190401",
+                   name="它的明细",
                    category="ASSET", direction="DEBIT", parent_id=parent.id,
                    level=2, is_leaf=True, carry_forward=False, qty_calc=False,
                    aux_calc=False, fx_calc=False, sort_no=0, active=True,

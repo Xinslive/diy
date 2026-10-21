@@ -57,7 +57,8 @@ def _add_child(db, book, parent_code: str, code: str, name: str,
     是在**提交时**查父节点的，「插子科目却不动父节点」会被 COMMIT 拒掉。
     """
     parent = db.get(Subject, _sid(db, book, parent_code))
-    child = Subject(book_id=book.id, code=code, name=name, category=parent.category,
+    child = Subject(book_id=book.id, year=parent.year, code=code, name=name,
+                    category=parent.category,
                     direction=parent.direction, level=parent.level + 1,
                     parent_id=parent.id, sort_no=99)
     db.add(child)

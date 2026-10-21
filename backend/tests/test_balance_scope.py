@@ -45,7 +45,7 @@ def _mv(make_voucher, period):
 
 
 def _rows(db, book, period):
-    subjects = queries.subject_tree(db, book.id)
+    subjects = queries.subject_tree(db, book.id, book.start_year)
     return queries.balance_sheet_of_accounts(db, book.id, subjects, period, True)[0]
 
 

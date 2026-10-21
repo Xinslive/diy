@@ -44,7 +44,10 @@ const snapVisible = ref(false)
 const snapshot = ref(null)
 
 const typeOf = (a) => ({ CREATE: 'success', UPDATE: 'warning', DELETE: 'danger', POST: 'success',
-  UNPOST: 'info', CLOSE: 'success', UNCLOSE: 'danger', YEAR_END: 'primary' }[a] || 'info')
+  UNPOST: 'info', CLOSE: 'success', UNCLOSE: 'danger', YEAR_END: 'primary',
+  // 拆分凭证：一张拆成两张，是**改**也是**建**，所以单独给一个色 ——
+  // 不然它落到默认的 info，混在一堆日志里认不出来。
+  SPLIT: 'primary' }[a] || 'info')
 const snapshotText = computed(() => JSON.stringify(snapshot.value, null, 2))
 function show(row) { snapshot.value = { before: row.before, after: row.after }; snapVisible.value = true }
 

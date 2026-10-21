@@ -5,7 +5,7 @@ import re
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -100,6 +100,66 @@ def _lines(record: InvoiceRecord) -> list[dict[str, Any]]:
 
 def _counterparty(meta: dict[str, Any], invoice_type: str) -> str:
     return _text(meta.get("seller_name") if invoice_type == "INPUT" else meta.get("buyer_name"))
+
+
+def _year_of(db: Session, book_id: int, when: date | None) -> int:
+    """某个日期落进哪个会计年度。
+
+    找不到期间（那一天所在的年度还没开）时退回**账套当前在记的那一年** ——
+    生成凭证那一步会自己报「会计期间不存在」，这里只管把科目搬到
+    哪张表上去，不越权替它判对错。
+    """
+    from app.accounting.periods import current_accounting_year
+    from app.accounting.util import find_period
+    from app.models import Book
+
+    if when is not None:
+        period = find_period(db, book_id, when)
+        if period is not None:
+            return period.year
+    book = db.get(Book, book_id)
+    return current_accounting_year(db, book) if book is not None else 0
+
+
+def _remap_to_year(db: Session, book_id: int, year: int,
+                   subject_ids: Iterable[int]) -> tuple[dict[int, int], list[str]]:
+    """把科目按**编码**搬到目标年度的科目表上。
+
+    返回 (旧 id -> 新 id 的映射, 搬不过去的科目描述)。
+
+    ---- 为什么发票要按编码搬 --------------------------------------------
+    发票配置与规则是**账套级**的，里面存的是一个科目 id；而科目表
+    **每个年度各有一份**（迁移 0032），2026 的 2221 和 2027 的 2221
+    是两行不同的记录。于是「配好的科目」与「这张发票要记的那一年」
+    天生可能对不上。
+
+    对不上就按**编码**搬 —— 编码是同一个会计科目在两张科目表之间
+    唯一稳定的对应关系（id 跨年根本不是一回事）。搬不动（新年度的
+    科目表里没有这个编码）就把科目名报出来，让用户去把配置改掉；
+    **绝不静默把账记到别的年度的科目上**。
+
+    已经是目标年度的科目原样返回，映射是恒等的。
+    """
+    ids = {int(s) for s in subject_ids if s is not None}
+    if not ids:
+        return {}, []
+    src = db.scalars(select(Subject).where(
+        Subject.book_id == book_id, Subject.id.in_(ids))).all()
+    mapping: dict[int, int] = {s.id: s.id for s in src}
+    need = [s for s in src if s.year != year]
+    if not need:
+        return mapping, []
+    dst = db.scalars(select(Subject).where(
+        Subject.book_id == book_id, Subject.year == year)).all()
+    by_code = {s.code: s for s in dst}
+    missing: list[str] = []
+    for s in need:
+        hit = by_code.get(s.code)
+        if hit is None:
+            missing.append(f"{s.code} {s.name}")
+        else:
+            mapping[s.id] = hit.id
+    return mapping, missing
 
 
 def _ensure_leaf_subjects(db: Session, book_id: int, ids: list[int | None], label: str) -> dict[int, Subject]:
@@ -416,6 +476,27 @@ def _build_preview(
         elif invoice_type == "OUTPUT":
             entries = _output_entries(by_subject, tax, int(tax_subject_id),
                                       int(settlement_subject_id), total, summary)
+
+        # 科目表每个年度各有一份 —— 配置里存的科目 id 可能属于别的年度，
+        # 而这张发票记在哪一年由**开票日期**决定。所以按编码把科目搬到
+        # 目标年度的科目表上；搬不过去的当场报出来。
+        #
+        # 这一步放在这里而不是等生成凭证时：预览页要显示的就是最终会
+        # 记到哪个科目上，两边不一致的话用户核对的是一张不存在的凭证。
+        if entries:
+            target_year = _year_of(db, batch.book_id, issue_date)
+            mapping, missing = _remap_to_year(
+                db, batch.book_id, target_year, [int(e["subject_id"]) for e in entries])
+            if missing:
+                problems.append(
+                    f"这些科目在 {target_year} 年度的科目表里不存在，"
+                    f"无法入账：{'、'.join(missing)}。"
+                    f"请在发票设置里改成本年度的科目")
+            else:
+                entries = [
+                    {**e, "subject_id": mapping.get(int(e["subject_id"]), int(e["subject_id"]))}
+                    for e in entries
+                ]
 
         if not by_subject:
             problems.append("没有可入账的发票明细")
@@ -860,12 +941,29 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
             # 手动同步一份，免得随后的 flush 又按旧值写回去。
             record.status = "COMMITTED"
             resolution = (record.payload or {}).get("resolution") or {}
+            entries = resolution.get("entries") or []
+            # **再搬一次**：科目表每个年度各有一份，而这张凭证要记在
+            # 开票日期所在的那一年。预览时已经搬过一次，这里是权威的一遍 ——
+            # 预览到确认之间可能隔着一次年度结转，那之后科目表就不是同一张了。
+            if entries:
+                target_year = _year_of(db, batch.book_id, record.issue_date)
+                mapping, missing = _remap_to_year(
+                    db, batch.book_id, target_year, [int(e["subject_id"]) for e in entries])
+                if missing:
+                    raise ValueError(
+                        f"这些科目在 {target_year} 年度的科目表里不存在，"
+                        f"无法生成凭证：{'、'.join(missing)}。"
+                        f"请在发票设置里改成本年度的科目")
+                entries = [
+                    {**e, "subject_id": mapping.get(int(e["subject_id"]), int(e["subject_id"]))}
+                    for e in entries
+                ]
             voucher = voucher_service.create_voucher(
                 db,
                 book_id=batch.book_id,
                 user=user,
                 voucher_date=record.issue_date,
-                entries=resolution.get("entries") or [],
+                entries=entries,
                 remark=f"发票 {record.invoice_no}",
                 attachments=1,
                 source="INVOICE",

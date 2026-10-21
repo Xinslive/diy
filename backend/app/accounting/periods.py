@@ -131,14 +131,22 @@ def get_period(db: Session, book_id: int, period_id: int) -> Period:
     return p
 
 
-def _subject_by_code(db: Session, book_id: int, code: str) -> Optional[Subject]:
-    return db.scalar(select(Subject).where(Subject.book_id == book_id, Subject.code == code))
+def _subject_by_code(db: Session, book_id: int, year: int, code: str) -> Optional[Subject]:
+    """按编码取**某个年度**的科目。
+
+    年度是必填参数而不是可选项：科目表现在每个年度各有一份，
+    「1002 银行存款」在 2026 和 2027 是两行不同的记录。不带年度去取，
+    拿到的可能是另一个年度的科目 —— 而它上面挂着的分录属于另一年。
+    """
+    return db.scalar(select(Subject).where(
+        Subject.book_id == book_id, Subject.year == year, Subject.code == code))
 
 
-def _subject_by_any_code(db: Session, book_id: int, codes: tuple[str, ...]) -> Optional[Subject]:
+def _subject_by_any_code(db: Session, book_id: int, year: int,
+                         codes: tuple[str, ...]) -> Optional[Subject]:
     """按候选编码依次查找，取第一个存在的。"""
     for code in codes:
-        found = _subject_by_code(db, book_id, code)
+        found = _subject_by_code(db, book_id, year, code)
         if found is not None:
             return found
     return None
@@ -167,22 +175,26 @@ def _subject_by_any_code(db: Session, book_id: int, codes: tuple[str, ...]) -> O
 # 整体搬进本年利润 —— 钱凭空消失，而**借贷仍然平衡，系统自检抓不到**。
 # 写侧有校验（``api/subjects.py``）拦一道，读侧再按 category 过滤一次，
 # 两道都留着：写侧拦新数据，读侧兜住**修复之前就已经躺在库里**的脏标记。
-def carry_forward_subjects(db: Session, book_id: int, *,
+def carry_forward_subjects(db: Session, book_id: int, year: int, *,
                             exclude_profit: bool = True) -> list[Subject]:
     """参与结转损益的科目集合。**结转与结平校验共用这一份定义。**
 
     ``exclude_profit=True``（唯一正确的用法）把本年利润排除在外。
     传 False 只会得到一个自相矛盾的集合（本年利润会把它自己结给自己），
     留着这个参数只是为了把「排除本年利润」这件事写成显式契约。
+
+    ``year`` 是必填：科目表每个年度各有一份，结转集合必须取**被结转那个
+    期间所属年度**的科目。取错年度的话，结出来的是另一张科目表上的余额。
     """
     stmt = select(Subject).where(
         Subject.book_id == book_id,
+        Subject.year == year,
         Subject.carry_forward.is_(True),
         Subject.is_leaf.is_(True),
         Subject.category == "PROFIT",
     )
     if exclude_profit:
-        profit = _subject_by_any_code(db, book_id, PROFIT_SUBJECT_CODES)
+        profit = _subject_by_any_code(db, book_id, year, PROFIT_SUBJECT_CODES)
         if profit is not None:
             stmt = stmt.where(Subject.id != profit.id)
     return list(db.scalars(stmt.order_by(Subject.code)).all())
@@ -333,7 +345,7 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
     #
     # 不过滤 active：停用 ≠ 删除。一个挂着余额的停用损益科目若被过滤掉，
     # 就能被直接结过去 —— 期间锁了、损益却留在科目上跨年，而且没有任何报错。
-    subjects = carry_forward_subjects(db, target.book_id)
+    subjects = carry_forward_subjects(db, target.book_id, target.year)
     # 一次算到最后一期，中间每一期的中间结果都会留在缓存里
     eng.compute([s.id for s in subjects], max(p.ord for p in pending))
     unsettled = []
@@ -676,7 +688,7 @@ def carry_forward_profit(db: Session, book_id: int, period: Period,
         # 旧凭证已经 flush 掉，下面重算余额时看到的才是「未结转」的真实损益
         db.flush()
 
-    profit = _subject_by_any_code(db, book_id, PROFIT_SUBJECT_CODES)
+    profit = _subject_by_any_code(db, book_id, period.year, PROFIT_SUBJECT_CODES)
     if profit is None:
         raise ValueError(
             f"账套缺少「本年利润」科目（编码 {'、'.join(PROFIT_SUBJECT_CODES)} 都不是）"
@@ -691,7 +703,7 @@ def carry_forward_profit(db: Session, book_id: int, period: Period,
     #
     # 不过滤 active：停用的收入/费用科目如果被排除，
     # 它的本年累计就不会被结走，损益永远留在科目上，本年利润也算不对。
-    subjects = carry_forward_subjects(db, book_id)
+    subjects = carry_forward_subjects(db, book_id, period.year)
 
     # 口径：**含未记账**。账簿默认只统计已记账凭证，可反结账会把区间内的凭证
     # 全部退回未记账 —— 那一刻按已记账口径算出来的损益全是 0，
@@ -823,8 +835,9 @@ def _last_active_year(db: Session, book_id: int, periods: list[Period]) -> int:
 
 
 def _refresh_opening(db: Session, book_id: int, first: Period,
-                     fmap: dict, subjects: list[Subject]) -> int:
-    """把本年期末余额写成下一年 1 月的期初，返回写入条数。
+                     fmap: dict, src_subjects: list[Subject],
+                     dst_subjects: list[Subject]) -> int:
+    """把本年期末余额按**编码**搬进下一年 1 月的期初，返回写入条数。
 
     「刷新」而不是「叠加」：期初是一次快照，重写就重写。
     这里刻意允许**覆盖**已存在的期初 —— 财务上最常见的动作就是
@@ -834,7 +847,23 @@ def _refresh_opening(db: Session, book_id: int, first: Period,
     但只要下一年已经记了账，就不能动它的期初：
     那时的期初已经被凭证引用，硬改会让已记账的凭证和新期初对不上。
 
-    ``subjects`` 必须覆盖**所有有余额的科目**，包括非末级的（审计 P1-1）。
+    ---- 按编码搬，而不是按 id --------------------------------------------
+    **为什么必须按编码。** 年度之间是**两套不同的科目行**：2026 的 1002 和
+    2027 的 1002 是两行记录、两个 id（科目表下沉到年度就是这个意思）。
+    id 之间没有任何对应关系，而**编码是唯一稳定的业务键** —— 它是
+    「同一个会计科目」在两张科目表之间的对应关系。
+
+    按 id 搬是搬不过去的：上一年的 id 在新年度根本不存在。
+
+    ---- 搬不动就拒绝 ---------------------------------------------------
+    余额非零、而在新年度科目表里找不到同编码科目 —— **拒绝结转**，
+    把差异列给用户。静默丢弃的后果是「钱凭空消失，而借贷仍然平衡，
+    系统自检查不出来」：那正是这个系统反复强调的头号风险。
+
+    余额为零的科目对不上**不拦**：那只是科目表改了（停用了一个空科目），
+    没有钱会丢。
+
+    ``src_subjects`` 必须覆盖**所有有余额的科目**，包括非末级的（审计 P1-1）。
     金额直接取 ``fmap[sid].closing`` —— 那是**子树聚合后**的余额
     （``ledger/engine`` 把分录上卷到各级父科目），不是「这个科目自己那一份」。
     一个科目自己的快照是该科目的**基准总额**，下级只补增量，
@@ -850,17 +879,38 @@ def _refresh_opening(db: Session, book_id: int, first: Period,
             f"{first.year} 年已经有 {used} 张凭证，不能再刷新期初余额。"
             f"要改 {first.year - 1} 年的数，请先反结账并处理掉 {first.year} 年的凭证。")
 
+    # 先配对再动数据：对不上的要在**任何写入之前**就报出来。
+    dst_by_code = {s.code: s for s in dst_subjects}
+    pairs: list[tuple[Subject, Decimal]] = []
+    missing: list[str] = []
+    for s in src_subjects:
+        amount = fmap[s.id].closing
+        if amount == ZERO:
+            continue        # 没有钱要对不上：科目表改了空科目，不拦
+        dst = dst_by_code.get(s.code)
+        if dst is None:
+            missing.append(f"  {s.code} {s.name} 余额 {amount}")
+            continue
+        pairs.append((dst, amount))
+
+    if missing:
+        raise ValueError(
+            f"{first.year} 年的科目表和 {first.year - 1} 年对不上，"
+            f"有余额的科目在新年度找不到同编码科目，余额搬不过去：\n"
+            + "\n".join(missing)
+            + "\n请先在 "
+            f"{first.year} 年的科目表里补上这些编码（或把它们的余额清零），再重新结转。"
+            "直接结转会让这笔钱凭空消失 —— 而借贷仍然平衡，系统自检查不出来。"
+        )
+
     # 重写而不是叠加：先清掉这一期旧的快照
     db.query(PeriodOpening).filter(PeriodOpening.period_id == first.id).delete(
         synchronize_session=False)
 
     count = 0
-    for s in subjects:
-        amount = fmap[s.id].closing
-        if amount == ZERO:
-            continue
+    for dst, amount in pairs:
         db.add(PeriodOpening(book_id=book_id, period_id=first.id,
-                             subject_id=s.id, amount=amount))
+                             subject_id=dst.id, amount=amount))
         count += 1
     return count
 
@@ -888,10 +938,19 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
     正确做法：年度只是账套的一个属性。结转要做的是
       1) 结转本年利润（落在本年 12 月）
       2) 追加下一年的 12 个会计期间，ord 接着往下排
-      3) 把本年期末余额写成下一年 1 月的期初快照
-    科目表、授权、期初录入都不用动 —— 它们本来就是账套的属性。
+      3) **给新年度一份自己的科目表**（还没有就复制本年度的）
+      4) 把本年期末余额**按编码**搬成下一年 1 月的期初快照
+
+    ---- 第 3、4 步为什么是「年度」而不是「账套」------------------------
+    科目表现在挂在**年度账套**上（``book_year``）：2026 和 2027 各有一份。
+    于是跨年结转不再是把同一行科目换个期间记一下，而是**把余额搬过两张
+    科目表** —— 编码是唯一稳定的对应关系（id 跨年根本不是一回事）。
+
+    搬不动（余额非零、但新年度没有同编码科目）就**拒绝结转**并列出差异，
+    见 ``_refresh_opening``。
     """
     from app.accounting.vouchers import create_voucher, post_vouchers
+    from app.accounting.years import copy_chart, subjects_of
 
     periods = list(
         db.scalars(select(Period).where(Period.book_id == book.id).order_by(Period.ord)).all()
@@ -928,8 +987,8 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
     #    这张凭证必须落在本年最后一个月，若该期已结账则先解锁再补做 ——
     #    年度结转是一键动作，不该要求用户手动反结账一次。
     unlocked_for_carry = False
-    profit = _subject_by_any_code(db, book.id, PROFIT_SUBJECT_CODES)
-    retained = _subject_by_any_code(db, book.id, RETAINED_SUBJECT_CODES)
+    profit = _subject_by_any_code(db, book.id, current_year, PROFIT_SUBJECT_CODES)
+    retained = _subject_by_any_code(db, book.id, current_year, RETAINED_SUBJECT_CODES)
     if profit and retained:
         eng = LedgerEngine(db, book.id)
         bal = eng.figures(profit.id, last.ord).closing
@@ -987,7 +1046,21 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
     # 2. 追加下一年的会计期间（ord 跨年度连续，接着往下排）
     new_periods = ensure_periods(db, book, target_year)
 
-    # 3. 下一年 1 月的期初 = 本年期末
+    # 3. 给新年度一份**自己的**科目表
+    #
+    #   · 新年度还没有科目表 → **复制本年度的**（新账套的初始科目表通常
+    #     和旧账套一样，之后各自演化；用户想换成别的随时可以覆盖导入，
+    #     只要新年度还没凭证也没期初，覆盖就是放行的）。
+    #   · 新年度已经有科目表 → **不动**。那是用户自己导入的，
+    #     复制一遍等于把用户刚做的工作抹掉。
+    src_subjects = subjects_of(db, book.id, current_year)
+    dst_subjects = subjects_of(db, book.id, target_year)
+    copied = 0
+    if not dst_subjects:
+        copied = copy_chart(db, book.id, current_year, target_year)
+        dst_subjects = subjects_of(db, book.id, target_year)
+
+    # 4. 下一年 1 月的期初 = 本年期末（**按编码**搬过两张科目表）
     eng = LedgerEngine(db, book.id)
     # **审计 P2-08**：这里原来带 Subject.active 过滤，于是停用科目的期末余额
     # 不会被写进次年期初 ——「停用」这个本该安全的操作变成了账务断层，
@@ -1008,18 +1081,36 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
     # 各级父科目），父级自己那一份钱自然含在里面。
     # 「父子各写一条同额快照会不会被算两遍」不会 —— 引擎读期初时以自身
     # 快照为基准、下级只补增量，见 ``LedgerEngine._roll_up_openings``。
-    subjects = db.scalars(select(Subject).where(Subject.book_id == book.id)).all()
-    fmap = eng.compute([s.id for s in subjects], last.ord)
+    #
+    # **只算本年度的科目**：上一年度的科目是另一批行（另一个年度的科目表），
+    # 把它们也算进来会得到一堆搬不过去的余额。
+    fmap = eng.compute([s.id for s in src_subjects], last.ord)
 
     first = new_periods[0]
-    refreshed = _refresh_opening(db, book.id, first, fmap, subjects)
-    count = refreshed
+    count = _refresh_opening(db, book.id, first, fmap, src_subjects, dst_subjects)
+
+    # **新年度的初始化状态**：第 1 步（定科目）已由 copy_chart 标好
+    # （目标年度本来就有自己的科目表的话，它早就是好的）；第 2 步（期初）
+    # 现在也做完了 —— 期初就是上面承接过来的那一份。
+    #
+    # 不标的话，新年度会一直挂在「初始化没做完」上：向导每进一次就催一次，
+    # 而期初接口还会以「该年度还没完成初始化第 1 步」把这一年的期初挡下来
+    # —— **明明账上已经有数了**。
+    from app.accounting.initialization import (OPENINGS_SOURCE_CARRY,
+                                               mark_openings_ready)
+    from app.accounting.years import ensure_book_year
+
+    mark_openings_ready(db, ensure_book_year(db, book, target_year),
+                        OPENINGS_SOURCE_CARRY)
+
     log(db, action="YEAR_END", entity="book", entity_id=book.id, user=user,
         book_id=book.id,
-        detail=f"年度结转：{current_year} → {target_year}，结转 {count} 条期初余额")
+        detail=f"年度结转：{current_year} → {target_year}，"
+               f"复制科目表 {copied} 条，结转 {count} 条期初余额")
     if commit:
         db.commit()
     return {"book_id": book.id, "new_year": target_year, "carried_subjects": count,
+            "copied_subjects": copied,
             "first_period": first.code, "unlocked_for_carry": unlocked_for_carry}
 
 
@@ -1046,6 +1137,25 @@ def ensure_periods(db: Session, book: Book, year: int) -> list[Period]:
        **不会把调用方（年度结转）已经做的工作一起回滚**。
     """
     db.execute(select(Book.id).where(Book.id == book.id).with_for_update())
+
+    # **年度账套行必须先于期间存在**（迁移 0032）：period 上有一条指向
+    # book_year(book_id, year) 的组合外键，没有对应年度行就插不进期间。
+    # 顺序反了会得到一条「违反外键约束」的 IntegrityError，而它真正的
+    # 原因是「年度还没登记」。
+    from app.accounting.years import ensure_book_year
+
+    try:
+        # **这一步也要在 savepoint 里面**：账套本身不存在时，登记年度账套
+        # 会先被外键拒绝。在 savepoint 外面的话，那条裸 IntegrityError 会
+        # 直接甩到接口层变成 500 —— 而这里本该给的是一句人话
+        # （账套不存在是参数错，不是服务器炸了）。
+        with db.begin_nested():
+            ensure_book_year(db, book, year)
+    except IntegrityError:
+        raise ValueError(
+            f"{year} 年的会计期间创建失败：年度账套登记被数据库拒绝"
+            f"（账套 {book.id}）。请确认该账套存在。"
+        )
 
     rows = list(
         db.scalars(

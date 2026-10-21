@@ -166,6 +166,7 @@ def test_VIEWER_调用每个账套写接口都被拒(client, db, book, plain_use
         ("批量记账", "POST", f"/api/books/{book.id}/vouchers/post", {"ids": [vid]}),
         ("批量反记账", "POST", f"/api/books/{book.id}/vouchers/unpost", {"ids": [vid]}),
         ("批量删除", "POST", f"/api/books/{book.id}/vouchers/batch-delete", {"ids": [vid]}),
+        ("拆分凭证", "POST", f"/api/books/{book.id}/vouchers/{vid}/split", {"at_line": 1}),
         ("整理凭证", "POST", f"/api/books/{book.id}/vouchers/organize", {}),
         ("提交导入", "POST", f"/api/books/{book.id}/vouchers/import/999999/commit", None),
         ("作废导入", "POST", f"/api/books/{book.id}/vouchers/import/999999/discard", None),

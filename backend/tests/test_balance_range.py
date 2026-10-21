@@ -20,7 +20,12 @@ from app.ledger import queries
 
 
 def _rows(db, book, to_period, from_period=None, include_unposted=True):
-    subjects = queries.subject_tree(db, book.id)
+    # **跨年区间要取区间涉及的所有年度的科目表**（并集）——
+    # 科目表每个年度各有一份（迁移 0032），只取止期那一张的话，
+    # 区间发生额会少掉起始年那半截。接口层走的是同一个取数口
+    # （``queries.subjects_for_periods``）。
+    subjects = queries.subjects_for_periods(
+        db, book.id, [from_period, to_period] if from_period else [to_period])
     rows, check = queries.balance_sheet_of_accounts(
         db, book.id, subjects, to_period, include_unposted, from_period=from_period)
     return {r["code"]: r for r in rows}, check
@@ -148,7 +153,7 @@ def test_余额表与总账问同一段区间_答案一样(db, book, make_vouche
     _mv(make_voucher, periods[1], [("1002", 111, 0), ("4001", 0, 111)])
     _mv(make_voucher, periods[2], [("1002", 222, 0), ("4001", 0, 222)])
 
-    subjects = queries.subject_tree(db, book.id)
+    subjects = queries.subject_tree(db, book.id, periods[3].year)
     bal, _ = queries.balance_sheet_of_accounts(
         db, book.id, subjects, periods[3], True, from_period=periods[1])
     gen = queries.general_ledger(

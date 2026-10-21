@@ -35,7 +35,7 @@ def _row(rows, subject_id):
 
 
 def _ledger(db, book, periods, subjects, from_month, to_month):
-    tree = queries.subject_tree(db, book.id)
+    tree = queries.subject_tree(db, book.id, book.start_year)
     return queries.general_ledger(
         db, book.id, tree, periods[from_month], periods[to_month], False)
 
@@ -216,7 +216,7 @@ def test_首期启用月不是一月时同样成立(db, admin_user):
     voucher("2026-04-10", 100)
     voucher("2026-06-10", 200)
 
-    rows = queries.subject_tree(db, book.id)
+    rows = queries.subject_tree(db, book.id, book.start_year)
     row = _row(queries.general_ledger(
         db, book.id, rows, by_month[4], by_month[6], False), subs["1001"])
     assert (row["opening"], row["period_debit"], row["closing"]) == (

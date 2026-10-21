@@ -53,7 +53,7 @@ def _seed(make_voucher, months=(1, 2, 3, 5, 6, 8)):
 
 def test_总账一页只跑一次全账聚合(db, book, periods, subjects, make_voucher):
     _seed(make_voucher)
-    tree = queries.subject_tree(db, book.id)
+    tree = queries.subject_tree(db, book.id, book.start_year)
 
     with _statements() as stmts:
         rows = queries.general_ledger(
@@ -73,7 +73,7 @@ def test_首年区间也只跑一次全账聚合(db, book, periods, subjects, ma
     这里会变成 compute(to) + range(to) + compute(from-1) 三次全账扫描。
     """
     _seed(make_voucher)
-    tree = queries.subject_tree(db, book.id)
+    tree = queries.subject_tree(db, book.id, book.start_year)
 
     with _statements() as stmts:
         queries.general_ledger(db, book.id, tree, periods[1], periods[6], False)

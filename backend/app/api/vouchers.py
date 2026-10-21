@@ -20,7 +20,7 @@ from decimal import Decimal
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -757,6 +757,65 @@ def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = 
         .order_by(Voucher.voucher_date, Voucher.id).limit(1)
     )
     return {"prev_id": prev_id, "next_id": next_id, "scope": "period", "index": None, "total": None}
+
+
+# ===================================================================== 拆分凭证
+
+
+class SplitIn(BaseModel):
+    """拆分的入参。
+
+    ``at_line`` = 第一张凭证保留到第几条分录（1 基）。也就是「在第 N 条分录
+    之后切一刀」——前半张留在原凭证，后半张另起一张新凭证。
+
+    下限 1 在这里挡；上限（分录数 - 1）只有服务端知道，由服务层判。
+    """
+    at_line: int = Field(ge=1)
+
+
+@router.get("/{voucher_id}/split-preview")
+def split_preview(voucher_id: int, book: Book = Depends(get_my_book),
+                  db: Session = Depends(get_db),
+                  _link: UserBook = Depends(require_book_write),
+                  user: SysUser = Depends(get_current_user)):
+    """拆分的预览：所有候选分界处、两半各自平不平、拆完各拿哪个号。**只算不改**。
+
+    跟 ``/insert-preview``、``/organize/preview`` 同一个道理：号码口径只有
+    后端一份，页面自己猜就一定会猜错；而拆分会改掉原凭证及后面同期的号，
+    先看清再确认。
+    """
+    v = db.get(Voucher, voucher_id)
+    if v is None or v.book_id != book.id:
+        raise HTTPException(404, "凭证不存在")
+    try:
+        return svc.split_preview(db, v)
+    except (ValueError, ArithmeticError) as e:
+        raise HTTPException(400, str(e))
+
+
+@router.post("/{voucher_id}/split")
+def split(voucher_id: int, payload: SplitIn, book: Book = Depends(get_my_book),
+          db: Session = Depends(get_db), _link: UserBook = Depends(require_book_write),
+          user: SysUser = Depends(get_current_user)):
+    """在第 ``at_line`` 条分录之后把一张凭证拆成两张。
+
+    两张各自必须借贷平衡；有一张不平就拆不成（400，且把两边的差额说清楚）。
+    **原凭证继承它自己的号**，新凭证往后拿一个（= 原号 +1），后面同期的号顺延 +1。
+    """
+    v = db.get(Voucher, voucher_id)
+    if v is None or v.book_id != book.id:
+        raise HTTPException(404, "凭证不存在")
+    try:
+        result = svc.split_voucher(db, v, user, payload.at_line)
+    except (ValueError, ArithmeticError) as e:
+        db.rollback()
+        raise HTTPException(400, str(e))
+    subs = _book_subjects(db, book.id)
+    return {
+        "original": _serialize(db, result["original"], subs),
+        "created": _serialize(db, result["created"], subs),
+        "moved": result["moved"],
+    }
 
 
 @router.get("/{voucher_id}")

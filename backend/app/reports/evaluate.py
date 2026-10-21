@@ -88,9 +88,14 @@ class ReportContext:
         # 写后必须换实例），所以同一次求值里共用一个实例、把查询次数压到常数。
         self.eng = LedgerEngine.for_ledger(db, book.id, include_unposted)
         self.eng_pf = LedgerEngine.for_report(db, book.id, include_unposted)
+        # 公式里 ``科目()`` 只认**编码**，而编码在每个年度各有一份科目表。
+        # 所以这里必须圈定**这张报表所属期间的那个年度** ——
+        # 否则 2026 和 2027 的「1002」会挤进同一个字典，
+        # 后写入的那份覆盖前一份，报表金额取到哪张表全看运气。
         self.subjects = {
             s.code: s
-            for s in db.scalars(select(Subject).where(Subject.book_id == book.id)).all()
+            for s in db.scalars(select(Subject).where(
+                Subject.book_id == book.id, Subject.year == period.year)).all()
         }
         # _orient 要按方向取正数，而公式里只拿得到 subject_id。
         # 一次性建好 id -> Subject 的索引：以前每格都 db.get() 一次，

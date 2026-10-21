@@ -84,22 +84,26 @@ def _tree(rows: list[Subject], current_year_activity: set[int] | None = None) ->
 
 @router.get("")
 def list_subjects(book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-                  include_inactive: bool = Query(False)):
+                  include_inactive: bool = Query(False),
+                  year: int | None = Query(None, description="会计年度；不传取账套当前在记的那一年")):
     """include_inactive=true 时连停用科目一起返回：编辑老凭证时，
     老凭证上挂的那个科目可能已经停用，不返回的话格子里就空了。"""
-    stmt = select(Subject).where(Subject.book_id == book.id)
-    if not include_inactive:
-        stmt = stmt.where(Subject.active.is_(True))
-    rows = list(db.scalars(stmt.order_by(Subject.code)).all())
+    from app.accounting.years import resolve_year, subjects_of
+
+    resolved = resolve_year(db, book, year)
+    rows = subjects_of(db, book.id, resolved, include_inactive=include_inactive)
     # 「本年」= **账套当前在记的那个会计年度**（审计 P2-5）。
     # 以前这里用服务器当前日历年 + 连接会话时区（UTC）：北京时间的跨年
     # 8 小时窗口里算的是上一年，给老账套补录旧年度时算的也是错的年份。
-    year = current_accounting_year(db, book)
+    #
+    # **现在这一栏是「这一份科目表所属的年度」**：科目表每个年度各有一份，
+    # 2027 年那张表上的科目在 2027 年有发生额，在 2026 年没有 —— 判据
+    # 必须跟着「正在看哪一年的科目表」走。
     current_year_activity = set(db.scalars(
         select(Entry.subject_id)
         .join(Period, and_(Period.book_id == Entry.book_id, Period.ord == Entry.period_ord))
         .where(Entry.book_id == book.id,
-               Period.year == year,
+               Period.year == resolved,
                Entry.amount != 0)
         .distinct()
     ).all())
@@ -111,11 +115,14 @@ def flat_subjects(book: Book = Depends(get_my_book), db: Session = Depends(get_d
                   include_parents: bool = Query(
                       False, description="是否连上级科目一起返回。报表公式可以引用"
                                          "上级科目并自动汇总其下所有末级；凭证录入、"
-                                         "发票制证这些地方仍然只要末级。")):
-    stmt = select(Subject).where(Subject.book_id == book.id, Subject.active.is_(True))
+                                         "发票制证这些地方仍然只要末级。"),
+                  year: int | None = Query(None, description="会计年度；不传取账套当前在记的那一年")):
+    from app.accounting.years import resolve_year, subjects_of
+
+    resolved = resolve_year(db, book, year)
+    rows = subjects_of(db, book.id, resolved, include_inactive=False)
     if not include_parents:
-        stmt = stmt.where(Subject.is_leaf.is_(True))
-    rows = db.scalars(stmt.order_by(Subject.code)).all()
+        rows = [s for s in rows if s.is_leaf]
     return [{"id": s.id, "code": s.code, "name": s.name, "direction": s.direction,
              "level": s.level, "category": s.category, "is_leaf": s.is_leaf,
              "carry_forward": s.carry_forward,
@@ -124,17 +131,26 @@ def flat_subjects(book: Book = Depends(get_my_book), db: Session = Depends(get_d
 
 @router.get("/frequent")
 def frequent_subjects(book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-                      limit: int = Query(20, ge=1, le=100)):
+                      limit: int = Query(20, ge=1, le=100),
+                      year: int | None = Query(None, description="会计年度；不传取账套当前在记的那一年")):
     """最常用的末级科目：按这张账里已录入的分录数排。
 
     凭证录入时同一个科目一天要按几十次，摆在第一屏比让人去搜快得多。
     柠檬云这一栏叫「AI推荐」，我们没有模型，就用真实使用频次顶上 ——
     它比任何推荐算法都更贴近这个人、这套账自己的记账习惯。
+
+    **按年度统计**：分录挂在各年自己的科目上，2026 年用得多的科目
+    对 2027 年没有参考价值（那张表可能是新换的）。
     """
+    from app.accounting.years import resolve_year
+
+    resolved = resolve_year(db, book, year)
     rows = db.execute(
         select(Entry.subject_id, func.count().label("n"))
         .join(Subject, Subject.id == Entry.subject_id)
-        .where(Entry.book_id == book.id, Subject.active.is_(True))
+        .join(Period, and_(Period.book_id == Entry.book_id, Period.ord == Entry.period_ord))
+        .where(Entry.book_id == book.id, Subject.active.is_(True),
+               Period.year == resolved)
         .group_by(Entry.subject_id)
         .order_by(func.count().desc(), Entry.subject_id)
         .limit(limit)
@@ -154,8 +170,8 @@ def frequent_subjects(book: Book = Depends(get_my_book), db: Session = Depends(g
     return out
 
 
-def _subject_import_state(db: Session, book_id: int) -> dict:
-    """能不能覆盖导入科目表。
+def _subject_import_state(db: Session, book_id: int, year: int) -> dict:
+    """能不能覆盖导入**这个年度**的科目表。
 
     实现搬到了 ``app.accounting.initialization`` —— 初始化状态要用同一份计数，
     两边各查一遍的话，「账套列表说能导入、点进去说不能」这种不一致迟早出现。
@@ -163,7 +179,7 @@ def _subject_import_state(db: Session, book_id: int) -> dict:
     """
     from app.accounting.initialization import subject_import_state
 
-    return subject_import_state(db, book_id)
+    return subject_import_state(db, book_id, year)
 
 
 def _parse_subject_upload(file: UploadFile, data: bytes | None = None) -> tuple[dict, str]:
@@ -192,8 +208,11 @@ def preview_subject_import(
     book: Book = Depends(get_my_book),
     db: Session = Depends(get_db),
     _link: UserBook = Depends(require_book_write),
+    year: int | None = Query(None, description="会计年度；不传取账套当前在记的那一年"),
 ):
     """解析外部科目表并返回预览，不修改账套。"""
+    from app.accounting.years import resolve_year
+
     try:
         data = read_upload(
             file,
@@ -203,16 +222,27 @@ def preview_subject_import(
     except UploadTooLarge as exc:
         raise HTTPException(413, str(exc)) from exc
     parsed, filename = _parse_subject_upload(file, data)
-    state = _subject_import_state(db, book.id)
+    resolved = resolve_year(db, book, year)
+    state = _subject_import_state(db, book.id, resolved)
+    # 期初不算「挡路」：它们会按**编码**搬到新科目表上（见 import_subjects）。
+    # 凭证与分录才是硬挡 —— 它们按科目 id 指着具体的行，换表就指空了。
+    blocked_reason = (
+        f"{resolved} 年已有凭证或分录，不能覆盖该年度的科目表；"
+        f"请先处理完这一年的业务数据，或换一个还没有数据的年度"
+        if not state["can_overwrite"] else ""
+    )
+    remap_hint = (
+        f"新科目表导入后，{resolved} 年的 {state['opening_count']} 条期初余额"
+        f"会按科目编码搬到新科目上；新表里没有的编码若还有余额，导入会被拒绝"
+        if state["opening_count"] > 0 else ""
+    )
     return {
         "filename": filename,
         "source": "用友科目表" if parsed["file_format"] == "xls" else "Excel 科目表",
         **parsed,
         "current": state,
-        "blocked_reason": (
-            "账套已有凭证或期初余额，不能覆盖科目表；请新建空账套或先完成业务数据迁移"
-            if not state["can_overwrite"] else ""
-        ),
+        "blocked_reason": blocked_reason,
+        "remap_hint": remap_hint,
     }
 
 
@@ -223,8 +253,16 @@ def import_subjects(
     db: Session = Depends(get_db),
     user: SysUser = Depends(get_current_user),
     _link: UserBook = Depends(require_book_write),
+    year: int | None = Query(None, description="会计年度；不传取账套当前在记的那一年"),
 ):
-    """确认覆盖科目表：重新解析文件，并在一个事务内整表替换。"""
+    """确认覆盖**这个年度**的科目表：重新解析文件，并在一个事务内整表替换。
+
+    **只动这一年的科目。** 别的年度的科目表一行都不碰 —— 这是「每个年度
+    有自己的科目表」的全部意义：2027 年换一张科目表，2026 年正在用的
+    那些科目、挂在它们上面的凭证与期初，全都原样不动。
+    """
+    from app.accounting.years import ensure_book_year, resolve_year
+
     try:
         data = read_upload(
             file,
@@ -243,26 +281,69 @@ def import_subjects(
     locked_book = db.scalar(select(Book).where(Book.id == book.id).with_for_update())
     if locked_book is None:
         raise HTTPException(404, "账套不存在")
-    state = _subject_import_state(db, locked_book.id)
+    resolved = resolve_year(db, locked_book, year)
+    state = _subject_import_state(db, locked_book.id, resolved)
     if not state["can_overwrite"]:
         raise HTTPException(
             409,
-            "账套已有业务数据，不能覆盖科目表"
-            f"（凭证 {state['voucher_count']} 张、分录 {state['entry_count']} 条、"
-            f"期初余额 {state['opening_count']} 条）。请新建空账套或先完成数据迁移",
+            f"{resolved} 年已有业务数据，不能覆盖该年度的科目表"
+            f"（凭证 {state['voucher_count']} 张、分录 {state['entry_count']} 条）。"
+            f"请先处理完 {resolved} 年的业务数据，或换一个还没有数据的年度",
         )
 
     old_count = state["subject_count"]
-    old_rule = locked_book.subject_code_rule
+    book_year = ensure_book_year(db, locked_book, resolved)
+    old_rule = book_year.subject_code_rule
     try:
+        # **本年度的期初先读出来。**
+        #
+        # 覆盖导入要把本年度的科目整批删掉，而 ``period_opening.subject_id``
+        # 的外键是 RESTRICT —— 被期初引用的科目删不掉，导入当场失败。
+        #
+        # 读的是**编码**而不是科目 id：期初的归属是编码的事，与它挂在哪一行
+        # 科目上无关（1002 的期初就是 1002 的期初，哪怕新表里 1002 换了 id）。
+        from app.accounting.years import (attach_openings, detach_openings,
+                                           opening_code_gaps, openings_of)
+
+        snapshots = openings_of(db, locked_book.id, resolved)
+
+        # **搬不过去的先说清楚，再动任何东西。**
+        #
+        # 编码在新科目表里没有、而余额非零 → 拒绝，并列出差异。
+        # 静默丢弃的后果是「钱没了，而借贷仍然平衡，系统自检不会报错」——
+        # 这套系统反复强调的头号风险。所以这个检查必须在删科目**之前**做，
+        # 让拒绝发生在零破坏的状态下。
+        new_codes = {item["code"] for item in parsed["subjects"]}
+        gaps = opening_code_gaps(snapshots, new_codes)
+        if gaps:
+            detail = "、".join(
+                f"{g['code']}（{g['amount']}）" for g in gaps[:10]
+            )
+            more = f" 等 {len(gaps)} 个编码" if len(gaps) > 10 else ""
+            raise HTTPException(
+                409,
+                f"新科目表里没有这些编码，而 {resolved} 年的期初余额挂在它们上面，"
+                f"搬不过去：{detail}{more}。"
+                f"请在新科目表里保留这些编码，或先清掉这些期初余额再导入",
+            )
+
+        # 期初摘下来：科目要删，期初必须先走（RESTRICT 外键）。
+        detach_openings(db, locked_book.id, resolved)
+
         max_level = db.scalar(
-            select(func.max(Subject.level)).where(Subject.book_id == locked_book.id)
+            select(func.max(Subject.level)).where(
+                Subject.book_id == locked_book.id, Subject.year == resolved)
         ) or 0
         # 自引用外键要求先删下级，再删上级；逐级删除也让这条路径不依赖数据库的
         # 删除计划，PostgreSQL 和测试数据库的行为保持一致。
+        #
+        # **只删本年度的**：``Subject.year == resolved`` 那个条件是这次改造的
+        # 关键 —— 少了它，「覆盖 2027 的科目表」会顺手把 2026 的科目全删了，
+        # 而 2026 的凭证正指着它们（``entry.subject_id`` 外键）。
         for level in range(max_level, 0, -1):
             db.execute(delete(Subject).where(
                 Subject.book_id == locked_book.id,
+                Subject.year == resolved,
                 Subject.level == level,
             ))
 
@@ -276,6 +357,7 @@ def import_subjects(
                 parent = by_code.get(item["parent_code"]) if item["parent_code"] else None
                 subject = Subject(
                     book_id=locked_book.id,
+                    year=resolved,
                     code=item["code"],
                     name=item["name"],
                     category=item["category"],
@@ -297,12 +379,25 @@ def import_subjects(
             for item, subject in created:
                 by_code[item["code"]] = subject
 
-        locked_book.subject_code_rule = parsed["code_rule"]
+        # 编码规则是**年度**的属性：2027 年换了一张结构不同的科目表，
+        # 它的接号规则就该跟着换，2026 年正在用的规则不该被带着一起变。
+        book_year.subject_code_rule = parsed["code_rule"] or book_year.subject_code_rule
         db.flush()
+
+        # **期初搬回新科目上。**
+        #
+        # 新科目已经建好（``by_code`` 是「编码 → 新科目行」），期初按编码
+        # 挂回去。金额没变，变的只是挂在哪一行上。
+        #
+        # 挂不上的（编码对不上）已经由 ``opening_code_gaps`` 挡在前面了 ——
+        # 到这里还挂不上只剩「金额为零且编码不存在」，那种没有数字要搬，
+        # 丢掉它不改变任何金额。
+        remapped = attach_openings(db, locked_book.id, snapshots, by_code)
+
         # 导入科目表就是初始化第 1 步的完成动作 —— 无论这个动作是从初始化
         # 向导里点的，还是从「科目表」页面上点的。与 SET_OPENINGS 的标记
         # 一样放在同一个事务里：状态与数据要么一起成立，要么一起回滚。
-        mark_subjects_ready(db, locked_book, "IMPORT")
+        mark_subjects_ready(db, book_year, "IMPORT")
         log(
             db,
             action="IMPORT_SUBJECTS",
@@ -310,13 +405,17 @@ def import_subjects(
             entity_id=locked_book.id,
             user=user,
             book_id=locked_book.id,
-            detail=f"覆盖导入科目表 {filename}：{old_count} → {len(parsed['subjects'])} 个科目",
-            before={"subject_count": old_count, "subject_code_rule": old_rule},
+            detail=f"覆盖导入 {resolved} 年科目表 {filename}："
+                   f"{old_count} → {len(parsed['subjects'])} 个科目"
+                   + (f"，期初按编码搬回 {remapped} 条" if remapped else ""),
+            before={"subject_count": old_count, "subject_code_rule": old_rule, "year": resolved},
             after={
                 "subject_count": len(parsed["subjects"]),
                 "subject_code_rule": parsed["code_rule"],
                 "filename": filename,
                 "file_format": parsed["file_format"],
+                "year": resolved,
+                "openings_remapped": remapped,
             },
         )
         db.commit()
@@ -324,27 +423,38 @@ def import_subjects(
         db.rollback()
         raise
 
+    db.refresh(locked_book)
     return {
         "ok": True,
+        "year": resolved,
         "deleted": old_count,
         "created": len(parsed["subjects"]),
         "code_rule": parsed["code_rule"],
         "filename": filename,
         # 初始化向导等的就是这份「第 1 步已完成」，随响应一起回去，
         # 前端不用再发一次 /init 才把下一步解锁
-        "init": init_state(db, locked_book),
+        "init": init_state(db, locked_book, resolved),
     }
 
 
 @router.post("", status_code=201)
 def create_subject(payload: SubjectIn, book: Book = Depends(get_my_book),
                    db: Session = Depends(get_db), user: SysUser = Depends(get_current_user),
-                   _link: UserBook = Depends(require_book_write)):
-    exists = db.scalar(select(Subject).where(Subject.book_id == book.id, Subject.code == payload.code))
+                   _link: UserBook = Depends(require_book_write),
+                   year: int | None = Query(None, description="会计年度；不传取账套当前在记的那一年")):
+    """在**某个年度**的科目表里新建科目。
+
+    年度决定它落在哪一张表上，也就决定了它能出现在哪些年度的凭证里。
+    """
+    from app.accounting.years import resolve_year
+
+    resolved = resolve_year(db, book, year)
+    exists = db.scalar(select(Subject).where(
+        Subject.book_id == book.id, Subject.year == resolved, Subject.code == payload.code))
     if exists:
         raise HTTPException(400, f"科目编码已存在: {payload.code}")
 
-    parent = _check_parent(db, book, payload.parent_id, self_id=None)
+    parent = _check_parent(db, book, payload.parent_id, self_id=None, year=resolved)
     # P1-1：父科目一旦有了下级就不再是末级，它**自己那份**余额（分录、期初）
     # 就脱离了明细口径。必须在动手之前就挡下来。
     if parent is not None:
@@ -357,7 +467,8 @@ def create_subject(payload: SubjectIn, book: Book = Depends(get_my_book),
         _reject_carry_forward(payload.code, payload.name, payload.category)
 
     s = Subject(
-        book_id=book.id, code=payload.code, name=payload.name, category=payload.category,
+        book_id=book.id, year=resolved, code=payload.code, name=payload.name,
+        category=payload.category,
         direction=payload.direction, parent_id=payload.parent_id,
         level=(parent.level + 1) if parent else 1,
         # P1-01：is_leaf 是服务端派生的，不接受客户端提交的值。
@@ -376,7 +487,8 @@ def create_subject(payload: SubjectIn, book: Book = Depends(get_my_book),
     # P3-10：建科目过去不留痕。新增一个科目会让科目表、总账、报表的
     # 行列结构都变，事后没人说得清「这个科目是什么时候、谁加的」。
     log(db, action="CREATE_SUBJECT", entity="subject", entity_id=s.id, user=user,
-        book_id=book.id, detail=f"新增科目 {s.code} {s.name}",
+        book_id=book.id,
+        detail=f"新增 {resolved} 年科目 {s.code} {s.name}",
         after=_subject_snapshot(s))
     db.commit()
     db.refresh(s)
@@ -404,20 +516,25 @@ def _descendant_ids(db: Session, subject_id: int) -> set[int]:
     return out
 
 
-def _check_parent(db: Session, book: Book, parent_id: int | None, self_id: int | None) -> Subject | None:
-    """校验要挂的父节点：必须属于本账套，且不能构成环。
+def _check_parent(db: Session, book: Book, parent_id: int | None, self_id: int | None,
+                  year: int) -> Subject | None:
+    """校验要挂的父节点：必须属于本账套**且属于同一个年度**，且不能构成环。
 
     新建科目时有这条校验（P1-06：更新路径**没有**），于是拿着另一个账套的
     科目 id 来改父节点，HTTP 200 —— 该科目随即从本账套的科目树里消失，
     变成 UI 上不可见、库里还在、还被分录引用的孤儿节点。
     对使用者来说这是最难排查的一类问题：看不见但还在参与计算。
+
+    **年度必须一致。** 科目表每个年度各有一份，父指针是**科目表内部**的
+    关系 —— 把 2026 的科目挂到 2027 的科目下面，树的层级与上卷就全乱了
+    （引擎按 parent_id 上卷，跨年上卷出来的余额没有意义）。
     """
     if not parent_id:
         return None
     if self_id is not None and parent_id == self_id:
         raise HTTPException(400, "上级科目不能是它自己")
     parent = db.get(Subject, parent_id)
-    if parent is None or parent.book_id != book.id:
+    if parent is None or parent.book_id != book.id or parent.year != year:
         raise HTTPException(400, "上级科目不存在")
     if self_id is not None and parent_id in _descendant_ids(db, self_id):
         raise HTTPException(400, "上级科目不能是它自己的下级（会形成循环）")
@@ -475,14 +592,17 @@ def _assert_no_own_balance(db: Session, subject: Subject, action: str) -> None:
     )
 
 
-def _children_map(db: Session, book_id: int) -> dict[int, list[int]]:
-    """账套内的父子关系：父 id -> 子 id 列表（一次查完，不发 N 次查询）。
+def _children_map(db: Session, book_id: int, year: int) -> dict[int, list[int]]:
+    """某个年度科目表内的父子关系：父 id -> 子 id 列表（一次查完，不发 N 次查询）。
 
     科目树只有几百条，整棵树一次读进来比边走边查划算；而且递归重算时
     每层都要问「谁的孩子是它」，逐层查会把一次改父放大成几十次查询。
+
+    **按年度查。** 科目表每个年度各有一份，父指针只在**同一张表**内部成立。
     """
     rows = db.execute(
-        select(Subject.parent_id, Subject.id).where(Subject.book_id == book_id)
+        select(Subject.parent_id, Subject.id).where(
+            Subject.book_id == book_id, Subject.year == year)
     ).all()
     out: dict[int, list[int]] = {}
     for parent_id, child_id in rows:
@@ -491,7 +611,7 @@ def _children_map(db: Session, book_id: int) -> dict[int, list[int]]:
     return out
 
 
-def _recompute_subtree(db: Session, book_id: int, root_id: int) -> None:
+def _recompute_subtree(db: Session, book_id: int, root_id: int, year: int) -> None:
     """从 root_id 起，递归重算整棵子树的 level 与 is_leaf（审计 P3-01 / P1-01）。
 
     两个字段都是**派生值**，凡是它们的依据变了就得重算：
@@ -508,7 +628,7 @@ def _recompute_subtree(db: Session, book_id: int, root_id: int) -> None:
     整条链都错。没有循环（``_check_parent`` 拦了自引用和挂到后代），
     递归不会死循环；深度也受科目编码规则约束，是有限的几层。
     """
-    children = _children_map(db, book_id)
+    children = _children_map(db, book_id, year)
     root = db.get(Subject, root_id)
     if root is None:
         return
@@ -554,7 +674,7 @@ def _sync_leaf_flags(db: Session, old_parent_id: int | None, new_parent_id: int 
             parent.is_leaf = not has_child
 
 
-def _recompute_root_leaf_flags(db: Session, book_id: int) -> None:
+def _recompute_root_leaf_flags(db: Session, book_id: int, year: int) -> None:
     """重算树根的 is_leaf。
 
     唯一的触发场景：**一个根的直接下级被删掉了**（或被改挂到别的根/别的层）。
@@ -565,7 +685,9 @@ def _recompute_root_leaf_flags(db: Session, book_id: int) -> None:
     提示它为什么不能记 —— 人只会以为系统坏了。
     """
     db.flush()
-    for root in db.scalars(select(Subject).where(Subject.parent_id.is_(None))).all():
+    for root in db.scalars(select(Subject).where(
+            Subject.book_id == book_id, Subject.year == year,
+            Subject.parent_id.is_(None))).all():
         has_child = db.scalar(
             select(Subject.id).where(Subject.parent_id == root.id).limit(1)
         ) is not None
@@ -637,12 +759,15 @@ def update_subject(subject_id: int, payload: SubjectEditIn, book: Book = Depends
     # 取子树而不是取祖先：判断的是「这个科目**当前**管着的钱」，
     # 而 parent_id 的改动在下面才生效（改挂时不该用改挂后的子树来判）。
     scope_ids = {subject_id} | _descendant_ids(db, subject_id)
-    # 「本年」= 账套当前在记的会计年度（审计 P2-5），与上面科目列表同口径。
+    # 「本年」= **这个科目所属的年度**。科目表每个年度各有一份，
+    # 2027 年那张表上的科目在 2027 年有发生额，在 2026 年没有 ——
+    # 判据必须跟着「这张科目属于哪一年」走，而不是账套当前在记的那一年
+    # （两者可能不是同一年：用户在 2027 年翻看 2026 年的科目表时）。
     current_year_activity = db.scalar(
         select(Entry.id)
         .join(Period, and_(Period.book_id == Entry.book_id, Period.ord == Entry.period_ord))
         .where(Entry.book_id == book.id, Entry.subject_id.in_(scope_ids),
-               Period.year == current_accounting_year(db, book), Entry.amount != 0)
+               Period.year == s.year, Entry.amount != 0)
         .limit(1)
     ) is not None
     # 只挡 **code**，和 db_init.sql 的 fn_subject_guard 同口径。
@@ -664,7 +789,8 @@ def update_subject(subject_id: int, payload: SubjectEditIn, book: Book = Depends
 
     if "code" in changed:
         duplicate = db.scalar(select(Subject.id).where(
-            Subject.book_id == book.id, Subject.code == changes["code"],
+            Subject.book_id == book.id, Subject.year == s.year,
+            Subject.code == changes["code"],
             Subject.id != subject_id).limit(1))
         if duplicate is not None:
             raise HTTPException(400, f"科目编码已存在: {changes['code']}")
@@ -672,7 +798,8 @@ def update_subject(subject_id: int, payload: SubjectEditIn, book: Book = Depends
     # P1-06：新建时有父科目校验，更新路径原来直接赋值。补上，
     # 连带环路检测与 level 跟随。
     if "parent_id" in changed:
-        parent = _check_parent(db, book, changes["parent_id"], self_id=subject_id)
+        parent = _check_parent(db, book, changes["parent_id"], self_id=subject_id,
+                               year=s.year)
         # P1-1：改父级是「升格」的另一个入口，有两道：
         #   ① 新父节点因此有了下级，它自己那份余额会脱离明细口径；
         #   ② 被移动的这个科目若原本是末级，挂上去之后它也不再是末级，
@@ -688,7 +815,7 @@ def update_subject(subject_id: int, payload: SubjectEditIn, book: Book = Depends
         s.parent_id = changes["parent_id"]
         s.level = (parent.level + 1) if parent else 1
         # P3-01：整棵子树的级次一起重算，不只是被移动的这一个节点。
-        _recompute_subtree(db, book.id, subject_id)
+        _recompute_subtree(db, book.id, subject_id, s.year)
         _sync_leaf_flags(db, old_parent_id, changes["parent_id"])
 
     # P1-01：is_leaf 从这个循环里拿掉了。
@@ -764,7 +891,7 @@ def delete_subject(subject_id: int, book: Book = Depends(get_my_book),
     # P1-01：删掉的可能正是父节点最后一个下级。不重算的话父节点会永远
     # 停在 is_leaf=False —— 从那以后它再也录不进分录，界面上却看不出原因。
     if old_parent_id is None:
-        _recompute_root_leaf_flags(db, book.id)
+        _recompute_root_leaf_flags(db, book.id, s.year)
     else:
         _sync_leaf_flags(db, old_parent_id, None)
     db.commit()

@@ -356,15 +356,31 @@ def test_0005_重复执行不改变结构(migrated_scratch):
 # ================================================================ 2. 护栏覆盖的路径
 
 
-def _subject(db, book_id, code, *, parent=None, is_leaf=True):
+def _year_of(db, book) -> int:
+    """账套的启用年度 —— 夹具 ``book`` 已经在 ``book_year`` 上登记好了它。"""
+    return db.execute(text("SELECT start_year FROM book WHERE id = :b"),
+                      {"b": book.id}).scalar()
+
+
+def _subject(db, book_id, code, *, parent=None, is_leaf=True, year=None):
+    """造一个科目（绕开 ORM，走裸 SQL —— 这些用例要的就是「绕路写入」）。
+
+    **年度是必填的**：科目表每个年度各有一份（迁移 0032），``subject.year``
+    是 NOT NULL，而且有组合外键钉在已登记的年度账套上。默认取账套的启用年度
+    —— 夹具 ``book`` 已经把那个年度登记好了。
+    """
+    if year is None:
+        year = db.execute(text("SELECT start_year FROM book WHERE id = :b"),
+                          {"b": book_id}).scalar()
     db.execute(text(
-        "INSERT INTO subject (book_id, code, name, parent_id, level, category, "
+        "INSERT INTO subject (book_id, year, code, name, parent_id, level, category, "
         "direction, is_leaf, ext_attrs, created_at, updated_at) VALUES "
-        "(:b, :c, :c, :p, :l, 'ASSET', 'DEBIT', :leaf, '{}'::jsonb, now(), now())"),
-        {"b": book_id, "c": code, "p": parent, "l": 2 if parent else 1,
+        "(:b, :y, :c, :c, :p, :l, 'ASSET', 'DEBIT', :leaf, '{}'::jsonb, now(), now())"),
+        {"b": book_id, "y": year, "c": code, "p": parent, "l": 2 if parent else 1,
          "leaf": is_leaf})
-    return db.execute(text("SELECT id FROM subject WHERE book_id=:b AND code=:c"),
-                      {"b": book_id, "c": code}).scalar()
+    return db.execute(text(
+        "SELECT id FROM subject WHERE book_id=:b AND year=:y AND code=:c"),
+        {"b": book_id, "y": year, "c": code}).scalar()
 
 
 def _leaf_subject_ids(db, book_id, n: int = 2) -> list[int]:
@@ -444,11 +460,11 @@ def test_插子科目不动父节点_提交时被拒(db, book):
 
     parent = _subject(db, book.id, "1900", is_leaf=True)
     db.commit()
-    db.execute(text("INSERT INTO subject (book_id, code, name, parent_id, level, "
+    db.execute(text("INSERT INTO subject (book_id, year, code, name, parent_id, level, "
                     "category, direction, is_leaf, ext_attrs, created_at, updated_at) "
-                    "VALUES (:b, '1905', '1905', :p, 2, 'ASSET', 'DEBIT', true, "
+                    "VALUES (:b, :y, '1905', '1905', :p, 2, 'ASSET', 'DEBIT', true, "
                     "'{}'::jsonb, now(), now())"),
-               {"b": book.id, "p": parent})
+               {"b": book.id, "y": _year_of(db, book), "p": parent})
     with pytest.raises(DBAPIError, match="末级"):
         db.commit()
     db.rollback()
@@ -465,11 +481,11 @@ def test_同一事务里改父节点_不挡(db, book):
     """
     parent = _subject(db, book.id, "1900", is_leaf=True)
     db.commit()
-    db.execute(text("INSERT INTO subject (book_id, code, name, parent_id, level, "
+    db.execute(text("INSERT INTO subject (book_id, year, code, name, parent_id, level, "
                     "category, direction, is_leaf, ext_attrs, created_at, updated_at) "
-                    "VALUES (:b, '1905', '1905', :p, 2, 'ASSET', 'DEBIT', true, "
+                    "VALUES (:b, :y, '1905', '1905', :p, 2, 'ASSET', 'DEBIT', true, "
                     "'{}'::jsonb, now(), now())"),
-               {"b": book.id, "p": parent})
+               {"b": book.id, "y": _year_of(db, book), "p": parent})
     db.execute(text("UPDATE subject SET is_leaf = false WHERE id = :p"), {"p": parent})
     db.commit()
     rows = db.execute(text("SELECT code, is_leaf FROM subject WHERE book_id = :b "
@@ -568,6 +584,12 @@ def test_并发_结账持锁时建凭证_被守卫挡住(migrated_scratch):
             "subject_code_rule, status, created_at, updated_at) "
             "VALUES (901, '并发测试', '并发账套', 2026, 1, '4-2-2-2', 'ACTIVE', "
             "now(), now())")
+        # 年度账套要先登记：期间与科目都有组合外键钉在
+        # ``book_year(book_id, year)`` 上，库里不可能出现一个
+        # 「没有登记过的 2026 年」却挂着 2026 年的期间。
+        conn.exec_driver_sql(
+            "INSERT INTO book_year (book_id, year, subject_code_rule, "
+            "created_at, updated_at) VALUES (901, 2026, '4-2-2-2', now(), now())")
         conn.exec_driver_sql(
             "INSERT INTO period (id, book_id, year, month, ord, locked, version, "
             "created_at, updated_at) VALUES (901, 901, 2026, 1, 1, false, 1, "
@@ -707,8 +729,9 @@ def test_绕过ORM的写入不再因为缺默认值而失败(db, book):
     # category 没有业务默认值（它是必填项），其余有默认值的列一律不给 ——
     # 旧库里它们只在 ORM 的 default= 里，绕路写入会 NOT NULL 失败。
     db.execute(text(
-        "INSERT INTO subject (book_id, code, name, category, created_at, updated_at) "
-        "VALUES (:b, '9900', '只给最少列', 'ASSET', now(), now())"), {"b": book.id})
+        "INSERT INTO subject (book_id, year, code, name, category, created_at, updated_at) "
+        "VALUES (:b, :y, '9900', '只给最少列', 'ASSET', now(), now())"),
+        {"b": book.id, "y": _year_of(db, book)})
     db.execute(text(
         "INSERT INTO voucher (book_id, period_id, voucher_no, voucher_date, "
         "created_at, updated_at) "
@@ -834,11 +857,42 @@ def test_模型与库的外键零差异(db):
     # compare_metadata 把一批变更装进 ModifyTableOps（容器），逐条摊开。
     # 只认「约束类」变更：外键的增删改与唯一键的增删，就是把库级护栏
     # 改回缺陷的那条路。列类型/默认值不在这里盯 —— 那是别的工作线。
+    #
+    # **两代 Alembic 的形状不一样，两套都要认。**
+    #   · 老版：结果是一个个 ``(操作码, 对象)`` 二元组，操作对象是
+    #     ``CreateUniqueConstraintOp`` 这种 **Op 类**。
+    #   · 1.20：结果是**不均匀**的 —— 单个操作仍是二元组，但操作码是
+    #     **字符串**（``'add_constraint'``），对象就是约束本身
+    #     （``UniqueConstraint``）；而「表被改了」这类会聚成一个
+    #     **列表**，里面是若干条操作元组（``('modify_type', None, 表名,
+    #     列名, {...}, 旧类型, 新类型)`` —— 七元组，不是二元组）。
+    #
+    # 早年这里写的是 ``for _code, obj in diffs`` —— 遇到列表项就抛
+    # ``ValueError: not enough values to unpack``，**真差异被报成解包错误**。
+    # 之所以一直没人看见：只要模型与库零差异，循环体一次都不进。
+    # 现在库里真出了差异（年度账套那一轮），它才露出来。
+    CONSTRAINT_CODES = {
+        "add_constraint", "drop_constraint", "remove_constraint",
+        "create_foreign_key", "create_unique_constraint",
+        "create_primary_key", "create_check_constraint",
+    }
     CONSTRAINT_OPS = {
         "AddConstraintOp", "DropConstraintOp", "CreateForeignKeyOp",
         "CreateUniqueConstraintOp", "CreatePrimaryKeyOp",
         "CreateCheckConstraintOp",
     }
+
+    def _flatten(diffs):
+        """把两代形状都摊平成「(操作码, 对象)」。"""
+        for entry in diffs:
+            items = entry if isinstance(entry, list) else [entry]
+            for item in items:
+                if isinstance(item, tuple) and len(item) == 2:
+                    yield item[0], item[1]
+                else:
+                    # 长元组（modify_type 之类）：不是约束操作，
+                    # 但也不能因此中断整轮遍历。
+                    yield (item[0] if item else None), None
 
     with engine.connect() as conn:
         diffs = compare_metadata(
@@ -846,18 +900,9 @@ def test_模型与库的外键零差异(db):
             Base.metadata)
 
     offenders: list[str] = []
-    # ``compare_metadata`` 返回的是 **DiffResult**：``[(op 代码, 对象), ...]``。
-    # ``add_table`` 给 Table、``add_index`` 给 Index、约束类改动给约束对象，
-    # 表级改动则装在 ModifyTableOps 容器里。
-    #
-    # 早年的写法按 ``[(表, ops 容器), ...]`` 解包。Table 恰好可迭代
-    # （迭代出的是列对象），于是它从没匹配上过 CONSTRAINT_OPS —— 这条
-    # 断言一直是**空转**的绿。0020 给 report_template 加上部分唯一索引之后，
-    # ``add_index`` 那条上的 Index 不可迭代，才把潜伏的形状错误翻成 TypeError。
-    # 形状修正之后它才真的在比较约束 —— 下面那句 assert 从此有意义。
-    for _code, obj in diffs:
+    for code, obj in _flatten(diffs):
         for item in getattr(obj, "ops", None) or [obj]:
-            if type(item).__name__ in CONSTRAINT_OPS:
+            if code in CONSTRAINT_CODES or type(item).__name__ in CONSTRAINT_OPS:
                 offenders.append(
                     f"{getattr(obj, 'name', '') or ''}: {type(item).__name__} "
                     f"{getattr(item, 'constraint_name', '') or ''} "
@@ -920,6 +965,8 @@ def test_head_是本文件认识的那一版():
         "0029_progressive_lockout",            # 递进式登录锁定：sys_user.lock_level（锁定轮次）
         "0030_admin_email_mfa",                # 管理员二次验证（邮箱链接）：admin_mfa_challenge 表
         "0031_subject_guard_year",             # 库层「本年」口径改成账套会计年度（重放 db_init.sql）
+        "0032_book_year",                     # 年度账套：科目表从账套级下沉到年度级（subject.year）
+        "0033_book_year_guardrails",          # 年度一致性护栏送达存量库（重放 db_init.sql）
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")

@@ -905,7 +905,6 @@ def _render_scope(
                              max_pages=max_pages, note=note, voucher_ids=voucher_ids)
 
     if scope == "BALANCE":
-        subjects = queries.subject_tree(db, book.id)
         # 区间口径：与页面、Excel 导出走**同一个** from_period，
         # 否则屏幕上一段区间、纸上却是单期，数字对不上（审计 7.3 同款毛病）
         bal_from = None
@@ -913,6 +912,9 @@ def _render_scope(
             bal_from = _period(db, book.id, from_period_id)
             if bal_from.ord > period.ord:
                 raise HTTPException(400, "起始期间不能晚于结束期间")
+        # 科目表每个年度各有一份：跨年区间取**区间涉及的所有年度**的并集。
+        subjects = queries.subjects_for_periods(
+            db, book.id, [bal_from, period] if bal_from else [period])
         rows, check = queries.balance_sheet_of_accounts(
             db, book.id, subjects, period, include_unposted, from_period=bal_from)
         # 范围跟屏幕上的三档单选一致，别让纸上多出一千多行明细
@@ -928,7 +930,7 @@ def _render_scope(
     from_period = _period(db, book.id, from_period_id) if from_period_id else to_period
 
     if scope == "LEDGER":
-        subjects = queries.subject_tree(db, book.id)
+        subjects = queries.subjects_for_periods(db, book.id, [from_period, to_period])
         if leaf_only:
             subjects = [s_ for s_ in subjects if s_.is_leaf]
         rows = queries.general_ledger(db, book.id, subjects, from_period, to_period,
@@ -1212,7 +1214,8 @@ def export_balance(book_id: int, period_id: Optional[int] = None,
         from_period = _period(db, book.id, from_period_id)
         if from_period.ord > period.ord:
             raise HTTPException(400, "起始期间不能晚于结束期间")
-    subjects = queries.subject_tree(db, book.id)
+    subjects = queries.subjects_for_periods(
+        db, book.id, [from_period, period] if from_period else [period])
     rows, check = queries.balance_sheet_of_accounts(
         db, book.id, subjects, period, include_unposted, from_period=from_period)
     # 与屏幕同一个范围口径：屏幕上「仅一级科目」而文件里是全表，用户只会
@@ -1266,7 +1269,7 @@ def export_general(book_id: int, period_id: Optional[int] = None,
     else:
         from_period = to_period
 
-    subjects = queries.subject_tree(db, book.id)
+    subjects = queries.subjects_for_periods(db, book.id, [from_period, to_period])
     if leaf_only:
         subjects = [s for s in subjects if s.is_leaf]
     rows = queries.general_ledger(db, book.id, subjects, from_period, to_period, include_unposted)

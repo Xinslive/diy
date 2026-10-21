@@ -137,7 +137,8 @@ def test_结转科目集合只认损益类(db, book, subjects):
     profit.carry_forward = True
     db.commit()
 
-    codes = {s.code for s in carry_forward_subjects(db, book.id)}
+    # 年度是必填：科目表每个年度各有一份（迁移 0032）
+    codes = {s.code for s in carry_forward_subjects(db, book.id, book.start_year)}
     assert "1001" not in codes, "资产科目进了结转集合"
     assert "3103" not in codes, "本年利润进了结转集合（它是结转的目的科目）"
     assert "5001" in codes, "损益科目不在结转集合里"

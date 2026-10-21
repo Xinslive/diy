@@ -403,7 +403,10 @@ function invoiceRowClass({ row }) { return row.status === 'REJECTED' ? 'invoice-
 async function loadAll() {
   if (!store.bookId) return
   const [cfg, flat, ruleRows, batches, limits] = await Promise.all([
-    invoiceApi.getConfig(store.bookId), subjectApi.subjectFlat(store.bookId), invoiceApi.listRules(store.bookId),
+    invoiceApi.getConfig(store.bookId),
+    // **年度必带**：科目表每个年度各有一份（后端迁移 0032）
+    subjectApi.subjectFlat(store.bookId, { year: store.currentYear }),
+    invoiceApi.listRules(store.bookId),
     invoiceApi.listBatches(store.bookId), invoiceApi.getLimits(store.bookId).catch(() => null)
   ])
   if (limits) uploadLimits.value = { maxFiles: limits.max_files, maxTotalBytes: limits.max_total_bytes }

@@ -458,7 +458,8 @@ def _add_detail_subject(db, book, parent_code, code, name):
     parent = db.scalar(
         select(Subject).where(Subject.book_id == book.id, Subject.code == parent_code))
     assert parent is not None, f"父科目不存在：{parent_code}"
-    child = Subject(book_id=book.id, code=code, name=name, category=parent.category,
+    child = Subject(book_id=book.id, year=parent.year, code=code, name=name,
+                    category=parent.category,
                     direction=parent.direction, level=parent.level + 1,
                     parent_id=parent.id, is_leaf=True, sort_no=99)
     db.add(child)

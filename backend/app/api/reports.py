@@ -369,9 +369,25 @@ def persist(template_id: int, book_id: int, period_id: int, db: Session = Depend
 # ===================================================================== 外部模板迁移
 
 
+def _template_year(db: Session, book_id: int, year: int | None) -> int:
+    """模板导入时用哪一年的科目表来校验公式里的科目编码。
+
+    科目表每个年度各有一份，而报表公式里写的是**编码**（``科目("1002")``）。
+    校验就得对着某一份具体的表 —— 默认用账套当前在记的那一年。
+    """
+    from app.accounting.years import resolve_year
+    from app.models import Book
+
+    book = db.get(Book, book_id)
+    if book is None:
+        raise HTTPException(404, "账套不存在")
+    return resolve_year(db, book, year)
+
+
 @router.post("/templates/import/preview")
 def preview_template_import(file: UploadFile = File(...), book_id: Optional[int] = None,
-                            user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+                            user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
+                            year: Optional[int] = Query(None, description="会计年度；不传取账套当前在记的那一年")):
     """只解析、检查当前账套科目，不创建模板。"""
     _require_template_write(db, user, book_id)
     # 必须在 try **之前**导入：``except TemplateImportError`` 子句要用的名字
@@ -385,7 +401,9 @@ def preview_template_import(file: UploadFile = File(...), book_id: Optional[int]
         raise HTTPException(413, str(exc)) from exc
     except TemplateImportError as exc:
         raise HTTPException(400, str(exc)) from exc
-    book_subjects = list(db.scalars(select(Subject).where(Subject.book_id == book_id).order_by(Subject.code)))
+    resolved = _template_year(db, book_id, year)
+    book_subjects = list(db.scalars(select(Subject).where(
+        Subject.book_id == book_id, Subject.year == resolved).order_by(Subject.code)))
     by_code = {subject.code: subject for subject in book_subjects}
     existing = db.scalar(select(ReportTemplate).where(
         ReportTemplate.book_id == book_id,
@@ -402,11 +420,14 @@ def preview_template_import(file: UploadFile = File(...), book_id: Optional[int]
 
 @router.post("/templates/import", status_code=201)
 def import_templates(payload: ImportTemplates, book_id: Optional[int] = None,
-                     user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+                     user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
+                     year: Optional[int] = Query(None, description="会计年度；不传取账套当前在记的那一年")):
     """先校验整批，再在一个事务内新建模板；不覆盖内置或已有报表。"""
     _require_template_write(db, user, book_id)
     from app.reports.importer import subject_codes, validate_formula
-    book_codes = set(db.scalars(select(Subject.code).where(Subject.book_id == book_id)))
+    resolved = _template_year(db, book_id, year)
+    book_codes = set(db.scalars(select(Subject.code).where(
+        Subject.book_id == book_id, Subject.year == resolved)))
     validated = []
     seen_codes: set[str] = set()
     for item in payload.templates:

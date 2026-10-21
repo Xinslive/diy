@@ -69,11 +69,18 @@ export const parseOpenings = (id, fd, basis = 'opening') => {
  * 账套初始化状态（两步向导唯一的数据来源）。
  * GET /books 的每一行已经带 init，**列表页不必为每张卡片再请求一次**；
  *  这条是给向导自己用的 —— 打开时拿一份最新的，任一步做完再刷新。
+ *
+ *  **年度是必带的**：初始化状态挂在**年度**上（后端迁移 0032）——
+ *  每个年度有**自己的**科目表，也各有各的「第 1 步做没做」。
+ *  2026 年做完了，不代表 2027 年做完了。
  */
-export const getInit = (id) => http.get(`/books/${id}/init`).then(r => r.data)
+export const getInit = (id, year) =>
+  http.get(`/books/${id}/init`, { params: year ? { year } : {} }).then(r => r.data)
 
 /** 第 1 步的第二条路：账上确实有科目时，直接沿用系统标准科目表（不覆盖导入）。 */
-export const keepChartSubjects = (id) => http.post(`/books/${id}/init/subjects/keep`).then(r => r.data)
+export const keepChartSubjects = (id, year) =>
+  http.post(`/books/${id}/init/subjects/keep`, null,
+    { params: year ? { year } : {} }).then(r => r.data)
 
 /**
  * 第 2 步的第二条路：声明「本期本来就没有期初余额」。
@@ -83,4 +90,6 @@ export const keepChartSubjects = (id) => http.post(`/books/${id}/init/subjects/k
  *  后端只接受**账上确实一条期初都没有**的账套（有的话就是「把期初清空」，
  *  与「本来就没有」不是一回事）。
  */
-export const skipOpenings = (id) => http.post(`/books/${id}/init/openings/skip`).then(r => r.data)
+export const skipOpenings = (id, year) =>
+  http.post(`/books/${id}/init/openings/skip`, null,
+    { params: year ? { year } : {} }).then(r => r.data)

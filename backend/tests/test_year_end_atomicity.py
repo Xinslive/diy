@@ -42,14 +42,23 @@ def _seed_2027_placeholder(db, book, subjects, admin_user):
     """
     from app.accounting.periods import ensure_periods
     from app.accounting.vouchers import create_voucher
+    from app.accounting.years import copy_chart
 
     new_periods = ensure_periods(db, book, 2027)
     jan27 = new_periods[0]
+    # **2027 的科目表要先装好**：科目表每个年度各有一份（迁移 0032），
+    # 凭证挂的科目必须与它所在期间**同年度**（库层护栏
+    # ``fn_entry_subject_year_guard``）。2027 年还没有科目表时，
+    # 2026 年的科目 id 在 2027 年根本不存在 —— 那条凭证压根建不出来。
+    copy_chart(db, book.id, 2026, 2027)
+    s2027 = {s.code: s.id for s in db.scalars(
+        select(Subject).where(
+            Subject.book_id == book.id, Subject.year == 2027)).all()}
     create_voucher(db, book_id=book.id, user=admin_user, voucher_date=date(2027, 1, 15),
                    entries=[
-                       {"subject_id": sid(subjects, "1002"), "direction": "DEBIT",
+                       {"subject_id": s2027["1002"], "direction": "DEBIT",
                         "amount": Decimal("5"), "summary": "占位"},
-                       {"subject_id": sid(subjects, "5001"), "direction": "CREDIT",
+                       {"subject_id": s2027["5001"], "direction": "CREDIT",
                         "amount": Decimal("5"), "summary": "占位"},
                    ], period_id=jan27.id, commit=True)
     return jan27
@@ -190,9 +199,13 @@ def test_成功的结转一次提交(db, book, periods, subjects, admin_user, ma
     dec_ord = db.scalar(select(Period.ord).where(
         Period.book_id == book.id, Period.year == 2026, Period.month == 12))
     assert eng.closing(sid(subjects, "3103"), dec_ord) == Decimal("0")
+    # 期初挂在**2027 年那张科目表**的科目上（科目表每个年度各有一份），
+    # 所以这里按 (账套, 年度, 编码) 找，不是拿 2026 年的 id 去查。
+    s2027_1002 = db.scalar(select(Subject.id).where(
+        Subject.book_id == book.id, Subject.year == 2027, Subject.code == "1002"))
     bank_opening = db.scalar(select(PeriodOpening).where(
         PeriodOpening.period_id == jan27.id,
-        PeriodOpening.subject_id == sid(subjects, "1002")))
+        PeriodOpening.subject_id == s2027_1002))
     # 银行存款期初：dr 6602 / cr 1002，现金实际是减少的，导出/期初存的是实际方位
     assert bank_opening is not None, "2027-01 缺少 1002 的期初"
     assert bank_opening.amount == Decimal("-100")

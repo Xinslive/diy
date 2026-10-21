@@ -1,7 +1,7 @@
 <template>
   <el-dialog
     v-model="visible"
-    title="账套初始化"
+    :title="`账套初始化 · ${year} 年度`"
     width="620px"
     :close-on-click-modal="false"
     @closed="reset"
@@ -68,7 +68,7 @@
 
     <!-- 目标账套要显式传进去：这个弹窗默认认的是**当前账套**，
          而向导可以对任意一本账套打开（卡片上的「继续初始化」） -->
-    <SubjectImportDialog v-model="importVisible" :book-id="targetId"
+    <SubjectImportDialog v-model="importVisible" :book-id="targetId" :year="year"
                          @imported="onSubjectsImported" />
 
     <!-- 底部那颗主按钮代表「现在最该做的那件事」，做完就换词。
@@ -101,7 +101,17 @@ import {
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
   /** 要初始化的账套；不传就用当前账套 */
-  bookId: { type: [Number, String], default: 0 }
+  bookId: { type: [Number, String], default: 0 },
+  /**
+   * 初始化**哪一年**。
+   *
+   * 初始化状态是**年度**的属性（后端迁移 0032）：每个年度有**自己的**
+   * 科目表，也各有各的「第 1 步做没做」。2026 年做完了不代表 2027 年做完了，
+   * 所以向导必须说清楚自己在管哪一年。
+   *
+   * 不传就取「这个账套当前在记的那一年」。
+   */
+  year: { type: [Number, String], default: 0 }
 })
 const emit = defineEmits(['update:modelValue', 'updated'])
 
@@ -113,7 +123,9 @@ const visible = computed({
   set: (v) => emit('update:modelValue', v)
 })
 const targetId = computed(() => Number(props.bookId) || store.bookId)
-const init = computed(() => store.initOf(targetId.value))
+/** 向导管的年度：显式传入优先，否则取这个账套当前在记的那一年 */
+const year = computed(() => Number(props.year) || store.yearOfBook(targetId.value) || 0)
+const init = computed(() => store.initOf(targetId.value, year.value))
 
 const keeping = ref(false)
 const skipping = ref(false)
@@ -137,7 +149,7 @@ const footerLabel = computed(() => FOOTER_LABEL[footerAction.value])
 
 /** 打开时拉一份最新的，任一步做完再刷新 —— 父组件拿账套列表那份可能已经过期 */
 async function refresh() {
-  await store.loadInit(targetId.value)
+  await store.loadInit(targetId.value, year.value)
 }
 
 watch(visible, (open) => {
@@ -172,7 +184,7 @@ function reset() {
 async function keepChart() {
   keeping.value = true
   try {
-    const res = await api.keepChartSubjects(targetId.value)
+    const res = await api.keepChartSubjects(targetId.value, year.value)
     // 后端把最新的 init 一并带回来了，直接就地更新，不必再拉一次
     store.markInit(targetId.value, res.init)
     ElMessage.success('已沿用系统标准科目表')
@@ -218,7 +230,7 @@ async function skipOpenings() {
   }
   skipping.value = true
   try {
-    const res = await api.skipOpenings(targetId.value)
+    const res = await api.skipOpenings(targetId.value, year.value)
     store.markInit(targetId.value, res.init)
     ElMessage.success('已记下：本期无期初余额')
     emit('updated', res.init)
