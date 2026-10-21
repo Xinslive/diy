@@ -483,6 +483,31 @@ def _add_constraint_if_missing(table: str, name: str, definition: str) -> None:
 
 def _finalize() -> None:
     """收口：NOT NULL、唯一键、组合外键、删掉账套级的初始化列。"""
+    # ------------------------------------------------------------------
+    # **先结算挂起的延迟事件，再动表结构。**
+    #
+    # ``subject`` 上有一条**延迟约束触发器**：
+    #
+    #     CREATE CONSTRAINT TRIGGER trg_subject_leaf_parent_guard
+    #     AFTER INSERT OR UPDATE OF parent_id ON subject
+    #     DEFERRABLE INITIALLY DEFERRED ...
+    #
+    # 它是「延迟到提交时才判」的，每插一行科目就排一个未决事件。而
+    # **PostgreSQL 不允许 ALTER 一张还有未决事件的表** ——
+    # 报的是 ``cannot ALTER TABLE "subject" because it has pending
+    # trigger events``。
+    #
+    # 于是这一步的成败取决于「克隆插了多少行」：
+    # 有克隆（跨年账套）就一定有未决事件，ALTER 必被挡。
+    #
+    # **这里曾经漏掉过。** 上一版把 ``SET CONSTRAINTS ALL IMMEDIATE`` 放在
+    # 「搬分录」那一步 —— 只有次年**有凭证**时才会走到。生产上那两个
+    # 跨年账套的次年**没有凭证**（只有期初快照），于是那句根本没执行，
+    # 收口时 ALTER 被挡，迁移当场失败。
+    # 结论：凡是要 ALTER 这张表，**必须**先把未决事件结算掉，且不能
+    # 依赖「另一条分支刚好会执行」。
+    # ------------------------------------------------------------------
+    op.execute("SET CONSTRAINTS ALL IMMEDIATE")
     op.execute("""
         DO $$
         BEGIN

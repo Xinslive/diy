@@ -1005,12 +1005,18 @@ def scratch_at_0031():
         conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {name} CASCADE")
 
 
-def _seed_two_year_book(eng) -> None:
+def _seed_two_year_book(eng, *, second_year_has_voucher: bool = True) -> None:
     """造一个横跨 2021/2022 的账套。
 
     * 2021 有凭证 → 锚年 = 2021，**2022 拿到克隆出来的那张科目表**
-    * 2022 也有凭证 → 次年的分录也要被重指
     * 2022 有期初快照 → 次年的期初也要被重指
+    * 2022 有凭证（``second_year_has_voucher``）→ 次年的分录也要被重指
+
+    **两种形状都要测。** 2022 有没有凭证，走的是迁移里**不同的分支**：
+    有凭证才会走「搬分录」那段（连带临时关触发器、结算延迟事件），
+    没有凭证就只走「克隆 + 搬期初」。而生产上那两个跨年账套的 2022
+    **只有期初快照、没有凭证** —— 只测「有凭证」那一种，就会漏掉
+    「迁移在生产上当场失败」的那条路。
 
     全用裸 SQL 写：0031 的 ``subject`` 表还没有 ``year`` 列，而 HEAD 的
     ORM 认定它 NOT NULL —— 用 ORM 写会当场报「列不存在」。
@@ -1048,11 +1054,11 @@ def _seed_two_year_book(eng) -> None:
             """),
                          {"id": int(code), "code": code, "name": name,
                                            "cat": category, "dir": direction})
-        # 2021-01 与 2022-01 各一张凭证
-        for vid, pid, vno, vdate, dcode, ccode, amount in (
-            (1, 1, "记-0001", "2021-01-15", "1001", "2001", 1000.00),
-            (2, 13, "记-0002", "2022-01-15", "1002", "2001", 500.00),
-        ):
+        # 2021-01 一定有凭证（它就是锚年）；2022-01 看形状
+        vouchers = [(1, 1, "记-0001", "2021-01-15", "1001", "2001", 1000.00)]
+        if second_year_has_voucher:
+            vouchers.append((2, 13, "记-0002", "2022-01-15", "1002", "2001", 500.00))
+        for vid, pid, vno, vdate, dcode, ccode, amount in vouchers:
             conn.execute(text("""
                 INSERT INTO voucher (id, book_id, period_id, voucher_no, voucher_date,
                                      status, source, attachments, remark,
@@ -1198,3 +1204,58 @@ def test_跨年账套_迁移后旧唯一键换成按年度的(scratch_at_0031):
         assert "uq_subject_book_year_code" in names, f"新唯一键没装上：{names}"
         assert "uq_subject_book_code" not in names, (
             f"旧唯一键还在：{names} —— 同编码的跨年科目插不进去")
+
+
+def test_跨年账套_次年只有期初没有凭证_迁移照样跑得完(scratch_at_0031):
+    """**生产上那两个跨年账套就是这种形状。**
+
+    2021 有凭证（锚年），2022 **只有期初快照、没有凭证**。
+
+    为什么这一条必须单独测：迁移里「搬分录」和「搬期初」是**不同的
+    分支**，而「结算延迟事件」原本只挂在搬分录那条分支上。生产那次
+    发布就死在这里 ——
+
+        cannot ALTER TABLE "subject" because it has pending trigger events
+
+    ``subject`` 上那条 ``trg_subject_leaf_parent_guard`` 是
+    ``DEFERRABLE INITIALLY DEFERRED`` 的约束触发器，每插一行科目就排
+    一个未决事件；而 PostgreSQL 不允许 ALTER 还有未决事件的表。次年
+    没有凭证 → 那条分支没走 → 收口时 ALTER 被挡 → 迁移当场失败，
+    现场停在「库没迁、代码没换」的���态。
+
+    只测「次年有凭证」那一种形状，恰好就把这条路漏掉了。
+    """
+    eng, _ = scratch_at_0031
+    _seed_two_year_book(eng, second_year_has_voucher=False)
+    _upgrade(eng, "head")
+
+    with eng.connect() as conn:
+        # 迁移跑完了
+        ver = conn.execute(text(
+            "select version_num from alembic_version")).scalar()
+        assert ver == "0033_book_year_guardrails", f"schema 只到 {ver}"
+
+        # 科目表按年度拆开
+        rows = conn.execute(text(
+            "SELECT year, count(*) FROM subject GROUP BY year ORDER BY year")).all()
+        assert [r[0] for r in rows] == [2021, 2022], f"科目表没按年度拆开：{rows}"
+
+        # 次年的期初指到次年那张表
+        rows = conn.execute(text("""
+            SELECT p.year, s.year, count(*)
+            FROM period_opening po
+            JOIN period p ON p.id = po.period_id
+            JOIN subject s ON s.id = po.subject_id
+            GROUP BY p.year, s.year""")).all()
+        assert rows, "期初快照不见了"
+        for period_year, subject_year, n in rows:
+            assert period_year == subject_year, (
+                f"期初挂到了别的年度的科目上：期间 {period_year} 年，"
+                f"科目 {subject_year} 年（{n} 条）")
+
+        # 金额一分不动
+        r = conn.execute(text("""
+            SELECT sum(case when direction='DEBIT' then amount else 0 end),
+                   sum(case when direction='CREDIT' then amount else 0 end)
+            FROM entry""")).one()
+        assert r[0] == r[1] == 1000.00, f"借贷被改了：{r}"

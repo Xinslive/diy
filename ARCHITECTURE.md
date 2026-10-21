@@ -1951,7 +1951,7 @@ trg_entry_subject_year_guard   <   trg_entry_sync
 | `0033_book_year_guardrails` | 重放 `db_init.sql`，装上三条年度一致性触发器 |
 
 `0032` **必须可重复执行**（仓库 0005 已有「重复执行不改变结构」纪律，
-迁移链测试会把 `alembic_version` 打回 0004 再重跑）。四个坑：
+迁移链测试会把 `alembic_version` 打回 0004 再重跑）。五个坑：
 
 * 判断「这个账套搬过没有」不能看「有没有 `year IS NULL` 的科目」——
   二次运行会把已克隆的 2027 科目搬回 2026。判据是**先登记 `book_year`**，
@@ -1972,6 +1972,19 @@ trg_entry_subject_year_guard   <   trg_entry_sync
   `trg_entry_lock_guard`，**关掉后必须先 `SET CONSTRAINTS ALL IMMEDIATE`**
   再装回去：分录一改，延迟到提交才判的余额校验就排队了，而 `ALTER TABLE`
   不接受还有未决事件的表。
+* **`ALTER TABLE` 之前必须 `SET CONSTRAINTS ALL IMMEDIATE`。**
+  `subject` 上有一条**延迟约束触发器** `trg_subject_leaf_parent_guard`
+  （`DEFERRABLE INITIALLY DEFERRED`），每插一行科目就排一个未决事件，而
+  **PostgreSQL 不允许 ALTER 还有未决事件的表**（报
+  `cannot ALTER TABLE "subject" because it has pending trigger events`）。
+  克隆插了多少行，就有多少个未决事件 —— 于是收口那步（`SET NOT NULL`、
+  换唯一键、加组合外键）必被挡。
+  **这条最隐蔽**：它原本被放在「搬分录」那个分支里，而那句只有在次年
+  **有凭证**时才会执行。生产上那两个跨年账套的次年**只有期初快照、没有凭证**，
+  于是那句根本没跑，迁移在生产上当场失败。
+  教训有两条：**凡是要 ALTER 这张表，就得自己结算**，不能指望另一条分支
+  刚好会执行；**测试必须按生产的形状来造数据** —— 「次年有凭证」与
+  「次年只有期初」走的是不同分支，只测前者正好漏掉后者。
 
 历史数据用 `scripts/merge_book_years.py` 把老库「一年一个账套」合并进来：
 主账套**没有**那一年科目表时**整张搬过来**（id 不变）；
