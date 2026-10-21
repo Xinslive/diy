@@ -71,6 +71,22 @@ try {
     assert.match(source.headers()['cache-control'], /immutable/)
     assert.equal((await publicAsset.request.get(state.url + `/api/plugins/${normal.id}/notes?book_id=${state.bookId}`)).status(), 401)
     const main = staff.document
+    // **在导航之前就把等待挂上**（2026-10-21 修）。
+    //
+    // 插件入口是用**动态 import()** 加载的（frontend/src/plugins/runtime.js），
+    // 那条请求由浏览器发起、不带 Authorization —— 这正是这条断言要守的东西：
+    // 插件的**代码**走 <script>/import 静态路径（不携带令牌），
+    // 插件的**数据**走 fetch（带令牌）。一旦有人把入口改成用带令牌的
+    // fetch 去拉，令牌就会进到资源请求里。
+    //
+    // 原来是在后面用 ``requests.some(...)`` 去翻**已经记过的数组**：
+    // 那条 import 请求到底有没有被记下来，取决于它相对断言的时序 ——
+    // 于是同一份代码上一轮 CI 是绿的、下一轮就红了（连续两轮红在
+    // plugin_e2e.mjs:84）。改成「先挂等待、再触发」，就不再靠运气。
+    // catch 立刻挂上：否则超时时的 rejection 在 await 之前就成了「未处理
+    const entryRequest = staff.page.waitForRequest(
+      r => r.url().endsWith(assets.entry) && !r.headers().authorization,
+      { timeout: 20000 }).catch(() => null)
     await staff.page.goto(state.url + `/#/plugin/${normal.id}`)
     assert.match(main.headers()['content-security-policy'], /script-src 'self';/)
     assert.ok(!main.headers()['content-security-policy'].includes('unsafe-eval'))
@@ -81,7 +97,10 @@ try {
     assert.equal((await created).status(), 200)
     await staff.page.getByRole('listitem').filter({ hasText: '浏览器签名插件往返验证' }).waitFor()
     await staff.page.screenshot({ path: fileURLToPath(new URL('plugin-authorized.png', output)), fullPage: true })
-    assert.ok(requests.some(r => r.url.endsWith(assets.entry) && !r.auth))
+    const entryReq = await entryRequest
+    assert.ok(entryReq,
+      `插件入口资源应当由浏览器以「不带 Authorization」的方式加载；` +
+      `实际记录到的请求：${JSON.stringify(requests.map(r => ({ url: r.url, auth: r.auth })))}`)
     assert.ok(requests.some(r => r.url.includes(`/api/plugins/${normal.id}/notes`) && r.auth))
     assert.ok(requests.every(r => !/[?&](token|access_token)=/i.test(r.url)))
     const csv = state.packages[2]

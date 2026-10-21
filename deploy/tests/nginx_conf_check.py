@@ -291,6 +291,26 @@ def _fmt_ver(ver: tuple[int, ...]) -> str:
     return ".".join(str(part) for part in ver)
 
 
+def _is_root() -> bool:
+    """当前是不是 root。
+
+    **nginx -t 需要 root**，而且不是「建议」而是「必须」：它要打开默认
+    错误日志（发行版装的位置通常是 ``/var/log/nginx/error.log``），还要
+    **真的 bind() 一下** 配置里 ``listen 80`` / ``listen 443`` 这些特权端口。
+
+    2026-10-21 的 CI 就栽在这儿：deploy job 以 ``runner`` 身份跑这一步，
+    于是 nginx 报的是
+
+        [alert] could not open error log file: open() "/var/log/nginx/error.log" failed (13: Permission denied)
+        [emerg] bind() to 0.0.0.0:80 failed (13: Permission denied)
+
+    —— 语法明明是 ok 的（nginx 自己都说 "syntax is ok"），却因为**权限**
+    判了失败。那 4 条红指认的不是配置，是身份。所以这里先问「你是不是
+    root」，不是就直接把原因说清楚，别让人去改配置。
+    """
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
 def check_real_nginx(root: Path, *, require_nginx: bool = False) -> None:
     nginx = find_nginx()
     if nginx is None:
@@ -317,6 +337,15 @@ def check_real_nginx(root: Path, *, require_nginx: bool = False) -> None:
         print("     （版本不够时 nginx -t 的结果说明不了配置对错，因此不跑）")
         return
     ok(f"nginx 版本 {_fmt_ver(ver)} >= {need}（这份配置里的 http2 on; 需要它）")
+
+    # ---- 身份闸：nginx -t 必须以 root 跑 ----
+    if not _is_root():
+        no("当前不是 root —— nginx -t 要打开默认错误日志"
+           "（/var/log/nginx/error.log）并真的 bind() 配置里的 80/443 端口；"
+           "非 root 跑出来的失败**与配置无关**（nginx 自己会说 \"syntax is ok\"，"
+           "挂在的是权限）。用 sudo 跑这一步。")
+        print("     （身份不对时 nginx -t 的结果说明不了配置对错，因此不跑）")
+        return
 
     print("== 真实 nginx -t ==")
     configs = [

@@ -505,7 +505,12 @@ jobs:
         # 「按文档启用限流」这条路径本身必须能过。
         # --require-nginx：没装 nginx 就判失败 —— 否则这道闸会「跳过 → 全绿」，
         # 变成一道什么也没验的假闸。
-        run: python3 deploy/tests/nginx_conf_check.py --require-nginx
+        #
+        # **必须 sudo**：nginx -t 要打开默认错误日志（/var/log/nginx/error.log）
+        # 并真的 bind() 配置里的 80/443。以 runner 身份跑的话，nginx 报的是
+        # 「could not open error log file」与「bind() failed (Permission denied)」
+        # —— 语法明明 ok，挂在的是权限。2026-10-21 的 CI 就是这么红了几条。
+        run: sudo python3 deploy/tests/nginx_conf_check.py --require-nginx
 
   # ------------------------------------------------------------------ 构建产物
   #
