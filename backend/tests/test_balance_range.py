@@ -199,11 +199,17 @@ def test_起始晚于止期_400(client, auth, db, book):
 
 def test_别人的期间_id_404(client, auth, book, db, admin_user, plain_user, plain_auth):
     """外账套的期间拿来当区间起点 = 越权探测，必须 404。"""
+    import uuid
+
     from app.models import Book
     from app.accounting.periods import create_periods
     from app.models import UserBook
 
-    other = Book(company_name="别家", name="别家账套", start_year=2026, start_month=1)
+    # 账套名必须带随机标签，理由见 test_voucher_split.py 里同名的注释：
+    # `uq_book` 是 (company_name, name) 上的全局唯一键，而这个账套建完就 commit。
+    tag = uuid.uuid4().hex[:8]
+    other = Book(company_name=f"别家公司{tag}", name=f"别家账套{tag}",
+                 start_year=2026, start_month=1)
     db.add(other)
     db.flush()
     create_periods(db, other)

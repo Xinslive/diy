@@ -392,11 +392,22 @@ def test_拆分预览接口只算不改(client, auth, db, book, admin_user, subj
 
 def test_拆分接口_别人的凭证是404(client, auth, db, book, admin_user, subjects):
     """跨账套不许碰：拿着别家账套的接口来拆这张凭证，404 而不是「拆了」。"""
+    import uuid
+
     from app.accounting.periods import create_periods
     from app.models import Book, UserBook
     from app.seed.chart_of_accounts import install_chart
 
-    other = Book(company_name="别家", name="别家账套", start_year=2026, start_month=1)
+    # 账套名必须带随机标签。`uq_book` 是 (company_name, name) 上的**全局**唯一键，
+    # 而这个账套建完就 commit —— 行留在 worker 的库里，不会随用例结束消失。
+    # 于是「两个用例用同一个写死的账套名」在 xdist 里就是一颗定时炸弹：
+    # 两条用例分到不同 worker 时各自相安无事，分到同一个 worker 时后一条
+    # 撞唯一键。CI 上它就是这么炸的（2026-10-21：test_balance_range.py 与
+    # 本文件用了同一个写死的 (别家, 别家账套)）。分工会随用例耗时漂移，
+    # 所以这条是偶发的 —— 偶发不等于可以放着不管。
+    tag = uuid.uuid4().hex[:8]
+    other = Book(company_name=f"别家公司{tag}", name=f"别家账套{tag}",
+                 start_year=2026, start_month=1)
     db.add(other)
     db.flush()
     create_periods(db, other)
