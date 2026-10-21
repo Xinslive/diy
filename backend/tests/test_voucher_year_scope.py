@@ -18,12 +18,29 @@
 4. 列表接口逐张带出年度（列表要跨年检索，前端得据此取表）
 5. 插入凭证的预览带出参照凭证那一年的年度（新凭证落在参照那一期里）
 6. 停用科目照样在那张表里（老凭证指着它，格子里得有名字）
+7. **年度字段不许带来 N+1**（打印层一次序列化 5000 张，逐张查库就是 5000 条）
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+
+import sqlalchemy
 from sqlalchemy import select
 
+from app.core.db import engine as app_engine
 from app.models import Period, Subject
+
+
+@contextmanager
+def _statements():
+    """收集本次调用期间真正发出去的 SQL（写法照 test_perf_accounting_paths.py）。"""
+    stmts: list[str] = []
+    handler = lambda conn, cursor, statement, params, ctx, many: stmts.append(statement)
+    sqlalchemy.event.listen(app_engine, "before_cursor_execute", handler)
+    try:
+        yield stmts
+    finally:
+        sqlalchemy.event.remove(app_engine, "before_cursor_execute", handler)
 
 
 def _chart_ids(db, book_id: int, year: int) -> set[int]:
@@ -174,3 +191,158 @@ def test_停用科目照样在那张表里_老凭证指着它(client, auth, db, 
                     params={"year": 2026}, headers=auth)
     assert r2.status_code == 200, r2.text
     assert not _has(r2.json()), "停用科目本不该出现在可选项里"
+
+
+# --------------------------------------------------------------------- 7. 年度不许带来 N+1
+
+
+def _print_query_count(client, auth, book, period) -> int:
+    """打印一个期间的凭证，看发出去多少条 SQL。"""
+    with _statements() as stmts:
+        r = client.get(f"/api/books/{book.id}/print/vouchers.html",
+                       params={"period_id": period.id}, headers=auth)
+    assert r.status_code == 200, r.text[:300]
+    return len(stmts)
+
+
+def test_序列化凭证时一个查询都不发(db, book, make_voucher):
+    """**序列化函数自己不查库** —— 年度由调用方一次取好传进来。
+
+    这条必须在一个**新会话**里测：同一个会话里 Period 早就在 identity map
+    里了（建凭证时加载过），``db.get(Period, …)`` 命中缓存不发 SQL —— 那样
+    测出来永远是 0 条，守卫就成了一句空话。换一个新会话，identity map 是空的，
+    「调用方没提前取好」的情形才成立。
+
+    与当初审计发现的严重 2 同一个形状：那里的科目没一次取好，满月的账就是
+    5000 次同样的查询。
+    """
+    from app.api.vouchers import _book_subjects, _serialize
+    from app.core.db import SessionLocal
+    from app.models import Voucher
+
+    v = make_voucher("2026-06-10", dr=[("1002", 100, "x")], cr=[("5001", 100, "x")])
+    db.commit()
+
+    with SessionLocal() as s:
+        vv = s.get(Voucher, v.id)
+        _ = vv.entries          # 分录先加载好，别把懒加载算进来
+        subs = _book_subjects(s, book.id)
+        with _statements() as stmts:
+            out = _serialize(s, vv, subs)
+        assert not stmts, (
+            f"序列化一张凭证发了 {len(stmts)} 条查询：{stmts} —— "
+            "年度要在序列化里查库，就是逐张一条的 N+1")
+        assert "year" not in out, (
+            "调用方没给期间索引时就不该有 year 这个键（不知道就干脆没有，"
+            "不留一个 None 让人以为「这一张没有年度」）")
+
+
+def test_打印一个期间的凭证时查询数不随凭证数增长(client, auth, db, book, periods,
+                                                subjects, make_voucher):
+    """**年度字段不许在序列化里逐张查库。**
+
+    打印层一次最多序列化 5000 张凭证（``page_size=5000``），而 ``_serialize``
+    是**逐张**调的 —— 它要是自己去按 id 查期间，满月的账就是 5000 条同样的
+    SELECT，与当初审计发现的严重 2（科目没一次取好，满月的账 5000 次同样的
+    查询）是同一个坑。
+
+    修法：年度由调用方**一次取好**传进来（``_book_periods``），序列化函数里
+    一个查询都不发。所以这里的断言是「凭证数翻十倍，查询数不跟着涨」。
+    """
+    period = periods[3]
+    for i in range(2):
+        make_voucher(f"2026-04-{10 + i:02d}", dr=[("1002", 100 + i, "x")],
+                     cr=[("5001", 100 + i, "x")])
+    db.commit()
+    small = _print_query_count(client, auth, book, period)
+
+    for i in range(18):
+        make_voucher(f"2026-04-{12 + i:02d}", dr=[("1002", 200 + i, "x")],
+                     cr=[("5001", 200 + i, "x")])
+    db.commit()
+    big = _print_query_count(client, auth, book, period)
+
+    assert big - small <= 5, (
+        f"凭证从 2 张涨到 20 张，查询数从 {small} 涨到 {big} —— "
+        "序列化里在逐张查库（N+1）")
+
+
+def test_凭证接口的年度查询不随凭证数增长(client, auth, db, book, periods,
+                                          subjects, make_voucher):
+    """列表接口同理：年度由**一次**取好的期间索引给出，不是逐张查。"""
+    period = periods[4]
+    for i in range(2):
+        make_voucher(f"2026-05-{10 + i:02d}", dr=[("1002", 100 + i, "x")],
+                     cr=[("5001", 100 + i, "x")])
+    db.commit()
+    with _statements() as stmts:
+        r = client.get(f"/api/books/{book.id}/vouchers", headers=auth)
+    assert r.status_code == 200, r.text[:300]
+    small = len(stmts)
+
+    for i in range(18):
+        make_voucher(f"2026-05-{12 + i:02d}", dr=[("1002", 200 + i, "x")],
+                     cr=[("5001", 200 + i, "x")])
+    db.commit()
+    with _statements() as stmts:
+        r = client.get(f"/api/books/{book.id}/vouchers", headers=auth)
+    assert r.status_code == 200, r.text[:300]
+    big = len(stmts)
+
+    assert big - small <= 3, (
+        f"凭证从 2 张涨到 20 张，列表接口的查询数从 {small} 涨到 {big} —— "
+        "年度在逐张查库（N+1）")
+
+
+def test_建凭证与改凭证的回执也带年度(client, auth, db, book, subjects):
+    """回执（POST/PUT 的响应）也要带年度 —— 前端建完凭证就地接着录，
+    那时页面上用的科目表得是**这一张所属年度**那张。"""
+    payload = {
+        "voucher_date": "2026-07-15",
+        "entries": [
+            {"subject_id": subjects["1002"].id, "direction": "DEBIT",
+             "amount": "100.00", "summary": "回执也要带年度"},
+            {"subject_id": subjects["5001"].id, "direction": "CREDIT",
+             "amount": "100.00", "summary": "回执也要带年度"},
+        ],
+        "remark": "", "attachments": 0,
+    }
+    r = client.post(f"/api/books/{book.id}/vouchers", json=payload, headers=auth)
+    assert r.status_code == 201, r.text
+    vid = r.json()["id"]
+    assert r.json()["year"] == 2026, f"建凭证的回执没有年度：{r.json()}"
+
+    payload["voucher_date"] = "2026-07-16"
+    r2 = client.put(f"/api/books/{book.id}/vouchers/{vid}", json=payload, headers=auth)
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["year"] == 2026, f"改凭证的回执没有年度：{r2.json()}"
+
+
+def test_拆分凭证时两张都带年度(client, auth, db, book, subjects):
+    """拆出来的两张也要带年度 —— 它们各自还是那张凭证所属年度的凭证。
+
+    分录要**借贷交替**：拆分要求前后两半各自平（这里在第 2 行后切），
+    而 make_voucher 造出来的顺序是「先借后贷」，切不出两半都平的刀口。
+    """
+    entries = [
+        {"subject_id": subjects["1002"].id, "direction": "DEBIT",
+         "amount": "100.00", "summary": "拆"},
+        {"subject_id": subjects["5001"].id, "direction": "CREDIT",
+         "amount": "100.00", "summary": "拆"},
+        {"subject_id": subjects["1002"].id, "direction": "DEBIT",
+         "amount": "200.00", "summary": "拆"},
+        {"subject_id": subjects["5001"].id, "direction": "CREDIT",
+         "amount": "200.00", "summary": "拆"},
+    ]
+    r = client.post(f"/api/books/{book.id}/vouchers",
+                    json={"voucher_date": "2026-08-10", "entries": entries,
+                          "remark": "", "attachments": 0}, headers=auth)
+    assert r.status_code == 201, r.text
+    vid = r.json()["id"]
+
+    r2 = client.post(f"/api/books/{book.id}/vouchers/{vid}/split",
+                     json={"at_line": 2}, headers=auth)
+    assert r2.status_code == 200, r2.text
+    d = r2.json()
+    assert d["original"]["year"] == 2026, d["original"]
+    assert d["created"]["year"] == 2026, d["created"]

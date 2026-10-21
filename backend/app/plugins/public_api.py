@@ -239,7 +239,7 @@ def context_for(manifest):
         """
         from app.accounting import vouchers as svc
         from app.api.schemas import VoucherIn
-        from app.api.vouchers import _book_subjects, _serialize
+        from app.api.vouchers import _book_periods, _book_subjects, _serialize
         from app.core.config import settings
 
         if not isinstance(payloads, list) or not payloads:
@@ -269,7 +269,10 @@ def context_for(manifest):
                     raise HTTPException(400, f"第 {i} 张凭证没建成，整批已回滚：{e}") from e
             # 科目一次取回给所有凭证复用（见 _book_subjects 的 docstring）。
             subs = _book_subjects(db, book.id)
-            return [_serialize(db, v, subs) for v in made]
+            # 期间同样一次取回（一条查询）：年度随凭证一起出去，形状与 REST 那边一致 ——
+            # 同一个「凭证」两处形状不同，是个迟早会咬人的坑。
+            periods = _book_periods(db, book.id, {v.period_id for v in made})
+            return [_serialize(db, v, subs, periods) for v in made]
 
     def table_access(db, user, name, book_id, write=False):
         if name not in declarations:

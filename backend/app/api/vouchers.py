@@ -85,28 +85,28 @@ def _serialize(db: Session, v: Voucher, subs: dict[int, Subject] | None = None,
     entries = sorted(v.entries, key=lambda e: e.line_no)
     # 列表页由调用方一次取好传进来；单张场景（建/改/删后回显）这里兜底。
     subs = _book_subjects(db, v.book_id) if subs is None else subs
-    # **这张凭证属于哪个会计年度** —— 期间那一行说了算。
+    # **年度由调用方给**：``periods`` 是「本次要序列化的这些凭证所属的期间」的索引。
     #
-    # 为什么必须随凭证一起给出去：科目表每个会计年度各有一份（迁移 0032），
-    # 而一张凭证的分录只能挂在**它自己那一期所属年度**的科目上
-    # （``accounting/vouchers._validate_entries`` 里按 ``Subject.year == period.year`` 校验）。
-    # 前端要按这个年度去取那张科目表 —— 拿顶栏那一年的话，往年凭证上的
-    # subject_id 在新年度那张表里根本不存在，格子里挂的科目就全是空的。
+    # 这里**绝不按 id 自己去查** —— 序列化函数里逐张查库就是 N+1：
+    # 打印层一次最多序列化 5000 张凭证（page_size=5000），满月的账就是 5000 条
+    # 同样的 SELECT，与当初审计发现的严重 2 是同一个坑（那里的科目一次取好就是
+    # 为此修的）。所以年度要么由调用方**一次取好**传进来，要么这个字段就没有 ——
+    # 绝不为了凑一个字段把打印拖慢。
     #
-    # 列表页由调用方一次取好期间传进来（避免一张一张查）；单张场景这里兜底。
-    period = (periods.get(v.period_id) if periods is not None
-              else db.get(Period, v.period_id))
+    # 年度是「这张凭证属于哪一年」，取自它自己那一期 —— 凭证页要按它去取
+    # **那一年**的科目表（科目表每个年度各有一份，迁移 0032），拿顶栏那一年的话，
+    # 往年凭证上的 subject_id 在新年度那张表里根本不存在，格子里挂的科目就全空。
+    period = periods.get(v.period_id) if periods else None
     # 合计走 side_totals：红字（负数）算到对面去，两栏都只摆正数
     dr_total, cr_total = svc.side_totals(
         [{"direction": e.direction, "amount": e.amount} for e in entries])
-    return {
+    out = {
         "id": v.id, "voucher_no": v.voucher_no, "voucher_date": v.voucher_date.isoformat(),
         "status": v.status, "source": v.source, "remark": v.remark,
         "attachments": v.attachments, "created_by": v.created_by,
         "posted_by": v.posted_by,
         "posted_at": v.posted_at.isoformat() if v.posted_at else None,
         "period_id": v.period_id,
-        "year": period.year if period is not None else None,
         "total_debit": str(dr_total),
         "total_credit": str(cr_total),
         "entries": [
@@ -119,6 +119,11 @@ def _serialize(db: Session, v: Voucher, subs: dict[int, Subject] | None = None,
             for e in entries
         ],
     }
+    # 年度只在真的知道的时候才带上（调用方给过期间索引）——
+    # 不知道就**没有这个键**，不留一个 None 让人以为「这一张没有年度」。
+    if period is not None:
+        out["year"] = period.year
+    return out
 
 
 def _book_period(db: Session, book: Book, period_id: int | None, label: str) -> Period | None:
@@ -198,7 +203,8 @@ def create(payload: VoucherIn, book: Book = Depends(get_my_book), db: Session = 
     except (ValueError, ArithmeticError) as e:
         db.rollback()
         raise HTTPException(400, str(e))
-    return _serialize(db, v)
+    # 期间一次取好（一条查询），年度随凭证一起出去（见 _serialize 的说明）
+    return _serialize(db, v, periods=_book_periods(db, book.id, {v.period_id}))
 
 
 def _target_period_code(db: Session, v: Voucher, voucher_date: date | None) -> str | None:
@@ -270,7 +276,8 @@ def update(voucher_id: int, payload: VoucherIn, book: Book = Depends(get_my_book
             f"凭证号 {v.voucher_no} 在{where}已经被另一张凭证占用"
             f"（可能刚被另一条记录占用）。请换一个号再试。"
         )
-    return _serialize(db, v)
+    # 期间一次取好（一条查询），年度随凭证一起出去（见 _serialize 的说明）
+    return _serialize(db, v, periods=_book_periods(db, book.id, {v.period_id}))
 
 
 def _assert_no_dead_gap(db: Session, book: Book, rows: list[Voucher]) -> None:
@@ -842,9 +849,12 @@ def split(voucher_id: int, payload: SplitIn, book: Book = Depends(get_my_book),
         db.rollback()
         raise HTTPException(400, str(e))
     subs = _book_subjects(db, book.id)
+    # 两张的期间一次取好（一条查询），年度随凭证一起出去
+    periods = _book_periods(db, book.id,
+                            {result["original"].period_id, result["created"].period_id})
     return {
-        "original": _serialize(db, result["original"], subs),
-        "created": _serialize(db, result["created"], subs),
+        "original": _serialize(db, result["original"], subs, periods),
+        "created": _serialize(db, result["created"], subs, periods),
         "moved": result["moved"],
     }
 
@@ -854,4 +864,5 @@ def detail(voucher_id: int, book: Book = Depends(get_my_book), db: Session = Dep
     v = db.get(Voucher, voucher_id)
     if v is None or v.book_id != book.id:
         raise HTTPException(404, "凭证不存在")
-    return _serialize(db, v)
+    # 期间一次取好（一条查询），年度随凭证一起出去（见 _serialize 的说明）
+    return _serialize(db, v, periods=_book_periods(db, book.id, {v.period_id}))
