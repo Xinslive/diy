@@ -1951,13 +1951,27 @@ trg_entry_subject_year_guard   <   trg_entry_sync
 | `0033_book_year_guardrails` | 重放 `db_init.sql`，装上三条年度一致性触发器 |
 
 `0032` **必须可重复执行**（仓库 0005 已有「重复执行不改变结构」纪律，
-迁移链测试会把 `alembic_version` 打回 0004 再重跑）。两个坑：
+迁移链测试会把 `alembic_version` 打回 0004 再重跑）。四个坑：
 
 * 判断「这个账套搬过没有」不能看「有没有 `year IS NULL` 的科目」——
   二次运行会把已克隆的 2027 科目搬回 2026。判据是**先登记 `book_year`**，
   再看有没有 `year IS NULL` 的科目。
 * `book_year` 的列类型用 `serial` / `integer`（与 `book.id` 对齐），
   否则 alembic 的 `compare_type` 会报差异。
+* **旧唯一键 `(book_id, code)` 必须早于克隆拆掉。** 它的语义是「一个账套
+  一份科目表」，而新模型下同编码要按年度各有一份 —— 克隆干的就是「在同一
+  账套里插同编码的新行」，旧键还在必然撞 `UniqueViolation`。新键
+  `(book_id, year, code)` 要等数据归位完才能加（加早了会把还没归位的行也算进
+  唯一性判定，那时的 `year` 还是 `NULL`）。所以**先拆旧键、搬数据、最后加新键**。
+  只有**横跨两个年度**的账套才走克隆这条路 —— 单年度账套永远碰不到这个坑，
+  而测试库里绝大多数账套都是单年度的，于是它一路带到了生产。
+* **期初快照只能「删了重建」，不能就地 `UPDATE`。** `trg_opening_guard`
+  挡的是 `period_opening` 上的任何 `UPDATE`（期初是快照，只能重算不能就地改），
+  应用层改期初走的也是同一条路（`years.detach_openings` → 换表 →
+  `years.attach_openings`）。另外，搬分录时若要临时关掉
+  `trg_entry_lock_guard`，**关掉后必须先 `SET CONSTRAINTS ALL IMMEDIATE`**
+  再装回去：分录一改，延迟到提交才判的余额校验就排队了，而 `ALTER TABLE`
+  不接受还有未决事件的表。
 
 历史数据用 `scripts/merge_book_years.py` 把老库「一年一个账套」合并进来：
 主账套**没有**那一年科目表时**整张搬过来**（id 不变）；

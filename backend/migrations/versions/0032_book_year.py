@@ -84,9 +84,51 @@ def _ddl() -> None:
     op.execute("ALTER TABLE subject ADD COLUMN IF NOT EXISTS year integer")
 
 
+def _drop_legacy_code_key() -> None:
+    """把旧唯一键 ``(book_id, code)`` 拆掉 —— **必须早于克隆**。
+
+    旧键的语义是「一个账套一份科目表」：同一个账套里编码不能重复。
+    而新模型下同编码要**按年度各有一份**（2026 的 1001 与 2027 的 1001
+    是两行、两码）。克隆科目表干的就是「在同一账套里插同编码的新行」——
+    旧键还在的话这一步必然撞 UniqueViolation。
+
+    换键本身在 ``_finalize`` 里做（加新键 ``(book_id, year, code)``）。
+    但**删旧键必须提前**：新键要等数据归位完才能加 —— 加早了会把
+    「还没归位的行」也算进唯一性判定（那时 ``year`` 还是 NULL）。
+
+    同一事务内完成：迁移失败回滚，旧键原样还在。
+    """
+    op.execute("ALTER TABLE subject DROP CONSTRAINT IF EXISTS uq_subject_book_code")
+
+
+def _set_trigger_enabled(table: str, trigger: str, enabled: bool) -> None:
+    """开/关一条**普通**触发器。
+
+    ``ALTER TABLE ... DISABLE TRIGGER`` 没有 ``IF EXISTS`` 这种写法 ——
+    触发器不存在时它直接报错。而迁移必须能在「这条触发器还没装上」的
+    库上跑（从 0001 起重放整条链时，0001 不装它），所以先问一句。
+
+    判存在用 ``pg_trigger`` 配 ``to_regclass``：后者走的是与
+    ``ALTER TABLE <table>`` **同一套 search_path 解析**，两边的
+    ``entry`` 必然是同一张表（迁移测试用独立 schema 当「另一个数据库」，
+    正是在那儿踩过 ``information_schema`` 看得见同名表的坑）。
+    """
+    exists = op.get_bind().execute(
+        text("SELECT 1 FROM pg_trigger "
+             "WHERE tgrelid = to_regclass(:t) AND tgname = :n AND NOT tgisinternal"),
+        {"t": table, "n": trigger}).scalar()
+    if not exists:
+        return
+    op.execute(
+        f"ALTER TABLE {table} {'ENABLE' if enabled else 'DISABLE'} TRIGGER {trigger}")
+
+
 def _migrate_data() -> None:
     """把存量数据归到年度上：登记年度、克隆科目表、重指分录与期初、补跨年期初。"""
     from app.core.db import SessionLocal
+
+    # **先拆旧唯一键**，理由见 ``_drop_legacy_code_key``。
+    _drop_legacy_code_key()
 
     db = SessionLocal(bind=op.get_bind())
     try:
@@ -232,16 +274,25 @@ def _clone_chart(db, book, originals, year: int) -> None:
     # 「已结账期间禁写」那条触发器挡的是**改业务数据**，而这里搬的是
     # **引用**（subject_id 从旧行指向同编码的新行），一个金额都不改。
     # 触发器看不见这个区别，所以迁移期间临时关掉它，搬完立刻装回去。
-    db.execute(text("ALTER TABLE entry DISABLE TRIGGER trg_entry_lock_guard"))
-    try:
-        ords = list(db.scalars(
-            select(Period.ord).where(Period.book_id == book.id, Period.year == year)
-        ).all())
-        if ords:
-            rows = db.execute(
-                select(Entry.id, Entry.subject_id)
-                .where(Entry.book_id == book.id, Entry.period_ord.in_(ords))
-            ).all()
+    #
+    # **只在真要改分录时才关。** 关了再开是一次 ALTER TABLE，而 ALTER
+    # TABLE 要求这张表上没有挂起的延迟触发器事件 —— 分录一改，延迟到
+    # 提交时才判的余额校验就排队了。所以顺序是：改完先结算（SET
+    # CONSTRAINTS ALL IMMEDIATE），再把触发器装回去。
+    # 没有分录要改的时候（本迁移的常态：次年没有凭证）就一步都别动 ——
+    # 「没打算改就不去改触发器」比「改了再改回来」少一个失败点。
+    ords = list(db.scalars(
+        select(Period.ord).where(Period.book_id == book.id, Period.year == year)
+    ).all())
+    rows = []
+    if ords:
+        rows = db.execute(
+            select(Entry.id, Entry.subject_id)
+            .where(Entry.book_id == book.id, Entry.period_ord.in_(ords))
+        ).all()
+    if rows:
+        _set_trigger_enabled("entry", "trg_entry_lock_guard", False)
+        try:
             for entry_id, subject_id in rows:
                 src = by_id.get(subject_id)
                 hit = created.get(src.code) if src is not None else None
@@ -251,29 +302,54 @@ def _clone_chart(db, book, originals, year: int) -> None:
                     text("UPDATE entry SET subject_id = :sid WHERE id = :eid"),
                     {"sid": hit.id, "eid": entry_id},
                 )
-        db.flush()
+            db.flush()
+            # 结算挂起的延迟事件：余额校验是「延迟到提交时才判」的，
+            # 而 ALTER TABLE 不接受还有未决事件的表。这里结算等于把
+            # 校验提前到现在做 —— 金额一个没动，平不平与迁移前同解。
+            db.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+        finally:
+            _set_trigger_enabled("entry", "trg_entry_lock_guard", True)
 
-        # ---- 重指该年度的期初快照 ----
-        #
-        # ``period_opening`` 上有一条「禁止 UPDATE」的触发器
-        # （``trg_opening_guard``：期初是快照，只能重算不能就地改）。
-        # 所以走「删掉旧的、按新归属重新插入」，与反结账流程同一条语义。
-        opening_rows = db.execute(
-            select(PeriodOpening.id, PeriodOpening.subject_id)
-            .join(Period, Period.id == PeriodOpening.period_id)
-            .where(Period.book_id == book.id, Period.year == year)
-        ).all()
-        for opening_id, subject_id in opening_rows:
-            src = by_id.get(subject_id)
-            hit = created.get(src.code) if src is not None else None
-            if hit is None:
-                continue
-            db.execute(
-                text("UPDATE period_opening SET subject_id = :sid WHERE id = :oid"),
-                {"sid": hit.id, "oid": opening_id},
-            )
-    finally:
-        db.execute(text("ALTER TABLE entry ENABLE TRIGGER trg_entry_lock_guard"))
+    # ---- 重指该年度的期初快照 ----
+    #
+    # **只能「删了重建」，不能就地 UPDATE。** ``period_opening`` 上有
+    # 一条 ``trg_opening_guard``（BEFORE UPDATE）：期初是快照，
+    # 不可直接修改，要改只能走反结账流程重算。UPDATE 会被它当场挡下
+    # （check_violation「期初快照不可直接修改」）。
+    #
+    # 应用层改期初走的是同一条路：``years.detach_openings`` 把快照
+    # 摘下来、换成新科目表、``years.attach_openings`` 再按编码挂回去。
+    # 这里与它对齐：删掉旧的、按新归属重新插入。
+    #
+    # 归属按**编码**算：期初属于「某个编码在某个年度的余额」，与它
+    # 挂在哪一行科目上无关 —— 2022 年 1001 的期初，该挂在 2022 年
+    # 那张表里的 1001 上。
+    opening_rows = db.execute(
+        select(PeriodOpening.id, PeriodOpening.period_id,
+               PeriodOpening.subject_id, PeriodOpening.amount,
+               PeriodOpening.created_at)
+        .join(Period, Period.id == PeriodOpening.period_id)
+        .where(Period.book_id == book.id, Period.year == year)
+    ).all()
+    for opening_id, period_id, subject_id, amount, created_at in opening_rows:
+        src = by_id.get(subject_id)
+        hit = created.get(src.code) if src is not None else None
+        if hit is None:
+            # 编码对不上（不该发生：克隆是整张表照搬的）——
+            # 保留原样，绝不静默丢掉一条有金额的期初。
+            continue
+        db.execute(
+            text("DELETE FROM period_opening WHERE id = :oid"), {"oid": opening_id})
+        db.execute(
+            text("""
+                INSERT INTO period_opening
+                    (book_id, period_id, subject_id, amount, created_at, updated_at)
+                VALUES (:b, :p, :s, :a, :c, now())
+            """),
+            {"b": book.id, "p": period_id, "s": hit.id,
+             "a": amount, "c": created_at},
+        )
+    db.flush()
 
 
 def _move_init_state(db, book, years, anchor: int, data_years: set[int]) -> None:

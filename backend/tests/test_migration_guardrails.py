@@ -970,3 +970,231 @@ def test_head_是本文件认识的那一版():
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")
+
+
+# ================================================================ 8. 0032 真的把数据搬对了
+#
+# 这一节测的是**迁移把数据搬对了**，不是「版本号对得上」。
+#
+# 为什么非要有它：生产上有两个账套横跨两个年度（2021 与 2022）。
+# 迁移要把科目表按年度拆开，并把**次年**的分录与期初重指到克隆出来的那
+# 张表上。这条路径在「只有一个年度」的账套上根本不会触发 ——
+# 而测试库里绝大多数账套都只有一个年度，于是那条路径**从来没被走过**，
+# 迁移里两个只在跨年账套上才暴露的缺陷就一路带到了生产：
+#
+#   1. 旧唯一键 ``(book_id, code)`` 还在，克隆必然撞 UniqueViolation；
+#   2. 期初快照用 UPDATE 重指，被 ``trg_opening_guard`` 当场挡下。
+#
+# 两条都会让生产迁移**当场失败**（不是数据错，是迁移跑不下去）——
+# 而迁移失败的那一刻，发布脚本已经把库备份好了、人也已经等着看结果了。
+
+
+@pytest.fixture
+def scratch_at_0031():
+    """一个停在 0031 的独立 schema —— 科目表还是账套级的那个形态。"""
+    name = "scratch_by"
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {name} CASCADE")
+        conn.exec_driver_sql(f"CREATE SCHEMA {name}")
+    eng = create_engine(
+        TEST_DB_URL, connect_args={"options": f"-c search_path={name}"})
+    _upgrade(eng, "0031_subject_guard_year")
+    yield eng, name
+    eng.dispose()
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {name} CASCADE")
+
+
+def _seed_two_year_book(eng) -> None:
+    """造一个横跨 2021/2022 的账套。
+
+    * 2021 有凭证 → 锚年 = 2021，**2022 拿到克隆出来的那张科目表**
+    * 2022 也有凭证 → 次年的分录也要被重指
+    * 2022 有期初快照 → 次年的期初也要被重指
+
+    全用裸 SQL 写：0031 的 ``subject`` 表还没有 ``year`` 列，而 HEAD 的
+    ORM 认定它 NOT NULL —— 用 ORM 写会当场报「列不存在」。
+    """
+    with eng.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO book (id, company_name, name, start_year, start_month,
+                              subject_code_rule, status, data_version,
+                              created_at, updated_at)
+            VALUES (1, '跨年测试公司', '跨年账套', 2021, 1, '4-2-2-2', 'ACTIVE', 0,
+                    now(), now())
+        """))
+        # 两个年度各 12 个期间。ord 跨年度连续（2021 是 1..12，2022 是 13..24）。
+        for year in (2021, 2022):
+            for month in range(1, 13):
+                conn.execute(text("""
+                    INSERT INTO period (id, book_id, year, month, ord, locked,
+                                        version, created_at, updated_at)
+                    VALUES (:id, 1, :year, :month, :ord, false, 1, now(), now())
+                """),
+                             {"id": (year - 2021) * 12 + month, "year": year,
+                              "month": month, "ord": (year - 2021) * 12 + month})
+        for code, name, category, direction in (
+            ("1001", "库存现金", "A", "DEBIT"),
+            ("1002", "银行存款", "A", "DEBIT"),
+            ("2001", "短期借款", "L", "CREDIT"),
+        ):
+            conn.execute(text("""
+                INSERT INTO subject (id, book_id, code, name, level, category,
+                                     direction, is_leaf, carry_forward, qty_calc,
+                                     aux_calc, fx_calc, sort_no, active, ext_attrs,
+                                     created_at, updated_at)
+                VALUES (:id, 1, :code, :name, 1, :cat, :dir, true, false, false,
+                        false, false, 0, true, '{}'::jsonb, now(), now())
+            """),
+                         {"id": int(code), "code": code, "name": name,
+                                           "cat": category, "dir": direction})
+        # 2021-01 与 2022-01 各一张凭证
+        for vid, pid, vno, vdate, dcode, ccode, amount in (
+            (1, 1, "记-0001", "2021-01-15", "1001", "2001", 1000.00),
+            (2, 13, "记-0002", "2022-01-15", "1002", "2001", 500.00),
+        ):
+            conn.execute(text("""
+                INSERT INTO voucher (id, book_id, period_id, voucher_no, voucher_date,
+                                     status, source, attachments, remark,
+                                     created_at, updated_at)
+                VALUES (:id, 1, :pid, :vno, :vdate, 'POSTED', 'MANUAL', 0, '',
+                        now(), now())
+            """),
+                         {"id": vid, "pid": pid, "vno": vno, "vdate": vdate})
+            # **一条语句插两行**：余额校验是延迟到提交时才判的，
+            # 分两次插的话第一条就会因为「只借不贷」被挡下。
+            conn.execute(text("""
+                INSERT INTO entry (voucher_id, book_id, period_ord, line_no,
+                                   subject_id, direction, amount, summary,
+                                   created_at, updated_at)
+                VALUES (:vid, 1, :ord, 1, :did, 'DEBIT', :amt, '收付', now(), now()),
+                       (:vid, 1, :ord, 2, :cid, 'CREDIT', :amt, '收付', now(), now())
+            """),
+                         {"vid": vid, "ord": pid, "did": int(dcode), "cid": int(ccode),
+                                           "amt": amount})
+        # 2022-01 的期初快照 —— 指向**原来那份**（账套级）科目行
+        for code, amount in (("1001", 1000.00), ("2001", -1000.00)):
+            conn.execute(text("""
+                INSERT INTO period_opening (book_id, period_id, subject_id, amount,
+                                            created_at, updated_at)
+                VALUES (1, 13, :sid, :amt, now(), now())
+            """),
+                         {"sid": int(code), "amt": amount})
+        # 克隆走 INSERT，id 由序列发 —— 序列必须与 max(id) 对齐，
+        # 否则克隆出来的第一行就会撞主键。
+        conn.exec_driver_sql("""
+            SELECT setval(pg_get_serial_sequence('subject','id'),
+                           coalesce((SELECT max(id) FROM subject), 0) + 1)
+        """)
+
+
+def test_跨年账套_科目表按年度拆开_次年的分录与期初都指到本年(scratch_at_0031):
+    """迁移跑得完，而且搬完之后**每一行都指对了**。
+
+    三件事必须同时成立：
+
+    1. 科目表按年度拆开 —— 2021 与 2022 各一份；
+    2. 次年的**分录**指到次年那张表；
+    3. 次年的**期初**指到次年那张表。
+
+    第 2、3 条是「钱还在原地」的保证：期初指错了编码，账面数字就会变，
+    而且变在没人看见的地方。
+    """
+    eng, _ = scratch_at_0031
+    _seed_two_year_book(eng)
+    _upgrade(eng, "head")
+
+    with eng.connect() as conn:
+        # 1. 科目表按年度拆开
+        rows = conn.execute(text(
+            "SELECT year, count(*), array_agg(code ORDER BY code) "
+            "FROM subject GROUP BY year ORDER BY year")).all()
+        assert [r[0] for r in rows] == [2021, 2022], f"科目表没有按年度拆开：{rows}"
+        assert all(r[1] == 3 for r in rows), f"某一年的科目数不对：{rows}"
+
+        # 2. 次年的分录指到次年那张表
+        rows = conn.execute(text("""
+            SELECT p.year, s.year, count(*)
+            FROM entry e
+            JOIN voucher v ON v.id = e.voucher_id
+            JOIN period p ON p.id = v.period_id
+            JOIN subject s ON s.id = e.subject_id
+            GROUP BY p.year, s.year
+        """)).all()
+        assert rows, "分录不见了 —— 迁移把数据搬丢了"
+        for period_year, subject_year, n in rows:
+            assert period_year == subject_year, (
+                f"分录挂到了别的年度的科目上：凭证在 {period_year} 年，"
+                f"科目在 {subject_year} 年（{n} 条）")
+
+        # 3. 次年的期初指到次年那张表
+        rows = conn.execute(text("""
+            SELECT p.year, s.year, s.code, po.amount
+            FROM period_opening po
+            JOIN period p ON p.id = po.period_id
+            JOIN subject s ON s.id = po.subject_id
+        """)).all()
+        assert rows, "期初快照不见了 —— 迁移把数据搬丢了"
+        for period_year, subject_year, code, amount in rows:
+            assert period_year == subject_year, (
+                f"期初挂到了别的年度的科目上：期间在 {period_year} 年，"
+                f"科目在 {subject_year} 年（{code}）")
+
+
+def test_跨年账套_迁移后凭证与分录与期初的条数与金额一分不动(scratch_at_0031):
+    """搬家的前提是**只搬家，不动账**。
+
+    金额、条数、借贷平衡全部与迁移前一致 —— 这条不过，说明迁移在
+    改业务数据，那比迁移失败严重得多。
+    """
+    eng, _ = scratch_at_0031
+    _seed_two_year_book(eng)
+
+    def snapshot(conn):
+        return {
+            "凭证": conn.execute(text("SELECT count(*) FROM voucher")).scalar(),
+            "分录": conn.execute(text("SELECT count(*) FROM entry")).scalar(),
+            "期间": conn.execute(text("SELECT count(*) FROM period")).scalar(),
+            "期初": conn.execute(text("SELECT count(*) FROM period_opening")).scalar(),
+            "借方": conn.execute(text(
+                "SELECT sum(amount) FROM entry WHERE direction='DEBIT'")).scalar(),
+            "贷方": conn.execute(text(
+                "SELECT sum(amount) FROM entry WHERE direction='CREDIT'")).scalar(),
+            "期初合计": conn.execute(text(
+                "SELECT sum(amount) FROM period_opening")).scalar(),
+        }
+
+    with eng.connect() as conn:
+        before = snapshot(conn)
+    _upgrade(eng, "head")
+    with eng.connect() as conn:
+        after = snapshot(conn)
+
+    assert before["凭证"] == after["凭证"], "凭证条数变了"
+    assert before["分录"] == after["分录"], "分录条数变了"
+    assert before["期间"] == after["期间"], "期间条数变了"
+    assert before["期初"] == after["期初"], "期初条数变了"
+    assert before["借方"] == after["借方"], "借方合计变了"
+    assert before["贷方"] == after["贷方"], "贷方合计变了"
+    assert before["期初合计"] == after["期初合计"], "期初金额合计变了"
+    assert after["借方"] == after["贷方"], "借贷不平了"
+
+
+def test_跨年账套_迁移后旧唯一键换成按年度的(scratch_at_0031):
+    """旧键 ``(book_id, code)`` 必须换成 ``(book_id, year, code)``。
+
+    旧键还在的话，同一个账套里两个年度的同编码科目就插不进去 ——
+    而那正是新模型的常态。
+    """
+    eng, _ = scratch_at_0031
+    _seed_two_year_book(eng)
+    _upgrade(eng, "head")
+
+    with eng.connect() as conn:
+        names = set(conn.execute(text("""
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = to_regclass('subject') AND contype = 'u'
+        """)).scalars())
+        assert "uq_subject_book_year_code" in names, f"新唯一键没装上：{names}"
+        assert "uq_subject_book_code" not in names, (
+            f"旧唯一键还在：{names} —— 同编码的跨年科目插不进去")
