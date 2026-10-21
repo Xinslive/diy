@@ -65,6 +65,20 @@ try {
     const granted = (await manifest.json()).plugins
     assert.equal(granted.length, 3)
     const assets = granted.find(p => p.id === normal.id)
+    // **资产 URL 里带一张短期票据**（backend/app/plugins/security.py::asset_token），
+    // 长这样：/api/plugins/assets/<id>/<digest>/frontend/_t/<到期秒>.<签名>/index.js
+    //
+    // 票据的到期时间是**整秒**（int(time.time()) + 3600），所以**两次 manifest
+    // 响应拿到的 URL 会差一个时间戳段** —— 测试自己取的那份 manifest 与页面
+    // 取的那份不在同一秒时，URL 就对不上。
+    //
+    // 2026-10-21 的 CI 就是这么红的：同一行断言连续三轮时绿时红（跨秒就红）。
+    // 断言真正要守的性质是「**浏览器以不带 Authorization 的方式**加载插件
+    // 代码」（插件代码走 import 静态路径不带令牌，插件数据走 fetch 带令牌），
+    // 所以这里把比较基准缩到**与票据无关**的那部分：
+    //   前缀 = /api/plugins/assets/<id>/，文件名 = index.js
+    const assetPrefix = '/api/plugins/assets/' + assets.id + '/'
+    const entryFile = assets.entry.split('/').pop()
     const publicAsset = await browser.newContext()
     const source = await publicAsset.request.get(state.url + assets.entry)
     assert.equal(source.status(), 200)
@@ -83,9 +97,11 @@ try {
     // 那条 import 请求到底有没有被记下来，取决于它相对断言的时序 ——
     // 于是同一份代码上一轮 CI 是绿的、下一轮就红了（连续两轮红在
     // plugin_e2e.mjs:84）。改成「先挂等待、再触发」，就不再靠运气。
-    // catch 立刻挂上：否则超时时的 rejection 在 await 之前就成了「未处理
+    // catch 立刻挂上：否则超时时的 rejection 在 await 之前就成了「未处理的
+    // promise 拒绝」，而 Node 默认会让进程带着它退出。
     const entryRequest = staff.page.waitForRequest(
-      r => r.url().endsWith(assets.entry) && !r.headers().authorization,
+      r => new URL(r.url()).pathname.startsWith(assetPrefix) && r.url().endsWith(entryFile)
+        && !r.headers().authorization,
       { timeout: 20000 }).catch(() => null)
     await staff.page.goto(state.url + `/#/plugin/${normal.id}`)
     assert.match(main.headers()['content-security-policy'], /script-src 'self';/)
