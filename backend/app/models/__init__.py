@@ -8,6 +8,7 @@ from app.models.printing import PrintTemplate
 from app.models.importing import ImportBatch
 from app.models.invoice import InvoiceBatch, InvoiceConfig, InvoiceRecord, InvoiceRule
 from app.models.audit import AuditLog
+from app.models.mcp import McpToken
 from app.models.backup import (BackupRun, KEEP_DAYS, SCOPE_BOOK, SCOPE_SYSTEM, STATUS_FAILED,
                           STATUS_SUCCESS, TIER_DAILY, TIER_MONTHLY, TIERS, TIER_WEEKLY)
 from app.models.mfa import (MFA_STATUSES, STATUS_CONSUMED, STATUS_EXPIRED,
@@ -19,7 +20,7 @@ __all__ = [
     "period_ord", "year_start_ord", "ord_to_month", "book_first_ord",
     "Subject", "Voucher", "Entry",
     "ReportTemplate", "ReportRow", "ReportCol", "ReportCell", "ReportResult",
-    "PrintTemplate", "AuditLog", "ImportBatch",
+    "PrintTemplate", "AuditLog", "ImportBatch", "McpToken",
     "InvoiceConfig", "InvoiceRule", "InvoiceBatch", "InvoiceRecord",
     "BackupRun", "TIERS", "KEEP_DAYS",
     "TIER_DAILY", "TIER_WEEKLY", "TIER_MONTHLY",

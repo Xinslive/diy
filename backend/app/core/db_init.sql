@@ -838,8 +838,19 @@ BEGIN
     FOREACH t IN ARRAY ARRAY[
         'book', 'period', 'period_opening', 'subject', 'voucher', 'entry',
         'sys_user', 'sys_user_book', 'import_batch',
-        'print_template', 'report_template', 'report_result'
+        'print_template', 'report_template', 'report_result',
+        'mcp_token'
     ] LOOP
+        -- **表还不存在就跳过。**
+        --
+        -- 这份文件会被多条迁移重放（0005 / 0010 / 0031 / 0033 / …），
+        -- 而重放发生在「当时已经建好的表」上。清单里如果有一张**后来才建**的
+        -- 表（如 0034 才建的 mcp_token），在它之前的重放就会撞上
+        -- "relation does not exist" —— 而 ``DROP TRIGGER IF EXISTS`` 只
+        -- 免掉「触发器不存在」，免不掉「表不存在」。
+        --
+        -- 加了这个守卫之后，清单里可以有后建的表，重放顺序不再是个坑。
+        CONTINUE WHEN to_regclass(t) IS NULL;
         EXECUTE format('DROP TRIGGER IF EXISTS trg_updated_at ON %I', t);
         EXECUTE format(
             'CREATE TRIGGER trg_updated_at BEFORE UPDATE ON %I '

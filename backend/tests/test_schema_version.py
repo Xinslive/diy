@@ -458,14 +458,26 @@ def test_旧的_init_db模块已经删掉():
 
 
 def test_main_启动只校验版本():
+    """启动路径**只校验版本，不执行任何 DDL**。
+
+    启动钩子现在写成 lifespan（``_lifespan``）而不是 ``@app.on_event``：
+    MCP 的 session manager 必须在 lifespan 里进入（Starlette 不会为被挂载的
+    子应用跑它自己的 lifespan），而 ``on_event`` 在新版 FastAPI 已废弃。
+
+    **断言的意图没变**：启动时校验 schema 版本，不建表、不改表。
+    """
     src = (BACKEND / "app" / "main.py").read_text(encoding="utf-8")
-    start = src.index('@app.on_event("startup")')
-    nxt = src.find("\n@app.", start)
+    start = src.index("async def _lifespan")
+    nxt = src.find("\ndef ", start + 1)
     startup = src[start: nxt if nxt > 0 else len(src)]
     assert "assert_schema_ready" in startup, "启动路径没调 assert_schema_ready"
     # 同样走 AST：这段代码的注释里就写着 create_all，按字符串判会永远红
     hit = _calls_named(ast.parse(startup), {"create_all", "drop_all", "init_database"})
     assert not hit, f"启动路径里还有建表调用 {sorted(hit)} —— 版本闸门形同虚设"
+    # 整个 main.py 都不许有建表调用 —— 启动路径只是其中一段，
+    # 换个钩子写法藏一个 create_all 进去，那道闸门照样形同虚设。
+    whole = _calls_named(ast.parse(src), {"create_all", "drop_all", "init_database"})
+    assert not whole, f"main.py 里还有建表调用 {sorted(whole)}"
 
 
 def test_测试库是由迁移建出来的():

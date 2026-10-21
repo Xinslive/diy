@@ -208,6 +208,98 @@ SDK 1.2.0 支持由用户在插件页面选择目标账套、保存账套配置�
 
 ---
 
+## MCP 只读数据服务
+
+给外部 AI agent（Claude Desktop / Cherry Studio / Dify / 自研 client）一个**查询**账套数据的入口。端点 `/api/mcp`，传输是 Streamable HTTP。agent 问「最近一笔租金是什么时候付出去的」「这个月电费付了吗」「今年收入费用变化」，答案里的数字来自本系统的账套数据，不是模型编的。
+
+**只读。** 工具集里**不存在**任何写工具 —— 建凭证、记账、结账、改科目、导入一个都没有；令牌自身也只有读语义。想让 agent 改数据，这条路走不通。
+
+### 怎么用
+
+1. **签发令牌**（管理员）。令牌绑定一个真实用户，**这个用户能访问哪些账套，agent 就只能访问哪些账套** —— 可见性完全来自用户的账套授权，不是令牌自己带的。签发响应里会回带该用户当前可访问的账套清单，签完当场就能确认 agent 将看到什么。
+   > 建议给外部 agent 建一个**只授权单个账套的 VIEWER 用户**，而不是复用 OWNER 账号 —— 绑定 OWNER 意味着 agent 能读该用户名下**所有**账套。
+2. **配到 MCP client**。令牌明文**只在签发那一次响应里返回**，库里只存 sha256 摘要，丢了只能吊销重签。Claude Desktop 的配置长这样：
+
+```json
+{
+  "mcpServers": {
+    "cwq": {
+      "type": "http",
+      "url": "http://<host>/api/mcp",
+      "headers": { "Authorization": "Bearer mcp_..." }
+    }
+  }
+}
+```
+
+3. **连 `http://<host>/api/mcp`**。端点**必须落在 `/api/` 前缀下** —— 否则会被前端回退（`try_files … /index.html`）吞成 HTML，client 报出来的是「协议解析失败」而不是 404，排查方向整个跑偏。`deploy/nginx/cwq.conf` 里已有专门的 `location ~ ^/api/mcp` 块（SSE 回包不缓冲、读超时 360s）。
+
+⚠️ 生产建议配 `MCP_ALLOWED_HOSTS=你的域名`（如 `acct.example.com:*`）。它开启传输层的 **DNS 重绑定防护**：Host 头不匹配的请求在**传输层**就被挡下（400/421），与「令牌不对」的 401 完全不同 —— 两者要分清。留空 = 关掉这层防护（端点仍然要令牌才能进，防护是第二层），这时外部 agent 能正常连上。
+
+### 工具
+
+| 工具 | 干什么 | 典型问法 |
+|---|---|---|
+| `list_books` | 列出可访问的账套与年度 | 「我有哪些账套」 |
+| `list_periods` | 列出账套的期间与结账状态 | 「哪几个月已经封账了」 |
+| `find_subjects` | 按名称 / 类别 / 方向找科目 | 「房屋租赁费是哪个科目」 |
+| `search_vouchers` | 凭证检索（分页，带分录明细） | 「去年有笔 12800 的租金凭证」 |
+| `latest_payment` | 最近一笔**真付出去**的钱 | 「最近一笔租金是什么时候付出去的」 |
+| `check_period_payments` | 核对某期间某类科目的付款情况 | 「这个月电费付了吗」 |
+| `ledger_balance` | 科目余额表（含试算平衡） | 「银行存款现在多少」 |
+| `income_expense_trend` | 收入 / 费用趋势（损益口径） | 「今年收入费用变化」 |
+| `render_report` | 渲染内置报表（资产负债表 / 利润表） | 「今年的利润表长什么样」 |
+| `accounting_context` | 账套上下文：当前会计年度、当前期间、科目与凭证数 | 「现在是哪年哪个月」 |
+
+`latest_payment` 与 `check_period_payments` 会把四种状态**分开说**：已付 / 仅计提未付（对方是应付账款）/ 有凭证但未记账 / 本月无记录 —— 「计提了」和「付了」是两回事，混起来会给出错误答案。
+
+每个工具的出参都带 `caliber`（口径标识）与 `notes[]`（人话解释）—— agent 据此知道自己手里的数是在哪个口径下取出来的：
+
+| `caliber` | 是什么口径 | 出现在 |
+|---|---|---|
+| `navigation` | 账套与年度进度（结账、初始化） | `list_books` |
+| `period` | 会计期间与结账状态 | `list_periods` |
+| `subject` | 科目表（**年度显式**，跨年 id 不通用） | `find_subjects` |
+| `context` | 账套当前上下文（在记的那一年、当前期） | `accounting_context` |
+| `voucher` | 凭证明细（默认**只读已记账**） | `search_vouchers` |
+| `payment` | 收付判定（对方是不是现金类科目 1001/1002/1012） | `latest_payment` / `check_period_payments` |
+| `ledger` | 账簿口径（**含**结转凭证） | `ledger_balance` |
+| `report` | 报表口径（**排除**结转凭证） | `income_expense_trend` / `render_report` |
+
+金额一律是**字符串**（两位小数、元、CNY），红字保留负号 —— 二进制浮点会把 `12800.00` 变成 `12800.000000000002`，与界面逐字对不上。
+
+出参有**正式的 JSON Schema**：每个工具在 `tools/list` 里都带 `outputSchema`（字段名英文、描述中文），返回值同时以 `structuredContent` 回传。写 agent 的人靠它知道 `total` 是命中总数还是本页条数、`paid` 与 `accrued_only` 为什么互斥 —— 不用去猜字段的含义。契约的唯一来源是 `backend/app/mcp/schemas.py`。
+
+### 令牌永不过期，所以要定期吊销
+
+这是产品决定：令牌没有到期时间，不会因为时间自动失效。失效开关只有两个 —— **显式吊销**，与**用户侧状态变化**（停用账号、删账号）。
+
+代价是**泄漏窗口是无限的**，所以吊销不是「出问题再说」，是常规动作：
+
+- 签发时**必须写明用途**（`name` 必填），一个 agent 一个令牌 —— 这样能**按 agent 单独吊销**，不用一刀切；
+- 每次成功调用都更新 `last_used_at`，列表接口同时给出 `unused_days`，能一眼看出哪些是僵尸令牌、哪些还在被外部 agent 用着；
+- 每次工具调用都写 `mcp.read` 审计（记「谁、查了哪个账套、调了哪个工具、结果多少行、耗时」，**不记数据本体**）。现有 HTTP 读接口一律不写审计，而 agent 批量拉数据在现有审计体系里**完全不可见** —— 这是新增的可观测面；
+- 改口令**不会**自动作废 MCP 令牌（否则「永不过期」的承诺就落空了）。标准处置是走「批量吊销该用户的全部令牌」这个显式动作；
+- 疑似泄漏时的标准动作：立刻吊销该令牌，必要时批量吊销该用户全部令牌。吊销**下一次调用立即生效**（每次调用都重新查库，不做跨请求缓存）。
+
+### 管理接口
+
+都在 `/api/system/mcp-tokens` 下，全部要求管理员：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/system/mcp-tokens` | 列出令牌（**不返回明文**）：名称、绑定用户、该用户可访问的账套清单与角色、启用状态、`last_used_at`、`unused_days`、吊销与宽限期 |
+| POST | `/api/system/mcp-tokens` | 签发。入参 `name`（必填）/ `user_id`；**明文只在这一个响应里返回一次** |
+| DELETE | `/api/system/mcp-tokens/{id}` | **立即吊销**（`revoked_at=now`、宽限期清空、停用） |
+| POST | `/api/system/mcp-tokens/{id}/rotate` | 轮换：签发新令牌，旧的进入宽限期（`MCP_TOKEN_ROTATE_GRACE_DAYS`，默认 7 天），**宽限期内旧令牌仍可用** |
+| DELETE | `/api/system/mcp-tokens?user_id=...` | 批量吊销某用户的全部令牌（改密、离职、疑似泄漏时的标准处置） |
+
+签发 / 吊销 / 轮换都写审计（`mcp.token.*`），因为这是权限面变更。
+
+上限与开关见 `.env.example` 的 `MCP_*` 段：`MCP_MAX_PAGE_SIZE`（单页上限）、`MCP_MAX_RANGE_MONTHS`（单次查询最多跨几个月）、`MCP_MAX_CALLS_PER_HOUR`（单令牌每小时调用数）、`MCP_AUDIT_READS`（是否记读取审计）、`MCP_STATEMENT_TIMEOUT_MS`（单次调用的库语句超时）。
+
+---
+
 ## 业务口径（已定稿，代码按此实现）
 
 这几条是需求的硬约束，改动前请先看 `ARCHITECTURE.md`。

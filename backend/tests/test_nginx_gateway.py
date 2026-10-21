@@ -58,8 +58,22 @@ def _blocks(text: str) -> list[tuple[str, str, str]]:
 
 
 def _app_paths() -> list[str]:
-    """应用真实注册过的路径（把 {book_id} 之类换成假参数）。"""
-    from fastapi.routing import APIRoute
+    """应用真实注册过的路径（把 {book_id} 之类换成假参数）。
+
+    **不只 FastAPI 的 ``APIRoute``。** MCP 端点是用 Starlette 的 ``Route``
+    挂的（里面跑的是一个 ASGI 子应用，不是 FastAPI 路由），而
+    ``fastapi.routing.APIRoute`` 本身就是 ``starlette.routing.Route`` 的子类
+    —— 所以按 ``Route`` 收，两种都覆盖到了。
+
+    为什么必须收：只认 ``APIRoute`` 的话，MCP 端点在这条用例眼里**根本不存在**
+    ，于是 nginx 里为它配的那条 ``location ~ ^/api/mcp`` 会被判成「命中不了
+    任何真实路由」—— 一条**假阳性**的护栏失败。而这条用例的全部意义就是
+    「照妖镜」，它自己不能照错人。
+
+    ``Mount`` 也要收：它的 ``path`` 是前缀，子路由挂在 ``routes`` 里，
+    两层都要摊平出来。
+    """
+    from starlette.routing import Mount, Route
 
     from app.main import app
 
@@ -69,8 +83,9 @@ def _app_paths() -> list[str]:
         if id(r) in seen:
             continue
         seen.add(id(r))
-        if isinstance(r, APIRoute):
+        if isinstance(r, (Route, Mount)):
             paths.append(r.path)
+            stack.extend(getattr(r, "routes", None) or [])
             continue
         for attr in ("routes", "original_router"):
             inner = getattr(r, attr, None)

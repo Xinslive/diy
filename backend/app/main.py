@@ -5,6 +5,7 @@ import logging
 import re
 import sys
 import uuid
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,8 +13,10 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
+from starlette.routing import Route
 
-from app.api import auth, books, invoices, ledger, printing, reports, scheduler, subjects, system, vouchers
+from app.api import (auth, books, invoices, ledger, mcp_admin, printing, reports,
+                     scheduler, subjects, system, vouchers)
 from app.core.config import detect_env, settings
 from app.core.db import get_db
 from app.core.schema_version import assert_schema_ready
@@ -65,11 +68,106 @@ def api_docs_urls(env: str | None = None) -> dict[str, str | None]:
     return {"docs_url": None, "redoc_url": None, "openapi_url": None}
 
 
+@asynccontextmanager
+async def _lifespan(application: FastAPI):
+    """应用的生命周期。
+
+    **为什么从 ``@app.on_event`` 改成 lifespan。**
+    ``on_event`` 在新版 FastAPI 已废弃，而 MCP 的 session manager **必须**
+    在 lifespan 里进入：Starlette **不会**为被挂载的子应用跑它自己的
+    lifespan（只有顶层 app 的 lifespan 会被执行），少了这一步，MCP 的第一个
+    请求就会报「Task group is not initialized」。
+
+    **顺序不能颠倒。**
+    启动：配置校验 → schema 校验 → 插件运行时 → MCP session manager；
+    关闭严格逆序：先停 MCP，再停插件。
+
+    为什么配置校验必须先于碰库（P3-04）：反过来的话，进程会先把 schema
+    建好、种子数据灌进去，再因为配置不合格退出 —— 库已经被改动过了，
+    而运维看到的是「启动失败」。
+
+    为什么 schema 只校验版本不执行 DDL（P3-01）：建表、改表的职责已经移交
+    Alembic，版本对不上就拒绝启动，并打印该执行哪条命令。
+    """
+    from app.core.config import validate_production_settings
+
+    validate_production_settings(settings)
+    assert_schema_ready()
+
+    from app.plugins.loader import startup as plugin_startup
+
+    application.state.plugin_runtime = plugin_startup()
+
+    stack = AsyncExitStack()
+    try:
+        endpoint = getattr(application.state, "mcp_endpoint", None)
+        if endpoint is not None:
+            # **每次启动都新建一套 MCP 服务。**
+            # session manager（StreamableHTTPSessionManager）一个实例只能
+            # run() 一次，lifespan 跑第二次就会抛「can only be called once
+            # per instance」。生产里 uvicorn 的 reload 与 --workers 都是
+            # 新进程（各自导入一次模块），不受影响；测试里每个 TestClient
+            # 一次 lifespan，就会踩到 —— 把这条做成「每次建一套新的」，
+            # 测试与生产就是同一条路径。
+            from app.mcp.server import build_app
+
+            mcp_server, mcp_asgi = build_app()
+            application.state.mcp_server = mcp_server
+            endpoint.set(mcp_asgi)
+            await stack.enter_async_context(mcp_server.session_manager.run())
+            _assert_mcp_mounted(application)
+        yield
+    finally:
+        # 逆序关闭：先停 MCP，再停插件运行时。
+        endpoint = getattr(application.state, "mcp_endpoint", None)
+        if endpoint is not None:
+            endpoint.clear()
+        await stack.aclose()
+        from app.plugins.hooks import set_runtime
+
+        set_runtime(None)
+        runtime = getattr(application.state, "plugin_runtime", None)
+        if runtime:
+            runtime.close()
+            application.state.plugin_runtime = None
+
+
+def _assert_mcp_mounted(application: FastAPI) -> None:
+    """启动期自检：MCP 端点**真的挂上了**。
+
+    计划 §5.5 建议的一条：挂载异常要在**启动期**暴露，而不是等外部 agent
+    第一次调用时才发现 404 / 503 —— 那种故障的现场早就过去了（谁在什么时候
+    用的哪个令牌都查不回来），而这里只要一行断言。
+
+    「挂上了」有两层，缺一不可：
+
+    1. ``/api/mcp`` 在路由表里（否则请求根本路由不到）；
+    2. 端点里已经有一套**就绪**的 MCP 服务（否则回 503「服务尚未就绪」）。
+
+    只在 MCP 启用时检查 —— ``MCP_ENABLED=false`` 时端点**本就不该存在**，
+    那是配置意图，不是故障。
+    """
+    from app.mcp.asgi import MCP_PATH
+
+    paths = {getattr(r, "path", None) for r in application.router.routes}
+    if MCP_PATH not in paths:
+        raise RuntimeError(
+            f"MCP 端点没有挂上：{MCP_PATH} 不在路由表里。"
+            "MCP_ENABLED 为 true 时它必须存在 —— 查 app.mcp.server.build_app "
+            "是不是抛了异常，或 _mount_mcp 是不是没跑到。")
+    endpoint = getattr(application.state, "mcp_endpoint", None)
+    if endpoint is None or not endpoint.ready:
+        raise RuntimeError(
+            "MCP 端点没有就绪：lifespan 没有把 MCP 服务塞进端点，"
+            "此时所有请求都会回 503「服务尚未就绪」。")
+
+
 app = FastAPI(
     title="财务记账系统 API",
     description="多账套云财务记账系统。核心原则：唯一事实来源是凭证与分录，"
                 "余额 / 账簿 / 报表 / 打印全部由同一套聚合引擎派生。",
     version="0.1.0",
+    lifespan=_lifespan,
     **api_docs_urls(),
 )
 
@@ -150,8 +248,43 @@ async def request_id_middleware(request: Request, call_next):
     return response
 
 for r in (auth.router, system.router, scheduler.router, books.router, subjects.router, vouchers.router, invoices.router,
-          ledger.router, reports.router, printing.router):
+          ledger.router, reports.router, printing.router, mcp_admin.router):
     app.include_router(r)
+
+
+def _mount_mcp(application: FastAPI) -> None:
+    """把 MCP 只读服务挂到 ``/api/mcp``。
+
+    **为什么用 ``Route`` 而不是 ``app.mount("/api/mcp", ...)``。**
+    Starlette 的 ``Mount`` 要求路径带尾斜杠：``/api/mcp`` 本身**不匹配**，
+    会落到 ``redirect_slashes`` 变成 307。对 MCP 客户端来说，一次 POST 的
+    307 跳转是「能不能跟上取决于这个客户端的实现」的赌注。所以这里用一条
+    精确的 ``Route("/api/mcp")``，路径改写交给 ``app/mcp/asgi.py`` 的适配器。
+
+    **为什么端点必须在 ``/api/`` 前缀下。**
+    ``deploy/nginx/cwq.conf`` 的 ``location /`` 是前端回退
+    （``try_files … /index.html``）—— 端点挂在 ``/api/`` 外面会被回退成
+    HTML，故障表现是「协议解析失败」而不是 404，排查成本高。
+
+    **挂载失败要当场暴露。**
+    建子应用时出错（工具签名有问题、SDK 接口对不上）会让启动期直接失败，
+    而不是留一个「服务起来了但 MCP 500」的半死状态。
+    """
+    if not settings.mcp_enabled:
+        log.info("MCP 只读服务未启用（MCP_ENABLED=false）：%s 不存在", "/api/mcp")
+        return
+
+    from app.mcp.asgi import MCP_PATH, McpEndpoint
+
+    # 挂的是**可换代的壳**：lifespan 每次启动时新建一套 MCP 服务塞进去。
+    # （session manager 一个实例只能 run() 一次，理由见 _lifespan 的注释。）
+    endpoint = McpEndpoint()
+    application.state.mcp_endpoint = endpoint
+    application.router.routes.append(Route(MCP_PATH, endpoint=endpoint))
+    log.info("MCP 只读服务已挂载：%s（stateless Streamable HTTP）", MCP_PATH)
+
+
+_mount_mcp(app)
 
 
 def _is_own_guardrail_text(message: str) -> bool:
@@ -248,37 +381,6 @@ async def dbapi_error_handler(request, exc: DBAPIError):
         content={"detail": f"数据库内部错误（请求号 {rid}），请联系管理员并提供该请求号"},
         headers={"X-Request-ID": rid},
     )
-
-
-@app.on_event("startup")
-def startup() -> None:
-    from app.core.config import validate_production_settings
-    from app.core.schema_version import assert_schema_ready
-
-    # P3-04：配置校验必须在碰库**之前**。
-    # 反过来的话，进程会先把 schema 建好、种子数据灌进去，再因为配置
-    # 不合格退出 —— 库已经被改动过了，而运维看到的是「启动失败」。
-    validate_production_settings(settings)
-
-    # P3-01：这里**只校验版本，不执行任何 DDL**。
-    # 原来这里是 ``init_database()`` —— 每次启动都 create_all + 重放 db_init.sql。
-    # 而 create_all 只建缺失的表、不改已存在的表，于是「给已有表加 NOT NULL 列」
-    # 这类变更在生产上会静默不生效：服务照常启动，问题到运行时才炸。
-    # 建表、改表的职责已经移交 Alembic（backend/migrations/），
-    # 版本对不上就拒绝启动，并打印该执行哪条命令。
-    assert_schema_ready()
-    from app.plugins.loader import startup as plugin_startup
-    app.state.plugin_runtime = plugin_startup()
-
-
-@app.on_event("shutdown")
-def shutdown_plugins():
-    from app.plugins.hooks import set_runtime
-    set_runtime(None)
-    runtime = getattr(app.state, "plugin_runtime", None)
-    if runtime:
-        runtime.close()
-        app.state.plugin_runtime = None
 
 
 @app.get("/api/health")

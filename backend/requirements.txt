@@ -101,3 +101,24 @@ packaging>=26.3
 croniter>=6.0.0
 # croniter uses python-dateutil for timezone-aware schedule calculations.
 python-dateutil>=2.9.0.post0
+
+# MCP（Model Context Protocol）只读数据服务：让外部 AI agent 查账套数据。
+#
+# **这里定版而不是写 >=，是有理由的。** 上面那些条目写 >= 的前提是
+# 「下界 = 实测跑通的版本」，超出部分由 lock 钉死；而 MCP 走的是另一条路：
+# 它的传输（Streamable HTTP）、工具注册方式与错误语义在 2.x 与 1.x 之间
+# **不兼容**。写成 >=，某天一次无关的依赖升级就可能把 MCP 端点的行为整个
+# 换掉 —— 而 MCP 的错误与出参是**给 AI agent 读的**，行为漂移的表现是
+# 「agent 某天开始答错」，没有报错、没有堆栈，排查成本极高。定版最省心。
+#
+# **2.x 把 FastMCP 改名成了 MCPServer**，本仓跟着 SDK 走。
+# 注意本仓用的是**主应用内新增的 app/mcp/ 模块**，不是插件形态：插件后端的
+# import 白名单不含 mcp/fastmcp，装插件时的静态扫描会直接拒包（详见
+# ARCHITECTURE「11.15 MCP 只读数据服务 › 为什么不是插件」）。所以这里装的是
+# SDK 本体，由主应用在 lifespan 里挂到 /api/mcp。
+#
+# 依赖链已核验与本仓现有版本无冲突：starlette 1.7.0 / pydantic 2.14.0 /
+# anyio 4.15.1 / uvicorn 0.54.0 / PyJWT 2.15.1 均满足其下界。
+# 新增的传递依赖（httpx2 / jsonschema / mcp-types / opentelemetry-api /
+# typing-inspection 等）随 lock 一起定版。
+mcp==2.3.0

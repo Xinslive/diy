@@ -347,6 +347,69 @@ class Settings(BaseSettings):
     plugin_lease_seconds: int = 30
     plugin_heartbeat_seconds: int = 5
 
+    # ------------------------------------------------ MCP 只读数据服务
+    #
+    # 给外部 AI agent（Claude Desktop / Cherry Studio / Dify / 自研 client）
+    # 一个查询账套数据的入口。**只读**：工具集里不存在写工具，令牌自身也只有
+    # 读语义（见 app/mcp/auth.py 与 app/mcp/tools/）。
+    #
+    # 默认**开**。与 ``plugin_enabled`` 默认关相反，理由是二者的信任模型
+    # 不同：插件是「管理员信任的进程内代码」，装上就跑在系统里；MCP 服务
+    # 在主应用内、只有只读工具、要令牌才能进 —— 它的暴露面是「谁能拿到
+    # 令牌」，而那件事由令牌生命周期与审计管着，不靠一个总开关兜底。
+    # 要彻底关掉外部接入，把 MCP_ENABLED=false 配上，并把已签发的令牌吊销。
+    mcp_enabled: bool = True
+
+    # 轮换宽限期（天）。轮换时旧令牌进入宽限，**宽限期内仍然可用**，
+    # 到期自动失效 —— 避免 agent 换 token 时断线。
+    #
+    # 取 7 天：够 agent 在客户端更新配置这段时间里平滑切过去，又不至于
+    # 让「旧令牌已轮换」这件事长时间看不出来。
+    mcp_token_rotate_grace_days: int = 7
+
+    # 单页最大条数。**强制分页**是 MCP 面的硬规矩（所有列表型工具都要
+    # 返回 total），这个值是 page_size 的上限。
+    #
+    # 取 200，与 ``api/vouchers.py`` 的页长上限对齐 —— 同一个数字，
+    # 界面上的「一页 200 条」与 agent 一次能拿到的量是同一个量级。
+    mcp_max_page_size: int = 200
+
+    # 单次查询允许跨的月数上限。防的是 agent 一次把整本账拉走。
+    # 取 60（5 年）：正常的「今年 vs 去年」对比跨 24 个月，宽裕。
+    mcp_max_range_months: int = 60
+
+    # 单令牌每小时调用次数上限。
+    #
+    # **为什么必须有它**：令牌永不过期 ⇒ 泄漏窗口是无限的。吊销是唯一
+    # 的「事后」手段，而限流是唯一能压住「被拿去批量导出数据」这一形态的
+    # **事前**手段。取 600（约每分钟 10 次）：远高于正常问答 agent 的节奏
+    # （一次问答 1~3 次工具调用），又能挡住「循环拉全库」。
+    mcp_max_calls_per_hour: int = 600
+
+    # 允许的 Host 头（逗号分隔）。MCP 传输层自带 DNS 重绑定防护，
+    # 默认只认 127.0.0.1 —— 生产在 nginx 后面，Host 是公网域名，
+    # 必须显式配进来，否则所有外部请求都被挡在防护层（表现为 421/400）。
+    #
+    # 支持 ``example.com`` 与 ``example.com:*`` 两种写法（后者带端口）。
+    # **留空 = 关闭 DNS 重绑定防护**，只适合本机直连的部署。
+    mcp_allowed_hosts: str = ""
+
+    # 是否记录 MCP 读取审计。默认开。
+    #
+    # 现有 HTTP 读接口一律不写审计，而外部 agent 批量拉取账套数据在现有
+    # 审计体系里**完全不可见** —— 这是新增的可观测面。审计只记标识与结果
+    # （谁、查了哪个账套、调了哪个工具、结果多少行、耗时），
+    # **不记返回数据本体**。
+    mcp_audit_reads: bool = True
+
+    # 单次工具调用的数据库语句超时（毫秒）。0 = 不设。
+    #
+    # agent 可能发出「跨 5 年 + 全科目 + 每页 200 条」这种把库跑满的请求；
+    # 库层的 statement_timeout 让它在服务端就被掐掉，而不是把 worker 占住
+    # 直到 nginx 超时。取 15000：正常的余额表/趋势查询在几百毫秒内完成，
+    # 15000 留给冷缓存下的慢查询。
+    mcp_statement_timeout_ms: int = 15000
+
     # 发票原件与解析结果的本地留存目录。数据库只保存相对文件名，便于迁移部署。
     invoice_storage_dir: str = "data/invoices"
     # 发票上传上限（审计 P2-12）。
@@ -648,6 +711,22 @@ def is_trusted_proxy(host: str | None, raw: str | None = None) -> bool:
     return any(addr in net for net in nets)
 
 
+def mcp_allowed_host_list(raw: str | None = None) -> list[str]:
+    """把 ``MCP_ALLOWED_HOSTS`` 解析成传输层要的 Host 白名单。
+
+    逗号分隔，两边空白都吃掉。**空 = 一个都不给**（调用方据此关闭
+    DNS 重绑定防护）。
+
+    支持两种写法：``example.com``（精确）与 ``example.com:*``（任意端口）。
+    传输层的匹配规则是「先精确、再试带端口的前缀」，所以 ``example.com``
+    不会匹配 ``example.com:8443`` —— 生产在 nginx 后面、带端口访问时
+    要写 ``example.com:*``。
+    """
+    if raw is None:
+        raw = settings.mcp_allowed_hosts
+    return [part.strip() for part in (raw or "").split(",") if part.strip()]
+
+
 def validate_production_settings(settings: "Settings", env: str | None = None) -> list[str]:
     """非 dev 环境下校验配置，不合格**拒绝启动**。
 
@@ -751,6 +830,26 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
         log.warning(
             "LOGIN_IP_THROTTLE_ENABLED=false：IP 维度登录节流已关闭，"
             "轮换用户名的爆破将不受任何聚合限制（这是显式的 fail-open）。")
+
+    # MCP 的 DNS 重绑定防护同理：它默认**关着**（这里留空 ⇒ 传输层不做
+    # Host 校验），配了 ``MCP_ALLOWED_HOSTS`` 才开。
+    #
+    # 为什么默认关而不是「只放行 127.0.0.1」：这个端点的第一道闸是
+    # **每次请求都校验的 bearer 令牌**，而生产没有 CORS 中间件（跨源读不到
+    # 响应、也带不上 Authorization 头）—— 浏览器侧的 DNS 重绑定拿不到令牌，
+    # 读不到任何数据。fail-closed 在这里有个更糟的表现：服务看起来装好了，
+    # 却把每一个外部 agent 都挡在外面，运维看到的是一个不透明的 400/421
+    # 而不是一句配置提示。
+    #
+    # 当成**告警**而不是拒绝启动：MCP 是新增面，没配的人可能压根不用它；
+    # 而为了一个可选功能拒绝启动，代价（升级后起不来）远大于收益。
+    if settings.mcp_enabled and not mcp_allowed_host_list(settings.mcp_allowed_hosts):
+        log.warning(
+            "MCP_ALLOWED_HOSTS 为空：MCP 端点的 DNS 重绑定防护未开启"
+            "（传输层不校验 Host 头）。端点仍需令牌才能访问，所以这不是"
+            "一个敞开的门；但若要为这一层再加一道，请设 "
+            "MCP_ALLOWED_HOSTS=你的域名（如 acct.example.com:*）后重启 —— "
+            "注意配错的表现是请求在传输层被挡下（400/421），不是 401。")
 
     return checks
 
