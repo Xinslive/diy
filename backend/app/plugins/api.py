@@ -16,6 +16,7 @@ from app.core.config import settings
 from app.core.db import get_db, SessionLocal, engine
 from app.core.deps import get_current_user, require_admin
 from app.core.uploads import UploadTooLarge, read_upload_sync
+from app.models.plugin import PluginInstallAttempt
 from app.models.system import SysUser
 from app.plugins import audit
 from app.plugins.errors import PluginError, not_found

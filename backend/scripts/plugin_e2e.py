@@ -40,6 +40,7 @@ def main():
     from app.core.security import hash_password
     from app.models import SysUser, UserBook, Book
     from app.accounting.periods import create_periods
+    from app.accounting.years import ensure_book_year
     from app.seed.chart_of_accounts import install_chart
     from datetime import datetime, timezone
     from scripts.plugin_package import generate_key, build
@@ -146,7 +147,6 @@ def verify_data_and_retained_uninstall(api, start_backend, port, env, temporary,
 import sys
 from pathlib import Path
 from sqlalchemy import tuple_
-from app.accounting.years import ensure_book_year
 from app.core.db import SessionLocal
 from app.models.base import Base
 from app.backup.export import export_scope, read_snapshot, restore, SCOPE_BOOK
