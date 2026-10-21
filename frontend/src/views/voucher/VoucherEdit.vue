@@ -12,10 +12,19 @@
            是为了跟右边日期框对齐；readonly 而非 disabled，禁用态会连背景一起
            变灰，读起来像"这张不能看"，实际上号是照常显示的。
            插入/增加模式下预填的就是后端算好的那个号（见 insert-preview），
-           保存时服务端重新算一次，页面上的号只是给人看的。 -->
-      <el-input v-model="form.voucher_no" readonly style="width: 110px" />
+           保存时服务端重新算一次，页面上的号只是给人看的。
+           宽度按**内容**给，不再留一大截空白：号是「凭证字 + 4 位数字」
+           （记0015），14px Arial 下大约 45px 宽，加上输入框左右 11px 内边距
+           和 1px 边框共 24px，80px 装得下还剩 11px 余量；再宽就只是空框了。 -->
+      <el-input v-model="form.voucher_no" readonly style="width: 80px" />
       <span class="muted">日期</span>
-      <el-date-picker v-model="form.voucher_date" type="date" value-format="YYYY-MM-DD" style="width: 150px" />
+      <!-- 日期同理收窄，但要给左边的日历图标留 22px：「2026-12-25」十个字符
+           约 72px，图标 22px + 内边距边框 24px，128px 刚好装满不挤。
+           clearable 关掉：日期框里那个「×」是清空按钮，日期是这张凭证的
+           一部分，不是筛选项 —— 一个手滑的 × 把日期抹掉，比日期框窄一点
+           严重得多，而且页面上没有任何入口能把它找回来。 -->
+      <el-date-picker v-model="form.voucher_date" type="date" value-format="YYYY-MM-DD"
+                      :clearable="false" style="width: 128px" />
       <span class="spacer" />
       <!-- 从列表进来的话，前一张/后一张翻的是**列表那个结果集**（筛选条件原样带着，
            可以跨月跨年）；直接打开某张凭证、不知道从哪来的，才退回同期间内翻。
