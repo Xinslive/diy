@@ -499,6 +499,53 @@ def test_凭证检索_能按摘要聚合(db, book, make_voucher, principal):
     assert out["group_totals"]["debit"] == "3500.00"
 
 
+def test_凭证检索_能按对方科目聚合(db, book, make_voucher, principal):
+    """**P1-2**：``group_by="counterparty"`` 给出**对方视角**的分布。
+
+    「借 560207 房屋租赁费 / 贷 1002 银行存款」这一张里，房屋租赁费那条的
+    对方是银行存款，银行存款那条的对方是房屋租赁费 —— 所以读「1002
+    银行存款」那个桶，就知道银行存款这一头对着哪些科目、各多少钱。
+    """
+    make_voucher("2026-03-15", dr=[("560207", "1000.00", "房租")],
+                 cr=[("1002", "1000.00", "房租")], posted=True)
+
+    out = call_tool("search_vouchers", principal, book_id=book.id, year=2026,
+                    group_by="counterparty")
+
+    groups = {g["key"]: g for g in out["groups"]}
+    assert "1002" in groups, groups
+    assert "560207" in groups, groups
+    # 银行存款那个桶里装的是「费用」那条分录（借方 1000）
+    assert groups["1002"]["debit"] == "1000.00"
+    # 费用那个桶里装的是「银行存款」那条分录（贷方 1000）
+    assert groups["560207"]["credit"] == "1000.00"
+
+
+def test_凭证检索_对方有多个时取金额最大的那条(db, book, make_voucher, principal):
+    """对方方向有多条分录时，**取金额最大的那条**。
+
+    取「第一条」不行 —— 那取决于数据库返回分录的顺序，同一份数据换个次序
+    答案就变了；并列时按科目编码取小的，保证同一个键稳定。
+
+    **样本要能区分两种取法**：这里的对方里，金额最大的（5001 / 60.00）
+    恰好是编码**最大**的 —— 按金额取会选 5001，按编码取会选 1002，两种
+    取法给出不同的桶，断言才有牙。
+    """
+    make_voucher("2026-03-15",
+                 dr=[("560207", "100.00", "分摊")],
+                 cr=[("1002", "40.00", "部分付款"), ("5001", "60.00", "核销")],
+                 posted=True)
+
+    out = call_tool("search_vouchers", principal, book_id=book.id, year=2026,
+                    group_by="counterparty")
+
+    groups = {g["key"]: g for g in out["groups"]}
+    # 借方那条（100.00）的对方取金额更大的 5001（60.00），不是 1002
+    assert "5001" in groups, groups
+    assert groups["5001"]["debit"] == "100.00"
+    assert "1002" not in groups or groups["1002"]["debit"] != "100.00", groups
+
+
 def test_凭证检索_能剔除结转凭证(db, book, make_voucher, admin_user, principal):
     """**P1-2 / 3.4**：结转凭证会把损益余额重复计入，聚合时必须能剔掉。"""
     make_voucher("2026-03-08", dr=[("1002", "20000.00", "收租")],

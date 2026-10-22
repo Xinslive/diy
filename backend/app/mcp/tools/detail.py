@@ -510,6 +510,8 @@ def _group_vouchers(vouchers, group_by: str, db) -> tuple[list[dict], dict]:
             elif group_by == "period":
                 key = period.code if period else ""
                 label = key
+            elif group_by == "counterparty":
+                key, label = _counterparty_bucket(entry, voucher, subject_of)
             else:   # direction
                 key = entry.direction
                 label = "借方" if entry.direction == "DEBIT" else "贷方"
@@ -546,6 +548,48 @@ def _group_vouchers(vouchers, group_by: str, db) -> tuple[list[dict], dict]:
         "net": money_str(t_debit - t_credit),
     }
     return groups, totals
+
+
+def _counterparty_bucket(entry, voucher, subject_of) -> tuple[str, str]:
+    """这条分录的**对方科目** → ``(分桶键, 显示名)``。
+
+    **对方是谁**：同一张凭证里**方向相反**的那些分录所涉及的科目。
+    「借 560207 房屋租赁费 / 贷 1002 银行存款」这一张里，房屋租赁费那条的
+    对方是银行存款，银行存款那条的对方是房屋租赁费 —— 所以
+    ``group_by=counterparty`` 给出的是**对方视角**的分布：读「1002 银行存款」
+    那个桶，就知道银行存款这一头对着的是哪些科目、各多少钱。
+
+    **对方有多个时取金额最大的那一条。** 一张凭证里对方方向可能有好几条
+    （借 A 100 / 借 B 50 / 贷 C 80 / 贷 D 70）：A 与 B 的对方都落在
+    {C, D} 里，取金额最大的 C。**取「第一条」是不行的** —— 那取决于数据库
+    返回分录的顺序，同一份数据换个次序答案就变了。「全列出来」也不行：
+    分桶键必须是单个值。
+
+    **并列时按科目编码取小的那个**，保证同一个键在任何一次调用里都稳定
+    （金额并列的两条分录不该让结果随排序抖动）。
+
+    对方方向一条分录都没有（单边凭证）⇒ 桶键为空，显示名写「（无对方分录）」
+    —— 不静默地把这条分录算进某个桶里。
+    """
+    others = [e for e in voucher.entries if e.direction != entry.direction]
+    if not others:
+        return "", "（无对方分录）"
+    # 按「金额从大到小、科目编码从小到大」取第一条。未知科目排在最后 ——
+    # 一个查不到科目的分录不该抢走「对方是谁」的位置。
+    others.sort(key=lambda e: (-abs(e.amount),
+                               _subject_code(e, subject_of) == "",
+                               _subject_code(e, subject_of)))
+    best = others[0]
+    code = _subject_code(best, subject_of)
+    if not code:
+        return "", "（对方科目未知）"
+    subject = subject_of.get(best.subject_id)
+    return code, f"{code} {subject.name}" if subject else code
+
+
+def _subject_code(entry, subject_of) -> str:
+    subject = subject_of.get(entry.subject_id)
+    return subject.code if subject else ""
 
 
 def _window_periods(db, book_id, from_period, to_period) -> list[Period]:
@@ -592,8 +636,8 @@ def search_vouchers(
     * ``status`` —— ``POSTED``（默认）/ ``UNPOSTED`` / ``ALL``。
     * ``include_unposted`` —— 是否把未记账凭证也算进来。
     * ``group_by`` —— 透视维度：``summary`` / ``subject`` / ``period`` /
-      ``direction``。给值则返回 ``groups[]`` 与 ``group_totals``，
-      聚合范围是**全部命中的凭证**（不是当前这一页）。
+      ``counterparty`` / ``direction``。给值则返回 ``groups[]`` 与
+      ``group_totals``，聚合范围是**全部命中的凭证**（不是当前这一页）。
     * ``exclude_carry_forward`` —— **是否剔除损益结转凭证**。
       结转凭证把损益余额搬到「本年利润」，统计费用/收入时算进去会**重复
       计入**（本次评估里「2025 年水电费」多算 48 万就是没剔它）。
@@ -630,10 +674,16 @@ def search_vouchers(
     group_key = None
     if group_by is not None and str(group_by).strip():
         group_key = check_enum(
-            group_by, ("summary", "subject", "period", "direction"), "group_by")
+            group_by, ("summary", "subject", "period", "counterparty", "direction"),
+            "group_by")
         notes.append(
             "本次按 group_by 聚合了**全部命中的凭证**（不是当前这一页），"
             "groups[] 给出透视结果，group_totals 是它的合计。")
+        if group_key == "counterparty":
+            notes.append(
+                "对方口径：对方＝同一张凭证里方向相反的分录；对方有多个时取"
+                "**金额最大的那一条**（并列按科目编码取小的），单边凭证归入"
+                "「（无对方分录）」。所以这个维度给的是**对方视角**的分布。")
 
     page = clamp_page(page)
     page_size = clamp_page_size(page_size)
