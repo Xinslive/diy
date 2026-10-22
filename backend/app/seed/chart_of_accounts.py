@@ -34,7 +34,7 @@
 """
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import insert, select, update
 from sqlalchemy.orm import Session
 
 from app.models import Subject
@@ -233,6 +233,20 @@ def install_chart(db: Session, book_id: int, year: int | None = None,
     ensure_book_year(db, book, year)
 
     if overwrite:
+        # **先把 parent_id 全置空，再删。**
+        #
+        # ``subject.parent_id`` 是指向自己的外键，而且**没有 ON DELETE CASCADE**。
+        # 原来这里逐个 ``db.delete(s)`` 之后 flush，ORM 按 id 顺序发 DELETE，
+        # 父科目先被删、子科目还指着它 —— 于是撞 ``subject_parent_id_fkey``，
+        # 整条 ``overwrite=True`` 路径是**坏的**（全仓无人调用，所以一直没暴露）。
+        #
+        # 先置空 parent_id 就没有先后顺序问题了：树在应用层被拆成
+        # 「一堆 parent_id IS NULL 的行」，再逐个删，外键不再指向任何被删的行。
+        db.execute(
+            update(Subject)
+            .where(Subject.book_id == book_id, Subject.year == year)
+            .values(parent_id=None)
+        )
         for s in db.scalars(select(Subject).where(
                 Subject.book_id == book_id, Subject.year == year)).all():
             db.delete(s)
@@ -240,27 +254,69 @@ def install_chart(db: Session, book_id: int, year: int | None = None,
 
     existing = set(db.scalars(select(Subject.code).where(
         Subject.book_id == book_id, Subject.year == year)).all())
-    count = 0
 
-    def add(code, name, category, direction, carry, children, level, parent_id, sort_no):
-        nonlocal count
-        if code in existing:
-            return None
-        s = Subject(
-            book_id=book_id, year=year, code=code, name=name, category=category,
-            direction=direction,
-            carry_forward=carry, level=level, parent_id=parent_id, is_leaf=not children,
-            sort_no=sort_no, active=True, ext_attrs={},
-        )
-        db.add(s)
-        db.flush()
-        count += 1
-        for i, (cc, cn, ccat, cdir, ccarry, gchildren) in enumerate(children, start=1):
-            add(cc, cn, ccat, cdir, ccarry, gchildren, level + 1, s.id, i * 10)
-        return s
+    # ---- 先把整棵树摊平成一条条记录，再按层级批量插 ----------------------
+    #
+    # **为什么不再逐条 flush。** 原来这里是 ``db.add(s); db.flush()`` 一条一次：
+    # 140 个科目 = 140 次 INSERT 往返 PostgreSQL。**而这条路径是热路径** ——
+    # ① 新建账套要装一次标准科目表；② 每一条会计用例的 ``book`` 夹具都要装
+    # 一次（夹具 = 「12 个期间 + 标准科目表」）。于是「每条用例多花 ~0.15 秒
+    # 全花在 140 次往返上」，全量 2000+ 条用例就是几百秒的纯网络往返。
+    #
+    # 改成**按层级批量**：先插第 1 层（一级科目），拿回它们的 id，再插第 2 层
+    # （子科目带上刚拿到的 parent_id），如此往下。140 条科目从 140 次往返降到
+    # 「层数次 INSERT + 层数次 SELECT 读回 id」，本表 3 层 = 6 次往返。
+    #
+    # **语义保持不变**（这几点是刻意对齐原实现的，别当成可以省的细节）：
+    #   · 已存在的编码要**连同整棵子树一起跳过** —— 原来 ``add()`` 命中
+    #     ``existing`` 就 ``return None``，根本不往下递归。父科目在、子孙不在的
+    #     情形下，老实现不会去补那些孤儿；
+    #   · ``existing`` 是**插之前**查出来的快照，不往里加新插进去的编码 ——
+    #     与老实现一致（老实现也没往里加）；
+    #   · ``sort_no`` 按**同级**序号 ×10，``is_leaf`` = 没有子科目；
+    #   · ``parent_id`` 指向**刚插进去**的父科目，不是同名同编码的历史行。
+    #
+    # 库层的护栏照样生效：``trg_subject_leaf_guard`` 是 BEFORE INSERT FOR EACH ROW，
+    # 批量插入逐行触发；``trg_subject_leaf_parent_guard`` 是 DEFERRABLE 的
+    # 约束触发器，提交时判「父科目不能是末级」—— 父级先插且 ``is_leaf=False``，
+    # 两条都过。
+    flat: list[tuple] = []
 
-    for i, (code, name, cat, dirn, cf, children) in enumerate(CHART, start=1):
-        add(code, name, cat, dirn, cf, children, 1, None, i * 10)
+    def walk(rows, level, parent_code):
+        for i, (code, name, cat, dirn, cf, children) in enumerate(rows, start=1):
+            if code in existing:
+                # 父科目已经有了 → 它的子孙老实现也不补，整棵子树跳过。
+                continue
+            flat.append((code, name, cat, dirn, cf, level, parent_code, i * 10, not children))
+            walk(children, level + 1, code)
+
+    walk(CHART, 1, None)
+    count = len(flat)
+    if not count:
+        return 0
+
+    id_by_code: dict[str, int] = {}
+    for level in sorted({row[5] for row in flat}):
+        rows = [r for r in flat if r[5] == level]
+        payload = [
+            {
+                "book_id": book_id, "year": year, "code": code, "name": name,
+                "category": category, "direction": direction,
+                "carry_forward": carry, "level": lv, "parent_id": id_by_code.get(parent_code),
+                "is_leaf": is_leaf, "sort_no": sort_no, "active": True, "ext_attrs": {},
+            }
+            for (code, name, category, direction, carry, lv, parent_code, sort_no, is_leaf) in rows
+        ]
+        db.execute(insert(Subject), payload)
+        # 读回这一层的 id，给下一层当 parent_id。
+        # （用 code 反查而不是依赖 RETURNING 的顺序：批量 INSERT 的行序
+        #   不该成为「父子关系对不对」的前提。）
+        for code, sid in db.execute(
+            select(Subject.code, Subject.id).where(
+                Subject.book_id == book_id, Subject.year == year,
+                Subject.code.in_([r[0] for r in rows])),
+        ):
+            id_by_code[code] = sid
 
     db.flush()
     return count
