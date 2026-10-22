@@ -70,14 +70,19 @@ def balance(book_id: int, period_id: Optional[int] = None,
 
 @router.get("/general")
 def general(book_id: int, period_id: Optional[int] = None, from_period_id: Optional[int] = None,
+            subject_id: Optional[int] = None,
             book: Book = Depends(get_my_book), db: Session = Depends(get_db),
             include_unposted: bool = Query(False), leaf_only: bool = Query(False)):
-    """总账：区间发生额 / 累计发生额 / 期末余额，与科目余额表同一份实现。
+    """总账（用友式）：**选一个一级科目**，看它在这段区间里的月度台账。
 
-    这里只校验起始期间属不属于本账套；**倒置区间由共享实现挡**
-    （``queries.balance_sheet_of_accounts`` 收到 from_period 后自己比 ord，
-    抛的也是同一个 400）。两张表委托的是同一个函数，闸门就该只有一个 ——
-    以前总账漏查 ord、余额表查了，同一段倒置区间一个 400 一份错账。
+    行结构与用友的「总分类账」一致：上年结转 → 每月「本月合计 / 累计」→
+    结转下年。屏幕上的样子与打印件是同一张纸。
+
+    ``subject_id`` 必须是**一级科目**（用友的总账是总分类账）。不给就取
+    第一个一级科目 —— 页面总要有个东西显示。
+
+    ``leaf_only`` **不再有意义**（总账的单位是一级科目），留着是为了不打断
+    老调用方，它不再影响任何输出。
     """
     to_period = _period(db, book.id, period_id)
     if from_period_id:
@@ -87,14 +92,34 @@ def general(book_id: int, period_id: Optional[int] = None, from_period_id: Optio
     else:
         from_period = to_period
 
-    subjects = queries.subjects_for_periods(db, book.id, [from_period, to_period])
-    if leaf_only:
-        subjects = [s for s in subjects if s.is_leaf]
-    rows = queries.general_ledger(db, book.id, subjects, from_period, to_period, include_unposted)
+    subjects = queries.general_ledger_subjects(db, book.id, to_period.year)
+    if not subjects:
+        return {
+            "from_period": from_period.code, "to_period": to_period.code,
+            "from_period_id": from_period.id, "to_period_id": to_period.id,
+            "subjects": [], "subject": None, "rows": [],
+            "include_unposted": include_unposted,
+        }
+
+    chosen = subjects[0]
+    if subject_id:
+        picked = next((s for s in subjects if s.id == subject_id), None)
+        if picked is None:
+            raise HTTPException(404, "科目不存在或不是一级科目")
+        chosen = picked
+
+    payload = queries.general_ledger(
+        db, book.id, chosen, from_period, to_period, include_unposted)
     return {
-        "from_period": from_period.code, "to_period": to_period.code,
-        "from_period_id": from_period.id, "to_period_id": to_period.id,
-        "rows": rows, "include_unposted": include_unposted,
+        "from_period": payload["from_period"],
+        "to_period": payload["to_period"],
+        "from_period_id": from_period.id,
+        "to_period_id": to_period.id,
+        # 一级科目清单 —— 页面上让人挑「看哪个科目」。
+        "subjects": [{"id": s.id, "code": s.code, "name": s.name} for s in subjects],
+        "subject": payload["subject"],
+        "rows": payload["rows"],
+        "include_unposted": include_unposted,
     }
 
 

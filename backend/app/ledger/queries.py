@@ -370,27 +370,171 @@ def detail_ledger(
     }
 
 
-# --------------------------------------------------------------------- 总账
+# --------------------------------------------------------------------- 总账（用友式）
+
+#: 总账的行型。用友的「总分类账」只有这四种行，没有别的：
+#: 期初一行、每月两行（本月合计 / 累计）、期末一行。
+KIND_OPENING = "OPENING"            # 上年结转
+KIND_MONTH_TOTAL = "MONTH_TOTAL"    # 本月合计
+KIND_YTD_TOTAL = "YTD_TOTAL"        # 累计
+KIND_CLOSING = "CLOSING"            # 结转下年
+
+
+def general_ledger_subjects(db: Session, book_id: int, year: int) -> list[Subject]:
+    """账套的**一级科目**（按科目表顺序）—— 一册总账的科目顺序。
+
+    用友的「总账」是**总分类账**：一个一级科目一份，把它下面所有明细科目
+    的分录汇总进去。所以总账的单位是**一级科目**，不是「一行一个科目」。
+
+    以前的总账是「一行一个科目」的余额表形态 —— 那张表就是科目余额表，
+    两处重复。现在总账改成用友形态，余额表形态由 ``/ledger/balance`` 承担。
+    """
+    return [s for s in subject_tree(db, book_id, year) if s.level == 1]
 
 
 def general_ledger(
     db: Session,
     book_id: int,
-    subjects: list[Subject],
+    subject: Subject,
     from_period: Period,
     to_period: Period,
     include_unposted: bool = False,
-) -> list[dict]:
-    """总账：每个科目一行，含区间期初、区间发生、累计发生、期末。
+    *,
+    eng: LedgerEngine | None = None,
+) -> dict:
+    """总账（用友式）：**一个一级科目一份**，逐月展开的台账。
 
-    **行结构与试算合计都委托给 balance_sheet_of_accounts** —— 两张表在区间
-    口径下问的是同一个问题（「这一段里每个科目怎么动的」）。以前这里是各自
-    写一遍的，而审计第 7.3 节记过一次「总账导出与页面显示对不上」，
-    根子就是同一个口径有了两份实现。给余额表加区间时没有理由再添一份。
+    行结构与用友的「总分类账」逐格对齐::
+
+        上年结转     期初余额 + 方向
+        01 本月合计  当月借方 / 贷方 + 月末余额 + 方向
+        01 累计      累计借方 / 贷方
+        ...
+        12 本月合计
+        12 本年累计
+        结转下年     期末余额 + 方向
+
+    **「累计」的口径是区间累计**（从区间首期起累加），所以
+    「期初 + 累计借 − 累计贷 = 期末」在任何区间都恒成立。
+    区间恰好是一个完整会计年度时，它就是用友的「本年累计」，两者逐格相等；
+    区间不是整年时，标签退回「累计」，期初/期末也退回「期初余额」「期末余额」
+    —— 写「上年结转」而实际不是上年末，是拿标签骗人。
+
+    **取数按「期间所属年度」分段。** 科目表每个年度各有一份，跨年区间里
+    2026 年的分录挂在 2026 年的科目 id 上、2027 年的挂在 2027 年的 id 上，
+    拿错年份的行去算就是一段凭空少掉的数。所以每一段用它自己那年的那一行，
+    段与段之间靠「上一年年末 = 下一年年初」这条结转关系接上。
+
+    ``eng`` 可以传进来共用：**打一册总账**（账套全部一级科目）是逐个科目
+    调本函数的，共用一个引擎实例，账簿聚合只跑一次；不传就自己建一个。
     """
-    rows, _check = balance_sheet_of_accounts(
-        db, book_id, subjects, to_period, include_unposted, from_period=from_period)
-    return rows
+    if from_period.ord > to_period.ord:
+        raise HTTPException(400, "起始期间不能晚于结束期间")
+
+    eng = eng or LedgerEngine.for_ledger(db, book_id, include_unposted)
+    periods = eng.periods()
+    range_periods = [p for p in periods if from_period.ord <= p.ord <= to_period.ord]
+    if not range_periods:
+        raise HTTPException(400, "所选期间范围内没有会计期间")
+
+    # 区间涉及的每一年的科目表里，**同编码**的那一行。
+    years = sorted({p.year for p in range_periods})
+    by_year: dict[int, Subject] = {}
+    for y in years:
+        for s in subject_tree(db, book_id, y):
+            if s.code == subject.code:
+                by_year[y] = s
+                break
+    if not by_year:
+        raise HTTPException(404, "科目不存在")
+
+    first, last = range_periods[0], range_periods[-1]
+
+    # **先把引擎热到区间最后一期。**
+    #
+    # 引擎的记忆化只在「已查到的上界 ≥ 本次上界」时才盖得住
+    # （``LedgerEngine._pick_donor``）：从第一期开始逐期问的话，每一期都要
+    # 重新发一次全账聚合 —— 12 个月就是 12 次。倒过来先问最后一期，
+    # 后面每一期都是从那一份结果里切片，**不发 SQL**。
+    warm = by_year.get(last.year) or by_year[years[-1]]
+    eng.figures(warm.id, last.ord)
+
+    # 逐期取数。``figures`` 取的是该科目在那一期的期初 / 当期发生额 / 期末，
+    # 发生额**已由引擎上卷到各级父科目**（_cum_movements），所以一级科目
+    # 那一行拿到的就是「它加上它所有下级」的合计 —— 正是用友总账要的口径。
+    seg: dict[int, dict] = {}
+    for p in range_periods:
+        node = by_year.get(p.year)
+        if node is None:
+            continue
+        f = eng.figures(node.id, p.ord)
+        seg[p.ord] = {
+            "opening": f.opening,
+            "debit": f.period_dr,
+            "credit": f.period_cr,
+            "closing": f.closing,
+        }
+
+    full_year = (first.year == last.year and first.month == 1 and last.month == 12)
+    opening_label = "上年结转" if full_year else "期初余额"
+    closing_label = "结转下年" if full_year else "期末余额"
+
+    def _blank(kind: str, period: Period, summary: str, **extra) -> dict:
+        row = {
+            "kind": kind,
+            "period": period.code,
+            "month": "", "day": "", "voucher_no": "",
+            "summary": summary,
+            "debit": None, "credit": None,
+            "direction": "", "balance": None,
+        }
+        row.update(extra)
+        return row
+
+    rows: list[dict] = []
+
+    # 期初行
+    side, amount = display_side(subject, seg[first.ord]["opening"])
+    rows.append(_blank(KIND_OPENING, first, opening_label,
+                       direction=side, balance=amount))
+
+    # 逐月两行
+    cum_dr = cum_cr = ZERO
+    for p in range_periods:
+        s = seg.get(p.ord)
+        if s is None:
+            continue
+        cum_dr += s["debit"]
+        cum_cr += s["credit"]
+        side, amount = display_side(subject, s["closing"])
+        rows.append(_blank(KIND_MONTH_TOTAL, p, "本月合计",
+                           month=f"{p.month:02d}",
+                           debit=s["debit"], credit=s["credit"],
+                           direction=side, balance=amount))
+        # 年末那一期的累计行改用「本年累计」——用友的固定写法。
+        #
+        # 「累　　计」中间是**两个全角空格**（U+3000），不是普通空格：
+        # 用友的标签一律按四字宽排版，普通空格排出来只有半字宽，字距对不上，
+        # 与样张并排看就是两个字的距离。标签写在这里而不是各个渲染器里，
+        # 是为了让打印件、Excel 与屏幕**逐字同一份**。
+        cum_summary = "本年累计" if (full_year and p.month == 12) else "累　　计"
+        rows.append(_blank(KIND_YTD_TOTAL, p, cum_summary,
+                           month=f"{p.month:02d}",
+                           debit=cum_dr, credit=cum_cr))
+
+    # 期末行
+    side, amount = display_side(subject, seg[last.ord]["closing"])
+    rows.append(_blank(KIND_CLOSING, last, closing_label,
+                       direction=side, balance=amount))
+
+    return {
+        "subject": {"id": subject.id, "code": subject.code, "name": subject.name,
+                    "level": subject.level},
+        "from_period": first.code,
+        "to_period": last.code,
+        "full_year": full_year,
+        "rows": rows,
+    }
 
 
 # --------------------------------------------------------------------- 科目余额表 / 试算平衡

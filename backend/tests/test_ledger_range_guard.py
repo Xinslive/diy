@@ -62,9 +62,14 @@ def _前置_区间本该有发生额(db, book, periods, subs) -> list[dict]:
     没有这一句，「倒置区间返回 400」可能只是因为区间里压根没数据 ——
     那种 400 是对的，但它证明不了闸门真的在挡什么。
     """
+    # 总账的单位是**一级科目**（用友的总分类账）：它下面所有明细科目的
+    # 分录由账簿引擎上卷进来，所以问一个一级科目就够。
+    # 问的是 1002 银行存款 —— ``_seed`` 的凭证都挂在它下面。
+    subject = subs["1002"]
     rows = queries.general_ledger(
-        db, book.id, list(subs.values()), periods[1], periods[FROM_MONTH], False)
-    moving = [r for r in rows if r["period_debit"] or r["period_credit"]]
+        db, book.id, subject, periods[1], periods[FROM_MONTH], False)["rows"]
+    moving = [r for r in rows
+              if r["kind"] == "MONTH_TOTAL" and (r["debit"] or r["credit"])]
     assert moving, "前置：这段区间必须有发生额，否则倒置区间返回 400 说明不了任何问题"
     return rows
 
@@ -85,7 +90,7 @@ def test_总账的倒置区间返回400而不是一份全零的错账(
     assert "起始期间不能晚于结束期间" in r.text, r.text[:400]
     # 记下旧实现会给出的那份错账长什么样：期初 = 期末、发生额全 0、试算还平。
     # 它不是「恰好没数」，而是把有数的区间算成了静止的 —— 这正是必须挡掉的。
-    assert all(r["opening"] == r["closing"] or r["period_debit"] or r["period_credit"]
+    assert any(r["kind"] == "MONTH_TOTAL" and (r["debit"] or r["credit"])
                for r in forward), "前置：正序区间的行不该全是静止行"
 
 
@@ -96,11 +101,14 @@ def test_总账的正序区间仍然是200且有发生额(
     _seed(make_voucher)
 
     r = client.get(f"/api/books/{book.id}/ledger/general", headers=auth,
-                   params=_params(periods, from_month=TO_MONTH, to_month=FROM_MONTH))
+                   params={**_params(periods, from_month=TO_MONTH, to_month=FROM_MONTH),
+                           # 问 1002 银行存款 —— ``_seed`` 的凭证挂在它下面。
+                           # 不点名的话后端给的是第一个一级科目（可能是没有分录的那一个）。
+                           "subject_id": _subjects(db, book)["1002"].id})
     assert r.status_code == 200, r.text[:400]
     rows = r.json()["rows"]
     assert rows, "正序区间应当有行"
-    assert any(row["period_debit"] > 0 for row in rows), \
+    assert any(row["kind"] == "MONTH_TOTAL" and row["debit"] > 0 for row in rows), \
         f"正序区间却没有发生额，闸门可能拦过头了：{rows[:2]}"
 
 
@@ -123,10 +131,12 @@ def test_倒置区间在共享实现里就被挡住(db, book, periods, subjects,
     assert exc.value.status_code == 400
     assert "起始期间不能晚于结束期间" in str(exc.value.detail)
 
-    # 总账是同一份实现的另一个门面，行为必须一致
+    # 总账是同一份实现的那个门面，行为必须一致
+    # （总账的单位是一级科目，所以这里问一个一级科目）。
+    subject = subs["1002"]
     with pytest.raises(HTTPException):
         queries.general_ledger(
-            db, book.id, list(subs.values()), periods[FROM_MONTH], periods[TO_MONTH], False)
+            db, book.id, subject, periods[FROM_MONTH], periods[TO_MONTH], False)
 
 
 # --------------------------------------------------------------------- 余额表 / 明细账

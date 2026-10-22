@@ -143,22 +143,36 @@ def test_区间也要试算平衡(db, book, make_voucher):
 
 
 def test_余额表与总账问同一段区间_答案一样(db, book, make_voucher):
-    """同一个口径只允许有一份实现。
+    """同一段区间、同一科目，两边给出来的数必须一样。
 
     以前余额表和总账各写一遍区间算法，总账导出因此栽过一次
-    （屏幕是区间、文件是全账，审计第 7.3 节）。现在 general_ledger
-    直接委托 balance_sheet_of_accounts，这条用例就是防止它又被拆开。
+    （屏幕是区间、文件是全账，审计第 7.3 节）。
+
+    总账改成用友式之后它**不再委托**余额表 —— 形状本来就不同
+    （余额表是一行一个科目，总账是一个一级科目一份的月度台账）。
+    但两边**必须从同一个引擎取数**：同一段区间、同一科目，
+    期初 / 区间发生额 / 期末要一样。这条用例就是防止它又被拆开。
     """
     periods = _periods(db, book)
     _mv(make_voucher, periods[1], [("1002", 111, 0), ("4001", 0, 111)])
     _mv(make_voucher, periods[2], [("1002", 222, 0), ("4001", 0, 222)])
 
     subjects = queries.subject_tree(db, book.id, periods[3].year)
-    bal, _ = queries.balance_sheet_of_accounts(
+    bal_rows, _ = queries.balance_sheet_of_accounts(
         db, book.id, subjects, periods[3], True, from_period=periods[1])
+    bal = next(r for r in bal_rows if r["code"] == "1002")
+
+    subject = next(s for s in subjects if s.code == "1002")
     gen = queries.general_ledger(
-        db, book.id, subjects, periods[1], periods[3], True)
-    assert bal == gen, "余额表与总账对同一段区间给出了不同的行"
+        db, book.id, subject, periods[1], periods[3], True)["rows"]
+    opening = next(r for r in gen if r["kind"] == "OPENING")
+    cum = [r for r in gen if r["kind"] == "YTD_TOTAL"][-1]
+    closing = next(r for r in gen if r["kind"] == "CLOSING")
+
+    assert opening["balance"] == bal["opening"], "区间期初两边对不上"
+    assert cum["debit"] == bal["period_debit"], "区间借方发生额两边对不上"
+    assert cum["credit"] == bal["period_credit"], "区间贷方发生额两边对不上"
+    assert closing["balance"] == bal["closing"], "期末余额两边对不上"
 
 
 # ------------------------------------------------------------------ HTTP 层

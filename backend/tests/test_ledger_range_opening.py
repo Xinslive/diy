@@ -30,14 +30,29 @@ from app.ledger.engine import LedgerEngine
 from app.models import Period, PeriodOpening, Subject
 
 
-def _row(rows, subject_id):
-    return next(r for r in rows if r["subject_id"] == subject_id)
+def _kind(rows, kind, month=None):
+    """按**行型**取一行（可再按月份筛）。
+
+    总账是**用友式**的：行型只有四种（上年结转 / 本月合计 / 累计 / 结转下年），
+    没有「一行一个科目」那版的科目行，所以不能再按 subject_id 找行 ——
+    整张表讲的本来就是**同一个科目**。
+    """
+    for r in rows:
+        if r["kind"] == kind and (month is None or r["month"] == month):
+            return r
+    raise AssertionError(f"总账里没有 {kind} 行"
+                         + (f"（{month} 月）" if month else ""))
 
 
-def _ledger(db, book, periods, subjects, from_month, to_month):
-    tree = queries.subject_tree(db, book.id, book.start_year)
+def _ledger(db, book, periods, subjects, from_month, to_month, code="1001"):
+    """一个**一级科目**在这段区间里的月度台账（用友式总账的行）。
+
+    总账的单位是一级科目：它下面所有明细科目的分录由账簿引擎上卷进来，
+    所以问一行一级科目就够，不必问整棵树。
+    """
+    subject = subjects[code]
     return queries.general_ledger(
-        db, book.id, tree, periods[from_month], periods[to_month], False)
+        db, book.id, subject, periods[from_month], periods[to_month], False)["rows"]
 
 
 def test_首年首月起算的区间期初必须是零(db, book, periods, subjects, make_voucher):
@@ -51,14 +66,16 @@ def test_首年首月起算的区间期初必须是零(db, book, periods, subjec
                      posted=True)
 
     rows = _ledger(db, book, periods, subjects, 1, 6)
-    row = _row(rows, subjects["1001"].id)
+    opening = _kind(rows, "OPENING")
+    cum = _kind(rows, "YTD_TOTAL", "06")
+    closing = _kind(rows, "CLOSING")
 
-    assert row["opening"] == Decimal("0"), (
-        f"区间期初应为账套首期的期初 0，实际 {row['opening']}"
+    assert opening["balance"] == Decimal("0"), (
+        f"区间期初应为账套首期的期初 0，实际 {opening['balance']}"
         "（取成了结束期自己的期初，即 5 月末的 600）")
-    assert row["period_debit"] == Decimal("1200")
-    assert row["closing"] == Decimal("1200"), (
-        f"期末应为 1200，实际 {row['closing']}（期初重复计入了 1~5 月的发生额）")
+    assert cum["debit"] == Decimal("1200")
+    assert closing["balance"] == Decimal("1200"), (
+        f"期末应为 1200，实际 {closing['balance']}（期初重复计入了 1~5 月的发生额）")
 
     # 行内自洽不是正确性的证据，所以再钉一条：区间期初必须等于「上一期期末」，
     # 而起始期是首期时不存在上一期 —— 它必须等于账套首期的期初快照。
@@ -76,9 +93,11 @@ def test_首年起算时父级科目也不重复计入(db, book, periods, subjec
                      dr=[("110101", amt, "收款")], cr=[("5001", amt, "收款")],
                      posted=True)
 
-    rows = _ledger(db, book, periods, subjects, 1, 6)
-    row = _row(rows, subjects["1101"].id)
-    assert (row["opening"], row["period_debit"], row["closing"]) == (
+    rows = _ledger(db, book, periods, subjects, 1, 6, code="1101")
+    opening = _kind(rows, "OPENING")
+    cum = _kind(rows, "YTD_TOTAL", "06")
+    closing = _kind(rows, "CLOSING")
+    assert (opening["balance"], cum["debit"], closing["balance"]) == (
         Decimal("0"), Decimal("1200"), Decimal("1200"))
 
 
@@ -99,7 +118,7 @@ def test_区间期初等于上一期期末(db, book, periods, subjects, make_vou
     assert may_closing == Decimal("1000")
 
     rows = _ledger(db, book, periods, subjects, 6, 6)
-    assert _row(rows, bank)["opening"] == may_closing == Decimal("1000")
+    assert _kind(rows, "OPENING")["balance"] == may_closing == Decimal("1000")
 
 
 def test_非首期的区间期初行为不变(db, book, periods, subjects, make_voucher):
@@ -110,8 +129,10 @@ def test_非首期的区间期初行为不变(db, book, periods, subjects, make_
                      posted=True)
 
     rows = _ledger(db, book, periods, subjects, 3, 6)
-    row = _row(rows, subjects["1001"].id)
-    assert (row["opening"], row["period_debit"], row["closing"]) == (
+    opening = _kind(rows, "OPENING")
+    cum = _kind(rows, "YTD_TOTAL", "06")
+    closing = _kind(rows, "CLOSING")
+    assert (opening["balance"], cum["debit"], closing["balance"]) == (
         Decimal("300"), Decimal("900"), Decimal("1200"))
 
 
@@ -124,8 +145,10 @@ def test_首期有期初余额时区间期初等于那张快照(db, book, period
                  posted=True)
 
     rows = _ledger(db, book, periods, subjects, 1, 6)
-    row = _row(rows, subjects["1001"].id)
-    assert (row["opening"], row["period_debit"], row["closing"]) == (
+    opening = _kind(rows, "OPENING")
+    cum = _kind(rows, "YTD_TOTAL", "06")
+    closing = _kind(rows, "CLOSING")
+    assert (opening["balance"], cum["debit"], closing["balance"]) == (
         Decimal("5000"), Decimal("300"), Decimal("5300"))
 
 
@@ -151,14 +174,18 @@ def test_区间期末等于结束期本身的期末(db, book, periods, subjects,
                  cr=[("5001", 600, "收款")], posted=True)
 
     eng = LedgerEngine.for_ledger(db, book.id)
+    tree = queries.subject_tree(db, book.id, book.start_year)
+    top = [s for s in tree if s.level == 1]
     for from_month in (1, 3, 6):
-        rows = _ledger(db, book, periods, subjects, from_month, 6)
-        for row in rows:
-            signed = (Decimal(row["closing"]) if row["direction"] == "借"
-                      else -Decimal(row["closing"]) if row["direction"] == "贷" else Decimal("0"))
-            assert signed == eng.closing(row["subject_id"], periods[6].ord), (
-                f"{row['code']} 从 {from_month} 月起算的区间期末 {signed}"
-                f" 与引擎算的 6 月期末 {eng.closing(row['subject_id'], periods[6].ord)} 不一致")
+        for subject in top:
+            rows = _ledger(db, book, periods, subjects, from_month, 6, code=subject.code)
+            closing = _kind(rows, "CLOSING")
+            amount = Decimal(str(closing["balance"]))
+            signed = (amount if closing["direction"] == "借"
+                      else -amount if closing["direction"] == "贷" else Decimal("0"))
+            assert signed == eng.closing(subject.id, periods[6].ord), (
+                f"{subject.code} 从 {from_month} 月起算的区间期末 {signed}"
+                f" 与引擎算的 6 月期末 {eng.closing(subject.id, periods[6].ord)} 不一致")
 
 
 def test_首期启用月不是一月时同样成立(db, admin_user):
@@ -216,10 +243,14 @@ def test_首期启用月不是一月时同样成立(db, admin_user):
     voucher("2026-04-10", 100)
     voucher("2026-06-10", 200)
 
-    rows = queries.subject_tree(db, book.id, book.start_year)
-    row = _row(queries.general_ledger(
-        db, book.id, rows, by_month[4], by_month[6], False), subs["1001"])
-    assert (row["opening"], row["period_debit"], row["closing"]) == (
+    tree = queries.subject_tree(db, book.id, book.start_year)
+    subject = next(s for s in tree if s.code == "1001")
+    rows = queries.general_ledger(
+        db, book.id, subject, by_month[4], by_month[6], False)["rows"]
+    opening = _kind(rows, "OPENING")
+    cum = _kind(rows, "YTD_TOTAL", "06")
+    closing = _kind(rows, "CLOSING")
+    assert (opening["balance"], cum["debit"], closing["balance"]) == (
         Decimal("0"), Decimal("300"), Decimal("300"))
 
     # 引擎侧：显式的「首期之前」时点

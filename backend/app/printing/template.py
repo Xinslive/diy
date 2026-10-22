@@ -143,25 +143,58 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
         ],
     },
     "LEDGER": {
+        # **总账是用友式的「总分类账」**：一个一级科目一份，逐月展开。
+        # 版式逐格照着用友导出的样张复刻（列宽、行表头、行标签、页眉页脚），
+        # 规格见 ``docs/用友总账打印样式规格.md``。
         "paper": "A4", "orientation": "portrait",
-        "margins": {"top": 15, "right": 10, "bottom": 15, "left": 12},
-        "title": {"text": "总　账", "size": 16, "bold": True, "align": "center"},
+        "margins": {"top": 12, "right": 10, "bottom": 12, "left": 10},
+        # 标题是模板化的：「{subject}总账」—— 用友的标题是「科目名 + 总账」。
+        "title": {"text": "{subject}总账", "size": 20, "bold": True, "align": "center"},
         "subtitle": {"text": "", "size": 11, "align": "center"},
         "font": {"family": "宋体", "size": 10},
-        "show": {"subject": True, "period": True, "page_no": True},
+        "show": {"period": True, "page_no": True},
+        # 列宽是实测值（占表格宽度百分比）。「方向」列只有 2.9%，
+        # 窄到表头必须竖排 —— 那是用友的固定写法，不是排版失误。
         "columns": [
-            {"key": "date", "label": "日期", "width": 10, "align": "center"},
-            {"key": "voucher_no", "label": "凭证字号", "width": 12, "align": "center"},
-            {"key": "summary", "label": "摘　要", "width": 26, "align": "left"},
-            {"key": "debit", "label": "借方金额", "width": 13, "align": "right"},
-            {"key": "credit", "label": "贷方金额", "width": 13, "align": "right"},
-            {"key": "direction", "label": "方向", "width": 8, "align": "center"},
-            {"key": "balance", "label": "余额", "width": 13, "align": "right"},
+            {"key": "month", "label": "月", "width": 3.6, "align": "center"},
+            {"key": "day", "label": "日", "width": 3.5, "align": "center"},
+            {"key": "voucher_no", "label": "凭证号数", "width": 8.8, "align": "center"},
+            {"key": "summary", "label": "摘 要", "width": 37.1, "align": "left"},
+            {"key": "debit", "label": "借 方", "width": 14.6, "align": "right"},
+            {"key": "credit", "label": "贷 方", "width": 14.7, "align": "right"},
+            {"key": "direction", "label": "方向", "width": 2.9, "align": "center",
+             "vertical": True},
+            {"key": "balance", "label": "余 额", "width": 14.7, "align": "right"},
         ],
-        "meta": {"company": True, "book": True, "period": True},
-        "footer": {"text": "", "show_page_no": True,
-                   "format": "第 {page} 页　共 {total} 页"},
+        "meta": {},
+        "footer": {"text": "", "show_page_no": False},
         "body": {"repeat_header": True, "border": True},
+        # 用友总账特有的那一组东西。表头/页脚不再走通用的 ``meta``/``footer``
+        # —— 用友的页眉是「标题 + 右上角账簿信息」，页脚是「核算单位 / 制表 /
+        # 打印日期」三段，与凭证、余额表那套通用页眉页脚不是一回事。
+        "ledger_book": {
+            # 一页放多少行数据。**26 行 = 一个完整会计年度**
+            # （上年结转 + 12×(本月合计/累计) + 结转下年），正好一页放下，
+            # 与用友样张一致 —— 那张样张就是 26 行数据印在一页上。
+            "rows_per_page": 26,
+            # 行高（mm）。**固定行高**而不是让它随内容长：分页是服务端算的，
+            # 行高一变，页数就与实际印出来的不一致，页眉上的「当前页-总页数」
+            # 也就跟着说谎。
+            "row_height_mm": 6.0,
+            # 本币名称。用友印「本币名称: 人民币」，我们没有币种字段
+            # （Book 只有 company_name），先固定写人民币。
+            "currency_name": "人民币",
+            # 右上角那个方括号标记：用友印「[正式账簿]」（**方括号是原样的一部分**）。
+            "book_label": "[正式账簿]",
+            # 表格上方的科目行。
+            "subject_caption": "科目: {subject}({subject_code})",
+            # 右上角第二行。**页号是「当前页-该科目总页数」**，不是「册号-页号」：
+            # 每个一级科目各自从 1 开始编页（1-1 = 只有 1 页，这是第 1 页）。
+            "page_label": "页号:  {page}-{pages}",
+            "footer_left": "核算单位: {company}",
+            "footer_center": "制表: {preparer}",
+            "footer_right": "打印日期: {print_date}",
+        },
     },
     "DETAIL_LEDGER": {
         "paper": "A4", "orientation": "landscape",
@@ -397,6 +430,9 @@ def validate_template(scope: str, content: dict | None) -> dict:
                 "width": max(0.5, float(c.get("width", 10) or 10)),
                 "align": align if align in ALIGN else "left",
                 "indent": int(c.get("indent", 0) or 0),
+                # 表头竖排（用友总账的「方向」列：窄到只能把「方」「向」摞起来）。
+                # **默认 False**：绝大多数列都是横排的。
+                "vertical": bool(c.get("vertical", False)),
             }
         )
     total = sum(c["width"] for c in cleaned) or 1.0
@@ -477,6 +513,27 @@ def validate_template(scope: str, content: dict | None) -> dict:
                 }
             )
         merged["elements"] = clean_elements
+
+    if scope == "LEDGER":
+        lb = merged.setdefault("ledger_book", {})
+        if not isinstance(lb, dict):
+            lb = {}
+        try:
+            rows_per_page = int(lb.get("rows_per_page", 26) or 26)
+        except (TypeError, ValueError):
+            rows_per_page = 25
+        # 一页至少一行、至多一百行。上限是防呆：写坏了的模板不该让服务端
+        # 一次渲染一百页纸（那是给自己挖的坑，也是给打印机的）。
+        lb["rows_per_page"] = max(1, min(100, rows_per_page))
+        # 行高（mm）会拼进 CSS，同样要夹区间。
+        lb["row_height_mm"] = _num(lb.get("row_height_mm"), 6.0, 3.0, 20.0)
+        # 下面几个是**文本**，不是 CSS：它们会被 _esc 转义后拼进 HTML，
+        # 不需要白名单，但长度要限一下，免得模板里塞一大段字把版式顶飞。
+        for key, limit in (("currency_name", 32), ("book_label", 32),
+                           ("subject_caption", 120), ("page_label", 64),
+                           ("footer_left", 120), ("footer_center", 120),
+                           ("footer_right", 120)):
+            lb[key] = str(lb.get(key, "") or "")[:limit]
     return merged
 
 
@@ -975,6 +1032,202 @@ def render_table_page(tpl: dict, ctx: dict, rows: list[dict], page: int, total: 
     <tbody>{''.join(body_rows)}</tbody>
   </table>
   {_footer_html(tpl, page, total)}
+</div></body></html>"""
+
+
+# --------------------------------------------------------------------- 用友式总账（账簿）
+
+#: 用友总账的页眉里那一组固定文案与位置。
+#:
+#: 「页号」那一行的意思是**当前页-该科目总页数**（1-1 = 只有 1 页，这是第 1 页），
+#: 每个一级科目各自从 1 开始编页。
+#:
+#: 位置是实测用友样张得到的：``info_left`` 是「页号 / 本币名称」两行的**左边缘**
+#: 落在表格宽度的百分之几（样张 81.6%）。用百分比而不是像素，是纸型换了位置
+#: 仍然对得上。
+LEDGER_BOOK_INFO_LEFT_PCT = 81.6
+
+
+def _ledger_book_text(text: str, ctx: dict) -> str:
+    """把 ``{subject}`` 这类占位符换成真值。
+
+    **只换已知的键**：模板里的花括号不是 Python 的格式化串，未知占位符原样
+    留着（用户可能就想印一个 ``{x}``）。值一律 ``_esc``，所以占位符里塞
+    什么都进不了 HTML。
+    """
+    out = str(text or "")
+    for key, value in ctx.items():
+        token = "{" + str(key) + "}"
+        if token in out:
+            out = out.replace(token, _esc(value))
+    return out
+
+
+def render_ledger_book_page(tpl: dict, ctx: dict, rows: list[dict], *,
+                            page: int, pages: int, year: str) -> str:
+    """用友式总账的**一页**。
+
+    版式逐格照着用友导出的样张复刻（规格与实测值见
+    ``docs/用友总账打印样式规格.md``）：
+
+    * **两行表头**：第 1 行是「年份」横跨「月 + 日」，其余六列 ``rowspan=2``
+      跨两行居中；第 2 行只有「月」「日」。用友的样张里这两行其实是**一个**
+      45px 高的表头行里嵌了一层子格，而 HTML 的 rowspan 画出来与之等效 ——
+      包括「年份」下方那条只跨「月+日」的横线。
+    * 八列的列宽是实测值；「方向」列窄到 2.9%，表头必须竖排。
+    * 全框线，内外同粗（用友的样张里所有线都是 1px 黑线）。
+    * 页眉：居中标题（带一条与标题等宽的下划线）+ 右上角「[正式账簿]」
+      + 「页号: 当前页-总页数」+「本币名称」。
+    * 页脚：核算单位 / 制表 / 打印日期 三段。
+
+    **分页在服务端做**：页眉上的「当前页-总页数」必须每页不同，而浏览器
+    打印时的页眉是 ``@page`` 边距框（浏览器不支持自定义内容），所以只能
+    一页一页地渲染出来。
+    """
+    lb = tpl.get("ledger_book") or {}
+    cols = tpl["columns"]
+    paper = str(tpl.get("paper", "A4"))
+    spec = PAPERS.get(paper, PAPERS["A4"])
+    landscape = tpl.get("orientation") == "landscape"
+    w, h = (spec["h"], spec["w"]) if landscape else (spec["w"], spec["h"])
+    size_line = f"{w}mm {h}mm"
+    if paper == "A4":
+        size_line = "A4 landscape" if landscape else "A4"
+    elif paper == "A5":
+        size_line = "A5 landscape" if landscape else "A5"
+
+    m = tpl.get("margins", {})
+    if not isinstance(m, dict):
+        m = {}
+    mt, mr, mb, ml = (
+        _num(m.get(k), 10.0, *MARGIN_RANGE) for k in ("top", "right", "bottom", "left")
+    )
+    font = tpl.get("font") or {}
+    family = _safe_font(font.get("family"))
+    fsize = _num(font.get("size"), 10, *FONT_SIZE_RANGE)
+    title = tpl.get("title") or {}
+    title_size = _num(title.get("size"), 20, *TITLE_SIZE_RANGE)
+    title_bold = "700" if title.get("bold", True) else "400"
+    row_h = _num(lb.get("row_height_mm"), 6.0, 3.0, 20.0)
+    border = "1px solid #000" if tpl.get("body", {}).get("border", True) else "none"
+
+    # ---- 页眉 ----
+    title_text = _ledger_book_text(title.get("text", ""), ctx)
+    book_label = _ledger_book_text(str(lb.get("book_label") or ""), ctx)
+    page_label = _ledger_book_text(
+        str(lb.get("page_label") or ""), ctx).replace("{page}", str(page)).replace(
+        "{pages}", str(pages))
+    currency = _ledger_book_text(str(lb.get("currency_name") or ""), ctx)
+    subject_caption = _ledger_book_text(str(lb.get("subject_caption") or ""), ctx)
+
+    # ---- 表头 ----
+    # 「月」「日」是日期的两半，年份压在它们正上方；其余列跨两行居中。
+    date_cols = {"month", "day"}
+    head1: list[str] = []
+    head2: list[str] = []
+    spanned = 0
+    for c in cols:
+        if c["key"] in date_cols:
+            continue
+        label = _esc(c["label"])
+        if c.get("vertical"):
+            label = "<br>".join(label)
+        head1.append(f'<th rowspan="2">{label}</th>')
+        spanned += 1
+    head1.insert(0, f'<th colspan="2" class="lb-year">{_esc(year)}</th>')
+    head2.append("<th>月</th><th>日</th>")
+
+    colgroup = "".join(f'<col style="width:{c["width"]}%" />' for c in cols)
+
+    # ---- 表体 ----
+    body: list[str] = []
+    for r in rows:
+        tds: list[str] = []
+        for c in cols:
+            raw = r.get(c["key"], "")
+            if c["align"] == "right":
+                cls, text = "lb-num", _fmt(raw)
+            elif c["align"] == "center":
+                cls, text = "lb-ctr", str(raw if raw is not None else "")
+            else:
+                cls, text = "lb-left", str(raw if raw is not None else "")
+            tds.append(f'<td class="{cls}">{_esc(text)}</td>')
+        body.append(f"<tr>{''.join(tds)}</tr>")
+    if not body:
+        body.append(f'<tr><td colspan="{len(cols)}" class="lb-ctr">（无数据）</td></tr>')
+
+    css = f"""
+@page {{ size: {size_line}; margin: {mt}mm {mr}mm {mb}mm {ml}mm; }}
+* {{ box-sizing: border-box; }}
+html, body {{ margin:0; padding:0; }}
+body {{
+  font-family: "{family}", "SimSun", "Songti SC", serif;
+  font-size: {fsize}pt; color:#000;
+  -webkit-print-color-adjust: exact; print-color-adjust: exact;
+}}
+.page {{ width:100%; }}
+/* 页眉：标题居中（带一条与标题等宽的下划线），右上角是账簿信息。
+   用绝对定位而不是 flex —— 「正式账簿」右对齐到表格右边缘，而「页号 /
+   本币名称」两行左对齐在表格宽度的 81.6% 处，两者的对齐基准不同，
+   flex 排不出这个形状。 */
+.lb-head {{ position:relative; }}
+.lb-title {{ text-align:center; font-size:{title_size}pt; font-weight:{title_bold};
+  line-height:1.2; margin:0 0 1mm; }}
+.lb-title span {{ border-bottom:1px solid #000; padding-bottom:1mm; }}
+.lb-book {{ position:absolute; right:0; top:0; font-size:{fsize}pt; }}
+.lb-info {{ position:absolute; left:{LEDGER_BOOK_INFO_LEFT_PCT}%; top:0;
+  font-size:{fsize}pt; line-height:1.5; white-space:nowrap; }}
+.lb-subject {{ font-size:{fsize}pt; margin:0 0 1mm; }}
+table.lb-grid {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
+table.lb-grid th, table.lb-grid td {{ border:{border}; padding:0 1mm;
+  vertical-align:middle; }}
+table.lb-grid thead th {{ font-weight:700; text-align:center; }}
+/* 两行表头：第 1 行（年份那半）5.5mm，第 2 行（半月日那半）5.5mm。
+   合计 11mm，与用友样张里 45px 的表头等比例。 */
+table.lb-grid thead tr:first-child th {{ height:5.5mm; }}
+table.lb-grid thead tr:last-child th {{ height:5.5mm; }}
+/* 年份比正文大一号（用友样张里 18px vs 13px），且加粗。 */
+table.lb-grid th.lb-year {{ font-size:{_num(fsize * 1.25, 12.5, 6, 40)}pt; }}
+table.lb-grid tbody td {{ height:{row_h}mm; }}
+table.lb-grid td.lb-num {{ text-align:right; white-space:nowrap; }}
+table.lb-grid td.lb-ctr {{ text-align:center; }}
+table.lb-grid td.lb-left {{ text-align:left; }}
+/* 页脚三段：左核算单位、中制表、右打印日期。中段落在表格正中。 */
+.lb-foot {{ display:grid; grid-template-columns:1fr 1fr 1fr; margin-top:1.5mm;
+  font-size:{_num(fsize * 0.9, 9, 6, 40)}pt; }}
+.lb-foot span:nth-child(2) {{ text-align:center; }}
+.lb-foot span:nth-child(3) {{ text-align:right; }}
+@media screen {{
+  body {{ background:#f0f0f0; padding:0; }}
+  .page {{ background:#fff; margin:0 0 16px; width:{w}mm; min-height:{h}mm;
+    padding:{mt}mm {mr}mm {mb}mm {ml}mm;
+    box-shadow:0 2px 12px rgba(0,0,0,.18); }}
+}}
+@media print {{
+  body {{ background:#fff; padding:0; }}
+  .page {{ box-shadow:none; padding:0; margin:0; }}
+}}
+"""
+    return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+{PRINT_CSP_META}
+<title>{_esc(title_text or "总账")}</title>
+<style>{css}</style></head><body>
+<div class="page">
+  <div class="lb-head">
+    <div class="lb-title"><span>{_esc(title_text)}</span></div>
+    <div class="lb-book">{_esc(book_label)}</div>
+    <div class="lb-info"><div>{_esc(page_label)}</div><div>本币名称: {_esc(currency)}</div></div>
+  </div>
+  <div class="lb-subject">{_esc(subject_caption)}</div>
+  <table class="lb-grid"><colgroup>{colgroup}</colgroup>
+    <thead><tr>{''.join(head1)}</tr><tr>{''.join(head2)}</tr></thead>
+    <tbody>{''.join(body)}</tbody>
+  </table>
+  <div class="lb-foot">
+    <span>{_esc(_ledger_book_text(str(lb.get("footer_left") or ""), ctx))}</span>
+    <span>{_esc(_ledger_book_text(str(lb.get("footer_center") or ""), ctx))}</span>
+    <span>{_esc(_ledger_book_text(str(lb.get("footer_right") or ""), ctx))}</span>
+  </div>
 </div></body></html>"""
 
 

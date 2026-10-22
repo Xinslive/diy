@@ -75,16 +75,20 @@ def main() -> int:
     # ---------------------------------------------------------------- 2 期初
     step(2, "录入期初余额")
     # 金额一律「借正贷负」：银行存款 200000 借方为正，权益类科目是贷方余额故取负
+    #
+    # 科目编码用**现行标准科目表**（用友 4-2-2）：1002 银行存款 / 3001 实收资本 /
+    # 310415 未分配利润。老编码（100201/4001/4104）在换成用友编号那次没跟着改，
+    # 这里补上 —— 脚本里写的编码必须是**真的存在**的科目，否则第一笔就 KeyError。
     openings = [
-        {"subject_id": S["100201"], "amount": "200000"},   # 银行存款
-        {"subject_id": S["4001"], "amount": "-80000"},     # 实收资本（贷方余额）
-        {"subject_id": S["4104"], "amount": "-120000"},    # 未分配利润（贷方余额）
+        {"subject_id": S["1002"], "amount": "200000"},     # 银行存款
+        {"subject_id": S["3001"], "amount": "-80000"},     # 实收资本（贷方余额）
+        {"subject_id": S["310415"], "amount": "-120000"},  # 未分配利润（贷方余额）
     ]
     r = client.post(f"/api/books/{BID}/periods", headers=H, json=openings)
     check("期初余额写入", r.status_code == 200, r.text[:80])
 
     bal = client.get(f"/api/books/{BID}/ledger/balance", headers=H, params={"period_id": P["2026-03"]}).json()
-    bank = next(x for x in bal["rows"] if x["code"] == "100201")
+    bank = next(x for x in bal["rows"] if x["code"] == "1002")
     check("期初 200000 正确派生到 3 月", Decimal(bank["opening"]) == Decimal("200000"),
           f"期初={bank['opening']}")
     check("期初试算平衡", bal["check"]["opening_balanced"], str(bal["check"]))
@@ -97,28 +101,28 @@ def main() -> int:
                            json={"voucher_date": d, "entries": entries, "remark": remark})
 
     bad = add_voucher("2026-03-05", [
-        {"subject_id": S["100201"], "direction": "DEBIT", "amount": "1000", "summary": "测试"},
-        {"subject_id": S["600101"], "direction": "CREDIT", "amount": "999", "summary": "测试"},
+        {"subject_id": S["1002"], "direction": "DEBIT", "amount": "1000", "summary": "测试"},
+        {"subject_id": S["5001"], "direction": "CREDIT", "amount": "999", "summary": "测试"},
     ])
     guard("借贷不平衡被应用层拦截", bad)
 
     r = add_voucher("2026-03-05", [
-        {"subject_id": S["100201"], "direction": "DEBIT", "amount": "120000", "summary": "2026年3月租金收款"},
-        {"subject_id": S["600101"], "direction": "CREDIT", "amount": "120000", "summary": "2026年3月租金收款"},
+        {"subject_id": S["1002"], "direction": "DEBIT", "amount": "120000", "summary": "2026年3月租金收款"},
+        {"subject_id": S["5001"], "direction": "CREDIT", "amount": "120000", "summary": "2026年3月租金收款"},
     ], "3月租金")
     check("凭证 1 创建成功", r.status_code == 201, r.text[:100])
     v1 = r.json()
 
     r = add_voucher("2026-03-10", [
-        {"subject_id": S["6602"], "direction": "DEBIT", "amount": "18000", "summary": "3月管理费用"},
-        {"subject_id": S["100201"], "direction": "CREDIT", "amount": "18000", "summary": "3月管理费用"},
-    ], "3月管理费用")
+        {"subject_id": S["560206"], "direction": "DEBIT", "amount": "18000", "summary": "3月水电费"},
+        {"subject_id": S["1002"], "direction": "CREDIT", "amount": "18000", "summary": "3月水电费"},
+    ], "3月水电费")
     check("凭证 2 创建成功", r.status_code == 201, r.text[:100])
     v2 = r.json()
 
     r = add_voucher("2026-03-15", [
-        {"subject_id": S["640101"], "direction": "DEBIT", "amount": "5000", "summary": "3月租金成本"},
-        {"subject_id": S["100201"], "direction": "CREDIT", "amount": "5000", "summary": "3月租金成本"},
+        {"subject_id": S["5401"], "direction": "DEBIT", "amount": "5000", "summary": "3月租金成本"},
+        {"subject_id": S["1002"], "direction": "CREDIT", "amount": "5000", "summary": "3月租金成本"},
     ], "3月成本")
     check("凭证 3 创建成功", r.status_code == 201)
     v3 = r.json()
@@ -134,7 +138,7 @@ def main() -> int:
     step(4, "记账")
     bal = client.get(f"/api/books/{BID}/ledger/balance", headers=H,
                      params={"period_id": P["2026-03"]}).json()
-    bank = next(x for x in bal["rows"] if x["code"] == "100201")
+    bank = next(x for x in bal["rows"] if x["code"] == "1002")
     check("未记账凭证不进账簿（期末仍为期初 200000）",
           Decimal(bank["closing"]) == Decimal("200000"), f"期末={bank['closing']}")
 
@@ -144,7 +148,7 @@ def main() -> int:
 
     bal = client.get(f"/api/books/{BID}/ledger/balance", headers=H,
                      params={"period_id": P["2026-03"]}).json()
-    bank = next(x for x in bal["rows"] if x["code"] == "100201")
+    bank = next(x for x in bal["rows"] if x["code"] == "1002")
     check("记账后银行存款 = 200000+120000-18000-5000 = 297000",
           Decimal(bank["closing"]) == Decimal("297000"), f"期末={bank['closing']}")
     check("本期发生额试算平衡", bal["check"]["period_balanced"], str(bal["check"]))
@@ -164,9 +168,9 @@ def main() -> int:
 
     bal = client.get(f"/api/books/{BID}/ledger/balance", headers=H,
                      params={"period_id": P["2026-03"]}).json()
-    rev = next(x for x in bal["rows"] if x["code"] == "600101")
-    cost = next(x for x in bal["rows"] if x["code"] == "640101")
-    profit = next(x for x in bal["rows"] if x["code"] == "4103")
+    rev = next(x for x in bal["rows"] if x["code"] == "5001")
+    cost = next(x for x in bal["rows"] if x["code"] == "5401")
+    profit = next(x for x in bal["rows"] if x["code"] == "3103")
     check("收入科目结转后余额为 0", Decimal(rev["closing"]) == 0, f"期末={rev['closing']}")
     check("成本科目结转后余额为 0", Decimal(cost["closing"]) == 0, f"期末={cost['closing']}")
     check("本年利润 = 120000-18000-5000 = 97000",
@@ -179,16 +183,16 @@ def main() -> int:
     check("结账成功", r.status_code == 200, r.text[:140])
 
     guard("已结账期间新增凭证被拒", add_voucher("2026-03-20", [
-        {"subject_id": S["100201"], "direction": "DEBIT", "amount": "100", "summary": "x"},
-        {"subject_id": S["600101"], "direction": "CREDIT", "amount": "100", "summary": "x"},
+        {"subject_id": S["1002"], "direction": "DEBIT", "amount": "100", "summary": "x"},
+        {"subject_id": S["5001"], "direction": "CREDIT", "amount": "100", "summary": "x"},
     ]))
     guard("已结账期间删除凭证被拒",
           client.delete(f"/api/books/{BID}/vouchers/{v1['id']}", headers=H))
     guard("已结账期间改凭证被拒",
           client.put(f"/api/books/{BID}/vouchers/{v1['id']}", headers=H,
                      json={"voucher_date": "2026-03-05", "entries": [
-                         {"subject_id": S["100201"], "direction": "DEBIT", "amount": "1", "summary": "x"},
-                         {"subject_id": S["600101"], "direction": "CREDIT", "amount": "1", "summary": "x"}]}))
+                         {"subject_id": S["1002"], "direction": "DEBIT", "amount": "1", "summary": "x"},
+                         {"subject_id": S["5001"], "direction": "CREDIT", "amount": "1", "summary": "x"}]}))
 
     # ---------------------------------------------------------------- 7 报表
     step(7, "报表（可配置公式引擎）")
@@ -249,20 +253,26 @@ def main() -> int:
 
     # ---------------------------------------------------------------- 8 账簿
     step(8, "账簿")
+    # 总账是**用友式**的：单位是**一级科目**，一张纸是该科目这一段区间的月度台账
+    # （上年结转 → 每月「本月合计 / 累计」→ 结转下年），不是「一行一个科目」的余额表。
     gl = client.get(f"/api/books/{BID}/ledger/general", headers=H,
-                    params={"period_id": P["2026-03"], "leaf_only": True}).json()
-    check("总账返回明细科目行", len(gl["rows"]) > 10, f"{len(gl['rows'])} 行")
-    bank_row = next(r for r in gl["rows"] if r["code"] == "100201")
-    check("总账银行存款期末 297000", Decimal(bank_row["closing"]) == Decimal("297000"),
-          str(bank_row["closing"]))
+                    params={"period_id": P["2026-03"]}).json()
+    check("总账给出一级科目清单", len(gl["subjects"]) > 10, f"{len(gl['subjects'])} 个一级科目")
+    check("总账表体是月度台账", len(gl["rows"]) >= 4, f"{len(gl['rows'])} 行")
+
+    gl_bank = client.get(f"/api/books/{BID}/ledger/general", headers=H,
+                         params={"period_id": P["2026-03"], "subject_id": S["1002"]}).json()
+    bank_row = gl_bank["rows"][-1]
+    check("总账银行存款期末 297000", Decimal(str(bank_row["balance"])) == Decimal("297000"),
+          str(bank_row["balance"]))
 
     dl = client.get(f"/api/books/{BID}/ledger/detail", headers=H,
-                    params={"subject_id": S["100201"], "period_id": P["2026-03"]}).json()
+                    params={"subject_id": S["1002"], "period_id": P["2026-03"]}).json()
     check("明细账含期初行 / 逐笔 / 合计",
           dl["rows"][0]["kind"] == "OPENING" and dl["rows"][-1]["kind"] == "TOTAL",
           f"{len(dl['rows'])} 行")
     check("明细账期末与总账一致",
-          Decimal(dl["rows"][-1]["balance"]) == Decimal(bank_row["closing"]))
+          Decimal(str(dl["rows"][-1]["balance"])) == Decimal(str(bank_row["balance"])))
 
     x = client.get(f"/api/books/{BID}/print/balance.xlsx", headers=H,
                    params={"period_id": P["2026-03"]})
@@ -279,8 +289,8 @@ def main() -> int:
     # 先把 4 月也做上，制造一个已结账区间
     r = client.post(f"/api/books/{BID}/vouchers", headers=H, json={
         "voucher_date": "2026-04-08", "entries": [
-            {"subject_id": S["100201"], "direction": "DEBIT", "amount": "90000", "summary": "4月租金"},
-            {"subject_id": S["600101"], "direction": "CREDIT", "amount": "90000", "summary": "4月租金"}]})
+            {"subject_id": S["1002"], "direction": "DEBIT", "amount": "90000", "summary": "4月租金"},
+            {"subject_id": S["5001"], "direction": "CREDIT", "amount": "90000", "summary": "4月租金"}]})
     client.post(f"/api/books/{BID}/vouchers/post", headers=H, json={"ids": [r.json()["id"]]})
     cf4 = client.post(f"/api/books/{BID}/periods/{P['2026-04']}/carry-forward", headers=H)
     v4 = client.get(f"/api/books/{BID}/vouchers", headers=H,
@@ -308,7 +318,7 @@ def main() -> int:
     # 反结账后账面回退到「未记账」口径
     bal = client.get(f"/api/books/{BID}/ledger/balance", headers=H,
                      params={"period_id": P["2026-03"]}).json()
-    bank = next(x for x in bal["rows"] if x["code"] == "100201")
+    bank = next(x for x in bal["rows"] if x["code"] == "1002")
     check("反结账后账簿回到期初 200000（凭证已回未记账）",
           Decimal(bank["closing"]) == Decimal("200000"), f"期末={bank['closing']}")
 
@@ -323,7 +333,7 @@ def main() -> int:
 
     bal = client.get(f"/api/books/{BID}/ledger/balance", headers=H,
                      params={"period_id": P["2026-03"]}).json()
-    bank = next(x for x in bal["rows"] if x["code"] == "100201")
+    bank = next(x for x in bal["rows"] if x["code"] == "1002")
     check("数据完全恢复（297000）", Decimal(bank["closing"]) == Decimal("297000"),
           f"期末={bank['closing']}")
 
@@ -350,7 +360,7 @@ def main() -> int:
 
     bal12 = client.get(f"/api/books/{BID}/ledger/balance", headers=H,
                        params={"period_id": P["2026-12"]}).json()
-    bank12 = next(x for x in bal12["rows"] if x["code"] == "100201")["closing"]
+    bank12 = next(x for x in bal12["rows"] if x["code"] == "1002")["closing"]
     check("2026 年末银行存款 = 200000+97000+90000 = 387000",
           Decimal(bank12) == Decimal("387000"), str(bank12))
 
@@ -367,7 +377,7 @@ def main() -> int:
     nper = client.get(f"/api/books/{nb['id']}/periods", headers=H).json()
     nbal = client.get(f"/api/books/{nb['id']}/ledger/balance", headers=H,
                       params={"period_id": nper[0]["id"]}).json()
-    bank27 = next((x for x in nbal["rows"] if x["code"] == "100201"), None)
+    bank27 = next((x for x in nbal["rows"] if x["code"] == "1002"), None)
     check("2027 年期初银行存款 = 2026 年期末（结转链完整）",
           bank27 and Decimal(bank27["opening"]) == Decimal(bank12),
           f"2027 期初={bank27['opening'] if bank27 else 'N/A'} / 2026 期末={bank12}")

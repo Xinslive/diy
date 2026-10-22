@@ -41,7 +41,14 @@ def _opening_scans(stmts) -> list[str]:
 
 
 def _tree_scans(stmts) -> list[str]:
-    return [s for s in stmts if "FROM subject" in s and "parent_id" in s]
+    """科目**上卷树**（祖先链）那一条扫描。
+
+    引擎建祖先链时只取 id 与 parent_id 两列；科目表本身的 SELECT 会带上
+    code 等整行字段 —— 用「不取 code」把两者分开，否则总账那几条
+    「按年度取科目表」的扫描会被误算成上卷树。
+    """
+    return [s for s in stmts
+            if "FROM subject" in s and "subject.parent_id" in s and "subject.code" not in s]
 
 
 def _seed(make_voucher, months=(1, 2, 3, 5, 6, 8)):
@@ -54,16 +61,19 @@ def _seed(make_voucher, months=(1, 2, 3, 5, 6, 8)):
 def test_总账一页只跑一次全账聚合(db, book, periods, subjects, make_voucher):
     _seed(make_voucher)
     tree = queries.subject_tree(db, book.id, book.start_year)
+    # 总账的单位是**一级科目**（用友的「总分类账」），所以这里问的是那一行，
+    # 不是整棵树 —— 它下面所有明细科目的分录由引擎上卷进来。
+    subject = next(s for s in tree if s.level == 1)
 
     with _statements() as stmts:
-        rows = queries.general_ledger(
-            db, book.id, tree, periods[3], periods[8], False)
+        payload = queries.general_ledger(
+            db, book.id, subject, periods[3], periods[8], False)
 
     assert len(_entry_aggregates(stmts)) == 1, (
         f"总账应该只跑一次全账聚合，实际 {len(_entry_aggregates(stmts))} 次")
     assert len(_opening_scans(stmts)) == 1, "期初快照只该读一次"
     assert len(_tree_scans(stmts)) == 1, "科目上卷树只该建一次"
-    assert rows, "总账不该是空的"
+    assert payload["rows"], "总账不该是空的"
 
 
 def test_首年区间也只跑一次全账聚合(db, book, periods, subjects, make_voucher):
@@ -74,9 +84,10 @@ def test_首年区间也只跑一次全账聚合(db, book, periods, subjects, ma
     """
     _seed(make_voucher)
     tree = queries.subject_tree(db, book.id, book.start_year)
+    subject = next(s for s in tree if s.level == 1)
 
     with _statements() as stmts:
-        queries.general_ledger(db, book.id, tree, periods[1], periods[6], False)
+        queries.general_ledger(db, book.id, subject, periods[1], periods[6], False)
 
     assert len(_entry_aggregates(stmts)) == 1, (
         f"首年区间应该只跑一次全账聚合，实际 {len(_entry_aggregates(stmts))} 次")

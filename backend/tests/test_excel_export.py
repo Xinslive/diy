@@ -201,12 +201,20 @@ def test_科目余额表抬头里的账套名不注入(payload):
 
 
 @pytest.mark.parametrize("payload", INJECTIONS)
-def test_总账抬头里的账套名不注入(payload):
-    ws = _sheet(general_ledger_excel(
-        {"from_period": "2026-01", "to_period": "2026-01", "rows": []},
-        book_name=payload))
-    _assert_no_formula(ws, "总账")
-    _assert_payload_preserved(ws, "总账", payload)
+def test_总账页脚里的核算单位不注入(payload):
+    """总账是**用友式**的：账套名不再进抬头，核算单位落在**页脚左段**。
+
+    公式注入的防线跟着搬家 —— 不能因为换了版式就把防护丢了。
+    抬头里那个字段原来叫「账套名」，现在页脚那一段叫「核算单位」，
+    两者都是建账者填的字，同样可能是「=cmd|...」。
+    """
+    wb = load_workbook(io.BytesIO(general_ledger_excel(
+        {"from_period": "2026-01", "to_period": "2026-01",
+         "subjects": [{"code": "1001", "name": "库存现金", "rows": []}]},
+        book_name=payload)))
+    for ws in wb.worksheets:
+        _assert_no_formula(ws, "总账")
+        _assert_payload_preserved(ws, "总账", payload)
 
 
 @pytest.mark.parametrize("payload", INJECTIONS)
@@ -299,7 +307,8 @@ def test_各导出接口都有行数上限():
         lambda: balance_excel({"rows": too_many, "check": check, "period": "2026-01"},
                               book_name="乙"),
         lambda: general_ledger_excel(
-            {"rows": too_many, "from_period": "2026-01", "to_period": "2026-01"},
+            {"subjects": [{"code": "1001", "name": "库存现金", "rows": too_many}],
+             "from_period": "2026-01", "to_period": "2026-01"},
             book_name="乙"),
         lambda: report_excel(
             {"period": "2026-01", "name": "报表", "cols": [{"label": "项目", "width": 100}],
@@ -374,10 +383,20 @@ def test_科目余额表抬头只有账套名和期间():
     assert ws.cell(row=2, column=1).value == "乙 · 期间 2026-01"
 
 
-def test_总账抬头只有账套名和区间():
-    ws = _sheet(general_ledger_excel(
-        {"from_period": "2026-01", "to_period": "2026-05", "rows": []}, book_name="乙"))
-    assert ws.cell(row=2, column=1).value == "乙 · 2026-01 至 2026-05"
+def test_总账抬头是科目名加本币名称():
+    """用友的总账抬头是「{科目名}总账」+「科目: 名称(编码)」+「本币名称」。
+
+    **不再有「账套名 · 区间」那一行** —— 用友那张纸上就没有它，
+    区间由月份列与**文件名**承担（见 test_general_ledger_export.py）。
+    """
+    wb = load_workbook(io.BytesIO(general_ledger_excel(
+        {"from_period": "2026-01", "to_period": "2026-05",
+         "subjects": [{"code": "1001", "name": "库存现金", "rows": []}]},
+        book_name="乙")))
+    ws = wb.worksheets[0]
+    assert ws.cell(row=1, column=1).value == "库存现金总账"
+    assert ws.cell(row=2, column=1).value == "科目: 库存现金(1001)"
+    assert ws.cell(row=2, column=6).value == "本币名称: 人民币"
 
 
 def test_报表抬头只有账套名和期间():
@@ -403,14 +422,19 @@ def test_期初余额表保留月份写法给老调用方():
 
 
 def test_所有Excel导出件里都不出现单位名(client, auth, book, periods, subjects):
-    """兜底：单位名不出现在任何一张导出件的任何一格里。
+    """兜底：单位名不出现在任何一张导出件的**抬头**里。
 
     走 HTTP 层而不是直接调导出函数：导出件是**发给客户和审计方**的东西，
-    中间任何一层（路由、参数、模板求值）把单位名塞回去，这条都会红。
+    中间任何一层（路由、参数、模板求值）把单位名塞回抬头，这条都会红。
 
     上面几条钉住的是每张表抬头的**具体格式**；这一条钉住的是**覆盖范围**
     —— 将来新增一个导出器时很容易顺手把单位名带上，而这类疏漏用户不会
     当成 bug，只会把纸面那份当成对的。
+
+    **唯一的例外是总账页脚左段的「核算单位:」**：那是用友正式账簿的固定
+    栏位（样张上就写着「核算单位: 泉州星悦荟商业管理有限公司」），
+    打印件里也有 —— 导出件缺了这一段，两边就不是同一张纸了。
+    例外只放宽到**页脚那一格**：抬头里出现单位名照样红。
     """
     company = book.company_name
     assert company, "夹具没给单位名，这条用例就测不到东西"
@@ -422,10 +446,11 @@ def test_所有Excel导出件里都不出现单位名(client, auth, book, period
     assert templates, "账套里一份报表模板都没有，报表导出这一路就没法测"
     leaf = next(s for s in subjects.values() if s.is_leaf)
 
+    ledger_url = f"/api/books/{book.id}/print/general-ledger.xlsx?period_id={pid}"
     urls = [
         f"/api/books/{book.id}/print/vouchers.xlsx?period_id={pid}",
         f"/api/books/{book.id}/print/balance.xlsx?period_id={pid}",
-        f"/api/books/{book.id}/print/general-ledger.xlsx?period_id={pid}",
+        ledger_url,
         f"/api/books/{book.id}/print/report.xlsx"
         f"?template_id={templates[0]['id']}&period_id={pid}",
         f"/api/books/{book.id}/print/detail-ledger.xlsx?subject_id={leaf.id}&period_id={pid}",
@@ -437,6 +462,19 @@ def test_所有Excel导出件里都不出现单位名(client, auth, book, period
         assert r.status_code == 200, f"{url} → {r.status_code} {r.text[:300]}"
         wb = load_workbook(io.BytesIO(r.content))
         for ws in wb.worksheets:
+            if url == ledger_url:
+                # 总账：核算单位只在**页脚左段**（第 1~4 行是抬头，不许出现）
+                head = [str(c.value) for row in ws.iter_rows(min_row=1, max_row=4)
+                        for c in row if c.value is not None]
+                assert not any(company in v for v in head), (
+                    f"{url} 的工作表「{ws.title}」抬头里出现了单位名 {company!r}：{head[:5]}")
+                foot = [str(c.value) for row in ws.iter_rows() for c in row
+                        if c.value is not None and company in str(c.value)]
+                assert foot, f"{url} 的工作表「{ws.title}」页脚少了核算单位"
+                for v in foot:
+                    assert v.startswith("核算单位: "), (
+                        f"单位名跑到了不该在的地方：{v!r}")
+                continue
             blob = " ".join(str(c.value) for row in ws.iter_rows()
                             for c in row if c.value is not None)
             assert company not in blob, (

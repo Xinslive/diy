@@ -135,9 +135,11 @@ def main() -> int:
     # ---------------------------------------------------------------
     section("凭证录入（用于整理/导入测试）")
     subs = {s["code"]: s for s in call("GET", f"/api/books/{bid}/subjects/flat")[1]}
-    dr_sub = subs["100201"]      # 银行存款-工商银行（明细级）
-    cr_sub = subs["600101"]      # 主营业务收入-租金（明细级）
-    exp_sub = subs["6602"]         # 管理费用（明细级，损益类）
+    # 科目编码用**现行标准科目表**（用友 4-2-2）。凭证分录只能挂末级科目，
+    # 所以这里挑的三个都是末级：1002 银行存款 / 5001 主营业务收入 / 560206 水电费。
+    dr_sub = subs["1002"]      # 银行存款
+    cr_sub = subs["5001"]      # 主营业务收入
+    exp_sub = subs["560206"]   # 管理费用/水电费
 
     def add_voucher(d: str, amount: float, no: str | None = None):
         payload = {
@@ -195,10 +197,10 @@ def main() -> int:
     section("凭证 Excel 导入")
     good = xlsx([
         ["日期", "凭证号", "摘要", "科目编码", "借方金额", "贷方金额", "附单据数", "备注"],
-        ["2026-11-03", "", "收到押金", "100201", 3000, "", 1, "导入测试"],
-        ["", "", "收到押金", "600101", "", 3000, "", ""],
-        ["2026-11-08", "记0500", "支付水电", "6602", 800, "", 2, ""],
-        ["", "", "支付水电", "100201", "", 800, "", ""],
+        ["2026-11-03", "", "收到押金", "1002", 3000, "", 1, "导入测试"],
+        ["", "", "收到押金", "5001", "", 3000, "", ""],
+        ["2026-11-08", "记0500", "支付水电", "560206", 800, "", 2, ""],
+        ["", "", "支付水电", "1002", "", 800, "", ""],
     ])
     st, imp = call("POST", f"/api/books/{bid}/vouchers/import",
                    files={"file": ("11月凭证.xlsx", good)})
@@ -213,7 +215,7 @@ def main() -> int:
     bad = xlsx([
         ["日期", "凭证号", "摘要", "科目编码", "借方金额", "贷方金额"],
         ["2026-11-12", "", "科目写错", "9999", 500, ""],
-        ["2026-11-15", "", "金额挂空（无贷方）", "100201", 300, ""],
+        ["2026-11-15", "", "金额挂空（无贷方）", "1002", 300, ""],
     ])
     st, imp2 = call("POST", f"/api/books/{bid}/vouchers/import",
                     files={"file": ("坏数据.xlsx", bad)})
@@ -313,7 +315,10 @@ def main() -> int:
     check("科目余额表打印页", st == 200 and "科目余额表" in html_b.decode())
 
     st, html_g = call("GET", f"/api/books/{bid}/print/general-ledger.html")
-    check("总账打印页", st == 200 and "总　账" in html_g.decode())
+    text_g = html_g.decode()
+    # 用友式总账：标题是「{科目名}总账」，右上角带「[正式账簿]」与「本币名称」。
+    check("总账打印页", st == 200 and "总账" in text_g)
+    check("总账打印页带用友页眉", "[正式账簿]" in text_g and "本币名称" in text_g)
 
     st, html_d = call("GET", f"/api/books/{bid}/print/detail-ledger.html?subject_id={dr_sub['id']}")
     check("明细账打印页", st == 200 and "期初余额" in html_d.decode())
