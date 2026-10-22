@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import Integer, Numeric, Select, and_, func, or_, select
+from sqlalchemy import Integer, Numeric, Select, and_, func, not_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -1225,6 +1225,7 @@ def query_vouchers(
     min_amount: Decimal | None = None,
     max_amount: Decimal | None = None,
     subject_id: int | None = None,
+    exclude_carry_forward: bool = False,
     page: int = 1,
     page_size: int = 50,
     sort: str = "no_desc",
@@ -1289,6 +1290,15 @@ def query_vouchers(
         if max_amount is not None:
             amt = amt.where(Entry.amount <= money(max_amount))
         stmt = stmt.where(Voucher.id.in_(amt))
+    if exclude_carry_forward:
+        # **剔除必须落在计数与分页之前**（见 organize.carry_forward_clause
+        # 的说明）：剔在页之后会让 ``total`` 与返回的 ``items`` 对不上，
+        # 调用方既不知道总数对不对，也不知道少的那几张去了哪。
+        #
+        # 判据与 ``organize.is_carry_forward`` 同一套（source 标记 +
+        # 备注 / 分录摘要里的结转短语），由那个模块提供 SQL 版本 ——
+        # 两边各写一份必然漂移，而「漂移」在这里表现为「悄悄少剔了」。
+        stmt = stmt.where(not_(svc_organize.carry_forward_clause()))
 
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     # 凭证号排序要按期间先后（记001 与 记012 分属不同月，跨月比大小无意义），

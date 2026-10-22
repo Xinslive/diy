@@ -518,6 +518,92 @@ def test_凭证检索_能剔除结转凭证(db, book, make_voucher, admin_user, 
         Decimal(with_cf["group_totals"]["debit"])
 
 
+def test_凭证检索_剔除结转凭证也作用在返回的凭证上(db, book, make_voucher,
+                                              admin_user, principal):
+    """**回归**：剔除要落在计数与分页之前，不能只作用在透视聚合上。
+
+    这个参数以前只在 ``group_by`` 给了值时才对 ``groups`` 的聚合集合生效，
+    主结果集（``items`` 与 ``total``）原样带着结转凭证 —— 而参数名与说明
+    都写着「剔除结转凭证」。调用方于是拿到一个**自以为剔干净了**的合计：
+    比不剔更难发现，因为数字看起来是对的。
+    """
+    make_voucher("2026-03-08", dr=[("1002", "20000.00", "收租")],
+                 cr=[("5001", "20000.00", "租金收入")], posted=True)
+    _carry_forward(db, book, admin_user, "2026-03")
+
+    with_cf = call_tool("search_vouchers", principal, book_id=book.id, year=2026,
+                        page_size=200)
+    without_cf = call_tool("search_vouchers", principal, book_id=book.id,
+                           year=2026, page_size=200, exclude_carry_forward=True)
+
+    assert without_cf["total"] < with_cf["total"], (
+        f"剔除结转凭证后总数应该变小：{without_cf['total']} vs {with_cf['total']}")
+    assert all(not it["is_carry_forward"] for it in without_cf["items"]), \
+        "剔除后返回的凭证里不该还有结转凭证"
+    assert len(without_cf["items"]) == without_cf["total"], \
+        "剔除后 total 与页内张数必须对得上（剔除落在计数之前）"
+
+
+def test_凭证检索_导入的结转凭证按分录摘要也能被剔除(db, book, make_voucher,
+                                                  admin_user, principal):
+    """**生产上的形态**：结转凭证是导入的，标记只写在分录摘要上。
+
+    生产库里 ``source='CARRY_FORWARD'`` 的凭证数为 0 —— 结转凭证全是导入
+    进来的，``remark`` 是空的，标记在**分录摘要**里。SQL 侧的判据若只认
+    ``source`` 与 ``remark``，导入的那批一张都剔不掉；而这类偏差不会报错，
+    只是数字悄悄多算了。
+    """
+    make_voucher("2026-03-08", dr=[("1002", "20000.00", "收租")],
+                 cr=[("5001", "20000.00", "租金收入")], posted=True)
+    # 导入的结转凭证：source 不是 CARRY_FORWARD，remark 里没有结转短语，
+    # 标记只在分录摘要里。
+    make_voucher("2026-03-20",
+                 dr=[("5001", "5000.00", "期间损益结转")],
+                 cr=[("3103", "5000.00", "期间损益结转")],
+                 source="IMPORT", remark="普通凭证", posted=True)
+
+    without_cf = call_tool("search_vouchers", principal, book_id=book.id,
+                           year=2026, page_size=200, exclude_carry_forward=True)
+
+    assert all(not it["is_carry_forward"] for it in without_cf["items"]), \
+        "按分录摘要认出来的结转凭证也必须被剔除"
+
+
+def test_结转凭证的SQL判据与Python判据逐张一致(db, book, make_voucher,
+                                              admin_user):
+    """**单一事实源**：SQL 版与 Python 版必须给出同一个答案。
+
+    两条判据分家时的症状是「静默少剔几张」：调用方拿到一个少了结转凭证
+    的合计，却以为已经剔干净了 —— 比完全不剔更难发现，因为没有任何报错。
+    """
+    from sqlalchemy import select
+
+    from app.accounting.organize import is_carry_forward
+    from app.accounting.vouchers import query_vouchers
+    from app.models import Voucher
+
+    make_voucher("2026-03-08", dr=[("1002", "20000.00", "收租")],
+                 cr=[("5001", "20000.00", "租金收入")], posted=True)
+    make_voucher("2026-03-20",
+                 dr=[("5001", "5000.00", "期间损益结转")],
+                 cr=[("3103", "5000.00", "期间损益结转")],
+                 source="IMPORT", remark="普通凭证", posted=True)
+    _carry_forward(db, book, admin_user, "2026-03")
+
+    everything = db.scalars(
+        select(Voucher).where(Voucher.book_id == book.id)).all()
+    python_cf = {v.id for v in everything if is_carry_forward(v)}
+    assert python_cf, "测试数据里应当有结转凭证"
+
+    kept, _total = query_vouchers(db, book.id, exclude_carry_forward=True,
+                                  page_size=200)
+    sql_cf = {v.id for v in everything} - {v.id for v in kept}
+
+    assert sql_cf == python_cf, (
+        "SQL 判据与 Python 判据给出的结转凭证集合不一致："
+        f"仅 SQL 认为 {sql_cf - python_cf}，仅 Python 认为 {python_cf - sql_cf}")
+
+
 def test_凭证检索_未记账口径的覆盖度标签不能写成已记账(db, book, make_voucher,
                                                  principal):
     """``status="UNPOSTED"`` 时 ``posting`` 不能标成 ``POSTED_ONLY``。

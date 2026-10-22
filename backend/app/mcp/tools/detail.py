@@ -291,7 +291,7 @@ def _sort_key(voucher: Voucher, period_ord: int, sort: str):
 
 def _query_by_subjects(db, book_id, subject_ids, *, from_period, to_period,
                        date_from, date_to, status, keyword, min_amount,
-                       max_amount, sort):
+                       max_amount, sort, exclude_carry_forward=False):
     """取「含这些科目中任意一个」的凭证（去重后的并集）。
 
     **为什么不自己写一条 ``Entry.subject_id IN (...)`` 的查询。**
@@ -303,6 +303,10 @@ def _query_by_subjects(db, book_id, subject_ids, *, from_period, to_period,
 
     代价是要把每个科目的结果整份取回来（去重后的总数才算得准），所以有
     ``MERGE_FETCH_LIMIT`` 那道闸。
+
+    ``exclude_carry_forward`` **原样传给 ``query_vouchers``**：剔除要发生
+    在每一条子查询的计数与分页之前，合并之后再剔就晚了（合并的基数是
+    未剔除的）。
     """
     merged: dict[int, Voucher] = {}
     for subject_id in subject_ids:
@@ -313,6 +317,7 @@ def _query_by_subjects(db, book_id, subject_ids, *, from_period, to_period,
             status=status, keyword=keyword,
             min_amount=min_amount, max_amount=max_amount,
             subject_id=subject_id,
+            exclude_carry_forward=exclude_carry_forward,
             page=1, page_size=MERGE_FETCH_LIMIT, sort=sort,
         )
         if total > len(rows):
@@ -448,7 +453,8 @@ def _voucher_cash_amount(voucher, subjects) -> Decimal:
 
 def _fetch_all_matching(db, book_id, subject_ids, *, from_period, to_period,
                         date_from, date_to, status, keyword, min_amount,
-                        max_amount, sort) -> list[Voucher]:
+                        max_amount, sort,
+                        exclude_carry_forward=False) -> list[Voucher]:
     """取**全部**命中的凭证（透视用），带上限闸门。
 
     **为什么不能只聚合当前这一页。** ``group_by`` 要回答的是
@@ -463,12 +469,13 @@ def _fetch_all_matching(db, book_id, subject_ids, *, from_period, to_period,
             db, book_id, subject_ids, from_period=from_period, to_period=to_period,
             date_from=date_from, date_to=date_to, status=status,
             keyword=keyword, min_amount=min_amount, max_amount=max_amount,
-            sort=sort)
+            sort=sort, exclude_carry_forward=exclude_carry_forward)
     rows, total = query_vouchers(
         db, book_id, from_period=from_period, to_period=to_period,
         date_from=date_from, date_to=date_to, status=status,
         keyword=keyword, min_amount=min_amount, max_amount=max_amount,
-        subject_id=None, page=1, page_size=MERGE_FETCH_LIMIT, sort=sort)
+        subject_id=None, exclude_carry_forward=exclude_carry_forward,
+        page=1, page_size=MERGE_FETCH_LIMIT, sort=sort)
     if total > len(rows):
         raise McpBadRequest(
             f"这个区间里命中的凭证有 {total} 张，超过透视上限 "
@@ -574,7 +581,27 @@ def search_vouchers(
     page: int = 1,
     page_size: int = 50,
 ) -> SearchVouchersResult:
-    """检索凭证（强制分页）。"""
+    """检索凭证（强制分页）。
+
+    入参：
+
+    * ``book_id`` —— 账套 id（**必填**）。
+    * ``year`` —— 会计年度。默认取账套当前在记的年度（不是服务器日历年）。
+    * ``subject_ids`` —— 限定科目（可多选，取并集）。
+    * ``keyword`` —— 搜凭证号、备注与分录摘要（**不搜科目名**）。
+    * ``status`` —— ``POSTED``（默认）/ ``UNPOSTED`` / ``ALL``。
+    * ``include_unposted`` —— 是否把未记账凭证也算进来。
+    * ``group_by`` —— 透视维度：``summary`` / ``subject`` / ``period`` /
+      ``direction``。给值则返回 ``groups[]`` 与 ``group_totals``，
+      聚合范围是**全部命中的凭证**（不是当前这一页）。
+    * ``exclude_carry_forward`` —— **是否剔除损益结转凭证**。
+      结转凭证把损益余额搬到「本年利润」，统计费用/收入时算进去会**重复
+      计入**（本次评估里「2025 年水电费」多算 48 万就是没剔它）。
+
+      **剔除作用在返回的凭证本身**（``items`` 与 ``total`` 都不含它们），
+      不是只作用在透视聚合上 —— 剔除在 SQL 层完成，落在计数与分页之前，
+      所以 ``total`` 与页内张数永远对得上。
+    """
     tc = current_tool_context(ctx)
     book = require_book(tc, book_id)
     db = tc.db
@@ -650,19 +677,22 @@ def search_vouchers(
             db, book_id, from_period=from_period, to_period=to_period,
             date_from=d_from, date_to=d_to, status=status_filter,
             keyword=keyword, min_amount=min_amt, max_amount=max_amt,
-            subject_id=None, page=page, page_size=page_size, sort=sort)
+            subject_id=None, exclude_carry_forward=exclude_carry_forward,
+            page=page, page_size=page_size, sort=sort)
     elif len(ids) == 1:
         rows, total = query_vouchers(
             db, book_id, from_period=from_period, to_period=to_period,
             date_from=d_from, date_to=d_to, status=status_filter,
             keyword=keyword, min_amount=min_amt, max_amount=max_amt,
-            subject_id=ids[0], page=page, page_size=page_size, sort=sort)
+            subject_id=ids[0], exclude_carry_forward=exclude_carry_forward,
+            page=page, page_size=page_size, sort=sort)
     else:
         # 多科目：分别查再合并（见 _query_by_subjects 的说明）。
         merged = _query_by_subjects(
             db, book_id, ids, from_period=from_period, to_period=to_period,
             date_from=d_from, date_to=d_to, status=status_filter,
-            keyword=keyword, min_amount=min_amt, max_amount=max_amt, sort=sort)
+            keyword=keyword, min_amount=min_amt, max_amount=max_amt, sort=sort,
+            exclude_carry_forward=exclude_carry_forward)
         total = len(merged)
         period_ords = {p.id: p.ord for p in year_periods}
         merged.sort(key=lambda v: _sort_key(v, period_ords.get(v.period_id, 0),
@@ -676,15 +706,16 @@ def search_vouchers(
 
     # **透视用的全量集合**。group_by 要的是「这一整批命中凭证」的汇总，
     # 不是当前这一页 —— 否则「2025 年电费一共多少」会被分页切成前 50 张。
+    #
+    # **结转凭证的剔除已经在 SQL 层做过了**（``exclude_carry_forward`` 传给了
+    # ``query_vouchers``），所以这里拿到的集合已经不含结转凭证，不再二次过滤。
     group_vouchers = rows
     if group_key is not None:
         group_vouchers = _fetch_all_matching(
             db, book_id, ids, from_period=from_period, to_period=to_period,
             date_from=d_from, date_to=d_to, status=status_filter,
-            keyword=keyword, min_amount=min_amt, max_amount=max_amt, sort=sort)
-        if exclude_carry_forward:
-            group_vouchers = [v for v in group_vouchers
-                              if not is_carry_forward(v)]
+            keyword=keyword, min_amount=min_amt, max_amount=max_amt, sort=sort,
+            exclude_carry_forward=exclude_carry_forward)
 
     # **命中过滤条件的分录条数**（凭证是按分录筛的）。
     matched_entries = 0
@@ -739,11 +770,16 @@ def search_vouchers(
             group_vouchers, group_key, db)
         notes.append(
             "聚合口径：按每条分录的「摘要 / 科目 / 期间 / 方向」分桶，"
-            "借方贷方合计与凭证合计同口径（红字算到对面）。"
-            + ("已剔除损益结转凭证。" if exclude_carry_forward else
-               "**未剔除**损益结转凭证 —— 结转凭证会把损益余额搬到本年利润，"
-               "统计费用/收入时通常要加 exclude_carry_forward=true，"
-               "否则会重复计入。"))
+            "借方贷方合计与凭证合计同口径（红字算到对面）。")
+    # **结转凭证的口径说明放在「有没有 group_by」之外** ——
+    # 剔除与否影响的是**返回的凭证本身**（items / total），不只是聚合。
+    # 以前这句话只挂在 group_by 的分支里，于是「不聚合时结转凭证到底剔没剔」
+    # 没人说得清 —— 而那正是最容易算错数的地方。
+    notes.append(
+        "已剔除损益结转凭证（items 与 total 都不含它们）。"
+        if exclude_carry_forward else
+        "**未剔除**损益结转凭证 —— 结转凭证把损益余额搬到本年利润，"
+        "统计费用/收入时通常要加 exclude_carry_forward=true，否则会重复计入。")
 
     coverage = voucher_coverage(
         db, book_id, year_periods,

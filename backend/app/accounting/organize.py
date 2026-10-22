@@ -29,7 +29,7 @@ from datetime import date
 from decimal import Decimal
 from typing import NamedTuple
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -401,6 +401,43 @@ def is_carry_forward(voucher: Voucher) -> bool:
         return True
     return any(m in (e.summary or "") for e in voucher.entries
                for m in _CARRY_FORWARD_MARKERS)
+
+
+def carry_forward_clause():
+    """SQL 侧的结转凭证判据 —— 与 :func:`is_carry_forward` 同一套。
+
+    **为什么要有 SQL 版。** ``is_carry_forward`` 是 Python 口径，要逐张
+    凭证走一遍 ``voucher.entries``。而「把结转凭证从查询里剔掉」这件事
+    **必须发生在计数与分页之前**：剔在页之后，``total`` 仍按含结转的
+    全量算，页里却少了几张 —— 调用方拿到一个自相矛盾的结果（总数比
+    页内多），而且不知道差的那几张是结转凭证还是被别的过滤滤掉的。
+
+    **判据必须与 Python 版逐字一致**：``source`` 标记 + 凭证备注里的
+    结转短语 + **分录摘要**里的结转短语。第三条不能省：生产库里
+    ``source='CARRY_FORWARD'`` 的凭证数为 0，结转凭证全是导入进来的，
+    标记只写在分录摘要上（备注是空的）。少了它，SQL 版与 Python 版对
+    同一批凭证会给出相反的答案，剔除就会漏。
+
+    **用子查询而不是 join。** 凭证与分录是 1:N，join 进来同一张凭证会
+    出现多行；去掉结转凭证时还得再 ``distinct()`` 把张数找回来，而
+    ``query_vouchers`` 的总数用的正是同一个 ``stmt`` —— 一 distinct
+    就把「命中条数」的语义弄丢了。``id IN (SELECT ...)`` 没有这个问题。
+
+    返回的是一个 SQLAlchemy 布尔表达式；取反（剔除）时用
+    ``not_(carry_forward_clause())``。
+    """
+    clauses = [Voucher.source == "CARRY_FORWARD"]
+    for marker in CARRY_FORWARD_MARKERS:
+        clauses.append(Voucher.remark.like(f"%{marker}%"))
+    clauses.append(
+        Voucher.id.in_(
+            select(Entry.voucher_id).where(
+                or_(*[Entry.summary.like(f"%{marker}%")
+                      for marker in CARRY_FORWARD_MARKERS])
+            )
+        )
+    )
+    return or_(*clauses)
 
 
 def _sort_key(voucher: Voucher, strategy: str, income_of=None):

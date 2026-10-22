@@ -124,24 +124,22 @@ def _carry_forward_period_ids(db, book_id: int) -> set[int]:
     函数：``list_periods`` 要的是**每个期间**的标志，一张张判就是
     「凭证数 × 一次 Python 调用」。
 
-    结转凭证不是可选信息 —— 它把损益余额搬到「本年利润」，多个工具的
-    金额口径都受它影响（本次评估里「2025 年水电费」算错 48 万就是
-    没剔它）。把它前置成显式字段，排查就不用靠猜。
+    **判据本身来自 ``organize.carry_forward_clause()``** —— 那是
+    ``is_carry_forward`` 的 SQL 版本，与它同源。这里不再自己拼一遍：
+    拼一遍就是两处判据各改各的，而它们只在「生产上有没有少剔几张」
+    这种地方分家（导入账套的结转凭证标记只写在分录摘要上，漏掉那条
+    判据就会静默少剔）。结转凭证不是可选信息 —— 它把损益余额搬到
+    「本年利润」，多个工具的金额口径都受它影响（本次评估里「2025 年
+    水电费」算错 48 万就是没剔它）。把它前置成显式字段，排查就不用靠猜。
     """
-    from sqlalchemy import or_, select
+    from sqlalchemy import select
 
-    from app.accounting.organize import CARRY_FORWARD_MARKERS
-    from app.models import Entry, Voucher
+    from app.accounting.organize import carry_forward_clause
+    from app.models import Voucher
 
-    clauses = [Voucher.source == "CARRY_FORWARD"]
-    for marker in CARRY_FORWARD_MARKERS:
-        clauses.append(Voucher.remark.like(f"%{marker}%"))
     stmt = (
         select(Voucher.period_id)
-        .outerjoin(Entry, Entry.voucher_id == Voucher.id)
-        .where(Voucher.book_id == book_id,
-               or_(*clauses,
-                   *[Entry.summary.like(f"%{m}%") for m in CARRY_FORWARD_MARKERS]))
+        .where(Voucher.book_id == book_id, carry_forward_clause())
         .distinct()
     )
     return {row[0] for row in db.execute(stmt).all()}
