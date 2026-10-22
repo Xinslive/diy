@@ -72,6 +72,22 @@ CARRY_FORWARD_NOTICE = {
             "损益科目上与总账 / 科目余额表的差额，即本期结转凭证金额。",
 }
 
+#: 模板与科目表对不上时的提示。
+#:
+#: **为什么要单独提示，而不是只逐格报错。** 账套可以 fork 一份自己的模板
+#: 副本，而模板里的科目编码是照着**别的**科目表写的 —— 于是那些格子逐格报
+#: 「科目不存在」，并把依赖它们的合计行（营业利润、利润总额、净利润、平衡校验）
+#: 连锁打成 null。调用方（尤其是 agent）逐格读 ``errors`` 要读几十行才拼得出
+#: 「模板与科目表不匹配」这个结论；一条 notice 直接说清缺哪些编码。
+MISSING_SUBJECTS_NOTICE = {
+    "code": "TEMPLATE_SUBJECTS_MISSING",
+    "level": "warning",
+    "text": "",
+}
+
+#: 公式里 ``科目("编码", …)`` 的编码。
+_SUBJECT_CODE_RE = re.compile(r'科目\(\s*"([^"]+)"')
+
 
 class ReportContext:
     """求值上下文：把账簿引擎和报表模板胶合起来。"""
@@ -156,6 +172,25 @@ class ReportContext:
     def subject_id(self, code: str) -> Optional[int]:
         s = self.subjects.get(code)
         return s.id if s else None
+
+    def missing_subject_codes(self) -> list[str]:
+        """模板引用了、但**本科目表里没有**的科目编码。
+
+        **为什么要在渲染前对账，而不是只逐格报错。** 账套可以 fork 一份自己
+        的模板副本，而模板里的科目编码是照着**别的**科目表写的：那些格子
+        逐格报「科目不存在」，并把依赖它们的合计行（营业利润、利润总额、
+        净利润、平衡校验）连锁打成 null。调用方逐格读 ``errors`` 要读几十行
+        才拼得出「模板与科目表不匹配」这个结论。
+
+        **只看本期间所属年度那张科目表** —— 科目表每个年度各有一份，
+        2026 的 ``5601`` 与 2025 的 ``5601`` 是两个科目。
+        """
+        missing: list[str] = []
+        for src in self.formulas.values():
+            for code in _SUBJECT_CODE_RE.findall(src or ""):
+                if code and code not in self.subjects and code not in missing:
+                    missing.append(code)
+        return sorted(missing)
 
     # -- 期间 --
     def _ym(self, ord_: int) -> tuple[int, int]:
@@ -468,6 +503,16 @@ def evaluate(
             **CARRY_FORWARD_NOTICE,
             "cols": [c.col_no for c in cols if c.kind in PF_KINDS],
             "amount": str(cf_amount),
+        })
+    missing = ctx.missing_subject_codes()
+    if missing:
+        notices.append({
+            **MISSING_SUBJECTS_NOTICE,
+            "codes": missing,
+            "text": (f"模板引用的以下编码在本科目表（{period.year} 年度）里不存在："
+                     f"{'、'.join(missing)} —— 引用了它们的单元格会报「科目不存在」，"
+                     f"并把依赖它们的合计行打成 null。要么先建这些科目，"
+                     f"要么把公式改成本科目表里已有的编码。"),
         })
 
     return {

@@ -122,6 +122,9 @@ def test_list_books_returns_authorized_book_with_year_progress(principal, book):
     assert row["years"] == [{
         "year": book.start_year, "total": 12, "closed": 0,
         "vouchers": 0, "carried": False,
+        # **记账进度**（评估报告 P2）：哪些年一张凭证都没记，
+        # 「vouchers=0」看不出是「没记账」还是「真没业务」。
+        "posted_vouchers": 0, "unposted_vouchers": 0,
     }]
     # init 是「这个账套当前在记那一年」的初始化进度，原样带出来。
     assert row["init"]["year"] == book.start_year

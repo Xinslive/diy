@@ -32,6 +32,7 @@ from app.mcp.auth import McpPrincipal
 from app.mcp.asgi import PRINCIPAL_KEY
 from app.mcp.tools import detail
 from app.models import Subject
+from tests.mcp_helpers import error_of
 
 
 # --------------------------------------------------------------------- 夹具
@@ -228,9 +229,9 @@ def test_search_vouchers_cross_year_subject_id_is_a_readable_400(
     result = _call(detail.search_vouchers, ctx=ctx, book_id=book.id, year=2027,
                                      subject_ids=[subject_2026.id])
     assert result.is_error
-    payload = result.structured_content or {}
-    assert payload.get("code") == "bad_request", payload
-    message = payload.get("message", "")
+    error = error_of(result)
+    assert error["code"] == "bad_request", error
+    message = error["message"]
     assert "2026" in message and "2027" in message, message
     assert "年度科目表" in message or "每一份" in message, message
 
@@ -441,8 +442,9 @@ def test_latest_payment_range_gate_rejects_huge_lookback(db, book, make_voucher,
                                    subject_keyword="房屋租赁费",
                                    lookback_months=100)
     assert result.is_error is True
-    assert result.structured_content["code"] == "bad_request"
-    assert "个月" in result.structured_content["message"]
+    error = error_of(result)
+    assert error["code"] == "bad_request"
+    assert "个月" in error["message"]
 
     # 区间收窄到 12 个月就能查 —— 闸门是「拆成多次查」，不是「不许查」。
     ok = _call(detail.latest_payment, ctx=ctx, book_id=book.id,
@@ -705,12 +707,12 @@ def test_跨年科目级次不一致时回400而不是栈(db, book, ctx):
                                     period_code="2027-02",
                                     from_period_code="2026-12")
     assert result.is_error is True
-    payload = result.structured_content
-    assert payload["code"] == "bad_request", payload
-    assert "级次不一致" in payload["message"], payload
+    error = error_of(result)
+    assert error["code"] == "bad_request", error
+    assert "级次不一致" in error["message"], error
     # 不透出栈
-    assert "Traceback" not in payload["message"]
-    assert ".py" not in payload["message"], payload
+    assert "Traceback" not in error["message"]
+    assert ".py" not in error["message"], error
 
 
 # --------------------------------------------------------------------- 权限
@@ -723,8 +725,9 @@ def test_tool_denies_book_without_grant(db, book, make_voucher, outsider_ctx):
 
     result = _call(detail.search_vouchers, ctx=outsider_ctx, book_id=book.id)
     assert result.is_error is True
-    assert result.structured_content["code"] == "forbidden"
-    assert "没有该账套的访问权限" in result.structured_content["message"]
+    error = error_of(result)
+    assert error["code"] == "forbidden"
+    assert "没有该账套的访问权限" in error["message"]
 
 
 def test_every_tool_denies_book_without_grant(db, book, outsider_ctx):
@@ -739,7 +742,7 @@ def test_every_tool_denies_book_without_grant(db, book, outsider_ctx):
     ):
         result = call()
         assert result.is_error is True
-        assert result.structured_content["code"] == "forbidden"
+        assert error_of(result)["code"] == "forbidden"
 
 
 def test_tool_reports_bad_period_as_readable_error(db, book, ctx):
@@ -748,7 +751,7 @@ def test_tool_reports_bad_period_as_readable_error(db, book, ctx):
                                            period_code="2030-01",
                                            subject_keyword="租金")
     assert result.is_error is True
-    assert result.structured_content["code"] == "bad_request"
+    assert error_of(result)["code"] == "bad_request"
 
 
 def test_tool_hides_unknown_book_behind_forbidden(db, ctx):
@@ -759,7 +762,7 @@ def test_tool_hides_unknown_book_behind_forbidden(db, ctx):
     """
     result = _call(detail.search_vouchers, ctx=ctx, book_id=999999)
     assert result.is_error is True
-    assert result.structured_content["code"] == "forbidden"
+    assert error_of(result)["code"] == "forbidden"
 
 
 # --------------------------------------------------------------------- 只读

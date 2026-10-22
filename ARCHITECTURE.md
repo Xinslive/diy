@@ -4625,7 +4625,7 @@ MCP 层**不自写聚合**。本项目历史上栽过「导出与页面显示对
 
 模型化之后还有一处容易踩的坑：**`CallToolResult` 自己也是 Pydantic 模型**。测试助手（或任何调用方）如果要区分「成功出参」与「结构化错误回执」，必须**先判 `CallToolResult` 再判 `BaseModel`** —— 顺序反了，错误回执会被当成普通出参摊成 dict，用例于是读到一堆 `None`。
 
-校验发生在工具**内部**（`tools/base.py` 的 `envelope()`），而不是靠 SDK 在外面兜。这样「字段类型不对」会变成一条**结构化错误**（`isError: true` + `{code, message}`），而不是一个裸的 `ValidationError` 穿到 agent 面前 —— 后者没有 `code`，agent 无法自我修正。
+校验发生在工具**内部**（`tools/base.py` 的 `envelope()`），而不是靠 SDK 在外面兜。这样「字段类型不对」会变成一条**结构化错误**（`isError: true` + 一份**符合该工具 `outputSchema`** 的回执），而不是一个裸的 `ValidationError` 穿到 agent 面前 —— 后者没有 `code`，agent 无法自我修正。
 
 `extra="allow"`：出参会随实现演进，多带一个诊断字段不该是破坏性的变更；严格模式会让「多了一个没声明的键」直接变成一次查询失败。
 
@@ -4633,7 +4633,25 @@ MCP 层**不自写聚合**。本项目历史上栽过「导出与页面显示对
 
 ### 失败模式：agent 拿到什么
 
-MCP 的错误**不抛异常**，翻成 `isError: true` + `structured_content = {code, message}`。`code` 给机器分支用，`message` 是中文、不含库结构。agent 靠这两个字段自我修正 —— 所以每一种失败都得给一个**能指导下一步**的 `code` 与**一句有用的话**。
+MCP 的错误**不抛异常**，翻成 `isError: true` + 一份**符合该工具 `outputSchema`** 的结构化回执。
+
+**错误回执必须满足工具自己声明的 `outputSchema`** —— 这条是硬约束（2026-10-22 评估报告 P0-2 的根因）。以前出错时回的是 `structured_content = {code, message}`，而 `RenderReportResult` 这类模型有四个必填字段（`caliber` / `notes` / `currency` / …），少一个就**形状对不上**。严格一点的 MCP 客户端拿 `tools/list` 里声明的 `outputSchema` 去校验 `structuredContent`，对不上直接抛协议错 **`-32602`** —— 于是**真正的异常一个都没露出来**，agent 只看到「结构不匹配」，排查方向整个跑偏。
+
+所以错误回执现在长这样（`McpResult.error` 是 `Optional[dict]`）：
+
+```json
+{
+  "caliber": "error",
+  "notes": ["会计期间不存在：1999-01"],
+  "currency": "CNY",
+  "error": {"code": "bad_request", "message": "会计期间不存在：1999-01", "detail": {...}}
+}
+```
+
+- `error.code` 给机器分支用，`error.message` 是中文、不含库结构，agent 靠这两个字段自我修正 —— 所以每一种失败都得给一个**能指导下一步**的 `code` 与**一句有用的话**；
+- `error.detail` 放**原始异常的摘要**（类型名 + 消息 + 上下文），让「为什么出错」在回执里就看得到，不必去翻服务端日志；
+- `caliber` 固定为 `"error"`，`notes` 放同一句人话 —— 这两个字段让回执**同时**满足「机器读 `error`」与「人读 `notes`」；
+- 拼回执的代码在 `app/mcp/errors.py::to_result(output_model)`，**按出参模型拼**，所以以后给某个工具加必填字段，错误回执不会又对不上（`tests/test_mcp_defect_remediation.py` 里有一条通用用例守着这条不变量）。
 
 | 情况 | code | 说明 |
 |---|---|---|
@@ -4677,6 +4695,80 @@ MCP 的错误**不抛异常**，翻成 `isError: true` + `structured_content = {
 - **nginx 块必须手工同步到宝塔 vhost**：生产站点是宝塔管理的 `/www/server/panel/vhost/nginx/acct.xins.live.conf`，**发布脚本不碰它** —— 仓库里 `deploy/nginx/cwq.conf` 那份是 `/opt/cwq` 布局用的，`deploy/nginx/acct.xins.live.conf` 才是生产形态的模板。同步时**不要照抄 `cwq.conf` 里的 `include /etc/nginx/cwq-include/cwq-rl-api*.conf;`**：那个目录只在 `/opt/cwq` 维护机布局下存在，生产没有，照抄过去 `nginx -t` 直接失败（§11.7.6 同一个坑的另一面）。生产当前生效的是手工插入的同名块，备份在 `acct.xins.live.conf.bak.20261022-093056-pre-mcp`。
 - **令牌落在只读专用账号上**：账号 `mcp_agent`（id=6，口令随机生成、从不使用）只授权账套 3「物业」一个，角色 `VIEWER`（`sys_user_book` 的角色白名单是 `OWNER` / `ACCOUNTANT` / `VIEWER`，**只有 `VIEWER` 是只读**）。令牌明文只在签发那一次响应里返回一次，服务器侧落在 `/root/cwq-mcp-token.txt`（600，root only），本机落在 `~/.cwq/mcp-token.txt` 与 `~/.cwq/mcp-client-config.json`（均 600，后者可直接贴进 MCP client）。
 - **改完怎么验**：`/root/cwq-mcp-verify.py`（700）跑一遍完整握手 + 真实工具调用，走**公网 URL** —— 它同时验了三件事：令牌有效、nginx 的 SSE 没被缓冲（`initialize` 回包是 `text/event-stream`）、账套授权范围只有那一个账套。
+
+### MCP 口径约定（2026-10-22 评估报告修复后确立）
+
+这一组是**业务口径**，不是实现细节：换一个人改这些工具，改出来的数必须一样。逐条记在这里，`tests/test_mcp_defect_remediation.py` 是它们的回归。
+
+#### 零值必须带覆盖度（`coverage`）
+
+一个工具返回「本期收入 0.00」时，调用方分不清三种情况：「真没这笔业务」/「有业务但没记账」/「口径把它排除了」。所以凡是有金额的工具，出参里都带一个 `coverage` 块：
+
+| 字段 | 含义 |
+|---|---|
+| `posting` | `POSTED_ONLY` / `POSTED_AND_UNPOSTED` / `UNPOSTED_ONLY` |
+| `posted_vouchers` / `unposted_vouchers` | **纳入统计**的凭证张数 |
+| `excluded_unposted_vouchers` | **因口径被排除**的未记账凭证张数（>0 时零值不可当业务事实） |
+| `periods_with_data` / `periods_total` | 有凭证的期间数 / 期间总数 |
+| `completeness` | `FULL` 完整 / `PARTIAL` 有东西没算进来 / `NONE` 一张凭证都没有 |
+
+**`completeness` 是「期间级」判据，不是「过滤后级」**：`NONE` = 区间内一张凭证都没有（不论记账状态）；`PARTIAL` = 有凭证、但有未记账被口径排除；`FULL` = 全部算进来了。`periods_with_data < periods_total` **不参与判定** —— 空月份不说明问题。
+
+**为什么是期间级**：跟着科目 / 摘要 / 金额过滤走，意味着每一层过滤都要复制一遍判定逻辑，少复制一层就是静默漂移。覆盖度回答的是「这个区间**有没有东西**」，这个问题本来就不该随过滤条件变化。
+
+#### 区间期初 = 起始期自己的期初
+
+`ledger_balance` 的区间查询，期初取**起始期那一期的期初余额**（= 上一期期末），与单期查询同一口径；本期借 / 贷列装的是**区间发生额**。跨年区间会带上年的结转余额 —— 修之前 `merge_by_code` 用本年科目行去算上一年期末，跨年时恒为 0。
+
+这条与 `tests/test_balance_range.py` 钉住的口径一致。「区间期初应该是上上年的数」是误读。
+
+#### 透视按**分录**分桶，且聚合的是**全量命中凭证**
+
+`search_vouchers` 的 `group_by`（`summary` / `subject` / `period` / `direction`）分桶单位是**分录**不是凭证：「2025 年电费一共多少」问的是那些摘要写着「电费」的**分录**的合计。聚合对象是**这一整批命中凭证**，不是当前这一页 —— 否则「一整年电费」会被分页切成前 50 张。超过 `MERGE_FETCH_LIMIT`（2000 张）直接报错并提示缩小范围，**宁可让调用方缩小区间，也不要给一份只算了前 2000 张的「合计」**。
+
+`matched_entries` 单独给出**命中过滤条件的分录条数** —— 凭证是按分录筛的（金额区间、关键字），命中的分录条数与返回的凭证张数不是一回事。
+
+#### 损益结转凭证不是业务付款
+
+结转凭证把损益余额搬到「本年利润」，它**不是一笔业务付款**。`latest_payment` / `check_period_payments` 一律排除它。识别只有一个事实源：`accounting.organize.is_carry_forward`（source 标记 + 摘要/备注里的结转短语）—— SQL 侧筛选用它的公开别名 `CARRY_FORWARD_MARKERS`。
+
+同理，`search_vouchers` 的 `exclude_carry_forward` 默认 `false`，但不剔除时**必须在 notes 里说清**「结转凭证会重复计入，统计费用/收入通常要加 `exclude_carry_forward=true`」。
+
+#### 「最近付款」的金额是**整张凭证**的，不是那条分录的
+
+一张付款凭证上常常有**好几条同科目**的分录（电费 3 笔 + 水费 2 笔），对方只有一条现金分录。只报「最近那条分录」会把 146,324.31 说成 3,950.80（差 37 倍）。
+
+所以 `latest_payment.amount` 取**这张凭证里该科目所有命中分录的带符号合计**（与 `check_period_payments.paid_amount` 同一口径，红字自然抵掉），并在 `amount_basis` 标出口径；单条分录的金额另给 `entry_amount`，现金侧合计给 `voucher_cash_amount`。
+
+#### 科目余额表的合计恒按**末级科目**算
+
+`ledger_balance` 的 `check` 合计**恒按 leaf 科目**算，不随 `subject_scope` 档位变化 —— 父级汇总行计进去会重复计数。所以 `subject_scope="all"` 时**显示行之和 ≠ 合计**，每一行用 `included_in_totals` 标明自己计不计入。这件事必须显式可见，否则调用方手动加总会得到一个偏大的数，还以为账不平。
+
+#### 枚举参数非法值给可读错误，不落到协议错
+
+`granularity` / `subject_scope` / `sort` / `group_by` 的非法值以前是抛异常，异常被 MCP 协议层翻成 **`-32602`**（"结构不匹配"）—— 调用方看到的是一句跟「你传错了粒度」毫无关系的话。现在非法值直接回一条**列出合法取值**的参数错误（`bad_request`），调用方才知道该改什么。
+
+`granularity` 支持 `month` / `quarter` / `year`（`income_expense_trend` 是 MCP 独有工具，没有 HTTP 对应，而「按季看收支」是 agent 常问的）。季度标签形如 `2026-Q2`，按年标签形如 `2026`。
+
+#### 同比在基期无数据时不给数字
+
+`income_expense_trend` 的 `yoy`：上一年没有损益发生额时不给同比；**本年一张凭证都没记账**（`excluded_unposted_vouchers > 0`）时也不给 —— 这时的「同比 -100%」是记账状态造成的假象，不是业务事实。
+
+#### 报表模板与科目表不匹配，给**一条**提示
+
+账套可以 fork 自己的模板副本，模板里的科目编码照着**别的**科目表写：那些格子逐格报「科目不存在」，并把依赖它们的合计行（营业利润、利润总额、净利润、平衡校验）连锁打成 null。调用方逐格读 `errors` 要读几十行才拼得出结论。所以 `render_report` 额外给一条 `TEMPLATE_SUBJECTS_MISSING` 提示，直接列出缺哪些编码（**只看本期间所属年度那张科目表** —— 科目表每个年度各有一份，2026 的 `5601` 与 2025 的 `5601` 是两个科目）。
+
+#### 记账进度要能一眼看出来
+
+「哪些年没记账」是最关键、也最难自己拼出来的信息。`accounting_context` 与 `list_books` 的年度行都带 `posted_vouchers` / `unposted_vouchers`；`unposted_vouchers > 0` ⇒ 这一年的账还没记完，任何只读已记账的工具在它上面看到的都是「已记账的那一部分」。
+
+`find_subjects` 查空时给 `hint`：同样的关键字在**别的年度**科目表里存在 ⇒ 提示显式指定 `year`（漏传 `year` 与「这个科目不存在」在返回结果上长得一模一样）。
+
+#### 出参字段声明必须属于它自己的工具
+
+出参模型都开了 `extra="allow"`，所以字段**声明错类不会抛任何错** —— 工具照样返回、测试照样全绿，唯独 agent 看到的 `outputSchema` 里没有它真正拿到的字段。这次就踩过：`groups` / `group_totals` / `matched_entries` 是凭证检索的字段，却被声明到了「科目查询」的出参模型上。
+
+`tests/test_mcp_defect_remediation.py` 里有两条通用用例守着这条：一条断言**互斥**（凭证检索的字段不能在科目查询里出现，反之亦然），一条断言**实际返回的键一个都不能漏在 `outputSchema` 之外**（客户端是拿 `outputSchema` 校验 `structuredContent` 的）。
 
 ## 12. 测试策略
 

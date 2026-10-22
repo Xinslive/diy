@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import typing
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Optional, TypeVar
@@ -238,6 +239,30 @@ def _count_of(result: Any) -> Optional[int]:
     return None
 
 
+def _output_model_of(fn: Callable[..., Any]) -> Optional[type[BaseModel]]:
+    """工具的**出参模型**（函数的返回标注）。
+
+    **为什么工具模块不许写 ``from __future__ import annotations``** ——
+    有了那条，返回标注会变成字符串，这里就认不出来（`isinstance(ann, type)`
+    为假）。认出来是**必须的**：出错时我们要按这个模型拼一个**符合
+    outputSchema** 的结构体回给客户端，否则严格的客户端会抛协议错
+    ``-32602``，把真正的异常吞掉（见 ``errors.McpError.to_result``）。
+
+    字符串标注仍然尽量还原（``get_type_hints``），但还原不了就返回
+    ``None`` —— 那时错误回执退回**基类契约** ``McpResult`` 拼（仍是一份
+    合规结构体，不是旧的 ``{code,message}``）。
+    """
+    ann = getattr(fn, "__annotations__", {}).get("return")
+    if isinstance(ann, str):
+        try:
+            ann = typing.get_type_hints(fn).get("return")
+        except Exception:  # pragma: no cover - 还原不了就按「没有出参模型」处理
+            return None
+    if isinstance(ann, type) and issubclass(ann, BaseModel):
+        return ann
+    return None
+
+
 def mcp_tool(*, name: str, description: str = ""):
     """把一个工具函数注册成 MCP 工具。
 
@@ -250,9 +275,11 @@ def mcp_tool(*, name: str, description: str = ""):
        全局命名空间（``base.py``），不是工具模块的。注解是对象时没有
        这个问题。
 
-    装饰器做三件事：
+    装饰器做四件事：
 
     * 兜住异常 ⇒ 翻成 ``CallToolResult(is_error=True)`` + 结构化 payload；
+    * **按出参模型拼错误回执**，让 ``structuredContent`` 仍然符合
+      ``outputSchema``（不然客户端只报 ``-32602``，真正的异常看不见）；
     * 开/关数据库会话、写读取审计；
     * 保留原函数的签名与注解（``functools.wraps``），让 SDK 生成出正确的
       JSON Schema。
@@ -260,6 +287,8 @@ def mcp_tool(*, name: str, description: str = ""):
 
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
         import functools
+
+        output_model = _output_model_of(fn)
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -281,7 +310,7 @@ def mcp_tool(*, name: str, description: str = ""):
                 error = to_mcp_error(exc, request_id=request_id)
                 log.info("MCP 工具失败 rid=%s tool=%s code=%s",
                          request_id, name, error.code)
-                return error.to_result()
+                return error.to_result(output_model)
 
         wrapper.__name__ = name
         wrapper.__qualname__ = name

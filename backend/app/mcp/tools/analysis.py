@@ -48,6 +48,7 @@ from app.mcp.caliber import (
     orient,
     resolve_year,
 )
+from app.mcp.coverage import coverage_note, voucher_coverage
 from app.mcp.errors import McpBadRequest, McpNotFoundError
 from app.mcp.schemas import (
     IncomeExpenseTrendResult,
@@ -82,14 +83,24 @@ PL_CATEGORIES = ("PROFIT",)
 TREND_CALIBER = "report"
 
 TREND_DESCRIPTION = (
-    "按月给出某个账套某一会计年度的收入、费用与净额（损益口径，已排除结转凭证）。"
+    "按月（或按季 / 按年）给出某个账套某一会计年度的收入、费用与净额"
+    "（损益口径，已排除结转凭证）。"
     "金额单位为元、两位小数，以字符串承载。"
+    "默认只统计已记账凭证；include_unposted=true 才把未记账的也算进来。"
 )
 
 REPORT_DESCRIPTION = (
     "渲染某个账套的报表：内置基线（资产负债表 BALANCE_SHEET / 利润表 INCOME_SHEET）"
     "或该账套自己的模板副本。返回行与单元格、单元格级公式报错，以及口径标注。"
+    "默认只统计已记账凭证；include_unposted=true 才把未记账的也算进来。"
 )
+
+#: 趋势工具支持的粒度。
+#:
+#: **为什么列在这里而不是散在各处。** 非法值以前是抛异常，异常又被 MCP 的
+#: 协议层翻成 ``-32602``，调用方看到的是「结构不匹配」而不是「粒度不合法」。
+#: 现在非法值直接回一条**列出合法取值**的参数错误。
+GRANULARITIES = ("month", "quarter", "year")
 
 
 # --------------------------------------------------------------------- 损益两方
@@ -196,6 +207,34 @@ def _change_pct(current: Decimal, base: Decimal) -> Optional[str]:
 # --------------------------------------------------------------------- 工具 8
 
 
+def _buckets(periods: list[Period], granularity: str) -> list[tuple[str, list[Period]]]:
+    """把一年的期间按粒度分桶。
+
+    返回 ``[(标签, 该桶的期间), ...]``，标签就是 ``series[].period``：
+
+    * ``month``   → ``2026-03``
+    * ``quarter`` → ``2026-Q2``
+    * ``year``    → ``2026``
+
+    **为什么按季 / 按年也要有。** 以前 ``granularity`` 只认 month，
+    传 ``quarter`` 直接抛异常、又被协议层翻成 ``-32602``：调用方既拿不到
+    想要的数据，也看不到「合法取值是什么」。
+    """
+    if granularity == "month":
+        return [(p.code, [p]) for p in periods]
+    if granularity == "quarter":
+        out: list[tuple[str, list[Period]]] = []
+        for p in periods:
+            label = f"{p.year}-Q{(p.month - 1) // 3 + 1}"
+            if out and out[-1][0] == label:
+                out[-1][1].append(p)
+            else:
+                out.append((label, [p]))
+        return out
+    # year：一年只有一桶
+    return [(str(periods[0].year), list(periods))]
+
+
 @mcp_tool(name="income_expense_trend", description=TREND_DESCRIPTION)
 def income_expense_trend(
     ctx: Context,
@@ -203,23 +242,30 @@ def income_expense_trend(
     year: int,
     granularity: str = "month",
     categories: Optional[list[str]] = None,
+    include_unposted: bool = False,
 ) -> IncomeExpenseTrendResult:
-    """某一会计年度的收支趋势（按月）。
+    """某一会计年度的收支趋势（按月 / 按季 / 按年）。
 
     入参：
 
     * ``book_id`` —— 账套 id（**必填**，可见性随令牌绑定用户的授权走）。
     * ``year`` —— 会计年度（**必填**）。科目表每个年度各有一份，跨年请按
       年度显式指定。
-    * ``granularity`` —— 目前只支持 ``"month"``。
+    * ``granularity`` —— ``"month"``（默认）/ ``"quarter"`` / ``"year"``。
     * ``categories`` —— 可选的科目类别过滤（英文码或中文名）。
+    * ``include_unposted`` —— 默认 ``false``（只统计**已记账**凭证）。
+      这一条以前没有，是「2026 年返回 12 期全 0、还给出同比 -100%」的
+      直接原因（那一年的凭证一张都没记账）。现在可以显式把未记账的也算
+      进来，而且无论开关如何，返回里都带 ``coverage`` 说明这次到底覆盖了
+      多少张凭证 —— 零值不再是一句没有来由的话。
     """
     tc = current_tool_context(ctx)
     book = require_book(tc, book_id)
 
-    if (granularity or "").strip().lower() != "month":
+    gran = (granularity or "").strip().lower()
+    if gran not in GRANULARITIES:
         raise McpBadRequest(
-            f"暂不支持的粒度「{granularity}」；当前只支持按月（month）")
+            f"暂不支持的粒度「{granularity}」；可用取值：{'、'.join(GRANULARITIES)}")
 
     year = resolve_year(tc.db, book, year)
 
@@ -232,10 +278,15 @@ def income_expense_trend(
 
     subjects = _pl_subjects(tc.db, book_id, year, categories)
 
+    coverage = voucher_coverage(tc.db, book_id, periods,
+                                 include_unposted=include_unposted)
+    cov_note = coverage_note(coverage)
+
     notes = [
         "损益取数已排除结转凭证；若与总账『本期发生额』不一致，差额即结转凭证金额",
-        "口径为报表口径：只统计已记账（POSTED）的凭证，金额单位为元、两位小数；"
-        "负数是红字（冲销），照原样保留符号。",
+        "口径为报表口径：只统计%s凭证，金额单位为元、两位小数；"
+        "负数是红字（冲销），照原样保留符号。" % (
+            "已记账与未记账的" if include_unposted else "**已记账**（POSTED）的"),
         "收入与费用按科目自然方向取正（与报表求值器同一套判据）：自然方向为贷的"
         "损益类科目算收入，为借的算费用。",
         "只统计**损益类**科目，与内置利润表口径一致：收入＝营业收入＋投资收益＋"
@@ -246,9 +297,16 @@ def income_expense_trend(
         "年度合计按区间逐期累加得出，不是「本年累计相减」—— 本年累计每年 1 月"
         "归零，跨年相减会算错。",
     ]
+    if cov_note:
+        # **放在最前面**：零值的解释比零值本身更重要。
+        notes.insert(0, cov_note)
     if not subjects:
         notes.append(
             f"该账套 {year} 年的科目表里没有可参与损益汇总的末级科目，返回的数全为 0。")
+    if coverage["completeness"] == "NONE":
+        notes.insert(
+            1, f"{year} 年这个区间里一张已记账凭证都没有 —— 下面的 0 是「没有业务」，"
+               f"不是「算错了」。")
 
     series: list[dict[str, Any]] = []
     annual_income = ZERO
@@ -256,22 +314,22 @@ def income_expense_trend(
 
     # **报表口径**：排除结转凭证。与 ``for_ledger`` 的差额恰是结转凭证金额。
     # 引擎是只读的（实例内记忆化），本模块一次调用只建一个。
-    eng = LedgerEngine.for_report(tc.db, book_id)
+    eng = LedgerEngine.for_report(tc.db, book_id, include_unposted)
     ids = [s.id for s in subjects]
 
     if ids:
         # 年度合计：区间逐期累加。先算它 —— 它覆盖的区间最大，
-        # 引擎的聚合缓存命中它之后，各月的那几次调用就不用再发 SQL 了。
+        # 引擎的聚合缓存命中它之后，各桶的那几次调用就不用再发 SQL 了。
         annual_moves = eng.range_movements(ids, periods[0].ord, periods[-1].ord)
         annual_income, annual_expense, _, _ = _split_totals(subjects, annual_moves)
 
-    for p in periods:
-        # 没有可汇总的科目时也要把这一期列出来（全 0）——
+    for label, bucket in _buckets(periods, gran):
+        # 没有可汇总的科目时也要把这一段列出来（全 0）——
         # 空序列会让 agent 以为「这个月不存在」，而不是「这个月没有发生额」。
-        moves = eng.range_movements(ids, p.ord, p.ord) if ids else {}
+        moves = eng.range_movements(ids, bucket[0].ord, bucket[-1].ord) if ids else {}
         income, expense, income_cat, expense_cat = _split_totals(subjects, moves)
         series.append({
-            "period": p.code,
+            "period": label,
             "income": money_str(income),
             "expense": money_str(expense),
             "net": money_str(income - expense),
@@ -294,6 +352,17 @@ def income_expense_trend(
         prev_income, prev_expense, _, _ = _split_totals(prev_subjects, prev_moves)
         if prev_income == 0 and prev_expense == 0:
             notes.append(f"上一年（{prev_year}）没有损益发生额，无法计算同比。")
+        elif annual_income == 0 and annual_expense == 0 and \
+                coverage["excluded_unposted_vouchers"]:
+            # **-100% 在这里是假的。** 本年一张凭证都没记账（被口径排除了），
+            # 于是「本年收入 0」不是业务事实，而是记账状态。拿它去同比，
+            # 得到的是「收入归零」这个**极其危险的错误结论**。
+            # 这种情况直接不给同比，并把原因说清楚。
+            notes.append(
+                f"本年（{year}）没有已记账的损益发生额，且该年还有 "
+                f"{coverage['excluded_unposted_vouchers']} 张未记账凭证没算进来 —— "
+                f"此时的「同比 -100%」是记账状态造成的假象，不是业务事实，"
+                f"因此不返回同比数字。要看含未记账的口径请传 include_unposted=true。")
         else:
             income_pct = _change_pct(annual_income, prev_income)
             expense_pct = _change_pct(annual_expense, prev_expense)
@@ -311,6 +380,7 @@ def income_expense_trend(
         series=series,
         yoy=yoy,
         carry_forward_excluded=True,
+        coverage=coverage,
     )
 
 
@@ -421,6 +491,7 @@ def render_report(
     template_id: Optional[int] = None,
     period_code: Optional[str] = None,
     period_id: Optional[int] = None,
+    include_unposted: bool = False,
 ) -> RenderReportResult:
     """渲染某个账套的报表。
 
@@ -430,6 +501,11 @@ def render_report(
     * ``template_code`` / ``template_id`` —— 二选一。内置基线的 code 是
       ``BALANCE_SHEET``（资产负债表）与 ``INCOME_SHEET``（利润表）。
     * ``period_code`` / ``period_id`` —— 二选一；都不传时取「当前在记的那一期」。
+    * ``include_unposted`` —— 默认 ``false``（只含**已记账**凭证，与总账、
+      科目余额表的默认口径一致）。这一条以前没有，于是「账还没记账」这件事
+      在报表里看不出来：期初栏与期末栏会一起停在期初快照上、平衡校验照样
+      是 0.00 —— 看着一切正常，其实整个数是记账状态决定的。现在可以显式
+      切换口径，而且无论开关如何都带 ``coverage`` 说明覆盖度。
     """
     tc = current_tool_context(ctx)
     book = require_book(tc, book_id)
@@ -440,7 +516,7 @@ def render_report(
     # **整张表都交给报表求值器** —— MCP 不自己算报表。
     # evaluate() 抛 HTTPException 时由 MCP 的错误层翻成结构化错误，
     # 这里**不要**自己 try/except 吞掉它。
-    result = evaluate(tc.db, template.id, book, period, False)
+    result = evaluate(tc.db, template.id, book, period, include_unposted)
 
     rows = []
     for row in result.get("rows") or []:
@@ -452,10 +528,21 @@ def render_report(
     # 只有期末 / 年初余额列 ⇒ 账簿口径（含结转凭证，与总账逐分相同）。
     caliber = "report" if any(c.get("excludes_carry_forward") for c in cols) else "ledger"
 
+    coverage = voucher_coverage(tc.db, book_id, [period],
+                                include_unposted=include_unposted)
+    cov_note = coverage_note(coverage)
+
     notes = [
         "本表由报表求值器渲染，数字与界面上的报表逐格一致。",
         "金额单位为元、两位小数，以字符串承载；负数是红字（冲销），照原样保留符号。",
+        "本次取数%s%s。"
+        % ("包含" if include_unposted else "只含",
+           "已记账与未记账凭证" if include_unposted else "已记账（POSTED）凭证"),
     ]
+    if cov_note:
+        # **放在最前面**：口径解释比数字本身更重要 ——
+        # 「数字和科目余额表对不上」的根因往往就在这里。
+        notes.insert(0, cov_note)
     if caliber == "report":
         notes.append(
             "「本期金额」「本年累计」等损益列已排除结转凭证；"
@@ -499,6 +586,8 @@ def render_report(
         carry_forward_period_amount=carry,
         notices=result.get("notices") or [],
         errors=errors,
+        include_unposted=include_unposted,
+        coverage=coverage,
     )
 
 

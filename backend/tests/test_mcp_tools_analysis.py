@@ -206,12 +206,20 @@ def test_红字按引擎口径参与合计(db, book, make_voucher, principal):
 
 
 def test_不支持的粒度给出结构化错误(db, book, principal):
-    """粒度只支持 month；给别的值要说清楚，不能默默按月算。"""
+    """非法粒度要说清楚，不能默默按月算，也不能抛协议错。
+
+    **粒度现在支持 month/quarter/year**（评估报告 P1-4 的验收写的是
+    「若 quarter 应当支持，则实现它」—— 实现比只报错更有用，
+    「今年各季度收入多少」是 agent 常问的问题）。所以这里验的是
+    **真正非法的值**给的是参数错误，且**列出合法取值**。
+    """
     failure = call_tool_expect_error("income_expense_trend", principal,
                                      book_id=book.id, year=2026,
-                                     granularity="quarter")
+                                     granularity="week")
     assert failure.code == "bad_request"
     assert "month" in failure.message
+    assert "quarter" in failure.message
+    assert "year" in failure.message
 
 
 def test_同比_与上一年同期比(db, book, make_voucher, principal):

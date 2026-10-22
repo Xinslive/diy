@@ -788,17 +788,38 @@ class LedgerEngine:
         ids = [s.id for s in subjects]
         fmap = self.compute(ids, to_ord)
         if from_ord is None:
-            prev_map = None
+            open_map = None
             moves = {sid: (fmap[sid].period_dr, fmap[sid].period_cr) for sid in ids}
         else:
-            prev_map = self.compute(ids, from_ord - 1)
+            # **区间期初 = 起始期那一期的期初**（用区间自己这几年的科目行算）。
+            #
+            # 这里原来取的是「起始期的**上一期**期末」，即
+            # ``compute(ids, from_ord - 1).closing``。两者的口径在正常情况下
+            # 等价，但**跨年时不等价**，而且差得很离谱：
+            #
+            # 科目表每个年度各有一份，2025 年的 ``1002`` 与 2024 年的
+            # ``1002`` 是两行、两个 id，**分录与期初快照都挂在各自那一年的
+            # id 上**。拿 2025 的那行去算 2024-12 的期末 —— 那个时点上它
+            # 一行分录都没有、也没有期初快照 —— 算出来是 **0**。
+            #
+            # 于是「2025-01 ~ 2025-12」这个区间的期初恒为 0、期末也跟着错，
+            # 而**行内自洽**（期初 + 区间发生额 = 期末），只有与单期查询
+            # 交叉核对才看得出来。「给我 2025 年这一年的余额」是最自然的
+            # 提问之一，它拿到的是错数。
+            #
+            # 现在改成直接取**起始期自己的期初**（``compute(ids, from_ord)``），
+            # 口径与单期查询**逐字一致** —— 同一期末日期、两种查法，期末合计
+            # 必须相等（``balance_sheet_of_accounts`` 的区间闸门守着这条）。
+            open_map = self.compute(ids, from_ord)
             moves = self.range_movements(ids, from_ord, to_ord)
 
         out: list[MergedFigures] = []
         for _code, members in groups.items():
             first, last = members[0], members[-1]
-            if prev_map is not None:
-                opening = prev_map[first.id].closing
+            if open_map is not None:
+                # ``first`` 是组里**最早**那一年的行 —— 也就是区间起始期
+                # 所属年度的那一行（区间涉及哪几年，取的就是哪几年的表）。
+                opening = open_map[first.id].opening
             else:
                 opening = fmap[first.id].opening
             dr = sum((moves.get(m.id, (ZERO, ZERO))[0] for m in members), ZERO)

@@ -73,6 +73,52 @@ INSTRUCTIONS = """\
 * 科目表每个会计年度各有一份：同一编码在不同年度是**两行、两个 id**。
   跨年请按 `year` 显式指定，不要把**上一年**的科目 id 传进来。
 
+## 看到 0 之前，先看 `coverage`
+
+凡**取凭证金额**的返回体（`search_vouchers` / `latest_payment` /
+`check_period_payments` / `ledger_balance` / `income_expense_trend` /
+`render_report`）都带一个 `coverage` 块，**读数之前先读它**：
+
+| 字段 | 含义 |
+|---|---|
+| `posting` | 本次取数的记账口径（`POSTED_ONLY` / `POSTED_AND_UNPOSTED`） |
+| `posted_vouchers` / `unposted_vouchers` | 区间内已记账 / 未记账的凭证张数 |
+| `excluded_unposted_vouchers` | **因口径被排除**的未记账凭证张数 |
+| `completeness` | `FULL`（全算进来了）/ `PARTIAL`（有凭证但有未记账被排除）/ `NONE`（区间内**一张凭证都没有**） |
+
+**`completeness` 为 `NONE` 时的 0 是「这个区间没有业务」，不是「算错了」**；
+为 `PARTIAL` 时，那个 0 里缺的是**还没记账**的部分 —— 要看全量就传
+`include_unposted=true`。同比（`yoy`）在「本年没有已记账的损益、但有未记账
+被排除」时**返回 `null`**，而不是一个由记账状态造出来的 `-100%`。
+
+## 出错时怎么读
+
+出错返回的 `structuredContent` **是一份符合该工具 `outputSchema` 的结构体**
+（所以它一定带 `caliber` 与 `notes[]`），错误本身在 `error` 里：
+
+```json
+{"caliber": "error", "notes": ["..."], "error": {"code": "bad_request", "message": "...", "detail": {...}}}
+```
+
+* `error.code` 给分支用：`unauthorized` / `forbidden` / `bad_request` /
+  `not_found` / `constraint_violation` / `query_timeout` / `rate_limited` /
+  `internal_error`；
+* `error.message` 是中文、可直接读；
+* `error.detail` 是原始异常的摘要 —— **出错先看它**，不要只猜 `code`。
+
+## 几个容易问错的口径
+
+* `income_expense_trend` 的 `granularity` 支持 `month` / `quarter` / `year`；
+  非法值会回 `bad_request` 并列出合法取值。
+* `search_vouchers` 的 `group_by="summary"` 可以一次拿到「按摘要汇总」，
+  `exclude_carry_forward=true` 可以把结转凭证剔掉（结转凭证会把损益余额
+  重复计入）。
+* `latest_payment` 的 `amount` 是**整张凭证**对方科目的合计
+  （`amount_basis="voucher_focus_side"`），不是最近那一条分录的金额 ——
+  一张凭证上有好几条同科目分录时两者差很多。
+* `ledger_balance` 给区间（`from_period_code` + `period_code`）时，
+  **期初 = 起始期自己的期初**（= 上一期期末），与单期查询同一口径。
+
 ## 账号可见性
 
 你看到的账套范围＝令牌绑定那个用户被授权的账套范围。用户的权限变了

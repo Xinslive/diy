@@ -378,6 +378,10 @@ def build_income_lookup(db, book_id: int):
 # 把一张正常凭证扔到号段末尾。命中最长的那个短语，边界最窄。
 _CARRY_FORWARD_MARKERS = ("期间损益结转", "结转损益")
 
+#: 公开别名：工具层（MCP / 只读服务）要按同一套标记在 **SQL 侧**筛，
+#: 那里读不到本模块的私有常量。单一事实源：改这里，两边一起改。
+CARRY_FORWARD_MARKERS = _CARRY_FORWARD_MARKERS
+
 
 def is_carry_forward(voucher: Voucher) -> bool:
     """这张是不是期末结转损益的凭证。

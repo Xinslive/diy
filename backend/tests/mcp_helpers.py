@@ -105,11 +105,37 @@ class McpToolFailure(AssertionError):
 
     def __init__(self, tool: str, result: CallToolResult):
         payload = result.structured_content or {}
+        # **原始回执**：用例要断言「结构体符合 outputSchema」「文本段里有
+        # 原始异常」时需要它 —— 以前拿不到，只能看拼好的那一句。
+        self.result = result
         self.tool = tool
-        self.code = payload.get("code", "")
-        self.message = payload.get("message", "") or (result.content[0].text
-                                                     if result.content else "")
+        # 错误码在 ``error`` 里（``McpResult.error = {code, message, detail}``）。
+        # 顶层**没有** ``code`` 字段 —— 那是旧形状，出错时回的是
+        # ``{"code","message"}``，形状对不上工具自己声明的 outputSchema，
+        # 客户端会抛协议错 -32602（见 app/mcp/errors.py 的说明）。
+        error = payload.get("error") or {}
+        self.code = error.get("code", "") or payload.get("code", "")
+        self.message = error.get("message", "") or payload.get("message", "") \
+            or (result.content[0].text if result.content else "")
         super().__init__(f"工具 {tool} 返回错误：[{self.code}] {self.message}")
+
+
+def error_of(result: CallToolResult) -> dict:
+    """取出结构化错误回执里的 ``error`` 段。
+
+    **错误码与消息在 ``error`` 里**（``{code, message, detail}``），顶层
+    **没有** ``code``/``message`` 字段 —— 那是旧形状，出错时回的是
+    ``{"code","message"}``，四个必填字段全缺，形状对不上工具自己声明的
+    ``outputSchema``，客户端会抛协议错 ``-32602``，真正的异常一个都露不出来
+    （评估报告 P0-2）。
+
+    用例要断言错误码/文案时走这里，别直接取顶层 —— 那样会把「回执形状」
+    悄悄退回到旧契约上。
+    """
+    payload = result.structured_content or {}
+    error = payload.get("error")
+    assert error, f"回执里没有 error 段：{payload}"
+    return error
 
 
 def call_tool_expect_error(name: str, principal: Optional[McpPrincipal] = None,
@@ -124,6 +150,6 @@ def call_tool_expect_error(name: str, principal: Optional[McpPrincipal] = None,
 
 
 __all__ = [
-    "McpToolFailure", "call_tool", "call_tool_expect_error", "make_ctx",
-    "make_principal", "tool_fn",
+    "McpToolFailure", "call_tool", "call_tool_expect_error", "error_of",
+    "make_ctx", "make_principal", "tool_fn",
 ]

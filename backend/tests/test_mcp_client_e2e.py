@@ -118,8 +118,12 @@ def test_真实客户端拿到的是结构化错误而不是异常(client, auth,
         "http://testserver/api/mcp", outsider_token, {"book_id": book.id})
     assert call.is_error, "没授权的调用应当回结构化错误"
     payload = call.structured_content
-    assert payload["code"] == "forbidden", payload
-    assert "没有该账套的访问权限" in payload["message"]
+    # **错误码在 ``error`` 里**（``{code, message, detail}``）。顶层没有
+    # ``code``/``message`` —— 那是旧形状，出错时回的结构对不上工具自己声明的
+    # outputSchema，客户端会抛协议错 -32602（评估报告 P0-2）。
+    error = payload["error"]
+    assert error["code"] == "forbidden", payload
+    assert "没有该账套的访问权限" in error["message"]
 
 
 def _flatten(exc: BaseException) -> str:

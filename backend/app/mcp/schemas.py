@@ -54,12 +54,53 @@ class McpResult(BaseModel):
         default=CURRENCY,
         description="金额单位：人民币元（两位小数，以字符串承载，避免浮点误差）",
     )
+    #: 出错的结构化回执。**成功时恒为 null**。
+    #:
+    #: 为什么要把它**声明**在出参模型里（而不是只在出错时才塞进字典）：
+    #: MCP 客户端会拿工具声明的 ``outputSchema`` 去校验 ``structuredContent``。
+    #: 出错时服务端回的那个结构体（``code`` / ``message``）如果不满足这个
+    #: schema，严格的客户端会直接抛协议错 ``-32602``（"missing required
+    #: property 'caliber'"）—— **真正的错误原因被吞掉，agent 只看到一句
+    #: 「结构不匹配」**。所以出错时回的那个结构体也必须符合本 schema：
+    #: 必填字段补上类型对得上的占位值，错误本身放在 ``error`` 里。
+    error: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=("出错的结构化回执：{code, message, detail}；成功时为 null。"
+                     "detail 放原始异常的摘要，让「为什么出错」在回执里就看得见。"),
+    )
 
 
 class _Row(BaseModel):
     """行级模型的公共配置。"""
 
     model_config = ConfigDict(extra="allow")
+
+
+class Coverage(_Row):
+    """本次统计实际覆盖了多少数据。
+
+    **这个块存在是为了让「0」不再是 ambiguously 的 0。**
+
+    一个工具返回「本期收入 0.00」时，调用方分不清三种情况：
+    「真的没有这笔业务」/「有业务但没记账」/「口径把它排除了」。
+    以前只能靠另一个工具去猜；现在看 ``coverage`` 就能知道：
+
+    * ``excluded_unposted_vouchers`` > 0 ⇒ **账没记账**，零值不可当业务事实；
+    * ``completeness == "NONE"`` ⇒ 这个区间确实一张凭证都没有；
+    * ``completeness == "FULL"`` ⇒ 覆盖完整，零值就是真的零值。
+    """
+
+    posting: str = Field(
+        description="记账状态口径：POSTED_ONLY 只含已记账 / "
+                    "POSTED_AND_UNPOSTED 两者都含 / UNPOSTED_ONLY 只含未记账")
+    posted_vouchers: int = Field(default=0, description="纳入统计的已记账凭证张数")
+    unposted_vouchers: int = Field(default=0, description="纳入统计的未记账凭证张数")
+    excluded_unposted_vouchers: int = Field(
+        default=0, description="**因口径被排除**的未记账凭证张数（>0 时零值不可当业务事实）")
+    periods_with_data: int = Field(default=0, description="有凭证的期间数")
+    periods_total: int = Field(default=0, description="期间总数")
+    completeness: str = Field(
+        default="FULL", description="覆盖度：FULL 完整 / PARTIAL 有东西没算进来 / NONE 一张都没有")
 
 
 # --------------------------------------------------------------------- 导航类
@@ -83,6 +124,12 @@ class YearProgress(_Row):
     closed: int = Field(description="已结账的期间数")
     vouchers: int = Field(description="该年的凭证数")
     carried: bool = Field(description="该年是否已全部结完（损益已结转）")
+    posted_vouchers: int = Field(
+        default=0, description="该年的**已记账**凭证数（vouchers − 这个数 = 未记账）")
+    unposted_vouchers: int = Field(
+        default=0,
+        description="该年的**未记账**凭证数。>0 ⇒ 这一年的账还没记完，"
+                    "看到的余额/报表只含已记账的那部分")
 
 
 class BookInit(_Row):
@@ -136,6 +183,10 @@ class PeriodRow(_Row):
     vouchers: int = Field(description="该期凭证总数")
     posted: int = Field(description="其中已记账的")
     unposted: int = Field(description="其中未记账的")
+    has_carry_forward: bool = Field(
+        default=False, description="该期有没有损益结转凭证（结转凭证会影响多个工具的取数口径，见 notes）")
+    subject_count: int = Field(
+        default=0, description="该期所属年度的科目表科目数")
 
 
 class ListPeriodsResult(McpResult):
@@ -172,6 +223,8 @@ class FindSubjectsResult(McpResult):
     total: int = Field(description="命中总数（不是本页条数）")
     page: int = Field(description="当前页号")
     page_size: int = Field(description="每页条数（超限会被夹住）")
+    hint: Optional[str] = Field(
+        default=None, description="查空时的提示（例如「该编码在 2025 年也存在，请显式指定 year」）")
 
 
 class BookBrief(_Row):
@@ -266,10 +319,37 @@ class VoucherRow(_Row):
     total_debit: str = Field(description="借方合计")
     total_credit: str = Field(description="贷方合计")
     entries: list[VoucherEntryRow] = Field(default_factory=list, description="分录明细")
+    is_carry_forward: bool = Field(
+        default=False, description="这是不是损益结转凭证（结转凭证会把损益余额搬到本年利润，聚合时通常要排除）")
+
+
+class VoucherGroupRow(_Row):
+    """按 ``group_by`` 聚合出来的一组。"""
+
+    key: str = Field(description="分组键（摘要 / 科目编码 / 期间 / 借贷方向）")
+    label: str = Field(default="", description="分组键的中文名")
+    vouchers: int = Field(default=0, description="该组涉及的凭证张数")
+    entries: int = Field(default=0, description="该组的分录条数")
+    debit: str = Field(default="0.00", description="借方合计（红字算到对面）")
+    credit: str = Field(default="0.00", description="贷方合计（红字算到对面）")
+    net: str = Field(default="0.00", description="净额（借方 − 贷方）")
+
+
+class VoucherGroupTotals(_Row):
+    """整组的合计（``group_by`` 的透视结果里附带的）。"""
+
+    vouchers: int = Field(default=0, description="涉及的凭证张数")
+    entries: int = Field(default=0, description="分录条数")
+    debit: str = Field(default="0.00", description="借方合计")
+    credit: str = Field(default="0.00", description="贷方合计")
+    net: str = Field(default="0.00", description="净额（借方 − 贷方）")
 
 
 class SearchVouchersResult(McpResult):
     """``search_vouchers`` 的出参：凭证检索。"""
+
+    coverage: Optional[Coverage] = Field(
+        default=None, description="本次统计实际覆盖了多少凭证（解决「静默零值」）")
 
     book_id: int = Field(description="账套 id")
     year: int = Field(description="本次查的是哪一年度")
@@ -277,6 +357,14 @@ class SearchVouchersResult(McpResult):
     total: int = Field(description="命中总数（不是本页条数）")
     page: int = Field(description="当前页号")
     page_size: int = Field(description="每页条数（超限会被夹住）")
+    groups: list[VoucherGroupRow] = Field(
+        default_factory=list, description="按 group_by 聚合出来的透视结果（未传 group_by 时为空）")
+    group_totals: Optional[VoucherGroupTotals] = Field(
+        default=None, description="聚合结果的合计")
+    matched_entries: int = Field(
+        default=0,
+        description="**命中过滤条件的分录条数**。凭证是按分录筛的（金额区间、"
+                    "关键字），所以命中的分录条数与返回的凭证张数不是一回事")
 
 
 class PaymentRecord(_Row):
@@ -305,11 +393,21 @@ class LatestPaymentResult(McpResult):
     候选记录在 ``alternatives[]`` 里，每条都带 ``kind``。
     """
 
+    coverage: Optional[Coverage] = Field(
+        default=None, description="本次统计实际覆盖了多少凭证（解决「静默零值」）")
+
     book_id: int = Field(description="账套 id")
     year: int = Field(description="本次查的是哪一年度")
     found: bool = Field(description="有没有找到「真付出去」的记录")
     payment_date: Optional[str] = Field(default=None, description="付款日期（YYYY-MM-DD）")
     amount: Optional[str] = Field(default=None, description="付款金额")
+    amount_basis: str = Field(
+        default="voucher_focus_side",
+        description="amount 的口径：voucher_focus_side 这张凭证里该科目所有命中分录的带符号合计（与 check_period_payments 的 paid_amount 同口径）/ none 没有付款记录")
+    entry_amount: Optional[str] = Field(
+        default=None, description="命中那一条分录自身的金额（旧的 amount 值，只代表单条分录，不代表整笔付款）")
+    voucher_cash_amount: Optional[str] = Field(
+        default=None, description="这张凭证现金侧的带符号合计（对方现金类科目的分录）")
     voucher_no: Optional[str] = Field(default=None, description="凭证号")
     voucher_id: Optional[int] = Field(default=None, description="凭证 id")
     subject: Optional[SubjectRef] = Field(default=None, description="付出去的科目")
@@ -330,6 +428,9 @@ class CheckPeriodPaymentsResult(McpResult):
     一个为真 —— 「已付」「仅计提未付」「有凭证但未记账」是三件不同的事，
     混起来就会给出错误答案。
     """
+
+    coverage: Optional[Coverage] = Field(
+        default=None, description="本次统计实际覆盖了多少凭证（解决「静默零值」）")
 
     book_id: int = Field(description="账套 id")
     year: int = Field(description="该期间所属年度")
@@ -359,6 +460,9 @@ class BalanceRow(_Row):
     ytd_credit: str = Field(description="本年累计贷方")
     closing: str = Field(description="期末余额（带符号）")
     side: str = Field(description="余额所在的借贷方：借/贷/平（**按符号**判定）")
+    included_in_totals: bool = Field(
+        default=True,
+        description="这一行**计入** check 合计吗（合计恒按末级科目算，父科目行不计入 —— 所以「显示行之和 ≠ 合计」）")
 
 
 class BalanceCheck(_Row):
@@ -380,11 +484,17 @@ class BalanceCheck(_Row):
 class LedgerBalanceResult(McpResult):
     """``ledger_balance`` 的出参：科目余额表。"""
 
+    coverage: Optional[Coverage] = Field(
+        default=None, description="本次统计实际覆盖了多少凭证（解决「静默零值」）")
+
     book_id: int = Field(description="账套 id")
     year: int = Field(description="该期间所属年度")
     period: str = Field(description="期末所在期间（YYYY-MM）")
     rows: list[BalanceRow] = Field(default_factory=list, description="余额行")
     check: BalanceCheck = Field(description="试算平衡结果")
+    totals_scope: str = Field(
+        default="leaf",
+        description="check 里的合计按哪个口径算的：leaf 只算末级科目（恒定，不随 subject_scope 变）/ all 含父科目")
 
 
 # --------------------------------------------------------------------- 分析类
@@ -412,6 +522,9 @@ class TrendYoy(_Row):
 
 class IncomeExpenseTrendResult(McpResult):
     """``income_expense_trend`` 的出参：收支趋势（报表口径）。"""
+
+    coverage: Optional[Coverage] = Field(
+        default=None, description="本次统计实际覆盖了多少凭证（解决「静默零值」）")
 
     year: int = Field(description="会计年度")
     series: list[TrendPoint] = Field(default_factory=list, description="逐期收支")
@@ -463,8 +576,36 @@ class ReportRow(_Row):
     cells: list[ReportCell] = Field(default_factory=list, description="各列的取值")
 
 
+class ReportNotice(_Row):
+    """报表求值器给出的**一条提示**。
+
+    **必须是一个模型，不能是 ``str``。** 求值器给的是结构化的提示
+    （``code`` / ``level`` / ``text``；结转口径的提示还带 ``cols`` 与
+    ``amount``），出参模型却写成 ``list[str]`` —— 于是**只要被渲染的期间
+    自己含有已记账的结转凭证**，提示列表就非空，出参校验当场失败
+    （``Input should be a valid string``），整张报表渲染不出来。
+
+    这条坑的代价特别大：失败发生在**最后一步**（拼出参），
+    报表本身已经算完了，而错误又被 MCP 的协议层翻成 ``-32602`` ——
+    调用方看到的只是「结构不匹配」，看不到「提示不是字符串」。
+    """
+
+    code: str = Field(description="提示的机器可读标识，如 CARRY_FORWARD_EXCLUDED")
+    level: str = Field(description="级别：info / warning")
+    text: str = Field(description="提示正文（人话，可直接展示）")
+    cols: list[int] = Field(
+        default_factory=list, description="这条提示涉及的列号（1 基）")
+    codes: list[str] = Field(
+        default_factory=list, description="这条提示涉及的科目编码（模板缺科目时列出）")
+    amount: Optional[str] = Field(
+        default=None, description="涉及的金额（两位小数的字符串）")
+
+
 class RenderReportResult(McpResult):
     """``render_report`` 的出参：渲染一张报表。"""
+
+    coverage: Optional[Coverage] = Field(
+        default=None, description="本次统计实际覆盖了多少凭证（解决「静默零值」）")
 
     template: ReportTemplateRef = Field(description="模板信息")
     period: ReportPeriod = Field(description="报表所属期间")
@@ -472,8 +613,12 @@ class RenderReportResult(McpResult):
     carry_forward_excluded: bool = Field(description="是否已排除结转凭证")
     carry_forward_period_amount: Optional[str] = Field(
         default=None, description="本期结转凭证金额")
-    notices: list[str] = Field(default_factory=list, description="提示")
+    notices: list[ReportNotice] = Field(default_factory=list, description="提示")
     errors: list[str] = Field(default_factory=list, description="报表级报错")
+    include_unposted: bool = Field(
+        default=False,
+        description="本次取数是否包含**未记账**凭证（false＝只含已记账，"
+                    "与总账、科目余额表的默认口径一致）")
 
 
 __all__ = [
@@ -485,5 +630,6 @@ __all__ = [
     "ListPeriodsResult", "McpResult", "PaymentRecord", "PeriodRow",
     "RenderReportResult", "ReportCell", "ReportPeriod", "ReportRow",
     "ReportTemplateRef", "SearchVouchersResult", "SubjectRef", "SubjectRow",
-    "TrendPoint", "TrendYoy", "VoucherEntryRow", "VoucherRow", "YearProgress",
+    "TrendPoint", "TrendYoy", "VoucherEntryRow", "VoucherGroupRow",
+    "VoucherGroupTotals", "VoucherRow", "YearProgress",
 ]

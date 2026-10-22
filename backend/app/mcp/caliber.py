@@ -243,6 +243,26 @@ def check_range(from_period: Period, to_period: Period) -> None:
         raise McpPeriodError("起始期间不能晚于结束期间")
 
 
+def check_enum(value: Optional[str], allowed: tuple[str, ...], param: str) -> str:
+    """枚举参数校验：非法值直接回**列出合法取值**的参数错误。
+
+    **为什么不能让它落到服务端异常。** 非法枚举值以前是抛异常，异常又被
+    MCP 的协议层翻成 ``-32602``（"结构不匹配"）—— 调用方看到的是一句跟
+    「你传错了粒度」毫无关系的话，只能猜。**枚举参数传错是调用方的错，
+    而调用方的错必须用一句「这里只支持 A / B / C」回给他**，他才能改。
+
+    大小写与空白一律归一化（``" Month "`` 也算 ``month``）—— agent 传参
+    不会特意对齐大小写，而大小写不敏感比报错更友好。
+    """
+    from app.mcp.errors import McpBadRequest
+
+    text = (value or "").strip().lower()
+    if text not in allowed:
+        raise McpBadRequest(
+            f"{param} 只支持 {'、'.join(allowed)}；收到的是 {value!r}。")
+    return text
+
+
 def clamp_page_size(page_size: Optional[int]) -> int:
     """把页长夹到 ``[1, mcp_max_page_size]``。
 

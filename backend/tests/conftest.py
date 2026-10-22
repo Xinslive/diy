@@ -637,9 +637,14 @@ def subjects(db, book):
     return {s.code: s for s in rows}
 
 
-@pytest.fixture
-def make_voucher(db, book, admin_user):
-    """建凭证的小工厂，自动补齐借贷平衡与默认科目。"""
+def build_voucher_factory(db, book, admin_user):
+    """造凭证的工厂，绑定**指定账套**。
+
+    **抽成模块级函数**，是为了让「跨年账套」也能用同一套造凭证逻辑 ——
+    工厂原来只是 conftest 那个单年账套夹具的返回值，别的账套用不上它，
+    跨年用例只能自己重写一遍（借贷平衡、年度科目表、「上一期结账了本期才能
+    记账」这些业务规矩都要重写一遍，容易漏）。
+    """
 
     def _make(
         d: str | date,
@@ -716,3 +721,13 @@ def make_voucher(db, book, admin_user):
         return v
 
     return _make
+
+
+@pytest.fixture
+def make_voucher(db, book, admin_user):
+    """建凭证的小工厂，自动补齐借贷平衡与默认科目。
+
+    绑定本用例的账套（``book`` 夹具）。跨年账套用
+    ``build_voucher_factory(db, 那个账套, admin_user)``。
+    """
+    return build_voucher_factory(db, book, admin_user)

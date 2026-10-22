@@ -43,11 +43,12 @@ import re
 from calendar import monthrange
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 from mcp.server.mcpserver import Context
 from sqlalchemy import select
 
+from app.accounting.organize import is_carry_forward
 from app.accounting.vouchers import query_vouchers, side_totals
 from app.accounting.years import subjects_of
 from app.ledger.queries import (
@@ -62,6 +63,7 @@ from app.mcp.caliber import (
     all_periods,
     build_income_lookup,
     cash_flow_kind_of,
+    check_enum,
     check_range,
     clamp_page,
     clamp_page_size,
@@ -75,6 +77,7 @@ from app.mcp.caliber import (
     parse_date,
     resolve_year,
 )
+from app.mcp.coverage import coverage_note, voucher_coverage
 from app.mcp.errors import McpBadRequest, McpNotFoundError
 from app.mcp.schemas import (
     CheckPeriodPaymentsResult,
@@ -401,8 +404,147 @@ def _candidate_records(db, vouchers, subject_ids, periods):
                 "status": voucher.status,
                 "period_code": period.code if period is not None else None,
                 "summary": entry.summary or "",
+                # **结转凭证的标记**（单一事实源：``accounting.organize``）。
+                # 结转凭证会把损益余额搬到「本年利润」，把它当成一笔
+                # 业务分录参与聚合就会**重复计数** —— 这是本次评估里
+                # 「2025 年水电费」算错 48 万的同一个坑。
+                "is_carry_forward": is_carry_forward(voucher),
             })
     return records
+
+
+def _paid_amount_by_voucher(records: list[dict]) -> dict[int, Decimal]:
+    """按凭证归集「已付」金额。
+
+    **为什么按凭证而不是按分录。** 一张付款凭证上可能有**好几条**同科目的
+    分录（电费 3 笔 + 水费 2 笔），对方的现金类分录只有一条。把「最近一条
+    命中分录的金额」当付款金额报出去，会差一个数量级 —— 实测 记0041 的真实
+    付款是 146,324.31，而「最近一条分录」只有 3,950.80。
+
+    **与 ``check_period_payments`` 的 ``paid_amount`` 同一个口径**：
+    命中科目那几条分录的带符号合计（红字冲销自然抵掉）。
+    """
+    out: dict[int, Decimal] = {}
+    for r in records:
+        if r["kind"] != KIND_PAID:
+            continue
+        sid = r["voucher_id"]
+        out[sid] = out.get(sid, Decimal("0")) + money_value(r["amount"])
+    return out
+
+
+def _voucher_cash_amount(voucher, subjects) -> Decimal:
+    """这张凭证**现金侧**的带符号合计（现金类科目那几条分录）。
+
+    付款时它在贷方、收款时它在借方；金额取原值（红字是负数，照原样保留）。
+    """
+    total = Decimal("0")
+    for e in voucher.entries:
+        subject = subjects.get(e.subject_id)
+        if subject is not None and is_cash_code(subject.code):
+            total += e.amount
+    return total
+
+
+def _fetch_all_matching(db, book_id, subject_ids, *, from_period, to_period,
+                        date_from, date_to, status, keyword, min_amount,
+                        max_amount, sort) -> list[Voucher]:
+    """取**全部**命中的凭证（透视用），带上限闸门。
+
+    **为什么不能只聚合当前这一页。** ``group_by`` 要回答的是
+    「2025 年电费一共多少」——那是**整批**命中凭证的合计。拿当前页（默认
+    50 张）去汇总，报出来的数就是错的，而且看着还挺正常。
+
+    上限用 ``MERGE_FETCH_LIMIT``（2000 张），超了直接报错并说清怎么缩小
+    范围 —— 宁可让调用方缩小区间，也不要给一份只算了前 2000 张的「合计」。
+    """
+    if subject_ids:
+        return _query_by_subjects(
+            db, book_id, subject_ids, from_period=from_period, to_period=to_period,
+            date_from=date_from, date_to=date_to, status=status,
+            keyword=keyword, min_amount=min_amount, max_amount=max_amount,
+            sort=sort)
+    rows, total = query_vouchers(
+        db, book_id, from_period=from_period, to_period=to_period,
+        date_from=date_from, date_to=date_to, status=status,
+        keyword=keyword, min_amount=min_amount, max_amount=max_amount,
+        subject_id=None, page=1, page_size=MERGE_FETCH_LIMIT, sort=sort)
+    if total > len(rows):
+        raise McpBadRequest(
+            f"这个区间里命中的凭证有 {total} 张，超过透视上限 "
+            f"{MERGE_FETCH_LIMIT} 张；请缩小日期范围或加上科目过滤后重试")
+    return rows
+
+
+def _group_vouchers(vouchers, group_by: str, db) -> tuple[list[dict], dict]:
+    """按 ``group_by`` 把凭证的分录分桶汇总。
+
+    **分桶的单位是「分录」，不是「凭证」。** 「2025 年电费一共多少」问的
+    是那些摘要写着「电费」的**分录**的合计；一张凭证里可能还有水费、
+    还有现金那一头。把凭证整张塞进一个桶，报出来的数就不是问的那个数。
+
+    借方贷方合计与凭证合计**同一口径**（红字算到对面，见
+    ``accounting.vouchers.side_totals``）。
+    """
+    subject_of = _subject_map(
+        db, [e.subject_id for v in vouchers for e in v.entries])
+    period_of = _period_map(db, [v.period_id for v in vouchers])
+    buckets: dict[str, dict[str, Any]] = {}
+    for voucher in vouchers:
+        period = period_of.get(voucher.period_id)
+        for entry in voucher.entries:
+            subject = subject_of.get(entry.subject_id)
+            if group_by == "summary":
+                key = (entry.summary or "").strip()
+                label = key or "（空摘要）"
+            elif group_by == "subject":
+                key = subject.code if subject else ""
+                label = f"{key} {subject.name}" if subject else key
+            elif group_by == "period":
+                key = period.code if period else ""
+                label = key
+            else:   # direction
+                key = entry.direction
+                label = "借方" if entry.direction == "DEBIT" else "贷方"
+            bucket = buckets.setdefault(key, {
+                "key": key, "label": label, "vouchers": set(), "entries": [],
+            })
+            bucket["vouchers"].add(voucher.id)
+            bucket["entries"].append(
+                {"amount": entry.amount, "direction": entry.direction})
+
+    groups: list[dict[str, Any]] = []
+    total_vouchers: set[int] = set()
+    total_entries: list[dict] = []
+    for key in sorted(buckets):
+        bucket = buckets[key]
+        debit, credit = side_totals(bucket["entries"])
+        groups.append({
+            "key": bucket["key"],
+            "label": bucket["label"],
+            "vouchers": len(bucket["vouchers"]),
+            "entries": len(bucket["entries"]),
+            "debit": money_str(debit),
+            "credit": money_str(credit),
+            "net": money_str(debit - credit),
+        })
+        total_vouchers |= bucket["vouchers"]
+        total_entries.extend(bucket["entries"])
+    t_debit, t_credit = side_totals(total_entries)
+    totals = {
+        "vouchers": len(total_vouchers),
+        "entries": len(total_entries),
+        "debit": money_str(t_debit),
+        "credit": money_str(t_credit),
+        "net": money_str(t_debit - t_credit),
+    }
+    return groups, totals
+
+
+def _window_periods(db, book_id, from_period, to_period) -> list[Period]:
+    """窗口内**真实存在**的期间（按 ord 升序）。"""
+    return [p for p in all_periods(db, book_id)
+            if from_period.ord <= p.ord <= to_period.ord]
 
 
 def _record_sort_key(record):
@@ -427,6 +569,8 @@ def search_vouchers(
     min_amount: Optional[str] = None,
     max_amount: Optional[str] = None,
     sort: str = "date_desc",
+    group_by: Optional[str] = None,
+    exclude_carry_forward: bool = False,
     page: int = 1,
     page_size: int = 50,
 ) -> SearchVouchersResult:
@@ -448,10 +592,21 @@ def search_vouchers(
         "keyword 只搜凭证号、备注与分录摘要，不搜科目名 —— 找科目请用 "
         "find_subjects。")
     notes.append(
-        "min_amount/max_amount 筛的是单条分录的金额，不是整张凭证的合计。")
+        "min_amount/max_amount 筛的是单条分录的金额，不是整张凭证的合计；"
+        "matched_entries 给出**命中过滤条件的分录条数**（与返回的凭证张数"
+        "不是一回事：一张凭证里可能只有一条分录命中）。")
     notes.append(
         "金额单位是元（两位小数字符串）；负数是红字，凭证合计按「红字算到"
         "对面」的口径。")
+
+    sort = check_enum(sort, ("date_desc", "date_asc", "no_asc", "no_desc"), "sort")
+    group_key = None
+    if group_by is not None and str(group_by).strip():
+        group_key = check_enum(
+            group_by, ("summary", "subject", "period", "direction"), "group_by")
+        notes.append(
+            "本次按 group_by 聚合了**全部命中的凭证**（不是当前这一页），"
+            "groups[] 给出透视结果，group_totals 是它的合计。")
 
     page = clamp_page(page)
     page_size = clamp_page_size(page_size)
@@ -475,7 +630,7 @@ def search_vouchers(
         return envelope(SearchVouchersResult, 
             caliber="voucher", notes=notes, book_id=book_id,
             year=resolved_year, total=0, page=page, page_size=page_size,
-            items=[])
+            items=[], groups=[], group_totals=None, matched_entries=0)
     from_period = year_periods[0]
     to_period = year_periods[-1]
     check_range(from_period, to_period)
@@ -519,6 +674,29 @@ def search_vouchers(
     subject_of = _subject_map(
         db, [e.subject_id for v in rows for e in v.entries])
 
+    # **透视用的全量集合**。group_by 要的是「这一整批命中凭证」的汇总，
+    # 不是当前这一页 —— 否则「2025 年电费一共多少」会被分页切成前 50 张。
+    group_vouchers = rows
+    if group_key is not None:
+        group_vouchers = _fetch_all_matching(
+            db, book_id, ids, from_period=from_period, to_period=to_period,
+            date_from=d_from, date_to=d_to, status=status_filter,
+            keyword=keyword, min_amount=min_amt, max_amount=max_amt, sort=sort)
+        if exclude_carry_forward:
+            group_vouchers = [v for v in group_vouchers
+                              if not is_carry_forward(v)]
+
+    # **命中过滤条件的分录条数**（凭证是按分录筛的）。
+    matched_entries = 0
+    for voucher in rows:
+        for entry in voucher.entries:
+            amt = entry.amount
+            if min_amt is not None and amt < min_amt:
+                continue
+            if max_amt is not None and amt > max_amt:
+                continue
+            matched_entries += 1
+
     items = []
     for voucher in rows:
         entries = list(voucher.entries)
@@ -547,11 +725,43 @@ def search_vouchers(
             "total_debit": money_str(debit),
             "total_credit": money_str(credit),
             "entries": entry_items,
+            # **结转凭证的标记**（单一事实源）。聚合收入/费用时通常要
+            # 排除它 —— 它把损益余额搬到「本年利润」，算进去就重复了。
+            "is_carry_forward": is_carry_forward(voucher),
         })
+
+    groups: list[dict[str, Any]] = []
+    group_totals = None
+    if group_key is not None:
+        group_vouchers.sort(key=lambda v: _sort_key(
+            v, {p.id: p.ord for p in year_periods}.get(v.period_id, 0), sort))
+        groups, group_totals = _group_vouchers(
+            group_vouchers, group_key, db)
+        notes.append(
+            "聚合口径：按每条分录的「摘要 / 科目 / 期间 / 方向」分桶，"
+            "借方贷方合计与凭证合计同口径（红字算到对面）。"
+            + ("已剔除损益结转凭证。" if exclude_carry_forward else
+               "**未剔除**损益结转凭证 —— 结转凭证会把损益余额搬到本年利润，"
+               "统计费用/收入时通常要加 exclude_carry_forward=true，"
+               "否则会重复计入。"))
+
+    coverage = voucher_coverage(
+        db, book_id, year_periods,
+        # **标签要与真正用的状态过滤一致** —— ``status`` 可以是
+        # ``POSTED`` / ``UNPOSTED`` / ``ALL``（``status_filter`` 为
+        # ``None`` 表示不限），标签说错等于告诉 agent 「我按已记账口径
+        # 取的数」，而实际取的是未记账。
+        include_unposted=(status_filter in (None, "UNPOSTED")),
+        include_posted=(status_filter in (None, "POSTED")))
+    cov_note = coverage_note(coverage)
+    if cov_note:
+        notes.insert(0, cov_note)
 
     return envelope(SearchVouchersResult, 
         caliber="voucher", notes=notes, book_id=book_id, year=resolved_year,
-        total=total, page=page, page_size=page_size, items=items)
+        total=total, page=page, page_size=page_size, items=items,
+        groups=groups, group_totals=group_totals,
+        matched_entries=matched_entries, coverage=coverage)
 
 
 # --------------------------------------------------------------------- 工具 5
@@ -644,10 +854,17 @@ def latest_payment(
         return envelope(LatestPaymentResult, 
             caliber="payment", notes=notes, book_id=book_id,
             year=resolved_year, found=False, payment_date=None, amount=None,
+            amount_basis="none", entry_amount=None, voucher_cash_amount=None,
             voucher_no=None, voucher_id=None, subject=None, counterparty=None,
             cash_flow_kind=None, status=None, period_code=None, alternatives=[],
             note=f"查询区间为空（as_of 在 {to_period.code} 之前），没有记录。")
     check_range(from_period, to_period)
+    coverage = voucher_coverage(
+        db, book_id, _window_periods(db, book_id, from_period, to_period),
+        include_unposted=include_unposted)
+    cov_note = coverage_note(coverage)
+    if cov_note:
+        notes.insert(0, cov_note)
     if len(years) > 1:
         notes.append(
             "查询区间跨了 " + "、".join(str(y) for y in years)
@@ -701,9 +918,18 @@ def latest_payment(
 
     posted = [r for r in records if r["status"] == "POSTED"]
     unposted = [r for r in records if r["status"] != "POSTED"]
-    paid = [r for r in posted if r["kind"] == KIND_PAID]
-    accrued = [r for r in posted if r["kind"] == KIND_ACCRUED]
-    received = [r for r in posted if r["kind"] == KIND_RECEIVED]
+    # **结转凭证一律不算「付款」。** 结转凭证把损益余额搬到「本年利润」，
+    # 它不是一笔业务付款；把它当成付款会把金额算大（本次评估里
+    # 「头号金额取的是结转凭证里的单条分录」就是这一条）。
+    carry = [r for r in posted if r.get("is_carry_forward")]
+    business = [r for r in posted if not r.get("is_carry_forward")]
+    paid = [r for r in business if r["kind"] == KIND_PAID]
+    accrued = [r for r in business if r["kind"] == KIND_ACCRUED]
+    received = [r for r in business if r["kind"] == KIND_RECEIVED]
+    if carry:
+        notes.append(
+            f"这个区间里有 {len({r['voucher_id'] for r in carry})} 张损益结转凭证，"
+            f"它们不是业务付款，已排除在「已付 / 仅计提未付」的结论之外。")
 
     def _visible(record):
         return include_unposted or record["status"] == "POSTED"
@@ -717,8 +943,19 @@ def latest_payment(
                         if r is not primary and _visible(r)][:MAX_ALTERNATIVES]
         subject_name = (primary["subject"] or {}).get("name") or ""
         partner_name = (primary["counterparty"] or {}).get("name") or "现金类科目"
+        # **金额按整张凭证算，不是那一条分录。** 一张付款凭证上常常有
+        # 好几条同科目的分录（电费 3 笔 + 水费 2 笔），对方只有一条现金分录 ——
+        # 只报「最近那条分录」会把 146,324.31 说成 3,950.80（差 37 倍）。
+        # 口径与 ``check_period_payments`` 的 ``paid_amount`` 完全一致。
+        paid_by_voucher = _paid_amount_by_voucher(paid)
+        amount = paid_by_voucher.get(voucher.id, Decimal("0"))
+        entry_amount = money_value(primary["amount"])
+        voucher_subjects = _subject_map(db, [e.subject_id for e in voucher.entries])
+        cash_amount = _voucher_cash_amount(voucher, voucher_subjects)
         note = (f"已付：{subject_name} 的对方是 {partner_name}，"
-                f"{primary['amount']} 元，{primary['date']}。")
+                f"{money_str(amount)} 元（凭证 {primary['voucher_no']} 里该科目的"
+                f"合计，不是单条分录的 {money_str(entry_amount)}），"
+                f"{primary['date']}。")
         if accrued:
             note += f" 另有 {len(accrued)} 条仅计提未付的记录（钱还没出去）。"
         if received:
@@ -731,12 +968,16 @@ def latest_payment(
                      f"{len(alternatives)} 条。")
         return envelope(LatestPaymentResult, 
             caliber="payment", notes=notes, book_id=book_id, year=resolved_year,
-            found=True, payment_date=primary["date"], amount=primary["amount"],
+            found=True, payment_date=primary["date"],
+            amount=money_str(amount),
+            amount_basis="voucher_focus_side",
+            entry_amount=money_str(entry_amount),
+            voucher_cash_amount=money_str(cash_amount),
             voucher_no=primary["voucher_no"], voucher_id=primary["voucher_id"],
             subject=primary["subject"], counterparty=primary["counterparty"],
             cash_flow_kind=kind, status=primary["status"],
             period_code=primary["period_code"], alternatives=alternatives,
-            note=note)
+            note=note, coverage=coverage)
 
     # 没有「已付」。把四种状态里实际命中的那一种讲清楚。
     if accrued:
@@ -763,9 +1004,11 @@ def latest_payment(
 
     return envelope(LatestPaymentResult, 
         caliber="payment", notes=notes, book_id=book_id, year=resolved_year,
-        found=False, payment_date=None, amount=None, voucher_no=None,
+        found=False, payment_date=None, amount=None, amount_basis="none",
+        entry_amount=None, voucher_cash_amount=None, voucher_no=None,
         voucher_id=None, subject=None, counterparty=None, cash_flow_kind=None,
-        status=None, period_code=None, alternatives=alternatives, note=note)
+        status=None, period_code=None, alternatives=alternatives, note=note,
+        coverage=coverage)
 
 
 # --------------------------------------------------------------------- 工具 6
@@ -845,7 +1088,9 @@ def check_period_payments(
             caliber="payment", notes=notes, book_id=book_id,
             year=table_year, period=period.code, locked=bool(period.locked),
             paid=False, paid_amount="0.00", paid_dates=[],
-            accrued_only=False, unposted_only=False, records=[], note=note)
+            accrued_only=False, unposted_only=False, records=[], note=note,
+            coverage=voucher_coverage(db, book_id, [period],
+                                      include_unposted=include_unposted))
 
     # 状态过滤：**已记账与未记账都要看**。
     #
@@ -861,9 +1106,18 @@ def check_period_payments(
 
     posted = [r for r in records if r["status"] == "POSTED"]
     unposted = [r for r in records if r["status"] != "POSTED"]
+    # **结转凭证不是业务付款。** 它的对方是「本年利润」（权益类），
+    # 天然不会被判成「已付」；这里再显式排除一道，免得哪天判据变了
+    # 把它算进来（本次评估的「2025 年水电费」就差点这么错）。
+    carry = [r for r in posted if r.get("is_carry_forward")]
+    business = [r for r in posted if not r.get("is_carry_forward")]
 
-    paid_records = [r for r in posted if r["kind"] == KIND_PAID]
-    accrued_records = [r for r in posted if r["kind"] == KIND_ACCRUED]
+    paid_records = [r for r in business if r["kind"] == KIND_PAID]
+    accrued_records = [r for r in business if r["kind"] == KIND_ACCRUED]
+    if carry:
+        notes.append(
+            f"本期有 {len({r['voucher_id'] for r in carry})} 张损益结转凭证，"
+            f"它们不是业务付款，未计入已付金额。")
 
     # 三个标志**互斥**：先看已付，再看仅计提，最后看有没有未记账的。
     paid = bool(paid_records)
@@ -881,6 +1135,12 @@ def check_period_payments(
 
     listed = posted + (unposted if include_unposted else [])
     listed.sort(key=_record_sort_key, reverse=True)
+
+    coverage = voucher_coverage(db, book_id, [period],
+                                include_unposted=include_unposted)
+    cov_note = coverage_note(coverage)
+    if cov_note:
+        notes.insert(0, cov_note)
 
     if paid:
         note = (f"本期已付：共 {len(paid_records)} 笔，合计 {paid_amount} 元，"
@@ -904,7 +1164,7 @@ def check_period_payments(
         period=period.code, locked=bool(period.locked), paid=paid,
         paid_amount=paid_amount, paid_dates=paid_dates,
         accrued_only=accrued_only, unposted_only=unposted_only,
-        records=listed, note=note)
+        records=listed, note=note, coverage=coverage)
 
 
 # --------------------------------------------------------------------- 工具 7
@@ -945,6 +1205,10 @@ def ledger_balance(
         from_period = find_period_by_code(db, book_id, from_period_code)
         check_range(from_period, period)
 
+    # **枚举参数要校验，不能让它落到「值错了就当 all」。**
+    # 以前非法值被悄悄当成 all，调用方拿到一份多行的表还以为是自己要的。
+    subject_scope = check_enum(subject_scope, ("all", "top", "leaf"), "subject_scope")
+
     notes.append(
         "余额表走的是界面同一份实现（ledger/queries.balance_sheet_of_accounts），"
         "所以同一期间的同一行数字与界面必然一致。")
@@ -953,6 +1217,16 @@ def ledger_balance(
         "方向反推；direction 才是科目的自然方向。")
     notes.append(
         "试算合计（check）按明细级科目算，不随 subject_scope 档位变化。")
+    notes.append(
+        "check 里的合计**恒按末级科目（leaf）算**，与 subject_scope 无关 —— "
+        "subject_scope 只决定 rows 里列不列父科目行。所以「all」档位下"
+        "**显示行之和 ≠ 合计**（父科目行不计入合计）；每一行的 "
+        "included_in_totals 标明它计不计入。")
+    if from_period is not None:
+        notes.append(
+            f"本次是**区间查询**（{from_period.code} ~ {period.code}）："
+            f"期初取 {from_period.code} 那一期的期初余额，与单期查询同一口径；"
+            f"本期借/贷列装的是**区间**发生额。")
 
     # 科目表：区间涉及哪几个年度就取哪几个年度的并集 —— 与接口
     # ``GET /api/books/{id}/ledger/balance`` 完全同一句取法。
@@ -984,15 +1258,29 @@ def ledger_balance(
             # **不是** subject.direction 的反推 —— 早期版本按自然方向判，
             # 会把「短期借款 −1000」显示成「借 1000」。
             "side": row["direction"],
+            # **这一行计不计入 check 合计**。合计恒按末级科目算（否则
+            # 父级汇总行会重复计数），所以父科目行是 false ——
+            # 「显示行之和 ≠ 合计」这件事必须显式可见，否则调用方
+            # 手动加总会得到一个偏大的数，还以为账不平。
+            "included_in_totals": bool(row.get("is_leaf")),
         })
 
     out_check = {}
     for key, value in check.items():
         out_check[key] = money_str(value) if isinstance(value, Decimal) else value
 
+    coverage = voucher_coverage(
+        db, book_id,
+        [p for p in (from_period, period) if p is not None],
+        include_unposted=include_unposted)
+    cov_note = coverage_note(coverage)
+    if cov_note:
+        notes.insert(0, cov_note)
+
     return envelope(LedgerBalanceResult, 
         caliber="ledger", notes=notes, book_id=book_id, year=period.year,
-        period=period.code, rows=out_rows, check=out_check)
+        period=period.code, rows=out_rows, check=out_check,
+        totals_scope="leaf", coverage=coverage)
 
 
 # --------------------------------------------------------------------- 注册

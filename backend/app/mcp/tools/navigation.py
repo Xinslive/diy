@@ -116,6 +116,51 @@ def _voucher_counts(db, book_id: int, periods: list) -> tuple[dict, dict]:
     return totals, posted
 
 
+def _carry_forward_period_ids(db, book_id: int) -> set[int]:
+    """哪些期间里有损益结转凭证（按期间 id）。
+
+    **判据与 ``accounting.organize.is_carry_forward`` 同一套**：source 标记
+    + 摘要/备注里的结转短语。之所以在 SQL 侧做而不是逐张凭证跑一遍那个
+    函数：``list_periods`` 要的是**每个期间**的标志，一张张判就是
+    「凭证数 × 一次 Python 调用」。
+
+    结转凭证不是可选信息 —— 它把损益余额搬到「本年利润」，多个工具的
+    金额口径都受它影响（本次评估里「2025 年水电费」算错 48 万就是
+    没剔它）。把它前置成显式字段，排查就不用靠猜。
+    """
+    from sqlalchemy import or_, select
+
+    from app.accounting.organize import CARRY_FORWARD_MARKERS
+    from app.models import Entry, Voucher
+
+    clauses = [Voucher.source == "CARRY_FORWARD"]
+    for marker in CARRY_FORWARD_MARKERS:
+        clauses.append(Voucher.remark.like(f"%{marker}%"))
+    stmt = (
+        select(Voucher.period_id)
+        .outerjoin(Entry, Entry.voucher_id == Voucher.id)
+        .where(Voucher.book_id == book_id,
+               or_(*clauses,
+                   *[Entry.summary.like(f"%{m}%") for m in CARRY_FORWARD_MARKERS]))
+        .distinct()
+    )
+    return {row[0] for row in db.execute(stmt).all()}
+
+
+def _subject_counts_by_year(db, book_id: int) -> dict[int, int]:
+    """各年度的科目表科目数。"""
+    from sqlalchemy import func, select
+
+    from app.models import Subject
+
+    rows = db.execute(
+        select(Subject.year, func.count(Subject.id))
+        .where(Subject.book_id == book_id)
+        .group_by(Subject.year)
+    ).all()
+    return {int(year): int(count) for year, count in rows}
+
+
 def _year_voucher_counts(db, book_id: int, year_periods: list) -> tuple[int, int]:
     """某个年度的凭证总数与已记账数（一次区间查询算完）。
 
@@ -194,11 +239,15 @@ def list_periods(ctx: Context, book_id: int) -> ListPeriodsResult:
     book = require_book(tc, book_id)
     periods = all_periods(db, book_id)
     totals, posted = _voucher_counts(db, book_id, periods)
-    items = [
-        period_dict(period, vouchers=totals.get(period.id, 0),
-                    posted=posted.get(period.id, 0))
-        for period in periods
-    ]
+    carry_periods = _carry_forward_period_ids(db, book_id)
+    subject_counts = _subject_counts_by_year(db, book_id)
+    items = []
+    for period in periods:
+        item = period_dict(period, vouchers=totals.get(period.id, 0),
+                           posted=posted.get(period.id, 0))
+        item["has_carry_forward"] = period.id in carry_periods
+        item["subject_count"] = subject_counts.get(period.year, 0)
+        items.append(item)
     tc.count(len(items))
     return envelope(ListPeriodsResult, 
         caliber="period",
@@ -206,6 +255,10 @@ def list_periods(ctx: Context, book_id: int) -> ListPeriodsResult:
             "期间按账套内连续序号 ord 排序；code 形如 2026-01。",
             "vouchers 是该期凭证总数，posted 是其中已记账的，unposted = vouchers - posted。",
             "locked=true 表示该期已结账（封账后不能再写凭证，但账照读不误）。",
+            "has_carry_forward=true 表示该期有损益结转凭证 —— 它把损益余额搬到"
+            "「本年利润」，聚合收入/费用时通常要排除（多个工具的金额口径"
+            "都受它影响）。",
+            "subject_count 是该期所属年度的科目表科目数。",
         ],
         book_id=book.id,
         items=items,
@@ -277,6 +330,25 @@ def find_subjects(ctx: Context, book_id: int, year: Optional[int] = None,
         notes.append(
             f"该账套 {resolved_year} 年还没有科目表；"
             f"现有科目表的年度是 {known_years(db, book_id) or '（无）'}。")
+    hint = None
+    if not matched:
+        # **查空时要说清「你可能查错了年度」。**
+        # 科目表每个会计年度各有一份，同一编码在不同年度是两个 id ——
+        # 漏传 year（或传了另一年）会拿到空结果，而空结果看起来与
+        # 「这个科目不存在」一模一样。
+        other = []
+        for y in known_years(db, book_id):
+            if y == resolved_year:
+                continue
+            for row in subjects_of(db, book_id, y, include_inactive=True):
+                if match_keyword(row, keyword):
+                    other.append(y)
+                    break
+        if other:
+            hint = (f"本次查的是 {resolved_year} 年度科目表，没有命中；"
+                    f"但同样的关键字在 {'、'.join(str(y) for y in other)} 年的"
+                    f"科目表里存在 —— 科目表每个会计年度各有一份，请显式指定 year。")
+
     return envelope(FindSubjectsResult, 
         caliber="subject",
         notes=notes,
@@ -286,6 +358,7 @@ def find_subjects(ctx: Context, book_id: int, year: Optional[int] = None,
         page=current_page,
         page_size=size,
         items=items,
+        hint=hint,
     )
 
 
@@ -325,6 +398,13 @@ def accounting_context(ctx: Context, book_id: int) -> AccountingContextResult:
         # 本工具额外多给一个科目数 —— agent 判断「这一年的账能不能查」
         # 需要知道这一年的科目表里有多少个科目。
         row["subject_count"] = len(subjects)
+        # **记账进度**：「哪些年没记账」是本次评估里最关键、也最难自己
+        # 拼出来的信息 —— 以前要逐期读 list_periods 的几十行才拼得出
+        # 「2022–2025 已记账、2026 未记账」这个结论。
+        y_total, y_posted = _year_voucher_counts(
+            db, book_id, periods_by_year.get(year, []))
+        row["posted_vouchers"] = y_posted
+        row["unposted_vouchers"] = max(0, y_total - y_posted)
         year_rows.append(row)
 
     current_year = current_accounting_year(db, book)
@@ -362,6 +442,9 @@ def accounting_context(ctx: Context, book_id: int) -> AccountingContextResult:
             "latest_closed_period 是最近一期已结账的期间；还没结过账时为 null。",
             "cash_subjects 只含现金类科目（编码前缀 1001 库存现金 / 1002 银行存款 / "
             "1012 其他货币资金），取的是当前年度的科目表。",
+            "years[] 里 posted_vouchers / unposted_vouchers 给出**记账进度**："
+            "unposted_vouchers > 0 ⇒ 这一年的账还没记完，任何只读已记账的"
+            "工具在它上面看到的都是「已记账的那一部分」。",
             "years[] 只列**有科目表**的年度；每行的年度进度（total 期间总数、"
             "closed 已结账期数、vouchers 凭证数、carried 是否已全部结完）与 "
             "list_books 的年度进度**同一口径**（同一份实现算出来的）；"
