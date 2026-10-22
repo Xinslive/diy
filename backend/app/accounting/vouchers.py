@@ -201,6 +201,40 @@ def _apply_shift(db: Session, anchor: Voucher, position: str = "before") -> list
     return moved
 
 
+def _log_renames(db: Session, moved: list[dict], user, book_id: int,
+                 prefix: str) -> None:
+    """「谁让了位」：**一张凭证一条审计**。
+
+    以前是把所有顺延凭证的 id 拼成 ``"24,25,26"`` 塞进 ``entity_id``，
+    而 ``audit_log.entity_id`` 只有 ``varchar(64)``。
+
+    **顺延超过十张就超长**：2025-01 那个月在第 9 张（记0009）上拆分，
+    后面 18 张凭证的号要整体顺延 —— 四个数位的 id 拼起来 89 个字符，
+    PostgreSQL 报 22001
+    （value too long for type character varying），整个事务回滚，
+    界面把它翻译成「提交的内容超出了字段允许的长度」——
+    看着像用户提交的问题，其实是日志表的一个字段放不下。
+    （「插入凭证」那处的 RENAME 审计是同一种写法，同样中过招。）
+
+    改成**一张一条**：
+      · ``entity_id`` 回到全系统「一条审计 = 一个实体」的约定，永远放得下；
+      · 顺延了几张就留几条痕，谁改了号一目了然；
+      · 每条自帶 before/after（改号前后的号），界面点「查看快照」能看明白。
+    """
+    for m in moved:
+        log(
+            db,
+            action="RENAME",
+            entity="voucher",
+            entity_id=m["id"],
+            user=user,
+            book_id=book_id,
+            detail=f"{prefix}：{m['from']}→{m['to']}",
+            before={"id": m["id"], "voucher_no": m["from"]},
+            after={"id": m["id"], "voucher_no": m["to"]},
+        )
+
+
 # --------------------------------------------------------------------- 校验
 
 
@@ -485,16 +519,7 @@ def create_voucher(
     if moved:
         # 号被顶走这件事必须留痕：事后有人问「记007 怎么变成这笔了」，
         # 操作日志里能一句话说清是老几号顺位过来的。
-        log(
-            db,
-            action="RENAME",
-            entity="voucher",
-            entity_id=",".join(str(m["id"]) for m in moved),
-            user=user,
-            book_id=book_id,
-            detail="插入凭证顺位：" + "、".join(f"{m['from']}→{m['to']}" for m in moved),
-            before={"moved": [{k: str(v) for k, v in m.items()} for m in moved]},
-        )
+        _log_renames(db, moved, user, book_id, "插入凭证顺位")
     log(
         db,
         action="CREATE",
@@ -983,18 +1008,7 @@ def split_voucher(db: Session, voucher: Voucher, user: SysUser,
         after=voucher_snapshot(created, entries=payload),
     )
     if moved:
-        log(
-            db,
-            action="RENAME",
-            entity="voucher",
-            entity_id=",".join(str(m["id"]) for m in moved),
-            user=user,
-            book_id=voucher.book_id,
-            detail="拆分凭证顺位：" + "、".join(
-                f"{m['from']}→{m['to']}" for m in moved),
-            before={"moved": [{k: str(v) for k, v in m.items()} for m in moved]},
-        )
-
+        _log_renames(db, moved, user, voucher.book_id, "拆分凭证顺位")
     try:
         db.commit()
     except IntegrityError as exc:

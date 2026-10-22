@@ -178,8 +178,91 @@ def test_拆分留下三条审计(db, book, admin_user, subjects):
                       if r.action == "CREATE" and r.entity_id == str(result["created"].id))
     assert len(create_log.after["entries"]) == 2
 
-    rename_log = next(r for r in rows if r.action == "RENAME")
-    assert rename_log.before["moved"]
+    # 「谁让了位」：**一张凭证一条**（不是一串 id 塞在一个 entity_id 里 ——
+    # 那个字段只有 varchar(64)，顺延多了会撑爆，见下一条用例）。
+    rename_logs = [r for r in rows if r.action == "RENAME"]
+    assert len(rename_logs) == 1
+    rename_log = rename_logs[0]
+    assert rename_log.entity_id.isdigit()
+    assert rename_log.before["voucher_no"] != rename_log.after["voucher_no"]
+    assert "→" in rename_log.detail
+
+
+def test_顺延的张数很多也能拆成_审计的entity_id不会撑爆字段(db, book, admin_user, subjects):
+    """生产事故：2025-01 有 26 张凭证，在第 9 张上拆分时**顺延 17 张**。
+
+    ``audit_log.entity_id`` 是 ``varchar(64)``，而「谁让了位」这条审计把
+    所有顺延凭证的 id 拼成一个逗号串塞进去 ——
+    17 个四位 id 就是 ``1391,1392,...,1403,1671,1672`` = 84 个字符，**超了**。
+
+    PostgreSQL 报 22001（value too long for type character varying），
+    界面把它翻译成「提交的内容超出了字段允许的长度」——
+    看着像用户提交的问题，其实是日志表的一个字段放不下。
+
+    这里造 40 张（id 会走到三位数），修好之前必然撑爆 64 字符。
+    """
+    v = create_voucher(
+        db, book_id=book.id, user=admin_user,
+        voucher_date=date.fromisoformat("2026-01-05"),
+        entries=_entries(subjects, PAIR_A + PAIR_B),
+        commit=False,
+    )
+    for i in range(40):
+        create_voucher(
+            db, book_id=book.id, user=admin_user,
+            voucher_date=date.fromisoformat("2026-01-%02d" % (6 + i % 20)),
+            entries=_entries(subjects, PAIR_A),
+            commit=False,
+        )
+    db.commit()
+    db.refresh(v)
+
+    result = split_voucher(db, v, admin_user, 2)
+
+    rows = db.scalars(select(AuditLog).where(AuditLog.book_id == book.id)).all()
+    renames = [r for r in rows if r.action == "RENAME"]
+    assert renames, "顺延了却没有留痕"
+    # 每一条都必须是**单个**凭证的 id：字段只有 64 个字符，
+    # 而全系统其它审计的 entity_id 也都是「一条 = 一个实体」。
+    for r in renames:
+        assert r.entity_id.isdigit(), f"entity_id 不是单个 id：{r.entity_id!r}"
+        assert len(r.entity_id) <= 64, f"entity_id 超长：{len(r.entity_id)}"
+    # 顺延了几张，就该有几条 —— 一张都不少
+    assert len(renames) == 40
+    assert len(result["moved"]) == 40
+
+
+def test_顺延的张数很多也能用插入凭证_审计的entity_id不会撑爆字段(db, book, admin_user, subjects):
+    """同一处毛病在「插入凭证」上也有：那儿的 RENAME 审计是同一种写法。"""
+    for i in range(40):
+        create_voucher(
+            db, book_id=book.id, user=admin_user,
+            voucher_date=date.fromisoformat("2026-01-%02d" % (6 + i % 20)),
+            entries=_entries(subjects, PAIR_A),
+            commit=False,
+        )
+    db.commit()
+    first = db.scalar(select(Voucher).where(Voucher.book_id == book.id)
+                      .order_by(Voucher.id).limit(1))
+
+    # 在第一张后面插一张 → 后面 40 张全部顺延
+    create_voucher(
+        db, book_id=book.id, user=admin_user,
+        voucher_date=date.fromisoformat("2026-01-05"),
+        entries=_entries(subjects, PAIR_A),
+        insert_after_id=first.id, insert_position="after", commit=False,
+    )
+    db.commit()
+
+    rows = db.scalars(select(AuditLog).where(AuditLog.book_id == book.id)).all()
+    renames = [r for r in rows if r.action == "RENAME"]
+    assert renames, "顺延了却没有留痕"
+    for r in renames:
+        assert r.entity_id.isdigit(), f"entity_id 不是单个 id：{r.entity_id!r}"
+        assert len(r.entity_id) <= 64, f"entity_id 超长：{len(r.entity_id)}"
+    # 参照凭证自己不动（position="after" 时它不满足让位条件），
+    # 所以是**其余** 39 张顺延
+    assert len(renames) == 39
 
 
 def test_预览一次列出全部候选并标出能不能拆(db, book, admin_user, subjects):
