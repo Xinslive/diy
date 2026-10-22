@@ -251,13 +251,24 @@ const newPassword = ref('')
 const userForm = reactive({ username: '', real_name: '', password: '', books: {} })
 const grant = reactive({ books: {} })
 
+// **账套一律只写账套名，不写单位名**（用户 2026-10-22 批注：「不显示单位名」）。
+//
+// 单位名（公司名）是**建账套时填的抬头**，不是账套的地址：全站顶上的账套
+// 选择框早就是只写账套名（见 MainLayout），Excel 导出的抬头也不带单位名
+// （ARCHITECTURE.md §8「Excel 导出的抬头：一律不带单位名」），而授权表里
+// 认的也是**账套**。
+// 授权这一列要回答的是「这个人能碰哪本账」，写成「启明物业管理有限公司 ·
+// 启明物业 · 负责人」把答案埋在一串抬头里 —— 管理员扫一眼标签反而看不清
+// 是哪本账，也把一列撑得横着拖。
+//
+// 真认不出是哪一个时（同名账套），退回到 `#id` —— 那才是唯一能区分的东西。
 const bookRows = computed(() =>
   // 年度是账套的属性，账套本身不再按年度拆开，所以这里不带年份
-  books.value.map((b) => ({ id: b.id, label: `${b.company_name} · ${b.name}` }))
+  books.value.map((b) => ({ id: b.id, label: b.name }))
 )
 const bookLabel = (id) => {
   const b = books.value.find((x) => x.id === id)
-  return b ? `${b.company_name} · ${b.name}` : `#${id}`
+  return b ? b.name : `#${id}`
 }
 
 function blankGrant() {

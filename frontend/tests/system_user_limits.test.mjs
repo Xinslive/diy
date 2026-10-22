@@ -72,5 +72,24 @@ t('删除失败时把后端的话原样透出来（最后一个管理员那句�
   assert.match(VIEW, /async function remove\(row\)[\s\S]*?e\?\.response\?\.data\?\.detail/)
 })
 
+console.log('')
+console.log('== 账套授权一列只写账套名，不写单位名 ==')
+//
+// 用户 2026-10-22 批注：「不显示单位名」。单位名是建账套时填的抬头，
+// 授权表里认的是**账套** —— 全站顶上的账套选择框也早就只写账套名。
+
+t('账套标签不再拼公司名', () => {
+  const code = VIEW.replace(/<!--[\s\S]*?-->/g, '')   // 注释里可以提这件事
+  assert.ok(!/company_name/.test(code), '账套标签里还在拼单位名')
+})
+
+t('账套标签只剩账套名与角色', () => {
+  assert.match(VIEW, /bookLabel\(b\.book_id\)\s*\}\}\s*·\s*\{\{ ROLE_CN\[b\.role\] \}\}/)
+})
+
+t('认不出账套时退回 id —— 那才是唯一能区分的东西', () => {
+  assert.match(VIEW, /return b \? b\.name : `#\$\{id\}`/)
+})
+
 console.log(`\n通过 ${pass} / 失败 ${fail}`)
 if (fail) process.exit(1)
