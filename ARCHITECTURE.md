@@ -4669,6 +4669,15 @@ MCP 的错误**不抛异常**，翻成 `isError: true` + `structured_content = {
 
 现有 HTTP 读接口一律不写审计，而外部 agent 批量拉取账套数据在现有审计体系里**完全不可见** —— MCP 读取审计是新增的可观测面，不改既有读接口行为。
 
+### 生产启用状态（2026-10-22）
+
+生产端点 `https://acct.xins.live/api/mcp` 已开通并通过端到端验收：`initialize` → `notifications/initialized`（202）→ `tools/list`（十个工具）→ `list_books` / `list_periods` 真实取数。
+
+- **后端不用配**：`MCP_ENABLED` 默认 true，迁移 `0034_mcp_token` 已应用，生产 `.env` **一条 `MCP_*` 都没有**，全走默认。`MCP_ALLOWED_HOSTS` 留空 = 传输层不校验 Host 头（令牌闸门仍在；开这层防护要设 `acct.xins.live,acct.xins.live:*` 并重启 `cwq-api`，配错的表现是请求被挡在传输层 400/421，**不是** 401）。
+- **nginx 块必须手工同步到宝塔 vhost**：生产站点是宝塔管理的 `/www/server/panel/vhost/nginx/acct.xins.live.conf`，**发布脚本不碰它** —— 仓库里 `deploy/nginx/cwq.conf` 那份是 `/opt/cwq` 布局用的，`deploy/nginx/acct.xins.live.conf` 才是生产形态的模板。同步时**不要照抄 `cwq.conf` 里的 `include /etc/nginx/cwq-include/cwq-rl-api*.conf;`**：那个目录只在 `/opt/cwq` 维护机布局下存在，生产没有，照抄过去 `nginx -t` 直接失败（§11.7.6 同一个坑的另一面）。生产当前生效的是手工插入的同名块，备份在 `acct.xins.live.conf.bak.20261022-093056-pre-mcp`。
+- **令牌落在只读专用账号上**：账号 `mcp_agent`（id=6，口令随机生成、从不使用）只授权账套 3「物业」一个，角色 `VIEWER`（`sys_user_book` 的角色白名单是 `OWNER` / `ACCOUNTANT` / `VIEWER`，**只有 `VIEWER` 是只读**）。令牌明文只在签发那一次响应里返回一次，服务器侧落在 `/root/cwq-mcp-token.txt`（600，root only），本机落在 `~/.cwq/mcp-token.txt` 与 `~/.cwq/mcp-client-config.json`（均 600，后者可直接贴进 MCP client）。
+- **改完怎么验**：`/root/cwq-mcp-verify.py`（700）跑一遍完整握手 + 真实工具调用，走**公网 URL** —— 它同时验了三件事：令牌有效、nginx 的 SSE 没被缓冲（`initialize` 回包是 `text/event-stream`）、账套授权范围只有那一个账套。
+
 ## 12. 测试策略
 
 | 文件 | 覆盖 |
