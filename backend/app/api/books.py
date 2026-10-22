@@ -11,6 +11,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.accounting import periods as svc
+from app.accounting.book_deletion import (DELETION_NAME, TRIGGER_RENAME, delete_book,
+                                          is_deletion_name)
 from app.accounting.initialization import (OPENINGS_SOURCE_IMPORT, blocked_reason,
                                            init_state, init_states, mark_openings_ready,
                                            mark_subjects_ready)
@@ -140,6 +142,12 @@ def create_book(payload: BookIn, user: SysUser = Depends(get_current_user), db: 
     )
     if exists:
         raise HTTPException(400, f"账套「{payload.company_name} · {payload.name}」已存在")
+
+    # 「删除」是保留名 —— 它是「改名即删账」那条路径的触发词
+    # （见 ``accounting/book_deletion.py``）。建账时就不让用它，
+    # 这个名字才不会同时是「一本真账的名字」和「删账的信号」。
+    if is_deletion_name(payload.name):
+        raise HTTPException(400, f"账套名「{DELETION_NAME}」是保留名，请换一个名字")
 
     book = Book(company_name=payload.company_name, name=payload.name,
                 start_year=payload.start_year, start_month=payload.start_month,
@@ -366,6 +374,40 @@ def skip_openings(
     return {"ok": True, "changed": changed, "init": init_state(db, book, resolved)}
 
 
+def _delete_by_rename(book: Book, db: Session, link: UserBook, user: SysUser) -> dict:
+    """账套只剩一个授权用户、那个人就是当前用户 —— 改名成「删除」等于删掉这本账。
+
+    **门禁是「你是不是唯一授权人」，不是「你是不是 OWNER」。**
+    账套只有一个授权人时，那个角色通常就是 OWNER；但也可能管理员把一本账
+    只留给了某个会计（OWNER 离职、账转交）。两种情况下这个人都是这本账
+    唯一能管的人 —— 拦住他，账套就成了没人能删的孤儿。
+    （只读账号连这一步都到不了：``require_book_write`` 先把它挡了。）
+
+    **为什么这条路要存在。** 管理员收回最后一份授权是**管理员**的动作，
+    可账套常常是使用者自己的（他自己建的账）；等他去找管理员、说明白
+    「这本账不要了」，中间还夹着一次口头沟通。而「把账套改名成『删除』」
+    是他本来就会做的动作（改个名）—— 名字成了那个信号。
+
+    界面上**不提示**这条路：没有按钮，没有文案，
+    只有真去改这个名字的人会撞上它。
+    """
+    grants = db.scalars(select(UserBook).where(UserBook.book_id == book.id)).all()
+    if len(grants) != 1 or grants[0].user_id != user.id:
+        # 不是唯一授权人 → 不删。
+        # 话只说「这个账套还有别人」，**不解释**这套机制 ——
+        # 机制不外露是这套设计的要求。
+        if normalize_role(link.role) != "OWNER":
+            raise HTTPException(403, "只有账套所有者可以修改账套名和单位名")
+        if not grants:
+            raise HTTPException(409, "这个账套的授权状态已经变了，请刷新后重试")
+        raise HTTPException(
+            409, f"这个账套还有 {len(grants)} 个授权用户，不能改名。")
+    result = delete_book(db, book, user, trigger=TRIGGER_RENAME)
+    db.commit()
+    return {"id": result["id"], "company_name": result["company_name"],
+            "name": result["name"], "deleted": True}
+
+
 @router.put("/{book_id}")
 def update_book(book_id: int, payload: BookEditIn, book: Book = Depends(get_my_book),
                 db: Session = Depends(get_db), link: UserBook = Depends(get_book_link),
@@ -379,10 +421,16 @@ def update_book(book_id: int, payload: BookEditIn, book: Book = Depends(get_my_b
     额外挂 ``require_book_write`` 是为了让「每个写接口都挂写依赖」成为**机械可查**
     的不变量（tests/test_viewer_matrix.py 遍历路由表检查），而不是靠人记得。
     它比下面的 OWNER 判断更宽松，叠加不会改变实际口径，只是把基础那道门先关上。
+
+    **「删除」是保留名**：账套只剩一个授权用户时，把名字改成「删除」
+    等于删掉这本账。那一支**不走** OWNER 判定，走自己的门禁
+    （见 :func:`_delete_by_rename`）。
     """
+    changes = payload.changes()
+    if "name" in changes and is_deletion_name(changes["name"]):
+        return _delete_by_rename(book, db, link, user)
     if normalize_role(link.role) != "OWNER":
         raise HTTPException(403, "只有账套所有者可以修改账套名和单位名")
-    changes = payload.changes()
     if not changes:
         return {"id": book.id, "company_name": book.company_name, "name": book.name}
     dup = db.scalar(

@@ -448,10 +448,18 @@ async function openEdit(row) {
 async function submitEdit() {
   saving.value = true
   try {
-    await api.updateBook(editTarget.value.id, { ...editForm })
+    const res = await api.updateBook(editTarget.value.id, { ...editForm })
     await store.loadBooks()
     editVisible.value = false
-    ElMessage.success('已保存')
+    // 账套名改成「删除」时，**账套本身没了** —— 不是改了个名。
+    // 那时磁贴会从列表里消失，提示一句「账套已删除」，
+    // 不解释这套机制：界面上没有删除按钮，也没有「改名即删除」的说明，
+    // 只有真去改这个名字的人会撞上它。
+    if (res && res.deleted) {
+      ElMessage.success('账套已删除')
+    } else {
+      ElMessage.success('已保存')
+    }
   } catch (e) {
     ElMessage.error(e?.response?.data?.detail || '保存失败')
   } finally {

@@ -23,6 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.accounting.audit_helper import log
+from app.accounting.book_deletion import TRIGGER_REVOKE, purge_unowned_books
 from app.backup import config as backup_config
 from app.backup import oss_client
 from app.backup import service as backup_service
@@ -460,6 +461,16 @@ def set_books(user_id: int, books: list[BookLinkIn], user: SysUser = Depends(get
             detail=what,
             before={"user": target.username, "role": old_role},
             after={"user": target.username, "role": new_role})
+    # **收回最后一份授权的账套，随这次变更一并删掉。**
+    #
+    # 一个授权用户都没有的账套，谁也打不开、谁也删不了，只能烂在库里 ——
+    # 而它是**曾经有过**一本账（凭证、期初、导出过的报表）。留着它，
+    # 账面上的历史数据和界面上能看到的账套列表就对不上了。
+    #
+    # 与授权变更在**同一个事务**里：删不掉就整体回滚，
+    # 不会出现「授权已经收了、账套还在」的中间态。
+    purge_unowned_books(db, user, [int(b) for b in set(before) - set(after)],
+                         trigger=TRIGGER_REVOKE)
     db.commit()
     return _serialize(target, {b.book_id: b.role for b in books})
 
@@ -498,6 +509,12 @@ def delete_user(user_id: int, user: SysUser = Depends(get_current_user),
     log(db, action="DELETE_USER", entity="user", entity_id=user_id, user=user,
         detail=f"删除用户 {target.username}", before=before)
     db.delete(target)
+    # 这个人一删，他名下每个账套的授权也一并没了（sys_user_book 随用户级联）。
+    # 「这个账套一个授权用户都没有了」这个事实要到这时候才成立 ——
+    # 所以清理必须排在 delete 之后、commit 之前，与删用户在同一事务里。
+    db.flush()
+    purge_unowned_books(db, user, [int(b) for b in before["books"]],
+                        trigger=TRIGGER_REVOKE)
     db.commit()
     return {"ok": True}
 
