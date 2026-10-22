@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import io
+import re
+import zipfile
 from decimal import Decimal
 
 import pytest
@@ -518,3 +520,93 @@ def test_期初余额表导出后还能被解析回来():
         f"往返导回来对不上：{got}")
     # 抬头行没被当成数据读进来（以前 A1 是单位名，删掉后 A1 是标题行）
     assert result["header_row"] == 3, result["header_row"]
+
+
+# ===================================================================== 合并区的框线
+#
+# 用友式表头是两行：「年份」横跨「月+日」（合并区 A4:B4），其余六列
+# （凭证号数/摘要/借方/贷方/方向/余额）纵向合并（C4:C5 … H4:H5）。
+#
+# Excel 画合并格的边线时，不是「把锚点那一格的框放大」，而是按合并区里
+# **每个格子各自的边框**拼出来：顶行取上边、底行取下边、左列取左边、
+# 右列取右边（openpyxl 自己的 ``MergedCellRange.format`` 写的也是这条）。
+#
+# 而 openpyxl 写文件时，一个格子**既没有值也没有样式，整个 ``<c>`` 元素
+# 都不写** —— 合并区里除了锚点以外的格子正是这种情形，除非显式给样式。
+# 少了那个格子，它负责的那一段边线就没人画：表头上面少一截横线、纵向
+# 合并的表头下面少一整条横线（用户 2026-10-22 报的现象）。
+#
+# 注意：**不能**用 ``load_workbook`` 读回来断言 —— openpyxl 的读取端会调
+# ``_clean_merge_range``，在内存里把边框「补齐」，缺陷就被读端抹平了。
+# 这个测试必须直接看**文件里到底写没写那个格子**。
+
+def _raw_sheet_xml(data: bytes, index: int = 0) -> str:
+    """读工作表原始 XML（不经 openpyxl 的读取端，缺陷才看得见）。"""
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        names = sorted(n for n in z.namelist()
+                       if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"))
+        return z.read(names[index]).decode("utf-8")
+
+
+def _cell_style_index(xml: str, coord: str) -> int | None:
+    """取某个格子在文件里的样式索引（``<c r="A1" s="3" …>`` 的 s）。"""
+    m = re.search(r'<c r="%s"(?:\s+s="(\d+)")?' % coord, xml)
+    return int(m.group(1)) if (m and m.group(1) is not None) else (
+        0 if m else None)
+
+
+def _border_sides(data: bytes, index: int, coord: str) -> dict[str, str | None]:
+    """取某个格子在**文件里**四条边的线型（没有线就是 None）。"""
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        sheet = z.read(sorted(n for n in z.namelist()
+                              if n.startswith("xl/worksheets/sheet")
+                              and n.endswith(".xml"))[index]).decode("utf-8")
+        styles = z.read("xl/styles.xml").decode("utf-8")
+    style_id = _cell_style_index(sheet, coord)
+    if style_id is None:
+        return {}
+    xf = re.findall(r"<xf [^>]*/>|<xf .*?</xf>", styles.split("<cellXfs")[1])
+    border_id = int(re.search(r'borderId="(\d+)"', xf[style_id]).group(1))
+    borders = re.findall(r"<border[ >].*?</border>", styles.split("<borders")[1].split("</borders>")[0])
+    border = borders[border_id]
+    sides = {}
+    for side in ("left", "right", "top", "bottom"):
+        m = re.search(r"<%s style=\"([^\"]+)\"" % side, border)
+        sides[side] = m.group(1) if m else None
+    return sides
+
+
+def _ledger_payload() -> dict:
+    return {"from_period": "2026-01", "to_period": "2026-01",
+            "subjects": [{"code": "1001", "name": "库存现金",
+                          "rows": [{"period": "2026-01", "month": "01", "day": "05",
+                                    "voucher_no": "记0001", "summary": "收现",
+                                    "debit": "100", "credit": "0",
+                                    "direction": "借", "balance": "100"}]}]}
+
+
+@pytest.mark.parametrize("导出", ["总账", "明细账"])
+def test_合并区里的框线写进了文件(导出):
+    """表头两行的合并区，每一个格子都要在文件里显式存在。
+
+    少一个格子就少一段框线 —— 这次是「2026年」上面少一截横线、纵向合并
+    的表头下面少一整条横线。
+    """
+    payload = _ledger_payload()
+    data = (general_ledger_excel(payload, book_name="乙") if 导出 == "总账"
+            else detail_ledger_excel(payload, book_name="乙"))
+    xml = _raw_sheet_xml(data)
+
+    # A4:B4 —— 年份横跨月+日。B4 不是锚点，但顶行要给上边、右列要给右边。
+    assert '<c r="B4"' in xml, f"{导出}：合并区 A4:B4 的 B4 没有写进文件"
+    sides = _border_sides(data, 0, "B4")
+    assert sides.get("top") == "thin", f"{导出}：B4 缺上边（合并区顶行）→ {sides}"
+    assert sides.get("right") == "thin", f"{导出}：B4 缺右边（合并区右列）→ {sides}"
+
+    # C4:C5 … H4:H5 —— 其余六列纵向合并。第 5 行是合并区的底行，要给下边。
+    for col in "CDEFGH":
+        coord = f"{col}5"
+        assert f'<c r="{coord}"' in xml, f"{导出}：合并区 {col}4:{col}5 的 {coord} 没有写进文件"
+        sides = _border_sides(data, 0, coord)
+        assert sides.get("bottom") == "thin", \
+            f"{导出}：{coord} 缺下边（合并区底行）→ {sides}"

@@ -90,6 +90,50 @@ FONT_CELL = Font(name="宋体", size=10)
 FONT_CELL_BOLD = Font(name="宋体", size=10, bold=True)
 
 
+def _propagate_merged_borders(ws) -> None:
+    """把合并区的框线补到合并区外圈的**每一段边**上。
+
+    Excel 画合并格时，边线不是「把锚点那一格的框放大到整个合并区」，而是按
+    合并区里**每个格子各自的边框**拼出来的：顶行取上边、底行取下边、左列取
+    左边、右列取右边。openpyxl 自己的 ``MergedCellRange.format`` 写的也是
+    这条规则。
+
+    而 openpyxl 写文件时，一个格子**既没有值也没有样式，整个 ``<c>`` 元素
+    都不写** —— 合并区里除了锚点以外的格子正是这种情形，除非显式给它们样式。
+    少了那个格子，它负责的那一段边线就没人画，纸上就少一截框线。
+
+    用友式表头就是踩在这个坑上：``merge_cells`` 是在给框线**之前**调用的，
+    锚点当时还没有边框，openpyxl 补边线那一步补了个空；后来补上的框线只有
+    锚点有。于是
+
+      * 「2026年」上面少一截横线（合并区 A4:B4，B4 不在文件里）；
+      * 纵向合并的表头（凭证号数/摘要/借方/贷方/方向/余额）下面少一整条
+        横线（合并区 C4:C5 … H4:H5，C5…H5 不在文件里）。
+
+    所以这里在建完表之后统一走一遍：按边把锚点的框线写到合并区外围的格子
+    上，让每一段边线都在文件里显式存在。没有框线的合并区（标题、页脚）
+    原样跳过 —— 那种合并区不画线，写进去只是给文件加一串空格子。
+    """
+    for rng in list(ws.merged_cells.ranges):
+        anchor_cell = ws.cell(row=rng.min_row, column=rng.min_col)
+        src = anchor_cell.border
+        if not any(getattr(src, name).style
+                   for name in ("left", "right", "top", "bottom")):
+            continue  # 锚点没有框线 → 这个合并区本来就不画线
+        for row in range(rng.min_row, rng.max_row + 1):
+            for col in range(rng.min_col, rng.max_col + 1):
+                if row == rng.min_row and col == rng.min_col:
+                    continue  # 锚点自己已经是完整的框
+                cell = ws.cell(row=row, column=col)
+                cur = cell.border
+                cell.border = Border(
+                    left=src.left if col == rng.min_col else cur.left,
+                    right=src.right if col == rng.max_col else cur.right,
+                    top=src.top if row == rng.min_row else cur.top,
+                    bottom=src.bottom if row == rng.max_row else cur.bottom,
+                )
+
+
 def _num(v) -> Optional[float]:
     """金额列写进单元格的形态。
 
@@ -447,6 +491,10 @@ def _ledger_book_sheet(
     ws.merge_cells(start_row=r, start_column=5, end_row=r, end_column=6)
     ws.cell(row=r, column=7, value=_text(f"打印日期: {print_date}")).alignment = RIGHT
     ws.merge_cells(start_row=r, start_column=7, end_row=r, end_column=8)
+
+    # 合并区的框线要在**所有框线都定下来之后**才补：表头那两行是先
+    # ``merge_cells`` 再给框线的，补早了补的是空气（见 ``_propagate_merged_borders``）。
+    _propagate_merged_borders(ws)
 
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A6"
