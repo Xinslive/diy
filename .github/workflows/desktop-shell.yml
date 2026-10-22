@@ -1,0 +1,182 @@
+# ===========================================================================
+# 桌面壳（tools/desktop-shell/）的 CI。
+#
+# **为什么单独一个 workflow，而不是在 ci.yml 里加个 job。**
+#
+# ci.yml 是「工程基线 CI」：后端全量 pytest、前端测试、镜像构建、发布脚本
+# 沙箱演练。它全部跑在 ubuntu 上。而桌面壳的产物是 **Windows exe**，
+# 只有在 windows-latest 上才打得出、才跑得动 —— 把它塞进 ci.yml 会让那套
+# 「全在 Linux 上跑」的基线出现一个异类 job。所以另起一个 workflow，
+# 各管各的。
+#
+# ---------------------------------------------------------------------------
+# 两道闸，以及它们各自在防什么
+# ---------------------------------------------------------------------------
+#
+# **闸 1：单元测试（ubuntu）**
+#     测的是平台无关的纯逻辑：路径展开、浏览器发现、参数拼装、URL 校验、
+#     配置解析、启动计划。跑在 Linux 上 —— 这样「改代码 → 看到红」只要
+#     几十秒，不用等 Windows runner 排队。逻辑本身与平台无关，所以
+#     Linux 上测出来的结论对 Windows 同样成立（真正依赖 Windows 的那部分
+#     由闸 2 覆盖）。
+#
+# **闸 2：Windows 构建 + 真跑 exe（windows-latest）**
+#     这道闸在防一件单元测试**根本测不出来**的事：PyInstaller 的失败方式
+#     很安静 —— 它不报错，它产出一个「双击没反应」的 exe。
+#
+#     所以这里不是「编译通过就算绿」，而是**把 exe 真跑起来**，
+#     用 --dry-run 让它把「打算怎么做」写成 JSON，再逐条断言：
+#       · exe 是个真的 PE（MZ 头）
+#       · 退出码 0、JSON 可解析
+#       · 目标地址是 acct.xins.live
+#       · 应用模式下参数里有 --app= 与 --user-data-dir=
+#       · --no-app-mode 退回默认浏览器且参数为空
+#       · --browser 显式指定时走自定义分支
+#       · profile 目录是绝对路径
+#       · 非 http/https 的地址被拒（退出码 2）
+#     断言逻辑写在 tools/desktop-shell/smoke_test.py 里，可以本地手动跑。
+#
+# ---------------------------------------------------------------------------
+# action 一律 pin 到 commit SHA
+# ---------------------------------------------------------------------------
+# 与 ci.yml 同一条规矩。标签（@v4）指向可变引用：仓库可以把 v4 重新指向
+# 另一个 commit，于是「昨天还干净的 action」今天就能跑完全不同的代码 ——
+# 而流水线里跑的是有 token 权限的代码。pin 住 SHA 之后那段代码就冻结了。
+# 括号里是 pin 住的版本号，升级时对照。
+# ===========================================================================
+
+name: Desktop Shell
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# 取消同一个 ref 上上一轮的旧运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------ 单元测试
+  test:
+    name: 壳的单元测试
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          # 3.11 —— 与 backend/Dockerfile、ci.yml 的 backend job、systemd
+          # 生产环境一致。壳本身只用标准库，理论上任何版本都行，但把版本
+          # 钉死是为了让「本地跑的」和「CI 跑的」是同一个东西。
+          python-version: '3.11'
+
+      - name: 跑单元测试
+        # 用 unittest 而不是 pytest：壳是零依赖工具，测试也不该拖上一个
+        # pytest。`python -m unittest` 就能跑；pytest 同样能收 unittest 的
+        # 用例，所以本仓库那套 pytest 也跑得动它。
+        run: |
+          set -euo pipefail
+          python -m unittest discover \
+            -s tools/desktop-shell/tests \
+            -t tools/desktop-shell/tests \
+            -v
+
+  # ------------------------------------------------------------------ Windows 构建
+  build-windows:
+    name: 构建 Windows exe
+    runs-on: windows-latest
+    needs: [test]
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: 装打包依赖（定版）
+        # 按 requirements-build.txt 定版装 PyInstaller。不用 >= ：PyInstaller
+        # 的打包行为在次版本之间会变（hidden import 推断、spec 语义、
+        # bootloader 都可能动），用 >= 等于「今天打的包」和「下个月打的包」
+        # 可能不是一回事。
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tools/desktop-shell/requirements-build.txt
+          python -m PyInstaller --version
+
+      - name: 生成图标
+        # 纯标准库生成，不需要 Pillow。产物也一并提交（生成物入库，
+        # 这样本地没装 Python 也能直接拿去打包）。
+        run: python tools/desktop-shell/make_icon.py tools/desktop-shell/shell.ico
+
+      - name: 打包 exe
+        # --distpath / --workpath 显式给死：不显式给的话它们相对于**当前
+        # 工作目录**，「在仓库根跑」和「在脚本目录跑」会产出到不同地方，
+        # 而下游（冒烟验证、产物上传）都指望产物在固定位置。
+        run: |
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --distpath tools/desktop-shell/dist `
+            --workpath tools/desktop-shell/build `
+            tools/desktop-shell/launcher.spec
+
+      - name: 冒烟验证（真跑一次 exe）
+        # 这步是整个 workflow 的重点。**编译通过不算绿** —— 必须把 exe
+        # 跑起来，让它把「打算怎么做」写成 JSON，再逐条断言。
+        # 断言逻辑在 tools/desktop-shell/smoke_test.py，本地也能手动跑。
+        run: |
+          python tools/desktop-shell/smoke_test.py tools/desktop-shell/dist/CWQ.exe
+
+      - name: 上传 exe 产物
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cwq-desktop-shell-exe
+          path: tools/desktop-shell/dist/CWQ.exe
+          retention-days: 30
+          # 产物没生成出来就不许「成功」—— 这是把「静默失败」挡在闸外的一道。
+          if-no-files-found: error
+
+      # ---------------------------------------------------------------- 安装包
+      #
+      # **这一步是软失败（continue-on-error）。**
+      #
+      # Inno Setup 在 GitHub runner 上要靠 chocolatey 装，而 chocolatey 的包
+      # 版本会漂 —— 那是**环境**的问题，不是代码的问题。让一个外部源的抖动
+      # 把整条流水线染红，会让人开始习惯性地忽略红色，那比红着更糟。
+      #
+      # 真正的主产物（exe）已经在上一步上传了，而且那一步是硬闸。
+      # 安装包出不来时，exe 照样能拿去用。
+      - name: 装 Inno Setup
+        continue-on-error: true
+        run: |
+          choco install innosetup --no-progress -y --limit-output
+          $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*" -Recurse -Filter ISCC.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) { $iscc = Get-ChildItem "${env:ProgramFiles}\Inno Setup*" -Recurse -Filter ISCC.exe -ErrorAction SilentlyContinue | Select-Object -First 1 }
+          if (-not $iscc) { Write-Output "ISCC.exe 没找到"; exit 1 }
+          $iscc.FullName | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "ISCC: $($iscc.FullName)"
+
+      - name: 编译安装包
+        continue-on-error: true
+        run: |
+          & $env:ISCC "tools/desktop-shell/installer.iss"
+
+      - name: 上传安装包产物
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cwq-desktop-shell-installer
+          path: dist-installer/CWQ-Setup.exe
+          retention-days: 30
+          if-no-files-found: warn
