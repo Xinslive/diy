@@ -162,5 +162,12 @@ export function canCreatePrivateTemplate(ctx = {}) {
  */
 export function showBuiltinTemplate(scope, templates = []) {
   if (scope === 'VOUCHER') return templates.length === 0
+  // 账簿（总账 / 明细账）：2026-10-22 起各有一份**基线模板**（用户自己在
+  // 设计器里调出来的那份，已定为内置默认基线）。基线已经承担了「这一范围
+  // 的默认版式」这个角色，再摆一个「内置默认」就是同一件事两种说法 ——
+  // 用户得先分清这两者是什么关系、打印时默认用哪一份。
+  if (scope === 'LEDGER' || scope === 'DETAIL_LEDGER') return templates.length === 0
+  // 科目余额表 / 报表：还没有基线模板，那一项是它们**唯一**的选项 ——
+  // 一并去掉会让这两个范围的设计器直接没有可选项。
   return true
 }

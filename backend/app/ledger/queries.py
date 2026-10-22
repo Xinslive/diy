@@ -107,6 +107,94 @@ def subject_of_book(db: Session, book_id: int, subject_id: int,
     return subject
 
 
+def _detail_account_rows(
+    node: Subject,
+    *,
+    opening: Decimal,
+    range_periods: list[Period],
+    entries_by_period: dict[int, list[tuple[Entry, Voucher]]],
+    month_moves: dict[int, tuple[Decimal, Decimal]],
+    ytd_moves: dict[int, tuple[Decimal, Decimal]],
+    is_leaf: bool,
+    from_period: Period,
+    full_year: bool = False,
+) -> list[dict]:
+    """**一个科目的明细账行**：期初 + 逐笔 + 本月合计 + 累计。
+
+    屏幕（``detail_ledger``）与账簿成册（``detail_ledger_book``）共用这一份。
+    余额方向、逐月合计、累计的口径只有这一处实现 —— 两处各写一遍，
+    迟早有一处算错，而纸上的账比屏幕上的更难被发现。
+
+    参数都已按**本科目**收窄（键是期间 ord），调用方负责投影。
+    """
+    rows: list[dict] = []
+
+    def account_row(kind: str, period: Period, **values) -> dict:
+        row = {
+            "kind": kind,
+            "subject_id": node.id,
+            "subject_code": node.code,
+            "subject_name": node.name,
+            "subject_level": node.level,
+            "voucher_no": "",
+            "voucher_date": None,
+            "period": f"{period.year}-{period.month:02d}",
+            "summary": "",
+            "debit": ZERO,
+            "credit": ZERO,
+            "direction": "平",
+            "balance": None,
+        }
+        row.update(values)
+        return row
+
+    running = opening
+    side, amount = display_side(node, running)
+    rows.append(account_row(
+        "OPENING", from_period,
+        voucher_no="期初余额", summary="期初余额", direction=side, balance=amount))
+
+    for period in range_periods:
+        if is_leaf:
+            for entry, voucher in entries_by_period.get(period.ord, []):
+                debit = entry.amount if entry.direction == "DEBIT" else ZERO
+                credit = entry.amount if entry.direction == "CREDIT" else ZERO
+                running += debit - credit
+                side, amount = display_side(node, running)
+                rows.append(account_row(
+                    "ENTRY", period,
+                    voucher_id=voucher.id,
+                    voucher_no=voucher.voucher_no,
+                    voucher_date=voucher.voucher_date.isoformat(),
+                    summary=entry.summary,
+                    debit=debit,
+                    credit=credit,
+                    direction=side,
+                    balance=amount,
+                    status=voucher.status,
+                ))
+
+        month_debit, month_credit = month_moves.get(period.ord, (ZERO, ZERO))
+        ytd_debit, ytd_credit = ytd_moves.get(period.ord, (ZERO, ZERO))
+        if not is_leaf:
+            # 父级本身没有分录，它的余额按**下级汇总的发生额**推进。
+            running += month_debit - month_credit
+        balance_side, balance_amount = display_side(node, running)
+        rows.append(account_row(
+            "MONTH_TOTAL", period, summary="本月合计",
+            debit=month_debit, credit=month_credit,
+            direction=balance_side, balance=balance_amount))
+        # 累计行的标签与总账**同一套规则**：整年打印时 12 月那行写「本年累计」，
+        # 其余写「累　　计」（两个字之间是**两个全角空格** U+3000，用友一律
+        # 按四字宽排版，普通空格只有半字宽，与样张并排看就是两个字的距离）。
+        rows.append(account_row(
+            "YTD_TOTAL", period,
+            summary="本年累计" if (full_year and period.month == 12) else "累　　计",
+            debit=ytd_debit, credit=ytd_credit,
+            direction=balance_side, balance=balance_amount))
+    return rows
+
+
 def detail_ledger(
     db: Session,
     book_id: int,
@@ -129,6 +217,10 @@ def detail_ledger(
     range_periods = [p for p in periods if from_period.ord <= p.ord <= to_period.ord]
     if not range_periods:
         raise HTTPException(400, "所选期间范围内没有会计期间")
+    # 整年 = 一个完整会计年度。整年时 12 月那条累计行写「本年累计」，
+    # 其余写「累　　计」—— 与总账同一套规则（见 _detail_account_rows）。
+    full_year = (range_periods[0].year == range_periods[-1].year
+                 and range_periods[0].month == 1 and range_periods[-1].month == 12)
     first_period_by_year: dict[int, Period] = {}
     for period in periods:
         first_period_by_year.setdefault(period.year, period)
@@ -279,72 +371,27 @@ def detail_ledger(
     rows: list[dict] = []
     subject_by_id = by_id
 
-    def account_row(kind: str, node: Subject, period: Period, **values) -> dict:
-        row = {
-            "kind": kind,
-            "subject_id": node.id,
-            "subject_code": node.code,
-            "subject_name": node.name,
-            "subject_level": node.level,
-            "voucher_no": "",
-            "voucher_date": None,
-            "period": f"{period.year}-{period.month:02d}",
-            "summary": "",
-            "debit": ZERO,
-            "credit": ZERO,
-            "direction": "平",
-            "balance": None,
-        }
-        row.update(values)
-        return row
-
     def append_account(node_id: int) -> None:
         node = subject_by_id[node_id]
         node_children = branch_order.get(node_id, [])
-        is_leaf = not node_children
-        running = opening_by_node.get(node_id, ZERO)
-        side, amount = display_side(node, running)
-        rows.append(account_row(
-            "OPENING", node, from_period,
-            voucher_no="期初余额", summary="期初余额", direction=side, balance=amount,
+        rows.extend(_detail_account_rows(
+            node,
+            opening=opening_by_node.get(node_id, ZERO),
+            range_periods=range_periods,
+            entries_by_period={
+                p.ord: entries_by_leaf_period.get((node_id, p.ord), [])
+                for p in range_periods
+            },
+            month_moves={
+                p.ord: tuple(monthly_moves[(node_id, p.ord)]) for p in range_periods
+            },
+            ytd_moves={
+                p.ord: ytd_moves[(node_id, p.ord)] for p in range_periods
+            },
+            is_leaf=not node_children,
+            from_period=from_period,
+            full_year=full_year,
         ))
-
-        for period in range_periods:
-            if is_leaf:
-                for entry, voucher in entries_by_leaf_period.get((node_id, period.ord), []):
-                    debit = entry.amount if entry.direction == "DEBIT" else ZERO
-                    credit = entry.amount if entry.direction == "CREDIT" else ZERO
-                    running += debit - credit
-                    side, amount = display_side(node, running)
-                    rows.append(account_row(
-                        "ENTRY", node, period,
-                        voucher_id=voucher.id,
-                        voucher_no=voucher.voucher_no,
-                        voucher_date=voucher.voucher_date.isoformat(),
-                        summary=entry.summary,
-                        debit=debit,
-                        credit=credit,
-                        direction=side,
-                        balance=amount,
-                        status=voucher.status,
-                    ))
-
-            month_debit, month_credit = monthly_moves[(node_id, period.ord)]
-            ytd_debit, ytd_credit = ytd_moves[(node_id, period.ord)]
-            if not is_leaf:
-                running += month_debit - month_credit
-            balance_side, balance_amount = display_side(node, running)
-            rows.append(account_row(
-                "MONTH_TOTAL", node, period,
-                summary="本月合计", debit=month_debit, credit=month_credit,
-                direction=balance_side, balance=balance_amount,
-            ))
-            rows.append(account_row(
-                "YTD_TOTAL", node, period,
-                summary="累计", debit=ytd_debit, credit=ytd_credit,
-                direction=balance_side, balance=balance_amount,
-            ))
-
         for child in node_children:
             append_account(child.id)
 
@@ -370,6 +417,262 @@ def detail_ledger(
     }
 
 
+# --------------------------------------------------------------------- 明细账（用友式成册）
+
+
+def detail_ledger_groups(
+    db: Session,
+    book_id: int,
+    year: int,
+    *,
+    subject_id: int | None = None,
+    from_subject_id: int | None = None,
+    to_subject_id: int | None = None,
+) -> list[dict]:
+    """明细账的**册页单位**：``[{subject, leaves, comprehensive}, ...]``。
+
+    明细账与总账的**册页单位一样是一级科目**（用户 2026-10-22 批注 3：
+    「明细账的这个同理，改成一级科目」）。
+
+    以前是末级科目：几百个末级科目各占一份，页眉翻过去全是「某某明细账」，
+    与总账的册页结构对不上。现在一个一级科目一份：
+
+    * 一级科目本身就是末级（1001 库存现金）→ 就是它自己那份明细。
+    * 一级科目下面有下级（1101 短期投资）→ 那一份是**综合明细账**：
+      下级科目按科目表顺序一块块排下来，每块首行写「编码 名称 期初余额」。
+
+    * **不给科目** —— 全账套的一级科目，逐个成册（用友明细账的做法）。
+    * **给了科目** —— 那一个科目就是一份：末级就它自己；父级则它下面那几个
+      （可用起止科目再框一段，语义与屏幕上的「子科目范围」一致）。
+
+    ``comprehensive`` 说的是「这一份里有没有下级科目」—— 有的话，各下级科目
+    的期初行要写上「编码 名称」，否则纸上分不清哪几行属于哪个下级。
+    """
+    tree = subject_tree(db, book_id, year)
+    children: dict[int, list[Subject]] = defaultdict(list)
+    for s in tree:
+        if s.parent_id:
+            children[s.parent_id].append(s)
+    for siblings in children.values():
+        siblings.sort(key=lambda s: (s.sort_no, s.code))
+
+    def leaves_of(node: Subject) -> list[Subject]:
+        out: list[Subject] = []
+
+        def walk(n: Subject) -> None:
+            kids = children.get(n.id, [])
+            if not kids:
+                out.append(n)
+                return
+            for kid in kids:
+                walk(kid)
+
+        walk(node)
+        return out
+
+    if subject_id:
+        root = subject_of_book(db, book_id, subject_id, year=year)
+        kids = children.get(root.id, [])
+        if not kids:
+            return [{"subject": root, "leaves": [root], "comprehensive": False}]
+        start = (subject_of_book(db, book_id, from_subject_id, year=year)
+                 if from_subject_id else kids[0])
+        end = (subject_of_book(db, book_id, to_subject_id, year=year)
+               if to_subject_id else kids[-1])
+        if start.parent_id != root.id or end.parent_id != root.id:
+            raise HTTPException(400, "起止科目必须是所选父科目的直接下级科目")
+        index = {s.id: i for i, s in enumerate(kids)}
+        if index[start.id] > index[end.id]:
+            raise HTTPException(400, "起始科目不能排在结束科目之后")
+        leaves: list[Subject] = []
+        for branch in kids[index[start.id]:index[end.id] + 1]:
+            leaves.extend(leaves_of(branch))
+        return [{"subject": root, "leaves": leaves, "comprehensive": True}]
+
+    groups: list[dict] = []
+    for s in tree:
+        if s.level != 1:
+            continue
+        kids = children.get(s.id, [])
+        if not kids:
+            groups.append({"subject": s, "leaves": [s], "comprehensive": False})
+        else:
+            groups.append({"subject": s, "leaves": leaves_of(s),
+                           "comprehensive": True})
+    # **册页单位按科目编码排**（见 ``subject_code_order``）：一册账的目录
+    # 按编码排，翻账的人才找得到。下级科目（综合明细账里的那几块）仍按
+    # 科目表顺序 —— 前端「子科目范围」下拉也是那个顺序。
+    groups.sort(key=lambda g: subject_code_order(g["subject"]))
+    return groups
+
+
+def detail_ledger_book(
+    db: Session,
+    book_id: int,
+    groups: list[dict],
+    from_period: Period,
+    to_period: Period,
+    include_unposted: bool = False,
+    *,
+    eng: LedgerEngine | None = None,
+) -> list[dict]:
+    """明细账成册：**一个册页单位一份**，返回 ``[{code, name, rows}, ...]``。
+
+    ``groups`` 是 ``detail_ledger_groups`` 的结果：每个单位一个一级科目
+    （或「仅当前科目」时的那一个科目），底下挂着它要印的末级科目。
+
+    与总账成册同一个思路：**一本账 = 连续的若干个册页单位**，单位之间不插页、
+    不分册，页码由渲染层按单位各自从 1 开始编。
+
+    **取数是一次性的，不是一个科目一次。**
+    科目表每个年度各有一份、跨年区间还要按编码对上（下面 id_to_row 那段），
+    逐个科目调 ``detail_ledger`` 会把「查科目表」「查分录」「算期初」
+    各做 N 遍 —— 一本明细账动辄几百个末级科目，那是几百次全账扫描。
+    这里把科目表、分录、期初各取一次，再按科目切片。
+
+    行本身由 ``_detail_account_rows`` 生成 —— 与屏幕上那本明细账
+    **同一份实现**，余额方向、逐月合计、累计的口径不会分叉。
+    """
+    if from_period.ord > to_period.ord:
+        raise HTTPException(400, "起始期间不能晚于结束期间")
+    if not groups:
+        return []
+
+    # 这一册要印的全部末级科目（各单位合起来，各单位之间不重叠）。
+    leaves: list[Subject] = []
+    for group in groups:
+        leaves.extend(group.get("leaves") or [])
+    if not leaves:
+        return []
+
+    eng = eng or LedgerEngine.for_ledger(db, book_id, include_unposted)
+    periods = eng.periods()
+    range_periods = [p for p in periods if from_period.ord <= p.ord <= to_period.ord]
+    if not range_periods:
+        raise HTTPException(400, "所选期间范围内没有会计期间")
+    full_year = (range_periods[0].year == range_periods[-1].year
+                 and range_periods[0].month == 1 and range_periods[-1].month == 12)
+
+    first_period_by_year: dict[int, Period] = {}
+    for period in periods:
+        first_period_by_year.setdefault(period.year, period)
+
+    # ---- 各年度的科目表按**编码**对上 ---------------------------------
+    #
+    # 科目表每个年度各有一份（迁移 0032）：2026 年的分录挂在 2026 年的
+    # 科目 id 上，2027 年的挂在 2027 年的 id 上，拿错年份的行去查就是
+    # 一段凭空少掉的数。所以按编码把各年度的行对上，再把分录折算到
+    # **止期**那一行（展示与汇总都走止期那张树）。
+    years_in_range = sorted({p.year for p in range_periods})
+    by_code: dict[str, dict[int, Subject]] = {}
+    for y in years_in_range:
+        for s in subject_tree(db, book_id, y):
+            by_code.setdefault(s.code, {})[y] = s
+
+    id_to_row: dict[int, int] = {}       # 任意年度的科目行 -> 止期那一行
+    opening_id_of: dict[int, int] = {}   # 止期那一行 -> 取期初用的那一行
+    query_ids: set[int] = set()
+    first_year = years_in_range[0]
+    for node in leaves:
+        per_year = by_code.get(node.code) or {}
+        row = per_year.get(to_period.year) or node
+        for s in per_year.values():
+            id_to_row[s.id] = row.id
+            query_ids.add(s.id)
+        if first_year in per_year:
+            opening_id_of[row.id] = per_year[first_year].id
+
+    leaf_ids = sorted({id_to_row.get(s.id, s.id) for s in leaves})
+
+    # ---- 期初：引擎一次算完（共用实例，账簿聚合只跑一遍）--------------
+    eng.compute(sorted(query_ids), to_period.ord)
+    opening_by_leaf = {
+        sid: eng.opening(opening_id_of.get(sid, sid), from_period.ord)
+        for sid in leaf_ids
+    }
+
+    # ---- 分录：一次查完，再按科目切片 ---------------------------------
+    earliest_ytd_ord = min(first_period_by_year[p.year].ord for p in range_periods)
+    monthly_moves: dict[tuple[int, int], list[Decimal]] = defaultdict(lambda: [ZERO, ZERO])
+    entries_by_leaf_period: dict[tuple[int, int], list[tuple[Entry, Voucher]]] = defaultdict(list)
+    if query_ids:
+        stmt = (
+            _entry_stmt(book_id, include_unposted)
+            .where(Entry.subject_id.in_(sorted(query_ids)))
+            .where(Entry.period_ord >= earliest_ytd_ord, Entry.period_ord <= to_period.ord)
+            .order_by(Entry.period_ord, Voucher.voucher_date, Voucher.voucher_no, Entry.line_no)
+        )
+        for entry, voucher, _subj in db.execute(stmt).all():
+            debit = entry.amount if entry.direction == "DEBIT" else ZERO
+            credit = entry.amount if entry.direction == "CREDIT" else ZERO
+            entry_id = id_to_row.get(entry.subject_id, entry.subject_id)
+            totals = monthly_moves[(entry_id, entry.period_ord)]
+            totals[0] += debit
+            totals[1] += credit
+            if entry.period_ord >= from_period.ord:
+                entries_by_leaf_period[(entry_id, entry.period_ord)].append((entry, voucher))
+
+    # ---- 累计：每年 1 月归零，逐月累加 -------------------------------
+    ytd_moves: dict[tuple[int, int], tuple[Decimal, Decimal]] = {}
+    ytd_running: dict[int, list[Decimal]] = {}
+    current_year = None
+    for period in periods:
+        if period.ord < earliest_ytd_ord or period.ord > to_period.ord:
+            continue
+        if period.year != current_year:
+            current_year = period.year
+            ytd_running = {sid: [ZERO, ZERO] for sid in leaf_ids}
+        for sid in leaf_ids:
+            month = monthly_moves[(sid, period.ord)]
+            ytd_running[sid][0] += month[0]
+            ytd_running[sid][1] += month[1]
+            if period.ord >= from_period.ord:
+                ytd_moves[(sid, period.ord)] = tuple(ytd_running[sid])
+
+    # ---- 逐末级科目出行 ----------------------------------------------
+    rows_by_leaf: dict[int, list[dict]] = {}
+    for node in leaves:
+        sid = id_to_row.get(node.id, node.id)
+        rows_by_leaf[sid] = _detail_account_rows(
+            node,
+            opening=opening_by_leaf.get(sid, ZERO),
+            range_periods=range_periods,
+            entries_by_period={
+                p.ord: entries_by_leaf_period.get((sid, p.ord), [])
+                for p in range_periods
+            },
+            month_moves={
+                p.ord: tuple(monthly_moves[(sid, p.ord)]) for p in range_periods
+            },
+            ytd_moves={
+                p.ord: ytd_moves.get((sid, p.ord), (ZERO, ZERO)) for p in range_periods
+            },
+            is_leaf=True,
+            from_period=from_period,
+            full_year=full_year,
+        )
+
+    # ---- 按册页单位成册 ----------------------------------------------
+    #
+    # 一个单位 = 一个一级科目（综合的则把它下面几个末级科目排成几块）。
+    # 纸上**没有「科目」列**（用友八列），所以综合明细账里每一块的首行
+    # 要在摘要列写明是哪个下级科目，否则那几十行看不出来属于谁。
+    books: list[dict] = []
+    for group in groups:
+        rows: list[dict] = []
+        for leaf in group.get("leaves") or []:
+            leaf_rows = rows_by_leaf.get(id_to_row.get(leaf.id, leaf.id), [])
+            if not leaf_rows:
+                continue
+            if group.get("comprehensive"):
+                leaf_rows = list(leaf_rows)
+                leaf_rows[0]["summary"] = f"{leaf.code} {leaf.name} 期初余额"
+            rows.extend(leaf_rows)
+        root = group["subject"]
+        books.append({"code": root.code, "name": root.name, "rows": rows})
+    return books
+
+
 # --------------------------------------------------------------------- 总账（用友式）
 
 #: 总账的行型。用友的「总分类账」只有这四种行，没有别的：
@@ -380,16 +683,43 @@ KIND_YTD_TOTAL = "YTD_TOTAL"        # 累计
 KIND_CLOSING = "CLOSING"            # 结转下年
 
 
+def subject_code_order(subject: Subject) -> tuple:
+    """册页单位按**科目编码数字**升序的排序键。
+
+    科目表本身的顺序（``subject_tree`` 的 ``category, code``）是按会计科目表
+    的**分类**排的：资产 → 所有者权益 → 负债 → 损益。照那个顺序打出来的册子，
+    「本年利润(4103)」会排在「应付账款(2202)」前面 —— 翻账的人是**按编码
+    找**的，这个目录看着是乱的（用户 2026-10-22）。
+
+    册页单位是**一册账的目录**，目录按编码排：编码就是这一行账在纸上的地址。
+
+    比较用**数字**而不是字符串：编码是数字串，按字符串比会得出「22」排在
+    「2」前面这种反直觉的结果。非纯数字的编码（自定义科目）排在数字编码
+    之后，按字典序。
+
+    **只用于册页单位（一级科目）这一层**：综合明细账里下级科目的顺序仍是
+    科目表顺序 —— 前端那个「子科目范围」下拉也是按科目表顺序列的，两边
+    必须一致，否则用户在下拉里选的「起始/结束」在后端会被判成倒置。
+    """
+    code = str(subject.code or "")
+    if code.isdigit():
+        return (0, int(code), code)
+    return (1, 0, code)
+
+
 def general_ledger_subjects(db: Session, book_id: int, year: int) -> list[Subject]:
-    """账套的**一级科目**（按科目表顺序）—— 一册总账的科目顺序。
+    """账套的**一级科目**（按科目编码数字升序）—— 一册总账的科目顺序。
 
     用友的「总账」是**总分类账**：一个一级科目一份，把它下面所有明细科目
     的分录汇总进去。所以总账的单位是**一级科目**，不是「一行一个科目」。
 
     以前的总账是「一行一个科目」的余额表形态 —— 那张表就是科目余额表，
     两处重复。现在总账改成用友形态，余额表形态由 ``/ledger/balance`` 承担。
+
+    **顺序按科目编码**（见 ``subject_code_order``），不是科目表的分类顺序。
     """
-    return [s for s in subject_tree(db, book_id, year) if s.level == 1]
+    subjects = [s for s in subject_tree(db, book_id, year) if s.level == 1]
+    return sorted(subjects, key=subject_code_order)
 
 
 def general_ledger(

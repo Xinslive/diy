@@ -135,6 +135,74 @@
             </section>
           </template>
 
+          <!-- ══════════════════════════ 账簿版式 ══════════════════════════
+               总账与明细账的页眉页脚不走通用那套（meta / footer）—— 用友的
+               页眉是「标题 + 右上角账簿信息 + 页号 + 本币名称」，页脚是
+               「核算单位 / 制表 / 打印日期」三段。这几段都在这里设，
+               别的地方不重复摆控件。 -->
+          <section v-if="hasLedgerBook" class="sec" data-field="ledger-book">
+            <h4 class="sec-t">账簿版式</h4>
+            <div class="f1">
+              <div class="fl">
+                <span class="lb">本币名称</span>
+                <el-input v-model="lb.currency_name" size="small" :disabled="ro"
+                          @input="touch" @change="commit" />
+              </div>
+              <div class="fl">
+                <span class="lb">右上角标记</span>
+                <el-input v-model="lb.book_label" size="small" placeholder="留空则不印"
+                          :disabled="ro" @input="touch" @change="commit" />
+              </div>
+              <div class="fl">
+                <span class="lb">科目标题</span>
+                <el-input v-model="lb.subject_caption" size="small" :disabled="ro"
+                          @input="touch" @change="commit" />
+              </div>
+              <div class="fl">
+                <span class="lb">页号格式</span>
+                <el-input v-model="lb.page_label" size="small" :disabled="ro"
+                          @input="touch" @change="commit" />
+              </div>
+              <div class="fl">
+                <span class="lb">页脚左段</span>
+                <el-input v-model="lb.footer_left" size="small" :disabled="ro"
+                          @input="touch" @change="commit" />
+              </div>
+              <div class="fl">
+                <span class="lb">页脚中段</span>
+                <el-input v-model="lb.footer_center" size="small" :disabled="ro"
+                          @input="touch" @change="commit" />
+              </div>
+              <div class="fl">
+                <span class="lb">页脚右段</span>
+                <el-input v-model="lb.footer_right" size="small" :disabled="ro"
+                          @input="touch" @change="commit" />
+              </div>
+              <div class="f">
+                <div class="fl">
+                  <span class="lb">每页行数</span>
+                  <el-input-number v-model="lb.rows_per_page" :min="1" :max="100" :step="1"
+                                   size="small" :controls="false" :disabled="ro" @change="commit" />
+                </div>
+                <div class="fl">
+                  <span class="lb">行高（mm）</span>
+                  <el-input-number v-model="lb.row_height_mm" :min="3" :max="20" :step="0.5"
+                                   size="small" :controls="false" :disabled="ro" @change="commit" />
+                </div>
+              </div>
+              <!-- 「不打印无发生额科目」**不在模板里**：它是**这一次打印**的开关，
+                   住在打印预览弹窗左栏、默认打开（用户 2026-10-22 批注 2）。
+                   模板里再摆一份，同一个设置就有两个地方能改 —— 改了一处、
+                   另一处不动，纸上出来的是旧值。后端 validate_template
+                   也会把老模板里存的那份 skip_empty 清掉。 -->
+            </div>
+            <p class="tip">
+              占位符：<code>{company}</code> 单位、<code>{preparer}</code> 制表人、
+              <code>{print_date}</code> 打印日期、<code>{subject}</code> 科目名、
+              <code>{subject_code}</code> 科目编码、<code>{page}</code>/<code>{pages}</code> 页码。
+            </p>
+          </section>
+
           <section class="sec" data-field="table">
             <h4 class="sec-t">表格</h4>
             <div class="f">
@@ -567,6 +635,17 @@ watch(() => props.isVoucher, (v) => { if (!v && props.activeTab === 'elements') 
 const elements = computed(() => props.tpl.elements || [])
 const cur = computed(() => elements.value.find((e) => e.id === props.selectedId) || null)
 const curIndex = computed(() => elements.value.findIndex((e) => e.id === props.selectedId))
+
+/**
+ * 账簿版式（总账 / 明细账）的那一组配置。
+ *
+ * 模板里有没有 ``ledger_book`` 就是「这是不是账簿范围」的唯一判据 ——
+ * 后端给总账与明细账的默认模板都带它，凭证/余额表/报表都不带，
+ * 而已保存的老模板载入时也会被后端 merge_defaults 补上。
+ */
+const hasLedgerBook = computed(() => !!props.tpl.ledger_book)
+/** 账簿版式的那块配置本身（就地 mutate，不整体替换 tpl）。 */
+const lb = computed(() => props.tpl.ledger_book || {})
 const rowCount = computed(() => {
   const raw = (props.tpl.voucher || {}).rows_per_page
   return Math.max(1, Math.min(5, Number(raw) || 5))

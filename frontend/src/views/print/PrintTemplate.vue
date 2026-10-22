@@ -104,6 +104,9 @@
           <template v-if="scope === 'DETAIL_LEDGER'">
             <label>科目</label>
             <el-select v-model="previewSubjectId" size="small" class="opt" @change="onPreviewSubjectChange">
+              <!-- 0 = 不指定科目 = **整册**（全账套末级科目连续成册）。
+                   单看一个科目更省事，但整册才是正式打印的那一册。 -->
+              <el-option label="全部科目（成册）" :value="0" />
               <el-option v-for="o in subjectOptions" :key="o.id" :label="o.label" :value="o.id" />
             </el-select>
             <template v-if="previewRangeSubjects.length">
@@ -482,12 +485,28 @@ async function loadTemplate(id) {
     ? (await printApi.templateDetail(store.bookId, id)).content
     : clone(meta.value.defaults[scope.value] || EMPTY_TPL)
   tpl.value = clone({ ...clone(EMPTY_TPL), ...base })
+  ensureLedgerBook()
   selectedId.value = null
   activeSlot.value = 0
   normalize()
   migrateVoucherVisibility()
   // 等列宽归一化完再取快照，否则「刚打开就显示未保存」是假警报
   savedSnapshot.value = JSON.stringify(tpl.value)
+}
+
+/**
+ * 账簿范围（总账 / 明细账）一定要有 ``ledger_book`` 那一块 —— 左栏的
+ * 「账簿版式」区靠它存在。
+ *
+ * 后端返回的已保存模板是 merge_defaults 之后的，理论上都有；但万一某份
+ * 模板是别处写进去的（或者默认值那一版还没有这块），左栏就会整片空着，
+ * 用户连「本币名称」「制表」都改不了。补一份兜底。
+ */
+function ensureLedgerBook() {
+  if (scope.value !== 'LEDGER' && scope.value !== 'DETAIL_LEDGER') return
+  if (!tpl.value.ledger_book) {
+    tpl.value.ledger_book = clone(meta.value.defaults?.[scope.value]?.ledger_book || {})
+  }
 }
 
 /**
@@ -538,7 +557,10 @@ async function loadPreviewData() {
     return [item, ...flatten(node.children || [], node.id)]
   })
   subjects.value = flatten(tree)
-  if (!previewSubjectId.value || !subjects.value.some((s) => s.id === previewSubjectId.value)) {
+  // 0 是「整册」这一档，它是合法的预览选择，不能当成「没选」。
+  if (!previewSubjectId.value
+      || (previewSubjectId.value !== 0
+          && !subjects.value.some((s) => s.id === previewSubjectId.value))) {
     previewSubjectId.value = subjects.value.find((s) => s.is_leaf && s.active)?.id || subjects.value[0]?.id || null
   }
   resetPreviewSubjectRange()
@@ -652,9 +674,10 @@ const printTarget = computed(() => {
       return { path: `/books/${b}/print/general-ledger.html`,
                params: { period_id: pid, from_period_id: fromPeriodId.value || undefined } }
     case 'DETAIL_LEDGER':
+      // 科目 0 = 整册（不传 subject_id，后端按全账套末级科目成册）。
       return { path: `/books/${b}/print/detail-ledger.html`,
                params: { period_id: pid, from_period_id: fromPeriodId.value || undefined,
-                 subject_id: previewSubjectId.value,
+                 subject_id: previewSubjectId.value || undefined,
                  from_subject_id: previewRangeSubjects.value.length ? previewFromSubjectId.value : undefined,
                  to_subject_id: previewRangeSubjects.value.length ? previewToSubjectId.value : undefined } }
     case 'BALANCE':

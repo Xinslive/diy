@@ -146,27 +146,40 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
         # **总账是用友式的「总分类账」**：一个一级科目一份，逐月展开。
         # 版式逐格照着用友导出的样张复刻（列宽、行表头、行标签、页眉页脚），
         # 规格见 ``docs/用友总账打印样式规格.md``。
-        "paper": "A4", "orientation": "portrait",
-        "margins": {"top": 12, "right": 10, "bottom": 12, "left": 10},
+        #
+        # **这一份的版式是用户自己在模板设计器里调出来的**（2026-10-22），
+        # 现在定为**内置默认基线**：横向 A4、行高 7mm、左右边距 20mm、
+        # 摘要列占 42%（横向才放得下用友那种长摘要）。代码里的默认值与
+        # 库里的基线行是同一份内容 —— 两边各说各话的话，用户改的是一份、
+        # 印出来的是另一份。
+        "paper": "A4", "orientation": "landscape",
+        "margins": {"top": 12, "right": 20, "bottom": 12, "left": 20},
         # 标题是模板化的：「{subject}总账」—— 用友的标题是「科目名 + 总账」。
         "title": {"text": "{subject}总账", "size": 20, "bold": True, "align": "center"},
+        # 副标题**留空 = 显示期间**（模板里填了别的就印别的）。
+        # 「标题下面显示期间的副标题」是账簿版式的一部分（用户 2026-10-22），
+        # 渲染器见 ``render_ledger_book_page``。
         "subtitle": {"text": "", "size": 11, "align": "center"},
         "font": {"family": "宋体", "size": 10},
         "show": {"period": True, "page_no": True},
-        # 列宽是实测值（占表格宽度百分比）。「方向」列只有 2.9%，
-        # 窄到表头必须竖排 —— 那是用友的固定写法，不是排版失误。
+        # 列宽是实测值（占表格宽度百分比，合计 100）。
+        # 「方向」列窄到表头必须竖排 —— 那是用友的固定写法，不是排版失误。
         "columns": [
-            {"key": "month", "label": "月", "width": 3.6, "align": "center"},
-            {"key": "day", "label": "日", "width": 3.5, "align": "center"},
-            {"key": "voucher_no", "label": "凭证号数", "width": 8.8, "align": "center"},
-            {"key": "summary", "label": "摘 要", "width": 37.1, "align": "left"},
-            {"key": "debit", "label": "借 方", "width": 14.6, "align": "right"},
-            {"key": "credit", "label": "贷 方", "width": 14.7, "align": "right"},
-            {"key": "direction", "label": "方向", "width": 2.9, "align": "center",
+            {"key": "month", "label": "月", "width": 4.32, "align": "center"},
+            {"key": "day", "label": "日", "width": 4.3372, "align": "center"},
+            {"key": "voucher_no", "label": "凭证号数", "width": 8.2147, "align": "center"},
+            {"key": "summary", "label": "摘要", "width": 42.234, "align": "left"},
+            {"key": "debit", "label": "借方", "width": 12.5637, "align": "right"},
+            {"key": "credit", "label": "贷方", "width": 12.6107, "align": "right"},
+            {"key": "direction", "label": "方向", "width": 3.1349, "align": "center",
              "vertical": True},
-            {"key": "balance", "label": "余 额", "width": 14.7, "align": "right"},
+            {"key": "balance", "label": "余额", "width": 12.5848, "align": "right"},
         ],
-        "meta": {},
+        # 账簿页眉不走通用 meta（那是凭证/余额表那一套），这里只留
+        # 「什么都不显示」这一份，与库里那份基线模板一致。
+        "meta": {"company": False, "book": False, "period": False, "voucher_no": False,
+                 "date": False, "attachments": False, "remark": False,
+                 "accountant": False, "checker": False, "cashier": False},
         "footer": {"text": "", "show_page_no": False},
         "body": {"repeat_header": True, "border": True},
         # 用友总账特有的那一组东西。表头/页脚不再走通用的 ``meta``/``footer``
@@ -174,51 +187,94 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
         # 打印日期」三段，与凭证、余额表那套通用页眉页脚不是一回事。
         "ledger_book": {
             # 一页放多少行数据。**26 行 = 一个完整会计年度**
-            # （上年结转 + 12×(本月合计/累计) + 结转下年），正好一页放下，
-            # 与用友样张一致 —— 那张样张就是 26 行数据印在一页上。
+            # （上年结转 + 12×(本月合计/累计) + 结转下年）。
+            #
+            # **这是「想要多少行」，不是「放得下多少行」**：横向 A4 的可印高度
+            # 只有 186mm，26 行 × 7mm 放不下 —— 真正分页时取两者的**小值**
+            # （见 ``ledger_book_rows_per_page``），页码才与纸上对得上。
             "rows_per_page": 26,
             # 行高（mm）。**固定行高**而不是让它随内容长：分页是服务端算的，
             # 行高一变，页数就与实际印出来的不一致，页眉上的「当前页-总页数」
             # 也就跟着说谎。
-            "row_height_mm": 6.0,
+            "row_height_mm": 7.0,
             # 本币名称。用友印「本币名称: 人民币」，我们没有币种字段
             # （Book 只有 company_name），先固定写人民币。
             "currency_name": "人民币",
-            # 右上角那个方括号标记：用友印「[正式账簿]」（**方括号是原样的一部分**）。
-            "book_label": "[正式账簿]",
+            # 右上角那个方括号标记。**默认留空 —— 不印。**
+            #
+            # 用友自己导出的样张右上角有「[正式账簿]」，但用户 2026-10-22 明确
+            # 要求去掉（浏览器批注 1）：那是用友的**产品/账簿性质标记**，不是
+            # 账簿版式的一部分，印在自家账上只会让人以为这纸是用友出的。
+            #
+            # 字段留着（不是删掉）：将来真要印这一行，改模板填回去即可，
+            # 渲染层也会照填的照印（空字符串则整个不输出那个元素）。
+            "book_label": "",
             # 表格上方的科目行。
             "subject_caption": "科目: {subject}({subject_code})",
             # 右上角第二行。**页号是「当前页-该科目总页数」**，不是「册号-页号」：
             # 每个一级科目各自从 1 开始编页（1-1 = 只有 1 页，这是第 1 页）。
             "page_label": "页号:  {page}-{pages}",
             "footer_left": "核算单位: {company}",
-            "footer_center": "制表: {preparer}",
+            # 中段空着：用友的正式账簿这一格不印「制表」（用户自己的版式如此）。
+            "footer_center": "",
             "footer_right": "打印日期: {print_date}",
+            # 「不打印无发生额的科目」**不在模板里** —— 它是这一次打印的开关
+            # （打印预览弹窗左栏，用户 2026-10-22 批注 2），默认打开。
+            # 放在模板里就等于同一个设置有两个地方能改，两处迟早对不上。
         },
     },
     "DETAIL_LEDGER": {
+        # **明细账沿用用友总账的版式**：两行表头、八列、页眉页脚、页码口径，
+        # 与总账**逐格一致** —— 差别只在数据：总账是逐月汇总行，明细账是
+        # **逐笔**（日 / 凭证号数 / 凭证摘要都填真值）。
+        #
+        # 规格见 ``docs/用友总账打印样式规格.md``。
+        #
+        # 版式同样是**用户自己调出来的那一份**（2026-10-22），与总账那份
+        # 基线模板同源：横向 A4、行高 7mm、摘要列占 42%。
         "paper": "A4", "orientation": "landscape",
-        "margins": {"top": 12, "right": 8, "bottom": 12, "left": 8},
-        "title": {"text": "明细分类账", "size": 15, "bold": True, "align": "center"},
+        "margins": {"top": 12, "right": 20, "bottom": 12, "left": 20},
+        "title": {"text": "{subject}明细账", "size": 20, "bold": True, "align": "center"},
+        # 副标题留空 = 显示期间（与总账同一口径）。
         "subtitle": {"text": "", "size": 10, "align": "center"},
-        "font": {"family": "宋体", "size": 9},
+        "font": {"family": "宋体", "size": 10},
         "show": {"period": True, "page_no": True},
+        # 八列与总账同宽同序（列宽是用户那份的实测值，合计 100）。
         "columns": [
-            {"key": "month", "label": "月", "width": 5, "align": "center"},
-            {"key": "day", "label": "日", "width": 5, "align": "center"},
-            {"key": "voucher_no", "label": "凭证字号", "width": 10, "align": "center"},
-            {"key": "code", "label": "科目编码", "width": 10, "align": "center"},
-            {"key": "name", "label": "科目名称", "width": 16, "align": "left"},
-            {"key": "summary", "label": "摘　要", "width": 24, "align": "left"},
-            {"key": "debit", "label": "借方金额", "width": 11, "align": "right"},
-            {"key": "credit", "label": "贷方金额", "width": 11, "align": "right"},
-            {"key": "direction", "label": "方向", "width": 7, "align": "center"},
-            {"key": "balance", "label": "方向余额", "width": 12, "align": "right"},
+            {"key": "month", "label": "月", "width": 4.2856, "align": "center"},
+            {"key": "day", "label": "日", "width": 4.2962, "align": "center"},
+            {"key": "voucher_no", "label": "凭证号数", "width": 8.18, "align": "center"},
+            {"key": "summary", "label": "摘要", "width": 41.6555, "align": "left"},
+            {"key": "debit", "label": "借方", "width": 12.7707, "align": "right"},
+            {"key": "credit", "label": "贷方", "width": 12.8139, "align": "right"},
+            {"key": "direction", "label": "方向", "width": 3.0825, "align": "center"},
+            {"key": "balance", "label": "余额", "width": 12.9156, "align": "right"},
         ],
-        "meta": {"company": True, "book": True, "period": True},
+        "meta": {"company": True, "book": False, "period": True, "voucher_no": False,
+                 "date": False, "attachments": False, "remark": False,
+                 "accountant": False, "checker": False, "cashier": False},
         "footer": {"text": "", "show_page_no": True,
                    "format": "第 {page} 页　共 {total} 页"},
         "body": {"repeat_header": True, "border": True},
+        # 账簿版式的那一组东西，与总账同一套字段名、同一套渲染。
+        "ledger_book": {
+            # 一页放多少行明细。明细账是逐笔的，一页放不下多少 —— 与总账
+            # 那个「26 行 = 一个完整会计年度」的口径无关，两者是各自独立的。
+            # 同样是「想要多少行」；实际放得下多少行由 ``ledger_book_rows_per_page``
+            # 按纸面算，取两者的小值。
+            "rows_per_page": 26,
+            "row_height_mm": 7.0,
+            "currency_name": "人民币",
+            # 右上角标记：与总账一致，**默认不印**（见 LEDGER 里的说明）。
+            "book_label": "",
+            "subject_caption": "科目: {subject}({subject_code})",
+            "page_label": "页号:  {page}-{pages}",
+            "footer_left": "核算单位: {company}",
+            "footer_center": "",
+            "footer_right": "打印日期: {print_date}",
+            # 「不打印无发生额的科目」同总账：是打印时的开关，不在模板里
+            # （用户 2026-10-22 批注 2 —— 开关放在打印预览弹窗里，默认打开）。
+        },
     },
     "BALANCE": {
         "paper": "A4", "orientation": "landscape",
@@ -514,10 +570,14 @@ def validate_template(scope: str, content: dict | None) -> dict:
             )
         merged["elements"] = clean_elements
 
-    if scope == "LEDGER":
+    # 总账与明细账共用同一套「账簿版式」配置，字段名与渲染路径完全一致。
+    if scope in ("LEDGER", "DETAIL_LEDGER"):
         lb = merged.setdefault("ledger_book", {})
         if not isinstance(lb, dict):
+            # 写回 merged —— 只把局部变量换掉的话，merged 里那个不是 dict 的
+            # 值会留着，下游 ``tpl.get("ledger_book") or {}`` 拿到的仍是它。
             lb = {}
+            merged["ledger_book"] = lb
         try:
             rows_per_page = int(lb.get("rows_per_page", 26) or 26)
         except (TypeError, ValueError):
@@ -534,6 +594,11 @@ def validate_template(scope: str, content: dict | None) -> dict:
                            ("footer_left", 120), ("footer_center", 120),
                            ("footer_right", 120)):
             lb[key] = str(lb.get(key, "") or "")[:limit]
+        # 「不打印无发生额科目」是**打印时的开关**，不是模板字段：
+        # 用户 2026-10-22 批注 2 要求它放在打印预览弹窗里、默认打开。
+        # 模板里那份（老模板存过）在这里**清掉** —— 同一个设置只留一处，
+        # 两处都能改的话迟早有一次是旧值。
+        lb.pop("skip_empty", None)
     return merged
 
 
@@ -1063,6 +1128,155 @@ def _ledger_book_text(text: str, ctx: dict) -> str:
     return out
 
 
+def ledger_book_detail_row(row: dict) -> dict:
+    """明细账的一行 -> 用友的**八列形状**。
+
+    HTML 打印与 Excel 导出是**同一张纸**，所以这个映射只有一份 ——
+    两处各写一遍，迟早有一处漏掉一列，而纸上少一列看不出来。
+
+    「月」「日」两列在明细账里是**从凭证日期上拆下来的**：分录行有凭证
+    日期，汇总行（期初 / 本月合计 / 累计）没有凭证日期 —— 那几行只填月份。
+
+    期初行的「凭证号数」列留空、摘要列写「期初余额」：那一栏装的是凭证
+    号，期初余额不是凭证。与总账的期初行是同一个写法。
+
+    ``period`` 留在行里（不是打印列）：渲染器用它算表头上那一行的年度。
+    """
+    voucher_date = row.get("voucher_date")
+    period = str(row.get("period") or "")
+    month = str(voucher_date)[5:7] if voucher_date else period[5:7]
+    day = str(voucher_date)[8:10] if voucher_date else ""
+    voucher_no = row.get("voucher_no") or ""
+    summary = row.get("summary") or ""
+    if row.get("kind") == "OPENING":
+        voucher_no = ""
+        summary = summary or "期初余额"
+    return {
+        "month": month,
+        "day": day,
+        "voucher_no": voucher_no,
+        "summary": summary,
+        "debit": row.get("debit"),
+        "credit": row.get("credit"),
+        "direction": row.get("direction") or "",
+        "balance": row.get("balance"),
+        "period": period,
+    }
+
+
+#: pt → mm。
+PT_TO_MM = 25.4 / 72
+
+#: 两行表头里每一行的高度（mm）。与 ``render_ledger_book_page`` 的 CSS
+#: （``thead tr`` 的 height）一一对应。
+LEDGER_BOOK_HEAD_ROW_MM = 5.5
+#: 标题的行高倍数（CSS 里 ``.lb-title`` 是 line-height:1.2）。
+LEDGER_BOOK_TITLE_LINE = 1.2
+#: 副标题与正文的行高倍数（1.35 是中文正文的常见行距）。
+LEDGER_BOOK_TEXT_LINE = 1.35
+#: 标题 / 副标题 / 科目行各自的下边距（mm），与 CSS 的 margin 一致。
+LEDGER_BOOK_TITLE_MARGIN_MM = 1.0
+LEDGER_BOOK_SUBTITLE_MARGIN_MM = 1.0
+LEDGER_BOOK_SUBJECT_MARGIN_MM = 1.0
+#: 页脚的上边距（mm），与 CSS 的 ``.lb-foot`` margin-top 一致。
+LEDGER_BOOK_FOOTER_MARGIN_MM = 1.5
+#: 留给边框线与浏览器排版误差的余量（mm）。
+LEDGER_BOOK_SAFETY_MM = 2.0
+
+
+def ledger_book_period_label(from_period: str | None,
+                             to_period: str | None) -> str:
+    """账簿页眉副标题那一行写的**期间文本**。
+
+    起止是同一期时只写一个 —— 写成「X 至 X」是把同一个期间在页内说了两遍，
+    而顶栏已经选过它了。跨期时写「起 至 止」。
+
+    **打印件与导出件是同一张纸**，所以这一串字由这一个函数出：两处各写
+    一遍（打印一份、Excel 一份），迟早有一处忘了「同一期只写一个」。
+    """
+    lo = (from_period or "").strip()
+    hi = (to_period or "").strip()
+    if not lo or not hi or lo == hi:
+        return hi or lo
+    return f"{lo} 至 {hi}"
+
+
+def ledger_book_rows_per_page(tpl: dict) -> int:
+    """一页**实际放得下**多少行数据。
+
+    模板里的 ``ledger_book.rows_per_page`` 是「**想要**多少行」，这一行算的是
+    「**纸面上放得下**多少行」—— 两者的**小值**才是真正印出来的页。
+
+    为什么要再算一遍：分页在服务端做（页眉上要印「当前页-总页数」，浏览器
+    打印时的页眉是 ``@page`` 边距框，放不了每页不同的内容），而浏览器
+    **不会**替我们把超出一张纸的表格截断 —— 表格比纸高时，它会**接着印到
+    下一张物理页**上。于是第一页的页眉写着「1-1」、第二张物理页上还是
+    「1-1」：一份 26 行的年账印出来两张纸，两张都自称第一页。
+
+    算式：可印高度 − 固定开销（标题 + 副标题 + 科目行 + 两行表头 + 页脚）
+    ÷ 行高。固定开销里的每个数都与 ``render_ledger_book_page`` 的 CSS 一一
+    对应 —— **改了 CSS 的字号/间距/行高，这里的数也要跟着改**。
+
+    取「小值」而不是「实算值」：模板说 26 行、纸面只放得下 20 行，那就印
+    20 行一页（分两页），而不是硬塞 26 行让浏览器替我们溢出。反过来模板说
+    10 行、纸面放得下 40 行，那还是 10 行一页 —— 模板的意图优先。
+
+    @param tpl 已归一化的模板（``validate_template`` 的输出）
+    @return 每页的行数，至少 1 行
+    """
+    lb = tpl.get("ledger_book") or {}
+    if not isinstance(lb, dict):
+        lb = {}
+    try:
+        want = int(lb.get("rows_per_page") or 26)
+    except (TypeError, ValueError):
+        want = 26
+    want = max(1, min(100, want))
+
+    paper = str(tpl.get("paper", "A4"))
+    spec = PAPERS.get(paper, PAPERS["A4"])
+    landscape = tpl.get("orientation") == "landscape"
+    # 横向时纸转过来：可印高度是**短边**减上下边距。
+    _w, h = (spec["h"], spec["w"]) if landscape else (spec["w"], spec["h"])
+
+    m = tpl.get("margins")
+    if not isinstance(m, dict):
+        m = {}
+    mt = _num(m.get("top"), 10.0, *MARGIN_RANGE)
+    mb = _num(m.get("bottom"), 10.0, *MARGIN_RANGE)
+
+    font = tpl.get("font")
+    if not isinstance(font, dict):
+        font = {}
+    fsize = _num(font.get("size"), 10, *FONT_SIZE_RANGE)
+    title = tpl.get("title")
+    if not isinstance(title, dict):
+        title = {}
+    title_size = _num(title.get("size"), 20, *TITLE_SIZE_RANGE)
+    subtitle = tpl.get("subtitle")
+    if not isinstance(subtitle, dict):
+        subtitle = {}
+    subtitle_size = _num(subtitle.get("size"), 11, *TITLE_SIZE_RANGE)
+    row_h = _num(lb.get("row_height_mm"), 6.0, 3.0, 20.0)
+
+    fixed = (
+        # 标题（行高 1.2 + 下边距）
+        title_size * LEDGER_BOOK_TITLE_LINE * PT_TO_MM + LEDGER_BOOK_TITLE_MARGIN_MM
+        # 副标题（期间那一行；账簿一定有它 —— 上下文里始终有期间）
+        + subtitle_size * LEDGER_BOOK_TEXT_LINE * PT_TO_MM + LEDGER_BOOK_SUBTITLE_MARGIN_MM
+        # 科目行（表格上方那一行）
+        + fsize * LEDGER_BOOK_TEXT_LINE * PT_TO_MM + LEDGER_BOOK_SUBJECT_MARGIN_MM
+        # 两行表头
+        + 2 * LEDGER_BOOK_HEAD_ROW_MM
+        # 页脚（上边距 + 一行 0.9 倍正文字号）
+        + LEDGER_BOOK_FOOTER_MARGIN_MM
+        + fsize * 0.9 * LEDGER_BOOK_TEXT_LINE * PT_TO_MM
+    )
+    room = h - mt - mb - fixed - LEDGER_BOOK_SAFETY_MM
+    fit = int(room // row_h) if row_h > 0 else want
+    return max(1, min(want, fit))
+
+
 def render_ledger_book_page(tpl: dict, ctx: dict, rows: list[dict], *,
                             page: int, pages: int, year: str) -> str:
     """用友式总账的**一页**。
@@ -1076,9 +1290,13 @@ def render_ledger_book_page(tpl: dict, ctx: dict, rows: list[dict], *,
       包括「年份」下方那条只跨「月+日」的横线。
     * 八列的列宽是实测值；「方向」列窄到 2.9%，表头必须竖排。
     * 全框线，内外同粗（用友的样张里所有线都是 1px 黑线）。
-    * 页眉：居中标题（带一条与标题等宽的下划线）+ 右上角「[正式账簿]」
-      + 「页号: 当前页-总页数」+「本币名称」。
+    * 页眉：居中标题（带一条与标题等宽的下划线）+「页号: 当前页-总页数」
+      +「本币名称」。右上角那个账簿标记**默认不印**（``book_label`` 为空
+      时整个元素不输出，不是输出一个空的角标）。
     * 页脚：核算单位 / 制表 / 打印日期 三段。
+
+    **总账与明细账共用这一个渲染器** —— 两者的版式逐格相同，差别只在喂
+    进来的行：总账是逐月汇总，明细账是逐笔（带日、凭证号数、凭证摘要）。
 
     **分页在服务端做**：页眉上的「当前页-总页数」必须每页不同，而浏览器
     打印时的页眉是 ``@page`` 边距框（浏览器不支持自定义内容），所以只能
@@ -1108,12 +1326,30 @@ def render_ledger_book_page(tpl: dict, ctx: dict, rows: list[dict], *,
     title = tpl.get("title") or {}
     title_size = _num(title.get("size"), 20, *TITLE_SIZE_RANGE)
     title_bold = "700" if title.get("bold", True) else "400"
+    # 副标题：模板里填了就印填的，**没填就印期间**。
+    #
+    # 「标题下面显示期间的副标题」是账簿版式的一部分（用户 2026-10-22）。
+    # 通用渲染器（``render_table_page``）一直是「subtitle.text or ctx['period']」，
+    # 而账簿这个渲染器**自己拼页眉**，以前整段没有副标题 —— 于是模板设计器
+    # 左栏那个「副标题」输入框对总账/明细账是**死的**：填什么都不出东西。
+    #
+    # 只空白算没填：模板里存的是单个空格（用户为了「先别显示」随手敲的），
+    # 那也要落到期间上，而不是印出一个空行。
+    subtitle = tpl.get("subtitle") or {}
+    subtitle_text = str(subtitle.get("text") or "").strip() or str(ctx.get("period") or "")
+    subtitle_size = _num(subtitle.get("size"), 11, *TITLE_SIZE_RANGE)
+    subtitle_align = _safe_align(subtitle.get("align"))
     row_h = _num(lb.get("row_height_mm"), 6.0, 3.0, 20.0)
     border = "1px solid #000" if tpl.get("body", {}).get("border", True) else "none"
 
     # ---- 页眉 ----
     title_text = _ledger_book_text(title.get("text", ""), ctx)
     book_label = _ledger_book_text(str(lb.get("book_label") or ""), ctx)
+    # 右上角那个账簿标记**默认不印**（用户 2026-10-22 批注 1 要求去掉
+    # 用友的「[正式账簿]」）。字段留着：模板里填回去就会照印。
+    # 空的时候整个 div 不输出 —— 留一个空的绝对定位元素在纸上，
+    # 既看不见又占着右上角那个位置。
+    book_html = f'<div class="lb-book">{_esc(book_label)}</div>' if book_label else ""
     page_label = _ledger_book_text(
         str(lb.get("page_label") or ""), ctx).replace("{page}", str(page)).replace(
         "{pages}", str(pages))
@@ -1167,13 +1403,19 @@ body {{
 }}
 .page {{ width:100%; }}
 /* 页眉：标题居中（带一条与标题等宽的下划线），右上角是账簿信息。
-   用绝对定位而不是 flex —— 「正式账簿」右对齐到表格右边缘，而「页号 /
+   用绝对定位而不是 flex —— 右上角的账簿标记右对齐到表格右边缘，而「页号 /
    本币名称」两行左对齐在表格宽度的 81.6% 处，两者的对齐基准不同，
    flex 排不出这个形状。 */
 .lb-head {{ position:relative; }}
 .lb-title {{ text-align:center; font-size:{title_size}pt; font-weight:{title_bold};
   line-height:1.2; margin:0 0 1mm; }}
-.lb-title span {{ border-bottom:1px solid #000; padding-bottom:1mm; }}
+/* 标题下面**不再有那条横线**（用户 2026-10-22：「把主标题下面的横线去掉吧」）。
+   用友导出的样张上是有的，但那是用友自己那条线的位置 —— 抄过来之后看着像
+   一条多余的框线，去掉更干净。 */
+.lb-title span {{ padding-bottom:1mm; }}
+/* 副标题 = 标题下面那一行的期间（模板里填了别的就印别的）。 */
+.lb-subtitle {{ text-align:{subtitle_align}; font-size:{subtitle_size}pt;
+  line-height:1.35; margin:0 0 1mm; }}
 .lb-book {{ position:absolute; right:0; top:0; font-size:{fsize}pt; }}
 .lb-info {{ position:absolute; left:{LEDGER_BOOK_INFO_LEFT_PCT}%; top:0;
   font-size:{fsize}pt; line-height:1.5; white-space:nowrap; }}
@@ -1205,7 +1447,13 @@ table.lb-grid td.lb-left {{ text-align:left; }}
 }}
 @media print {{
   body {{ background:#fff; padding:0; }}
-  .page {{ box-shadow:none; padding:0; margin:0; }}
+  /* **一个 .page 就是一张物理纸**：没有这条，两个册页单位会接在同一张纸上
+     连续印下去（第一张还装得下时，第二张直接跟在后面），页眉上的
+     「当前页-总页数」于是全都不对 —— 纸上第二页写着「2-2」，物理上却是
+     第一张纸的下半截。 */
+  .page {{ box-shadow:none; padding:0; margin:0;
+    break-after:page; page-break-after:always; }}
+  .page:last-child {{ break-after:auto; page-break-after:auto; }}
 }}
 """
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -1215,7 +1463,8 @@ table.lb-grid td.lb-left {{ text-align:left; }}
 <div class="page">
   <div class="lb-head">
     <div class="lb-title"><span>{_esc(title_text)}</span></div>
-    <div class="lb-book">{_esc(book_label)}</div>
+    <div class="lb-subtitle">{_esc(subtitle_text)}</div>
+    {book_html}
     <div class="lb-info"><div>{_esc(page_label)}</div><div>本币名称: {_esc(currency)}</div></div>
   </div>
   <div class="lb-subject">{_esc(subject_caption)}</div>

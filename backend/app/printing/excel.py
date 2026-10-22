@@ -20,6 +20,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from app.printing.template import ledger_book_period_label
+
 ZERO = Decimal("0")
 CENT = Decimal("0.01")
 
@@ -340,8 +342,120 @@ LEDGER_BOOK_HEADERS = [
 ]
 
 
+def _ledger_book_sheet(
+    wb: Workbook,
+    *,
+    sheet_title: str,
+    fallback_title: str,
+    doc_title: str,
+    subject_code: str,
+    subject_name: str,
+    rows: list[dict],
+    year_label: str,
+    company: str,
+    preparer: str,
+    print_date: str,
+    period_label: str = "",
+):
+    """用友账簿的**一张表**：抬头 + 两行表头 + 表体 + 页脚。
+
+    总账与明细账是**同一张纸**，所以这段版式只有一份实现 —— 两处各写
+    一遍，迟早有一处少一列，而纸上少一列看不出来。
+
+    表体的行是**用友八列形状**（月 / 日 / 凭证号数 / 摘要 / 借方 / 贷方 /
+    方向 / 余额），由 ``app.printing.template.ledger_book_detail_row`` 摊好。
+
+    **标题下面那一行是期间**（用户 2026-10-22）：打印件在标题下面印期间
+    副标题，导出件也要有 —— 两个通道是同一张纸，一边有一边没有，纸上与
+    文件上就差了一行。
+    """
+    ws = wb.create_sheet(title=_safe_sheet_title(sheet_title, fallback_title))
+
+    for i, (_label, width) in enumerate(LEDGER_BOOK_HEADERS, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+
+    # ---- 抬头 ----
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
+    head = ws.cell(row=1, column=1, value=_text(doc_title))
+    head.font = Font(name="宋体", size=16, bold=True)
+    head.alignment = CENTER
+    ws.row_dimensions[1].height = 26
+
+    # 副标题 = 期间（与打印件同一串字，见 ledger_book_period_label）。
+    if period_label:
+        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=8)
+        sub = ws.cell(row=2, column=1, value=_text(period_label))
+        sub.font = Font(name="宋体", size=10)
+        sub.alignment = CENTER
+        ws.row_dimensions[2].height = 18
+
+    ws.cell(row=3, column=6, value=_text("本币名称: 人民币")).alignment = RIGHT
+    ws.merge_cells(start_row=3, start_column=6, end_row=3, end_column=8)
+    # 科目行只在真的印某一个科目时才有 —— 整册被「不打印无发生额科目」跳空
+    # 之后的那张空白页，不该顶着「科目: ()」出去。
+    if subject_name or subject_code:
+        ws.cell(row=3, column=1,
+                value=_text(f"科目: {subject_name}({subject_code})")).alignment = LEFT
+
+    # ---- 两行表头（年份横跨「月+日」）----
+    ws.merge_cells(start_row=4, start_column=1, end_row=4, end_column=2)
+    y = ws.cell(row=4, column=1, value=_text(year_label))
+    y.font = Font(name="宋体", size=11, bold=True)
+    y.alignment = CENTER
+    for col, (label, _w) in enumerate(LEDGER_BOOK_HEADERS[2:], start=3):
+        ws.merge_cells(start_row=4, start_column=col, end_row=5, end_column=col)
+        c = ws.cell(row=4, column=col, value=_text(label))
+        c.font = FONT_CELL_BOLD
+        c.alignment = CENTER
+        c.border = BOX
+    for col, label in ((1, "月"), (2, "日")):
+        c = ws.cell(row=5, column=col, value=_text(label))
+        c.font = FONT_CELL_BOLD
+        c.alignment = CENTER
+        c.border = BOX
+    y.border = BOX
+
+    # ---- 表体 ----
+    r = 5
+    for row in rows:
+        r += 1
+        values = [
+            _text(row.get("month") or ""),
+            _text(row.get("day") or ""),
+            _text(row.get("voucher_no") or ""),
+            _text(row.get("summary") or ""),
+            _num(row.get("debit")),
+            _num(row.get("credit")),
+            _text(row.get("direction") or ""),
+            _num(row.get("balance")),
+        ]
+        for i, value in enumerate(values, start=1):
+            c = ws.cell(row=r, column=i, value=value)
+            c.border = BOX
+            c.font = FONT_CELL
+            c.alignment = (LEFT if i == 4 else
+                           CENTER if i in (1, 2, 3, 7) else RIGHT)
+        ws.row_dimensions[r].height = 16
+
+    # ---- 页脚 ----
+    r += 2
+    foot = ws.cell(row=r, column=1,
+                   value=_text(f"核算单位: {company}"))
+    foot.alignment = LEFT
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=4)
+    ws.cell(row=r, column=5, value=_text(f"制表: {preparer}")).alignment = CENTER
+    ws.merge_cells(start_row=r, start_column=5, end_row=r, end_column=6)
+    ws.cell(row=r, column=7, value=_text(f"打印日期: {print_date}")).alignment = RIGHT
+    ws.merge_cells(start_row=r, start_column=7, end_row=r, end_column=8)
+
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A6"
+    return ws
+
+
 def general_ledger_excel(payload: dict, *, book_name: str,
-                          company: str = "", preparer: str = "") -> bytes:
+                          company: str = "", preparer: str = "",
+                          print_date: str | None = None) -> bytes:
     """总账（用友式）：**一个一级科目一张工作表**，版式与打印件一致。
 
     以前这里是「一行一个科目」的余额表形态（编码/名称/期初/本期/本年/期末），
@@ -359,188 +473,116 @@ def general_ledger_excel(payload: dict, *, book_name: str,
     total_rows = sum(len(s.get("rows") or []) for s in subjects)
     _check_size("总账", total_rows)
 
-    print_date = date.today().strftime("%Y.%m.%d")
+    print_date = print_date or date.today().strftime("%Y.%m.%d")
+    # 标题下面那一行的期间（与打印件同一串字）。
+    period_label = ledger_book_period_label(
+        payload.get("from_period"), payload.get("to_period"))
     for index, subject in enumerate(subjects):
-        title = _safe_sheet_title(
-            f"{subject.get('name') or ''}({subject.get('code') or ''})",
-            f"总账{index + 1}")
-        ws = wb.create_sheet(title=title)
         rows = subject.get("rows") or []
-
-        for i, (_label, width) in enumerate(LEDGER_BOOK_HEADERS, start=1):
-            ws.column_dimensions[get_column_letter(i)].width = width
-
-        # ---- 抬头 ----
-        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
-        head = ws.cell(row=1, column=1,
-                       value=_text(f"{subject.get('name') or ''}总账"))
-        head.font = Font(name="宋体", size=16, bold=True)
-        head.alignment = CENTER
-        ws.row_dimensions[1].height = 26
-
-        ws.cell(row=2, column=1,
-                value=_text(f"科目: {subject.get('name') or ''}"
-                            f"({subject.get('code') or ''})")).alignment = LEFT
-        ws.cell(row=2, column=6, value=_text("本币名称: 人民币")).alignment = RIGHT
-        ws.merge_cells(start_row=2, start_column=6, end_row=2, end_column=8)
-
-        # ---- 两行表头（年份横跨「月+日」）----
         year = str((rows[0].get("period") if rows else "") or "")[:4]
-        ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=2)
-        y = ws.cell(row=3, column=1, value=_text(f"{year}年"))
-        y.font = Font(name="宋体", size=11, bold=True)
-        y.alignment = CENTER
-        for col, (label, _w) in enumerate(LEDGER_BOOK_HEADERS[2:], start=3):
-            ws.merge_cells(start_row=3, start_column=col, end_row=4, end_column=col)
-            c = ws.cell(row=3, column=col, value=_text(label))
-            c.font = FONT_CELL_BOLD
-            c.alignment = CENTER
-            c.border = BOX
-        for col, label in ((1, "月"), (2, "日")):
-            c = ws.cell(row=4, column=col, value=_text(label))
-            c.font = FONT_CELL_BOLD
-            c.alignment = CENTER
-            c.border = BOX
-        y.border = BOX
-
-        # ---- 表体 ----
-        r = 4
-        for row in rows:
-            r += 1
-            values = [
-                _text(row.get("month") or ""),
-                _text(row.get("day") or ""),
-                _text(row.get("voucher_no") or ""),
-                _text(row.get("summary") or ""),
-                _num(row.get("debit")),
-                _num(row.get("credit")),
-                _text(row.get("direction") or ""),
-                _num(row.get("balance")),
-            ]
-            for i, value in enumerate(values, start=1):
-                c = ws.cell(row=r, column=i, value=value)
-                c.border = BOX
-                c.font = FONT_CELL
-                c.alignment = (LEFT if i == 4 else
-                               CENTER if i in (1, 2, 3, 7) else RIGHT)
-            ws.row_dimensions[r].height = 16
-
-        # ---- 页脚 ----
-        r += 2
-        foot = ws.cell(row=r, column=1,
-                       value=_text(f"核算单位: {company or book_name}"))
-        foot.alignment = LEFT
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=4)
-        ws.cell(row=r, column=5, value=_text(f"制表: {preparer}")).alignment = CENTER
-        ws.merge_cells(start_row=r, start_column=5, end_row=r, end_column=6)
-        ws.cell(row=r, column=7, value=_text(f"打印日期: {print_date}")).alignment = RIGHT
-        ws.merge_cells(start_row=r, start_column=7, end_row=r, end_column=8)
-
-        ws.sheet_view.showGridLines = False
-        ws.freeze_panes = "A5"
+        _ledger_book_sheet(
+            wb,
+            sheet_title=f"{subject.get('name') or ''}({subject.get('code') or ''})",
+            fallback_title=f"总账{index + 1}",
+            doc_title=f"{subject.get('name') or ''}总账",
+            subject_code=subject.get("code") or "",
+            subject_name=subject.get("name") or "",
+            rows=rows,
+            year_label=f"{year}年",
+            company=company or book_name,
+            preparer=preparer,
+            print_date=print_date,
+            period_label=period_label,
+        )
 
     if not subjects:
-        ws = wb.create_sheet(title="总账")
-        ws.cell(row=1, column=1, value=_text("（没有一级科目）"))
+        # 一个科目都没印（整册都被「不打印无发生额科目」跳空了）时，也要给一张
+        # **完整的账簿页** —— 抬头、页脚都在。裸一张「（没有一级科目）」的表不是
+        # 账簿页：打印件那一路此时给的是一张带页眉页脚的空白页，两边得是同一张纸。
+        _ledger_book_sheet(
+            wb,
+            sheet_title="总账",
+            fallback_title="总账",
+            doc_title="总账",
+            subject_code="",
+            subject_name="",
+            rows=[],
+            year_label=f"{date.today().year}年",
+            company=company or book_name,
+            preparer=preparer,
+            print_date=print_date,
+            period_label=period_label,
+        )
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
-def detail_ledger_excel(payload: dict, *, book_name: str) -> bytes:
+def detail_ledger_excel(payload: dict, *, book_name: str,
+                         company: str = "", preparer: str = "",
+                         print_date: str | None = None) -> bytes:
+    """明细账（用友式）：**一个一级科目一张工作表**，版式与打印件一致。
+
+    以前这里是「一张表塞所有科目」的样子（凭证号 / 摘要 / 借贷 / 方向 /
+    余额五列，无月日、无页眉页脚），与打印件不是一回事 —— 而这两个通道
+    印的是**同一张纸**。现在与总账共用同一份版式代码：册页单位逐个成表，
+    逐笔展开，行是**用友八列形状**。
+
+    册页单位是**一级科目**（用户 2026-10-22 批注 3，与总账一致）：一级科目
+    下面是综合明细账时，一张表里排着它那几个下级科目的几块。
+
+    ``payload["subjects"]`` 是 ``[{code, name, rows}, ...]``。
+    """
     wb = Workbook()
-    ws = wb.active
-    ws.title = "明细账"
-    ws.sheet_view.showGridLines = False
+    wb.remove(wb.active)
 
-    # 明细账是「跨全科目跨全年」的那一张，行数上界最高，先卡上限（见 MAX_EXPORT_ROWS）。
-    _check_size("明细账", len(payload.get("rows") or []))
+    subjects = payload.get("subjects") or []
+    # 明细账是「跨全科目跨全年」的那一册，行数上界最高，先卡上限
+    # （见 MAX_EXPORT_ROWS）。
+    total_rows = sum(len(s.get("rows") or []) for s in subjects)
+    _check_size("明细账", total_rows)
 
-    subject = payload.get("subject", {})
-    subject_range = payload.get("subject_range")
-    comprehensive = bool(payload.get("comprehensive"))
-    headers = ["凭证号"]
-    widths = [13]
-    if comprehensive:
-        headers.extend(["科目编码", "科目名称"])
-        widths.extend([13, 26])
-    headers.extend(["摘要", "借方", "贷方", "方向", "余额"])
-    widths.extend([42, 15, 15, 9, 17])
-    last_col = len(headers) + 2
+    print_date = print_date or date.today().strftime("%Y.%m.%d")
+    # 标题下面那一行的期间（与打印件同一串字）。
+    period_label = ledger_book_period_label(
+        payload.get("from_period"), payload.get("to_period"))
+    for index, subject in enumerate(subjects):
+        rows = subject.get("rows") or []
+        year = str((rows[0].get("period") if rows else "") or "")[:4]
+        _ledger_book_sheet(
+            wb,
+            sheet_title=f"{subject.get('name') or ''}({subject.get('code') or ''})",
+            fallback_title=f"明细账{index + 1}",
+            doc_title=f"{subject.get('name') or ''}明细账",
+            subject_code=subject.get("code") or "",
+            subject_name=subject.get("name") or "",
+            rows=rows,
+            year_label=f"{year}年",
+            company=company or book_name,
+            preparer=preparer,
+            print_date=print_date,
+            period_label=period_label,
+        )
 
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
-    ws.cell(row=1, column=1, value="明细账").font = Font(name="宋体", size=16, bold=True)
-    ws.cell(row=1, column=1).alignment = CENTER
-    ws.row_dimensions[1].height = 30
-
-    subtitle = f"{book_name} · {subject.get('code', '')} {subject.get('name', '')}"
-    if subject_range:
-        subtitle += f" · {subject_range['from']['code']} 至 {subject_range['to']['code']}"
-    subtitle += f" · {payload.get('from_period', '')} 至 {payload.get('to_period', '')}"
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
-    ws.cell(row=2, column=1, value=_text(subtitle)).alignment = CENTER
-
-    for col, width in enumerate([8, 8, *widths], start=1):
-        ws.column_dimensions[get_column_letter(col)].width = width
-
-    year = str(payload.get("from_period", ""))[:4]
-    ws.merge_cells(start_row=4, start_column=1, end_row=4, end_column=2)
-    ws.cell(row=4, column=1, value=f"{year}年" if year else "日期")
-    ws.cell(row=5, column=1, value="月")
-    ws.cell(row=5, column=2, value="日")
-    for col, header in enumerate(headers, start=3):
-        ws.merge_cells(start_row=4, start_column=col, end_row=5, end_column=col)
-        ws.cell(row=4, column=col, value=header)
-
-    for row_num in (4, 5):
-        for col in range(1, last_col + 1):
-            cell = ws.cell(row=row_num, column=col)
-            cell.font = FONT_CELL_BOLD
-            cell.alignment = CENTER
-            cell.border = HEADER_BOX
-    ws.row_dimensions[4].height = 22
-    ws.row_dimensions[5].height = 21
-
-    money_cols = [last_col - 3, last_col - 2, last_col]
-    row_num = 6
-    subject_level = int(subject.get("level") or 1)
-    for row in payload.get("rows", []):
-        voucher_date = str(row.get("voucher_date") or "")
-        period = str(row.get("period") or "")
-        date_value = voucher_date or period
-        month = date_value[5:7] if len(date_value) >= 7 else ""
-        day = voucher_date[8:10] if len(voucher_date) >= 10 else ""
-        kind = row.get("kind")
-        values = [month, day, _text(row.get("voucher_no") if kind == "ENTRY" else "")]
-        if comprehensive:
-            depth = max(0, int(row.get("subject_level") or 1) - subject_level)
-            name = f"{'　' * depth}{row.get('subject_name', '')}"
-            values.extend([_text(row.get("subject_code", "")), _text(name)])
-        summary = "累　　计" if kind == "YTD_TOTAL" else row.get("summary", "")
-        values.extend([
-            _text(summary), _num(row.get("debit")), _num(row.get("credit")),
-            _text(row.get("direction")), _num(row.get("balance")),
-        ])
-        is_total = kind in ("OPENING", "MONTH_TOTAL", "YTD_TOTAL")
-        row_font = FONT_CELL_BOLD if is_total else FONT_CELL
-        for col, value in enumerate(values, start=1):
-            cell = ws.cell(row=row_num, column=col, value=value)
-            cell.border = BOX
-            cell.font = row_font
-            cell.alignment = CENTER if col in (1, 2, last_col - 1) else (
-                RIGHT if col in money_cols else LEFT
-            )
-        _money_style(ws, row_num, money_cols)
-        ws.row_dimensions[row_num].height = 21
-        row_num += 1
-
-    ws.freeze_panes = "A6"
-    ws.print_title_rows = "1:5"
-    ws.page_setup.orientation = "landscape"
-    ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 0
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
-    return _to_bytes(wb)
+    if not subjects:
+        # 同总账：整册跳空时也给一张完整的空白账簿页（抬头、页脚都在）。
+        _ledger_book_sheet(
+            wb,
+            sheet_title="明细账",
+            fallback_title="明细账",
+            doc_title="明细账",
+            subject_code="",
+            subject_name="",
+            rows=[],
+            year_label=f"{date.today().year}年",
+            company=company or book_name,
+            preparer=preparer,
+            print_date=print_date,
+            period_label=period_label,
+        )
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 # --------------------------------------------------------------------- 报表

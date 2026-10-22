@@ -1386,9 +1386,15 @@ def test_打印端点已经不再认纸型参数(client, auth, book):
 
 
 def test_改方向纵向横向互换(client, auth, book):
-    """纵向模板转横向，以及转回来。"""
+    """纵向模板转横向，以及转回来。
+
+    **基线模板默认是横向**（2026-10-22 需求方自己调的那一份），
+    所以这里从横向起步，再切回纵向。
+    """
     url = f"/api/books/{book.id}/print/general-ledger.html"
-    assert _page_size(client.get(url, headers=auth).text) == "A4"
+    assert _page_size(client.get(url, headers=auth).text) == "A4 landscape"
+    assert _page_size(client.get(url, params={"orientation": "portrait"},
+                                 headers=auth).text) == "A4"
     assert _page_size(client.get(url, params={"orientation": "landscape"},
                                  headers=auth).text) == "A4 landscape"
 

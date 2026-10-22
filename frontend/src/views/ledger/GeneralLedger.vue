@@ -12,13 +12,6 @@
                        :label="`${s.code} ${s.name}`" :value="s.code" />
           </el-select>
         </div>
-        <div class="ledger-toolbar__group ledger-toolbar__group--scope">
-          <span class="ledger-toolbar__label">打印范围</span>
-          <el-select v-model="printScope" class="ledger-scope-select">
-            <el-option label="本册（全部一级科目）" value="book" />
-            <el-option label="仅当前科目" value="current" />
-          </el-select>
-        </div>
       </div>
       <div class="ledger-toolbar__row ledger-toolbar__row--period">
         <div class="ledger-toolbar__group">
@@ -80,7 +73,9 @@
     </div>
 
     <PrintDialog v-model="printVisible" :book-id="store.bookId" :path="printPath"
-                 scope="LEDGER" :params="printParams" title="打印总账" />
+                 scope="LEDGER" :params="printParams" title="打印总账"
+                 :print-ranges="LEDGER_PRINT_RANGES"
+                 v-model:range="printRange" v-model:skip-empty="printSkipEmpty" />
   </div>
 </template>
 
@@ -92,6 +87,9 @@ import PrintDialog from '@/components/PrintDialog.vue'
 import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
+import {
+  LEDGER_PRINT_RANGES, PRINT_RANGE_BOOK, SKIP_EMPTY_DEFAULT, ledgerPrintParams,
+} from '@/utils/ledgerPrint'
 
 const store = useSessionStore()
 const data = ref({ rows: [], subjects: [] })
@@ -140,8 +138,14 @@ const includeUnposted = ref(true)
 /**
  * 打印范围：**本册**是账套的全部一级科目、连续打成一册（用友正式账簿的做法）；
  * 「仅当前科目」只打屏幕上正在看的这一个。
+ *
+ * **这个设置住在打印预览弹窗里**（用户 2026-10-22 批注 1、2）：工具栏上
+ * 原来那个下拉已经删掉。状态仍然放在这一页 —— 页面上那个「导出 Excel」
+ * 要的是同一份范围。
  */
-const printScope = ref('book')
+const printRange = ref(PRINT_RANGE_BOOK)
+/** 「不打印无发生额科目」，默认打开（用户 2026-10-22 批注 2）。 */
+const printSkipEmpty = ref(SKIP_EMPTY_DEFAULT)
 
 /**
  * 分页是**纯前端切片** —— 后端接口照旧一次把整段返回，契约不动。
@@ -244,17 +248,23 @@ function previewHtml() {
 const printVisible = ref(false)
 const printPath = computed(() => `/books/${store.bookId}/print/general-ledger.html`)
 /**
- * 只有范围，模板 id 由弹窗自己选 —— 它得让用户在打之前改主意。
+ * 打印与导出共用的那份参数。
  *
  * 「仅当前科目」才带 subject_id：**本册**是账套全部一级科目连续成册，
  * 不带 subject_id 后端就打整册；带了反而只出一个科目。
  * 这个 id 取自当前响应，与打印用的 period_id 是同一份年度的，不会对不上。
+ *
+ * 拼装规则收在 ``utils/ledgerPrint.js``，打印预览弹窗与「导出 Excel」
+ * 共用同一份 —— 两处各拼一遍的话，纸上是一册、文件里是另一个科目。
  */
-const printParams = computed(() => ({
-  period_id: toId.value, from_period_id: fromId.value || undefined,
-  include_unposted: includeUnposted.value,
-  ...(printScope.value === 'current' && data.value.subject?.id
-    ? { subject_id: data.value.subject.id } : {}),
+const printParams = computed(() => ledgerPrintParams({
+  range: printRange.value,
+  base: {
+    period_id: toId.value, from_period_id: fromId.value || undefined,
+    include_unposted: includeUnposted.value,
+  },
+  subject: data.value.subject?.id ? { subject_id: data.value.subject.id } : {},
+  skipEmpty: printSkipEmpty.value,
 }))
 
 function exportXlsx() {
@@ -312,7 +322,6 @@ watch(() => [store.bookId, store.currentYear, store.periods.length], () => {
   gap: 8px;
 }
 .ledger-toolbar__group--subject { flex: 0 1 420px; }
-.ledger-toolbar__group--scope { flex: 0 1 260px; }
 .ledger-toolbar__label {
   flex: 0 0 auto;
   color: var(--cwq-muted);
@@ -329,14 +338,12 @@ watch(() => [store.bookId, store.currentYear, store.periods.length], () => {
   margin-left: auto;
 }
 .ledger-toolbar :deep(.ledger-subject-select) { width: 280px; }
-.ledger-toolbar :deep(.ledger-scope-select) { width: 190px; }
 .ledger-toolbar :deep(.ledger-period-select) { width: 132px; }
 .ledger-toolbar :deep(.el-checkbox) { margin-right: 0; }
 
 @media (max-width: 760px) {
   .ledger-toolbar { padding: 0 12px; }
-  .ledger-toolbar__group--subject,
-  .ledger-toolbar__group--scope { flex: 1 1 100%; }
+  .ledger-toolbar__group--subject { flex: 1 1 100%; }
   .ledger-toolbar :deep(.ledger-subject-select) { flex: 1 1 200px; width: auto; }
   .ledger-toolbar__row--period { padding: 10px 0; }
   .ledger-toolbar__actions { margin-left: auto; }

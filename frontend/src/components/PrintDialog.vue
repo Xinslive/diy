@@ -33,6 +33,30 @@
               <el-radio-button value="landscape">横向</el-radio-button>
             </el-radio-group>
           </el-form-item>
+
+          <!-- 打印日期只有账簿（总账 / 明细账）页脚里那一格要它。
+               以前它是后端自动取当天 —— 补记账、归档重打时纸上要写的是
+               补账那天，不是出纸那天，所以这里必须能改（用户 2026-10-22 批注 3）。 -->
+          <el-form-item v-if="isLedgerBook" label="打印日期">
+            <el-input v-model="printDate" placeholder="留空则用当天日期" clearable
+                      @change="refreshPreview" />
+          </el-form-item>
+
+          <!-- 打印范围与「不打印无发生额科目」是**这一次打印**的设置，
+               所以住在弹窗里（用户 2026-10-22 批注 1、2）：页面工具栏上
+               原来那个「打印范围」下拉已经删掉 —— 同一件事只留一处。
+               模板设计器那边不传 printRanges（那里选的是版式，科目由
+               设计器自己的预览科目下拉决定），所以这里不会出现第二份。 -->
+          <el-form-item v-if="printRanges.length" label="打印范围">
+            <el-select v-model="rangeValue" style="width: 100%">
+              <el-option v-for="r in printRanges" :key="r.value"
+                         :label="r.label" :value="r.value" />
+            </el-select>
+          </el-form-item>
+
+          <el-form-item v-if="printRanges.length" label="不打印无发生额科目">
+            <el-switch v-model="skipEmptyValue" />
+          </el-form-item>
         </el-form>
 
         <!-- 说明沉到栏底：设置项只有三行，撑不满 60vh 高的预览区，
@@ -90,9 +114,26 @@ const props = defineProps({
   scope: { type: String, default: 'VOUCHER' },
   /** 除模板/纸型之外的打印范围参数（期间、凭证、科目…）。 */
   params: { type: Object, default: () => ({}) },
+  /**
+   * 打印范围的可选项（总账 / 明细账那份「本册 / 仅当前科目」）。
+   *
+   * **传了才显示**「打印范围」与「不打印无发生额科目」两个控件 —— 显隐由
+   * 调用方决定，而不是这里按 scope 猜：凭证、余额表、报表没有「成册」这回事，
+   * 模板设计器那边选的科目由它自己的预览科目下拉决定。
+   */
+  printRanges: { type: Array, default: () => [] },
+  /**
+   * 当前打印范围（``v-model:range``）。
+   *
+   * 状态**放在父页面**：页面上那个「导出 Excel」按钮要的是同一份范围，
+   * 放在弹窗里的话，导出的口径就得另问弹窗一次。
+   */
+  range: { type: String, default: '' },
+  /** 「不打印无发生额科目」（``v-model:skip-empty``），默认打开。 */
+  skipEmpty: { type: Boolean, default: true },
   title: { type: String, default: '打印' },
 })
-const emit = defineEmits(['update:modelValue'])
+const emit = defineEmits(['update:modelValue', 'update:range', 'update:skipEmpty'])
 
 const visible = computed({
   get: () => props.modelValue,
@@ -120,6 +161,29 @@ const printing = ref(false)
 const templateKey = computed(() => (props.scope === 'REPORT' ? 'print_template_id' : 'template_id'))
 
 const isVoucher = computed(() => props.scope === 'VOUCHER')
+/** 账簿（总账 / 明细账）：页脚里有「打印日期」那一格。 */
+const isLedgerBook = computed(() =>
+  props.scope === 'LEDGER' || props.scope === 'DETAIL_LEDGER')
+/** 打印日期。留空 = 用当天（后端兜底）；填了 = 就按填的印。 */
+const printDate = ref('')
+
+/**
+ * 打印范围与「不打印无发生额科目」都是**父页面**的状态（父页面还要拿它们
+ * 拼导出参数），这里只做一层双向绑定。
+ *
+ * 父页面没给范围时退回第一档 —— 那一档是「本册」，与两页的默认值一致，
+ * 不会出现「弹窗里显示本册、请求却按仅当前科目发」这种对不上的情况。
+ */
+const rangeValue = computed({
+  get: () => (props.printRanges.some((r) => r.value === props.range)
+    ? props.range
+    : (props.printRanges[0]?.value ?? '')),
+  set: (v) => emit('update:range', v),
+})
+const skipEmptyValue = computed({
+  get: () => props.skipEmpty,
+  set: (v) => emit('update:skipEmpty', v),
+})
 
 function orientationOf(t) {
   return t?.content?.orientation || 'portrait'
@@ -129,6 +193,7 @@ function buildParams() {
   const p = { ...props.params }
   if (templateId.value !== null) p[templateKey.value] = templateId.value
   if (orientation.value) p.orientation = orientation.value
+  if (isLedgerBook.value && printDate.value) p.print_date = printDate.value
   return p
 }
 
@@ -136,6 +201,7 @@ async function init() {
   error.value = ''
   html.value = ''
   templateId.value = null
+  printDate.value = ''
   try {
     // meta 是公开字典，缓存一份即可，不必每次开弹窗都拉。
     if (!papers.value.length) {
@@ -216,6 +282,12 @@ async function doPrint() {
 }
 
 watch(() => props.modelValue, (v) => { if (v) init() })
+
+// 父页面改了参数（打印范围、不打印无发生额科目）就重出预览 ——
+// 预览与打印必须是同一份内容：用户看到的范围就是印出来的范围。
+// 范围这两个控件的状态在父页面（导出 Excel 也要用），所以这里等
+// props.params 变回来再刷新，而不是自己再算一遍参数。
+watch(() => props.params, () => { if (visible.value) refreshPreview() }, { deep: true })
 </script>
 
 <style scoped>

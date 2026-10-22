@@ -47,12 +47,15 @@ def _sheet(wb, code):
 
 
 def _data_rows(ws):
-    """表体行：从第 5 行起，到页脚之前。
+    """表体行：从第 6 行起，到页脚之前。
+
+    表头的行数是固定的：1 标题 / 2 期间副标题 / 3 科目与本币名称 / 4-5 两行
+    表头 —— 第 6 行才是第一条数据行。
 
     页脚那一行是「核算单位: …」，摘要列（D 列）是空的 —— 就用它当终止标记。
     """
     out = []
-    for row in ws.iter_rows(min_row=5, values_only=True):
+    for row in ws.iter_rows(min_row=6, values_only=True):
         if row[3] is None:
             break
         out.append(row)
@@ -68,8 +71,12 @@ def test_一个一级科目一张工作表(client, auth, db, book, periods, subj
     """导出件是**一册总账**：每个一级科目一张表，顺序跟科目表一致。
 
     以前是一张「一行一个科目」的余额表 —— 那张纸不是总账。
+
+    ``skip_empty=false``：这条测的是**表的形状**（一个一级科目一张表），
+    而这一期本来就没有发生额 —— 开着「不打印无发生额科目」的话整册是空的，
+    只剩一张空白页。关掉它，才能看见「每个科目都有一张表」这件事。
     """
-    wb = _export(client, auth, book, period_id=periods[6].id)
+    wb = _export(client, auth, book, period_id=periods[6].id, skip_empty="false")
     names = wb.sheetnames
     assert len(names) > 1, f"一个一级科目一张表，至少得有多张：{names}"
     assert "库存现金(1001)" in names, names
@@ -135,8 +142,12 @@ def test_区间外的凭证不计入本期发生额(db, client, auth, book, peri
 
 
 def test_不传起始期间时退化成单期(client, auth, db, book, periods, subjects):
-    """老调用方只传 period_id，行为不能变。"""
-    wb = _export(client, auth, book, period_id=periods[6].id)
+    """老调用方只传 period_id，行为不能变。
+
+    ``skip_empty=false``：这一期本来没有发生额，开着「不打印无发生额科目」
+    的话整册是空的，只剩一张空白页 —— 那样就看不到「退化成单期」这件事。
+    """
+    wb = _export(client, auth, book, period_id=periods[6].id, skip_empty="false")
     ws = _sheet(wb, "1001")
     assert _months(ws) == ["06", "06"], _months(ws)
 

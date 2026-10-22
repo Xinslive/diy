@@ -45,6 +45,9 @@ from app.printing.template import (
     DIRECTIONS,
     PAPERS,
     SCOPES,
+    ledger_book_detail_row,
+    ledger_book_period_label,
+    ledger_book_rows_per_page,
     render_ledger_book_page,
     render_table_page,
     wrap_pages,
@@ -842,44 +845,112 @@ def _ledger_book_subjects(db: Session, book: Book, period: Period,
     return subjects
 
 
-def _ledger_book_context(db: Session, book: Book, period: Period,
-                         subject: Subject, user: SysUser) -> dict:
-    """总账一页的页眉/页脚上下文。
+def _period_label(from_period: Period | None, to_period: Period) -> str:
+    """页眉副标题那一行写的**期间文本**。
 
-    用友的总账页眉不是通用页眉：它要「本币名称」与「[正式账簿]」这两个
+    规则收在 ``template.ledger_book_period_label`` 里 —— 打印件与导出件是
+    同一张纸，这串字只能有一处出。
+    """
+    return ledger_book_period_label(
+        from_period.code if from_period is not None else None, to_period.code)
+
+
+def _ledger_book_context(db: Session, book: Book, period: Period,
+                         subject_name: str, subject_code: str, user: SysUser,
+                         print_date: str | None = None,
+                         period_label: str | None = None) -> dict:
+    """账簿（总账 / 明细账）一页的页眉/页脚上下文。
+
+    用友的账簿页眉不是通用页眉：它要「本币名称」与「页号」这两个
     通用页眉里没有的东西。
 
     **本币名称固定写「人民币」**（不是读字段）：``Book`` 表没有币种列，
     加一列会牵出一次迁移 + 账套设置页的输入项。国内一般纳税人的账套就是
     人民币，先把版式做对；将来真要支持多币种时再抽字段，那时这一处改成
     读字段即可。
+
+    **打印日期可以在打印预览页上设**（用户 2026-10-22 批注 3）：给了就用
+    给的那个，没给才回落到当天 —— 不是每次都自动取当天。
+
+    **副标题写的是期间区间**（用户 2026-10-22：标题下面要显示期间）：
+    ``period_label`` 给的是「起 至 止」那一串；没给就退回止期。
+
+    科目只收**名称与编码**两个字符串：总账那边传的是 Subject，明细账那边
+    传的是成册结果里的一项（不是 ORM 对象）—— 收字符串就不用为了传两
+    个值去造一个 Subject 实例。
     """
-    return pv.context(
+    ctx = pv.context(
         db, book, period,
-        subject=subject.name,
-        subject_code=subject.code,
-        # 没有登录人时（比如设计器预览那条路拿不到 user）就空着 ——
-        # 「制表:」后面空着是不好看，但总比整张纸 500 掉强。
-        preparer=((user.real_name or user.username or "") if user else ""),
-        print_date=date.today().strftime("%Y.%m.%d"),
+        subject=subject_name,
+        subject_code=subject_code,
+        # ``pv.context`` 的 period 是**仅位置参数**，这里用关键字覆盖成
+        # 区间文本（见 preview.context 的 docstring）。
+        period=period_label or period.code,
     )
+    # ``pv.context`` 会丢掉空值（None / ""），而页眉页脚里那几处占位符必须
+    # **始终**有值 —— 否则纸上会印出字面的「{subject}」「{preparer}」
+    # 「{print_date}」。所以在这里补齐，而不是靠 context 的 kwargs。
+    ctx["subject"] = subject_name or ""
+    ctx["subject_code"] = subject_code or ""
+    ctx["preparer"] = (user.real_name or user.username or "") if user else ""
+    ctx["print_date"] = print_date or date.today().strftime("%Y.%m.%d")
+    return ctx
+
+
+def _ledger_book_is_empty(rows: list[dict]) -> bool:
+    """这个册页单位在区间内是不是「什么都没有」。
+
+    **无发生额，且余额全是零** —— 两者都空才是真的没东西。
+
+    只有发生额为零、期初有数的科目要印：那笔期初余额是账上的事实，
+    印出来是这一页的最后一行余额；不印就成了「少了一笔」。
+
+    「无发生额」的判断只看**借方/贷方两列**：方向与余额是结果，不是发生额。
+
+    **余额要整段看，不能只看第一行**：明细账的册页单位可能是一个综合
+    明细账（一个一级科目下面几个末级科目排成几块），第一块是空的、第二块
+    有期初余额时，只看第一行会把这个有余额的科目当成空科目跳过 ——
+    纸上就少了一笔实数。
+    """
+    for r in rows:
+        if (r.get("debit") or 0) or (r.get("credit") or 0):
+            return False
+    for r in rows:
+        balance = r.get("balance")
+        if balance:
+            return False
+    return True
 
 
 def _render_ledger_book(db: Session, book: Book, tpl: dict,
                          from_period: Period, to_period: Period,
                          include_unposted: bool, user: SysUser,
-                         subject_id: int | None = None) -> str:
+                         subject_id: int | None = None,
+                         print_date: str | None = None,
+                         skip_empty: bool = True) -> str:
     """把账套的一级科目逐个渲染成用友式总账，**连续成册**。
 
     每个一级科目各自从第 1 页开始编页，页眉上写「当前页-该科目总页数」
     （1-1 = 只有一页，这是第一页）。**分页在服务端做** —— 浏览器打印时的
     页眉是 ``@page`` 边距框，放不了每页不同的内容。
+
+    ``skip_empty`` 是**这一次打印的开关**（打印预览弹窗里那个「不打印无发生额
+    科目」，默认打开），不是模板字段 —— 模板里放一份就等于同一个设置有两个
+    能改的地方。
     """
     from app.ledger import queries
 
     subjects = _ledger_book_subjects(db, book, to_period, subject_id)
     lb = tpl.get("ledger_book") or {}
-    rows_per_page = max(1, int(lb.get("rows_per_page") or 26))
+    # **分页取「模板要的」与「纸面放得下的」两者的较小值**（见
+    # ``template.ledger_book_rows_per_page``）：横向 A4 的可印高度只有
+    # 186mm，模板里写 26 行、行高 7mm 的话，那 26 行放不下一页 —— 硬塞的
+    # 结果是浏览器把它接到下一张物理页上，于是第一页写着「1-1」、第二张
+    # 物理页还是「1-1」。按纸面算出来的行数分页，页码才与纸上对得上。
+    rows_per_page = ledger_book_rows_per_page(tpl)
+    # 用户点名要某一个科目时，那一页就该有 —— 就算它这一段期间确实没动过。
+    skip = skip_empty and not subject_id
+    label = _period_label(from_period, to_period)
 
     # **一册总账共用一个引擎实例**：账簿聚合是账簿最热的那条查询
     # （见 LedgerEngine 的模块 docstring），一册几十个一级科目逐个建引擎
@@ -893,10 +964,13 @@ def _render_ledger_book(db: Session, book: Book, tpl: dict,
         payload = queries.general_ledger(
             db, book.id, subject, from_period, to_period, include_unposted, eng=eng)
         rows = payload["rows"]
+        if skip and _ledger_book_is_empty(rows):
+            continue
         total_rows += len(rows)
         chunks = [rows[i:i + rows_per_page] for i in range(0, len(rows), rows_per_page)]
         for index, chunk in enumerate(chunks, start=1):
-            ctx = _ledger_book_context(db, book, to_period, subject, user)
+            ctx = _ledger_book_context(db, book, to_period, subject.name,
+                                      subject.code, user, print_date, label)
             # 表头上的年份 = 本页第一行所属的年度。区间跨年时，
             # 换年那一页的表头跟着换 —— 与用友「一年一本」的观感一致。
             year = f"{str(chunk[0].get('period') or to_period.code)[:4]}年"
@@ -911,17 +985,128 @@ def _render_ledger_book(db: Session, book: Book, tpl: dict,
             "请缩小查询范围（按期间分段打印）后重试。")
     if not docs:
         return wrap_pages([render_ledger_book_page(
-            tpl, _ledger_book_context(db, book, to_period,
-                                      _dummy_subject(book), user),
+            tpl, _ledger_book_context(db, book, to_period, "", "",
+                                      user, print_date, label),
             [], page=1, pages=1, year=f"{to_period.year}年")])
     return wrap_pages(docs)
 
 
-def _dummy_subject(book: Book) -> Subject:
-    """空册时的占位科目（账套里一个一级科目都没有的极端情况）。"""
-    return Subject(id=0, book_id=book.id, year=0, code="", name="",
-                   category="ASSET", level=1, is_leaf=False, direction="DEBIT",
-                   active=True, sort_no=0, parent_id=None)
+# --------------------------------------------------------------------- 用友式明细账（账簿）
+
+
+def _detail_book_groups(db: Session, book: Book, period: Period,
+                        subject_id: int | None = None,
+                        from_subject_id: int | None = None,
+                        to_subject_id: int | None = None) -> list[dict]:
+    """一册明细账的**册页单位**（一级科目逐个），按科目表顺序。
+
+    * **不给科目** —— 全账套的一级科目，一册明细账就是这些一级科目连续排下来。
+    * **给了科目** —— 那一个科目（末级就它自己；父科目就它下面那几个，
+      还可以用起止科目再框一段）。
+
+    单位一律是**一级科目**（用户 2026-10-22 批注 3）：明细账与总账的册页
+    结构一致，都是一级科目一份、综合的那个是**综合明细账**（下级科目排成
+    几块，每块首行写「编码 名称 期初余额」）。
+    """
+    from app.ledger import queries
+
+    return queries.detail_ledger_groups(
+        db, book.id, period.year,
+        subject_id=subject_id,
+        from_subject_id=from_subject_id,
+        to_subject_id=to_subject_id,
+    )
+
+
+def _detail_book_payload(db: Session, book: Book, groups: list[dict],
+                         from_period: Period, to_period: Period,
+                         include_unposted: bool, eng) -> list[dict]:
+    """一册明细账的数据（已摊成用友八列）。
+
+    **HTML 打印与 Excel 导出共用这一份** —— 两个通道印的是同一张纸，
+    数据口径分叉的话，纸上和文件上会有一份是对的、有一份是错的。
+    """
+    from app.ledger import queries
+
+    books = queries.detail_ledger_book(
+        db, book.id, groups, from_period, to_period, include_unposted, eng=eng)
+    return [
+        {
+            "code": item["code"],
+            "name": item["name"],
+            "rows": [ledger_book_detail_row(r) for r in item["rows"]],
+        }
+        for item in books
+    ]
+
+
+def _render_detail_ledger_book(db: Session, book: Book, tpl: dict,
+                                from_period: Period, to_period: Period,
+                                include_unposted: bool, user: SysUser,
+                                *, subject_id: int | None = None,
+                                from_subject_id: int | None = None,
+                                to_subject_id: int | None = None,
+                                print_date: str | None = None,
+                                skip_empty: bool = True) -> str:
+    """明细账成册：一级科目逐个打成一份，**连续成册**。
+
+    版式与总账**逐格相同**（同一个渲染器、同一套页眉页脚、同一个页码
+    口径），差别只在数据：总账是逐月汇总，明细账是逐笔（带日、凭证号数、
+    凭证摘要）。
+
+    每个一级科目各自从第 1 页开始编页，页眉写「当前页-该科目总页数」。
+    """
+    from app.ledger import queries
+
+    groups = _detail_book_groups(db, book, to_period, subject_id,
+                                  from_subject_id, to_subject_id)
+    lb = tpl.get("ledger_book") or {}
+    # 与总账同一个口径：一页放多少行取「模板要的」与「纸面放得下的」较小值
+    # （理由见 ``template.ledger_book_rows_per_page``）。
+    rows_per_page = ledger_book_rows_per_page(tpl)
+    # 「不打印无发生额的科目」只对**整册**生效。
+    #
+    # 用户点名要某一个科目时，那一页就该有 —— 就算它这一段期间确实没动过，
+    # 印出来的是「期初余额 0 + 每月合计 0」，那也是一条信息（这个科目这一段
+    # 是空的）。而整册几百个一级科目，其中绝大多数没动过，全印出来是几百页
+    # 废纸。这两件事不能混成一条规则。
+    skip = skip_empty and not subject_id
+    label = _period_label(from_period, to_period)
+
+    # **一册明细账共用一个引擎实例**（理由同 _render_ledger_book）。
+    from app.ledger.engine import LedgerEngine
+    eng = LedgerEngine.for_ledger(db, book.id, include_unposted)
+    books = _detail_book_payload(db, book, groups, from_period, to_period,
+                                 include_unposted, eng)
+
+    docs: list[str] = []
+    total_rows = 0
+    for item in books:
+        rows = item["rows"]
+        if skip and _ledger_book_is_empty(rows):
+            continue
+        total_rows += len(rows)
+        starts = list(range(0, len(rows), rows_per_page))
+        chunks = [rows[i:i + rows_per_page] for i in starts]
+        for index, (chunk, start) in enumerate(zip(chunks, starts), start=1):
+            ctx = _ledger_book_context(db, book, to_period, item["name"],
+                                       item["code"], user, print_date, label)
+            # 表头上的年份 = 本页第一行所属的年度。区间跨年时，换年那一页的
+            # 表头跟着换 —— 与用友「一年一本」的观感一致。
+            year = f"{str(rows[start].get('period') or to_period.code)[:4]}年"
+            docs.append(render_ledger_book_page(
+                tpl, ctx, chunk, page=index, pages=len(chunks), year=year))
+    from app.printing import excel as xl
+    if total_rows > xl.MAX_EXPORT_ROWS:
+        raise xl.ExportTooLarge(
+            f"明细账共 {total_rows:,} 行，超过单次打印上限 {xl.MAX_EXPORT_ROWS:,} 行。"
+            "请缩小查询范围（按科目或按期间分段打印）后重试。")
+    if not docs:
+        return wrap_pages([render_ledger_book_page(
+            tpl, _ledger_book_context(db, book, to_period, "", "",
+                                      user, print_date, label),
+            [], page=1, pages=1, year=f"{to_period.year}年")])
+    return wrap_pages(docs)
 
 
 def _report_print_col(col: dict) -> dict:
@@ -1001,11 +1186,20 @@ def _render_scope(
     max_pages: Optional[int] = None,
     note: str = "",
     user: Optional[SysUser] = None,
+    print_date: Optional[str] = None,
+    skip_empty: bool = True,
 ) -> str:
     """把一个「打印范围」渲染成完整 HTML。五个 .html 接口和预览接口都调它。
 
-    ``user`` 只给总账用：它的页脚要印「制表: <谁>」，那得是**当前这个人**
-    （总账是账簿，制表人是出纸的人）。别的范围不用这个参数。
+    ``user`` 只给账簿用（总账/明细账）：它的页脚要印「制表: <谁>」，那得是
+    **当前这个人**（账簿是账，制表人是出纸的人）。别的范围不用这个参数。
+
+    ``print_date`` 同样只给账簿用：打印预览页上可以指定打印日期，不给才回落到
+    当天（用户 2026-10-22 批注 3）。
+
+    ``skip_empty`` 也只给账簿用：打印预览页上的「不打印无发生额科目」开关，
+    默认打开（用户 2026-10-22 批注 2）。它是**这一次打印的设置**，不是模板
+    字段 —— 模板里再放一份就等于同一个设置有两个地方能改。
     """
     from app.ledger import queries
 
@@ -1050,29 +1244,22 @@ def _render_scope(
         to_period = period
         from_period = _period(db, book.id, from_period_id) if from_period_id else to_period
         doc = _render_ledger_book(db, book, tpl, from_period, to_period,
-                                  include_unposted, user, subject_id=subject_id)
+                                  include_unposted, user, subject_id=subject_id,
+                                  print_date=print_date, skip_empty=skip_empty)
         return _with_note(doc, note)
 
     if scope == "DETAIL_LEDGER":
-        if not subject_id:
-            raise HTTPException(400, "明细账预览需要先选择一个科目")
-        payload = queries.detail_ledger(
-            db, book.id, subject_id, from_period, to_period, include_unposted,
-            from_subject_id=from_subject_id, to_subject_id=to_subject_id,
-        )
-        subj = payload["subject"]
-        subject_caption = f"{subj['code']} {subj['name']}"
-        if payload.get("subject_range"):
-            subject_caption += (
-                f"（{payload['subject_range']['from']['code']} 至 "
-                f"{payload['subject_range']['to']['code']}）"
-            )
-        ctx = pv.context(db, book, to_period,
-                         subject=subject_caption,
-                         period=f"{payload['from_period']} 至 {payload['to_period']}"
-                         if payload["from_period"] != payload["to_period"] else payload["from_period"])
-        doc = render_table_page(tpl, ctx,
-                                _check_print_rows(pv.detail_rows(payload), "明细账"), 1, 1)
+        # **用友式明细账**：与总账同一套版式，数据是逐笔而不是逐月汇总。
+        #
+        # 以前这里是「必须先选一个科目」的通用表格：一行一个分录，横向十列，
+        # 页眉页脚走的是通用那一套 —— 与用友的明细分类账不是一回事。
+        # 现在**不给科目就是整册**（全账套的末级科目连续排下来），
+        # 给了科目就只打那一个。
+        doc = _render_detail_ledger_book(
+            db, book, tpl, from_period, to_period, include_unposted, user,
+            subject_id=subject_id, from_subject_id=from_subject_id,
+            to_subject_id=to_subject_id, print_date=print_date,
+            skip_empty=skip_empty)
         return _with_note(doc, note)
 
     if scope == "REPORT":
@@ -1157,11 +1344,27 @@ def print_balance(book_id: int, period_id: Optional[int] = None,
                                         subject_scope=subject_scope))
 
 
+def _print_date_arg(raw: Optional[str]) -> Optional[str]:
+    """打印日期参数。
+
+    **留空 = 用当天**（老行为，也是兜底）；**给了就按给的印** ——
+    打印预览页上可以指定日期，不必每次都自动取当天（用户 2026-10-22 批注 3）。
+
+    长度限 40：它是页脚上的一行字，塞一大段进去会把版式顶飞。
+    """
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    return value[:40] if value else None
+
+
 @router.get("/general-ledger.html")
 def print_general(book_id: int, period_id: Optional[int] = None,
                   from_period_id: Optional[int] = None, template_id: Optional[int] = None,
                   include_unposted: bool = Query(False),
                   subject_id: Optional[int] = None,
+                  print_date: Optional[str] = None,
+                  skip_empty: bool = Query(True),
                   orientation: Optional[str] = None,
                   book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                   user: SysUser = Depends(get_current_user)):
@@ -1169,6 +1372,9 @@ def print_general(book_id: int, period_id: Optional[int] = None,
 
     ``subject_id`` 给了就只打那一个科目（屏幕上正在看哪个科目时的常用动作），
     不给就是账套的全部一级科目。
+
+    ``skip_empty`` 是「不打印无发生额的科目」开关（打印预览弹窗里那个，
+    默认打开）：区间内既没有发生额、余额也都是零的科目不印。
 
     ``leaf_only`` 这个参数曾经有意义（筛明细科目），现在**没有**了 ——
     总账的单位是**一级科目**（用友的「总分类账」）。留着是为了不打断老调用方，
@@ -1178,23 +1384,35 @@ def print_general(book_id: int, period_id: Optional[int] = None,
     return _html_response(_render_scope(db, book, "LEDGER", tpl, period_id=period_id,
                                         from_period_id=from_period_id,
                                         include_unposted=include_unposted,
-                                        subject_id=subject_id, user=user))
+                                        subject_id=subject_id, user=user,
+                                        print_date=_print_date_arg(print_date),
+                                        skip_empty=skip_empty))
 
 
 @router.get("/detail-ledger.html")
-def print_detail(book_id: int, subject_id: int, period_id: Optional[int] = None,
+def print_detail(book_id: int, subject_id: Optional[int] = None,
+                 period_id: Optional[int] = None,
                  from_period_id: Optional[int] = None, template_id: Optional[int] = None,
                  from_subject_id: Optional[int] = None, to_subject_id: Optional[int] = None,
                  include_unposted: bool = Query(False),
+                 print_date: Optional[str] = None,
+                 skip_empty: bool = Query(True),
                  orientation: Optional[str] = None,
                  book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                   user: SysUser = Depends(get_current_user)):
+    """用友式明细账：一级科目逐个打成一份，**连续成册**。
+
+    ``subject_id`` **不给了就是整册**（全账套的一级科目连续排下来），
+    给了就只打那一个科目 —— 父科目则打它下面那几个（可用起止科目再框一段）。
+    """
     tpl = _with_orientation(_tpl_dict(_template(db, book, "DETAIL_LEDGER", template_id, user.id)), orientation)
     return _html_response(_render_scope(db, book, "DETAIL_LEDGER", tpl, period_id=period_id,
                                         from_period_id=from_period_id, subject_id=subject_id,
                                         from_subject_id=from_subject_id,
                                         to_subject_id=to_subject_id,
-                                        include_unposted=include_unposted))
+                                        include_unposted=include_unposted, user=user,
+                                        print_date=_print_date_arg(print_date),
+                                        skip_empty=skip_empty))
 
 
 @router.get("/report.html")
@@ -1358,6 +1576,8 @@ def export_balance(book_id: int, period_id: Optional[int] = None,
 def export_general(book_id: int, period_id: Optional[int] = None,
                    from_period_id: Optional[int] = None,
                    subject_id: Optional[int] = None,
+                   print_date: Optional[str] = None,
+                   skip_empty: bool = Query(True),
                    book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                    include_unposted: bool = Query(False),
                    user: SysUser = Depends(get_current_user)):
@@ -1372,6 +1592,9 @@ def export_general(book_id: int, period_id: Optional[int] = None,
 
     现在与 general-ledger.html 的口径一致：认 from_period_id，缺省则退化成
     单期导出（老调用方不受影响）。
+
+    ``skip_empty`` 与打印件**同一个口径**（打印预览弹窗上那个开关，默认
+    打开）—— 打印与导出是同一张纸，两个通道不能一个跳一个不跳。
     """
     from app.ledger import queries
 
@@ -1398,10 +1621,13 @@ def export_general(book_id: int, period_id: Optional[int] = None,
     # 一册总账共用一个引擎实例（理由同 ``_render_ledger_book``）
     from app.ledger.engine import LedgerEngine
     eng = LedgerEngine.for_ledger(db, book.id, include_unposted)
+    skip = skip_empty and not subject_id
     payload_subjects = []
     for subject in subjects:
         payload = queries.general_ledger(
             db, book.id, subject, from_period, to_period, include_unposted, eng=eng)
+        if skip and _ledger_book_is_empty(payload["rows"]):
+            continue
         payload_subjects.append({
             "code": payload["subject"]["code"],
             "name": payload["subject"]["name"],
@@ -1411,7 +1637,8 @@ def export_general(book_id: int, period_id: Optional[int] = None,
         {"subjects": payload_subjects,
          "from_period": from_period.code, "to_period": to_period.code},
         book_name=book.name, company=book.company_name,
-        preparer=(user.real_name or user.username or ""))
+        preparer=(user.real_name or user.username or ""),
+        print_date=_print_date_arg(print_date))
     span = from_period.code if from_period.id == to_period.id else f"{from_period.code}-{to_period.code}"
     return Response(content=data, media_type=XLSX_MIME,
                     headers={"Content-Disposition": _filename(f"总账_{span}.xlsx")})
@@ -1437,13 +1664,23 @@ def export_report(book_id: int, template_id: int, period_id: int, book: Book = D
 
 @router.get("/detail-ledger.xlsx")
 @_xlsx
-def export_detail_ledger(book_id: int, subject_id: int, period_id: Optional[int] = None,
+def export_detail_ledger(book_id: int, subject_id: Optional[int] = None,
+                         period_id: Optional[int] = None,
                          from_period_id: Optional[int] = None,
                          from_subject_id: Optional[int] = None,
                          to_subject_id: Optional[int] = None,
                          include_unposted: bool = Query(False),
-                         book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
-    from app.ledger import queries
+                         print_date: Optional[str] = None,
+                         skip_empty: bool = Query(True),
+                         book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                         user: SysUser = Depends(get_current_user)):
+    """明细账导出（用友式）：**一个一级科目一张工作表**，与打印件同一张纸。
+
+    ``subject_id`` **不给就是整册**（全账套的一级科目），给了就只导那一个。
+
+    ``skip_empty`` 与打印件同一个口径（默认打开）：打印与导出是同一张纸，
+    两个通道不能一个跳一个不跳。
+    """
     from app.printing import excel as xl
 
     to_period = _period(db, book.id, period_id)
@@ -1455,13 +1692,26 @@ def export_detail_ledger(book_id: int, subject_id: int, period_id: Optional[int]
             raise HTTPException(404, "起始期间不存在")
     else:
         from_period = to_period
+    if from_period.ord > to_period.ord:
+        raise HTTPException(400, "起始期间不能晚于结束期间")
 
-    payload = queries.detail_ledger(
-        db, book.id, subject_id, from_period, to_period, include_unposted,
-        from_subject_id=from_subject_id, to_subject_id=to_subject_id,
-    )
-    data = xl.detail_ledger_excel(payload, book_name=book.name)
+    groups = _detail_book_groups(db, book, to_period, subject_id,
+                                  from_subject_id, to_subject_id)
+    from app.ledger.engine import LedgerEngine
+    eng = LedgerEngine.for_ledger(db, book.id, include_unposted)
+    payload_subjects = _detail_book_payload(db, book, groups, from_period,
+                                            to_period, include_unposted, eng)
+    # 用户点名要某一个科目时，那一页就该有（理由同 _render_detail_ledger_book）。
+    if skip_empty and not subject_id:
+        payload_subjects = [
+            s for s in payload_subjects if not _ledger_book_is_empty(s["rows"])]
+    data = xl.detail_ledger_excel(
+        {"subjects": payload_subjects,
+         "from_period": from_period.code, "to_period": to_period.code},
+        book_name=book.name, company=book.company_name,
+        preparer=(user.real_name or user.username or ""),
+        print_date=_print_date_arg(print_date))
     span = from_period.code if from_period.id == to_period.id else f"{from_period.code}-{to_period.code}"
-    code = payload["subject"]["code"]
+    label = groups[0]["subject"].code if len(groups) == 1 else "全账套"
     return Response(content=data, media_type=XLSX_MIME,
-                    headers={"Content-Disposition": _filename(f"明细账_{code}_{span}.xlsx")})
+                    headers={"Content-Disposition": _filename(f"明细账_{label}_{span}.xlsx")})

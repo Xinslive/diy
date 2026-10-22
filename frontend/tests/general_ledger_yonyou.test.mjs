@@ -14,6 +14,10 @@ import fs from 'node:fs'
 
 const GENERAL = fs.readFileSync(
   new URL('../src/views/ledger/GeneralLedger.vue', import.meta.url), 'utf8')
+const RANGE = fs.readFileSync(
+  new URL('../src/utils/ledgerPrint.js', import.meta.url), 'utf8')
+/** 只看模板部分：注释里提到「打印范围」不算，那个下拉得真的不在页面上。 */
+const GENERAL_TPL = GENERAL.split('<script setup>')[0]
 
 let pass = 0, fail = 0
 const t = (name, fn) => {
@@ -87,19 +91,32 @@ t('页内控件不改全局期间', () => {
 console.log('')
 console.log('== 打印与导出 ==')
 //
-// 打印范围定了两档：**本册**是账套全部一级科目、连续打成一册（用友正式账簿
-// 的做法）；「仅当前科目」只打屏幕上正在看的那一个。
+// 打印范围（整册 / 仅当前科目）与「不打印无发生额科目」现在住在**打印预览
+// 弹窗**里（用户 2026-10-22 批注 1、2）：工具栏上那个下拉已经删掉 ——
+// 同一个设置只留一处，两处都能改的话迟早有一次是旧值。
 
-t('打印范围有两档，默认本册', () => {
-  assert.match(GENERAL, /printScope/, '没有打印范围的选择')
-  assert.match(GENERAL, /ref\('book'\)/, '默认不是「本册」')
-  assert.match(GENERAL, /本册（全部一级科目）/, '没有「本册」这一档')
-  assert.match(GENERAL, /仅当前科目/, '没有「仅当前科目」这一档')
+t('工具栏上不再有打印范围下拉', () => {
+  assert.ok(!/打印范围/.test(GENERAL_TPL), '工具栏上还有「打印范围」')
+  assert.ok(!/ledger-scope-select/.test(GENERAL), '工具栏上还有那个下拉')
+})
+t('打印范围搬进打印预览弹窗', () => {
+  assert.match(GENERAL, /:print-ranges="LEDGER_PRINT_RANGES"/)
+  assert.match(GENERAL, /v-model:range="printRange"/)
+  assert.match(GENERAL, /v-model:skip-empty="printSkipEmpty"/)
+})
+t('两档文案与口径共用一份（utils/ledgerPrint.js）', () => {
+  // 总账与明细账是同一册结构，各写一份文案的话，用户会以为两本册子结构不同。
+  assert.match(GENERAL, /from '@\/utils\/ledgerPrint'/)
+  assert.match(RANGE, /本册（全部一级科目）/)
+  assert.match(RANGE, /仅当前科目/)
+})
+t('默认是整册', () => {
+  assert.match(GENERAL, /ref\(PRINT_RANGE_BOOK\)/)
 })
 t('「仅当前科目」才带 subject_id', () => {
-  // 本册不带 subject_id —— 带了后端就只打一个科目，一整册打不出来。
-  assert.match(GENERAL, /printScope\.value === 'current'/, '打印范围没参与参数')
-  assert.match(GENERAL, /subject_id: data\.value\.subject\.id/, '当前科目的 id 没带出去')
+  // 整册不带 subject_id —— 带了后端就只打一个科目，一整册打不出来。
+  assert.match(GENERAL, /ledgerPrintParams\(/)
+  assert.match(GENERAL, /subject_id: data\.value\.subject\.id/)
 })
 t('导出与打印共用同一份参数', () => {
   // 各写一遍迟早漏：漏的那一处就会出现「屏幕是一段、文件是全账」。

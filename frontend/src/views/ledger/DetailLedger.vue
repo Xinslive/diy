@@ -96,7 +96,9 @@
     </div>
 
     <PrintDialog v-model="printVisible" :book-id="store.bookId" :path="printPath"
-                 scope="DETAIL_LEDGER" :params="printParams" title="打印明细账" />
+                 scope="DETAIL_LEDGER" :params="printParams" title="打印明细账"
+                 :print-ranges="LEDGER_PRINT_RANGES"
+                 v-model:range="printRange" v-model:skip-empty="printSkipEmpty" />
   </div>
 </template>
 
@@ -111,6 +113,9 @@ import SubjectPicker from '@/components/SubjectPicker.vue'
 import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
+import {
+  LEDGER_PRINT_RANGES, PRINT_RANGE_CURRENT, SKIP_EMPTY_DEFAULT, ledgerPrintParams,
+} from '@/utils/ledgerPrint'
 
 const store = useSessionStore()
 const router = useRouter()
@@ -142,7 +147,10 @@ const viewRows = computed(() => {
     ...row,
     month: String(row.voucher_date || row.period || '').slice(5, 7),
     day: row.voucher_date ? String(row.voucher_date).slice(8, 10) : '',
-    summary: row.kind === 'YTD_TOTAL' ? '累\u3000\u3000计' : row.summary || '',
+    // 累计行的标签由**后端**给（整年 12 月写「本年累计」，其余写「累　　计」，
+    // 与总账同一套规则）。以前这里前端硬写「累　　计」，于是屏幕与纸上
+    // 在整年那一行对不上 —— 纸上写本年累计、屏幕写累计。
+    summary: row.summary || '',
     debitText: row.debit == null ? '' : fmt(row.debit),
     creditText: row.credit == null ? '' : fmt(row.credit),
     balanceText: row.balance == null ? '' : fmt(row.balance),
@@ -306,25 +314,48 @@ function previewHtml() {
 
 const printVisible = ref(false)
 const printPath = computed(() => `/books/${store.bookId}/print/detail-ledger.html`)
-/** 只有范围，模板 id 由弹窗自己选 —— 它得让用户在打之前改主意。
- *  subject_id 是这个接口必填的，少了它预览直接 400。 */
-const printParams = computed(() => ({
-  subject_id: subjectId.value,
-  period_id: toId.value, from_period_id: fromId.value || undefined,
-  from_subject_id: isComprehensive.value ? fromSubjectId.value : undefined,
-  to_subject_id: isComprehensive.value ? toSubjectId.value : undefined,
-  include_unposted: includeUnposted.value,
+/**
+ * 打印范围：**本册**是全账套的一级科目、连续打成一册（用友明细账的做法，
+ * 与总账同一册结构 —— 用户 2026-10-22 批注 3）；**仅当前科目**只打屏幕上
+ * 正在看的那一个。
+ *
+ * **这个设置住在打印预览弹窗里**（用户 2026-10-22 批注 1、2）：工具栏上
+ * 原来那个下拉已经删掉。状态仍然放在这一页 —— 页面上那个「导出 Excel」
+ * 要的是同一份范围。
+ *
+ * **默认是「仅当前科目」**（用户 2026-10-22 批注 4）：明细账是**逐笔**的账，
+ * 整册打出来是全账套几百个一级科目、动辄几百页纸；用户走到明细账这一页，
+ * 心里要的通常就是屏幕上正在看的那一个科目。总账那边默认仍是「本册」。
+ */
+const printRange = ref(PRINT_RANGE_CURRENT)
+/** 「不打印无发生额科目」，默认打开（用户 2026-10-22 批注 2）。 */
+const printSkipEmpty = ref(SKIP_EMPTY_DEFAULT)
+/**
+ * 打印与导出共用的那份参数（拼装规则见 ``utils/ledgerPrint.js``）。
+ *
+ * 「仅当前科目」时带上屏幕上的那一个：父科目就带上起止子科目（综合明细账
+ * 可以只框其中一段），末级科目就只带它自己。
+ */
+const printParams = computed(() => ledgerPrintParams({
+  range: printRange.value,
+  base: {
+    period_id: toId.value, from_period_id: fromId.value || undefined,
+    include_unposted: includeUnposted.value,
+  },
+  subject: {
+    subject_id: subjectId.value,
+    from_subject_id: isComprehensive.value ? fromSubjectId.value : undefined,
+    to_subject_id: isComprehensive.value ? toSubjectId.value : undefined,
+  },
+  skipEmpty: printSkipEmpty.value,
 }))
 
 function exportXlsx() {
-  downloadFile(`/books/${store.bookId}/print/detail-ledger.xlsx`, {
-    subject_id: subjectId.value,
-    period_id: toId.value,
-    from_period_id: fromId.value || undefined,
-    from_subject_id: isComprehensive.value ? fromSubjectId.value : undefined,
-    to_subject_id: isComprehensive.value ? toSubjectId.value : undefined,
-    include_unposted: includeUnposted.value,
-  }, '明细账.xlsx')
+  // 导出与打印共用同一份参数：屏幕上是「起始月 ~ 结束月」这一段，
+  // 导出也得是这一段 —— 审计第 7.3 节把「明细账导出：区间与页面显示一致」
+  // 列为验收项。
+  downloadFile(`/books/${store.bookId}/print/detail-ledger.xlsx`,
+    { ...printParams.value }, '明细账.xlsx')
 }
 </script>
 

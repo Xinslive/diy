@@ -295,7 +295,10 @@ def test_导出行数超限给出明确错误():
     刻意选**报错**而不是静默截断：交给审计方的账表少一段，比导不出来糟得多。
     """
     with pytest.raises(ExportTooLarge) as ei:
-        detail_ledger_excel({"rows": [{}] * (MAX_EXPORT_ROWS + 1)}, book_name="乙")
+        detail_ledger_excel(
+            {"subjects": [{"code": "1001", "name": "库存现金",
+                           "rows": [{}] * (MAX_EXPORT_ROWS + 1)}]},
+            book_name="乙")
     assert "超过" in str(ei.value)
 
 
@@ -303,7 +306,9 @@ def test_各导出接口都有行数上限():
     too_many = [{}] * (MAX_EXPORT_ROWS + 1)
     check = {"period_balanced": True, "closing_balanced": True}
     cases = [
-        lambda: detail_ledger_excel({"rows": too_many}, book_name="乙"),
+        lambda: detail_ledger_excel(
+            {"subjects": [{"code": "1001", "name": "库存现金", "rows": too_many}]},
+            book_name="乙"),
         lambda: balance_excel({"rows": too_many, "check": check, "period": "2026-01"},
                               book_name="乙"),
         lambda: general_ledger_excel(
@@ -329,8 +334,10 @@ def test_刚好到上限不报错():
              "debit": "1.00", "credit": "", "direction": "借", "balance": "1.00",
              "subject_code": "1001", "subject_name": "库存现金", "subject_level": 1}
             for _ in range(MAX_EXPORT_ROWS)]
-    ws = _sheet(detail_ledger_excel({"rows": rows, "from_period": "2026-01"},
-                                    book_name="乙"))
+    ws = _sheet(detail_ledger_excel(
+        {"subjects": [{"code": "1001", "name": "库存现金", "rows": rows}],
+         "from_period": "2026-01"},
+        book_name="乙"))
     assert ws.max_row >= MAX_EXPORT_ROWS
 
 
@@ -388,6 +395,10 @@ def test_总账抬头是科目名加本币名称():
 
     **不再有「账套名 · 区间」那一行** —— 用友那张纸上就没有它，
     区间由月份列与**文件名**承担（见 test_general_ledger_export.py）。
+
+    但**期间要在标题下面那一行**（用户 2026-10-22：标题下面显示期间的
+    副标题）：打印件在标题下面印期间，导出件也要有 —— 两个通道是同一张纸，
+    一边有一边没有，纸上与文件上就差了一行。
     """
     wb = load_workbook(io.BytesIO(general_ledger_excel(
         {"from_period": "2026-01", "to_period": "2026-05",
@@ -395,8 +406,9 @@ def test_总账抬头是科目名加本币名称():
         book_name="乙")))
     ws = wb.worksheets[0]
     assert ws.cell(row=1, column=1).value == "库存现金总账"
-    assert ws.cell(row=2, column=1).value == "科目: 库存现金(1001)"
-    assert ws.cell(row=2, column=6).value == "本币名称: 人民币"
+    assert ws.cell(row=2, column=1).value == "2026-01 至 2026-05"
+    assert ws.cell(row=3, column=1).value == "科目: 库存现金(1001)"
+    assert ws.cell(row=3, column=6).value == "本币名称: 人民币"
 
 
 def test_报表抬头只有账套名和期间():
@@ -431,9 +443,10 @@ def test_所有Excel导出件里都不出现单位名(client, auth, book, period
     —— 将来新增一个导出器时很容易顺手把单位名带上，而这类疏漏用户不会
     当成 bug，只会把纸面那份当成对的。
 
-    **唯一的例外是总账页脚左段的「核算单位:」**：那是用友正式账簿的固定
+    **唯一的例外是用友账簿页脚左段的「核算单位:」**：那是用友正式账簿的固定
     栏位（样张上就写着「核算单位: 泉州星悦荟商业管理有限公司」），
     打印件里也有 —— 导出件缺了这一段，两边就不是同一张纸了。
+    总账与明细账都是用友账簿，例外对两者同样成立。
     例外只放宽到**页脚那一格**：抬头里出现单位名照样红。
     """
     company = book.company_name
@@ -447,13 +460,17 @@ def test_所有Excel导出件里都不出现单位名(client, auth, book, period
     leaf = next(s for s in subjects.values() if s.is_leaf)
 
     ledger_url = f"/api/books/{book.id}/print/general-ledger.xlsx?period_id={pid}"
+    detail_url = (f"/api/books/{book.id}/print/detail-ledger.xlsx"
+                  f"?subject_id={leaf.id}&period_id={pid}")
+    # 用友账簿（总账 / 明细账）：页脚左段有「核算单位:」，抬头里不许有。
+    book_urls = {ledger_url, detail_url}
     urls = [
         f"/api/books/{book.id}/print/vouchers.xlsx?period_id={pid}",
         f"/api/books/{book.id}/print/balance.xlsx?period_id={pid}",
         ledger_url,
         f"/api/books/{book.id}/print/report.xlsx"
         f"?template_id={templates[0]['id']}&period_id={pid}",
-        f"/api/books/{book.id}/print/detail-ledger.xlsx?subject_id={leaf.id}&period_id={pid}",
+        detail_url,
         f"/api/books/{book.id}/openings.xlsx?period_id={pid}",
         f"/api/books/{book.id}/vouchers/import-template.xlsx",
     ]
@@ -462,8 +479,8 @@ def test_所有Excel导出件里都不出现单位名(client, auth, book, period
         assert r.status_code == 200, f"{url} → {r.status_code} {r.text[:300]}"
         wb = load_workbook(io.BytesIO(r.content))
         for ws in wb.worksheets:
-            if url == ledger_url:
-                # 总账：核算单位只在**页脚左段**（第 1~4 行是抬头，不许出现）
+            if url in book_urls:
+                # 账簿：核算单位只在**页脚左段**（第 1~4 行是抬头，不许出现）
                 head = [str(c.value) for row in ws.iter_rows(min_row=1, max_row=4)
                         for c in row if c.value is not None]
                 assert not any(company in v for v in head), (

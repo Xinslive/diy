@@ -579,8 +579,12 @@ def test_总账打印超上限返回413(client, auth, book, periods, mk_voucher,
 
     mk_voucher("2026-01-05")
     monkeypatch.setattr(xl, "MAX_EXPORT_ROWS", 1)
+    # **要带上未记账凭证**：那张凭证是「未记账」状态，而打印默认不含它们 ——
+    # 整册于是全是空科目，「不打印无发生额科目」把它们全跳过，行数是 0，
+    # 也就谈不上超上限。超限要拿**真的有行**的那一册来试。
     r = client.get(f"/api/books/{book.id}/print/general-ledger.html",
-                   params={"period_id": periods[1].id}, headers=auth)
+                   params={"period_id": periods[1].id,
+                           "include_unposted": "true"}, headers=auth)
     assert r.status_code == 413, f"超行数的打印页被放行了：{r.status_code} {r.text}"
 
 

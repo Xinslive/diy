@@ -316,12 +316,18 @@ def main() -> int:
 
     st, html_g = call("GET", f"/api/books/{bid}/print/general-ledger.html")
     text_g = html_g.decode()
-    # 用友式总账：标题是「{科目名}总账」，右上角带「[正式账簿]」与「本币名称」。
+    # 用友式总账：标题是「{科目名}总账」，页眉带「页号」与「本币名称」。
+    # 右上角那个「[正式账簿]」**不印**（2026-10-22 需求方批注 1）——
+    # 那是用友的产品标记，印在自家账上只会让人以为这纸是用友出的。
     check("总账打印页", st == 200 and "总账" in text_g)
-    check("总账打印页带用友页眉", "[正式账簿]" in text_g and "本币名称" in text_g)
+    check("总账打印页带用友页眉", "本币名称" in text_g and "页号" in text_g)
+    check("总账打印页不印用友的账簿标记", "[正式账簿]" not in text_g)
 
     st, html_d = call("GET", f"/api/books/{bid}/print/detail-ledger.html?subject_id={dr_sub['id']}")
-    check("明细账打印页", st == 200 and "期初余额" in html_d.decode())
+    text_d = html_d.decode()
+    # 明细账与总账是同一套用友版式，只是数据是逐笔的。
+    check("明细账打印页", st == 200 and "期初余额" in text_d)
+    check("明细账打印页带用友页眉", "本币名称" in text_d and "页号" in text_d)
 
     st, rtpls = call("GET", "/api/reports/templates")
     st, html_r = call("GET", f"/api/books/{bid}/print/report.html"
