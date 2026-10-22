@@ -213,7 +213,7 @@ const ROLE_TAG = { OWNER: 'danger', ACCOUNTANT: 'primary', VIEWER: 'info' }
 // **前端先挡住并说人话**，后端那份是最后一道网。
 const USERNAME_MAX = 64        // 与 sys_user.username 的列宽一致
 const REAL_NAME_MAX = 64       // 与 sys_user.real_name 的列宽一致
-const PASSWORD_MIN = 8         // 与后端 PASSWORD_MIN_LENGTH 一致
+const PASSWORD_MIN = 6         // 与后端 PASSWORD_MIN_LENGTH 一致
 const USERNAME_MIN = 2
 
 // 用户名的形状约束：不能有空白与控制字符（换行会写进审计日志与告警邮件，

@@ -106,7 +106,7 @@ def test_注册成功但拿不到任何账套(client, plain_auth, registration_o
 
 
 @pytest.mark.parametrize("payload,why", [
-    ({"username": "abc", "password": "12345"}, "密码不足 8 位"),
+    ({"username": "abc", "password": "12345"}, "密码不足 6 位"),
     ({"username": "张三", "password": "abcd1234"}, "用户名含中文"),
     ({"username": "has space", "password": "abcd1234"}, "用户名含空格"),
     ({"username": "ab", "password": "abcd1234"}, "用户名过短"),
@@ -114,6 +114,21 @@ def test_注册成功但拿不到任何账套(client, plain_auth, registration_o
 def test_注册参数被拒(client, payload, why, registration_on):
     r = client.post("/api/auth/register", json=payload)
     assert r.status_code == 422, f"{why} 竟然通过了：{r.text}"
+
+
+def test_注册口令下限是六位(client, registration_on):
+    """**注册的下限是 6 位**（用户 2026-10-22 定的口径）。
+
+    与管理员建号**同一把尺** —— 过去自助注册是 8 位、比管理员建号更严，
+    改完后两边都是 6 位。这条用例钉住的是**边界**：5 位被拒、6 位能注册。
+    """
+    r = client.post("/api/auth/register",
+                    json={"username": "fivechar01", "password": "ab12c"})
+    assert r.status_code == 422, f"5 位口令被收了：{r.text[:200]}"
+
+    r = client.post("/api/auth/register",
+                    json={"username": "sixchar01", "password": "ab12cd"})
+    assert r.status_code == 201, f"6 位口令被拒了：{r.text[:200]}"
 
 
 def test_用户名不可重复(client, registration_on):

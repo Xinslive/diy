@@ -62,3 +62,26 @@ test('登录页确实去拉了这个开关，并把它绑在注册页签上', ()
   assert.doesNotMatch(LOGIN, /catch\s*\{[^}]*registrationEnabled\.value\s*=\s*true/,
     '请求失败时把注册入口点亮了')
 })
+
+test('注册页不再显示「（至少 N 位）」这类口令长度提示', () => {
+  // 只看**模板**（用户看得见的那部分），不看脚本里的注释 —— 注释里可以写
+  // 「原来那句已去掉」，那不是界面上的字。
+  const tpl = LOGIN.slice(LOGIN.indexOf('<template>'), LOGIN.indexOf('</template>'))
+  assert.match(tpl, /v-model="reg\.password"[^>]*placeholder="密码"/,
+    '注册页的口令占位符还带着长度提示')
+  assert.doesNotMatch(tpl, /（至少\s*\d+\s*位）/,
+    '注册页里还有「（至少 N 位）」这样的长度提示')
+})
+
+test('注册页的口令下限与后端是同一个数', () => {
+  // 前端常量与后端 PASSWORD_MIN_LENGTH 各写一份，两边不一样时用户看到的是
+  // 前端拦下的那句「至少 N 位」，而后端会回另一条 —— 两句对不上。
+  const backend = fs.readFileSync(
+    new URL('../../backend/app/api/system.py', import.meta.url), 'utf8')
+  const b = backend.match(/PASSWORD_MIN_LENGTH = (\d+)/)
+  assert.ok(b, '后端读不到 PASSWORD_MIN_LENGTH')
+  const f = LOGIN.match(/const PASSWORD_MIN = (\d+)/)
+  assert.ok(f, '登录页读不到 PASSWORD_MIN')
+  assert.equal(Number(f[1]), Number(b[1]),
+    `前端 ${f[1]} 位与后端 ${b[1]} 位不是一个口径`)
+})

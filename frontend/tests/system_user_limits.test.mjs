@@ -2,12 +2,12 @@
  * 「用户与授权」页的入参约束（src/views/system/UserAdmin.vue，**线上那份源码**）。
  *
  * 为什么要有这条：后端的口令与姓名长度口径已经统一了
- * （backend/app/api/system.py：口令 ≥ 8 位且两类字符、姓名 ≤ 64 与列宽一致），
+ * （backend/app/api/system.py：口令 ≥ 6 位且两类字符、姓名 ≤ 64 与列宽一致），
  * 而**前端是最后一道能给出人话的地方** —— 超长时后端回的是 422，
  * 原样弹给管理员并不能告诉她该改成什么样。
  *
  * 所以这里钉住的是**两端口径对得上**这件事：三个常量必须与后端一致
- * （用户名 64、姓名 64、口令 8），输入框必须真的挂着 maxlength，
+ * （用户名 64、姓名 64、口令 6），输入框必须真的挂着 maxlength，
  * 且**重置口令那一条也必须用同一套判据**（过去建号查 6 位、重置查 6 位、
  * 后端却是两套不同的下限 —— 「同一个属性三套下限」正是审计 P2-1 说的）。
  *
@@ -43,8 +43,8 @@ t('姓名长度上限是 64（与 sys_user.real_name 的列宽一致）', () => 
   assert.equal(constValue('REAL_NAME_MAX'), 64)
 })
 
-t('口令下限是 8 位（与后端 PASSWORD_MIN_LENGTH 一致）', () => {
-  assert.equal(constValue('PASSWORD_MIN'), 8)
+t('口令下限是 6 位（与后端 PASSWORD_MIN_LENGTH 一致）', () => {
+  assert.equal(constValue('PASSWORD_MIN'), 6)
 })
 
 t('两个输入框都挂着 maxlength —— 不然超长要到提交时才发现', () => {
@@ -64,8 +64,12 @@ t('用户名形状校验在（换行/空格会被拒）', () => {
   assert.match(VIEW, /USERNAME_BAD\.test\(username\)/)
 })
 
-t('不再有「至少 6 位」这种旧文案 —— 它与后端已经不是一个口径了', () => {
-  assert.doesNotMatch(VIEW, /至少 6 位/)
+t('口令位数不写死在文案里 —— 提示一律跟着常量走', () => {
+  // 写死的「至少 8 位」这类文案与真正的下限**分处两地**，改一次就要改两处，
+  // 而漏改的那一处不会报错：它只是在界面上悄悄变成一句假话。
+  // 下限从 8 改成 6 之后，这条钉的就是「别再写死数字」。
+  assert.doesNotMatch(VIEW, /至少 \d+ 位/)
+  assert.match(VIEW, /至少 \$\{PASSWORD_MIN\} 位/)
 })
 
 t('删除失败时把后端的话原样透出来（最后一个管理员那句自带处置动作）', () => {

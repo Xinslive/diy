@@ -305,6 +305,28 @@ def test_只有一类字符的口令被拒(client, auth, admin_user):
     assert r.status_code == 422, f"单一类字符的口令被收了：{r.status_code} {r.text[:200]}"
 
 
+def test_下限就是六位_五位被拒六位能建号也能重置(client, db, auth, plain_user):
+    """**下限是 6 位**（用户 2026-10-22 定的口径）。
+
+    这条用例钉的是**边界本身**：过去下限是 8 位，改成 6 位之后 6 位要能过、
+    5 位要被拒 —— 少了它，「下限」就只是一句注释，改成几都不会有人发现。
+
+    口令取 ``ab12cd``：6 位，且**两类字符**（小写 + 数字）—— 只测长度，
+    别把复杂度那条也一起测了，两条规则混在一条断言里，坏了看不出坏在哪。
+    """
+    r = client.post("/api/system/users", headers=auth,
+                    json={"username": "six_char_user", "password": "ab12cd"})
+    assert r.status_code == 201, f"6 位口令被拒了：{r.status_code} {r.text[:200]}"
+
+    r = client.patch(f"/api/system/users/{plain_user.id}", headers=auth,
+                     json={"password": "ab12cd"})
+    assert r.status_code == 200, f"重置路径拒了 6 位口令：{r.status_code} {r.text[:200]}"
+
+    r = client.post("/api/system/users", headers=auth,
+                    json={"username": "five_char_user", "password": "ab12c"})
+    assert r.status_code == 422, f"5 位口令被收了：{r.status_code} {r.text[:200]}"
+
+
 def test_合规的口令能建号也能重置(client, db, auth, admin_user, plain_user):
     r = client.post("/api/system/users", headers=auth,
                     json={"username": "strong_user_1", "password": "abcd1234"})

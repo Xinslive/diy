@@ -253,7 +253,7 @@ def public_config(db: Session = Depends(get_db)):
 #:
 #: **这里再写一遍是有意的。** ``RegisterIn`` 的定义在 ``api/schemas.py``，
 #: 那份文件正由另一条工作线改动；而这一条边界（用户名 3-32 位、口令
-#: 至少 8 位）**不该只由那一处来守** —— 一个「注册接口的口令下限」是
+#: 至少 6 位）**不该只由那一处来守** —— 一个「注册接口的口令下限」是
 #: 安全边界，不是接口形状。把它就地再校一遍，schemas.py 那边将来放宽
 #: 了，这里仍然拦得住。
 #:
@@ -262,7 +262,7 @@ def public_config(db: Session = Depends(get_db)):
 _REGISTER_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 _REGISTER_USERNAME_MIN = 3
 _REGISTER_USERNAME_MAX = 32
-_REGISTER_PASSWORD_MIN = 8
+_REGISTER_PASSWORD_MIN = 6
 _REGISTER_PASSWORD_MAX = 128
 
 

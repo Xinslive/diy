@@ -35,8 +35,10 @@ class TokenOut(BaseModel):
 class RegisterIn(BaseModel):
     # 自助注册只允许字母数字下划线，避免带空格/中文的口令在日志和口令提示里混淆
     username: str = Field(min_length=3, max_length=32, pattern=r"^[A-Za-z0-9_]+$")
-    # 比管理员建号更严：管理员建号 6 位，自助注册 8 位
-    password: str = Field(min_length=8, max_length=128)
+    # 与管理员建号**同一把尺**（6 位）：自助注册不再比管理员建号更严。
+    # 两边各写一遍是刻意的 —— 这条下限在 ``api/auth.py`` 里还要再校一次，
+    # 免得 schemas.py 将来被改宽了就跟着松掉。
+    password: str = Field(min_length=6, max_length=128)
     real_name: str = Field(default="", max_length=64)
 
 

@@ -100,7 +100,7 @@
                         size="large" @keyup.enter="submitRegister" />
             </el-form-item>
             <el-form-item>
-              <el-input v-model="reg.password" type="password" placeholder="密码（至少 8 位）"
+              <el-input v-model="reg.password" type="password" placeholder="密码"
                         size="large" show-password @keyup.enter="submitRegister" />
             </el-form-item>
             <el-form-item>
@@ -172,6 +172,16 @@ const password = ref('')
 // 接口就能收号码。别把这里的正则当成安全边界 —— 真要只收手机号，得在
 // schemas.py 里收紧 pattern，那会连带改掉若干以用户名当标识的测试。
 const PHONE_RE = /^1[3-9]\d{9}$/
+
+// 自助注册的口令下限 —— **与后端同一套口径**（backend/app/api/system.py 的
+// PASSWORD_MIN_LENGTH、backend/app/api/auth.py 的 _REGISTER_PASSWORD_MIN，
+// 三处都是 6）。
+//
+// **占位符里不写这个数**（原来那句「密码（至少 8 位）」已去掉）：那句是
+// **静态文案**，它与真正的下限分处两地，改一次就要改两处，而注册页恰恰是
+// 漏改最多的那个。界面上只保留**校验结果**—— 真输了太短的密码，当场会说
+// 一句人话，而不是让人对着一个可能过期的括号猜规则。
+const PASSWORD_MIN = 6
 
 const reg = reactive({ username: '', password: '', confirm: '' })
 
@@ -257,8 +267,8 @@ async function submitRegister() {
   const phone = reg.username.trim()
   if (!PHONE_RE.test(phone))
     return ElMessage.warning('请输入 11 位手机号')
-  if (reg.password.length < 8)
-    return ElMessage.warning('密码至少 8 位')
+  if (reg.password.length < PASSWORD_MIN)
+    return ElMessage.warning(`密码至少 ${PASSWORD_MIN} 位`)
   if (reg.password !== reg.confirm)
     return ElMessage.warning('两次输入的密码不一致')
 
