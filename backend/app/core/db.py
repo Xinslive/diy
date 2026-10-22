@@ -48,9 +48,26 @@ def _pin_session_timezone(dbapi_conn, _record) -> None:
     这里只挂应用引擎：``ALTER ROLE`` / ``ALTER DATABASE`` 那条路要写进部署步骤，
     换个连接串或者换个 PG 实例就失效了；而「应用自己保证读回来的时间戳是 UTC」
     是这条不变量本来就该成立的地方。
+
+    **必须 commit，否则这条 SET 活不过第一次归还连接池。**
+    PostgreSQL 里 ``SET`` 是**事务性**的：它在事务里执行、随那个事务一起
+    提交或**回滚**。而连接池归还连接时做的正是 ``rollback()`` ——
+    于是连接上那句 ``SET TIME ZONE 'UTC'`` 被撤销，时区打回服务器默认
+    （本机是 ``Etc/UTC``，生产机实测是 ``Asia/Shanghai``）。
+
+    后果不是「时区不准」这么轻：**每条连接只有第一次用是对的**，
+    之后复用的时间戳全带服务器本地时区 —— 正好是这段注释想防的那件事，
+    而且它只在连接被复用之后才发作，测试里表现为**时好时坏**
+    （2026-10-22 在清理测试库时暴露：同一条用例，连接是新的就绿、
+    复用的就红，报 ``Etc/UTC != timezone.utc``）。
+
+    ``commit()`` 之后这条 SET 落到了「会话级已提交」的状态，
+    后续任何 ``rollback()`` 都撤销不了它 —— 这才是「钉死」。
     """
     with dbapi_conn.cursor() as cur:
         cur.execute("SET TIME ZONE 'UTC'")
+    # 关键：SET 是事务性的，不提交就会随连接归还池时的 rollback 一起消失。
+    dbapi_conn.commit()
 
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, class_=Session)
