@@ -419,7 +419,18 @@ const WATCHER_SRC = tabsWatcherFromSource()
 /** 让真实 watcher 挂到一个可变的 route 上，返回 { route, tabs }。 */
 function mountWatcher(initial) {
   const s = fresh()
-  const route = reactive({ name: initial.name, path: initial.path, query: {} })
+  // route 要跟 vue-router 的 route 一个形状：**fullPath 由 path + query 拼出来**。
+  // 少了 fullPath，源码里那条 watch 就退回只看 path —— query 变了也不响，
+  // 下面那条用例就成了空转（断言照样过，证明不了任何东西）。
+  const route = reactive({
+    name: initial.name,
+    path: initial.path,
+    query: {},
+    get fullPath() {
+      const q = Object.entries(this.query).map(([k, v]) => `${k}=${v}`).join('&')
+      return this.path + (q ? '?' + q : '')
+    },
+  })
   // 源码里那条 watch(...) 就是被测对象：route / tabs / watch 全由外面喂进去
   new Function('watch', 'route', 'tabs', WATCHER_SRC)(watch, route, s)
   return { route, tabs: s }
@@ -455,13 +466,22 @@ await ta('换到别的页面：照旧新开一条标签（watcher 没被改瞎�
   assert.deepEqual(keys(tabs), ['vouchers', 'balance'])
 })
 
-await ta('只改 query 不动标签（标签存的是 path，query 不进存储）', async () => {
+await ta('只改 query：标签结构不动、存储不写，但完整地址要跟着更新', async () => {
   const { route, tabs } = mountWatcher({ name: 'voucher-edit', path: '/vouchers/12' })
-  const before = JSON.stringify(tabs.opened)
-  route.query = { period_id: '3' }        // query 变了，path 没变
-  await nextTick()
-  assert.equal(JSON.stringify(tabs.opened), before, 'query 变化不该惊动标签')
-  assert.equal(tabs.opened[0].path, '/vouchers/12')
+  let writes = 0
+  const real = localStorage.setItem.bind(localStorage)
+  localStorage.setItem = (k, v) => { writes++; return real(k, v) }
+  try {
+    route.query = { period_id: '3' }        // query 变了，path 没变
+    await nextTick()
+    assert.equal(tabs.opened.length, 1, 'query 变化不该多开一条标签')
+    assert.equal(tabs.opened[0].path, '/vouchers/12', '存进存储的仍然是裸路径')
+    assert.equal(tabs.opened[0].full, '/vouchers/12?period_id=3',
+      '标签记的完整地址要跟着 query 走 —— 不跟的话点回标签时查询条件就没了')
+    assert.equal(writes, 0, 'query 变化不该写存储（query 里夹着上下文，不许进 localStorage）')
+  } finally {
+    localStorage.setItem = real
+  }
 })
 
 await ta('重复通知同一个页面：不新增标签、也不重写存储', async () => {
@@ -482,6 +502,64 @@ await ta('重复通知同一个页面：不新增标签、也不重写存储', a
   } finally {
     localStorage.setItem = real
   }
+})
+
+console.log('')
+console.log('== 标签记的完整地址：条件不许在切页时丢掉 ==')
+
+t('标签记下带 query 的完整地址（只记裸路径的话，点回来条件就没了）', () => {
+  const s = fresh()
+  s.open({ name: 'vouchers', path: '/vouchers', fullPath: '/vouchers?kw=%E8%AE%B00' })
+  assert.equal(s.opened[0].path, '/vouchers', '存进存储的是裸路径')
+  assert.equal(s.opened[0].full, '/vouchers?kw=%E8%AE%B00', '内存里记的完整地址要带着 query')
+})
+t('没有 fullPath 的 route（手搓的）退回裸路径，不能整个 undefined', () => {
+  const s = fresh()
+  s.open({ name: 'balance', path: '/balance' })
+  assert.equal(s.opened[0].full, '/balance')
+})
+t('关掉当前标签：接班的那条带着它自己的条件', () => {
+  const s = fresh()
+  s.open({ name: 'balance', path: '/balance', fullPath: '/balance?scope=all' })
+  s.open({ name: 'subjects', path: '/subjects', fullPath: '/subjects?kw=%E7%AE%A1%E7%90%86' })
+  s.open({ name: 'vouchers', path: '/vouchers', fullPath: '/vouchers?kw=%E8%AE%B00' })
+  const r = s.close('subjects', 'subjects')
+  assert.equal(r.next, '/vouchers?kw=%E8%AE%B00',
+    '接班的那条要带着自己的条件走 —— 只给裸路径，用户刚筛的条件就没了')
+})
+t('**完整地址不进 localStorage**：存的仍然只有 key/title/path 三个字段', () => {
+  localStorage.removeItem(TABS_KEY)
+  setUser(7)
+  const s = fresh()
+  s.open({ name: 'vouchers', path: '/vouchers', fullPath: '/vouchers?kw=%E8%AE%B00&min=100' })
+  const parsed = JSON.parse(localStorage.getItem(TABS_KEY))
+  assert.deepEqual(Object.keys(parsed.opened[0]).sort(), ['key', 'path', 'title'],
+    `一条标签里多带了字段：${Object.keys(parsed.opened[0]).join(',')}`)
+  assert.ok(!localStorage.getItem(TABS_KEY).includes('kw='),
+    'query 被一起存下来了 —— 里面夹着期间、金额这些上下文')
+})
+t('从存储读回来的标签：完整地址就是那个裸路径（存储里没有 query 可复原）', () => {
+  localStorage.removeItem(TABS_KEY)
+  setUser(7)
+  const s = fresh()
+  s.open(R('balance', '/balance'))
+  const again = reload()
+  assert.equal(again.opened[0].full, '/balance')
+})
+
+/**
+ * 标签栏那个 @click 到底是往哪儿跳 —— 从**真实模板源码**里抠出来跑，
+ * 不写等价物：抠错地方断言照样会过，空转比红更坏。
+ */
+t('标签栏点开的是完整地址（带 query 的那个），不是裸路径', () => {
+  const clicks = [...LAYOUT_SRC.matchAll(/@click="(router\.push\([^"]+\))"/g)].map((m) => m[1])
+  const tabClick = clicks.find((c) => /t\.(full|path)/.test(c))
+  assert.ok(tabClick, '标签栏那个 @click 找不到了')
+  const pushed = []
+  const router = { push: (to) => pushed.push(to) }
+  new Function('router', 't', tabClick)(router, { full: '/vouchers?kw=%E8%AE%B00', path: '/vouchers' })
+  assert.equal(pushed[0], '/vouchers?kw=%E8%AE%B00',
+    '标签栏点开的是裸路径 —— 切回这一页时查询条件会被重置')
 })
 
 process.exit(fail ? 1 : 0)

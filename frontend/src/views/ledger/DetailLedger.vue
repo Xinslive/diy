@@ -22,11 +22,11 @@
       <div class="ledger-toolbar__row ledger-toolbar__row--period">
         <div class="ledger-toolbar__group">
           <span class="ledger-toolbar__label">会计期间</span>
-          <el-select v-model="fromId" class="ledger-period-select" @change="onFilterChange">
+          <el-select v-model="fromId" class="ledger-period-select" @change="onPeriodChange('from')">
             <el-option v-for="p in yearPeriods" :key="p.id" :label="p.code" :value="p.id" />
           </el-select>
           <span class="ledger-toolbar__separator">至</span>
-          <el-select v-model="toId" class="ledger-period-select" @change="onFilterChange">
+          <el-select v-model="toId" class="ledger-period-select" @change="onPeriodChange('to')">
             <el-option v-for="p in yearPeriods" :key="p.id" :label="p.code" :value="p.id" />
           </el-select>
         </div>
@@ -111,6 +111,7 @@ import { downloadFile } from '@/api/print'
 import PrintDialog from '@/components/PrintDialog.vue'
 import SubjectPicker from '@/components/SubjectPicker.vue'
 import { useLatestLoad } from '@/composables/useLatestLoad'
+import { useUrlConditions } from '@/composables/useUrlConditions'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 import {
@@ -191,6 +192,33 @@ const includeUnposted = ref(true)
  */
 const yearPeriods = computed(() => store.periodsOfYear(store.currentYear))
 
+/** 科目编码 ↔ id。 */
+function subjectIdOf(code) { return subjects.value.find((s) => s.code === code)?.id ?? null }
+function subjectCodeOf(id) { return subjects.value.find((s) => s.id === id)?.code || '' }
+/** 期间编码 ↔ id（编码是「2027-01」这种）。 */
+function periodIdOf(code) { return yearPeriods.value.find((p) => p.code === code)?.id ?? null }
+function periodCodeOf(id) { return yearPeriods.value.find((p) => p.id === id)?.code || '' }
+
+/**
+ * 条件 ↔ URL。
+ *
+ * 标签栏不做 keep-alive：切走再切回来就是组件重建，条件只活在组件里的话，
+ * 回来必然是默认值 —— 那就是「查询参数被重置」这个毛病。所以条件住进 URL，
+ * 标签栏记的完整地址带着它，回来照常重新取数（数据不旧），用的还是原来那组条件。
+ *
+ * **URL 里放编码，不放 id。** 科目表每个年度各有一份（后端迁移 0032），
+ * 编码跨年度不变，id 每年都换 —— 放 id 的话，换个年度再点回标签就指空了。
+ */
+const { restore } = useUrlConditions({
+  subject: { type: 'str', get: () => subjectCodeOf(subjectId.value), set: (c) => { const id = subjectIdOf(c); if (id) subjectId.value = id } },
+  // 子科目范围只有选了父科目才有意义，末级科目上就不带它
+  subFrom: { type: 'str', get: () => (isComprehensive.value ? subjectCodeOf(fromSubjectId.value) : ''), set: (c) => { const id = subjectIdOf(c); if (id) fromSubjectId.value = id } },
+  subTo: { type: 'str', get: () => (isComprehensive.value ? subjectCodeOf(toSubjectId.value) : ''), set: (c) => { const id = subjectIdOf(c); if (id) toSubjectId.value = id } },
+  from: { type: 'str', get: () => periodCodeOf(fromId.value), set: (c) => { const id = periodIdOf(c); if (id) fromId.value = id } },
+  to: { type: 'str', get: () => periodCodeOf(toId.value), set: (c) => { const id = periodIdOf(c); if (id) toId.value = id } },
+  unposted: { ref: includeUnposted, type: 'bool', def: true },
+})
+
 /** 起止必须落在顶栏那个年份里；落空了就回到顶栏当前那一期。
  *
  *  顶栏换年份时原来那个期间 id 不在新列表里，el-select 会显示成空白或裸 id，
@@ -230,9 +258,40 @@ async function load() {
 /** 条件变了就回第一页：停在原来那页会看着像「明细少了」。 */
 function onFilterChange() { page.value = 1; load() }
 
+/**
+ * 起止倒置时把另一头一起带过去。
+ *
+ * 后端对倒置区间直接 400（「起始期间不能晚于结束期间」），屏幕上只剩一条红提示，
+ * 表还是上一份数据 —— 用户根本不知道自己刚点的是什么。
+ * 用户动的是哪一头，就让哪一头说了算，另一头跟上去。
+ * （科目余额表那边是同一套做法，见 BalanceSheet.onFromChange。）
+ */
+function onPeriodChange(which) {
+  const from = yearPeriods.value.find((p) => p.id === fromId.value)
+  const to = yearPeriods.value.find((p) => p.id === toId.value)
+  if (from && to && from.ord > to.ord) {
+    if (which === 'from') toId.value = fromId.value
+    else fromId.value = toId.value
+  }
+  onFilterChange()
+}
+
 function resetSubjectRange() {
   fromSubjectId.value = rangeSubjects.value[0]?.id ?? null
   toSubjectId.value = rangeSubjects.value.at(-1)?.id ?? null
+}
+
+/**
+ * 子科目范围只**补位**，不覆盖已经定好的那一段。
+ *
+ *  用户自己拉过的那一段（从 URL 带回来的）得留着；
+ *  不属于当前科目的（换了科目、换了年度）才补回整段。
+ */
+function alignSubjectRange() {
+  const kids = rangeSubjects.value
+  if (!kids.length) { fromSubjectId.value = null; toSubjectId.value = null; return }
+  if (!kids.some((s) => s.id === fromSubjectId.value)) fromSubjectId.value = kids[0].id
+  if (!kids.some((s) => s.id === toSubjectId.value)) toSubjectId.value = kids[kids.length - 1].id
 }
 
 function onSubjectChange() {
@@ -284,6 +343,13 @@ onMounted(async () => {
   anchorPeriods()
   subjectsBookId = store.bookId
   await loadSubjects()
+  // 条件从 URL 捡回来：标签栏切走再切回来时，标签记的完整地址带着它。
+  // 科目 id 要等科目树到位才认得出来，所以这一步排在 loadSubjects 之后。
+  restore()
+  // 期间必须落在顶栏那个年份里（URL 里那份可能是上一年留下的）
+  anchorPeriods()
+  // 子科目范围跟着复原后的科目走；用户自己拉过的那一段保留
+  alignSubjectRange()
   load()
 })
 // **单一数据源**：账套 + 顶栏年份 + 该年份的期间数。

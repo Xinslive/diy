@@ -237,6 +237,7 @@ import VoucherCanvasLayer from '@/components/print/VoucherCanvasLayer.vue'
 import PaperGuides from '@/components/print/PaperGuides.vue'
 import TemplateInspector from '@/components/print/TemplateInspector.vue'
 import PrintDialog from '@/components/PrintDialog.vue'
+import { useUrlConditions } from '@/composables/useUrlConditions'
 import * as printApi from '@/api/print'
 import * as reportApi from '@/api/report'
 import * as subjectApi from '@/api/subject'
@@ -321,6 +322,24 @@ const HOT_CN = {
 const paperOptions = computed(() => pickPapers(meta.value.papers || []))
 
 const listOfScope = computed(() => list.value.filter((t) => t.scope === scope.value))
+
+/**
+ * 「在改哪一套版式」↔ URL。
+ *
+ * 标签栏不做 keep-alive：切走再切回来就是组件重建，只活在组件里的选择
+ * 回来就回到默认那一套。所以范围与模板也住进 URL，标签栏记的完整地址带着它们。
+ *
+ * **改到一半的版式内容不在这里** —— 那是未保存的草稿，不是查询条件；
+ * 草稿归草稿管（这一页本来就有「放弃改动」），别跟查询条件混在一处。
+ */
+const { restore } = useUrlConditions({
+  scope: { type: 'str', def: 'VOUCHER', get: () => scope.value, set: (v) => { if (SCOPES[v]) scope.value = v } },
+  tpl: {
+    type: 'id',
+    get: () => templateId.value || null,
+    set: (v) => { if (listOfScope.value.some((t) => t.id === v)) templateId.value = v },
+  },
+})
 
 /** 生效的默认模板（口径见 utils/printTemplate.js，与打印弹窗共用一份）。 */
 const effectiveDefaultId = computed(() => sharedEffectiveDefault(listOfScope.value))
@@ -835,7 +854,11 @@ onMounted(async () => {
   meta.value = await printApi.templateMeta(store.bookId)
   await loadTemplates()
   await loadPreviewData()
-  templateId.value = listOfScope.value.find((t) => t.is_default)?.id || listOfScope.value[0]?.id || 0
+  // 条件从 URL 复原（标签栏切回来时带着它）：先范围，再那一档里的模板
+  restore()
+  if (!templateId.value || !listOfScope.value.some((t) => t.id === templateId.value)) {
+    templateId.value = listOfScope.value.find((t) => t.is_default)?.id || listOfScope.value[0]?.id || 0
+  }
   await loadTemplate(templateId.value)
 })
 

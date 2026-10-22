@@ -19,7 +19,7 @@
       </template>
       <span v-else class="muted">期间</span>
       <el-select v-model="periodId" class="balance-period-select" :disabled="!yearPeriods.length"
-                 @change="load">
+                 @change="onPeriodChange">
         <el-option v-for="p in yearPeriods" :key="p.id" :label="p.code" :value="p.id">
           <span class="period-opt">
             <span>{{ p.code }}</span>
@@ -119,6 +119,7 @@ import * as api from '@/api/ledger'
 import { downloadFile } from '@/api/print'
 import PrintDialog from '@/components/PrintDialog.vue'
 import { useLatestLoad } from '@/composables/useLatestLoad'
+import { useUrlConditions } from '@/composables/useUrlConditions'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 
@@ -140,6 +141,28 @@ const mode = ref('single')
 const fromId = ref(store.periodId)
 const yearPeriods = computed(() => store.periodsOfYear(store.currentYear))
 const isRange = computed(() => mode.value === 'range')
+
+/** 期间编码 ↔ id（编码是「2027-01」这种）。 */
+function periodIdOf(code) { return yearPeriods.value.find((p) => p.code === code)?.id ?? null }
+function periodCodeOf(id) { return yearPeriods.value.find((p) => p.id === id)?.code || '' }
+
+/**
+ * 条件 ↔ URL。
+ *
+ * 标签栏不做 keep-alive：切走再切回来就是组件重建，条件只活在组件里的话，
+ * 回来必然是默认值 —— 那就是「查询参数被重置」这个毛病。所以条件住进 URL，
+ * 标签栏记的完整地址带着它，回来照常重新取数（数据不旧），用的还是原来那组条件。
+ *
+ * 默认值不写进 URL：地址栏只留用户真改过的那些。
+ */
+const { restore } = useUrlConditions({
+  scope: { ref: scope, type: 'str', def: 'top' },
+  mode: { ref: mode, type: 'str', def: 'single' },
+  period: { type: 'str', get: () => periodCodeOf(periodId.value), set: (c) => { const id = periodIdOf(c); if (id) periodId.value = id } },
+  // 本期模式下没有「起」这一说，URL 上就不带它 —— 地址栏上写的是真话
+  from: { type: 'str', get: () => (isRange.value ? periodCodeOf(fromId.value) : ''), set: (c) => { const id = periodIdOf(c); if (id) fromId.value = id } },
+  unposted: { ref: includeUnposted, type: 'bool', def: true },
+})
 /** 区间模式下发生额那一列得改名字：字段叫 period_debit，装的是**整段**的发生额 */
 const moveDebitLabel = computed(() => (isRange.value ? '区间借方' : '本期借方'))
 const moveCreditLabel = computed(() => (isRange.value ? '区间贷方' : '本期贷方'))
@@ -184,6 +207,17 @@ function onFromChange() {
   const from = yearPeriods.value.find((p) => p.id === fromId.value)
   const to = yearPeriods.value.find((p) => p.id === periodId.value)
   if (from && to && from.ord > to.ord) periodId.value = fromId.value
+  load()
+}
+
+/** 止期往前挪到起期之前时，把起期一起带过去 —— 与 onFromChange 一个道理。
+ *  倒置的区间后端直接 400，屏幕上只剩一条红提示，表还是上一份数据。 */
+function onPeriodChange() {
+  if (isRange.value) {
+    const from = yearPeriods.value.find((p) => p.id === fromId.value)
+    const to = yearPeriods.value.find((p) => p.id === periodId.value)
+    if (from && to && from.ord > to.ord) fromId.value = periodId.value
+  }
   load()
 }
 
@@ -237,7 +271,14 @@ function exportXlsx() {
       : `科目余额表_${periodCode.value}.xlsx`)
 }
 
-onMounted(async () => { alignPeriod(); await load() })
+onMounted(async () => {
+  alignPeriod()
+  // 条件从 URL 复原：标签栏切走再切回来时，标签记的完整地址带着它
+  restore()
+  // URL 里那份期间若不在顶栏这个年份里，这一轮把它归位
+  alignPeriod()
+  await load()
+})
 // 顶栏换账套 / 换年度：先归位再取数，否则会用新账套的 id 去查旧期间。
 //
 //  **还得盯住 periods 的长度**，不能只盯年份 —— 总账和明细账早就踩过这个坑：

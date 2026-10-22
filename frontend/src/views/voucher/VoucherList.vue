@@ -150,16 +150,16 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Printer, Sort, Upload } from '@element-plus/icons-vue'
 import * as api from '@/api/voucher'
 import PrintDialog from '@/components/PrintDialog.vue'
+import { useUrlConditions } from '@/composables/useUrlConditions'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 
 const store = useSessionStore()
-const route = useRoute()
 const router = useRouter()
 const rows = ref([])
 const total = ref(0)
@@ -175,6 +175,22 @@ function isLocked(row) {
 const query = reactive({
   keyword: '', min_amount: null, max_amount: null,
   page: 1, page_size: 50
+})
+
+/**
+ * 条件 ↔ URL。
+ *
+ * 标签栏不做 keep-alive：切走再切回来就是组件重建，条件只活在组件里的话，
+ * 回来必然是默认值 —— 那就是「查询参数被重置」这个毛病。所以条件住进 URL：
+ * 标签栏记的完整地址带着它，回来照常重新取数（数据不旧），用的还是原来那组条件。
+ *
+ * 键名沿用 kw / min / max：凭证详情页（VoucherEdit）也是靠这三个键把条件
+ * 带来带去的 —— 键名一改，那条线就断了。
+ */
+const { restore } = useUrlConditions({
+  kw: { type: 'str', get: () => query.keyword, set: (v) => { query.keyword = v } },
+  min: { type: 'num', get: () => query.min_amount, set: (v) => { query.min_amount = v } },
+  max: { type: 'num', get: () => query.max_amount, set: (v) => { query.max_amount = v } },
 })
 
 // --------------------------------------------------------------------- 排序
@@ -240,14 +256,6 @@ function filterQuery() {
   if (query.min_amount !== null) q.min = String(query.min_amount)
   if (query.max_amount !== null) q.max = String(query.max_amount)
   return q
-}
-
-/** 页面刷新 / 从凭证页返回时，靠 URL 把上次的条件捡回来。 */
-function restoreFilterFromUrl() {
-  const q = route.query || {}
-  query.keyword = q.kw || ''
-  query.min_amount = q.min === undefined || q.min === '' ? null : Number(q.min)
-  query.max_amount = q.max === undefined || q.max === '' ? null : Number(q.max)
 }
 
 function firstSummary(row) {
@@ -344,7 +352,8 @@ async function removeOne(row) {
 }
 onMounted(() => {
   query.page = 1
-  restoreFilterFromUrl()
+  // 条件从 URL 复原：页面刷新、从凭证页返回、从标签栏切回来，走的都是这一条
+  restore()
   load()
 })
 watch(() => store.bookId, () => {
@@ -352,14 +361,11 @@ watch(() => store.bookId, () => {
   selection.value = []
   load()
 })
-/** 条件栏清空，顺带把 URL 上残留的条件也抹掉（不然一刷新它又回来了）。 */
+/** 条件栏清空。URL 上残留的条件由 useUrlConditions 一并抹掉（不然一刷新它又回来了）。 */
 function clearFilter() {
   query.keyword = ''
   query.min_amount = null
   query.max_amount = null
-  if (route.query && Object.keys(route.query).length) {
-    router.replace({ name: 'vouchers' })
-  }
 }
 
 /**

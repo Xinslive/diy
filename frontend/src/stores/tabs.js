@@ -8,6 +8,11 @@ import { NAV, menuKeyOf } from '@/router/nav'
  * **不做 keep-alive**：切走再切回来，页面照常按当前账套 / 期间重新取数。
  * 缓存实例看着更快，但切账套、记账保存后回列表这些地方会拿到旧数据，
  * 而账务软件拿旧数据的代价比多打一次接口高得多。
+ *
+ * **不做 keep-alive 不等于「条件也一起丢掉」。** 重新取数是必须的（数据不能旧），
+ * 但**取数用哪一组条件**是另一回事：用户设好的科目、期间、关键字不该因为他
+ * 看了一眼别的页面就没了。所以标签额外记一个**完整地址**（带 query 的那个），
+ * 点回标签时按它走，页面照常重新取数，只是用的是原来那组条件。
  */
 
 /** 标签结构存哪儿。跟令牌同一份 localStorage，但**只存结构**，见下面两条注释。 */
@@ -26,6 +31,9 @@ const KNOWN_KEYS = new Set(NAV.flatMap((m) => m.items).map((it) => menuKeyOf(it.
  *  项目约定就是令牌只放 localStorage），账套 id、期间 id 再顺手带进来一份，
  *  等于把「记住上次看哪儿」这个便利变成一份谁都能翻的账套目录。
  *  path 只留**路径**、连 query 都不留：路径是页面地址，至多一个凭证 id。
+ *
+ *  **带 query 的完整地址（`full`）只在内存里**，见下面 open() 那段 ——
+ *  持久化这一条不许破：query 里夹着期间、金额、科目这些上下文。
  */
 const TAB_FIELDS = ['key', 'title', 'path']
 
@@ -63,7 +71,13 @@ function readTabs(plugins = false) {
     if (parsed.user_id != null && parsed.user_id !== savedUserId()) return []
     return parsed.opened
       .filter((t) => t && typeof t.key === 'string' && typeof t.path === 'string' && t.path.startsWith('/'))
-      .map((t) => Object.fromEntries(TAB_FIELDS.map((k) => [k, typeof t[k] === 'string' ? t[k] : ''])))
+      .map((t) => {
+        const o = Object.fromEntries(TAB_FIELDS.map((k) => [k, typeof t[k] === 'string' ? t[k] : '']))
+        // 从存储里读回来的标签没有 query（存储里就不许有），
+        // 完整地址就是那个裸路径 —— 点它等于回到这一页的默认条件。
+        o.full = o.path
+        return o
+      })
       // 认不出的 key（菜单改名 / 下线了）直接丢：标签栏里摆一条点进去 404 的标签，
       // 比少摆一条难看得多
       .filter((t) => KNOWN_KEYS.has(t.key) || (plugins && t.key.startsWith("plugin:")))
@@ -81,6 +95,18 @@ function saveTabs(opened) {
   } catch {
     // 写不进去就算了：标签页是「方便」，不是「功能」，存不上不该影响干活
   }
+}
+
+/**
+ * 标签记的**完整地址**（path + query + hash）。
+ *
+ *  vue-router 的 route.fullPath 就是它；万一碰上没有 fullPath 的 route
+ *  （测试里手搓的那种），退回 path —— 少带一个 query 不至于让标签不能用。
+ */
+function fullPathOf(route) {
+  const full = typeof route?.fullPath === 'string' ? route.fullPath : ''
+  if (full.startsWith('/')) return full
+  return typeof route?.path === 'string' ? route.path : ''
 }
 
 export const useTabsStore = defineStore('tabs', {
@@ -121,13 +147,24 @@ export const useTabsStore = defineStore('tabs', {
      *  标签记的必须是列表；自动保存把地址从 /vouchers/new 换成 /vouchers/{id}
      *  之后，记的必须是新地址（VoucherEdit 保存完会显式调一次本方法：
      *  那次只改地址栏、不走 router，等不到路由名的通知）。
+     *
+     *  **另外还记一个完整地址（full，带 query）**，只在内存里：
+     *  页面条件（科目、期间、关键字…）住在 URL 的 query 里，而标签栏不做
+     *  keep-alive —— 不记这个完整地址，点回标签时 URL 里的条件就丢了，
+     *  用户设好的查询条件被重置成默认值（明细账的科目、凭证的关键字都跑不掉）。
+     *  它不进 localStorage：query 里夹着期间、金额这些上下文，
+     *  持久化只留裸 path（见 TAB_FIELDS）。
      */
     open(route) {
       const key = menuKeyOf(route?.name)
       if (!key || typeof route?.path !== 'string' || !route.path.startsWith('/')) return
       if (String(key).startsWith('plugin:') && !this.pluginItems.some(p => p.menu.name === key && p.menu.route === route.path)) return
+      const full = fullPathOf(route)
       const hit = this.opened.find((t) => t.key === key)
       if (hit) {
+        // 完整地址先更新：条件变了（只有 query 变）时，标签才知道该回到哪一步。
+        // 这一步**不写存储** —— 存进去的还是那个裸 path。
+        hit.full = full
         // 地址没变就**连存储都不写**：调用方是路由 watcher，翻页、筛选、后退
         // 都会叫到这儿，每次都 JSON.stringify 一份再 setItem 纯属白刷。
         // 写存储不是没有副作用的动作，调用频次一高就该先问一句「真的变了吗」。
@@ -140,6 +177,7 @@ export const useTabsStore = defineStore('tabs', {
         key,
         title: this.titles[key] || route.meta?.title || String(route.name),
         path: route.path,
+        full,
       })
       saveTabs(this.opened)
     },
@@ -159,8 +197,12 @@ export const useTabsStore = defineStore('tabs', {
       saveTabs(this.opened)
       if (!wasActive) return { active: false, next: null }
       if (!this.opened.length) return { active: true, next: '/' }
-      // 就近接管：后面还有就从后面顶上，没有就退回前一条
-      return { active: true, next: this.opened[i]?.path || this.opened[i - 1]?.path }
+      // 就近接管：后面还有就从后面顶上，没有就退回前一条。
+      // 走**完整地址**：接班的那条标签带着它自己那组条件（科目、期间、关键字），
+      // 只给裸路径的话，接班页面打开就是默认条件 —— 又是「条件被重置」。
+      const next = (this.opened[i]?.full || this.opened[i]?.path)
+        || (this.opened[i - 1]?.full || this.opened[i - 1]?.path)
+      return { active: true, next }
     },
     closeOthers(key) {
       this.opened = this.opened.filter((t) => t.key === key)

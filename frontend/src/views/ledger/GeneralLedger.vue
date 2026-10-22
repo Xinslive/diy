@@ -16,11 +16,11 @@
       <div class="ledger-toolbar__row ledger-toolbar__row--period">
         <div class="ledger-toolbar__group">
           <span class="ledger-toolbar__label">会计期间</span>
-          <el-select v-model="fromId" class="ledger-period-select" @change="onFilterChange">
+          <el-select v-model="fromId" class="ledger-period-select" @change="onPeriodChange('from')">
             <el-option v-for="p in yearPeriods" :key="p.id" :label="p.code" :value="p.id" />
           </el-select>
           <span class="ledger-toolbar__separator">至</span>
-          <el-select v-model="toId" class="ledger-period-select" @change="onFilterChange">
+          <el-select v-model="toId" class="ledger-period-select" @change="onPeriodChange('to')">
             <el-option v-for="p in yearPeriods" :key="p.id" :label="p.code" :value="p.id" />
           </el-select>
         </div>
@@ -85,6 +85,7 @@ import * as api from '@/api/ledger'
 import { downloadFile } from '@/api/print'
 import PrintDialog from '@/components/PrintDialog.vue'
 import { useLatestLoad } from '@/composables/useLatestLoad'
+import { useUrlConditions } from '@/composables/useUrlConditions'
 import { useSessionStore } from '@/stores/session'
 import { fmt } from '@/utils/format'
 import {
@@ -182,6 +183,27 @@ const { loading, run, isStale } = useLatestLoad('ledger/general')
  *  下拉里却能翻出 2026-06，翻过去算的是另一本账。 */
 const yearPeriods = computed(() => store.periodsOfYear(store.currentYear))
 
+/** 期间编码 ↔ id（编码是「2027-01」这种）。 */
+function periodIdOf(code) { return yearPeriods.value.find((p) => p.code === code)?.id ?? null }
+function periodCodeOf(id) { return yearPeriods.value.find((p) => p.id === id)?.code || '' }
+
+/**
+ * 条件 ↔ URL。
+ *
+ * 标签栏不做 keep-alive：切走再切回来就是组件重建，条件只活在组件里的话，
+ * 回来必然是默认值 —— 那就是「查询参数被重置」这个毛病。所以条件住进 URL，
+ * 标签栏记的完整地址带着它，回来照常重新取数（数据不旧），用的还是原来那组条件。
+ *
+ * 科目直接放编码：总账认的就是编码（科目表每个年度各有一份，id 每年都换，
+ * 编码才跨年度不变）。
+ */
+const { restore } = useUrlConditions({
+  subject: { ref: subjectCode, type: 'str' },
+  from: { type: 'str', get: () => periodCodeOf(fromId.value), set: (c) => { const id = periodIdOf(c); if (id) fromId.value = id } },
+  to: { type: 'str', get: () => periodCodeOf(toId.value), set: (c) => { const id = periodIdOf(c); if (id) toId.value = id } },
+  unposted: { ref: includeUnposted, type: 'bool', def: true },
+})
+
 /**
  * 起止必须落在顶栏那个年份里，且**默认是整年**。
  *
@@ -191,12 +213,16 @@ const yearPeriods = computed(() => store.periodsOfYear(store.currentYear))
  *
  *  换年份后重置成整年：上一年的区间在新年份里不存在，而年账本来也是按年算的。
  *  同一年内只补位（id 落在池子外才补），用户自己拉窄的区间保留。
+ *
+ *  @param {boolean} [resetToYear=false] 强制回到整年。
+ *        默认只在「还没认过这个年份」时才重置 —— 从 URL 复原过条件之后再调一次，
+ *        这一轮只补位不重置，用户拉窄的区间才留得住。
  */
 let anchoredYear = null
-function anchorPeriods() {
+function anchorPeriods(resetToYear = false) {
   const pool = yearPeriods.value
   if (!pool.length) { fromId.value = null; toId.value = null; return }
-  if (anchoredYear !== String(store.currentYear)) {
+  if (resetToYear || anchoredYear !== String(store.currentYear)) {
     anchoredYear = String(store.currentYear)
     fromId.value = pool[0].id
     toId.value = pool[pool.length - 1].id
@@ -241,6 +267,23 @@ async function load() {
 function onFilterChange() { page.value = 1; load() }
 function onSubjectChange() { page.value = 1; load() }
 
+/**
+ * 起止倒置时把另一头一起带过去。
+ *
+ * 后端对倒置区间直接 400（「起始期间不能晚于结束期间」），屏幕上只剩一条红提示，
+ * 表还是上一份数据 —— 用户根本不知道自己刚点的是什么。
+ * 用户动的是哪一头，就让哪一头说了算，另一头跟上去。
+ */
+function onPeriodChange(which) {
+  const from = yearPeriods.value.find((p) => p.id === fromId.value)
+  const to = yearPeriods.value.find((p) => p.id === toId.value)
+  if (from && to && from.ord > to.ord) {
+    if (which === 'from') toId.value = fromId.value
+    else fromId.value = toId.value
+  }
+  onFilterChange()
+}
+
 function previewHtml() {
   printVisible.value = true
 }
@@ -275,7 +318,14 @@ function exportXlsx() {
     { ...printParams.value }, '总账.xlsx')
 }
 
-onMounted(() => { anchorPeriods(); load() })
+onMounted(() => {
+  // 默认区间是整年；URL 里指定的起止优先（标签栏切回来时带着它）
+  anchorPeriods(true)
+  restore()
+  // URL 里那份期间若不在顶栏这个年份里，这一轮把它归位
+  anchorPeriods()
+  load()
+})
 // **单一数据源**：账套 + 顶栏年份 + 该年份的期间数，就是「现在该按哪一段查」。
 //
 //  以前是两个 watch（bookId 一个、年份/期间数一个），而 store.setBook() 是

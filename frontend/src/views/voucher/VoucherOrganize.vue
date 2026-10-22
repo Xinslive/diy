@@ -110,11 +110,23 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search, Select } from '@element-plus/icons-vue'
 import * as voucherApi from '@/api/voucher'
+import { useUrlConditions } from '@/composables/useUrlConditions'
 import { useSessionStore } from '@/stores/session'
 
 const store = useSessionStore()
 /** 默认按日期升序：用户点开这个页面多半就是嫌现在的号跟日期对不上 */
 const strategy = ref('SORT_DATE')
+
+/**
+ * 整理方式 ↔ URL。
+ *
+ * 标签栏不做 keep-alive：切走再切回来就是组件重建，条件只活在组件里的话，
+ * 回来必然是默认值 —— 那就是「查询参数被重置」这个毛病。所以条件住进 URL，
+ * 标签栏记的完整地址带着它，回来还是那一种整理方式。
+ */
+const { restore } = useUrlConditions({
+  strategy: { ref: strategy, type: 'str', def: 'SORT_DATE' },
+})
 const plan = ref(null)
 const loading = ref(false)
 const applying = ref(false)
@@ -163,7 +175,11 @@ async function preview() {
 }
 
 // 打开页面先体检一次；换了期间/账套要重测 —— 上个月的结论不能拿来管这个月
-onMounted(loadCheck)
+onMounted(() => {
+  // 整理方式从 URL 复原（标签栏切回来时带着它）
+  restore()
+  loadCheck()
+})
 watch(() => [store.bookId, store.periodId], loadCheck)
 
 async function apply() {

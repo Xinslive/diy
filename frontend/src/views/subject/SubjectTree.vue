@@ -53,6 +53,7 @@ import * as api from '@/api/subject'
 import SubjectFormDialog from '@/components/SubjectFormDialog.vue'
 import SubjectEditDialog from '@/components/SubjectEditDialog.vue'
 import SubjectImportDialog from '@/components/SubjectImportDialog.vue'
+import { useUrlConditions } from '@/composables/useUrlConditions'
 import { useSessionStore } from '@/stores/session'
 import { CATEGORY_LABEL } from '@/utils/subjectCode'
 
@@ -60,6 +61,17 @@ const store = useSessionStore()
 const tree = ref([])
 const loading = ref(false)
 const keyword = ref('')
+
+/**
+ * 筛选关键字 ↔ URL。
+ *
+ * 标签栏不做 keep-alive：切走再切回来就是组件重建，条件只活在组件里的话，
+ * 回来必然被清空 —— 那就是「查询参数被重置」这个毛病。所以条件住进 URL，
+ * 标签栏记的完整地址带着它，回来还是那一组条件。
+ */
+const { restore } = useUrlConditions({
+  kw: { type: 'str', get: () => keyword.value, set: (v) => { keyword.value = v } },
+})
 const visible = ref(false)
 const parentId = ref(null)
 const editVisible = ref(false)
@@ -157,7 +169,11 @@ async function remove(row) {
   load()
 }
 
-onMounted(load)
+onMounted(() => {
+  // 筛选关键字从 URL 复原（标签栏切回来时带着它）
+  restore()
+  load()
+})
 // 换账套、换年度都要重取：另一个年度是**另一张**科目表
 watch(() => [store.bookId, year.value], load)
 </script>

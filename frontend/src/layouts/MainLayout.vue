@@ -98,8 +98,8 @@
              读屏用户跳不到，纯图标按钮也点不中（只有 8×8 的 svg 命中区）。 -->
         <div v-for="t in tabs.opened" :key="t.key" class="tb-tab" :class="{ active: t.key === activeKey }"
              role="tab" :aria-selected="t.key === activeKey" tabindex="0"
-             @click="router.push(t.path)"
-             @keydown.enter="router.push(t.path)">
+             @click="router.push(t.full || t.path)"
+             @keydown.enter="router.push(t.full || t.path)">
           <span>{{ t.title }}</span>
           <button v-if="tabs.opened.length > 1" type="button" class="tb-close"
                   :aria-label="`关闭 ${t.title}`" title="关闭" @click.stop="closeTab(t.key)">
@@ -242,12 +242,16 @@ function onCommand(cmd) {
  * 拼成**一个字符串**再 watch，而不是 `[route.name, route.path]`：
  * 数组每次求值都是新引用，watcher 按引用比，等于什么依赖一动就触发一次。
  * 字符串按值比，name 和 path 都没真变时不会触发。
- * route.path 不含 query，所以只改筛选条件不会惊动标签（标签存的也是 path）。
  *
- * 触发得再频也不怕：tabs.open 对已存在的标签**只改 path**，不改标题、不动脏状态，
- * 而且地址没变时直接返回、连存储都不写（见 stores/tabs.js 的 open）。
+ * **watch 的是 fullPath，不是 path** —— 页面条件（科目、期间、关键字）住在
+ * query 里，只改条件时 path 一个字没动，但标签必须跟着更新它记的**完整地址**，
+ * 否则点回标签时条件没了（见 stores/tabs.js 里 full 那段）。
+ * 只改条件**不会动标签栏的结构**，也**不写 localStorage**：存进去的仍是裸 path。
+ *
+ * 触发得再频也不怕：tabs.open 对已存在的标签**只改地址**，不改标题、不动脏状态，
+ * 而且裸地址没变时直接返回、连存储都不写（见 stores/tabs.js 的 open）。
  */
-watch(() => `${route.name} ${route.path}`, () => tabs.open(route), { immediate: true })
+watch(() => `${route.name} ${route.fullPath || route.path}`, () => tabs.open(route), { immediate: true })
 
 function closeTab(key) {
   const { next } = tabs.close(key, activeKey.value)
