@@ -146,7 +146,7 @@ def test_400响应也带请求号(client, book):
 
 
 
-def test_500不回数据库原始文本(client, book, auth, monkeypatch):
+def test_500不回数据库原始文本(client, book, auth, plain_user, monkeypatch):
     """``str(orig)`` 里是表名、列名、约束名，有时还带数据片段 ——
     回给调用方等于把库结构抄送给未授权方。"""
     from sqlalchemy.exc import DBAPIError
@@ -158,7 +158,10 @@ def test_500不回数据库原始文本(client, book, auth, monkeypatch):
         raise DBAPIError("UPDATE sys_user_book", {}, _Orig("表 sys_user_book 的键值重复: 张三, secret-hash-abc"))
 
     monkeypatch.setattr("app.api.system._apply_links", boom)
-    r = client.put(f"/api/system/users/1/books", headers=auth, json=[
+    # 目标是**真实存在**的用户：接口里先 ``db.get(SysUser, user_id)``，
+    # 人不存在就 404 返回了，压根走不到 _apply_links，测的就不是「500 之后
+    # 怎么回包」而是「404 怎么回包」了。
+    r = client.put(f"/api/system/users/{plain_user.id}/books", headers=auth, json=[
         {"book_id": book.id, "role": "OWNER"}])
 
     assert r.status_code == 500, r.text

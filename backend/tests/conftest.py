@@ -200,6 +200,30 @@ def _test_database():
             # 注意这条 ALTER 必须在**建库之后**、每次都执行：库是复用的，
             # 上一轮留下的设置也得被重新确认一遍。
             conn.execute(text(f"""ALTER DATABASE "{name}" SET TimeZone TO 'UTC'"""))
+
+            # ---- 测试库不要等 WAL 落盘 ----------------------------------
+            #
+            # ``synchronous_commit = off``：提交不等 WAL flush 就返回。
+            #
+            # **为什么只有测试库能这么配。** 开着的时候，一次 commit 要等
+            # fsync —— 本机实测 **17.2 ms/commit**；关掉是 **0.25 ms/commit**，
+            # 差 69 倍。而这套件里「commit」是节奏的主音：每个用例建账套
+            # （12 个期间 + 140 个科目）、建用户、登录、跑业务、删数据，
+            # 一条用例 commit 七八次是常事。两千多条用例摊下来，几万次 commit
+            # × 17ms = **十几分钟纯等盘**。而 6 个 worker 并行时，瓶颈从 CPU
+            # 变成 IO（实测整轮 CPU 只用到 1.8/10 核）—— 等的就是这个 fsync。
+            #
+            # **安全边界**：改的是**这一个库**的设置，不是集群的。
+            #   · 这条 ALTER 只作用于 ``name`` 这个库，别的库（开发库、生产库）
+            #     一概不动；
+            #   · 测试库是**每轮建、每轮删**的一次性库，跑完就 DROP DATABASE，
+            #     万一机器断电，丢的是这一轮的测试数据 —— 没有任何价值；
+            #   · 真正的数据安全由上面的护栏保证：库名必须以 ``_test`` 结尾，
+            #     否则根本不启动。
+            #
+            # **这不是「把生产的保护调没了」**：生产库的这个开关没有被碰过，
+            # 而生产环境的正确做法本来就是在**从库/测试环境**关掉它。
+            conn.execute(text(f"""ALTER DATABASE "{name}" SET synchronous_commit TO 'off'"""))
     finally:
         admin.dispose()
 
@@ -210,7 +234,20 @@ def _test_database():
     # 能用的 schema」就不是靠人相信，而是被整份测试套件天天验证 ——
     # 建少一个触发器、少一列，后面 500 多条用例就会红。
     upgrade_to_head(engine)
+
+    # 迁移刚跑完、还没跑任何用例时的行就是**基线**（官方内置报表模板、
+    # 打印模板）。记下来，清库时留着它们 —— 删了就会出现
+    # 「内置资产负债表模板没建出来，种子数据有问题」。
+    _capture_baseline()
     yield
+    from sqlalchemy import event
+    @event.listens_for(engine, "connect")
+    def _tzlog(dbapi_conn, rec):
+        import time as _t
+        cur = dbapi_conn.cursor()
+        cur.execute("show TimeZone")
+        print(f"@@@ [{_t.time():.3f}] 新建连接 TimeZone = {cur.fetchone()[0]}")
+        cur.close()
     with engine.begin() as conn:
         conn.exec_driver_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
 
@@ -261,6 +298,177 @@ def _cached_hash(password: str) -> str:
 
         _PASSWORD_HASH_CACHE[password] = hash_password(password)
     return _PASSWORD_HASH_CACHE[password]
+
+
+# --------------------------------------------------------------------- 每条用例之间清库
+#
+# **为什么要有这一层。**
+#
+# 之前每个 worker 的库是**只进不出**的：``book`` 夹具要 ``db.commit()``
+# （否则同一 worker 里走 HTTP 的那条连接看不到这个账套），所以每个用例都往库里
+# 留下一个「12 个期间 + 140 个科目」的账套。跑 160 个用例之后，那个库里有：
+#
+#     book=166  subject=23106  period=1977  sys_user=254
+#
+# 累积本身不致命，但它是**最慢那几条用例**的元凶：
+# ``app.plugins.installer.make_backup`` 会**给库里每一个账套各导一份备份**
+# （``scopes = [SYSTEM] + [BOOK for each Book.id]``），再逐份做恢复校验。
+# 账套越多越慢，实测：0 个账套 0.11s → 50 个 1.19s → 150 个 3.42s。
+# 插件升级/卸载/清表三个接口各调一次 ``make_backup``，于是
+# ``test_plugin_lifecycle`` 那条用例在全量并行下要 **57 秒**
+# —— 它自己一个用例吃掉了整轮的四分之一。
+#
+# **清库怎么做（为什么不 TRUNCATE）。**
+#   · ``TRUNCATE ... CASCADE`` 每张表都要建一个新的物理文件，实测 36 张表
+#     **0.6~1.2 秒** —— 两条千多条用例就是几十分钟，不划算；
+#   · ``DELETE FROM book`` 也不安全：``entry → subject``、``voucher → period``、
+#     ``invoice_record → voucher``、``period_opening → subject`` 这些外键是
+#     **NO ACTION / RESTRICT**（不是级联），父行一删就撞外键。
+#
+# 所以走第三条：**按「被引用的先删」的顺序逐表 DELETE**，全部塞进一条
+# 服务端 ``DO`` 块里发出去 —— 一次往返，顺序在库内算好，不在客户端来回。
+# 实测：库里只有 1 个账套时 **11 毫秒**（一条用例的量级），
+# 100 个账套时 2.4 秒 —— 但清理之后库里回到 0，所以永远走的是 11ms 那条路。
+#
+# **顺序是算出来的，不是手写的。** 每次清理都从 ``pg_constraint`` 读出外键图，
+# 拓扑排序出「子表在前」；手写清单一定会有遗漏，而漏掉的那张表会安静地
+# 累积，症状又是「某条用例突然变慢」—— 那种问题最难查。
+#
+# **为什么只清 ``public``。** ``test_migration_guardrails`` 的 ``migrated_scratch``
+# 夹具另开一个 schema 跑迁移，那边的表不在 ``public`` 里，不受影响；
+# 插件运行时建出来的 ``plugin_*`` 表也在 ``public`` 里，会被一起清掉
+# （插件夹具自己也会 drop 它们，不冲突）。
+#
+# **为什么放在用例「开始前」而不是「结束后」。** 开始前清，顺序上更稳：
+# 上一个用例的夹具（``db`` 的 Session、``client`` 的 TestClient）一定已经
+# 拆完了，不会有连接开着事务挡着 DELETE。顺便还白送一个好处 ——
+# **每条用例都从同一个干净状态出发**，用例之间不再有先后依赖。
+#
+# 想临时关掉（比如手工复现一条用例、想看累积效应）：
+# ``CWQ_TEST_KEEP_DATA=1 pytest``。
+
+_CLEAN_SQL_CACHE: dict[str, str] = {}
+
+#: 迁移种下的**基线行**（表名 -> 这些行的主键 id）。
+#:
+#: 为什么必须留着：迁移 0021/0022/0024 会往库里种下官方内置的报表模板
+#: （资产负债表、利润表）与打印模板 —— 它们是**全局基线**，不是某个账套的数据。
+#: 全表删掉之后，一批用例会直接报「内置资产负债表模板没建出来，种子数据有问题」
+#: （2026-10 首次启用清库时踩过：52 failed + 64 errors）。
+#:
+#: 这里记的是**行 id 快照**，不是「哪张表要排除」的硬编码清单：
+#: 迁移往哪张表种了数据，就自动把那几张表的基线行留下来；
+#: 将来迁移再种新表，也不用回来改这里。
+_SEEDED_BASELINE: dict[str, tuple[int, ...]] = {}
+
+
+def _capture_baseline() -> None:
+    """记下「迁移刚跑完、还没跑任何用例」时库里的行 —— 那些就是基线。"""
+    global _SEEDED_BASELINE
+    snapshot: dict[str, tuple[int, ...]] = {}
+    with engine.connect() as conn:
+        for table in _public_tables():
+            has_id = conn.execute(text(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name=:t AND column_name='id'"),
+                {"t": table}).scalar()
+            if not has_id:
+                continue
+            ids = tuple(r[0] for r in conn.execute(
+                text(f'SELECT id FROM public."{table}" ORDER BY id')))
+            if ids:
+                snapshot[table] = ids
+    _SEEDED_BASELINE = snapshot
+
+
+def _public_tables() -> list[str]:
+    """public schema 里的业务表（``alembic_version`` 不算，它是迁移状态）。"""
+    with engine.connect() as conn:
+        return [r[0] for r in conn.execute(text(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_name <> 'alembic_version' "
+            "ORDER BY table_name"))]
+
+
+def _delete_order(tables: list[str]) -> list[str]:
+    """排出「被引用的先删」的顺序：子表在前，父表在后。
+
+    外键图直接从 ``pg_constraint`` 读 —— 手写清单迟早会漏，
+    而漏掉的那张表会安静地累积，表现为「某条用例莫名其妙变慢」。
+    """
+    with engine.connect() as conn:
+        edges = conn.execute(text(
+            "SELECT c.relname, p.relname "
+            "FROM pg_constraint con "
+            "JOIN pg_class c ON c.oid = con.conrelid "
+            "JOIN pg_class p ON p.oid = con.confrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE con.contype = 'f' AND n.nspname = 'public'")).all()
+    # refs[t] = 引用了 t 的那些表
+    refs: dict[str, set[str]] = {t: set() for t in tables}
+    for child, parent in edges:
+        if child in refs and parent in refs and child != parent:
+            refs[parent].add(child)
+    order: list[str] = []
+    left = set(tables)
+    while left:
+        # 没人再引用它的可以先删
+        ready = sorted(t for t in left if not (refs[t] & left))
+        if not ready:
+            # 有环（自引用外键）：剩下的按名字排，自引用那条由 NO ACTION 兜底
+            ready = sorted(left)
+        order += ready
+        left -= set(ready)
+    return order
+
+
+def _clean_public_tables() -> None:
+    """把 public schema 的业务数据清空（迁移种下的基线数据留着）。"""
+    tables = _public_tables()
+    if not tables:
+        return
+    key = ",".join(tables)
+    sql = _CLEAN_SQL_CACHE.get(key)
+    if sql is None:
+        order = _delete_order(tables)
+        # 一条 DO 块发出去：一次往返，删除顺序在库内执行。
+        parts = []
+        for t in order:
+            keep = _SEEDED_BASELINE.get(t)
+            if keep:
+                # 这张表有基线行：只删不是基线的那些（测试造的副本）。
+                ids = ",".join(str(i) for i in keep)
+                parts.append(f'  DELETE FROM public."{t}" WHERE id NOT IN ({ids});\n')
+            else:
+                parts.append(f'  DELETE FROM public."{t}";\n')
+        sql = "DO $$\nBEGIN\n" + "".join(parts) + "END $$;"
+        _CLEAN_SQL_CACHE[key] = sql
+    with engine.begin() as conn:
+        # ``session_replication_role = replica``：本次事务里不触发**行级触发器**
+        # （``fn_posted_voucher_guard`` 之类）与**外键约束触发器**。
+        #
+        # 为什么可以这么做：测试库是一次性的（每轮建、每轮删），而这套夹具
+        # 本来就在 session 级 ``DROP SCHEMA public CASCADE`` —— 清空是它的本职。
+        # 库层那些护栏守的是**应用的写路径**（不许改已记账凭证、不许改已结账
+        # 期间的账），不是守测试夹具擦桌子。留着它们只会让清理在「上一条用例
+        # 锁了期间、记了凭证」之后卡住。
+        #
+        # 用 ``SET LOCAL``：只在这一个事务里生效，事务一提交自动还原，
+        # 不会把连接还回池时留一个 replica 角色给后面的请求。
+        #
+        # 外键不校验了，删除顺序就不再是**正确性**问题，但顺序仍然保留 ——
+        # 一是万一这个库上 ``cwq`` 不是超级用户（``SET`` 会被拒），
+        # 还能退回到按序删除；二是按序删除读起来更符合直觉。
+        conn.exec_driver_sql("SET LOCAL session_replication_role = replica")
+        conn.exec_driver_sql(sql)
+
+
+@pytest.fixture(autouse=True)
+def _clean_slate():
+    """每条用例开始前清空 public schema 的业务数据（见上面那段说明）。"""
+    if os.environ.get("CWQ_TEST_KEEP_DATA") != "1":
+        _clean_public_tables()
+    yield
 
 
 # --------------------------------------------------------------------- 基础夹具

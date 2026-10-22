@@ -593,7 +593,14 @@ SMTP 口令与 OCR token、OSS AccessKey 同一套规矩：**只写不读**，�
 ```bash
 cd backend
 
-.venv/bin/python -m pytest                      # 全量单元/接口测试；当前数量以收集与验证记录为准
+# 日常开发：只跑「你这次改动影响到的用例」（按真实导入关系算，不是猜）
+.venv/bin/python scripts/test_changed.py         # 打印受影响的测试文件 + 建议命令
+.venv/bin/python scripts/test_changed.py --run   # 直接跑
+.venv/bin/python scripts/test_changed.py --base main   # 跟 main 比
+
+# 提交前：全量（默认 -n 6 并行，本机 10 核实测 60~80 秒）
+.venv/bin/python -m pytest
+
 .venv/bin/python scripts/demo_e2e.py            # 69 项端到端流程
 .venv/bin/python scripts/demo_modules.py        # 53 项模块冒烟
 node onboard.mjs                                # 19 步浏览器开户全流程（需前后端都起着）
@@ -604,6 +611,13 @@ cd ../frontend && npm run test                  # 全量前端测试（node --te
 
 - 插件专项及完整回归命令见 [验证记录](docs/plugin-verification.md)。真实浏览器演练使用专用 `*_plugin_browser_test` 库和临时签名密钥，不能传业务库连接串。
 - pytest 用**独立测试库** `cwq_test`，每个用例一个全新账套，绝不碰开发库
+- **每条用例之间会清一次库**（`conftest` 的 `_clean_slate`）：让每条用例都从同一个干净状态出发，
+  也让插件备份这类「按库里账套数线性变慢」的操作不再拖垮整轮。
+  迁移种下的官方基线数据（内置报表模板、打印模板）会被保留。
+  想看「不清理」的样子：`CWQ_TEST_KEEP_DATA=1 pytest`
+- **命令行上不要再加 `-q`**：`pytest.ini` 的 `addopts` 里已经有一个 `-q`，
+  再加一个就变成 `-qq`，pytest 9 会把结尾「N passed in Xs」那行**整个吞掉** ——
+  跑完一轮看不到结论
 - 两个 demo 脚本每次运行自建 uuid 账套，可以反复跑
 - `onboard.mjs` 跑真实浏览器：新建账套 → 初始化两步向导 → 录期初（含反方向余额）
   → 试算平衡 → 保存回读 → 导出再导入 → 下载文件鉴权 → 拖拽磁贴排序并验证刷新后仍在

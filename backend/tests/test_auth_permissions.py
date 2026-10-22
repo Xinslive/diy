@@ -314,13 +314,18 @@ def test_开关只认真布尔(client, auth, bad):
 # --------------------------------------------------------------------- 权限边界
 
 #: (说明, 方法, 路径, 请求体) —— 普通用户每一条都必须是 403
+#:
+#: 路径里的 ``{other}`` 是**被操作的那个用户**（管理员）。写死成 ``1`` 是不行的：
+#: 用户 id 由数据库序列分配，写死的 1 只在「这个 worker 还没建过用户」时
+#: 恰好存在 —— 那种「碰巧对」会让「改**他人**资料」这条变成改一个不存在的人，
+#: 名不副实。占位符在下面按真实 id 填。
 FORBIDDEN = [
     ("列全部用户",   "post", "/api/system/users", {"username": "hack1", "password": "abcd1234"}),
     ("列全部账套",   "get",  "/api/system/books", None),
     ("全局审计日志", "get",  "/api/system/audit-logs", None),
-    ("改他人资料",   "patch", "/api/system/users/1", {"password": "abcd1234"}),
-    ("删他人",       "delete", "/api/system/users/1", None),
-    ("给别人授权账套", "put", "/api/system/users/1/books", []),
+    ("改他人资料",   "patch", "/api/system/users/{other}", {"password": "abcd1234"}),
+    ("删他人",       "delete", "/api/system/users/{other}", None),
+    ("给别人授权账套", "put", "/api/system/users/{other}/books", []),
     ("看注册开关", "get", "/api/system/registration", None),
     ("改注册开关", "put", "/api/system/registration", {"enabled": True}),
 ]
@@ -348,7 +353,8 @@ def test_管理员仍然看得到操作日志(client, auth, book, make_voucher):
 
 
 @pytest.mark.parametrize("label,method,path,body", FORBIDDEN, ids=[c[0] for c in FORBIDDEN])
-def test_普通用户一律被拒(client, plain_auth, label, method, path, body):
+def test_普通用户一律被拒(client, plain_auth, admin_user, label, method, path, body):
+    path = path.format(other=admin_user.id)
     r = getattr(client, method)(path, headers=plain_auth, **({"json": body} if body is not None else {}))
     assert r.status_code == 403, f"{label} 没有拦住：{r.status_code} {r.text}"
 

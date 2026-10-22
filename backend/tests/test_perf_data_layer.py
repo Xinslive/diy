@@ -139,6 +139,18 @@ def test_凭证按科目筛选不再需要回堆(db, book, subjects, make_vouche
     Index Only Scan 要求命中页在可见性图（visibility map）里被标成
     all-visible，而刚灌完数据的表一页都不是 —— 所以这里先 VACUUM。
     VACUUM 不能跑在 ``db`` 夹具的事务里，自己开一条 autocommit 连接。
+
+    **为什么还要 REINDEX（这是 2026-10 启用「用例之间清库」之后才暴露的）。**
+    夹具现在每条用例前会把业务表**整表 DELETE** 干净。DELETE 会给索引留下
+    **死元组**，而 btree 只有在死项位于页尾、或能被 ``kill_prior_tuple``
+    回收时才可能把该页标成 all-visible —— 卡在页中间的死项，VACUUM 清不掉。
+    于是「VACUUM 之后索引页全可见」这件事**不再成立**：命中页上混着上几轮
+    清库留下的死项，计划就从 ``Index Only Scan`` 退化成 ``Index Scan``
+    （后者要回堆取 voucher_id，正是这条用例要防的那个退化）。
+
+    症状是**时好时坏**：同一个用例，单独跑永远绿（全量跑时它前面那个 worker
+    攒了几百次清库，索引早就脏了）。所以这里把物理前提写死在用例里 ——
+    **REINDEX 之后索引是全新的，页天然 all-visible**，不再依赖上一轮跑过什么。
     """
     import sqlalchemy as sa
 
@@ -149,6 +161,8 @@ def test_凭证按科目筛选不再需要回堆(db, book, subjects, make_vouche
     try:
         with vacuum.connect() as c:
             c.execute(text("VACUUM (ANALYZE) entry"))
+            # 重建索引：把清库留下的死元组一并清掉，页才能标成 all-visible。
+            c.execute(text("REINDEX TABLE entry"))
     finally:
         vacuum.dispose()
 
