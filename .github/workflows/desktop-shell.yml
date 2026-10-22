@@ -94,6 +94,22 @@ jobs:
     runs-on: windows-latest
     needs: [test]
 
+    # **Windows 控制台默认不是 UTF-8。**
+    #
+    # 第一次跑这条 workflow 时，windows-latest 上 make_icon.py 打印「✅」
+    # 抛了 UnicodeEncodeError（cp1252 编不出这个字符），整条 workflow
+    # 红在「生成图标」那一步。代码里已经用 force_utf8_output() 加固
+    # （见 launcher.py），但这里再设一道环境变量作为双保险 ——
+    # 这条 workflow 里**每一个** Python 脚本都受益，不必逐个记得加固。
+    #
+    # 注意：中文 Windows 默认是 cp936、PowerShell 5.1 下是 cp1252，
+    # 两者都写不出 ✅ 与部分中文，所以这一道不是多余的。
+    #
+    # （`env:` 是 **job 级**的键，必须与 `steps:` 平级 —— 放进 steps 列表里
+    # 会让整个 YAML 解析失败。）
+    env:
+      PYTHONIOENCODING: utf-8
+
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

@@ -28,6 +28,12 @@ import sys
 import zlib
 from pathlib import Path
 
+# UTF-8 输出加固在 launcher.py 里（一份实现，脚本都从那儿取）。
+# Windows 控制台默认 cp936/cp1252，print("✅") 会抛 UnicodeEncodeError
+# —— 而且那个异常发生在 print 那一行，脚本会直接崩掉。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from launcher import force_utf8_output  # noqa: E402
+
 # 前景/背景色
 BG = (0x40, 0x9E, 0xFF)      # #409EFF —— Element Plus 主色
 FG = (0xFF, 0xFF, 0xFF)
@@ -149,11 +155,17 @@ def build_ico(sizes=SIZES) -> bytes:
 
 
 def main(argv: list[str]) -> int:
+    force_utf8_output()
     out = Path(argv[1]) if len(argv) > 1 else Path(__file__).resolve().parent / "shell.ico"
     out.parent.mkdir(parents=True, exist_ok=True)
     data = build_ico()
     out.write_bytes(data)
-    print(f"✅ {out}  {len(data):,} 字节  尺寸 {', '.join(str(s) for s in SIZES)}")
+    # 用 _out 一样的兜底：Windows 控制台编码不当时，图标已经生成好了，
+    # 不该因为「打不出这行提示」而以非零码退出 —— 那会让 CI 误判成失败。
+    try:
+        print(f"✅ {out}  {len(data):,} 字节  尺寸 {', '.join(str(s) for s in SIZES)}")
+    except Exception:
+        pass
     return 0
 
 

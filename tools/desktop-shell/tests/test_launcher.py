@@ -368,5 +368,71 @@ class ProfileDirTest(unittest.TestCase):
         self.assertNotIn("Roaming", str(path))
 
 
+class ForceUtf8OutputTest(unittest.TestCase):
+    """``force_utf8_output()`` —— Windows 控制台编码加固。
+
+    **这条测试是被 CI 逼出来的。** 第一次跑 Desktop Shell workflow 时，
+    windows-latest 上 ``make_icon.py`` 打印「✅」抛了
+    ``UnicodeEncodeError: 'charmap' codec can't encode character '\\u2705'``，
+    整条 workflow 在「生成图标」那一步红了。
+
+    修完之后必须有测试守着，否则下一次有人改 print 的写法、或换了台
+    编码不同的机器，同样的坑会再踩一遍。
+    """
+
+    def _cp1252_stream(self):
+        """一个用 cp1252 编码的文本流 —— 模拟 Windows 控制台。"""
+        import io
+
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+        self.addCleanup(stream.detach)
+        return stream, raw
+
+    def test_reconfigures_to_utf8(self):
+        stream, _ = self._cp1252_stream()
+        original_out, original_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = stream, stream
+        try:
+            launcher.force_utf8_output()
+            encoding = stream.encoding
+        finally:
+            sys.stdout, sys.stderr = original_out, original_err
+        self.assertEqual(encoding.lower(), "utf-8")
+
+    def test_emoji_printable_after_forcing(self):
+        # 真正的断言：加固之后 print("✅") 不再抛。
+        # 修复前这一行会抛 UnicodeEncodeError。
+        stream, _ = self._cp1252_stream()
+        original_out, original_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = stream, stream
+        try:
+            launcher.force_utf8_output()
+            print("✅ 中文与 emoji 都能写出去")
+        finally:
+            sys.stdout, sys.stderr = original_out, original_err
+
+    def test_tolerates_missing_stream(self):
+        # GUI 打包（windowed）下 sys.stdout 可能是 None。
+        # 那时不能抛 —— 壳的启动流程不能因为「没有控制台」而崩掉。
+        original_out, original_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = None, None
+        try:
+            launcher.force_utf8_output()  # 不抛即通过
+        finally:
+            sys.stdout, sys.stderr = original_out, original_err
+
+    def test_tolerates_stream_without_reconfigure(self):
+        # 没有 reconfigure 方法的流（比如被换成 io.StringIO）也不能抛。
+        import io
+
+        original_out, original_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+        try:
+            launcher.force_utf8_output()
+        finally:
+            sys.stdout, sys.stderr = original_out, original_err
+
+
 if __name__ == "__main__":
     unittest.main()

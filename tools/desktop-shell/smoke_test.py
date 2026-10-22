@@ -36,7 +36,29 @@ import sys
 import tempfile
 from pathlib import Path
 
+# UTF-8 输出加固在 launcher.py 里（一份实现，脚本都从那儿取）。
+# Windows 控制台默认 cp936/cp1252，print("✅") 会抛 UnicodeEncodeError。
+#
+# **这个脚本尤其不能崩在 print 上**：它是 CI 的主闸。它自己因为编码问题
+# 挂掉，等于闸门自己塌了 —— 那比「没这道闸」还糟，因为日志上会显示
+# 「跑过了」，只是没跑成。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from launcher import force_utf8_output  # noqa: E402
+
 EXPECTED_URL = "https://acct.xins.live"
+
+
+def _out(text: str) -> None:
+    """打印一条结果，且**绝不因编码问题抛异常**。
+
+    兜底 reason：``force_utf8_output()`` 已经把编码修好了，理论上不会抛。
+    但 stdout 在某些环境（管道被关闭、被重定向到 None）下不可写 ——
+    一道校验闸因为「打印不出结果」而中途退出，比报个假阴性更糟。
+    """
+    try:
+        print(text)
+    except Exception:
+        pass
 
 # exe 的合法退出码（与 launcher.py 的 main() 返回值对应）
 RC_OK = 0
@@ -178,6 +200,7 @@ def check_rejects_bad_url(exe: Path) -> None:
 
 
 def main(argv: list[str]) -> int:
+    force_utf8_output()
     allow_non_pe = False
     args = list(argv[1:])
     if args and args[0] == "--allow-non-pe":
@@ -185,7 +208,7 @@ def main(argv: list[str]) -> int:
         args = args[1:]
 
     if not args:
-        print("用法：python3 smoke_test.py <exe 路径>", file=sys.stderr)
+        _out("用法：python3 smoke_test.py <exe 路径>")
         return 1
 
     exe = Path(args[0]).resolve()
@@ -203,17 +226,17 @@ def main(argv: list[str]) -> int:
             check()
         except SmokeFailure as exc:
             failures += 1
-            print(f"❌ {name}\n   {exc}")
+            _out(f"❌ {name}\n   {exc}")
         except Exception as exc:  # noqa: BLE001 —— 冒烟脚本要报出任何异常
             failures += 1
-            print(f"❌ {name}\n   意外异常：{exc!r}")
+            _out(f"❌ {name}\n   意外异常：{exc!r}")
         else:
-            print(f"✅ {name}")
+            _out(f"✅ {name}")
 
     if failures:
-        print(f"\n❌ {failures}/{len(checks)} 项没过")
+        _out(f"\n❌ {failures}/{len(checks)} 项没过")
         return 1
-    print(f"\n✅ {len(checks)}/{len(checks)} 项全过：{exe}")
+    _out(f"\n✅ {len(checks)}/{len(checks)} 项全过：{exe}")
     return 0
 
 

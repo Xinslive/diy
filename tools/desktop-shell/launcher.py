@@ -336,6 +336,35 @@ def show_message(title: str, text: str, *, error: bool = False) -> None:
         pass
 
 
+def force_utf8_output() -> None:
+    """把 stdout / stderr 切到 UTF-8，让中文与 emoji 能写出去。
+
+    **Windows 控制台默认不是 UTF-8。** cmd.exe 下的 cp936、
+    PowerShell 5.1 下的 cp1252，都会让 ``print("✅")`` 直接抛
+    ``UnicodeEncodeError``。
+
+    这不是理论问题 —— CI 第一次跑就撞上了：windows-latest 上
+    ``make_icon.py`` 打印「✅」时抛
+    ``UnicodeEncodeError: 'charmap' codec can't encode character '\\u2705'``，
+    整条 workflow 在「生成图标」那一步红了。
+
+    而这个失败形态特别坏：**异常发生在 print 那一行**，所以脚本看起来
+    只是「没打出一行提示」，实际上进程已经崩了，后面该做的事全没做。
+    冒烟验证脚本更不能这样 —— 它是 CI 的主闸,自己崩了就等于没设闸。
+
+    ``sys.stdout`` 在 GUI 打包（windowed）下可能是 None 或被替换成
+    丢弃输出的空对象，所以每个 stream 都要先探属性再动手。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def _safe_print(text: str, stream=None) -> None:
     """在无控制台（GUI 打包）下也能安全地 print。
 
@@ -453,6 +482,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    force_utf8_output()
     args = parse_args(sys.argv[1:] if argv is None else argv)
 
     config, config_path = load_config()
