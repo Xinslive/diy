@@ -59,11 +59,15 @@
           </el-form-item>
         </el-form>
 
-        <!-- 说明沉到栏底：设置项只有三行，撑不满 60vh 高的预览区，
-             留一大片空在下面会让人以为左侧没加载出来。 -->
-        <div class="note">
-          <p class="note-tip">方向只对本次打印生效，不会改动模板；纸张一律 A4。</p>
-          <p v-if="isVoucher" class="note-sub">一页放几张凭证由所选模板决定，在模板设计器里改。</p>
+        <!-- 说明沉到栏底：设置项只有几行，撑不满预览区高，
+             留一大片空在下面会让人以为左侧没加载出来。
+             原来这里还有一句讲「方向只对本次打印生效、纸张一律 A4」的话 ——
+             用户 2026-10-22 批注：去掉。方向与纸型在上面的控件里一眼就
+             看得见，再补一句解释只是把左栏压得满满当当。
+             于是这里只剩凭证页真需要的那一句（别的范围连这条线都不画，
+             空一条虚线看着像没加载完）。 -->
+        <div v-if="isVoucher" class="note">
+          <p class="note-sub">一页放几张凭证由所选模板决定，在模板设计器里改。</p>
         </div>
       </div>
 
@@ -304,7 +308,6 @@ watch(() => props.params, () => { if (visible.value) refreshPreview() }, { deep:
 /* 说明沉底，填掉设置项与预览区之间那片空白 */
 .note { margin-top: auto; padding-top: 12px; border-top: 1px dashed #e4e7ed; }
 .note p { margin: 0; font-size: 12px; line-height: 1.7; }
-.note-tip { color: #909399; }
 .note-sub { color: #c0c4cc; }
 .note-warn { color: #e6a23c; }
 
