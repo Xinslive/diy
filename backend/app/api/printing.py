@@ -1006,7 +1006,7 @@ def _detail_book_groups(db: Session, book: Book, period: Period,
 
     单位一律是**一级科目**（用户 2026-10-22 批注 3）：明细账与总账的册页
     结构一致，都是一级科目一份、综合的那个是**综合明细账**（下级科目排成
-    几块，每块首行写「编码 名称 期初余额」）。
+    几块，每块首行写「名称 期初余额」）。
     """
     from app.ledger import queries
 

@@ -130,7 +130,11 @@ def test_有下级的一级科目是综合明细账(db, book):
 
 
 def test_综合明细账每块首行写明是哪个下级科目(db, book, periods, subjects):
-    """纸上**没有「科目」列**（用友八列），所以块首行的摘要要说明归属。"""
+    """纸上**没有「科目」列**（用友八列），所以块首行的摘要要说明归属。
+
+    摘要里**只有科目名、没有编码**（用户 2026-10-22 浏览器批注 1）：
+    编码是账套内部的地址，只有科目表里才认它；翻账的人看的是名字。
+    """
     groups = {g["subject"].code: g for g in _groups(db, book)}
     books = queries.detail_ledger_book(
         db, book.id, [groups["1101"]], periods[1], periods[12], True)
@@ -138,8 +142,8 @@ def test_综合明细账每块首行写明是哪个下级科目(db, book, period
     rows = books[0]["rows"]
     opening_summaries = [r["summary"] for r in rows if r["kind"] == "OPENING"]
     assert opening_summaries == [
-        "110101 股票 期初余额", "110102 债券 期初余额",
-        "110103 基金 期初余额", "110110 其他 期初余额",
+        "股票 期初余额", "债券 期初余额",
+        "基金 期初余额", "其他 期初余额",
     ], opening_summaries
     # 册页的抬头是**一级科目**，不是某个末级科目
     assert books[0]["code"] == "1101"
@@ -147,7 +151,7 @@ def test_综合明细账每块首行写明是哪个下级科目(db, book, period
 
 
 def test_末级一级科目的期初行仍写期初余额(db, book, periods, subjects):
-    """1001 库存现金本身就是末级 —— 它的期初行不用再缀一遍「编码 名称」。"""
+    """1001 库存现金本身就是末级 —— 它的期初行不用再缀一遍科目名。"""
     groups = {g["subject"].code: g for g in _groups(db, book)}
     books = queries.detail_ledger_book(
         db, book.id, [groups["1001"]], periods[1], periods[12], True)
@@ -182,7 +186,8 @@ def test_给父科目就出那一份综合明细账(client, auth, book, periods,
     parent = subjects["1101"]
     html = _book_html(client, auth, book, periods, subject_id=parent.id)
     assert "短期投资" in html
-    assert "110101 股票 期初余额" in html
+    assert "股票 期初余额" in html
+    assert "110101 股票" not in html, "摘要列不该再带科目编码"
     assert "库存现金" not in html, "给了科目就不该带出别的科目"
 
 
@@ -210,7 +215,8 @@ def test_关掉开关就全都印(client, auth, book, periods, subjects, make_vo
     html = _book_html(client, auth, book, periods, skip_empty="false")
     assert "库存现金" in html
     assert "短期投资" in html, "关了开关之后，没动过的科目也该印"
-    assert "110101 股票 期初余额" in html
+    assert "股票 期初余额" in html
+    assert "110101 股票" not in html, "摘要列不该再带科目编码"
 
 
 def test_开关不在模板里_老模板里那份会被清掉(client, auth, book):

@@ -439,14 +439,14 @@ def detail_ledger_groups(
 
     * 一级科目本身就是末级（1001 库存现金）→ 就是它自己那份明细。
     * 一级科目下面有下级（1101 短期投资）→ 那一份是**综合明细账**：
-      下级科目按科目表顺序一块块排下来，每块首行写「编码 名称 期初余额」。
+      下级科目按科目表顺序一块块排下来，每块首行写「名称 期初余额」。
 
     * **不给科目** —— 全账套的一级科目，逐个成册（用友明细账的做法）。
     * **给了科目** —— 那一个科目就是一份：末级就它自己；父级则它下面那几个
       （可用起止科目再框一段，语义与屏幕上的「子科目范围」一致）。
 
     ``comprehensive`` 说的是「这一份里有没有下级科目」—— 有的话，各下级科目
-    的期初行要写上「编码 名称」，否则纸上分不清哪几行属于哪个下级。
+    的期初行要写上「名称」，否则纸上分不清哪几行属于哪个下级。
     """
     tree = subject_tree(db, book_id, year)
     children: dict[int, list[Subject]] = defaultdict(list)
@@ -666,7 +666,14 @@ def detail_ledger_book(
                 continue
             if group.get("comprehensive"):
                 leaf_rows = list(leaf_rows)
-                leaf_rows[0]["summary"] = f"{leaf.code} {leaf.name} 期初余额"
+                # **只写科目名，不写编码**（用户 2026-10-22 浏览器批注 1：
+                # 「摘要列，显示科目的时候不要显示科目代码」）。
+                #
+                # 编码是**账套内部**的地址，只有科目表里才认它；账簿上认的是
+                # **科目名**。摘要列写「110101 股票 期初余额」，等于在一本给人
+                # 看的账里夹了一串内部编号 —— 翻账的人不查编码，那几个字对他
+                # 一点用没有，还把「股票 期初余额」这一行往右挤。
+                leaf_rows[0]["summary"] = f"{leaf.name} 期初余额"
             rows.extend(leaf_rows)
         root = group["subject"]
         books.append({"code": root.code, "name": root.name, "rows": rows})
