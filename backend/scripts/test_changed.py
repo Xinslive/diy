@@ -133,7 +133,14 @@ def _build_graph() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
 def _changed_files(base: str) -> list[str]:
     """相对 ``base`` 改动过的文件（含未提交改动）。"""
     out: set[str] = set()
-    for args in (["diff", "--name-only", base], ["diff", "--name-only", "--cached"]):
+    # **--relative**：路径要相对 ``backend/``（ROOT），不能是仓库根。
+    #
+    # 少了它，``git diff --name-only`` 给的是「backend/app/ledger/queries.py」，
+    # 而下面判断「这个改动是不是 app/ 下的模块」用的是「app/」开头 ——
+    # 一对比全部落空，于是**改了什么都说成「没有测试依赖」**。
+    # 那不是「这次改动安全」，那是**静默不跑**：真出问题时已经没有用例拦着了。
+    for args in (["diff", "--name-only", "--relative", base],
+                 ["diff", "--name-only", "--relative", "--cached"]):
         try:
             out |= {line.strip() for line in _run_git(*args).splitlines() if line.strip()}
         except subprocess.CalledProcessError:
