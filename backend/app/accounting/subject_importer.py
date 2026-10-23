@@ -60,6 +60,53 @@ _CATEGORY_MAP = {
 }
 _DIRECTION_MAP = {"借": "DEBIT", "借方": "DEBIT", "贷": "CREDIT", "贷方": "CREDIT"}
 
+#: 类别的中文名（报错用）。
+_CATEGORY_LABELS = {
+    "ASSET": "资产类",
+    "LIABILITY": "负债类",
+    "EQUITY": "所有者权益类",
+    "COST": "成本类",
+    "PROFIT": "损益类",
+}
+
+#: 科目树的**层级深度上限**（审查修复）。
+#:
+#: 账簿引擎 ``LedgerEngine._roll_up_openings`` 里有个 16 层的**保险丝**：
+#: 超过 16 层的子树合计会被**静默截断** —— 期初上卷少算一层，
+#: 余额对不上，而**没有任何报错**。
+#:
+#: 导入是科目树唯一的批量入口，所以这里在导入边界上把这条上限**写出来**：
+#: 超限时明确报错，而不是让它一路走到引擎里被悄悄截断。
+#:
+#: 为什么现在不会触发：这份解析器已经有一道「级次超过系统支持的 8 级」的
+#: 检查（更严），而父子关系是按「级次 + 编码前缀」认的，树深不会超过级次。
+#: 这条检查的作用是**把上限显式化**：将来若放宽级次上限，这里不会变成
+#: 静默截断的入口。标准科目表只有 3 级。
+MAX_SUBJECT_DEPTH = 16
+
+
+def _canonical_prefix_categories() -> dict[str, str]:
+    """本账套编码体系里，**科目编码首位（大类码）** → 类别。
+
+    这张表**不是拍脑袋写的**，是从内置标准科目表
+    （``app/seed/chart_of_accounts.py``，用友 4-2-2）里读出来的 ——
+    那一级科目才是「大类码」的定义处（子科目编码是父级编码的前缀，
+    首位与父级一致）。
+
+    为什么「编码首位」是一条**独立于「类型」列**的证据：「类型」列是外部
+    系统自己写的、写错一个字就错；而编码首位是编码规则决定的 ——
+    1002 开头是 1，而 1 在这套体系里就是资产类。**两份证据对不上，
+    就是这份表有问题。**
+    """
+    from app.seed.chart_of_accounts import CHART
+
+    out: dict[str, str] = {}
+    for row in CHART:
+        code, category = row[0], row[2]
+        if code and category:
+            out.setdefault(str(code)[0], category)
+    return out
+
 
 def _text(value: Any) -> str:
     """把 Excel 单元格稳定地转成文本，避免 ``1001.0`` 污染科目编码。"""
@@ -217,6 +264,84 @@ def _error_list(items: list[dict]) -> list[dict]:
     ]
 
 
+def _parent_chain_depth(item: dict, by_code: dict[str, dict]) -> int:
+    """这个科目在父子链上有多深（自己算第 1 级）。
+
+    按 ``parent_code`` 一路上溯；遇到环或找不到父级就停（那两道另有检查
+    会报错），这里只负责算深度。
+    """
+    depth = 1
+    cur = item
+    seen = {item.get("code")}
+    while cur.get("parent_code"):
+        parent = by_code.get(cur["parent_code"])
+        if parent is None or parent.get("code") in seen:
+            break
+        seen.add(parent.get("code"))
+        depth += 1
+        cur = parent
+    return depth
+
+
+def _check_prefix_categories(subjects: list[dict]) -> None:
+    """**科目编码首位（大类码）与「类型」必须一致**（独立于「类型」列的校验）。
+
+    「类型」列是外部系统自己写的，写错一个字就错；而**编码首位是编码规则
+    决定的**：本账套用友 4-2-2 体系里，第一级科目是 4 位大类码
+    （1002 开头是 1），子科目编码是父级编码的前缀、首位与父级一致。
+    两份证据对不上，就是这份表有问题。
+
+    为什么值得拦：损益类科目会被自动置上 ``carry_forward``
+    （见下面 ``carry_forward = category == "PROFIT"``），而月末结转会把
+    带这个标记的科目的余额**整体搬进本年利润** —— 钱凭空消失，
+    而**借贷仍然平衡，系统自检抓不到**。
+
+    ---- 什么时候**不做**这道校验（重要）------------------------------
+    导入的是**外部系统的科目表**，它的编码体系可能与本账套不同
+    （存量账里还有上一版《企业会计准则》编号：4001 实收资本是所有者权益类、
+    6001 主营业务收入是损益类）。所以：
+
+    * 首位**不在**本账套体系里（比如 6、7 开头）→ 不校验，无从判断。
+    * 首位在，但这份表把它用在了**另一个类别**上（同一首位的所有科目都
+      不是本账套给这个首位的类别）→ 不校验：这份表用的是另一套体系，
+      拿本账套的规则去判它就是误伤。
+
+    只有「这个首位在这份表里已经按本账套的体系用起来」时，才拿它去校验
+    同一位位的**个别**科目 —— 那才是真正的「类型列写错了」。
+    """
+    canonical = _canonical_prefix_categories()
+    if not canonical:
+        return
+    used: dict[str, set[str]] = defaultdict(set)
+    for item in subjects:
+        code = item.get("code") or ""
+        category = item.get("category")
+        if code and category:
+            used[code[0]].add(category)
+    checkable = {
+        digit for digit, cats in used.items()
+        if digit in canonical and canonical[digit] in cats
+    }
+    if not checkable:
+        return
+    for item in subjects:
+        code = item.get("code") or ""
+        category = item.get("category")
+        if not code or not category:
+            continue
+        digit = code[0]
+        if digit not in checkable or category == canonical[digit]:
+            continue
+        _add_error(item, (
+            f"科目编码首位与「类型」不一致：{code} {item.get('name', '')} 的编码首位"
+            f"「{digit}」在本账套的编码体系里是"
+            f"{_CATEGORY_LABELS.get(canonical[digit], canonical[digit])}，"
+            f"而这张表把它标成了{_CATEGORY_LABELS.get(category, category)}。"
+            f"请核对外部科目表的「类型」列 —— 类型写错会让结转损益搬错科目的余额，"
+            f"而借贷仍然平衡、系统自检查不出来。"
+        ))
+
+
 def parse_subject_workbook(data: bytes, filename: str = "") -> dict:
     """解析外部科目表，返回预览数据，不写数据库。"""
     if not data:
@@ -292,6 +417,10 @@ def parse_subject_workbook(data: bytes, filename: str = "") -> dict:
             "level": level or 0,
             "parent_code": "",
             "is_leaf": True,
+            # **「类型」列推出来的**，不是「编码首位」推出来的 —— 所以它
+            # 只对了一半：类型列写错时，这里跟着错。导入路径上还有一道
+            # **独立于类型列**的校验（``_check_prefix_categories``：编码
+            # 首位的大类码必须与类别对得上），两道证据不一致就报错。
             "carry_forward": category == "PROFIT",
             "qty_calc": bool(optional["unit"]),
             "aux_calc": bool(optional["auxiliary_type"]),
@@ -390,6 +519,31 @@ def parse_subject_workbook(data: bytes, filename: str = "") -> dict:
             for item in subjects:
                 if item["level"] in missing_levels:
                     _add_error(item, f"缺少第 {item['level']} 级的有效编码段")
+
+    # ---- 科目树深度上限（审查修复）------------------------------------
+    #
+    # 引擎的期初上卷有个 16 层保险丝，超过就**静默截断**子树合计。这里在
+    # 导入边界上把同一条上限写出来：超限时明确报错，别让它走到引擎里被
+    # 悄悄少算一层。深度按「声明的级次」与「实际父子链」两者取大。
+    for item in subjects:
+        depth = max(int(item.get("level") or 0), _parent_chain_depth(item, by_code))
+        if depth > MAX_SUBJECT_DEPTH:
+            _add_error(
+                item,
+                f"科目层级深度 {depth} 超过上限 {MAX_SUBJECT_DEPTH} 级 —— "
+                f"账簿引擎的期初上卷只处理到 {MAX_SUBJECT_DEPTH} 层，"
+                f"再深的子树合计会被静默截断（余额对不上且不报错）。"
+                f"请把科目表拆浅一些再导入。"
+            )
+
+    # ---- 编码首位（大类码）与「类型」必须一致（审查修复）--------------
+    #
+    # 这一道**独立于「类型」列**：编码首位是编码规则决定的（大类码），
+    # 「类型」是外部系统自己写的。两者对不上，就是这份表有问题 ——
+    # 而「类型」写错的后果不是显示难看：损益类科目会被自动置上
+    # ``carry_forward``，月末结转会把它的余额整体搬进「本年利润」，
+    # 钱凭空消失，而借贷仍然平衡、系统自检抓不到。
+    _check_prefix_categories(subjects)
 
     errors = _error_list(subjects)
     for item in subjects:

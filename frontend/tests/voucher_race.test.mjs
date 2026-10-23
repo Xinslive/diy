@@ -74,13 +74,16 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
   const prevId = { value: null }
   const nextId = { value: null }
   const neighbourScope = { value: '' }
+  // 切账套撞号的提示状态（见 VoucherEdit.vue 的 crossBook 说明）。
+  // 这里恒为 null —— 这一组用例测的是「翻凭证」这条，不涉及切账套。
+  const crossBook = { value: null }
 
   const ctx = {
     route: { params: { id: '0' }, query: {} },
     form: {},
     voucherId, savedAt, insertCtx, subjectRefs, rowEls, markingRows, voucherPeriod, voucherPeriodId,
-    lastSaved, prevId, nextId, neighbourScope,
-    store: { bookId: 1, periods: [] },
+    lastSaved, prevId, nextId, neighbourScope, crossBook,
+    store: { bookId: 1, periods: [], books: [] },
     listFilter: { value: {} },
     entrySig: { value: 'sig' },
     api: {
@@ -94,7 +97,7 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
     loadInsertPreview: async () => null,
     loadNextDefaults: async () => ({ voucher_no: '记001', voucher_date: '2026-01-31' }),
     defaultDate: () => '2026-01-31',
-    ElMessage: { success() {}, error() {} },
+    ElMessage: { success() {}, error() {}, warning() {} },
     router: { push() {} }, history: {}, location: {},
   }
 
@@ -102,9 +105,10 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
     'ctx',
     `
     const { route, form, voucherId, savedAt, insertCtx, subjectRefs, rowEls, markingRows, voucherPeriod,
-            voucherPeriodId, lastSaved, prevId, nextId, neighbourScope, store, listFilter, entrySig,
+            voucherPeriodId, lastSaved, prevId, nextId, neighbourScope, crossBook, store, listFilter, entrySig,
             api, loadSubjects, ensureRows, loadInsertPreview, loadNextDefaults,
             defaultDate, ElMessage, router, history, location } = ctx
+    const bookName = (id) => '账套 ' + id
     ${staleSrc}
     ${yearSrc}
     let loadSeq = 0

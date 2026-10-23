@@ -57,3 +57,28 @@ export function slotsPerPage(tpl) {
   const n = Number(tpl?.voucher?.slots_per_page)
   return SLOTS_OPTIONS.includes(n) ? n : 2
 }
+
+/**
+ * 正文字号的**下限**（pt）。
+ *
+ * 总账与明细账是拿给外部看的正式账簿，10pt 的正文在 A4 上看不清 ——
+ * 用户 2026-10-23 定的：这两个范围的下限是 **12pt**，别的范围（凭证 / 余额表 /
+ * 报表）仍是 6pt。
+ *
+ * **两边必须一样**：前端的下限与后端的下限是同一条线 ——
+ * 后端是 ``app/printing/template.py`` 的 ``LEDGER_MIN_FONT_SIZE``（也是 12），
+ * 校验 / 打印 / 导出三处都执行。
+ * 各写各的就会有一处漏：漏在前端是**能填小值**（填 9pt，存下去后端再抬成 12pt，
+ * 用户只会以为界面在骗人），漏在后端是**印出小字**。
+ *
+ * 放在这里而不是留在页面里，是为了让这条线**可测**：
+ * 以前它只是 PrintTemplate.vue 里的一行三元表达式，测试只能对着源码做正则断言
+ * （断言源码里存在字面量 `? 12 : 6`）—— 那种断言守不住「12 是不是真的是下限」，
+ * 只守得住「那行字面量还在不在」。规则要有一个**能被直接调用**的地方。
+ *
+ * @param {string} scope 模板范围：``'LEDGER'`` 总账 / ``'DETAIL_LEDGER'`` 明细账
+ * @returns {number} 正文字号下限（pt）
+ */
+export function minFontSize(scope) {
+  return (scope === 'LEDGER' || scope === 'DETAIL_LEDGER') ? 12 : 6
+}

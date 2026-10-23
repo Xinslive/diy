@@ -2,19 +2,46 @@
 
 演示版使用 PBKDF2-HMAC-SHA256（标准库实现，无三方依赖）。
 生产环境可整体替换为 argon2 / bcrypt，只需替换 verify_password / hash_password。
+
+**口令散列的成本是「可升级」的**：散列串里记着算出它时用的迭代数，
+验证一律按**库里记着的那个数**算（所以老口令永远登得进去），而当库里
+那个数低于当前值时，验证成功之后会用当前值重算一遍并写回
+（见 :func:`password_needs_rehash`）。这样提高成本不需要停机、不需要
+强制所有人改密码，也不会把谁锁在门外。
 """
 import base64
 import hashlib
 import hmac
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from uuid import uuid4
 
 import jwt
 
 from app.core.config import settings
 
-_ITERATIONS = 240_000
+#: PBKDF2-HMAC-SHA256 的迭代轮数。
+#:
+#: **600,000** 是 OWASP 2023 对 PBKDF2-HMAC-SHA256 的建议值（原来的 240,000
+#: 低于这条线，差额 2.5 倍）。本机实测：240k 约 22ms、600k 约 52ms ——
+#: 一次登录多花 30ms，换来的是离线爆破成本翻 2.5 倍。
+#:
+#: **提高它不会把存量用户挡在门外**：散列串里带着算出它时的轮数
+#: （``pbkdf2_sha256$<iters>$<salt>$<dk>``），验证时按库里那个数算；
+#: 老散列登录成功之后会被 :func:`password_needs_rehash` 判为「该升级」，
+#: 由登录路径重算并写回（见 ``api/auth.py``）。于是成本是**随登录自动爬升**的，
+#: 而不是一次性的「全部作废重设」。
+_ITERATIONS = 600_000
+
+#: 散列串里允许出现的最大轮数。
+#:
+#: 库里的散列是**我们自己写的**，但万一这一列被改坏（手工改库、导入脏数据），
+#: 一个离谱大的轮数会让每一次验证都变成一次几十分钟的 CPU 占用 ——
+#: 那是一个不需要任何凭据就能触发的 DoS。所以解析时给它一个上限，
+#: 越界的一律当「散列不合法」（验证直接失败，不去算）。
+_MAX_ITERATIONS = 10_000_000
 
 # --------------------------------------------------------------------- 密码策略
 #
@@ -68,6 +95,30 @@ def password_policy_error(password: str) -> Optional[str]:
     return None
 
 
+def _parse_stored(stored: str) -> Optional[tuple[int, bytes, bytes]]:
+    """拆开库里那串散列：``(轮数, 盐, 摘要)``。**不合法时返回 None。**
+
+    轮数必须落在 ``1.._MAX_ITERATIONS`` 之间：散列是我们自己写的，正常情况下
+    必然满足，但**万一这一列被改坏**（手工改库、导入了脏数据），一个离谱大的
+    轮数会让每一次验证都变成一次几十分钟的 CPU 占用 —— 那是一个不需要任何
+    凭据就能触发的拒绝服务。越界的一律当「散列不合法」，验证直接失败。
+    """
+    try:
+        algo, iters, salt_b64, dk_b64 = stored.split("$")
+        if algo != "pbkdf2_sha256":
+            return None
+        count = int(iters)
+        if count < 1 or count > _MAX_ITERATIONS:
+            return None
+        salt = base64.b64decode(salt_b64)
+        dk = base64.b64decode(dk_b64)
+        if not salt or not dk:
+            return None
+        return count, salt, dk
+    except Exception:
+        return None
+
+
 def hash_password(password: str) -> str:
     salt = os.urandom(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, _ITERATIONS)
@@ -75,14 +126,31 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, stored: str) -> bool:
-    try:
-        algo, iters, salt_b64, dk_b64 = stored.split("$")
-        if algo != "pbkdf2_sha256":
-            return False
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), base64.b64decode(salt_b64), int(iters))
-        return hmac.compare_digest(dk, base64.b64decode(dk_b64))
-    except Exception:
+    """验证口令。
+
+    **按库里记着的轮数算**，不是按当前值 —— 于是老散列（24 万轮）依然登得进去，
+    升级轮数不会把任何存量用户挡在门外。轮数升级由
+    :func:`password_needs_rehash` + 登录路径上的重算写回来完成。
+    """
+    parsed = _parse_stored(stored or "")
+    if parsed is None:
         return False
+    iters, salt, dk = parsed
+    calc = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iters)
+    return hmac.compare_digest(calc, dk)
+
+
+def password_needs_rehash(stored: str) -> bool:
+    """这个散列是不是该用**当前**轮数重算一遍。
+
+    只在**口令已经验证通过**之后才该调用它 —— 判据是「轮数低于当前值」，
+    不是「口令对不对」。散列本身不合法时返回 False（那种散列验证阶段就已经
+    失败了，重算没有意义）。
+    """
+    parsed = _parse_stored(stored or "")
+    if parsed is None:
+        return False
+    return parsed[0] < _ITERATIONS
 
 
 def token_minutes_for(is_admin: bool) -> int:
@@ -121,11 +189,23 @@ def create_access_token(user_id: int, username: str, is_admin: bool = False,
       （:func:`app.core.deps.require_recent_admin_mfa`）就是拿它跟
       ``admin_mfa_grace_minutes`` 比。
 
-    **不传时载荷与改动前逐字一致**（一个字段都不多不少）—— 这样普通用户
-    的登录路径、已签发的老令牌、以及所有断言载荷形状的回归测试都不受影响。
+    **另外三个字段每个令牌都带**（审查 M-11）：
+
+    * ``iat`` —— 签发时刻（epoch 秒）。之前载荷里只有 ``exp``，于是「这个令牌
+      是什么时候签的」只能靠 ``exp`` 倒推。
+    * ``jti`` —— 这一枚令牌的唯一标识（``uuid4().hex``）。它是「**只吊销这一枚
+      令牌**」的粒度：同一个账号的两台设备拿到的令牌 jti 不同，将来要做
+      单枚吊销（登出某一台、改密后只踢掉泄露的那一枚）时就有地方可指了。
+      **它不替代 ``tv``**：``tv`` 是账号级的、立刻生效的全量撤销（改密/停用），
+      仍然是主机制，``jti`` 是它之上的**更细的粒度**，两者都在。
+    * ``iss`` —— 签发方（``settings.jwt_issuer``）。**解码时必须校验**：没有它，
+      同一套 ``JWT_SECRET`` 为别的服务签发的令牌也能被本服务接受（只要 ``sub``
+      指向某个存在的用户）—— 跨系统复用密钥是常见部署形态，那会变成一条越权路径。
     """
+    now = int(time.time())
     expires = datetime.now(timezone.utc) + timedelta(minutes=token_minutes_for(is_admin))
     payload = {"sub": str(user_id), "username": username,
+               "iat": now, "jti": uuid4().hex, "iss": settings.jwt_issuer,
                "exp": expires, "tv": int(token_version or 0)}
     if mfa_at is not None:
         payload["amr"] = "pwd+mfa"
@@ -136,4 +216,23 @@ def create_access_token(user_id: int, username: str, is_admin: bool = False,
 
 
 def decode_access_token(token: str) -> dict:
-    return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    """解码并校验访问令牌。**``iss`` 必须对得上。**
+
+    **存量令牌（没有 ``iss`` 的那些）一律拒绝。** 这是刻意的 fail-closed：
+    拒绝的代价是「升级后最长 12 小时的窗口内，已签发的令牌要重新登录一次」；
+    放行的代价是「同一个密钥下别的服务签的令牌在本服务照样能用」。前者是
+    一次可预期的重新登录，后者是一条**跨系统的越权路径** —— 后者更贵。
+
+    而且这个窗口本来就不长：令牌最长 12 小时（管理员 4 小时），
+    而**改口令 / 停用账号会立刻作废它**（``tv`` 与库里的 ``token_version``
+    比对），也就是说「有人拿着旧令牌」这件事最多持续到下一次改密为止。
+
+    **``aud`` 故意不加**（暂时也不校验）：本服务只有一个受众 —— 它自己的 API，
+    令牌从来不会发给第三方。加一个永远等于同一个值的字段只会多一处要同步的
+    口径。**将来真的有了第二个受众（网关、第三方集成）再加，那时必须
+    同时改签发与校验两侧**：PyJWT 的默认行为是「载荷里有 ``aud`` 而解码时
+    没给 ``audience`` ⇒ 直接判非法」，只改签发侧会把自己刚签的令牌也拒掉。
+    """
+    return jwt.decode(token, settings.jwt_secret,
+                      algorithms=[settings.jwt_algorithm],
+                      issuer=settings.jwt_issuer)

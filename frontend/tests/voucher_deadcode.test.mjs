@@ -135,6 +135,11 @@ t('源码里已经没有 quiet 这个名字了（形参、条件、调用点都�
 })
 
 t('save() 不再带任何形参（手动保存那条路的入口整个去掉了）', () => {
+  // **这一条是有意守文本的**，不是权宜之计：
+  // 它守的是「save() 不长形参」这个**产品决定** —— 一旦 save() 又长出形参，
+  // 说明有人把「手动保存」那条老路接了回来，而那条路与「自动保存 + 离开前 flush」
+  // 的语义是打架的（见文件头）。这种决定守不出行为，只能守住字面。
+  // 至于 save() 的**行为**，由下面那几条用例真跑一遍源码来验。
   assert.match(grab('save'), /^async function save\(\)/,
     'save() 又长出形参了 —— 真加了手动保存按钮的话，这里该配一条说清楚的话的路')
 })
@@ -143,7 +148,10 @@ t('没有调用点还在往 save 里传对象（连传空对象都不传）', ()
   const calls = codeLines()
     .filter(([, l]) => /(?<![.\w])save\s*\(/.test(l) && !/function\s+save/.test(l))
     .map(([, l]) => l.trim())
-  assert.deepEqual(calls, ['await save()', 'return save() === true'],
+  // `return await save()` —— **await 不能省**：save() 是 async，
+  // 少一个 await 就是拿 Promise 对象跟 true 比，恒为假（审查 P1-1）。
+  // flushIfDirty 的行为由 tests/test_reviewfix_voucher_flush.test.mjs 真跑一遍验。
+  assert.deepEqual(calls, ['await save()', 'return await save()'],
     `调用点变了，逐条复核一下：\n${calls.join('\n')}`)
 })
 

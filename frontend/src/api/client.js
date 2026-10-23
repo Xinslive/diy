@@ -4,6 +4,17 @@ import { ElMessage } from 'element-plus'
 export const http = axios.create({ baseURL: '/api', timeout: 30000 })
 
 /**
+ * 登录页的地址。**唯一一份**。
+ *
+ * 路由表里注册的是 `path: '/login'`（见 router/index.js 的 routes），
+ * 而本项目用的是 **hash 路由**（createWebHashHistory），所以浏览器地址是
+ * `#/login`。以前这两个字符串各写一份（这里是 '#/login'，那边是 '/login'），
+ * 改了一处忘了另一处 —— 令牌一失效就跳到一个不存在的地址，页面上只剩一片白。
+ * 改路由表里的登录页路径时，**这里也要一起改**（反之亦然）。
+ */
+export const LOGIN_HASH = '#/login'
+
+/**
  * 由 main.js 在 Pinia 建好之后注入：``clearSession() => useSessionStore().logout()``。
  *
  * 为什么要注入而不是直接 import：
@@ -45,7 +56,7 @@ http.interceptors.response.use(
       // 改成惰性取：store 还没被创建（用户从没登录）时就不清，那本来也没有
       // 需要清的内存态。
       if (clearSession) clearSession()
-      if (!location.hash.includes('/login')) location.hash = '#/login'
+      if (!location.hash.includes('/login')) location.hash = LOGIN_HASH
       return Promise.reject(error)
     }
     const detail = error.response?.data?.detail

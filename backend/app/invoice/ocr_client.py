@@ -14,9 +14,12 @@ import ipaddress
 import json
 import os
 import socket
+import threading
 import time
 from typing import Any
 from urllib.parse import urljoin, urlsplit
+
+from app.core.config import settings
 
 try:
     import requests
@@ -41,6 +44,47 @@ _MAX_REDIRECTS = 3
 #: 共享地址段（CGNAT，100.64.0.0/10）：不是 RFC1918 私有段，但同样不是公网。
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
+#: 解析结果的缓存时长（秒）。
+#:
+#: **为什么要有这个缓存。** SSRF 校验（``getaddrinfo``）与真正连接用的解析
+#: **必须是同一次** —— 否则中间有一个空档：攻击者控制的 DNS 第一次给公网 IP
+#: （校验通过）、第二次给 ``127.0.0.1``（连接打到内网）。这就是 DNS 重绑定
+#: 的 TOCTOU。缓存让「校验」与「连接」用**同一批地址**，那个空档就没有了。
+#:
+#: 30 秒：短到「域名换了 IP」不会变成半天的旧账，长到同一秒里的多次请求
+#: 不必反复解析。
+_RESOLVE_TTL = 30.0
+_RESOLUTIONS: dict[str, tuple[float, list[str]]] = {}
+_RESOLVE_LOCK = threading.Lock()
+
+
+def _resolve(host: str) -> list[str]:
+    """解析主机名，返回**全部**地址（**带短 TTL 缓存**）。"""
+    now = time.monotonic()
+    with _RESOLVE_LOCK:
+        cached = _RESOLUTIONS.get(host)
+        if cached is not None and cached[0] > now:
+            return list(cached[1])
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise OcrApiError("OCR 结果地址的主机名解析失败") from exc
+    addresses: list[str] = []
+    for info in infos:
+        raw = info[4][0]
+        if raw not in addresses:
+            addresses.append(raw)
+    if not addresses:
+        raise OcrApiError("OCR 结果地址解析不出任何地址")
+    with _RESOLVE_LOCK:
+        _RESOLUTIONS[host] = (now + _RESOLVE_TTL, list(addresses))
+        if len(_RESOLUTIONS) > 64:
+            # 顺手清掉过期的，别让它随「见过的域名数」只增不减。
+            for key, (expires, _addresses) in list(_RESOLUTIONS.items()):
+                if expires <= now:
+                    _RESOLUTIONS.pop(key, None)
+    return addresses
+
 
 def _is_public_ip(ip: ipaddress._BaseAddress) -> bool:
     """这个 IP 是不是可以放心去连的公网地址。"""
@@ -53,19 +97,16 @@ def _is_public_ip(ip: ipaddress._BaseAddress) -> bool:
     return True
 
 
-def _check_host_is_public(host: str) -> None:
+def _check_host_is_public(host: str) -> list[str]:
     """主机名必须解析到**全部**公网地址，否则拒绝。
 
     只要有一个解析结果是内网/环回/链路本地就拒 —— 云厂商的元数据地址
     （``169.254.169.254``）与各家内网服务都在这些段里。
+
+    返回**已校验的那批地址**：连接要用同一批（见 ``_pin``）—— 校验用一次
+    解析、连接用另一次解析，中间那个空档就是 DNS 重绑定。
     """
-    try:
-        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as exc:
-        raise OcrApiError("OCR 结果地址的主机名解析失败") from exc
-    addresses = {info[4][0] for info in infos}
-    if not addresses:
-        raise OcrApiError("OCR 结果地址的主机名解析不出任何地址")
+    addresses = _resolve(host)
     for raw in addresses:
         try:
             ip = ipaddress.ip_address(raw)
@@ -90,29 +131,130 @@ def check_public_url(url: str) -> str:
     return url
 
 
+def _pin(url: str, addresses: list[str]) -> tuple[bool, str, dict[str, str]]:
+    """把请求**钉到已校验的 IP** 上（Host 头仍然是原来的主机名）。
+
+    **这是 DNS 重绑定（TOCTOU）的正解**：校验用 ``getaddrinfo`` 判「全是公网」，
+    随后 ``requests`` **会再解析一次** —— 两次解析之间，攻击者控制的 DNS 可以
+    第一次给公网 IP、第二次给 ``127.0.0.1``。把连接目标换成**已校验的那个
+    IP**，两次解析就变成一次，绑定不成立。
+
+    **https 不能这么干**：证书是按主机名签发的，连到 IP 会验签失败（那等于
+    关掉 TLS 校验，比 TOCTOU 更糟）。https 走「保持主机名 + 连上之后核对
+    **真实对端地址**」那条路（见 ``_check_peer_is_public``）：残余的空档是
+    「TLS 握手本身可能打到一个被重绑的地址」，但**正文一个字节都不会被读走**
+    —— 这正是这条防线要防的东西（把内网的响应内容读回来）。
+    """
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if parts.scheme.lower() != "http" or not addresses or not host:
+        return False, url, {}
+    ip = addresses[0]
+    literal = f"[{ip}]" if ":" in ip else ip
+    port = parts.port
+    netloc = f"{literal}:{port}" if port else literal
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    host_header = f"{host}:{port}" if port else host
+    return True, f"http://{netloc}{path}", {"Host": host_header}
+
+
+def _peer_address(response) -> str:
+    """连接**实际**用到的那一个 IP（socket 对端地址）。
+
+    这是 DNS 重绑定的**精确**判定：请求前的解析说「这是公网」，但连接时
+    用的可能是另一个（内网）地址。socket 里拿到的对端地址就是真相。
+    """
+    raw = getattr(response, "raw", None)
+    connection = getattr(raw, "_connection", None)
+    sock = getattr(connection, "sock", None)
+    if sock is None:
+        return ""
+    try:
+        return str(sock.getpeername()[0])
+    except (OSError, IndexError, TypeError):
+        return ""
+
+
+def _check_peer_is_public(response) -> None:
+    """连上之后核对**真实对端**是不是公网。不是就拒绝，且**不读正文**。"""
+    peer = _peer_address(response)
+    if not peer:
+        # 拿不到对端地址（代理、实现差异）就不阻断 —— 但正文仍然受字节上限保护。
+        return
+    try:
+        ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return
+    if not _is_public_ip(ip):
+        raise OcrApiError(
+            "OCR 结果地址在连接时指向内网或保留地址（DNS 重绑定），已拒绝抓取")
+
+
 def _fetch_result_text(url: str, *, timeout: tuple[int, int]) -> str:
     """抓 OCR 结果正文。**每跳重定向都重新校验**，最多 ``_MAX_REDIRECTS`` 跳。
 
     响应内容**不回显**：失败时只说状态码，不把正文（可能是内网服务的
     页面/数据）带进异常消息。
+
+    **按字节上限流式读**（审查 H-07）：``response.text`` 会把整个响应读进
+    内存再解码 —— 而这个响应来自**不可信**的地址（``jsonUrl`` 由 OCR 服务
+    给出）。一个自称「返回 2GB JSONL」的服务就能把 API 进程的内存打满。
+    这里逐块读、边读边计数，超了立刻中止。
     """
+    limit = max(1, int(settings.invoice_ocr_max_response_bytes))
     current = url
     for _ in range(_MAX_REDIRECTS + 1):
         current = check_public_url(current)
+        # 连接要用**校验时解析出的那一批地址**（短 TTL 缓存里就是它）。
+        addresses = _resolve(_host_of(current))
+        pinned, request_url, headers = _pin(current, addresses)
         try:
-            response = requests.get(current, timeout=timeout, allow_redirects=False)
+            with requests.get(request_url, timeout=timeout, allow_redirects=False,
+                             headers=headers, stream=True) as response:
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get("Location") or ""
+                    if not location:
+                        raise OcrApiError("OCR 结果地址返回了重定向但没有目标")
+                    current = urljoin(current, location)
+                    continue
+                if response.status_code != 200:
+                    raise OcrApiError(f"下载 OCR 结果失败（HTTP {response.status_code}）")
+                if not pinned:
+                    # 没有钉住（https）：连上之后核对真实对端，正文一个字节都不先读。
+                    _check_peer_is_public(response)
+                return _read_capped(response, limit=limit)
         except requests.RequestException as exc:
             raise OcrApiError(f"下载 OCR 结果失败：{exc}") from exc
-        if response.status_code in (301, 302, 303, 307, 308):
-            location = response.headers.get("Location") or ""
-            if not location:
-                raise OcrApiError("OCR 结果地址返回了重定向但没有目标")
-            current = urljoin(current, location)
-            continue
-        if response.status_code != 200:
-            raise OcrApiError(f"下载 OCR 结果失败（HTTP {response.status_code}）")
-        return response.text
     raise OcrApiError("OCR 结果地址重定向次数过多")
+
+
+def _host_of(url: str) -> str:
+    try:
+        return urlsplit(url or "").hostname or ""
+    except ValueError:
+        return ""
+
+
+def _read_capped(response, *, limit: int) -> str:
+    """流式读正文，**超过字节上限立刻中止**。"""
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > limit:
+                raise OcrApiError(
+                    f"OCR 结果正文超过上限 {limit} 字节，已中止下载；"
+                    "请确认这个结果地址指向的是本次任务的结果")
+            chunks.append(chunk)
+    except requests.RequestException as exc:
+        raise OcrApiError(f"下载 OCR 结果失败：{exc}") from exc
+    encoding = response.encoding or "utf-8"
+    return b"".join(chunks).decode(encoding, errors="replace")
 
 
 def _json(response: requests.Response, *, action: str) -> dict[str, Any]:
@@ -136,8 +278,16 @@ def _error_detail(response: requests.Response) -> str:
 
 
 def _markdown_pages(jsonl: str) -> list[str]:
-    """把 API 返回的 JSONL 结果展开为按页排列的文本。"""
+    """把 API 返回的 JSONL 结果展开为按页排列的文本。
+
+    **页数与文字总量都有上限**（审查 H-07）：OCR 的页数来自 PDF，而 PDF 的
+    页数已经被 ``merge_pdfs`` 限过；这里再限一次，是为了让「OCR 兜底」这条
+    路**不成为绕过页数上限的口子**（文本层解析超限时正是它接手）。
+    """
     pages: list[str] = []
+    max_pages = max(1, int(settings.invoice_max_pdf_pages))
+    max_chars = max(1, int(settings.invoice_max_text_chars))
+    total = 0
     for raw_line in jsonl.splitlines():
         line = raw_line.strip()
         if not line:
@@ -156,7 +306,17 @@ def _markdown_pages(jsonl: str) -> list[str]:
             markdown = layout.get("markdown") or {}
             text = markdown.get("text") if isinstance(markdown, dict) else ""
             if text:
-                pages.append(_markdown_to_plain_text(str(text)))
+                plain = _markdown_to_plain_text(str(text))
+                total += len(plain)
+                if len(pages) + 1 > max_pages:
+                    raise OcrApiError(
+                        f"OCR 结果有超过 {max_pages} 页，超过单次上限；"
+                        "请把文件分批上传")
+                if total > max_chars:
+                    raise OcrApiError(
+                        f"OCR 结果的文字共 {total} 个字符，超过单次上限 "
+                        f"{max_chars} 个字符；请把文件分批上传")
+                pages.append(plain)
     if not pages:
         raise OcrApiError("OCR 任务已完成，但结果中没有找到页面文本")
     return pages

@@ -6,7 +6,7 @@ import re
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert
 from app.core.config import settings
 from app.core.db import SessionLocal
@@ -123,9 +123,26 @@ class WorkerRuntime:
                 pass
 
     def close(self):
+        """worker 退出：**把自己的行直接删掉**。
+
+        以前是把 ``lease_at`` 改成过去（等于「把租约作废」）。效果上等价，
+        但**行还留在表里** —— 而 worker 重启是常态（部署、进程被 OOM 杀掉
+        后的拉起）：同一个 ``worker_id`` 换新，旧行就成了「僵尸行」。
+
+        **为什么要删而不是作废。** 屏障数的是「本代次里活着的 worker 数」，
+        僵尸行会让这个数对不上（``len(hosts) == expected + 1``）→ 屏障关闭 →
+        所有插件接口 503。删掉之后，重启不需要等租约过期。
+
+        **被 SIGKILL 的 worker 走不到这里**（没有 finally）。那种情况下旧行
+        要等租约自然过期（``plugin_lease_seconds``）才不再算数 —— 这一段
+        空窗是**故意留着**的：凭「看起来像僵尸」去删**别的** worker 的行，
+        风险是删掉一个活着但心跳慢的 worker，那会让屏障**永久**关着
+        （比 30 秒的 503 更糟）。
+        """
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
         with SessionLocal.begin() as db:
-            db.execute(update(PluginWorkerRuntime).where(PluginWorkerRuntime.generation == self.generation,
-                PluginWorkerRuntime.worker_id == self.worker_id).values(lease_at=now() - timedelta(days=1)))
+            db.execute(delete(PluginWorkerRuntime).where(
+                PluginWorkerRuntime.generation == self.generation,
+                PluginWorkerRuntime.worker_id == self.worker_id))

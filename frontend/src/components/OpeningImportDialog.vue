@@ -146,6 +146,8 @@ import { Document, UploadFilled, View } from '@element-plus/icons-vue'
 import * as api from '@/api/book'
 import { useSessionStore } from '@/stores/session'
 import { balanceDiff, importSummaryText, mismatchHint } from '@/utils/bookInit'
+import { moneyText } from '@/utils/format'
+import { moneyCents } from '@/utils/amountGrid'
 
 const props = defineProps({ modelValue: { type: Boolean, default: false } })
 const emit = defineEmits(['update:modelValue', 'imported'])
@@ -186,7 +188,19 @@ const mismatchText = computed(() => mismatchHint(result.value))
 const sideOf = (row) => row.display_side
   || (row.direction === 'CREDIT' ? '贷' : row.direction === 'DEBIT' ? '借' : '—')
 
-const money = (v) => (Number(v || 0)).toLocaleString('zh-CN', { minimumFractionDigits: 2 })
+/**
+ * 金额文字：带千分位、两位小数。
+ *
+ * 以前是 `(Number(v || 0)).toLocaleString('zh-CN', { minimumFractionDigits: 2 })` ——
+ * 两个毛病：
+ *   ① **浮点**：18 位整数在浮点里已经不是原来那个数了；
+ *   ② `maximumFractionDigits` 没给，默认是 3 —— 于是 1.005 显示成 **"1.005"**，
+ *      而期初余额页显示的是 "1.00"：**同一个业务对象，两个界面，两个数**。
+ *
+ * 现在统一走**整数分**（BigInt）+ utils/format.js 的 moneyText ——
+ * 那是期初余额页、凭证页共用的同一份格式规则：定点到分、两位小数、带千分位。
+ */
+const money = (v) => moneyText(moneyCents(v))
 
 /** 预览步得宽：那几列里除「名称」「说明」都是定宽，低于 780px 就要横向滚动 */
 const dialogWidth = 'min(820px, calc(100vw - 32px))'

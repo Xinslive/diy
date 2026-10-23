@@ -19,7 +19,9 @@ import pytest
 from app.core.config import Settings, validate_production_settings
 
 GOOD_SECRET = "a" * 48
-GOOD_DB = "postgresql+psycopg://cwq:Str0ngP%40ss@db.internal:5432/cwq"
+# 库口令 16 位（审查 L-08：生产校验现在要求库口令 ≥16 字符，且**按真实
+# 口令算**而不是按连接串里的百分号编码字面量算）。
+GOOD_DB = "postgresql+psycopg://cwq:Str0ngP%40ssXYZwAB@db.internal:5432/cwq"
 
 
 def _prod(**kw):
@@ -261,3 +263,129 @@ def test_DB_ECHO与DEBUG是两个独立问题():
     assert "DB_ECHO" in msg
     assert "LOG_LEVEL" in msg
 
+
+
+# --------------------------------------------------------------------- 审查 H-01
+#
+# 管理员邮箱 MFA 的验证链接基址。
+#
+# **这一条为什么进 problems 而不是 warning**：留空时宿主退回 ``request.base_url``
+# —— 那是**客户端给的 Host 头**。于是攻击者拿到管理员口令后，带
+# ``Host: evil.example`` 登录一次，系统会向管理员邮箱发出一封**域名正规、
+# 系统自己发出**的邮件，但链接指向攻击者的域名；管理员点开 → 令牌落到对方
+# 服务器 → 对方换到管理员访问令牌。**二次验证反而成了投递通道。**
+#
+# 这与 JWT 密钥同一档：一次配置缺失 = 一条完整的管理员接管链。
+
+
+def test_MFA开着而链接基址为空时拒绝启动():
+    with pytest.raises(ValueError) as e:
+        _check(_prod(admin_mfa_enabled=True, admin_mfa_link_base=""))
+    assert "ADMIN_MFA_LINK_BASE" in str(e.value)
+
+
+def test_MFA链接基址不是https时拒绝启动():
+    with pytest.raises(ValueError) as e:
+        _check(_prod(admin_mfa_enabled=True, admin_mfa_link_base="http://acct.example.com"))
+    assert "ADMIN_MFA_LINK_BASE" in str(e.value)
+
+
+def test_MFA链接基址配对了就放行():
+    _check(_prod(admin_mfa_enabled=True, admin_mfa_link_base="https://acct.example.com"))
+
+
+def test_MFA没开时不要求配链接基址():
+    """MFA 默认关着 —— 为一个没开的功能拒绝启动，是拿可用性换一个不存在的风险。"""
+    _check(_prod(admin_mfa_enabled=False, admin_mfa_link_base=""))
+
+
+def test_dev环境不要求MFA链接基址():
+    validate_production_settings(
+        _prod(admin_mfa_enabled=True, admin_mfa_link_base=""), env="dev")
+
+
+# --------------------------------------------------------------------- 审查 L-03
+#
+# MCP 的 Host 白名单（DNS 重绑定防护）。
+#
+# **默认不拦**，因为 ``.env.example`` 里 ``MCP_ALLOWED_HOSTS=`` 本来就是空的
+# （而 ``MCP_ENABLED=true``）—— 默认就拦的话，照抄示例的部署会直接起不来。
+# 想要 fail-closed 的部署自己把 ``MCP_ENFORCE_ALLOWED_HOSTS`` 打开。
+
+
+def test_MCP强制模式下没配Host白名单就拒绝启动():
+    with pytest.raises(ValueError) as e:
+        _check(_prod(mcp_enabled=True, mcp_enforce_allowed_hosts=True,
+                     mcp_allowed_hosts=""))
+    assert "MCP_ALLOWED_HOSTS" in str(e.value)
+
+
+def test_MCP非强制模式下没配Host白名单仍然放行():
+    """默认部署不能因为这一项起不来 —— 风险有令牌兜着。"""
+    _check(_prod(mcp_enabled=True, mcp_enforce_allowed_hosts=False,
+                 mcp_allowed_hosts=""))
+
+
+# --------------------------------------------------------------------- 审查 M-13
+#
+# ``.env.example`` 里的 ``APP_ENV``。
+#
+# **它原来写的是 ``APP_ENV=dev``** —— 于是「``cp .env.example .env`` 然后直接
+# 上生产」这条最常见的路径，会把**全部**生产配置校验一起关掉：弱 JWT 密钥
+# 能签发任意用户的令牌、``/docs`` 与 ``/openapi.json`` 对外暴露完整路由表、
+# CORS 中间件被装上。三条防线同时失效，而进程不会给任何提示。
+#
+# 下面这条把「示例文件里那个键必须是空的」钉死。
+
+
+def test_env_example里的APP_ENV必须留空():
+    """留空 = 走 config.py 的默认 prod = fail-closed（审查 M-13）。
+
+    这条用例守的是**文件内容**，不是运行时行为 —— 因为风险恰恰在于
+    「照抄示例直接上线」这条路径：只要示例里写着 ``APP_ENV=dev``，
+    一次 ``cp`` 就是一次自我免检。
+    """
+    from pathlib import Path
+
+    example = Path(__file__).resolve().parents[2] / ".env.example"
+    text = example.read_text(encoding="utf-8")
+    values = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip()
+    assert values.get("APP_ENV", "") == "", (
+        f".env.example 里的 APP_ENV={values.get('APP_ENV')!r} —— "
+        "照抄示例上线会把全部生产配置校验一起关掉。留空（= 默认 prod）。")
+
+
+# --------------------------------------------------------------------- 审查 L-08
+#
+# 数据库口令的长度下限。
+#
+# **长度必须按"真实口令"量，而不是按连接串里的字面量量。**
+# 连接串里的口令是**百分号编码**的，而百分号编码能把一个字符撑成三个 ——
+# 于是 ``%41%41%41%41%41%41``（真实口令 6 个字符）在字面上是 18 个字符，
+# 能轻松越过长度下限。而百分号编码是**任何含特殊字符的口令都必须用**的形式，
+# 不是刻意构造的边角情况。
+
+
+def test_库口令长度按真实口令算而不是按编码后的字面量():
+    from app.core.config import _db_password
+
+    assert _db_password("postgresql+psycopg://cwq:%41%41%41%41%41%41@h:5432/d") == "AAAAAA"
+    assert _db_password("postgresql+psycopg://cwq:Str%40ngP%40ss@h:5432/d") == "Str@ngP@ss"
+    assert _db_password("postgresql+psycopg://cwq:cwq123@h:5432/d") == "cwq123"
+
+
+def test_百分号编码撑长度的口令过不了长度下限():
+    """6 个字符的真实口令，编码成 18 个字面量 —— 仍然必须被拦。"""
+    with pytest.raises(ValueError) as e:
+        _check(_prod(database_url="postgresql+psycopg://cwq:%41%41%41%41%41%41@h:5432/d"))
+    assert "数据库密码" in str(e.value)
+
+
+def test_够长的库口令放行():
+    _check(_prod(database_url="postgresql+psycopg://cwq:Str0ngP%40ssXYZwAB@h:5432/d"))

@@ -1594,6 +1594,22 @@ def voucher_slots_per_page(tpl: dict) -> int:
 
 
 def _entry_amount(entry: dict) -> Decimal:
+    """取一条分录的金额。
+
+    **兜底为什么是 0 而不是抛错**（审查 L-37 的核实结论）：这里渲染的是
+    **已经过校验的数据** —— 分录金额在 ``accounting/vouchers.py::_validate_entries``
+    就被 ``util.money()`` 量化成两位小数的 Decimal，落库时又受
+    ``ck_entry_amount_nonzero`` 与借贷平衡触发器双重约束。打印侧拿到的
+    序列化文本不可能解析失败。
+
+    所以这一层是**防御性兜底**而不是业务分支：真遇到解析不了的输入时，
+    抛错会让整张凭证打印不出来（用户拿不到任何东西），返回 0 则至少能出纸，
+    金额位置留 0.00 —— 而**那种情形下纸面数据本来就已经不可信了**，
+    打印侧不该再把它变成一次 500。
+
+    **但它不会静默掩盖问题**：金额在入库前就被拦住了，能走到这里说明是
+    数据层出了状况，而不是这一行的问题。
+    """
     raw = entry.get("amount")
     if raw in (None, ""):
         return Decimal("0")

@@ -29,7 +29,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -55,6 +55,11 @@ class RunResult:
     #: 产物一份不差 —— 用户于是去重跑备份，而真实原因（清理里的一个异常）
     #: 仍然只躺在服务端日志里。这个字段是那件事**唯一的去处**。
     prune_error: Optional[str] = None
+    #: **提前停止时还有几个目标没备份**（0 = 正常跑完）。
+    #:
+    #: 提前停止的原因是**租约丢了**（这个备份任务已被另一个 worker 接管）。
+    #: 那不是「成功」—— 剩下的目标确实没备份，必须让人看得见。
+    stopped: int = 0
 
     @property
     def succeeded(self) -> list[BackupRun]:
@@ -106,9 +111,41 @@ def _record(db: Session, run: BackupRun) -> None:
     db.refresh(run)
 
 
+def _prepare_upload(tmp: Path, workdir: Path, label: str) -> tuple[Path, str, int]:
+    """把导出的 gzip 变成「**该上传的那份**」，返回 ``(路径, SHA256, 字节数)``。
+
+    **配了密钥就加密，没配就照旧。** 加密用的是 AES-256-GCM（带认证），
+    密钥来自 ``settings.backup_encryption_key``。
+
+    * **返回的 SHA256 是密文的** —— OSS 上真正存着的那串字节。算明文的
+      校验和会让恢复时的比对必然对不上（那是「校验和与明文不一致」的经典坑）。
+    * **密钥为空 = 不加密**，但要**明确记一条告警**：默默保持明文而没人知道，
+      比明文本身更危险。
+    * **密钥必须与 OSS AccessKey 分开存放**（见
+      ``export.encryption_key`` 的说明）：两者的爆炸半径不一样。
+
+    加密后的文件落在同一个临时目录里，上传完就删（临时目录里不留明文）。
+    """
+    key = export_mod.encryption_key()
+    if key is None:
+        logger.warning(
+            "OSS 备份未加密：没有配置 BACKUP_ENCRYPTION_KEY。"
+            "备份制品将以**明文 gzip** 存放在 OSS 上（任何人拿到对象即可解压）。"
+            "要加密请配置一把 base64 的 32 字节随机密钥。")
+        return tmp, export_mod.file_sha256(tmp), tmp.stat().st_size
+    cipher = _new_temp(workdir, label + "-enc")
+    try:
+        size = export_mod.encrypt_file(tmp, cipher)
+    except Exception:
+        cipher.unlink(missing_ok=True)
+        raise
+    return cipher, export_mod.file_sha256(cipher), size
+
+
 def run_backup(db: Session, *, actor=None, book_ids: Optional[Iterable[int]] = None,
                force_tier: Optional[str] = None, prune: bool = True,
-               now: Optional[datetime] = None) -> RunResult:
+               now: Optional[datetime] = None,
+               should_stop: Optional[Callable[[], bool]] = None) -> RunResult:
     """跑一轮备份。返回每个目标的运行记录与被清理的对象。
 
     **连接池用完就关**，理由写在 :func:`app.backup.oss_client.close_bucket`：
@@ -117,13 +154,16 @@ def run_backup(db: Session, *, actor=None, book_ids: Optional[Iterable[int]] = N
 
     这里只做「建桶 + 收尾」，真正的活儿在 :func:`_run_backup_with_bucket` ——
     拆开是为了不用给那 60 行主体再套一层 try/finally（缩进一多，diff 就没法看了）。
+
+    ``should_stop`` 是**尽力停止**的钩子：返回 True 就停止本轮（剩下的目标
+    不备份）。调度器用它把「租约已丢、该让接管者接手」这件事落成动作。
     """
     cfg = cfg_mod.require_ready(db)
     bucket = oss_client.make_bucket(cfg)
     try:
         return _run_backup_with_bucket(
             db, cfg, bucket, actor=actor, book_ids=book_ids,
-            force_tier=force_tier, prune=prune, now=now)
+            force_tier=force_tier, prune=prune, now=now, should_stop=should_stop)
     finally:
         # finally 而不是「跑到最后一行关」：备份里最常见的结局是**抛异常**
         # （某一本网络失败、配置被改掉）。只在成功路径上关，等于异常路径永远漏。
@@ -133,7 +173,8 @@ def run_backup(db: Session, *, actor=None, book_ids: Optional[Iterable[int]] = N
 def _run_backup_with_bucket(db: Session, cfg: dict, bucket, *, actor=None,
                             book_ids: Optional[Iterable[int]] = None,
                             force_tier: Optional[str] = None, prune: bool = True,
-                            now: Optional[datetime] = None) -> RunResult:
+                            now: Optional[datetime] = None,
+                            should_stop: Optional[Callable[[], bool]] = None) -> RunResult:
     now_utc = now or datetime.now(timezone.utc)
     workdir = _workdir()
 
@@ -152,13 +193,22 @@ def _run_backup_with_bucket(db: Session, cfg: dict, bucket, *, actor=None,
             "先建一个账套，或检查 book_ids 过滤条件。")
 
     runs: list[BackupRun] = []
-    for scope, book_id, label, book in targets:
+    stopped = 0
+    for index, (scope, book_id, label, book) in enumerate(targets):
+        if should_stop is not None and should_stop():
+            # **租约丢了**（这个备份已被另一个 worker 接管）：本轮到此为止。
+            # 已上传的产物仍然有效（幂等键会挡住接管者重复上传），没备份到的
+            # 等下一个周期 —— 但这件事必须**如实记下来**，不能报成「成功」。
+            stopped = len(targets) - index
+            logger.warning("OSS 备份提前停止：还有 %d 个目标未备份（租约已丢失）", stopped)
+            break
         tier = force_tier or tier_mod.classify(db, scope, book_id, now_utc)
         if tier not in ("daily", "weekly", "monthly"):
             raise ValueError(f"未知备份档位 {tier!r}，可选：daily/weekly/monthly")
         moment = tier_mod.local_now(now_utc)
         key = tier_mod.object_key(cfg["prefix"], tier, scope, book_id, moment)
         tmp = _new_temp(workdir, label)
+        cipher_path = None
         started = datetime.now(timezone.utc)
         run = BackupRun(
             book_id=book_id, scope=scope, book_label=label, tier=tier,
@@ -168,12 +218,18 @@ def _run_backup_with_bucket(db: Session, cfg: dict, bucket, *, actor=None,
             stats = export_mod.export_scope(
                 db, scope=scope, book_id=book_id, book_label=label,
                 out_path=tmp, now=now_utc)
-            oss_client.put_bytes(bucket, key, tmp.read_bytes())
+            upload_path, checksum, size_bytes = _prepare_upload(tmp, workdir, label)
+            cipher_path = upload_path if upload_path != tmp else None
+            # **按文件上传，不按内存。** 备份任务跑在 API 进程里，与在线请求
+            # 共享同一个进程的内存：把整份 gzip 读进内存再上传，一本大账套的
+            # 快照就能把在线请求挤到 OOM。oss2 自己分片读文件。
+            oss_client.put_file(bucket, key, str(upload_path))
             run.status = STATUS_SUCCESS
             run.oss_key = key
-            run.size_bytes = stats.size_bytes
+            run.size_bytes = size_bytes
             run.row_count = stats.rows
-            run.checksum = stats.checksum
+            # 校验和是**密文**的 SHA256 —— OSS 上真正存着的那串字节。
+            run.checksum = checksum
             run.message = f"{len(stats.tables)} 张表 / {stats.rows} 行"
         except Exception as exc:                      # noqa: BLE001 - 逐个隔离
             # **失败也要落记录，而且要全文。** 「上传失败」四个字在排障时等于
@@ -183,6 +239,8 @@ def _run_backup_with_bucket(db: Session, cfg: dict, bucket, *, actor=None,
             run.message = f"{type(exc).__name__}: {exc}"
         finally:
             tmp.unlink(missing_ok=True)
+            if cipher_path is not None:
+                cipher_path.unlink(missing_ok=True)
             run.finished_at = datetime.now(timezone.utc)
             _record(db, run)
             runs.append(run)
@@ -212,6 +270,8 @@ def _run_backup_with_bucket(db: Session, cfg: dict, bucket, *, actor=None,
     detail = f"OSS 备份 {ok}/{len(runs)} 成功，清理 {len(deleted)} 份过期产物"
     if prune_error:
         detail += f"；⚠ 清理失败：{prune_error}"
+    if stopped:
+        detail += f"；⚠ 提前停止：还有 {stopped} 个目标未备份（租约已丢失）"
     log(
         db,
         action="BACKUP_RUN",
@@ -220,10 +280,10 @@ def _run_backup_with_bucket(db: Session, cfg: dict, bucket, *, actor=None,
         user=actor,
         detail=detail,
         after={"succeeded": ok, "total": len(runs), "deleted": len(deleted),
-               "prune_error": prune_error or ""},
+               "prune_error": prune_error or "", "stopped": stopped},
     )
     db.commit()
-    return RunResult(runs=runs, deleted=deleted, prune_error=prune_error)
+    return RunResult(runs=runs, deleted=deleted, prune_error=prune_error, stopped=stopped)
 
 
 def recent_runs(db: Session, limit: int = 50) -> list[BackupRun]:

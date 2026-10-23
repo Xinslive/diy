@@ -48,7 +48,8 @@ from app.core.config import is_trusted_proxy, settings
 from app.core.db import get_db
 from app.core.deps import get_current_user
 from app.core.security import (create_access_token, hash_password,
-                               password_policy_error, verify_password)
+                               password_needs_rehash, password_policy_error,
+                               verify_password)
 from app.models import (REAL_NAME_MAX_LENGTH, AdminMfaChallenge, SysUser,
                         UserBook)
 # LoginIpThrottle 直接从定义模块导入而没有走 app.models 的导出桶：
@@ -602,7 +603,7 @@ def _record_failure(db: Session, user: SysUser) -> dict | None:
 #
 # 阈值 30 次 / 15 分钟，比账号维度的 5 次高一个数量级。理由只有一条：
 # 一个共享出口上，一个月结期几十个人输错口令是**正常业务噪声**；而
-# 攻击者的每一次尝试都要付 PBKDF2 的 20ms，本来就不便宜。宁可让他多试
+# 攻击者的每一次尝试都要付 PBKDF2 的 50ms，本来就不便宜。宁可让他多试
 # 几次，也不要把一整个办公室挡在门外 —— 这条参数的取舍方向是单边的。
 #
 # 惩罚用「递增延迟 + Retry-After」而不是一把锁：超阈值后每多失败一次多睡
@@ -879,16 +880,16 @@ def _dummy_hash() -> str:
     """一个「谁的密码都不匹配」的合法散列，用来给未知用户名做等量计算。
 
     为什么需要：原来的写法是「用户不存在就直接 401」，跳过口令校验。
-    PBKDF2 是刻意做慢的（这里 24 万次迭代，约 20ms），于是**扫用户名的
-    成本几乎为零**，而**猜密码**一次要 20ms —— 响应时间差一个数量级，
+    PBKDF2 是刻意做慢的（这里 60 万次迭代，约 50ms），于是**扫用户名的
+    成本几乎为零**，而**猜密码**一次要 50ms —— 响应时间差一个数量级，
     攻击者按响应快慢就能把用户名挨个筛出来，再拿筛选结果去打口令。
 
     所以用户名不存在时也要把同样的活干完。这一条同时把「爆破成本」
-    从「扫免费、猜 20ms」拉平成「全是 20ms」，不引入任何新的 CPU 放大：
+    从「扫免费、猜 50ms」拉平成「全是 50ms」，不引入任何新的 CPU 放大：
     每次请求至多**一次**口令校验，与一次正常登录完全同量。
 
-    懒加载 + lru_cache：算一次 20ms，如果放在 import 期算就是让每次
-    启动都白白付这 20ms（哪怕这个进程一整天没人登录）。
+    懒加载 + lru_cache：算一次 50ms，如果放在 import 期算就是让每次
+    启动都白白付这 50ms（哪怕这个进程一整天没人登录）。
     """
     return hash_password("cwq-dummy-password-for-constant-time-login")
 
@@ -910,7 +911,7 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
     src = _throttle_ip(request)       # 判定口径，两者故意不同
     now = _utcnow()
 
-    # 判定放在**口令校验之前**：被节流的来源每一次都不必付那 20ms 的 PBKDF2。
+    # 判定放在**口令校验之前**：被节流的来源每一次都不必付那 50ms 的 PBKDF2。
     # 这不是为了省 CPU —— 它同时是「节流期间不验证口令」这条原则的延伸：
     # 既然不验，正确口令与错误口令在节流期里拿到的回答完全相同（都是 429），
     # 不存在任何用响应差异去猜口令的余地。
@@ -1048,6 +1049,24 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
     user.locked_until = None
     user.lock_level = 0
 
+    # ---- 口令散列的成本升级（审查 L-09）--------------------------------
+    #
+    # PBKDF2 的轮数从 24 万提到 60 万（OWASP 2023 对 PBKDF2-HMAC-SHA256 的
+    # 建议值）。散列串里带着算出它时的轮数，所以**验证时按库里那个数算** ——
+    # 老口令照样登得进去，升级不会把任何人挡在门外。
+    #
+    # 这里做的是**升级的那一半**：口令已经验过了，而库里那个轮数低于当前值，
+    # 于是用当前值重算一遍写回去。成本于是**随登录自动爬升**，不用逼所有人
+    # 改密码。
+    #
+    # **为什么不会留下半截状态**：这一行只是改 ORM 对象上的字段，它与本次
+    # 登录的其它记账（失败计数清零、审计）**在同一个事务里提交**（下面
+    # ``db.commit()``；管理员走二次验证时是 ``_start_admin_mfa`` 里那次
+    # 提交）。要么两者一起落库，要么一起回滚 —— 不存在「散列写了、计数没写」
+    # 这种中间态。
+    if password_needs_rehash(user.password_hash):
+        user.password_hash = hash_password(payload.password)
+
     # ---- 管理员二次验证的分叉 ------------------------------------------
     #
     # 口令到这里已经验过了。**从这里开始，管理员多一道邮箱确认**，
@@ -1123,6 +1142,22 @@ def _start_admin_mfa(db: Session, user: SysUser, request: Request,
         db.commit()
         raise HTTPException(503, error)
 
+    # **站点地址没配 ⇒ 不发那封邮件**（fail-closed）。
+    #
+    # 这一步放在**造挑战之前**：链接的落点不定，就不该在库里留下一条
+    # 永远也走不通的挑战（用户会收到一个「查无此挑战」的界面）。
+    try:
+        link_base = mfa_service.link_base(request)
+    except mfa_service.MfaLinkBaseNotConfigured as exc:
+        log.error("未配置站点地址，管理员登录被拒（不发送二次验证邮件）：user=%s ip=%s",
+                  user.username, ip)
+        _mfa_audit(db, core_audit.MFA_ACTION_FAILED, user,
+                   f"未配置站点地址，登录被拒：{user.username}（{ip}）",
+                   username=user.username[:64], ip=ip,
+                   reason="link_base_not_configured")
+        db.commit()
+        raise HTTPException(503, str(exc))
+
     challenge, email_token, client_secret = mfa_service.create_challenge(
         db, user, reason="login", ip=ip,
         user_agent=request.headers.get("user-agent", ""))
@@ -1134,7 +1169,7 @@ def _start_admin_mfa(db: Session, user: SysUser, request: Request,
     # 旁路发信：发不出去也不该让登录失败（那是一次可用性事故）。
     mfa_service.send_challenge_email(
         user=user, challenge=challenge, email_token=email_token,
-        link_base=mfa_service.link_base(request), reason="login")
+        link_base=link_base, reason="login")
     return MfaRequiredOut(
         mfa_required=True,
         challenge_id=challenge.id,
@@ -1202,7 +1237,7 @@ def _verify_page(ok: bool) -> str:
 
 
 @router.get("/mfa/verify")
-def mfa_verify(token: str = Query("", max_length=512),
+def mfa_verify(request: Request, token: str = Query("", max_length=512),
                db: Session = Depends(get_db)):
     """点邮件里的验证链接。**只置状态，不发令牌。**
 
@@ -1212,8 +1247,27 @@ def mfa_verify(token: str = Query("", max_length=512),
     **失败时也不泄露任何内部细节**：文案里没有表名、没有堆栈、没有
     「token 不存在」这种可供区分的信息（区分了就能拿来数库里有多少
     挑战）。
+
+    **限流（审查 L-02）**：这个端点**必然是未认证可达的**（邮件网关会预取
+    它），而它每次都要查一次库 —— 于是「谁都能打」等于「谁都能驱动数据库
+    查询」。所以按来源计数：连续猜错（token 对不上任何挑战）超过阈值就
+    退避，退避期间**连查询都不发生**。
+    「已用过」「已过期」是点错链接的真人，**不计**失败。
     """
+    ip = _throttle_ip(request)
+    allowed, retry_after = mfa_service.verify_guard(ip)
+    if not allowed:
+        raise HTTPException(
+            429, f"验证链接的尝试过于频繁，请 {retry_after} 秒后再试",
+            headers={"Retry-After": str(retry_after)})
+
     ok, reason, row = mfa_service.verify_email_token(db, token)
+    # 只有「token 对不上任何挑战」才算失败（那是「在猜」的形态）；
+    # 「已用过」「已过期」是真人点错，不计入。
+    if ok:
+        mfa_service.note_verify_success(ip)
+    elif reason == "invalid":
+        mfa_service.note_verify_failure(ip)
     if row is not None:
         # 只给「确实对得上某条挑战」的点击留痕。随机 token 的点击**不留**
         # —— 这个链接是公共的，每次都留一条等于给审计表灌水。
@@ -1333,6 +1387,12 @@ def mfa_resend(payload: MfaChallengeIn, request: Request,
     if user is None:
         raise HTTPException(401, "验证请求无效，请重新登录")
 
+    # 站点地址没配 ⇒ 不造挑战、不发信（理由见 _start_admin_mfa）。
+    try:
+        link_base = mfa_service.link_base(request)
+    except mfa_service.MfaLinkBaseNotConfigured as exc:
+        raise HTTPException(503, str(exc))
+
     new_row, email_token, client_secret = mfa_service.create_challenge(
         db, user, reason=row.reason or "login", ip=row.ip,
         user_agent=row.user_agent)
@@ -1343,7 +1403,7 @@ def mfa_resend(payload: MfaChallengeIn, request: Request,
     db.commit()
     mfa_service.send_challenge_email(
         user=user, challenge=new_row, email_token=email_token,
-        link_base=mfa_service.link_base(request), reason=new_row.reason)
+        link_base=link_base, reason=new_row.reason)
     return MfaChallengeOut(
         challenge_id=new_row.id,
         client_secret=client_secret,
@@ -1375,6 +1435,12 @@ def mfa_reauth(request: Request, user: SysUser = Depends(get_current_user),
         raise HTTPException(503, error)
 
     ip = _client_ip(request)
+    # 站点地址没配 ⇒ 不造挑战、不发信（理由见 _start_admin_mfa）。
+    try:
+        link_base = mfa_service.link_base(request)
+    except mfa_service.MfaLinkBaseNotConfigured as exc:
+        raise HTTPException(503, str(exc))
+
     row, email_token, client_secret = mfa_service.create_challenge(
         db, user, reason="reauth", ip=ip,
         user_agent=request.headers.get("user-agent", ""))
@@ -1385,7 +1451,7 @@ def mfa_reauth(request: Request, user: SysUser = Depends(get_current_user),
     db.commit()
     mfa_service.send_challenge_email(
         user=user, challenge=row, email_token=email_token,
-        link_base=mfa_service.link_base(request), reason="reauth")
+        link_base=link_base, reason="reauth")
     return MfaChallengeOut(
         challenge_id=row.id,
         client_secret=client_secret,

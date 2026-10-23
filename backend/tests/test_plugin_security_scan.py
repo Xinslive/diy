@@ -52,6 +52,58 @@ SUBSCRIPT_CALLS = [
     "handlers['run']()\n",
 ]
 
+# ---------------------------------------------------------------------------
+# 审查 S-01：扫描器曾被两种极简写法完全绕过，而插件在宿主进程内无沙箱执行。
+#
+# **这两条曾经扫出来是 CLEAN，运行时却拿到了宿主的文件系统与命令执行。**
+# 它们不是"漏了几个名字"，而是**两个结构缺口**：
+#
+#   1. **别名的原名仍然是原名**。``from io import open as fh`` 之后，代码里
+#      再也不出现 ``open`` 这个名字 —— "读取即拒绝"那档看不见它，
+#      属性规则又只认 ``io.open(...)`` 这种属性形态，也看不见它。
+#   2. **裸 Name 形态的双下划线名**。``__builtins__`` 是 Name 不是 Attribute，
+#      所以"属性以 __ 开头就拒"那条规则碰不到它；而它能一次性把
+#      eval / exec / open / __import__ 全部拿回来。
+#
+# 下面的用例把这两个缺口钉死。**只要有人改扫描器把它们放回去，这里立刻红。**
+# ---------------------------------------------------------------------------
+ALIASED_CAPABILITY_IMPORTS = [
+    # 磁盘文件：别名的 open
+    "from io import open as fh\nfh('/etc/hostname').read()\n",
+    "from io import open\n",
+    # 内建能力：换名的 eval
+    "from io import eval as e\n",
+    # 双下划线家族
+    "ev = __builtins__['eval']\n",
+    "__builtins__['eval']('1+1')\n",
+    "l = __loader__\n",
+    "d = __spec__.loader\n",
+    "g = __dict__\n",
+    "globals()\n",
+]
+
+
+@pytest.mark.parametrize("source", ALIASED_CAPABILITY_IMPORTS)
+def test_别名与双下划线拿不到宿主能力(source):
+    """别名导入与双下划线裸名**必须**被拒（审查 S-01）。"""
+    assert rules_of("backend/main.py", source), f"这行代码拿到了宿主能力，扫描却是 CLEAN：{source!r}"
+
+
+@pytest.mark.parametrize("source", [
+    "from io import BytesIO\nBytesIO(b'x').read()\n",
+    "import io\n",
+    "x = __name__\n",
+    "x = __file__\n",
+    "x = __doc__\n",
+    "x = __package__\n",
+    "class A:\n    def __init__(self):\n        self.x = 1\n",
+    "class A:\n    __slots__ = ('x',)\n",
+    "__all__ = ['a']\n",
+])
+def test_规则收紧后插件的正常写法仍然放行(source):
+    """收紧的是「拿到能力的方式」，不是「插件能写什么」。"""
+    assert rules_of("backend/main.py", source) == set(), f"误伤了正常写法：{source!r}"
+
 
 def rules_of(path, source, permissions=None):
     return {finding["rule"] for finding in scan_file(path, source.encode(), permissions=permissions)}
@@ -129,6 +181,43 @@ def test_signed_package_with_dangerous_import_is_rejected(plugin_env):
         verify_archive(raw, keys=keys)
     assert exc.value.code == "STATIC_SCAN_REJECTED"
     assert {finding["rule"] for finding in exc.value.findings} == {"PY_IMPORT"}
+
+
+# ---------------------------------------------------------------------------
+# 审查 S-01 的**端到端**证明：走真实安装闸门的那条路
+#
+# 上面那些用例测的是 ``scan_file`` 这一层。这里测的是**整条安装闸门** ——
+# 解包 → 验签 → 静态扫描，用的是**合法 Ed25519 签名**的包。
+#
+# 为什么要单独写一条：S-01 的原始证明正是"真实 ``verify_archive`` 接受了
+# 一个签好名的恶意包" —— 也就是说，签名是**真的**，扫描是**唯一**那道闸。
+# 只测 scan_file 的话，将来有人把 verify_archive 里的扫描调用删掉，
+# 上面那些用例照样全绿。
+# ---------------------------------------------------------------------------
+MALICIOUS_BACKEND = b'''from io import open as fh
+ev = __builtins__["eval"]
+
+def register(registrar, ctx):
+    fh("/etc/hostname").read()
+    ev("__import__('os').system('id')")
+'''
+
+
+@pytest.mark.parametrize("source", [
+    MALICIOUS_BACKEND,
+    b'ev = __builtins__["eval"]\ndef register(registrar, ctx):\n    ev("1+1")\n',
+    b'l = __loader__\ndef register(registrar, ctx):\n    pass\n',
+])
+def test_签了名的恶意包过不了安装闸门(plugin_env, source):
+    """合法签名的恶意包必须在**安装闸门**被拒（审查 S-01）。"""
+    build, _ = plugin_env
+    files = {"backend/main.py": source,
+             "frontend/index.js": b"export default () => ({});"}
+    raw, _manifest, keys, _ = build(files=files)
+    with pytest.raises(PluginError) as exc:
+        verify_archive(raw, keys=keys)
+    assert exc.value.code == "STATIC_SCAN_REJECTED", (
+        f"签名合法、扫描放行 ⇒ 宿主沦陷。包内容：{source!r}")
 
 
 def test_revoked_key_blocks_an_installed_plugin_on_the_load_path(plugin_env, client, auth, monkeypatch):

@@ -118,43 +118,17 @@ def lock_summary(user: Any) -> dict:
 # （:func:`source_bucketing`），由 ``GET /api/system/login-protection``
 # 显式地告诉管理员，并给出改法。
 #
-# **分桶键的算法收在这里**（:func:`source_bucket_key`）——「哪个来源算同一
-# 个桶」只有一份实现，别在别处再写一遍。
-
-#: 分桶键的前缀。带前缀是为了让「按 IP 分的桶」与「按对端分的桶」在
-#: 存储层里**永远不会撞上** —— 它们的粒度不同，混在一张表里会让「某个
-#: 键的失败数」含义不明。
-BUCKET_PREFIX_IP = "ip"
-BUCKET_PREFIX_PEER = "peer"
-
-
-def source_bucket_key(peer: str, resolved: str | None = None, *,
-                     trusted: bool = False) -> str:
-    """这次请求算在哪个桶里。
-
-    * ``resolved`` 有值**且**对端是可信代理 ⇒ 按**客户端 IP** 分桶
-      （``ip:<地址>``）：这才是「哪个客户端在扫」。
-    * 其余情况 ⇒ 按 **TCP 对端** 分桶（``peer:<地址>``）：对端是攻击者
-      唯一伪造不了的东西。**这包括「对端是可信代理、但代理没带
-      X-Real-IP / X-Forwarded-For」** —— 那种情况下没有任何可证明的
-      客户端地址，退回对端是**保守**的选择（可证明的粒度就是最粗的粒度）。
-
-    **「可证明的粒度」是这个函数唯一的原则。** 宁可粗一点（多误伤），
-    不可细一点（被伪造）。
-
-    ⚠️ **这个键是给人看的诊断形态，不是 ``login_ip_throttle.ip`` 那一列的
-    取值**：那一列是 ``String(45)``，存的是**原始地址**（最长 45 字符的
-    IPv6），而这里的键带了前缀，最长会到 48 字符 —— 直接写进去会截断。
-    真要把它接进 ``auth.py``，要么那一列换成 ``String(64)``，要么这里
-    改成对超长地址取散列。**别把两处的长度口径搞混。**
-    """
-    peer = (peer or "").strip() or "-"
-    if trusted:
-        client = (resolved or "").strip()
-        if client:
-            return f"{BUCKET_PREFIX_IP}:{client[:45]}"
-    return f"{BUCKET_PREFIX_PEER}:{peer[:45]}"
-
+# **分桶键本身不在这里**（审查 L-04）：原来这个模块里有一个
+# ``source_bucket_key()``，但它**从来没有被调用过**，而且它生成的键
+# （``ip:`` + 最长 45 字符的地址 = 最长 48 字符）与目标列
+# ``login_ip_throttle.ip`` 的 ``String(45)`` **对不上** —— 直接接上去会
+# 静默截断，并让不同的 IP 撞成同一个键。
+#
+# 「已定义却未接入」的代码比没有更糟：它看起来像是已经做好的防护，
+# 后来的人会以为「IP 维度已经按客户端 IP 分桶了」。所以它被删掉了。
+# 真要把它接进 ``auth.py``，前提是**先**把那一列的宽度口径解决掉
+# （改成 ``String(64)`` 或对超长地址取散列）—— 那是改数据库结构，
+# 不在这次整改的范围里。
 
 def source_bucketing() -> dict:
     """当前**按来源聚合**的分桶口径（可观测，不含任何凭据）。
@@ -232,8 +206,8 @@ def source_bucketing() -> dict:
 # 「一次登录尝试」的入口（延迟要在那里等/拒）。把「等几秒再验口令」写成
 # 一句口号是没有用的，得真的在登录路径上等。
 #
-# ⚠️ **当前默认行为未改**（首轮仍是 10 分钟硬锁）。原因见本模块末尾
-# 「为什么现在没接上」。
+# ✅ **这套结构已经在登录路径上生效了**（第 1-2 轮秒级延迟、第 3 轮起
+# 分钟级硬锁）。实际形态见本模块末尾「实际生效的结构」。
 
 #: 第一轮的延迟（秒）。**刻意很短**：第一轮是「连错三次」就能触发的，
 #: 那正是最容易被拿来当一次性 DoS 工具的形态。
@@ -259,6 +233,13 @@ def account_delay_seconds(level: int) -> int:
     ``level`` 是**轮次**（``lock_level``），不是失败次数 —— 失败次数在触发
     时就被清零了（那是「离下次触发还差几次」的语义），拿它算延迟会在
     最需要知道的那刻失真（理由同 :func:`lock_duration_minutes`）。
+
+    ⚠️ **实际只会用到前 :data:`ACCOUNT_HARD_LOCK_AFTER_ROUNDS` - 1 轮**
+    （默认是第 1、2 轮 ⇒ 5 秒、10 秒）：第 3 轮起走的是**分钟级硬锁**
+    （:func:`should_hard_lock`），不再走这条延迟阶梯。所以 20/40/80 那些
+    档位在运行时**永远不会被走到** —— 汇报时不能把它们说成生效的阶梯
+    （见 :func:`protection_summary`）。这里保留完整公式，是为了让门槛
+    将来被调大时不必改算法。
     """
     level = max(1, int(level or 1))
     delay = ACCOUNT_DELAY_BASE_SECONDS * (2 ** (level - 1))
@@ -306,18 +287,53 @@ def protection_summary() -> dict:
     * **来源维度**：按什么分桶？是不是「全站一个桶」（审计 P2-3）。
     * **账号维度**：阈值多少、锁多久、阶梯长什么样（审计 P2-4）。
     * **IP 维度**：阈值与窗口，硬锁开没开。
+
+    **账号维度必须按「实际生效的两段结构」汇报**（审查 L-10 / M-10）：
+    真实行为是「**前两轮秒级延迟、第 3 轮起分钟级硬锁**」，而不是
+    「五档秒级延迟」。以前这里报的是 ``[5,10,20,40,80]`` 秒 ——
+    而 20/40/80 那些档位**在运行时永远不会被走到**（第 3 轮起就
+    :func:`should_hard_lock` 了），于是面板在说一件系统没在做的事。
+
+    **只改汇报口径，不改行为**：硬锁比短延迟**更严**，为了让文档好看而
+    放宽锁定（把 ``ACCOUNT_HARD_LOCK_AFTER_ROUNDS`` 调大）那是把安全
+    措施改松了 —— 那是另一件事，需要单独拍板。
     """
+    rounds = []
+    for level in range(1, 6):
+        if should_hard_lock(level):
+            rounds.append({
+                "round": level,
+                "mode": "hard_lock",
+                "delay_seconds": None,
+                "lock_minutes": lock_duration_minutes(level),
+            })
+        else:
+            rounds.append({
+                "round": level,
+                "mode": "delay",
+                "delay_seconds": account_delay_seconds(level),
+                "lock_minutes": None,
+            })
+    # 只列**真正会走到的**秒级延迟（第 1 .. 硬锁门槛-1 轮）。
+    delay_levels = max(0, ACCOUNT_HARD_LOCK_AFTER_ROUNDS - 1)
     return {
         "source_bucketing": source_bucketing(),
         "account": {
             "max_failures": int(getattr(settings, "login_max_failures", 3) or 3),
             "base_minutes": int(getattr(settings, "login_lock_minutes", 10) or 10),
             "max_minutes": int(getattr(settings, "login_lock_max_minutes", 1440) or 1440),
+            # 每轮的**硬锁时长**（分钟）。第 3 轮起走的就是这一条。
             "ladder": [lock_duration_minutes(i) for i in range(1, 6)],
-            # 递增延迟阶梯（审计 P2-4）。**当前尚未在登录路径上生效** ——
-            # 执行点要落在 api/auth.py（见本模块「为什么现在没接上」）。
-            "delay_ladder_seconds": [account_delay_seconds(i) for i in range(1, 6)],
+            # **实际生效的阶梯**（逐轮）：前两轮是秒级延迟，之后是分钟级硬锁。
+            # 界面照着这个显示，就不会说出系统没在做的事。
+            "rounds": rounds,
+            # 秒级延迟阶梯 —— **只含真正会走到的档位**。
+            # （以前这里报的是完整的 5→10→20→40→80，而 20/40/80 永远走不到。）
+            "delay_ladder_seconds": [account_delay_seconds(i)
+                                      for i in range(1, delay_levels + 1)],
+            # 延迟的**理论**上限（提高硬锁门槛之后才会用得上）。
             "delay_max_seconds": ACCOUNT_DELAY_MAX_SECONDS,
+            # 第几轮起升级成硬锁（423）。
             "hard_lock_after_rounds": ACCOUNT_HARD_LOCK_AFTER_ROUNDS,
         },
         "ip": {
@@ -329,29 +345,29 @@ def protection_summary() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 为什么现在没接上（审计 P2-4 的现状说明）
+# 实际生效的结构（审计 P2-4 的现状，**已接上**）
 # ---------------------------------------------------------------------------
 #
-# 上面这套「递增延迟」**当前没有在登录路径上生效**，原因有三，都不是「忘了」：
+# 上面这套「递增延迟 + 第 3 轮起硬锁」**已经在登录路径上生效了**，执行点是
+# ``api/auth.py``：
 #
-# 1. **执行点在 ``api/auth.py``**：延迟要在登录尝试里真的等/拒，而登录
-#    路径是那个文件（不在这次整改的文件所有权范围内）。
-# 2. **现有行为被测试钉死**：``tests/test_login_lockout.py`` 断言「首轮锁
-#    ``settings.login_lock_minutes``（10 分钟）」「第二轮是第一轮的两倍」。
-#    把首轮改成 5 秒延迟会让那两条变红 —— 而那个测试文件也不在所有权
-#    范围内。**改行为必须连着改那个测试文件一起改**，不能只改一半。
-# 3. **数据库没有「延迟截止时间」这一列**：现在只有 ``locked_until``，
-#    而它同时被 423 的判定读。要让「延迟」与「硬锁」共存而不新增列，
-#    判据只能是轮次（:func:`delay_state`）—— 这正是上面那套算法的由来。
+# * ``_record_failure``：轮次 < :data:`ACCOUNT_HARD_LOCK_AFTER_ROUNDS` 时把
+#   ``locked_until`` 写成 ``now + account_delay_seconds(level)``（**秒级
+#   延迟**）；轮次 ≥ 门槛时写成 ``now + lock_duration_minutes(level)``
+#   （**分钟级硬锁**，423）。
+# * ``login`` 的锁定分支：用 :func:`delay_state` 判出是「延迟」就回
+#   **429 + Retry-After**（等几秒就能用正确口令继续），是「硬锁」才回 423。
 #
-# **接上它需要改的三处**（供后续整改直接照做）：
+# **本模块只提供口径与算术**，执行点始终在 ``api/auth.py`` —— 那里才是
+# 「一次登录尝试」的入口（延迟要在那里拒）。
 #
-# * ``api/auth.py::_record_failure``：把 ``locked_until`` 写成
-#   ``now + timedelta(seconds=lockout.account_delay_seconds(level))``
-#   （轮次 ≥ ``ACCOUNT_HARD_LOCK_AFTER_ROUNDS`` 时仍用
-#   ``lock_duration_minutes`` 走硬锁）；
-# * ``api/auth.py::login`` 的锁定分支：``lockout.delay_state(user)`` 判出
-#   是「延迟」就**等完继续验口令**（不要 423），是「硬锁」才 423；
-# * ``tests/test_login_lockout.py``：把「首轮 10 分钟」改成「首轮
-#   5 秒延迟、正确口令等完仍可登录」。
+# **汇报口径必须跟着实际行为走**（审查 L-10 / M-10）：
+# :func:`protection_summary` 现在按**逐轮的实际形态**汇报（前两轮秒级延迟、
+# 之后分钟级硬锁），而不是报一条「五档秒级延迟」——那 20/40/80 秒的档位
+# 在运行时永远走不到，报出来就是面板在说系统没在做的事。
+#
+# **要改的是口径，不是行为**：想让 20/40/80 秒那些档位真的可达，就得把
+# :data:`ACCOUNT_HARD_LOCK_AFTER_ROUNDS` 调大 —— 那是**放宽**硬锁
+# （把硬锁变成短延迟），属于安全强度上的取舍，需要单独拍板，不在这次
+# 「说实话」的范围内。
 

@@ -115,7 +115,24 @@ def _order_clauses(table, order_by):
 
 
 
-def context_for(manifest):
+def context_for(manifest, *, plugin=False):
+    """给一份 manifest 造它的能力上下文。
+
+    ``plugin=True`` 是**插件拿到的那一份**（``loader.load_one`` 里交给
+    ``register(registrar, ctx)`` 的就是它）；默认的 ``plugin=False`` 是**宿主
+    自己**用的那一份（``plugins/services.py`` 拿它挂宿主路由）。
+
+    两者差一处，但差的是要紧的一处：**插件面不含导入批次的「确认」能力。**
+    确认只能走一次独立的 HTTP 请求（宿主路由
+    ``POST /api/plugins/{id}/_host/imports/{ident}/confirm``），于是「用户点了
+    确认」成为不可省略、且在审计里留痕的动作。
+
+    **审批流不是安全边界，权限才是。** 宿主级校验（账套授权、批次归属、
+    状态机、预览摘要一致、SAVEPOINT 原子提交）才是权威的那一层：即便插件
+    绕过确认，数据完整性也守得住。插件侧确认破坏的是**审批语义** —— 一次
+    请求内自己预览、自己确认、自己提交，用户那次独立的点击从来没有发生过，
+    而审计里却会留下「用户确认过」的假象。
+    """
     pid = manifest["id"]
     permissions = set(manifest["permissions"])
     declarations = {t["name"]: t["scope"] for t in manifest.get("tables", [])}
@@ -419,5 +436,6 @@ def context_for(manifest):
         exposed["settings"] = SimpleNamespace(get=setting_get, put=setting_put)
     if "import:rw" in permissions:
         from app.plugins.imports import service
-        exposed["imports"] = service(manifest, principal)
+        # 插件面（plugin=True）**不含 confirm**：确认必须是一次独立的请求。
+        exposed["imports"] = service(manifest, principal, expose_confirm=not plugin)
     return SimpleNamespace(**exposed)

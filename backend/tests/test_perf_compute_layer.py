@@ -444,9 +444,14 @@ def test_除零照旧报错(db, book, periods, one_cell):
 
 
 def test_空单元格是零不是报错(db, book, periods, one_cell):
-    """引用一个没有公式的格子 = 0。这条最容易被「缓存了 None」之类的改动弄坏。"""
+    """引用一个**存在但没有公式**的格子 = 0。这条最容易被「缓存了 None」之类的改动弄坏。
+
+    （引用**模板里根本没有**的格子是另一回事：那是越界，要报错 ——
+    见 ``tests/test_reviewfix_report_misc.py``。）
+    """
     tid, cell = one_cell
-    cell.formula = "D9+D10"
+    # 模板的行是 1~2、列是 1~3：A1 / B1 在网格里、但没有公式 → 取 0
+    cell.formula = "A1+B1"
     db.flush()
     assert _value(db, tid, book, periods[3]) == Decimal("0")
 

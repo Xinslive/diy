@@ -43,14 +43,16 @@ import re
 from calendar import monthrange
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterable, Optional
+from typing import Annotated, Any, Iterable, Optional
 
 from mcp.server.mcpserver import Context
+from pydantic import Field
 from sqlalchemy import select
 
 from app.accounting.organize import is_carry_forward
 from app.accounting.vouchers import query_vouchers, side_totals
 from app.accounting.years import subjects_of
+from app.core.config import settings
 from app.ledger.queries import (
     balance_sheet_of_accounts,
     filter_balance_rows,
@@ -99,6 +101,9 @@ from app.mcp.tools.base import (
 #: 合并的实现是「按科目分别调 query_vouchers，再在 Python 里并起来」，所以
 #: 一次要把某个科目在区间内的**全部**凭证拉进来才能算准去重后的总数。这个
 #: 上限是那道闸：超过它就要求 agent 缩小日期范围，而不是让它把整本账拉走。
+#:
+#: **实际生效值是 ``settings.mcp_max_merge_vouchers``**（默认 2000，与这里
+#: 一致）。这个常量只作为兜底默认值 —— 配置才是唯一的口径来源。
 MERGE_FETCH_LIMIT = 2000
 
 #: 一个关键词最多允许命中多少个科目（含跨年度）。
@@ -106,7 +111,21 @@ MERGE_FETCH_LIMIT = 2000
 #: 命中的科目越多，要跑的查询越多（每个科目一次 ``query_vouchers``）。
 #: 真要一次看几十个科目，agent 应该改用 ``subject_id`` 精确指定 —— 这条闸
 #: 逼它把话说清楚，而不是让它悄悄截断。
+#:
+#: **实际生效值是 ``settings.mcp_max_subjects``**（默认 60）。这条闸**同时**
+#: 约束显式传入的 ``subject_ids`` —— 以前它只管关键词路径，显式传 id 是条
+#: 没有闸的路（审查 H-03）。
 MAX_SUBJECTS = 60
+
+
+def _max_subjects() -> int:
+    """单次调用允许的科目个数上限（配置为准）。"""
+    return max(1, int(getattr(settings, "mcp_max_subjects", MAX_SUBJECTS)))
+
+
+def _max_merge_vouchers() -> int:
+    """多科目合并集的总张数上限（配置为准）。"""
+    return max(1, int(getattr(settings, "mcp_max_merge_vouchers", MERGE_FETCH_LIMIT)))
 
 #: ``alternatives[]`` 最多回多少条候选。
 MAX_ALTERNATIVES = 10
@@ -302,12 +321,19 @@ def _query_by_subjects(db, book_id, subject_ids, *, from_period, to_period,
     不涉及任何会计口径。
 
     代价是要把每个科目的结果整份取回来（去重后的总数才算得准），所以有
-    ``MERGE_FETCH_LIMIT`` 那道闸。
+    ``settings.mcp_max_merge_vouchers`` 那道闸。
+
+    **那道闸现在是「总量闸」，不是「每个科目各一份」。** 以前每个科目都能
+    单独取满 2000 张，全部驻留进同一个 ``merged`` 字典 —— 传 60 个科目就是
+    12 万张凭证（还带着全部分录的对象图）一次性进内存，一次调用就能把进程
+    拖垮。现在：**合并集累计超过上限就报错**，并且错误信息会分清是
+    「单个科目就超了」还是「合并起来超了」—— 两者的处置不一样。
 
     ``exclude_carry_forward`` **原样传给 ``query_vouchers``**：剔除要发生
     在每一条子查询的计数与分页之前，合并之后再剔就晚了（合并的基数是
     未剔除的）。
     """
+    limit = _max_merge_vouchers()
     merged: dict[int, Voucher] = {}
     for subject_id in subject_ids:
         rows, total = query_vouchers(
@@ -318,14 +344,20 @@ def _query_by_subjects(db, book_id, subject_ids, *, from_period, to_period,
             min_amount=min_amount, max_amount=max_amount,
             subject_id=subject_id,
             exclude_carry_forward=exclude_carry_forward,
-            page=1, page_size=MERGE_FETCH_LIMIT, sort=sort,
+            page=1, page_size=limit, sort=sort,
         )
         if total > len(rows):
+            # **单个科目就超了**：与合并无关，缩小这个科目的区间才行。
             raise McpBadRequest(
-                f"科目 {subject_id} 在该区间内的凭证超过 {MERGE_FETCH_LIMIT} 张，"
-                "请缩小日期范围后重试")
+                f"科目 {subject_id} 在该区间内就有 {total} 张凭证，超过单次上限 "
+                f"{limit} 张；请缩小日期范围，或改用更精确的科目/关键字过滤后重试")
         for voucher in rows:
             merged[voucher.id] = voucher
+            if len(merged) > limit:
+                # **合并起来超了**：每个科目单独看都没超，是并集太大。
+                raise McpBadRequest(
+                    f"这些科目合并后共有 {len(merged)} 张凭证，超过单次上限 "
+                    f"{limit} 张；请减少科目数量或缩小日期范围后重试")
     return list(merged.values())
 
 
@@ -461,9 +493,11 @@ def _fetch_all_matching(db, book_id, subject_ids, *, from_period, to_period,
     「2025 年电费一共多少」——那是**整批**命中凭证的合计。拿当前页（默认
     50 张）去汇总，报出来的数就是错的，而且看着还挺正常。
 
-    上限用 ``MERGE_FETCH_LIMIT``（2000 张），超了直接报错并说清怎么缩小
-    范围 —— 宁可让调用方缩小区间，也不要给一份只算了前 2000 张的「合计」。
+    上限用 ``settings.mcp_max_merge_vouchers``（默认 2000 张），超了直接报错
+    并说清怎么缩小范围 —— 宁可让调用方缩小区间，也不要给一份只算了前 2000 张
+    的「合计」。
     """
+    limit = _max_merge_vouchers()
     if subject_ids:
         return _query_by_subjects(
             db, book_id, subject_ids, from_period=from_period, to_period=to_period,
@@ -475,11 +509,11 @@ def _fetch_all_matching(db, book_id, subject_ids, *, from_period, to_period,
         date_from=date_from, date_to=date_to, status=status,
         keyword=keyword, min_amount=min_amount, max_amount=max_amount,
         subject_id=None, exclude_carry_forward=exclude_carry_forward,
-        page=1, page_size=MERGE_FETCH_LIMIT, sort=sort)
+        page=1, page_size=limit, sort=sort)
     if total > len(rows):
         raise McpBadRequest(
             f"这个区间里命中的凭证有 {total} 张，超过透视上限 "
-            f"{MERGE_FETCH_LIMIT} 张；请缩小日期范围或加上科目过滤后重试")
+            f"{limit} 张；请缩小日期范围或加上科目过滤后重试")
     return rows
 
 
@@ -611,7 +645,14 @@ def search_vouchers(
     ctx: Context,
     book_id: int,
     year: Optional[int] = None,
-    subject_ids: Optional[list[int]] = None,
+    subject_ids: Optional[Annotated[list[int], Field(
+        max_length=settings.mcp_max_subjects,
+        description=(
+            f"要按科目过滤时传科目 id 列表，**最多 {settings.mcp_max_subjects} 个**。"
+            "上限同时写在 JSON Schema 的 maxItems 上（给 agent 看），"
+            "服务端还会再判一次 —— schema 是给人看的，不是护栏。"
+        ),
+    )]] = None,
     keyword: Optional[str] = None,
     status: str = "POSTED",
     include_unposted: bool = False,
@@ -659,6 +700,13 @@ def search_vouchers(
     notes.append(
         "默认只读已记账凭证（status=POSTED）；include_unposted=true 才包含"
         "未记账凭证。")
+    # **把「按年查询」这件事说清楚**（审查 L-27）：``mcp_max_range_months``
+    # 那条闸只约束跨期查询；本工具的窗口已经被年度夹住（最多 12 个月），
+    # 天然比那条闸更严。不说清楚，agent 会以为那条闸没生效。
+    notes.append(
+        f"本次查询按年度取数（窗口已夹在 {resolved_year} 年内，最多 12 个月）；"
+        "跨期查询的区间上限（mcp_max_range_months）只约束可跨年的工具，"
+        "按年查询天然比它更严。")
     notes.append(
         "keyword 只搜凭证号、备注与分录摘要，不搜科目名 —— 找科目请用 "
         "find_subjects。")
@@ -713,6 +761,19 @@ def search_vouchers(
     check_range(from_period, to_period)
 
     ids = [int(s) for s in (subject_ids or []) if s is not None]
+    # **科目个数闸（审查 H-03）。**
+    #
+    # 以前这条闸只管关键词路径（``MAX_SUBJECTS``），**显式传 subject_ids 是
+    # 一条没有闸的路**：调用方可以一次传整个账套的科目（真实账套常有
+    # 100~500 个），每个科目各自取满合并上限张凭证，全部驻留进同一个字典 ——
+    # 一次调用就能把内存放大成一次拒绝服务。
+    #
+    # 现在两条路径**同一个口径**（``settings.mcp_max_subjects``）。
+    max_subjects = _max_subjects()
+    if len(ids) > max_subjects:
+        raise McpBadRequest(
+            f"这次传了 {len(ids)} 个科目，超过单次上限 {max_subjects} 个；"
+            "请改用关键字缩小科目范围，或分几次查询")
     known = _subject_map(db, ids)
     for subject_id in ids:
         subject = known.get(subject_id)
@@ -974,10 +1035,10 @@ def latest_payment(
             for subject in subjects_of(db, book_id, table_year):
                 if match_keyword(subject, subject_keyword):
                     target_ids.append(subject.id)
-        if len(target_ids) > MAX_SUBJECTS:
+        if len(target_ids) > _max_subjects():
             raise McpBadRequest(
                 f"关键字命中了 {len(target_ids)} 个科目，超过单次上限 "
-                f"{MAX_SUBJECTS} 个；请换一个更具体的关键字，或改用 subject_id。")
+                f"{_max_subjects()} 个；请换一个更具体的关键字，或改用 subject_id。")
         if not target_ids:
             return envelope(LatestPaymentResult, 
                 caliber="payment", notes=notes, book_id=book_id,
@@ -1161,10 +1222,10 @@ def check_period_payments(
         for subject in subjects_of(db, book_id, table_year):
             if match_keyword(subject, subject_keyword):
                 target_ids.append(subject.id)
-        if len(target_ids) > MAX_SUBJECTS:
+        if len(target_ids) > _max_subjects():
             raise McpBadRequest(
                 f"关键字命中了 {len(target_ids)} 个科目，超过单次上限 "
-                f"{MAX_SUBJECTS} 个；请换一个更具体的关键字，或改用 subject_id。")
+                f"{_max_subjects()} 个；请换一个更具体的关键字，或改用 subject_id。")
 
     if not target_ids:
         note = (f"没有找到匹配的科目（查的是 {table_year} 年度的科目表）。"

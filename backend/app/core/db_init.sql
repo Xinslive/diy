@@ -248,7 +248,16 @@ CREATE CONSTRAINT TRIGGER trg_entry_balance
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION fn_check_voucher_balance();
 
--- 空凭证（一条分录都没有）同样要拦住
+-- 凭证层的**借贷平衡复核**（延迟到事务提交时校验）。
+--
+-- **它不拦空凭证。** 一条分录都没有时，借方合计与贷方合计都是 0，
+-- 而 0 = 0 —— 平衡检查是过的，本触发器放行。
+-- （本条注释原来宣称本触发器会拦住「一条分录都没有」的凭证，与实现不符：
+--  实现里只有 ``v_debit <> v_credit`` 这一条判据，没有「分录条数为 0」的判据。
+--  空凭证是在**应用层**拦的 —— ``accounting/vouchers._validate_entries``
+--  的「凭证至少需要一条分录」。**这里刻意不改触发器的行为**：
+--  改触发器函数体就得让存量库重放一遍（迁移），那是另一件事，
+--  而应用层那道闸已经挡住了空凭证。）
 DROP TRIGGER IF EXISTS trg_voucher_balance ON voucher;
 CREATE CONSTRAINT TRIGGER trg_voucher_balance
     AFTER INSERT ON voucher

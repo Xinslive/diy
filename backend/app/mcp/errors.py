@@ -12,9 +12,14 @@
 * **PG 自带的英文违例文案** ⇒ 换成一句脱敏提示（那是库结构）；
 * **其它异常** ⇒ 一句「内部错误（请求号 X）」，原文只进服务端日志。
 
-判据仍然是「文案里有没有汉字」，而不是维护一张 sqlstate 白名单 ——
+判据是「**有汉字、且不是 PG 的固定话术**」，而不是维护一张 sqlstate 白名单 ——
 理由与 ``main.py`` 相同：sqlstate 是有限的几个，而**文案来源**才是真正
 要管的东西。
+
+**为什么"只看有没有汉字"不够**（审查补漏）：PG 的违例原文里会夹带中文
+**数据**（重复键的值可能是凭证号「记0001」）。只判汉字的话，带着中文数据的
+23505 原文（表名、约束名、**重复键的值**）会被当成自家提示原样回给 agent。
+所以除了汉字，还要排除 PG 那几套固定英文模板（``_PG_VIOLATION_MARKERS``）。
 
 **错误的形状。**
 工具出错时回 ``CallToolResult(is_error=True)``，``structured_content``
@@ -262,15 +267,44 @@ _CONSTRAINT_SQLSTATES = ("23514", "23505", "23503", "23502", "22001")
 _QUERY_CANCELED = "57014"
 
 
+#: PG 自己的违例话术。**只要命中一条，就不是「我们自己写的中文护栏」** ——
+#: 哪怕它夹带了中文**数据**（凭证号「记0001」、摘要都会是中文）。
+#:
+#: 这些是 PG 固定的几套英文模板（唯一/外键/非空/CHECK/超长），不是我们写的
+#: 散文，所以判据是稳定的。
+#:
+#: **为什么不能只看「有没有汉字」**（审查补漏）：PG 的违例原文里会夹带中文
+#: **数据**，于是「含中文 ⇒ 是我们写的」这个判据会被骗过 —— 带着中文数据的
+#: 23505 原文（表名、约束名、**重复键的值**）会被当成自家提示原样回给 agent。
+#: 与 ``main.py`` 的同一套判据保持一致。
+_PG_VIOLATION_MARKERS = (
+    "violates",                 # violates unique/foreign key/check/not-null constraint
+    "duplicate key value",      # 23505
+    "detail:",                  # PG 的 DETAIL 行
+    "key (",                    # DETAIL 里的 Key (col)=(val)
+    "is not present in table",  # 23503
+    "null value in column",     # 23502
+    "value too long for type",  # 22001
+    "row for relation",         # 23514
+)
+
+
 def _is_own_guardrail_text(message: str) -> bool:
     """这句违例文案是不是**我们自己写的中文护栏文案**。
 
-    判据与 ``main.py`` 相同：**里面有没有汉字**。
+    判据：**有汉字**（我们自己写的提示都是中文）**且不是 PG 的固定话术**。
+
     ``db_init.sql`` 里的 ``RAISE EXCEPTION '已记账的凭证不允许删除'`` 有汉字
     ⇒ 是写给人看的提示；PG 自带的 ``duplicate key value violates unique
     constraint "uq_..."`` 没有汉字 ⇒ 里面带的是**库结构**，不能回给 agent。
+
+    **但 PG 的原文里也会夹带中文数据**（重复键的值可能是凭证号「记0001」），
+    所以光看"有没有汉字"不够 —— 还要排除 PG 那几套**固定英文模板**。
     """
-    return any("一" <= ch <= "鿿" for ch in message)
+    if not any("一" <= ch <= "鿿" for ch in message):
+        return False
+    lowered = message.lower()
+    return not any(marker in lowered for marker in _PG_VIOLATION_MARKERS)
 
 
 def _generic_constraint_detail(sqlstate: str | None) -> str:

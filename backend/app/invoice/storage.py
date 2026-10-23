@@ -68,12 +68,31 @@ def merge_pdfs(sources: list[tuple[str, str]], batch_id: int) -> str:
     一份源文件都读不出来（加密、损坏、根本不是 PDF）时**整批失败**并点名是谁：
     这类文件属于「本该解析却解析不了」，静默跳过等于用户以为传进去了。
     非 PDF 文件的跳过在接口层就完成了，压根不会走到这里。
+
+    **合并前先校验总页数**（审查 H-07）：合并出来的 PDF 会被逐页取文本层、
+    逐页解析成发票，页数就是这一批要处理的工作量。不校验的话，一百份
+    扫描件会被合成一份几千页的 PDF，然后一路走到解析器里才炸。
     """
     import pypdfium2 as pdfium
 
     directory = root()
     filename = f"batch_{batch_id}.pdf"
     target = directory / filename
+    pages_limit = max(1, int(settings.invoice_max_pdf_pages))
+    total_pages = 0
+    for relative, source_name in sources:
+        try:
+            probe = pdfium.PdfDocument(path_for(relative))
+        except Exception as exc:  # noqa: BLE001 —— pdfium 的异常类型随版本变
+            raise ValueError(f"源文件无法读取（可能已加密或已损坏）：{source_name}") from exc
+        try:
+            total_pages += len(probe)
+        finally:
+            probe.close()
+        if total_pages > pages_limit:
+            raise ValueError(
+                f"这批文件加起来有 {total_pages} 页，超过单批上限 {pages_limit} 页"
+                f"（超在 {source_name}）；请分成几批上传")
     fd, temp_name = tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=directory)
     os.close(fd)
     document = None

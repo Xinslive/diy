@@ -1218,8 +1218,9 @@ def _render_scope(
             if bal_from.ord > period.ord:
                 raise HTTPException(400, "起始期间不能晚于结束期间")
         # 科目表每个年度各有一份：跨年区间取**区间涉及的所有年度**的并集。
-        subjects = queries.subjects_for_periods(
-            db, book.id, [bal_from, period] if bal_from else [period])
+        # 只取首尾两年的话，中间那一年的科目表没进查询 —— 那年的发生额
+        # 会**整段消失且不报错**（审查修复）。
+        subjects = queries.subjects_for_range(db, book.id, bal_from, period)
         rows, check = queries.balance_sheet_of_accounts(
             db, book.id, subjects, period, include_unposted, from_period=bal_from)
         # 范围跟屏幕上的三档单选一致，别让纸上多出一千多行明细
@@ -1555,8 +1556,7 @@ def export_balance(book_id: int, period_id: Optional[int] = None,
         from_period = _period(db, book.id, from_period_id)
         if from_period.ord > period.ord:
             raise HTTPException(400, "起始期间不能晚于结束期间")
-    subjects = queries.subjects_for_periods(
-        db, book.id, [from_period, period] if from_period else [period])
+    subjects = queries.subjects_for_range(db, book.id, from_period, period)
     rows, check = queries.balance_sheet_of_accounts(
         db, book.id, subjects, period, include_unposted, from_period=from_period)
     # 与屏幕同一个范围口径：屏幕上「仅一级科目」而文件里是全表，用户只会

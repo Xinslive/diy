@@ -353,13 +353,32 @@ def persist(template_id: int, book_id: int, period_id: int, db: Session = Depend
 
     from decimal import Decimal
 
+    # **落库前先量化**（审查修复）：``report_result.value`` 是 ``Numeric(20,2)``，
+    # 而这里原来直接把求值出来的原值丢进去 —— 数据库会**静默四舍五入**
+    # （1/3 → 0.33），而页面上显示的是未量化的原值。于是「页面上是 0.3333…」、
+    # 「导出/落库是 0.33」，两份数对不上，而且没人知道差在哪。
+    #
+    # 量化口径用全系统唯一的那一份（``app.accounting.util.money``：两位小数、
+    # 四舍五入），别在这里另写一套 —— 报表的数与账簿的数必须是同一个口径。
+    from app.accounting.util import money
+
     for row in data["rows"]:
         for idx, cell in enumerate(row["cells"]):
             col_no = data["cols"][idx]["col_no"]
+            raw = cell["value"]
+            try:
+                value = money(Decimal(raw)) if raw else None
+            except ValueError as exc:
+                # 公式能算出超量级/非法的数（``money`` 会拒）—— 那时候给
+                # 一句人话，而不是让数据库抛 ``NumericValueOutOfRange``。
+                raise HTTPException(
+                    400,
+                    f"报表结果落库失败：{row['label']}（第{row['row_no']}行 "
+                    f"第{col_no}列）{exc}")
             db.add(ReportResult(
                 template_id=template_id, book_id=book.id, period_id=period.id,
                 row_no=row["row_no"], col_no=col_no, formula=cell["formula"],
-                value=Decimal(cell["value"]) if cell["value"] else None,
+                value=value,
                 error=cell["error"],
             ))
     db.commit()

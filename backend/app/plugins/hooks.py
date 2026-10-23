@@ -42,6 +42,9 @@ def committed(db):
             handler = hooks.get(payload['name'])
             if not handler:
                 continue
+            # user 在鉴权闸里取；闸本身出问题（DB 抖动）时它是未定义的，
+            # 下面的 except 分支要能记审计 —— 所以先给个 None。
+            user = None
             try:
                 with SessionLocal() as gate:
                     user = gate.get(SysUser, payload['user_id'])
@@ -61,4 +64,19 @@ def committed(db):
                 try:
                     audit.failure('hook', pid, user, 'HOOK_EXECUTION_FAILED')
                 except Exception:
+                    log.exception('plugin hook audit failed id=%s', pid)
+            except BaseException:
+                # **顺序不能反：Exception 在前、BaseException 在后。**
+                #
+                # SystemExit / KeyboardInterrupt / GeneratorExit 派生自
+                # BaseException，**不被 except Exception 接住** —— 它们会一路
+                # 穿出 ``Session.commit()``。后果不是"插件出错"而是：结账
+                # 事务**已经提交**（原子性没破），调用方却拿到 500 ——
+                # 用户看到「结账失败」，实际账已经锁了，重试还会撞「已结账」。
+                #
+                # 所以插件的异常**任何形态都不许穿出宿主边界**。
+                log.exception('plugin hook aborted id=%s name=%s', pid, payload['name'])
+                try:
+                    audit.failure('hook', pid, user, 'HOOK_EXECUTION_FAILED')
+                except BaseException:
                     log.exception('plugin hook audit failed id=%s', pid)

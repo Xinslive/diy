@@ -34,12 +34,22 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import * as api from '@/api/book'
+import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'
 import { formatDateTime } from '@/utils/datetime'
 
 const store = useSessionStore()
 const logs = ref([])
-const loading = ref(false)
+/**
+ * 只认最新一趟（见 composables/useLatestLoad.js 的文件头那份清单）。
+ *
+ * 这一页的触发口有两个：切账套（watch store.bookId）与页面自己的加载。
+ * 切账套那一次靠 MainLayout 的 viewKey 整页重挂兜底就够了；
+ * 但**页内**再触发一次加载时（连点、watch 与 onMounted 撞在一起），
+ * 组件还活着 —— 旧响应写进来，表格里就是另一批日志。
+ * 所以这里接上守卫：这是「页内加载点」的样板。
+ */
+const { loading, run, isStale } = useLatestLoad('system/audit')
 const snapVisible = ref(false)
 const snapshot = ref(null)
 
@@ -53,8 +63,10 @@ function show(row) { snapshot.value = { before: row.before, after: row.after }; 
 
 async function load() {
   if (!store.bookId) return
-  loading.value = true
-  try { logs.value = await api.auditLogs(store.bookId, 200) } finally { loading.value = false }
+  const d = await run(() => api.auditLogs(store.bookId, 200))
+  // 过期的那一趟：条件早被用户改掉了，写进去就是「表格里是另一批日志」
+  if (isStale(d)) return
+  logs.value = d
 }
 onMounted(load)
 watch(() => store.bookId, load)

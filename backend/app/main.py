@@ -187,7 +187,16 @@ if _cors_env in ("dev", "test"):
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-        allow_credentials=True,
+        # **不带凭据**（审查 L-05）。原来这里是 ``allow_credentials=True``，
+        # 与「允许本机任意端口」那条通配正则叠在一起：那么**任何**跑在
+        # localhost 任意端口上的页面都能带着凭据跨源读本系统的响应。
+        #
+        # 本项目**全仓没有任何 Cookie 依赖**（没有 set_cookie、没有
+        # ``request.cookies``）—— 令牌走 ``Authorization`` 头 + 前端
+        # localStorage，**不带凭据照样工作**。而浏览器对「带凭据的跨源
+        # 请求」有额外的限制（CORS 预检更严、不能通配），去掉它对开发
+        # 没有影响，对「本机任意端口」这个过宽的口径是实打实的收紧。
+        allow_credentials=False,
         allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
         allow_methods=["*"],
         allow_headers=["*"],
@@ -290,19 +299,52 @@ _mount_mcp(app)
 def _is_own_guardrail_text(message: str) -> bool:
     """这句违例文案是不是**我们自己写的中文护栏文案**。
 
-    判据是「里面有没有汉字」：
+    **两个条件都要满足**（审查 L-01）：
 
-    * ``db_init.sql`` 里的 ``RAISE EXCEPTION '已记账的凭证不允许删除'``
-      —— 有汉字 ⇒ 是写给人看的提示，可以回给客户端；
-    * PG 自带的违例文案（``duplicate key value violates unique constraint
-      "uq_..."``）—— 纯英文 ⇒ 里面带的是**表名与约束名**，是库结构，
-      不能回给客户端。
+    1. **里面有没有汉字** —— 我们写的护栏（``db_init.sql`` 里的
+       ``RAISE EXCEPTION '已记账的凭证不允许删除'``）是中文；PG 自带的
+       违例文案是英文的，里面带的是**表名与约束名**，是库结构。
+    2. **里面有没有 PG 自己的话术**（``violates`` / ``duplicate key
+       value`` / ``DETAIL:`` / ``Key (`` …）—— **这一条是补上的漏洞**。
 
-    为什么用「有没有汉字」而不是「sqlstate 白名单」：sqlstate 是有限的几个，
-    而**文案来源**才是真正要管的东西（我们写的 vs PG 写的）。文案判据在
-    新增一条约束时不需要同步维护一张表 —— 忘了维护，就会重新开始泄露。
+    为什么第 1 条单独不够：PG 的违例文案里**会夹带数据**，而数据可能是
+    中文的 —— 最典型的就是凭证号：
+
+        duplicate key value violates unique constraint "uq_voucher_period_no"
+        DETAIL:  Key (period_id, voucher_no)=(1, 记0001) already exists.
+
+    这里面的「记0001」**有汉字**，于是「有没有汉字」这个判据会说「这是我们
+    自己写的护栏」—— 于是表名、约束名与**重复键的值**被原样回给了客户端。
+
+    所以第 2 条是必须的：**我们自己写的护栏是完整的一句话（中文散文），
+    不含 PG 的话术**；PG 的话术则是固定的几套英文模板。两边都判，才不会
+    被数据里的汉字骗过去。
+
+    为什么不用「sqlstate 白名单」：sqlstate 是有限的几个，而**文案来源**
+    才是真正要管的东西（我们写的 vs PG 写的）。文案判据在新增一条约束时
+    不需要同步维护一张表 —— 忘了维护，就会重新开始泄露。
     """
-    return any("一" <= ch <= "鿿" for ch in message)
+    if not any("一" <= ch <= "鿿" for ch in message):
+        return False
+    lowered = message.lower()
+    return not any(marker in lowered for marker in _PG_VIOLATION_MARKERS)
+
+
+#: PG 自己的违例话术。**只要命中一条，就不是「我们自己写的中文护栏」** ——
+#: 哪怕它夹带了中文数据（凭证号、摘要都会是中文）。
+#:
+#: 这些是 PG 固定的几套英文模板（唯一/外键/非空/CHECK/超长），不是我们写
+#: 的散文，所以判据是稳定的。
+_PG_VIOLATION_MARKERS = (
+    "violates",                 # violates unique/foreign key/check/not-null constraint
+    "duplicate key value",      # 23505
+    "detail:",                  # PG 的 DETAIL 行
+    "key (",                    # DETAIL 里的 Key (col)=(val)
+    "is not present in table",  # 23503
+    "null value in column",     # 23502
+    "value too long for type",  # 22001
+    "row for relation",         # 23514
+)
 
 
 def _generic_constraint_detail(sqlstate: str | None) -> str:
@@ -358,6 +400,18 @@ async def dbapi_error_handler(request, exc: DBAPIError):
     where = f"rid={rid} {request.method} {request.url.path}"
 
     if sqlstate in ("23514", "23505", "23503", "23502", "22001"):
+        # **判据必须用「原始文案」**（审查 L-01 的连带修复）。
+        #
+        # 原来这条判断发生在**加了中文前缀之后**：23505 的文案被拼成
+        # 「数据已存在或被引用，违反唯一约束：duplicate key value violates
+        # unique constraint "uq_voucher_period_no" DETAIL: Key (period_id,
+        # voucher_no)=(1, 记0001) already exists.」—— 于是「有没有汉字」
+        # 这个判据**永远为真**，PG 自带的英文原文（表名、约束名、**重复键的值**）
+        # 就被当成「我们自己写的中文护栏」原样回给了客户端。
+        #
+        # 加前缀只是为了日志好读，**不该影响「这句文案是谁写的」这个判断** ——
+        # 所以判断必须在加前缀**之前**做。
+        own_guardrail_text = _is_own_guardrail_text(message)
         if sqlstate == "23505":
             message = f"数据已存在或被引用，违反唯一约束：{message}"
         elif sqlstate == "22001":
@@ -370,7 +424,7 @@ async def dbapi_error_handler(request, exc: DBAPIError):
         log.warning("数据库约束拒绝 %s sqlstate=%s %s", where, sqlstate, message[:200])
         # **只有我们自己写的中文文案才回给客户端**（见 docstring）。
         # PG 自带的英文违例文案里带着表名与约束名 —— 那是库结构，不是提示。
-        detail = message[:500] if _is_own_guardrail_text(message) else _generic_constraint_detail(sqlstate)
+        detail = message[:500] if own_guardrail_text else _generic_constraint_detail(sqlstate)
         return JSONResponse(status_code=400,
                             content={"detail": detail},
                             headers={"X-Request-ID": rid})

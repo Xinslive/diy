@@ -64,6 +64,8 @@
 """
 from __future__ import annotations
 
+import itertools
+import math
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -117,6 +119,14 @@ DIRECTION_WORDS: dict[str, str] = {
 # 普通凭证导入表不会有这一列。
 JOURNAL_HEADER_MARKERS = ("上级科目", "科目全路径", "上级科目名称")
 
+#: 表头扫描深度（审查修复）。
+#:
+#: 外部系统导出常在表头上方带标题、制表日期、账套名 —— 写死「第 1 行是
+#: 表头」对真实文件是错的，整份表都读不进来。期初余额导入早就改成扫描了
+#: （``opening_importer`` 扫 20/15 行、还认双行合并表头），凭证导入这一条
+#: 是漏的。15 行与期初那条同款。
+VOUCHER_HEADER_SCAN_ROWS = 15
+
 
 def _looks_like_journal(header: list[Any]) -> bool:
     """这份表是用友的序时账吗（逐条分录平铺、每行重复日期与凭证号数）。
@@ -144,6 +154,18 @@ def _looks_like_journal(header: list[Any]) -> bool:
 
 def _norm(value: Any) -> str:
     return "".join(str(value).split()).lower() if value is not None else ""
+
+
+def _cell_text(value: Any) -> str:
+    """把单元格稳定转成文本（数字型编码 ``1001.0`` → ``1001``）。"""
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if math.isnan(value):
+            return ""
+        if value.is_integer():
+            return str(int(value))
+    return str(value).strip()
 
 
 def map_columns(header: list[Any]) -> tuple[dict[str, int], list[str]]:
@@ -315,12 +337,87 @@ def parse_workbook(data: bytes, book_id: int, db: Session,
         rows_iter.close()
 
 
-def _parse_rows(rows_iter, book_id: int, db: Session) -> dict:
-    try:
-        header = [c for c in next(rows_iter)]
-    except StopIteration as exc:
-        raise ValueError("Excel 是空文件") from exc
+def _merge_header(first: list[Any], second: list[Any]) -> list[str]:
+    """把上下两行表头按列拼起来（用友某些版本把表头分两行）。"""
+    width = max(len(first), len(second))
+    out: list[str] = []
+    for index in range(width):
+        top = _cell_text(first[index]) if index < len(first) else ""
+        bottom = _cell_text(second[index]) if index < len(second) else ""
+        out.append(f"{top}{bottom}")
+    return out
 
+
+def _header_score(mapping: dict[str, int]) -> int:
+    """这个表头认出了几样**必需**的东西（满分 3）。
+
+    必需的三样：日期、能定位科目的列（编码或名称）、金额列（借/贷/金额）。
+    打分而不是「认不认得出」：一份表头可能只认得出两样 —— 那时候仍然
+    是它，缺的那一样由下面那句报错说清楚。
+    """
+    score = 0
+    if "voucher_date" in mapping:
+        score += 1
+    if "subject" in mapping or "subject_name" in mapping:
+        score += 1
+    if {"debit", "credit", "amount"} & set(mapping):
+        score += 1
+    return score
+
+
+def _scan_header(rows: list[list[Any]]) -> tuple[int, list[Any], int]:
+    """在前若干行里找表头，返回 ``(表头首行下标, 表头内容, 表头占几行)``。
+
+    找不到就返回 ``(0, rows[0], 1)`` —— 让下面那句「缺少必需的表头列」
+    照原样报出去（用户看到的是他第 1 行的内容）。
+
+    双行合并表头：用友某些版本把「日期」「凭证号」这类列名分两行放，
+    单行必然认不全 —— 合并下一行才认得出。这种表头**占两行**，
+    数据从第三行开始（行号基准也跟着走，见 ``_parse_rows``）。
+    """
+    best_score = -1
+    best = (0, rows[0], 1)
+    for index, row in enumerate(rows):
+        mapping, _unknown = map_columns(row)
+        score = _header_score(mapping)
+        if score > best_score:
+            best_score, best = score, (index, row, 1)
+        # 只在「这一行自己已经认出点东西」时才去拼下面那行：
+        # 否则标题行（「序时账」「2026 年 10 月」）会和真正的表头拼在一起。
+        if score >= 1 and index + 1 < len(rows):
+            merged = _merge_header(row, rows[index + 1])
+            merged_mapping, _unknown = map_columns(merged)
+            merged_score = _header_score(merged_mapping)
+            if merged_score > best_score:
+                best_score, best = merged_score, (index, merged, 2)
+    return best
+
+
+def _parse_rows(rows_iter, book_id: int, db: Session) -> dict:
+    # ---- 表头扫描（审查修复）-----------------------------------------
+    #
+    # 原来这里只认「第 1 行就是表头」（``header = next(rows_iter)``）。
+    # 外部系统导出常在表头上方带标题、制表日期、账套名（用友导出就是
+    # 这样），于是**整份表读不进来** —— 而期初余额导入早就有同款扫描
+    # （``opening_importer`` 扫 20/15 行、还认双行合并表头）。凭证导入
+    # 这一条是漏的。
+    #
+    # 表头不在第 1 行时，**行号基准同步修正**（下面 ``line_no`` 的初值）——
+    # 否则报错里说的「第 N 行」指的是「第 N 个数据行」，用户在 Excel 里
+    # 按行号找会找错地方。
+    buffered: list[list[Any]] = []
+    index = 0
+    while index < VOUCHER_HEADER_SCAN_ROWS:
+        try:
+            row = next(rows_iter)
+        except StopIteration:
+            break
+        buffered.append(list(row))
+        index += 1
+    if not buffered:
+        raise ValueError("Excel 是空文件")
+
+    header_index, header, header_rows = _scan_header(buffered)
     mapping, unknown = map_columns(list(header))
     missing = [
         name
@@ -360,7 +457,11 @@ def _parse_rows(rows_iter, book_id: int, db: Session) -> dict:
     vouchers: list[dict] = []
     errors: list[dict] = []
     current: dict | None = None
-    line_no = 1
+    # **行号基准跟着表头走**（审查修复）：表头在第 1 行时初值是 1，
+    # 循环里先加 1 再处理，于是第一个数据行是「第 2 行」—— 与 Excel
+    # 里的真实行号一致。表头不在第 1 行时（上面扫描出来的 ``header_index``），
+    # 初值同步平移，报错里说的「第 N 行」才是用户在 Excel 里看到的那一行。
+    line_no = header_index + header_rows
     rows_budget = RowBudget(
         settings.import_max_rows,
         hint="请按期间或按凭证类别拆成多份分别导入")
@@ -402,7 +503,11 @@ def _parse_rows(rows_iter, book_id: int, db: Session) -> dict:
                 f"这份表解析出超过 {settings.import_max_vouchers} 张凭证，超过单次导入上限。"
                 "请拆成多份分别导入")
 
-    for row in rows_iter:
+    # 表头前面那几行（标题、制表日期）**不是数据**，直接丢掉；
+    # 表头占的那几行也丢掉。剩下的行先从缓冲区里取，再接上文件剩下的部分。
+    data_start = header_index + header_rows
+    pending_rows = iter(buffered[data_start:])
+    for row in itertools.chain(pending_rows, rows_iter):
         line_no += 1
         # 行数与凭证数的上限在**遍历过程中**判，而不是先 count 一遍：
         # 先 count 照样会把整个工作表读进内存，那正是要防的事。

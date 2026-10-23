@@ -34,11 +34,15 @@ REPEATABLE READ（见 :func:`export_scope`）。
 from __future__ import annotations
 
 import base64
+import binascii
+import contextlib
+import os
 import re
 import gzip
 import hashlib
 import json
 import logging
+import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -48,6 +52,7 @@ from typing import Any, Iterator, Optional
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.schema_version import BACKEND_ROOT
 from app.models import SCOPE_BOOK, SCOPE_SYSTEM
 from app.models.base import Base
@@ -276,6 +281,163 @@ class ExportStats:
 
 class ExportRefused(Exception):
     """拒绝产出这份备份。消息必须说清「为什么不备份」与「下一步」。"""
+
+
+# --------------------------------------------------------------------- 制品加密
+#
+#: 加密制品的魔数。恢复时靠它认出「这是密文」，而不是把密文当 gzip 去解。
+ENCRYPTED_MAGIC = b"CWQENC01\n"
+
+#: GCM 的 nonce 长度与 tag 长度（字节）。
+_NONCE_BYTES = 12
+_TAG_BYTES = 16
+
+#: 流式读写块大小。加密与解密都按块走，**内存与制品大小无关**。
+_CHUNK = 1024 * 1024
+
+
+def encryption_key() -> Optional[bytes]:
+    """客户端加密密钥（32 字节），**没配就返回 None**。
+
+    **None 的含义是「这一份备份不加密」**，调用方必须**明确记一条告警** ——
+    默默当成加密了才是真正危险的形态。
+
+    **密钥必须与 OSS AccessKey 分开存放。** 两者放在同一个地方，等于「拿到
+    备份系统的人同时拿到了解密钥匙」：AccessKey 只该给上传权限，密钥该给
+    （能拿到备份的人）解密权限。两者的爆炸半径不一样，就不该放在同一处。
+    """
+    raw = (settings.backup_encryption_key or "").strip()
+    if not raw:
+        return None
+    try:
+        key = base64.b64decode(raw, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ExportRefused(
+            "备份加密密钥（BACKUP_ENCRYPTION_KEY）不是合法的 base64；"
+            "请用 `python -c \"import base64,os;print(base64.b64encode(os.urandom(32)).decode())\"` 生成") from exc
+    if len(key) != 32:
+        raise ExportRefused(
+            f"备份加密密钥必须是 32 字节（当前 {len(key)} 字节）；"
+            "请用 `python -c \"import base64,os;print(base64.b64encode(os.urandom(32)).decode())\"` 生成")
+    return key
+
+
+def encrypt_file(src: Path, dst: Path) -> int:
+    """把 gzip 制品加密成另一个文件（AES-256-GCM，**流式**），返回密文字节数。
+
+    **格式**：``magic | nonce(12) | 密文 | tag(16)``。
+
+    * 魔数让恢复侧能认出这是密文；
+    * nonce 每次随机（GCM 下 nonce 重用是灾难性的，所以绝不重复）；
+    * tag 在**末尾** —— 这是流式 GCM 的形状：认证标签只有整段消息结束时才算得出来。
+
+    **为什么用流式 GCM 而不是 ``AESGCM.encrypt``。** 高层 API 一次吃整段消息，
+    几百 MB 的备份就得整段进内存 —— 而备份任务就跑在 API 进程里，与在线请求
+    共享内存。低层 ``Cipher(..., modes.GCM(...))`` 的 ``update()/finalize()``
+    同样提供 AES-GCM 的**认证加密**，但内存是常数级。
+
+    **SHA256 的顺序**：校验和必须算在**密文**上（记进 ``sys_backup_run.checksum``），
+    因为那才是 OSS 上真正存着的字节；算在明文上的话，恢复时拿远端对象比对会
+    必然对不上。明文 gzip 自己的校验和仍有价值（它证明导出本身没坏），但它
+    不是 OSS 上那个对象的校验和。
+    """
+    key = encryption_key()
+    if key is None:
+        raise ExportRefused("没有配置备份加密密钥，无法加密制品")
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    nonce = os.urandom(_NONCE_BYTES)
+    encryptor = Cipher(algorithms.AES(key), modes.GCM(nonce)).encryptor()
+    written = 0
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        fout.write(ENCRYPTED_MAGIC)
+        fout.write(nonce)
+        written += len(ENCRYPTED_MAGIC) + len(nonce)
+        while True:
+            chunk = fin.read(_CHUNK)
+            if not chunk:
+                break
+            data = encryptor.update(chunk)
+            if data:
+                fout.write(data)
+                written += len(data)
+        tail = encryptor.finalize()
+        if tail:
+            fout.write(tail)
+            written += len(tail)
+        fout.write(encryptor.tag)
+        written += len(encryptor.tag)
+    return written
+
+
+def decrypt_file(src: Path, dst: Path) -> None:
+    """把加密制品解开成明文文件。**验不过就拒绝，不给「尽力而为」留路。**
+
+    认证标签对不上时，GCM 的 ``finalize()`` 抛 ``InvalidTag`` —— 那意味着
+    这份文件被改过或被截断了，**绝不能**把解出来的东西灌进库里。
+    """
+    key = encryption_key()
+    if key is None:
+        raise ExportRefused(
+            "这份备份是加密的，但服务端没有配置备份加密密钥（BACKUP_ENCRYPTION_KEY）；"
+            "请先配置同一把密钥再恢复")
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    size = src.stat().st_size
+    header = len(ENCRYPTED_MAGIC) + _NONCE_BYTES
+    if size < header + _TAG_BYTES:
+        raise ExportRefused(f"{src.name} 太短，不是一份完整的加密备份")
+    with open(src, "rb") as fin:
+        if fin.read(len(ENCRYPTED_MAGIC)) != ENCRYPTED_MAGIC:
+            raise ExportRefused(f"{src.name} 不是加密备份（魔数不对）")
+        nonce = fin.read(_NONCE_BYTES)
+        fin.seek(size - _TAG_BYTES)
+        tag = fin.read(_TAG_BYTES)
+        fin.seek(header)
+        decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+        remaining = size - _TAG_BYTES - header
+        try:
+            with open(dst, "wb") as fout:
+                while remaining > 0:
+                    chunk = fin.read(min(_CHUNK, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    data = decryptor.update(chunk)
+                    if data:
+                        fout.write(data)
+                tail = decryptor.finalize()
+                if tail:
+                    fout.write(tail)
+        except InvalidTag as exc:
+            try:
+                dst.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise ExportRefused(
+                f"{src.name} 的认证标签对不上：文件被改过、被截断，或用的不是同一把密钥；已拒绝恢复") from exc
+
+
+def is_encrypted(path: Path) -> bool:
+    """这份制品是不是加密的（看魔数，不看别的）。"""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(len(ENCRYPTED_MAGIC)) == ENCRYPTED_MAGIC
+    except OSError:
+        return False
+
+
+def file_sha256(path: Path) -> str:
+    """文件（流式）的 SHA256。**对 OSS 上真正存着的那份字节算。**"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 # ------------------------------------------------------------ 哪些表进哪份备份
@@ -681,18 +843,47 @@ def _ordered_rows(table, rows: list[dict]) -> list[dict]:
     return [rows[i] for i in order]
 
 
+@contextlib.contextmanager
+def _open_snapshot(path: Path):
+    """打开一份快照的**明文**字节流。
+
+    加密制品先解到临时文件（解密是流式的，内存与制品大小无关），明文制品
+    直接开 gzip。两条路都只交给上层一个普通二进制流，上层不需要知道它是不是
+    加密的。
+    """
+    if not is_encrypted(path):
+        with gzip.open(path, "rb") as fh:
+            yield fh
+        return
+    fd, temp_name = tempfile.mkstemp(prefix="cwq-restore-", suffix=".gz")
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        decrypt_file(path, temp_path)
+        with gzip.open(temp_path, "rb") as fh:
+            yield fh
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def read_snapshot(path: Path) -> dict:
     """解开一份快照，先验后跑。
 
     和 ``db_backup.py::assert_restorable`` 同一个立场：恢复要执行的是归档里的
     内容，最坏的情况不是恢复失败，而是**恢复「成功」了**。所以解不开、版本不认识、
     根本不是这个格式的，一律拒绝，不给「尽力而为」留路。
+
+    **加密制品先解密。** 魔数认得出密文；解密失败（密钥不对、文件被改过）
+    一律拒绝 —— 与「先验后跑」同一个立场。
     """
-    try:
-        with gzip.open(path, "rb") as fh:
+    with _open_snapshot(path) as fh:
+        try:
             data = json.load(fh)
-    except (OSError, EOFError, gzip.BadGzipFile, json.JSONDecodeError) as exc:
-        raise ExportRefused(f"归档解不开（{path.name}）：{exc}。它可能没传完，或已被截断。") from exc
+        except (OSError, EOFError, gzip.BadGzipFile, json.JSONDecodeError) as exc:
+            raise ExportRefused(f"归档解不开（{path.name}）：{exc}。它可能没传完，或已被截断。") from exc
     # 格式与版本都在 **header** 里（导出时是这么写的：{"header":{...},"tables":{...}}）。
     # 写成去顶层找就是「导出成功、恢复永远拒绝」—— 而且每一侧单看都成立，
     # 只有真跑一次往返才会暴露。

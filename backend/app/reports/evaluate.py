@@ -126,6 +126,10 @@ class ReportContext:
         self.formulas: dict[tuple[int, int], str] = {}
         self._cells: dict[tuple[int, int], Decimal] = {}
         self._visiting: set[tuple[int, int]] = set()
+        # 模板的**行号集合与列号集合**（网格 = 行 × 列）。用来判「这一格
+        # 在模板里存不存在」—— 见 ``_cell_exists``。
+        self._template_rows: Optional[set[int]] = None
+        self._template_cols: Optional[set[int]] = None
         # 账套里真实存在的会计期间：(年, 月) -> Period。期间字面量必须指向
         # 其中一个（见 resolve_period）。
         self._known_periods_cache: Optional[dict[tuple[int, int], Period]] = None
@@ -393,6 +397,24 @@ class ReportContext:
             return self._cells[key]
         if key in self._visiting:
             raise FormulaError(f"公式循环引用: 第{row}行 第{col}列")
+        # ---- 越界引用要报错，不能静默取 0（审查修复）------------------
+        #
+        # 以前 ``self.formulas.get(key, "")`` 拿不到就是空串 → 求值成 0：
+        # 公式里写 ``=B99``（模板里根本没有这一格），那一格就**安静地
+        # 变成 0**，整张表看起来正常得很 —— 而那个 0 是「引用错了」，
+        # 不是「这一格确实是 0」。金额是 0 还是「压根没这一格」，
+        # 财务分得清，程序分不清就该说清楚。
+        #
+        # 与「期间字面量越界」同一个口径（见 ``_period_literal``）：
+        # 宁可这一格报一行红字，也不要整张表印着一个看着没问题的错数。
+        #
+        # 两种「空」要分清：
+        #   · **模板里有这一格、只是公式为空** → 合法，取 0（这一格就是空的）。
+        #   · **模板里根本没有这一格**（行或列不存在）→ 越界，报错。
+        if not self._cell_exists(row, col):
+            raise FormulaError(
+                f"公式引用了不存在的单元格：第{row}行 第{col}列"
+                f"（模板里没有这一格）")
         self._visiting.add(key)
         try:
             src = self.formulas.get(key, "")
@@ -405,6 +427,24 @@ class ReportContext:
             self._visiting.discard(key)
         self._cells[key] = value
         return value
+
+    def _cell_exists(self, row: int, col: int) -> bool:
+        """模板里到底有没有这一格。
+
+        模板的网格 = **行 × 列**（``ReportRow`` × ``ReportCol``），
+        单元格（``ReportCell``）只是网格上写了公式的那些格。所以判据是
+        「这一行在不在、这一列在不在」，而不是「有没有公式」——
+        有这一格但公式为空是合法的（取 0）。
+
+        **拿不到模板的行/列集合时一律当作「有」**：那是直接构造
+        ``EvalContext`` 的老调用方（测试与脚本），它们没有模板可依，
+        无从判断某一格是不是越界 —— 那时保持老口径（取 0），
+        而不是凭「公式字典里没有」就报错。真正的求值入口
+        （``evaluate``）**一定**会把网格传进来，所以生产路径上是严的。
+        """
+        if self._template_rows is None or self._template_cols is None:
+            return True
+        return row in self._template_rows and col in self._template_cols
 
     def memoized_cell(self, row: int, col: int) -> Optional[Decimal]:
         """本轮求值里**已经算过**的这一格；没算过返回 ``None``。
@@ -425,9 +465,15 @@ class ReportContext:
 
 
 class EvalContext(ReportContext):
-    def __init__(self, db, book, period, formulas: dict[tuple[int, int], str], include_unposted=False):
+    def __init__(self, db, book, period, formulas: dict[tuple[int, int], str],
+                 include_unposted=False, *, template_rows: Optional[set[int]] = None,
+                 template_cols: Optional[set[int]] = None):
         self._formulas = formulas
         super().__init__(db, book, period, include_unposted)
+        # **必须在 super().__init__ 之后**：父类构造里会把这两个字段初始化成
+        # None（那是「不知道模板长什么样」的默认值），这里再填上真值。
+        self._template_rows = template_rows
+        self._template_cols = template_cols
 
     def _load_formulas(self) -> None:
         self.formulas = self._formulas
@@ -458,7 +504,9 @@ def evaluate(
     )
     formulas = {(c.row_no, c.col_no): c.formula for c in cells}
 
-    ctx = EvalContext(db, book, period, formulas, include_unposted)
+    ctx = EvalContext(db, book, period, formulas, include_unposted,
+                      template_rows={r.row_no for r in rows},
+                      template_cols={c.col_no for c in cols})
     evaluator = Evaluator(ctx)
 
     grid, errors = [], []

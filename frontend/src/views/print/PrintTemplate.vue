@@ -243,7 +243,7 @@ import * as printApi from '@/api/print'
 import * as reportApi from '@/api/report'
 import * as subjectApi from '@/api/subject'
 import { useSessionStore } from '@/stores/session'
-import { pickPapers, slotsPerPage } from '@/utils/paper'
+import { minFontSize as minFontSizeOf, pickPapers, slotsPerPage } from '@/utils/paper'
 import {
   effectiveDefaultId as sharedEffectiveDefault, showBuiltinTemplate,
   templateTags, canEditTemplate, canDeleteTemplate, canCreateTemplate,
@@ -386,9 +386,12 @@ const isVoucher = computed(() => scope.value === 'VOUCHER')
  * 又被抬成 12pt，用户只会以为界面在骗人。**两边必须一样。**
  *
  * 别的范围（凭证 / 余额表 / 报表）仍是 6pt —— 各自的版式另有约定。
+ *
+ * **规则本身住在 utils/paper.js 的 minFontSize()** —— 那是「打印的口径」
+ * 该待的地方，也让它**能被直接测**：以前这行只是页面里的三元表达式，
+ * 测试只能对着源码断言字面量 `? 12 : 6` 在不在（守不住「12 是不是下限」）。
  */
-const minFontSize = computed(() =>
-  (scope.value === 'LEDGER' || scope.value === 'DETAIL_LEDGER') ? 12 : 6)
+const minFontSize = computed(() => minFontSizeOf(scope.value))
 // 一页几张凭证读模板自己的 slots_per_page（缺省 2，与后端一致）。
 // 画布按它切槽位、检查器按它算毫米 —— 两边必须读同一个字段，否则用户会看到
 // 「检查器说一页一张、画布上却并排放两张」。

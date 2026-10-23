@@ -1,6 +1,6 @@
 /**
- * 总账 / 明细账的字号下限 12pt（src/views/print/PrintTemplate.vue +
- * src/components/print/TemplateInspector.vue，**线上那份源码**）。
+ * 总账 / 明细账的字号下限 12pt（src/utils/paper.js 的 minFontSize() +
+ * src/views/print/PrintTemplate.vue + src/components/print/TemplateInspector.vue）。
  *
  *  10pt 的正文在 A4 上看不清，而总账与明细账是要拿给外部看的正式账簿
  *  （用户 2026-10-23）。后端已经把这条线钉死了（app.printing.template
@@ -12,9 +12,23 @@
  *
  *  **两边必须一样**：前端的下限与后端的下限是同一条线，各写各的
  *  就会有一处漏 —— 漏在前端是能填小值，漏在后端是印出小字。
+ *
+ *  「总账 / 明细账的下限是 12」这条规则**住在 utils/paper.js 里**，
+ *  这里**直接调用它**来断言（线上那份源码，vite 的 ssrLoadModule 加载）。
+ * 以前这条测试断言的是「源码里存在字面量 `? 12 : 6`」——
+ * 那种断言守不住「12 是不是真的是下限」，只守得住「那行字面量还在不在」；
+ * 规则挪个地方写（比如换成 `Math.max(6, 12)`），测试照样绿。
  */
+import { createServer } from 'vite'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import { fileURLToPath } from 'node:url'
+
+const ROOT = fileURLToPath(new URL('../', import.meta.url))
+const server = await createServer({
+  root: ROOT, logLevel: 'error', server: { middlewareMode: true }
+})
+const U = await server.ssrLoadModule('/src/utils/paper.js')
 
 const PAGE = fs.readFileSync(
   new URL('../src/views/print/PrintTemplate.vue', import.meta.url), 'utf8')
@@ -29,14 +43,31 @@ const t = (name, fn) => {
 
 console.log('== 总账 / 明细账的下限是 12pt ==')
 
-t('范围是这两个：总账与明细账', () => {
-  assert.match(PAGE, /scope\.value === 'LEDGER' \|\| scope\.value === 'DETAIL_LEDGER'/,
-    '设计器没有把总账 / 明细账认出来')
+t('**行为**：账簿类页面的字号下限是 12（直接调用线上那份规则）', () => {
+  // 总账
+  assert.equal(U.minFontSize('LEDGER'), 12, '总账的正文字号下限不是 12')
+  // 明细账
+  assert.equal(U.minFontSize('DETAIL_LEDGER'), 12, '明细账的正文字号下限不是 12')
 })
 
-t('这两个范围给 12，别的一律 6', () => {
-  // 一行里同时写着这两个数：抬到 12 的条件与抬不动的范围
-  assert.match(PAGE, /\? 12 : 6/, '设计器的字号下限不是「账簿 12、其余 6」')
+t('别的范围仍是 6（各自的版式另有约定）', () => {
+  for (const scope of ['VOUCHER', 'BALANCE', 'REPORT', '', undefined, null, 'OTHER']) {
+    assert.equal(U.minFontSize(scope), 6, `${scope} 的下限不该被抬到 12`)
+  }
+})
+
+t('设计器把当前范围交给那份规则（范围判断住在规则里，不在页面里）', () => {
+  // 规则搬到 utils/paper.js 之后，页面这一侧只负责「把当前 scope 递过去」——
+  // 范围认错了还是认对了，全由那一份说了算（两边不再各认一遍）。
+  assert.match(PAGE, /minFontSizeOf\(scope\.value\)/,
+    '设计器没有把当前范围交给 utils/paper.js 的 minFontSize')
+  assert.match(PAGE, /const scope = /, '设计器没有当前范围可用')
+})
+
+t('设计器用的是那份规则，不是自己又写了一遍', () => {
+  assert.match(PAGE, /minFontSizeOf\(scope\.value\)/,
+    '设计器没有调用 utils/paper.js 的 minFontSize —— 规则又分家了')
+  assert.match(PAGE, /from '@\/utils\/paper'/, '设计器没有引入 utils/paper')
 })
 
 t('检查器用父组件给的下限，不用写死的 6', () => {
@@ -60,4 +91,6 @@ t('下限是父组件传进来的，不是组件自己定的', () => {
 
 console.log('')
 console.log('通过 ' + pass + ' / 失败 ' + fail)
-if (fail) process.exit(1)
+// vite 的 dev server 攥着端口与文件监听，不关掉的话进程永远退不出去
+await server.close()
+process.exit(fail ? 1 : 0)

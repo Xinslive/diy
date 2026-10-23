@@ -156,7 +156,10 @@ def _carry_entry_directions(db, book, subjects):
 
     v = db.scalars(select(Voucher).where(
         Voucher.book_id == book.id,
-        Voucher.remark == "2026年 结转本年利润").order_by(Voucher.id.desc())).first()
+        # remark 末尾带一段签名尾巴（见 periods._carry_forward_token），
+        # 所以这里按前缀找，不能按全等找。
+        Voucher.remark.startswith("2026年 结转本年利润")
+    ).order_by(Voucher.id.desc())).first()
     assert v is not None, "没找到年度结转凭证"
     # 留存那条要取 310415 未分配利润（末级，记账接口只认末级），
     # 不是它的上级 3104 —— 分录挂不到非末级上。

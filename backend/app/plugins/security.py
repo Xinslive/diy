@@ -33,6 +33,7 @@ from app.core.uploads import RowBudget, UploadTooLarge, check_archive_size
 from app.plugins.errors import PluginError
 from app.plugins.manifest import canonical_payload, parse_manifest, plugin_digest, safe_path
 from app.plugins.scan_policy import (
+    ALLOWED_DUNDER_NAMES,
     BACKEND_MODULES,
     DENIED_ATTRIBUTES,
     DENIED_NAMES_ON_CALL,
@@ -218,6 +219,16 @@ def _scan_python(path: str, tree: ast.AST, permissions) -> list[dict]:
                 if name == "*" or name in rule.denied:
                     finding("PY_IMPORT", node.lineno)
                     continue
+                # **别名的原名仍然是原名**（审查 S-01）。
+                # ``from io import open as fh`` 之后，代码里再也不会出现
+                # ``open`` 这个名字 —— 于是「读取即拒绝」那档看不见它，
+                # 而属性规则只认 ``io.open(...)`` 这种属性形态，也看不见它。
+                # 扫描结果是 CLEAN，运行时却拿到了宿主文件系统。
+                # 所以：**内建能力名与双下划线名，一律在 import 这一步就拒**，
+                # 无论被换成什么别名、无论从哪个模块来。
+                if name in DENIED_NAMES_ON_LOAD or name.startswith("__"):
+                    finding("PY_IMPORT", node.lineno)
+                    continue
                 if rule.symbols is not None and name not in rule.symbols:
                     finding("PY_IMPORT", node.lineno)
                     continue
@@ -241,6 +252,16 @@ def _scan_python(path: str, tree: ast.AST, permissions) -> list[dict]:
             if isinstance(node.ctx, ast.Load) and node.id in DENIED_NAMES_ON_LOAD:
                 # 「取名后调用」的第一环：imp = __import__ / e = eval / f = open。
                 finding("PY_CALL", node.lineno)
+            elif (isinstance(node.ctx, ast.Load) and node.id.startswith("__")
+                  and node.id not in ALLOWED_DUNDER_NAMES):
+                # **双下划线名字按形态一律拒**（审查 S-01）。
+                # 属性形态（``x.__class__``）上面那条规则已经拦了；这里补的是
+                # **裸 Name** 形态 —— ``__builtins__`` / ``__loader__`` /
+                # ``__spec__`` / ``__dict__`` 都是这一类，属性规则看不见它们，
+                # 而它们每一个都能把内建能力重新拿回来。
+                # 白名单只有 ``__name__`` / ``__file__`` / ``__doc__`` /
+                # ``__package__`` 四个只读元信息。
+                finding("PY_REFLECTION", node.lineno)
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Subscript):
                 # func["eval"](...)：下标取函数一律拒绝。
@@ -377,6 +398,23 @@ def verify_directory(directory: Path, expected_digest: str, *, keys=None) -> Ver
         if len(content) != item["size"] or hashlib.sha256(content).hexdigest() != item["sha256"]:
             raise PluginError("FILE_DIGEST_MISMATCH", "插件目录文件被修改")
         files[item["path"]] = content
+    # **加载期也重跑一次静态扫描**（审查 L-28）。
+    #
+    # 之前的现状：安装期扫过、加载期不扫。单看当下这不是漏洞 ——
+    # 文件内容被 manifest 里的 sha256 钉死，manifest 本身被签名覆盖，
+    # 所以「装时干净、载时脏」在没有签名密钥的前提下不可达。
+    #
+    # 但它是**纵深深度**上的缺口：扫描规则是**会变**的。哪天有人放宽了
+    # 某条规则（或加进一条新的能力），已经装在磁盘上的旧包**不会被重扫** ——
+    # 于是"当前规则认为危险"的代码仍然能加载并执行。
+    #
+    # 重扫的成本是一次 AST 遍历（插件文件本来就要读一遍算 sha256），
+    # 换来的是"规则一变，存量插件立刻按新规则复检"。
+    permissions = manifest.get("permissions")
+    findings = [finding for path, content in files.items()
+                for finding in scan_file(path, content, permissions=permissions)]
+    if findings:
+        raise PluginError("STATIC_SCAN_REJECTED", "插件包含不允许的代码或资源", findings=findings)
     return VerifiedPackage(manifest, expected_digest, files)
 
 

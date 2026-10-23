@@ -312,3 +312,81 @@ def test_科目列表的本年发生额按账套的会计年度判定(client, au
     assert node is not None, "科目树里没有 1001"
     assert node["has_current_year_activity"] is True, (
         "2025 年的发生额没被算成「本年发生额」—— 判据用的是服务器日历年")
+
+
+# ---------------------------------------------------------------------------
+# 金额在 JSON 上的表示（审查 M-18 / D-14）
+#
+# **两个接口的线上表示是不一样的，这本身不是 bug，但它是"没写下来"的。**
+#
+#   /vouchers  的分录金额 → **十进制文本**（"1234.50"）
+#   /ledger/*  的余额与发生额 → **JSON number**（1234.5）
+#
+# 原因：分录金额要回到前端参与**整数分**运算（判平、合计、补差），
+# 文本是最不容易被 JSON 解析悄悄改掉的形式；账簿侧的数是**已经算完的聚合值**，
+# 前端只做展示。
+#
+# **真正要守的是下面那条不变量：两个接口对同一笔钱给出的数必须一致。**
+# 表示可以统一（那是后面的事），但**不一致就是 bug** —— 凭证页写着 1234.50、
+# 账簿页写着 1234.49，那是要出事的。
+#
+# 精度边界（要有数）：两位小数在 2^53 分以内是 float 精确的，
+# 2^53 ≈ 9.007e13 分 ≈ 9.007e11 元 —— 现实账套远够不到。
+# 但"够不到"不等于"对"：契约得写下来，测试得盯住一致性。
+# ---------------------------------------------------------------------------
+
+
+def test_凭证接口与账簿接口对同一笔金额给出同一个数(client, auth, db, book, admin_user, make_voucher):
+    """凭证页看到的金额与账簿页看到的金额必须**逐分相等**（审查 M-18）。"""
+    from decimal import Decimal
+
+    amount = Decimal("1234.50")
+    # ``make_voucher`` **本身就是**那个小工厂（夹具返回的是
+    # ``build_voucher_factory(...)`` 的产物），所以直接调用即可 ——
+    # 不要再传一遍 ``(db, book, admin_user)``，那三个会被当成
+    # ``_make`` 的 (d, dr, cr) 三个位置参数。
+    voucher = make_voucher(
+        "2026-01-15",
+        dr=[("1002", amount, "银行存款")],
+        cr=[("3001", amount, "实收资本")],
+        posted=True)
+    db.commit()
+
+    # —— 凭证接口：分录金额是十进制文本 ——
+    r = client.get(f"/api/books/{book.id}/vouchers/{voucher.id}", headers=auth)
+    assert r.status_code == 200, r.text
+    entry = next(e for e in r.json()["entries"] if e["direction"] == "DEBIT")
+    assert entry["amount"] == "1234.50", f"凭证接口的金额表示变了：{entry['amount']!r}"
+
+    # —— 账簿接口：同一笔的期末余额 ——
+    periods = client.get(f"/api/books/{book.id}/periods", headers=auth).json()
+    pid = periods[0]["id"]
+    r = client.get(f"/api/books/{book.id}/ledger/balance",
+                   headers=auth, params={"period_id": pid})
+    assert r.status_code == 200, r.text
+    rows = r.json()["rows"]
+    row = next(x for x in rows if x.get("code") == "1002")
+    closing = row["closing"]
+
+    # 账簿侧是 number、凭证侧是文本 —— 换成同一个数再比。
+    # **用 Decimal 比而不是 float 比**：float 比的是"两个近似值相等"，
+    # 那正是这条用例要防的东西本身。
+    assert Decimal(str(closing)) == amount, (
+        f"账簿的期末余额 {closing!r} 与凭证的分录金额 {amount} 对不上 —— "
+        "两个接口对同一笔钱给出了不同的数。")
+
+
+def test_两个接口的金额表示已被文档化(client, auth, db, book, subjects, make_voucher):
+    """ARCHITECTURE 的「金额序列化口径」表必须写明 JSON API 这一行（审查 D-14）。
+
+    之前那张表只列了「前端整数分 / Excel 导出 Decimal / 审计快照十进制文本」，
+    **唯独没有 JSON API** —— 于是"账簿是 float、凭证是文本"这件事既没有
+    理由也没有约束，下一个人改哪一边都不会有人拦。
+    """
+    from pathlib import Path
+
+    doc = Path(__file__).resolve().parents[2] / "ARCHITECTURE.md"
+    text = doc.read_text(encoding="utf-8")
+    assert "JSON API" in text, (
+        "ARCHITECTURE 的金额序列化口径表里没有 JSON API 这一行 —— "
+        "账簿接口用 number、凭证接口用文本这件事必须写下来并有约束。")

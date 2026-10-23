@@ -51,7 +51,12 @@ _EXEMPT_EXACT = {
     "/api/books/order",
 }
 _EXEMPT_PREFIXES = ("/api/auth/", "/api/system/")
-_REPORTS_PREFIX = "/api/reports/"   # 报表走 reports._can_write，另有用例
+_REPORTS_PREFIX = "/api/reports/"
+# 报表写接口走的是**另一道更严的门**：``reports._require_template_write``
+# 要求「显式给出 book_id」且「该账套角色是 OWNER」，比 require_book_write
+# （OWNER + ACCOUNTANT）更严。所以它整段豁免出上面那张矩阵 ——
+# 但**豁免的是"写权限"，不是"门禁本身"**，见下面那条静态断言。
+_REPORTS_GATES = frozenset({"_require_template_write", "_require_owned_template"})
 
 
 def _all_routes() -> list[APIRoute]:
@@ -110,6 +115,72 @@ def test_每个账套写接口都挂了写依赖():
             missing.append(f"{sorted(set(r.methods))[0]:6} {path}")
     assert not missing, (
         "这些写接口没挂 require_book_write，VIEWER 能直接调用：\n" + "\n".join(missing))
+
+
+def _gate_calls(route) -> set:
+    """这条路由的**函数体里**调用了哪些宿主函数名。
+
+    用 AST 而不是正则：正则会把注释里的名字也算进去，而注释里提到一个
+    门禁函数名再正常不过 —— 那不是"这个路由有门禁"的证据。
+
+    读不出来（源码不可得 / 语法异常）时返回空集，于是那条断言会红 ——
+    **宁可误红，也不要静默放过**。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    try:
+        source = textwrap.dedent(inspect.getsource(route.endpoint))
+    except (OSError, TypeError):
+        return set()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    called: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                called.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                called.add(func.attr)
+    return called
+
+
+def test_报表写接口都过了它自己那道门():
+    """报表写接口必须调用 ``_require_template_write`` / ``_require_owned_template``
+    或挂 ``require_book_write``（审查报告 §6 的结构性缺口）。
+
+    **为什么这条要单独写。** 报表那一整段前缀被豁免出上面那张矩阵，
+    理由是"报表走自己那道门"。但那条理由**没有任何测试在守**：
+    15 个报表写路由里只有 3 个在动态矩阵的用例列表里（persist / cells /
+    templates），其余 11 个（fork / import / copy / rows 增改删 / cols 增改删）
+    **既不在静态矩阵里，也没有行为用例**。
+
+    于是"给 reports.py 新增一个写路由、忘了调门禁"这件事**没有任何测试会红** ——
+    这正是 ``core/deps.py:194-201`` 记录的那次历史漏挂（close_period /
+    unclose_period / year_end / set_openings 曾只挂 get_my_book）的同一种形态，
+    只是换了个文件。
+
+    这条断言守的是「别忘了加」，与上面那条守同一个性质。
+    """
+    missing = []
+    for r in _all_routes():
+        if not (set(r.methods or ()) & {"POST", "PUT", "PATCH", "DELETE"}):
+            continue
+        if not r.path.startswith(_REPORTS_PREFIX):
+            continue
+        if require_book_write in _dep_calls(r):
+            continue
+        if _gate_calls(r) & _REPORTS_GATES:
+            continue
+        missing.append(f"{sorted(set(r.methods))[0]:6} {r.path}")
+    assert not missing, (
+        "这些报表写接口没调用 _require_template_write / _require_owned_template，"
+        "也没挂 require_book_write —— 任何登录用户都能改报表口径：\n"
+        + "\n".join(missing))
 
 
 def _make_voucher_as(client, headers) -> tuple[int, int]:

@@ -15,6 +15,7 @@ import { createServer } from 'vite'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { moneyText as moneyTextOf } from '../src/utils/format.js'
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url))
 const { amountToNumber, sanitizeAmount, moneyCents, absMoneyText } = await createServer({
@@ -113,11 +114,14 @@ const BLOCK = amountBlock()
 /**
  * 用真实的金额实现搭一套页面状态。
  * amounts / sides 就是页面里那两个 reactive 对象（读回路径写进去的那两个）。
+ *
+ * moneyTextOf 是 utils/format.js 的那份统一格式规则（整数分 → 文本）：
+ * 页面里的 moneyText 现在只是它的委托，所以这里要把那一份注入进来。
  */
 function pageState(amounts, sides) {
-  const factory = new Function('amounts', 'sides', 'moneyCents', 'absMoneyText', `${BLOCK}
+  const factory = new Function('amounts', 'sides', 'moneyCents', 'absMoneyText', 'moneyTextOf', `${BLOCK}
     return { centsOfRow, signedCents, signedText, totalsCents, moneyText }`)
-  return factory(amounts, sides, moneyCents, absMoneyText)
+  return factory(amounts, sides, moneyCents, absMoneyText, moneyTextOf)
 }
 
 t('load() 不用净化：读回来的数直接用后端给的字符串', () => {

@@ -15,7 +15,7 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { computed, reactive } from 'vue'
-import { fmt } from '../src/utils/format.js'
+import { moneyText } from '../src/utils/format.js'
 import { centsToText, moneyCents } from '../src/utils/amountGrid.js'
 
 const SRC = fs.readFileSync(
@@ -57,10 +57,10 @@ const BLOCK = amountBlock()
  */
 function state(entries) {
   const form = reactive({ entries: entries.map((e) => ({ subject_id: 1, summary: '', ...e })) })
-  const factory = new Function('computed', 'fmt', 'form', 'moneyCents', 'centsToText', `${BLOCK}
+  const factory = new Function('computed', 'moneyText', 'form', 'moneyCents', 'centsToText', `${BLOCK}
     return { form, totals, total, signedTotals, diffCents, balanced, diffTag, blank,
              centsOf, centsText, voucherTotals, voucherSignedTotals, autoBalanceNeed }`)
-  return factory(computed, fmt, form, moneyCents, centsToText)
+  return factory(computed, moneyText, form, moneyCents, centsToText)
 }
 
 /** 页脚那一行文案。照抄模板里的优先级：还没录 → 平 → 差额（VoucherEdit.vue:179-181）。 */

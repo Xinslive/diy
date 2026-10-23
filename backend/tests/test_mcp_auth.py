@@ -413,9 +413,13 @@ def test_单令牌每小时调用次数有上限(client, auth, admin_user, monke
     auth_mod.reset_rate_limits()
 
 
-def test_限流只影响超限的那个令牌(client, auth, admin_user, monkeypatch):
-    """限流按**令牌**计数，不是按用户 —— 否则一个忙令牌会连累同用户的
-    另一个 agent。"""
+def test_限流按用户计数_换一枚令牌不换桶(client, auth, admin_user, monkeypatch):
+    """限流按**用户**计数 —— 换一枚令牌**不换桶**（审查 L-26）。
+
+    以前键是 ``token_id``，于是「换一枚令牌」就换一个桶：令牌永不过期、
+    泄漏窗口无限，一个用户发 10 枚令牌就能拿到 10 倍配额，限流形同虚设。
+    键改成用户之后，**一个人一共只有一个桶**。
+    """
     from app.mcp import auth as auth_mod
 
     auth_mod.reset_rate_limits()
@@ -427,7 +431,8 @@ def test_限流只影响超限的那个令牌(client, auth, admin_user, monkeypa
     for _ in range(2):
         assert mcp_post(client, busy, "tools/list").status_code == 200
     assert mcp_post(client, busy, "tools/list").status_code == 429
-    assert mcp_post(client, other, "tools/list").status_code == 200
+    # 同一用户的另一枚令牌：**同一个桶**，也该被挡住。
+    assert mcp_post(client, other, "tools/list").status_code == 429
 
     auth_mod.reset_rate_limits()
 

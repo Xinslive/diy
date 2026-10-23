@@ -512,9 +512,17 @@ def test_新科目表缺编码且余额非零_拒绝导入并列出差异(
 
     # 一张**没有**那些编码的新表
     keep = [c for c in _subjects_of(db, book.id, 2027) if c not in busy][:2]
+    # 「类型」必须跟**编码首位**（大类码）对得上 —— 导入路径上有一道
+    # **独立于「类型」列**的校验（编码首位的大类码与类别必须一致，见
+    # ``accounting/subject_importer``）。类型与编码对不上时，那道闸会
+    # **先**挡下来（400），这条用例就测不到「搬不动就拒绝」那条路了。
+    def _type_of(code: str) -> str:
+        return {"1": "资产", "2": "负债", "3": "所有者权益",
+                "4": "成本", "5": "损益"}.get(code[0], "资产")
+
     chart = _chart_xlsx([
-        ("资产", 1, keep[0], "保留的科目", "借"),
-        ("负债", 1, keep[1], "保留的科目", "贷"),
+        (_type_of(keep[0]), 1, keep[0], "保留的科目", "借"),
+        (_type_of(keep[1]), 1, keep[1], "保留的科目", "贷"),
     ])
 
     r = _import_chart(client, auth, book.id, 2027, chart)

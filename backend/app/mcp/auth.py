@@ -77,7 +77,7 @@ def now_utc() -> datetime:
 
 # --------------------------------------------------------------------- 限流
 
-#: 单令牌每小时调用次数的计数状态。键是令牌 id，值是 ``(窗口起点, 次数)``。
+#: 每小时调用次数的计数状态。键是**用户 id**，值是 ``(窗口起点, 次数)``。
 #:
 #: **为什么用内存而不是数据库。**
 #: 令牌**永不过期** ⇒ 泄漏窗口是无限的。吊销是唯一的事后手段，而限流是
@@ -90,12 +90,41 @@ def now_utc() -> datetime:
 #: 代价更大；而限流本身是**兜底**，不是精确配额 —— 真要看「谁在用、查了
 #: 什么」，靠的是**读取审计**（``app/mcp/audit.py``），那是落库的、跨进程
 #: 完整的。
-_RATE_STATE: dict[int, tuple[datetime, int]] = {}
+#:
+#: **后续项（DB 版）**：把这个字典换成一张计数表（或 Redis），就能把
+#: 「× worker 数」这个放大系数去掉，也能让「换一枚令牌」不再换桶。
+#: 那是较大的改动（每次调用一次写放大），这里先做前一半。
+#:
+#: **为什么键是用户而不是令牌（审查 L-26）。** 以前键是 ``token_id``，
+#: 于是「换一枚令牌」就换一个桶：同一个用户发 10 枚令牌就能拿到 10 倍的
+#: 配额，而令牌**永不过期**、泄漏窗口无限 —— 那等于限流形同虚设。键改成
+#: 用户之后，**换令牌不换桶**：一个人一共只能用一个桶。
+_RATE_STATE: dict[tuple[str, int], tuple[datetime, int]] = {}
 _RATE_LOCK = threading.Lock()
 
 
+def _token_owner_id(token_id: int) -> Optional[int]:
+    """令牌 → 所属用户。计数按用户走，所以这里要把令牌换成用户。
+
+    **一次主键查询**（限流本来就要每次调用前判一次，多这一次索引查找
+    不改变量级）。查不到时返回 None —— 调用方退回按令牌计数，不因为
+    「查不到归属」就放行。
+    """
+    from app.core.db import SessionLocal
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        with SessionLocal() as db:
+            return db.scalar(select(McpToken.user_id).where(McpToken.id == token_id))
+    except SQLAlchemyError:
+        return None
+
+
 def check_rate_limit(token_id: int, limit: Optional[int] = None) -> None:
-    """单令牌每小时调用次数上限。超了抛 ``McpRateLimited``。
+    """每小时调用次数上限。超了抛 ``McpRateLimited``。
+
+    **计数键是用户**（同一个用户的所有令牌共用一个桶），见 ``_RATE_STATE``
+    上面的说明。拿不到令牌的归属时退回按令牌计数（更保守，不会误杀）。
 
     窗口按**自然小时**对齐（``now`` 截断到整点）。固定窗口比滑动窗口便宜
     得多，而这里要的只是「一小时里别超过 N 次」这个量级的判断。
@@ -105,18 +134,20 @@ def check_rate_limit(token_id: int, limit: Optional[int] = None) -> None:
         return
     now = now_utc()
     window = now.replace(minute=0, second=0, microsecond=0)
+    owner = _token_owner_id(token_id)
+    key = ("user", owner) if owner is not None else ("token", token_id)
     with _RATE_LOCK:
-        start, count = _RATE_STATE.get(token_id, (window, 0))
+        start, count = _RATE_STATE.get(key, (window, 0))
         if start != window:
             start, count = window, 0
         count += 1
-        _RATE_STATE[token_id] = (window, count)
+        _RATE_STATE[key] = (window, count)
         # 顺手清掉上一小时及更早的条目 —— 不清的话，这个字典会随
         # 「签发过的令牌数」只增不减。
-        stale = [key for key, (started, _c) in _RATE_STATE.items()
+        stale = [k for k, (started, _c) in _RATE_STATE.items()
                  if started < window]
-        for key in stale:
-            _RATE_STATE.pop(key, None)
+        for stale_key in stale:
+            _RATE_STATE.pop(stale_key, None)
     if count > limit:
         raise McpRateLimited(
             f"该令牌本小时的调用次数已超过上限（{limit} 次），请稍后再试")

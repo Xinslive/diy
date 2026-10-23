@@ -52,10 +52,11 @@ def balance(book_id: int, period_id: Optional[int] = None,
         # 打印与导出等**所有**委托方，而以前只有这一个接口查过 ord。
         if from_period.ord > period.ord:
             raise HTTPException(400, "起始期间不能晚于结束期间")
-    # 科目表每个年度各有一份：跨年区间要取**区间涉及的所有年度**的并集，
-    # 只取止期那一张的话，区间发生额会少掉起始年那半截。
-    subjects = queries.subjects_for_periods(
-        db, book.id, [from_period, period] if from_period else [period])
+    # 科目表每个年度各有一份：跨年区间要取**区间涉及的所有年度**的并集。
+    # 只取首尾那两张的话，中间年度（2027）的科目表压根没进查询 ——
+    # 那年的分录挂在第三套科目行上，区间发生额会**整段消失且不报错**
+    # （审查修复）。``subjects_for_range`` 按区间取全。
+    subjects = queries.subjects_for_range(db, book.id, from_period, period)
     rows, check = queries.balance_sheet_of_accounts(
         db, book.id, subjects, period, include_unposted, from_period=from_period)
     is_range = from_period is not None and from_period.id != period.id

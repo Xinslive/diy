@@ -5,6 +5,41 @@ import { isCanceled } from '@/api/client'
 export const STALE = Symbol('stale-response')
 
 /**
+ * ┌────────────────────────────────────────────────────────────────────┐
+ * │  这份守卫**不是全站都有** —— 别以为接上了就到处都安全。          │
+ * └────────────────────────────────────────────────────────────────────┘
+ *
+ * **已接入的（页面自己调 run() + isStale()）**：
+ *   · views/ledger/GeneralLedger.vue   'ledger/general'
+ *   · views/ledger/DetailLedger.vue    'ledger/detail'
+ *   · views/ledger/BalanceSheet.vue    'ledger/balance'
+ *   · views/report/ReportView.vue      'report/render'
+ *   · views/voucher/VoucherList.vue    'voucher/list'
+ *   · views/system/AuditLog.vue        'system/audit'
+ *
+ * **依赖 MainLayout 的 viewKey 整页重挂兜底（没接这份守卫）**：
+ *   账套 / 期间一变，viewKey（`${route.name}-${store.bookId}-${scope}-${refreshKey}`）
+ *   就变，**整页重挂** —— 旧组件连同它的 watch 一起被停掉，
+ *   旧响应写进的是一个**已经销毁的实例**，用户看不见。
+ *   于是「切账套 / 切期间」这一类场景，多半**不需要**额外的守卫。
+ *   唯一例外是期初余额页（口径是**年度**，viewKey 用年度，见 MainLayout）。
+ *
+ * ⚠️ **边界：viewKey 重挂管不着「页内」的动作。**
+ *   翻页、改页大小、排序、页内筛选 —— 这些都发生在**同一个组件实例**里，
+ *   组件不会被重挂，于是：
+ *     · 旧响应**会**写进还活着的页面 → 页脚停在第 4 页、表格里是第 3 页；
+ *     · 这类路径**必须**自己接守卫（VoucherList 与 AuditLog 就是样板）。
+ *   换句话说：**凡是「不换账套、不换期间、只动页面上的条件」的加载点，
+ *   都要自己想清楚有没有守卫。**
+ *
+ * 另外三种「自己看住自己」的写法，别跟这一份混着记：
+ *   · VoucherEdit.vue 的 load() / loadSubjects() / loadBalances()：显式 Seq 守卫
+ *     （那三处的响应会写进**同一张表单**，错一次就是张冠李戴）；
+ *   · api/client.js 的 getLatest()：**掐掉**上一趟，省掉白跑的往返（另一半防线）；
+ *   · 什么守卫都没有的：见上面那份清单 —— 那些是「页内动作」或「一次性加载」。
+ */
+
+/**
  * 「切条件就重新查」的页面用的守卫：只认最新那一次。
  *
  * 要解决的是这个：在期间下拉上快速连点时，多个请求并发在途，后发先至会让

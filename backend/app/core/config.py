@@ -148,6 +148,13 @@ class Settings(BaseSettings):
 
     jwt_secret: str = DEFAULT_JWT_SECRET
     jwt_algorithm: str = "HS256"
+    # 签发方标识（审查 M-11）。
+    #
+    # **为什么要有它。** JWT 载荷里没有 ``iss`` 时，一份**为别的服务**签发的
+    # 令牌也能被本服务接受 —— 只要 ``sub`` 指向某个存在的用户。跨系统复用
+    # 同一个 ``JWT_SECRET`` 的场景（很常见：同一套密钥签多个服务）就会变成
+    # 一条越权路径。带上 ``iss`` 并在解码时校验，这条路径就断了。
+    jwt_issuer: str = "cwq-api"
     access_token_minutes: int = 720
     # 管理员令牌有效期上限（审计 P3-04 建议 3：令牌有效期按角色区分，管理员更短）。
     # 取「与 access_token_minutes 的较小者」而不是直接生效 ——
@@ -376,15 +383,33 @@ class Settings(BaseSettings):
 
     # 单次查询允许跨的月数上限。防的是 agent 一次把整本账拉走。
     # 取 60（5 年）：正常的「今年 vs 去年」对比跨 24 个月，宽裕。
+    #
+    # **口径（2026-10-23 整改时补写）**：本项**只约束跨期查询，不约束按年查询**。
+    # 按年查询的窗口本来就 ≤12 个月（一个年度），**比 60 个月更严**，
+    # 所以那条路径走不到这道闸、也不会被它误伤。
     mcp_max_range_months: int = 60
 
-    # 单令牌每小时调用次数上限。
-    #
+    # 单令牌每小时调用次数上限。    #
     # **为什么必须有它**：令牌永不过期 ⇒ 泄漏窗口是无限的。吊销是唯一
     # 的「事后」手段，而限流是唯一能压住「被拿去批量导出数据」这一形态的
     # **事前**手段。取 600（约每分钟 10 次）：远高于正常问答 agent 的节奏
     # （一次问答 1~3 次工具调用），又能挡住「循环拉全库」。
     mcp_max_calls_per_hour: int = 600
+
+    # 单次调用允许传入的**科目个数**上限（审查 H-03）。
+    #
+    # `search_vouchers` 的多科目路径是「按科目分别查、再合并到同一个字典」，
+    # 而 `subject_ids` 之前**没有任何长度闸** —— 于是调用方可以一次传
+    # 整个账套的科目（真实账套常有 100~500 个），每个科目各自取满
+    # `mcp_max_merge_vouchers` 张凭证，全部驻留内存。
+    # 取 60，与关键词路径的 `MAX_SUBJECTS` 同一个口径。
+    mcp_max_subjects: int = 60
+
+    # 多科目**合并集**的总张数上限（审查 H-03）。
+    #
+    # `mcp_max_merge_vouchers` 之前是**每个科目**各 2000 张，不是总量闸；
+    # 真正的总量闸在这里。
+    mcp_max_merge_vouchers: int = 2000
 
     # 允许的 Host 头（逗号分隔）。MCP 传输层自带 DNS 重绑定防护，
     # 默认只认 127.0.0.1 —— 生产在 nginx 后面，Host 是公网域名，
@@ -393,6 +418,19 @@ class Settings(BaseSettings):
     # 支持 ``example.com`` 与 ``example.com:*`` 两种写法（后者带端口）。
     # **留空 = 关闭 DNS 重绑定防护**，只适合本机直连的部署。
     mcp_allowed_hosts: str = ""
+
+    # 是否把「MCP 没配 Host 白名单」升级成**拒绝启动**（审查 L-03）。
+    #
+    # **默认 False，这是有意的。** 这一项如果默认 True，会让**照抄
+    # ``.env.example`` 的部署直接起不来** —— 那个文件里
+    # ``MCP_ALLOWED_HOSTS=`` 就是空的，而 ``MCP_ENABLED=true``。
+    # 拿可用性换一个已经有令牌兜着的风险（见 validate_production_settings
+    # 里那段说明），不划算。
+    #
+    # 所以这里的分工是：**默认只告警**（但告警级别提到 ERROR，并写进启动
+    # 校验的"已检查项"清单，让它在启动日志里显形）；**想要 fail-closed 的
+    # 部署自己打开这个开关**。
+    mcp_enforce_allowed_hosts: bool = False
 
     # 是否记录 MCP 读取审计。默认开。
     #
@@ -437,6 +475,24 @@ class Settings(BaseSettings):
     # 没有这个闸，单次请求能占住一个 worker 线程几十分钟。
     invoice_max_total_bytes: int = 20 * 1024 * 1024
     invoice_max_files: int = 60
+
+    # 单个 PDF 的**页数**上限（审查 M-09）。
+    #
+    # 字节闸挡不住"页数极多"的 PDF：一个 20MB 的文件可以塞进上万页，
+    # 而解析侧是把整本 PDF 的每一页文本一次性读进内存的（invoice/text_parser.py）。
+    # 字节在闸内、页数不在闸内 ⇒ 一个普通用户就能让解析阶段的 CPU/内存飙升。
+    invoice_max_pdf_pages: int = 200
+
+    # 一批发票解析出来的**总字符数**上限（审查 M-09）。
+    # 页数闸管住了"多少页"，这一条管住"每页多少字"—— 扫描件转出来的文本层
+    # 可以很短，但也可以是一页塞几十万字。
+    invoice_max_text_chars: int = 2_000_000
+
+    # OCR 服务返回体的**字节**上限（审查 M-09）。
+    #
+    # 之前是 `response.text` —— 整个响应体一次性读进内存。OCR 服务被诱导
+    # 返回超大 JSONL 时，worker 的内存就跟着走。
+    invoice_ocr_max_response_bytes: int = 20_000_000
     # 外部 PaddleOCR API。未同时配置 URL 和 token 时，发票功能仍可处理文本型 PDF，
     # 但不会尝试 OCR 兜底。
     invoice_ocr_api_url: str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
@@ -528,6 +584,20 @@ class Settings(BaseSettings):
 
     # 定时备份总开关。关掉之后界面与手动触发仍可用，只是不再有 systemd 定时跑。
     backup_enabled: bool = True
+
+    # 备份制品的**客户端加密**密钥（审查 M-07）。
+    #
+    # **为什么必须有。** 备份管线是 ``gzip → SHA256 → OSS``，而 SHA256 是
+    # **校验和，不是加密** —— OSS 上的对象是**明文 gzip 压缩包**。备份是全系统
+    # 数据价值密度最高的单一制品：桶的读权限一旦泄露（AK 泄露 / 桶策略过宽 /
+    # 阿里云侧账号被盗），攻击者直接下载全部账套的全量凭证与金额。
+    #
+    # **留空 = 不加密**（保持现状），但生产校验会要求它非空 —— 与
+    # ``JWT_SECRET`` 同一个 fail-closed 口径。
+    #
+    # 格式：``base64(32 字节随机)``。用 age / AES-GCM 这一类带认证的方案；
+    # 密钥**必须与 OSS AccessKey 分开存放**，否则「拿到备份就等于拿到解密钥匙」。
+    backup_encryption_key: str = ""
     # 是否额外备份系统级数据（用户、授权、参数、全局基线模板）。
     backup_include_system: bool = True
     # 保留天数的天级/周级。月度恒为永久 —— 不做成可配，理由见
@@ -644,8 +714,20 @@ def detect_env(settings: "Settings", env: str | None = None) -> str:
 
 
 def _db_password(url: str) -> str:
+    """从连接串里取出数据库口令。
+
+    **必须做 URL 解码**（审查 L-08 的补漏）：连接串里的口令是
+    **百分号编码**的，而"口令长度"这道闸量的是**真实口令**的长度 ——
+    不解码的话，``%41%41%41%41%41%41``（6 个字符的真实口令）会被量成
+    18 个字符，**轻松越过长度下限**。这不是理论漏洞：百分号编码是
+    任何含特殊字符的口令都必须用的形式，而它恰好能把长度撑大三倍。
+    """
     m = re.search(r"://[^:/@]*:([^@]*)@", url or "")
-    return m.group(1) if m else ""
+    if not m:
+        return ""
+    from urllib.parse import unquote
+
+    return unquote(m.group(1))
 
 
 def trusted_proxy_networks(raw: str | None = None) -> tuple:
@@ -768,6 +850,54 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
         problems.append(
             f"数据库密码仍是默认值（{DEFAULT_DB_PASSWORD!r}）—— "
             "同样公开在源码里")
+    elif len(_db_password(settings.database_url)) < 16:
+        # 审查 L-08。**默认值那条已经拦了**，这一条管的是"换了个新的，
+        # 但换成了另一个弱口令" —— 而数据库口令就在连接串里，
+        # 弱口令等于把整库交出去。
+        #
+        # **为什么下限是 16 而不是更长**：这一条要拦的是"随手敲的弱口令"，
+        # 16 字符已经排除了绝大多数人类可记忆的短口令；再长就变成
+        # "必须用密码管理器"，那是运维纪律问题，不该由启动闸门代劳。
+        problems.append(
+            f"数据库密码只有 {len(_db_password(settings.database_url))} 个字符，"
+            "少于 16 —— 数据库口令就在连接串里，弱口令等于把整库交出去。"
+            "请改成长随机串（例如 openssl rand -base64 24）。")
+
+    # ---------------------------------------------------------------------------
+    # 管理员邮箱 MFA 的验证链接基址（审查 H-01）
+    #
+    # **为什么这一条是 fail-closed 而不是告警。**
+    #
+    # 验证链接的落点由 ``ADMIN_MFA_LINK_BASE`` 决定；留空时宿主会退回
+    # ``request.base_url`` —— 而那是**客户端给的 Host 头**。于是：
+    # 攻击者拿到管理员口令后，带 ``Host: evil.example`` 登录一次，系统就会
+    # 向管理员邮箱发出一封**域名正规、系统自己发出**的邮件，但链接指向
+    # 攻击者的域名。管理员点开 → 令牌落到对方服务器 → 对方换到管理员访问令牌。
+    #
+    # 也就是说：**二次验证不但没挡住，反而成了投递通道**。
+    # 这是"一次配置缺失 = 一条完整的管理员接管链"，与 JWT 密钥同一档，
+    # 所以进 problems（拒绝启动），而不是 warning。
+    #
+    # **为什么只在 MFA 开着时才要求**：MFA 默认关着（``admin_mfa_enabled``
+    # 默认 False），关着的时候这个键配不配都没有意义 —— 为一个没开的
+    # 功能拒绝启动，是拿可用性换一个不存在的风险。
+    #
+    # 注意这里只能看到 **env** 的开关；MFA 运行时可以在界面上打开
+    # （存在 ``sys_setting`` 里）。那种情况下启动期查不到，但运行期
+    # ``app.notify.mfa.link_base`` 仍会拒绝发信（不配就不发），两道都在。
+    if settings.admin_mfa_enabled:
+        link_base = (settings.admin_mfa_link_base or "").strip()
+        if not link_base:
+            problems.append(
+                "ADMIN_MFA_ENABLED=true 但 ADMIN_MFA_LINK_BASE 为空 —— "
+                "验证邮件里的链接会退回到请求的 Host 头（客户端可控），"
+                "攻击者可以借此把二次验证变成钓鱼投递通道。"
+                "请显式配置站点地址，例如 ADMIN_MFA_LINK_BASE=https://acct.example.com")
+        elif not link_base.lower().startswith("https://"):
+            problems.append(
+                f"ADMIN_MFA_LINK_BASE={link_base!r} 不是 https:// 开头 —— "
+                "验证链接走明文 HTTP 的话，令牌会经由链路被截获。"
+                "请改成 https:// 开头的完整站点地址。")
 
     # P3-14：级别配置对了不代表级别**安全**。生产开 DEBUG 时，
     # DB_ECHO 一旦也开着，SQLAlchemy 会把带绑定参数的 SQL 全打进日志 ——
@@ -792,6 +922,27 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
             "写进日志，也就是把全公司的凭证金额复制进日志系统"
             "（日志通常比数据库备份还多人能读）。"
             "排查请临时开，看完就改回来。")
+
+    # ---------------------------------------------------------------------------
+    # MCP 的 Host 白名单：可选的 fail-closed（审查 L-03）
+    #
+    # **为什么默认不拦**：``.env.example`` 里 ``MCP_ALLOWED_HOSTS=`` 就是空的，
+    # 而 ``MCP_ENABLED=true`` —— 默认就拦的话，**照抄示例的部署会直接起不来**。
+    # 这一项的风险（DNS 重绑定）本身有令牌兜着（端点要 Authorization 头，
+    # 浏览器侧的简单请求带不上；生产又没有 CORS 中间件），所以默认只告警是
+    # 划算的取舍。
+    #
+    # 想要 fail-closed 的部署把 ``MCP_ENFORCE_ALLOWED_HOSTS=true`` 打开，
+    # 那时它进 problems，拒绝启动。
+    # ---------------------------------------------------------------------------
+    if (settings.mcp_enabled and settings.mcp_enforce_allowed_hosts
+            and not mcp_allowed_host_list(settings.mcp_allowed_hosts)):
+        problems.append(
+            "MCP_ALLOWED_HOSTS 为空，但 MCP_ENFORCE_ALLOWED_HOSTS=true —— "
+            "MCP 端点的 DNS 重绑定防护未开启（传输层不校验 Host 头）。"
+            "请设 MCP_ALLOWED_HOSTS=你的域名（如 acct.example.com:*）"
+            "（注意配错的表现是请求在传输层被挡下 400/421，不是 401），"
+            "或把 MCP_ENFORCE_ALLOWED_HOSTS 改回 false。")
 
     if problems:
         raise ValueError(
@@ -843,13 +994,29 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
     #
     # 当成**告警**而不是拒绝启动：MCP 是新增面，没配的人可能压根不用它；
     # 而为了一个可选功能拒绝启动，代价（升级后起不来）远大于收益。
+    #
+    # **审查 L-03 之后改了两处**（仍然默认不拦）：
+    #   1. 告警级别从 warning 提到 **ERROR** —— 它是"纵深防御缺了一层"，
+    #      不该和「TRUSTED_PROXIES 为空」那条（纯部署形态提示）一个量级；
+    #   2. 这条**写进启动校验的「已检查项」清单**，于是它在启动日志里显形，
+    #      而不是淹没在一堆日志里。
+    # 想要 fail-closed 的部署把 ``MCP_ENFORCE_ALLOWED_HOSTS=true`` 打开 ——
+    # 那时它就进 problems，拒绝启动。默认不开是因为
+    # ``.env.example`` 里这一项本来就是空的，开着会让照抄示例的部署直接起不来。
     if settings.mcp_enabled and not mcp_allowed_host_list(settings.mcp_allowed_hosts):
-        log.warning(
+        message = (
             "MCP_ALLOWED_HOSTS 为空：MCP 端点的 DNS 重绑定防护未开启"
             "（传输层不校验 Host 头）。端点仍需令牌才能访问，所以这不是"
             "一个敞开的门；但若要为这一层再加一道，请设 "
             "MCP_ALLOWED_HOSTS=你的域名（如 acct.example.com:*）后重启 —— "
             "注意配错的表现是请求在传输层被挡下（400/421），不是 401。")
+        if settings.mcp_enforce_allowed_hosts:
+            # 强制模式已经在上面进 problems 并抛出去了，走不到这里。
+            log.error(message)
+        else:
+            log.error(message)
+            checks.append("MCP Host 白名单未配置（已告警；"
+                          "要拒绝启动请设 MCP_ENFORCE_ALLOWED_HOSTS=true）")
 
     return checks
 

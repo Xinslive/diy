@@ -54,7 +54,7 @@ from urllib.parse import quote
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
+from app.core.config import detect_env, settings
 from app.core.system_settings import get_value, set_value
 from app.models import AdminMfaChallenge, SysUser
 from app.models.mfa import (STATUS_CONSUMED, STATUS_EXPIRED, STATUS_PENDING,
@@ -325,17 +325,59 @@ def build_verify_link(link_base: str, email_token: str) -> str:
     return f"{base}/api/auth/mfa/verify?token={quote(email_token, safe='')}"
 
 
-def link_base(request) -> str:
-    """验证链接的站点前缀。
+#: 没配 ``ADMIN_MFA_LINK_BASE`` 时给运维看的那句话。
+#:
+#: 说清三件事：**没发信**、**为什么不发**、**怎么改**。
+#: 「为什么」必须写明白「不能用请求里的 Host 头」—— 否则运维看到的只是一句
+#: 「没配置」，多半会当成配置项填错，然后随手填一个自己记得住的域名。
+LINK_BASE_MISSING = (
+    "没有配置站点地址（ADMIN_MFA_LINK_BASE），出于安全考虑未发送二次验证邮件。"
+    "验证链接不会退回使用请求里的 Host 头（那是客户端可控的，会让二次验证变成"
+    "钓鱼投递通道）。请让管理员在系统设置里配置站点地址"
+    "（形如 https://acct.example.com），或设置环境变量 ADMIN_MFA_LINK_BASE 后重试。"
+)
 
-    **优先用配置里的** ``admin_mfa_link_base``。留空时退回**请求的
-    base_url** —— 那是**客户端给的 Host 头**，拼出来的链接可能指向
-    攻击者控制的域名（钓鱼链接的经典做法，而信还是系统自己发的）。
-    所以留空时记一条 **warning**，提醒生产环境必须显式配置。
+
+class MfaLinkBaseNotConfigured(RuntimeError):
+    """站点地址没配 ⇒ **不发那封邮件**。
+
+    这是**配置错误**，不是临时故障：不配就每一次都失败。调用方把它翻成
+    503（服务不可用），**不是** 500 —— 500 会让人以为是程序坏了。
+    """
+
+    def __init__(self, message: str = LINK_BASE_MISSING) -> None:
+        super().__init__(message)
+
+
+def link_base(request) -> str:
+    """验证链接的站点前缀。**生产环境没配就不发信**（fail-closed）。
+
+    **只认配置里的** ``admin_mfa_link_base``（管理员显式配置的站点地址）。
+
+    过去这里在留空时退回**请求的 base_url** —— 那是**客户端给的 Host 头**。
+    后果是一条完整的账号接管链：攻击者拿到管理员口令后，带
+    ``Host: evil.example`` 登录一次，系统就会向管理员邮箱发出一封
+    **域名正规、系统自己发出**的邮件，但链接指向攻击者的域名；管理员点开 →
+    ``email_token`` 落到对方服务器 → 对方调 ``/api/auth/mfa/poll`` 换到管理员
+    访问令牌。**二次验证不但没挡住，反而成了投递通道。**
+
+    所以：
+
+    * **生产（``APP_ENV=prod``）没配 ⇒ 抛 :class:`MfaLinkBaseNotConfigured`**，
+      由调用方翻成 503。**不发一封错的信，胜过发一封指向别人域名的信。**
+    * 开发/测试环境退回 ``request.base_url`` 并记一条 **warning** ——
+      本地跑不必先配一遍域名（那里没有「别人点你的链接」这件事）。
+
+    环境判定用 :func:`app.core.config.detect_env` —— 与启动校验、``/health``
+    是**同一个口径**（显式没配 ``APP_ENV`` 时按 prod 处理）。
     """
     configured = (settings.admin_mfa_link_base or "").strip()
     if configured:
         return configured.rstrip("/")
+    if detect_env(settings) == "prod":
+        log.error("ADMIN_MFA_LINK_BASE 未配置，拒绝发送二次验证邮件"
+                  "（退回 Host 头会让二次验证变成钓鱼投递通道）")
+        raise MfaLinkBaseNotConfigured()
     base = str(request.base_url).rstrip("/")
     log.warning("ADMIN_MFA_LINK_BASE 未配置，验证链接退回请求的 base_url：%s", base)
     return base
@@ -501,6 +543,104 @@ def poll_guard(challenge_id: int) -> tuple[bool, int]:
                 _poll_state.pop(key, None)
         _poll_state[challenge_id] = (now, count + 1)
         return True, 0
+
+
+# ---------------------------------------------------------------------------
+# 点链接接口的失败计数与退避（审查 L-02）
+# ---------------------------------------------------------------------------
+#
+# ``/api/auth/mfa/verify`` **不需要鉴权** —— 它是一个公开的链接：邮件网关会
+# 预取它、手机会在锁屏上预览它、IT 会留档它。所以它必然是未认证可达的。
+#
+# 令牌本身是 256 位随机，猜不中，**所以它不是认证绕过**。但它每次请求都要
+# 打一次库（按 token 的散列查挑战行），于是「一个未认证的请求 = 一次数据库
+# 查询」—— 而这个端点是全站唯一一个「谁都能打」的数据库入口。
+#
+# 这一层挡的就是这件事：**按来源计数 + 退避**。超过阈值就暂时不让这个来源
+# 再打这个端点（连查询都不发生）。
+#
+# **只数「token 对不上任何挑战」的失败**（``invalid``）：那才是「在猜」的形态。
+# 「已用过」「已过期」是**点错了链接的真人**（用户点两次旧邮件很常见），
+# 把它算成失败会误伤正常使用，所以不计。
+#
+# 粒度是**进程级**，与 :func:`poll_guard` 同一套理由：它要挡的是「把点链接
+# 当放大器」，进程级状态已经够用；跨进程限流需要额外的表，而这一点收益
+# 换不来一张新表。
+
+#: 同一个来源在窗口内允许的「无效 token」次数。超过就退避。
+VERIFY_FAIL_LIMIT = 10
+
+#: 失败计数的有效窗口（秒）。超过这个时间的失败不累计。
+VERIFY_FAIL_WINDOW_SECONDS = 900
+
+#: 超过阈值后的退避时长（秒）。
+#:
+#: **刻意不长（60 秒）**：退避期间这个来源**一个请求都打不动**，而在
+#: ``TRUSTED_PROXIES`` 没配的部署里所有请求共用同一个来源桶（nginx →
+#: 127.0.0.1），于是「退避」会连带把**管理员自己点邮件链接**也挡住。
+#: 60 秒的窗口把这份连带影响压到最小，同时把「一次未认证请求 = 一次数据库
+#: 查询」的放大倍数压到 1/6（每分钟最多 10 次）。
+#:
+#: 退避期一过计数就**清零**（不是接着上一次算），所以攻击者要维持封锁就得
+#: 每 60 秒再花 10 次无效请求 —— 数据库侧看到的是一个**有上界**的速率。
+VERIFY_BLOCK_SECONDS = 60
+
+#: 状态表的条数上限。超过就丢掉最老的一批 —— 防止「用随机来源刷限流表」
+#: 把内存吃光（那等于换了个形式的放大器）。
+_VERIFY_STATE_MAX = 2048
+
+#: 来源 -> (窗口起点, 失败次数, 退避到什么时候)
+_verify_state: dict[str, tuple[float, int, float]] = {}
+_verify_lock = threading.Lock()
+
+
+def verify_guard(ip: str) -> tuple[bool, int]:
+    """点链接接口的准入。返回 ``(放行吗, 还要等几秒)``。
+
+    **在查库之前问**：被退避的来源连那条查询都不会发生 —— 那正是这一层
+    要省掉的东西。
+    """
+    key = (ip or "-").strip() or "-"
+    now = time.monotonic()
+    with _verify_lock:
+        started, count, blocked_until = _verify_state.get(key, (0.0, 0, 0.0))
+        if blocked_until > now:
+            return False, int(blocked_until - now) + 1
+        # 退避期过了就重新计数 —— 不是「解封后接着上一次算」。
+        if started and now - started > VERIFY_FAIL_WINDOW_SECONDS:
+            _verify_state.pop(key, None)
+        return True, 0
+
+
+def note_verify_failure(ip: str) -> None:
+    """记一次「token 对不上任何挑战」。超过阈值就退避。"""
+    key = (ip or "-").strip() or "-"
+    now = time.monotonic()
+    with _verify_lock:
+        started, count, blocked_until = _verify_state.get(key, (0.0, 0, 0.0))
+        if not started or now - started > VERIFY_FAIL_WINDOW_SECONDS:
+            started, count = now, 0
+        count += 1
+        if count >= VERIFY_FAIL_LIMIT:
+            blocked_until = now + VERIFY_BLOCK_SECONDS
+            count = 0
+        if len(_verify_state) >= _VERIFY_STATE_MAX:
+            for old in sorted(_verify_state, key=lambda k: _verify_state[k][0])[:256]:
+                _verify_state.pop(old, None)
+        _verify_state[key] = (started, count, blocked_until)
+
+
+def note_verify_success(ip: str) -> None:
+    """点对了就把计数清零 —— 正常使用不该背着旧账。"""
+    key = (ip or "-").strip() or "-"
+    with _verify_lock:
+        _verify_state.pop(key, None)
+
+
+def reset_verify_state() -> None:
+    """清掉点链接的失败计数。**只给测试用。**"""
+    with _verify_lock:
+        _verify_state.clear()
 
 
 # ----------------------------------------------------------------- 应急口令

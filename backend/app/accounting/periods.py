@@ -19,6 +19,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 from datetime import date
 from decimal import Decimal
 from typing import Optional
@@ -251,8 +253,26 @@ def resolve_profit_subject(db: Session, book_id: int, year: int) -> tuple[Option
 # ``carry_forward``（``accounting/subject_importer.py``），那张表的「类型」列
 # 写错一个词，资产科目就被标成结转科目，随后任何一次月末结转都会把它的余额
 # 整体搬进本年利润 —— 钱凭空消失，而**借贷仍然平衡，系统自检抓不到**。
-# 写侧有校验（``api/subjects.py``）拦一道，读侧再按 category 过滤一次，
-# 两道都留着：写侧拦新数据，读侧兜住**修复之前就已经躺在库里**的脏标记。
+#
+# ---- 这里**只有一道**有效防线（审查修复）------------------------------
+# 以前的注释说「写侧有校验（``api/subjects.py``）拦一道，读侧再按 category
+# 过滤一次，两道都留着」。那是**循环论证**：``category`` 本身是从同一列
+# 「类型」推导出来的（``subject_importer.py`` 里 ``_CATEGORY_MAP`` →
+# ``carry_forward = category == "PROFIT"``），于是「按 category 过滤」与
+# 「按 carry_forward 过滤」判的是**同一件事**，不是两道独立的防线。
+#
+# 事实是：
+#   · **写侧**（``api/subjects.py``）有一道**真正独立**的校验 ——
+#     「carry_forward 只许落在损益类科目上」。它独立于「类型」列：用户手工
+#     勾「结转科目」而类别是资产类，当场被拒。
+#   · **导入侧**的那一道以前与写侧同源（都从「类型」列来），所以导入进来的
+#     脏标记**读侧兜不住**。导入侧现在补了一道**独立于「类型」列**的校验：
+#     科目编码的首位（大类码）与「类型」必须一致（见
+#     ``subject_importer`` 里的说明与那里的实现）—— 两份证据对不上就拒。
+#   · **读侧**的 ``category == "PROFIT"`` 过滤本身**不是独立防线**，
+#     它只是把写侧的判据再表述一遍。它的价值在于：万一库里已经躺着脏标记
+#     （导入进来的、或历史遗留的），结转时只认真正的损益类科目，
+#     不会把资产科目的余额搬进本年利润。
 def carry_forward_subjects(db: Session, book_id: int, year: int, *,
                             exclude_profit: bool = True) -> list[Subject]:
     """参与结转损益的科目集合。**结转与结平校验共用这一份定义。**
@@ -410,6 +430,35 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
                 .group_by(Voucher.period_id)
             ).all()
         )
+    # ---- 跨年链：显式拒绝（审查修复）----------------------------------
+    #
+    # 级联结账的链是「ord <= 被结那一期的全部未结账期间」，而 **ord 跨年度
+    # 连续** —— 链是可以跨年的。以前跨年链是被**默默放行**的，而它有两处
+    # 致命后果：
+    #
+    #   ① 损益结平校验按**被校验期间自己的年度**才有意义（科目表每个年度
+    #      各有一份，见下面那段）。以前只取 target 那一年，于是链上属于
+    #      其他年度的期间用的是**另一年的科目行** —— 那些行在那些期间既
+    #      没有分录也没有期初快照，closing 恒为 0，于是**被判成「已结平」**：
+    #      前几年挂在损益科目上的余额就这么被放过去了。
+    #   ② 跨年结账会把上一年的期间一起锁上，而上一年的账可能压根还没结转
+    #      损益 —— 那是不可逆的封存。
+    #
+    # 所以这条链一旦跨年就**当场拒绝**，并说清下一步该做什么。
+    #
+    # 放在「空月份不许结账」那道闸**之前**：那是结构性的判断（你要做的
+    # 这件事本身就不该做），而空月份是数据问题 —— 先说结构性的那条，
+    # 用户才不会以为「补几张凭证就能跨年结账」。
+    chain_years = sorted({p.year for p in to_lock})
+    if len(chain_years) > 1:
+        first_year, last_year = chain_years[0], chain_years[-1]
+        raise ValueError(
+            f"结账链跨了年度（{'、'.join(str(y) for y in chain_years)}），已停止结账："
+            f"级联结账会把 {first_year} 年的期间一起锁上，而每个年度的科目表是两套 —— "
+            f"跨年的损益结平校验会拿错科目表算，等于没校验。"
+            f"请先结完上一年度（{first_year} 年）的全部期间，再结 {last_year} 年的期间。"
+        )
+
     empty = [p for p in to_lock if not counts.get(p.id)]
     if empty:
         raise ValueError(
@@ -434,7 +483,7 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
     # 科目上没人结走。结转损益是按**本年累计**算的，12 月那张凭证会把 11 月
     # 的收入一并扫进本年利润，于是 11 月的钱出现在 12 月的凭证里，
     # 两边都「结账成功」，账面却已经错了，而且再也查不出来是谁动的手。
-    eng = LedgerEngine(db, target.book_id)
+    eng = LedgerEngine.for_ledger(db, target.book_id)
     # 结账校验取的是**「要结转的末级科目」**—— 与结转损益用的是**同一个
     # helper**（``carry_forward_subjects``，审计 P1-1 / P1-2）。以前这里是
     # 另写一份（不排除本年利润、也不看 category），两份口径不一致的直接
@@ -442,14 +491,27 @@ def close_period(db: Session, period: Period, user: SysUser, auto_post: bool = T
     #
     # 不过滤 active：停用 ≠ 删除。一个挂着余额的停用损益科目若被过滤掉，
     # 就能被直接结过去 —— 期间锁了、损益却留在科目上跨年，而且没有任何报错。
-    subjects = carry_forward_subjects(db, target.book_id, target.year)
+    #
+    # ---- 科目表按**被校验期间自己的年度**取（审查修复）----------------
+    # 科目表每个年度各有一份，而结平校验要问的是「**这一期**的损益科目在
+    # **这一期**还剩多少余额」。以前这里只取 ``target.year`` 那一套 ——
+    # 链上跨年的那些期间（虽然现在已经被上面那道闸挡住了）会拿到**另一年
+    # 的科目行**：那些行在那些期间既没有分录也没有期初快照，closing 恒为 0，
+    # 于是**被判成「已结平」**，损益余额就这么被放过去了。
+    #
+    # 同一个年度只查一次（``carry_forward_subjects`` 每次调用都发一条查询），
+    # 不是每期查一次。
+    by_year: dict[int, list[Subject]] = {}
+    for year in chain_years:
+        by_year[year] = carry_forward_subjects(db, target.book_id, year)
+    subject_ids = sorted({s.id for subs in by_year.values() for s in subs})
     # 一次算到最后一期，中间每一期的中间结果都会留在缓存里
-    eng.compute([s.id for s in subjects], max(p.ord for p in pending))
+    eng.compute(subject_ids, max(p.ord for p in pending))
     unsettled = []
     for p in pending:
         residual = [
             f"{s.code} {s.name} 余额 {f.closing}"
-            for s in subjects
+            for s in by_year[p.year]
             if abs((f := eng.figures(s.id, p.ord)).closing) > ZERO
         ]
         if residual:
@@ -645,7 +707,111 @@ def _carry_forward_vouchers(db: Session, period: Period) -> list[Voucher]:
     )
 
 
-def _is_system_carry_forward(v: Voucher, period: Period) -> bool:
+def _signature_key() -> bytes:
+    """结转凭证签名用的密钥 —— **由服务端配置派生，不出现在库里**。
+
+    取自 ``JWT_SECRET``（生产环境强制校验、fail-closed，见
+    ``app/core/config.py``），再按用途派生一把子密钥，免得与签发令牌共用
+    同一段密钥材料。
+
+    说清楚它的分量：开发 / 测试环境里 ``JWT_SECRET`` 是公开的默认值，
+    那时这道签名挡的是「随手打一个 source」，不是「铁了心伪造」；
+    生产环境里它是真秘密，伪造不出签名。
+    """
+    from app.core.config import settings
+
+    return hmac.new(
+        settings.jwt_secret.encode("utf-8"),
+        b"cwq/carry-forward-signature/v1",
+        hashlib.sha256,
+    ).digest()
+
+
+def _prev_carry_forward_id(db: Session, v: Voucher) -> int:
+    """同一期间里排在它前面的**最后一张**系统结转凭证 id（没有就是 0）。"""
+    prev = db.scalar(
+        select(func.max(Voucher.id)).where(
+            Voucher.period_id == v.period_id,
+            Voucher.source == "CARRY_FORWARD",
+            Voucher.id < v.id,
+        )
+    )
+    return int(prev or 0)
+
+
+def _carry_forward_token(db: Session, v: Voucher) -> str:
+    """结转凭证签名里的**不可猜测成分**。
+
+    ``HMAC(服务端密钥, 账套 + 凭证 id + 前一张系统结转凭证 id)``。
+
+    为什么是这三样：凭证 id 绑住「这一行」；前一张系统凭证 id 把同一期
+    的几张结转凭证**串成一条链**（动一张、其余的签名就都对不上）；
+    密钥在服务端，没有它谁也算不出这个值。
+    """
+    raw = f"{v.book_id}:{v.id}:{_prev_carry_forward_id(db, v)}".encode("utf-8")
+    return hmac.new(_signature_key(), raw, hashlib.sha256).hexdigest()[:16]
+
+
+def _remark_token(remark: str, base: str) -> str | None:
+    """从 remark 里取出签名尾巴；形状不对返回 None。
+
+    形状是 ``<base> #<16 位十六进制>``。
+    """
+    if not remark.startswith(base + " #"):
+        return None
+    token = remark[len(base) + 2:]
+    if len(token) != 16:
+        return None
+    try:
+        int(token, 16)
+    except ValueError:
+        return None
+    return token
+
+
+def _remark_matches(remark: str, base: str) -> bool:
+    """remark 是 base 本身，或者是 base + 签名尾巴。"""
+    return remark == base or _remark_token(remark, base) is not None
+
+
+def _sign_carry_forward(db: Session, v: Voucher, remark: str) -> str:
+    """给刚生成的结转凭证 remark 补上签名尾巴，返回最终 remark。
+
+    调用点在 ``create_voucher`` **之后**（凭证 id 那时才拿到）。
+
+    审计快照里记的是**签名之前**的 remark（快照在 ``create_voucher`` 内部
+    就拍了）：那不影响追溯 —— 快照里的 remark 照样能认出这是哪张结转凭证，
+    签名尾巴只用于「能不能被『重新结转』删掉」这一项判定。
+    """
+    v.remark = f"{remark} #{_carry_forward_token(db, v)}"
+    db.flush()
+    return v.remark
+
+
+def _signed_era_start(db: Session, book_id: int) -> int | None:
+    """这个账套里**第一张带签名**的结转凭证 id（还没有就是 None）。
+
+    它是「存量老凭证」与「伪造」的分界线：系统从启用签名的那一刻起，
+    生成的每一张结转凭证都带签名尾巴 —— 所以**在第一张带签名的凭证之后**
+    出现的、remark 里没有签名尾巴的 CARRY_FORWARD 凭证，一定不是系统
+    生成的（升级前的存量凭证 id 都在它之前，仍然认）。
+
+    没有它的话，「兼容老签名」这一条就等于给伪造开了一条永久的后门：
+    伪造者只要照抄老 remark 的样子就能让凭证被「重新结转」删掉。
+    """
+    return db.scalar(
+        select(func.min(Voucher.id)).where(
+            Voucher.book_id == book_id,
+            Voucher.source == "CARRY_FORWARD",
+            # PostgreSQL 的正则匹配运算符 ``~``：remark 末尾那一段
+            # ``#<16 位十六进制>`` 就是签名尾巴。
+            Voucher.remark.op("~")(r"#[0-9a-f]{16}$"),
+        )
+    )
+
+
+def _is_system_carry_forward(v: Voucher, period: Period, db: Session,
+                             era: int | None = None) -> bool:
     """这张 CARRY_FORWARD 凭证是不是**系统自己生成**的那一张。
 
     ``source == "CARRY_FORWARD"`` 这个标记**不是**「系统生成」的充分条件。
@@ -661,24 +827,52 @@ def _is_system_carry_forward(v: Voucher, period: Period) -> bool:
     * **源头**：客户端的 ``source`` 里已经没有 CARRY_FORWARD
       （``api/schemas.py``），写权限只由 ``create_voucher(internal=True)`` 发放。
     * **兜底**：本函数。判据是「签名」—— 系统生成方写死的 remark 尾部，
-      加上每条分录都写死的摘要（``_CARRY_FORWARD_SIGNATURES``）。
-      两个生成方对签名负责，见 ``carry_forward_profit`` 的 ``SUMMARY``
-      与 ``year_end_carry`` 的 ``YEAR_END_SUMMARY``。
+      加上每条分录都写死的摘要（``_CARRY_FORWARD_SIGNATURES``），
+      **再加上 remark 末尾那段不可猜测的签名尾巴**。
 
-    说清楚它的分量：remark 与摘要**不是密码学意义上的防伪标记**，一个铁了心
-    伪造的人照样能写对。它挡的是「随手打一个 source」和**修复之前就躺在库里**
-    的伪造行 —— 那些行的摘要是人自己写的摘要，签不上。真正的边界是第一条
-    （客户端压根提交不了这个 source）。之所以还要它：删除是不可逆的，
-    而本系统的凭证号可复用、删掉只能靠审计快照追溯，宁可多认一道。
+    ---- 签名尾巴（审查修复）------------------------------------------
+    原来的签名只有 remark + 摘要，**两样都是人能写对的**：伪造一张
+    remark 写着「2026-09 结转损益（收入类）」、摘要写着「期间损益结转」的
+    凭证，「重新结转」就会把它当成系统生成的那张删掉 —— 而它可能已经记账。
+    这道口子正是「删除保护网唯一的缺口」。
+
+    现在 remark 末尾多一段 ``#<16 位十六进制>``，它是
+    ``HMAC(服务端密钥, 账套 + 凭证 id + 前一张系统结转凭证 id)``：
+    **没有服务端密钥算不出来**，伪造者哪怕把 remark 与摘要一字不差地抄对，
+    也签不上。
+
+    **向后兼容**：签名尾巴是**后加**的，库里已有的系统结转凭证（remark
+    里没有 ``#`` 那一段）**仍然认得出** —— 判据是「remark 尾部对得上
+    且每条分录摘要都对得上」。没有这一条，一次上线就会让所有存量账套
+    的「重新结转」全部报「来源不明的结转凭证」。
 
     认不出来就返回 False，调用方 **fail closed**：不删，报错让人来看。
     绝不「就删有把握的那几张、其余留着」 —— 那等于告诉用户
     「重新结转完成了」，而他的一张已记账凭证还在原地，下次重结转再被拦一次。
     """
+    if not v.entries:
+        return False
     for prefix in (f"{period.code} ", f"{period.year}年 "):
         for suffix, summary in _CARRY_FORWARD_SIGNATURES.items():
-            if v.remark == prefix + suffix and v.entries and all(
-                e.summary == summary for e in v.entries
+            if not all(e.summary == summary for e in v.entries):
+                continue
+            base = prefix + suffix
+            if v.remark == base:
+                # **存量老凭证**：没有签名尾巴，但 remark 与摘要都对得上。
+                # 仍然认 —— 否则一次上线就会让所有存量账套的「重新结转」
+                # 全部报「来源不明的结转凭证」。
+                #
+                # 但只认**升级之前生成的**：这个账套里第一张带签名的结转
+                # 凭证 id 就是分界线（见 ``_signed_era_start``）——
+                # 在那之后出现的无签名凭证一定是伪造的。
+                if era is None:
+                    era = _signed_era_start(db, v.book_id)
+                if era is None or v.id < era:
+                    return True
+                continue
+            token = _remark_token(v.remark, base)
+            if token is not None and hmac.compare_digest(
+                token, _carry_forward_token(db, v)
             ):
                 return True
     return False
@@ -713,7 +907,8 @@ def _drop_carry_forward(db: Session, period: Period, existing: list[Voucher],
     """
     from app.accounting.audit_helper import voucher_snapshot
 
-    unknown = [v for v in existing if not _is_system_carry_forward(v, period)]
+    era = _signed_era_start(db, period.book_id)
+    unknown = [v for v in existing if not _is_system_carry_forward(v, period, db, era=era)]
     if unknown:
         raise ValueError(
             f"{period.code} 有一张来源不明的结转凭证（{'、'.join(v.voucher_no for v in unknown)}），"
@@ -812,7 +1007,7 @@ def carry_forward_profit(db: Session, book_id: int, period: Period,
     # 结转损益就会回一句「无需结转」，而用户明明看到满屏的收入凭证。
     # 期末结转要的是「本期实际发生额」，跟记账状态无关；
     # 新生成的结转凭证默认也是未记账，结账时统一自动记账，口径自然对齐。
-    eng = LedgerEngine(db, book_id, include_unposted=True)
+    eng = LedgerEngine.for_ledger(db, book_id, include_unposted=True)
     fmap = eng.compute([s.id for s in subjects], period.ord)
 
     income, expense = [], []
@@ -851,20 +1046,26 @@ def carry_forward_profit(db: Session, book_id: int, period: Period,
                     "summary": SUMMARY} for s, amt in income]
         entries.append({"subject_id": profit.id, "direction": "CREDIT",
                         "amount": sum(a for _, a in income), "summary": SUMMARY})
-        created.append(create_voucher(
+        v = create_voucher(
             db, book_id=book_id, user=user, voucher_date=last_day, entries=entries,
             source="CARRY_FORWARD", remark=f"{period.code} 结转损益（收入类）",
-            internal=True, commit=False))
+            internal=True, commit=False)
+        # remark 末尾补签名尾巴（不可猜测的那一段，见 ``_carry_forward_token``）。
+        # 凭证 id 这时才拿到，所以签名只能落在 create_voucher 之后。
+        _sign_carry_forward(db, v, f"{period.code} 结转损益（收入类）")
+        created.append(v)
 
     if expense:
         entries = [{"subject_id": profit.id, "direction": "DEBIT",
                     "amount": sum(a for _, a in expense), "summary": SUMMARY}]
         entries += [{"subject_id": s.id, "direction": "CREDIT", "amount": amt,
                      "summary": SUMMARY} for s, amt in expense]
-        created.append(create_voucher(
+        v = create_voucher(
             db, book_id=book_id, user=user, voucher_date=last_day, entries=entries,
             source="CARRY_FORWARD", remark=f"{period.code} 结转损益（成本费用类）",
-            internal=True, commit=False))
+            internal=True, commit=False)
+        _sign_carry_forward(db, v, f"{period.code} 结转损益（成本费用类）")
+        created.append(v)
 
     nos = [v.voucher_no for v in created]
     if created and keep_posted:
@@ -998,6 +1199,12 @@ def _refresh_opening(db: Session, book_id: int, first: Period,
     余额为零的科目对不上**不拦**：那只是科目表改了（停用了一个空科目），
     没有钱会丢。
 
+    ---- 被关掉结转的损益科目也拒绝（审查修复）------------------------
+    ``category == "PROFIT"`` 且 ``carry_forward=False`` 的科目，余额非零时
+    **不能**作为期初结转到下一年：结转损益不结走它、结账的结平校验也不看它，
+    于是它会一路挂到下一年的期初上 —— 那一年利润表看不到它、资产负债表不平，
+    而全程无报错。见上面 ``blocked`` 那段。
+
     ``src_subjects`` 必须覆盖**所有有余额的科目**，包括非末级的（审计 P1-1）。
     金额直接取 ``fmap[sid].closing`` —— 那是**子树聚合后**的余额
     （``ledger/engine`` 把分录上卷到各级父科目），不是「这个科目自己那一份」。
@@ -1014,15 +1221,42 @@ def _refresh_opening(db: Session, book_id: int, first: Period,
     dst_by_code = {s.code: s for s in dst_subjects}
     pairs: list[tuple[Subject, Decimal]] = []
     missing: list[str] = []
+    # ---- 被关掉结转的损益科目：拒绝年度结转（审查修复）----------------
+    #
+    # ``carry_forward=False`` 的损益科目被**同时**排除在结转损益与结账的
+    # 结平校验之外（两侧共用 ``carry_forward_subjects``，所以自洽）。
+    # 但这里承接期初时**不看 category、不看 carry_forward**，只按
+    # 「余额非零且新年度有同编码科目」搬 —— 于是那笔损益被写进**下一年度
+    # 1 月的期初快照**，挂在损益科目上：下一年利润表看不到它、资产负债表
+    # 不平，而**全程无报错**。
+    #
+    # 所以年度结转在这里 **fail closed**：这类余额不能作为期初结转下去。
+    blocked: list[str] = []
     for s in src_subjects:
         amount = fmap[s.id].closing
         if amount == ZERO:
             continue        # 没有钱要对不上：科目表改了空科目，不拦
+        if s.category == "PROFIT" and not s.carry_forward:
+            blocked.append(f"  {s.code} {s.name} 余额 {amount}")
+            continue
         dst = dst_by_code.get(s.code)
         if dst is None:
             missing.append(f"  {s.code} {s.name} 余额 {amount}")
             continue
         pairs.append((dst, amount))
+
+    if blocked:
+        raise ValueError(
+            f"{first.year} 年结转不了：下列损益科目的「结转」被关掉了，"
+            f"它们的余额不能作为期初结转到 {first.year} 年 ——\n"
+            + "\n".join(blocked)
+            + f"\n这些科目是损益类（category=PROFIT）却关掉了结转："
+            f"结转损益不会把它们结走，结账的损益结平校验也不看它们，"
+            f"于是它们的余额会一路挂到 {first.year} 年的期初上 —— "
+            f"那一年利润表看不到这笔钱、资产负债表也不平，而没有任何报错。\n"
+            f"请先把它改回结转科目（启用「结转」开关）再做一次「结转损益」，"
+            f"或者把这笔余额用红字凭证清零，再重新做年度结转。"
+        )
 
     if missing:
         raise ValueError(
@@ -1123,7 +1357,7 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
     profit, _ = resolve_profit_subject(db, book.id, current_year)
     retained = _subject_by_any_code(db, book.id, current_year, RETAINED_SUBJECT_CODES)
     if profit and retained:
-        eng = LedgerEngine(db, book.id)
+        eng = LedgerEngine.for_ledger(db, book.id)
         bal = eng.figures(profit.id, last.ord).closing
         if bal != ZERO:
             if last.locked:
@@ -1146,7 +1380,7 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
             # 12 月里已有的结转凭证先删掉再重做：改了 2026 的数再点一次年度结转
             # 是常规操作，不删就会叠出第二张结转凭证，未分配利润凭空翻倍。
             stale = [v for v in _carry_forward_vouchers(db, last)
-                     if v.remark == f"{current_year}年 结转本年利润"]
+                     if _remark_matches(v.remark, f"{current_year}年 结转本年利润")]
             if stale:
                 _drop_carry_forward(db, last, stale, user)
 
@@ -1158,6 +1392,7 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
             # ``_drop_carry_forward`` 靠它认出这张是系统生成的才肯删。
             # 改这两处字面量必须同步改签名表，否则第二次年度结转会
             # 撞上「来源不明的结转凭证」而拒绝执行。
+            # remark 末尾的签名尾巴由 ``_sign_carry_forward`` 在建完凭证后补上。
             amt = abs(bal)
             profit_dir = "DEBIT" if bal < 0 else "CREDIT"
             entries = [
@@ -1171,6 +1406,8 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
                                voucher_date=date(current_year, 12, 31), entries=entries,
                                source="CARRY_FORWARD", remark=f"{current_year}年 结转本年利润",
                                internal=True, commit=False)
+            # 补签名尾巴（不可猜测的那一段，见 ``_carry_forward_token``）
+            _sign_carry_forward(db, v, f"{current_year}年 结转本年利润")
 
             # 追加凭证后 12 月又变成未记账，重新记账并结账
             post_vouchers(db, book.id, [v.id], user, commit=False)
@@ -1213,7 +1450,7 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
         set_profit_subject_setting(db, book.id, target_year, src_profit)
 
     # 4. 下一年 1 月的期初 = 本年期末（**按编码**搬过两张科目表）
-    eng = LedgerEngine(db, book.id)
+    eng = LedgerEngine.for_ledger(db, book.id)
     # **审计 P2-08**：这里原来带 Subject.active 过滤，于是停用科目的期末余额
     # 不会被写进次年期初 ——「停用」这个本该安全的操作变成了账务断层，
     # 次年账凭空少一笔且无任何提示。**绝不能引入 active 过滤**：

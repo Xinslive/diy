@@ -2,6 +2,26 @@ import * as Vue from 'vue'
 import { validatePlugin } from './manifest'
 import { fetchManifest, pluginClient, pluginServices } from './api'
 
+/**
+ * ⚠️ **信任边界：插件 JS 与宿主同页、同权限。**
+ *
+ * 宿主传给插件的 `host` 是 Object.freeze 的 —— 但**冻结不了插件自己的执行环境**：
+ * 插件跑在同一个页面里，于是它可以：
+ *   · 读 `localStorage['cwq_token']`（**登录令牌对插件可见**）；
+ *   · 读同源的 cookie、调用同源的 `/api/**`（拿令牌自己发请求也行）；
+ *   · 改 DOM、读页面上的数据。
+ *
+ * **这是架构选择，不是实现缺陷** —— 任何前端插件框架都是同页执行
+ * （iframe 沙箱是另一条路，但那样插件就拿不到宿主组件与主题）。
+ * 所以这一行的纪律是：
+ *   **信任前提 = 管理员只安装可信插件。** 安装一个插件 = 把本子的账本权限给它。
+ *   插件的授权走 `pluginClient(id)` / `pluginServices(api)` —— 后端仍按
+ *   「插件自己是什么角色」判权限；但**前端这一层的令牌是共享的**，
+ *   所以后端那条判据是唯一的硬边界，前端不做、也做不了隔离。
+ *
+ * 写在这里是因为下一个人很容易以为「host 冻住了 = 插件碰不到宿主的东西」。
+ */
+
 export const pluginEntries = Vue.shallowRef([])
 import { PluginUnavailable as Unavailable } from './unavailable'
 export { PluginUnavailable } from './unavailable'

@@ -30,13 +30,42 @@ const AUDIT = fs.readFileSync(
   new URL('../src/views/system/AuditLog.vue', import.meta.url), 'utf8')
 
 let pass = 0, fail = 0
-const t = (name, fn) => {
-  try { fn(); console.log('  OK  ', name); pass++ }
-  catch (e) { console.log('  FAIL', name, '—', String(e.message).split('\n')[0]); fail++ }
-}
+/**
+ * 用例先登记、末尾统一跑（顺序执行，async 的也照样 await）。
+ * 拆分的那个「打开弹窗」是 async 的 —— 当场执行的话断言会跑在 await 之前，
+ * 那样测出来的是「什么都没发生」，不是「行为对不对」。
+ */
+const tests = []
+const t = (name, fn) => tests.push([name, fn])
 
 const D = (amount) => ({ direction: 'DEBIT', amount })
 const C = (amount) => ({ direction: 'CREDIT', amount })
+
+/**
+ * 抠出 `function <name>(...) {...}` 的整段源码（按大括号配平）。
+ * 抠的是**页面上真在用的那段代码**，不是抄一份等价实现。
+ */
+function grabFn(name) {
+  const m = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(VIEW)
+  assert.ok(m, `源码里找不到 function ${name}(`)
+  const i = m.index
+  let depth = 0, j = VIEW.indexOf('(', i)
+  for (; j < VIEW.length; j++) {
+    if (VIEW[j] === '(') depth++
+    else if (VIEW[j] === ')') { depth--; if (depth === 0) break }
+  }
+  assert.equal(VIEW[j], ')', `${name} 的参数表没配平`)
+  const bodyStart = VIEW.indexOf('{', j)
+  assert.ok(bodyStart !== -1, `${name} 找不到函数体`)
+  depth = 0
+  for (j = bodyStart; j < VIEW.length; j++) {
+    if (VIEW[j] === '{') depth++
+    else if (VIEW[j] === '}') { depth--; if (depth === 0) break }
+  }
+  const src = VIEW.slice(i, j + 1)
+  assert.ok(src.endsWith('}'), `${name} 抠出来的不是一段完整的函数`)
+  return src
+}
 
 console.log('== 合计与判平（红字算到对面）==')
 
@@ -137,6 +166,66 @@ t('打开弹窗前先把没存上的改动冲掉', () => {
   assert.match(m[0], /flushIfDirty\(\)/)
 })
 
+t('**行为**：改动没存上就不开弹窗，存上了才开（不再只查「源码里有没有这个词」）', async () => {
+  // 原来这里只有一句「源码里出现过 flushIfDirty」—— 正是这个 bug 能长期存活的原因：
+  // flushIfDirty 恒返回 false（`save() === true` 比的是 Promise 对象），
+  // 于是拆分凭证在**有未落库改动**时被**永久误拦**，提示语还是错的。
+  // 现在从**真实源码**里抠出 openSplit 跑一遍，测的是页面上真在用的那段代码。
+  const src = grabFn('openSplit')
+  const said = []
+  const splitVisible = { value: false }
+  const build = (flushResult) => {
+    const factory = new Function('deps', `
+      const canSplit = deps.canSplit
+      const flushIfDirty = deps.flushIfDirty
+      const splitVisible = deps.splitVisible
+      const ElMessage = deps.ElMessage
+      ${src}
+      return openSplit
+    `)
+    return factory({
+      canSplit: { value: true },
+      flushIfDirty: async () => flushResult,
+      splitVisible,
+      ElMessage: { warning: (m) => said.push(m) },
+    })
+  }
+
+  // ① 存上了 → 弹窗照开，不多嘴
+  const ok = build(true)
+  await ok()
+  assert.equal(splitVisible.value, true, '改动存上了却不开弹窗')
+  assert.deepEqual(said, [], `存上了还多嘴：${JSON.stringify(said)}`)
+
+  // ② 没存上 → 不开弹窗，并说清「先存好再拆」
+  splitVisible.value = false
+  said.length = 0
+  const bad = build(false)
+  await bad()
+  assert.equal(splitVisible.value, false, '没存上就把弹窗开了 —— 拆走的是库里的旧内容')
+  assert.deepEqual(said, ['还有改动没存上，先存好再拆'], `没存上时没说清：${JSON.stringify(said)}`)
+
+  // ③ 这张压根不能拆 → 连问都不问
+  said.length = 0
+  const factory = new Function('deps', `
+    const canSplit = deps.canSplit
+    const flushIfDirty = deps.flushIfDirty
+    const splitVisible = deps.splitVisible
+    const ElMessage = deps.ElMessage
+    ${src}
+    return openSplit
+  `)
+  const cant = factory({
+    canSplit: { value: false },
+    flushIfDirty: async () => { throw new Error('不该走到 flushIfDirty') },
+    splitVisible,
+    ElMessage: { warning: (m) => said.push(m) },
+  })
+  await cant()
+  assert.equal(splitVisible.value, false)
+  assert.deepEqual(said, [])
+})
+
 t('拆完要重载这一页（原凭证行数少了，新凭证在后面）', () => {
   const m = VIEW.match(/async function onSplit[\s\S]*?\n}/)
   assert.ok(m, '源码里找不到 onSplit')
@@ -192,6 +281,17 @@ t('审计页认得 SPLIT 这个动作', () => {
   assert.match(AUDIT, /SPLIT:/)
 })
 
+console.log('')
+for (const [name, fn] of tests) {
+  try {
+    await fn()
+    console.log('  OK  ', name)
+    pass++
+  } catch (e) {
+    console.log('  FAIL', name, '—', String(e.message).split('\n')[0])
+    fail++
+  }
+}
 console.log('')
 console.log(fail ? `通过 ${pass} / 失败 ${fail}` : `通过 ${pass} / 失败 0`)
 process.exit(fail ? 1 : 0)

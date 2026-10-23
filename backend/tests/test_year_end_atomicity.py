@@ -93,7 +93,9 @@ def _snapshot(db, book, subjects):
     carry = sorted(
         v.id for v in db.scalars(select(Voucher).where(
             Voucher.book_id == book.id,
-            Voucher.remark == "2026年 结转本年利润")).all())
+            # remark 末尾带一段签名尾巴（见 periods._carry_forward_token），
+            # 所以这里按前缀找，不能按全等找。
+            Voucher.remark.startswith("2026年 结转本年利润"))).all())
     return {
         "profit": eng.closing(sid(subjects, "3103"), dec_ord),
         "retained": eng.closing(sid(subjects, "3104"), dec_ord),
@@ -161,7 +163,7 @@ def test_结转失败不留残留凭证(db, book, periods, subjects, admin_user,
 
     leftover = db.scalars(select(Voucher).where(
         Voucher.book_id == book.id,
-        Voucher.remark == "2026年 结转本年利润")).all()
+        Voucher.remark.startswith("2026年 结转本年利润"))).all()
     assert leftover == [], f"残留了结转凭证：{[v.voucher_no for v in leftover]}"
 
 

@@ -18,6 +18,7 @@ import json
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -650,6 +651,14 @@ class _FakeOss:
         self.objects[key] = data
         return "etag"
 
+    def put_file(self, bucket, key, path):
+        """备份走的是**按文件**上传（不把整份 gzip 读进内存）。"""
+        if self.fail_on and self.fail_on in key:
+            from app.backup.oss_client import OssError
+            raise OssError(f"模拟失败：{key}")
+        self.objects[key] = Path(path).read_bytes()
+        return "etag"
+
     def iter_objects(self, prefix):
         for k in sorted(self.objects):
             if k.startswith(prefix):
@@ -680,6 +689,7 @@ def oss(monkeypatch, db):
     fake = _FakeOss()
     monkeypatch.setattr(oss_mod, "make_bucket", fake.make_bucket)
     monkeypatch.setattr(oss_mod, "put_bytes", fake.put_bytes)
+    monkeypatch.setattr(oss_mod, "put_file", fake.put_file)
     monkeypatch.setattr(ret, "iter_objects", lambda b, p: fake.iter_objects(p))
     monkeypatch.setattr(ret, "delete_object", lambda b, k: fake.delete_object(k))
     return fake
@@ -1231,6 +1241,12 @@ class _FakeOss2:
         # 刚写下的就是「现在」。少了这一步，这个替身会把本轮刚上传的对象也
         # 标成陈旧品，于是它们立刻被自己删掉 —— 一个只让测试通过、自己跑不通
         # 的替身，比没有替身更糟。
+        self.mtimes[key] = int(self.now.timestamp())
+        return SimpleNamespace(etag="etag")
+
+    def put_object_from_file(self, key, handle):
+        """备份走的是**按文件**上传（不把整份 gzip 读进内存）。"""
+        self.objects[key] = handle.read()
         self.mtimes[key] = int(self.now.timestamp())
         return SimpleNamespace(etag="etag")
 

@@ -56,7 +56,7 @@
 | `audit:write` | `ctx.audit_write()` | 写入插件自定义审计事件 |
 | `settings:rw` | `ctx.settings.*` | 管理员维护插件级短配置 |
 | `upload:read` | `ctx.upload_read()` | 在当前请求中读取插件接口收到的文件 |
-| `import:rw` | `ctx.imports.*`、前端 `services.imports` | 持久文件、预览、确认、整批提交和来源追溯 |
+| `import:rw` | `ctx.imports.*`（**不含 `confirm`**）、前端 `services.imports` | 持久文件、预览、整批提交和来源追溯；**确认必须走前端 `services.imports.confirm` 的独立宿主请求**（详见 plugin-data） |
 
 `import:rw` 只提供导入批次能力；正式提交还必须声明 `voucher:write`。`plugin_data:rw` 只允许访问 manifest 声明的插件表，不能用来读取宿主业务表。
 

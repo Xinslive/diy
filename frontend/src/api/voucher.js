@@ -1,5 +1,18 @@
-import { http, apiUrl } from './client'
-export const queryVouchers = (bookId, params) => http.get(`/books/${bookId}/vouchers`, { params }).then(r => r.data)
+import { http, apiUrl, getLatest } from './client'
+
+/**
+ * 凭证列表：翻页 / 改页大小 / 换排序都会重发一趟，而这几处控件是**可以连点**的
+ * （分页器的 `@current-change`、表头的 `toggleSort`）。
+ * 连点第 3、4 页 → 请求 A/B 并发 → B 先回、A 后回 →
+ * **页脚停在第 4 页、表格里却是第 3 页的数据**。
+ *
+ * 所以这一条改走 getLatest：同一把 key 的上一趟直接 abort，
+ * 配合页面上的代次守卫（composables/useLatestLoad.js），
+ * 两道防线缺一不可 —— 只有 abort 挡不住「abort 到达之前就已经 resolve」的那次。
+ * 键按端点分开：翻凭证列表不该把账簿三视图那次一起掐掉。
+ */
+export const queryVouchers = (bookId, params) =>
+  getLatest('voucher/list', `/books/${bookId}/vouchers`, params)
 export const getVoucher = (bookId, id) => http.get(`/books/${bookId}/vouchers/${id}`).then(r => r.data)
 /** 新开一张时预填的凭证号 + 期间最后一张的日期。号码由后端发，和落库同源。 */
 export const nextVoucher = (bookId, periodId) =>

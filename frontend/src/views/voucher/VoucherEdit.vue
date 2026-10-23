@@ -259,9 +259,9 @@ import * as subjectApi from '@/api/subject'
 import * as ledgerApi from '@/api/ledger'
 import { useSessionStore } from '@/stores/session'
 import { useTabsStore } from '@/stores/tabs'
-import { fmt } from '@/utils/format'
+import { moneyText } from '@/utils/format'
 import { centsToText, moneyCents } from '@/utils/amountGrid'
-import { displayBalance } from '@/utils/balanceSign'
+import { displayBalanceCents } from '@/utils/balanceSign'
 import { findFirstProblem } from '@/utils/voucherRows'
 import AmountGrid from '@/components/AmountGrid.vue'
 import SubjectPicker from '@/components/SubjectPicker.vue'
@@ -578,17 +578,24 @@ watch([balancePeriodId, voucherId], loadBalances, { immediate: true })
  *
  * 算一次全表，不在模板里逐行遍历 —— 每次敲键重算一遍 O(行数) 就够，
  * 摊到每行各算一次是 O(行数²)。
+ *
+ * **单位是整数分（BigInt）**：这一段以前是 `Number(e.amount)` 浮点累加，
+ * 与同一页的 centsOf / voucherTotals / autoBalanceNeed 全都走的整数分口径
+ * 打架 —— 18 位金额会在这一处差出 0.03 元。金额只在这里定点化一次，
+ * 之后全是整数加减。
  */
+// ---- ownDelta 段开始（tests/test_reviewfix_own_delta.test.mjs 从这里头抠实现跑）----
 const ownDelta = computed(() => {
   const m = {}
   for (const e of form.entries) {
     if (!e.subject_id) continue
-    const a = num(e.amount)
-    if (!a) continue
-    m[e.subject_id] = (m[e.subject_id] || 0) + (e.direction === 'DEBIT' ? a : -a)
+    const c = centsOf(e.amount)          // 整数分（BigInt），与合计那一段同一份定点化
+    if (!c) continue
+    m[e.subject_id] = (m[e.subject_id] || 0n) + (e.direction === 'DEBIT' ? c : -c)
   }
   return m
 })
+// ---- ownDelta 段结束 ----
 
 /**
  * 这一行显示的余额文本：纯数字，不带「借/贷」也不带「余额」两个字。
@@ -596,7 +603,7 @@ const ownDelta = computed(() => {
  * 正负按科目表那一列「余额方向」定，不是按实际落在借方还是贷方：
  * 借属性借正贷负、贷属性借负贷正（见 utils/balanceSign.js）。
  * 0 显示成空 —— 一个空科目没有余额可言，写个「0.00」只会在每张凭证上多几行噪音。
- * 千分位由 fmt 统一带，跟页脚合计、科目余额表是同一套写法。
+ * 千分位由 moneyText 统一带，跟页脚合计、科目余额表是同一套写法。
  */
 /**
  * 哪几行正在「标记科目」。
@@ -623,13 +630,23 @@ const balanceText = (row) => {
   // 一个空科目也会被自己这笔钱点亮 —— 600101 原本余额是 0，
   // 借方填了 3000 万就该显示出来，而不是空着。
   //
+  // **全程整数分**：
+  //   · 账上余额（后端给的是 number/float）先定点成整数分 —— 只在这里转换一次，
+  //     转换之后就不再有浮点；
+  //   · ownDelta 已经是整数分（见上面那一段），两段相加还是整数分；
+  //   · 翻正负在整数分上做（displayBalanceCents），显示走 moneyText（整数分 → 文本）。
+  // 以前这里是 `num(账上余额) + ownDelta` —— 两边都是浮点，
+  // 18 位金额会差出 0.03 元，而这一格正是辅助记账时人照着填数的那个数。
+  //
   // 借贷先按引擎口径（借正贷负）加总，**加完再按科目余额方向翻正负**：
   // 贷属性的科目（负债/权益/收入）借方有余额时显示负数，一眼看出录反了方向。
   // 翻只在这一处发生，别在 ownDelta 里提前翻 —— 那样基数和增量两套符号会打架。
   const sub = subjectOf(sid)
-  const n = displayBalance(sub?.direction, num(balances.value[sid]) + (ownDelta.value[sid] || 0))
-  if (!n) return ''
-  return fmt(n)
+  const base = centsOf(balances.value[sid])          // 账上余额 → 整数分
+  const delta = ownDelta.value[sid] || 0n            // 本张正在填的（整数分）
+  const shown = displayBalanceCents(sub?.direction, base + delta)
+  if (!shown) return ''
+  return moneyText(shown)
 }
 
 // ---- 借方/贷方是两个独立格子，数据层还是一个 direction + amount ----
@@ -784,9 +801,17 @@ const balanced = computed(() => diffCents.value === 0n)
  *
  *  金额从整数分直接落成字符串：不平的时候至少差一分，
  * 所以这里**不可能再出现「贷方大 0.00」**那种看不懂的话。
+ *
+ * **页脚是文本，合计格是金额格 —— 两者写法不一样是刻意的，别去「统一」。**
+ *   · 合计格（AmountCells）是**逐位落格**的：亿…元九格 + 角 + 分，
+ *     每一位单独占一格，为的是跟打印纸上的金额格对齐（打印出来是同一张纸）；
+ *     所以它不带千分位 —— 格子是定宽的，塞不下千分位逗号。
+ *   · 页脚这一句是**一句人话**，带千分位（"借方大 3,003,000.00"），
+ *     它跟科目余额表、期初页的合计栏用的是同一份 moneyText。
+ * 强行把两边改成一样，只会让其中一个失去它存在的理由。
  */
 const diffTag = computed(() => `${diffCents.value > 0n ? '借方大' : '贷方大'} ${
-  fmt(centsText(diffCents.value < 0n ? -diffCents.value : diffCents.value))}`)
+  moneyText(diffCents.value < 0n ? -diffCents.value : diffCents.value)}`)
 
 // 一分钱都还没录的时候别急着报红字，那是噪音不是提示
 const blank = computed(() => totals.value.debit === 0n && totals.value.credit === 0n)
@@ -1104,9 +1129,11 @@ function autoBalance(i, side) {
   if (side === 'd') setDebit(row, text)
   else setCredit(row, text)
   activeRow.value = row
+  // 金额从整数分直接落成文本（moneyText）：中间不经过浮点，
+  // 18 位金额不会被 Number 改小（以前这里是 fmt(text) —— 文本 → 浮点 → 文本）。
   ElMessage.success(need < 0n
-    ? `已按差额补上 ${fmt(text)}（红字冲销）`
-    : `已按差额补上 ${fmt(text)}`)
+    ? `已按差额补上 ${moneyText(need)}（红字冲销）`
+    : `已按差额补上 ${moneyText(need)}`)
 }
 
 /**
@@ -1453,8 +1480,32 @@ function stale(seq) { return seq !== loadSeq }
  * `loadSeq` 也得一起抬一代：还在路上的旧响应回来时必须自己认得出过期，
  * 否则抹干净的表单又被它填回上一张的样子。
  */
+/**
+ * 切账套时，地址栏里那个 id 是**上一个账套**的凭证号。
+ *
+ * 凭证 id 是**账套内自增**的，两个账套撞号是常事 —— 于是切过去有两种结果：
+ *   · 新账套**恰好有**这个 id → 页面**静默打开另一本账的另一张凭证**，
+ *     屏幕上那张跟人刚才看的那张长得完全不一样，却没有任何提示；
+ *   · 新账套没有这个 id → 报错跳列表（那半处理得体面）。
+ *
+ * 这里记下「上一个账套的哪张凭证」，切过去之后**明示一次** ——
+ * 只加提示，**不改加载行为**（还是打开本账套的同号凭证，不是回到上一本账）。
+ */
+const crossBook = ref(null)
+
+/** 账套的名字（提示里要指名道姓，光说「另一个账套」等于没说）。 */
+function bookName(bookId) {
+  const b = store.books.find((x) => x.id === bookId)
+  return b?.company_name || b?.name || `账套 ${bookId}`
+}
+
 function resetForm() {
   ++loadSeq
+  // 记下「上一张是哪个账套的哪张」—— 见上面 crossBook 的说明。
+  // 没有凭证 id（新增页）时不记：那不是「撞号」，没有需要提示的事。
+  if (voucherId.value) {
+    crossBook.value = { bookId: formBookId.value, voucherId: voucherId.value }
+  }
   voucherId.value = 0
   voucherPeriod.value = null
   voucherPeriodId.value = 0
@@ -1515,13 +1566,31 @@ async function load() {
       // 这个 id 在**当前账套**里读不出来。多半是切了账套而地址栏还挂着
       // 上一张的号（两个账套的凭证 id 是各自自增的，撞上号也不稀奇）。
       // 停在一张空表上、还绑着那个 id，只会更让人以为凭证没了 —— 回列表去。
-      ElMessage.error('这张凭证在当前账套里不存在')
+      const cross = crossBook.value
+      if (cross) {
+        // 切账套撞号：说清「你原来看的是哪本账的哪张」（见 crossBook 的说明）
+        crossBook.value = null
+        ElMessage.error(
+          `已切换到账套「${bookName(store.bookId)}」：原凭证（账套「${bookName(cross.bookId)}」`
+          + `#${cross.voucherId}）在此账套里不存在`)
+      } else {
+        ElMessage.error('这张凭证在当前账套里不存在')
+      }
       router.push({ name: 'vouchers' })
       return
     }
     if (stale(seq)) return
     // 双重确认：代次之外再核对 id，防的是「代次对上了但期间切换了」
     if (Number(route.params.id || 0) !== myId) return
+    // 切账套撞号：这张是**本账套**的同号凭证，不是刚才那本账的那张 —— 明示一次。
+    // 只提示，不改加载行为（下面照旧打开本账套的这张）。
+    if (crossBook.value) {
+      const cross = crossBook.value
+      crossBook.value = null
+      ElMessage.warning(
+        `已切换到账套「${bookName(store.bookId)}」：原凭证（账套「${bookName(cross.bookId)}」`
+        + `#${cross.voucherId}）不在此账套，已打开本账套的 #${myId}`)
+    }
     voucherPeriod.value = store.periods.find((p) => p.id === v.period_id) || null
     voucherPeriodId.value = v.period_id   // store.periods 还没灌完时也能算余额
     // **科目表按这张凭证自己那一年取**（不是顶栏那一年）——
@@ -1752,6 +1821,13 @@ watch([entrySig, balanced], () => {
  * 是还没录完 —— 为这个拦住人不让人走是本末倒置。
  *
  * 返回 true = 没有待补的改动（或补上了）；false = 有改动但没存上。
+ *
+ * **必须 `await`**：save() 是 async，返回的是 Promise。
+ * 原来这里写的是 `save() === true` —— 拿一个 Promise 对象跟 `true` 比，
+ * **恒为假**：于是「改动已经存上了」也被报成「没存上」，
+ * 离开凭证页时弹出那个红框（"这一张还有改动没能存上，离开就会丢掉"），
+ * 而保存其实早就成功了；拆分凭证则被**永久误拦**，提示语还是错的。
+ * await 之后拿到的是 save() 真正 resolve 出来的那个布尔值。
  */
 async function flushIfDirty() {
   if (readonly.value) return true
@@ -1759,7 +1835,7 @@ async function flushIfDirty() {
   if (entrySig.value === lastSaved.value) return true
   if (!balanced.value) return true
   if (!hasCompleteEntry.value) return true
-  return save() === true
+  return await save()
 }
 
 /** 真有东西没存上吗？浏览器的关页签/刷新提示问的是这一句。 */

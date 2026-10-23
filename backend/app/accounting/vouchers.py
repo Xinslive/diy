@@ -316,10 +316,29 @@ def _validate_entries(db: Session, book_id: int, entries: list[dict],
     # **正负相抵**（借 111 / 借 -111）同理：红字把 -111 搬去了对面，两栏一样大，
     # 按「借贷合计相等」就是平的（2026-10-12 用户明确要求这么判），也该存。
     #
-    # 只挡**一条金额都没填**的：每条都是 0，那不是「记了 0 块」，是没填。
-    # 它存进去，报表上凭空多出一张凭证，还查不出是哪张干的。
-    if all(money(e["amount"]) == 0 for e in entries):
-        raise ValueError("凭证金额不能是 0")
+    # ---- 逐条拒「金额为 0」的分录（审查修复）--------------------------
+    # 以前这里只在**所有**分录都为 0 时报错。那样「借 100 / 贷 100 / 贷 0」
+    # 这种（借贷合计仍然相等、于是能过平账检查）的零金额分录是能存进去的：
+    # 账面上多出一行 0，纸质的凭证上也多一行没有金额的格子。
+    #
+    # 数据库那道 ``ck_entry_amount_nonzero`` 其实是拦得住的，但它是约束触发器，
+    # 抛出来的话用户看到的是一串数据库原文。这里用同一判据先拦一道，
+    # **并且说清是哪一行**（分录序号）—— 用户能照着改。
+    #
+    # 注意别误伤红字与同侧相抵：判据是「这一条的金额是不是 0」，
+    # 不是「合计是不是 0」。111 与 -111 都不是 0，放行。
+    zero_lines = [
+        f"第 {index} 行（{'借方' if e.get('direction') == 'DEBIT' else '贷方'}）"
+        for index, e in enumerate(entries, start=1)
+        if money(e["amount"]) == 0
+    ]
+    if zero_lines:
+        raise ValueError(
+            f"凭证金额不能是 0：{'、'.join(zero_lines)}。"
+            "金额为 0 的分录不是「记了 0 块」，是没填 —— "
+            "它存进去，报表上会凭空多出一行凭证，还查不出是哪张干的。"
+            "请把这几行的金额填上，或删掉这几行。"
+        )
 
     subject_ids = {e["subject_id"] for e in entries}
     stmt = select(Subject.id, Subject.code, Subject.name, Subject.is_leaf).where(

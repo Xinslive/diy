@@ -232,6 +232,20 @@ def check_range(from_period: Period, to_period: Period) -> None:
     区间上限是 ``mcp_max_range_months``。它的作用是**防止 agent 一次把整本
     账拉走** —— 不是性能问题（分页已经限住了），是「一个令牌被拿去批量
     导出数据」这件事本身。
+
+    **这一项只约束「跨期查询」，不约束「按年查询」（审查 L-27）。**
+    ``search_vouchers`` 先用 ``year`` 把窗口夹成该年度（最多 12 个月），
+    再调这里 —— 所以在那个工具上这条闸**永远不会触发**。这是**有意的**，
+    不是漏洞：按年查询的窗口本来就比 60 个月更窄（12 < 60），也就是说
+    它**比这条闸更严**。要把它「变成会触发」而靠放宽上限，是把一条保护
+    拆了。
+
+    所以各工具的口径是：
+
+    * **跨期查询**（``latest_payment`` 那种可以跨年的窗口）→ 这条闸真的会
+      触发，超过 ``mcp_max_range_months`` 就报错；
+    * **按年查询**（``search_vouchers``）→ 窗口已被年度夹住，比这条闸更严；
+      工具的 ``notes`` 里会说明这一点（免得 agent 以为这条闸没生效）。
     """
     limit = settings.mcp_max_range_months
     span = months_between(from_period, to_period)

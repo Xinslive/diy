@@ -12,6 +12,8 @@ import re
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Tuple
 
+from app.core.config import settings
+
 try:
     import pypdfium2 as p
 except ImportError:  # pragma: no cover - 运行环境通过 requirements 安装
@@ -20,19 +22,57 @@ except ImportError:  # pragma: no cover - 运行环境通过 requirements 安装
 
 # ---------- 文本提取 ----------
 
+
+def max_pdf_pages() -> int:
+    """单次解析允许的 PDF 页数上限。"""
+    return max(1, int(settings.invoice_max_pdf_pages))
+
+
+def max_text_chars() -> int:
+    """单次解析允许的文字总量上限（所有页加起来）。"""
+    return max(1, int(settings.invoice_max_text_chars))
+
+
 def extract_pages_text(pdf_path: str) -> List[str]:
-    """按页读取纯文本。失败时返回空字符串占位。"""
+    """按页读取纯文本。失败时返回空字符串占位。
+
+    **两道闸（审查 H-07）：页数与文字总量。**
+
+    * **页数闸在读页之前判**（``len(doc)``）—— 500 页的 PDF 逐页取文本层
+      本身就是几秒的 CPU 与几十 MB 的内存，而且它会一路走到「一页一张发票」
+      的解析链上。超了就该让用户分批，而不是把整本扫描件吞下去。
+    * **文字总量闸逐页累加** —— 一页 100 万字符的「文字层」同样能把内存打满；
+      上限按**所有页加起来**算，不看单页。
+
+    两道闸都报清楚「实际是多少、上限是多少、怎么办」。
+    """
     if p is None:
         raise RuntimeError("缺少 pypdfium2 依赖，请安装后再解析 PDF")
+    pages_limit, chars_limit = max_pdf_pages(), max_text_chars()
     doc = p.PdfDocument(pdf_path)
-    out: List[str] = []
-    for i in range(len(doc)):
-        try:
-            tp = doc[i].get_textpage()
-            out.append(tp.get_text_range() or "")
-        except Exception:
-            out.append("")
-    return out
+    try:
+        pages = len(doc)
+        if pages > pages_limit:
+            raise ValueError(
+                f"这份 PDF 有 {pages} 页，超过单次解析上限 {pages_limit} 页；"
+                "请分成几批上传")
+        out: List[str] = []
+        total = 0
+        for i in range(pages):
+            try:
+                tp = doc[i].get_textpage()
+                text = tp.get_text_range() or ""
+            except Exception:
+                text = ""
+            total += len(text)
+            if total > chars_limit:
+                raise ValueError(
+                    f"这份 PDF 的文字共 {total} 个字符，超过单次解析上限 "
+                    f"{chars_limit} 个字符；请分成几批上传")
+            out.append(text)
+        return out
+    finally:
+        doc.close()
 
 
 def page_count(pdf_path: str) -> int:

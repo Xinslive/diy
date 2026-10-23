@@ -13,9 +13,13 @@
     当期借方 = 借方累计(P) - 借方累计(P-1)
 
 期初的来源有两条：
-    - 该期间有期初快照（结账时冻结 / 账套初始化录入）→ 直接取快照
+    - 该期间有期初快照（账套初始化录入 / 年度结转承接）→ 直接取快照
     - 否则 → 由上一期期末实时推导
 这样未结账期间不需要物化任何数据，反结账只要删掉快照即可自动恢复可写。
+
+（**结账不写快照**：``period_opening`` 只在账套初始化录入期初与年度结转
+承接上一年期末余额这两处落数据。结账只锁期间、记账凭证，不动期初 ——
+所以「结账会冻结期初」这种说法是不成立的，别按它写代码。）
 
 「账套首期之前」也是一个**必须显式成立**的语义（2026-10-13 审计 P0-03）：
 账套启用月是第一个会计期间，启用月**之前没有期间**，但启用月的期初是一个
@@ -763,9 +767,19 @@ class LedgerEngine:
         而且试算平衡会**重复计数**（上级那年的数含它的下级，
         下级又单独计一次）。这种情况宁可报错，让用户按年度分别查 ——
         报一个说不清的数，比报一个错数更糟。
+
+        **年度没取全时拒绝合并（fail closed）。** 区间跨了 N 个年度、
+        而传进来的科目表只覆盖 M 个年度（M<N）时，中间那一年的分录
+        挂在第三套科目行上，压根匹配不到这些 id —— 区间发生额会**静默少掉**
+        整整一年，而行内仍然自洽（期初 + 发生额 = 期末），没有任何地方会报错。
+        与其给一张缺了中间年度的余额表，不如当场报错：取表漏了一年这件事
+        只有开发者看得见，用户看不见。
         """
         if not subjects:
             return []
+
+        if from_ord is not None:
+            self._assert_range_years_covered(subjects, from_ord, to_ord)
 
         groups: dict[str, list[Subject]] = {}
         for s in subjects:
@@ -834,6 +848,46 @@ class LedgerEngine:
                 closing=opening + dr - cr,
             ))
         return out
+
+    def _assert_range_years_covered(self, subjects: list[Subject], from_ord: int,
+                                    to_ord: int) -> None:
+        """区间跨了 N 个年度、但科目表只覆盖 M 个年度（M<N）时**报错**。
+
+        只对「**那一年确实有科目表**」的年份报错：区间里有一年压根没建过
+        科目表（空年度），那一年既没有分录也没有期初快照，本来就没有数
+        可丢 —— 那种情况报错只会挡住一次本来正常的查询。
+
+        区间跨哪些年度由**期间表**说了算（``ord`` 连续、跨年连续），
+        所以「区间涉及哪几年」这件事只有一处答案：期间表。
+        """
+        lo, hi = min(int(from_ord), int(to_ord)), max(int(from_ord), int(to_ord))
+        pmap = self._period_map()
+        range_years = sorted({pmap[o].year for o in pmap if lo <= o <= hi})
+        if len(range_years) < 2:
+            return
+        covered = {int(s.year) for s in subjects}
+        missing = [y for y in range_years if y not in covered]
+        if not missing:
+            return
+        materialized = set(
+            self.db.scalars(
+                select(Subject.year)
+                .where(Subject.book_id == self.book_id, Subject.year.in_(missing))
+                .distinct()
+            ).all()
+        )
+        if not materialized:
+            return
+        lost = sorted(int(y) for y in materialized)
+        raise ValueError(
+            f"这段区间跨了 {len(range_years)} 个年度（"
+            f"{'、'.join(str(y) for y in range_years)}），"
+            f"但 {'、'.join(str(y) for y in lost)} 年的科目表没被取到 —— "
+            f"那几年的分录挂在各自的科目行上，不取就**整段丢掉**，"
+            f"而且余额表仍然是自洽的、不会报错。"
+            f"请把区间内所有年度的科目表一起取出来"
+            f"（``queries.subjects_for_range``），或按年度分别查询。"
+        )
 
     def figures(self, subject_id: int, ord_: int) -> Figures:
         key = (subject_id, ord_)

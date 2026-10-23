@@ -141,6 +141,7 @@ import { downloadFile } from '@/api/print'
 import {
   absMoneyText, amountInputText, centsToText, moneyCents, sanitizeAmountDetailed,
 } from '@/utils/amountGrid'
+import { moneyText as moneyTextOf } from '@/utils/format'
 import { CATEGORY_LABEL } from '@/utils/subjectCode'
 import { hasInit, importSummaryText, subjectsReady } from '@/utils/bookInit'
 
@@ -275,12 +276,17 @@ function totalsCents(subjects) {
   return { dr, cr }
 }
 
-/** 合计栏的金额文字：带千分位。定点出来的，一分不差。 */
+/**
+ * 合计栏的金额文字：带千分位。定点出来的，一分不差。
+ *
+ * **格式规则住在 utils/format.js 的 moneyText（整数分 → 文本）** ——
+ * 期初导入预览弹窗（components/OpeningImportDialog.vue）用的是**同一份**。
+ * 以前这两个界面各写各的，同一个业务对象能显示成两个数
+ * （1.005 在导入预览里是 "1.005"，在期初页是 "1.00"）。
+ * 这里只留一个名字给页面用，实现交给那一份。
+ */
 function moneyText(cents) {
-  const neg = cents < 0n
-  const a = neg ? -cents : cents
-  const yuan = (a / 100n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')
-  return `${neg ? '-' : ''}${yuan}.${String(a % 100n).padStart(2, '0')}`
+  return moneyTextOf(cents)
 }
 // ---- 金额段结束（tests/opening_balance.test.mjs 从这里头抠实现跑）----
 

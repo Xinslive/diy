@@ -22,7 +22,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, tuple_
-from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.accounting import importer as svc_import
@@ -50,9 +50,26 @@ def _filename(name: str) -> str:
     return "attachment; filename*=UTF-8''" + urllib.parse.quote(name)
 
 
-def _diag(exc: DBAPIError) -> str:
-    diag = getattr(exc.orig, "diag", None)
-    return (getattr(diag, "message_primary", None) or str(exc.orig)).strip()
+# ---------------------------------------------------------------------------
+# **数据库异常不再在这里就地收口**（审查 L-01 / P1-2）
+# ---------------------------------------------------------------------------
+#
+# 原来这里有一个 ``_diag(exc)`` 辅助函数：从 psycopg 的
+# ``diag.message_primary`` 里取原文，塞进 ``HTTPException`` 的 detail。
+# 它把 PG 的原始违例文案交给了客户端 —— 里面是表名、列名、约束名，
+# 唯一冲突时还会带出重复键的值。
+#
+# 之所以曾经「看起来没问题」：我们自己写的护栏文案（``db_init.sql`` 里的
+# ``RAISE EXCEPTION``）是中文，本来就是给人看的；但 **PG 自己的**违例
+# 文案是英文的，里面带着表名与约束名。同一段代码分不清这两者。
+#
+# 现在这一层**整体交给** ``app/main.py`` 的全局处理器（``dbapi_error_handler``）：
+# 它按「文案是不是我们自己写的中文」区分 —— 我们写的中文护栏原文照旧回给
+# 客户端（那是给人看的提示），PG 自带的英文文案一律换成**脱敏文案 + 请求号**
+# （表名/列名/约束名只进服务端日志）。口径只有一份，不必两处各判一次。
+#
+# 后果：约束类违例仍然是 **4xx**（23505/23503/23502/23514/22001 → 400），
+# 其它数据库异常是脱敏的 **500**。也就是说这条路由**没有**把 4xx 降级成 500。
 
 router = APIRouter(prefix="/api/books/{book_id}/vouchers", tags=["凭证"])
 
@@ -436,9 +453,11 @@ def organize(payload: OrganizeIn, book: Book = Depends(get_my_book), db: Session
     except (ValueError, ArithmeticError) as e:
         db.rollback()
         raise HTTPException(400, str(e))
-    except DBAPIError as e:
-        db.rollback()
-        raise HTTPException(400, f"改号失败：{_diag(e)}")
+    # **数据库异常不在这里就地吞掉**（审查 L-01）：原来这条分支把
+    # ``diag.message_primary`` 原样放进 detail，客户端因此能读到 PG 的
+    # 违例原文（表名、列名、约束名，唯一冲突时还会带出重复键的值）。
+    # 现在它上抛给 ``app/main.py`` 的全局处理器：约束类仍是 **4xx**
+    # （脱敏文案 + ``X-Request-ID``），其它是脱敏的 500。
     return result
 
 

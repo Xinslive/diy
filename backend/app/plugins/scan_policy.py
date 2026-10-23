@@ -89,7 +89,19 @@ BACKEND_MODULES = {
     "uuid": _rule("UUID 生成：不读写任何外部系统"),
 
     # —— 内存缓冲：文件打开由属性规则单独拒绝（io.open）——
-    "io": _rule("内存缓冲（BytesIO/StringIO）：磁盘文件由 io.open 打开，已被属性规则拒绝"),
+    #
+    # **denied 里的 ``open`` 不是重复劳动**（审查 S-01）。属性规则只认
+    # ``io.open(...)`` 这种**属性形态**；而 ``from io import open as fh``
+    # 之后拿到的是一个**裸名字**，属性规则永远碰不到它，``DENIED_NAMES_ON_LOAD``
+    # 也只判「读取这个名字」，看不到它被 import 时就换了名字。
+    # 于是这一行曾经是完全放行的：签名插件可以 ``from io import open as fh``
+    # 然后 ``fh('/etc/hostname').read()`` —— 宿主 worker 的整个文件系统对它敞开。
+    # 现在它**在 import 这一步**就被拒，理由写在这里而不是只写在扫描器里。
+    "io": _rule(
+        "内存缓冲（BytesIO/StringIO）：磁盘文件入口 io.open 在 import 阶段就拒绝，"
+        "别名导入（from io import open as fh）同样拒绝",
+        denied={"open"},
+    ),
 
     # —— 框架与第三方库：插件路由和用户上传文件解析确实需要 ——
     "fastapi": _rule(
@@ -174,4 +186,33 @@ DENIED_NAMES_ON_LOAD = frozenset({
 # 也能挡住 ``bp = breakpoint`` 之后 ``bp()``。
 DENIED_NAMES_ON_CALL = frozenset({
     "input", "breakpoint", "vars",
+})
+
+# ---------------------------------------------------------------------------
+# 双下划线名字：默认**一律拒绝**（审查 S-01）
+#
+# **为什么是「一律」而不是逐个列举。** 逐个列举过一个名字，下一个就会
+# 从别的缝里漏进来 —— 这次漏的是 ``__builtins__``：
+#
+#     ev = __builtins__["eval"]
+#     ev("__import__('os').system('id')")
+#
+# 它是**裸 Name**（不是属性），所以「属性以 __ 开头就拒」那条规则看不见它；
+# 而 ``DENIED_NAMES_ON_LOAD`` 是逐个名字写的，``__builtins__`` 不在里面。
+# 扫出来是 CLEAN，运行时却在宿主进程里执行了任意命令。
+#
+# 同一族里还有一整串等价入口，每一个都能拿到内建能力：
+#   ``__builtins__``  —— 内建命名空间（eval/exec/open/__import__）
+#   ``__loader__``    —— 模块加载器，能再拿一次 ``__builtins__``
+#   ``__spec__``      —— 同上（``.loader`` 属性本身不以 __ 开头，躲过了属性规则）
+#   ``__dict__``      —— 模块全局字典，里面就有 ``__builtins__``
+#   ``__globals__`` / ``__class__`` / ``__subclasses__`` / ``__reduce__`` …
+#
+# 所以规则是**按形态**而不是按名字：插件代码里任何以 ``__`` 开头的名字，
+# 除下面这张极小的白名单外，全部拒绝。这样加新名字不需要改这份清单。
+# ---------------------------------------------------------------------------
+ALLOWED_DUNDER_NAMES = frozenset({
+    # 模块被解释器自动注入的四个只读元信息，插件用它们做日志/自述是合理的，
+    # 且都**不指向任何能力**（拿不到内建命名空间、拿不到加载器）。
+    "__name__", "__file__", "__doc__", "__package__",
 })

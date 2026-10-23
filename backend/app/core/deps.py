@@ -40,7 +40,20 @@ def get_current_user(
     # 又会出现「解两次得到两份载荷」的不一致窗口。
     if request is not None:
         request.state.auth_payload = payload
-    user = db.get(SysUser, int(payload["sub"]))
+    # **``sub`` 缺失或不是数字 ⇒ 401，不是 500**（审查 M-12）。
+    #
+    # 签名合法但载荷里没有 ``sub`` 的令牌（老版本签发的、别的服务用同一把
+    # 密钥签的、手工构造的）会**解码成功** —— 错误只会在下面取 ``sub`` 时
+    # 才炸，于是 KeyError/ValueError 变成一次 500，并把堆栈写进日志。
+    # 一个「令牌不对」的请求必须回 401：它是**客户端**的问题，不是服务端的。
+    sub = payload.get("sub")
+    if sub is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "访问令牌无效或已过期")
+    try:
+        user_id = int(sub)
+    except (TypeError, ValueError):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "访问令牌无效或已过期")
+    user = db.get(SysUser, user_id)
     if user is None or not user.active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户不存在或已停用")
     # 令牌版本核对（审计 P2-01）。JWT 自签名、服务端不存会话，所以「谁签发的、

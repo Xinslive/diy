@@ -2,6 +2,19 @@
 
 调用者身份始终来自 ASGI 上下文。每批只写一本账；SELECT FOR UPDATE 串行化
 修订和提交。SUBMITTING 只存在于提交事务内，进程中断会回滚到 CONFIRMED。
+
+**「确认」是一道独立的请求，不是一段可以省掉的步骤。**
+插件拿到的是 ``ctx.imports``（**不含 confirm**）：它可以上传、解析、预览、
+提交，但**不能替用户确认**。确认只能走宿主路由
+``POST /api/plugins/{id}/_host/imports/{ident}/confirm`` —— 那是浏览器里
+用户点下的那一次点击，是一次**独立的 HTTP 请求**。确认动作会把当次的请求号
+写进批次的 ``request_id``；提交时要求**自己带着另一个请求号**，否则拒绝。
+
+为什么这么严：**审批流不是安全边界，权限才是。** 宿主级校验（权限、批次归属、
+状态机、预览摘要一致、SAVEPOINT 原子提交）是完整且权威的 —— 即便插件跳过
+确认，数据的完整性也守得住。插件侧确认真正破坏的是**审批语义**：一次请求内
+自己预览、自己确认、自己提交，等于用户那次独立的点击从来没有发生过，
+而事后审计里会留下「用户确认过」的假象。
 """
 from __future__ import annotations
 
@@ -23,6 +36,7 @@ from app.core.db import SessionLocal
 from app.core.deps import get_my_book, require_book_write
 from app.models.plugin import PluginRegistry
 from app.models.plugin_import import PluginImportBatch as Batch, PluginImportFile as Source, PluginVoucherOrigin as Origin
+from app.plugins.public_api import current_request_id
 from app.plugins.uploads import read_file
 from app.plugins.configuration import validate_snapshot
 
@@ -32,6 +46,15 @@ EDITABLE = {"UPLOADED", "PREVIEW_READY", "EDITING", "CONFIRMED", "FAILED"}
 
 def now():
     return datetime.now(timezone.utc)
+
+
+def _request_id() -> str:
+    """当前请求的请求号（宿主网关注入）。
+
+    **为空就意味着「说不清这是哪一次请求」** —— 确认/提交要靠它证明是两次
+    独立请求，所以拿不到号时不能放行。
+    """
+    return str(current_request_id.get() or "").strip()[:128]
 
 
 def canonical(value):
@@ -121,7 +144,20 @@ def evidence(batch):
             "revision": batch.revision, "status": batch.status, "request_id": batch.request_id}
 
 
-def service(manifest, principal):
+def service(manifest, principal, *, expose_confirm=False):
+    """宿主侧的导入能力。
+
+    ``expose_confirm`` 决定**确认**能力是否出现在暴露面上：
+
+    * ``False``（**插件拿到的就是这一份**）—— 不含 ``confirm``。插件可以上传、
+      解析、预览、提交，但确认必须由**另一次独立的 HTTP 请求**经宿主路由完成。
+    * ``True`` —— 只有宿主自己的路由（``plugins/services.py``）用它，
+      ``POST /_host/imports/{ident}/confirm`` 就是那条「用户点了确认」的路径。
+
+    拆成两个面不是为了好看：``ctx.imports`` 一次性给出全套能力时，插件可以在
+    **一次请求内**完成「预览 → 确认 → 提交」，用户那次独立的点击就从来没有
+    发生过。
+    """
     pid = manifest["id"]
     permissions = set(manifest["permissions"])
 
@@ -253,7 +289,10 @@ def service(manifest, principal):
                 batch.plugin_version, batch.plugin_digest = plugin.version, plugin.plugin_digest
             batch.status = "PREVIEW_READY" if first and not errors else "EDITING"
             batch.revision += 1
+            # 改了预览 ⇒ 之前的确认作废（连同它的请求号一起清掉：它证明的是
+            # 「这一版预览被确认过」，预览一改就不再是同一版）。
             batch.validation_errors, batch.confirmed_at = errors, None
+            batch.request_id = ""
             record(db, user, batch, "preview", error_count=len(errors))
             return serialize(db, batch)
 
@@ -264,6 +303,11 @@ def service(manifest, principal):
         return save_preview(ident, payloads, revision=revision, parsed=False)
 
     def confirm(ident, *, revision):
+        """把批次标成「用户已确认」。**只能由宿主路由调用**（插件面没有它）。
+
+        确认动作会把**当次的请求号**写进 ``batch.request_id``：这是「用户点了
+        确认」这件事**可核验**的凭据 —— 提交时要求拿着另一个请求号。
+        """
         with SessionLocal.begin() as db:
             user, batch = access(db, ident, lock=True, write=True)
             check_revision(batch, revision)
@@ -274,15 +318,26 @@ def service(manifest, principal):
             _, errors = validate_payloads(db, batch.book_id, batch.preview)
             if errors:
                 raise HTTPException(422, {"code": "IMPORT_INVALID_PREVIEW", "errors": errors})
+            rid = _request_id()
+            if not rid:
+                # 没有请求号就证明不了「这是一次独立的确认请求」—— 不放行。
+                raise HTTPException(409, {
+                    "code": "IMPORT_CONFIRM_REQUEST_REQUIRED",
+                    "message": "这次确认没有请求号，无法核验它是一次独立请求；"
+                               "请刷新页面后重新确认"})
             if batch.status != "CONFIRMED":
                 batch.status, batch.confirmed_at = "CONFIRMED", now()
                 batch.revision += 1
-                record(db, user, batch, "confirmed")
+            # 重新确认也要更新请求号：它证明的是「**最近一次**确认发生在哪次请求」。
+            batch.request_id = rid
+            record(db, user, batch, "confirmed", confirmed_request_id=rid)
             return serialize(db, batch)
 
     def submit(ident, *, revision, request_id=""):
         if "voucher:write" not in permissions:
             raise HTTPException(403, "插件未声明 voucher:write 能力")
+        # 提交方的请求号：优先用调用方给的（宿主路由会传），否则取当前请求的。
+        rid = str(request_id or "").strip()[:128] or _request_id()
         error = None
         with SessionLocal.begin() as db:
             user, batch = access(db, ident, lock=True, write=True)
@@ -293,9 +348,24 @@ def service(manifest, principal):
             validate_snapshot(db, manifest, batch.book_id, batch.configuration)
             if batch.status != "CONFIRMED" or not batch.confirmed_at:
                 raise HTTPException(409, "必须先由用户确认当前预览")
+            if not batch.request_id:
+                raise HTTPException(409, {
+                    "code": "IMPORT_CONFIRM_REQUEST_REQUIRED",
+                    "message": "这个批次没有经过独立的确认请求确认；"
+                               "请让用户在页面上点一次「确认当前预览」后再提交"})
+            if not rid:
+                raise HTTPException(409, {
+                    "code": "IMPORT_SUBMIT_REQUEST_REQUIRED",
+                    "message": "这次提交没有请求号，无法核验它与确认是两次独立请求；"
+                               "请刷新页面后重新提交"})
+            if batch.request_id == rid:
+                raise HTTPException(409, {
+                    "code": "IMPORT_CONFIRM_REQUEST_REUSED",
+                    "message": "确认与提交必须来自两次独立的请求；"
+                               "请在用户确认之后的另一次请求里提交"})
             if canonical(batch.preview) != batch.preview_digest:
                 raise HTTPException(409, "预览摘要不一致，请重新生成并确认")
-            batch.request_id = str(request_id or "")[:128]
+            batch.request_id = rid
             batch.status = "SUBMITTING"
             db.flush()
             try:
@@ -367,8 +437,14 @@ def service(manifest, principal):
                 "max_rows": settings.import_max_rows, "max_vouchers": settings.import_max_vouchers,
                 "draft_days": settings.import_batch_ttl_days, "retention_days": settings.plugin_import_retention_days}
 
-    return SimpleNamespace(create=create, read=read, list=list_batches, source=source, limits=limits, origin=origin,
-                           preview=preview, edit=edit, confirm=confirm, submit=submit, cancel=cancel)
+    exposed = dict(create=create, read=read, list=list_batches, source=source, limits=limits,
+                   origin=origin, preview=preview, edit=edit, submit=submit, cancel=cancel)
+    # **确认不在默认暴露面上。** 只有宿主自己的路由才拿得到它（见
+    # ``service`` 的 docstring）—— 插件面少了它，「用户点确认」才是一次
+    # 不可省略的独立请求。
+    if expose_confirm:
+        exposed["confirm"] = confirm
+    return SimpleNamespace(**exposed)
 
 
 def purge_expired(db, *, at=None, limit=500):

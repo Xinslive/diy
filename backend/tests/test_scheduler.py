@@ -557,7 +557,7 @@ def test_任务失败会发告警邮件(scheduler_db, monkeypatch):
     """
     发出的 = _拦下告警(monkeypatch)
 
-    def _炸(name):
+    def _炸(name, **kwargs):
         raise RuntimeError("任务炸了")
 
     monkeypatch.setattr(service, "_run_system", _炸)
@@ -587,7 +587,7 @@ def test_备份任务失败发的是备份告警(scheduler_db, monkeypatch):
     """
     发出的 = _拦下告警(monkeypatch)
 
-    def _炸(name):
+    def _炸(name, **kwargs):
         raise RuntimeError("AccessKey 无效")
 
     monkeypatch.setattr(service, "_run_system", _炸)

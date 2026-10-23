@@ -3,6 +3,11 @@ import { useSessionStore } from '@/stores/session'
 import { needsBookRedirect } from '@/utils/bookGuard'
 
 const routes = [
+  // 登录页。这里注册的是 **hash 路由里的路径段**（'/login'），
+  // 浏览器上的完整地址是 '#/login' —— 那一份字符串住在 api/client.js 的
+  // LOGIN_HASH 常量里（令牌失效时用它跳回来）。
+  // **改这一处就要改那一处**：以前两边各写一份，改了一处忘了另一处，
+  // 令牌一失效就跳到一个不存在的地址，页面上只剩一片白。
   { path: '/login', name: 'login', component: () => import('@/views/LoginView.vue'), meta: { public: true } },
   // 插件开发文档：全站**唯一**免登录的页面，也是全站**唯一没有入口**的页面。
   //

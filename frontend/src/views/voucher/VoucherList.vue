@@ -182,6 +182,7 @@ import { Printer, Sort, Upload } from '@element-plus/icons-vue'
 import * as api from '@/api/voucher'
 import PrintDialog from '@/components/PrintDialog.vue'
 import { useUrlConditions } from '@/composables/useUrlConditions'
+import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'
 import { conditionsBelongTo } from '@/utils/filterScope'
 import { fmt } from '@/utils/format'
@@ -191,7 +192,11 @@ const router = useRouter()
 const route = useRoute()
 const rows = ref([])
 const total = ref(0)
-const loading = ref(false)
+/**
+ * 只认最新一趟：分页 / 排序能连点，旧响应不许覆盖新数据
+ * （见 composables/useLatestLoad.js）。
+ */
+const { loading, run, isStale } = useLatestLoad('voucher/list')
 const selection = ref([])
 /** 顶栏那个期间的「整理就绪」体检结果。干净就是 null，不占地方。 */
 const check = ref(null)
@@ -316,14 +321,16 @@ async function load() {
   // 反过来，**拿着旧账套的期间 id 查新账套**更糟：后端会回「起始期间不存在」。
   // 以前正是在这儿出的错（store 以为账套没换，旧期间一直留着）。
   if (!store.periodsReady) return
-  loading.value = true
-  try {
-    const data = await api.queryVouchers(store.bookId, queryParams())
-    rows.value = data.items
-    total.value = data.total
-  } finally {
-    loading.value = false
-  }
+  // 只认最新一趟：分页器能连点、表头排序也能连点，两趟并发时
+  // 后发先至会把**旧响应**写进表格 —— 页脚停在第 4 页、表格里是第 3 页的数据。
+  // 页面上的代次守卫（composables/useLatestLoad.js）与 api 层的 getLatest
+  // 是两道防线，缺一不可（理由见 useLatestLoad 的文件头）。
+  const d = await run(() => api.queryVouchers(store.bookId, queryParams()))
+  // 过期的那一趟：结果已经到了，但条件（页码/排序/期间）早被用户改掉了 ——
+  // 写进去就是「表格里的数对不上页脚」。
+  if (isStale(d)) return
+  rows.value = d.items
+  total.value = d.total
   loadCheck()
 }
 

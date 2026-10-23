@@ -62,17 +62,65 @@ def subjects_for_periods(db: Session, book_id: int, periods: list[Period]) -> li
 
     排序按 (类别, 编码, 年度)：单年时与 ``subject_tree`` 逐字一致
     （年度是常量），跨年时同一编码的各年度挨在一起，便于按编码归并。
+
+    ---- 区间里的年度必须一个不落（审查修复）--------------------------
+    过去这里**只按传入的期间**算年度，而调用方（余额表接口、打印、导出、
+    MCP）传的是 ``[from_period, period]`` **两个**期间 —— 于是只算得出
+    **首尾两年**，中间年度（2027）的科目表根本没被取到。
+
+    后果不是「少一行」，是**中间整年的发生额消失且不报错**：2027 年的
+    分录挂在 2027 那套科目行上（另一个 id），``merge_by_code`` 拿首尾
+    两年的 id 去聚合，2027 那半截压根匹配不到 —— 区间借方合计少一截，
+    而行内仍然自洽（期初 + 发生额 = 期末），**没有任何地方会报错**。
+
+    所以这里不再只信传入的期间：**把首尾期间之间的整段区间查出来**，
+    区间里出现过的每个年度都进并集。调用方传得全（见
+    ``subjects_for_range``）与传得少，结果一样 —— 少的那一份由这里补上。
     """
-    years = sorted({int(p.year) for p in periods})
+    if not periods:
+        return []
+    years = {int(p.year) for p in periods}
+    ords = [int(p.ord) for p in periods]
+    lo, hi = min(ords), max(ords)
+    if lo != hi:
+        span = db.scalars(
+            select(Period.year)
+            .where(Period.book_id == book_id, Period.ord >= lo, Period.ord <= hi)
+            .distinct()
+        ).all()
+        years |= {int(y) for y in span}
     if not years:
         return []
     return list(
         db.scalars(
             select(Subject)
-            .where(Subject.book_id == book_id, Subject.year.in_(years))
+            .where(Subject.book_id == book_id, Subject.year.in_(sorted(years)))
             .order_by(Subject.category, Subject.code, Subject.year)
         ).all()
     )
+
+
+def subjects_for_range(db: Session, book_id: int, from_period: Optional[Period],
+                       period: Period) -> list[Subject]:
+    """**区间**（``from_period`` ~ ``period``）涉及的所有年度的科目表并集。
+
+    区间口径的调用方都用它：科目余额表、总账打印、Excel 导出都要把
+    区间里**每一期**的年度都算进去（理由见 ``subjects_for_periods``）。
+
+    ``from_period`` 是 None 或与止期同一期时，退化成单期查询 ——
+    单年时取表的结果与过去逐字一致。
+    """
+    if from_period is None or from_period.id == period.id:
+        return subjects_for_periods(db, book_id, [period])
+    lo, hi = sorted((int(from_period.ord), int(period.ord)))
+    rows = list(
+        db.scalars(
+            select(Period)
+            .where(Period.book_id == book_id, Period.ord >= lo, Period.ord <= hi)
+            .order_by(Period.ord)
+        ).all()
+    )
+    return subjects_for_periods(db, book_id, rows or [from_period, period])
 
 
 # --------------------------------------------------------------------- 明细账

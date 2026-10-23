@@ -269,7 +269,9 @@ def load_one(runtime, plugin):
     if not callable(register) or len(pyinspect.signature(register).parameters) != 2:
         raise PluginError("INVALID_PLUGIN_ENTRY", "插件必须提供 register(registrar, ctx)")
     registrar = Registrar(verified.manifest)
-    result = register(registrar, context_for(verified.manifest))
+    # 插件拿到的是**插件面**的上下文：不含导入批次的「确认」能力 ——
+    # 确认必须走宿主路由那一次独立的 HTTP 请求（见 public_api.context_for）。
+    result = register(registrar, context_for(verified.manifest, plugin=True))
     if result is not None:
         raise PluginError("INVALID_PLUGIN_ENTRY", "register 不得返回 app 或其他对象")
     from app.plugins.services import router_for
@@ -371,6 +373,18 @@ class PluginGateway:
         except Exception:
             request_id = scope.get("state", {}).get("request_id", "")
             log.exception("plugin request failed id=%s request_id=%s", pid, request_id)
+            if response_started:
+                raise
+            await JSONResponse({"detail": {"code": "PLUGIN_EXECUTION_FAILED", "message": "插件执行失败", "request_id": request_id}}, status_code=500)(scope, receive, private_send)
+        except BaseException:
+            # **顺序不能反：Exception 在前、BaseException 在后。**
+            #
+            # 插件抛 SystemExit / KeyboardInterrupt / GeneratorExit 时，
+            # ``except Exception`` 接不住 —— 它会穿出宿主，把整个请求变成
+            # 连接中断（客户端看到的是「网关挂了」，而不是「插件执行失败」）。
+            # 插件的异常**任何形态都不许穿出宿主边界**。
+            request_id = scope.get("state", {}).get("request_id", "")
+            log.exception("plugin request aborted id=%s request_id=%s", pid, request_id)
             if response_started:
                 raise
             await JSONResponse({"detail": {"code": "PLUGIN_EXECUTION_FAILED", "message": "插件执行失败", "request_id": request_id}}, status_code=500)(scope, receive, private_send)
