@@ -1,3 +1,20 @@
+# -*- coding: utf-8 -*-
+#
+# **上面这行是 PEP 263 的编码声明，不是装饰，删了会炸。**
+#
+# pip 读 requirements 文件时用的是**系统默认编码**（``locale.getpreferredencoding``），
+# 不是 UTF-8：中文 Windows 上是 cp936，英文 Windows 上是 cp1252。而 pip 只有在
+# 文件头两行里看到 ``coding:`` 声明时才按声明解码，否则直接拿默认编码硬解 ——
+# 本文件里全是中文注释，UTF-8 的字节在 cp936/cp1252 下必然解码失败：
+#
+#     UnicodeDecodeError: 'gbk' codec can't decode byte 0x80 in position 22
+#
+# **这不是假想**：用 Wine 在 cp936 环境下跑 pip，第一句就是这个错。
+# （GitHub 的 windows-latest 恰好把系统 UTF-8 选项打开了，所以 CI 上看不出来 ——
+# 也就是说 CI 绿并不能证明中文 Windows 用户装得上。）
+#
+# 详见 requirements-build.lock 头部同题的说明。
+
 # 构建桌面壳所需的依赖（**只有打包工具**，运行时零依赖）。
 #
 # 壳本身只用标准库，运行时不需要任何第三方包。这一份清单是**构建期**的：
@@ -6,5 +23,9 @@
 # 版本定版（不是 >=）：PyInstaller 的打包行为在次版本之间会变
 # （hidden import 推断、spec 文件语义、bootloader 都可能动）。
 # 用 >= 意味着「今天打的包」和「下个月打的包」可能不是一回事。
-# 升级流程：改这里 → 重新构建 → 跑 smoke_test.py → 提交。
+#
+# **但实际安装用的是 requirements-build.lock（带哈希），不是这一份。**
+# 这一份是「想要哪些包、什么版本」的意图声明；锁文件才是真正装的东西 ——
+# 理由（只钉版本号钉不住字节）与生成方式见锁文件头部。
+# 升级流程：改这里 → 重新生成锁文件 → 重新构建 → 跑 smoke_test.py → 提交。
 pyinstaller==6.22.3

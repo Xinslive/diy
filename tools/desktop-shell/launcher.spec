@@ -41,7 +41,14 @@ from pathlib import Path
 
 # PyInstaller 注入的全局变量：spec 文件所在目录
 SPEC_DIR = Path(SPECPATH).resolve()
-REPO_ROOT = SPEC_DIR.parents[1]
+#
+# **这里原来还有一行 ``REPO_ROOT = SPEC_DIR.parents[1]``，已删。**
+# 它是死代码 —— 整个 spec 里没有任何地方用它；而它自己会出事：
+# ``parents[1]`` 要求 spec 上面至少有两级目录，一旦 spec 放在浅层级
+# （比如把桌面壳单独拎出来打包），就抛
+#     IndexError: list index out of range
+# 而报错位置在 spec 的第 44 行，与「打包」这个动作毫无关系，最容易把人引偏。
+# 真正用到的路径只有一个：spec 目录（图标与版本文件都在它旁边）。
 
 # 目录模式开关：CI 与本地脚本都用环境变量切，避免改 spec 文件
 ONEDIR = os.environ.get("CWQ_SHELL_ONEDIR") == "1"

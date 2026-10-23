@@ -1,0 +1,104 @@
+# -*- coding: utf-8 -*-
+# 桌面壳的**构建期**依赖锁文件（带哈希）。
+#
+# **上面第 1 行的编码声明不是装饰，删了会炸，而且位置也不能挪。**
+#
+# pip 读 requirements 文件用的是**系统默认编码**（``locale.getpreferredencoding``），
+# 不是 UTF-8：中文 Windows 是 cp936，英文 Windows 是 cp1252。pip 只有在文件头
+# **前两行**里看到 ``coding:`` 声明时才按声明解码，否则拿默认编码硬解 —— 本文件
+# 满是中文注释，UTF-8 的字节在 cp936/cp1252 下必然解码失败：
+#
+#     UnicodeDecodeError: 'gbk' codec can't decode byte 0x9f in position 24
+#
+# **这不是假想**：用 Wine 在 cp936 环境下跑 pip，第一句就是这个错。
+# GitHub 的 windows-latest 恰好开了系统 UTF-8 选项，所以 CI 上看不出来 ——
+# 「CI 绿」并不能证明中文 Windows 用户装得上，而本仓库的 README 恰恰教用户
+# 在自己机器上构建。
+#
+# **前两行**这个限制是 pip 的实现决定的（它只 split 前两行去找声明）——
+# 声明写在第三行往后等于没写，这个坑踩过一次。
+#
+# ---------------------------------------------------------------------------
+# 为什么多出这一个文件
+# ---------------------------------------------------------------------------
+# 本仓库有一条明文规矩：**「action 一律 pin commit SHA、依赖一律
+# --require-hashes」**（见 .github/workflows/ci.yml 与 ARCHITECTURE.md）。
+# 后端那条流水线一直照做：pip install --require-hashes -r requirements-dev.lock。
+#
+# 而桌面壳原来是 ``pip install -r tools/desktop-shell/requirements-build.txt``
+# —— **没有 --require-hashes，锁文件里也没有哈希**。那一版只钉了版本号
+# （pyinstaller==6.22.3），没有钉「钉的是哪一份字节」。
+#
+# 只钉版本号的问题是：同一个版本号的 wheel 可以被重新打包上传（PyPI 不允许
+# 覆盖同名同版本的文件，但**允许**上传「文件名不同、内容不同」的重新打包
+# 版本，setuptools 至今还这么干）。于是「pin 了 6.22.3」并不等于「装到的是
+# 我审过的那份 6.22.3」—— 供应链攻击的入口正是在这里。
+#
+# 加上哈希之后，pip 会在安装前逐个核对 SHA-256，对不上就**拒绝安装**。
+#
+# ---------------------------------------------------------------------------
+# 这份锁文件是给「Windows x64 + CPython 3.11」用的
+# ---------------------------------------------------------------------------
+# 与 .github/workflows/desktop-shell.yml 里的 ``python-version: '3.11'`` 一致。
+#
+# 哈希是**按 wheel 文件本身**算的，所以换平台/换 Python 小版本就会对不上，
+# pip 会直接失败 —— 这是**故意的**：构建环境必须与被审过的那一份完全一致。
+# 要换环境（如 3.12）就重新生成这个文件，别手改哈希。
+#
+# ---------------------------------------------------------------------------
+# 生成方式（可复现），以及一个必须知道的坑
+# ---------------------------------------------------------------------------
+#     python -m pip download --dest ./wheels --only-binary=:all: \
+#         --platform win_amd64 --python-version 3.11 \
+#         --implementation cp --abi cp311 "pyinstaller==6.22.3"
+#     # 然后对每个 .whl 算 sha256，填到下面
+#
+# **坑**：`pip download --platform` **只切换「下载哪个平台的 wheel」，不切换
+# 环境标记的求值平台**。在 macOS 上跑上面这条命令，pip 会按 **macOS** 的
+# 标记来解析依赖，于是：
+#   * 多给了 macholib（``sys_platform == 'darwin'``，Windows 用不到）；
+#   * **漏掉了 pefile 与 pywin32-ctypes**（两者都是 ``sys_platform == 'win32'``
+#     的条件依赖，macOS 上被标记过滤掉了）。
+# 那份漏项的锁文件在 Windows 上会让 ``--require-hashes`` 直接失败
+# （"all requirements must have their versions pinned"）。
+#
+# 所以下面这份依赖集是**照 PyInstaller wheel 自己的 METADATA 手工列全的**，
+# 不是 pip 在 macOS 上替我们列的。核对依据：
+#   Requires-Dist: altgraph
+#   Requires-Dist: importlib-metadata>=4.6; python_version < '3.10'   ← 3.11 用不到
+#   Requires-Dist: macholib>=1.8; sys_platform == 'darwin'            ← Windows 用不到
+#   Requires-Dist: packaging>=22.0
+#   Requires-Dist: pefile>=2022.5.30; sys_platform == 'win32'        ← 必须列
+#   Requires-Dist: pyinstaller-hooks-contrib>=2026.7
+#   Requires-Dist: pywin32-ctypes>=0.2.1; sys_platform == 'win32'     ← 必须列
+#   Requires-Dist: setuptools>=42.0.0
+#
+# **反过来，这份锁文件在 macOS 上是故意装不上的**：那里 pip 会因为
+# macholib 没有被钉住而报错。宁可失败，也不要在没审过的平台上装成功。
+#
+# ---------------------------------------------------------------------------
+# 为什么列了 setuptools
+# ---------------------------------------------------------------------------
+# PyInstaller 的元数据要求 setuptools>=42。runner 镜像里预装的 setuptools
+# 版本会随镜像滚动，不写进锁文件就等于把「装哪个 setuptools」交给运气。
+
+# --- PyInstaller 本体：只有 win_amd64 的 wheel（PyPI 上 PyInstaller 只发
+#     带平台标签的 wheel，没有纯 python 的 wheel 可选） ---
+pyinstaller==6.22.3 \
+    --hash=sha256:500bd58c7bf7e584a8435adccbd763a0b918d5c12b08d74ff50fd79b2915458b
+
+# --- PyInstaller 的传递依赖 ---
+altgraph==0.17.5 \
+    --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+pyinstaller-hooks-contrib==2026.9 \
+    --hash=sha256:fb3e67dd64122561724c48ad0366ac9e8c16e638b63bf7d85de03bf3fdbf06c3
+setuptools==84.2.1 \
+    --hash=sha256:ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2
+
+# --- Windows 专属条件依赖（sys_platform == 'win32'） ---
+pefile==2024.8.26 \
+    --hash=sha256:76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f
+pywin32-ctypes==0.2.3 \
+    --hash=sha256:8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8

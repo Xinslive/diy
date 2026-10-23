@@ -137,15 +137,42 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 装打包依赖（定版）
-        # 按 requirements-build.txt 定版装 PyInstaller。不用 >= ：PyInstaller
-        # 的打包行为在次版本之间会变（hidden import 推断、spec 语义、
-        # bootloader 都可能动），用 >= 等于「今天打的包」和「下个月打的包」
-        # 可能不是一回事。
+      - name: 装打包依赖（定版 + 哈希锁定）
+        # 按 requirements-build.lock 装 —— **哈希锁定，不只是钉版本号**。
+        #
+        # 仓库的规矩是「依赖一律 --require-hashes」（ci.yml 一直照做）。
+        # 只钉版本号是不够的：同一个版本号的 wheel 可以被重新打包上传
+        # （PyPI 不允许覆盖同名同版本的文件，但允许上传「文件名不同、
+        # 内容不同」的重新打包版本，setuptools 至今还这么干）。于是
+        # 「pin 了 6.22.3」并不等于「装到的是我审过的那份 6.22.3」——
+        # 供应链攻击的入口正是在这里。加上哈希后 pip 会在安装前逐个核对
+        # SHA-256，对不上就拒绝安装。
+        #
+        # --only-binary=:all: 是 --require-hashes 的必要搭配：哈希是按
+        # wheel 文件本身算的，sdist 要解包后才算得出来，对不上。
+        #
+        # 锁文件里的哈希是按 **Windows x64 + CPython 3.11** 的 wheel 算的
+        # （与上面 pin 的 python-version 一致），换平台/换小版本会直接失败 ——
+        # 这是故意的：构建环境必须与被审过的那一份完全一致。
         run: |
           python -m pip install --upgrade pip
-          pip install -r tools/desktop-shell/requirements-build.txt
+          pip install --require-hashes --only-binary=:all: `
+            -r tools/desktop-shell/requirements-build.lock
+
+          # **钉版本本身也要有断言。** 锁文件装对了，不等于装的是预期的那个
+          # 版本 —— 将来有人改了锁文件里的版本号并重算了哈希，这里就是
+          # 最后一道拦。措辞跟 ci.yml 里「钉版本要有断言」那条一致。
+          #
+          # **这段是 PowerShell**（windows-latest 的默认 shell），不是 bash：
+          # ``tr``、``[ "$v" != ... ]`` 在这里都不存在，用了会是「命令找不到」
+          # 而不是「断言失败」—— 断言失败会红，命令找不到也会红，但错误信息
+          # 会把人引到「PowerShell 坏了」而不是「版本不对」。
           python -m PyInstaller --version
+          $v = (python -m PyInstaller --version | Out-String).Trim()
+          if ($v -ne "6.22.3") {
+            Write-Output "::error::PyInstaller 版本不是锁定的 6.22.3（实际 '$v'）"
+            exit 1
+          }
 
       - name: 生成图标
         # 纯标准库生成，不需要 Pillow。产物也一并提交（生成物入库，

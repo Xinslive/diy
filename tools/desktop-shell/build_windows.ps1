@@ -60,12 +60,28 @@ if (-not (Test-Path (Join-Path $venv "Scripts\python.exe"))) {
 $py = Join-Path $venv "Scripts\python.exe"
 
 # ---------------------------------------------------------------- 2. 依赖
-Say "装打包依赖（按 requirements-build.txt 定版）"
+#
+# **按 requirements-build.lock 装（哈希锁定），不是按 requirements-build.txt。**
+#
+# 仓库的规矩是「依赖一律 --require-hashes」：只钉版本号钉不住「钉的是哪一份
+# 字节」—— 同一个版本号的 wheel 可以被重新打包上传，「pin 了 6.22.3」不等于
+# 「装到的是审过的那份 6.22.3」。--only-binary=:all: 是 --require-hashes 的
+# 必要搭配（哈希是按 wheel 文件本身算的，sdist 解包后才算得出来）。
+#
+# 锁文件里的哈希是按 **Windows x64 + CPython 3.11** 的 wheel 算的，换 Python
+# 小版本就会对不上而直接失败 —— 这是故意的，构建环境必须与被审过的那份一致。
+Say "装打包依赖（按 requirements-build.lock 哈希锁定）"
 & $py -m pip install --upgrade pip --quiet
 if ($LASTEXITCODE -ne 0) { Fail "pip 自升级失败" }
-& $py -m pip install --quiet -r (Join-Path $ScriptDir "requirements-build.txt")
-if ($LASTEXITCODE -ne 0) { Fail "装 PyInstaller 失败" }
-& $py -m PyInstaller --version
+& $py -m pip install --quiet --require-hashes --only-binary=:all: `
+    -r (Join-Path $ScriptDir "requirements-build.lock")
+if ($LASTEXITCODE -ne 0) { Fail "装 PyInstaller 失败（哈希校验没过就是装错了字节，见锁文件头部）" }
+# 钉版本本身也要有断言：锁文件装对了，不等于装的是预期的那个版本。
+$pyiVer = (& $py -m PyInstaller --version | Out-String).Trim()
+if ($pyiVer -ne "6.22.3") {
+    Fail "PyInstaller 版本不是锁定的 6.22.3（实际 '$pyiVer'）"
+}
+Write-Host "PyInstaller $pyiVer"
 
 # ---------------------------------------------------------------- 3. 图标
 Say "生成图标"
