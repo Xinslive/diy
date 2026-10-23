@@ -97,9 +97,10 @@ tools/desktop-shell/
 ├── requirements-build.lock 构建期依赖的**哈希锁定版**（CI 与本地都用它）
 ├── shell.json.example     配置示例
 ├── shell.ico              图标（生成物，也入库，方便换品牌图标）
-└── tests/                 单元测试（90 条）
+└── tests/                 单元测试（112 条）
     ├── test_launcher.py           壳的纯逻辑（66 条）
-    └── test_launch_path_probe.py  探针自身的纯逻辑（24 条）
+    ├── test_launch_path_probe.py  探针自身的纯逻辑（24 条）
+    └── test_ci_wiring.py          CI 接线自检（22 条，见 4.5）
 ```
 
 ---
@@ -115,7 +116,7 @@ cd tools/desktop-shell
 .\build_windows.ps1
 ```
 
-脚本按顺序做六件事，任一步失败立刻停：
+脚本按顺序做八件事，任一步失败立刻停：
 
 1. 建/复用构建虚拟环境 `.venv-build`
 2. 按 `requirements-build.lock` **哈希锁定**装 PyInstaller
@@ -123,6 +124,8 @@ cd tools/desktop-shell
 4. **跑单元测试** —— 构建前就红，好过打完包才发现逻辑坏了
 5. PyInstaller 打包 → `dist/CWQ.exe`
 6. **冒烟验证** —— 真跑一次 exe，逐条断言它的行为
+7. **真 spawn 验证** —— 真跑一次**不带参数**的 exe，替身浏览器接住参数（见 4.6）
+8. 可选：用 Inno Setup 出安装包
 
 产物：
 
@@ -137,7 +140,7 @@ dist-installer/CWQ-Setup.exe            安装包（装了 Inno Setup 才有）
 
 `.github/workflows/desktop-shell.yml`，两个 job、三道闸：
 
-- **单元测试**（ubuntu）：90 条，平台无关的纯逻辑（壳 66 + 探针 24）
+- **单元测试**（ubuntu）：112 条，平台无关的纯逻辑（壳 66 + 探针 24 + CI 接线自检 22）
 - **Windows 构建 + 冒烟**（windows-latest）：真出 exe、真跑一遍、真断言
   - **闸 2a**：冒烟验证 —— `--dry-run` 出的 JSON 逐条核对
   - **闸 2b**：真 spawn —— 替身浏览器**真收到了参数**（见 4.6）
@@ -225,6 +228,33 @@ python3 -m unittest discover -s tools/desktop-shell/tests -t tools/desktop-shell
 # 或用仓库那套 pytest
 python3 -m pytest tools/desktop-shell/tests
 ```
+
+**三类用例，测三种东西。**
+
+| 文件 | 测的是 | 平台 |
+|---|---|---|
+| `test_launcher.py` | 壳的纯逻辑：路径展开、浏览器发现、参数拼装、URL 校验、启动计划 | 任意 |
+| `test_launch_path_probe.py` | 探针自身的纯逻辑：沙箱布局、环境变量覆盖、期望参数 | 任意 |
+| `test_ci_wiring.py` | **CI 接线**：闸还在不在、是不是硬闸、顺序对不对、action 有没有 pin SHA | 任意 |
+
+第三类看着像鸡肋 —— 改 workflow 不改一行代码，任何代码测试都不会红。
+但**真正会出事的就是这种改动**：
+
+- 有人给真 spawn 硬闸加上 `continue-on-error` → 闸还在，但已经不挡人了；
+- 有人把「上传 exe 产物」挪到验证之前 → 验证不过，产物照样发出去；
+- 有人把某个 action 从 pin 的 SHA 改回 `@v4` → 供应链防护悄悄没了；
+- 有人删掉 `needs: [test]` → 单测已经红了，Windows runner 照样白跑额度。
+
+这四件事**都不会让任何一行代码测试失败** —— 所以得有东西盯着它们。
+
+它不装 PyYAML：壳是零依赖工具，它的测试也就该零依赖。做法是一个只够用的
+迷你扫描器（按缩进切 job / step / step 的直接键）；环境里恰好有 PyYAML 时，
+再用**真的 YAML 解析器**把同一批结论复验一遍 —— 第二双眼睛，不是第二套规则。
+
+> 边界：CI 的单测 job（ubuntu）**不装** PyYAML，所以那 6 条解析器复验用例
+> 在 CI 里是 skip 状态，跑的是文本层那 16 条。YAML **语法**层面若被写坏，
+> GitHub 自己会在 push 时就报出来（workflow 起不来、注解写明是文件无效），
+> 不会静默通过 —— 所以这里没有再为它加依赖。语义层面由这 22 条盯着。
 
 ### 4.6 验证「真的把浏览器拉起来」
 
