@@ -393,3 +393,86 @@ def test_保留策略不删别的文件(tmp_path, monkeypatch):
     db_backup.dump_to_file(tmp_path / "db-2026-10-04.sql", keep=1)
 
     assert (tmp_path / "backup.log").exists(), "保留策略把日志删了"
+
+class TestStripUnsupportedSettings:
+    """恢复前剔除服务端不认识的 SET 行。
+
+    **为什么要有这个。** pg_dump 会把版本特有的会话参数写进 dump：
+    ``transaction_timeout`` 是 PostgreSQL 17 才有的，pg_dump 17+ 会写
+    一行 ``SET transaction_timeout = 0;``。PG 16 的服务端不认识它。
+
+    而恢复命令带 ``--single-transaction`` + ``ON_ERROR_STOP=1`` —— 那一条
+    SET 会让**整份 dump 回滚，一张表都不恢复**，退出码只有 3。
+
+    实测（postgres:16 服务端 + pg_dump 18.6 客户端）：
+      ERROR:  unrecognized configuration parameter "transaction_timeout"
+      退出码 3；之后 \\dt → Did not find any relations.
+
+    本仓库把恢复称作「系统唯一的退路」，所以这条必须堵住。
+    """
+
+    def _module(self):
+        return _load_db_backup()
+
+    def test_removes_only_unknown_setting(self):
+        db = self._module()
+        dump = (
+            b"--\n-- PostgreSQL database dump\n--\n\n"
+            b"SET statement_timeout = 0;\n"
+            b"SET lock_timeout = 0;\n"
+            b"SET transaction_timeout = 0;\n"
+            b"SET client_encoding = 'UTF8';\n"
+            b"CREATE TABLE t(id int);\n"
+            b"INSERT INTO t VALUES (1);\n"
+        )
+        known = {"statement_timeout", "lock_timeout", "client_encoding"}
+        out, removed = db.strip_unsupported_settings(dump, known)
+
+        assert removed == ["transaction_timeout"]
+        assert b"transaction_timeout" not in out
+        # 服务端认识的必须原样留着
+        assert b"SET statement_timeout = 0;" in out
+        assert b"SET client_encoding = 'UTF8';" in out
+        # 数据与结构一行都不能少
+        assert b"CREATE TABLE t(id int);" in out
+        assert b"INSERT INTO t VALUES (1);" in out
+
+    def test_keeps_everything_when_all_known(self):
+        db = self._module()
+        dump = b"SET statement_timeout = 0;\nCREATE TABLE t(id int);\n"
+        known = {"statement_timeout"}
+        out, removed = db.strip_unsupported_settings(dump, known)
+        assert removed == []
+        assert out == dump
+
+    def test_does_not_touch_data_looking_like_set(self):
+        # 删的是**整行** SET 语句，不是文本里出现的参数名 ——
+        # INSERT 的值里正好写着 transaction_timeout 时不能被改。
+        db = self._module()
+        dump = (
+            b"SET transaction_timeout = 0;\n"
+            b"INSERT INTO t(v) VALUES ('transaction_timeout');\n"
+        )
+        out, removed = db.strip_unsupported_settings(dump, set())
+        assert removed == ["transaction_timeout"]
+        assert b"INSERT INTO t(v) VALUES ('transaction_timeout');" in out
+
+    def test_ignores_composite_set_statements(self):
+        # SET SESSION CHARACTERISTICS AS TRANSACTION ... 不是单个参数，
+        # 不该被当成「服务端不认识的参数名」而删掉。
+        db = self._module()
+        dump = b"SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE;\n"
+        out, removed = db.strip_unsupported_settings(dump, set())
+        assert removed == []
+        assert out == dump
+
+    def test_server_setting_names_returns_none_when_unreachable(self):
+        # 问不到服务端时返回 None（含义是「不知道」），调用方据此不剔任何东西。
+        db = self._module()
+        original = db.PSQL_BIN
+        db.PSQL_BIN = "/definitely/not/here/psql"
+        try:
+            assert db.server_setting_names("postgresql://u:p@h:5432/d") is None
+        finally:
+            db.PSQL_BIN = original
+

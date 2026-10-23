@@ -93,13 +93,70 @@ jobs:
           # 与 backend/Dockerfile 和本地 .venv 一致（3.11）
           python-version: '3.11'
 
-      - name: 装 PostgreSQL 客户端
+      - name: 装 PostgreSQL 客户端（版本必须与服务端一致）
         # 备份/恢复测试要真的调 pg_dump 和 psql。GitHub runner 镜像里不保证有，
         # 所以显式装 —— 靠「镜像里碰巧有」的话，某天 runner 换镜像就静默 skip 了。
+        #
+        # **版本必须钉死成与服务端同一个主版本（16）。**
+        #
+        # 原来装的是不带版本号的 ``postgresql-client``，装到哪个版本取决于
+        # **发行版源里现在是什么**。ubuntu-latest 在 2026-10-19 迁到 Ubuntu 26
+        # 之后，源里的默认客户端升到了 17/18，而本 workflow 的服务端是
+        # ``postgres:16`` —— 于是 pg_dump 18 生成的 dump 里带了
+        # ``SET transaction_timeout = 0;``（transaction_timeout 是 PG 17 才有的
+        # 参数），PG 16 服务端不认，恢复直接失败。
+        #
+        # 失败形态特别隐蔽：``db_backup.py`` 的恢复带 ``--single-transaction``
+        # 与 ``ON_ERROR_STOP=1``，那一条 SET 会让**整份 dump 回滚、一张表都
+        # 不恢复**，而退出码只有 3。2026-10-23 那次 CI 红的就是这个
+        # （backend/tests/test_db_backup_restore.py）。
+        #
+        # 这不是「凑合能用」的问题：pg_dump 官方明说「不保证它的输出能装进
+        # 旧主版本的服务器」。所以**客户端与服务端同主版本**是硬要求，
+        # 不是偏好。
+        #
+        # 用 PGDG 官方源装指定主版本，并**核对装出来的确实是 16** ——
+        # 钉版本这件事本身也要有断言，否则哪天源里没有 16.x 了，
+        # apt 会静默装回默认版本，问题原地复现。
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y postgresql-client
-          pg_dump --version && psql --version
+          sudo apt-get install -y --no-install-recommends curl ca-certificates gnupg
+
+          # PGDG 官方源的签名公钥（与 nginx 那一步同一套做法：指纹钉死）
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc             | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          ALLOWED="B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8"
+          FPRS=$(gpg --show-keys --with-colons /usr/share/keyrings/pgdg.gpg                  | awk -F: '/^fpr:/{print $10}')
+          echo "PGDG 公钥指纹：${FPRS}"
+          MATCHED=0
+          for f in ${FPRS}; do
+            for a in ${ALLOWED}; do
+              if [ "$f" = "$a" ]; then MATCHED=1; fi
+            done
+          done
+          if [ "$MATCHED" != "1" ]; then
+            echo "::error::PGDG 签名公钥指纹不在允许清单里（官方轮换了密钥？）—— 人工确认后更新 ci.yml 的 ALLOWED"
+            exit 1
+          fi
+
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main"             | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-16
+
+          # **断言装出来的确实是 16** —— 钉版本这件事本身也要有断言。
+          # 源里没有 16.x 时 apt 会报错；这里再查一遍版本号，是防
+          # 「apt 装了别的东西」与「PATH 上还有别的 pg_dump」两种情况。
+          pg_dump --version
+          psql --version
+          pg_dump --version | grep -qE " 16\." || {
+            echo "::error::pg_dump 不是 16.x —— 与 postgres:16 服务端不同主版本，转储会带出版本特有参数"
+            exit 1
+          }
+          psql --version | grep -qE " 16\." || {
+            echo "::error::psql 不是 16.x —— 与 postgres:16 服务端不同主版本"
+            exit 1
+          }
 
       - name: 装锁定版本的依赖
         working-directory: backend

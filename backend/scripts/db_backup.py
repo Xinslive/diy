@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -179,9 +180,114 @@ def dump(url: str) -> int:
     return rc
 
 
+# ---------------------------------------------------------------------------
+# 服务端不认识 dump 里的 SET 行时的自愈
+# ---------------------------------------------------------------------------
+#
+# **问题。** pg_dump 会把「导出时用的会话参数」写进 dump 开头，其中有些是
+# **版本特有**的：``transaction_timeout`` 是 PostgreSQL 17 才有的参数，
+# pg_dump 17+ 会在 dump 里写一行 ``SET transaction_timeout = 0;``。
+# 而 PG 16 的服务端不认识它 —— 恢复时直接报
+# ``ERROR: unrecognized configuration parameter "transaction_timeout"``。
+#
+# **为什么这是「恢复彻底失败」而不是「一行报错」。**
+# 恢复命令带 ``--single-transaction`` 与 ``ON_ERROR_STOP=1``（见
+# :func:`restore_command`）：前者让整份 dump 要么全进要么全不进，后者让
+# 首个错误立刻非零退出。两者叠加的结果是 —— **那一条 SET 让整个事务回滚，
+# 一张表都不恢复**，而退出码只有 3。
+#
+# 实测（postgres:16 服务端 + pg_dump 18.6 客户端）：
+#   ERROR:  unrecognized configuration parameter "transaction_timeout"
+#   退出码 3；之后查 \dt → Did not find any relations.
+#
+# 这个仓库把恢复称作「系统唯一的退路」（见本模块开头），所以「恢复不了」
+# 不是能接受的状态 —— 而触发它的条件（客户端比服务端新）非常容易发生：
+# 发行版升级 apt 源里的 postgresql-client 就会换掉客户端版本。
+#
+# **修法。** 恢复前先问服务端它认识哪些配置参数，把 dump 里服务端**不认识**
+# 的 SET 行剔掉再恢复。
+#
+# 为什么可以剔：这些 SET 只是 pg_dump 记下的会话参数（超时、编码之类），
+# 不是数据，也不是结构。剔掉它们不改变恢复出来的库的内容。而被剔的那几个
+# 参数，恰恰是「新版客户端为了保护旧服务端而加的保险」（比如把事务超时设成
+# 0 = 不超时）—— 旧服务端本来就没有这个概念，缺了它反而回到该版本的本意。
+#
+# 问不到服务端（客户端缺失、连不上）时**不剔任何东西**：那时候本来也
+# 恢复不了，不该在这里做猜测。
+
+_SET_LINE = re.compile(rb"^SET ([A-Za-z_][A-Za-z0-9_]*) = ")
+
+
+def server_setting_names(url: str) -> set[str] | None:
+    """问服务端它认识哪些配置参数。
+
+    返回参数名集合；问不到（客户端缺失、连不上、权限不足）时返回 ``None``
+    —— 那个 ``None`` 的含义是「不知道」，不是「一个都没有」，调用方据此
+    **不做任何剔除**。
+    """
+    u = _parse(url)
+    cmd = [PSQL_BIN, "--no-psqlrc", "--tuples-only", "--no-align",
+           "--dbname", (u.path or "/").lstrip("/"),
+           "-h", u.hostname, "-p", str(u.port or 5432),
+           "-U", u.username or "",
+           "--command", "SELECT name FROM pg_settings;"]
+    try:
+        result = subprocess.run(cmd, env=_env(u), capture_output=True, timeout=60)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    names = set()
+    for line in result.stdout.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if line:
+            names.add(line)
+    return names or None
+
+
+def strip_unsupported_settings(sql: bytes, known: set[str]) -> tuple[bytes, list[str]]:
+    """把 dump 里服务端不认识的 ``SET xxx = ...`` 行剔掉。
+
+    :param sql: 原始 dump。
+    :param known: 服务端认识的参数名（:func:`server_setting_names` 的结果）。
+    :return: ``(处理后的 dump, 被剔掉的参数名列表)``。
+
+    只处理 ``SET <名字> = <值>;`` 这种简单形式。像
+    ``SET SESSION CHARACTERISTICS AS TRANSACTION ...`` 这种复合形式
+    **不动** —— 它不是单个参数，误判的风险大于收益，而它也不带版本特有的
+    新参数名。
+    """
+    removed: list[str] = []
+    kept: list[bytes] = []
+    for line in sql.splitlines(keepends=True):
+        match = _SET_LINE.match(line)
+        if match:
+            name = match.group(1).decode("ascii", "replace")
+            if name not in known:
+                removed.append(name)
+                continue  # 整行丢掉：留着半行会让 psql 语法出错
+        kept.append(line)
+    return b"".join(kept), removed
+
+
 def restore(url: str, sql: bytes) -> int:
     u = _parse(url)
     assert_restorable(sql)
+
+    # 服务端不认识 dump 里的某个 SET 时，那一条会让 --single-transaction
+    # 整份回滚 —— 一张表都不恢复。剔掉它再恢复。
+    known = server_setting_names(url)
+    if known is not None:
+        cleaned, removed = strip_unsupported_settings(sql, known)
+        if removed:
+            print(
+                f"恢复前剔除了服务端不认识的会话参数：{', '.join(sorted(set(removed)))}。"
+                "这些是 pg_dump 记下的版本特有参数（新版客户端写进 dump 的保险），"
+                "留着会让整份 dump 回滚、一张表都不恢复。",
+                file=sys.stderr,
+            )
+            sql = cleaned
+
     return _run(restore_command(url), _env(u), stdin_bytes=sql)
 
 
