@@ -12,6 +12,10 @@
  * 这里守住三件事：列宽用固定值（min-width 会让它随内容长回去）、数值就是
  * 132、以及**按钮文案没变** —— 一旦「查看/改」改成更长的文案，132 就不再
  * 够了，这条例子要先把宽度重算一遍。
+ *
+ * 同一页的「日期」列也一起盯：它是**固定值**，且必须保留 nowrap ——
+ * Element Plus 的 .cell 默认 overflow:hidden + text-overflow:ellipsis，
+ * 宽度压到不够时日期会变成「2026-12-3…」，那比宽一点难看得多。
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -21,6 +25,8 @@ const SRC = fs.readFileSync(
 
 /** 操作列那一行的标签 */
 const actionCol = SRC.match(/<el-table-column[^>]*label="操作"[^>]*>/)
+/** 日期列那一行的标签（属性跨行，所以先并成一行再匹配） */
+const dateCol = SRC.match(/<el-table-column[^>]*label="日期"[^>]*>/)
 
 let pass = 0, fail = 0
 const t = (name, fn) => {
@@ -52,6 +58,38 @@ t('列宽的依据写在注释里：最宽的是「查看/改」那一种', () =
 t('收窄不改变这一列的其它行为：仍固定在右侧，且仍按权限显示', () => {
   assert.match(actionCol[0], /fixed="right"/, '操作列不再固定在右侧')
   assert.match(actionCol[0], /v-if="store\.canWrite"/, '操作列的权限判断被改了')
+})
+
+console.log('')
+console.log('== 凭证列表：日期列窄，但不许被截断 ==')
+
+t('日期列用的是固定 width，不是 min-width', () => {
+  assert.ok(dateCol, '找不到「日期」列')
+  assert.match(dateCol[0], /\bwidth="/, '日期列没有固定宽度')
+  assert.doesNotMatch(dateCol[0], /min-width=/, '日期列用了 min-width')
+})
+
+t('日期列宽是 112px（日期文本 83px + 内边距 24px + 5px 余量）', () => {
+  const m = dateCol[0].match(/\bwidth="(\d+)"/)
+  assert.ok(m, '日期列没有写死宽度')
+  assert.equal(Number(m[1]), 112, `日期列宽是 ${m[1]}px，不是 112px`)
+})
+
+t('日期列保留 nowrap —— 窄了也不许折行或出省略号', () => {
+  // **不能只写 /class-name="nowrap"/**：``label-class-name="nowrap"`` 里
+  // 也含这段子串 —— 那种写法在「表头 nowrap 还在、正文 nowrap 没了」时
+  // 照样判通过，护栏就成了摆设。所以这里用否定回顾（?<!label-）。
+  assert.match(dateCol[0], /(?<!label-)class-name="nowrap"/, '日期列的**正文**丢了 nowrap')
+  assert.match(dateCol[0], /label-class-name="nowrap"/, '日期列表头丢了 nowrap')
+  assert.match(SRC, /\.nowrap \.cell\) \{ white-space: nowrap; \}/,
+    'nowrap 的样式没了 —— 日期会折行')
+})
+
+t('日期列宽的依据写在注释里：83px 的文本 + 24px 内边距 = 107px 下限', () => {
+  const idx = SRC.indexOf('label="日期"')
+  const before = SRC.slice(Math.max(0, idx - 900), idx)
+  assert.match(before, /83/, '没写清日期文本有多宽 —— 改日期格式时没法重算')
+  assert.match(before, /107/, '没写清这列的下限是多少')
 })
 
 console.log('')

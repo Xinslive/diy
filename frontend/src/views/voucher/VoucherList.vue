@@ -83,7 +83,13 @@
       >
         <el-table-column type="selection" width="42" />
         <!-- 日期不许折行：'2026-12-31' 断成两行，扫一列日期全靠猜 -->
-        <el-table-column prop="voucher_date" label="日期" width="124"
+        <!-- 列宽按**日期文本本身**算：实测 '2026-12-31' 在 14px 系统字体下
+             占 83px（macOS 的 SF 比 Windows 的 Segoe 更宽，取宽的那个）；
+             单元格左右内边距各 12px → 下限 83 + 24 = 107px，
+             留 5px 余量（字号/字体差异）→ 112px。
+             原来给到 124px，右边空着一截。nowrap 配 overflow:hidden，
+             宽度不够会变成省略号（'2026-12-3…'），所以这个下限不能压。 -->
+        <el-table-column prop="voucher_date" label="日期" width="112"
                          class-name="nowrap" label-class-name="nowrap">
           <template #header>
             <span class="sort-head" :class="headClass('date_')"
