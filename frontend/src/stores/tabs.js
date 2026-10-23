@@ -24,6 +24,29 @@ const TABS_VERSION = 1
 const KNOWN_KEYS = new Set(NAV.flatMap((m) => m.items).map((it) => menuKeyOf(it.name)))
 
 /**
+ * 「有页面、没菜单」的路由 key。
+ *
+ * 「个人资料」的入口在右上角的账号菜单里，**不占侧栏** —— 但它照样是一个
+ * 正常的标签页：开得起来、关得掉、刷新一次之后还在。
+ *
+ * KNOWN_KEYS 是**从菜单派生**的（菜单改名/下线时，靠它把旧标签丢掉），所以
+ * 这一类页面必须**单独登记**。不登记的后果很具体：标签刚开出来还在，
+ * 按一下 F5 刷新页面，标签就没了 —— 页面还开着，但标签栏里那条不见了，
+ * 于是「关掉这一页」的把手也没了。
+ */
+const EXTRA_KEYS = new Set(['profile'])
+
+/**
+ * 这个 key 认不认得。
+ *
+ * 三处都认：菜单里的（KNOWN_KEYS）、有页面没菜单的（EXTRA_KEYS）、
+ * 插件页（``plugin:`` 前缀，且要当前用户的 manifest 里确实有它）。
+ */
+const isKnownKey = (key, plugins = false) =>
+  KNOWN_KEYS.has(key) || EXTRA_KEYS.has(key)
+  || (plugins && String(key).startsWith('plugin:'))
+
+/**
  * 一条 tab **只允许有这三个字段**，多一个都不写进 localStorage。
  *
  *  这条注释不是洁癖：「持久化」这个词挨着「顺手多带点东西」太近了。
@@ -80,7 +103,7 @@ function readTabs(plugins = false) {
       })
       // 认不出的 key（菜单改名 / 下线了）直接丢：标签栏里摆一条点进去 404 的标签，
       // 比少摆一条难看得多
-      .filter((t) => KNOWN_KEYS.has(t.key) || (plugins && t.key.startsWith("plugin:")))
+      .filter((t) => isKnownKey(t.key, plugins))
   } catch {
     return []      // 存了坏数据 / 存不下：当作没有，重新开
   }
@@ -132,7 +155,7 @@ export const useTabsStore = defineStore('tabs', {
     setPluginEntries(entries) {
       this.pluginItems = entries
       const allowed = new Map(entries.map(p => [p.menu.name, p.menu.route]))
-      this.opened = this.opened.filter(t => KNOWN_KEYS.has(t.key) || allowed.get(t.key) === t.path)
+      this.opened = this.opened.filter(t => isKnownKey(t.key) || allowed.get(t.key) === t.path)
       // 只在当前用户 manifest 校验后恢复保存的插件标签。
       for (const t of this.pendingPluginTabs) if (allowed.get(t.key) === t.path && !this.opened.some(x => x.key === t.key)) this.opened.push({ ...t, title: entries.find(p => p.menu.name === t.key).menu.title })
       this.pendingPluginTabs = []

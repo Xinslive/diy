@@ -47,8 +47,10 @@ from app.core import lockout
 from app.core.config import is_trusted_proxy, settings
 from app.core.db import get_db
 from app.core.deps import get_current_user
-from app.core.security import create_access_token, hash_password, verify_password
-from app.models import AdminMfaChallenge, SysUser, UserBook
+from app.core.security import (create_access_token, hash_password,
+                               password_policy_error, verify_password)
+from app.models import (REAL_NAME_MAX_LENGTH, AdminMfaChallenge, SysUser,
+                        UserBook)
 # LoginIpThrottle 直接从定义模块导入而没有走 app.models 的导出桶：
 # 那个桶不属于本条工作线的改动范围，而漏登记的实际后果只是「别人
 # from app.models import * 时拿不到这个类」—— 全仓没有任何地方这么用。
@@ -1431,3 +1433,230 @@ def me(user: SysUser = Depends(get_current_user), db: Session = Depends(get_db))
         "is_admin": user.is_admin,
         "books": [{"id": b.book_id, "role": b.role} for b in books],
     }
+
+
+# --------------------------------------------------- 个人资料：改自己的姓名与口令
+#
+# 「改自己的名字」「改自己的密码」这两件事过去**没有入口**：姓名只能由
+# 管理员在「用户与授权」里改，口令也只能由管理员重置 —— 于是「我想改个
+# 名字」这件事的答案只剩「去找管理员」，管理员不在的时候人就卡在那儿了。
+#
+# 两条路必须**同时存在**、且互不代替：管理员改的是**别人**（含重置别人
+# 那把忘了的口令），这里改的是**自己**。自助这一条不削弱管理员那一条：
+# 它只能动自己那一个账号，且动不了用户名、动不了角色、动不了授权。
+#
+# **两套称呼的分工**：**界面上说「密码」，代码里说「口令」** —— 同一个东西的
+# 两种场合。界面上的字是给使用者看的（要与登录页、管理员页一致，那几页
+# 一直写「密码」）；代码里的「口令」是本文件既有的内部称呼（口令散列、
+# 口令策略），沿用它是为了不与周围的代码割裂。**用户看得见的字，一律「密码」。**
+#
+# **账号为什么不能改**：账号（用户名）是登录标识，也是审计里认人的依据
+# （``_audit`` 的 entity_id、告警邮件的收件人、审计列表里那一行都按它
+# 写）。改它会让「这条记录是谁做的」在事后对不上，所以这一版只放开姓名。
+
+
+class ProfileIn(BaseModel):
+    """改自己的姓名。"""
+
+    # **必填**（没有默认值）：发一个空 body 过来时应当是 422（「你没说改成什么」），
+    # 而不是「把名字清空」—— 后者是一个没人会主动要求、却发生了的结果。
+    # 传空字符串则是**明确的意图**：清掉显示名，顶栏退回显示用户名。
+    real_name: str = Field(max_length=REAL_NAME_MAX_LENGTH)
+
+
+class PasswordChangeIn(BaseModel):
+    """本人改密码。**当前密码必填** —— 理由见 :func:`change_own_password`。"""
+
+    # 上限只防「拿一个超长字符串来磨 PBKDF2」；**下限不在这里管** ——
+    # 密码策略（位数与字符类别）由 ``core.security.password_policy_error``
+    # 一处说了算。这里再写一套，就会与管理员建号那条路分叉。
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=1, max_length=256)
+
+
+def _profile_view(user: SysUser) -> dict:
+    """回给客户端的用户信息（与 ``GET /auth/me`` 同一形状的子集）。"""
+    return {
+        "id": user.id,
+        "username": user.username,
+        "real_name": user.real_name,
+        "is_admin": bool(user.is_admin),
+    }
+
+
+@router.patch("/me")
+def update_profile(payload: ProfileIn, request: Request,
+                   user: SysUser = Depends(get_current_user),
+                   db: Session = Depends(get_db)):
+    """改**自己的**姓名。
+
+    **只改自己的**：``user`` 来自令牌（``get_current_user``），请求体里
+    **没有「改谁」这个字段** —— 所以不存在「改到别人头上」的可能，也就
+    不必再问一句「你是不是管理员」。这是这一条接口最省事的地方：授权
+    判据与操作对象是同一个东西，不存在两道关卡对不上的可能。
+
+    **留痕**：姓名会出现在顶栏、账套授权页、审计快照里，改了就得记一笔。
+    审计里记「改前 → 改后」，**不记别的** —— 姓名不是凭据，不需要掩码。
+    """
+    ip = _client_ip(request)
+    before = user.real_name
+    after = payload.real_name or ""
+    user.real_name = after
+    if after != before:
+        _audit(
+            db,
+            action="UPDATE_PROFILE",
+            entity="user",
+            entity_id=user.id,
+            user=user,
+            detail=f"本人修改姓名：{before or '（空）'} → {after or '（空）'}",
+            before={"real_name": before},
+            after={"real_name": after, "ip": ip},
+        )
+    db.commit()
+    return _profile_view(user)
+
+
+@router.post("/me/password")
+def change_own_password(payload: PasswordChangeIn, request: Request,
+                         user: SysUser = Depends(get_current_user),
+                         db: Session = Depends(get_db)):
+    """改**自己的**口令。
+
+    ### 为什么必须验「当前密码」
+
+    会话令牌是**可以被拿走的**：XSS、共享电脑、令牌落在别人手里。令牌在手
+    就能调这个接口 —— 没有「当前密码」这道关，拿到令牌的人**顺手就把账号
+    的口令改了**，而真正的用户要到下次登录才发现进不去；他连「是谁改的」
+    都无从知道，因为审计里记的是「本人修改」。
+
+    这一道关把「有令牌」降级成「有令牌**且**知道口令」—— 而知道口令的人
+    本来就已经是账号的主人了。
+
+    ### 为什么「当前密码」算错也要计入登录那套锁定
+
+    这个接口验证的也是口令，而它是一个**持着有效令牌**就能调的接口 ——
+    登录那边的账号锁定与 IP 节流**都不覆盖它**。不另设一套，就是白送一个
+    不限速的口令猜测机：拿着（偷来的）令牌每秒几十次地猜当前密码，猜中即
+    改密、账号到手。PBKDF2 的 33ms 只把**单次**成本抬高，抬高不出「限速」。
+
+    所以口径与登录**完全一致**：同一套计数（``failed_logins``）、同一套
+    递进延迟、同一套硬锁（``lock_level`` / ``locked_until``）。宁可让
+    「手滑连输错几次的人」多等几秒，也不能让这条接口比登录那扇门更好撞。
+
+    ### 改完为什么会被登出
+
+    改密即 ``token_version += 1`` —— 该账号**所有**在用令牌一次性作废
+    （审计 P2-01 的机制，与管理员重置口令同一条）。代价是这个人要重新
+    登录一次；换来的是「口令泄露后改密」这条最常用的处置**真的生效**：
+    攻击者手里的旧令牌当场作废，而不是照常读写账套到自然过期。
+    """
+    ip = _client_ip(request)
+
+    # ---- 1. 账号此刻是不是正处在延迟 / 硬锁中 --------------------------
+    # 与登录同一个判定、同一个说法。锁定中的账号**不许改口令** ——
+    # 否则「正在被撞」这件事就有了第二条不受限速的路。
+    left = _lock_left(user)
+    if left > 0:
+        state = lockout.delay_state(user)
+        if state["hard_locked"]:
+            _audit(
+                db,
+                action="CHANGE_PASSWORD_DENIED",
+                entity="user",
+                entity_id=user.id,
+                user=user,
+                detail=f"账号锁定中，改密码被拒：{user.username}（{ip}）",
+                after={"username": user.username, "ip": ip,
+                       "locked_until": user.locked_until.isoformat()
+                       if user.locked_until else None},
+            )
+            db.commit()
+            raise HTTPException(423, f"账号已锁定，请 {left // 60 + 1} 分钟后再试")
+        _audit(
+            db,
+            action="CHANGE_PASSWORD_DENIED",
+            entity="user",
+            entity_id=user.id,
+            user=user,
+            detail=f"连续验证失败过多，暂时限流 {left} 秒，改密码被拒："
+                   f"{user.username}（{ip}）",
+            after={"username": user.username, "ip": ip, "delay_seconds": left},
+        )
+        db.commit()
+        raise HTTPException(
+            429,
+            f"连续验证失败次数过多，请 {left} 秒后重试",
+            headers={"Retry-After": str(left)},
+        )
+
+    # ---- 2. 验当前密码 --------------------------------------------------
+    if not verify_password(payload.current_password, user.password_hash):
+        locked = _record_failure(db, user)
+        _audit(
+            db,
+            action="CHANGE_PASSWORD_FAILED",
+            entity="user",
+            entity_id=user.id,
+            user=user,
+            detail=f"修改密码失败：当前密码不正确（{user.username}，{ip}）",
+            after={"username": user.username, "ip": ip,
+                   "failed_logins": user.failed_logins or 0,
+                   "lock_level": user.lock_level or 0},
+        )
+        db.commit()
+        if locked and locked.get("hard"):
+            raise HTTPException(
+                423,
+                f"当前密码不正确，且账号已被锁定 {locked['minutes']} 分钟"
+                f"（第 {locked['level']} 轮）：请联系管理员解锁或稍后再试")
+        if locked:
+            raise HTTPException(
+                429,
+                f"当前密码不正确，请 {locked['seconds']} 秒后再试",
+                headers={"Retry-After": str(locked["seconds"])},
+            )
+        raise HTTPException(400, "当前密码不正确")
+
+    # ---- 3. 新密码合不合策略 -------------------------------------------
+    # 策略**只有一处**（``core.security.password_policy_error``），与管理员
+    # 建号、重置同一条尺子。自助改密不比管理员那套松，也**不比它紧** ——
+    # 紧了就有人去求管理员改，两条路最后都回到同一把尺。
+    #
+    # **这两条检查不碰任何状态**：请求被拒就该什么都没发生（计数不清零、
+    # 库里的东西不动）。计数清零放在全部检查通过之后 —— 免得「口令太弱」
+    # 这种**根本没改**的请求顺手把计数清了（那等于给猜口令的人白送额度）。
+    problem = password_policy_error(payload.new_password)
+    if problem:
+        raise HTTPException(400, problem)
+    if verify_password(payload.new_password, user.password_hash):
+        # 「新密码与当前密码相同」不是错误，但**必须挡住**：它会把用户
+        # 踢下线（下面要撤销全部令牌），却什么也没改 —— 白挨一次重新登录。
+        raise HTTPException(400, "新密码不能与当前密码相同")
+
+    # 当前密码**验过了** —— 这个账号回到了正常状态，计数与轮次一并清零
+    # （与登录成功同一套口径：否则一次误输留下的计数会跟后面几次正常操作
+    # 叠起来，最终把一个从没被人猜过的账号锁住）。
+    user.failed_logins = 0
+    user.locked_until = None
+    user.lock_level = 0
+
+    # ---- 4. 改口令 + 撤销该账号全部在用令牌 ----------------------------
+    user.password_hash = hash_password(payload.new_password)
+    user.token_version = (user.token_version or 0) + 1
+    _audit(
+        db,
+        action="CHANGE_PASSWORD",
+        entity="user",
+        entity_id=user.id,
+        user=user,
+        detail=f"本人修改密码：{user.username}（{ip}）—— 已撤销该账号全部在用令牌",
+        before={"password_changed": False},
+        after={"password_changed": True, "username": user.username, "ip": ip,
+               "token_version": user.token_version},
+    )
+    db.commit()
+    # 回执里明说「要重新登录」—— 客户端据此清本地令牌并回登录页，
+    # 而不是等下一个请求撞 401 才被动发现。
+    return {"ok": True, "reauth_required": True,
+            "token_version": user.token_version}

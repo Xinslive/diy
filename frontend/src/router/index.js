@@ -41,6 +41,15 @@ const routes = [
       { path: 'vouchers/invoices', name: 'invoice-import', component: () => import('@/views/voucher/InvoiceImport.vue'), meta: { title: '发票导入', requiresBook: true } },
       { path: 'print-templates', name: 'print-templates', component: () => import('@/views/print/PrintTemplate.vue'), meta: { title: '打印模板', requiresBook: true } },
       { path: 'users', name: 'users', component: () => import('@/views/system/UserAdmin.vue'), meta: { title: '用户与授权', adminOnly: true } },
+      // 个人资料：**不占侧栏**，入口在右上角的账号菜单里。
+      //
+      // 它不属于任何一个模块（不是「凭证处理」，也不是「系统管理」——那一模块
+      // 是管理员的），所以侧栏里没有它的位置；放进去反而会让「这一页属于哪个
+      // 模块」这件事变得说不清。
+      //
+      // **不标 requiresBook**：改自己的名字与口令跟账套无关 —— 管理员自己
+      // 未必有账套，标了就把这条路堵死。
+      { path: 'profile', name: 'profile', component: () => import('@/views/ProfileView.vue'), meta: { title: '个人资料' } },
       { path: 'ocr-settings', name: 'ocr-settings', component: () => import('@/views/system/OcrSettings.vue'), meta: { title: '外部服务', adminOnly: true } },
       { path: 'notify-settings', name: 'notify-settings', component: () => import('@/views/system/NotifySettings.vue'), meta: { title: '邮件通知', adminOnly: true } },
       { path: 'data-security', name: 'data-security', component: () => import('@/views/system/DataSecurity.vue'), meta: { title: '数据安全', adminOnly: true } },

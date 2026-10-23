@@ -38,6 +38,10 @@ const BOOK_ROUTES = [
 const SYSTEM_ROUTES = [
   'books', 'users', 'ocr-settings', 'notify-settings', 'data-security',
   'plugins', 'scheduler-tasks',
+  // 个人资料：改自己的名字与口令，本来就与账套无关。
+  // 标了 requiresBook 的话，**没有账套的人连自己的口令都改不了** ——
+  // 而「自己没分到账套」在这个系统里是常态（管理员自己也可能一个账套都没有）。
+  'profile',
 ]
 
 let pass = 0, fail = 0

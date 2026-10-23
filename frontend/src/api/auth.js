@@ -4,6 +4,33 @@ export const register = (payload) => http.post('/auth/register', payload).then(r
 export const me = () => http.get('/auth/me').then(r => r.data)
 
 /**
+ * 改**自己的**姓名。
+ *
+ * 请求体里**没有「改谁」这个字段** —— 目标永远是令牌对应的那个人，
+ * 所以不存在「改到别人头上」的可能，也不需要再问一句「你是不是管理员」。
+ *
+ * 顺带说明：接口**不返回**新的令牌。改姓名不动密码，因此**不必**重新登录，
+ * 现有的会话照旧有效。
+ */
+export const updateProfile = (payload) =>
+  http.patch('/auth/me', payload).then(r => r.data)
+
+/**
+ * 改**自己的**密码。
+ *
+ * **当前密码必填**（``current_password``）—— 会话令牌是可以被拿走的
+ * （XSS、共享电脑、令牌落在别人手里），没有这道关，拿到令牌的人
+ * 顺手就把账号的密码改了。
+ *
+ * **成功之后必须重新登录**：改密码会撤销这个账号**所有**在用令牌
+ * （``token_version`` 加一，审计 P2-01），攻击者手里的旧令牌当场作废。
+ * 回执里的 ``reauth_required`` 就是这句话的机器可读版本，调用方据此
+ * 清本地令牌并回登录页 —— 而不是等下一个请求撞 401 才被动发现。
+ */
+export const changePassword = (payload) =>
+  http.post('/auth/me/password', payload).then(r => r.data)
+
+/**
  * 登录页用的匿名配置：自助注册开没开。
  *
  * 必须在**还没有令牌**时就能读，所以它不能挂在带鉴权的接口下 —— 登录页正是

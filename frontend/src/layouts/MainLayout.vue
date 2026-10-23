@@ -74,7 +74,11 @@
         </span>
         <template #dropdown>
           <el-dropdown-menu>
-            <el-dropdown-item command="logout">退出登录</el-dropdown-item>
+            <!-- 「个人资料」排在「退出登录」**上面**：
+                 这两件事的先后顺序就是人对「我要走了」的直觉顺序 ——
+                 先看看自己的资料，最后才是走。 -->
+            <el-dropdown-item command="profile">个人资料</el-dropdown-item>
+            <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
           </el-dropdown-menu>
         </template>
       </el-dropdown>
@@ -167,9 +171,17 @@ const activeModule = ref('')
 
 /** 侧栏显示哪个模块 —— 跟顶部高亮的是同一个。
  *  侧栏如果自己去按 route 推，点了顶部「凭证处理」却还列着「科目余额表」，
- *  顶部亮着一个模块、侧边列着另一个模块的菜单，两处对不上。 */
+ *  顶部亮着一个模块、侧边列着另一个模块的菜单，两处对不上。
+ *
+ *  **末尾那级兜底**：个人资料页不属于任何模块，直接敲地址栏进来时
+ *  「当前模块」是空的 —— 这时候侧栏退到第一个模块，而不是留一条空白的
+ *  侧栏（一个空图标 + 空的菜单区，看起来像坏了）。从界面上点进来时
+ *  上一级兜底就够用：activeModule 还留着上一个模块，侧栏不变，
+ *  人不会觉得「页面跳走了」。 */
 const shownModule = computed(
-  () => nav.value.find((m) => m.key === activeModule.value) || activeModuleObj.value
+  () => nav.value.find((m) => m.key === activeModule.value)
+    || activeModuleObj.value
+    || nav.value[0]
 )
 
 /**
@@ -225,6 +237,9 @@ function onCommand(cmd) {
     store.logout()
     tabs.reset()
     router.push('/login')
+  } else if (cmd === 'profile') {
+    // 走路由名而不是写死的路径：路径写两遍，改一处忘一处就是 404。
+    router.push({ name: 'profile' })
   }
 }
 

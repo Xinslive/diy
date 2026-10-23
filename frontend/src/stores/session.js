@@ -235,6 +235,29 @@ export const useSessionStore = defineStore('session', {
     },
 
     /**
+     * 把「改了姓名」这件事写回本地状态。
+     *
+     * **为什么不能只改 localStorage**：store 里的 ``user`` 与 storage 里那份
+     * 是**两份副本**（登录那一刻各写一份）。只改其中一份，顶栏那个名字
+     * 要等下一次 ``refreshMe`` 才会变 —— 那是「明明改了，界面没动」。
+     *
+     * **为什么是「合并」而不是「整份替换」**：接口只回姓名相关的几个字段，
+     * 整份替换会把 ``books``（这个人的账套授权）抹掉 —— 而 ``books`` 是
+     * 另一条接口（``/books``）拉来的，不属于「个人资料」这一份。合并的
+     * 另一半边界是：**只认接口回的那几个字段** —— 别的键（比如别人塞进来的
+     * ``books``）一律不认，免得一份「个人资料」回执把「账套授权」覆盖掉。
+     */
+    applyProfile(data) {
+      if (!data) return
+      const next = { ...(this.user || {}) }
+      for (const k of ['id', 'username', 'real_name', 'is_admin']) {
+        if (data[k] !== undefined) next[k] = data[k]
+      }
+      this.user = next
+      localStorage.setItem('cwq_user', JSON.stringify(next))
+    },
+
+    /**
      * 登出：**先本地、后远端**。
      *
      *  语义（顺序是刻意的）：
