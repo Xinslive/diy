@@ -88,14 +88,18 @@ tools/desktop-shell/
 ├── launcher.spec          PyInstaller 打包描述
 ├── version_info.txt       VERSIONINFO（CompanyName/ProductName/…）
 ├── make_icon.py           纯标准库生成 .ico（7 个尺寸）
-├── smoke_test.py          对构建产物跑冒烟验证
+├── smoke_test.py          冒烟验证：跑 exe 的 --dry-run，断言「打算怎么做」
+├── launch_path_probe.py   启动路径探针：真跑一次，断言浏览器**真被拉起来**
+├── stub_browser.py        探针用的「替身浏览器」（打成真 exe 后当浏览器用）
 ├── build_windows.ps1      Windows 本地构建（含安装包）
 ├── installer.iss          Inno Setup 安装包脚本
 ├── requirements-build.txt 构建期依赖（只有 PyInstaller，版本钉死）
 ├── requirements-build.lock 构建期依赖的**哈希锁定版**（CI 与本地都用它）
 ├── shell.json.example     配置示例
 ├── shell.ico              图标（生成物，也入库，方便换品牌图标）
-└── tests/test_launcher.py 单元测试（66 条）
+└── tests/                 单元测试（90 条）
+    ├── test_launcher.py           壳的纯逻辑（66 条）
+    └── test_launch_path_probe.py  探针自身的纯逻辑（24 条）
 ```
 
 ---
@@ -131,10 +135,12 @@ dist-installer/CWQ-Setup.exe            安装包（装了 Inno Setup 才有）
 
 ### 4.2 CI
 
-`.github/workflows/desktop-shell.yml`，两道闸：
+`.github/workflows/desktop-shell.yml`，两个 job、三道闸：
 
-- **单元测试**（ubuntu）：40 条，平台无关的纯逻辑
+- **单元测试**（ubuntu）：90 条，平台无关的纯逻辑（壳 66 + 探针 24）
 - **Windows 构建 + 冒烟**（windows-latest）：真出 exe、真跑一遍、真断言
+  - **闸 2a**：冒烟验证 —— `--dry-run` 出的 JSON 逐条核对
+  - **闸 2b**：真 spawn —— 替身浏览器**真收到了参数**（见 4.6）
 
 产物作为 artifact 上传（`cwq-desktop-shell-exe`）。
 
@@ -190,6 +196,13 @@ W="wine-stable/Wine Stable.app/Contents/Resources/wine/bin/wine"
 
 # 5. 冒烟 —— **在 Wine 里跑**，跑的是真的 PE
 "$W" 'C:\Python311\python.exe' 'C:\cwq\smoke_test.py' 'C:\cwq\dist\CWQ.exe'
+
+# 6. 真 spawn 验证（见 4.6）—— 打替身浏览器 + 跑探针
+"$W" 'C:\Python311\python.exe' -m PyInstaller --noconfirm --clean --onefile \
+    --name msedge --distpath 'C:\cwq\probe\dist' --workpath 'C:\cwq\probe\build' \
+    --specpath 'C:\cwq\probe' 'C:\cwq\stub_browser.py'
+"$W" 'C:\Python311\python.exe' 'C:\cwq\launch_path_probe.py' \
+    --exe 'C:\cwq\dist\CWQ.exe' --stub 'C:\cwq\probe\dist\msedge.exe'
 ```
 
 三个必须知道的坑：
@@ -217,33 +230,78 @@ python3 -m pytest tools/desktop-shell/tests
 
 **为什么 `--dry-run` 不够**：它在 `main()` 里是**提前返回**的，压根走不到
 `spawn()`。也就是说「CI 的 dry-run 全绿」并不等于「用户双击能开窗」——
-中间那一段本来是没有闸的。
+中间那一段本来是没有闸的。`spawn()` 是整个壳唯一的副作用出口，
+它坏掉的症状是「双击什么也不发生」：没有报错、没有弹窗，比崩溃还难查。
 
-2026-10-23 在 Wine 下用「替身浏览器」把这段补上了，方法是：
+**做法**（`launch_path_probe.py`，CI 与本地都跑）：
 
-1. 用 PyInstaller 打一个**真 exe** 替身（必须是真 exe：Windows 会校验 PE 头，
-   `.bat` 改名不行），让它把自己的 `sys.argv` 写成 UTF-8 JSON；
-2. 把它放到**真实的 Edge 安装位置**
-   `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`；
-3. **不带任何参数**运行 exe（就是双击那一下），看替身有没有收到参数。
+1. 用 PyInstaller 打一个**真 exe** 替身浏览器（`stub_browser.py`），
+   让它把自己的 `sys.argv` 写成 UTF-8 JSON；
+2. 把替身装到**真实的 Edge 安装位置**
+   `<沙箱>\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`；
+3. **不带任何参数**运行壳 exe —— 就是用户双击那一下；
+4. 断言替身收到的参数 == 期望参数，一个字不差。
 
-实测结果（Wine + 真 Windows Python 3.11.9 + 真 PE）：
+三个条件少一条，验到的就是**另一件事**：
+
+| 少的条件 | 验到的其实是 |
+|---|---|
+| 装在真实安装位置 | 「显式路径能跑」，不是「发现逻辑能跑」 |
+| 是真 exe（`.bat` 改名不行） | 「spawn 抛异常」（Windows 拒绝执行，错误 193） |
+| 不带参数运行 | 绕过了「壳自己决定传什么参数」 |
+
+**为什么用环境变量沙箱，而不是真的往 Program Files 里塞替身。**
+CI runner 上真的装着 Edge，往那儿塞会破坏 runner 自己的浏览器（还可能触发
+杀软）。探针把 `ProgramFiles(x86)` / `ProgramFiles` / `LOCALAPPDATA` 三个
+环境变量指向临时目录：**发现逻辑走的是同一段代码**（`expand_env` + `is_file`），
+只是根目录换了 —— runner 的真 Edge 一根汗毛都不会掉，用户的 `%LOCALAPPDATA%`
+也不会被写脏。
+
+> ⚠️ 一个必须守住的细节：Windows 的环境变量名**大小写不敏感**，而
+> CPython 构造子进程环境块时把键**原样**写进去 —— 同名不同大小写的两条
+> 会同时进环境块，子进程读到哪一条不受控。探针覆盖 `ProgramFiles(x86)`
+> 之前会先把所有大小写变体删干净，否则它可能读到 runner 上**真的** Edge
+> 的目录，然后把真浏览器拉起来。
+
+**实测结果**（Wine + 真 Windows Python 3.11.9 + 真 PE，2026-10-23）：
+
+```
+✅ 壳 exe 存在
+✅ 替身存在
+✅ 替身是真 PE
+✅ 不带参数运行 → 发现 → 拉起 → 参数
+✅ --browser 显式指定 → 参数一致
+```
 
 - `find_browser()` 在真实安装路径上找到了 Edge，**真的 spawn 成功**，退出码 0；
 - 替身收到的参数与 dry-run 计划**逐字一致**，其中
-  `--user-data-dir=C:\users\home\AppData\Local\财务记账系统\browser-profile`
+  `--user-data-dir=...\AppData\Local\财务记账系统\browser-profile`
   的**中文路径完整无损** —— 没有被 ANSI 编码破坏；
 - 壳的日志落到了 `%LOCALAPPDATA%\财务记账系统\logs\shell.log`
-  （中文目录名正常）。
+  （中文目录名正常），且那行日志记下的浏览器路径正是沙箱里的替身 ——
+  这证明走的是「发现」这条路，不是「显式指定」。
 
-对应地，仓库里补了 `SpawnTest` / `MainLaunchTest` 两组用例，把
+本地跑（Windows）：
+
+```powershell
+python -m PyInstaller --noconfirm --clean --onefile --name msedge `
+    --distpath .probe-stub\dist --workpath .probe-stub\build --specpath .probe-stub `
+    tools/desktop-shell/stub_browser.py
+python tools/desktop-shell/launch_path_probe.py `
+    --exe tools/desktop-shell/dist/CWQ.exe `
+    --stub .probe-stub\dist\msedge.exe
+```
+
+`build_windows.ps1` 已经把这两步接上了（打包后自动跑），CI 的
+`desktop-shell.yml` 里也有一份一样的。
+
+对应地，仓库里还有 `SpawnTest` / `MainLaunchTest` 两组用例，把
 「参数怎么交给 `Popen`」和「实际 spawn 的参数 == dry-run 计划」钉死。
-`spawn()` 是整个壳唯一的副作用出口，它坏掉的症状是「双击什么也不发生」——
-没有报错、没有弹窗，比崩溃还难查。
 
-> 边界：Wine ≠ Windows 内核。CI 在 `windows-latest` 上跑的是 `--dry-run`，
-> **并没有**验真浏览器；上面这个实验验到的是「参数确实被交出去了」。
-> `MessageBoxW`、真实杀软行为仍属推断。
+> 边界：Wine ≠ Windows 内核。**探针脚本本身已在 Wine 下真跑通过**，
+> 但 CI 里那一层（YAML + PowerShell 调用）因 GitHub Actions 额度耗尽
+> **尚未在真实 Windows runner 上执行过**。`MessageBoxW`、真实杀软行为
+> 仍属推断。
 
 ---
 
@@ -343,8 +401,10 @@ python3 -m pytest tools/desktop-shell/tests
   替换 `tools/desktop-shell/shell.ico` 即可（`make_icon.py` 会在缺失时重新生成，
   所以**别删掉它**，除非同时删掉 spec 里那段自动生成逻辑）。
 - **`version_info.txt` 里的 CompanyName 是占位值**，发布前必须改。
-- **「浏览器真的被拉起来」只在 Wine 下验过**（见 4.6），没在真实 Windows
-  内核上验过。`MessageBoxW`、真实杀软行为仍属推断。
+- **「浏览器真的被拉起来」已在 Wine 下验过**（见 4.6，探针脚本化、可复跑，
+  CI 与本地同一套），但**没在真实 Windows 内核上验过** —— CI 里那一层
+  （YAML + PowerShell 调用）因 GitHub Actions 额度耗尽，还**没有在真实
+  Windows runner 上执行过**。`MessageBoxW`、真实杀软行为仍属推断。
 
 ---
 

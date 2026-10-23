@@ -126,7 +126,40 @@ Say "冒烟验证（真跑一次 exe）"
 & $py (Join-Path $ScriptDir "smoke_test.py") $exe
 if ($LASTEXITCODE -ne 0) { Fail "冒烟验证没过 —— 别把这份产物发出去" }
 
-# ---------------------------------------------------------------- 7. 安装包
+# ---------------------------------------------------------------- 7. 真实启动路径
+#
+# 冒烟验证只跑 --dry-run，而 --dry-run 在 main() 里是**提前返回**的 ——
+# 它压根走不到 spawn()。所以「冒烟全绿」不等于「用户双击能开窗」：
+# 中间那一段本来是没有闸的。
+#
+# 这一步**真的**跑一次不带参数的 exe（= 双击那一下），用一个「替身浏览器」
+# 真 exe 装在**真实的 Edge 安装位置**接住参数。替身收到了参数 =
+# 「发现 → 拉起 → 参数」整条路径都通了。
+#
+# 替身用**同一个** PyInstaller 打（版本与打包产物一致），打完由探针先验它
+# 是不是真 PE —— .bat 改名会被 Windows 拒绝执行（错误 193）。
+#
+# 沙箱是**环境变量级**的（ProgramFiles(x86) / LOCALAPPDATA 指向临时目录），
+# 所以不会碰到这台机器上真的 Edge，也不会写脏真的用户目录。
+Say "验证「真的把浏览器拉起来」（真 spawn）"
+$stubDir = Join-Path $ScriptDir ".probe-stub"
+New-Item -ItemType Directory -Force -Path $stubDir | Out-Null
+& $py -m PyInstaller `
+    --noconfirm `
+    --clean `
+    --onefile `
+    --name msedge `
+    --distpath (Join-Path $stubDir "dist") `
+    --workpath (Join-Path $stubDir "build") `
+    --specpath $stubDir `
+    (Join-Path $ScriptDir "stub_browser.py")
+if ($LASTEXITCODE -ne 0) { Fail "打替身浏览器失败" }
+$stub = Join-Path $stubDir "dist\msedge.exe"
+if (-not (Test-Path $stub)) { Fail "替身浏览器没打出来：$stub" }
+& $py (Join-Path $ScriptDir "launch_path_probe.py") --exe $exe --stub $stub
+if ($LASTEXITCODE -ne 0) { Fail "真实启动路径验证没过 —— 别把这份产物发出去" }
+
+# ---------------------------------------------------------------- 8. 安装包
 if (-not $SkipInstaller) {
     $iscc = @(
         "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",

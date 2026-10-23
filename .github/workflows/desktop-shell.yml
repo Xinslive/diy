@@ -36,6 +36,15 @@
 #       · 非 http/https 的地址被拒（退出码 2）
 #     断言逻辑写在 tools/desktop-shell/smoke_test.py 里，可以本地手动跑。
 #
+#     闸 2 里还有**第三步**，比上面那条更靠里：
+#
+#     **闸 3：真 spawn（同一道 workflow 里）**
+#         --dry-run 在 main() 里是**提前返回**的，压根走不到 spawn()。
+#         所以上面那条全绿，并不等于「用户双击能开窗」—— 中间那一段本来
+#         没有闸。闸 3 用一个「替身浏览器」真 exe 装在真实的 Edge 安装位置，
+#         不带参数运行壳 exe（= 双击那一下），断言替身**真的收到了参数**。
+#         断言逻辑在 tools/desktop-shell/launch_path_probe.py。
+#
 # ---------------------------------------------------------------------------
 # action 一律 pin 到 commit SHA
 # ---------------------------------------------------------------------------
@@ -197,6 +206,36 @@ jobs:
         # 断言逻辑在 tools/desktop-shell/smoke_test.py，本地也能手动跑。
         run: |
           python tools/desktop-shell/smoke_test.py tools/desktop-shell/dist/CWQ.exe
+
+      - name: 验证「真的把浏览器拉起来」（真 spawn）
+        # **这一步在验一件 --dry-run 永远验不到的事**：壳真的把浏览器进程
+        # 拉起来了，并把参数交出去了。
+        #
+        # `--dry-run` 在 main() 里是**提前返回**的，压根走不到 spawn()。
+        # 所以「CI 的 dry-run 全绿」并不等于「用户双击能开窗」——
+        # 中间那一段本来是没有闸的。spawn() 坏掉的症状是「双击什么也不发生」，
+        # 没有报错、没有弹窗，比崩溃还难查。
+        #
+        # 做法：打一个「替身浏览器」真 exe（把自己的命令行参数写成 JSON），
+        # 把它放到**真实的 Edge 安装位置**，再**不带参数**运行壳 exe ——
+        # 就是用户双击那一下。替身收到参数 = 发现 + spawn 整条路径都通了。
+        #
+        # **为什么用环境变量沙箱，而不直接往 Program Files 里塞替身**：
+        # CI runner 上真的装着 Edge，往那儿塞会破坏 runner 自己的浏览器
+        # （还可能触发杀软）。探针把 ProgramFiles(x86) / ProgramFiles /
+        # LOCALAPPDATA 三个环境变量指到临时目录 —— 发现逻辑走的是同一段
+        # 代码，只是根目录换了，runner 的真 Edge 一根汗毛都不会掉。
+        #
+        # 断言逻辑在 tools/desktop-shell/launch_path_probe.py。
+        run: |
+          $stubDir = Join-Path $env:RUNNER_TEMP "cwq-stub"
+          New-Item -ItemType Directory -Force -Path $stubDir | Out-Null
+          python -m PyInstaller --noconfirm --clean --onefile --name msedge `
+            --distpath "$stubDir\dist" --workpath "$stubDir\build" --specpath "$stubDir" `
+            tools/desktop-shell/stub_browser.py
+          python tools/desktop-shell/launch_path_probe.py `
+            --exe tools/desktop-shell/dist/CWQ.exe `
+            --stub "$stubDir\dist\msedge.exe"
 
       - name: 上传 exe 产物
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
