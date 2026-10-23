@@ -96,3 +96,8 @@ tools/desktop-shell/build/
 
 # Inno Setup 的输出目录（仓库根下，见 installer.iss 的 OutputDir）。
 dist-installer/
+
+# 「真实启动路径验证」用的替身浏览器构建目录（见 launch_path_probe.py）。
+# 里面的 dist/ 与 build/ 已被上面两条覆盖，但这个目录本身要单独忽略 ——
+# 否则本地跑一次验证就会在仓库里留下一堆未跟踪文件。
+tools/desktop-shell/.probe-stub/
