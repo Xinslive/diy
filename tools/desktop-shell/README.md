@@ -84,17 +84,18 @@
 
 ```
 tools/desktop-shell/
-├── launcher.py            壳的全部逻辑（纯标准库，536 行）
+├── launcher.py            壳的全部逻辑（纯标准库，631 行）
 ├── launcher.spec          PyInstaller 打包描述
 ├── version_info.txt       VERSIONINFO（CompanyName/ProductName/…）
 ├── make_icon.py           纯标准库生成 .ico（7 个尺寸）
 ├── smoke_test.py          对构建产物跑冒烟验证
 ├── build_windows.ps1      Windows 本地构建（含安装包）
 ├── installer.iss          Inno Setup 安装包脚本
-├── requirements-build.txt 构建期依赖（只有 PyInstaller）
+├── requirements-build.txt 构建期依赖（只有 PyInstaller，版本钉死）
+├── requirements-build.lock 构建期依赖的**哈希锁定版**（CI 与本地都用它）
 ├── shell.json.example     配置示例
 ├── shell.ico              图标（生成物，也入库，方便换品牌图标）
-└── tests/test_launcher.py 单元测试（40 条）
+└── tests/test_launcher.py 单元测试（61 条）
 ```
 
 ---
@@ -113,7 +114,7 @@ cd tools/desktop-shell
 脚本按顺序做六件事，任一步失败立刻停：
 
 1. 建/复用构建虚拟环境 `.venv-build`
-2. 按 `requirements-build.txt` 定版装 PyInstaller
+2. 按 `requirements-build.lock` **哈希锁定**装 PyInstaller
 3. 生成图标
 4. **跑单元测试** —— 构建前就红，好过打完包才发现逻辑坏了
 5. PyInstaller 打包 → `dist/CWQ.exe`
@@ -157,7 +158,52 @@ dist-installer/CWQ-Setup.exe            安装包（装了 Inno Setup 才有）
 python3 tools/desktop-shell/smoke_test.py tools/desktop-shell/dist/CWQ.exe
 ```
 
-### 4.4 跑测试
+### 4.4 在 macOS / Linux 上交叉出 Windows exe（Wine）
+
+**PyInstaller 不支持交叉编译** —— 它要的是目标平台的 bootloader。所以「在 macOS
+上直接 `pyinstaller`」出来的永远是 Mach-O，不是 PE。
+
+但**可以用 Wine 把整条 Windows 工具链跑起来**，从而在 macOS/Linux 上产出真
+PE。2026-10-23 实测跑通，产物与 CI 出的同源：
+
+```bash
+# 1. Wine（Apple Silicon 用 osx64 构建，走 Rosetta；Linux 用官方包）
+curl -fL -o wine.tar.xz \
+  "https://github.com/Gcenx/macOS_Wine_builds/releases/download/11.0_1/wine-stable-11.0_1-osx64.tar.xz"
+tar xf wine.tar.xz
+export WINEPREFIX=/tmp/wine-prefix
+"wine-stable/Wine Stable.app/Contents/Resources/wine/bin/wine" wineboot -u
+
+# 2. Windows 版 CPython（NuGet 的便携包，解压即用，无需安装器）
+curl -fL -o python.nupkg "https://www.nuget.org/api/v2/package/python/3.11.9"
+unzip -q python.nupkg -d py && cp -R py/tools/. "$WINEPREFIX/drive_c/Python311/"
+
+# 3. 装 PyInstaller —— 用**同一个哈希锁文件**，走的是 Windows 的 pip，
+#    解析出来的 wheel 与 CI 完全一致
+W="wine-stable/Wine Stable.app/Contents/Resources/wine/bin/wine"
+"$W" 'C:\Python311\python.exe' -m pip install --require-hashes --only-binary=:all: \
+    -r 'C:\cwq\requirements-build.lock'
+
+# 4. 打包（spec 用 SPECPATH 定位自身，目录层级随意）
+"$W" 'C:\Python311\python.exe' -m PyInstaller --noconfirm --clean \
+    --distpath 'C:\cwq\dist' --workpath 'C:\cwq\build' 'C:\cwq\launcher.spec'
+
+# 5. 冒烟 —— **在 Wine 里跑**，跑的是真的 PE
+"$W" 'C:\Python311\python.exe' 'C:\cwq\smoke_test.py' 'C:\cwq\dist\CWQ.exe'
+```
+
+三个必须知道的坑：
+
+- **Wine 里没有 X11 也行**，但 `WINEDLLOVERRIDES="mshtml,mscoree="` 要设上 ——
+  否则任何程序想装 Gecko/Mono 时会弹交互框，在非交互环境里**永久挂住**。
+- **Wine 默认 locale 是 cp936**，pip 会用系统默认编码读 requirements 文件，
+  中文注释直接 `UnicodeDecodeError`。锁文件第一行的 `# -*- coding: utf-8 -*-`
+  （PEP 263）就是为此存在的，**不能删、也不能挪到第三行往后**。
+- **spec 里的死代码会咬人**：原先有一行 `REPO_ROOT = SPEC_DIR.parents[1]`，
+  目录一浅就 `IndexError`，报错还指向 spec 第 44 行 —— 与「打包」毫无关系。
+  已删。
+
+### 4.5 跑测试
 
 ```bash
 # 零依赖
@@ -213,6 +259,22 @@ python3 -m pytest tools/desktop-shell/tests
 ---
 
 ## 7. 分发与签名
+
+### 7.1 当前已有的分发点
+
+产物放在生产机的独立下载目录里，**不随发布目录被覆盖**：
+
+```
+生产机（8.155.171.57）：/www/wwwroot/acct.xins.live/downloads/<随机段>/CWQ.exe
+公网地址：              https://acct.xins.live/downloads/<随机段>/CWQ.exe
+```
+
+- `<随机段>` 是一段 32 位十六进制随机串，**每次换产物都换**。
+- nginx 侧是 `deploy/nginx/acct.xins.live.conf` 里的 `location /downloads/`，
+  **`autoindex` 是关的** —— 开着索引等于把随机段公布出去，那随机路径就白设了。
+  目录本身返回 403，按完整路径取文件正常。
+- 生产 vhost 是**手工同步**的（发布脚本不碰它），换主机时记得同步这一段，
+  并按目标机的目录布局改 `alias` 的路径。
 
 见 [`../../docs/Windows打包exe可行性研究.md`](../../docs/Windows打包exe可行性研究.md) 的
 「打包与分发」一节。三个要点：
