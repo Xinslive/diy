@@ -262,6 +262,15 @@ const monthsOfYear = computed(() =>
     .sort((a, b) => a.month - b.month)
 )
 
+/**
+ * 换账套。
+ *
+ * 注意上面那行是 ``v-model="store.bookId"`` —— v-model 会**先**把新账套
+ * 写进 store，这个 @change 再进来时 bookId 早就是新的了。所以「旧期间要不要清」
+ * 这件事**不能**由这里判断，store 自己记了一份「手上这批期间是谁的」
+ * （periodsBookId），setBook 按那份判据走。详见 stores/session.js 与
+ * ARCHITECTURE.md 1.7 节。
+ */
 async function onBookChange(id) {
   await store.setBook(id)
 }

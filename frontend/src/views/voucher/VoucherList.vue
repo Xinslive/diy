@@ -176,17 +176,19 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Printer, Sort, Upload } from '@element-plus/icons-vue'
 import * as api from '@/api/voucher'
 import PrintDialog from '@/components/PrintDialog.vue'
 import { useUrlConditions } from '@/composables/useUrlConditions'
 import { useSessionStore } from '@/stores/session'
+import { conditionsBelongTo } from '@/utils/filterScope'
 import { fmt } from '@/utils/format'
 
 const store = useSessionStore()
 const router = useRouter()
+const route = useRoute()
 const rows = ref([])
 const total = ref(0)
 const loading = ref(false)
@@ -204,6 +206,16 @@ const query = reactive({
 })
 
 /**
+ * 什么时候看全账套、什么时候只看顶栏那个月：
+ *   **一个筛选条件都没填** → 就看顶栏定下的那个月（空表格比跨年 200 行好用）；
+ *   **填了任一条件** → 放宽到全部期间（要问的是「全年哪些凭证含 16」，
+ *     这时候被顶栏那个月卡着反而是帮倒忙）。
+ * 两头都跟用户说的一致，不是拍脑袋定的中间值。
+ */
+const hasFilter = computed(() =>
+  !!(query.keyword || query.min_amount !== null || query.max_amount !== null))
+
+/**
  * 条件 ↔ URL。
  *
  * 标签栏不做 keep-alive：切走再切回来就是组件重建，条件只活在组件里的话，
@@ -217,6 +229,22 @@ const { restore } = useUrlConditions({
   kw: { type: 'str', get: () => query.keyword, set: (v) => { query.keyword = v } },
   min: { type: 'num', get: () => query.min_amount, set: (v) => { query.min_amount = v } },
   max: { type: 'num', get: () => query.max_amount, set: (v) => { query.max_amount = v } },
+  // **这组条件属于哪本账。**
+  //
+  // 条件住在 URL 里，页面重挂后只认 URL —— 所以「换账套要清条件」必须在
+  // **重挂时**判断（组件里的 watch 活不到那一刻：账套一变 MainLayout 的
+  // viewKey 就变，整页重挂，watch 一起被停掉）。
+  //
+  // 那怎么认出「这组条件是上一本账的」？光记住「条件存在过」不够 ——
+  // 切走再切回来也重挂，条件得留着。得记住**是谁的**。
+  //
+  // 没有条件时不写这一项：地址栏里只留用户真填过的那些。
+  book: {
+    type: 'str',
+    get: () => (hasFilter.value ? String(store.bookId) : ''),
+    // 账套不是「条件」，只拿来比 —— 不往回写。
+    set: () => {}
+  },
 })
 
 // --------------------------------------------------------------------- 排序
@@ -251,16 +279,6 @@ function headClass(prefix) {
   }
 }
 
-/**
- * 什么时候看全账套、什么时候只看顶栏那个月：
- *   **一个筛选条件都没填** → 就看顶栏定下的那个月（空表格比跨年 200 行好用）；
- *   **填了任一条件** → 放宽到全部期间（要问的是「全年哪些凭证含 16」，
- *     这时候被顶栏那个月卡着反而是帮倒忙）。
- * 两头都跟用户说的一致，不是拍脑袋定的中间值。
- */
-const hasFilter = computed(() =>
-  !!(query.keyword || query.min_amount !== null || query.max_amount !== null))
-
 /** 传给后端的查询参数：条件栏照旧，期间按 hasFilter 决定给不给。 */
 function queryParams() {
   const p = { ...query, sort: sort.value }
@@ -291,6 +309,13 @@ function firstSummary(row) {
 
 async function load() {
   if (!store.bookId) return
+  // 切账套的**那一瞬间**期间还在路上（store 已经把上一个账套的期间清干净了）。
+  // 这时 periodId 是 0，不带期间查就是「把整本账的凭证全拉一遍」——
+  // 多余的一趟，外加一帧「列表突然变成全年」的闪烁。等期间到位再查。
+  //
+  // 反过来，**拿着旧账套的期间 id 查新账套**更糟：后端会回「起始期间不存在」。
+  // 以前正是在这儿出的错（store 以为账套没换，旧期间一直留着）。
+  if (!store.periodsReady) return
   loading.value = true
   try {
     const data = await api.queryVouchers(store.bookId, queryParams())
@@ -378,13 +403,25 @@ async function removeOne(row) {
 }
 onMounted(() => {
   query.page = 1
-  // 条件从 URL 复原：页面刷新、从凭证页返回、从标签栏切回来，走的都是这一条
-  restore()
-  load()
-})
-watch(() => store.bookId, () => {
-  query.page = 1
-  selection.value = []
+  // 条件从 URL 复原：页面刷新、从凭证页返回、从标签栏切回来，走的都是这一条。
+  //
+  // 但**换过账套**的时候不捡：凭证号、金额都是**这一本账**里的检索，
+  // 拿到另一本账上去查，命中的是别的账的凭证 —— 看着像「这个账套的凭证少了」。
+  //
+  // 判断只能落在**重挂时**：账套一变 MainLayout 的 viewKey 就变，整页重挂，
+  // 组件里的 watch 活不到那一刻（重挂会把 watch 一起停掉）。
+  // 认出「条件是谁的」靠 URL 上的 book —— 条件在 URL 里，归属也得在 URL 里。
+  //
+  // 换月不清条件：条件填了就放宽到全部期间（见 hasFilter），
+  // 月份本来就不参与条件，犯不着为它作废。
+  if (!conditionsBelongTo(route.query, store.bookId)) {
+    // restore([]) = 「什么都不捡，但把自动同步打开」——
+    // 于是 URL 上那份残留也被一并抹掉（不然下次重挂又把它捡回来）。
+    clearFilter()
+    restore([])
+  } else {
+    restore()
+  }
   load()
 })
 /** 条件栏清空。URL 上残留的条件由 useUrlConditions 一并抹掉（不然一刷新它又回来了）。 */
@@ -395,14 +432,24 @@ function clearFilter() {
 }
 
 /**
- * 顶栏换月 → 条件栏清空，重新按新的那个月取。
- * 早先的写法是「有条件就当没看见，换了月也不动」：条件是**全账套**的，
- * 月份是**单月**的，两个范围叠在一起时结果既不是这个月、也不是那个月，
- * 用户看着只会以为账丢了。月份一变，条件就该作废。
+ * 一趟查询的触发口：账套 + 顶栏期间 + **期间表本身**。
+ *
+ * 「期间表本身」这一项不能少：切账套时 store 会把旧期间清掉、换成新账套的，
+ * 而新账套那一期的 id 未必跟旧的不同（两个账套的第一期很可能都是
+ * 「2026-01」，id 甚至可能撞上）—— 那一刻 periodId 不变，
+ * 只盯 periodId 的 watch 就不响，列表会一直是空的。
+ * 盯住 periods 的长度，期间一到位就有人叫醒这一页。
+ *
+ * 原来这里是两条 watch（一条盯账套、一条盯期间），各自调 load()：
+ * 切账套时账套变、期间也变，两条都响 → 同一份查询发两趟。
+ * 合成一条之后，一趟查询只有一个触发口。
+ *
+ * 这里**不管条件清不清**：那是 onMounted 的事（条件住在 URL 里，
+ * 归属也在 URL 里，只能在重挂时判）。
  */
-watch(() => store.periodId, () => {
+watch(() => [store.bookId, store.periodId, store.periods.length], () => {
   query.page = 1
-  clearFilter()
+  // 断号体检只对当前账套当前那期有意义，换了账套就得重算。
   check.value = null
   load()
 })

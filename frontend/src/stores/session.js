@@ -19,6 +19,17 @@ export const useSessionStore = defineStore('session', {
     booksLoaded: false,
     bookId: Number(localStorage.getItem('cwq_book') || 0),
     periods: [],
+    // **手上这批期间属于哪个账套。** 0 = 手上没有期间。
+    //
+    //  为什么非要单独记一份：判断「要不要清掉旧期间」不能看 bookId 变没变。
+    //  顶栏那行是 ``v-model="store.bookId"``，而 v-model 会**先**把新账套
+    //  写进 store，@change 里再调 setBook 时 bookId 早就是新的了 ——
+    //  「变了没有」永远答 false，旧账套的期间就一直留着。拿它当判据，
+    //  等于在问一个已经被回答过的问题。
+    //
+    //  真正该问的是「手上这批期间是谁的」。这个判据跟「谁来写 bookId」无关，
+    //  所以 v-model 先写、还是直接调 setBook，都判得对。
+    periodsBookId: 0,
     periodId: Number(localStorage.getItem('cwq_period') || 0),
     // 刚建好的账套。放在 store 而不是组件里，是因为建完第一个账套时
     // bookId 会从 0 变成新账套，MainLayout 的 viewKey 一变整个页面就重新挂载，
@@ -72,6 +83,19 @@ export const useSessionStore = defineStore('session', {
       return book?.init ?? null
     },
     currentPeriod: (s) => s.periods.find((p) => p.id === s.periodId) || null,
+    /**
+     * 当前账套的期间**到位了没有**。
+     *
+     *  切账套的**那一瞬间**手上可能什么都没有：旧的刚被清掉，新的还在路上。
+     *  这时候拿着 periodId 去查，就是拿着上一个账套的期间 id 查新账套 ——
+     *  后端会回「会计期间不存在」（总账）或「起始期间不存在」（凭证列表）。
+     *
+     *  判据是「手上的期间是不是当前账套的」，不是「期间数组空不空」：
+     *  账套一个期间都没有是可能的（刚建好还没启用月份），
+     *  那种情况下期间**到位了**，只是空的 —— 拿「空不空」当判据会把
+     *  这种账套的页面永远卡在「不查」。
+     */
+    periodsReady: (s) => s.bookId > 0 && s.periodsBookId === s.bookId,
     /** 当前账套能不能写。**失败时关闭（fail-closed）**。
      *
      *  原来是 ``s.currentBook?.role !== 'VIEWER'`` —— 黑名单写法。
@@ -306,6 +330,7 @@ export const useSessionStore = defineStore('session', {
       // 免得登出后那半秒里顶栏还渲染着上一个人的月份（401 那条路是同步清的）。
       this.periods = []
       this.periodId = 0
+      this.periodsBookId = 0
       // 初始化状态跟账套列表一样是**这个人的账**：上一个用户停在哪一步，
       // 跟下一个用户无关。留着就可能让新用户一进来就看见一张「待初始化」的卡片，
       // 而那本账根本不是他的。books 同理（上面已清）。
@@ -353,6 +378,11 @@ export const useSessionStore = defineStore('session', {
       if (!this.books.find((b) => b.id === this.bookId)) {
         this.bookId = 0
         this.periodId = 0
+        // 记住的账套没了（被删了，或者换人了）：它那批期间也是**别的账**的，
+        // 留着就是「拿着上一个账套的期间查下一个账套」。一并清掉。
+        this.periods = []
+        this.periodsBookId = 0
+        localStorage.removeItem('cwq_period')
       }
       if (!this.bookId) this.bookId = this.books[0]?.id || 0
       if (this.bookId) localStorage.setItem('cwq_book', String(this.bookId))
@@ -361,25 +391,41 @@ export const useSessionStore = defineStore('session', {
 
     /** 换账套：默认进最新年度。 */
     async setBook(id) {
-      const changed = this.bookId !== id
       this.bookId = id
       localStorage.setItem('cwq_book', String(id))
-      if (changed) {
+      // 「要不要清掉旧期间」问的是**手上的期间属于哪个账套**，不是 bookId 变没变。
+      // 顶栏那行是 v-model="store.bookId"：v-model 会先把新账套写进 store，
+      // @change 里再进来时 bookId 早就是新的了 —— 拿「变了没有」当判据，
+      // 这里永远进不来，旧期间就一直留着。页面拿着上一个账套的期间 id
+      // 去查新账套，后端回「会计期间不存在」。
+      //
+      // 换句话说：以前问的「bookId 变了吗」是个已经被回答过的问题，
+      // 该问的是「手上这批期间是谁的」。
+      if (this.periodsBookId !== id) {
         // 换账套后旧的 periodId 一定不属于新账套，先清掉避免期间下拉闪旧值。
         // 进账套一律按「最早还在用的年度 + 最早未结账月」落位，不接着上次的账套看。
         this.periods = []
         this.periodId = 0
+        this.periodsBookId = 0
         localStorage.removeItem('cwq_period')
       }
       await this.loadPeriods()
     },
     async loadPeriods() {
-      if (!this.bookId) {
+      const bookId = this.bookId
+      if (!bookId) {
         this.periods = []
         this.periodId = 0
+        this.periodsBookId = 0
         return
       }
-      this.periods = await bookApi.listPeriods(this.bookId)
+      const periods = await bookApi.listPeriods(bookId)
+      // 期间是**账套的属性**：请求在路上时用户可能又切了账套。
+      // 旧账套的那份这时候回来，直接盖上去就是「拿着 A 的期间查 B」。
+      // 所以只在账套还是那个账套时才落。
+      if (this.bookId !== bookId) return
+      this.periods = periods
+      this.periodsBookId = bookId
       if (!this.periods.find((p) => p.id === this.periodId)) {
         // 记住的期间已经不存在（换年度 / 反结账）—— 落在「还在用的」那一期
         this.setPeriod(this.defaultPeriodId(this.defaultYear()))
