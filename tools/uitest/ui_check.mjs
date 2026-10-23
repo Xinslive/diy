@@ -21,8 +21,8 @@ await step('打开登录页', async () => {
 await page.screenshot({ path: `${out}/01-login.png` })
 
 await step('登录', async () => {
-  // 用户名在 dev 下预填成 admin，但**口令不再预填**（见 LoginView.vue 的注释：
-  // 生产构建连用户名预填也去掉了）。原来这里只点「登录」，于是从那一刻起
+  // 账号在 dev 下预填成 admin，但**密码不再预填**（见 LoginView.vue 的注释：
+  // 生产构建连账号预填也去掉了）。原来这里只点「登录」，于是从那一刻起
   // 整个脚本全在登录页上空转，后面每一步都超时 —— 看起来像十几处功能坏了。
   await page.fill('input[type=password]', process.env.CWQ_PASSWORD || '123456')
   await page.click('button:has-text("登录")')

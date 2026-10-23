@@ -15,7 +15,7 @@ async function login(username) {
   page.on('request', r => { if (r.url().includes('/api/plugins/')) requests.push({ url: r.url(), auth: !!r.headers().authorization }) })
   page.on('pageerror', e => errors.push(e.message))
   const document = await page.goto(state.url + '/#/login')
-  await page.getByPlaceholder('用户名', { exact: true }).fill(username)
+  await page.getByPlaceholder('账号', { exact: true }).fill(username)
   await page.getByPlaceholder('密码', { exact: true }).fill(state.password)
   await page.getByRole('button', { name: '登录', exact: true }).click()
   await page.waitForURL('**/#/books')

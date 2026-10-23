@@ -14,7 +14,7 @@ page.on('console', m => { if (m.type() === 'error') errs.push('console: ' + m.te
 
 await page.goto('http://127.0.0.1:5173', { waitUntil: 'domcontentloaded' })
 await page.waitForTimeout(2000)
-await page.locator('input[placeholder="用户名"]').fill('admin')
+await page.locator('input[placeholder="账号"]').fill('admin')
 await page.locator('input[placeholder="密码"]').fill('123456')
 await page.locator('.el-tab-pane:visible button:has-text("登录")').first().click()
 await page.waitForSelector('.shell .sidebar', { timeout: 25000 })
