@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -552,6 +553,197 @@ class VersionInfoFileTest(unittest.TestCase):
         table = info.kids[0].table[0]
         fields = {s.key: s.value for s in table.strings}
         self.assertEqual(fields["OriginalFilename"], "CWQ.exe")
+
+
+class IsInteractiveTest(unittest.TestCase):
+    """``is_interactive()`` —— 判定「有没有人能在旁边点掉那个模态框」。
+
+    **这条测试是被 CI 挂住逼出来的。** 第一次跑冒烟验证时，Windows runner
+    上弹出的 ``MessageBoxW`` 没人点，那一步卡了 11 分钟。
+    """
+
+    @contextlib.contextmanager
+    def _with_env(self, **env):
+        """临时替换环境变量，跑完恢复。"""
+        saved = {k: os.environ.get(k) for k in env}
+        for k, v in env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        try:
+            yield
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_ci_env_is_not_interactive(self):
+        with self._with_env(CI="1", CWQ_SHELL_NONINTERACTIVE=None):
+            self.assertFalse(launcher.is_interactive())
+
+    def test_explicit_noninteractive_switch(self):
+        with self._with_env(CI=None, CWQ_SHELL_NONINTERACTIVE="1"):
+            self.assertFalse(launcher.is_interactive())
+
+    def test_posix_without_display_is_not_interactive(self):
+        original = launcher.platform.system
+        launcher.platform.system = lambda: "Linux"
+        try:
+            with self._with_env(CI=None, CWQ_SHELL_NONINTERACTIVE=None,
+                                DISPLAY=None, WAYLAND_DISPLAY=None):
+                self.assertFalse(launcher.is_interactive())
+        finally:
+            launcher.platform.system = original
+
+    def test_posix_with_display_is_interactive(self):
+        original = launcher.platform.system
+        launcher.platform.system = lambda: "Linux"
+        try:
+            with self._with_env(CI=None, CWQ_SHELL_NONINTERACTIVE=None,
+                                DISPLAY=":0", WAYLAND_DISPLAY=None):
+                self.assertTrue(launcher.is_interactive())
+        finally:
+            launcher.platform.system = original
+
+
+class DryRunNeverShowsDialogTest(unittest.TestCase):
+    """``--dry-run`` 绝不能弹模态框。
+
+    **这条测试是被 CI 挂住逼出来的。** ``MessageBoxW`` 是模态的：它会一直
+    等用户点掉。Windows runner 上没人点，那一步就永久阻塞。
+
+    所以 ``--dry-run`` 必须**无条件**抑制弹窗 —— 它的全部意义就是
+    「别真做事」，包括别弹框。
+
+    这条测试**不依赖平台**：它断言的是「调用 show_message 时一定带了
+    suppress=True」，而不是「运行时真的没弹」。
+    """
+
+    def _main_show_message_kwargs(self, argv):
+        """跑一次 main()，捕获 show_message 收到的关键字参数。"""
+        captured = []
+        original = launcher.show_message
+
+        def spy(title, text, **kwargs):
+            captured.append(kwargs)
+
+        launcher.show_message = spy
+        try:
+            with quiet():
+                launcher.main(argv)
+        finally:
+            launcher.show_message = original
+        return captured
+
+    def test_bad_url_dry_run_suppresses_dialog(self):
+        calls = self._main_show_message_kwargs(
+            ["--dry-run", "--url", "file:///etc/passwd"]
+        )
+        self.assertTrue(calls, "非法 URL 应当触发一次 show_message")
+        for kwargs in calls:
+            self.assertTrue(
+                kwargs.get("suppress"),
+                f"dry-run 下的 show_message 必须带 suppress=True，实际是 {kwargs}",
+            )
+
+    def test_missing_browser_dry_run_suppresses_dialog(self):
+        calls = self._main_show_message_kwargs(
+            ["--dry-run", "--browser", "/definitely/not/here/chrome"]
+        )
+        self.assertTrue(calls, "找不到浏览器应当触发一次 show_message")
+        for kwargs in calls:
+            self.assertTrue(
+                kwargs.get("suppress"),
+                f"dry-run 下的 show_message 必须带 suppress=True，实际是 {kwargs}",
+            )
+
+
+class SmokeTestHarnessTest(unittest.TestCase):
+    """冒烟验证脚本自身的行为。
+
+    **为什么要有这些。** 第一次跑这条 workflow 时，Windows 上「冒烟验证」
+    那一步卡了整整 11 分钟 —— 每条用例都耗满了 120 秒超时。也就是说
+    **冒烟脚本自己坏掉时，症状是「CI 挂住」而不是「CI 报红」**，而挂住
+    是最难诊断的形态。
+
+    所以这里断言脚本的关键属性：超时预算是有界的、失败会抛可读的错误、
+    而且它**不建管道**（Windows 上服务进程没有有效 STDIN 句柄，管道捕获
+    是已知隐患）。
+    """
+
+    SCRIPT = Path(__file__).resolve().parents[1] / "smoke_test.py"
+
+    def _source(self):
+        return self.SCRIPT.read_text(encoding="utf-8")
+
+    def test_script_exists(self):
+        self.assertTrue(self.SCRIPT.is_file(), f"缺冒烟脚本：{self.SCRIPT}")
+
+    def test_does_not_use_capture_output(self):
+        """脚本**代码**里不得用 ``capture_output=True``。
+
+        用 AST 查而不是文本匹配 —— 因为文档字符串里要解释「为什么不用它」，
+        文本匹配会把那段说明也当成违规。
+
+        原因：Windows 上服务进程没有有效 STDIN 句柄，GUI 子系统 exe 与
+        管道捕获的组合也是已知隐患。改用文件重定向。
+        """
+        import ast
+
+        tree = ast.parse(self._source())
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg == "capture_output":
+                    offenders.append(node.lineno)
+        self.assertEqual(
+            offenders,
+            [],
+            f"冒烟脚本第 {offenders} 行用了 capture_output：Windows 上服务进程"
+            "没有有效 STDIN 句柄，且 GUI 子系统 exe 的管道捕获会挂死。"
+            "改用文件重定向。",
+        )
+
+    def test_passes_stdin_devnull(self):
+        # 显式给 stdin=DEVNULL 是 Windows 上跑服务/无人值守进程的必要动作。
+        self.assertIn(
+            "stdin=subprocess.DEVNULL",
+            self._source(),
+            "冒烟脚本必须显式传 stdin=subprocess.DEVNULL（Windows 服务进程"
+            "没有有效 STDIN 句柄）",
+        )
+
+    def test_has_bounded_timeout(self):
+        # 超时值乘以用例数就是一次失败的等待上限，所以它必须有界且不大。
+        source = self._source()
+        self.assertIn("timeout: int = ", source)
+        # 抓出默认值，确认不超过 60 秒
+        import re
+
+        match = re.search(r"timeout: int = (\d+)", source)
+        self.assertIsNotNone(match)
+        self.assertLessEqual(
+            int(match.group(1)),
+            60,
+            "冒烟脚本的单次超时不能超过 60 秒：它要乘以用例数，"
+            "太长会让一次失败看起来像「CI 卡住了」",
+        )
+
+    def test_kills_process_tree_on_timeout(self):
+        # 超时后必须杀掉整个进程树，否则 exe 拉起的浏览器会变成孤儿，
+        # 继续占着资源，下一条用例接着受影响。
+        self.assertIn("_kill_tree", self._source())
+
+    def test_timeout_failure_message_is_actionable(self):
+        # 超时时给出的提示要指向真原因，而不是只说「超时了」。
+        source = self._source()
+        self.assertIn("模态对话框", source)
+        self.assertIn("suppress", source)
 
 
 if __name__ == "__main__":

@@ -319,12 +319,66 @@ def write_log(message: str, env: Mapping[str, str] | None = None) -> None:
         pass
 
 
-def show_message(title: str, text: str, *, error: bool = False) -> None:
-    """弹一个系统消息框。
+def is_interactive() -> bool:
+    """判断当前是不是**有人在旁边**的环境。
+
+    **为什么必须有这个判定。** ``show_message`` 弹的是 ``MessageBoxW`` ——
+    那是**模态对话框，会一直等用户点掉**。在无人值守的地方（CI runner、
+    计划任务、无人值守服务），那个框会**永久阻塞**。
+
+    这不是理论：CI 第一次跑冒烟验证就挂在这儿 —— 「拒绝非 http/https 地址」
+    那条用例触发了错误提示，消息框在 runner 上弹出来没人点，那一步卡了
+    11 分钟才被取消。
+
+    判据（按可靠性排序）：
+      1. ``CI`` 环境变量 → 自动化环境。
+      2. ``CWQ_SHELL_NONINTERACTIVE`` → 调用方明确说「没人值守」。
+      3. Windows 上看有没有交互式桌面会话（``WTSGetActiveConsoleSessionId``，
+         返回 0 表示没有已登录的控制台会话）。
+      4. POSIX 上有 ``DISPLAY`` / ``WAYLAND_DISPLAY`` → 有图形会话。
+
+    判不出来时往「有人」那边靠：真实用户的桌面上弹框才是正确行为，
+    只有在明确的无人环境里才不该弹。
+    """
+    if os.environ.get("CI"):
+        return False
+    if os.environ.get("CWQ_SHELL_NONINTERACTIVE"):
+        return False
+
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+
+            # WTSGetActiveConsoleSessionId：0 表示**没有**已登录的控制台会话。
+            # 有会话 → 有人在，能点框。
+            session_id = ctypes.windll.kernel32.WTSGetActiveConsoleSessionId()
+            return session_id != 0
+        except Exception:
+            return True
+
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def show_message(
+    title: str, text: str, *, error: bool = False, suppress: bool = False
+) -> None:
+    """
+
+    :param suppress: 调用方明确要求不弹（``--dry-run`` 用）。
+        这一条**优先于**所有环境判定 —— dry-run 的全部意义就是
+        「别真做事」，包括别弹框。
+    弹一个系统消息框。
 
     打包成 GUI 程序（无控制台）后，``print`` 的内容用户是看不见的 ——
-    出错时必须有个能弹出来的东西，否则用户只会觉得「双击了没反应」。
+    出错时必须有个能弹出来的东西，否则用户只会觉得「双击没反应」。
+
+    **但不是任何时候都弹。** 没人能点框的环境里（CI、计划任务），
+    模态框会永久阻塞进程 —— 那里只写日志，不弹框。见 :func:`is_interactive`。
     """
+    if suppress or not is_interactive():
+        # 无人环境：把内容写进日志就够了。日志有人来看，框没人能点。
+        write_log(f"[无交互环境，未弹窗] {title}: {text}")
+        return
     if platform.system() != "Windows":
         _safe_print(f"{title}: {text}", stream=sys.stderr)
         return
@@ -493,7 +547,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         url = validate_url(raw_url)
     except ValueError as exc:
-        show_message(f"{APP_NAME}", str(exc), error=True)
+        show_message(f"{APP_NAME}", str(exc), error=True, suppress=args.dry_run)
         write_log(f"URL 无效：{exc}")
         return 2
 
@@ -503,7 +557,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if Path(args.browser).is_file():
             browser = Browser(name="custom", path=args.browser)
         else:
-            show_message(f"{APP_NAME}", f"找不到指定的浏览器：\n{args.browser}", error=True)
+            show_message(
+                f"{APP_NAME}",
+                f"找不到指定的浏览器：\n{args.browser}",
+                error=True,
+                suppress=args.dry_run,
+            )
             write_log(f"指定的浏览器不存在：{args.browser}")
             return 2
     else:
@@ -544,7 +603,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         except Exception as exc:
             write_log(f"拉起浏览器失败：{exc}")
-            show_message(f"{APP_NAME}", f"打开浏览器失败：\n{exc}", error=True)
+            show_message(
+                f"{APP_NAME}",
+                f"打开浏览器失败：\n{exc}",
+                error=True,
+                suppress=args.dry_run,
+            )
             return 4
 
     # 没有浏览器，或者用户主动要求用默认浏览器。
@@ -557,6 +621,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "这台机器上没找到 Edge / Chrome / Brave，也没有可用的默认浏览器。\n"
         f"请直接在浏览器地址栏打开：{url}",
         error=True,
+        suppress=args.dry_run,
     )
     write_log("没有可用浏览器，且默认浏览器也打不开")
     return 5

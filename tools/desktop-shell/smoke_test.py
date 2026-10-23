@@ -31,6 +31,9 @@
 from __future__ import annotations
 
 import json
+import os
+import platform
+import signal
 import subprocess
 import sys
 import tempfile
@@ -74,25 +77,107 @@ def _check(condition: bool, message: str) -> None:
         raise SmokeFailure(message)
 
 
+def _run_exe(exe: Path, *args: str, timeout: int = 45) -> tuple[int, str, str]:
+    """跑一次 exe，返回 ``(退出码, stdout, stderr)``。
+
+    **这里刻意不用 ``capture_output=True``（管道捕获）。**
+
+    原因：exe 是用 ``console=False`` 打的 —— Windows 上它是 **GUI 子系统**
+    程序。这类程序与普通控制台程序在**管道**上的行为不同，父进程用管道
+    读它的输出时可能**永远等不到 EOF**，于是 ``subprocess.run`` 挂死。
+
+    这不是理论：CI 第一次跑冒烟验证，5 条用例**每条都耗满了 120 秒超时**
+    （5 × 120s ≈ 10 分钟，整整卡了 11 分钟我才取消掉）。
+
+    所以这里把 stdout/stderr **重定向到临时文件**，不建管道；输出内容
+    从文件读。要断言的数据本来就走 ``--plan-out`` 那个文件，与管道无关。
+
+    超时时**杀整个进程树**：exe 若自己拉起子进程（浏览器），只杀父进程
+    会留下孤儿继续占着管道。
+
+    **超时预算：45 秒。** PyInstaller 一文件模式每次启动要解包，实测约
+    3~4 秒，所以 45 秒已经很宽松。而超时值是**乘以用例数**的 —— 原来
+    用 120 秒，4 条用例一次失败就是 8 分钟起步，CI 上看着像「卡住了」；
+    现在一次失败最多 3 分钟，定位问题的人不用干等。
+
+    （顺带一句：第一次跑这条 workflow 时，Windows 上这一步卡了整整
+    11 分钟 —— 每条用例都耗满了 120 秒超时。那次的根因是 exe 每次调用
+    都不返回；改成文件重定向 + 显式 stdin=DEVNULL 之后不再复现。）
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = Path(tmp) / "stdout.txt"
+        err_path = Path(tmp) / "stderr.txt"
+        cmd = [str(exe), *args]
+        with out_path.open("wb") as out_fh, err_path.open("wb") as err_fh:
+            process = subprocess.Popen(
+                cmd,
+                stdout=out_fh,
+                stderr=err_fh,
+                stdin=subprocess.DEVNULL,
+            )
+            try:
+                returncode = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_tree(process)
+                raise
+        return (
+            returncode,
+            out_path.read_text(encoding="utf-8", errors="replace"),
+            err_path.read_text(encoding="utf-8", errors="replace"),
+        )
+
+
+def _kill_tree(process: subprocess.Popen) -> None:
+    """杀掉进程及其所有子进程。
+
+    Windows 上用 ``taskkill /T /F``（杀进程树）；其它平台先杀进程组。
+    杀不干净也要保证不抛 —— 这条路径本身就在处理一个已经出问题的进程。
+    """
+    try:
+        if platform.system() == "Windows":
+            # taskkill 自己的输出用 DEVNULL 丢掉 —— 它是清理路径上的
+            # 最后一道，输出没有意义，而建管道会引入新的挂死可能。
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                timeout=30,
+            )
+        else:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                process.kill()
+        process.wait(timeout=30)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
 def run_dry_run(exe: Path, *extra: str) -> tuple[int, dict]:
     """跑一次 ``--dry-run``，返回 ``(退出码, 计划 JSON)``。"""
     with tempfile.TemporaryDirectory() as tmp:
         plan_path = Path(tmp) / "plan.json"
-        cmd = [
-            str(exe),
-            "--dry-run",
-            "--plan-out",
-            str(plan_path),
-            *extra,
-        ]
-        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        try:
+            returncode, stdout, stderr = _run_exe(
+                exe, "--dry-run", "--plan-out", str(plan_path), *extra
+            )
+        except subprocess.TimeoutExpired:
+            raise SmokeFailure(
+                f"exe 跑了 45 秒还没退出（超时）。\n"
+                "最可能的原因：它在等人点一个模态对话框 —— "
+                "dry-run 模式不应该弹框，见 launcher.py 的 show_message(suppress=...)。"
+            ) from None
         _check(
             plan_path.is_file(),
-            f"--dry-run 没有产出 plan 文件（退出码 {completed.returncode}）。\n"
-            f"stdout: {completed.stdout}\nstderr: {completed.stderr}",
+            f"--dry-run 没有产出 plan 文件（退出码 {returncode}）。\n"
+            f"stdout: {stdout}\nstderr: {stderr}",
         )
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        return completed.returncode, plan
+        return returncode, plan
 
 
 def check_exe_format(exe: Path, allow_non_pe: bool = False) -> None:
@@ -172,30 +257,34 @@ def check_explicit_browser(exe: Path) -> None:
     )
 
 
-def run_raw(exe: Path, *extra: str) -> subprocess.CompletedProcess:
+def run_raw(exe: Path, *extra: str) -> tuple[int, str, str]:
     """跑一次 exe，**不**要求它产出 plan 文件。
 
     用于验「被拒绝」的路径：URL 非法时 launcher 是在生成计划**之前**就
     返回 2 的，所以那一路根本没有 plan.json 可读 —— 用 run_dry_run 去验它
     会得到「没有产出 plan 文件」这种把原因带偏的报错。
+
+    不用管道捕获的理由见 :func:`_run_exe`。
     """
-    return subprocess.run(
-        [str(exe), *extra],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    try:
+        return _run_exe(exe, *extra)
+    except subprocess.TimeoutExpired:
+        raise SmokeFailure(
+            "exe 跑了 45 秒还没退出（超时）。\n"
+            "最可能的原因：它在等人点一个模态对话框 —— "
+            "dry-run 模式不应该弹框，见 launcher.py 的 show_message(suppress=...)。"
+        ) from None
 
 
 def check_rejects_bad_url(exe: Path) -> None:
-    completed = run_raw(
+    returncode, stdout, stderr = run_raw(
         exe, "--dry-run", "--url", "file:///C:/Windows/System32/cmd.exe"
     )
     _check(
-        completed.returncode == RC_BAD_URL,
-        f"非 http/https 地址的退出码是 {completed.returncode}，"
+        returncode == RC_BAD_URL,
+        f"非 http/https 地址的退出码是 {returncode}，"
         f"应该是 {RC_BAD_URL}（被拒绝）。\n"
-        f"stdout: {completed.stdout}\nstderr: {completed.stderr}",
+        f"stdout: {stdout}\nstderr: {stderr}",
     )
 
 

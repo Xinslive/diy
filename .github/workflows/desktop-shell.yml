@@ -50,7 +50,24 @@ name: Desktop Shell
 on:
   push:
     branches: ['**']
+    # **只在壳相关的文件变了才跑。**
+    #
+    # 这条 workflow 每跑一次要 2~4 分钟（Windows runner 冷启动 + 打包）。
+    # 而 GitHub Actions 的免费额度是**按月**算的（免费账户 2,000 分钟/月）。
+    # 一个「每次 push 都跑」的新 workflow 会在用户没察觉的情况下把额度吃掉 ——
+    # 额度用完之后，**连主 CI 一起跑不了**（那条要 12 分钟）。
+    #
+    # 所以这里限定 paths：只有动了壳的代码、CI 配置、或者研究文档才触发。
+    # 想要随时手动跑：workflow_dispatch。
+    paths:
+      - 'tools/desktop-shell/**'
+      - '.github/workflows/desktop-shell.yml'
+      - 'docs/Windows打包exe可行性研究.md'
   pull_request:
+    paths:
+      - 'tools/desktop-shell/**'
+      - '.github/workflows/desktop-shell.yml'
+      - 'docs/Windows打包exe可行性研究.md'
   workflow_dispatch:
 
 # 取消同一个 ref 上上一轮的旧运行
