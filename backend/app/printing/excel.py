@@ -86,8 +86,17 @@ RIGHT = Alignment(horizontal="right", vertical="center")
 #: 而 openpyxl 是全内存构建，省下来的都是实打实的请求时长。
 #:
 #: 只有两种：正常体与合计行的加粗体。样式表里是同一个东西，文件不变。
-FONT_CELL = Font(name="宋体", size=10)
-FONT_CELL_BOLD = Font(name="宋体", size=10, bold=True)
+#:
+#: **字号 12pt**（用户 2026-10-23）：总账 / 明细账的导出件与打印件是同一张纸，
+#: 打印件那一份的字号下限也是 12pt（``app.printing.template.LEDGER_MIN_FONT_SIZE``）。
+#: 以前这里写 10pt，于是「印出来的」与「导出来的」大小不一致 ——
+#: 同一张账，两边看不是同一份东西。
+FONT_CELL = Font(name="宋体", size=12)
+FONT_CELL_BOLD = Font(name="宋体", size=12, bold=True)
+#: 页眉页脚那几行（核算单位 / 制表 / 打印日期 / 本币名称 / 科目行）。
+#: 它们以前**根本没设字体**，落回 openpyxl 的默认（Calibri 11pt）——
+#: 那是全表唯一比正文还小的一批字。统一成宋体 12pt。
+FONT_TEXT = Font(name="宋体", size=12)
 
 
 def _propagate_merged_borders(ws) -> None:
@@ -421,7 +430,8 @@ def _ledger_book_sheet(
     # ---- 抬头 ----
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
     head = ws.cell(row=1, column=1, value=_text(doc_title))
-    head.font = Font(name="宋体", size=16, bold=True)
+    # 主标题 20pt 加粗（用户 2026-10-23）：与打印件的标题同一档字号。
+    head.font = Font(name="宋体", size=20, bold=True)
     head.alignment = CENTER
     ws.row_dimensions[1].height = 26
 
@@ -429,22 +439,25 @@ def _ledger_book_sheet(
     if period_label:
         ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=8)
         sub = ws.cell(row=2, column=1, value=_text(period_label))
-        sub.font = Font(name="宋体", size=10)
+        sub.font = FONT_TEXT
         sub.alignment = CENTER
         ws.row_dimensions[2].height = 18
 
-    ws.cell(row=3, column=6, value=_text("本币名称: 人民币")).alignment = RIGHT
+    ws.cell(row=3, column=6, value=_text("本币名称: 人民币")).font = FONT_TEXT
+    ws.cell(row=3, column=6).alignment = RIGHT
     ws.merge_cells(start_row=3, start_column=6, end_row=3, end_column=8)
     # 科目行只在真的印某一个科目时才有 —— 整册被「不打印无发生额科目」跳空
     # 之后的那张空白页，不该顶着「科目: ()」出去。
     if subject_name or subject_code:
-        ws.cell(row=3, column=1,
-                value=_text(f"科目: {subject_name}({subject_code})")).alignment = LEFT
+        c = ws.cell(row=3, column=1,
+                    value=_text(f"科目: {subject_name}({subject_code})"))
+        c.font = FONT_TEXT
+        c.alignment = LEFT
 
     # ---- 两行表头（年份横跨「月+日」）----
     ws.merge_cells(start_row=4, start_column=1, end_row=4, end_column=2)
     y = ws.cell(row=4, column=1, value=_text(year_label))
-    y.font = Font(name="宋体", size=11, bold=True)
+    y.font = Font(name="宋体", size=12, bold=True)
     y.alignment = CENTER
     for col, (label, _w) in enumerate(LEDGER_BOOK_HEADERS[2:], start=3):
         ws.merge_cells(start_row=4, start_column=col, end_row=5, end_column=col)
@@ -485,11 +498,16 @@ def _ledger_book_sheet(
     r += 2
     foot = ws.cell(row=r, column=1,
                    value=_text(f"核算单位: {company}"))
+    foot.font = FONT_TEXT
     foot.alignment = LEFT
     ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=4)
-    ws.cell(row=r, column=5, value=_text(f"制表: {preparer}")).alignment = CENTER
+    mid = ws.cell(row=r, column=5, value=_text(f"制表: {preparer}"))
+    mid.font = FONT_TEXT
+    mid.alignment = CENTER
     ws.merge_cells(start_row=r, start_column=5, end_row=r, end_column=6)
-    ws.cell(row=r, column=7, value=_text(f"打印日期: {print_date}")).alignment = RIGHT
+    right = ws.cell(row=r, column=7, value=_text(f"打印日期: {print_date}"))
+    right.font = FONT_TEXT
+    right.alignment = RIGHT
     ws.merge_cells(start_row=r, start_column=7, end_row=r, end_column=8)
 
     # 合并区的框线要在**所有框线都定下来之后**才补：表头那两行是先

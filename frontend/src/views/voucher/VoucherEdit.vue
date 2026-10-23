@@ -37,21 +37,28 @@
           <el-button :disabled="!nextId" @click="goNeighbour('next')">后一张</el-button>
         </el-button-group>
       </el-tooltip>
-      <el-button :disabled="!canAdd" @click="insertVoucher">插入凭证</el-button>
-      <el-button :disabled="!canAdd" @click="addVoucher">增加凭证</el-button>
-      <!-- 拆分凭证：把这一张按分录边界拆成两张。**写**动作，所以跟插入/增加
-           排在一组 —— 「打印预览」是读，不受「这张不能改」的三条限制影响，
-           排在它前面会让人以为拆也是只读的事。 -->
-      <el-tooltip :content="splitHint" placement="bottom">
-        <el-button :disabled="!canSplit" @click="openSplit">拆分凭证</el-button>
-      </el-tooltip>
-      <!-- 打印是**读**，不是写：所以它不受「这张不能改」的三条限制
-           （已记账 / 所在期间已结账 / 只读账号）影响，照样能点。
-           后端那条接口（GET /print/vouchers.html）本来就没有写门禁，只挂
-           get_my_book —— 把一张已记账的凭证打出来，是归档前最常做的事，
-           把它拦掉拦掉的是最该让打出来的那一类。
-           保留的唯一条件是有这张凭证可打（v-if="voucherId"）。 -->
-      <el-button v-if="voucherId" @click="printVoucher">打印预览</el-button>
+      <!-- 这四颗动作按钮（插入 / 增加 / 拆分 / 打印）挨得太开：
+           Element Plus 给「相邻的按钮」加了 12px 左边距
+           （.el-button + .el-button），工具条自己又有 8px 的缝，
+           两颗之间就成了 20px —— 一排四颗占掉四百多像素，看着是散着的。
+           收进一个自己的小分组：左边距去掉，只留 4px 的缝。 -->
+      <div class="tb-acts">
+        <el-button :disabled="!canAdd" @click="insertVoucher">插入凭证</el-button>
+        <el-button :disabled="!canAdd" @click="addVoucher">增加凭证</el-button>
+        <!-- 拆分凭证：把这一张按分录边界拆成两张。**写**动作，所以跟插入/增加
+             排在一组 —— 「打印预览」是读，不受「这张不能改」的三条限制影响，
+             排在它前面会让人以为拆也是只读的事。 -->
+        <el-tooltip :content="splitHint" placement="bottom">
+          <el-button :disabled="!canSplit" @click="openSplit">拆分凭证</el-button>
+        </el-tooltip>
+        <!-- 打印是**读**，不是写：所以它不受「这张不能改」的三条限制
+             （已记账 / 所在期间已结账 / 只读账号）影响，照样能点。
+             后端那条接口（GET /print/vouchers.html）本来就没有写门禁，只挂
+             get_my_book —— 把一张已记账的凭证打出来，是归档前最常做的事，
+             把它拦掉拦掉的是最该让打出来的那一类。
+             保留的唯一条件是有这张凭证可打（v-if="voucherId"）。 -->
+        <el-button v-if="voucherId" @click="printVoucher">打印预览</el-button>
+      </div>
     </div>
 
     <div class="card">
@@ -2114,6 +2121,14 @@ watch(() => [store.bookId, store.periodId, store.currentYear, route.params.id], 
 .maker { display: inline-flex; align-items: center; gap: 6px; color: #606266; }
 .foot-right { display: inline-flex; align-items: baseline; gap: 22px; }
 .foot-right b { font-variant-numeric: tabular-nums; color: var(--cwq-text); }
+
+/* 工具条右边那四颗动作按钮（插入 / 增加 / 拆分 / 打印）。
+   Element Plus 给「相邻的按钮」加了 12px 左边距（.el-button + .el-button），
+   工具条自己又有 8px 的缝 —— 两颗之间就是 20px，一排四颗占掉四百多像素，
+   看上去是散着的（用户 2026-10-23：「这四个按钮间距缩小一点」）。
+   收进一个自己的小分组：左边距去掉，只留 4px 的缝。 */
+.tb-acts { display: flex; align-items: center; gap: 4px; }
+.tb-acts :deep(.el-button + .el-button) { margin-left: 0; }
 
 /* 打印预览与打印都已改走 PrintDialog，页内不再留任何打印用样式：
    预览由后端渲染的那份 HTML 负责，页内再留一套就是两套版式，

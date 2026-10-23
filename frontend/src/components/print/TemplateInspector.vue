@@ -67,7 +67,10 @@
               </div>
               <div v-if="!isVoucher" class="fl">
                 <span class="lb">字号（pt）</span>
-                <el-input-number v-model="tpl.font.size" :min="6" :max="24" :step="0.5"
+                <!-- 下限由父组件给（minFontSize）：总账 / 明细账是 12pt，
+                     别的范围还是 6pt。设计器不许填出后端会抬走的值 ——
+                     填 9pt、存下去、加载时变 12pt，用户只会以为界面在骗人。 -->
+                <el-input-number v-model="tpl.font.size" :min="minFontSize" :max="24" :step="0.5"
                                  size="small" :disabled="ro" @change="commit" />
               </div>
             </div>
@@ -87,7 +90,7 @@
                 <div class="f">
                   <div class="fl">
                     <span class="lb">字号（pt）</span>
-                    <el-input-number v-model="tpl.title.size" :min="8" :max="40"
+                    <el-input-number v-model="tpl.title.size" :min="minTitleSize" :max="40"
                                      size="small" :disabled="ro" @change="commit" />
                   </div>
                   <div class="fl">
@@ -519,6 +522,9 @@ const props = defineProps({
   /** 草稿模板，就地 mutate。父组件保证永远是完整骨架，所以模板里可以放心写 tpl.margins.top。 */
   tpl: { type: Object, required: true },
   isVoucher: { type: Boolean, default: false },
+  /** 正文字号下限（pt）。总账 / 明细账是 12（用户 2026-10-23），
+   *  别的范围留 6 —— 与后端 template.py 的区间一一对应。 */
+  minFontSize: { type: Number, default: 6 },
   /** 当前选中的凭证元素 id，可为 null。id 的生成在父组件，本组件只读。 */
   selectedId: { type: String, default: null },
   canWrite: { type: Boolean, default: true },
@@ -526,6 +532,9 @@ const props = defineProps({
   paperOptions: { type: Array, default: () => [] },
 })
 const emit = defineEmits(['update:activeTab', 'change', 'select', 'add-element'])
+
+/** 标题字号的下限：不得低于正文的下限，但也不低于通用的 8pt。 */
+const minTitleSize = computed(() => Math.max(8, props.minFontSize))
 
 /** A4 的毫米尺寸。meta 没加载出来时 slotMm 也得有尺寸可用。 */
 const PAPER_SPEC = { A4: { w: 210, h: 297 } }

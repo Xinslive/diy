@@ -89,5 +89,33 @@ t('保存时把附件数原样送回去', () => {
 })
 
 console.log('')
+console.log('== 右边那四颗动作按钮不要散着 ==')
+
+t('四颗动作按钮收在一个自己的分组里', () => {
+  // 以前四颗按钮是工具条的直接子元素：Element Plus 给「相邻的按钮」加了
+  // 12px 左边距（.el-button + .el-button），工具条自己又有 8px 的缝，
+  // 两颗之间就是 20px —— 一排四颗占掉四百多像素，看着是散着的
+  // （用户 2026-10-23：「这四个按钮间距缩小一点」）。
+  assert.match(toolbar(), /class="tb-acts"/, '四颗按钮没有收进自己的分组')
+})
+
+t('分组里只留 4px 的缝，并且去掉 Element Plus 那 12px 左边距', () => {
+  // 少任何一条都不行：只写 gap 不去左边距 → 4 + 12 = 16px，还是偏宽；
+  // 只去左边距不写 gap → 0px，四颗按钮会连成一片。
+  assert.match(VIEW, /\.tb-acts\s*\{[^}]*gap:\s*4px/, '分组里没有 4px 的缝')
+  assert.match(VIEW, /\.tb-acts\s*:deep\(\.el-button \+ \.el-button\)\s*\{[^}]*margin-left:\s*0/,
+    'Element Plus 的 12px 左边距没去掉')
+})
+
+t('分组里正好是那四颗动作按钮', () => {
+  const m = toolbar().match(/<div class="tb-acts">([\s\S]*?)<\/div>/)
+  assert.ok(m, '工具条里没有 .tb-acts 分组')
+  const group = m[1]
+  for (const label of ['插入凭证', '增加凭证', '拆分凭证', '打印预览']) {
+    assert.ok(group.includes(label), `分组里少了「${label}」`)
+  }
+})
+
+console.log('')
 console.log(fail ? `通过 ${pass} / 失败 ${fail}` : `通过 ${pass} / 失败 0`)
 process.exit(fail ? 1 : 0)

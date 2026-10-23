@@ -84,6 +84,21 @@ FONT_FAMILIES = (
 FONT_SIZE_RANGE = (6, 24)
 #: 标题 / 副标题字号区间（pt）。比正文宽一点，允许做大标题。
 TITLE_SIZE_RANGE = (8, 48)
+#: **总账 / 明细账的字号下限（pt）。**
+#:
+#: 用户 2026-10-23：这两张纸上的字号**一律不得低于 12pt**。10pt 的正文在
+#: A4 上要拿放大镜才看得清，而总账/明细账是要拿给外部看的正式账簿。
+#:
+#: **只收这两个范围**：凭证纸要塞五行分录、法定报表要放得下几十行，
+#: 跟着一起抬会把那些纸撑破 —— 每页行数是按字号算的
+#: （见 ``ledger_book_rows_per_page``）。
+#:
+#: 这条线由 ``validate_template`` 统一执行，因此**库里存着的旧模板也一样**：
+#: 加载时就被抬到 12pt，不靠谁记得去改库。前端设计器的输入框下限
+#: （``TemplateInspector`` 的 ``minFontSize``）跟着同一条线走。
+LEDGER_MIN_FONT_SIZE = 12
+#: 走「用友账簿版式」的两个范围：总账 / 明细账。
+LEDGER_SCOPES = ("LEDGER", "DETAIL_LEDGER")
 #: 页边距区间（mm）。负数在 CSS 里会被浏览器丢弃、过大则整页空白，这里夹住。
 MARGIN_RANGE = (0, 100)
 ELEMENT_BINDS = {
@@ -159,8 +174,9 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
         # 副标题**留空 = 显示期间**（模板里填了别的就印别的）。
         # 「标题下面显示期间的副标题」是账簿版式的一部分（用户 2026-10-22），
         # 渲染器见 ``render_ledger_book_page``。
-        "subtitle": {"text": "", "size": 11, "align": "center"},
-        "font": {"family": "宋体", "size": 10},
+        "subtitle": {"text": "", "size": 12, "align": "center"},
+        # 正文 12pt —— 账簿的字号下限（见 LEDGER_MIN_FONT_SIZE，用户 2026-10-23）。
+        "font": {"family": "宋体", "size": 12},
         "show": {"period": True, "page_no": True},
         # 列宽是实测值（占表格宽度百分比，合计 100）。
         # 「方向」列窄到表头必须竖排 —— 那是用友的固定写法，不是排版失误。
@@ -236,8 +252,9 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
         "margins": {"top": 12, "right": 20, "bottom": 12, "left": 20},
         "title": {"text": "{subject}明细账", "size": 20, "bold": True, "align": "center"},
         # 副标题留空 = 显示期间（与总账同一口径）。
-        "subtitle": {"text": "", "size": 10, "align": "center"},
-        "font": {"family": "宋体", "size": 10},
+        "subtitle": {"text": "", "size": 12, "align": "center"},
+        # 正文 12pt —— 与总账同一口径（见 LEDGER_MIN_FONT_SIZE）。
+        "font": {"family": "宋体", "size": 12},
         "show": {"period": True, "page_no": True},
         # 八列与总账同宽同序（列宽是用户那份的实测值，合计 100）。
         "columns": [
@@ -453,13 +470,21 @@ def validate_template(scope: str, content: dict | None) -> dict:
     if not isinstance(font, dict):
         font = {}
     font["family"] = _safe_font(font.get("family"))
-    font["size"] = _num(font.get("size"), 10, *FONT_SIZE_RANGE)
+    # 总账 / 明细账有**自己的字号下限**（12pt，见 LEDGER_MIN_FONT_SIZE）：
+    # 正文字号、标题字号、副标题字号三个都要夹，少夹一处就有一处能漏出小字。
+    if scope in LEDGER_SCOPES:
+        font_low = LEDGER_MIN_FONT_SIZE
+        title_size_range = (LEDGER_MIN_FONT_SIZE, TITLE_SIZE_RANGE[1])
+    else:
+        font_low = FONT_SIZE_RANGE[0]
+        title_size_range = TITLE_SIZE_RANGE
+    font["size"] = _num(font.get("size"), 10, font_low, FONT_SIZE_RANGE[1])
     merged["font"] = font
 
     # title 与 subtitle 用各自的默认字号（16 / 11），别让写坏的值把副标题
     # 悄悄变成大标题那种字号 —— 副标题比正文小是版式约定。
-    _clean_title_like(merged, "title", TITLE_SIZE_RANGE, 16)
-    _clean_title_like(merged, "subtitle", TITLE_SIZE_RANGE, 11)
+    _clean_title_like(merged, "title", title_size_range, 16)
+    _clean_title_like(merged, "subtitle", title_size_range, 11)
 
     # 页边距是原有 float 兜底，那一处已经足够：float() 对任何非数字串都抛
     # ValueError，走 except 退回 10.0，因此不可能把非数字原样拼进 @page。
@@ -1201,6 +1226,35 @@ def ledger_book_period_label(from_period: str | None,
     return f"{lo} 至 {hi}"
 
 
+def _ledger_sizes(tpl: dict) -> tuple[float, float, float]:
+    """账簿版式的三个字号：正文 / 标题 / 副标题（pt）。
+
+    **三个都不得低于 12pt**（``LEDGER_MIN_FONT_SIZE``）—— 模板里存着更小的
+    值也照样抬上来。这道下限在这里再兜一次，而不是只靠 ``validate_template``：
+    渲染层是公开入口，它不假设自己拿到的字典是干净的（与 ``_page_css``
+    同一套理由）。
+
+    返回值给两处用：``render_ledger_book_page``（拼 CSS）与
+    ``ledger_book_rows_per_page``（算每页放得下多少行）。**两处必须一致** ——
+    分页按字号算，CSS 也按字号排，两边对不上时页眉上的「当前页-总页数」
+    就会与纸上实际印出来的对不上（这正是 ``ledger_book_rows_per_page``
+    文档里那句话的意思）。
+    """
+    font = tpl.get("font")
+    if not isinstance(font, dict):
+        font = {}
+    title = tpl.get("title")
+    if not isinstance(title, dict):
+        title = {}
+    subtitle = tpl.get("subtitle")
+    if not isinstance(subtitle, dict):
+        subtitle = {}
+    fsize = max(LEDGER_MIN_FONT_SIZE, _num(font.get("size"), 12, *FONT_SIZE_RANGE))
+    title_size = max(LEDGER_MIN_FONT_SIZE, _num(title.get("size"), 20, *TITLE_SIZE_RANGE))
+    subtitle_size = max(LEDGER_MIN_FONT_SIZE, _num(subtitle.get("size"), 12, *TITLE_SIZE_RANGE))
+    return fsize, title_size, subtitle_size
+
+
 def ledger_book_rows_per_page(tpl: dict) -> int:
     """一页**实际放得下**多少行数据。
 
@@ -1245,18 +1299,9 @@ def ledger_book_rows_per_page(tpl: dict) -> int:
     mt = _num(m.get("top"), 10.0, *MARGIN_RANGE)
     mb = _num(m.get("bottom"), 10.0, *MARGIN_RANGE)
 
-    font = tpl.get("font")
-    if not isinstance(font, dict):
-        font = {}
-    fsize = _num(font.get("size"), 10, *FONT_SIZE_RANGE)
-    title = tpl.get("title")
-    if not isinstance(title, dict):
-        title = {}
-    title_size = _num(title.get("size"), 20, *TITLE_SIZE_RANGE)
-    subtitle = tpl.get("subtitle")
-    if not isinstance(subtitle, dict):
-        subtitle = {}
-    subtitle_size = _num(subtitle.get("size"), 11, *TITLE_SIZE_RANGE)
+    # 三个字号与 render_ledger_book_page 用**同一个函数**取值 ——
+    # 分页算式与 CSS 必须是同一套数（见 _ledger_sizes 的说明）。
+    fsize, title_size, subtitle_size = _ledger_sizes(tpl)
     row_h = _num(lb.get("row_height_mm"), 6.0, 3.0, 20.0)
 
     fixed = (
@@ -1322,9 +1367,9 @@ def render_ledger_book_page(tpl: dict, ctx: dict, rows: list[dict], *,
     )
     font = tpl.get("font") or {}
     family = _safe_font(font.get("family"))
-    fsize = _num(font.get("size"), 10, *FONT_SIZE_RANGE)
+    # 三个字号都不得低于 12pt（见 _ledger_sizes）。
+    fsize, title_size, subtitle_size = _ledger_sizes(tpl)
     title = tpl.get("title") or {}
-    title_size = _num(title.get("size"), 20, *TITLE_SIZE_RANGE)
     title_bold = "700" if title.get("bold", True) else "400"
     # 副标题：模板里填了就印填的，**没填就印期间**。
     #
@@ -1337,7 +1382,6 @@ def render_ledger_book_page(tpl: dict, ctx: dict, rows: list[dict], *,
     # 那也要落到期间上，而不是印出一个空行。
     subtitle = tpl.get("subtitle") or {}
     subtitle_text = str(subtitle.get("text") or "").strip() or str(ctx.get("period") or "")
-    subtitle_size = _num(subtitle.get("size"), 11, *TITLE_SIZE_RANGE)
     subtitle_align = _safe_align(subtitle.get("align"))
     row_h = _num(lb.get("row_height_mm"), 6.0, 3.0, 20.0)
     border = "1px solid #000" if tpl.get("body", {}).get("border", True) else "none"
@@ -1429,14 +1473,17 @@ table.lb-grid thead th {{ font-weight:700; text-align:center; }}
 table.lb-grid thead tr:first-child th {{ height:5.5mm; }}
 table.lb-grid thead tr:last-child th {{ height:5.5mm; }}
 /* 年份比正文大一号（用友样张里 18px vs 13px），且加粗。 */
-table.lb-grid th.lb-year {{ font-size:{_num(fsize * 1.25, 12.5, 6, 40)}pt; }}
+table.lb-grid th.lb-year {{ font-size:{max(LEDGER_MIN_FONT_SIZE, _num(fsize * 1.25, 15, 6, 40))}pt; }}
 table.lb-grid tbody td {{ height:{row_h}mm; }}
 table.lb-grid td.lb-num {{ text-align:right; white-space:nowrap; }}
 table.lb-grid td.lb-ctr {{ text-align:center; }}
 table.lb-grid td.lb-left {{ text-align:left; }}
 /* 页脚三段：左核算单位、中制表、右打印日期。中段落在表格正中。 */
+/* 页脚字号是「正文的 0.9 倍」，但**不得低于 12pt**（正文 12pt 时 0.9 倍是
+   10.8pt，比下限还小 —— 那一行是「核算单位 / 制表 / 打印日期」，
+   印小了这一行就没人核了）。 */
 .lb-foot {{ display:grid; grid-template-columns:1fr 1fr 1fr; margin-top:1.5mm;
-  font-size:{_num(fsize * 0.9, 9, 6, 40)}pt; }}
+  font-size:{max(LEDGER_MIN_FONT_SIZE, _num(fsize * 0.9, 12, 6, 40))}pt; }}
 .lb-foot span:nth-child(2) {{ text-align:center; }}
 .lb-foot span:nth-child(3) {{ text-align:right; }}
 @media screen {{

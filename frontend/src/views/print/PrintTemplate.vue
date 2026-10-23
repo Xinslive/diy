@@ -83,6 +83,7 @@
           v-model:active-tab="tab"
           :tpl="tpl"
           :is-voucher="isVoucher"
+          :min-font-size="minFontSize"
           :selected-id="selectedId"
           :can-write="canEditDraft"
           :paper-options="paperOptions"
@@ -376,6 +377,18 @@ const tplLabel = (t) => {
   return tags.length ? `${t.name}（${tags.join(' · ')}）` : t.name
 }
 const isVoucher = computed(() => scope.value === 'VOUCHER')
+/**
+ * 设计器里正文字号的下限（pt）。
+ *
+ * **总账 / 明细账是 12pt**（用户 2026-10-23）：那两张纸上的字不得低于
+ * 12pt，10pt 在 A4 上看不清。后端 `template.py` 的 `LEDGER_MIN_FONT_SIZE`
+ * 是同一条线 —— 设计器填出的值后端会原样收下，填 9pt 存下去，加载时
+ * 又被抬成 12pt，用户只会以为界面在骗人。**两边必须一样。**
+ *
+ * 别的范围（凭证 / 余额表 / 报表）仍是 6pt —— 各自的版式另有约定。
+ */
+const minFontSize = computed(() =>
+  (scope.value === 'LEDGER' || scope.value === 'DETAIL_LEDGER') ? 12 : 6)
 // 一页几张凭证读模板自己的 slots_per_page（缺省 2，与后端一致）。
 // 画布按它切槽位、检查器按它算毫米 —— 两边必须读同一个字段，否则用户会看到
 // 「检查器说一页一张、画布上却并排放两张」。
