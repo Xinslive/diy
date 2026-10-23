@@ -173,6 +173,9 @@ def test_VIEWER_调用每个账套写接口都被拒(client, db, book, plain_use
         ("新建科目", "POST", f"/api/books/{book.id}/subjects",
          {"code": "9999", "name": "只读新建", "category": "ASSET", "direction": "DEBIT"}),
         ("改账套", "PUT", f"/api/books/{book.id}", {"name": "只读改名"}),
+        # 改「结转损益冲到哪个科目」= 改账务口径，只读账号不许改
+        ("设本年利润", "PUT",
+         f"/api/books/{book.id}/years/2026/profit-subject", {"code": "3103"}),
         ("新建打印模板", "POST", f"/api/books/{book.id}/print/templates",
          {"scope": "VOUCHER", "name": "只读模板", "content": {}}),
         ("报表落库", "POST",

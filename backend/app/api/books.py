@@ -18,7 +18,7 @@ from app.accounting.initialization import (OPENINGS_SOURCE_IMPORT, blocked_reaso
                                            mark_subjects_ready)
 from app.accounting.util import money
 from app.api.schemas import (BookEditIn, BookIn, BookOrderIn, CarryForwardIn, CloseIn,
-                           OpeningListIn, UncloseIn, YearEndIn)
+                           OpeningListIn, ProfitSubjectIn, UncloseIn, YearEndIn)
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import (get_book_link, get_current_user, get_my_book, normalize_role,
@@ -919,6 +919,103 @@ def carry_forward(book_id: int, period_id: int,
     except ValueError as e:
         db.rollback()
         raise HTTPException(400, str(e))
+
+
+@router.get("/{book_id}/years/{year}/profit-subject")
+def get_profit_subject(book_id: int, year: int, book: Book = Depends(get_my_book),
+                       db: Session = Depends(get_db)):
+    """本年利润科目 —— 手工设定优先，其次按候选编码自动识别。
+
+    **返回里「设的是什么」与「实际用的是什么」是分开的两件事。**
+    手工设定的编码可能已经不在这一年的科目表里（整表换过一次），
+    这时实际用的是自动识别到的另一个科目。合成一句话返回的话，
+    用户会以为自己的设定生效了 —— 而结转冲到的其实是另一个科目。
+    """
+    _require_year(db, book.id, year)
+    return _profit_subject_state(db, book.id, year)
+
+
+@router.put("/{book_id}/years/{year}/profit-subject")
+def set_profit_subject(book_id: int, year: int, payload: ProfitSubjectIn,
+                       book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                       user: SysUser = Depends(get_current_user),
+                       # 设定会改变结转冲到的科目 —— 只读账套不许改
+                       _link: UserBook = Depends(require_book_write)):
+    """手工设定（或清掉）「本年利润」科目。
+
+    **设定的是科目编码，不是 id**：科目表每个年度各有一份，同一编码在
+    2026 与 2027 是两行不同的记录，存 id 就只能管一年。
+
+    校验有三条，都是「设了也用不了」的情况，挡在写入之前：
+      · 编码不在这一年的科目表里 —— 否则结转时找不到它，回落自动识别，
+        用户以为设上了而实际没生效；
+      · 不是末级科目 —— 凭证只记在末级上，结转凭证会被服务端拒掉；
+      · 已停用 —— 停用的语义是「不让再挂新的分录」。
+    """
+    _require_year(db, book.id, year)
+    code = (payload.code or "").strip()
+    if code:
+        subject = db.scalar(
+            select(Subject).where(
+                Subject.book_id == book.id, Subject.year == year, Subject.code == code
+            )
+        )
+        if subject is None:
+            raise HTTPException(400, f"{year} 年的科目表里没有编码 {code} 的科目")
+        if not subject.is_leaf:
+            raise HTTPException(400, f"{code} {subject.name} 不是末级科目，结转凭证只能记在末级科目上")
+        if not subject.active:
+            raise HTTPException(400, f"{code} {subject.name} 已停用，不能作为本年利润科目")
+    else:
+        subject = None
+
+    before = svc.profit_subject_setting(db, book.id, year)
+    svc.set_profit_subject_setting(db, book.id, year, code or None)
+    from app.accounting.audit_helper import log
+
+    log(db, action="UPDATE", entity="book_year", entity_id=f"{book.id}-{year}", user=user,
+        book_id=book.id,
+        detail=(f"设定 {year} 年本年利润科目为 {code}" if code
+                else f"清掉 {year} 年本年利润科目的手工设定（回到自动识别）"),
+        before={"profit_subject_code": before},
+        after={"profit_subject_code": code or None})
+    db.commit()
+    return _profit_subject_state(db, book.id, year)
+
+
+def _require_year(db: Session, book_id: int, year: int) -> None:
+    """这个账套有没有这一年。没有就是 400 —— 不能给一个不存在的年度建设定。"""
+    from app.accounting.years import book_year_of
+
+    if book_year_of(db, book_id, year) is None:
+        raise HTTPException(400, f"账套没有 {year} 年的记账年度")
+
+
+def _profit_subject_state(db: Session, book_id: int, year: int) -> dict:
+    """本年利润科目的当前状态（设定值 + 实际用的那个 + 来源）。"""
+    setting = svc.profit_subject_setting(db, book_id, year)
+    subject, source = svc.resolve_profit_subject(db, book_id, year)
+    # 设定值指向的科目已经不在这一年的科目表里 → stale。
+    # 这种情况**不停用设定**：用户可能马上要把那张表导回来，
+    # 自动清掉等于替他做了决定。
+    stale = bool(setting) and (
+        db.scalar(select(Subject).where(
+            Subject.book_id == book_id, Subject.year == year, Subject.code == setting
+        )) is None
+    )
+    return {
+        "year": year,
+        "setting_code": setting,
+        "source": source,
+        "stale": stale,
+        "candidates": list(svc.PROFIT_SUBJECT_CODES),
+        "subject": (
+            {"id": subject.id, "code": subject.code, "name": subject.name,
+             "category": subject.category, "is_leaf": subject.is_leaf,
+             "active": subject.active}
+            if subject is not None else None
+        ),
+    }
 
 
 @router.post("/{book_id}/periods/{period_id}/close")

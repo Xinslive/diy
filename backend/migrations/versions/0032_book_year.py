@@ -53,7 +53,7 @@ Create Date: 2026-10-21
 from __future__ import annotations
 
 from alembic import op
-from sqlalchemy import func, select, text
+from sqlalchemy import func, insert, select, text, update
 
 revision = "0032_book_year"
 down_revision = "0031_subject_guard_year"
@@ -156,13 +156,33 @@ def _migrate_book(db, book) -> None:
         years = [int(book.start_year)]
 
     # ---- 1. 登记年度账套行 ----
+    #
+    # **查询只取主键、插入用 core insert 显式写死列名。**
+    #
+    # 理由写在 ARCHITECTURE.md「迁移链中间调用的应用代码必须能跑在历史 schema 上」
+    # 那一段：ORM 的整表 ``select()`` 会带上**模型当前的全部列**，ORM 的
+    # ``insert()`` 也会把**可空但未赋值**的列列进去 —— 两头都是
+    # ``UndefinedColumn``。
+    #
+    # 而 ``book_year.profit_subject_code``（手工设定的本年利润科目）是
+    # 0035 才加的列：0032 这一刻它**还不存在**。用 ORM 读写这张表，
+    # 整条迁移链在「从 0031 往后跑」时当场炸掉 —— 报的还是一句
+    # 「列不存在」，跟本条迁移要做的事毫无关系。
+    #
+    # 所以这里一律走 core：查只查 id，插只插点名的三列。
+    # **这条约束对以后再给 book_year 加列同样成立** —— 凡是这条链里
+    # 读写的表，迁移里的访问都必须与列集合无关。
     for year in years:
         exists = db.scalar(
-            select(BookYear).where(BookYear.book_id == book.id, BookYear.year == year)
+            select(BookYear.id).where(BookYear.book_id == book.id, BookYear.year == year)
         )
         if exists is None:
-            db.add(BookYear(book_id=book.id, year=year,
-                            subject_code_rule=book.subject_code_rule))
+            db.execute(
+                insert(BookYear.__table__).values(
+                    book_id=book.id, year=year,
+                    subject_code_rule=book.subject_code_rule,
+                )
+            )
     db.flush()
 
     # ---- 1b. 已经搬过一次了吗？----
@@ -370,24 +390,42 @@ def _move_init_state(db, book, years, anchor: int, data_years: set[int]) -> None
     ), {"b": book.id}).mappings().first()
     book_init = dict(book_row) if book_row else {}
 
+    # **同样不用 ORM 实体**（理由见上面第 1 步的注释）：这里只碰四个
+    # 初始化状态列，用 core 取、core 写，列名点出来。
+    #
+    # ``updated_at`` 要显式带上：``book_year`` 上**没有** ``trg_updated_at``
+    # 触发器（db_init.sql 的触发器清单里没有这张表），ORM 那边靠
+    # ``onupdate=func.now()`` 刷新，绕开 ORM 就得自己写上 ——
+    # 否则这一行的修改时间会停在搬数据之前。
+    cols = BookYear.__table__.c
     for year in years:
-        row = db.scalar(
-            select(BookYear).where(BookYear.book_id == book.id, BookYear.year == year)
-        )
+        row = db.execute(
+            select(cols.init_subjects_at, cols.init_subjects_source,
+                   cols.init_openings_at, cols.init_openings_source)
+            .where(cols.book_id == book.id, cols.year == year)
+        ).mappings().first()
         if row is None:
             continue
+        values: dict = {}
         if year == anchor:
-            row.init_subjects_at = book_init.get("init_subjects_at")
-            row.init_subjects_source = book_init.get("init_subjects_source")
-            row.init_openings_at = book_init.get("init_openings_at")
-            row.init_openings_source = book_init.get("init_openings_source")
+            values["init_subjects_at"] = book_init.get("init_subjects_at")
+            values["init_subjects_source"] = book_init.get("init_subjects_source")
+            values["init_openings_at"] = book_init.get("init_openings_at")
+            values["init_openings_source"] = book_init.get("init_openings_source")
         else:
-            if row.init_subjects_at is None:
-                row.init_subjects_at = book_init.get("init_subjects_at")
-                row.init_subjects_source = book_init.get("init_subjects_source") or "CHART"
-            if year in data_years and row.init_openings_at is None:
-                row.init_openings_at = book_init.get("init_openings_at")
-                row.init_openings_source = book_init.get("init_openings_source") or "IMPORT"
+            if row["init_subjects_at"] is None:
+                values["init_subjects_at"] = book_init.get("init_subjects_at")
+                values["init_subjects_source"] = book_init.get("init_subjects_source") or "CHART"
+            if year in data_years and row["init_openings_at"] is None:
+                values["init_openings_at"] = book_init.get("init_openings_at")
+                values["init_openings_source"] = book_init.get("init_openings_source") or "IMPORT"
+        if values:
+            values["updated_at"] = func.now()
+            db.execute(
+                update(BookYear.__table__)
+                .where(cols.book_id == book.id, cols.year == year)
+                .values(**values)
+            )
     db.flush()
 
 

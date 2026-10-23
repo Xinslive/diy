@@ -33,9 +33,27 @@
           </template>
         </div>
         <p class="tile-desc">损益类科目本期发生额 → 本年利润。</p>
+        <!-- 本年利润是结转的**目的科目**。系统按编码自动识别，但每本账的科目表
+             是各人自己的 —— 识别不到时账就结不了转，而这一版之前界面上
+             没有任何地方能改。
+
+             **它就是一个字段，不是「设置功能」**：值本身就是控件，
+             选中即生效。所以没有「设置」按钮，也没有弹窗 ——
+             要改的人一眼看到的就是能改的那一格。 -->
+        <div class="tile-profit" :class="{ warn: profitMissing }">
+          <span class="tile-profit-label">本年利润</span>
+          <el-select v-model="profitFormCode" class="tile-profit-select" size="small"
+                     filterable :loading="profitLoading" :disabled="!store.canWrite"
+                     popper-class="profit-subject-popper" @change="onProfitChange">
+            <el-option v-for="o in profitOptions" :key="o.key" :value="o.code" :label="o.name" />
+          </el-select>
+        </div>
         <el-button class="tile-btn" type="primary" :loading="carrying"
-                   :disabled="!store.canWrite || store.currentPeriod?.locked || prevBlocked" @click="doCarry">
-          {{ prevBlocked ? '先结上一月' : (carryInfo.has ? '重新结转' : '执行结转') }}
+                   :disabled="!store.canWrite || store.currentPeriod?.locked || prevBlocked || profitMissing"
+                   @click="doCarry">
+          {{ prevBlocked ? '先结上一月'
+             : (profitMissing ? '先设本年利润科目'
+                : (carryInfo.has ? '重新结转' : '执行结转')) }}
         </el-button>
       </div>
 
@@ -142,6 +160,7 @@
 import { computed, ref, watch, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import * as api from '@/api/book'
+import * as subjectApi from '@/api/subject'
 import { voucherPeriodCheck } from '@/api/voucher'
 import { useSessionStore } from '@/stores/session'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
@@ -194,6 +213,142 @@ function monthClass(p) {
     pending: !p.locked && p.vouchers > 0,
     idle: !p.locked && !p.vouchers,
     current: p.id === store.periodId
+  }
+}
+
+/* ---- 本年利润科目 ---- */
+/**
+ * 结转损益的**目的科目**：损益类科目的发生额冲到这里。
+ *
+ * 系统按候选编码（3103 / 4103）自动识别，但每本账的科目表是各人自己的 ——
+ * 编码改成 3111 的有、干脆叫「本年损益」的也有。识别不到时账就结不了转，
+ * 而**界面上原本没有任何地方能改**（这一版之前确实没有）。
+ *
+ * 这里摆出来的是三件不同的事，别混成一句：
+ *   · ``subject``  —— 实际会冲到的那个科目（自动识别或手工设定）
+ *   · ``stale``    —— 手工设定指向的科目已经不在这一年的科目表里
+ *     （整表换过一次）。这时实际用的是自动识别到的另一个，而设定值还留着，
+ *     由用户决定要不要改回去 —— 系统不替他清。
+ *   · ``missing``  —— 两级都没有，确实找不到本年利润科目
+ */
+const profit = ref(null)
+const profitAsked = ref(false)
+const profitLoading = ref(false)
+/** 这一年的**末级科目**（凭证只记在末级上，所以只给末级）。 */
+const profitSubjects = ref([])
+
+/** 确实找不到本年利润科目（**不是**「还没问过」）。 */
+const profitMissing = computed(() => profitAsked.value && !!profit.value && !profit.value.subject)
+
+/**
+ * 下拉里「自动识别」这一项的值。
+ *
+ * **不能拿空串当它** —— el-select 的值是空串时走的是「没选」那条路，
+ * 界面上摆出来的是占位文字，而不是那一项自己。
+ * 所以用一个不会撞上科目编码的哨兵值。
+ */
+const AUTO = '__auto__'
+
+/** 下拉当前选中的值：``AUTO`` = 自动识别，否则是科目编码。 */
+const profitFormCode = ref(AUTO)
+
+/**
+ * 下拉里的选项。
+ *
+ * **第一项是「自动识别」**（value 为空串）：它是正当的一个选项，
+ * 不是「没填」—— 选它就回到系统的自动口径。
+ * 后面跟这一年的末级科目，选中即手工指定。
+ *
+ * 「设定值已经失效」的情形（那张科目表被整表换过）**照样把那一项列出来**：
+ * 藏起来的话，用户看到的是「我明明设过，怎么没了」，而实际上
+ * 系统已经悄悄改用自动识别到的另一个科目了 —— 那才是真的没了。
+ */
+const profitOptions = computed(() => {
+  const p = profit.value
+  const head = profitMissing.value
+    ? { key: 'auto', code: AUTO, name: '未找到本年利润科目' }
+    : {
+        key: 'auto',
+        code: AUTO,
+        name: p?.subject ? `自动识别（${p.subject.code}）` : '自动识别',
+      }
+  const rows = profitSubjects.value.map((s) => ({
+    key: s.code, code: s.code, name: `${s.code} ${s.name}`,
+  }))
+  const setting = p?.setting_code
+  if (setting && !rows.some((r) => r.code === setting)) {
+    rows.unshift({ key: setting, code: setting, name: `${setting}（科目表里没有）` })
+  }
+  return [head, ...rows]
+})
+
+
+async function loadProfit() {
+  const cur = store.currentPeriod
+  if (!cur) {
+    profit.value = null
+    profitAsked.value = true
+    return
+  }
+  const bookId = store.bookId
+  const year = cur.year
+  try {
+    const r = await api.getProfitSubject(bookId, year)
+    // 切账套/切年份时旧请求可能后到，迟到的响应会盖掉新状态
+    if (store.bookId !== bookId || store.currentPeriod?.year !== year) return
+    profit.value = r
+    // 下拉当前值 = 手工设定值（没有设定就是自动识别）
+    profitFormCode.value = r.setting_code || AUTO
+    loadProfitSubjects(year)
+  } catch {
+    if (store.bookId !== bookId || store.currentPeriod?.year !== year) return
+    // 问过了但没问到：状态按「未知」处理，**不**当成「没有本年利润科目」——
+    // 把网络故障说成「你这本账缺科目」，用户会去查一个不存在的问题。
+    profit.value = null
+  } finally {
+    if (store.bookId === bookId && store.currentPeriod?.year === year) profitAsked.value = true
+  }
+}
+
+/**
+ * 选定即生效。
+ *
+ * **不用「保存」按钮**：这个值不是表单里的一项待提交的输入，
+ * 它就是「结转冲到哪里」这个事实本身 —— 选完就该生效，
+ * 多按一次保存只会让人怀疑刚才那一下到底算不算数。
+ *
+ * 失败时**把下拉拨回原值**：界面上留着一个没存上的选择，
+ * 用户会以为已经改了（然后结转时冲错了科目）。
+ */
+async function onProfitChange(code) {
+  const cur = store.currentPeriod
+  if (!cur) return
+  const before = profit.value?.setting_code || ''
+  try {
+    const r = await api.setProfitSubject(store.bookId, cur.year, code === AUTO ? null : code)
+    profit.value = r
+    profitAsked.value = true
+    ElMessage.success(r.source === 'setting'
+      ? `本年利润科目已设为 ${r.setting_code}`
+      : '本年利润科目回到自动识别')
+  } catch (e) {
+    profitFormCode.value = before || AUTO
+    ElMessage.error(e?.response?.data?.detail || '设定失败')
+  }
+}
+
+/** 拉这一年的末级科目，供下拉选。 */
+async function loadProfitSubjects(year) {
+  profitLoading.value = true
+  try {
+    const rows = await subjectApi.subjectFlat(store.bookId, { year })
+    if (store.currentPeriod?.year !== year) return
+    profitSubjects.value = rows || []
+  } catch {
+    if (store.currentPeriod?.year !== year) return
+    profitSubjects.value = []
+  } finally {
+    if (store.currentPeriod?.year === year) profitLoading.value = false
   }
 }
 
@@ -383,7 +538,13 @@ async function previewUnclose() {
 }
 
 watch([() => store.periodId, () => store.bookId], loadCarryInfo)
-onMounted(loadCarryInfo)
+// 本年利润按**年度**取：同一年的 12 个月共用一份设定，
+// 而这个设定挂的就是「这一年的科目表里的哪一个科目」。
+watch([() => store.bookId, () => store.currentPeriod?.year], loadProfit)
+onMounted(() => {
+  loadCarryInfo()
+  loadProfit()
+})
 
 async function doYearEnd() {
   const from = store.currentYear
@@ -485,6 +646,27 @@ async function doYearEnd() {
   flex: 1;
 }
 .tile-btn { width: 100%; margin: 0; }
+
+/* ---- 本年利润科目这一行 ----
+   它**就是一个字段**：值本身就是控件，选中即生效，所以没有「设置」按钮。
+   找不到时整行转成琥珀色 —— 这一格动不了的原因是「没有本年利润科目」，
+   得让人一眼看见，而不是点下去才知道。 */
+.tile-profit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -4px 0 12px;
+  font-size: 12px;
+}
+.tile-profit-label {
+  flex: 0 0 auto;
+  color: var(--cwq-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.tile-profit :deep(.tile-profit-select) { flex: 1 1 auto; min-width: 0; }
+.tile-profit.warn :deep(.el-select__selected-item),
+.tile-profit.warn :deep(.el-select__placeholder) { color: #b45309; font-weight: 600; }
 
 /* ---- 整年月度宫格 ---- */
 .year-card { padding: 16px; }

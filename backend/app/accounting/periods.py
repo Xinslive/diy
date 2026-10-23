@@ -152,6 +152,84 @@ def _subject_by_any_code(db: Session, book_id: int, year: int,
     return None
 
 
+# --------------------------------------------------------------------- 本年利润科目
+#
+# 「本年利润」是结转损益的**目的科目**。它原先只能靠编码猜，而科目表是
+# 各人自己的 —— 编码改成 3111 的有、叫「本年损益」的也有。识别不出来时
+# 账就结不了转，**而界面上没有任何地方能改**（这一版之前确实没有）。
+#
+# 所以这里有**两级口径**，且顺序是「手工设定优先」：
+#
+#   1. 用户在「期末结账 → 结转损益」里手工指定的科目（``book_year.profit_subject_code``）
+#   2. 候选编码自动识别（``PROFIT_SUBJECT_CODES``）
+#
+# 手工设定只覆盖「用哪一个科目」，**不改变识别失败时的行为**：两级都找不到，
+# 照样报错 —— 那是「这套账还没有本年利润科目」的事实，不该被糊弄过去。
+#
+# 设定值失效时（那张科目表被整表换掉了，编码不在了）**回落到自动识别**，
+# 而不是拿一个不存在的科目去记账。回落这件事要让人看见，所以接口把
+# 「设的是什么」与「实际用的是什么」两件事分开返回。
+
+#: 本年利润科目的来源标记。
+PROFIT_SOURCE_SETTING = "setting"   # 用户手工指定
+PROFIT_SOURCE_AUTO = "auto"         # 按候选编码自动识别
+PROFIT_SOURCE_MISSING = "missing"   # 两级都没有
+
+
+def profit_subject_setting(db: Session, book_id: int, year: int) -> Optional[str]:
+    """用户手工设定的「本年利润」科目编码。**没设过就是 None**。"""
+    from app.accounting.years import book_year_of
+
+    row = book_year_of(db, book_id, year)
+    if row is None:
+        return None
+    code = (row.profit_subject_code or "").strip()
+    return code or None
+
+
+def set_profit_subject_setting(db: Session, book_id: int, year: int,
+                                code: Optional[str]) -> Optional[str]:
+    """写下（或清掉）「本年利润」科目的手工设定值。
+
+    年度账套行按需创建 —— 设定的对象是「这个年度的科目表里的某一个科目」，
+    没有年度行就意味着这个年度还没有科目表，而那种情况下也压根没有科目可设。
+    """
+    from app.accounting.years import book_year_of, ensure_book_year
+
+    value = (code or "").strip() or None
+    row = book_year_of(db, book_id, year)
+    if row is None:
+        book = db.get(Book, book_id)
+        if book is None:
+            raise ValueError(f"账套 {book_id} 不存在")
+        row = ensure_book_year(db, book, year)
+    row.profit_subject_code = value
+    db.flush()
+    return value
+
+
+def resolve_profit_subject(db: Session, book_id: int, year: int) -> tuple[Optional[Subject], str]:
+    """本年利润科目。返回 ``(科目, 来源)``，找不到时科目是 ``None``。
+
+    **所有用到本年利润的地方都要走这里** —— 结转损益、结转科目集合
+    （排除本年利润）、年度结转（冲平本年利润）。三处各写一份的话，
+    「手工设定」这条覆盖只会在其中一处生效，另两处照样按编码猜，
+    而用户看到的现象是「我明明设了，结转还是结不了」。
+    """
+    setting = profit_subject_setting(db, book_id, year)
+    if setting:
+        found = _subject_by_code(db, book_id, year, setting)
+        # 设定的科目不在这一年的科目表里（整表换过了）→ 回落自动识别，
+        # 但**不覆盖设定值**：用户设的东西还在，界面上会提示「设的是 X、
+        # 实际用的是 Y」，要不要改由用户决定。
+        if found is not None:
+            return found, PROFIT_SOURCE_SETTING
+    found = _subject_by_any_code(db, book_id, year, PROFIT_SUBJECT_CODES)
+    if found is not None:
+        return found, PROFIT_SOURCE_AUTO
+    return None, PROFIT_SOURCE_MISSING
+
+
 # --------------------------------------------------------------------- 结转科目集合
 #
 # 「哪些科目参与结转损益」**只有这一份定义**（审计 P1-1 / P1-2）。
@@ -194,10 +272,29 @@ def carry_forward_subjects(db: Session, book_id: int, year: int, *,
         Subject.category == "PROFIT",
     )
     if exclude_profit:
-        profit = _subject_by_any_code(db, book_id, year, PROFIT_SUBJECT_CODES)
-        if profit is not None:
-            stmt = stmt.where(Subject.id != profit.id)
+        # **排除的是「实际会被当成目的科目的那一个」**（``resolve_profit_subject``），
+        # 外加自动识别的那一个 —— 两个都排掉：
+        #
+        #   · 手工设定优先：用户把本年利润指定成 3111，被结转的集合里就不能再有它，
+        #     否则它会**结转给自己**（自己冲自己，借贷仍然平衡，系统自检抓不到）。
+        #   · 再排掉自动识别的那一个：不排的话，用户设了 3111 之后，
+        #     旧口径认的 4103 反而会被当成普通损益科目结走 —— 那是行为回退。
+        excluded = _excluded_profit_ids(db, book_id, year)
+        if excluded:
+            stmt = stmt.where(Subject.id.notin_(excluded))
     return list(db.scalars(stmt.order_by(Subject.code)).all())
+
+
+def _excluded_profit_ids(db: Session, book_id: int, year: int) -> set[int]:
+    """结转时必须排除的「本年利润」科目 id 集合（见 ``carry_forward_subjects``）。"""
+    ids: set[int] = set()
+    resolved, _ = resolve_profit_subject(db, book_id, year)
+    if resolved is not None:
+        ids.add(resolved.id)
+    auto = _subject_by_any_code(db, book_id, year, PROFIT_SUBJECT_CODES)
+    if auto is not None:
+        ids.add(auto.id)
+    return ids
 
 
 def current_accounting_year(db: Session, book: Book) -> int:
@@ -688,10 +785,15 @@ def carry_forward_profit(db: Session, book_id: int, period: Period,
         # 旧凭证已经 flush 掉，下面重算余额时看到的才是「未结转」的真实损益
         db.flush()
 
-    profit = _subject_by_any_code(db, book_id, period.year, PROFIT_SUBJECT_CODES)
+    profit, _source = resolve_profit_subject(db, book_id, period.year)
     if profit is None:
+        # 报错要说清**下一步做什么**。原来那句「账套缺少「本年利润」科目」只说了
+        # 现象，用户既不知道该去哪儿改，也不知道这件事能改 —— 而这一版之前
+        # 确实无处可改，只能干看着。
         raise ValueError(
-            f"账套缺少「本年利润」科目（编码 {'、'.join(PROFIT_SUBJECT_CODES)} 都不是）"
+            f"{period.year} 年的科目表里没有「本年利润」科目"
+            f"（自动识别的编码 {'、'.join(PROFIT_SUBJECT_CODES)} 都不是）。"
+            f"请到「期末结账 → 结转损益 → 设置本年利润科目」里指定一个。"
         )
 
     # 结转损益的科目集合 = **共享 helper**（``carry_forward_subjects``）。
@@ -1016,7 +1118,9 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
     #    这张凭证必须落在本年最后一个月，若该期已结账则先解锁再补做 ——
     #    年度结转是一键动作，不该要求用户手动反结账一次。
     unlocked_for_carry = False
-    profit = _subject_by_any_code(db, book.id, current_year, PROFIT_SUBJECT_CODES)
+    # 本年利润认手工设定（``resolve_profit_subject``），与结转损益同一份口径 ——
+    # 两处各认各的就会出现「结转用 A、年度结转冲平用 B」，本年利润永远冲不平。
+    profit, _ = resolve_profit_subject(db, book.id, current_year)
     retained = _subject_by_any_code(db, book.id, current_year, RETAINED_SUBJECT_CODES)
     if profit and retained:
         eng = LedgerEngine(db, book.id)
@@ -1088,6 +1192,25 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
     if not dst_subjects:
         copied = copy_chart(db, book.id, current_year, target_year)
         dst_subjects = subjects_of(db, book.id, target_year)
+
+    # 3b. 把「本年利润科目」的**手工设定**带到新年度
+    #
+    # 新年度的科目表是照抄本年度的（``copy_chart``），所以本年度手工指定的
+    # 本年利润编码在新年度多半也在。不带过去的话，新年度会退回自动识别 ——
+    # 而这本账的科目表压根不认 3103/4103，于是**新年度一开账就结不了转**，
+    # 用户得再设一遍同样的东西。带着走，跨年就不必重复劳动。
+    #
+    # **只在那个编码在新年度的科目表里确实存在时才带**：
+    # 新年度若是用户自己导入的另一张表，这个编码可能压根没有 ——
+    # 带过去就是一个指向不存在科目的设定（解析时会回落自动识别，
+    # 但界面上会多一句「设的那个不在了」的提示）。
+    src_profit = profit_subject_setting(db, book.id, current_year)
+    if src_profit and db.scalar(
+        select(Subject).where(
+            Subject.book_id == book.id, Subject.year == target_year,
+            Subject.code == src_profit)
+    ) is not None:
+        set_profit_subject_setting(db, book.id, target_year, src_profit)
 
     # 4. 下一年 1 月的期初 = 本年期末（**按编码**搬过两张科目表）
     eng = LedgerEngine(db, book.id)

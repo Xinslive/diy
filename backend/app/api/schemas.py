@@ -328,6 +328,18 @@ class YearEndIn(BaseModel):
     from_year: Optional[int] = None
 
 
+class ProfitSubjectIn(BaseModel):
+    """设定「本年利润」科目的入参。
+
+    ``code`` 是**科目编码**，不是 id：科目表每个年度各有一份，同一编码在
+    2026 与 2027 是两行不同的记录，存 id 就只能管一年。
+
+    ``code`` 传 ``None``（或空串）表示**清掉手工设定**、回到自动识别 ——
+    「自动识别」是一个正当的选项，不是「没填」。
+    """
+    code: Optional[str] = None
+
+
 # ---- 报表 ----
 class CellIn(BaseModel):
     row_no: int

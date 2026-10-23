@@ -309,6 +309,11 @@ body {
 .period-popper .el-select-dropdown__item { padding: 0 8px; }
 .period-popper .el-tag { height: 18px; padding: 0 5px; font-size: 11px; }
 
+/* 本年利润科目的下拉：选项是「编码 名称」，窄框里放不下 —— 跟着那个
+   四分之一页宽的框走会折成两行，而折行的那一格正是最要紧的信息。
+   下拉单独给一个宽度（选项行是 12px，两行才不至于挤成一团）。 */
+.profit-subject-popper.el-popper { min-width: 240px !important; }
+
 /* ── 表格里的矩形选区（composables/useCellSelection.js）────────────────────
    浏览器的原生选区在表格里是**按文档顺序线性**扩的：从 C3 拖到 C9 会把中间
    几整行连同左右各列一起框进去，而人在这类数字表格里的意图永远是「这一列

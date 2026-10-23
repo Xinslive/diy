@@ -19,6 +19,20 @@ export const setOpenings = (id, rows, year) =>
   http.post(`/books/${id}/periods`, rows, { params: year ? { year } : {} }).then(r => r.data)
 export const carryForwardInfo = (id, pid) =>
   http.get(`/books/${id}/periods/${pid}/carry-forward`).then(r => r.data)
+/**
+ * 本年利润科目（结转损益的**目的科目**）。
+ *
+ * 系统按候选编码自动识别，但每本账的科目表是各人自己的 ——
+ * 识别不到时账就结不了转，而界面上得有个地方能改，所以有这一对接口。
+ *
+ * 传的是**科目编码**而不是 id：科目表每个年度各有一份，同一编码在 2026 与
+ * 2027 是两行不同的记录，存 id 就只能管一年。`code` 传 null 表示
+ * 「清掉手工设定，回到自动识别」—— 自动识别是一个正当的选项，不是「没填」。
+ */
+export const getProfitSubject = (id, year) =>
+  http.get(`/books/${id}/years/${year}/profit-subject`).then(r => r.data)
+export const setProfitSubject = (id, year, code) =>
+  http.put(`/books/${id}/years/${year}/profit-subject`, { code: code || null }).then(r => r.data)
 // 结转损益永远是「有旧凭证就删掉、按最新余额重算」，replace 只为兼容旧调用
 export const carryForward = (id, pid, replace = true) =>
   http.post(`/books/${id}/periods/${pid}/carry-forward`, { replace }).then(r => r.data)
