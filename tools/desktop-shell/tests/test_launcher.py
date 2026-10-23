@@ -434,5 +434,125 @@ class ForceUtf8OutputTest(unittest.TestCase):
             sys.stdout, sys.stderr = original_out, original_err
 
 
+class VersionInfoFileTest(unittest.TestCase):
+    """version_info.txt 必须能被 ``eval()`` 加载成一个 ``VSVersionInfo``。
+
+    **为什么这条测试存在。** PyInstaller 用 ``eval(text)`` 加载 version 文件
+    （``PyInstaller/utils/win32/versioninfo.py`` 的
+    ``load_version_info_from_text_file``），**不是** ``exec``。
+    eval 只接受**一个表达式**，所以顶层赋值语句（``version = '0.1.0'``）
+    会直接抛 ``SyntaxError``，整个打包随之失败。
+
+    CI 第一次跑就撞上了：windows-latest 上报 ``line 21: version = '0.1.0'
+    SyntaxError: invalid syntax``，然后被 PyInstaller 包成
+    ``ValueError: Failed to deserialize VSVersionInfo from text-based
+    representation!`` —— 报错离病因隔了两层，很难一眼看出是那行赋值。
+
+    所以这里用 eval 真加载一次，把这条约束钉住。
+    """
+
+    VERSION_FILE = Path(__file__).resolve().parents[1] / "version_info.txt"
+
+    def _load(self):
+        """按 PyInstaller 的方式加载：解码 → 替换 Tuple → eval。"""
+        text = self.VERSION_FILE.read_text(encoding="utf-8")
+        # PyInstaller 源码里就是这一步（把老式的 Tuple 写法换成 tuple）
+        text = text.replace("Tuple", "tuple")
+        return eval(text, self._vs_namespace())
+
+    def _vs_namespace(self):
+        """version 文件里那些名字的最小实现。
+
+        真 PyInstaller 用的是 win32 versioninfo 的真结构；这里只需要
+        能把文件 eval 出来、并能被下面几条断言检查。
+        """
+        class _Node:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        def _kids_list(kids):
+            return kids
+
+        def StringFileInfo(table):
+            return _Node(table=table)
+
+        def StringTable(lang_id, strings):
+            return _Node(lang_id=lang_id, strings=strings)
+
+        def StringStruct(key, value):
+            return _Node(key=key, value=value)
+
+        def VarFileInfo(items):
+            return _Node(items=items)
+
+        def VarStruct(key, value):
+            return _Node(key=key, value=value)
+
+        def FixedFileInfo(**kw):
+            return _Node(**kw)
+
+        def VSVersionInfo(**kw):
+            return _Node(**kw)
+
+        return {
+            "VSVersionInfo": VSVersionInfo,
+            "FixedFileInfo": FixedFileInfo,
+            "StringFileInfo": StringFileInfo,
+            "StringTable": StringTable,
+            "StringStruct": StringStruct,
+            "VarFileInfo": VarFileInfo,
+            "VarStruct": VarStruct,
+        }
+
+    def test_file_exists(self):
+        self.assertTrue(self.VERSION_FILE.is_file(), f"缺 version 文件：{self.VERSION_FILE}")
+
+    def test_loads_via_eval(self):
+        # 核心断言：文件必须整体是一个表达式。
+        # 顶层赋值（version = '...'）会让这一行抛 SyntaxError。
+        info = self._load()
+        self.assertIsNotNone(info)
+
+    def test_no_top_level_assignment(self):
+        # 再明确一次：不允许出现顶层赋值语句。
+        # 注释里的说明文字不算 —— 用 compile 的 AST 看真实语句。
+        import ast
+
+        text = self.VERSION_FILE.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        for node in tree.body:
+            self.assertNotIsInstance(
+                node,
+                ast.Assign,
+                f"version 文件里有顶层赋值（第 {node.lineno} 行）："
+                "PyInstaller 用 eval() 加载它，赋值语句会抛 SyntaxError",
+            )
+
+    def test_has_required_versioninfo_fields(self):
+        # 这些字段是杀软误报申诉会检查的，缺一个都会影响通过率。
+        info = self._load()
+        table = info.kids[0].table[0]
+        fields = {s.key: s.value for s in table.strings}
+        for key in (
+            "CompanyName",
+            "FileDescription",
+            "FileVersion",
+            "InternalName",
+            "OriginalFilename",
+            "ProductName",
+            "ProductVersion",
+        ):
+            self.assertIn(key, fields, f"VERSIONINFO 缺字段：{key}")
+            self.assertTrue(fields[key].strip(), f"VERSIONINFO 的 {key} 是空的")
+
+    def test_original_filename_matches_exe_name(self):
+        # OriginalFilename 要与实际产出的 exe 名一致，否则「属性」里显示的
+        # 名字与用户双击的那个对不上。
+        info = self._load()
+        table = info.kids[0].table[0]
+        fields = {s.key: s.value for s in table.strings}
+        self.assertEqual(fields["OriginalFilename"], "CWQ.exe")
+
+
 if __name__ == "__main__":
     unittest.main()

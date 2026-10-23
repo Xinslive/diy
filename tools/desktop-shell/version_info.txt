@@ -1,12 +1,31 @@
-# -*- coding: utf-8 -*-
+# ===========================================================================
+# 财务记账系统 桌面壳 —— Windows VERSIONINFO
 #
-# PyInstaller 的 version 文件 —— **不是 JSON，是一段会被 exec 的 Python**。
+# ⚠️ **这个文件必须整体是一个「表达式」，不能有任何顶层赋值语句。**
 #
-# 这些字段不是装饰。杀软误报申诉（Defender WDSI / Avast / ESET）会检查
-# FileDescription、CompanyName、FileVersion 这些 VERSIONINFO 字段：
-# 一个「没有公司名、描述是英文、版本号是 0.0.0.0」的可执行文件，
-# 在申诉时会被当成来路不明的程序。见
-# docs/Windows打包exe可行性研究.md「代码签名」一节。
+# PyInstaller 用 ``eval(text)`` 加载它（见
+# ``PyInstaller/utils/win32/versioninfo.py`` 的
+# ``load_version_info_from_text_file``）—— 不是 ``exec``。
+# eval 只接受**一个表达式**，所以 ``version = '0.1.0'`` 这种赋值语句
+# 会直接抛 ``SyntaxError: invalid syntax``，整个打包随之失败。
+#
+# 这不是理论：CI 第一次跑就撞上了 —— windows-latest 上报
+# ``File "<string>", line 21: version = '0.1.0'  SyntaxError: invalid syntax``，
+# 然后 PyInstaller 把它包成 ``ValueError: Failed to deserialize
+# VSVersionInfo from text-based representation!``。
+#
+# 代价在于「报错信息离病因很远」：真正的问题是第 21 行一个无害的赋值，
+# 报出来的却是「version 文件反序列化失败」。所以本仓库有一条测试
+# （tests/test_launcher.py::VersionInfoFileTest）专门用 eval 加载这个文件，
+# 把这条约束钉住 —— 免得哪天有人「顺手加一行 version = ...」又红一次。
+#
+# ---------------------------------------------------------------------------
+# 这些字段不是装饰
+# ---------------------------------------------------------------------------
+# 杀软误报申诉（Defender WDSI / Avast / ESET）会检查 FileDescription、
+# CompanyName、FileVersion 这些 VERSIONINFO 字段：一个「没有公司名、
+# 描述是英文、版本号是 0.0.0.0」的可执行文件，在申诉时会被当成
+# 来路不明的程序。见 ../../docs/Windows打包exe可行性研究.md「代码签名」。
 #
 # ⚠️ 发布前请把 CompanyName / LegalCopyright 换成**真实的发行主体**。
 #    保留占位值不影响功能，但会让误报申诉更难通过。
@@ -14,12 +33,9 @@
 # 2026-03-01 起，代码签名证书的最长有效期约 460 天（约 15 个月），
 # 比以前的 39 个月短了一截 —— 续签节奏要按这个算。
 #
-# 版本号在这里出现三处（filevers / prodvers / StringStruct），
+# 版本号在下面出现三处（filevers / prodvers / StringStruct），
 # 改版本时**三处一起改**，漏一处就会在「属性 → 详细信息」里显示
 # 一个对不上的版本。
-
-version = '0.1.0'
-ver_string = '0.1.0'
 
 VSVersionInfo(
     ffi=FixedFileInfo(
