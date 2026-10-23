@@ -1205,6 +1205,12 @@ th.c-head .addr { margin-top: 2px; }
 
 /* 列头的增删按钮走常规流：绝对定位会被 label 输入框压住，点不到也看不见 */
 .report-table th.c-head { vertical-align: top; }
+/* 查看模式下表头里只剩列名 —— 要**上下居中**，不能吊在格子上沿。
+   thead th 固定 46px、内容只有一行 16px，vertical-align: top 会把列名
+   顶到 7px 内边距那一线，下面空出十几像素，看着像没对齐。
+   设计模式的表头要堆 ⊕✕ 按钮、列名输入框、列字母、口径下拉，只能从上往下排，
+   那边继续 top。 */
+.report-page:not(.is-designing) .report-table th.c-head { vertical-align: middle; }
 .head-edit { display: flex; justify-content: flex-end; gap: 2px; margin-bottom: 2px; }
 .col-label { width: 100%; }
 .col-meta { margin-top: 4px; }
