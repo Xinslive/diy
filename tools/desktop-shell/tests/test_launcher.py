@@ -827,7 +827,24 @@ class SmokeTestHarnessTest(unittest.TestCase):
     def test_kills_process_tree_on_timeout(self):
         # 超时后必须杀掉整个进程树，否则 exe 拉起的浏览器会变成孤儿，
         # 继续占着资源，下一条用例接着受影响。
-        self.assertIn("_kill_tree", self._source())
+        #
+        # **按 AST 查「有没有调用」，不按文本查「叫什么名字」。**
+        # 文本查 "_kill_tree" 会把「函数叫什么」和「有没有调用」耦在一起 ——
+        # 改个名就误报，而期望本身（超时必须杀进程树）一点没变。
+        import ast
+
+        called = False
+        for node in ast.walk(ast.parse(self._source())):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = getattr(func, "attr", None) or getattr(func, "id", None)
+            if name and name.endswith("kill_tree"):
+                called = True
+        self.assertTrue(
+            called,
+            "超时路径必须调用「杀进程树」的函数 —— 否则 exe 拉起的浏览器会变成孤儿",
+        )
 
     def test_timeout_failure_message_is_actionable(self):
         # 超时时给出的提示要指向真原因，而不是只说「超时了」。

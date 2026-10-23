@@ -51,12 +51,14 @@ from launcher import force_utf8_output  # noqa: E402
 EXPECTED_URL = "https://acct.xins.live"
 
 
-def _out(text: str) -> None:
+def report(text: str) -> None:
     """打印一条结果，且**绝不因编码问题抛异常**。
 
     兜底 reason：``force_utf8_output()`` 已经把编码修好了，理论上不会抛。
     但 stdout 在某些环境（管道被关闭、被重定向到 None）下不可写 ——
     一道校验闸因为「打印不出结果」而中途退出，比报个假阴性更糟。
+
+    （公开而不带下划线：``launch_path_probe.py`` 复用同一套「断言 + 汇报」。）
     """
     try:
         print(text)
@@ -72,13 +74,22 @@ class SmokeFailure(AssertionError):
     pass
 
 
-def _check(condition: bool, message: str) -> None:
+def check(condition: bool, message: str) -> None:
     if not condition:
         raise SmokeFailure(message)
 
 
-def _run_exe(exe: Path, *args: str, timeout: int = 45) -> tuple[int, str, str]:
+def run_exe(
+    exe: Path,
+    *args: str,
+    timeout: int = 45,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
     """跑一次 exe，返回 ``(退出码, stdout, stderr)``。
+
+    :param env: 子进程的环境变量。``None`` 表示继承当前进程的环境。
+        ``launch_path_probe.py`` 用它把 ``ProgramFiles(x86)`` 等
+        指向沙箱 —— 传 ``None`` 就会继承真实环境，沙箱就失效了。
 
     **这里刻意不用 ``capture_output=True``（管道捕获）。**
 
@@ -103,8 +114,18 @@ def _run_exe(exe: Path, *args: str, timeout: int = 45) -> tuple[int, str, str]:
     （顺带一句：第一次跑这条 workflow 时，Windows 上这一步卡了整整
     11 分钟 —— 每条用例都耗满了 120 秒超时。那次的根因是 exe 每次调用
     都不返回；改成文件重定向 + 显式 stdin=DEVNULL 之后不再复现。）
+
+    **临时目录用 ``ignore_cleanup_errors=True``：**
+    exe 拉起的子进程（浏览器）会**继承** stdout/stderr 句柄，而壳
+    ``Popen`` 完就退出了 —— 父进程返回时，那个子进程往往还开着这两个
+    文件。于是删临时目录会撞上「共享冲突」（WinError 32）。
+
+    这不是理论问题：``launch_path_probe.py`` 第一次在 Wine 下跑就撞上了，
+    报的是 ``PermissionError: [WinError 32]``。而它其实是**正常现象**
+    （子进程还活着），不该让整道闸失败。清理失败最多留下两个空文件，
+    比起把一次成功的验证报成失败，划算得多。
     """
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         out_path = Path(tmp) / "stdout.txt"
         err_path = Path(tmp) / "stderr.txt"
         cmd = [str(exe), *args]
@@ -114,11 +135,12 @@ def _run_exe(exe: Path, *args: str, timeout: int = 45) -> tuple[int, str, str]:
                 stdout=out_fh,
                 stderr=err_fh,
                 stdin=subprocess.DEVNULL,
+                env=env,
             )
             try:
                 returncode = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                _kill_tree(process)
+                kill_tree(process)
                 raise
         return (
             returncode,
@@ -127,7 +149,7 @@ def _run_exe(exe: Path, *args: str, timeout: int = 45) -> tuple[int, str, str]:
         )
 
 
-def _kill_tree(process: subprocess.Popen) -> None:
+def kill_tree(process: subprocess.Popen) -> None:
     """杀掉进程及其所有子进程。
 
     Windows 上用 ``taskkill /T /F``（杀进程树）；其它平台先杀进程组。
@@ -162,7 +184,7 @@ def run_dry_run(exe: Path, *extra: str) -> tuple[int, dict]:
     with tempfile.TemporaryDirectory() as tmp:
         plan_path = Path(tmp) / "plan.json"
         try:
-            returncode, stdout, stderr = _run_exe(
+            returncode, stdout, stderr = run_exe(
                 exe, "--dry-run", "--plan-out", str(plan_path), *extra
             )
         except subprocess.TimeoutExpired:
@@ -171,7 +193,7 @@ def run_dry_run(exe: Path, *extra: str) -> tuple[int, dict]:
                 "最可能的原因：它在等人点一个模态对话框 —— "
                 "dry-run 模式不应该弹框，见 launcher.py 的 show_message(suppress=...)。"
             ) from None
-        _check(
+        check(
             plan_path.is_file(),
             f"--dry-run 没有产出 plan 文件（退出码 {returncode}）。\n"
             f"stdout: {stdout}\nstderr: {stderr}",
@@ -182,12 +204,12 @@ def run_dry_run(exe: Path, *extra: str) -> tuple[int, dict]:
 
 def check_exe_format(exe: Path, allow_non_pe: bool = False) -> None:
     """确认它是个真的 Windows PE。"""
-    _check(exe.is_file(), f"exe 不存在：{exe}")
+    check(exe.is_file(), f"exe 不存在：{exe}")
     with exe.open("rb") as handle:
         header = handle.read(2)
     if allow_non_pe:
         return
-    _check(
+    check(
         header == b"MZ",
         f"{exe} 不是 Windows PE（头是 {header!r}，应该是 b'MZ'）。"
         "可能是 Linux/macOS 上交叉打包的产物。",
@@ -196,33 +218,33 @@ def check_exe_format(exe: Path, allow_non_pe: bool = False) -> None:
 
 def check_default_plan(exe: Path) -> None:
     rc, plan = run_dry_run(exe, "--url", EXPECTED_URL)
-    _check(rc == RC_OK, f"默认 dry-run 退出码是 {rc}，应该是 {RC_OK}")
-    _check(
+    check(rc == RC_OK, f"默认 dry-run 退出码是 {rc}，应该是 {RC_OK}")
+    check(
         plan["target_url"] == EXPECTED_URL,
         f"目标地址是 {plan['target_url']!r}，应该是 {EXPECTED_URL!r}",
     )
-    _check(
+    check(
         plan["mode"] in ("app-window", "default-browser"),
         f"未知的 mode：{plan['mode']!r}",
     )
 
     if plan["mode"] == "app-window":
         args = plan["args"]
-        _check(
+        check(
             any(a.startswith("--app=") for a in args),
             f"应用模式但参数里没有 --app=：{args}",
         )
-        _check(
+        check(
             any(a.startswith("--user-data-dir=") for a in args),
             f"应用模式但参数里没有 --user-data-dir=：{args}",
         )
-        _check(
+        check(
             plan["browser"] is not None,
             "应用模式但 browser 是 None",
         )
 
     profile = Path(plan["profile_dir"])
-    _check(
+    check(
         profile.is_absolute(),
         f"profile 目录不是绝对路径：{plan['profile_dir']!r}。"
         "相对路径会被解析到当前工作目录，而双击 exe 时那个目录是随机的。",
@@ -231,12 +253,12 @@ def check_default_plan(exe: Path) -> None:
 
 def check_no_app_mode(exe: Path) -> None:
     rc, plan = run_dry_run(exe, "--url", EXPECTED_URL, "--no-app-mode")
-    _check(rc == RC_OK, f"--no-app-mode 退出码是 {rc}，应该是 {RC_OK}")
-    _check(
+    check(rc == RC_OK, f"--no-app-mode 退出码是 {rc}，应该是 {RC_OK}")
+    check(
         plan["mode"] == "default-browser",
         f"--no-app-mode 时 mode 是 {plan['mode']!r}，应该是 'default-browser'",
     )
-    _check(plan["args"] == [], f"--no-app-mode 时不该有浏览器参数：{plan['args']}")
+    check(plan["args"] == [], f"--no-app-mode 时不该有浏览器参数：{plan['args']}")
 
 
 def check_explicit_browser(exe: Path) -> None:
@@ -246,12 +268,12 @@ def check_explicit_browser(exe: Path) -> None:
     所以只要它是个存在的可执行文件就行 —— 而 exe 自己一定满足。
     """
     rc, plan = run_dry_run(exe, "--url", EXPECTED_URL, "--browser", str(exe))
-    _check(rc == RC_OK, f"--browser 退出码是 {rc}，应该是 {RC_OK}")
-    _check(
+    check(rc == RC_OK, f"--browser 退出码是 {rc}，应该是 {RC_OK}")
+    check(
         plan["mode"] == "app-window",
         f"显式指定浏览器时 mode 是 {plan['mode']!r}，应该是 'app-window'",
     )
-    _check(
+    check(
         plan["browser"] is not None and plan["browser"]["name"] == "custom",
         f"显式指定浏览器时 browser 不是 custom：{plan['browser']}",
     )
@@ -264,10 +286,10 @@ def run_raw(exe: Path, *extra: str) -> tuple[int, str, str]:
     返回 2 的，所以那一路根本没有 plan.json 可读 —— 用 run_dry_run 去验它
     会得到「没有产出 plan 文件」这种把原因带偏的报错。
 
-    不用管道捕获的理由见 :func:`_run_exe`。
+    不用管道捕获的理由见 :func:`run_exe`。
     """
     try:
-        return _run_exe(exe, *extra)
+        return run_exe(exe, *extra)
     except subprocess.TimeoutExpired:
         raise SmokeFailure(
             "exe 跑了 45 秒还没退出（超时）。\n"
@@ -280,7 +302,7 @@ def check_rejects_bad_url(exe: Path) -> None:
     returncode, stdout, stderr = run_raw(
         exe, "--dry-run", "--url", "file:///C:/Windows/System32/cmd.exe"
     )
-    _check(
+    check(
         returncode == RC_BAD_URL,
         f"非 http/https 地址的退出码是 {returncode}，"
         f"应该是 {RC_BAD_URL}（被拒绝）。\n"
@@ -297,7 +319,7 @@ def main(argv: list[str]) -> int:
         args = args[1:]
 
     if not args:
-        _out("用法：python3 smoke_test.py <exe 路径>")
+        report("用法：python3 smoke_test.py <exe 路径>")
         return 1
 
     exe = Path(args[0]).resolve()
@@ -310,22 +332,22 @@ def main(argv: list[str]) -> int:
     ]
 
     failures = 0
-    for name, check in checks:
+    for name, fn in checks:
         try:
-            check()
+            fn()
         except SmokeFailure as exc:
             failures += 1
-            _out(f"❌ {name}\n   {exc}")
+            report(f"❌ {name}\n   {exc}")
         except Exception as exc:  # noqa: BLE001 —— 冒烟脚本要报出任何异常
             failures += 1
-            _out(f"❌ {name}\n   意外异常：{exc!r}")
+            report(f"❌ {name}\n   意外异常：{exc!r}")
         else:
-            _out(f"✅ {name}")
+            report(f"✅ {name}")
 
     if failures:
-        _out(f"\n❌ {failures}/{len(checks)} 项没过")
+        report(f"\n❌ {failures}/{len(checks)} 项没过")
         return 1
-    _out(f"\n✅ {len(checks)}/{len(checks)} 项全过：{exe}")
+    report(f"\n✅ {len(checks)}/{len(checks)} 项全过：{exe}")
     return 0
 
 
