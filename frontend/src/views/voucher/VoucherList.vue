@@ -21,16 +21,22 @@
         <span class="muted">分录金额</span>
       </el-tooltip>
       <!-- 金额框要放得下**完整的金额**（用户 2026-10-23：「金额不能显示全」）。
-           el-input-number 的内层输入框只拿到「外宽 − 30px」（左右各 15px 内边距），
-           78px 的外宽只剩 48px；而 14px Arial 下一个数字 7.8px，
-           「4421.79」= 6 个数字 + 1 个小数点 = 50.6px —— **差 2.6px 就被截掉**，
-           输进去看着像「4421.7」。
-           120px 给到 90px 的字宽，够放下八位整数加两位小数（99999999.99 = 85.7px）。 -->
-      <el-input-number v-model="query.min_amount" :controls="false" :min="0" :precision="2"
-                       :value-on-clear="null" placeholder="从" style="width: 120px" @keyup.enter="load" />
+           **不靠加宽，靠把那 30px 的内边距收掉**：el-input-number 两侧各留
+           15px 是给加减按钮的，这两个框没有按钮（:controls="false"），
+           那 30px 全是浪费 —— 78px 的外宽只剩 48px 字宽，
+           而 14px Arial 下一个数字 7.8px，「4421.79」= 50.6px，
+           **差 2.6px 就被截掉**，输进去看着像「4421.7」。
+           内边距收到 8px 之后，92px 的框给出 76px 字宽，
+           够放下七位整数加两位小数（9999999.99 = 74px）；
+           框本身只比原来宽 14px，一眼看过去还是原来那个大小
+           （用户 2026-10-23：「宽度太大了，这不好看」）。 -->
+      <el-input-number v-model="query.min_amount" class="amt-input" :controls="false" :min="0"
+                       :precision="2" :value-on-clear="null" placeholder="从"
+                       style="width: 92px" @keyup.enter="load" />
       <span class="muted">—</span>
-      <el-input-number v-model="query.max_amount" :controls="false" :min="0" :precision="2"
-                       :value-on-clear="null" placeholder="到" style="width: 120px" @keyup.enter="load" />
+      <el-input-number v-model="query.max_amount" class="amt-input" :controls="false" :min="0"
+                       :precision="2" :value-on-clear="null" placeholder="到"
+                       style="width: 92px" @keyup.enter="load" />
 
       <span class="spacer" />
 
@@ -403,6 +409,11 @@ watch(() => store.periodId, () => {
 </script>
 
 <style scoped>
+/* 金额筛选框的内边距：Element Plus 给 el-input-number 两侧各留 15px
+   （那是给加减按钮的），这两个框没有按钮 —— 不收掉的话，框宽里有 30px
+   是空的，金额长一点就露不全。收到 8px 之后 92px 的框能给出 76px 字宽。 */
+.toolbar .amt-input :deep(.el-input__wrapper) { padding-left: 8px; padding-right: 8px; }
+
 /* 日期不许折行：「2026-12-31」断成两行，扫一列日期全靠猜 */
 :deep(.el-table .nowrap .cell) { white-space: nowrap; }
 
