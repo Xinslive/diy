@@ -92,6 +92,33 @@ def depth_after(lines: list[str]) -> list[tuple[int, str]]:
     return res
 
 
+def location_blocks(lines: list[str], header: str) -> list[list[str]]:
+    """取出所有以 ``header`` 开头的 location 块（按花括号配平）。
+
+    ``header`` 形如 ``"location / {"`` —— 用 ``startswith`` 匹配，
+    所以 ``location / {`` 不会误取 ``location /assets/ {``。
+
+    **要返回全部而不是第一个**：同一份配置里 ``location / {`` 可能出现两次
+    —— 80 端口那个是「跳 HTTPS」，443 端口那个才是 SPA 兜底。
+    只看第一个会把断言安到错误的块上（于是「加了 header 也判失败」，
+    或者更糟：把它加在跳转块上反而算通过）。
+    """
+    blocks: list[list[str]] = []
+    for i, ln in enumerate(lines):
+        if not ln.strip().startswith(header):
+            continue
+        depth = 0
+        out: list[str] = []
+        for l2 in lines[i:]:
+            code = l2.split("#", 1)[0]
+            depth += code.count("{") - code.count("}")
+            out.append(l2)
+            if depth <= 0 and "{" in l2:
+                break
+        blocks.append(out)
+    return blocks
+
+
 def balanced(lines: list[str]) -> tuple[bool, str]:
     depth = 0
     for line in lines:
@@ -160,6 +187,30 @@ def check_structure(conf: Path) -> None:
            "TRUSTED_PROXIES，与限流无关（死指针）")
     else:
         ok("没有把限流指向不存在的小节")
+
+    # --- 入口页必须 no-cache，带哈希的资源必须 immutable ---
+    #
+    # 少任何一条都会变成「发布成功、界面没变」：
+    #   · 入口页没有 no-cache → 浏览器按启发式规则缓存它（Chrome/Edge 拿
+    #     「距 Last-Modified 的 10%」当新鲜期），发布后一两个小时内客户端
+    #     拿到的还是上一个版本的 index.html，它指向旧哈希资源。
+    #   · 资源没有 immutable → 每次访问都重下，白白浪费带宽。
+    # 两条一起才是完整答案：**入口永远重新验证，资源永远不过期**。
+    # SPA 块 = 那些把请求回退到 /index.html 的 location（80 端口那个
+    # 「跳 HTTPS」的同名块不算）。断言必须落在**真正吐 HTML 的那一块**上。
+    spa = [b for b in location_blocks(lines, "location / {")
+           if any("/index.html" in l for l in b)]
+    assets = location_blocks(lines, "location /assets/ {")
+    if any(re.search(r'add_header\s+Cache-Control\s+"no-cache"', l)
+           for b in spa for l in b):
+        ok("SPA 入口页带 Cache-Control: no-cache（发布后客户端不会拿着旧 index.html）")
+    else:
+        no("SPA 入口页没有 Cache-Control: no-cache —— 浏览器会按启发式规则缓存它，"
+           "发布后客户端拿到的还是上一个版本的 index.html，界面看着像「没生效」")
+    if any("immutable" in l for b in assets for l in b):
+        ok("带内容哈希的 /assets/ 仍然 immutable 一年")
+    else:
+        no("/assets/ 少了 immutable —— 入口已经每次重新验证了，资源不该再每次重下")
 
 
 # --------------------------------------------------------------------------

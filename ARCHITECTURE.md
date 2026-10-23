@@ -3714,6 +3714,43 @@ vhost），它用 `server_name acct.xins.live` 精确匹配，不需要这份 ho
 grep -c cwq_https_redirect /etc/nginx/conf/nginx.conf
 ```
 
+### 11.7.6.1 前端入口页必须 `no-cache`，否则发布后客户端还拿着旧 index.html
+
+**现象**：改完前端、发布成功，公网也确实在发新产物，客户端打开的界面**还是旧的**
+—— 看着像「改动没生效」「发布没上去」。
+
+**根因**：`index.html` 是 SPA 的入口，它指向的是**带内容哈希**的 `/assets/*`：
+资源名随构建变，入口页本身不变。没有 `Cache-Control` 时浏览器按**启发式规则**
+缓存它（Chrome/Edge 拿「现在 - Last-Modified 的 10%」当新鲜期）。入口页的
+`Last-Modified` 是上一次发布的时间，于是发布之后的**一两个小时**内，客户端拿到的
+是**上一个版本**的 index.html —— 它指向旧哈希资源，界面于是没变。
+
+本地开发看不出来（dev server 不这么缓存），**桌面壳那个独立窗口最容易撞上**：
+它用自己的浏览器 profile（`%LOCALAPPDATA%\财务记账系统\browser-profile`），
+缓存一直留在那儿，开着不动就是「昨天的界面」。
+
+**约束**：
+
+- 入口页（`location /` 的 SPA 兜底）发 `Cache-Control: no-cache` ——
+  含义是「用之前必须重新验证」，304 也算数，成本只有一次条件请求；
+- 带内容哈希的 `/assets/` 仍然 `expires 1y` + `public, immutable`；
+- 两条一起才是完整答案：**入口永远重新验证，资源永远不过期**。
+
+注意 nginx 的 `add_header` **不继承**：某个 location 里只要自己写了
+`add_header`，server 级的安全头就不会带进来。所以安全头要**每个 location 都写全**
+（本项目一贯如此，见文件头「原则 A」），别指望继承。
+
+改完 nginx 配置要 `nginx -t` 再 `nginx -s reload`，并复查响应头：
+
+```
+curl -sI https://acct.xins.live/ | grep -i cache-control                 # no-cache
+curl -sI https://acct.xins.live/assets/<hash>.js | grep -i cache-control # immutable
+```
+
+`deploy/tests/nginx_conf_check.py` 守着这两条（CI 的 deploy job 会真跑一遍
+`nginx -t`）：断言必须落在**真正吐 HTML 的那一块**上 —— 同一份配置里
+`location / {` 可能出现两次，80 端口那个是「跳 HTTPS」，不是入口页。
+
 ### 11.7.7 发布脚本末尾会无条件 `enable` 单元，所以「关掉」必须是显式状态
 
 `deploy.sh` 第 7 步每次发布末尾都会 `systemctl enable --now cwq-backup.timer`。
