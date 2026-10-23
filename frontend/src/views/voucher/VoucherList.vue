@@ -20,11 +20,17 @@
       <el-tooltip content="按分录金额筛选：凭证里有任意一行落在这个区间，整张都会被列出来" placement="top">
         <span class="muted">分录金额</span>
       </el-tooltip>
+      <!-- 金额框要放得下**完整的金额**（用户 2026-10-23：「金额不能显示全」）。
+           el-input-number 的内层输入框只拿到「外宽 − 30px」（左右各 15px 内边距），
+           78px 的外宽只剩 48px；而 14px Arial 下一个数字 7.8px，
+           「4421.79」= 6 个数字 + 1 个小数点 = 50.6px —— **差 2.6px 就被截掉**，
+           输进去看着像「4421.7」。
+           120px 给到 90px 的字宽，够放下八位整数加两位小数（99999999.99 = 85.7px）。 -->
       <el-input-number v-model="query.min_amount" :controls="false" :min="0" :precision="2"
-                       :value-on-clear="null" placeholder="从" style="width: 78px" @keyup.enter="load" />
+                       :value-on-clear="null" placeholder="从" style="width: 120px" @keyup.enter="load" />
       <span class="muted">—</span>
       <el-input-number v-model="query.max_amount" :controls="false" :min="0" :precision="2"
-                       :value-on-clear="null" placeholder="到" style="width: 78px" @keyup.enter="load" />
+                       :value-on-clear="null" placeholder="到" style="width: 120px" @keyup.enter="load" />
 
       <span class="spacer" />
 
