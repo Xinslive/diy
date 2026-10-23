@@ -533,7 +533,14 @@ onMounted(async () => {
 .create-book-button :deep(.el-icon) { margin-right: 5px; }
 .book-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr));
+  /* 三列一行是硬指标，不能靠 "宽了就三列、窄了就两列" 蒙混：
+     外壳最窄 1280px（main.css 里 .shell 的 min-width）
+     → 减去侧栏 220px 得 1060px 内容区
+     → 再减去 .page 左右各 24px 页边距，网格实得 1012px
+     → 扣掉两道 12px 的缝，一列最多 329px。
+     minmax 的下限必须 ≤ 329px：写成 330px 就多出 2px（1014 > 1012），
+     auto-fit 会悄悄退回两列。取 320px 留余量，窄卡片里也不顶边。 */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
   align-items: stretch;
   gap: 12px;
 }
@@ -591,7 +598,9 @@ onMounted(async () => {
 .book-name-link :deep(.el-link__inner) { text-align: left; white-space: normal; overflow-wrap: anywhere; }
 .book-tile-meta {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  /* 两格不再各占一半：年度那格要塞一个 100px 宽的下拉框，宽度按内容给足，
+     「已结账」那格拿剩下的。均分的话窄卡片里下拉框先被挤扁。 */
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
   margin-top: 8px;
   padding: 9px 0;
   border-top: 1px solid #edf0f3;
@@ -600,8 +609,9 @@ onMounted(async () => {
 .book-fact { display: flex; min-width: 0; align-items: center; gap: 7px; }
 .book-fact + .book-fact { padding-left: 18px; border-left: 1px solid #edf0f3; }
 .book-fact-label { flex: 0 0 auto; color: #8993a1; font-size: 12px; line-height: 1.4; }
-.book-fact strong { color: #3a4655; font-size: 14px; font-weight: 600; }
-.book-year-select { width: 100px; }
+.book-fact strong { color: #3a4655; font-size: 14px; font-weight: 600; white-space: nowrap; }
+/* 下拉框不许被 flex 压瘦：宽 100px 是内容区（"2026 年" + 箭头）刚好放得下的尺寸 */
+.book-year-select { width: 100px; flex: none; }
 .book-tile-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; padding-top: 8px; }
 /* 拖拽的两个态：被拖的那张压暗、整块网格给一个「可以放」的鼠标形状。
    落点靠磁贴在拖动中**让位**来表达 —— 比在两卡之间画一条线省事，
@@ -638,6 +648,6 @@ onMounted(async () => {
   .book-tile-meta { gap: 8px; }
   .book-fact { align-items: flex-start; flex-direction: column; gap: 4px; }
   .book-fact + .book-fact { padding-left: 12px; }
-  .book-year-select { width: 110px; }
+  .book-year-select { width: 110px; flex: none; }
 }
 </style>
