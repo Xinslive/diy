@@ -55,13 +55,16 @@ await t('缺 book_id 时宁可一个参数都不发（由后端拒），不偷�
 console.log('')
 console.log('== P1-15 报表口径必须显式标注 ==')
 
-await t('列头按 excludes_carry_forward 挂「不含结转」角标', () => {
-  assert.ok(/v-if="c\.excludes_carry_forward"/.test(SRC), '损益口径的列头没标')
-  assert.ok(/class="caliber/.test(SRC), '角标没渲染出来')
+await t('表头不再挂「不含结转」角标（用户批注：表头上不要这个标签）', () => {
+  assert.ok(!/class="caliber/.test(SRC), '「不含结转」角标还在表头上')
+  assert.ok(!/>不含结转</.test(SRC), '「不含结转」角标文字还留在界面上')
+  assert.ok(!/\.caliber\s*\{/.test(SRC), '角标的样式还留着（已成死样式）')
 })
-await t('角标说的是「本期金额（不含结转损益）」，并且说清与总账的差额是什么', () => {
-  assert.ok(/不含结转损益/.test(SRC), '口径角标没有把这句话说完整')
+await t('口径改由列头 title 说明，说清与总账的差额是什么', () => {
+  assert.ok(/不含结转损益/.test(SRC), '口径说明没有把这句话说完整')
   assert.ok(/结转凭证金额/.test(SRC), '没说明与总账差的就是结转凭证金额')
+  assert.ok(/const colTitle = \(c\) => \(c\.excludes_carry_forward/.test(SRC),
+    '口径说明没有跟着 excludes_carry_forward 走')
 })
 await t('notices 非空时在表头下方挂一条提示', () => {
   assert.ok(/v-for="\(n, i\) in data\.notices \|\| \[\]"/.test(SRC), 'notices 没渲染')

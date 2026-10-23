@@ -132,12 +132,13 @@
               <el-input v-if="designMode" v-model="c.label" size="small" class="col-label"
                         @change="renameCol(c, $event)" />
               <template v-else>{{ c.label }}</template>
-              <!-- 口径角标：这一列走的是**报表口径**（损益取数，排除结转凭证），
-                   与总账 / 科目余额表那个「含结转」的账簿口径差的就是结转凭证。
-                   不标出来，用户只会觉得这个数算错了。这是给**看表的人**看的，
-                   所以不受设计模式开关影响。 -->
-              <span v-if="c.excludes_carry_forward" class="caliber no-print"
-                    :title="COL_CALIBER_HINT">不含结转</span>
+              <!-- 口径说明不再挂角标（用户批注：表头上不要「不含结转」这个标签）。
+                   口径本身没变：损益列走**报表口径**（排除结转凭证），与总账 /
+                   科目余额表那个「含结转」的账簿口径差的就是结转凭证。
+                   这句话改由两处承担 ——
+                     · 列头 title（colTitle）：鼠标悬停可见，不占版面；
+                     · 表头下方的 notices（后端口径）：本期真的结转过时明确说明。
+                   角标太抢眼，用户看到的是一排标签，不是报表。 -->
               <!-- 列字母 A~H：公式里写的就是它（「合计(C2:C10)」），学公式时要看，
                    所以设计模式下留着。 -->
               <div v-if="designMode" class="addr no-print">{{ c.letter }}</div>
@@ -438,7 +439,11 @@ const builder = reactive({
  * （cols[].excludes_carry_forward / notices / carry_forward_period_amount），
  * 这一段只负责把它们**说出来**。没有它，README 开头那句
  * 「不存在某个报表和总账对不上」在界面上是查证的 —— 用户只会得出
- * 「这个报表算错了」的结论。 */
+ * 「这个报表算错了」的结论。
+ *
+ * 说法放在哪里：表头上那个「不含结转」角标已按用户批注撤掉（表头挂一排
+ * 标签，看表的人先看到标签、看不到报表）。口径改由两处承担 ——
+ * 列头 title（悬停可见）与表头下方的 notices（本期真结转过时明说）。 */
 const COL_CALIBER_HINT = '本期金额（不含结转损益）：这一列按损益口径取数，'
   + '已排除本期结转凭证。与总账 / 科目余额表的差额 = 本期结转凭证金额，不是算错。'
 
@@ -446,7 +451,7 @@ const noticeType = (n) => (n.level === 'error' ? 'error' : n.level === 'warning'
 /** 「本期金额 / 本年累计」这种列名，提示里好让人一眼对上号 */
 const colNameOf = (colNos = []) =>
   data.value.cols.filter((c) => colNos.includes(c.col_no)).map((c) => `「${c.label}」`).join('、')
-/** 列头 title：带角标的那几列，说清楚它跟账簿差在哪 */
+/** 列头 title：损益口径的那几列，说清楚它跟账簿差在哪（悬停可见） */
 const colTitle = (c) => (c.excludes_carry_forward ? `${c.label}｜${COL_CALIBER_HINT}` : '')
 
 const lastRowNo = computed(() => Math.max(0, ...data.value.rows.map((r) => r.row_no)))
@@ -1205,22 +1210,6 @@ th.c-head .addr { margin-top: 2px; }
 .col-meta { margin-top: 4px; }
 .col-meta :deep(.el-select) { width: 100%; }
 
-/* 口径角标：小到不抢眼，但一眼能看见「这一列的数跟总账不是同一口径」。
-   打印/导出走的是后端那份模板，这里是屏幕上的说明，所以标 no-print。 */
-.caliber {
-  display: inline-block;
-  margin-top: 3px;
-  padding: 0 4px;
-  border: 1px solid #e6a23c;
-  border-radius: 3px;
-  background: #fdf6ec;
-  color: #b8823b;
-  font-size: 10px;
-  line-height: 15px;
-  font-weight: 400;
-  white-space: nowrap;
-  vertical-align: middle;
-}
 .notice-sub { margin-top: 4px; font-size: 12px; }
 .notice-sub .money { font-variant-numeric: tabular-nums; }
 
