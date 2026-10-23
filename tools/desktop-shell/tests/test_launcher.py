@@ -7,9 +7,10 @@
 都能跑，不是二选一。
 
 **测的是什么**：全部是**平台无关的纯逻辑** —— 路径展开、浏览器发现、
-参数拼装、URL 校验、配置解析、启动计划。真正依赖 Windows 的部分
-（拉起进程、消息框）由 CI 在 ``windows-latest`` 上用 ``--dry-run``
-产出的 JSON 来断言，那条闸在 ``.github/workflows/desktop-shell.yml``。
+参数拼装、URL 校验、配置解析、启动计划、进程启动参数。真正依赖 Windows
+的部分（浏览器真的弹窗出来、消息框）由 CI 在 ``windows-latest`` 上用
+``--dry-run`` 产出的 JSON 来断言，那条闸在
+``.github/workflows/desktop-shell.yml``。
 
 跑法：
     python3 -m unittest discover -s tools/desktop-shell/tests -v
@@ -26,6 +27,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # 壳不是包，从仓库任何位置跑都要能找到它
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -342,6 +344,94 @@ class MainTest(unittest.TestCase):
                 launcher.main(["--dry-run", "--plan-out", str(out)])
             plan = json.loads(out.read_text(encoding="utf-8"))
         self.assertTrue(Path(plan["profile_dir"]).is_absolute())
+
+
+class SpawnTest(unittest.TestCase):
+    """``spawn()`` —— 壳里唯一真正创建进程的函数。
+
+    **为什么它值得单独测**：它是整个壳唯一的「副作用出口」。前面所有函数
+    （找浏览器、拼参数、生成计划）都只碰字符串，只有这一行会真的起进程。
+    它坏掉的症状是「双击 exe 什么也不发生」—— 没有报错、没有弹窗、
+    窗口一闪就没，比崩溃还难排查。
+
+    「浏览器确实起来了」那部分要真 Windows 才能验；CI 在
+    ``windows-latest`` 上跑的是 ``--dry-run``，并不覆盖它。
+    Wine 下的替身浏览器实验（方法与结论见 README 4.6）验到了
+    「参数确实被交出去了」，但那仍不等于真实 Windows 内核。
+    这里钉死的是「参数怎么交给 Popen」—— 那是出问题最难查的一层。
+    """
+
+    def test_passes_command_as_list_not_string(self):
+        # 传字符串会让 Windows 走 cmd.exe 解析：路径里的空格会被拆开、
+        # 中文 profile 路径可能被编码破坏，而且等于把参数交给了 shell。
+        with mock.patch.object(launcher.subprocess, "Popen") as popen:
+            launcher.spawn(["C:\\Program Files\\msedge.exe", "--app=https://a"])
+        cmd = popen.call_args.args[0]
+        self.assertIsInstance(cmd, list)
+        self.assertEqual(cmd[0], "C:\\Program Files\\msedge.exe")
+
+    def test_does_not_enable_shell(self):
+        with mock.patch.object(launcher.subprocess, "Popen") as popen:
+            launcher.spawn(["msedge.exe"])
+        self.assertFalse(popen.call_args.kwargs.get("shell", False))
+
+    def test_creationflags_matches_platform_flag(self):
+        # Windows 上是 CREATE_NO_WINDOW（不让子进程闪黑框）；
+        # 其它平台这个常量不存在，取值必须是 0 —— 非零的 creationflags
+        # 在 POSIX 上会被 subprocess 直接拒掉（ValueError）。
+        expected = getattr(launcher.subprocess, "CREATE_NO_WINDOW", 0)
+        with mock.patch.object(launcher.subprocess, "Popen") as popen:
+            launcher.spawn(["msedge.exe"])
+        self.assertEqual(popen.call_args.kwargs.get("creationflags"), expected)
+
+
+class MainLaunchTest(unittest.TestCase):
+    """``main()`` 真正启动浏览器的那条路径（不是 --dry-run）。
+
+    **为什么不能只测 dry-run**：``--dry-run`` 在 ``main()`` 里是**提前返回**
+    的，它压根走不到 ``spawn()``。也就是说 dry-run 全绿并不代表「双击能开窗」，
+    中间那一段是没有闸的。这组用例把那段补上：只 mock 掉 ``Popen``
+    （起真进程），其余全部走真代码。
+    """
+
+    def _run(self, argv):
+        with mock.patch.object(launcher, "write_log"), \
+                mock.patch.object(launcher.subprocess, "Popen") as popen:
+            rc = launcher.main(argv)
+        return rc, popen
+
+    def test_actually_spawns_the_browser(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "fakebrowser.exe"
+            fake.write_bytes(b"MZ")
+            rc, popen = self._run(["--browser", str(fake)])
+        self.assertEqual(rc, 0)
+        popen.assert_called_once()
+        cmd = popen.call_args.args[0]
+        self.assertEqual(cmd[0], str(fake))
+        self.assertIn(f"--app={launcher.DEFAULT_URL}", cmd)
+
+    def test_spawned_args_match_the_plan(self):
+        # 实际传给浏览器的参数必须和 dry-run 输出的计划**完全一致** ——
+        # 否则「CI 断言的计划」和「用户实际看到的窗口」就是两回事。
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "fakebrowser.exe"
+            fake.write_bytes(b"MZ")
+            plan_out = Path(tmp) / "plan.json"
+
+            # 先跑一次 dry-run 拿到「计划说什么」
+            with quiet():
+                launcher.main([
+                    "--dry-run", "--plan-out", str(plan_out),
+                    "--browser", str(fake),
+                ])
+            plan = json.loads(plan_out.read_text(encoding="utf-8"))
+
+            # 再跑一次真的启动，拿到「实际传了什么」
+            _, popen = self._run(["--browser", str(fake)])
+            spawned = list(popen.call_args.args[0])
+
+        self.assertEqual(spawned, [str(fake), *plan["args"]])
 
 
 class ProfileDirTest(unittest.TestCase):

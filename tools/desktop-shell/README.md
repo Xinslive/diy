@@ -95,7 +95,7 @@ tools/desktop-shell/
 ├── requirements-build.lock 构建期依赖的**哈希锁定版**（CI 与本地都用它）
 ├── shell.json.example     配置示例
 ├── shell.ico              图标（生成物，也入库，方便换品牌图标）
-└── tests/test_launcher.py 单元测试（61 条）
+└── tests/test_launcher.py 单元测试（66 条）
 ```
 
 ---
@@ -213,6 +213,38 @@ python3 -m unittest discover -s tools/desktop-shell/tests -t tools/desktop-shell
 python3 -m pytest tools/desktop-shell/tests
 ```
 
+### 4.6 验证「真的把浏览器拉起来」
+
+**为什么 `--dry-run` 不够**：它在 `main()` 里是**提前返回**的，压根走不到
+`spawn()`。也就是说「CI 的 dry-run 全绿」并不等于「用户双击能开窗」——
+中间那一段本来是没有闸的。
+
+2026-10-23 在 Wine 下用「替身浏览器」把这段补上了，方法是：
+
+1. 用 PyInstaller 打一个**真 exe** 替身（必须是真 exe：Windows 会校验 PE 头，
+   `.bat` 改名不行），让它把自己的 `sys.argv` 写成 UTF-8 JSON；
+2. 把它放到**真实的 Edge 安装位置**
+   `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`；
+3. **不带任何参数**运行 exe（就是双击那一下），看替身有没有收到参数。
+
+实测结果（Wine + 真 Windows Python 3.11.9 + 真 PE）：
+
+- `find_browser()` 在真实安装路径上找到了 Edge，**真的 spawn 成功**，退出码 0；
+- 替身收到的参数与 dry-run 计划**逐字一致**，其中
+  `--user-data-dir=C:\users\home\AppData\Local\财务记账系统\browser-profile`
+  的**中文路径完整无损** —— 没有被 ANSI 编码破坏；
+- 壳的日志落到了 `%LOCALAPPDATA%\财务记账系统\logs\shell.log`
+  （中文目录名正常）。
+
+对应地，仓库里补了 `SpawnTest` / `MainLaunchTest` 两组用例，把
+「参数怎么交给 `Popen`」和「实际 spawn 的参数 == dry-run 计划」钉死。
+`spawn()` 是整个壳唯一的副作用出口，它坏掉的症状是「双击什么也不发生」——
+没有报错、没有弹窗，比崩溃还难查。
+
+> 边界：Wine ≠ Windows 内核。CI 在 `windows-latest` 上跑的是 `--dry-run`，
+> **并没有**验真浏览器；上面这个实验验到的是「参数确实被交出去了」。
+> `MessageBoxW`、真实杀软行为仍属推断。
+
 ---
 
 ## 5. 配置
@@ -311,6 +343,8 @@ python3 -m pytest tools/desktop-shell/tests
   替换 `tools/desktop-shell/shell.ico` 即可（`make_icon.py` 会在缺失时重新生成，
   所以**别删掉它**，除非同时删掉 spec 里那段自动生成逻辑）。
 - **`version_info.txt` 里的 CompanyName 是占位值**，发布前必须改。
+- **「浏览器真的被拉起来」只在 Wine 下验过**（见 4.6），没在真实 Windows
+  内核上验过。`MessageBoxW`、真实杀软行为仍属推断。
 
 ---
 
