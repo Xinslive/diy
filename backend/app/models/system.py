@@ -15,6 +15,19 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, TimestampMixin
 
 
+#: 姓名的长度上限，**与列宽一致**（``sys_user.real_name`` 是 ``String(64)``）。
+#:
+#: 不加这个上限，超长时数据库抛 ``StringDataRightTruncation``（sqlstate
+#: ``22001``）⇒ 接口回 **500「数据库内部错误」** —— 那是一句纯入参问题，
+#: 却长得像数据库故障，把排障方向整个带偏（审计 P2-6）。加了它就是 422，
+#: 与同一批接口里 ``username`` 的处理一致。
+#:
+#: 放**模型**里而不是某个 api 文件里：这条上限说的是**这一列有多宽**，
+#: 而写这个字段的接口有三处（管理员建号、管理员重置、本人自助改密）——
+#: 口径收在列旁边，改列宽时它跟着一起被看见。
+REAL_NAME_MAX_LENGTH = 64
+
+
 class SysUser(Base, TimestampMixin):
     __tablename__ = "sys_user"
 

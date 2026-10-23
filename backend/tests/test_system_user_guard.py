@@ -298,11 +298,22 @@ def test_建号与重置两条路径的下限一致(client, db, auth, admin_user
     assert r.status_code == 422, f"重置路径收了 2 位口令：{r.status_code} {r.text[:200]}"
 
 
-def test_只有一类字符的口令被拒(client, auth, admin_user):
-    """复杂度下限：至少两类字符。「aaaaaaaa」看着长，字典一撞就开。"""
+def test_全部数字的密码也认(client, auth, admin_user):
+    """**复杂度下限已撤**（用户 2026-10-23 定的口径）：全部数字也认。
+
+    过去这条规则是「至少两类字符」，理由是「单类字符看着长，字典一撞就开」。
+    现在撤掉：真正兜底的是登录失败锁定与 PBKDF2 的成本，不是字符的花样；
+    而要求「两类」拦下的是**随手敲出来的数字串** —— 那种密码本来就该被
+    允许，逼人为了凑花样写一个自己记不住的密码，净损失。
+
+    这条用例钉的是「**规则真的没了**」：只把它从代码里删掉的话，将来谁
+    看着「6 位全数字」觉得不安全，又会悄悄加回来 —— 而那时候没人会记得
+    它是被明确撤掉的。
+    """
     r = client.post("/api/system/users", headers=auth,
-                    json={"username": "weak_class_user", "password": "aaaaaaaa"})
-    assert r.status_code == 422, f"单一类字符的口令被收了：{r.status_code} {r.text[:200]}"
+                    json={"username": "digits_only_user", "password": "123456"})
+    assert r.status_code == 201, \
+        f"全部数字的密码被拒了：{r.status_code} {r.text[:200]}"
 
 
 def test_下限就是六位_五位被拒六位能建号也能重置(client, db, auth, plain_user):
@@ -311,8 +322,8 @@ def test_下限就是六位_五位被拒六位能建号也能重置(client, db, 
     这条用例钉的是**边界本身**：过去下限是 8 位，改成 6 位之后 6 位要能过、
     5 位要被拒 —— 少了它，「下限」就只是一句注释，改成几都不会有人发现。
 
-    口令取 ``ab12cd``：6 位，且**两类字符**（小写 + 数字）—— 只测长度，
-    别把复杂度那条也一起测了，两条规则混在一条断言里，坏了看不出坏在哪。
+    密码取 ``ab12cd``：6 位 —— 只测长度，别把别的规则也一起测了，
+    两条规则混在一条断言里，坏了看不出坏在哪。
     """
     r = client.post("/api/system/users", headers=auth,
                     json={"username": "six_char_user", "password": "ab12cd"})

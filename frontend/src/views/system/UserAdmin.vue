@@ -106,7 +106,7 @@
         </el-form-item>
         <el-form-item label="初始密码">
           <el-input v-model="userForm.password" type="password" show-password
-                    :placeholder="`至少 ${PASSWORD_MIN} 位，且包含两类字符`" />
+                    :placeholder="`至少 ${PASSWORD_MIN} 位`" />
         </el-form-item>
       </el-form>
       <el-divider content-position="left">账套授权</el-divider>
@@ -161,7 +161,7 @@
         </el-form-item>
         <el-form-item label="新密码">
           <el-input v-model="newPassword" type="password" show-password
-                    :placeholder="`至少 ${PASSWORD_MIN} 位，且包含两类字符`" />
+                    :placeholder="`至少 ${PASSWORD_MIN} 位`" />
         </el-form-item>
       </el-form>
       <!-- 重置口令 = 撤销该账号的全部在用令牌（审计 P2-01）。
@@ -220,14 +220,15 @@ const USERNAME_MIN = 2
 // 把一行撑成两行 —— 看起来像多了一条记录）。
 const USERNAME_BAD = new RegExp('[\\s\\x00-\\x1f\\x7f]')
 
-// 口令策略：**长度 + 至少两类字符**（大写 / 小写 / 数字 / 符号）。
-// 单类字符（「aaaaaaaa」）看着长，字典一撞就开；要求四类齐备又太苛刻。
+// 密码策略：**只有长度**（与后端 app/core/security.py 同一把尺）。
+//
+// **不再要求两类字符**（用户 2026-10-23 定的口径）：全部数字也认。
+// 真正兜底的是登录失败锁定与 PBKDF2 的成本，不是字符的花样；要求「两类」
+// 拦下的是随手敲出来的数字串，而那种密码本来就不该被禁止 —— 逼人为了凑
+// 花样写一个自己记不住的密码，净损失。
 function passwordProblem(password) {
-  if (!password) return '口令不能为空'
-  if (password.length < PASSWORD_MIN) return `口令至少 ${PASSWORD_MIN} 位`
-  const classes = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/]
-    .filter(re => re.test(password)).length
-  if (classes < 2) return '口令至少要包含两类字符（大写 / 小写 / 数字 / 符号）'
+  if (!password) return '密码不能为空'
+  if (password.length < PASSWORD_MIN) return `密码至少 ${PASSWORD_MIN} 位`
   return ''
 }
 

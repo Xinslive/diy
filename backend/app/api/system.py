@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import re
-import string
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -31,9 +30,11 @@ from app.core import system_settings
 from app.core import lockout
 from app.core.db import SessionLocal, get_db
 from app.core.deps import get_current_user, require_admin, require_recent_admin_mfa
-from app.core.security import hash_password
-from app.models import (SCOPE_SYSTEM, STATUS_FAILED, TIER_DAILY, AuditLog,
-                        BackupRun, Book, SysUser, UserBook)
+from app.core.security import (PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH,
+                               hash_password, password_policy_error)
+from app.models import (REAL_NAME_MAX_LENGTH, SCOPE_SYSTEM, STATUS_FAILED,
+                        TIER_DAILY, AuditLog, BackupRun, Book, SysUser,
+                        UserBook)
 from app.models.scheduler import ScheduledTask, ScheduledTaskRun
 from app.notify import config as notify_config
 from app.notify import events as notify_events
@@ -167,66 +168,20 @@ USERNAME_SHAPE_NOTE = (
     "（用户名会写进审计日志与告警邮件，换行会伪造出多出来的记录）"
 )
 
-#: 姓名的长度上限，**与列宽一致**（``sys_user.real_name`` 是 ``String(64)``）。
-#:
-#: 不加这个上限，超长时数据库抛 ``StringDataRightTruncation``（sqlstate
-#: ``22001``）⇒ 接口回 **500「数据库内部错误」** —— 那是一句纯入参问题，
-#: 却长得像数据库故障，把排障方向整个带偏（审计 P2-6）。加了它就是 422，
-#: 与同一批接口里 ``username`` 的处理一致。
-REAL_NAME_MAX_LENGTH = 64
-
 # --------------------------------------------------------------------- 口令策略
 #
-# **口径只收在这里**（审计 P2-1）。建号与重置两条路径**共用**下面这几个值 ——
-# 过去是三套不同的下限（建号 6 位、重置**没有**下限、自助注册 8 位），
+# **口径收在 app/core/security.py 一处**（审计 P2-1）：建号、重置与
+# 「本人自助改密」问的是同一个问题 —— 「这个口令算不算一个可用的口令」。
+# 过去这三处各写一份（建号 6 位、重置**没有**下限、自助注册 8 位），
 # 而最危险的那条（管理员重置）恰恰是唯一一条没有下限的：把账号口令重置成
 # 1 个字符，系统照收，而且那个口令**立即可用**。
 #
-# **下限 6 位**（用户 2026-10-22 定的口径）：自助注册与管理员建号**用同一把
-# 尺**，不再「注册比建号更严」。8 位那条是 2026-10-20 审计后加的，理由是
-# 「离线爆破一个 6 位口令是常规操作」—— 那条理由仍然成立，所以**复杂度下限
-# 留着**：至少 2 类字符；真正兜底的是 PBKDF2 的成本与登录失败锁定，不是一个
-# 位数。**存量用户不受影响**（见下），改下限不追溯既有口令。
+# 搬家的理由不是「想让它更整齐」，而是**自助改密这条新路必须与建号用同一把
+# 尺** —— 两处各判一次的话，迟早会对不上，而对不上的那一次一定是「更松」
+# 的那处（新建的那条路径没人记得它的规矩）。
 #
-# **复杂度：至少 2 类字符**（大写 / 小写 / 数字 / 符号）。
-# 单类字符（「aaaaaaaa」）看着长，字典与规则化爆破一撞就开；而要求 4 类
-# 齐备又会把「顺手敲出来的口令」挡掉 —— 那是把「难猜」换成了「难记」，
-# 而难记的口令会被写在便利贴上贴在显示器旁，净损失。
-#
-# **存量用户不受影响**：口令策略**只在真的要设新口令时**校验。改姓名、改
-# 状态、走一遍「改别的字段」都**不**触发它 —— 否则历史口令只有 6 位的用户
-# 在管理员想给他改个电话时会被卡住，而「改别的字段也要重设口令」正是把
-# 存量用户逼着改口令的最坏理由。
-PASSWORD_MIN_LENGTH = 6
-PASSWORD_MAX_LENGTH = 128
-PASSWORD_MIN_CHAR_CLASSES = 2
-
-
-def password_policy_error(password: str) -> Optional[str]:
-    """口令不合策略时返回一句**给管理员看**的话；合规返回 ``None``。
-
-    建号与重置共用这一个判断 —— 别两处各写一遍（写两遍就会改一处漏一处，
-    而「最危险的那条没有下限」正是这么来的）。
-    """
-    if password is None:
-        return None
-    if len(password) < PASSWORD_MIN_LENGTH:
-        return f"口令至少 {PASSWORD_MIN_LENGTH} 位"
-    if len(password) > PASSWORD_MAX_LENGTH:
-        return f"口令最长 {PASSWORD_MAX_LENGTH} 位"
-    classes = 0
-    if any(c.islower() for c in password):
-        classes += 1
-    if any(c.isupper() for c in password):
-        classes += 1
-    if any(c.isdigit() for c in password):
-        classes += 1
-    if any(c in string.punctuation for c in password):
-        classes += 1
-    if classes < PASSWORD_MIN_CHAR_CLASSES:
-        return (f"口令至少要包含两类字符"
-                f"（大写 / 小写 / 数字 / 符号），当前只有 {classes} 类")
-    return None
+# 顶层那句 import 让 `app.api.system.password_policy_error` 仍然解析得到：
+# 口径搬了家，但**别人引用它的路径不该跟着搬家**。
 
 
 class UserIn(BaseModel):

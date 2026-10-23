@@ -1,5 +1,6 @@
 from app.models.base import Base
-from app.models.system import SysUser, SystemSetting, UserBook
+from app.models.system import (REAL_NAME_MAX_LENGTH, SysUser, SystemSetting,
+                             UserBook)
 from app.models.book import (Book, BookYear, Period, PeriodOpening, book_first_ord,
                            ord_to_month, period_ord, year_start_ord)
 from app.models.accounting import Entry, Subject, Voucher

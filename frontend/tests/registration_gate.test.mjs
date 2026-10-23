@@ -76,8 +76,11 @@ test('注册页不再显示「（至少 N 位）」这类口令长度提示', ()
 test('注册页的口令下限与后端是同一个数', () => {
   // 前端常量与后端 PASSWORD_MIN_LENGTH 各写一份，两边不一样时用户看到的是
   // 前端拦下的那句「至少 N 位」，而后端会回另一条 —— 两句对不上。
+  // 后端的口令下限**只有一处**（app/core/security.py）：建号、重置、
+  // 自助注册、本人自助改密四条路径共用它。读别的文件就会在「口径搬了家」
+  // 的时候静默读不到 —— 这条测试正是为了让那次搬家被看见。
   const backend = fs.readFileSync(
-    new URL('../../backend/app/api/system.py', import.meta.url), 'utf8')
+    new URL('../../backend/app/core/security.py', import.meta.url), 'utf8')
   const b = backend.match(/PASSWORD_MIN_LENGTH = (\d+)/)
   assert.ok(b, '后端读不到 PASSWORD_MIN_LENGTH')
   const f = LOGIN.match(/const PASSWORD_MIN = (\d+)/)
