@@ -84,13 +84,16 @@
       </el-dropdown>
     </header>
 
-    <!-- ── 标签栏：打开过的页面，可关闭、可左右翻 ───────────────────── -->
+    <!-- ── 标签栏：打开过的页面，可关闭、可刷新 ─────────────────────── -->
     <div class="tabbar no-print">
-      <button class="tb-btn" :disabled="!tabs.canClosePrev" title="关闭上一页" @click="closePrev">
-        <el-icon><ArrowLeft /></el-icon>
-      </button>
-      <button class="tb-btn" :disabled="!tabs.canClosePrev" title="关闭下一页" @click="closeNext">
-        <el-icon><ArrowRight /></el-icon>
+      <!-- 刷新：把当前页重新拉一遍。
+           原来的两个「关闭上一页 / 关闭下一页」按钮去掉了 ——
+           关标签这件事右侧的「标签操作」下拉已经能做（关闭其他 / 关闭全部），
+           而「翻到相邻那一页再把它关掉」这个动作本身很容易误伤：
+           标签排到一屏开不下时，这两支按钮点下去关掉的是**人没打算关的那一条**。 -->
+      <button class="tb-btn" :disabled="refreshing"
+              :title="refreshing ? '正在刷新' : '刷新当前页'" @click="refreshView">
+        <el-icon><Refresh /></el-icon>
       </button>
       <button class="tb-btn" title="回到首页" @click="router.push('/books')">
         <el-icon><HomeFilled /></el-icon>
@@ -138,7 +141,7 @@ import { useTabsStore } from '@/stores/tabs'
 import { landingOf, menuKeyOf, visibleNav } from '@/router/nav'
 import { pluginEntries } from '@/plugins/runtime'
 import {
-  ArrowDown, ArrowLeft, ArrowRight, Close, DArrowRight, Expand, Fold, HomeFilled,
+  ArrowDown, Close, DArrowRight, Expand, Fold, HomeFilled, Refresh,
 } from '@element-plus/icons-vue'
 
 const store = useSessionStore()
@@ -153,11 +156,48 @@ const nav = computed(() => visibleNav(store.isAdmin, pluginEntries.value))
 // **期初余额页例外**：它的口径是**年度**，跟月份无关。所以它的 key 用年度
 // 而不是期间 —— 否则顶栏切一下月份就重挂整页，用户刚录了一半的数直接没了，
 // 而页面上摆的还是同一份数（换了页还得重新拉一次，白白闪一下）。
+//
+// **末尾那一段是刷新计数**：刷新按钮加一 → key 变 → 当前页重挂 →
+// 页面自己按当前账套/期间重新取数。这是「刷新」在本应用里的实现方式，
+// 不是整页 reload（理由见 refreshView 的注释）。
 const viewKey = computed(() => {
   if (route.meta.pluginId) return `plugin-${route.meta.pluginId}`
   const scope = route.name === 'openings' ? store.currentYear : store.periodId
-  return `${route.name}-${store.bookId}-${scope}`
+  return `${route.name}-${store.bookId}-${scope}-${refreshKey.value}`
 })
+
+/**
+ * 刷新当前页。
+ *
+ * **重挂当前页，而不是整页 reload。** 整页 reload 要重新走一遍路由守卫、
+ * 重新登录态恢复，还会把「停在哪个账套、哪一期」重算一遍 ——
+ * 而那套落位规则会把人带回「最早还在用的那个月」，
+ * 于是「刷新一下看看」这个动作顺带把位置也挪了。重挂只换当前这一页，
+ * 标签、账套、期间都原样不动。
+ *
+ * **先拉账套/期间，再重挂。** 顶栏的账套与期间是全局上下文：
+ * 别人刚把 12 月结账了，月份下拉就该跟着变，而页面自己只认「当前这一期」。
+ *
+ * **插件页不重挂。** 插件保留它自己选的目标账套和没保存的预览
+ * （见上面 viewKey 的注释），重挂等于替用户把没存的东西扔了。
+ * 插件页上这个按钮只刷新全局上下文，页面内容由插件自己管。
+ */
+const refreshKey = ref(0)
+const refreshing = ref(false)
+
+async function refreshView() {
+  if (refreshing.value) return
+  refreshing.value = true
+  try {
+    await store.loadBooks()
+  } catch {
+    // 拉不到也让页面重挂：它自己取数时会再报一次错。
+    // 在这里吞掉、页面却还是旧数据，才是最坏的那种「点了没反应」。
+  } finally {
+    refreshKey.value += 1
+    refreshing.value = false
+  }
+}
 
 /** 当前标签页 / 侧栏高亮的 key —— 凭证三种路由共用一个入口，所以不能直接用 route.name */
 const activeKey = computed(() => menuKeyOf(route.name))
@@ -271,15 +311,6 @@ watch(() => `${route.name} ${route.fullPath || route.path}`, () => tabs.open(rou
 function closeTab(key) {
   const { next } = tabs.close(key, activeKey.value)
   if (next) router.push(next)
-}
-
-function closePrev() {
-  const i = tabs.indexOfKey(activeKey.value)
-  if (i > 0) closeTab(tabs.opened[i - 1].key)
-}
-function closeNext() {
-  const i = tabs.indexOfKey(activeKey.value)
-  if (i >= 0 && i < tabs.opened.length - 1) closeTab(tabs.opened[i + 1].key)
 }
 
 function onTabCommand(cmd) {

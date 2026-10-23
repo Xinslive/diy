@@ -147,8 +147,7 @@ export const useTabsStore = defineStore('tabs', {
       for (const p of s.pluginItems) m[p.menu.name] = p.menu.title
       return m
     },
-    /** 当前标签在标签栏里的位置，-1 表示还没打开（理论上不会发生） */
-    indexOfKey: (s) => (key) => s.opened.findIndex((t) => t.key === key),
+    /** 标签栏里除当前这一条之外还有没有别的标签（关标签的下拉用） */
     canClosePrev: (s) => s.opened.length > 1,
   },
   actions: {
