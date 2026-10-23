@@ -54,7 +54,7 @@ def get_current_user(
     if int(payload.get("tv", 0)) != (user.token_version or 0):
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
-            "访问令牌已失效（口令或账号状态已变更），请重新登录")
+            "访问令牌已失效（密码或账号状态已变更），请重新登录")
     return user
 
 

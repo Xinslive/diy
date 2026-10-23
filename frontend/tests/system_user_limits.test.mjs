@@ -7,8 +7,8 @@
  * 原样弹给管理员并不能告诉她该改成什么样。
  *
  * 所以这里钉住的是**两端口径对得上**这件事：三个常量必须与后端一致
- * （用户名 64、姓名 64、口令 6），输入框必须真的挂着 maxlength，
- * 且**重置口令那一条也必须用同一套判据**（过去建号查 6 位、重置查 6 位、
+ * （账号 64、姓名 64、密码 6），输入框必须真的挂着 maxlength，
+ * 且**重置密码那一条也必须用同一套判据**（过去建号查 6 位、重置查 6 位、
  * 后端却是两套不同的下限 —— 「同一个属性三套下限」正是审计 P2-1 说的）。
  *
  * 只看源码就下断言：这些事说的都是「界面上有没有这个东西」，
@@ -35,7 +35,7 @@ const t = (name, fn) => {
 
 console.log('== 入参约束与后端对齐 ==')
 
-t('用户名长度上限是 64（与 sys_user.username 的列宽一致）', () => {
+t('账号长度上限是 64（与 sys_user.username 的列宽一致）', () => {
   assert.equal(constValue('USERNAME_MAX'), 64)
 })
 
@@ -43,7 +43,7 @@ t('姓名长度上限是 64（与 sys_user.real_name 的列宽一致）', () => 
   assert.equal(constValue('REAL_NAME_MAX'), 64)
 })
 
-t('口令下限是 6 位（与后端 PASSWORD_MIN_LENGTH 一致）', () => {
+t('密码下限是 6 位（与后端 PASSWORD_MIN_LENGTH 一致）', () => {
   assert.equal(constValue('PASSWORD_MIN'), 6)
 })
 
@@ -52,7 +52,7 @@ t('两个输入框都挂着 maxlength —— 不然超长要到提交时才发�
   assert.match(VIEW, /v-model="userForm\.real_name"[^>]*:maxlength="REAL_NAME_MAX"/)
 })
 
-t('建号与重置口令用的是同一个判据', () => {
+t('建号与重置密码用的是同一个判据', () => {
   // 建号
   assert.match(VIEW, /function saveUser\(\)[\s\S]*?passwordProblem\(userForm\.password\)/)
   // 重置
@@ -64,7 +64,7 @@ t('用户名形状校验在（换行/空格会被拒）', () => {
   assert.match(VIEW, /USERNAME_BAD\.test\(username\)/)
 })
 
-t('口令位数不写死在文案里 —— 提示一律跟着常量走', () => {
+t('密码位数不写死在文案里 —— 提示一律跟着常量走', () => {
   // 写死的「至少 8 位」这类文案与真正的下限**分处两地**，改一次就要改两处，
   // 而漏改的那一处不会报错：它只是在界面上悄悄变成一句假话。
   // 下限从 8 改成 6 之后，这条钉的就是「别再写死数字」。

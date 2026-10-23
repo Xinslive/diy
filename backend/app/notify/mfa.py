@@ -569,7 +569,7 @@ def _mail_text(username: str, link: str, ttl_minutes: int, reason: str) -> tuple
         f"{link}\n\n"
         "这个链接只能确认「是我在操作」，它本身不是登录凭证。\n"
         "确认之后请回到发起登录的那个浏览器窗口，点击「我已验证」继续。\n\n"
-        "如果这不是你本人的操作，请立刻到「用户与授权」页重置管理员口令，"
+        "如果这不是你本人的操作，请立刻到「用户与授权」页重置管理员密码，"
         "并联系运维核查操作日志。\n"
     )
     return subject, body

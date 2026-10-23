@@ -61,7 +61,7 @@
         <el-tab-pane label="登录" name="login">
           <el-form @submit.prevent="submitLogin">
             <el-form-item>
-              <el-input v-model="username" placeholder="用户名" size="large" @keyup.enter="submitLogin" />
+              <el-input v-model="username" placeholder="账号" size="large" @keyup.enter="submitLogin" />
             </el-form-item>
             <el-form-item>
               <el-input v-model="password" type="password" placeholder="密码" size="large"
@@ -207,7 +207,7 @@ onMounted(() => { ticker = setInterval(() => { now.value = Date.now() }, 1000) }
 onUnmounted(() => { if (ticker) clearInterval(ticker) })
 
 async function submitLogin() {
-  if (!username.value || !password.value) return ElMessage.warning('请填写用户名和密码')
+  if (!username.value || !password.value) return ElMessage.warning('请填写账号和密码')
   busy.value = true
   try {
     const r = await store.login(username.value, password.value)

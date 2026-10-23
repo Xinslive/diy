@@ -44,7 +44,7 @@
       />
 
       <el-table :data="users" border size="default">
-        <el-table-column prop="username" label="用户名" width="130" />
+        <el-table-column prop="username" label="账号" width="130" />
         <el-table-column prop="real_name" label="姓名" width="130" />
         <el-table-column label="状态" width="90">
           <template #default="{ row }">
@@ -98,7 +98,7 @@
     <!-- 新建用户 -->
     <el-dialog v-model="dlgUser" title="新建用户" width="520px">
       <el-form :model="userForm" label-width="86px">
-        <el-form-item label="用户名">
+        <el-form-item label="账号">
           <el-input v-model="userForm.username" :maxlength="USERNAME_MAX" show-word-limit />
         </el-form-item>
         <el-form-item label="姓名">
@@ -164,8 +164,8 @@
                     :placeholder="`至少 ${PASSWORD_MIN} 位`" />
         </el-form-item>
       </el-form>
-      <!-- 重置口令 = 撤销该账号的全部在用令牌（审计 P2-01）。
-           这条以前不做，于是「口令泄露后重置口令」根本挡不住旧令牌。
+      <!-- 重置密码 = 撤销该账号的全部在用令牌（审计 P2-01）。
+           这条以前不做，于是「密码泄露后重置密码」根本挡不住旧令牌。
            代价是这个人要重新登录一次 —— 得让人看见，不然会以为是系统坏了。 -->
       <el-alert
         type="warning" :closable="false" show-icon
@@ -216,7 +216,7 @@ const REAL_NAME_MAX = 64       // 与 sys_user.real_name 的列宽一致
 const PASSWORD_MIN = 6         // 与后端 PASSWORD_MIN_LENGTH 一致
 const USERNAME_MIN = 2
 
-// 用户名的形状约束：不能有空白与控制字符（换行会写进审计日志与告警邮件，
+// 账号的形状约束：不能有空白与控制字符（换行会写进审计日志与告警邮件，
 // 把一行撑成两行 —— 看起来像多了一条记录）。
 const USERNAME_BAD = new RegExp('[\\s\\x00-\\x1f\\x7f]')
 
@@ -233,11 +233,11 @@ function passwordProblem(password) {
 }
 
 function usernameProblem(username) {
-  if (!username) return '用户名不能为空'
-  if (username.length < USERNAME_MIN) return `用户名至少 ${USERNAME_MIN} 位`
-  if (username.length > USERNAME_MAX) return `用户名最长 ${USERNAME_MAX} 位`
+  if (!username) return '账号不能为空'
+  if (username.length < USERNAME_MIN) return `账号至少 ${USERNAME_MIN} 位`
+  if (username.length > USERNAME_MAX) return `账号最长 ${USERNAME_MAX} 位`
   if (USERNAME_BAD.test(username)) {
-    return '用户名不能包含空格、换行或控制字符（它会写进审计日志与告警邮件）'
+    return '账号不能包含空格、换行或控制字符（它会写进审计日志与告警邮件）'
   }
   return ''
 }
@@ -410,7 +410,7 @@ async function savePassword() {
   )
   dlgReset.value = false
   if (isSelf) {
-    // 自己重置自己的口令 = 自己的令牌也被撤销了。与其等下一次请求撞 401
+    // 自己重置自己的密码 = 自己的令牌也被撤销了。与其等下一次请求撞 401
     // 再被全局拦截器踢出去，不如当场说清楚。
     store.logout()
     router.push({ name: 'login' })

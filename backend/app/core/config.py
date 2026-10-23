@@ -766,7 +766,7 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
 
     if _db_password(settings.database_url) == DEFAULT_DB_PASSWORD:
         problems.append(
-            f"数据库口令仍是默认值（{DEFAULT_DB_PASSWORD!r}）—— "
+            f"数据库密码仍是默认值（{DEFAULT_DB_PASSWORD!r}）—— "
             "同样公开在源码里")
 
     # P3-14：级别配置对了不代表级别**安全**。生产开 DEBUG 时，
@@ -798,12 +798,12 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
             "生产配置校验不通过，拒绝启动：\n  - "
             + "\n  - ".join(problems)
             + "\n  改法：生成一个随机长串 openssl rand -hex 32，"
-              "写进部署环境的 JWT_SECRET；数据库口令一并换掉。"
+              "写进部署环境的 JWT_SECRET；数据库密码一并换掉。"
               "若确实只想在开发环境跑，设 APP_ENV=dev。")
 
     checks = [
         f"JWT_SECRET 非默认值且 ≥{MIN_SECRET_BYTES} 字节",
-        "数据库口令非默认值",
+        "数据库密码非默认值",
         f"日志级别 {settings.log_level}（生产不允许 DEBUG）",
     ]
     log.info("生产配置校验通过：%s", "；".join(checks))
@@ -829,7 +829,7 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
     elif not settings.login_ip_throttle_enabled:
         log.warning(
             "LOGIN_IP_THROTTLE_ENABLED=false：IP 维度登录节流已关闭，"
-            "轮换用户名的爆破将不受任何聚合限制（这是显式的 fail-open）。")
+            "轮换账号名的爆破将不受任何聚合限制（这是显式的 fail-open）。")
 
     # MCP 的 DNS 重绑定防护同理：它默认**关着**（这里留空 ⇒ 传输层不做
     # Host 校验），配了 ``MCP_ALLOWED_HOSTS`` 才开。

@@ -114,7 +114,7 @@ DEFAULT_ENDPOINT_SCHEME = "https://"
 #: 显式写了 ``http://`` 时给运维看的文案。必须自带「改成什么」，
 #: 否则这条报错只会被当成「配置坏了」。
 INSECURE_ENDPOINT_NOTE = (
-    "OSS endpoint 必须是 https://。备份制品里是全账套凭证、金额与用户口令散列，"
+    "OSS endpoint 必须是 https://。备份制品里是全账套凭证、金额与用户密码散列，"
     "而 Authorization 头里的 AccessKey ID 与请求签名也会跟着明文过网 —— "
     "捕获后可重放同一个 PUT，覆盖 OSS 上的备份对象。\n"
     "  请把 endpoint 改成带 https:// 的形式，例如："

@@ -103,7 +103,7 @@ def test_改密要留审计(client, db, admin_user, plain_user):
                  json={"password": "brandnew123"})
 
     entry = [x for x in _logs(db, "UPDATE_USER") if str(x.entity_id) == str(plain_user.id)][-1]
-    assert "重置口令" in entry.detail, entry.detail
+    assert "重置密码" in entry.detail, entry.detail
 
 
 @pytest.mark.parametrize("secret", ["secret123", "brandnew123"])

@@ -813,8 +813,8 @@ def restore(db: Session, path: Path, *, dry_run: bool = False,
             reset = _force_password_reset(payloads)
             if reset:
                 logging.getLogger("cwq.backup.export").warning(
-                    "恢复的 %d 个账号已置为「无口令 + 停用」：备份制品不带口令散列，"
-                    "恢复后必须逐个重置口令并启用（先给一个管理员重置口令，"
+                    "恢复的 %d 个账号已置为「无密码 + 停用」：备份制品不带密码散列，"
+                    "恢复后必须逐个重置密码并启用（先给一个管理员重置密码，"
                     "否则没有人能登录）。", reset)
         db.execute(table.insert(), _ordered_rows(table, payloads))
         counts[table.name] = len(payloads)

@@ -88,7 +88,7 @@ def test_登录失败要留审计(client, db, admin_user):
     assert rows, "登录失败没有留审计记录 —— 爆破在日志里不留任何痕迹"
     entry = rows[-1]
     assert admin_user.username in entry.detail
-    assert "口令" in entry.detail
+    assert "密码" in entry.detail
     assert entry.user_id == admin_user.id
 
 

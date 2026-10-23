@@ -276,10 +276,10 @@ def _validate_registration(payload: RegisterIn) -> None:
     if not (_REGISTER_USERNAME_MIN <= len(username) <= _REGISTER_USERNAME_MAX):
         raise HTTPException(
             422,
-            f"用户名长度必须在 {_REGISTER_USERNAME_MIN} 到 "
+            f"账号长度必须在 {_REGISTER_USERNAME_MIN} 到 "
             f"{_REGISTER_USERNAME_MAX} 位之间")
     if not _REGISTER_USERNAME_RE.match(username):
-        raise HTTPException(422, "用户名只能包含字母、数字与下划线")
+        raise HTTPException(422, "账号只能包含字母、数字与下划线")
     if not (_REGISTER_PASSWORD_MIN <= len(payload.password or "")
             <= _REGISTER_PASSWORD_MAX):
         raise HTTPException(
@@ -925,7 +925,7 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
         _audit_login(False, db, ip, user, payload.username, "账号已停用")
         _note_source_failure(db, payload, src, now)
         db.commit()
-        raise HTTPException(401, "用户名或密码错误")
+        raise HTTPException(401, "账号或密码错误")
 
     if user is not None:
         left = _lock_left(user)
@@ -974,14 +974,14 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
     if user is None:
         # 等量计算：不存在的用户名也要走完一次口令校验（见 _dummy_hash）。
         verify_password(payload.password, _dummy_hash())
-        _audit_login(False, db, ip, None, payload.username, "用户名不存在",
+        _audit_login(False, db, ip, None, payload.username, "账号不存在",
                      user_exists=False)
         _note_source_failure(db, payload, src, now)
         db.commit()
-        raise HTTPException(401, "用户名或密码错误")
+        raise HTTPException(401, "账号或密码错误")
 
     if not verify_password(payload.password, user.password_hash):
-        _audit_login(False, db, ip, user, payload.username, "口令错误",
+        _audit_login(False, db, ip, user, payload.username, "密码错误",
                      user_exists=True, failed_logins=user.failed_logins)
         # 「这个来源在扫」的跨线事件由 _note_source_failure 统一留 ——
         # 四条失败路径共用一个入口，少一条就等于给攻击者留了一条免费的路。
@@ -1034,7 +1034,7 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
                 username=user.username, real_name=user.real_name or "",
                 ip=ip, minutes=locked["minutes"], level=locked["level"],
                 threshold=settings.login_max_failures)
-        raise HTTPException(401, "用户名或密码错误")
+        raise HTTPException(401, "账号或密码错误")
 
     # 登录成功即清零：否则一次误输留下的计数会跟后面几次正常登录叠起来，
     # 最终把一个从没被人猜过的账号锁住。
@@ -1125,7 +1125,7 @@ def _start_admin_mfa(db: Session, user: SysUser, request: Request,
         db, user, reason="login", ip=ip,
         user_agent=request.headers.get("user-agent", ""))
     _mfa_audit(db, core_audit.MFA_ACTION_SENT, user,
-               f"口令已通过，已向通知邮箱发送二次验证链接：{user.username}（{ip}）",
+               f"密码已通过，已向通知邮箱发送二次验证链接：{user.username}（{ip}）",
                username=user.username[:64], ip=ip, challenge_id=challenge.id,
                reason="login")
     db.commit()

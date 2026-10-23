@@ -164,8 +164,8 @@ class BookLinkIn(BaseModel):
 USERNAME_PATTERN = re.compile(r"^[^\s\x00-\x1f\x7f]+$")
 
 USERNAME_SHAPE_NOTE = (
-    "用户名不能包含空格、换行或控制字符"
-    "（用户名会写进审计日志与告警邮件，换行会伪造出多出来的记录）"
+    "账号不能包含空格、换行或控制字符"
+    "（账号会写进审计日志与告警邮件，换行会伪造出多出来的记录）"
 )
 
 # --------------------------------------------------------------------- 口令策略
@@ -324,7 +324,7 @@ def update_user(user_id: int, payload: UserPatch, user: SysUser = Depends(get_cu
         if _active_admin_count(db, exclude_id=target.id) == 0:
             raise HTTPException(
                 409,
-                "不能停用最后一个系统管理员：停用之后没有人能开号、改口令与授权，"
+                "不能停用最后一个系统管理员：停用之后没有人能开号、改密码与授权，"
                 "系统管理面将无人可用（唯一出口是运维跑脚本）。"
                 "请先启用另一个管理员，再停用这一个。",
             )
@@ -361,7 +361,7 @@ def update_user(user_id: int, payload: UserPatch, user: SysUser = Depends(get_cu
     if payload.active is not None and payload.active != before["active"]:
         did.append("启用账号" if payload.active else "停用账号")
     if password_changed:
-        did.append("重置口令")
+        did.append("重置密码")
     if payload.real_name is not None and payload.real_name != before["real_name"]:
         did.append("修改姓名")
     if revoked:
@@ -454,7 +454,7 @@ def delete_user(user_id: int, user: SysUser = Depends(get_current_user),
     if target.is_admin and _active_admin_count(db, exclude_id=target.id) == 0:
         raise HTTPException(
             409,
-            "不能删除最后一个系统管理员：删掉之后没有人能开号、改口令与授权，"
+            "不能删除最后一个系统管理员：删掉之后没有人能开号、改密码与授权，"
             "系统管理面将无人可用（唯一出口是运维跑脚本）。"
             "请先新建另一个管理员并给它授权，再删这一个。",
         )
@@ -899,7 +899,7 @@ def put_notify_config(payload: NotifyConfigPatch,
         entity_id="notify",
         user=user,
         detail="更新邮件通知配置"
-               + ("（含口令）" if (payload.password or payload.clear_password) else ""),
+               + ("（含密码）" if (payload.password or payload.clear_password) else ""),
         before={k: before.get(k) for k in
                 ("host", "port", "username", "password_hint",
                  "from_address", "use_ssl", "use_tls", "recipients", "enabled")},
