@@ -53,18 +53,28 @@ BATCH_TTL_SQL = (
     "DELETE FROM import_batch WHERE status = 'PENDING' AND created_at < :cutoff")
 
 
-def _plan(db, sql: str, params: dict, *, force_index: bool = True) -> list[str]:
+def _plan(db, sql: str, params: dict, *, force_index: bool = True,
+          no_bitmap: bool = False) -> list[str]:
     """跑一条 EXPLAIN 并返回计划文本。
 
     ``force_index=True`` 时关掉 seqscan：断言的是「**存在一条能用的索引**」，
     而测试库只有几千行、PG 在那个量级上选 Seq Scan 与索引扫描纯属噪声。
     关掉只是把这个选择固定住，免得用例随统计信息抖动（VACUUM 一次就翻面）。
+
+    ``no_bitmap=True`` 时连 bitmap 路径也关掉：有些断言要钉的是**计划的形状**
+    （走索引、且不用回堆），而 bitmap 扫描与索引扫描的**成本可能只差 0.01**
+    （实测 8.14 vs 8.15），谁赢取决于当轮库里累积的物理状态 ——
+    留着它就等于把断言交给运气。
     """
     if force_index:
         db.execute(text("SET enable_seqscan = off"))
+    if no_bitmap:
+        db.execute(text("SET enable_bitmapscan = off"))
     try:
         return [r[0] for r in db.execute(text("EXPLAIN " + sql), params)]
     finally:
+        if no_bitmap:
+            db.execute(text("SET enable_bitmapscan = on"))
         if force_index:
             db.execute(text("SET enable_seqscan = on"))
 
@@ -136,21 +146,34 @@ def test_凭证按科目筛选不再需要回堆(db, book, subjects, make_vouche
     这条断言的是**收益**而不是「有索引就行」—— 单列 subject_id 索引同样
     能过上一条，却要多一次 heap fetch 才能拿到 voucher_id。
 
-    Index Only Scan 要求命中页在可见性图（visibility map）里被标成
-    all-visible，而刚灌完数据的表一页都不是 —— 所以这里先 VACUUM。
+    **这条用例曾经时好时坏，原因不在「有没有索引」，而在「优化器在两条
+    成本几乎一样的路里挑了哪条」。** 目标形状有两条候选：``Index Only Scan``
+    （voucher_id 就在索引里，不用回堆）和 ``Bitmap Heap Scan``（同一个索引，
+    但要回堆取页）。两条路的价格随**命中页在可见性图里是不是 all-visible**
+    摆动：页不是 all-visible 时，优化器给 Index Only 补一笔「回堆取数」的
+    估算成本，合计 **8.14**，而 Bitmap Heap Scan 是 **8.15** —— **只差 0.01**，
+    谁赢取决于当轮库里累积的物理状态；页碰巧是 all-visible 时 Index Only
+    降到 4.15，余量变成 2 倍，于是又稳稳地赢。这就是「单跑永远绿、全量跑
+    时好时坏」的来源。
+
+    **为什么不能靠 VACUUM 把「页 all-visible」这个前提做实。** 夹具每条用例
+    前会把业务表整表 DELETE 干净（conftest 里「为什么不用 TRUNCATE」那段：
+    外键是 NO ACTION/RESTRICT，只能按依赖顺序逐表删）。清库之后这条表被
+    截成 0 页，新灌进去的两行落在一页**全新的页**上，那一页上没有死元组
+    可剪，VACUUM 也就没有理由给它打 all-visible 标记。实测在失败那一轮：
+    VACUUM 之后 ``pg_class.relallvisible`` 仍是 0，
+    ``pg_visibility_map('entry')`` 里第 0 页仍是 ``all_visible=False``。
+    更要紧的是 **REINDEX 重建的是索引，碰不到堆的可见性图** ——
+    2026-10 那次「加 REINDEX 就好了」的修复其实没修掉偶发红，只是把症状
+    推迟了（当年 docstring 里「死元组卡在页中间 VACUUM 清不掉」是误诊）。
+
+    **所以这里换一种钉法：把优化器的竞争路径摘掉，而不是放宽期望。**
+    ``_plan(..., no_bitmap=True)`` 关掉 bitmap 这条路，于是计划形状恒定：
+    索引覆盖输出列时是 ``Index Only Scan``（不回堆，正是这条用例要的收益），
+    索引退回单列时是 ``Index Scan``（要回堆，正是要防的那个退化）——
+    **索引缺列这个回归照样会红**，期望值没有被削弱。
+
     VACUUM 不能跑在 ``db`` 夹具的事务里，自己开一条 autocommit 连接。
-
-    **为什么还要 REINDEX（这是 2026-10 启用「用例之间清库」之后才暴露的）。**
-    夹具现在每条用例前会把业务表**整表 DELETE** 干净。DELETE 会给索引留下
-    **死元组**，而 btree 只有在死项位于页尾、或能被 ``kill_prior_tuple``
-    回收时才可能把该页标成 all-visible —— 卡在页中间的死项，VACUUM 清不掉。
-    于是「VACUUM 之后索引页全可见」这件事**不再成立**：命中页上混着上几轮
-    清库留下的死项，计划就从 ``Index Only Scan`` 退化成 ``Index Scan``
-    （后者要回堆取 voucher_id，正是这条用例要防的那个退化）。
-
-    症状是**时好时坏**：同一个用例，单独跑永远绿（全量跑时它前面那个 worker
-    攒了几百次清库，索引早就脏了）。所以这里把物理前提写死在用例里 ——
-    **REINDEX 之后索引是全新的，页天然 all-visible**，不再依赖上一轮跑过什么。
     """
     import sqlalchemy as sa
 
@@ -160,14 +183,19 @@ def test_凭证按科目筛选不再需要回堆(db, book, subjects, make_vouche
     vacuum = sa.create_engine(app_engine.url, isolation_level="AUTOCOMMIT")
     try:
         with vacuum.connect() as c:
+            # ANALYZE：刷新 planner 的行数/页数估算，让计划基于刚灌进去的
+            # 这两行，而不是上一轮清库之后的旧统计。
             c.execute(text("VACUUM (ANALYZE) entry"))
-            # 重建索引：把清库留下的死元组一并清掉，页才能标成 all-visible。
+            # REINDEX：把清库留下的索引膨胀清掉、把索引页数刷成真实值。
+            # 注意它**只重建索引**，碰不到堆的可见性图 —— 别再把它当成
+            # 「让页 all-visible」的手段。
             c.execute(text("REINDEX TABLE entry"))
     finally:
         vacuum.dispose()
 
     plan = "\n".join(_plan(db, SUBJECT_FILTER_SQL,
-                           {"sid": subjects["1001"].id}, force_index=True))
+                           {"sid": subjects["1001"].id}, force_index=True,
+                           no_bitmap=True))
     assert "Index Only Scan" in plan, (
         "子查询没能 Index Only，说明白带了 voucher_id 的收益没拿到：\n" + plan)
 
