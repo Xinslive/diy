@@ -111,7 +111,15 @@
             <el-tag v-else type="warning" size="small">未记账</el-tag>
           </template>
         </el-table-column>
-        <el-table-column v-if="store.canWrite" label="操作" width="168" fixed="right">
+        <!-- 操作列宽按**最宽的那一格**算，不按平均：
+             未记账凭证的按钮是「查看/改」（3 个汉字 + 一个半角斜杠 ≈ 50px，
+             加按钮内边距约 56px），已记账是「查看」（34px）；
+             两个按钮之间有 12px 间距，单元格左右内边距各 12px ——
+             所以最宽的一行要 56 + 12 + 34 + 24 = 126px。
+             原来给到 168px，右边空出 40 多像素，窄一窄正好把宽度让给
+             旁边的「状态」列（那一列本来就被右边这列压住一截）。
+             126 是下限，留 6px 余量给不同机器的字体差异：132px。 -->
+        <el-table-column v-if="store.canWrite" label="操作" width="132" fixed="right">
           <template #default="{ row }">
             <!-- 已记账凭证锁定：只能看，改/删都要先退回复记账状态（入口在「期末结账 → 反结账」） -->
             <el-button link type="primary" @click="open(row)">
