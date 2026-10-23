@@ -118,6 +118,12 @@ jobs:
         # 用 PGDG 官方源装指定主版本，并**核对装出来的确实是 16** ——
         # 钉版本这件事本身也要有断言，否则哪天源里没有 16.x 了，
         # apt 会静默装回默认版本，问题原地复现。
+        #
+        # 但**装上不等于用上**：runner 镜像自带 PostgreSQL 客户端 18
+        # （ubuntu-latest 迁到 Ubuntu 26 之后，/usr/bin/pg_dump 是
+        # pg_wrapper，指向**最新装上的那个**），apt 装出来的 16 在
+        # /usr/lib/postgresql/16/bin —— 不在 PATH 上。不把它顶到 PATH
+        # 最前面，断言查的是 18、后面的备份/恢复测试用的也是 18。
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -144,9 +150,30 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client-16
 
+          # **把 16 顶到 PATH 最前面。**
+          #
+          # 2026-10-23 那次 CI 红的就是这里：镜像自带的 pg_dump 18.6 排在
+          # PATH 前面，断言查到 18 直接 exit 1，pytest 根本没跑。
+          # 更要命的是「就算断言松了」的情形 —— 备份/恢复测试会调 18 生成
+          # 的 dump，PG 16 服务端不认里面的版本特有参数。
+          #
+          # $GITHUB_PATH 对**后续步骤**也生效（会被前置到 PATH），所以
+          # 后面的全量 pytest 调到的也是这个 16 —— 这才是「钉版本」的
+          # 真正含义：不是装上，是**用上**。
+          PG16_BIN="/usr/lib/postgresql/16/bin"
+          test -x "$PG16_BIN/pg_dump" || {
+            echo "::error::装完 postgresql-client-16 仍找不到 $PG16_BIN/pg_dump —— 客户端目录布局变了？"
+            exit 1
+          }
+          echo "$PG16_BIN" >> "$GITHUB_PATH"
+          export PATH="$PG16_BIN:${PATH}"
+
           # **断言装出来的确实是 16** —— 钉版本这件事本身也要有断言。
           # 源里没有 16.x 时 apt 会报错；这里再查一遍版本号，是防
           # 「apt 装了别的东西」与「PATH 上还有别的 pg_dump」两种情况。
+          # 现在断言查的是**真正会被调用**的那个 pg_dump。
+          command -v pg_dump
+          command -v psql
           pg_dump --version
           psql --version
           pg_dump --version | grep -qE " 16\." || {
