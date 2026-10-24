@@ -112,14 +112,25 @@ API 只占 210%），应用侧再加进程只是让更多请求同时去挤 PG�
 | `max_wal_size` | **`512MB`** | 磁盘；2 GB 在小盘上会挤掉 `.releases` 的 dump 空间 |
 | `autovacuum_max_workers` | **`2`** | 默认 3 × `autovacuum_work_mem` 会造成尖峰 |
 | `autovacuum_work_mem` | **`32MB`** | 默认 64 MB × 3 workers = 192 MB 尖峰 |
-| `max_parallel_workers` | **`4`** | PG16 默认 8；每个并行 worker 独立吃 `work_mem` |
+| `max_parallel_workers` | **`4`** | PG 默认 8；每个并行 worker 独立吃 `work_mem` |
 | `max_parallel_workers_per_gather` | **`2`** | 每个并行 worker 独立吃 `work_mem` |
 
-**改完必须重启容器**（`ALTER SYSTEM` 只改配置文件）：
+**改完必须重启 PG**（`ALTER SYSTEM` 只改配置文件；而且这台机上的 PG
+**不在容器里** —— 完整改法与判据见第十一节）：
 
 ```bash
-docker exec -it cwq-pg psql -U cwq -d cwq -c "ALTER SYSTEM SET shared_buffers='160MB'; ..."
-docker restart cwq-pg
+# ⚠️ 用宿主机 psql，不是 docker exec —— 这台机上没有名为 cwq-pg 的容器
+sudo -u postgres /usr/lib/postgresql/15/bin/psql -d cwq -c "
+ALTER SYSTEM SET shared_buffers='160MB';
+ALTER SYSTEM SET work_mem='2MB';
+ALTER SYSTEM SET max_connections='30';
+ALTER SYSTEM SET maintenance_work_mem='64MB';
+ALTER SYSTEM SET effective_cache_size='640MB';
+ALTER SYSTEM SET max_wal_size='512MB';
+ALTER SYSTEM SET autovacuum_max_workers='2';
+ALTER SYSTEM SET autovacuum_work_mem='32MB';
+ALTER SYSTEM SET max_parallel_workers=4;
+ALTER SYSTEM SET max_parallel_workers_per_gather=2;"
 ```
 
 ### 1.6 GB 机器的内存预算（改完之后）
@@ -412,3 +423,198 @@ nginx -t && systemctl reload nginx    # 宝塔上用 nginx -s reload
 
 运维要动前端时，改的是 `releases/dist-<commit>-<时间戳>/` 里的内容 ——
 **不要直接改 `dist/`**（那是软链，改的是当前这一份，改完下次发布就没了）。
+
+---
+
+## 十一、生产机上手工做的事（`acct.xins.live` / 8.155.171.57）
+
+**仓库里的改动只是代码。** 这一节列的是**主机状态** —— 代码改不到，
+必须在生产机上执行。每一条都给了判据。
+
+> 数字来自 2026-10-24 的生产机实测：`nproc=2`、`Mem total 1676 MB`、
+> 有 1 GB swap、`oom_kill=0`（**这台机从来没有被 OOM killer 杀过任何进程**）。
+> **先量再改** —— 别把别的机器的数搬过来。
+
+### 11.1 PostgreSQL 换成 1.6 GB 档
+
+**⚠️ 这台机的 PG 不在 Docker 里。** 生产机跑的是 **Debian/Ubuntu 打包的
+宿主机 PostgreSQL 15**（`/usr/lib/postgresql/15/bin/postgres -D /var/lib/postgresql/15/main`），
+监听 `127.0.0.1:5432`，由 `postgresql.service` 管。
+**没有名为 `cwq-pg` 的容器** —— `docker exec cwq-pg psql` 照抄会直接报
+`No such container`。
+
+2026-10-24 实测的**实际生效值**与第四节「1.6 GB 档」的对照：
+
+| 参数 | 实测值 | 1.6 GB 档目标 | 要不要改 |
+|---|---|---|---|
+| `shared_buffers` | 160 MB | 160 MB | ✅ 已达标 |
+| `work_mem` | 4 MB | 2 MB | ⚠️ 要改（4 MB × 30 连接 × 排序 = 峰值翻倍） |
+| `max_connections` | 100 | 30 | ⚠️ 要改（100 个连接 × 4 MB work_mem 就是 400 MB） |
+| `maintenance_work_mem` | 64 MB | 64 MB | ✅ 已达标 |
+| `effective_cache_size` | 5 GB | 640 MB | ⚠️ 要改（**5 GB 远超 1.6 GB 物理内存**，规划器会以为内存无限、按大内存规划查询计划） |
+| `max_wal_size` | 1 GB | 512 MB | ⚠️ 要改（checkpoint 时的 WAL 峰值） |
+| `min_wal_size` | 80 MB | 80 MB | ✅ 可不动 |
+| `autovacuum_max_workers` | 3 | 2 | ⚠️ 2 vCPU 上 3 个 autovacuum 会抢 CPU |
+| `autovacuum_work_mem` | 64 MB（默认） | 32 MB | ⚠️ 要改 |
+| `max_parallel_workers` | 8 | 4 | ⚠️ 2 vCPU 机器上 8 个并行 worker 是自伤 |
+| `max_parallel_workers_per_gather` | 2 | 2 | ✅ 已达标 |
+| `checkpoint_timeout` | 300 s | 300 s | ✅ 可不动 |
+| `random_page_cost` | 4 | 4 | ✅ 可不动（SSD 调 1.1 收益不确定，先不动） |
+
+改法（`ALTER SYSTEM` 写进 `postgresql.auto.conf`，优先级高于
+`postgresql.conf`，且不动主配置文件）：
+
+```bash
+# ⚠️ 用宿主机 psql，不是 docker exec
+sudo -u postgres /usr/lib/postgresql/15/bin/psql -d cwq -c "
+ALTER SYSTEM SET shared_buffers='160MB';
+ALTER SYSTEM SET work_mem='2MB';
+ALTER SYSTEM SET max_connections='30';
+ALTER SYSTEM SET maintenance_work_mem='64MB';
+ALTER SYSTEM SET effective_cache_size='640MB';
+ALTER SYSTEM SET max_wal_size='512MB';
+ALTER SYSTEM SET autovacuum_max_workers='2';
+ALTER SYSTEM SET autovacuum_work_mem='32MB';
+ALTER SYSTEM SET max_parallel_workers=4;
+ALTER SYSTEM SET max_parallel_workers_per_gather=2;"
+```
+
+**其中 5 个参数必须重启 PG 才生效**（`shared_buffers` / `max_connections` /
+`max_wal_size` / `max_parallel_workers` / `autovacuum_max_workers`），
+其余是 `SIGHUP` 级 —— 所以**必须重启，不能只 reload**：
+
+```bash
+# 重启前先记下当前连接数，确认降到 30 不会把现有连接挤掉
+sudo -u postgres /usr/lib/postgresql/15/bin/psql -d cwq -tAc \
+  "select count(*) from pg_stat_activity;"
+systemctl restart postgresql
+```
+
+> **重启 PG 会断开 API 的连接池。** 池带 `pool_pre_ping`，重连是自动的；
+> 但重启窗口内（几秒）接口会 500。**在低峰期做**，重启后立刻按 11.5 的判据
+> 确认 API 自己爬起来了 —— 如果没爬起来，`systemctl restart cwq-api`
+> （那不是故障，是池没恢复）。
+
+**判据**：
+
+```bash
+sudo -u postgres /usr/lib/postgresql/15/bin/psql -d cwq -c \
+  "SHOW shared_buffers; SHOW work_mem; SHOW max_connections; SHOW effective_cache_size;"
+# 期望：160MB / 2MB / 30 / 640MB
+systemctl show postgresql -p ActiveState        # active
+```
+
+### 11.2 systemd 单元
+
+`deploy.sh` **不安装** `cwq-api.service`（它只 `systemctl restart cwq-api`），
+所以必须手工渲染后装上去。
+
+**⚠️ 生产机上已经有一份手工修过路径的 unit**
+（`/etc/systemd/system/cwq-api.service`），它的路径类键已经是
+`/www/wwwroot/acct.xins.live`（不是模板里的 `/opt/cwq`），
+**不能直接拿仓库模板覆盖** —— 覆盖了服务就起不来。
+
+**正确做法：用仓库那份模板，按本机布局渲染**：
+
+```bash
+# 1) 备份现有的手工 unit
+cp -a /etc/systemd/system/cwq-api.service \
+      /etc/systemd/system/cwq-api.service.bak.$(date +%Y%m%d-%H%M%S)
+
+# 2) 从仓库模板渲染（把 /opt/cwq 换成生产路径）
+sed -e 's|/opt/cwq/backups|/www/wwwroot/acct.xins.live/backups|g' \
+    -e 's|/opt/cwq|/www/wwwroot/acct.xins.live|g' \
+    deploy/systemd/cwq-api.service \
+  > /etc/systemd/system/cwq-api.service
+
+# 3) 装之前先让 systemd 自己验一遍语法（装坏了会起不来）
+systemd-analyze verify /etc/systemd/system/cwq-api.service
+
+# 4) 确认可写白名单三行齐全，且没有残留 /opt/cwq
+grep -nE '/opt/cwq' /etc/systemd/system/cwq-api.service    # 应无输出
+grep -n 'ReadWritePaths' /etc/systemd/system/cwq-api.service
+#   期望：/www/wwwroot/acct.xins.live/backend/logs
+#         /www/wwwroot/acct.xins.live/backend/data
+#         /www/wwwroot/acct.xins.live/backups
+
+systemctl daemon-reload && systemctl restart cwq-api
+```
+
+> **发布顺序是硬约束：先发代码，后装这一段。**
+> `MemoryHigh=400M` 是按**优化之后**的稳态（**实测 290 MB**）定的，
+> 而生产上**旧代码**的稳态实测是 **313 MB** —— 先装 unit 再发代码，
+> unit 一装上就会把正在跑的旧版本节流掉，表现为「发版后接口变慢」，
+> 而根因是「上限按新代码的数定的，却先套在了旧代码上」。
+
+### 11.3 logrotate
+
+**2026-10-24 实测确认：`/etc/logrotate.d/` 里确实没有 cwq 相关文件。**
+`unit` 里是 `StandardOutput=append:…/api.log`（append 不轮转）——
+日志只增不减。
+
+```bash
+cp deploy/logrotate/cwq-api /etc/logrotate.d/cwq-api
+# 把里面的 /opt/cwq 换成这台机的实际应用根
+sed -i 's|/opt/cwq|/www/wwwroot/acct.xins.live|g' /etc/logrotate.d/cwq-api
+logrotate -d /etc/logrotate.d/cwq-api    # -d 是演练，不真转
+```
+
+### 11.4 `.env`：三项建议显式写上
+
+生产机当前的 `.env` **已经有的**：`CWQ_API_WORKERS=2`、
+`LEDGER_CACHE_MAXSIZE=16`、`LEDGER_CACHE_TTL_SECONDS=60`、
+`CWQ_BACKUP_WORK_DIR=…/backups/work`（已是推荐值）、
+`INVOICE_STORAGE_DIR=…/backend/data/invoices`。
+
+**下面三项在代码里都有默认值，不配也能正常工作**
+（`ledger_cache_moves_maxsize=4`、`CWQ_API_MAX_CONCURRENCY=32`、
+`CWQ_API_MAX_REQUESTS=2000`）。**建议显式写上**，理由是「配置文件要能读出
+当前生效值」，而不是「不配就会出错」：
+
+```
+LEDGER_CACHE_MOVES_MAXSIZE=4
+CWQ_API_MAX_CONCURRENCY=32
+CWQ_API_MAX_REQUESTS=2000
+CWQ_API_MAX_REQUESTS_JITTER=200
+```
+
+> `CWQ_API_MAX_CONCURRENCY` 注意 **MCP 的 SSE 连接会长期占住一个名额**
+> （nginx 侧读超时 360 s）。真的不够用就调大。
+
+### 11.5 发布后验收（判据）
+
+```bash
+# 服务与重启
+systemctl show cwq-api -p ActiveState -p NRestarts -p MemoryCurrent
+#   ActiveState=active   NRestarts=0
+#   MemoryCurrent 应当明显低于旧版的 313 MB（优化省掉了账簿物化与上传缓冲）
+
+# 双端健康
+curl -fsS http://127.0.0.1:8000/api/health && echo   # 内网
+curl -fsS https://acct.xins.live/api/health && echo   # 公网
+
+# 启动参数（应当能看到四道护栏）
+ps -eo args | grep '[u]vicorn app.main:app'
+#   期望：--workers 2 --timeout-keep-alive 60
+#         --limit-concurrency 32 --limit-max-requests 2000
+#         --limit-max-requests-jitter 200 --no-access-log
+```
+
+### 11.6 ~~给 3 个 Docker 容器设内存上限~~ —— **撤回**
+
+**⚠️ 2026-10-24 生产机实测：这台机的三个容器都不是本项目的。**
+
+| 容器 | 内存占用 | 是什么 |
+|---|---|---|
+| `invoice-system-app` | 112.8 MiB | **别的业务**（发票系统） |
+| `media-parser-backend` | 141.9 MiB | **别的业务**（媒体解析） |
+| `frps_tz6c_frps_TZ6c_1` | 26.8 MiB | **别的业务**（内网穿透 frps） |
+
+**本项目不对别人的容器设置内存上限。** 给 `media-parser-backend` 设 256 MB 上限，
+是在**随时可能把别人的服务 OOM 掉** —— 它已经占了 141.9 MiB。
+整台机的容器内存治理是**运维层面的独立决策**，需要先量出各容器的真实峰值、
+并与各业务方确认 —— 不在本项目范围内。
+
+> 同一台机还同时跑着另外 11 个子域，本项目只是其中一个乘客 ——
+> 所以 unit 里给的是 `CPUWeight=50`（**竞争时让路**）而不是 `CPUQuota`
+> （那是把整台机的 CPU 当成独占额度）。

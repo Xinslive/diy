@@ -513,7 +513,5 @@ cd frontend && npm test
 | [`docs/plugin-verification.md`](docs/plugin-verification.md) | 签名与验证 |
 | [`docs/plugin-troubleshooting.md`](docs/plugin-troubleshooting.md) | 插件排障 |
 | [`docs/plugin-roadmap.md`](docs/plugin-roadmap.md) | 插件路线图 |
-| [`docs/用友总账打印样式规格.md`](docs/用友总账打印样式规格.md) | 总账打印样式规格 |
-| [`docs/Windows打包exe可行性研究.md`](docs/Windows打包exe可行性研究.md) | 桌面壳可行性研究 |
 | [`tools/desktop-shell/README.md`](tools/desktop-shell/README.md) | 桌面壳说明 |
 | [`tools/uitest/README.md`](tools/uitest/README.md) | UI 探测脚本说明 |

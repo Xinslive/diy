@@ -42,8 +42,6 @@
 所以这里用的是**真正的浏览器内核**（Edge/Chrome 的 `--app=` 模式）：
 打印、下载、多标签一切照旧。
 
-完整分析见 [`../../docs/Windows打包exe可行性研究.md`](../../docs/Windows打包exe可行性研究.md)。
-
 ### 2.2 用 `--app=` 而不是裸的 `webbrowser.open()`
 
 裸 `webbrowser.open()` 会打开用户平时的浏览器，带地址栏、有标签页——
@@ -396,8 +394,7 @@ python tools/desktop-shell/launch_path_probe.py `
 - 生产 vhost 是**手工同步**的（发布脚本不碰它），换主机时记得同步这一段，
   并按目标机的目录布局改 `alias` 的路径。
 
-见 [`../../docs/Windows打包exe可行性研究.md`](../../docs/Windows打包exe可行性研究.md) 的
-「打包与分发」一节。三个要点：
+发布前必须处理的三件事：
 
 1. **签代码签名证书。** 微软 2024 年起已明确：EV 证书**不再**提供 SmartScreen
    立即放行，现在基于文件哈希 + 签名者信誉累积。OV 证书 + 固定发布者身份
@@ -440,6 +437,5 @@ python tools/desktop-shell/launch_path_probe.py `
 
 ## 9. 相关文档
 
-- [`../../docs/Windows打包exe可行性研究.md`](../../docs/Windows打包exe可行性研究.md)
-  —— 完整技术分析：为什么是 L3、为什么不内嵌 WebView、L1/L2 的代价对比、
-  以及本仓库里另外两条路（本地实例、内嵌 PostgreSQL）要做的话有多重。
+- [`../../README.md`](../../README.md) §十四「桌面客户端」—— 这个壳在整个系统里的位置。
+- [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md) —— 整体架构（服务端那一侧）。

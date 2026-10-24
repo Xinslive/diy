@@ -25,7 +25,7 @@
 # 杀软误报申诉（Defender WDSI / Avast / ESET）会检查 FileDescription、
 # CompanyName、FileVersion 这些 VERSIONINFO 字段：一个「没有公司名、
 # 描述是英文、版本号是 0.0.0.0」的可执行文件，在申诉时会被当成
-# 来路不明的程序。见 ../../docs/Windows打包exe可行性研究.md「代码签名」。
+# 来路不明的程序。发布前必须处理的三件事见 tools/desktop-shell/README.md §7。
 #
 # ⚠️ 发布前请把 CompanyName / LegalCopyright 换成**真实的发行主体**。
 #    保留占位值不影响功能，但会让误报申诉更难通过。
