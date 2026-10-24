@@ -26,11 +26,13 @@
       <el-date-picker v-model="form.voucher_date" type="date" value-format="YYYY-MM-DD"
                       :clearable="false" style="width: 128px" />
       <span class="spacer" />
-      <!-- 从列表进来的话，前一张/后一张翻的是**列表那个结果集**（筛选条件原样带着，
-           可以跨月跨年）；直接打开某张凭证、不知道从哪来的，才退回同期间内翻。
+      <!-- 前一张/后一张翻的是**凭证号顺序**（跟列表「凭证号顺序」那一档同一套）：
+           同一张期间内，号小的在前、号大的在后 —— 「前一张」就是凭证号小一号的那张；
+           跨期间时月份大的在后。从列表带条件进来的话，就在**筛选结果集**里翻
+           （条件原样带着，可以跨月跨年）；没带条件的在全账套里翻。
            插入/增加直接开一张新的。原来那个「增加分录」按钮去掉了 ——
            分录靠回车往下加，不用专门去找按钮。 -->
-      <el-tooltip :content="neighbourScope || '按同一会计期间的录入顺序前后翻'"
+      <el-tooltip :content="neighbourScope"
                   placement="bottom" :disabled="!neighbourScope">
         <el-button-group>
           <el-button :disabled="!prevId" @click="goNeighbour('prev')">前一张</el-button>
@@ -1348,7 +1350,8 @@ function backToList() {
   router.push({ name: 'vouchers', query: route.query || {} })
 }
 
-/** 前一张 / 后一张：翻的是列表那个结果集，条件一路带着，跳到头/尾时按钮自己禁用。 */
+/** 前一张 / 后一张：按**凭证号顺序**翻（期间内按号、跨期间按月份），
+ *  带筛选条件时就在筛选结果集里翻。条件一路带着，跳到头/尾时按钮自己禁用。 */
 function goNeighbour(which) {
   const id = which === 'prev' ? prevId.value : nextId.value
   if (!id) return
@@ -1525,9 +1528,17 @@ async function loadNeighbour(seq) {
   if ((seq !== undefined && stale(seq)) || voucherId.value !== myId) return
   prevId.value = r.prev_id
   nextId.value = r.next_id
-  neighbourScope.value = r.scope === 'filtered'
-    ? `筛选结果里的第 ${r.index + 1} / ${r.total} 张`
-    : ''
+  // 位置提示说清楚自己在**哪一套顺序**里的第几张，免得以为按钮坏了。
+  // 带筛选条件 → 筛选结果集里那张；不带 → 全账套的凭证序列里那张。
+  // 两套顺序都是**凭证号顺序**（期间内按号、跨期间按月份），跟列表
+  // 「凭证号顺序」那一档一致。
+  if (!Number.isFinite(r.index) || r.index < 0) {
+    neighbourScope.value = r.scope === 'filtered'
+      ? '这张不在当前筛选结果里' : ''
+  } else {
+    neighbourScope.value = (r.scope === 'filtered' ? '筛选结果' : '全部凭证')
+      + `里的第 ${r.index + 1} / ${r.total} 张`
+  }
 }
 
 /** load() 的代次标记。

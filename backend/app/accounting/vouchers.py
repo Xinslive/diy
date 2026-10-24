@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import Integer, Numeric, Select, and_, func, not_, or_, select
+from sqlalchemy import Integer, Numeric, Select, and_, func, not_, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -1307,6 +1307,31 @@ def _no_seq():
     """
     digits = func.substring(Voucher.voucher_no, r"(\d+)$")
     return func.coalesce(func.cast(digits, Integer), -1)
+
+
+def no_seq():
+    """凭证号里的序号（对外口）。
+
+    ``_no_seq`` 是排序键的一半，列表排序和「前一张 / 后一张」都要用同一份 ——
+    两处各抠一次数字，早晚会在某个怪号上分道扬镳（库里真有 "wochakan" 这种号）。
+    """
+    return _no_seq()
+
+
+def order_key():
+    """凭证在**全账套**里的先后顺序键：``(期间 ord, 号段数字, id)``。
+
+    这**就是**列表「凭证号顺序」那一档（``_apply_sort`` 的 ``no_asc``）：
+
+      * 同一张期间内按号段数字排 —— 记005 的前一张是记004；
+      * 跨期间按期间先后排 —— 12 月的那张排在 1 月之后。
+
+    「前一张 / 后一张」翻的就是这个键（用户 2026-10-24：
+    「同一个月里凭证号大的在后，不同月里月份越大的越后」）。
+    之所以复用而不是另写一套：这两处必须是**同一个顺序** ——
+    用户在列表里看到的相邻两张，就是前后张要跳的那两张。
+    """
+    return tuple_(Period.ord, _no_seq(), Voucher.id)
 
 
 def _apply_sort(stmt: Select, sort: str) -> Select:

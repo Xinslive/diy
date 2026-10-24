@@ -38,7 +38,11 @@
 #
 # **不归 logrotate 管的两样**：
 #   * nginx 的 access/error log —— 宝塔自己管（/www/wwwlogs/）。
-#   * PostgreSQL 的日志 —— 容器里由 PG 自己轮转。
+#   * PostgreSQL 的日志 —— **宿主机**的 Debian 打包版 PG 15，
+#     由 Debian 自带的 ``/etc/logrotate.d/postgresql-common`` 管
+#     （weekly / rotate 10 / copytruncate，落在 ``/var/log/postgresql/``）。
+#     2026-10-24 生产机实测确认那个文件在、规则也在，所以这里**不重复管** ——
+#     两份规则管同一个文件，logrotate 会报错或互相覆盖。
 
 /opt/cwq/backend/logs/api.log
 /opt/cwq/backend/logs/api.err.log {

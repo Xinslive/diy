@@ -21,7 +21,7 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select, tuple_
+from sqlalchemy import func, literal, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -739,67 +739,76 @@ def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = 
               _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user),
               keyword: Optional[str] = None, min_amount: Optional[Decimal] = None,
               max_amount: Optional[Decimal] = None):
-    """前一张 / 后一张 —— 翻的是**列表里那个结果集**，不是同期间的全部凭证。
+    """前一张 / 后一张 —— 按**凭证号顺序**在全账套里前后挪。
 
-    带着筛选条件来（凭证号/摘要、分录金额区间）时，就在筛选结果里前后挪，并允许跨月跨年：
-    筛出「每月一张凭证号含 16 的」，进 8 月那张，前一张就是 7 月那张。
+    顺序键是 ``(期间先后, 号段数字, id)``，跟列表「凭证号顺序」那一档
+    **完全同一套**（``svc.order_key``）：
 
-    两种情况下顺序都是**时间正序**，不是列表那个倒序：前一张是更早的，后一张是更晚的。
-    列表倒着排是为了让最新的一眼在顶上，而「前一张 / 后一张」是翻时间的动作 ——
-    混成同一个顺序，在 8 月那张点前一张会跳去 9 月，怎么点都回不来。
-    不带条件时同样按 (日期, id) 升序，只把范围收在同期间内，
-    连续录一叠凭证时「后一张」该是接下来要填的那张。
+      * 同一张期间内：号小的在前，号大的在后 —— 记005 的「前一张」是记004；
+      * 跨期间：月份大的在后 —— 12 月那张的「前一张」是 11 月的最后一张。
 
-    带筛选的分支也走**单条 SQL**（审计严重 5）。原来为了「前后各一张」把整个
-    结果集按 200 一页翻到收齐再 ``ids.index(...)``：最多 100 轮 × (1 次 count
-    子查询 + 1 次分页查询) ≈ 200 条 SQL，并把最多两万张凭证实例化进 identity map。
-    现在前后各取一条、index 用一次条件聚合数出来 —— 返回体一个字没变。
+    用户 2026-10-24 的原话：「同一个月里，凭证号大的在后，点击前一张，
+    应该跳到凭证号小一号的」「不同月里，月份越大的越后」。
+    这里原来按 ``(日期, id)`` 排，于是同一月里**日期靠前的那张被当成了第一张**：
+    号是 记003 的那张日期比 记001 还早，点「前一张」就跳去了号更大的那边 ——
+    顺序跟用户在列表里看到的完全对不上。
+
+    带筛选条件（凭证号/摘要、分录金额区间）时，在**筛选结果集**里按同一个键
+    前后挪，集合可以跨月跨年；不带条件时范围是**全账套** —— 一条规则管到底，
+    不在月份边界上停住（停住等于把一条顺序劈成两半，跨月那一下反而不连续）。
+
+    全程只读，只发 3 条 SQL：一次聚合问清「结果集多大、这张在不在里面、
+    它前面有几个」，前后各一条 ``LIMIT 1`` 取邻票。
     """
     v = db.get(Voucher, voucher_id)
     if v is None or v.book_id != book.id:
         raise HTTPException(404, "凭证不存在")
 
-    if keyword or min_amount is not None or max_amount is not None:
-        scope = _filtered_scope(
-            db, book.id, keyword=keyword, min_amount=min_amount, max_amount=max_amount)
-        # 一次聚合问清三件事：结果集多大、这张在不在里面、它前面有几个。
-        # 「在不在里面」不能拿「前后都查不到」来代替 —— 结果集的第一张就是
-        # prev=None 却 index=0，靠「查不到邻票」判断会把它误判成不在结果集里。
-        total, hits, before = db.execute(
-            select(
-                func.count(),
-                func.count().filter(Voucher.id == voucher_id),
-                func.count().filter(
-                    tuple_(Voucher.voucher_date, Voucher.id) < (v.voucher_date, v.id)),
-            ).select_from(Voucher).where(*scope)).one()
-        if not hits:                          # 这张不在结果集里（比如筛选条件刚改过）
-            return {"prev_id": None, "next_id": None, "scope": "filtered",
-                    "index": -1, "total": total}
-        prev_id = db.scalar(
-            select(Voucher.id).where(
-                *scope, tuple_(Voucher.voucher_date, Voucher.id) < (v.voucher_date, v.id))
-            .order_by(Voucher.voucher_date.desc(), Voucher.id.desc()).limit(1)
-        )
-        next_id = db.scalar(
-            select(Voucher.id).where(
-                *scope, tuple_(Voucher.voucher_date, Voucher.id) > (v.voucher_date, v.id))
-            .order_by(Voucher.voucher_date, Voucher.id).limit(1)
-        )
-        # index 是「时间正序结果集里的位置」（0 基）—— 与不带条件时
-        # `tuple_(voucher_date, id)` 升序那一条是同一个口径。
-        return {"prev_id": prev_id, "next_id": next_id, "scope": "filtered",
-                "index": before, "total": total}
+    # 这张自己在顺序键里的位置：期间 ord + 号段数字。
+    # 两个值都问数据库要，不在 Python 里抠 —— 抠数字的判据只有一处
+    # （``svc.no_seq``），Python 再写一份早晚会跟它分道扬镳。
+    v_ord = db.scalar(select(Period.ord).where(Period.id == v.period_id))
+    v_seq = db.scalar(select(svc.no_seq()).select_from(Voucher).where(Voucher.id == voucher_id))
+    if v_ord is None:
+        # 期间行不在（正常不会发生：period_id 有外键约束）。没有先后可言，
+        # 两头都不指 —— 总比指一张错的好。
+        return {"prev_id": None, "next_id": None, "scope": "book",
+                "index": -1, "total": 0}
 
-    scope = (Voucher.book_id == book.id, Voucher.period_id == v.period_id)
+    key = svc.order_key()
+    cur = tuple_(literal(v_ord), literal(v_seq), literal(voucher_id))
+
+    if keyword or min_amount is not None or max_amount is not None:
+        conds = list(_filtered_scope(
+            db, book.id, keyword=keyword, min_amount=min_amount, max_amount=max_amount))
+        scope = "filtered"
+    else:
+        conds = [Voucher.book_id == book.id]
+        scope = "book"
+
+    # 一次聚合问清三件事：结果集多大、这张在不在里面、它前面有几个。
+    # 「在不在里面」不能拿「前后都查不到」来代替 —— 结果集的第一张就是
+    # prev=None 却 index=0，靠「查不到邻票」判断会把它误判成不在结果集里。
+    total, hits, before = db.execute(
+        select(
+            func.count(),
+            func.count().filter(Voucher.id == voucher_id),
+            func.count().filter(key < cur),
+        ).select_from(Voucher).join(Period, Voucher.period_id == Period.id).where(*conds)).one()
+    if not hits:                          # 这张不在结果集里（比如筛选条件刚改过）
+        return {"prev_id": None, "next_id": None, "scope": scope,
+                "index": -1, "total": total}
+
+    base = select(Voucher).join(Period, Voucher.period_id == Period.id).where(*conds)
     prev_id = db.scalar(
-        select(Voucher.id).where(*scope, tuple_(Voucher.voucher_date, Voucher.id) < (v.voucher_date, v.id))
-        .order_by(Voucher.voucher_date.desc(), Voucher.id.desc()).limit(1)
-    )
+        base.where(key < cur)
+        .order_by(Period.ord.desc(), svc.no_seq().desc(), Voucher.id.desc()).limit(1))
     next_id = db.scalar(
-        select(Voucher.id).where(*scope, tuple_(Voucher.voucher_date, Voucher.id) > (v.voucher_date, v.id))
-        .order_by(Voucher.voucher_date, Voucher.id).limit(1)
-    )
-    return {"prev_id": prev_id, "next_id": next_id, "scope": "period", "index": None, "total": None}
+        base.where(key > cur)
+        .order_by(Period.ord.asc(), svc.no_seq().asc(), Voucher.id.asc()).limit(1))
+    # index 是「这套顺序里的位置」（0 基）—— 跟列表「凭证号顺序」是同一个口径。
+    return {"prev_id": prev_id, "next_id": next_id, "scope": scope,
+            "index": before, "total": total}
 
 
 # ===================================================================== 拆分凭证
