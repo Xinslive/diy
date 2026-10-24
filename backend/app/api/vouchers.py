@@ -757,18 +757,28 @@ def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = 
     前后挪，集合可以跨月跨年；不带条件时范围是**全账套** —— 一条规则管到底，
     不在月份边界上停住（停住等于把一条顺序劈成两半，跨月那一下反而不连续）。
 
-    全程只读，只发 3 条 SQL：一次聚合问清「结果集多大、这张在不在里面、
-    它前面有几个」，前后各一条 ``LIMIT 1`` 取邻票。
+    全程只读，只发 4 条业务 SQL：一条取「这张 + 它的顺序位置」、一次聚合问清
+    「结果集多大、这张在不在里面、它前面有几个」，前后各一条 ``LIMIT 1`` 取邻票。
     """
-    v = db.get(Voucher, voucher_id)
-    if v is None or v.book_id != book.id:
+    # 一条查询把「这张凭证」和「它在顺序键里的位置」一起取回来：
+    # 凭证归属（校验是不是这本账的）、期间 ord、号段数字。
+    # 合成一条是因为这里要守住「一次「前一张/后一张」只发 4 条业务查询」
+    # （tests/test_perf_api_layer.py）—— 拆成「取凭证 + 取期间 + 取号段」三条就变 6 条了。
+    row = db.execute(
+        select(
+            Voucher.book_id.label("book_id"),
+            Period.ord.label("p_ord"),
+            svc.no_seq().label("p_seq"),
+        ).select_from(Voucher).join(Period, Voucher.period_id == Period.id)
+        .where(Voucher.id == voucher_id)
+    ).first()
+    if row is None or row.book_id != book.id:
         raise HTTPException(404, "凭证不存在")
 
     # 这张自己在顺序键里的位置：期间 ord + 号段数字。
     # 两个值都问数据库要，不在 Python 里抠 —— 抠数字的判据只有一处
     # （``svc.no_seq``），Python 再写一份早晚会跟它分道扬镳。
-    v_ord = db.scalar(select(Period.ord).where(Period.id == v.period_id))
-    v_seq = db.scalar(select(svc.no_seq()).select_from(Voucher).where(Voucher.id == voucher_id))
+    v_ord, v_seq = row.p_ord, row.p_seq
     if v_ord is None:
         # 期间行不在（正常不会发生：period_id 有外键约束）。没有先后可言，
         # 两头都不指 —— 总比指一张错的好。
@@ -799,7 +809,9 @@ def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = 
         return {"prev_id": None, "next_id": None, "scope": scope,
                 "index": -1, "total": total}
 
-    base = select(Voucher).join(Period, Voucher.period_id == Period.id).where(*conds)
+    # 选 **id** 而不是整行：``db.scalar()`` 对 ORM 实体查询返回的是那个实体本身
+    # （不是它的 id），返回体里会塞进一整个 Voucher 对象。
+    base = select(Voucher.id).join(Period, Voucher.period_id == Period.id).where(*conds)
     prev_id = db.scalar(
         base.where(key < cur)
         .order_by(Period.ord.desc(), svc.no_seq().desc(), Voucher.id.desc()).limit(1))

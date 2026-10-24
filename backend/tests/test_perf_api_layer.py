@@ -455,33 +455,42 @@ def test_筛选条件与列表口径一致(client, db, auth, book, mk_voucher):
     assert got["total"] == list_total == 5, (got, list_total)
 
 
-def test_无筛选时仍按同期间翻且不带索引(client, auth, book, mk_voucher):
+def test_无筛选时按凭证号顺序翻并给出索引(client, auth, book, mk_voucher):
+    """不带筛选条件时范围是**全账套**，顺序仍是凭证号顺序（期间内按号、跨期间按月份）。
+
+    用户 2026-10-24：「同一个月里，凭证号大的在后，点击前一张，应该跳到凭证号小一号的」
+    「不同月里，月份越大的越后」。
+    """
     a = mk_voucher("2026-01-05")
     b = mk_voucher("2026-01-10")
-    mk_voucher("2026-02-03")
+    feb = mk_voucher("2026-02-03")
 
     r = client.get(f"/api/books/{book.id}/vouchers/{a.id}/neighbour", headers=auth).json()
-    assert r == {"prev_id": None, "next_id": b.id, "scope": "period",
-                 "index": None, "total": None}, r
+    assert r == {"prev_id": None, "next_id": b.id, "scope": "book",
+                 "index": 0, "total": 3}, r
+    # 跨月那一下是连续的：1 月最后一张的后一张就是 2 月那张
+    r2 = client.get(f"/api/books/{book.id}/vouchers/{b.id}/neighbour", headers=auth).json()
+    assert r2 == {"prev_id": a.id, "next_id": feb.id, "scope": "book",
+                  "index": 1, "total": 3}, r2
 
 
-def test_筛选路径的index按日期排序而不是凭证号(client, auth, book, mk_voucher):
-    """倒着录凭证（先录日期靠后的）时，index 仍按**时间正序**算。
+def test_筛选路径的index按凭证号而不是日期(client, auth, book, mk_voucher):
+    """倒着录凭证（先录日期靠后的）时，index 仍按**凭证号**算。
 
-    旧实现复用了 ``query_vouchers`` 的默认排序（期间 + 凭证号倒序）再 reverse，
-    于是同期间里「后录的凭证号更大」会把日期顺序整个倒过来，与 docstring 写的
-    「两种情况下顺序都是时间正序」、也与不带筛选那条路（``tuple_(date, id)``）
-    对不上。现在两条路是同一个口径。
+    顺序键是 ``(期间 ord, 号段数字, id)`` —— 跟列表「凭证号顺序」那一档同一套，
+    也跟「前一张 / 后一张」当年被改成按日期之前的原始契约一致
+    （``_old_neighbour`` 就是拿 ``query_vouchers`` 的默认排序倒过来实现的）。
+    这里两张的日期与号正好相反：记001 的日期更晚，按号它在前，按日期它在后。
     """
     late = mk_voucher("2026-01-20", summary="16 先录的")   # 凭证号 记001
     early = mk_voucher("2026-01-05", summary="16 后录的")  # 凭证号 记002
 
-    first = client.get(f"/api/books/{book.id}/vouchers/{early.id}/neighbour",
+    first = client.get(f"/api/books/{book.id}/vouchers/{late.id}/neighbour",
                        params={"keyword": "16"}, headers=auth).json()
-    assert (first["prev_id"], first["next_id"], first["index"]) == (None, late.id, 0), first
-    second = client.get(f"/api/books/{book.id}/vouchers/{late.id}/neighbour",
+    assert (first["prev_id"], first["next_id"], first["index"]) == (None, early.id, 0), first
+    second = client.get(f"/api/books/{book.id}/vouchers/{early.id}/neighbour",
                         params={"keyword": "16"}, headers=auth).json()
-    assert (second["prev_id"], second["next_id"], second["index"]) == (early.id, None, 1), second
+    assert (second["prev_id"], second["next_id"], second["index"]) == (late.id, None, 1), second
 
 
 # ===================================================================== 中等 4

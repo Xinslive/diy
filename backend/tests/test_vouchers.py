@@ -562,26 +562,37 @@ def test_跨年看的是上年十二月(db, book, admin_user, subjects, make_vou
 # --------------------------------------------------------------------- 前一张/后一张
 
 
-def test_前一张后一张按录入顺序翻(client, auth, book, make_voucher):
-    """同期间内按 (日期, id) 升序翻 —— 连续录入时「后一张」是接下来要填的那张。"""
-    v1 = make_voucher("2026-01-05", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
-    v2 = make_voucher("2026-01-10", dr=[("1001", 200, "x")], cr=[("5001", 200, "x")])
-    v3 = make_voucher("2026-01-20", dr=[("1001", 300, "x")], cr=[("5001", 300, "x")])
+def test_前一张后一张按凭证号顺序翻(client, auth, book, make_voucher):
+    """同期间内按**凭证号**升序翻 —— 跟列表「凭证号顺序」那一档同一套。
+
+    这里故意让**日期跟号打架**：号大的那张日期更早。
+    按号走 → 「前一张」是号小一号的那张；按日期走 → 会跳到号更大的那边去，
+    这正是用户 2026-10-24 报的那个毛病。
+    """
+    v1 = make_voucher("2026-01-20", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")],
+                      voucher_no="记001")
+    v2 = make_voucher("2026-01-10", dr=[("1001", 200, "x")], cr=[("5001", 200, "x")],
+                      voucher_no="记002")
+    v3 = make_voucher("2026-01-05", dr=[("1001", 300, "x")], cr=[("5001", 300, "x")],
+                      voucher_no="记003")
 
     def nb(v):
         r = client.get(f"/api/books/{book.id}/vouchers/{v.id}/neighbour", headers=auth)
         assert r.status_code == 200, r.text
         d = r.json()
-        assert d["scope"] == "period"      # 没带筛选条件 → 退回同期间
+        assert d["scope"] == "book"      # 没带筛选条件 → 全账套的凭证序列
         return (d["prev_id"], d["next_id"])
 
-    assert nb(v1) == (None, v2.id)
-    assert nb(v2) == (v1.id, v3.id)
-    assert nb(v3) == (v2.id, None)
+    assert nb(v1) == (None, v2.id)       # 记001 的后一张是 记002
+    assert nb(v2) == (v1.id, v3.id)      # 记002 的前一张是 记001、后一张是 记003
+    assert nb(v3) == (v2.id, None)       # 记003 的前一张是 记002（不是日期更早的那张）
 
 
 def test_同一天的多张凭证按录入先后排(client, auth, book, make_voucher):
-    """同一天的两张凭证必须能区分前后，否则「后一张」会来回跳。"""
+    """同一天的两张凭证必须能区分前后，否则「后一张」会来回跳。
+
+    号相同时（同号段、跨 id）靠 id 兜底 —— 顺序键的最后一段就是 id。
+    """
     a = make_voucher("2026-01-05", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
     b = make_voucher("2026-01-05", dr=[("1001", 200, "x")], cr=[("5001", 200, "x")])
 
@@ -591,19 +602,41 @@ def test_同一天的多张凭证按录入先后排(client, auth, book, make_vou
     assert (r2["prev_id"], r2["next_id"]) == (None, b.id)
 
 
-def test_前后张不跨会计期间(client, auth, book, make_voucher):
-    """1 月最后一张的后一张不该跳到 2 月 —— 跳过去日期会突然变掉。"""
-    jan = make_voucher("2026-01-28", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
-    feb = make_voucher("2026-02-03", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
+def test_前后张跨月时按月份先后(client, auth, book, make_voucher):
+    """用户 2026-10-24：「不同月里，月份越大的越后」。
 
-    assert client.get(f"/api/books/{book.id}/vouchers/{jan.id}/neighbour", headers=auth).json()["next_id"] is None
-    assert client.get(f"/api/books/{book.id}/vouchers/{feb.id}/neighbour", headers=auth).json()["prev_id"] is None
+    所以 11 月那张的「后一张」是 12 月那张，12 月那张的「前一张」是 11 月那张 ——
+    顺序是一条连续的序列，不在月底断掉。
+    """
+    nov = make_voucher("2026-11-28", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
+    dec = make_voucher("2026-12-03", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
+
+    assert client.get(
+        f"/api/books/{book.id}/vouchers/{nov.id}/neighbour", headers=auth).json()["next_id"] == dec.id
+    assert client.get(
+        f"/api/books/{book.id}/vouchers/{dec.id}/neighbour", headers=auth).json()["prev_id"] == nov.id
+
+
+def test_同一期间里号大的那张在后(client, auth, book, make_voucher):
+    """用户原话的直接落地：同一个月里，凭证号大的在后，
+    点「前一张」跳到凭证号小一号的那张。"""
+    v1 = make_voucher("2026-03-05", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
+    v2 = make_voucher("2026-03-06", dr=[("1001", 200, "x")], cr=[("5001", 200, "x")])
+    v3 = make_voucher("2026-03-07", dr=[("1001", 300, "x")], cr=[("5001", 300, "x")])
+
+    d = client.get(f"/api/books/{book.id}/vouchers/{v3.id}/neighbour", headers=auth).json()
+    assert d["prev_id"] == v2.id      # 记003 的前一张 = 记002
+    assert d["next_id"] is None       # 本月最后一张，后一张没了
+
+    d2 = client.get(f"/api/books/{book.id}/vouchers/{v2.id}/neighbour", headers=auth).json()
+    assert (d2["prev_id"], d2["next_id"]) == (v1.id, v3.id)
 
 
 def test_带筛选条件时前后张翻的是结果集(client, auth, book, make_voucher):
     """用户举的例子：筛出「凭证号含 16」的（每月一张），进 8 月那张，
     前一张是 7 月那张，后一张从 7 月点回来还是 8 月。
-    顺序是**时间正序**—— 跟列表那个倒序不是一个东西，混了会跳去 9 月。"""
+    顺序是**凭证号顺序**（期间内按号、跨期间按月份）——
+    跟列表「凭证号顺序」那一档同一套，不是日期。"""
     def mk(day, no):
         v = make_voucher(day, dr=[("1001", 100, no)], cr=[("5001", 100, no)])
         return v
