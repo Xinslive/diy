@@ -250,6 +250,8 @@ cd backend && .venv/bin/python scripts/backup_to_oss.py
 ├── plugins/                  内置插件源码
 │   ├── com.cwq.periodic/     周期记账
 │   └── com.cwq.reimburse/   民宿报销
+├── .minimax/skills/          给 AI agent 用的项目级 Skill
+│   └── cwq-accounting-mcp/   本项目 MCP 的查询口径与调用纪律
 ├── deploy/                   发布脚本、systemd 单元、nginx 配置、CDN 部署指南
 ├── tools/
 │   ├── uitest/               Playwright 一次性 UI 探测脚本（不是回归测试）
@@ -373,6 +375,18 @@ cd backend && .venv/bin/python scripts/backup_to_oss.py
 服务是**只读**的：令牌在 `/api/system/mcp-tokens` 签发与轮换，有调用频次上限、单次最大页数、最大查询月数、语句超时，并记录审计日志。
 
 MCP SDK **定版安装**（`mcp==2.3.0`），不写 `>=` —— 它的传输、工具注册方式与错误语义在 2.x 与 1.x 之间不兼容，而 MCP 的出参是给 AI agent 读的，行为漂移的表现是「agent 某天开始答错」，没有报错、没有堆栈。
+
+### 给 agent 用的 Skill
+
+`.minimax/skills/cwq-accounting-mcp/` 是配套的项目级 Skill，讲清楚**怎么用这个服务才算查对账**：
+
+- 十个工具各自对应哪一类问题、调用顺序（先定位账套与年度，再选工具）；
+- 每个返回体都带 `caliber` / `notes[]` / `coverage`，**读数之前先读 `coverage`** —— 这个服务最危险的返回不是报错，是**在账没记完时给出一份结构完整的零值**；
+- 「已付 / 仅计提未付 / 有凭证但未记账」三个互斥标志不能合并成一句话；
+- 金额是字符串、负数是红字、损益走报表口径而余额走账簿口径；
+- 出错时 `error.code` 的分支处理与降级路径。
+
+Skill 里的口径全部来自本仓实现，不是外部约定 —— 改了这边的口径，记得同步改它。
 
 ---
 
@@ -693,5 +707,6 @@ CWQ_CDN_UPLOAD=1   # 发布时把 dist/assets/ 传到 OSS
 | [`docs/plugin-verification.md`](docs/plugin-verification.md) | 签名与验证 |
 | [`docs/plugin-troubleshooting.md`](docs/plugin-troubleshooting.md) | 插件排障 |
 | [`docs/plugin-roadmap.md`](docs/plugin-roadmap.md) | 插件路线图 |
+| [`.minimax/skills/cwq-accounting-mcp/SKILL.md`](.minimax/skills/cwq-accounting-mcp/SKILL.md) | **agent 怎么用本项目的 MCP 查账**：工具选择、口径纪律、错误分支 |
 | [`tools/desktop-shell/README.md`](tools/desktop-shell/README.md) | 桌面壳说明 |
 | [`tools/uitest/README.md`](tools/uitest/README.md) | UI 探测脚本说明 |
