@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -838,6 +839,67 @@ class _BucketWithSession:
         self.session = _FakeSession()
 
 
+def test_oss2_的签名第二个参数确实是文件名():
+    """钉住 **SDK 的契约本身**：``put_object_from_file(key, filename)``。
+
+    这条得对着**真 SDK** 看。替身照着实现写的时候，实现和替身会一起错
+    （真犯过一次：2026-10-23 加 ``put_file`` 时传了文件句柄，替身也就跟着
+    收句柄，于是每天都在失败的离站备份在测试里一路绿灯）。只有对着 SDK 看，
+    才能发现两边一起错。
+    """
+    import inspect
+
+    import oss2
+
+    params = list(inspect.signature(oss2.Bucket.put_object_from_file).parameters)
+    assert params[:3] == ["self", "key", "filename"], params
+
+
+def test_上传传的是路径_不是文件句柄(tmp_path):
+    """``put_file`` 传给 oss2 的必须是**本地文件路径**。
+
+    传句柄进去，oss2 拿它当路径用，抛的是
+    ``TypeError: expected str, bytes or os.PathLike object, not BufferedReader``
+    —— 每一轮离站备份都失败，而且日志里看不出是自己这边的参数问题。
+
+    这里用一个**照 SDK 契约写**的替身：只收路径，给句柄就当场抛。
+    """
+    seen = {}
+
+    class ContractBucket:
+        def put_object_from_file(self, key, filename):
+            # 照 oss2 的契约：第二个参数是本地文件路径，oss2 自己会 open 它。
+            if not isinstance(filename, (str, os.PathLike)):
+                raise TypeError(
+                    "expected str, bytes or os.PathLike object, not "
+                    f"{type(filename).__name__}")
+            with open(filename, "rb") as handle:
+                seen["content"] = handle.read()
+            seen["filename"] = filename
+            return SimpleNamespace(etag="etag")
+
+    target = tmp_path / "backup.json.gz"
+    target.write_bytes(b"hello")
+
+    oss_mod.put_file(ContractBucket(), "backup/daily/book-1/x.json.gz", str(target))
+
+    assert isinstance(seen["filename"], str), "传过去的必须还是路径"
+    assert seen["content"] == b"hello"
+
+
+def test_本地文件不存在时报的是人话():
+    """文件不在了要说清楚是哪个文件，别让 oss2 的异常糊过去。"""
+    import pytest as _pytest
+
+    class Bucket:
+        def put_object_from_file(self, key, filename):
+            raise FileNotFoundError(filename)
+
+    with _pytest.raises(oss_mod.OssError) as excinfo:
+        oss_mod.put_file(Bucket(), "backup/daily/book-1/x.json.gz", "/nope/x.json.gz")
+    assert "本地文件不存在" in str(excinfo.value)
+
+
 def test_make_bucket显式传超时_不用SDK默认的60秒(monkeypatch):
     """不传 ``connect_timeout`` 时 oss2 用的是 ``defaults.connect_timeout = 60``。
 
@@ -1244,9 +1306,18 @@ class _FakeOss2:
         self.mtimes[key] = int(self.now.timestamp())
         return SimpleNamespace(etag="etag")
 
-    def put_object_from_file(self, key, handle):
-        """备份走的是**按文件**上传（不把整份 gzip 读进内存）。"""
-        self.objects[key] = handle.read()
+    def put_object_from_file(self, key, filename):
+        """备份走的是**按文件**上传（不把整份 gzip 读进内存）。
+
+        **这里必须照 SDK 的契约写，不能照实现写。** oss2 的签名是
+        ``put_object_from_file(key, filename)``，第二个参数是**本地文件路径**。
+        当年实现里传的是文件句柄，这个替身也就跟着收句柄 —— 两边一起错，
+        于是「每天都在失败的离站备份」在测试里一路绿灯。
+
+        替身照契约写（并且只收路径），实现传错参数时就会当场炸出来。
+        """
+        with open(filename, "rb") as handle:
+            self.objects[key] = handle.read()
         self.mtimes[key] = int(self.now.timestamp())
         return SimpleNamespace(etag="etag")
 

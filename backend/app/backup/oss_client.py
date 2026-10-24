@@ -327,17 +327,27 @@ def put_file(bucket, key: str, path: str) -> str:
     就得先把整个文件读进内存 —— 于是**备份任务跑在 API 进程里，与在线请求
     共享同一个进程的内存**：一本大账套的快照会把在线请求的内存吃掉。
 
-    这里走 oss2 的**文件句柄**上传（``put_object_from_file``）：oss2 自己
-    分片读文件，内存里只有一块分片。**代价要说清楚**：oss2 的这个接口
+    这里走 oss2 的**按文件**上传（``put_object_from_file``）：oss2 自己
+    打开文件、流式读，内存里只有一块分片。**代价要说清楚**：oss2 的这个接口
     会把文件读进它的分片缓存，单个分片仍在内存里，但**不再与账套大小成正比**。
+
+    **第二个参数是「本地文件路径」，不是文件句柄。**
+    oss2 的签名是 ``put_object_from_file(key, filename)`` —— 它自己会
+    ``open(filename)``。传句柄进去，oss2 拿句柄当路径用，抛的是
+    ``TypeError: expected str, bytes or os.PathLike object, not BufferedReader``。
+
+    这个错已经犯过一次：``put_file`` 是 2026-10-23 的安全审查整改里新加的
+    （那个提交之前走 ``put_bytes``，一切正常），加进来就把句柄传了进去 ——
+    于是**离站备份从那天起每天失败，一个对象都没传上去**。更糟的是测试是绿的：
+    替身照着实现写（收句柄），而不是照 SDK 的契约写（收路径），两边一起错，
+    错得整整齐齐。
 
     ETag 的形状与 ``put_bytes`` 一样可能是非 MD5 的十六进制串（分片上传），
     真正的完整性校验仍然走我们自己算的 SHA256（``sys_backup_run.checksum``）。
     """
     oss2 = _import_oss2()
     try:
-        with open(path, "rb") as handle:
-            return bucket.put_object_from_file(key, handle).etag
+        return bucket.put_object_from_file(key, path).etag
     except FileNotFoundError as exc:
         raise OssError(f"上传失败：本地文件不存在 {path}") from exc
     except oss2.exceptions.OssError as exc:
