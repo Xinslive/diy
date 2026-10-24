@@ -18,7 +18,9 @@ from app.core.config import settings
 from app.core.system_settings import ocr_config
 from app.invoice import storage
 from app.invoice.parser import invoice_dict, parse_pdf_with_fallback
-from app.invoice.text_parser import page_count
+from app.invoice.text_parser import (
+    extract_pages_text, merge_invoice_pages, page_count, parse_page,
+)
 from app.models import (
     InvoiceBatch,
     InvoiceConfig,
@@ -974,6 +976,98 @@ def preview_batch(db: Session, batch: InvoiceBatch, overrides: dict[str, dict] |
         "sources": sources,
         "invoices": [serialize_record(record) for record in records],
     }
+
+
+def reparse_record(
+    db: Session,
+    batch: InvoiceBatch,
+    record: InvoiceRecord,
+    overrides: dict[str, dict] | None = None,
+) -> dict[str, Any]:
+    """把一张**解析失败的**发票重新解析一次。
+
+    为什么要有这个按钮：解析是在**上传那一刻**跑的，而解析器会认不出一些
+    票面写法（PDF 把汉字拆成独立一格、明细表头少一列…）。解析器后来修好了，
+    可这批票已经躺在库里了 —— 让用户把整个批次重新传一遍，等于让他白干一遍
+    （几百张票重传一次要几分钟，还可能撞上重复上传的拦截）。
+
+    重新解析走的是**原文件**：批次存的那份 PDF 还在（只有「作废批次」才会
+    删掉它），于是只重跑那一页的文字提取与解析，别的记录一根汗毛都不动。
+
+    **判重没有被放宽**：重新解析出来的号码照样要跟批次里别的记录、跟账上
+    已有的对一遍 —— 撞了就报错，不悄悄写进去。
+
+    重新解析可能把一页认出**多张**发票（比如原来那几页其实是三张票）。
+    那就一张一张建出来，而不是只留第一张把另外两张丢掉 —— 丢掉了用户就
+    永远不知道自己少了两张票。
+    """
+    if batch.status not in ("PENDING", "REJECTED"):
+        raise ValueError(f"该批次已是「{batch.status}」状态，不能重新解析")
+    if not batch.file_path:
+        raise ValueError("这个批次没有留下原始文件，无法重新解析")
+    pdf_path = storage.path_for(batch.file_path)
+    if not pdf_path.exists():
+        raise ValueError("这个批次的原始文件已经不在了，无法重新解析")
+
+    texts = extract_pages_text(str(pdf_path))
+    start = max(0, int(record.page_index))
+    span = max(1, int((record.payload or {}).get("page_span") or 1))
+    pages = texts[start:start + span]
+    if not pages:
+        raise ValueError("原文件里找不到这一页")
+
+    invoices = merge_invoice_pages(
+        [parse_page(start + offset, text) for offset, text in enumerate(pages)]
+    )
+    if not invoices:
+        raise ValueError("这一页仍然解析不出发票")
+
+    numbers = [_text((invoice_dict(inv).get("meta") or {}).get("invoice_no")) for inv in invoices]
+    wanted = {number for number in numbers if number}
+    # 批次里**别的**记录占着的号码
+    same_batch = {
+        _text(other.invoice_no) for other in batch.invoices
+        if other.id != record.id and _text(other.invoice_no)
+    }
+    # 账上已有的（作废的批次不算，与上传那条路径同一口径）
+    existing = _existing_invoice_numbers(db, batch.book_id, wanted)
+    own = _text(record.invoice_no)
+    clash = sorted((wanted & (same_batch | existing)) - {own})
+    if clash:
+        raise ValueError("重新解析出来的发票号码与已有的重复：" + "、".join(clash))
+
+    config = get_config(db, batch.book_id)
+    # 来源文件沿用旧记录的那一个：重新解析的是**同一页**，它原来是从哪个
+    # 文件来的还是哪个文件（批次里的「来源文件」列不能凭空变个名字）。
+    source_file = _text((record.payload or {}).get("source_file"))
+    # 人工改过的东西（选过的进项/销项、手工挑过的科目）要**跟着搬到新记录上** ——
+    # 重新解析换掉的是记录（新的记录新的 id），用户改过的那张发票还是那张，
+    # 不能让他的修改跟着旧记录一起消失。
+    overrides = dict(overrides or {})
+    carried = overrides.get(str(record.id))
+    db.delete(record)
+    db.flush()
+    for invoice, number in zip(invoices, numbers):
+        payload = {**invoice_dict(invoice), "source_file": source_file}
+        meta = payload.get("meta") or {}
+        new_record = InvoiceRecord(
+            batch=batch,
+            book_id=batch.book_id,
+            page_index=invoice.page_index,
+            invoice_no=number or None,
+            issue_date=_date(meta.get("issue_date")),
+            invoice_type=_type_from_taxpayer(meta, config.get("taxpayer_id", "")),
+            parse_warning=payload.get("parse_warning", ""),
+            payload=payload,
+        )
+        db.add(new_record)
+        db.flush()
+        if carried:
+            overrides[str(new_record.id)] = dict(carried)
+    # 关系集合要重新读一遍：刚删掉的那条还在 batch.invoices 里挂着，
+    # 后面 _build_preview 拿到的就会是**旧的**那一份。
+    db.expire(batch, ["invoices"])
+    return preview_batch(db, batch, overrides)
 
 
 def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, Any]:

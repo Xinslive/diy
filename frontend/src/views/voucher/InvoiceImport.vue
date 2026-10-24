@@ -42,21 +42,21 @@
               </el-col>
               <el-col :xs="24" :sm="12">
                 <el-form-item label="销项税额">
-                  <el-select v-model="config.output_tax_subject_id" :disabled="!store.canWrite" filterable clearable>
+                  <el-select v-model="config.output_tax_subject_id" :disabled="!store.canWrite" filterable clearable :persistent="false">
                     <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                   </el-select>
                 </el-form-item>
               </el-col>
               <el-col :xs="24" :sm="12">
                 <el-form-item label="进项贷方">
-                  <el-select v-model="config.input_credit_subject_id" :disabled="!store.canWrite" filterable clearable>
+                  <el-select v-model="config.input_credit_subject_id" :disabled="!store.canWrite" filterable clearable :persistent="false">
                     <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                   </el-select>
                 </el-form-item>
               </el-col>
               <el-col :xs="24" :sm="12">
                 <el-form-item label="销项借方">
-                  <el-select v-model="config.output_debit_subject_id" :disabled="!store.canWrite" filterable clearable>
+                  <el-select v-model="config.output_debit_subject_id" :disabled="!store.canWrite" filterable clearable :persistent="false">
                     <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                   </el-select>
                 </el-form-item>
@@ -68,14 +68,14 @@
               -->
               <el-col :xs="24" :sm="12">
                 <el-form-item label="进项兜底">
-                  <el-select v-model="config.input_fallback_subject_id" :disabled="!store.canWrite" filterable clearable placeholder="未配置则报错">
+                  <el-select v-model="config.input_fallback_subject_id" :disabled="!store.canWrite" filterable clearable :persistent="false" placeholder="未配置则报错">
                     <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                   </el-select>
                 </el-form-item>
               </el-col>
               <el-col :xs="24" :sm="12">
                 <el-form-item label="销项兜底">
-                  <el-select v-model="config.output_fallback_subject_id" :disabled="!store.canWrite" filterable clearable placeholder="未配置则报错">
+                  <el-select v-model="config.output_fallback_subject_id" :disabled="!store.canWrite" filterable clearable :persistent="false" placeholder="未配置则报错">
                     <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                   </el-select>
                 </el-form-item>
@@ -257,7 +257,15 @@
                       </el-select>
                     </el-form-item>
                     <el-form-item label="税额科目" v-if="invoiceTypeFor(row) === 'OUTPUT'">
-                      <el-select :model-value="taxSubjectFor(row)" :disabled="!store.canWrite" filterable style="width: 210px" @update:model-value="(v) => setTaxSubject(row, v)">
+                      <!--
+                        persistent=false：下拉里的选项**只在展开时才创建**。
+                        Element Plus 的 el-select 默认 persistent=true ——
+                        那一大堆 el-option 组件在**下拉关着的时候就已经渲染好了**
+                        （只是用 v-show 藏起来）。几十张发票全部展开时，
+                        「科目下拉数 × 科目表行数」个组件一次性堆出来，
+                        就是这个页面卡成这样的原因。
+                      -->
+                      <el-select :model-value="taxSubjectFor(row)" :disabled="!store.canWrite" filterable :persistent="false" style="width: 210px" @update:model-value="(v) => setTaxSubject(row, v)">
                         <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                       </el-select>
                     </el-form-item>
@@ -265,12 +273,28 @@
                       <span class="muted">不单列，并入第一条明细行</span>
                     </el-form-item>
                     <el-form-item label="结算科目">
-                      <el-select :model-value="settlementSubjectFor(row)" :disabled="!store.canWrite" filterable style="width: 210px" @update:model-value="(v) => setSettlementSubject(row, v)">
+                      <el-select :model-value="settlementSubjectFor(row)" :disabled="!store.canWrite" filterable :persistent="false" style="width: 210px" @update:model-value="(v) => setSettlementSubject(row, v)">
                         <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                       </el-select>
                     </el-form-item>
-                    <el-form-item label="这张">
+                    <!--
+                      没有标签：原来那个「这张」是个从两栏布局里剩下的残骸 ——
+                      「发票类型 / 税额 / 结算科目 / 这张」读起来像四件并列的事，
+                      其实最后那栏只是这一张发票的操作按钮。
+                      去掉标签后按钮组自己右对齐，位置比原来更靠边。
+                    -->
+                    <el-form-item class="row-actions">
                       <el-button size="small" :disabled="!store.canWrite" @click="toggleIgnored(row)">忽略这张</el-button>
+                      <!--
+                        只有**有问题**的发票才给这个按钮：解析成功的发票重跑一遍
+                        不会变好，而按钮一多就分不清哪个是真需要点的。
+                      -->
+                      <el-button
+                        v-if="row.errors?.length"
+                        size="small" type="warning" plain
+                        :loading="reparsingId === row.id" :disabled="!store.canWrite"
+                        @click="reparse(row)"
+                      >重新解析</el-button>
                     </el-form-item>
                   </el-form>
                 </div>
@@ -303,7 +327,7 @@
                         一个格子里两行字看着是散的。留出标记的位置，两样东西
                         同一行。
                       -->
-                      <el-select :model-value="lineSubjectFor(row, $index)" :disabled="!store.canWrite" filterable clearable style="width: 160px" @update:model-value="(v) => setLineSubject(row, $index, v)">
+                      <el-select :model-value="lineSubjectFor(row, $index)" :disabled="!store.canWrite" filterable clearable :persistent="false" style="width: 160px" @update:model-value="(v) => setLineSubject(row, $index, v)">
                         <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                       </el-select>
                       <!--
@@ -348,7 +372,7 @@
         <el-form-item label="匹配对象"><el-radio-group v-model="ruleForm.match_type"><el-radio value="SELLER">供应商/客户</el-radio><el-radio value="ITEM">项目名称</el-radio></el-radio-group></el-form-item>
         <el-form-item label="发票类型"><el-select v-model="ruleForm.invoice_type" style="width: 200px"><el-option label="进项和销项" value="BOTH" /><el-option label="仅进项" value="INPUT" /><el-option label="仅销项" value="OUTPUT" /></el-select></el-form-item>
         <el-form-item label="关键词"><el-input v-model="ruleForm.keyword" placeholder="如：办公用品、某某科技有限公司" /></el-form-item>
-        <el-form-item label="入账科目"><el-select v-model="ruleForm.subject_id" filterable style="width: 100%"><el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" /></el-select></el-form-item>
+        <el-form-item label="入账科目"><el-select v-model="ruleForm.subject_id" filterable :persistent="false" style="width: 100%"><el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" /></el-select></el-form-item>
         <el-form-item label="优先级"><el-input-number v-model="ruleForm.priority" :min="-1000" :max="1000" /></el-form-item>
       </el-form>
       <template #footer><el-button @click="ruleVisible = false">取消</el-button><el-button type="primary" :loading="savingRule" @click="createRule">保存</el-button></template>
@@ -384,6 +408,9 @@ const totalBytes = computed(() => files.value.reduce((sum, file) => sum + (file.
 const uploading = ref(false)
 const committing = ref(false)
 const previewing = ref(false)
+// 正在重新解析的那一张（按钮上的 loading）。用 id 而不是布尔量 ——
+// 一批几十张发票，哪一张转圈要能看出来。
+const reparsingId = ref(null)
 const savingConfig = ref(false)
 const savingRule = ref(false)
 // 兜底科目也在这里：saveConfig 整个 config 提交，少一个字段就等于把那一项清空。
@@ -527,6 +554,19 @@ async function recalculate() {
   previewing.value = true
   try { batch.value = await invoiceApi.previewBatch(store.bookId, batch.value.id, overridePayload()); ElMessage.success('预览已重新计算') } finally { previewing.value = false }
 }
+async function reparse(row) {
+  reparsingId.value = row.id
+  try {
+    batch.value = await invoiceApi.reparseRecord(store.bookId, batch.value.id, row.id, overridePayload())
+    const stillBad = batch.value.error_count
+    if (stillBad) ElMessage.warning('已重新解析，仍有发票需要核对')
+    else ElMessage.success('重新解析完成')
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.detail || '重新解析失败')
+  } finally {
+    reparsingId.value = null
+  }
+}
 async function commit() {
   await ElMessageBox.confirm(`确认根据 ${batch.value.ready_count} 张发票生成未记账凭证吗？生成后仍可在凭证页面修改。`, '确认生成凭证', { type: 'warning' })
   committing.value = true
@@ -590,6 +630,10 @@ onMounted(loadAll)
 .invoice-detail { padding: 2px 10px 12px 44px; }
 .detail-toolbar { padding: 4px 0 8px; border-bottom: 1px solid #edf0f4; }
 .detail-toolbar :deep(.el-form-item) { margin-bottom: 5px; }
+/* 去掉「这张」那个标签之后，按钮组自己站到这一行的最右边 —— 它是这一张
+   发票的操作，不是跟「发票类型 / 税额 / 结算科目」并列的一项。 */
+.detail-toolbar :deep(.el-form-item.row-actions) { margin-left: auto; margin-right: 0; }
+.detail-toolbar :deep(.el-form-item.row-actions .el-form-item__content) { gap: 8px; }
 .invoice-errors { margin: 10px 0; padding: 8px 10px; border-left: 3px solid #d93025; background: #fff5f4; color: #b42318; font-size: 12px; line-height: 1.8; }
 .line-table { margin-top: 8px; }
 .entry-preview { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; align-items: center; font-size: 12px; }

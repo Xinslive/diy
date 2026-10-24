@@ -245,6 +245,35 @@ def preview_invoice_batch(batch_id: int, request: Request, payload: InvoicePrevi
         raise _db_error(request, exc) from exc
 
 
+@router.post("/batches/{batch_id}/records/{record_id}/reparse")
+def reparse_invoice_record(batch_id: int, record_id: int, request: Request,
+                           payload: InvoicePreviewIn | None = None,
+                           book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                           _link: UserBook = Depends(require_book_write)):
+    """把一张解析失败的发票**重新解析**一次。
+
+    走批次存下来的那份原始 PDF，只重跑那一页。解析器修好之后不用把整个
+    批次重传一遍 —— 几百张票重传一次要几分钟，还可能撞上重复上传的拦截。
+
+    覆盖项（人工改过的科目、忽略过的行）跟着一起提交：重新解析不该把用户
+    已经做过的人工修正冲掉。
+    """
+    batch = _batch(book, db, batch_id)
+    record = db.scalar(
+        select(InvoiceRecord).where(InvoiceRecord.id == record_id,
+                                     InvoiceRecord.batch_id == batch.id))
+    if record is None:
+        raise HTTPException(404, "这张发票不在这个批次里")
+    try:
+        return service.reparse_record(db, batch, record, (payload.overrides if payload else {}))
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _db_error(request, exc) from exc
+
+
 @router.post("/batches/{batch_id}/commit")
 def commit_invoice_batch(batch_id: int, request: Request, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                          _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
