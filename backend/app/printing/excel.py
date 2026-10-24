@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import io
+import re
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
@@ -40,6 +41,33 @@ MAX_EXPORT_ROWS = 50_000
 #: 见 ``_safe_sheet_title``。
 _ILLEGAL_TITLE_CHARS = set(r"[]:*?/\\")
 
+#: **XML 1.0 不允许出现在文档里的字符**（C0 控制字符除 TAB/LF/CR 外、
+#: C1 控制字符 U+007F–U+009F、以及 U+FFFE / U+FFFF）。
+#:
+#: Excel 底层就是 XML。openpyxl 写单元格时把字符串直接塞进 ``<t>`` 节点，
+#: 遇到这些字符 lxml 会抛：
+#:
+#:     ValueError: All strings must be XML compatible:
+#:     Unicode or ASCII, no NULL bytes or control characters
+#:
+#: 而这是**整个文件写不出来**的错：不是那一格没写上，是 xlsx 一个字节都
+#: 生成不了，接口直接 500，前端只显示「导出失败」。行数再多也一样 ——
+#: 493 行和 50 万行撞上同样一个坏字符，同样一个字节都出不来。
+#:
+#: 现实来源是**发票 PDF 的文字层**：pypdfium2 的 ``get_text_range()`` 会把
+#: UTF-16 的 BOM 在某些字形映射里漏成 U+FFFE 混进摘要，例如
+#: 「*电线电缆*广州五羊ZC\ufffeBV2.5平方线」。这份字符被原样存进
+#: ``entry.summary``，之后每一条含它的明细账/总账导出都会整份失败。
+#:
+#: 这里既在写入前清洗（``_text``），也在落盘前**统一清扫整张表**
+#: （``_scrub_workbook``），因为漏网之鱼可能来自任何一处写入点。
+_ILLEGAL_XML_CHARS = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufffe\uffff]")
+
+#: XML 1.0 允许的三个控制字符。直接删掉会改变文本长度与版面，
+#: 换成等宽空格：信息不丢，单元格也不会被撑开。
+_XML_SAFE_CONTROL = {"\x09": " ", "\x0a": " ", "\x0d": " "}
+
 
 class ExportTooLarge(ValueError):
     """导出行数超限。由 API 层翻译成 413 并带上可操作的提示。"""
@@ -63,9 +91,15 @@ def _safe_sheet_title(name: str, fallback: str) -> str:
     这些名字本身都是合法业务名，报错等于「你起名起得不合法」。
     剔完为空（名字全是非法字符）才退回默认名。sheet 名只在标签页上显示，
     不参与账务计算，清洗掉这几个字符不影响导出内容的正确性。
+
+    **还要洗 XML 非法字符**：工作表名在 xlsx 里是 ``<sheet name="...">``
+    的**属性值**，属性值同样受 XML 1.0 约束 —— 一个 U+FFFE 就能让 lxml
+    抛 ``All strings must be XML compatible``，整份文件写不出来。
+    明细账/报表的工作表名来自科目名和报表名（都是用户填的），
+    这是和生产那次一样的死法，只是换了个位置。
     """
     cleaned = "".join(ch for ch in str(name or "") if ch not in _ILLEGAL_TITLE_CHARS)
-    cleaned = cleaned.strip()[:31]
+    cleaned = scrub_xml_chars(cleaned).strip()[:31]
     return cleaned or fallback
 
 THIN = Side(style="thin", color="000000")
@@ -182,10 +216,28 @@ def _text(value) -> str:
     """
     if value is None:
         return ""
-    text = str(value)
+    text = scrub_xml_chars(str(value))
     if text[:1] in ("=", "+", "-", "@", "\t", "\r"):
         return "'" + text
     return text
+
+
+def scrub_xml_chars(text: str) -> str:
+    """去掉 XML 1.0 写不出去的控制字符，其余内容原样保留。
+
+    TAB/LF/CR 是 XML 1.0 **允许**的（换行、制表在单元格里很常见），
+    但它们会让单元格看起来像被撑开了行；这里换成等宽空格，既不丢信息，
+    也不破坏版面。
+
+    U+FFFE / U+FFFF 在 XML 里是**永久非法**的（不管有没有 BOM 上下文），
+    必须去掉 —— 它们在发票 PDF 文字层里出现过，是整份导出失败的元凶。
+    """
+    if not text:
+        return text
+    for bad, good in _XML_SAFE_CONTROL.items():
+        if bad in text:
+            text = text.replace(bad, good)
+    return _ILLEGAL_XML_CHARS.sub("", text)
 
 
 def _money_style(ws, row: int, cols: range):
@@ -193,7 +245,50 @@ def _money_style(ws, row: int, cols: range):
         ws.cell(row=row, column=c).number_format = "#,##0.00"
 
 
+def _scrub_workbook(wb: Workbook) -> None:
+    """把整本工作簿里所有字符串单元格扫一遍，剥掉 XML 非法字符。
+
+    **为什么不能只靠 ``_text()``**：``_text`` 只覆盖「经过它的写入点」。
+    将来有人写 ``ws.cell(row=r, column=3, value=raw_summary)``（忘了套
+    ``_text``），或者某个单元格的值是**后来才被赋上去的**，脏字符就会
+    原样进到 XML 里，然后整份文件写不出来 —— 而症状只有「导出失败」，
+    现场一行都查不出是哪一格坏。
+
+    所以在**落盘前**统一扫一遍。这是唯一的兜底点：所有导出都从
+    ``_to_bytes`` 出去，一处改动覆盖全部导出面。
+    """
+    for ws in wb.worksheets:
+        # 工作表名是 xlsx 的**属性值**，同样受 XML 1.0 约束。
+        # 明细账/报表的工作表名来自科目名、报表名（都是用户填的）。
+        title = ws.title
+        cleaned_title = scrub_xml_chars(title).strip()[:31]
+        if cleaned_title and cleaned_title != title:
+            ws.title = cleaned_title
+        # 已写入的单元格（含 value / data_type）。
+        for cell in list(getattr(ws, "_cells", {}).values()):
+            value = cell.value
+            if isinstance(value, str):
+                cleaned = scrub_xml_chars(value)
+                if cleaned != value:
+                    cell.value = cleaned
+        # 兜底：逐行扫一遍，防止有单元格不在 ``_cells`` 里被漏掉
+        # （合并区域的边缘单元格就是这种）。
+        for row in ws.iter_rows():
+            for cell in row:
+                value = cell.value
+                if isinstance(value, str):
+                    cleaned = scrub_xml_chars(value)
+                    if cleaned != value:
+                        cell.value = cleaned
+
+
 def _to_bytes(wb: Workbook) -> bytes:
+    """序列化成 xlsx 字节。**落盘前先扫掉 XML 非法字符。**
+
+    所有 Excel 导出都必须走这里，不要另起 ``wb.save(buf)`` ——
+    绕过清扫 = 把「导出失败」这个症状放回线上。
+    """
+    _scrub_workbook(wb)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -282,9 +377,7 @@ def vouchers_excel(rows: list[dict], *, title: str = "记账凭证", period: str
         ws.cell(row=r + 2, column=6, value=_num(sum_cr)).font = Font(bold=True)
         _money_style(ws, r + 2, range(5, 7))
 
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+    return _to_bytes(wb)
 
 
 # --------------------------------------------------------------------- 科目余额表
@@ -379,9 +472,7 @@ def balance_excel(payload: dict, *, book_name: str) -> bytes:
     ws.cell(row=r + 1, column=4, value=_verdict(
         check, "closing_balanced", "期末余额", totals["closing_debit"], totals["closing_credit"]))
 
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+    return _to_bytes(wb)
 
 
 # --------------------------------------------------------------------- 总账（用友式）
@@ -579,9 +670,7 @@ def general_ledger_excel(payload: dict, *, book_name: str,
             print_date=print_date,
             period_label=period_label,
         )
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+    return _to_bytes(wb)
 
 
 def detail_ledger_excel(payload: dict, *, book_name: str,
@@ -646,9 +735,7 @@ def detail_ledger_excel(payload: dict, *, book_name: str,
             print_date=print_date,
             period_label=period_label,
         )
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+    return _to_bytes(wb)
 
 
 # --------------------------------------------------------------------- 报表
@@ -786,9 +873,7 @@ def report_excel(payload: dict, *, book_name: str) -> bytes:
         for i, e in enumerate(payload["errors"]):
             ws.cell(row=r + i + 1, column=1, value=_text(e)).font = Font(color="CC0000")
 
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+    return _to_bytes(wb)
 
 
 def opening_balance_excel(rows: list[dict], *, book_name: str, year: int,

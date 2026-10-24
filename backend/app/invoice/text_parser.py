@@ -21,6 +21,32 @@ except ImportError:  # pragma: no cover - 运行环境通过 requirements 安装
     p = None
 
 
+#: **XML 1.0 不允许写进 Excel 的字符**（C0 控制字符除 TAB/LF/CR、
+#: C1 控制字符 U+007F–U+009F、以及 U+FFFE / U+FFFF）。
+#:
+#: PDF 文字层会把 UTF-16 的 BOM 漏成 U+FFFE 混进项目名，例如
+#: 「*电线电缆*广州五羊ZC\ufffeBV2.5平方线」。这份字符原样存进
+#: ``entry.summary``，之后**每一份**含它的明细账/总账导出都会整份失败
+#: （Excel 底层是 XML，lxml 直接抛
+#: ``All strings must be XML compatible``，一个字节都出不来）。
+#:
+#: 解析层就把它挡掉：源头干净了，历史数据可以一次性订正，以后也不会
+#: 再攒出新的脏字符。
+_CONTROL_CHARS = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufffe\uffff]")
+
+
+def scrub_control_chars(text: str) -> str:
+    """去掉 XML 1.0 写不出去的控制字符，其余原样保留。
+
+    TAB/LF/CR 是 XML 1.0 **允许**的，解析器按行切分时要靠它们定位，
+    所以这里**不动**它们（Excel 那侧另有 ``scrub_xml_chars`` 负责版面）。
+    """
+    if not text:
+        return text
+    return _CONTROL_CHARS.sub("", text)
+
+
 def _jsonable(value):
     """Decimal → 字符串。
 
@@ -74,7 +100,9 @@ def extract_pages_text(pdf_path: str) -> List[str]:
         for i in range(pages):
             try:
                 tp = doc[i].get_textpage()
-                text = tp.get_text_range() or ""
+                # PDF 文字层会混进 U+FFFE 之类的 XML 非法字符（见
+                # ``scrub_control_chars``）。挡在这里，脏字符就不会进摘要。
+                text = scrub_control_chars(tp.get_text_range() or "")
             except Exception:
                 text = ""
             total += len(text)

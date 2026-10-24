@@ -20,6 +20,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from app.core.config import settings
+from app.invoice.text_parser import scrub_control_chars
 
 try:
     import requests
@@ -406,7 +407,10 @@ def ocr_pdf_to_texts(
             # jsonUrl 是**不可信输入**：它由 OCR 服务给出，抓它之前先过
             # 协议 / 网段 / 跳转三道闸（审计 P2-2）。响应内容也不回显。
             result_text = _fetch_result_text(str(json_url), timeout=(30, 120))
-            return _markdown_pages(result_text)
+            # OCR 结果同样可能带 XML 非法字符（PDF 文字层/OCR 都见过
+            # U+FFFE）。解析层统一挡掉，别让脏字符进摘要 ——
+            # 详见 ``app.invoice.text_parser.scrub_control_chars``。
+            return [scrub_control_chars(p) for p in _markdown_pages(result_text)]
         if state == "failed":
             raise OcrApiError(f"OCR 任务失败：{str(payload.get('errorMsg') or '未知错误')[:300]}")
         time.sleep(max(0.2, poll_seconds))
