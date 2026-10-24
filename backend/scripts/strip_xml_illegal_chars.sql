@@ -77,13 +77,28 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
--- 1) 凭证分录的摘要
+-- 1) 凭证分录的摘要 —— **只动未结账期间的**
+--
+-- 已结账期间的分录改不了：库里有 ``fn_entry_lock_guard`` 触发器守着，
+-- 一 UPDATE 就抛「会计期间已结账，禁止修改凭证」。这是**对的** ——
+-- 已结账就是「这一段定死了」，改它等于把定账改掉。
+-- 本次实测：20 条脏分录里 19 条在未结账期间（2026-06/07/08），1 条在
+-- 2026-09（已结账，手工凭证）。
+--
+-- 那 1 条**不绕**：解锁 → 改 → 重新结账，是把定账的账做了一遍，代价与
+-- 风险都不是「清一个字符」该付的。它导出时会被导出层扫掉（代码侧已修），
+-- 账上留着也不影响任何一张报表 —— 那个字符在 Excel 里本来就看不见。
+--
+-- 这里**不**用「先解锁再改」：绕开护栏不是这个脚本该做的事。
 UPDATE entry e
    SET summary = regexp_replace(
          e.summary,
          '[\U00000000-\U00000008\U0000000B\U0000000C\U0000000E-\U0000001F\U0000007F-\U0000009F\U0000FFFE\U0000FFFF]',
          '', 'g')
- WHERE e.summary ~ '[\U00000000-\U00000008\U0000000B\U0000000C\U0000000E-\U0000001F\U0000007F-\U0000009F\U0000FFFE\U0000FFFF]';
+ WHERE e.summary ~ '[\U00000000-\U00000008\U0000000B\U0000000C\U0000000E-\U0000001F\U0000007F-\U0000009F\U0000FFFE\U0000FFFF]'
+   AND NOT EXISTS (
+         SELECT 1 FROM period p
+          WHERE p.book_id = e.book_id AND p.ord = e.period_ord AND p.locked);
 
 -- 2) 发票记录里冻结的解析结果与「凭证预览」
 UPDATE invoice_record r
@@ -93,6 +108,11 @@ UPDATE invoice_record r
 -- ---- 事务内核对 ----
 SELECT '还带非法字符的分录: ' || count(*) FROM entry
  WHERE summary ~ '[\U00000000-\U00000008\U0000000B\U0000000C\U0000000E-\U0000001F\U0000007F-\U0000009F\U0000FFFE\U0000FFFF]';
+-- 已结账期间里剩下的（动不了的那几条）—— 导出层会扫掉，账上不影响任何报表
+SELECT '其中在已结账期间(动不了，导出层会扫掉): ' || count(*) FROM entry e
+ WHERE e.summary ~ '[\U00000000-\U00000008\U0000000B\U0000000C\U0000000E-\U0000001F\U0000007F-\U0000009F\U0000FFFE\U0000FFFF]'
+   AND EXISTS (SELECT 1 FROM period p
+                WHERE p.book_id = e.book_id AND p.ord = e.period_ord AND p.locked);
 SELECT '还带非法字符的发票记录: ' || count(*) FROM invoice_record
  WHERE payload::text ~ '[\U00000000-\U00000008\U0000000B\U0000000C\U0000000E-\U0000001F\U0000007F-\U0000009F\U0000FFFE\U0000FFFF]';
 SELECT '摘要变成空的分录: ' || count(*) FROM entry WHERE summary IS NULL OR btrim(summary) = '';
