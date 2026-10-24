@@ -65,7 +65,7 @@
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { CATEGORY_LABEL, ensurePinyin, matchSubject } from '@/utils/subjectCode'
+import { CATEGORY_LABEL, ensurePinyin, matchSubject, needsPinyin } from '@/utils/subjectCode'
 import { rowOpen, searchHitIds } from '@/utils/subjectSearch'
 import { perFrame, rafThrottle } from '@/utils/frame'
 
@@ -230,8 +230,25 @@ const roots = computed(() => {
 
 /** 在不在搜：没有关键字就没有筛选，面板上摆的是目录（只画人点开的那几支）。 */
 const searching = computed(() => !!keyword.value.trim())
-/** 筛选后留下哪几条（命中的 + 从一级到它的整条路）。判定在 utils/subjectSearch.js */
-const hit = computed(() => (searching.value ? searchHitIds(props.options, keyword.value) : null))
+/**
+ * 筛选后留下哪几条（命中的 + 从一级到它的整条路）。判定在 utils/subjectSearch.js
+ *
+ * **必须读一次 ``dictReady``**（2026-10-24 性能审计补上）。
+ *
+ * 拼音首字母的匹配结果存在模块级的普通 ``Map`` 里 —— 它**不是响应式的**，
+ * 所以「字典到位」这件事本身不会让这个 computed 失效。结果是：
+ * 用户打字快过字典加载时，这一轮算出来的是「搜不到首字母」的版本，
+ * 字典到位后**不会重算**，面板就一直空着，直到用户再敲一个字符。
+ *
+ * 显式读一次 ``dictReady.value`` 就是把它列进依赖表 —— 字典到位 → 依赖变了
+ * → 这个 computed 重算 → 同一串输入按新字典重新过滤一遍。
+ * 这正是本文件上方那句注释（「到位后要把同一串输入重新过滤一次」）要的效果，
+ * 以前只是**写着**而没有真的做到。
+ */
+const hit = computed(() => {
+  dictReady.value
+  return searching.value ? searchHitIds(props.options, keyword.value) : null
+})
 
 /**
  * 这一支摊不摊开 —— 面板上那个 ▸ / ▾ 就读它，两边得一处算：
@@ -453,7 +470,6 @@ function onFocus() {
   const el = inputEl.value
   if (el && el.value !== text.value) el.value = text.value
   selectAll()
-  ensurePinyin().then(() => { dictReady.value = true })   // 拉到手，筛选跟着重算
   openPanel()
 }
 
@@ -522,6 +538,20 @@ function onInput(e) {
   selAllArmed = false
   text.value = e.target.value
   keyword.value = e.target.value
+  // **拼音字典在这时才可能拉**（2026-10-24 性能审计改）。
+  //
+  // 原来是在 ``onFocus``（点进格子）就无条件 ``ensurePinyin()`` ——
+  // 于是「进凭证页点任意一行」就等于强制下发 138 KB（gzip）并解析 306 KB JS，
+  // 而**绝大多数人根本不用拼音首字母搜索**。
+  //
+  // 现在改成：输入里**出现 ASCII 字母**才拉（编码与中文名都不需要它，
+  // 走的是另外两条匹配路径）。见 utils/subjectCode.js 的 needsPinyin()。
+  //
+  // 字典到位后把 dictReady 置起来 → tree 这个 computed 重算 →
+  // 同一串输入重新过滤一次，否则「先打后加载」的用户就永远搜不到了。
+  if (!dictReady.value && needsPinyin(keyword.value)) {
+    ensurePinyin().then(() => { dictReady.value = true })
+  }
   // 整格删空 = 这一行不要科目了。清空内容是允许的，光靠失焦回填的话，
   // 选错了科目就再也清不掉了 —— 只能换一个，不能没有。
   if (!e.target.value.trim() && props.modelValue != null) {

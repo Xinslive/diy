@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.api.reports import _visible_template
 from app.api.vouchers import _book_subjects, _serialize
@@ -742,13 +742,34 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
                                      status=status, page_size=5000)
     else:
         ids = list(dict.fromkeys(voucher_ids))
-        vouchers = list(db.scalars(select(Voucher).where(
-            Voucher.book_id == book.id, Voucher.id.in_(ids)
-        )).all())
+        # **分录一次性捞出来**（与 ``query_vouchers`` 同一个坑的同一处修法）：
+        # 下面逐张 ``_serialize`` 会读 ``v.entries``，不预取就是**每张凭证一次
+        # 懒加载** —— 选 500 张凭证就是 500 次往返，而且是在**渲染**路径上。
+        vouchers = list(db.scalars(
+            select(Voucher).where(
+                Voucher.book_id == book.id, Voucher.id.in_(ids)
+            ).options(selectinload(Voucher.entries))
+        ).unique().all())
         if len(vouchers) != len(ids):
             raise HTTPException(404, "所选凭证不存在或不属于当前账套")
     vouchers = sorted(vouchers, key=lambda v: (v.voucher_date, v.voucher_no, v.id))
     shown = vouchers[:max_pages] if max_pages else vouchers
+
+    # **行数闸**（2026-10-24 性能审计补上）。
+    #
+    # 同族的三个打印范围都有这道闸 —— 科目余额表（`_check_print_rows`）、
+    # 总账（:982）、明细账（:1100）—— **唯独凭证这一路没有**。
+    # 而它恰恰是内存最凶的一个：凭证打印是**整份文档一次性在内存里拼出来**的，
+    # 而且同时存在三份拷贝 —— ``pieces``（分片后的结构）、``docs``（每页一串
+    # HTML）、``wrap_pages(docs)``（拼好的整份文档）。满月的账 5000 张凭证
+    # × 8 行分录 = 4 万行，光是这几份拷贝就是几十 MB，而这是**一台 1.6 GB
+    # 的机器**。
+    #
+    # 行数的口径与 Excel 导出那道闸**逐字一致**（``xl.vouchers_excel`` 也是
+    # 「所有凭证的分录条数之和」），两处面对的是同一份账、同一批行。
+    # 判据放在**序列化之前**：此时只多付一次 ``len()``，而一旦过了这一关，
+    # 后面每次复制都还没有发生。
+    _check_print_line_count(sum(len(v.entries) for v in shown), "记账凭证")
 
     period_codes = {}
     if voucher_ids is not None and shown:
@@ -799,6 +820,21 @@ def _with_note(doc: str, note: str) -> str:
                        f'<p class="page-note">{html.escape(note)}</p><div class="page">', 1)
 
 
+def _check_print_line_count(n: int, kind: str) -> None:
+    """HTML 打印通道的行数闸（**按行数判**，不按行数列表判）。
+
+    为什么单独拆一个「按个数」版本：凭证打印页拿到的是**凭证对象**，
+    行数要现算（每张凭证的分录条数加起来），手上并没有一个「行」的列表 ——
+    而总数是与 ``MAX_EXPORT_ROWS`` 同一把尺，那就该共用同一个判据，
+    不该因为「没有列表」就少一道闸。
+    """
+    from app.printing import excel as xl
+    if n > xl.MAX_EXPORT_ROWS:
+        raise xl.ExportTooLarge(
+            f"{kind}共 {n:,} 行，超过单次打印上限 {xl.MAX_EXPORT_ROWS:,} 行。"
+            "请缩小查询范围（按科目或按期间分段打印）后重试。")
+
+
 def _check_print_rows(rows: list, kind: str) -> list:
     """HTML 打印通道的行数闸。
 
@@ -814,11 +850,7 @@ def _check_print_rows(rows: list, kind: str) -> list:
     与 ``_xlsx`` 装饰器的处理完全一致（明确失败，而不是静默截断出缺行的账）。
     """
     n = len(rows)
-    from app.printing import excel as xl
-    if n > xl.MAX_EXPORT_ROWS:
-        raise xl.ExportTooLarge(
-            f"{kind}共 {n:,} 行，超过单次打印上限 {xl.MAX_EXPORT_ROWS:,} 行。"
-            "请缩小查询范围（按科目或按期间分段打印）后重试。")
+    _check_print_line_count(n, kind)
     return rows
 
 
@@ -1674,14 +1706,27 @@ def export_detail_ledger(book_id: int, subject_id: Optional[int] = None,
                          skip_empty: bool = Query(True),
                          book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                          user: SysUser = Depends(get_current_user)):
-    """明细账导出（用友式）：**一个一级科目一张工作表**，与打印件同一张纸。
+    """明细账导出：**屏幕那张表**（用户 2026-10-24 批注 1、2、3）。
+
+    **以前这里是「按打印模板做」的**：导出件是打印件的翻版（用友八列，
+    科目名塞在摘要列里，没有科目编码与科目名称两列）。用户要的是
+    「改成下方显示的样子」—— **屏幕上的那张表**：
+
+    * 查上级科目（综合明细账）时，一张表里排着它下面几个子科目的行，
+      没有「科目编码 / 科目名称」两列就分不清哪几行属于谁；
+    * 查末级科目时屏幕上就没有那两列，导出件跟着屏幕走。
+
+    所以导出**直接用屏幕那本明细账的行**（``queries.detail_ledger``），
+    不再走打印件那一套（``_detail_book_payload``）。数据源是同一个函数，
+    屏幕与文件不会算出两个数。
 
     ``subject_id`` **不给就是整册**（全账套的一级科目），给了就只导那一个。
 
-    ``skip_empty`` 与打印件同一个口径（默认打开）：打印与导出是同一张纸，
-    两个通道不能一个跳一个不跳。
+    ``skip_empty`` 与打印件同一个口径（默认打开）：两个通道不能一个跳
+    一个不跳。
     """
     from app.printing import excel as xl
+    from app.ledger import queries
 
     to_period = _period(db, book.id, period_id)
     if to_period.book_id != book.id:
@@ -1698,13 +1743,45 @@ def export_detail_ledger(book_id: int, subject_id: Optional[int] = None,
     groups = _detail_book_groups(db, book, to_period, subject_id,
                                   from_subject_id, to_subject_id)
     from app.ledger.engine import LedgerEngine
+    # 一册共用一个引擎实例（理由同 ``_render_ledger_book``）：逐个科目重建
+    # 引擎，期初聚合就白算 N 遍。
     eng = LedgerEngine.for_ledger(db, book.id, include_unposted)
-    payload_subjects = _detail_book_payload(db, book, groups, from_period,
-                                            to_period, include_unposted, eng)
-    # 用户点名要某一个科目时，那一页就该有（理由同 _render_detail_ledger_book）。
-    if skip_empty and not subject_id:
-        payload_subjects = [
-            s for s in payload_subjects if not _ledger_book_is_empty(s["rows"])]
+    payload_subjects = []
+    total_rows = 0
+    for group in groups:
+        root = group["subject"]
+        payload = queries.detail_ledger(
+            db, book.id, root.id, from_period, to_period, include_unposted,
+            # 起止子科目只对**用户点名的那一个科目**有意义（屏幕上的
+            # 「子科目范围」）：整册导出时每一册都是自己下面那一整段。
+            from_subject_id=from_subject_id if subject_id else None,
+            to_subject_id=to_subject_id if subject_id else None,
+            eng=eng)
+        rows = payload["rows"]
+        # 用户点名要某一个科目时，那一页就该有（理由同 _render_detail_ledger_book）。
+        if skip_empty and not subject_id and _ledger_book_is_empty(rows):
+            continue
+        total_rows += len(rows)
+        # 行数闸：**边算边卡**，别等整册的行都拼好了才发现超限
+        # （超限要报 413，不是截断 —— 理由见 excel.MAX_EXPORT_ROWS）。
+        if total_rows > xl.MAX_EXPORT_ROWS:
+            raise xl.ExportTooLarge(
+                f"明细账共 {total_rows:,} 行，超过单次导出上限 "
+                f"{xl.MAX_EXPORT_ROWS:,} 行。请缩小查询范围（按科目或按期间"
+                "分段导出）后重试。")
+        rng = payload.get("subject_range") or {}
+        payload_subjects.append({
+            "code": payload["subject"]["code"],
+            "name": payload["subject"]["name"],
+            # 有没有下级科目 —— 决定导出件带不带「科目编码 / 科目名称」两列
+            #（屏幕上也是这个开关）。
+            "comprehensive": bool(payload.get("comprehensive")),
+            "range": {
+                "from": (rng.get("from") or {}).get("code") or "",
+                "to": (rng.get("to") or {}).get("code") or "",
+            } if rng else None,
+            "rows": rows,
+        })
     data = xl.detail_ledger_excel(
         {"subjects": payload_subjects,
          "from_period": from_period.code, "to_period": to_period.code},

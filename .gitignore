@@ -65,6 +65,18 @@ dl.mjs
 # 是**源码目录**，整个目录忽略掉会让人加进去的文件凭空消失（见上面那段）。
 /backend/data/invoices/
 
+# 发票上传的暂存工作目录（2026-10-24 性能审计加）。
+#
+# 上传改成「边读边写」之后，源文件先落到这里（``.upload-*.pdf``），
+# 合并成 ``batch_{id}.pdf`` 之后就删掉。里面是**全量账务数据的明文**，
+# 与 ``backend/data/invoices`` 同一性质 —— 只留本机。
+#
+# 同样是钉具体路径，不钉 ``backend/data/``（理由见上面那段）。
+/backend/data/backup-work/
+
+# 测试用的上传暂存目录（tests/test_perf_memory_2026_10.py 的守卫用例）。
+/backend/data/test-upload-guard/
+
 # 本地构建与演练产物：隔离浏览器演练的截图/跟踪产物（output/playwright/），
 # 以及 plugin_package.py --output 打出来的 .cwp 安装包（output/plugins/）。
 # 和上面的 .shots/ 一样：它们是「某一次构建或验证当时产出了什么」，不是源码，

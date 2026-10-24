@@ -288,31 +288,151 @@ def test_页脚里不漏出字面占位符(client, auth, book, periods):
 # --------------------------------------------------------------------- 导出
 
 
-def test_导出与打印是同一张纸(client, auth, book, periods, subjects, make_voucher):
-    """Excel 导出与 HTML 打印印的是同一张纸：一个一级科目一张表。"""
+def _export_detail(client, auth, book, **params):
+    r = client.get(f"/api/books/{book.id}/print/detail-ledger.xlsx", headers=auth,
+                   params=params)
+    assert r.status_code == 200, r.text
+    return load_workbook(io.BytesIO(r.content))
+
+
+def _header_labels(ws):
+    """第 4 行的列头。
+
+    年份那一格横跨「月 + 日」（A4 是锚点、B4 是空的），所以**列数 = 标签数 + 1**。
+    """
+    labels = [ws.cell(row=4, column=c).value
+              for c in range(1, ws.max_column + 1)]
+    return [x for x in labels if x is not None]
+
+
+def _col(labels, name):
+    """列头名 -> 表体里的列号（0 基）。
+
+    年份那一格横跨「月 + 日」（A4 是锚点、B4 是空的），所以第 4 行里
+    **年份之后**的标签比它在表体里的列号少 1。
+    """
+    i = labels.index(name)
+    return i if i == 0 else i + 1
+
+
+def _body_rows(ws, ncols):
+    """表体行（第 6 行起，到页脚之前那一空行为止）。"""
+    out = []
+    for row in ws.iter_rows(min_row=6, max_col=ncols, values_only=True):
+        if row[0] is None:
+            break
+        out.append(row)
+    return out
+
+
+def test_导出件是屏幕那张表_末级科目(client, auth, book, periods, subjects, make_voucher):
+    """用户 2026-10-24 批注 1：导出件照**屏幕**那样，不是照打印模板。
+
+    末级科目时屏幕与打印件的列数一样（八列），但**抬头不一样**：
+    屏幕那一行是「账套 · 科目 · 期间」，打印件是「{科目名}明细账 + 期间代码」。
+    """
     make_voucher("2026-01-10", dr=[("1001", 100, "现金收入")], cr=[("5001", 100, "x")],
                  posted=True)
-    r = client.get(f"/api/books/{book.id}/print/detail-ledger.xlsx", headers=auth,
-                   params={"period_id": periods[12].id,
-                           "from_period_id": periods[1].id,
-                           "subject_id": subjects["1001"].id})
-    assert r.status_code == 200, r.text
-    wb = load_workbook(io.BytesIO(r.content))
-    assert len(wb.worksheets) == 1, "只打一个科目就该只有一张表"
+    wb = _export_detail(client, auth, book, period_id=periods[12].id,
+                        from_period_id=periods[1].id, subject_id=subjects["1001"].id)
+    assert len(wb.worksheets) == 1, "只导一个科目就该只有一张表"
     ws = wb.worksheets[0]
-    assert "库存现金明细账" in str(ws.cell(row=1, column=1).value)
-    # 标题下面那一行是**期间**（与打印件同一张纸、同一串字）
-    assert ws.cell(row=2, column=1).value == "2026-01 至 2026-12"
-    # 八个列头，与打印件同一套（第 4、5 行是两行表头）
-    heads = [ws.cell(row=4, column=c).value for c in range(1, 9)]
-    assert heads[0] == "2026年"
+    # 标题与副标题：屏幕那一行
+    assert ws.cell(row=1, column=1).value == "明 细 账"
+    sub = str(ws.cell(row=2, column=1).value)
+    assert book.name in sub and "1001" in sub and "库存现金" in sub, sub
+    assert "01月 至 12月" in sub, sub
+    # 末级科目：**没有**科目编码与科目名称两列（用户 2026-10-24 批注 3）
+    labels = _header_labels(ws)
+    assert "科目编码" not in labels and "科目名称" not in labels, labels
+    assert labels[0] == "2026年"
     assert [ws.cell(row=5, column=c).value for c in (1, 2)] == ["月", "日"]
-    assert heads[2] == "凭证号数" and heads[7] == "余额"
+    assert "凭证号" in labels and "余额" in labels, labels
     # 逐笔的摘要与凭证号都在
     blob = " ".join(str(c.value) for row in ws.iter_rows() for c in row
                     if c.value is not None)
     assert "现金收入" in blob
     assert "记0001" in blob
+
+
+def test_导出件查上级科目时有科目编码与科目名称两列(client, auth, book, periods,
+                                          subjects, make_voucher):
+    """用户 2026-10-24 批注 2：查上级科目时导出件要有这两列。
+
+    打印模板是**故意**没有这两列的（纸面靠摘要列分块），但导出件是要拿进
+    Excel 里筛、透视、核对的 —— 一张表里排着好几个子科目的行时，
+    没有编码与名称就分不清哪几行属于谁。
+    """
+    make_voucher("2026-01-10", dr=[("110101", 100, "买入股票")], cr=[("5001", 100, "x")],
+                 posted=True)
+    wb = _export_detail(client, auth, book, period_id=periods[12].id,
+                        from_period_id=periods[1].id, subject_id=subjects["1101"].id)
+    ws = wb.worksheets[0]
+    labels = _header_labels(ws)
+    assert "科目编码" in labels, labels
+    assert "科目名称" in labels, labels
+    ncols = len(labels) + 1
+    body = _body_rows(ws, ncols)
+    assert body, "导出件里一行都没有"
+    # 前三列之后就是「科目编码 / 科目名称」—— 值要与屏幕上的那一列一致
+    code_col = _col(labels, "科目编码")
+    name_col = _col(labels, "科目名称")
+    codes = {r[code_col] for r in body if r[code_col]}
+    assert "1101" in codes, codes
+    assert "110101" in codes, codes
+    names = {r[name_col] for r in body if r[name_col]}
+    assert "短期投资" in names and "股票" in names, names
+
+
+def test_导出件的行与屏幕上那本账逐行一致(client, auth, book, periods, subjects,
+                                     make_voucher):
+    """导出件复用**屏幕那本明细账的行**（同一个取数函数），不会算出两个数。"""
+    make_voucher("2026-01-10", dr=[("110101", 100, "买入股票")], cr=[("5001", 100, "x")],
+                 posted=True)
+    params = {"subject_id": subjects["1101"].id, "period_id": periods[12].id,
+              "from_period_id": periods[1].id}
+    screen = client.get(f"/api/books/{book.id}/ledger/detail", headers=auth,
+                        params=params).json()
+    wb = _export_detail(client, auth, book, **params)
+    ws = wb.worksheets[0]
+    labels = _header_labels(ws)
+    ncols = len(labels) + 1
+    body = _body_rows(ws, ncols)
+    assert len(body) == len(screen["rows"]), (
+        f"导出 {len(body)} 行，屏幕上 {len(screen['rows'])} 行")
+
+    def col(name):
+        return _col(labels, name)
+
+    for sheet_row, screen_row in zip(body, screen["rows"]):
+        assert sheet_row[col("摘要")] == screen_row["summary"], (sheet_row, screen_row)
+        assert sheet_row[col("科目编码")] == screen_row["subject_code"], (
+            sheet_row, screen_row)
+        assert sheet_row[col("科目名称")] == screen_row["subject_name"], (
+            sheet_row, screen_row)
+        assert sheet_row[col("借方")] == screen_row["debit"], (sheet_row, screen_row)
+        assert sheet_row[col("贷方")] == screen_row["credit"], (sheet_row, screen_row)
+        assert sheet_row[col("方向")] == screen_row["direction"], (sheet_row, screen_row)
+        assert sheet_row[col("余额")] == screen_row["balance"], (sheet_row, screen_row)
+
+
+def test_导出件里父科目自己的汇总行也在(client, auth, book, periods, subjects):
+    """综合明细账里，上级科目自己也有「期初余额 / 本月合计 / 累计」三行。
+
+    屏幕上就有（父科目按下级汇总），导出件照屏幕就也得有 —— 少了这三行，
+    文件里的合计与屏幕对不上。
+    """
+    wb = _export_detail(client, auth, book, period_id=periods[12].id,
+                        from_period_id=periods[1].id, subject_id=subjects["1101"].id)
+    ws = wb.worksheets[0]
+    labels = _header_labels(ws)
+    ncols = len(labels) + 1
+    body = _body_rows(ws, ncols)
+    mine = [r for r in body if r[_col(labels, "科目编码")] == "1101"]
+    assert mine, "导出件里没有父科目自己的行"
+    summaries = [r[_col(labels, "摘要")] for r in mine]
+    assert "期初余额" in summaries, summaries
+    assert "本月合计" in summaries, summaries
 
 
 def test_导出的打印日期与打印件一致(client, auth, book, periods, subjects):

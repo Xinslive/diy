@@ -38,6 +38,7 @@ from app.accounting.audit_helper import log
 from app.backup import config as cfg_mod
 from app.backup import export as export_mod
 from app.backup import oss_client, retention, tier as tier_mod
+from app.core.schema_version import BACKEND_ROOT
 from app.models import (SCOPE_BOOK, SCOPE_SYSTEM, STATUS_FAILED, STATUS_SUCCESS,
                         BackupRun, Book)
 
@@ -85,13 +86,40 @@ def _workdir() -> Path:
 
     产物只在这里停留到上传完成，随后删掉 —— 库里所有账的全量数据在服务器上
     留一份明文，既多占磁盘，又把「数据只在 OSS 上」这件事变成假的。
+
+    **绝不回退到 ``/tmp``**（2026-10-24 性能审计改）。
+
+    为什么不能回退：``cwq-api.service`` 开着 ``PrivateTmp=true``，
+    于是服务看到的 ``/tmp`` 是一个**私有的 tmpfs —— 那是内存盘**。
+    全量账务备份（gzip 后的 JSON，压完仍可能是几十 MB）落进去 =
+    **直接吃 API 的内存，而且永不被换出**。容量峰值时它就是压垮进程的那一下，
+    而症状是「备份跑到一半服务变慢/被杀」，看起来与备份毫无关系。
+
+    另一台生产机（``/opt/cwq`` 布局）的 ``/tmp`` 是真磁盘，回退过去只是
+    「明文备份落在系统临时目录」这个卫生问题；同一台机器上还有另外 11 个
+    子域，明文落在共享的 ``/tmp`` 里也是不该发生的事。
+
+    **没配置时落在应用自己的 ``backend/data/backup-work``**，理由：
+
+    * 它是**磁盘**，不在 ``PrivateTmp`` 的射程之内（那只影响 /tmp、/var/tmp、/run）；
+    * 它在 unit 的 ``ReadWritePaths=`` 白名单里（``/opt/cwq/backend/data``），
+      一定可写；
+    * 它已经是发票等运行时文件待的地方（``INVOICE_STORAGE_DIR=data/invoices``），
+      权限与归属口径一致。
+
+    显式配 ``CWQ_BACKUP_WORK_DIR`` 可以把它挪到别处（比如运维单独给的
+    ``/www/wwwroot/acct.xins.live/backups/work``）—— 那是**推荐**做法，
+    但缺省值本身是安全的，不该让「没配」变成「备份跑不起来」。
     """
-    override = os.environ.get("CWQ_BACKUP_WORK_DIR", "")
+    override = os.environ.get("CWQ_BACKUP_WORK_DIR", "").strip()
     if override:
         p = Path(override)
         p.mkdir(parents=True, exist_ok=True)
         return p
-    return Path(tempfile.gettempdir())
+
+    p = Path(BACKEND_ROOT) / "data" / "backup-work"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def _new_temp(workdir: Path, label: str) -> Path:

@@ -43,6 +43,15 @@ _ILLEGAL_TITLE_CHARS = set(r"[]:*?/\\")
 #: XML 非法字符的**定义与清洗**都在 ``app.core.text_clean``（单一出处）。
 #: 这里只是引它 —— 打印层、发票解析层、模型守卫共用同一份规则，
 #: 三层防线才不会各洗各的、洗出三种结果。
+#:
+#: 为什么要洗：Excel 底层就是 XML，openpyxl 写单元格时把字符串直接塞进
+#: ``<t>`` 节点，遇到 XML 1.0 不允许的字符 lxml 会抛
+#: ``ValueError: All strings must be XML compatible`` —— 那是**整个文件
+#: 写不出来**的错（不是那一格没写上，是 xlsx 一个字节都生成不了，接口 500，
+#: 前端只显示「导出失败」）。行数再多也一样：一行坏字符能拖垮一份导出件。
+#:
+#: 入口那道防线在 ``app/models/text_guard.py``（写进库前就洗掉），
+#: 这里是最后一道兜底：落盘前把整本工作簿扫一遍。
 from app.core.text_clean import scrub_xml_chars as scrub_xml_chars  # noqa: F401
 
 
@@ -632,20 +641,252 @@ def general_ledger_excel(payload: dict, *, book_name: str,
     return _to_bytes(wb)
 
 
+#: 明细账**导出件**的列 —— **屏幕那张表的逐列翻版**。
+#:
+#: 「科目编码 / 科目名称」两列只在**综合明细账**（查的是上级科目）时才有：
+#: 查末级科目时屏幕上就没有这两列，导出件跟着屏幕走
+#: （用户 2026-10-24 批注 3）。理由见 ``detail_ledger_excel`` 的说明。
+LEDGER_SCREEN_HEADERS = [
+    ("月", 6), ("日", 6), ("凭证号", 12),
+    ("科目编码", 12), ("科目名称", 26),
+    ("摘要", 42), ("借方", 16), ("贷方", 16), ("方向", 8), ("余额", 16),
+]
+
+#: 末级科目（屏幕上没有科目那两列）时的那一套列。
+LEDGER_SCREEN_HEADERS_LEAF = [
+    h for h in LEDGER_SCREEN_HEADERS if h[0] not in ("科目编码", "科目名称")
+]
+
+
+def _ledger_screen_period_label(from_period: str | None,
+                                to_period: str | None) -> str:
+    """期间那一段：**屏幕上的写法**（``01月`` 或 ``01月 至 03月``）。
+
+    与打印件的 ``ledger_book_period_label`` 是两套写法：打印件那一行写的是
+    「2026-01 ~ 2026-03」这种代码形式（纸面版式），导出件跟屏幕走 ——
+    屏幕的副标题写的就是「01月 至 03月」。
+    """
+    f = str(from_period or "")[5:7]
+    t = str(to_period or "")[5:7]
+    if not f and not t:
+        return ""
+    if not t or f == t:
+        return f"{f}月"
+    return f"{f}月 至 {t}月"
+
+
+def _ledger_screen_subtitle(subject: dict, book_name: str,
+                            from_period: str | None,
+                            to_period: str | None) -> str:
+    """副标题：**屏幕那一行**（账套 · 科目 · 子科目范围 · 期间）。
+
+    屏幕上写的是「启明物业 · 6001 主营业务收入 · 600101 至 600102 · 01月」，
+    导出件逐字照抄 —— 导出件离开了这个页面，得自己说清是哪本账的哪个科目
+    的哪一段，否则收到文件的人无从判断。
+    """
+    parts = [book_name or ""]
+    code = subject.get("code") or ""
+    name = subject.get("name") or ""
+    if code or name:
+        parts.append(f"{code} {name}".strip())
+    rng = subject.get("range") or {}
+    if rng.get("from") or rng.get("to"):
+        parts.append(f"{rng.get('from') or ''} 至 {rng.get('to') or ''}")
+    period = _ledger_screen_period_label(from_period, to_period)
+    if period:
+        parts.append(period)
+    return _text(" · ".join(p for p in parts if p))
+
+
+def _ledger_screen_cells(row: dict, *, with_subject: bool) -> list:
+    """屏幕的一行 -> 导出表的一行（列顺序见 ``LEDGER_SCREEN_HEADERS``）。
+
+    **月 / 日**是从凭证日期上拆下来的（与 ``template.ledger_book_detail_row``
+    同一套规则）：逐笔行有凭证日期，汇总行（期初 / 本月合计 / 累计）没有 ——
+    那几行只填月份。
+
+    **凭证号数**只在**逐笔行**上有：期初余额 / 本月合计 / 累计都不是凭证
+    （屏幕上那一列也只有真凭证号才点得开）。
+    """
+    voucher_date = row.get("voucher_date")
+    period = str(row.get("period") or "")
+    month = str(voucher_date)[5:7] if voucher_date else period[5:7]
+    day = str(voucher_date)[8:10] if voucher_date else ""
+    voucher_no = row.get("voucher_no") if row.get("voucher_id") else ""
+    cells = [
+        _text(month),
+        _text(day),
+        _text(voucher_no or ""),
+    ]
+    if with_subject:
+        cells.append(_text(row.get("subject_code") or ""))
+        cells.append(_text(row.get("subject_name") or ""))
+    cells += [
+        _text(row.get("summary") or ""),
+        _num(row.get("debit")),
+        _num(row.get("credit")),
+        _text(row.get("direction") or ""),
+        _num(row.get("balance")),
+    ]
+    return cells
+
+
+def _ledger_screen_sheet(
+    wb: Workbook,
+    *,
+    sheet_title: str,
+    fallback_title: str,
+    doc_title: str,
+    subtitle: str,
+    subject_code: str,
+    subject_name: str,
+    rows: list[dict],
+    year_label: str,
+    with_subject: bool,
+    company: str,
+    preparer: str,
+    print_date: str,
+):
+    """明细账**导出件**的一张表：屏幕那张表的逐格翻版。
+
+    与 ``_ledger_book_sheet``（打印件）是**两回事**：那张是**纸面**版式
+    （八列，科目名塞在摘要列里）；这张是**屏幕那张表**（有科目编码与科目
+    名称两列，行也是屏幕上的行）。用户 2026-10-24 批注 1、2 要求导出件照
+    屏幕来。
+
+    表头结构（两行表头、年份横跨「月 + 日」）与打印件一致 —— 两张表长得
+    像，用户在两份之间来回看时不用重新认位置；不一样的只是**表体**。
+    """
+    ws = wb.create_sheet(title=_safe_sheet_title(sheet_title, fallback_title))
+
+    headers = LEDGER_SCREEN_HEADERS if with_subject else LEDGER_SCREEN_HEADERS_LEAF
+    ncols = len(headers)
+    for i, (_label, width) in enumerate(headers, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+
+    # 摘要 / 方向两列的位置随「有没有科目那两列」而变（Excel 的列号是死的）。
+    summary_col = 6 if with_subject else 4
+    direction_col = 9 if with_subject else 7
+    money_cols = (7, 8, 10) if with_subject else (5, 6, 8)
+
+    # ---- 抬头 ----
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+    head = ws.cell(row=1, column=1, value=_text(doc_title))
+    # 主标题 20pt 加粗（用户 2026-10-23）：与打印件的标题同一档字号。
+    head.font = Font(name="宋体", size=20, bold=True)
+    head.alignment = CENTER
+    ws.row_dimensions[1].height = 26
+
+    # 副标题 = 屏幕那一行（账套 · 科目 · 子科目范围 · 期间）。
+    if subtitle:
+        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=ncols)
+        sub = ws.cell(row=2, column=1, value=subtitle)
+        sub.font = FONT_TEXT
+        sub.alignment = CENTER
+        ws.row_dimensions[2].height = 18
+
+    ws.cell(row=3, column=ncols - 2, value=_text("本币名称: 人民币")).font = FONT_TEXT
+    ws.cell(row=3, column=ncols - 2).alignment = RIGHT
+    ws.merge_cells(start_row=3, start_column=ncols - 2, end_row=3, end_column=ncols)
+    # 科目行只在真的导某一个科目时才有 —— 整册被「不打印无发生额科目」跳空
+    # 之后的那张空白页，不该顶着「科目: ()」出去。
+    if subject_name or subject_code:
+        c = ws.cell(row=3, column=1,
+                    value=_text(f"科目: {subject_name}({subject_code})"))
+        c.font = FONT_TEXT
+        c.alignment = LEFT
+
+    # ---- 两行表头（年份横跨「月+日」）----
+    ws.merge_cells(start_row=4, start_column=1, end_row=4, end_column=2)
+    y = ws.cell(row=4, column=1, value=_text(year_label))
+    y.font = Font(name="宋体", size=12, bold=True)
+    y.alignment = CENTER
+    for col, (label, _w) in enumerate(headers[2:], start=3):
+        ws.merge_cells(start_row=4, start_column=col, end_row=5, end_column=col)
+        c = ws.cell(row=4, column=col, value=_text(label))
+        c.font = FONT_CELL_BOLD
+        c.alignment = CENTER
+        c.border = BOX
+    for col, label in ((1, "月"), (2, "日")):
+        c = ws.cell(row=5, column=col, value=_text(label))
+        c.font = FONT_CELL_BOLD
+        c.alignment = CENTER
+        c.border = BOX
+    y.border = BOX
+
+    # ---- 表体 ----
+    r = 5
+    for row in rows:
+        r += 1
+        values = _ledger_screen_cells(row, with_subject=with_subject)
+        for i, value in enumerate(values, start=1):
+            c = ws.cell(row=r, column=i, value=value)
+            c.border = BOX
+            c.font = FONT_CELL
+            if i in (1, 2, direction_col):
+                c.alignment = CENTER
+            elif i in money_cols:
+                c.alignment = RIGHT
+            else:
+                c.alignment = LEFT
+        # 金额列给上「#,##0.00」：屏幕上是「125,800.00」，文件里也该是
+        # 「125,800.00」，而不是一个裸的 125800（打开文件第一眼就对不上）。
+        _money_style(ws, r, money_cols)
+        ws.row_dimensions[r].height = 16
+
+    # ---- 页脚 ----
+    r += 2
+    left = max(2, ncols // 2)
+    mid = 2
+    foot = ws.cell(row=r, column=1, value=_text(f"核算单位: {company}"))
+    foot.font = FONT_TEXT
+    foot.alignment = LEFT
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=left)
+    m = ws.cell(row=r, column=left + 1, value=_text(f"制表: {preparer}"))
+    m.font = FONT_TEXT
+    m.alignment = CENTER
+    ws.merge_cells(start_row=r, start_column=left + 1, end_row=r, end_column=left + mid)
+    right = ws.cell(row=r, column=left + mid + 1,
+                    value=_text(f"打印日期: {print_date}"))
+    right.font = FONT_TEXT
+    right.alignment = RIGHT
+    ws.merge_cells(start_row=r, start_column=left + mid + 1, end_row=r, end_column=ncols)
+
+    # 合并区的框线要在**所有框线都定下来之后**才补：表头那两行是先
+    # ``merge_cells`` 再给框线的，补早了补的是空气（见 ``_propagate_merged_borders``）。
+    _propagate_merged_borders(ws)
+
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A6"
+    return ws
+
+
 def detail_ledger_excel(payload: dict, *, book_name: str,
                          company: str = "", preparer: str = "",
                          print_date: str | None = None) -> bytes:
-    """明细账（用友式）：**一个一级科目一张工作表**，版式与打印件一致。
+    """明细账导出件：**屏幕那张表的逐格翻版**。
 
-    以前这里是「一张表塞所有科目」的样子（凭证号 / 摘要 / 借贷 / 方向 /
-    余额五列，无月日、无页眉页脚），与打印件不是一回事 —— 而这两个通道
-    印的是**同一张纸**。现在与总账共用同一份版式代码：册页单位逐个成表，
-    逐笔展开，行是**用友八列形状**。
+    **以前这里是「按打印模板做」的**（用户 2026-10-24 批注 1）：
+    「目前导出的exce格式是按打印模板来设计的，可是我希望能改成下方显示的样子」。
+    打印件是**纸面**口径 —— 用友账簿的八列，纸上靠「摘要列写科目名」分块，
+    没有科目编码与科目名称两列（那是有意为之，编码是账套内部的地址）。
 
-    册页单位是**一级科目**（用户 2026-10-22 批注 3，与总账一致）：一级科目
-    下面是综合明细账时，一张表里排着它那几个下级科目的几块。
+    但导出件是**拿进 Excel 里筛、透视、核对**的东西：查一个上级科目时，
+    一张表里排着它下面好几个子科目的行，没有科目编码与名称两列根本分不清
+    哪几行属于谁 —— 用户 2026-10-24 批注 2：「打印模板是故意设置没有这两列的，
+    但是导出的excel要有这两列」。
 
-    ``payload["subjects"]`` 是 ``[{code, name, rows}, ...]``。
+    所以这里**不再复用打印件的版式**（``_ledger_book_sheet``），改成照着
+    屏幕上的那张表逐列逐行地写：行直接用 ``queries.detail_ledger`` 的行
+    （屏幕那本明细账的行），列就是屏幕上那几列 —— **月 / 日 / 凭证号数 /
+    [科目编码 / 科目名称] / 摘要 / 借方 / 贷方 / 方向 / 余额**。
+
+    「科目编码 / 科目名称」两列**只在综合明细账（查上级科目）时才有**：
+    查末级科目时屏幕上就没有这两列，导出件跟着屏幕走
+    （用户 2026-10-24 批注 3：「选择某个末级科目时，是可以没有那两列的」）。
+
+    ``payload["subjects"]`` 是 ``[{code, name, comprehensive, range, rows}, ...]``；
+    ``rows`` 是**屏幕那本明细账的行**（原样带过来，不另拼一套）。
     """
     wb = Workbook()
     wb.remove(wb.active)
@@ -657,42 +898,45 @@ def detail_ledger_excel(payload: dict, *, book_name: str,
     _check_size("明细账", total_rows)
 
     print_date = print_date or date.today().strftime("%Y.%m.%d")
-    # 标题下面那一行的期间（与打印件同一串字）。
-    period_label = ledger_book_period_label(
-        payload.get("from_period"), payload.get("to_period"))
+    from_period = payload.get("from_period")
+    to_period = payload.get("to_period")
     for index, subject in enumerate(subjects):
         rows = subject.get("rows") or []
         year = str((rows[0].get("period") if rows else "") or "")[:4]
-        _ledger_book_sheet(
+        _ledger_screen_sheet(
             wb,
             sheet_title=f"{subject.get('name') or ''}({subject.get('code') or ''})",
             fallback_title=f"明细账{index + 1}",
-            doc_title=f"{subject.get('name') or ''}明细账",
+            doc_title="明 细 账",
+            subtitle=_ledger_screen_subtitle(
+                subject, book_name, from_period, to_period),
             subject_code=subject.get("code") or "",
             subject_name=subject.get("name") or "",
             rows=rows,
-            year_label=f"{year}年",
+            year_label=f"{year}年" if year else "",
+            with_subject=bool(subject.get("comprehensive")),
             company=company or book_name,
             preparer=preparer,
             print_date=print_date,
-            period_label=period_label,
         )
 
     if not subjects:
         # 同总账：整册跳空时也给一张完整的空白账簿页（抬头、页脚都在）。
-        _ledger_book_sheet(
+        _ledger_screen_sheet(
             wb,
             sheet_title="明细账",
             fallback_title="明细账",
-            doc_title="明细账",
+            doc_title="明 细 账",
+            subtitle=_ledger_screen_subtitle(
+                {}, book_name, from_period, to_period),
             subject_code="",
             subject_name="",
             rows=[],
             year_label=f"{date.today().year}年",
+            with_subject=False,
             company=company or book_name,
             preparer=preparer,
             print_date=print_date,
-            period_label=period_label,
         )
     return _to_bytes(wb)
 

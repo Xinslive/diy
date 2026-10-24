@@ -54,6 +54,28 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.schema_version import BACKEND_ROOT
+
+
+def _snapshot_workdir() -> str:
+    """解密的明文快照往哪个目录落。
+
+    **不能是系统临时目录。** ``cwq-api.service`` 开着 ``PrivateTmp=true``，
+    服务里的 ``/tmp`` 是内存盘（tmpfs）—— 明文快照的大小**就是它占的内存**，
+    而且不会换出。备份与恢复都发生在业务低峰，但低峰不等于空闲：
+    那正是「把这本书的记忆吃光」的最坏时机。
+
+    优先用运维配的 ``CWQ_BACKUP_WORK_DIR``；没配就退到
+    ``backend/data``（工作目录之下，一定可写，也在 unit 的
+    ``ReadWritePaths=`` 白名单里）。
+    """
+    override = os.environ.get("CWQ_BACKUP_WORK_DIR", "").strip()
+    if override:
+        p = Path(override)
+        p.mkdir(parents=True, exist_ok=True)
+        return str(p)
+    fallback = Path(BACKEND_ROOT) / "data"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return str(fallback)
 from app.models import SCOPE_BOOK, SCOPE_SYSTEM
 from app.models.base import Base
 
@@ -855,7 +877,19 @@ def _open_snapshot(path: Path):
         with gzip.open(path, "rb") as fh:
             yield fh
         return
-    fd, temp_name = tempfile.mkstemp(prefix="cwq-restore-", suffix=".gz")
+    # **临时文件要落在磁盘目录，不能落在 /tmp**（2026-10-24 性能审计改）。
+    #
+    # ``mkstemp`` 不给 ``dir=`` 时用的是系统临时目录；而
+    # ``cwq-api.service`` 开着 ``PrivateTmp=true``，服务里的 ``/tmp``
+    # 是**内存盘（tmpfs）**。解密出来的明文快照（= 全量账务数据）
+    # 写进去 = 直接吃内存，而且大小**等于快照大小** ——
+    # 内存峰值时它就是压垮进程的那一下。
+    #
+    # 落到哪个目录：优先用 ``CWQ_BACKUP_WORK_DIR``（运维配好的磁盘目录），
+    # 没配就退到应用自己的 ``backend/data``（工作目录之下，一定可写，
+    # 也在 unit 的 ReadWritePaths 白名单里）。
+    workdir = _snapshot_workdir()
+    fd, temp_name = tempfile.mkstemp(prefix="cwq-restore-", suffix=".gz", dir=workdir)
     os.close(fd)
     temp_path = Path(temp_name)
     try:

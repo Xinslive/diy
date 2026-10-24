@@ -16,7 +16,8 @@ from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
 # 本地别名保持函数名 ``read_upload`` 不变（守卫测试按这个名字认共享容量闸），
 # 指向的其实是同步版 —— 端点是同步 ``def``，不能再 await。
-from app.core.uploads import UploadTooLarge, human_bytes, read_upload_sync as read_upload
+from app.core.uploads import (UploadTooLarge, human_bytes, read_upload_sync as read_upload,
+                              save_upload_to_temp)
 from app.invoice import service
 from app.invoice import storage
 from app.models import InvoiceBatch, InvoiceRecord, Book, SysUser, UserBook
@@ -186,6 +187,24 @@ def _check_upload_limits(files: list[UploadFile]) -> list[UploadFile]:
     return files
 
 
+def _check_single_file_size(upload: UploadFile, name: str) -> None:
+    """单个文件的大小闸 —— 给**不读内容**的文件用。
+
+    2026-10-24 性能审计把上传改成「边读边写」之后，非 PDF 文件**不再被读**
+    （读它只是为了知道它不是 PDF，而文件名已经能判了）。于是单份上限那道闸
+    得换个地方守：以前是「读的时候顺手发现超了」，现在是「按声明的大小先看一眼」。
+
+    ``UploadFile.size`` 来自 multipart 的 part 头，是客户端声明的大小。
+    声明值与实际不符的那部分，由网关那条 ``client_max_body_size``（52 MB）
+    与合计闸（50 MB）一起兜着 —— 真正能被读进来的内容始终有上界。
+    """
+    size = getattr(upload, "size", 0) or 0
+    if size > settings.invoice_max_bytes:
+        raise UploadTooLarge(
+            f"发票 {name} 大小 {human_bytes(size)}，超过单份上限 "
+            f"{human_bytes(settings.invoice_max_bytes)}。请拆成多份分别上传")
+
+
 @router.post("/batches", status_code=201)
 def upload_invoice_batch(request: Request, files: list[UploadFile] = File(...), book: Book = Depends(get_my_book),
                          db: Session = Depends(get_db),
@@ -194,13 +213,39 @@ def upload_invoice_batch(request: Request, files: list[UploadFile] = File(...), 
         # 容量闸必须在读第一个字节之前；「非 PDF 忽略」交给 service ——
         # 那是唯一一处判定什么该被跳过，接口层不再写第二份规则。
         files = _check_upload_limits(files)
-        payloads: list[tuple[str, bytes]] = []
-        for upload in files:
-            name = upload.filename or "发票.pdf"
-            payloads.append((name, read_upload(
-                upload, limit=settings.invoice_max_bytes, label=f"发票 {name}",
-                hint="请拆成多份分别上传")))
-        batch = service.create_batch(db, book.id, user, payloads)
+        # **逐个落盘，不在内存里攒**（2026-10-24 性能审计改）。
+        #
+        # 原来这里是 ``payloads: list[tuple[str, bytes]]`` —— 把**所有**上传
+        # 的字节读进内存，累计上限 ``invoice_max_total_bytes`` = 50 MB。
+        # 而这些字节**本来就已经在磁盘上了**：FastAPI 的 ``UploadFile.file``
+        # 是 ``SpooledTemporaryFile``，超过 1 MB 自动溢写。
+        # 读成 ``bytes`` 等于把已经在磁盘上的东西**又抄一份进内存**。
+        #
+        # 改成边读边写（``storage.stage_temp_stream``）：峰值内存 = 一个 64 KB
+        # 的块，与上传大小无关。在 1.6 GB 的生产机上，这是「一次上传 300 个
+        # 文件」这件事从「吃掉 50 MB」变成「吃掉 64 KB」的差别。
+        staged: list[tuple[str, str]] = []
+        skipped: list[str] = []
+        try:
+            for upload in files:
+                name = upload.filename or "发票.pdf"
+                if not service.is_pdf(name):
+                    # 非 PDF 不读内容（读它只是为了知道它不是 PDF）。
+                    # 但**大小闸照样要过** —— 一个 25 MB 的 jpg 以前会被
+                    # 单份上限挡下来，现在不读它了，得换个地方挡。
+                    _check_single_file_size(upload, name)
+                    skipped.append(name)
+                    continue
+                relative = save_upload_to_temp(
+                    upload.file, storage.root(), limit=settings.invoice_max_bytes,
+                    label=f"发票 {name}")
+                staged.append((name, relative))
+        except UploadTooLarge as exc:
+            for _, relative in staged:
+                storage.delete(relative)
+            db.rollback()
+            raise HTTPException(413, str(exc)) from exc
+        batch = service.create_batch_from_staged(db, book.id, user, staged, skipped)
         preview = service.preview_batch(db, batch)
     except UploadTooLarge as exc:
         db.rollback()

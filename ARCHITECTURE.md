@@ -729,9 +729,31 @@ watch(() => [store.bookId, store.currentYear, store.periods.length], async () =>
 （整年 12 月写「本年累计」，其余写「累　　计」）。前端以前硬写「累　　计」，
 于是整年那一行纸上写「本年累计」、屏幕写「累计」 —— 现在标签由后端给。
 
-**打印与导出是同一张纸**：两边共用 `queries.detail_ledger_book` 的同一份 `rows`，
-再共用 `template.ledger_book_detail_row` 摊成八列。Excel 是
+### 明细账的导出件不是打印件，是**屏幕那张表**（2026-10-24 改）
+
+**以前导出件是打印件的翻版**：两边共用 `queries.detail_ledger_book` 的同一份
+`rows`，再共用 `template.ledger_book_detail_row` 摊成八列，Excel 是
 **一个一级科目一张工作表**（`excel.detail_ledger_excel`）。
+
+现在**打印件与导出件分道扬镳**（用户 2026-10-24 批注 1、2、3）：
+
+| | 打印件（纸面） | 导出件（Excel） |
+|---|---|---|
+| 版式 | 用友八列 | **屏幕那张表**：月 / 日 / 凭证号 / **[科目编码 / 科目名称]** / 摘要 / 借方 / 贷方 / 方向 / 余额 |
+| 「科目编码 / 科目名称」两列 | **故意没有**（纸面靠「摘要列写科目名」分块） | **综合明细账时必须有** |
+| 行 | `queries.detail_ledger_book`（末级科目成块） | `queries.detail_ledger`（**屏幕那本明细账的行**：父科目自己的汇总行也在） |
+| 抬头 | 「{科目名}明细账」+ 期间代码 | 「明 细 账」+ **屏幕那一行**（账套 · 科目 · 子科目范围 · 期间） |
+
+分道扬镳的理由是**两份文件的用途不同**。打印件是给人看的纸面账簿：
+「科目编码」是账套内部的地址，印在纸上没用（2026-10-22 批注 1）。
+导出件是**拿进 Excel 里筛、透视、核对**的东西：查一个上级科目时，一张表里
+排着它下面好几个子科目的行，没有编码与名称两列就分不清哪几行属于谁
+（用户 2026-10-24 批注 2：「打印模板是故意设置没有这两列的，但是导出的excel
+要有这两列」）。查末级科目时屏幕上就没有那两列，导出件跟着屏幕走（批注 3）。
+
+**取数仍是同一处**：导出件直接用 `queries.detail_ledger` 的行 —— 就是屏幕那个
+接口的同一个函数（`app/api/ledger.py::detail` 调它，导出路由也调它），
+不另拼一套，所以屏幕与文件不会算出两个数、也不会有一个漏行。
 
 ### 总账与明细账的字号下限：12pt（2026-10-23 加）
 
@@ -747,7 +769,7 @@ A4 上要拿放大镜才看得清，而总账与明细账是要拿给外部看�
 | --- | --- | --- |
 | `validate_template` | 正文 / 标题 / 副标题三个字号都夹到 ≥ 12pt | **库里存着的旧模板**（生产那份基线是 10pt）加载时就被抬上来，不靠谁记得去改库 |
 | `render_ledger_book_page` | 三个字号再兜一次，且**页脚**取 `max(12, 正文 × 0.9)` | 页脚是「正文的 0.9 倍」，正文 12pt 时是 10.8pt —— 比下限还小，而那一行是「核算单位 / 制表 / 打印日期」，印小了这一行就没人核了 |
-| `excel._ledger_book_sheet` | 导出件正文 12pt、**主标题 20pt 加粗** | 导出件与打印件是同一张纸。以前导出件是 10pt、打印件也是 10pt，现在两边都得是 12pt |
+| `excel._ledger_book_sheet` / `excel._ledger_screen_sheet` | 导出件正文 12pt、**主标题 20pt 加粗** | 导出件与打印件是同一张纸（总账走前者，明细账的导出件走后者）。以前导出件是 10pt、打印件也是 10pt，现在两边都得是 12pt |
 
 **三个字号与分页算式必须取同一份数**（`template._ledger_sizes`）：分页按字号算
 （「这一页放得下多少行」），CSS 也按字号排，两边对不上时页眉上的
@@ -3037,7 +3059,7 @@ token 在 localStorage 由 axios 拦截器注入，所以 `iframe.src` / `window
 | 科目余额表 `balance_excel` | `{账套名} · 期间 {期间}` | **已去掉** |
 | 总账 `general_ledger_excel` | `{账套名} · {起} 至 {止}` | **已去掉** |
 | 报表 `report_excel` | `{账套名} · 期间 {期间}` | **已去掉** |
-| 明细账 `detail_ledger_excel` | `{账套名} · {科目} · {起} 至 {止}` | 本来就没有 |
+| 明细账 `detail_ledger_excel` | `{账套名} · {科目} · {子科目范围} · {期间}`（**屏幕那一行**） | 本来就没有 |
 | 期初余额 `opening_balance_excel` | `{账套名}　期初余额表　{年}年度` | **已去掉** |
 
 **为什么去掉。** 单位名（`book.company_name`）是账套的属性，不是这张纸的抬头。
@@ -5670,6 +5692,63 @@ MCP 的错误**不抛异常**，翻成 `isError: true` + 一份**符合该工具
 出参模型都开了 `extra="allow"`，所以字段**声明错类不会抛任何错** —— 工具照样返回、测试照样全绿，唯独 agent 看到的 `outputSchema` 里没有它真正拿到的字段。这次就踩过：`groups` / `group_totals` / `matched_entries` 是凭证检索的字段，却被声明到了「科目查询」的出参模型上。
 
 `tests/test_mcp_defect_remediation.py` 里有两条通用用例守着这条：一条断言**互斥**（凭证检索的字段不能在科目查询里出现，反之亦然），一条断言**实际返回的键一个都不能漏在 `outputSchema` 之外**（客户端是拿 `outputSchema` 校验 `structuredContent` 的）。
+
+## 11.16 1.6 GB 生产机上的内存与性能（2026-10-24 补）
+
+生产机 `acct.xins.live`（8.155.171.57）总内存只有 **1.6 GB**，而且同时承载
+**11+ 子域与 3 个 Docker 容器**。这一节记的是那轮审查落地的结构性问题；
+完整的实测数字与「必须在生产机手工做的事」见
+**`性能与内存审查报告_2026-10-24.md`**。
+
+### 11.16.1 账簿取数不再物化 ORM 实体
+
+`app/ledger/queries.py::_entry_stmt` 原来是 `select(Entry, Voucher, Subject)` ——
+两个调用点都只绑定 `_subj` 且**从未使用它**。代价是每行三个带 identity map
+的 ORM 对象。
+
+实测（`scripts/measure_ledger_memory.py`，tracemalloc，6 万分录的账本）：
+**98.8 MB → 23.6 MB 峰值（−76%）**。响应体**逐字未变**
+（`scripts/dump_ledger_payload.py` 的 sha256 比对）。
+
+**为什么这是结构问题而不是微优化**：按原来的每行 5.6 KB 算，一次整本明细账
+是 **336 MB 的瞬时内存** —— 全机的 21%，而且发生在**用户点一下**的瞬间。
+
+### 11.16.2 缓存的上界要按「一条有多大」来分
+
+四个跨请求缓存共用一个上界是不合适的：`periods`/`ancestors`/`openings`
+一条是几十 KB，而 **`moves` 的一条就是整本账的发生额聚合**
+（压测规模 ≈ 2.7 MB/条）。`ledger_cache_maxsize=16` 对它是 **43 MB 常驻/worker**。
+
+现在 `moves` 单独用 `LEDGER_CACHE_MOVES_MAXSIZE=4`。
+
+**缓存的语义一点没动**（键带 `data_version`、先读版本号再取数）——
+那部分是对的，动它换来的是最难查的一类 bug。本轮只调了**上界**。
+
+### 11.16.3 打印通道的行数闸必须齐全
+
+同族的三个打印范围（科目余额表 / 总账 / 明细账）都有行数闸，
+**唯独记账凭证没有** —— 而它恰恰是内存最凶的一个：整份 HTML 文档
+一次性在内存里拼出来，而且同时存在三份拷贝（`pieces` / `docs` / `wrap_pages`）。
+
+现在凭证打印也走同一把尺（`xl.MAX_EXPORT_ROWS`，超限 413）。
+**明确失败（提示缩小范围）比静默截断出一份缺行的账好得多** —— 缺行的账
+交给审计方是错的。
+
+### 11.16.4 生产机的三层护栏
+
+| 层 | 改了什么 | 为什么 |
+|---|---|---|
+| **PostgreSQL** | `deploy/tuning.md` 拆出「1.6 GB 档」（`shared_buffers=160MB` / `work_mem=2MB` / `max_connections=30` …） | 原来的 4 GB 档落在这台机上，PG 自己就要 **≥1712 MB** —— **超过全机 1600 MB**，必然 swap |
+| **systemd** | `MemoryHigh=320M` + `MemoryMax=512M`（**原来那行是注释掉的**）、`Restart=on-failure`、`StartLimitBurst=5`、`OOMPolicy=kill` | 没有 cgroup 上限 = OOM killer **挑最大的进程杀** = 杀 PostgreSQL（未提交事务回滚、连接断开），症状却在应用这边 |
+| **uvicorn** | `--limit-concurrency 32` / `--limit-max-requests 2000` / `--no-access-log` | 排队中的请求照样占内存；worker 永不回收而账越记越多；访问日志与 nginx 的那份**完全重复** |
+
+### 11.16.5 备份不能落在 /tmp
+
+`cwq-api.service` 开着 `PrivateTmp=true`，服务里的 `/tmp` 是
+**内存盘（tmpfs）** —— 全量账务备份落进去就是直接吃内存且永不换出。
+所以备份的工作目录**绝不回退到 `/tmp`**：没配 `CWQ_BACKUP_WORK_DIR` 时
+落在应用自己的 `backend/data/backup-work`（磁盘、在 unit 的
+`ReadWritePaths=` 白名单里）。恢复时的明文快照同理（`mkstemp` 带 `dir=`）。
 
 ## 12. 测试策略
 

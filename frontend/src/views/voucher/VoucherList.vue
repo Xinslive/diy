@@ -175,12 +175,16 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Printer, Sort, Upload } from '@element-plus/icons-vue'
 import * as api from '@/api/voucher'
-import PrintDialog from '@/components/PrintDialog.vue'
+// **打印弹窗按需加载**（2026-10-24 性能审计改）：它是 9.5 KB raw /
+// 4.1 KB gzip，而凭证列表页上**大多数人根本不打印** —— 静态 import
+// 意味着每次进列表页都要把它拽下来。defineAsyncComponent 让它单独成块，
+// 只有真的点「打印」才去取。
+const PrintDialog = defineAsyncComponent(() => import('@/components/PrintDialog.vue'))
 import { useUrlConditions } from '@/composables/useUrlConditions'
 import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'

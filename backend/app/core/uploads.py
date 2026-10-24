@@ -103,6 +103,61 @@ def _read_capped(file, *, limit: int | None, label: str, hint: str) -> bytes:
     return data
 
 
+#: 分块读写的块大小。64 KB —— 足够大到系统调用次数少，
+#: 又足够小到「上传 300 个文件」时内存里始终只有一个块。
+UPLOAD_CHUNK_SIZE = 64 * 1024
+
+
+def save_upload_to_temp(fileobj, directory, *, limit: int, label: str = "文件",
+                        hint: str = "请拆成多份分别上传") -> str:
+    """把一个上传流**分块**落进 ``directory`` 下的临时文件，返回文件名。
+
+    **这是「读进内存那道闸」的另一半**（2026-10-24 性能审计加）。
+
+    发票上传原来把**所有**文件的字节读进内存（合计上限 50 MB），而这些字节
+    **本来就已经在磁盘上了** —— FastAPI 的 ``UploadFile.file`` 是
+    ``SpooledTemporaryFile``，超过 1 MB 自动溢写。读成 ``bytes`` 等于把
+    已经在磁盘上的东西**又抄一份进内存**。
+
+    这里改成边读边写：读一块、写一块、丢掉那块。
+    **峰值内存 = 一个 64 KB 的块，与上传大小无关。**
+
+    大小上限在**读的过程中**判（不是读之前判）：``limit + 1`` 那一道才是
+    真正的兜底 —— ``file.size`` 是客户端声明的，不可信。
+
+    为什么要放在这个模块里：容量闸都住在这儿（``read_upload`` /
+    ``check_archive_size`` / ``RowBudget``），守卫测试
+    （``tests/test_upload_capacity_matrix.py``）也按「这个模块里的闸」
+    来认每个上传入口有没有守。闸住在别处，就等于把一条纪律拆成两处。
+    """
+    import os
+    import tempfile
+    from pathlib import Path
+
+    base = Path(directory)
+    base.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".upload-", suffix=".pdf", dir=base)
+    total = 0
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            while True:
+                chunk = fileobj.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise UploadTooLarge(
+                        f"{label} 超过上限 {human_bytes(limit)}，{hint}")
+                handle.write(chunk)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+    return os.path.basename(temp_name)
+
+
 async def read_upload(file, *, limit: int | None = None,
                       label: str = "文件",
                       hint: str = "请拆成多份分别上传") -> bytes:

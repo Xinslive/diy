@@ -2,6 +2,23 @@
 Description=云财务记账系统 API (FastAPI)
 After=network.target postgresql.service
 Wants=postgresql.service
+# ---------------------------------------------------------------------------
+# 重启风暴闸（2026-10-24 性能审计补上）
+# ---------------------------------------------------------------------------
+# **默认的 5 次 / 10 秒对一台 1.6 GB 的机器是灾难性的。**
+#
+# 记忆吃满 → 进程被杀 → systemd 拉起来 → 进程又吃满 → 再被杀 ——
+# 每 3 秒一轮，每一轮都要：fork 两个 worker、重新导入框架、重新建连接池、
+# 跑一次 schema 预检。CPU 与磁盘 I/O 全耗在这上面，**而真正的服务一次都没起来**。
+#
+# 收紧成「5 分钟内最多 5 次」之后：偶发的一次崩溃仍然会自动恢复（5 次以内），
+# 但**持续性的资源不足会显形** —— 单元进入 failed 状态，journal 里能看到，
+# 而不是被一轮又一轮的重启淹没成「服务时好时坏」。
+#
+# 这两个键必须写在 **[Unit]** 段里（systemd 的 StartLimit* 是 Unit 段的键，
+# 写在 [Service] 段会被忽略且不报错）。
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -52,8 +69,44 @@ ExecStartPre=/bin/sh -c 'case "$CWQ_API_WORKERS" in ""|*[!0-9]*|0) echo "CWQ_API
 ExecStartPre=/opt/cwq/backend/.venv/bin/python scripts/preflight.py
 ExecStart=/opt/cwq/backend/.venv/bin/python scripts/start_server.py \
     --server uvicorn --host 127.0.0.1 --port 8000
-Restart=always
-RestartSec=3
+# **Restart=on-failure，不是 always**（2026-10-24 性能审计改）。
+#
+# `always` 的语义是「**不管怎么退出都重启**」—— 包括**干净退出**。
+# 内存吃满被 OOM killer 杀掉时当然要重启，但 `always` + `RestartSec=3`
+# 意味着「一杀一拉」每 3 秒一轮，每一轮都要重新 fork 两个 worker、重新导入
+# 框架、重新建连接池。**服务一次都没真正起来**，CPU 与 I/O 却全耗在重启上 ——
+# 这正是「生产服务器性能不够高」最容易被误判成「数据库慢」的那种形态。
+#
+# `on-failure` 只在**非零退出码或被信号杀死**时重启：崩溃/OOM 仍然自动恢复，
+# 而正常停机（发版、运维 stop）不再被 systemd 拉起来。
+Restart=on-failure
+# 3 秒 → 10 秒：配合上面的 StartLimitBurst=5，给「短暂内存尖峰」留出
+# 自行退让的时间（Linux 会在压力下回收页缓存，而不是立刻杀进程），
+# 同时把持续失败时的重启风暴压到 5 分钟 5 次。
+RestartSec=10
+# **OOMPolicy=kill**：cgroup 被 OOM killer 命中时，把**整个单元**一起收掉，
+# 由 systemd 干净地重启。
+#
+# 默认的 `stop` 只杀掉主进程（uvicorn 父进程），两个 worker 可能活下来变成
+# 孤儿 —— 于是端口还占着、请求没人应答，而 systemd 认为服务已经停了。
+# 这与本文件 ExecStartPre 那段注释里描述的「服务挂了但端口还在」是同一类
+# 故障，只是触发原因不同。
+OOMPolicy=kill
+# **CPUWeight=50**：这台机同时跑着另外 11 个子域与 3 个 Docker 容器，
+# API 不是唯一的乘客。CPUWeight 只在**竞争**时按权重分配，机器空闲时
+# 仍然把 CPU 全给它 —— 所以它不影响本服务的独占性能，只在抢的时候让路。
+#
+# 刻意**不**用 CPUQuota：限流是把「这台机器一共多少 CPU」当成 API 的独享
+# 额度，而实际配额要按 `nproc` 与其它负载实测定，猜一个数写死在模板里
+# 只会变成新的「随手写的数字」。要限就用 systemd 的
+# `CPUQuota=` 在**生产机上手工**加，且必须先量出并发与延迟的取舍。
+CPUWeight=50
+# **TasksMax=512**：线程/进程数上限。
+#
+# 算式：2 个 worker × anyio 默认线程池 40 = 80，再加调度器一次 tick 的
+# 最多 20 路 fan-out（`asyncio.gather(run_in_threadpool(...))`）= 100，
+# 加两个 worker 本身与余量。512 给的是余量，不是紧箍咒。
+TasksMax=512
 
 # ---------------------------------------------------------------------------
 # 文件描述符上限（2026-10-15 压测基线后补）
@@ -89,7 +142,31 @@ LimitNOFILE=8192
 # 余量，否则它挡不住 OOM killer 去动 PG —— 真要保护 PG，正确的做法是
 # 给 postgres 单独的 systemd 单元加 MemoryMax，而不是给 API 加。
 # 见 deploy/tuning.md。
-# MemoryMax=768M
+#
+# ---- 2026-10-24 性能审计：这一行原来是**注释掉的** ----
+#
+# 注释掉 = API 的 cgroup **没有任何内存上限**，于是整台机器的内存压力
+# 全部由整机 OOM killer 决定杀谁 —— 而 OOM killer 挑的是**占用最多的**那个
+# 进程，也就是 PostgreSQL。PG 被杀 = 未提交事务回滚、连接被断开，
+# 症状是「偶发的 500 / 连接重置」，而根因在应用这边，根本查不到。
+#
+# 现在给两档：
+#   * **MemoryHigh=320M** —— 软上限。超过之后内核开始回收本 cgroup 的
+#     页缓存并对进程施加节流（分配变慢），**不杀进程**。稳态实测 ~236 MB，
+#     320 留了余量，正是「先让它慢下来，而不是先让它死」。
+#   * **MemoryMax=512M** —— 硬上限。超过就由 cgroup 的 OOM killer 杀
+#     **本 cgroup 内**的进程（配合上面的 OOMPolicy=kill，整个单元一起走，
+#     systemd 干净重启）。512 是压测峰值（~356 MB）的 1.4 倍余量。
+#
+# 这两个数是按 **1.6 GB 生产机**（acct.xins.live）定的 —— 那台机还同时
+# 跑着 11 个子域与 3 个 Docker 容器。给 API 划一条明确的边界，比让
+# 「谁被 OOM killer 挑中」变成随机事件要好得多。
+#
+# 另一台生产机（110.42.44.53，/opt/cwq 布局）是 4 GB 档，两档都可以放宽；
+# 但**先用 systemctl show cwq-api -p MemoryCurrent 量出真实占用再改**，
+# 别把这里的数直接搬过去。
+MemoryHigh=320M
+MemoryMax=512M
 
 # 财务系统只读代码目录；运行时目录包含发票和可信插件包、journal 备份。
 NoNewPrivileges=true

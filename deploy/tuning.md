@@ -64,7 +64,32 @@ API 只占 210%），应用侧再加进程只是让更多请求同时去挤 PG�
 
 ## 四、PostgreSQL 参数
 
-按物理内存给出，**按 2 vCPU / 4 GB 档**（推荐配置）：
+**这一节有两套值，别混用。**
+
+- **4 GB 档**（`/opt/cwq` 那台生产机，110.42.44.53）：下表「4 GB 档」列。
+- **1.6 GB 档**（`acct.xins.live` 那台生产机，8.155.171.57）：下表「1.6 GB 档」列。
+
+> ### ⚠️ 2026-10-24：1.6 GB 机器按 4 GB 档配 = 必然 swap
+>
+> 这台机总内存只有 **1.6 GB**，而且**同时承载 11+ 子域与 3 个 Docker 容器**。
+> 4 GB 档那套参数落在这台机上，光是 PG 自己就要：
+>
+> | 参数 | 4 GB 档 | 占 1600 MB | 算式 |
+> |---|---|---|---|
+> | `shared_buffers` | 1 GB | **64%** | 1024 MB，单它就吃掉三分之二整机 |
+> | `wal_buffers` | auto | 2% | = shared_buffers/32 = 32 MB |
+> | `work_mem` × `max_connections` | 8 MB × 50 | **25%** | 400 MB |
+> | `maintenance_work_mem` | 256 MB | 16% | 建索引/autovacuum 时独占 |
+> | **PG 下限** | | **≥ 1712 MB** | **> 全机 1600 MB** |
+> | + nginx 40 + API 236 + OS 200 | | **≥ 2188 MB** | **= 全机的 137%** |
+>
+> `effective_cache_size = 3GB` 更是 **187%** —— 它不占内存，但**有害**：
+> 规划器以为有 3 GB 缓存可用，于是低估磁盘 I/O、选错执行计划。
+>
+> **所以生产机必须用 1.6 GB 档那一列。** 这不是「保守一点」，
+> 是照抄 4 GB 档会让 PG 在启动时就把自己算进 swap。
+
+### 4 GB 档（`/opt/cwq` 布局那台机）
 
 | 参数 | 建议值 | 理由 |
 |---|---|---|
@@ -75,12 +100,58 @@ API 只占 210%），应用侧再加进程只是让更多请求同时去挤 PG�
 | `max_connections` | `50` | 应用稳态只用 30，默认 100 偏大 |
 | `max_wal_size` | `2GB` | Excel 导入会产生大量 WAL |
 
+### 1.6 GB 档（`acct.xins.live` 那台机，2026-10-24 新增）
+
+| 参数 | 建议值 | 算式 |
+|---|---|---|
+| `shared_buffers` | **`160MB`** | 10% × 1600。共享机上它是**永不回收**的常驻内存，必须小 |
+| `work_mem` | **`2MB`** | 30 连接 × 2 = 60 MB 最坏（4 GB 档的 8 MB 按比例下来） |
+| `max_connections` | **`30`** | = 2 worker × (pool 5 + overflow 10) = 30，与 `config.py` 的默认值精确对齐 |
+| `maintenance_work_mem` | **`64MB`** | 夜间建索引独占；PG 峰值 = 200 + 210 + 64 ≈ 474 MB |
+| `effective_cache_size` | **`640MB`** | 40% × 1600 ≈ shared_buffers 160 + 可用页缓存 ~480 |
+| `max_wal_size` | **`512MB`** | 磁盘；2 GB 在小盘上会挤掉 `.releases` 的 dump 空间 |
+| `autovacuum_max_workers` | **`2`** | 默认 3 × `autovacuum_work_mem` 会造成尖峰 |
+| `autovacuum_work_mem` | **`32MB`** | 默认 64 MB × 3 workers = 192 MB 尖峰 |
+| `max_parallel_workers` | **`4`** | PG16 默认 8；每个并行 worker 独立吃 `work_mem` |
+| `max_parallel_workers_per_gather` | **`2`** | 每个并行 worker 独立吃 `work_mem` |
+
+**改完必须重启容器**（`ALTER SYSTEM` 只改配置文件）：
+
+```bash
+docker exec -it cwq-pg psql -U cwq -d cwq -c "ALTER SYSTEM SET shared_buffers='160MB'; ..."
+docker restart cwq-pg
+```
+
+### 1.6 GB 机器的内存预算（改完之后）
+
+| 组件 | 稳态 MB | 依据 |
+|---|---|---|
+| OS + 宝塔面板 + sshd + cron | 200 | 宝塔自跑 PHP/MySQL，需实测 |
+| 页缓存（可回收） | 150 | 给 PG 缓存外的查询留底 |
+| nginx（master + 2 worker，含另 11 个子域） | 40 | 每连接约 50 KB |
+| Docker 容器 ×3 | **待实测** | `docker stats --no-stream` —— 这一格是整个预算里最不确定的 |
+| uvicorn 父进程 | 28 | 本文第一节 |
+| uvicorn worker ×2 | 208 | 2 × 104 MB（延迟导入后） |
+| 账簿聚合缓存 ×2 worker | 22 | `LEDGER_CACHE_MOVES_MAXSIZE=4` × 2.7 MB × 2（见下） |
+| PostgreSQL（按 1.6 GB 档参数） | 300 | 见上表算式 |
+| **合计（不含 Docker）** | **948** | 1600 − 948 = **652 MB** 给 Docker 与发版尖峰 |
+
+> 账簿聚合缓存这一格在 2026-10-24 从 48 MB 降到了 22 MB：
+> `moves` 缓存一条就是**整本账**的发生额聚合（压测规模 7,608 组 ≈ 2.7 MB），
+> 原来的 maxsize=16 对它太大。现在 `moves` 单独用
+> `LEDGER_CACHE_MOVES_MAXSIZE=4`（见 `config.py`）。
+
 ### 为什么 `work_mem` 要按连接数反推
 
 `work_mem` 是**每个排序/哈希节点**的额度，30 条连接同时各跑一个报表聚合就是
 30 份。默认 4MB × 30 = 120 MB 尚可，但一旦调大到 64MB 就是 1.9 GB ——
 **在 4 GB 机器上直接把 PG 推到 swap**。这正是「调大 work_mem 提升查询」
-最常见的翻车方式。
+最常见的翻车方式。在 1.6 GB 机器上同理：2 MB × 30 = 60 MB 才是能兜住的数。
+
+> ⚠️ 4 GB 档那张表里 `work_mem=8MB` 与 `max_connections=50` **自身矛盾**：
+> 正文按 30 条连接算 240 MB，表里的 50 会让最坏情况变成 400 MB。
+> 4 GB 档的 `max_connections` 应改成 **30**（与 `config.py` 的
+> `pool_size 5 + overflow 10` × 2 worker 精确对齐）。
 
 ### 验证方法
 

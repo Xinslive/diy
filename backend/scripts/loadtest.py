@@ -268,20 +268,38 @@ class Bench:
             raise RuntimeError(f"找不到账套「{book_name}」，现有：{[b['name'] for b in books]}")
         book_id = match["id"]
 
-        subs = (await self.client.get(
-            f"{base}/api/books/{book_id}/subjects", headers=h)).json()
-
         # 期间走正式接口取，不靠 ``period_id=0`` 的隐式兜底 ——
         # 那条兜底是 ``if period_id:`` 判出来的，0 恰好为假才落到
         # 「取最后一个期间」。压测脚本靠一个假值走对路，等哪天
         # 兜底改成 ``is None`` 就会静默地一直打 period 0。
+        pls = (await self.client.get(
+            f"{base}/api/books/{book_id}/periods", headers=h)).json()
+        rows = pls if isinstance(pls, list) else (pls.get("periods") or [])
         if period_id is None:
-            pls = (await self.client.get(
-                f"{base}/api/books/{book_id}/periods", headers=h)).json()
-            rows = pls if isinstance(pls, list) else (pls.get("periods") or [])
             period_id = max((r.get("id", 0) for r in rows), default=0)
         if not period_id:
             raise RuntimeError("取不到任何会计期间，先用 seed_perf.py 造数")
+
+        # **科目表每个年度各有一份（迁移 0032），所以科目必须按期间所属年度取。**
+        #
+        # 不带 ``year`` 时接口返回的是「账套当前在记的那一年」 ——
+        # 口径是「最近一期**有凭证**的期间所在的年度」。造数脚本默认铺两个年度，
+        # 于是默认取到的是最后一年那套科目 id；而明细账接口是按**止期所属年度**
+        # 查科目的（``queries.detail_ledger`` 里 ``year = to_period.year``）。
+        # 两者对不上就是「科目不存在」，四个 ledger 场景全 404 ——
+        # 而 404 是「打错了地方」，不是「服务慢」。
+        #
+        # 所以这里先定下 period，再按它的 year 取科目表。
+        period_row = next((r for r in rows if r.get("id") == period_id), None)
+        if period_row is None:
+            raise RuntimeError(f"期间 {period_id} 不属于账套「{book_name}」")
+        year = period_row.get("year")
+        if year is None:
+            raise RuntimeError(f"期间 {period_id} 没有年度信息")
+
+        subs = (await self.client.get(
+            f"{base}/api/books/{book_id}/subjects", params={"year": year},
+            headers=h)).json()
 
         leaves, parents = _walk_tree(subs)
         if not leaves:

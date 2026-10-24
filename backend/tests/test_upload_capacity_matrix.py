@@ -84,7 +84,8 @@ def test_每个上传入口都调了共享容量闸():
             node.func.id for node in ast.walk(ast.parse(inspect.cleandoc(src)))
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         }
-        gated = {"read_upload", "read_upload_sync", "check_archive_size", "RowBudget"} & calls
+        gated = {"read_upload", "read_upload_sync", "check_archive_size", "RowBudget",
+                 "save_upload_to_temp"} & calls
         if not gated:
             missing.append(f"{sorted(set(r.methods))[0]:6} {r.path}")
     assert not missing, (
@@ -92,7 +93,9 @@ def test_每个上传入口都调了共享容量闸():
         + "\n".join(missing)
         + "\n读字节数（read_upload）、解压体积（check_archive_size）、"
           "行数（RowBudget）三道闸至少要有对应的那些；"
-          "新增上传入口请照抄 app/api/vouchers.py 的 upload_import。")
+          "新增上传入口请照抄 app/api/vouchers.py 的 upload_import。"
+          "\n（发票上传走的是 save_upload_to_temp —— 它是同一道「按字节数设上限」"
+          "的闸，只是边读边写、内存里不放大头。）")
 
 
 def test_期初解析与凭证导入共用同一套闸():

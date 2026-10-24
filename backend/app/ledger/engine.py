@@ -101,12 +101,20 @@ def shared(kind: str, key: Any):
 
     「某种东西缓存多大、留多久」在 config.py 里，不是每个调用点各写一遍 ——
     写在调用点的话，改一次要翻半个目录。
+
+    **不同种类的缓存用不同的上界**（2026-10-24 性能审计）：``moves`` 的
+    一条是**整本账**的发生额聚合（压测规模 ~2.7 MB/条），其余三种
+    （periods / ancestors / openings）一条只有几十 KB。共用一个上界的话，
+    光是 moves 就会在每个 worker 里常驻十几 MB —— 在 1.6 GB 的生产机上
+    这不是小数目。详见 config.py 里 ``ledger_cache_moves_maxsize`` 的注释。
     """
     from app.core.config import settings
 
+    maxsize = (settings.ledger_cache_moves_maxsize if kind == "moves"
+               else settings.ledger_cache_maxsize)
     return cache_for(
         kind,
-        maxsize=settings.ledger_cache_maxsize,
+        maxsize=maxsize,
         ttl_seconds=settings.ledger_cache_ttl_seconds,
     )
 

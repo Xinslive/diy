@@ -221,7 +221,10 @@ def test_上传接口的数据库异常同样脱敏(client, auth, configured, st
     def boom(*args, **kwargs):
         raise _fake_integrity_error()
 
-    monkeypatch.setattr(service, "create_batch", boom)
+    # 上传接口走的是「已落盘的源文件」那个入口（2026-10-24 性能审计：
+    # 字节不再在内存里攒，改成边读边写）。脱敏的断言与入口无关 ——
+    # 它验的是「异常不能把 SQL 原文回给客户端」，所以打在真正的那个入口上。
+    monkeypatch.setattr(service, "create_batch_from_staged", boom)
 
     response = _post_files(client, configured, auth, [("10月8日.pdf", _pdf_bytes("inv_a.pdf"))])
 

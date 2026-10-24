@@ -437,7 +437,16 @@ if [[ ! -f "$INCOMING/requirements.lock" ]]; then
   die "产物里缺 requirements.lock —— 没有锁文件就无法保证「装出来的就是测试时那一版」。
    **现网代码、前端产物与服务均未改动。**"
 fi
-if ! "$VENV/bin/pip" install -q -r "$INCOMING/requirements.lock"; then
+# ``--no-cache-dir``（2026-10-24 性能审计补上）：
+#
+# pip 默认把下载的 wheel 缓存在 ``~/.cache/pip``，**那个目录永不清**。
+# 两次发版之间它的体积会一路涨，而它涨的是**磁盘**，不是内存 ——
+# 但在小盘上这与日志占盘是同一类问题。
+#
+# 真正吃内存的是 pip **解析**依赖时的峰值 RSS（200~400 MB 量级），
+# 而这台机只有 1.6 GB、还同时跑着现网服务。``--no-cache-dir`` 不影响解析
+# 峰值，但它去掉的是「缓存无限涨盘」这一条 —— 那一条是可以零成本去掉的。
+if ! "$VENV/bin/pip" install -q --no-cache-dir -r "$INCOMING/requirements.lock"; then
   log "❌ 装运行时依赖失败"
   log "   现网代码、前端产物与服务**均未改动**，线上仍是上一版在跑"
   log "   常见原因是锁文件里有这台机器装不上的包；修好后重新发布即可"

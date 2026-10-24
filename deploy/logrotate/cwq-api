@@ -1,0 +1,54 @@
+# /etc/logrotate.d/cwq-api
+#
+# cwq-api 的访问日志与错误日志（systemd 的 StandardOutput=append: 落的那两个）。
+#
+# **为什么必须有它**（2026-10-24 性能审计补上）：
+#
+# 1. **日志只增不减。** unit 里是 ``StandardOutput=append:…/api.log`` ——
+#    append 模式不会轮转，也没有任何东西去管它的大小。
+# 2. **uvicorn 那一层已经关了访问日志**（``start_server.py`` 里的
+#    ``--no-access-log``，因为 nginx 记的是同一批请求），所以这两个文件
+#    记的是**应用侧**的日志：每个请求一行。
+#    按「100 请求/分钟」这种很小的量，一天就是 100 MB。
+# 3. **磁盘写满的后果比「日志丢了」严重得多**：备份要写、发版要写、
+#    PostgreSQL 的 WAL 也要写。日志把盘占满，**备份静悄悄地不产出了** ——
+#    而症状是「页面一切正常」。
+#
+# **copytruncate 不能去掉。** systemd 持有那个文件的 fd，普通的
+# ``rename + create`` 之后 systemd 仍然往**旧 inode** 写 —— 新文件永远是 0 字节，
+# 而旧文件还在长大。``copytruncate`` 是「复制内容再截断原文件」，
+# 代价是复制与截断之间有一个极短的窗口会丢几行日志 —— 换一份永远不更新的日志，
+# 这笔交易划算。
+#
+# ``size`` 与 ``daily`` **同时给**：logrotate 每天跑一次，而 ``size``
+# 让「一天里就涨到 50M」的情况当天就被处理掉。
+# 两条同时存在时，logrotate 取**先到者**。
+#
+# 装法（生产机上手工装，路径按主机改）：
+#
+#   cp deploy/logrotate/cwq-api /etc/logrotate.d/cwq-api
+#   # 然后把里面的 /opt/cwq 换成这台机的实际应用根
+#   #   /www/wwwroot/acct.xins.live
+#   logrotate -d /etc/logrotate.d/cwq-api   # -d 是演练，不真转
+#
+# 判据（转一次之后）：
+#
+#   ls -lh /www/wwwroot/acct.xins.live/backend/logs/
+#   # 应该有 api.log.1（压缩成 api.log.1.gz）而 api.log 重新从小开始
+#
+# **不归 logrotate 管的两样**：
+#   * nginx 的 access/error log —— 宝塔自己管（/www/wwwlogs/）。
+#   * PostgreSQL 的日志 —— 容器里由 PG 自己轮转。
+
+/opt/cwq/backend/logs/api.log
+/opt/cwq/backend/logs/api.err.log {
+    daily
+    size 50M
+    rotate 7
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+    dateext
+}

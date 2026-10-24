@@ -126,19 +126,24 @@ def wipe_books(db, prefix: str) -> int:
     return len(books)
 
 
-def leaf_subject_ids(db, book_id: int) -> list[int]:
+def leaf_subject_ids(db, book_id: int, year: int | None = None) -> list[int]:
     """账套里的**末级**科目 id，按 id 升序。
 
     只取末级：明细账的取数口径就是末级科目（汇总科目上的钱来自它下面），
     拿汇总科目去压测会走另一条分支，测到的不是真实路径。
+
+    ``year`` 不传时返回**所有年度**的末级科目；给了就只取那一张科目表。
+    分录必须挂在本年度的科目上（``fn_entry_subject_year_guard``），所以
+    造分录时是按凭证所属年度取的那一份。
     """
-    return list(db.scalars(
-        select(Subject.id).where(Subject.book_id == book_id, Subject.is_leaf.is_(True))
-        .order_by(Subject.id)
-    ).all())
+    stmt = select(Subject.id).where(Subject.book_id == book_id,
+                                     Subject.is_leaf.is_(True))
+    if year is not None:
+        stmt = stmt.where(Subject.year == year)
+    return list(db.scalars(stmt.order_by(Subject.id)).all())
 
 
-def widen_chart(db, book_id: int, target: int) -> int:
+def widen_chart(db, book_id: int, target: int, year: int) -> int:
     """把账套的科目表扩到 ``target`` 个，返回新增数。
 
     **为什么必须扩。** 标准科目表只有 61 个科目，而 ``性能审计报告``
@@ -157,11 +162,29 @@ def widen_chart(db, book_id: int, target: int) -> int:
 
     编码走 9xxx 段，与标准表（1xxx~6xxx）不撞；``uq_subject_book_code``
     是 (book_id, code) 唯一，靠编码前缀天然避开。
+
+    **科目表是按年度各有一份的（迁移 0032），所以新科目必须带上 year。**
+    ``Subject.year`` 是 NOT NULL，唯一约束是 ``(book_id, year, code)``，
+    库层还有 ``fn_subject_parent_year_guard()`` 盯着「父子必须在同一张
+    科目表上」。这一列是 0032 之后才有的，而本函数是那之前写的 ——
+    新科目不填 year 就会插进 NULL，被那条触发器当场打回：
+
+        CheckViolation: 上级科目属于 2026 年度，与本科目（<NULL> 年度）
+        不在同一张科目表上
+
+    也就是说 ``--widen-to``（**默认值就是 320**）从 0032 之后一直跑不通，
+    压测基线里那句「320 科目」根本不是这条路径造出来的。本函数因此按
+    **父科目自己的 year** 落库 —— 不是按账套的 start_year，因为扩出来的
+    科目要挂在哪个年度的父科目下，就属于哪一张科目表。
+
+    ``year`` 参数指定**扩哪一张**（年度）科目表。``target`` 是那一张表
+    的科目数目标，不是整本账的总数 —— 科目表本来就是每年各有一份，
+    界面上 ``/subjects?year=…`` 取的也是那一份。
     """
     if target <= 0:
         return 0
     have = db.scalar(select(func.count()).select_from(Subject)
-                     .where(Subject.book_id == book_id)) or 0
+                     .where(Subject.book_id == book_id, Subject.year == year)) or 0
     need = target - have
     if need <= 0:
         return 0
@@ -169,11 +192,12 @@ def widen_chart(db, book_id: int, target: int) -> int:
     # 只挑「已经有下级」的父科目 —— is_leaf 由服务端按子级关系维护，
     # 这种父科目的 is_leaf 必然是 false，正好是能挂子科目的那批。
     parents = list(db.scalars(
-        select(Subject).where(Subject.book_id == book_id, Subject.is_leaf.is_(False))
+        select(Subject).where(Subject.book_id == book_id, Subject.year == year,
+                               Subject.is_leaf.is_(False))
         .order_by(Subject.id)
     ).all())
     if not parents:
-        raise RuntimeError("账套里没有可挂子科目的父科目，无法扩充科目表")
+        raise RuntimeError(f"{year} 年度科目表里没有可挂子科目的父科目，无法扩充科目表")
 
     # 类别与余额方向成对：资产/成本是借方，其余是贷方。
     cats = [("ASSET", "DEBIT"), ("PROFIT", "CREDIT"), ("COST", "DEBIT"),
@@ -185,6 +209,9 @@ def widen_chart(db, book_id: int, target: int) -> int:
         seq = i + 1
         rows.append({
             "book_id": book_id,
+            # 跟着父科目走：新科目属于父科目所在的那一张（年度）科目表。
+            # 不写这一列 → 触发器 fn_subject_parent_year_guard 报错。
+            "year": parent.year,
             "code": f"9{seq:03d}",
             "name": f"压测扩展科目{seq}",
             "parent_id": parent.id,
@@ -215,16 +242,21 @@ def build_book(db, user: SysUser, name: str, year: int, years: int,
     db.flush()
     for y in range(year, year + years):
         ensure_periods(db, book, y)
-    install_chart(db, book.id)
-    added = widen_chart(db, book.id, widen_to)
-    if added:
-        print(f"  科目表扩充: +{added} 个（目标 {widen_to}）")
+        # **科目表每个年度各有一份（迁移 0032）**，所以每个铺了期间的年度
+        # 都要装一张自己的科目表。只装 start_year 那一张的话，铺到下一年的
+        # 凭证就没有科目可挂 —— 库层 ``fn_entry_subject_year_guard()`` 会报
+        # 「分录的科目属于 2026 年度，不能记在 2027 年度的凭证上」。
+        install_chart(db, book.id, y)
+        added = widen_chart(db, book.id, widen_to, y)
+        if added:
+            print(f"  {y} 年度科目表扩充: +{added} 个（目标 {widen_to}）")
     db.add(UserBook(user_id=user.id, book_id=book.id, role="OWNER"))
     db.commit()
     return book
 
 
-def seed_vouchers(db, book: Book, subjects: list[int], periods: list[Period],
+def seed_vouchers(db, book: Book, subjects_by_year: dict[int, list[int]],
+                  periods: list[Period],
                   n_vouchers: int, entries_per: int, year: int) -> tuple[int, int]:
     """批量写入 n_vouchers 张已记账凭证，返回 (凭证数, 分录数)。
 
@@ -235,9 +267,16 @@ def seed_vouchers(db, book: Book, subjects: list[int], periods: list[Period],
     特判「最后一条补差」，不如让调用方传偶数并在下面 assert ——
     构造出来的**假平**数据会让账簿聚合的数对不上，排查成本远高于
     这里多一句断言。
+
+    ``subjects_by_year`` 是「年度 → 该年度科目表里的末级科目 id」。
+    **必须按年度分池**：科目表每个年度各有一份（迁移 0032），分录只能挂
+    在本年度科目上（``fn_entry_subject_year_guard``）—— 拿 2026 的科目去记
+    2027 的凭证，库层会直接打回。
     """
     assert entries_per % 2 == 0, "entries_per 必须是偶数，否则无法配平借贷"
-    assert subjects, "账套里没有末级科目"
+    assert subjects_by_year, "账套里没有末级科目"
+    empty = [y for y, ids in subjects_by_year.items() if not ids]
+    assert not empty, f"这些年度没有末级科目可用：{empty}"
 
     n_vouchers = min(n_vouchers, len(periods) * 100_000)
     made = 0
@@ -285,6 +324,9 @@ def seed_vouchers(db, book: Book, subjects: list[int], periods: list[Period],
             period = periods[(made + j) % len(periods)]
             base = made + j
             amount = D("100.00") + D(base % 900)
+            # 本张凭证所属年度的末级科目池 —— 科目表每年各有一份，
+            # 挂错年度的科目会被 fn_entry_subject_year_guard 打回。
+            pool = subjects_by_year[period.year]
             # 科目按全局序号轮转：让同一个科目在整库里均匀铺开，
             # 这样多科目筛选才能复现 0011 记的那个交叉点。
             for k in range(entries_per):
@@ -293,7 +335,7 @@ def seed_vouchers(db, book: Book, subjects: list[int], periods: list[Period],
                     "book_id": book.id,           # trg_entry_sync 会覆盖，显式填只为可读
                     "period_ord": ord_by_id[period.id],
                     "line_no": k + 1,
-                    "subject_id": subjects[(base * entries_per + k) % len(subjects)],
+                    "subject_id": pool[(base * entries_per + k) % len(pool)],
                     "direction": "DEBIT" if k < half else "CREDIT",
                     "amount": amount,
                     "summary": f"压测分录 {base}-{k + 1}",
@@ -356,14 +398,20 @@ def main() -> int:
             t0 = time.time()
             book = build_book(db, user, name, args.year, args.years,
                               widen_to=args.widen_to)
-            subjects = leaf_subject_ids(db, book.id)
+            # **按年度分池**：科目表每个年度各有一份（迁移 0032），
+            # 造分录时必须用凭证所属年度的那一份。
+            subjects_by_year = {
+                y: leaf_subject_ids(db, book.id, y)
+                for y in range(args.year, args.year + args.years)
+            }
+            subjects = [sid for ids in subjects_by_year.values() for sid in ids]
             periods = list(db.scalars(
                 select(Period).where(Period.book_id == book.id).order_by(Period.ord)
             ).all())
             t_build = time.time() - t0
 
             t1 = time.time()
-            nv, ne = seed_vouchers(db, book, subjects, periods,
+            nv, ne = seed_vouchers(db, book, subjects_by_year, periods,
                                    n_vouchers, entries_per, args.year)
             t_seed = time.time() - t1
             grand_v += nv

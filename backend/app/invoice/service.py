@@ -870,28 +870,30 @@ def skip_note(skipped: list[str]) -> str:
     return f"已忽略 {len(skipped)} 个非 PDF 文件：{head}{more}"
 
 
-def batch_label(files: list[tuple[str, bytes]]) -> str:
+def batch_label(names: list[str]) -> str:
     """批次标题：一份就写原名，多份写成「首个文件名 等 N 个文件」。
 
     历史列表与确认页都用它当标题，所以要短、要能认出是哪批。全量文件名
     只在提醒里出现（几十个名字铺满一列反而认不出哪批）。
     """
-    names = [name for name, _ in files]
     if len(names) == 1:
         return names[0]
     return f"{names[0]} 等 {len(names)} 个文件"
 
 
-def _page_sources(files: list[tuple[str, bytes]], relatives: list[str]) -> list[tuple[str, int, int]]:
+def _page_sources(names: list[str], relatives: list[str]) -> list[tuple[str, int, int]]:
     """算出每个源文件在合并后 PDF 里的页码区间 ``(文件名, 起页, 止页)``。
 
     合并之后原件字节流已经不按文件分开了，但「这张发票来自哪个文件」在核对
     时必须能说出来（哪个文件有问题、重传哪一份）。所以合并前先把每份的页数
     读出来，按选择顺序累加成区间。
+
+    **只要名字**：页数是从磁盘上那份文件读出来的（``storage.path_for``），
+    字节流本身在这里没有用处 —— 所以这一层只接名字，不接字节。
     """
     spans: list[tuple[str, int, int]] = []
     cursor = 0
-    for (name, _), relative in zip(files, relatives):
+    for name, relative in zip(names, relatives):
         count = page_count(str(storage.path_for(relative)))
         spans.append((name, cursor, cursor + count))
         cursor += count
@@ -945,6 +947,44 @@ def _existing_invoice_numbers(db: Session, book_id: int, numbers: set[str]) -> s
 def create_batch(db: Session, book_id: int, user: SysUser, files: list[tuple[str, bytes]]) -> InvoiceBatch:
     """一次上传 1..N 个文件，落成一个批次；非 PDF 在这里被忽略。
 
+    **字节入口**（既有契约，测试与内部调用走这里）。
+    字节先落成临时源文件，再走 :func:`_create_batch` —— **同一份实现**，
+    不写第二遍，免得两条路漂移。
+
+    想让内存里不放大头，走 :func:`create_batch_from_staged`（上传接口用的就是它）。
+    """
+    staged: list[tuple[str, str]] = []
+    skipped: list[str] = []
+    for name, data in files:
+        if is_pdf(name):
+            staged.append((name, storage.stage_temp_bytes(data)))
+        else:
+            skipped.append(name)
+    return _create_batch(db, book_id, user, staged, skipped)
+
+
+def create_batch_from_staged(db: Session, book_id: int, user: SysUser,
+                             staged: list[tuple[str, str]],
+                             skipped: list[str]) -> InvoiceBatch:
+    """**已落盘**的源文件入口：``staged`` 是 ``(用户文件名, 临时相对路径)``。
+
+    上传接口走这条：上传的字节流本来就在磁盘上
+    （FastAPI 的 ``UploadFile.file`` 是 ``SpooledTemporaryFile``，超过 1 MB
+    自动溢写），把它 ``read()`` 成 ``bytes`` 等于把已经在磁盘上的东西
+    **又抄一份进内存** —— 一批最多 50 MB，全部同时驻留。
+
+    改成边读边写之后，峰值内存 = 一个 64 KB 的块，与上传大小无关。
+    """
+    return _create_batch(db, book_id, user, staged, skipped)
+
+
+def _create_batch(db: Session, book_id: int, user: SysUser,
+                  staged: list[tuple[str, str]], skipped: list[str]) -> InvoiceBatch:
+    """建批次的**唯一一份实现**（源文件已经在磁盘上）。
+
+    ``staged`` 是 ``(用户文件名, 临时相对路径)``；``skipped`` 是被忽略的
+    非 PDF 文件名。
+
     单份时就是原来的行为：原文件原样落盘，不合并、不重写。多份时先各自暂存，
     再按选择顺序合并成一份 —— 解析器本来就是按页切发票的，所以合并之后
     「一份批次 N 张发票」的老链路一个字不用改，页码也天然连续。
@@ -953,30 +993,33 @@ def create_batch(db: Session, book_id: int, user: SysUser, files: list[tuple[str
     常态，让它们把整批判掉等于这个功能不可用；而该成功的文件失败了还静默
     跳过，等于用户以为传进去了。忽略掉的名字写进批次备注，不无声消失。
     """
-    pdfs = [(name, data) for name, data in files if is_pdf(name)]
-    skipped = [name for name, _ in files if not is_pdf(name)]
-    if not pdfs:
+    names = [name for name, _ in staged]
+    if not staged:
         detail = f"，本次 {len(skipped)} 个文件都不是 PDF：{'、'.join(skipped[:5])}" if skipped else ""
         raise ValueError(f"没有可解析的 PDF 文件{detail}")
     message = skip_note(skipped)
-    files = pdfs
-    filename = batch_label(files)
+    filename = batch_label(names)
     batch = InvoiceBatch(book_id=book_id, filename=filename, created_by=user.username)
     db.add(batch)
     db.flush()
     saved_path = ""
-    staged: list[str] = []
+    staged_paths: list[str] = []
+    temps = [relative for _, relative in staged]
     try:
-        if len(files) == 1:
-            saved_path = storage.save_pdf(batch.id, files[0][1])
+        if len(staged) == 1:
+            # 单份：原文件原样落盘，**不重写**（改名不改内容）。
+            saved_path = storage.promote(temps[0], f"batch_{batch.id}.pdf")
         else:
-            staged = [storage.stage_pdf(batch.id, index, data) for index, (_, data) in enumerate(files, start=1)]
-            saved_path = storage.merge_pdfs(list(zip(staged, [name for name, _ in files])), batch.id)
+            staged_paths = [
+                storage.promote(temp, f"batch_{batch.id}_src{index}.pdf")
+                for index, temp in enumerate(temps, start=1)
+            ]
+            saved_path = storage.merge_pdfs(list(zip(staged_paths, names)), batch.id)
         batch.file_path = saved_path
-        spans = _page_sources(files, staged or [saved_path])
-        for relative in staged:
+        spans = _page_sources(names, staged_paths or [saved_path])
+        for relative in staged_paths:
             storage.delete(relative)
-        staged = []
+        staged_paths = []
         # 凭据从系统配置解析（库里优先、.env 兜底），解析层只负责执行。
         ocr = ocr_config(db)
         invoices, ocr_used = parse_pdf_with_fallback(str(storage.path_for(saved_path)), ocr)
@@ -1039,7 +1082,9 @@ def create_batch(db: Session, book_id: int, user: SysUser, files: list[tuple[str
         batch.status = "PENDING"
         db.commit()
     except _DuplicateInvoice as dup:
-        for relative in staged:
+        for relative in staged_paths:
+            storage.delete(relative)
+        for relative in temps:
             storage.delete(relative)
         if saved_path:
             storage.delete(saved_path)
@@ -1057,7 +1102,11 @@ def create_batch(db: Session, book_id: int, user: SysUser, files: list[tuple[str
                                                  sorted(existing))) from dup
         raise ValueError("发票已存在，不能重复导入（这份文件与已上传的发票重复）") from dup
     except Exception:
-        for relative in staged:
+        for relative in staged_paths:
+            storage.delete(relative)
+        # 临时源文件也要清掉 —— 它们是被 promote 之前的名字，
+        # promote 成功的那几个已经不在这个列表里了（改的是名字，不是复制）。
+        for relative in temps:
             storage.delete(relative)
         if saved_path:
             storage.delete(saved_path)

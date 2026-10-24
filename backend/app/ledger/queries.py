@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import date
 from decimal import Decimal
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from fastapi import HTTPException
 from sqlalchemy import Select, and_, func, select
@@ -18,11 +19,50 @@ from app.models import Book, Entry, Period, Subject, Voucher
 CATEGORY_ORDER = {"ASSET": 0, "LIABILITY": 1, "EQUITY": 2, "COST": 3, "PROFIT": 4}
 
 
+class EntryRow(NamedTuple):
+    """明细账要用的**一行的全部内容**。
+
+    **为什么是 NamedTuple 而不是 ORM 实体。**
+
+    明细账要把整本账的分录一次性取回来再按科目切：一次整本账 = 6 万行。
+    取 ORM 实体时每行都要建 ``Entry`` 与 ``Voucher`` 两个带 identity map
+    的对象，还额外 join 了一张**从头到尾没被用过的** ``Subject`` ——
+    实测每行约 5.6 KB，6 万行就是 **336 MB** 的瞬时内存，
+    而这台生产机总共只有 1.6 GB。
+
+    改成列元组后每行约 0.8 KB（**-85%**），而且少一个 join。
+
+    字段只留**真的被用到的**：``Entry`` 侧要 amount/direction/summary
+    （出行用）加 subject_id/period_ord（归位用）；``Voucher`` 侧要
+    id/no/date/status（出行用）。``Entry.line_no`` 只参与 ORDER BY，
+    不必取出来 —— SQL 里的 ORDER BY 不要求那一列出现在 SELECT 列表中。
+    """
+    subject_id: int
+    period_ord: int
+    amount: Decimal
+    direction: str
+    summary: str
+    voucher_id: int
+    voucher_no: str
+    voucher_date: date
+    voucher_status: str
+
+
 def _entry_stmt(book_id: int, include_unposted: bool) -> Select:
+    """取一整本账的分录行（只取 ``EntryRow`` 需要的那些列）。
+
+    **不要在这里 join ``Subject``。** 以前这里是 ``select(Entry, Voucher,
+    Subject)``，但两个调用点都只绑定 ``_subj``、**从头到尾没用过它** ——
+    多出来的代价是每行多一个 ORM 对象（6 万行 = 几十 MB），
+    以及一次完全用不上的 join。
+    """
     stmt = (
-        select(Entry, Voucher, Subject)
+        select(
+            Entry.subject_id, Entry.period_ord, Entry.amount,
+            Entry.direction, Entry.summary,
+            Voucher.id, Voucher.voucher_no, Voucher.voucher_date, Voucher.status,
+        )
         .join(Voucher, Voucher.id == Entry.voucher_id)
-        .join(Subject, Subject.id == Entry.subject_id)
         .where(Entry.book_id == book_id)
     )
     if not include_unposted:
@@ -160,7 +200,7 @@ def _detail_account_rows(
     *,
     opening: Decimal,
     range_periods: list[Period],
-    entries_by_period: dict[int, list[tuple[Entry, Voucher]]],
+    entries_by_period: dict[int, list[EntryRow]],
     month_moves: dict[int, tuple[Decimal, Decimal]],
     ytd_moves: dict[int, tuple[Decimal, Decimal]],
     is_leaf: bool,
@@ -204,22 +244,22 @@ def _detail_account_rows(
 
     for period in range_periods:
         if is_leaf:
-            for entry, voucher in entries_by_period.get(period.ord, []):
-                debit = entry.amount if entry.direction == "DEBIT" else ZERO
-                credit = entry.amount if entry.direction == "CREDIT" else ZERO
+            for row in entries_by_period.get(period.ord, []):
+                debit = row.amount if row.direction == "DEBIT" else ZERO
+                credit = row.amount if row.direction == "CREDIT" else ZERO
                 running += debit - credit
                 side, amount = display_side(node, running)
                 rows.append(account_row(
                     "ENTRY", period,
-                    voucher_id=voucher.id,
-                    voucher_no=voucher.voucher_no,
-                    voucher_date=voucher.voucher_date.isoformat(),
-                    summary=entry.summary,
+                    voucher_id=row.voucher_id,
+                    voucher_no=row.voucher_no,
+                    voucher_date=row.voucher_date.isoformat(),
+                    summary=row.summary,
                     debit=debit,
                     credit=credit,
                     direction=side,
                     balance=amount,
-                    status=voucher.status,
+                    status=row.voucher_status,
                 ))
 
         month_debit, month_credit = month_moves.get(period.ord, (ZERO, ZERO))
@@ -252,15 +292,25 @@ def detail_ledger(
     include_unposted: bool = False,
     from_subject_id: int | None = None,
     to_subject_id: int | None = None,
+    *,
+    eng: LedgerEngine | None = None,
 ) -> dict:
-    """明细账：末级逐笔展示；父级按科目树汇总并展开所选子科目范围。"""
+    """明细账：末级逐笔展示；父级按科目树汇总并展开所选子科目范围。
+
+    **这是屏幕与导出件共同的取数口**（用户 2026-10-24 批注 1、2：
+    导出件要照屏幕那样，所以导出直接用这个函数的行，不另拼一套）。
+
+    ``eng`` 是给**整册导出**用的：一册几十个一级科目，逐个科目重建引擎
+    就把期初聚合白算 N 遍 —— 传同一个实例进来，算过的不再算
+    （引擎是单次请求内的只读计算器，理由见 ``app.ledger.engine``）。
+    """
     # 科目表每个年度各有一份 —— 明细账看的是**区间所在年度**的那张表。
     year = to_period.year
     subject = subject_of_book(db, book_id, subject_id, year=year)
     if from_period.ord > to_period.ord:
         raise HTTPException(400, "起始期间不能晚于结束期间")
 
-    eng = LedgerEngine.for_ledger(db, book_id, include_unposted)
+    eng = eng or LedgerEngine.for_ledger(db, book_id, include_unposted)
     periods = eng.periods()
     range_periods = [p for p in periods if from_period.ord <= p.ord <= to_period.ord]
     if not range_periods:
@@ -373,7 +423,7 @@ def detail_ledger(
 
     earliest_ytd_ord = min(first_period_by_year[p.year].ord for p in range_periods)
     monthly_moves: dict[tuple[int, int], list[Decimal]] = defaultdict(lambda: [ZERO, ZERO])
-    entries_by_leaf_period: dict[tuple[int, int], list[tuple[Entry, Voucher]]] = defaultdict(list)
+    entries_by_leaf_period: dict[tuple[int, int], list[EntryRow]] = defaultdict(list)
     if selected_leaf_ids:
         stmt = (
             _entry_stmt(book_id, include_unposted)
@@ -382,23 +432,26 @@ def detail_ledger(
             .order_by(Entry.period_ord, Voucher.voucher_date, Voucher.voucher_no, Entry.line_no)
         )
         parent_by_id = {s.id: s.parent_id for s in all_subjects}
-        for entry, voucher, _subj in db.execute(stmt).all():
-            debit = entry.amount if entry.direction == "DEBIT" else ZERO
-            credit = entry.amount if entry.direction == "CREDIT" else ZERO
+        for row in db.execute(stmt).tuples().all():
+            sid, p_ord, amount, direction, summary, vid, vno, vdate, vstatus = row
+            debit = amount if direction == "DEBIT" else ZERO
+            credit = amount if direction == "CREDIT" else ZERO
             # **折算到止期那一行的 id**（跨年区间）：分录挂的是各自年度的
             # 科目行，上卷与展示都走止期那张树。
-            entry_id = id_to_row.get(entry.subject_id, entry.subject_id)
+            entry_id = id_to_row.get(sid, sid)
             current = entry_id
             while current in included_nodes:
-                totals = monthly_moves[(current, entry.period_ord)]
+                totals = monthly_moves[(current, p_ord)]
                 totals[0] += debit
                 totals[1] += credit
                 parent_id = parent_by_id.get(current)
                 if parent_id is None:
                     break
                 current = parent_id
-            if entry.period_ord >= from_period.ord:
-                entries_by_leaf_period[(entry_id, entry.period_ord)].append((entry, voucher))
+            if p_ord >= from_period.ord:
+                entries_by_leaf_period[(entry_id, p_ord)].append(
+                    EntryRow(sid, p_ord, amount, direction, summary,
+                             vid, vno, vdate, vstatus))
 
     ytd_moves: dict[tuple[int, int], tuple[Decimal, Decimal]] = {}
     ytd_by_node = {node_id: [ZERO, ZERO] for node_id in included_nodes}
@@ -642,7 +695,7 @@ def detail_ledger_book(
     # ---- 分录：一次查完，再按科目切片 ---------------------------------
     earliest_ytd_ord = min(first_period_by_year[p.year].ord for p in range_periods)
     monthly_moves: dict[tuple[int, int], list[Decimal]] = defaultdict(lambda: [ZERO, ZERO])
-    entries_by_leaf_period: dict[tuple[int, int], list[tuple[Entry, Voucher]]] = defaultdict(list)
+    entries_by_leaf_period: dict[tuple[int, int], list[EntryRow]] = defaultdict(list)
     if query_ids:
         stmt = (
             _entry_stmt(book_id, include_unposted)
@@ -650,15 +703,18 @@ def detail_ledger_book(
             .where(Entry.period_ord >= earliest_ytd_ord, Entry.period_ord <= to_period.ord)
             .order_by(Entry.period_ord, Voucher.voucher_date, Voucher.voucher_no, Entry.line_no)
         )
-        for entry, voucher, _subj in db.execute(stmt).all():
-            debit = entry.amount if entry.direction == "DEBIT" else ZERO
-            credit = entry.amount if entry.direction == "CREDIT" else ZERO
-            entry_id = id_to_row.get(entry.subject_id, entry.subject_id)
-            totals = monthly_moves[(entry_id, entry.period_ord)]
+        for sid, p_ord, amount, direction, summary, vid, vno, vdate, vstatus in (
+                db.execute(stmt).tuples().all()):
+            debit = amount if direction == "DEBIT" else ZERO
+            credit = amount if direction == "CREDIT" else ZERO
+            entry_id = id_to_row.get(sid, sid)
+            totals = monthly_moves[(entry_id, p_ord)]
             totals[0] += debit
             totals[1] += credit
-            if entry.period_ord >= from_period.ord:
-                entries_by_leaf_period[(entry_id, entry.period_ord)].append((entry, voucher))
+            if p_ord >= from_period.ord:
+                entries_by_leaf_period[(entry_id, p_ord)].append(
+                    EntryRow(sid, p_ord, amount, direction, summary,
+                             vid, vno, vdate, vstatus))
 
     # ---- 累计：每年 1 月归零，逐月累加 -------------------------------
     ytd_moves: dict[tuple[int, int], tuple[Decimal, Decimal]] = {}

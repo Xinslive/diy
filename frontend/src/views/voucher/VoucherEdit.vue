@@ -253,7 +253,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as api from '@/api/voucher'
@@ -267,10 +267,26 @@ import { displayBalanceCents } from '@/utils/balanceSign'
 import { findFirstProblem, lastFilledRowAt, rowCanBeDeleted } from '@/utils/voucherRows'
 import AmountGrid from '@/components/AmountGrid.vue'
 import SubjectPicker from '@/components/SubjectPicker.vue'
-import SubjectFormDialog from '@/components/SubjectFormDialog.vue'
 import AmountCells from '@/components/AmountCells.vue'
 import AmountUnits from '@/components/AmountUnits.vue'
-import PrintDialog from '@/components/PrintDialog.vue'
+
+// **这两个弹窗是按需加载的**（2026-10-24 性能审计改）。
+//
+// 原来它们是静态 import，于是**每次进凭证页都要把它们拽下来**：
+//   * SubjectFormDialog —— 40.8 KB raw / 14.2 KB gzip，里面带着
+//     el-tree + el-tree-select + el-text；
+//   * PrintDialog —— 9.5 KB raw / 4.1 KB gzip。
+// 而**绝大多数人根本不会点「新增科目」**，更不会一进页面就打印 ——
+// 这 18 KB gzip 是白付的固定开销。
+//
+// 改成 defineAsyncComponent 之后，它们各自分成独立 chunk，只有真的
+// 打开弹窗时才会去取。代价是首次打开有一个网络往返（几十 KB，本地
+// 开发是瞬时的，生产上也在几十毫秒量级），换来的是首屏少 18 KB gzip。
+//
+// 用 defineAsyncComponent 而不是在模板里写动态 import()：前者保留了在
+// 模板里直接写 ``<SubjectFormDialog v-model=... />`` 的用法。
+const SubjectFormDialog = defineAsyncComponent(() => import('@/components/SubjectFormDialog.vue'))
+const PrintDialog = defineAsyncComponent(() => import('@/components/PrintDialog.vue'))
 import VoucherSplitDialog from '@/components/VoucherSplitDialog.vue'
 import { rafThrottle } from '@/utils/frame'
 import { Bottom, CircleCloseFilled, EditPen, Top } from '@element-plus/icons-vue'
