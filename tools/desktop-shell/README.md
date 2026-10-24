@@ -383,8 +383,8 @@ python tools/desktop-shell/launch_path_probe.py `
 产物放在生产机的独立下载目录里，**不随发布目录被覆盖**：
 
 ```
-生产机（8.155.171.57）：/www/wwwroot/acct.xins.live/downloads/<随机段>/CWQ.exe
-公网地址：              https://acct.xins.live/downloads/<随机段>/CWQ.exe
+生产机（43.138.178.174）：/www/wwwroot/acct.xins.live/downloads/<随机段>/CWQ.exe
+公网地址：                  https://acct.xins.live/downloads/<随机段>/CWQ.exe
 ```
 
 - `<随机段>` 是一段 32 位十六进制随机串，**每次换产物都换**。

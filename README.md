@@ -472,6 +472,36 @@ cd frontend && npm test
 
 生产机**不再当构建机**。CI 的 `build-artifacts` job 出产物，生产机只取产物 → 解包 → 装依赖 → 迁移 → 切产物 → 重启 → 探活。原来的「生产机跑 pytest + pnpm build」是发版尖峰里最重的一步，还要求生产机常驻 Node.js / pnpm / pytest 三套只为发版存在的工具链。
 
+### 部署目标机：**只有一台**
+
+本项目**只在 `43.138.178.174` 上部署**（Debian 13 + nginx 1.26.3 + PG 16.15，
+应用根 `/www/wwwroot/acct.xins.live`）。
+
+历史上部署过三台机：`8.155.171.57`（宝塔，与 tax/work/ai 等 9 个子域共用）、
+`110.42.44.53`（`/opt/cwq` 布局，与 19+ 站点共用）、
+以及现在的 `43.138.178.174`。**前两台已于 2026-10-24 清理完毕** ——
+代码、数据库、systemd 单元、nginx 站点配置、调度 tick、`cwq` 系统用户全部移除，
+两台机上本项目的其余站点**照常服务，未受影响**。
+
+> **为什么必须只有一台**：两台机同时跑着这个项目时，两个库各自推进、
+> 调度任务被领两遍，数据分叉之后无论回滚到哪台都是错的。
+> 「旧机已经清干净」解决不了「有人又往旧机上发一次版」。
+
+所以 `deploy/deploy.sh` 里有一道**目标机守卫**（`check_deploy_target`），
+在发布开始前就核对本机身份，对不上直接退出：
+
+| 判据 | 说明 |
+| --- | --- |
+| `/etc/cwq-deploy-target` | 目标机上的授权标记文件，内容是本机被授权的 IP（现为 `43.138.178.174`）。**「谁是生产机」写在目标机自己的磁盘上**，换机器时改这一个文件即可 |
+| 下线主机名单 | `8.155.171.57` / `110.42.44.53`。**这一条永远先查** —— 授权不能推翻禁令，防止把标记文件拷到老机上就放行 |
+| 内置名单 | 没有标记文件时，只有出口 IP 是 `43.138.178.174` 才放行 |
+
+判据用**公网出口 IP**（不是 hostname、不是网卡地址）：云主机普遍是 NAT 布局，
+网卡上只有内网地址（当前生产机是 `10.1.0.15`），而它对外的身份是弹性公网 IP。
+
+沙箱演练可以用 `CWQ_ALLOW_ANY_HOST=1 deploy.sh` 跳过检查 ——
+**生产环境不要设这个变量**。
+
 ### systemd 单元
 
 | 单元 | 职责 |
@@ -486,6 +516,11 @@ cd frontend && npm test
 
 - `cwq.conf` —— upstream + keepalive、`/api/` 与 `/api/mcp` 反代、前端静态目录、`/api/scheduler/tick` 独立限流。
 - `acct.xins.live.conf` —— 生产站点 server_name、ACME 证书、限流。
+- 两份都带 **ESA 回源双向校验（mTLS）** 的配置：信任 ESA 根证书
+  （`/etc/nginx/ssl/esa/esa-client-ca.pem`）、校验客户端证书，并把
+  `$ssl_client_verify` 记进访问日志。切换强制/过渡态用
+  `deploy/esa-mtls.sh`（服务器上是 `/usr/local/sbin/cwq-esa-mtls.sh`）。
+  详见 [`deploy/esa-mtls.md`](deploy/esa-mtls.md)。
 
 ### 动静分离与 CDN 部署
 
@@ -531,10 +566,22 @@ cd frontend && npm test
    nginx -t && nginx -s reload
    ```
 
-4. **配两条 Cache Rule**：
-   - `/runtime-config.js` → **不缓存**（它是 `.js`，Cloudflare 默认会缓存，
-     而它决定「API 在哪」，缓存住了就是「改了配置不生效」）；
-   - `/api/*` → **不缓存**（缓存住业务响应 = 把一个人的数据发给另一个人）。
+4. **配 Cache Rule**（Caching → Cache Rules；多条命中时**靠后的一条赢**，
+   这几条互斥，顺序随意）：
+   - `/api/*` → **Bypass cache**（缓存住业务响应 = 把一个人的数据发给另一个人；
+     这一条同时挡住了插件资产被缓存一年，以及 `.xlsx` 导出被缓存 120 分钟）；
+   - `/runtime-config.js` → **Bypass cache**（它决定「API 在哪」，
+     缓存住了就是「改了配置不生效」）；
+   - `/assets/*` → **Eligible for cache**，Edge TTL 选「有 cache-control 就按它来，
+     没有就不缓存」。
+
+   > 表达式写 `starts_with(http.request.uri.path, "/api/")`，或
+   > `http.request.uri.path wildcard "/api/*"`；正则形式
+   > `http.request.uri.path matches "^/api/"` **仅 Business / Enterprise 套餐可用**。
+   >
+   > Edge TTL 选「**遵循源站的 Cache-Control**」是不够的：它管的是「缓存多久」，
+   > 管不了「哪些 URL 有资格被缓存」，而且源站没给 `Cache-Control` 时它会回落到
+   > 「200 响应缓存 120 分钟」。逐项说明见 [`deploy/cloudflare.md`](deploy/cloudflare.md) 第 4 节。
 5. **关掉 Rocket Loader 与 Auto Minify**（前者会改写 `<script>` 标签，
    本项目是 ES module；后者会重新压缩产物，与 CSP 对不上时浏览器直接拒绝执行）。
 6. 发布后自检：
@@ -548,6 +595,22 @@ cd frontend && npm test
 子域）。上传上限免费版 100 MB —— 本系统发票批量上传上限 50 MB，够用。
 
 完整步骤、必关开关与排障对照表见 **[`deploy/cloudflare.md`](deploy/cloudflare.md)**。
+
+#### 形态一之变体：阿里云 ESA（生产在用）
+
+生产 `acct.xins.live` 现在前置是**阿里云 ESA**（响应头 `server: ESA`、
+`via: ens-cache20.*`、`x-site-cache-status`；`deploy/verify_cdn.sh` 三家都认）。
+
+ESA 比上面那套多两件事：
+
+1. **回源双向校验（mTLS）** —— ESA 回源时带上自己的客户端证书，源站验签。
+   源站侧已就位（`/etc/nginx/ssl/esa/esa-client-ca.pem` +
+   `ssl_verify_client`），控制台侧开关与切换步骤见
+   **[`deploy/esa-mtls.md`](deploy/esa-mtls.md)**。
+2. **真实 IP 还原要单独装** —— ESA 的回源网段**不是静态公开列表**，得从
+   控制台「安全防护 → 源站防护」复制出来，再用
+   `deploy/esa-realip-update.sh` 生成并安装。不装的话登录节流会按 ESA
+   边缘节点分桶（**且不报错**）—— 详见 [`deploy/esa-mtls.md`](deploy/esa-mtls.md) 第 6 节。
 
 #### 形态二：静态资源放到另一个 CDN 域名
 
@@ -621,6 +684,7 @@ CWQ_CDN_UPLOAD=1   # 发布时把 dist/assets/ 传到 OSS
 | --- | --- |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | 架构细节（很长，按模块逐层展开） |
 | [`deploy/cloudflare.md`](deploy/cloudflare.md) | **部署到 CDN（Cloudflare 形态）**：缓存规则、必关开关、真实 IP 还原、已知限制 |
+| [`deploy/esa-mtls.md`](deploy/esa-mtls.md) | **阿里云 ESA 回源双向校验（mTLS）**：源站侧配置、控制台步骤、切换与回滚、真实 IP 还原、实测结论 |
 | [`docs/plugin-overview.md`](docs/plugin-overview.md) | 插件开发总览与快速开始 |
 | [`docs/plugin-spec.md`](docs/plugin-spec.md) | 插件清单、权限、运行时参考 |
 | [`docs/plugin-guide.md`](docs/plugin-guide.md) | 插件开发指南 |

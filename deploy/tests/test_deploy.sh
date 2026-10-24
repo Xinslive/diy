@@ -204,14 +204,21 @@ STUB
   : > "$DEPDIR/calls"
 }
 
+# 沙箱里跑 deploy.sh 必须放行目标机校验：这台机器的出口 IP 不会是生产机。
+# 放行变量加在**每一个 runner 的调用行**上，而不是 export 到全局 ——
+# 这样「测试跑在哪台机器上」这件事对 deploy.sh 是显式可见的，
+# 也不会顺手把放行带进同文件里其它不经过 runner 的直接调用。
+CWQ_ALLOW_ANY_HOST=1
 run_script(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+    CWQ_ALLOW_ANY_HOST=1 \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 run_script_no_artifacts(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/empty-artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+    CWQ_ALLOW_ANY_HOST=1 \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 # 显式清掉 DATABASE_URL：这条只用来验证「目标库不确定时脚本会停手」。
@@ -219,6 +226,7 @@ run_script_no_artifacts(){
 run_script_no_db_url(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+    CWQ_ALLOW_ANY_HOST=1 \
     env -u DATABASE_URL LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 # 显式给 DATABASE_URL：用来验证「.env 不存在」这条路径 —— 那条路径是
@@ -227,6 +235,7 @@ run_script_no_db_url(){
 run_script_with_db_url(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+    CWQ_ALLOW_ANY_HOST=1 \
     DATABASE_URL="postgresql+psycopg://cwq:pw@127.0.0.1:15432/cwq" \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
@@ -236,6 +245,7 @@ calls(){ cat "$DEPDIR/calls" 2>/dev/null; }
 run_script_cdn(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+    CWQ_ALLOW_ANY_HOST=1 \
     CWQ_ASSET_BASE="https://cdn.example.com/" CWQ_ORIGIN="https://acct.example.com" \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
@@ -680,6 +690,7 @@ run_script_staged_relative(){
   cp "$(dirname "$SCRIPT")"/systemd/* "$STAGE/systemd/"
   ( cd "$STAGE" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+    CWQ_ALLOW_ANY_HOST=1 \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash ./deploy.sh 2>&1 )
 }
 
@@ -1324,6 +1335,115 @@ if grep -cE '/assets/index-' "$APP/frontend/dist/index.html" >/dev/null 2>&1; th
   ok "资源文件名仍带内容哈希（CDN 才能长缓存）"
 else
   no "资源地址里看不到内容哈希"
+fi
+
+# ---------------------------------------------------------------------------
+# 目标机守卫：只在 43.138.178.174 上部署
+# ---------------------------------------------------------------------------
+# 这组断言验的是**发布被拦住**这件事本身，不是「拦的时候日志长什么样」。
+#
+# 为什么要有它：本项目历史上部署过三台机，前两台已清理。清理只解决
+# 「旧机上没有东西了」，解决不了「有人又往旧机上发一次版」。
+# 一旦发版成功，两台机就各自推进一份库、各自领一遍调度任务 ——
+# 那是最难查的一类故障。所以这道闸必须**有测试盯着**，
+# 否则哪天有人为了「先跑起来」把它注释掉，没人会发现。
+echo
+echo "== 目标机守卫 =="
+
+# 守卫的判据是「本机出口 IP」。沙箱里 curl 是桩（只记录调用、不返回真 IP），
+# 所以用 CWQ_HOST_IP 注入 —— 守卫专门支持这个变量，就是为了让
+# 「识别成某台机时的行为」可以被确定地测出来。
+#
+# 这几组用例验的是**发布被拦住**这件事本身，不是日志长什么样。
+# 为什么必须有它：本项目历史上部署过三台机，前两台已清理。清理只解决
+# 「旧机上没有东西了」，解决不了「有人又往旧机上发一次版」。
+# 一旦发版成功，两台机就各自推进一份库、各自领一遍调度任务 ——
+# 那是最难查的一类故障。所以这道闸必须**有测试盯着**，
+# 否则哪天有人为了「先跑起来」把它注释掉，没人会发现。
+
+# 在老机上发布 → 必须拒绝
+setup_sandbox
+OUT=$( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+        SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+        CWQ_HOST_IP=8.155.171.57 \
+        LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" --check-only 2>&1 ); RC=$?
+if [[ "${RC}" != "0" ]] && grep -qE "已下线的老生产机" <<<"$OUT"; then
+  ok "在已下线的旧机（8.155.171.57）上发布被拒绝（退出码 ${RC}）"
+else
+  no "在旧机上发布没有被拒绝 —— 守卫形同虚设（退出码 ${RC}）"
+fi
+
+# 更早那台（/opt/cwq 布局）同样必须被拒绝
+setup_sandbox
+OUT=$( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+        SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+        CWQ_HOST_IP=110.42.44.53 \
+        LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" --check-only 2>&1 ); RC=$?
+if [[ "${RC}" != "0" ]] && grep -qE "已下线的老生产机" <<<"$OUT"; then
+  ok "在已下线的旧机（110.42.44.53）上发布被拒绝（退出码 ${RC}）"
+else
+  no "在旧机上发布没有被拒绝 —— 守卫形同虚设（退出码 ${RC}）"
+fi
+
+# 被拒绝的发布不能有任何副作用
+setup_sandbox
+OUT=$( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+        SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+        CWQ_HOST_IP=8.155.171.57 \
+        LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" --check-only 2>&1 ); RC=$?
+if calls_has "alembic upgrade head"; then
+  no "被拒绝的发布仍然往下走了（改了库）"
+else
+  ok "被拒绝的发布没有产生任何副作用（没碰库）"
+fi
+
+# **授权不能推翻禁令**：把生产机的授权标记拷到老机上，也必须被拒。
+# 这是「先查下线名单、后看授权标记」这条顺序要保住的理由。
+setup_sandbox
+printf '43.138.178.174\n' > "$DEPDIR/target-marker"
+OUT=$( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+        SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+        CWQ_HOST_IP=8.155.171.57 CWQ_DEPLOY_TARGET_FILE="$DEPDIR/target-marker" \
+        LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" --check-only 2>&1 ); RC=$?
+if [[ "${RC}" != "0" ]] && grep -qE "已下线的老生产机" <<<"$OUT"; then
+  ok "授权标记被拷到老机上仍然被拒（授权推翻不了禁令）"
+else
+  no "拷过去的授权标记放行了旧机 —— 下线名单被绕过了（退出码 ${RC}）"
+fi
+
+# 标记文件与本机不符时也必须拒 —— 那是「以为在 A 机、实际在 B 机」。
+setup_sandbox
+printf '203.0.113.99\n' > "$DEPDIR/target-marker"
+OUT=$( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+        SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+        CWQ_HOST_IP=10.1.0.15 CWQ_DEPLOY_TARGET_FILE="$DEPDIR/target-marker" \
+        LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" --check-only 2>&1 ); RC=$?
+if [[ "${RC}" != "0" ]] && grep -qE "目标机授权标记与本机不符" <<<"$OUT"; then
+  ok "标记文件与本机不符时发布被拒绝"
+else
+  no "标记文件写着别的 IP 仍然放行了 —— 这正是「以为在 A 机、实际在 B 机」（退出码 ${RC}）"
+fi
+
+# 生产机（标记与本机一致）→ 放行
+setup_sandbox
+printf '43.138.178.174\n' > "$DEPDIR/target-marker"
+OUT=$( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+        SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+        CWQ_HOST_IP=43.138.178.174 CWQ_DEPLOY_TARGET_FILE="$DEPDIR/target-marker" \
+        LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" --check-only 2>&1 ); RC=$?
+if grep -qE "目标机授权标记：43\.138\.178\.174" <<<"$OUT"; then
+  ok "生产机上发布被放行"
+else
+  no "生产机被误拦了 —— 这道闸会挡住正常发布（退出码 ${RC}）"
+fi
+
+# 显式放行：沙箱演练要能跑通。
+setup_sandbox
+OUT=$(run_script --check-only); RC=$?
+if [[ "${RC}" == "0" ]]; then
+  ok "CWQ_ALLOW_ANY_HOST=1 时沙箱演练照常通过"
+else
+  no "沙箱演练被守卫挡住了 —— 测试与演练没法做（退出码 ${RC}）"
 fi
 
 echo

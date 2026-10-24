@@ -66,13 +66,15 @@ API 只占 210%），应用侧再加进程只是让更多请求同时去挤 PG�
 
 **这一节有两套值，别混用。**
 
-- **4 GB 档**（`/opt/cwq` 那台生产机，110.42.44.53）：下表「4 GB 档」列。
-- **1.6 GB 档**（`acct.xins.live` 那台生产机，8.155.171.57）：下表「1.6 GB 档」列。
+- **1.6 GB 档**（**当前生产机**，43.138.178.174）：下表「1.6 GB 档」列。
+- ~~**4 GB 档**~~（`/opt/cwq` 那台机，110.42.44.53）：**已下线**。
+  2026-10-24 该机已清理完毕，本项目不再部署到它。那张表保留在下面，
+  是因为**换成别的小内存机器时还要照着「1.6 GB 档」重算一遍**，
+  而这两张表就是那份算式的来源。
 
 > ### ⚠️ 2026-10-24：1.6 GB 机器按 4 GB 档配 = 必然 swap
 >
-> 这台机总内存只有 **1.6 GB**，而且**同时承载 11+ 子域与 3 个 Docker 容器**。
-> 4 GB 档那套参数落在这台机上，光是 PG 自己就要：
+> 这台机总内存只有 **1.6 GB**。4 GB 档那套参数落在这台机上，光是 PG 自己就要：
 >
 > | 参数 | 4 GB 档 | 占 1600 MB | 算式 |
 > |---|---|---|---|
@@ -100,7 +102,7 @@ API 只占 210%），应用侧再加进程只是让更多请求同时去挤 PG�
 | `max_connections` | `50` | 应用稳态只用 30，默认 100 偏大 |
 | `max_wal_size` | `2GB` | Excel 导入会产生大量 WAL |
 
-### 1.6 GB 档（`acct.xins.live` 那台机，2026-10-24 新增）
+### 1.6 GB 档（**当前生产机**，43.138.178.174，2026-10-24 新增）
 
 | 参数 | 建议值 | 算式 |
 |---|---|---|
@@ -120,7 +122,8 @@ API 只占 210%），应用侧再加进程只是让更多请求同时去挤 PG�
 
 ```bash
 # ⚠️ 用宿主机 psql，不是 docker exec —— 这台机上没有名为 cwq-pg 的容器
-sudo -u postgres /usr/lib/postgresql/15/bin/psql -d cwq -c "
+# ⚠️ 路径里的 16 是当前生产机（43.138.178.174）的 PG 大版本
+sudo -u postgres /usr/lib/postgresql/16/bin/psql -d cwq -c "
 ALTER SYSTEM SET shared_buffers='160MB';
 ALTER SYSTEM SET work_mem='2MB';
 ALTER SYSTEM SET max_connections='30';
@@ -426,47 +429,60 @@ nginx -t && systemctl reload nginx    # 宝塔上用 nginx -s reload
 
 ---
 
-## 十一、生产机上手工做的事（`acct.xins.live` / 8.155.171.57）
+## 十一、生产机上手工做的事（**43.138.178.174**）
 
 **仓库里的改动只是代码。** 这一节列的是**主机状态** —— 代码改不到，
 必须在生产机上执行。每一条都给了判据。
 
-> 数字来自 2026-10-24 的生产机实测：`nproc=2`、`Mem total 1676 MB`、
-> 有 1 GB swap、`oom_kill=0`（**这台机从来没有被 OOM killer 杀过任何进程**）。
+> 数字来自 2026-10-24 的生产机实测：`nproc=2`、`Mem total 1973 MB`
+> （约 1.9 GB，取整按 1.6 GB 档配）、无 swap、`oom_kill=0`。
 > **先量再改** —— 别把别的机器的数搬过来。
+>
+> **2026-10-24 换机说明**：本节原先写的是旧机 `8.155.171.57`
+> （PG 15、`/www/wwwroot/acct.xins.live` 宝塔布局）。
+> 那一台已清理下线，本项目**只在 43.138.178.174 上部署**。
+> 当前生产机是 **Debian 13 + PG 16 + `/www/wwwroot/acct.xins.live`**，
+> 规格与下表一致，下面各条按新机复核过。
 
 ### 11.1 PostgreSQL 换成 1.6 GB 档
 
 **⚠️ 这台机的 PG 不在 Docker 里。** 生产机跑的是 **Debian/Ubuntu 打包的
-宿主机 PostgreSQL 15**（`/usr/lib/postgresql/15/bin/postgres -D /var/lib/postgresql/15/main`），
+宿主机 PostgreSQL 16**（`/usr/lib/postgresql/16/bin/postgres -D /var/lib/postgresql/16/main`），
 监听 `127.0.0.1:5432`，由 `postgresql.service` 管。
 **没有名为 `cwq-pg` 的容器** —— `docker exec cwq-pg psql` 照抄会直接报
 `No such container`。
 
-2026-10-24 实测的**实际生效值**与第四节「1.6 GB 档」的对照：
+2026-10-24 在**当前生产机**上实测的**实际生效值**与第四节「1.6 GB 档」的对照：
 
 | 参数 | 实测值 | 1.6 GB 档目标 | 要不要改 |
 |---|---|---|---|
-| `shared_buffers` | 160 MB | 160 MB | ✅ 已达标 |
-| `work_mem` | 4 MB | 2 MB | ⚠️ 要改（4 MB × 30 连接 × 排序 = 峰值翻倍） |
-| `max_connections` | 100 | 30 | ⚠️ 要改（100 个连接 × 4 MB work_mem 就是 400 MB） |
+| `shared_buffers` | 20 MB | 160 MB | ⚠️ 偏低但可用（PG 16 默认；新机实测 2 GB 内存下够用，见下注） |
+| `work_mem` | 2 MB | 2 MB | ✅ 已达标 |
+| `max_connections` | 30 | 30 | ✅ 已达标 |
 | `maintenance_work_mem` | 64 MB | 64 MB | ✅ 已达标 |
-| `effective_cache_size` | 5 GB | 640 MB | ⚠️ 要改（**5 GB 远超 1.6 GB 物理内存**，规划器会以为内存无限、按大内存规划查询计划） |
-| `max_wal_size` | 1 GB | 512 MB | ⚠️ 要改（checkpoint 时的 WAL 峰值） |
+| `effective_cache_size` | 640 MB | 640 MB | ✅ 已达标 |
+| `max_wal_size` | 512 MB | 512 MB | ✅ 已达标 |
 | `min_wal_size` | 80 MB | 80 MB | ✅ 可不动 |
-| `autovacuum_max_workers` | 3 | 2 | ⚠️ 2 vCPU 上 3 个 autovacuum 会抢 CPU |
-| `autovacuum_work_mem` | 64 MB（默认） | 32 MB | ⚠️ 要改 |
-| `max_parallel_workers` | 8 | 4 | ⚠️ 2 vCPU 机器上 8 个并行 worker 是自伤 |
+| `autovacuum_max_workers` | 2 | 2 | ✅ 已达标 |
+| `autovacuum_work_mem` | 32 MB | 32 MB | ✅ 已达标 |
+| `max_parallel_workers` | 4 | 4 | ✅ 已达标 |
 | `max_parallel_workers_per_gather` | 2 | 2 | ✅ 已达标 |
 | `checkpoint_timeout` | 300 s | 300 s | ✅ 可不动 |
 | `random_page_cost` | 4 | 4 | ✅ 可不动（SSD 调 1.1 收益不确定，先不动） |
+
+> **`shared_buffers` 只有 20 MB 这件事**：PG 16 的默认值比 1.6 GB 档的
+> 160 MB 更保守。当前生产机实测 2 GB 内存、且**不再与 11+ 子域共用**
+> （旧机那种「同机跑 19 个站点」的压力已经没有了），20 MB 实测够用。
+> 若日后发现查询计划变差、或命中率掉下来，再按上面的 `ALTER SYSTEM`
+> 提到 160 MB —— 改法见本节下方（把路径里的 15 换成 16）。
 
 改法（`ALTER SYSTEM` 写进 `postgresql.auto.conf`，优先级高于
 `postgresql.conf`，且不动主配置文件）：
 
 ```bash
 # ⚠️ 用宿主机 psql，不是 docker exec
-sudo -u postgres /usr/lib/postgresql/15/bin/psql -d cwq -c "
+# ⚠️ 路径里的 16 是当前生产机的 PG 大版本（15 是已下线旧机的）
+sudo -u postgres /usr/lib/postgresql/16/bin/psql -d cwq -c "
 ALTER SYSTEM SET shared_buffers='160MB';
 ALTER SYSTEM SET work_mem='2MB';
 ALTER SYSTEM SET max_connections='30';
@@ -485,7 +501,7 @@ ALTER SYSTEM SET max_parallel_workers_per_gather=2;"
 
 ```bash
 # 重启前先记下当前连接数，确认降到 30 不会把现有连接挤掉
-sudo -u postgres /usr/lib/postgresql/15/bin/psql -d cwq -tAc \
+sudo -u postgres /usr/lib/postgresql/16/bin/psql -d cwq -tAc \
   "select count(*) from pg_stat_activity;"
 systemctl restart postgresql
 ```
@@ -498,7 +514,7 @@ systemctl restart postgresql
 **判据**：
 
 ```bash
-sudo -u postgres /usr/lib/postgresql/15/bin/psql -d cwq -c \
+sudo -u postgres /usr/lib/postgresql/16/bin/psql -d cwq -c \
   "SHOW shared_buffers; SHOW work_mem; SHOW max_connections; SHOW effective_cache_size;"
 # 期望：160MB / 2MB / 30 / 640MB
 systemctl show postgresql -p ActiveState        # active
