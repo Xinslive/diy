@@ -186,7 +186,21 @@ RE_ISSUER = re.compile(r"开票人[:：]\s*(\S+)")
 #:
 #: 实测就是一张这样的票：号码、日期、买卖方、价税合计全都认得出来，
 #: 只有明细是空的 —— 因为表头那一行印的是"项 目 名称 规格型号 …"。
-RE_TABLE_HEADER = re.compile(r"项\s*目\s*名\s*称\s*规\s*格\s*型\s*号")
+#:
+#: **只认第一列的表头「项目名称」**，不再要求后面紧跟「规格型号」。
+#:
+#: 「规格型号」是**普通货物发票**的版式。发票还有很多种版式：建筑服务票的
+#: 列是「项目名称 建筑服务发生地 建筑项目名称 金额 税率/征收率 税额」，
+#: 压根没有「规格型号」那一列 —— 要求它就等于把这种票整批挡在门外
+#: （号码、日期、买卖方、合计全都认得出来，就是明细提不出来）。
+#:
+#: 认宽了的风险很小：认错了也只是把「表头之前的一小段」算进明细区，
+#: 而 ``_split_items`` 只从带 ``*`` 的行开始切 —— 前面那点文字会被丢掉。
+RE_TABLE_HEADER = re.compile(r"项\s*目\s*名\s*称")
+
+#: 建筑服务票的表头里有这一列，说明明细的**名字区是三个格子**：
+#: 项目名称、建筑服务发生地、建筑项目名称。别的版式没有它。
+BUILDING_SERVICE_HEADER = re.compile(r"建\s*筑\s*服\s*务\s*发\s*生\s*地")
 RE_BIG_AMOUNT_HEADER = re.compile(r"价税合计（大写）\s*（小写）")
 # 大写金额（「价税合计（大写）」那一行）。
 #
@@ -446,16 +460,22 @@ def extract_meta(text: str) -> InvoiceMeta:
 
 # ---------- 项目明细 ----------
 
-def _extract_detail_block(text: str) -> str:
-    """明细区段：表头之后第一个 `*` 字符 → 文本末尾。_split_items 会按 `*` 块自动切。"""
+def _extract_detail_block(text: str) -> tuple[str, str]:
+    """明细区段：表头之后第一个 `*` 字符 → 文本末尾。_split_items 会按 `*` 块自动切。
+
+    连带把**表头那一行**一起返回：不同版式的票，明细的列不一样
+    （建筑服务票多一列「建筑服务发生地」），名字那一段要按版式切。
+    """
     m = RE_TABLE_HEADER.search(text)
     if not m:
-        return ""
+        return "", ""
+    line_end = text.find("\n", m.start())
+    header = text[m.start(): line_end if line_end > 0 else len(text)]
     tail = text[m.end():]
     star_match = re.search(r"\*", tail)
     if not star_match:
-        return ""
-    return tail[star_match.start():]
+        return "", ""
+    return tail[star_match.start():], header
 
 
 def _split_items(block: str) -> List[str]:
@@ -509,7 +529,7 @@ def _strip_trailing_spec(cell: str) -> str:
     return "".join(parts)
 
 
-def _parse_item(raw: str) -> Optional[InvoiceLine]:
+def _parse_item(raw: str, header: str = "") -> Optional[InvoiceLine]:
     flat = re.sub(r"\s+", " ", raw).strip()
     # 扫所有候选 TAIL_RE 匹配，挑最后合理位置
     best = None
@@ -546,7 +566,15 @@ def _parse_item(raw: str) -> Optional[InvoiceLine]:
     # 项目名截断：第二个 * 之后起算的第二个空格及以后的内容视为单位/数量/单价等泄漏，丢弃。
     # rest 仍使用 raw_tail 完整内容，以便继续抽取 unit/quantity/unit_price。
     _parts = raw_tail.split()
-    if len(_parts) >= 2:
+    if BUILDING_SERVICE_HEADER.search(header) and len(_parts) >= 3:
+        # **建筑服务票**：名字区是**三个**格子 —— 项目名称、建筑服务发生地、
+        # 建筑项目名称。
+        #
+        # 发生地是地址（对本账没用，还占地方），留下「项目名称 + 建筑项目名称」：
+        # 一个是税局归的类目（其它建筑服务），一个是「干了什么活」（零星修缮）。
+        # 两个都留着，摘要才认得出这张票是干什么的。
+        name_tail = "".join([_parts[0], *_parts[2:]])
+    elif len(_parts) >= 2:
         # 先用空格拼接，便于下一步识别"前导空格 + 常见单位词"误入 name_tail 的情况
         # （如 "*XX*扫描仪 个 1 200" -> name_tail 应是 "扫描仪" 而不是 "扫描仪个"）。
         # 即便 len(_parts) < 3（折扣行常见，产品名 + 规格 贴在一起没有 unit/qty/price 列），
@@ -687,13 +715,13 @@ def merge_discount_lines(lines: List[InvoiceLine]) -> List[InvoiceLine]:
 
 
 def extract_lines(text: str) -> List[InvoiceLine]:
-    block = _extract_detail_block(text)
+    block, header = _extract_detail_block(text)
     if not block:
         return []
     items = _split_items(block)
     out: List[InvoiceLine] = []
     for it in items:
-        parsed = _parse_item(it)
+        parsed = _parse_item(it, header)
         if parsed is not None:
             out.append(parsed)
     return merge_discount_lines(out)
