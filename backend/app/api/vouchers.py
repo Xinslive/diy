@@ -114,7 +114,7 @@ def _serialize(db: Session, v: Voucher, subs: dict[int, Subject] | None = None,
     # **那一年**的科目表（科目表每个年度各有一份，迁移 0032），拿顶栏那一年的话，
     # 往年凭证上的 subject_id 在新年度那张表里根本不存在，格子里挂的科目就全空。
     period = periods.get(v.period_id) if periods else None
-    # 合计走 side_totals：红字（负数）算到对面去，两栏都只摆正数
+    # 合计走 side_totals：按列求和、负数照减 —— 跟账上（触发器、账套引擎）同一口径
     dr_total, cr_total = svc.side_totals(
         [{"direction": e.direction, "amount": e.amount} for e in entries])
     out = {
@@ -225,39 +225,25 @@ def create(payload: VoucherIn, book: Book = Depends(get_my_book), db: Session = 
 
 
 def _target_period_code(db: Session, v: Voucher, voucher_date: date | None) -> str | None:
-    """改凭证日期跨期时，目标期间是否已经被**同号凭证**占了（审计 P2-3）。
+    """改凭证日期跨期时，**目标期间的编码**（没有改期时返回 None）。
 
-    凭证号是**按期间唯一**的（``uq_voucher_period_no``），而每个月的号都从
-    「记0001」重新开始 —— 所以「把 9 月的记0001 改成 10 月」是最自然的用户
-    动作，而 10 月几乎必然已经有记0001。
+    供并发兜底那条路径拼消息用（撞了唯一约束时，得说清是撞在哪一期）。
 
-    以前这条路径**没有任何占用检查**：改期 → flush → 撞唯一约束 → 裸的
-    ``UniqueViolation``，全局处理器把**数据库英文原文**回给用户
-    （``duplicate key value violates unique constraint "uq_voucher_period_no"``），
-    既看不懂，又带出了表名、列名、约束名。同一张唯一约束，``create_voucher``
-    走的是「先占用检查 + savepoint + 翻成人话」，改期这边一条都没有。
+    以前这里还查「目标期间有没有同号的凭证」，跨期改日期会被它挡下来
+    （422「那个期间已经有凭证号 X，不能把凭证改到那一期」）。可凭证号又不许人
+    手工改了（用户 2026-10-19 定的），于是「改个日期」在跨期时**根本走不通** ——
+    而改日期恰恰是最自然的动作（用户 2026-10-24）。
 
-    这里提前一步查出来，翻成 422 + 人话。返回目标期间的编码（没有改期时
-    返回 None），供并发兜底那条路径拼消息用。
+    现在号由服务端**跟着目标期间重新发**（该期现有最大号 + 1，见
+    ``accounting.vouchers.update_voucher``），撞号这件事压根不会发生；
+    真正还可能撞上的只有并发（别人同一刻把那个号占了），那条由下面
+    IntegrityError 兜底翻成人话。
     """
     if not voucher_date:
         return None
     target = find_period(db, v.book_id, voucher_date)
     if target.id == v.period_id:
         return None
-    taken = db.scalar(
-        select(Voucher.id).where(
-            Voucher.period_id == target.id,
-            Voucher.voucher_no == v.voucher_no,
-            Voucher.id != v.id,
-        ).limit(1)
-    )
-    if taken is not None:
-        raise HTTPException(
-            422,
-            f"{target.code} 已经有凭证号 {v.voucher_no}，不能把凭证改到那一期"
-            f"（凭证号在期间内唯一）。请换一个号，或者把凭证日期改回原期间。"
-        )
     return target.code
 
 
@@ -283,15 +269,15 @@ def update(voucher_id: int, payload: VoucherIn, book: Book = Depends(get_my_book
         db.rollback()
         raise HTTPException(400, str(e))
     except IntegrityError:
-        # 兜底：占用检查与 flush 之间还有窗口（别人同一刻把同号的号占了）。
+        # 兜底：重新发号与 flush 之间还有窗口（别人同一刻把同号的号占了）。
         # 库里的唯一约束是最后一道防线，撞出来的是一条裸 IntegrityError ——
         # 翻成人话，**不把数据库原文漏给客户端**。
         db.rollback()
         where = f"{target_code} " if target_code else "目标期间 "
         raise HTTPException(
             422,
-            f"凭证号 {v.voucher_no} 在{where}已经被另一张凭证占用"
-            f"（可能刚被另一条记录占用）。请换一个号再试。"
+            f"凭证号 {v.voucher_no} 在{where}刚被另一张凭证占用"
+            f"（可能刚被另一条记录占用）。请再保存一次，系统会重新发号。"
         )
     # 期间一次取好（一条查询），年度随凭证一起出去（见 _serialize 的说明）
     return _serialize(db, v, periods=_book_periods(db, book.id, {v.period_id}))

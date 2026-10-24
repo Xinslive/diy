@@ -239,30 +239,36 @@ def _log_renames(db: Session, moved: list[dict], user, book_id: int,
 
 
 def side_totals(entries: list[dict]) -> tuple[Decimal, Decimal]:
-    """凭证两栏的合计：**红字算到对面去**。
+    """凭证两栏的合计：**按列求和，负数照减**。
 
-    贷方红字（负数）本质是借方，借方红字本质是贷方 —— 这是红字的本意，
-    不是「贷方减了 300」。所以每栏只加正数：
+        借方合计 = Σ 借方分录的金额（红字照减）
+        贷方合计 = Σ 贷方分录的金额（红字照减）
 
-        借方合计 = 借方正数 + 贷方红字（绝对值）
-        贷方合计 = 贷方正数 + 借方红字（绝对值）
+    也就是「把这一列显示的数字加起来」—— 合计行摆的数跟上面几行摆的数是同一套
+    （用户 2026-10-24 定的口径：借 −333 / 贷 2225 的凭证，合计就该摆
+    「借 −333 / 贷 2225」，不是把红字搬到对面去摆成「借 0 / 贷 2558」）。
 
-    跟「带符号的两边相等」完全等价（移项即可），所以拿它判平也对；
-    但它是**给人看**的那个数：两栏都摆得下正数，一眼比得出大小。
+    **这个口径必须跟账上的那个一致**，而账上早就是这一套了：
+        · 数据库的借贷平衡触发器（``db_init.sql::fn_check_voucher_balance``）
+          —— 按列求和；
+        · 账套引擎（总账 / 明细账的发生额，``ledger/engine.py``）—— 按列求和；
+        · 凭证导入的合计（``accounting/importer.py``）—— 按列求和；
+        · 本文件 ``_validate_entries`` 的判平 —— 按列求和。
+
+    以前这里用的是「红字算到对面去」（负数搬到对面，两栏只摆正数）。那条口径在
+    **判平**上没错（``dr_side - cr_side`` 与 ``dr_signed - cr_signed`` 恒等，移项即得），
+    但摆出来的数跟账上的数不是一回事：借方合计摆 0，账上借方发生额却是 −333。
+    于是凭证纸上的合计跟总账、明细账对不上 —— 合计只有一个口径，就是账上的那个。
+
+    判平用它也准：借方合计 = 贷方合计 ⟺ 带符号借方 = 带符号贷方，与触发器同解。
     """
     dr = cr = Decimal("0")
     for e in entries:
         amt = money(e["amount"])
-        if amt > 0:
-            if e["direction"] == "DEBIT":
-                dr += amt
-            else:
-                cr += amt
-        elif amt < 0:
-            if e["direction"] == "DEBIT":
-                cr += -amt
-            else:
-                dr += -amt
+        if e["direction"] == "DEBIT":
+            dr += amt
+        else:
+            cr += amt
     return dr, cr
 
 
@@ -563,6 +569,9 @@ def update_voucher(
     db: Session, voucher: Voucher, user: SysUser, payload: dict
 ) -> Voucher:
     before = voucher_snapshot(voucher)
+    # 本次修改**之前**的凭证号：跨期改日期时服务端会重发一个号，后面的
+    # 「凭证号不能手工修改」要拿这个原号去比（比重发后的新号会误伤）。
+    orig_no = voucher.voucher_no
     period = db.get(Period, voucher.period_id)
     if period.locked:
         raise ValueError(f"{period.code} 已结账，不能修改凭证")
@@ -589,9 +598,41 @@ def update_voucher(
             "insert_after 只在新增凭证时有效（「插在谁后面、后面的号顺位」）；"
             "修改已存在的凭证请直接填 voucher_no。")
 
+    # 改日期跨期时，凭证号要**跟着目标期间重新发一个**（下面细说）。
+    # 这两个变量留给后面的日志用：换号这件事必须留痕。
+    renumbered: tuple[str, str] | None = None
+    new_period: Period | None = None
     if "voucher_date" in payload and payload["voucher_date"]:
         new_date = payload["voucher_date"]
         new_period = find_period(db, voucher.book_id, new_date)
+        if new_period.id != voucher.period_id:
+            # **换了期间 = 换了号段**。
+            #
+            # 凭证号是**按期间唯一**的（``uq_voucher_period_no``），而每个月的号
+            # 都从「记0001」重新开始 —— 「把 1 月的记0009 改成 2 月」在 2 月几乎
+            # 必然撞号（2 月已经有记0009）。这条路上原来只有一句话可走：「撞号了，
+            # 改不了」。
+            #
+            # 凭证号又不许人手工改（用户 2026-10-19 定的：新增/插入/修改三处只读），
+            # 于是「改个日期」在跨期时是**走不通**的 —— 而改日期恰恰是最自然的动作。
+            #
+            # 现在：**跟着目标期间重新发一个号**（该期现有最大号 + 1）。
+            # 用户 2026-10-24 要的就是这个：「改完日期自动分配目标期间的凭证号」。
+            #
+            # 号必须在**改期间之前**算：这一行一改，flush 就把这张挪进目标期，
+            # 它自己的旧号会被算进「该期最大号」里 —— 1 月的记0009 挪到 2 月，
+            # 2 月本来有记0001..记0008，算完会变成记0010，中间凭空空三个号。
+            #
+            # 凭证字取**目标期间在用的那个**（跟「整理凭证」同一份算法）：
+            # 混用两个凭证字会让那个期间的「整理就绪」体检报「混用了多个凭证字」，
+            # 记账、结账都过不去。目标期间一张都没有时，沿用这张自己的凭证字。
+            canon = svc_organize.normalize_no(voucher.voucher_no)
+            own_prefix = svc_organize.split_no(canon)[0] if canon else "记"
+            new_no = next_voucher_no(
+                db, new_period,
+                prefix=svc_organize.period_prefix(db, new_period, fallback=own_prefix))
+            renumbered = (voucher.voucher_no, new_no)
+            voucher.voucher_no = new_no
         voucher.voucher_date = new_date
         voucher.period_id = new_period.id
 
@@ -608,10 +649,14 @@ def update_voucher(
     # **明确拒绝**而不是静默忽略：静默忽略会让人以为改成功了（这正是 P2-2
     # 当初要消灭的那种"返回成功却什么都没做"）。要改号请走「整理凭证」，
     # 它会整体重排并留下审计。
+    #
+    # 比较的基准是**换号之前**那个号：跨期改日期时凭证号由服务端重发（见上），
+    # 若拿重发后的新号去比，客户端回传的「原来那个号」会被误判成「手工改号」，
+    # 于是一条正常的改日期被挡成 400「凭证号不能手工修改」。
     new_no = svc_organize.normalize_no(payload.get("voucher_no"))
-    if new_no and new_no != voucher.voucher_no:
+    if new_no and new_no != orig_no:
         raise ValueError(
-            f"凭证号不能手工修改（{voucher.voucher_no} → {new_no}）。"
+            f"凭证号不能手工修改（{orig_no} → {new_no}）。"
             "凭证号由系统按期间自动生成；要调整号段请用「整理凭证」重排。"
         )
 
@@ -665,6 +710,8 @@ def update_voucher(
         # 这张凭证上从此会长期挂着非末级分录，事后有人查「为什么它还能改」，
         # 答案只能在这条日志里，不能靠翻代码重新推一遍。
         detail=f"修改凭证 {voucher.voucher_no}"
+               + (f"（改到 {new_period.code}，凭证号 {renumbered[0]} → {renumbered[1]}）"
+                  if renumbered and new_period else "")
                + (f"（保留 {grandfathered} 条历史非末级分录，本次未改动）"
                   if grandfathered else ""),
         before=before,
@@ -760,28 +807,25 @@ def _assert_contiguous_line_no(entries: list[Entry]) -> None:
 def _half_totals(entries: list[Entry]) -> dict:
     """一半分录的合计与判平结果。
 
-    **判平用带符号和，展示用 ``side_totals``** —— 两套口径，结论永远一致：
-    设 ``dr_side - cr_side = (Σ借正 + Σ贷负) - (Σ贷正 + Σ借负)``，
-    移项就是 ``dr_signed - cr_signed``，所以「平不平」两种算法同解，
-    差的只是红字凭证上摆出来的数（界面那一栏要的是正数）。
+    **展示与判平是同一套口径**（``side_totals`` 现在就是按列求和、负数照减）：
+    合计摆的就是带符号的数，所以「平不平」跟摆出来的那两个数说的是同一件事，
+    不会再出现「界面说差 600、纸上却只摆得出两个正数」。
 
-    判平口径必须与 ``_validate_entries`` 一致（它也是带符号和），
+    判平口径必须与 ``_validate_entries`` 一致（它也是按列求和），
     否则会出现「页面说平、服务端说不平」。
     """
     rows = [{"direction": e.direction, "amount": e.amount} for e in entries]
-    dr_side, cr_side = side_totals(rows)
-    dr_signed = sum((money(e.amount) for e in entries if e.direction == "DEBIT"), Decimal("0"))
-    cr_signed = sum((money(e.amount) for e in entries if e.direction == "CREDIT"), Decimal("0"))
+    dr, cr = side_totals(rows)
     return {
         "lines": len(entries),
         # **过一遍 money()**：``side_totals`` 的零值是 ``Decimal("0")``，
         # 直接 str() 出来是「0」而不是「0.00」—— 页面上摆的是「0.00」，
         # 这里摆「0」，同一个数两种写法，看着像两个数。
-        "debit": str(money(dr_side)),
-        "credit": str(money(cr_side)),
-        "balanced": dr_signed == cr_signed,
+        "debit": str(money(dr)),
+        "credit": str(money(cr)),
+        "balanced": dr == cr,
         # 差额 = 借 - 贷。正数是借方多，负数是贷方多。
-        "diff": str(money(dr_signed - cr_signed)),
+        "diff": str(money(dr - cr)),
     }
 
 

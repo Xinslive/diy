@@ -265,20 +265,20 @@ def test_search_vouchers_multi_subject_merges(db, book, make_voucher, ctx):
     assert both["items"][0]["voucher_date"] == "2026-10-09"
 
 
-def test_search_vouchers_red_letter_totals_go_to_the_other_side(
+def test_search_vouchers_red_letter_totals_are_column_sums(
         db, book, make_voucher, ctx):
-    """红字（负数）算到对面去 —— 合计口径不能简单相加。
+    """合计按列求和，红字照减 —— 与账上（触发器、账套引擎）同一套口径。
 
-    借方红字（-100）实质上是贷方、贷方红字（-100）实质上是借方，所以这张
-    冲销凭证的**两栏都是 100**（各自的红字跑到对面去了），而分录金额本身
-    照原样保留符号（不改成正数）。
+    借方红字（-100）就摆在本栏，合计照减，所以这张冲销凭证的两栏都是 -100.00
+    （分录金额本身也照原样保留符号，不改成正数）。
+    以前这里把红字搬到对面去，报「借 100 / 贷 100」，跟账上的数对不上。
     """
     make_voucher("2026-10-08", dr=[("560207", "-100.00", "红字冲销")],
                  cr=[("1002", "-100.00", "红字冲销")], posted=True)
 
     item = _call(detail.search_vouchers, ctx=ctx, book_id=book.id)["items"][0]
-    assert item["total_debit"] == "100.00"
-    assert item["total_credit"] == "100.00"
+    assert item["total_debit"] == "-100.00"
+    assert item["total_credit"] == "-100.00"
     amounts = {e["subject_code"]: e["amount"] for e in item["entries"]}
     assert amounts["560207"] == "-100.00"     # 符号照原样保留
     assert amounts["1002"] == "-100.00"

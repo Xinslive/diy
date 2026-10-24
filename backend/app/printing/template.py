@@ -1621,20 +1621,15 @@ def _entry_amount(entry: dict) -> Decimal:
 
 def _slice_total(entries: list[dict], direction: str) -> Decimal:
     """拆出来的每一张自己那几行的合计，口径跟凭证上的合计一致：
-    红字（负数）算到对面去 —— 拆页是排版，不是改账。"""
+    **按列求和，负数照减**（红字就摆在本栏里，合计也照减）——
+    拆页是排版，不是改账。"""
     dr = cr = Decimal("0")
     for e in entries:
         amt = _entry_amount(e)
-        if amt > 0:
-            if e.get("direction") == "DEBIT":
-                dr += amt
-            else:
-                cr += amt
-        elif amt < 0:
-            if e.get("direction") == "DEBIT":
-                cr += -amt
-            else:
-                dr += -amt
+        if e.get("direction") == "DEBIT":
+            dr += amt
+        else:
+            cr += amt
     return dr if direction == "DEBIT" else cr
 
 

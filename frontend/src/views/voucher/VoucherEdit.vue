@@ -191,10 +191,12 @@
               />
             </div>
             <!-- 删除 ⊗ 不占格子的位置：它挂在**自己这一行**的右边外面，
-                 跟左边的 ⊕ / ＋ 一个待遇 —— 只有变绿的那一行才看得见它 -->
+                 跟左边的 ⊕ / ＋ 一个待遇 —— 只有变绿的那一行才看得见它。
+                 底下那几行「等着填」的空位上没有 ⊗：那是留给人写字的地方，
+                 删了它立刻又被补回来，看着像没删。 -->
             <div class="vg-del">
-              <el-icon v-if="canDeleteRow" class="row-del" :class="{ 'is-off': readonly }"
-                       title="删除这一行" @click.stop="removeRow(i)"><CircleCloseFilled /></el-icon>
+              <el-icon v-if="readonly || canDeleteRowAt(i)" class="row-del" :class="{ 'is-off': readonly }"
+                       :title="delTitle" @click.stop="removeRow(i)"><CircleCloseFilled /></el-icon>
             </div>
           </div>
           </div>
@@ -262,7 +264,7 @@ import { useTabsStore } from '@/stores/tabs'
 import { moneyText } from '@/utils/format'
 import { centsToText, moneyCents } from '@/utils/amountGrid'
 import { displayBalanceCents } from '@/utils/balanceSign'
-import { findFirstProblem } from '@/utils/voucherRows'
+import { findFirstProblem, lastFilledRowAt, rowCanBeDeleted } from '@/utils/voucherRows'
 import AmountGrid from '@/components/AmountGrid.vue'
 import SubjectPicker from '@/components/SubjectPicker.vue'
 import SubjectFormDialog from '@/components/SubjectFormDialog.vue'
@@ -374,8 +376,6 @@ const nonLeafRows = computed(() => form.entries.filter((e) => badSubject(e) && n
 const newNonLeafRows = computed(() =>
   nonLeafRows.value.filter((e) => !form.legacySubjects.includes(e.subject_id)))
 
-/** 这张凭证还剩几行：四行是底线，出现第五行才说明「多写了」，那哪一行都删得掉 */
-const canDeleteRow = computed(() => form.entries.length > 4)
 // 这张凭证自己的会计期间。顶栏那个期间是「现在正在记哪个月」，
 // 打开一张旧凭证时两者根本不是一回事，页眉写错期间很容易误导人。
 const voucherPeriod = ref(null)
@@ -719,36 +719,29 @@ function centsText(c) {
 }
 
 /**
- * 凭证上印的合计：**负数算到对面去**，在整数分上做。
+ * 凭证两栏的合计：**按列求和，负数照减**，在整数分上做。
  *
- *  贷方红字（负数）本质上是借方，借方红字本质上是贷方 —— 这是红字的本意，
- *  不是「贷方减了 300」。所以两栏都只把正数加进来：
- *      借方合计 = 借方正数 + 贷方红字（绝对值）
- *      贷方合计 = 贷方正数 + 借方红字（绝对值）
- *  这么算，两栏都摆得下正数，一眼比得出大小；否则会出现「借 300 / 贷 −300，
- *  差额 600」这种看着像凭空多出 600 的合计。
+ *      借方合计 = Σ 借方分录的金额（红字照减）
+ *      贷方合计 = Σ 贷方分录的金额（红字照减）
  *
- *  判平用它也准：借方合计 = 贷方合计 ⟺ 带符号借方 = 带符号贷方，两种口径完全等价。
+ *  也就是「把这一列显示的数字加起来」—— 合计行摆的数跟上面几行摆的数是同一套。
+ *  （用户 2026-10-24：一张借 −333 / 贷 2225 的凭证，合计该是「借 −333 / 贷 2225」，
+ *  而不是把 −333 搬到对面去摆成「借 0 / 贷 2558」。）
+ *
+ *  以前这里用的是「红字算到对面去」（负数搬到对面，两栏只摆正数）。那条口径
+ *  在**判平**上没错（`dr_side - cr_side` 与 `dr_signed - cr_signed` 恒等），
+ *  但摆出来的数跟账上的数不是一回事：
+ *      · 数据库的借贷平衡触发器 —— 按列求和；
+ *      · 账套引擎（总账 / 明细账的发生额）—— 按列求和；
+ *      · 凭证导入的合计 —— 按列求和；
+ *      · 后端 ``_validate_entries`` 的判平 —— 按列求和。
+ *  只有「摆给人看的合计」是另一套，于是纸上那一行跟账上对不上：
+ *  借方合计摆 0，账上借方发生额却是 −333。合计只有一个口径，就是账上的那个。
+ *
+ *  **判平、差额、补差、合计，全都用这一份**（带符号，负数照减）：
+ *  借方合计 = 贷方合计 ⟺ 带符号借方 = 带符号贷方（与数据库触发器同解）。
  */
 function voucherTotals(entries) {
-  let debit = 0n, credit = 0n
-  for (const e of entries || []) {
-    const c = centsOf(e.amount)
-    if (c > 0n) {
-      if (e.direction === 'DEBIT') debit += c
-      else credit += c
-    } else if (c < 0n) {
-      // 红字：写到对面去
-      if (e.direction === 'DEBIT') credit += -c
-      else debit += -c
-    }
-  }
-  return { debit, credit }
-}
-
-/** 带符号的合计（借正贷负，负数照减），「=」补差用这一份。
- *  显示用的合计把负数搬去了对面，拿它当差额会把补出来的数翻一倍。 */
-function voucherSignedTotals(entries) {
   let debit = 0n, credit = 0n
   for (const e of entries || []) {
     const c = centsOf(e.amount)
@@ -768,13 +761,23 @@ const totals = computed(() => voucherTotals(form.entries))
 /**
  * 显示用的合计：格子里落的那两行。**单位是分**（与 totals 同源，不再自己除一次 100）——
  * 除以 100 走浮点的话，18 位整数会在这一步掉精度。
+ *
+ * 一栏摆不摆数，看的是**这一栏有没有录过数**，不是「这一栏合计是不是 0」：
+ * 同侧相抵的凭证（借 1000 / 借 −1000）借方那一栏合计是 0，可它明明录了数 ——
+ * 按合计判断会把「借 0.00」藏掉，合计那一行看着像没录过
+ * （2026-10-12 那条「正负相抵按平处理」的要求，说的就是这种凭证）。
+ * 一栏从头到尾没数（没填金额、或者压根没有这一栏的分录）→ 留空：
+ * 空格子比一个孤零零的 0 干净。
  */
+function columnTotal(direction) {
+  const sum = direction === 'DEBIT' ? totals.value.debit : totals.value.credit
+  const hasNumber = form.entries.some((e) => e.direction === direction && centsOf(e.amount) !== 0n)
+  return hasNumber ? centsText(sum) : ''
+}
 const total = computed(() => ({
-  debit: totals.value.debit ? centsText(totals.value.debit) : '',
-  credit: totals.value.credit ? centsText(totals.value.credit) : ''
+  debit: columnTotal('DEBIT'),
+  credit: columnTotal('CREDIT')
 }))
-/** 补差用的带符号合计 */
-const signedTotals = computed(() => voucherSignedTotals(form.entries))
 /** 差额（分）。借方大就是正的 —— 方向和大小在同一个数上，不用分两处判断。 */
 const diffCents = computed(() => totals.value.debit - totals.value.credit)
 /**
@@ -786,8 +789,11 @@ const diffCents = computed(() => totals.value.debit - totals.value.credit)
  *
  * 两种看着「不像平」的形状都是平的，别去替人把它们判成不平：
  *  红字凭证（借 −300 / 贷 −300）冲的是老账，照样该存；
- *  正负相抵（借 111 / 借 −111）记的是一次冲销 —— 红字把 −111 搬去了对面，
- *  两栏一样大，就该按平处理（2026-10-12 用户明确要求的）。
+ *  正负相抵（借 111 / 借 −111）记的是一次冲销 —— 两栏各自抵成 0，一样大，
+ *  就该按平处理（2026-10-12 用户明确要求的）。
+ *
+ * 判平就是「按列求和的两栏相等」—— 与数据库触发器、后端 `_validate_entries`
+ * 同一个口径（以前是「红字算到对面」那套展示口径，两者同解，但纸上摆的数不一样）。
  *
  *  一条都还没录是另一回事：那走 `blank`，页脚说「还没录金额」，不是「平」。
  */
@@ -814,12 +820,23 @@ const diffTag = computed(() => `${diffCents.value > 0n ? '借方大' : '贷方�
   moneyText(diffCents.value < 0n ? -diffCents.value : diffCents.value)}`)
 
 // 一分钱都还没录的时候别急着报红字，那是噪音不是提示
-const blank = computed(() => totals.value.debit === 0n && totals.value.credit === 0n)
+//
+// 「没录」看的是**有没有录过数**，不是「两栏合计是不是 0」：
+// 同侧相抵的凭证（借 111 / 借 −111）两栏合计都是 0，可它明明录了数 ——
+// 按合计判断会把它说成「还没录金额」，人一看就知道程序没看懂。
+// （2026-10-12 那条「正负相抵按平处理」的要求，说的就是这种凭证要按平处理。）
+const blank = computed(() => !form.entries.some((e) => centsOf(e.amount) !== 0n))
 // ---- 金额段结束（tests/voucher_balance.test.mjs 从这里头抠实现跑）----
 
 // 「这张凭证现在长什么样」：自动保存靠它判断有没有改动。没动过就不重存。
+//
+// **凭证号不进这个签名**：它不是人改的（页面上只读，用户 2026-10-19 定的），
+// 而是服务端发的 —— 改了日期跨到另一个期间，服务端会**按目标期间重新发一个号**
+// （该期现有最大号 + 1）。号一变签名就变，等于凭空多一趟自动保存；
+// 更要命的是：号是**跟着服务端**走的，签名里带着它就会把「服务端改的号」
+// 误判成「人改了这张凭证」。
 const entrySig = computed(() => JSON.stringify([
-  form.voucher_date, form.voucher_no, form.attachments, form.remark,
+  form.voucher_date, form.attachments, form.remark,
   form.entries.map((e) => [e.subject_id, e.direction, e.amount, e.summary])
 ]))
 const lastSaved = ref('')      // 上一次落库的签名
@@ -1106,8 +1123,10 @@ function autoBalance(i, side) {
   // opposite = 写进去这一格的**对面**合计；same = 写进去这一格的**本侧**合计
   // 全是整数分：补完这一格之后判平用的那份量化结果也必然是平的，
   // 不会再出现「已按差额补上 300.30」却依然存不了的情况。
-  const opposite = side === 'd' ? signedTotals.value.credit : signedTotals.value.debit
-  const same = side === 'd' ? signedTotals.value.debit : signedTotals.value.credit
+  //
+  // 走的就是合计那份（按列求和、负数照减）—— 与判平、与数据库触发器同一个口径。
+  const opposite = side === 'd' ? totals.value.credit : totals.value.debit
+  const same = side === 'd' ? totals.value.debit : totals.value.credit
   const mine = centsOf(row.amount)
   // 这一行现在的方向。空格也记着方向（默认借方），但金额是 0，翻不翻都一样
   const mineSide = row.direction === 'CREDIT' ? 'c' : 'd'
@@ -1210,9 +1229,53 @@ function insertRowAt(offset) {
 const insertRowAbove = () => insertRowAt(0)
 const insertRowBelow = () => insertRowAt(1)
 
+/**
+ * 最后一行**有内容**的行号（一张都没填就是 -1）。
+ *
+ *  底下那几行「等着填」的空位不算内容 —— 它们是留给人写字的地方。
+ *  算成一条线而不是每一行现算：一屏 154 行时，逐行现算就是 154² 次判断
+ *  （这一页刚因为同类问题卡死过一次，见 utils/voucherRows.js）。
+ */
+const lastFilledAt = computed(() => lastFilledRowAt(form.entries))
+
+/**
+ * 规则在 utils/voucherRows.js 里（rowCanBeDeleted）：底下那几行等着填的空位
+ *  之外，哪一行都删得掉 —— 四行是**行数的下限**，不是**分录的护栏**。
+ */
+function canDeleteRowAt(i) {
+  return rowCanBeDeleted(form.entries, i, lastFilledAt.value)
+}
+
+/** 鼠标压在 ⊗ 上要说的话：只读就说清楚只读，别让人以为按钮坏了 */
+const delTitle = computed(() => (readonly.value ? '只读凭证不能改' : '删除这一行'))
+
+/**
+ * 删掉这一行。
+ *
+ *  **后面的行自动往上排** —— 这是用户 2026-10-24 明确要的：删掉前四行里的
+ *  某一行时，后面的行顶上来的位置，别在那儿留一个空行。
+ *
+ *  删完底下补回空位（还是四行）：那几行是留给人接着写字的地方，
+ *  删一行就少一行地方，录下一条时又得临时找地方。
+ */
 function removeRow(i) {
-  if (readonly.value || !canDeleteRow.value) return
-  form.entries.splice(i, 1)
+  if (readonly.value || !canDeleteRowAt(i)) return
+  const rows = form.entries
+  const gone = rows[i]
+  rows.splice(i, 1)              // 后面的行自动往上排
+  ensureRows(4)
+  // 绿行得跟着往上挪：被删的那一行已经不在表里了，而鼠标还压在这个位置上。
+  // 绿行得落在**顶上来的那一行**上 —— 不然 ⊕ / ＋ / ⊗ 一起消失，
+  // 人还以为按钮坏了。
+  const next = rows[i] ?? rows[rows.length - 1] ?? null
+  if (activeRow.value === gone) activeRow.value = next
+  if (hoverRow.value === gone) hoverRow.value = next
+  // 正在「标记科目」的那一行被删了，它的标记也得收掉（键是分录对象，不是行号）
+  if (markingRows.value.has(gone)) {
+    const rest = new Set(markingRows.value)
+    rest.delete(gone)
+    markingRows.value = rest
+  }
 }
 
 /** 至少留 4 行空着：多数凭证两三条就录完了，但行得摆够，
@@ -1721,8 +1784,17 @@ async function save() {
 
   const payload = {
     voucher_date: form.voucher_date, entries, remark: form.remark,
-    attachments: form.attachments, voucher_no: form.voucher_no || null,
-    // 只有新凭证 + 还在插入模式里才带：更新老凭证时带了会把号再顺位一次
+    attachments: form.attachments,
+    // **凭证号不送**（用户 2026-10-19 定的：新增 / 插入 / 修改三处一律只读，
+    // 号由服务端发）。服务端那边也不采信客户端送来的号 ——
+    // 新增走 next_voucher_no，插入走 insert_slot，修改跨期时按目标期间重发。
+    //
+    // 以前这里是把 form.voucher_no 一起送过去的：跨期改日期时，服务端重发完号、
+    // 页面还没来得及换（或者人连着改了两次日期，两趟保存撞在一起），
+    // 送过去的还是**旧号** —— 服务端当场回一句「凭证号不能手工修改（记0009 → 记0012）」，
+    // 人完全看不懂是自己改的日期惹的祸。不送就没有这个坑。
+    //
+    // 只有新凭证 + 还在插入模式里才带 insert_after：更新老凭证时带了会把号再顺位一次
     insert_after: !voucherId.value && insertCtx.value ? insertCtx.value.anchor_id : null,
     // 向前（占参照的号）还是向后（拿参照号 +1）。与 insert_after 同生共死。
     insert_position: !voucherId.value && insertCtx.value
@@ -1742,6 +1814,20 @@ async function save() {
         ? await api.createVoucher(bookId, payload)
         : await api.updateVoucher(bookId, voucherId.value, payload)
       voucherId.value = saved.id
+      // **服务端可能给这张重新发过号**：改了日期跨到另一个期间，凭证号是按期间
+      // 唯一的，号段也就跟着换了 —— 服务端按目标期间重新发了一个（该期最大号 + 1）。
+      // 页面上那个只读的凭证号必须跟着换，否则人看着「记0009」、库里是「记0012」，
+      // 而且下一趟自动保存会把**旧的号**发回去，后端当场回一句
+      // 「凭证号不能手工修改」，人完全看不懂是自己改的日期惹的祸。
+      if (saved.voucher_no && saved.voucher_no !== form.voucher_no) {
+        form.voucher_no = saved.voucher_no
+      }
+      // 期间也一样：跨期之后页眉那个「会计期间」得跟着换，
+      // 辅助记账的余额、打印时取的期间才跟这张是一期的。
+      if (saved.period_id && saved.period_id !== voucherPeriodId.value) {
+        voucherPeriod.value = store.periods.find((p) => p.id === saved.period_id) || null
+        voucherPeriodId.value = saved.period_id
+      }
       lastSaved.value = sentSig
       failedSig.value = ''
       savedAt.value = new Date().toTimeString().slice(0, 5)

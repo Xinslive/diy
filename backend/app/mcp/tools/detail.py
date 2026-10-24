@@ -32,7 +32,7 @@
 余额委托 ``ledger/queries.balance_sheet_of_accounts``（与界面同一份实现），
 凭证检索委托 ``accounting/vouchers.query_vouchers``，收付判定委托
 ``accounting/organize.cash_flow_kind``，金额与红字处理委托
-``accounting/vouchers.side_totals``。本模块**不写第二套聚合** —— 本仓审计
+``accounting.vouchers.side_totals``（按列求和、负数照减）。本模块**不写第二套聚合** —— 本仓审计
 第 7.3 节记过的「导出与页面显示对不上」，根子就是同一个口径有了两份实现。
 
 **为什么本模块不写 ``from __future__ import annotations``。**
@@ -524,7 +524,7 @@ def _group_vouchers(vouchers, group_by: str, db) -> tuple[list[dict], dict]:
     是那些摘要写着「电费」的**分录**的合计；一张凭证里可能还有水费、
     还有现金那一头。把凭证整张塞进一个桶，报出来的数就不是问的那个数。
 
-    借方贷方合计与凭证合计**同一口径**（红字算到对面，见
+    借方贷方合计与凭证合计**同一口径**（按列求和、负数照减，见
     ``accounting.vouchers.side_totals``）。
     """
     subject_of = _subject_map(
@@ -881,7 +881,7 @@ def search_vouchers(
             group_vouchers, group_key, db)
         notes.append(
             "聚合口径：按每条分录的「摘要 / 科目 / 期间 / 方向」分桶，"
-            "借方贷方合计与凭证合计同口径（红字算到对面）。")
+            "借方贷方合计与凭证合计同口径（按列求和、负数照减）。")
     # **结转凭证的口径说明放在「有没有 group_by」之外** ——
     # 剔除与否影响的是**返回的凭证本身**（items / total），不只是聚合。
     # 以前这句话只挂在 group_by 的分支里，于是「不聚合时结转凭证到底剔没剔」

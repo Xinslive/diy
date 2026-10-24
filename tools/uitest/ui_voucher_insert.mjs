@@ -1,7 +1,7 @@
 // 凭证录入页这四条新口径的验收脚本：只读 + 内存里的临时操作，不落库。
 //   1. 摘要格点一下整格选中
 //   2. 金额格 ↑/↓ 在上下行之间跳
-//   3. 金额格敲「=」自动配平；负数红字；红字算到对面去的合计口径
+//   3. 金额格敲「=」自动配平；负数红字；合计按列求和、负数照减的口径
 //   4. 插入凭证：拿参照的号、说明条、保存时带 insert_after
 // 写接口一律拦下来（记一笔再伪造回包），所以不会往真账里塞凭证。
 //   node ui_voucher_insert.mjs
@@ -150,15 +150,17 @@ const totalOf = async (side) => {
   return (neg ? '-' : '') + d.slice(0, -2) + '.' + d.slice(-2)
 }
 // 借 100 / 借 200，第三行（空行）往贷方敲 = → 补 300
+// 补出来的值带着两位小数（300.00）：金额格里的值一律是「元.角分」，
+// 人手敲 300 落进去也是 300.00（见 ui_voucher.mjs「只敲整数时角分自动补 00」）。
 await rows().nth(2).locator('.td-amt.c .amt').click(); await sleep(300)
 await page.keyboard.type('='); await sleep(600)
-await check('空行往贷方敲「=」补上差额 300', await rows().nth(2).locator('.td-amt.c .amt-input').inputValue(), '300')
+await check('空行往贷方敲「=」补上差额 300', await rows().nth(2).locator('.td-amt.c .amt-input').inputValue(), '300.00')
 await check('补完就平了', (await foot()).includes('借贷平衡'), true)
 await check('合计格照旧只有「合计」', await page.locator('.td-sumcell').innerText(), '合计')
 
 // 已经补对了还敲 =：数字不变，也不啰嗦
 await page.keyboard.press('='); await sleep(700)
-await check('已补对还敲「=」不乱写', await rows().nth(2).locator('.td-amt.c .amt-input').inputValue(), '300')
+await check('已补对还敲「=」不乱写', await rows().nth(2).locator('.td-amt.c .amt-input').inputValue(), '300.00')
 await check('也不再多嘴报一遍',
   (await page.locator('.el-message').allTextContents()).some(t => t.includes('已按差额补上 300')), true)
 
@@ -171,7 +173,7 @@ await check('第三行现在借方 200', await totalOf('d'), '500.00')
 await rows().nth(2).locator('.td-amt.c .amt').click(); await sleep(250)
 await page.keyboard.type('='); await sleep(700)
 await check('往贷方敲「=」补 300（这一行从借 200 变成贷 300）',
-  await rows().nth(2).locator('.td-amt.c .amt-input').inputValue(), '300')
+  await rows().nth(2).locator('.td-amt.c .amt-input').inputValue(), '300.00')
 await check('这一行的 200 没有被顶掉：借方合计还是 300', await totalOf('d'), '300.00')
 await check('补完正好平', (await foot()).includes('借贷平衡'), true)
 await page.screenshot({ path: OUT + 'voucher-balance-flip.png' })
@@ -185,7 +187,7 @@ await check('并说一声已经平了',
   (await page.locator('.el-message').allTextContents()).some(t => t.includes('已经平了')), true)
 await rows().nth(3).locator('.td-sum textarea').fill(''); await sleep(300)
 
-// ---- 改成红字负数：合计按「负数算到对面」的口径
+// ---- 改成红字负数：合计按列求和、负数照减（红字留在本栏）
 // 点金额格不再整格选中，改数前自己先全选掉再打
 // 负号是**整格的属性**而不是插进去的字符，所以打法是「先把数重打成 300，再按一下 -」
 // ——全选后直接打「-300」是不行的，那个 - 翻的是整格的符号，不是替掉选中的数字
@@ -198,16 +200,17 @@ await check('按一下「-」整格翻负', await rows().nth(2).locator('.td-amt
 await check('红字是红的', await page.evaluate(() => getComputedStyle(
   document.querySelectorAll('.vg-row')[3].querySelector('.td-amt.c .amt-cell')).color),
   'rgb(217, 48, 37)')
-await check('借 100+200、贷 -300 → 借方合计 600', await totalOf('d'), '600.00')
-await check('贷方合计 0', await totalOf('c'), '0.00')
+// 合计 = 把这一列显示的数字加起来：借方 100+200 = 300，贷方 −300 照减（留在本栏）
+await check('借 100+200、贷 -300 → 借方合计 300', await totalOf('d'), '300.00')
+await check('贷方合计 -300（红字留在本栏，合计照减）', await totalOf('c'), '-300.00')
 await check('并说清是借方大 600', (await foot()).includes('借方大 600.00'), true)
-await check('合计行不再是一片红（负数已经算到对面）',
-  await page.evaluate(() => document.querySelector('.vg-total .td-total.c .amt-cells')?.classList.contains('is-red')), false)
+await check('合计行里的红字也是红的',
+  await page.evaluate(() => document.querySelector('.vg-total .td-total.c .amt-cells')?.classList.contains('is-red')), true)
 await page.screenshot({ path: OUT + 'voucher-red-negative.png' })
 
 // 红字之后敲「=」：同侧重填，贷方变成 +300，平
 await page.keyboard.press('='); await sleep(700)
-await check('红字之后敲「=」同侧重填成 +300', await rows().nth(2).locator('.td-amt.c .amt-input').inputValue(), '300')
+await check('红字之后敲「=」同侧重填成 +300', await rows().nth(2).locator('.td-amt.c .amt-input').inputValue(), '300.00')
 await check('红字之后敲「=」也能平', (await foot()).includes('借贷平衡'), true)
 
 // ==================================================== 4. 插入凭证
@@ -226,8 +229,10 @@ await check('新页拿的是参照凭证的号', await page.locator('.toolbar in
 await check('日期沿用参照凭证', await page.locator('.toolbar input').nth(1).inputValue(), anchorDate)
 // 页面上不摆任何说明条：插入这件事靠「号已经是插入位那个号」自己说话
 await check('插入页不出现说明条', await page.locator('.insert-note').count(), 0)
-await check('凭证号格只剩「留空按插入位发号」这一句提示',
-  await page.locator('.toolbar input').first().getAttribute('placeholder'), '留空按插入位发号')
+// 凭证号格是**只读**的：号由服务端发，人不许手改（用户 2026-10-19 定的）。
+// 页面上摆的就是插入位那个号（上面那条已经对过了），不需要一句提示语。
+await check('凭证号格是只读的',
+  await page.locator('.toolbar input').first().getAttribute('readonly') !== null, true)
 
 // 填平它 → 自动保存带上 insert_after
 const writesBefore = writes.length
@@ -239,7 +244,10 @@ await rows().nth(1).locator('.td-amt.c .amt').click(); await sleep(250)
 await page.keyboard.type('10'); await sleep(2000)
 const created = writes.slice(writesBefore).find(w => w.method === 'POST')
 await check('保存时带了 insert_after', created?.body?.insert_after, anchorId)
-await check('凭证号就是插入位', created?.body?.voucher_no, anchorNo)
+// 凭证号**不送**（用户 2026-10-19：新增 / 插入 / 修改三处一律只读，号由服务端发）。
+// 服务端也不采信客户端送来的号 —— 插入走 insert_slot（占参照的号或参照号 +1）。
+await check('保存请求里没有凭证号（号由服务端发）',
+  Object.prototype.hasOwnProperty.call(created?.body || {}, 'voucher_no'), false)
 
 // 中途没填完就离开：不写库，别人的号原封不动
 await page.goto(`${BASE}/#/vouchers/new`); await sleep(2000)

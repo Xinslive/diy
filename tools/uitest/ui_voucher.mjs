@@ -632,7 +632,23 @@ await check('页面上一个字都没丢', await rows().nth(0).locator('.td-sum 
 // ---- 回车一路往下写：从上到下、从左到右，一格一格挪，不跳行 ----
 const BASE_ROWS = await rows().count()
 const focusIn = (sel) => page.locator(sel).evaluate(e => e === document.activeElement)
-await check('只摆四行时不显示删除按钮', await rows().locator('.row-del').count(), 0)
+// 有内容的行（挂了科目或写了金额）—— 删除按钮只长在这些行上
+const filledRows = () => page.evaluate(() => [...document.querySelectorAll('.vg-row:not(.vg-head):not(.vg-total)')]
+  .filter(r => {
+    const s = r.querySelector('.sp-input')?.value?.trim()
+    const d = r.querySelector('.td-amt.d .amt-input')?.value?.trim()
+    const c = r.querySelector('.td-amt.c .amt-input')?.value?.trim()
+    return s || d || c
+  }).length)
+
+// 四行以内也能删（老规矩是「只摆得下四行时一个 ⊗ 都没有」）：
+// 有内容的行带着 ⊗，底下那几行等着填的空位上没有
+await check('四行以内，有内容的行也带着删除按钮',
+  await rows().locator('.row-del').count(), await filledRows())
+await check('底下那几行等着填的空位上没有删除按钮',
+  await rows().nth(BASE_ROWS - 1).locator('.row-del').count(), 0)
+await rows().nth(0).hover(); await sleep(300)
+await check('绿着的第一行带着删除按钮', await rows().nth(0).locator('.row-del').isVisible(), true)
 
 await rows().nth(2).locator('.td-sum textarea').click(); await sleep(300)
 await page.keyboard.press('Enter'); await sleep(500)
@@ -695,13 +711,19 @@ const gridBox = await page.locator('.vgrid').boundingBox()
 await check('⊗ 挂在表格右边外面', delBox.x >= gridBox.x + gridBox.width - 1, true)
 await check('只有一行同时挂着三个 ⊗', await page.locator('.vg-del .row-del:visible').count(), 1)
 
-// ---- 删除：出现第五行之前不给删，出现之后哪一行都能删 ----
-await check('凑到第五行后每一行都带着删除按钮', await rows().locator('.row-del').count(), BASE_ROWS + 1)
+// ---- 删除：四行以内也能删，删完后面的行自动往上排 ----
+await check('每一行有内容的都带着删除按钮',
+  await rows().locator('.row-del').count(), await filledRows())
 await rows().nth(0).hover(); await sleep(300)
 await check('绿着的第一行能删', await rows().nth(0).locator('.row-del').isVisible(), true)
+// 删第一行之前先把第二行记下来：删完它得顶到第一行的位置上去
+const secondSubj = await rows().nth(1).locator('.sp-input').inputValue()
 await rows().nth(0).locator('.row-del').click(); await sleep(600)
 await check('第一行也删得掉（不是「前四行保底」）', await rows().count(), BASE_ROWS)
-await check('删回四行又把删除按钮收起来', await rows().locator('.row-del').count(), 0)
+await check('后面的行自动往上排（原来第二行顶上来了）',
+  await rows().nth(0).locator('.sp-input').inputValue(), secondSubj)
+await check('删除按钮跟着剩下的有内容的行走',
+  await rows().locator('.row-del').count(), await filledRows())
 
 // 哪一行变绿：鼠标扫到哪一行就是哪一行（扫别人时刚才那行让位，不会两行一起绿）
 await rows().nth(1).hover(); await sleep(300)
@@ -822,14 +844,16 @@ await fillAmt(rows().nth(0).locator('.td-amt.d .amt-input'), '1000'); await slee
 await check('只填借方 → 报差额',
   (await page.locator('.foot-right .tag-bad').textContent()).trim(), '借方大 1,000.00')
 
-// 借 1000 跟借 −1000 摆在一张凭证上：红字把 −1000 搬到对面去了，两栏都是 1000。
+// 借 1000 跟借 −1000 摆在一张凭证上：借方这一栏自己抵成 0。
 // 两栏一样大就是平的 —— 早先拿「带符号那一对是不是 0」再判一道，摆出来的却是
 // 一句自相矛盾的红字「差额 0.00」，人只会以为程序算错了（2026-10-12 用户纠正）。
 await fillAmt(rows().nth(1).locator('.td-amt.d .amt-input'), '-1000'); await sleep(400)
 await check('借贷正负相抵 → 按平处理', (await page.locator('.foot-right .tag-ok').textContent()).trim(), '借贷平衡 ✓')
 await check('这一状态下不报红字', await page.locator('.foot-right .tag-bad').count(), 0)
-await check('合计行摆的也是 1000 / 1000',
-  [await totalOf('d'), await totalOf('c')], ['1000.00', '1000.00'])
+// 合计按列求和、负数照减：借方这一栏抵成 0，就摆「0.00」（别把录过数的一栏藏起来）；
+// 贷方那一栏压根没有分录 → 留空
+await check('合计行摆的是借 0.00 / 贷空',
+  [await totalOf('d'), await totalOf('c')], ['0.00', ''])
 await fillAmt(rows().nth(1).locator('.td-amt.d .amt-input'), ''); await sleep(400)
 await check('撤掉红字 → 回到「只填借方」的差额',
   (await page.locator('.foot-right .tag-bad').textContent()).trim(), '借方大 1,000.00')

@@ -89,14 +89,15 @@ def test_原样提交自己那个号不算改号(client, auth, book, book_id, ma
     assert r.json()["voucher_no"] == v.voucher_no
 
 
-def test_只改日期不改号是可以的(client, auth, book, book_id, make_voucher):
-    """凭证号锁死不等于这张凭证不能改 —— 挪到别的期间是正常业务动作。
+def test_只改日期同期间不动号(client, auth, book, book_id, make_voucher):
+    """同期间内改日期 → 号不动。
 
-    号跟着走期间（号段是按期间分的），所以挪月份不需要、也不允许改号。
+    号段是按期间分的，同期间挪一天不换号 —— 换了号等于凭改日期把别人的号段
+    搅乱了。
     """
     v = make_voucher("2026-01-05", dr=[("1002", 10, "x")], cr=[("5001", 10, "x")])
     r = _put(client, auth, book_id, v.id, {
-        "voucher_date": "2026-02-20",
+        "voucher_date": "2026-01-25",
         "entries": [
             {"subject_id": v.entries[0].subject_id, "direction": "DEBIT",
              "amount": "10", "summary": "x"},
@@ -107,8 +108,64 @@ def test_只改日期不改号是可以的(client, auth, book, book_id, make_vou
         "remark": "",
     })
     assert r.status_code == 200, r.text
-    assert r.json()["voucher_date"] == "2026-02-20"
-    assert r.json()["voucher_no"] == v.voucher_no
+    assert r.json()["voucher_date"] == "2026-01-25"
+    assert r.json()["voucher_no"] == v.voucher_no, "同期间改日期不该动号"
+
+
+def test_只改日期跨期会自动换号(client, auth, book, book_id, make_voucher):
+    """跨期改日期 → 服务端按**目标期间**重新发号（该期最大号 + 1）。
+
+    凭证号是按期间唯一的（``uq_voucher_period_no``），每个月都从「记0001」重新
+    开始 —— 「把 1 月的记0001 改成 2 月」在 2 月几乎必然撞号。而凭证号又不许人
+    手工改了，于是跨期改日期以前是**走不通**的（用户 2026-10-24）。
+
+    现在号由服务端跟着目标期间重发：目标期间已有 记0001，新号就是 记0002。
+    """
+    v = make_voucher("2026-01-05", dr=[("1002", 10, "x")], cr=[("5001", 10, "x")])
+    other = make_voucher("2026-02-05", dr=[("1002", 20, "x")], cr=[("5001", 20, "x")])
+    assert v.voucher_no == other.voucher_no == "记0001", (v.voucher_no, other.voucher_no)
+
+    r = _put(client, auth, book_id, v.id, {
+        "voucher_date": "2026-02-20",
+        "entries": [
+            {"subject_id": v.entries[0].subject_id, "direction": "DEBIT",
+             "amount": "10", "summary": "x"},
+            {"subject_id": v.entries[1].subject_id, "direction": "CREDIT",
+             "amount": "10", "summary": "x"},
+        ],
+        "remark": "",
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["voucher_date"] == "2026-02-20"
+    assert body["voucher_no"] == "记0002", body["voucher_no"]
+    # 别人的号不许动
+    got = client.get(f"/api/books/{book_id}/vouchers/{other.id}", headers=auth).json()
+    assert got["voucher_no"] == "记0001", got["voucher_no"]
+
+
+def test_回传旧号加跨期改期不被误判成改号(client, auth, book, book_id, make_voucher):
+    """客户端回传**原来的号** + 改日期跨期 → 正常换号，不报「不能手工修改」。
+
+    「凭证号不能手工修改」比的是**改之前**那个号。拿换号后的新号去比的话，
+    客户端回传的旧号会被误判成「手工改号」，一条正常的改日期就被挡成 400。
+    """
+    v = make_voucher("2026-01-05", dr=[("1002", 10, "x")], cr=[("5001", 10, "x")])
+    other = make_voucher("2026-02-05", dr=[("1002", 20, "x")], cr=[("5001", 20, "x")])
+
+    r = _put(client, auth, book_id, v.id, {
+        "voucher_date": "2026-02-20",
+        "entries": [
+            {"subject_id": v.entries[0].subject_id, "direction": "DEBIT",
+             "amount": "10", "summary": "x"},
+            {"subject_id": v.entries[1].subject_id, "direction": "CREDIT",
+             "amount": "10", "summary": "x"},
+        ],
+        "voucher_no": v.voucher_no,      # 回传旧号（前端已不再送，但客户端可能有）
+        "remark": "",
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["voucher_no"] == "记0002", r.json()["voucher_no"]
 
 
 def test_修改凭证不接受insert_after(client, auth, book, book_id, make_voucher):

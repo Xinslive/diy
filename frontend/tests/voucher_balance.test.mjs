@@ -36,7 +36,7 @@ function amountBlock() {
   assert.ok(a !== -1, `源码里找不到标记 ${START}`)
   assert.ok(b > a, `源码里找不到结束标记 ${END}`)
   const block = SRC.slice(a, b)
-  for (const fn of ['centsOf', 'centsText', 'voucherTotals', 'voucherSignedTotals', 'autoBalanceNeed']) {
+  for (const fn of ['centsOf', 'centsText', 'voucherTotals', 'autoBalanceNeed']) {
     assert.ok(block.includes(`function ${fn}(`), `抠出来的段里没有 ${fn}() —— 标记挪位置了？`)
   }
   return block
@@ -58,8 +58,8 @@ const BLOCK = amountBlock()
 function state(entries) {
   const form = reactive({ entries: entries.map((e) => ({ subject_id: 1, summary: '', ...e })) })
   const factory = new Function('computed', 'moneyText', 'form', 'moneyCents', 'centsToText', `${BLOCK}
-    return { form, totals, total, signedTotals, diffCents, balanced, diffTag, blank,
-             centsOf, centsText, voucherTotals, voucherSignedTotals, autoBalanceNeed }`)
+    return { form, totals, total, diffCents, balanced, diffTag, blank,
+             centsOf, centsText, voucherTotals, autoBalanceNeed }`)
   return factory(computed, moneyText, form, moneyCents, centsToText)
 }
 
@@ -101,18 +101,19 @@ t('借 0.1 + 借 0.2 / 贷 0.3 → 平', () => {
 
 t('红字凭证 借 −300 / 贷 −300 → 平（红字照存，语义不许破）', () => {
   const s = state([D('-300'), C('-300')])
-  // 负数算到对面去：两边各摆 300.00
-  assert.equal(s.totals.value.debit, 30000n)
-  assert.equal(s.totals.value.credit, 30000n)
+  // 合计按列求和、负数照减：两栏都是 −300.00
+  // （跟账上一样：数据库触发器、账套引擎都按列求和）
+  assert.equal(s.totals.value.debit, -30000n)
+  assert.equal(s.totals.value.credit, -30000n)
   assert.equal(s.balanced.value, true, '红字冲销的老凭证必须照存')
   assert.equal(footerTag(s), '借贷平衡 ✓')
 })
 
 t('正负相抵 借 111 / 借 −111 → 平（按平处理，语义不许破）', () => {
   const s = state([D('111'), D('-111')])
-  // 红字把 −111 搬去了对面，两栏一样大
-  assert.equal(s.totals.value.debit, 11100n)
-  assert.equal(s.totals.value.credit, 11100n)
+  // 借方这一列自己抵成 0，贷方也是 0 —— 两栏一样大，就是平的
+  assert.equal(s.totals.value.debit, 0n)
+  assert.equal(s.totals.value.credit, 0n)
   assert.equal(s.balanced.value, true, '冲销凭证被当成不平了')
   assert.equal(footerTag(s), '借贷平衡 ✓')
 })
@@ -168,18 +169,44 @@ t('枚举：凡是真平的一律判平，老口径会拒掉其中一大片', ()
 console.log('')
 console.log('== 负数在整数分口径下的处理（不假设，实测）==')
 
-t('红字写进对面那一栏，不是相减', () => {
-  // 借方红字落到贷方栏、贷方红字落到借方栏 —— 红字的本意（冲销同一笔），
-  // 不是「贷方减了 300」。要是照带符号显示，这一格会摆出负数，
-  // 页脚的差额也就凭空多出一份。
-  assert.deepEqual(state([D('-100.10')]).totals.value, { debit: 0n, credit: 10010n },
-    '借方红字没搬到贷方那一栏')
-  assert.deepEqual(state([C('-300')]).totals.value, { debit: 30000n, credit: 0n },
-    '贷方红字没搬到借方那一栏')
-  // 带符号的合计仍然照减 —— 补差要的是这个，不是搬过栏的那个
-  assert.deepEqual(state([D('-100.10'), C('-100.10')]).signedTotals.value,
+t('红字留在本栏，合计照减（不搬到对面去）', () => {
+  // 合计就是「把这一列显示的数字加起来」：红字摆在借方那一栏，借方合计就照减。
+  // 跟账上同一套（数据库触发器、账套引擎都按列求和）——
+  // 以前这里把红字搬到对面，纸上摆的借方合计跟账上的借方发生额对不上。
+  assert.deepEqual(state([D('-100.10')]).totals.value, { debit: -10010n, credit: 0n },
+    '借方红字不该被搬到贷方那一栏')
+  assert.deepEqual(state([C('-300')]).totals.value, { debit: 0n, credit: -30000n },
+    '贷方红字不该被搬到借方那一栏')
+  assert.deepEqual(state([D('-100.10'), C('-100.10')]).totals.value,
     { debit: -10010n, credit: -10010n })
   assert.equal(state([D('-100.10'), C('-100.10')]).balanced.value, true)
+})
+
+t('用户那张凭证：借 −333 / 贷 2222 / 贷 3 → 合计借 −333.00 / 贷 2225.00', () => {
+  // 用户 2026-10-24 指着屏幕说的：合计该是「借 −333 / 贷 2225」，
+  // 不是把 −333 搬到对面去摆成「借 0 / 贷 2558」（那看着像凭空多出 2558）。
+  const s = state([C('2222'), C('3'), D('-333')])
+  assert.deepEqual(s.totals.value, { debit: -33300n, credit: 222500n })
+  assert.equal(s.total.value.debit, '-333.00')
+  assert.equal(s.total.value.credit, '2225.00')
+  assert.equal(s.balanced.value, false)
+  assert.equal(footerTag(s), '贷方大 2,558.00')
+})
+
+t('合计格摆不摆数，看的是「这一栏录没录过数」', () => {
+  // 同侧相抵：借方这一栏录了 1000 和 −1000，合计是 0 —— 摆「0.00」，
+  // 别把这一栏藏成「没录过数」。
+  const s = state([D('1000'), D('-1000')])
+  assert.equal(s.total.value.debit, '0.00')
+  // 贷方那一栏压根没有分录 → 留空（空格子比一个孤零零的 0 干净）
+  assert.equal(s.total.value.credit, '')
+  // 一栏都没录 → 两栏都空
+  assert.equal(state([]).total.value.debit, '')
+  assert.equal(state([]).total.value.credit, '')
+  // 只填了借方 → 贷方那一栏空着
+  const one = state([D('1000')])
+  assert.equal(one.total.value.debit, '1000.00')
+  assert.equal(one.total.value.credit, '')
 })
 
 t('借 −100.10 / 贷 +100.10 是不平的（别把它当成红字冲销）', () => {
@@ -192,7 +219,7 @@ t('借 −100.10 / 贷 +100.10 是不平的（别把它当成红字冲销）', (
 
 t('落格用的真正减号 U+2212 也认成红字', () => {
   const s = state([D('−300'), C('−300')])
-  assert.equal(s.totals.value.debit, 30000n, 'U+2212 被当成垃圾字符剔掉的话会变成正的 300')
+  assert.equal(s.totals.value.debit, -30000n, 'U+2212 被当成垃圾字符剔掉的话会变成正的 300')
   assert.equal(s.balanced.value, true)
 })
 
@@ -202,9 +229,9 @@ t('只敲了一个负号 / 空格子 → 0，不是 NaN', () => {
   assert.equal(s.blank.value, true)
 })
 
-t('带符号合计：借 100 / 借 −100 两边都归零（补差靠这个口径）', () => {
+t('按列求和：借 100 / 借 −100 两边都归零（判平、补差、合计同一套）', () => {
   const s = state([D('100'), D('-100')])
-  assert.deepEqual(s.signedTotals.value, { debit: 0n, credit: 0n })
+  assert.deepEqual(s.totals.value, { debit: 0n, credit: 0n })
   assert.equal(s.balanced.value, true, '正负相抵按平处理（2026-10-12 用户明确要求）')
 })
 
@@ -264,7 +291,7 @@ console.log('== P0-1 第二重矛盾：补差之后必须真的存得下 ==')
  */
 function needFor(s, i, side) {
   const row = s.form.entries[i]
-  const st = s.signedTotals.value
+  const st = s.totals.value
   const mineSide = row.direction === 'CREDIT' ? 'c' : 'd'
   return s.autoBalanceNeed({
     opposite: side === 'd' ? st.credit : st.debit,

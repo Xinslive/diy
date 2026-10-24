@@ -716,6 +716,20 @@ def _dominant_prefix(rows: list[Voucher]) -> str:
     return max(counts.items(), key=lambda kv: (kv[1], kv[0] == "记"))[0]
 
 
+def period_prefix(db: Session, period: Period, fallback: str = "记") -> str:
+    """这个期间在用的凭证字（出现次数最多的那个）；期间里一张都没有时给 fallback。
+
+    ``_dominant_prefix`` 只认内存里那批行，这里替它查库 —— 「把一张凭证挪进
+    另一个期间」要按**目标期间**的凭证字发号：混用两个凭证字会让那个期间的
+    「整理就绪」体检报「混用了多个凭证字」，记账、结账都过不去
+    （见 ``check_period``）。
+    """
+    rows = list(db.scalars(
+        select(Voucher).where(Voucher.period_id == period.id)
+    ).all())
+    return _dominant_prefix(rows) if rows else fallback
+
+
 def irreparable_gaps(db: Session, book_id: int, period: Period,
                      deleting: set[int]) -> list[str]:
     """删掉 ``deleting``（凭证 id 集合）之后，这个期间会留下哪些

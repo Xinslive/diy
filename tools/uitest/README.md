@@ -27,7 +27,8 @@ node tools/uitest/ui_voucher.mjs
 
 ## 关于里面几个路径
 
-* 少数脚本（`ui_list` / `ui_nav` / `ui_subject` / `ui_voucher` / `ui_voucher_insert`）
+* 少数脚本（`ui_list` / `ui_nav` / `ui_subject` / `ui_voucher` / `ui_voucher_insert` /
+  `ui_voucher_total` / `ui_voucher_renumber`）
   用 `import.meta.url` 定位截图目录。这里写的是 `../../.shots/`，为的是搬进
   `tools/uitest/` 之后**输出位置不变**，仍然落在仓库根的 `.shots/`。
 * 还有几个脚本（`shot*` / `period_verify` / `final`）把输出目录写成了
@@ -39,6 +40,20 @@ node tools/uitest/ui_voucher.mjs
 这些脚本是一次性的调查产物，本身没有回归价值：界面早变了，脚本也早失效了。
 它们的价值只有「留个记录，方便复查当时看到了什么」，所以保持原样、不进 CI。
 要长期守住某个界面行为，正确做法是在 `frontend/tests/` 里补一个用例。
+
+## 凭证页的两条可重复验收
+
+`ui_voucher_total.mjs` 与 `ui_voucher_renumber.mjs` 也是**可重复跑**的回归检查
+（与 `ui_year_chart.mjs` 同类，不同于上面那些一次性探针）：
+
+```
+node tools/uitest/ui_voucher_total.mjs      # 合计按列求和、负数照减
+node tools/uitest/ui_voucher_renumber.mjs    # 跨期改日期 → 服务端重发号 → 页面回写
+```
+
+两条都是**只读 + 写接口拦截**：真账一个字节都不动。服务端那一半（真发号、真换期）
+由 `backend/tests/test_voucher_no_edit.py`、`test_api_contracts.py` 在真库上跑；
+这两条脚本守的是**页面这一半**（合计怎么摆、换号后页面上摆的是哪个号）。
 
 ## 唯一的例外：`ui_year_chart.mjs`
 

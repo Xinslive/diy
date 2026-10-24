@@ -1,4 +1,4 @@
-"""API 层与数据契约：长度上限、跨账套参数、角色归一化、撞号的人话。
+"""API 层与数据契约：长度上限、跨账套参数、角色归一化、跨期换号。
 
 这一组对应审查报告「API 层与数据契约」域的 P1-3 / P2-1 / P2-2 / P2-5 / P2-6 / P3-1。
 
@@ -224,12 +224,16 @@ def test_账套所有者的判断走归一化(client, auth, db, book, monkeypatc
 # --------------------------------------------------------------------- P2-3 撞号的人话
 
 
-def test_改凭证日期跨期撞号返回422且是人话(client, auth, db, book, subjects,
-                                          make_voucher):
-    """改到另一个已经有同号凭证的期间 → 422 + 人话，**不漏数据库英文原文**。
+def test_改凭证日期跨期自动换号且不漏数据库英文原文(client, auth, db, book,
+                                                  subjects, make_voucher):
+    """改到另一个期间 → 服务端**按目标期间重新发号**，不再被同号挡住。
 
-    以前这里没有任何占用检查：改期 → flush → 撞 ``uq_voucher_period_no`` →
-    裸的 UniqueViolation，全局处理器把数据库原文回给用户。
+    历史：这里以前是「422 + 人话」——改期撞 ``uq_voucher_period_no`` 就把请求
+    挡下来。可凭证号不许人手工改了（用户 2026-10-19 定的），于是「改个日期」
+    在跨期时根本走不通，而改日期恰恰是最自然的动作（用户 2026-10-24）。
+
+    现在：跟着目标期间重新发一个号（该期现有最大号 + 1），并把换号这件事
+    留在审计日志里。数据库的英文原文与库结构名仍然不许漏给客户端。
     """
     v1 = make_voucher("2026-01-05", dr=[("1001", 10, "x")], cr=[("5001", 10, "x")])
     v2 = make_voucher("2026-02-05", dr=[("1001", 20, "x")], cr=[("5001", 20, "x")])
@@ -239,16 +243,19 @@ def test_改凭证日期跨期撞号返回422且是人话(client, auth, db, book
         "voucher_date": "2026-02-10",
         "entries": _entries(subjects, [("1001", 10, "x")], [("5001", 10, "x")]),
     })
-    assert r.status_code == 422, f"撞号返回了 {r.status_code}：{r.text}"
-    detail = r.json()["detail"]
-    assert "记0001" in detail, detail
-    assert "2026-02" in detail, detail
+    assert r.status_code == 200, f"跨期改日期被挡住了：{r.status_code} {r.text}"
+    body = r.json()
+    # 目标期间已有 记0001（新号 = 该期最大号 + 1），且**不能动别人的号**
+    assert body["voucher_no"] == "记0002", body["voucher_no"]
+    assert body["voucher_date"] == "2026-02-10", body["voucher_date"]
     # 数据库的英文原文与库结构名不许漏给客户端
     assert "uq_voucher_period_no" not in r.text, r.text
     assert "duplicate key" not in r.text.lower(), r.text
-    # 撞号之后凭证必须还在原期间
+    # 换完号之后凭证确实在目标期间，且同期间不重号
     db.expire_all()
-    assert db.get(Voucher, v1.id).period_id == v1.period_id, "撞号之后凭证被挪走了"
+    moved = db.get(Voucher, v1.id)
+    assert moved.period_id == v2.period_id, "凭证没有挪到目标期间"
+    assert db.get(Voucher, v2.id).voucher_no == "记0001", "别人的凭证号被动过了"
 
 
 # --------------------------------------------------------------------- P2-5 会计年度

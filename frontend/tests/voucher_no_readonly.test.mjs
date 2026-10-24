@@ -96,5 +96,38 @@ t('保存时把位置一起提交', () => {
     'payload 里没有 insert_position，后端只能默认向前插入')
 })
 
+console.log('== 改日期跨期：号跟着目标期间重发（用户 2026-10-24）==')
+
+t('保存时不再把凭证号送回去', () => {
+  // 号是服务端发的（新增走 next_voucher_no、插入走 insert_slot、
+  // 改期跨期时按目标期间重发）。送回去的是**旧号**时，服务端刚重发完、
+  // 页面还没来得及换（或者人连着改了两次日期，两趟保存撞在一起），
+  // 服务端会回一句「凭证号不能手工修改（记0009 → 记0012）」——
+  // 人完全看不懂是自己改的日期惹的祸。
+  const payload = VIEW.match(/const payload = \{[\s\S]*?\n  \}/)
+  assert.ok(payload, '找不到 payload')
+  assert.doesNotMatch(payload[0], /voucher_no:/,
+    'payload 里还在送凭证号 —— 跨期重发之后送过去的会是旧号')
+})
+
+t('保存成功后把服务端发的号回写到表单', () => {
+  assert.match(VIEW, /form\.voucher_no = saved\.voucher_no/,
+    '服务端重发过号之后，页面上那个只读的凭证号必须跟着换')
+})
+
+t('跨期之后期间也跟着换（页眉、辅助记账余额、打印都跟着这张走）', () => {
+  assert.match(VIEW, /voucherPeriodId\.value = saved\.period_id/,
+    '跨期之后期间没跟着换，页眉还写着旧期间')
+})
+
+t('凭证号不进「这张变了没有」的签名', () => {
+  // 号不是人改的（页面上只读），而是服务端发的：它一变签名就变，
+  // 等于凭空多一趟自动保存，还把「服务端改的号」误判成「人改了这张凭证」。
+  const sig = VIEW.match(/const entrySig = computed\(\(\) => JSON\.stringify\(\[[\s\S]*?\]\)\)/)
+  assert.ok(sig, '找不到 entrySig')
+  assert.doesNotMatch(sig[0], /form\.voucher_no/,
+    '凭证号进了 dirty 签名 —— 服务端重发号会触发一趟多余的自动保存')
+})
+
 console.log(`\n通过 ${pass} / 失败 ${fail}`)
 process.exit(fail ? 1 : 0)

@@ -67,7 +67,7 @@ function grabFn(name) {
   return src
 }
 
-console.log('== 合计与判平（红字算到对面）==')
+console.log('== 合计与判平（按列求和，红字照减）==')
 
 t('借 500 / 贷 0：不平，差额是借方多 500', () => {
   const s = halfTotals([D('500')])
@@ -82,9 +82,9 @@ t('红字（借 −300 / 贷 −300）是平的', () => {
   const s = halfTotals([D('-300'), C('-300')])
   assert.equal(s.balanced, true)
   assert.equal(s.diff, '0.00')
-  // 展示口径：红字搬到对面，两栏都是正数
-  assert.equal(s.debit, '300.00')
-  assert.equal(s.credit, '300.00')
+  // 合计按列求和、负数照减：红字留在本栏，两栏都是 −300.00
+  assert.equal(s.debit, '-300.00')
+  assert.equal(s.credit, '-300.00')
 })
 
 t('正负相抵（借 111 / 借 −111）也算平', () => {

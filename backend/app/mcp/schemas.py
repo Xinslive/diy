@@ -330,8 +330,8 @@ class VoucherGroupRow(_Row):
     label: str = Field(default="", description="分组键的中文名")
     vouchers: int = Field(default=0, description="该组涉及的凭证张数")
     entries: int = Field(default=0, description="该组的分录条数")
-    debit: str = Field(default="0.00", description="借方合计（红字算到对面）")
-    credit: str = Field(default="0.00", description="贷方合计（红字算到对面）")
+    debit: str = Field(default="0.00", description="借方合计（按列求和，负数照减）")
+    credit: str = Field(default="0.00", description="贷方合计（按列求和，负数照减）")
     net: str = Field(default="0.00", description="净额（借方 − 贷方）")
 
 

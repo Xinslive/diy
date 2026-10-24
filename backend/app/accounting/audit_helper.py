@@ -73,16 +73,14 @@ def voucher_snapshot(voucher: Voucher, entries: Any = None) -> dict:
     进去的、关系上还没有，不显式传就会白发一次懒加载。
 
     **借贷合计与界面同口径**（审计 P3-3）。这里的 ``debit`` / ``credit`` 走的是
-    ``accounting/vouchers.py::side_totals`` 那套算法：**红字算到对面**，
-    两栏只摆正数 —— 与凭证列表、凭证编辑页显示的合计一模一样。
+    ``accounting/vouchers.py::side_totals`` 那套算法：**按列求和、负数照减** ——
+    与凭证列表、凭证编辑页显示的合计、以及账上（数据库触发器、账套引擎）一模一样。
 
-    以前这里是**带符号**求和，于是同一张含红字分录的凭证，审计快照说
-    ``debit=100.00, credit=-100.00``，界面说 ``借 200 / 贷 0``。
+    以前这里是**带符号**求和，而界面那边把红字搬去了对面，于是同一张含红字分录的
+    凭证，审计快照说 ``debit=100.00, credit=-100.00``，界面说 ``借 200 / 贷 0``。
     两种算法各自自洽，但审计快照是「凭证号可复用」场景下**唯一**的事后追溯
     依据，两处口径不一致，复盘时对不上数，还容易被当成「库里算错了」。
-
-    带符号的原值没有丢：另存成 ``debit_signed`` / ``credit_signed``，
-    需要看「这一栏的净数」时用它（红字冲销的原始方向就靠它还原）。
+    现在两边都是按列求和（用户 2026-10-24 定的口径），这个坑就没了。
     """
     rows = [_entry_dict(e) for e in (voucher.entries if entries is None else entries)]
     rows.sort(key=lambda r: r["line_no"])
@@ -106,10 +104,12 @@ def voucher_snapshot(voucher: Voucher, entries: Any = None) -> dict:
         "source": voucher.source,
         "remark": voucher.remark,
         "attachments": voucher.attachments,
-        # 界面口径：红字算到对面，两栏都是正数
+        # 界面口径：按列求和、负数照减
         "debit": _jsonable(dr_total),
         "credit": _jsonable(cr_total),
-        # 带符号口径：这一栏的净数（红字冲销的方向靠它还原）
+        # 带符号口径：这一栏的净数。
+        # 两套口径合并成一套之后，这两个字段跟上面那两个是**同一个数** ——
+        # 留着是为了不改已经落库的快照形状（老行里有它们）。
         "debit_signed": _jsonable(dr_signed),
         "credit_signed": _jsonable(cr_signed),
         "entries": [{**r, "amount": _jsonable(r["amount"])} for r in rows],

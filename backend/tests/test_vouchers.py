@@ -240,6 +240,78 @@ def test_改凭证换月后分录期间同步(db, book, periods, subjects, make_
         select(Entry).where(Entry.voucher_id == v.id)).all())
 
 
+# ====================================================================== 改期换号
+#
+# 凭证号是**按期间唯一**的（uq_voucher_period_no），而每个月的号都从「记0001」
+# 重新开始 —— 所以「把 1 月的记0001 改成 2 月」在 2 月几乎必然撞号。
+#
+# 而凭证号又不许人手工改（用户 2026-10-19 定的：新增 / 插入 / 修改三处只读），
+# 于是「改个日期」在跨期时曾经**根本走不通** —— 撞号就回一句「改不了」。
+# 改日期恰恰是最自然的动作（用户 2026-10-24）。
+#
+# 现在：号**跟着目标期间重发**（该期现有最大号 + 1）。
+
+
+def test_改日期跨期后凭证号按目标期间重发(db, book, periods, subjects, make_voucher, admin_user):
+    """1 月的记0001 改成 2 月 → 2 月已经有两张 → 新号是 记0003。"""
+    v = make_voucher("2026-01-05", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
+    old_no = v.voucher_no
+    assert old_no == "记0001"
+    make_voucher("2026-02-03", dr=[("1001", 10, "x")], cr=[("5001", 10, "x")])
+    make_voucher("2026-02-04", dr=[("1001", 10, "x")], cr=[("5001", 10, "x")])
+
+    update_voucher(db, v, admin_user, {"voucher_date": date(2026, 2, 5)})
+    db.refresh(v)
+    assert v.period_id == periods[2].id
+    assert v.voucher_no == "记0003", f"号没有按目标期间重发：{v.voucher_no}"
+    assert v.voucher_no != old_no
+
+
+def test_改日期不跨期凭证号不动(db, book, subjects, make_voucher, admin_user):
+    """还在同一期里挪日期 = 号段没换，号不能动。"""
+    v = make_voucher("2026-01-05", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
+    old_no = v.voucher_no
+    update_voucher(db, v, admin_user, {"voucher_date": date(2026, 1, 20)})
+    db.refresh(v)
+    assert v.voucher_no == old_no
+
+
+def test_跨期重发用目标期间的凭证字(db, book, periods, subjects, make_voucher, admin_user):
+    """目标期间在用「银」字 → 挪进去的凭证也得是「银」字。
+
+    混用两个凭证字会让那个期间的「整理就绪」体检报「混用了多个凭证字」，
+    记账、结账都过不去（见 organize.check_period）。
+    """
+    v = make_voucher("2026-01-05", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
+    make_voucher("2026-02-03", dr=[("1001", 10, "x")], cr=[("5001", 10, "x")],
+                 voucher_no="银0001")
+    update_voucher(db, v, admin_user, {"voucher_date": date(2026, 2, 5)})
+    db.refresh(v)
+    assert v.voucher_no == "银0002", f"凭证字没跟目标期间走：{v.voucher_no}"
+
+
+def test_跨期重发的号不会把自己的旧号算进目标期间的最大号(db, book, periods, subjects,
+                                                      make_voucher, admin_user):
+    """1 月的记0009 挪到 2 月（2 月本来有记0001..记0008）→ 新号是 记0009。
+
+    号必须在**改期间之前**算：这一行一改，flush 就把这张挪进目标期，
+    它自己的旧号会被算进「该期最大号」里 —— 那样会发出记0010，中间凭空空三个号。
+    """
+    for i in range(1, 9):
+        make_voucher(f"2026-02-{i:02d}", dr=[("1001", 10, "x")], cr=[("5001", 10, "x")])
+    # 1 月先有八张，这张排在最后 → 记0009
+    for i in range(1, 9):
+        make_voucher(f"2026-01-{i:02d}", dr=[("1001", 10, "x")], cr=[("5001", 10, "x")])
+    v = make_voucher("2026-01-31", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
+    db.refresh(v)
+    old_no = v.voucher_no
+    assert old_no == "记0009"
+
+    update_voucher(db, v, admin_user, {"voucher_date": date(2026, 2, 20)})
+    db.refresh(v)
+    assert v.voucher_no == "记0009", f"把自己的旧号算进了目标期间的最大号：{v.voucher_no}"
+
+
 def test_删除凭证连同分录(db, book, make_voucher, admin_user):
     v = make_voucher("2026-01-05", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
     vid = v.id
@@ -938,37 +1010,56 @@ def test_金额为0的分录仍然被拒(db, book, admin_user, subjects):
         )
 
 
-def test_合计口径_贷方红字算到借方():
-    """借 100 / 借 200 / 贷 −300 → 借方合计 600、贷方合计 0。
+def test_合计口径_按列求和_贷方红字照减():
+    """借 100 / 借 200 / 贷 −300 → 借方合计 300.00、贷方合计 −300.00。
 
-    红字的本意是「贷方那一笔其实是借方」，不是「贷方减了 300」。
-    照带符号相加会印出「借 300 / 贷 −300、差额 600」，看着像凭空多出 600 块。
+    合计就是「把这一列显示的数字加起来」：红字留在本栏，合计也照减
+    （用户 2026-10-24 定的口径）。
+
+    以前这里把红字搬到对面去，摆成「借 600 / 贷 0」—— 那跟账上的数不是一回事
+    （账上借方发生额就是 300、贷方 −300，数据库触发器也是按列求和判的平），
+    凭证纸上的合计跟总账、明细账对不上。
     """
     entries = [
         {"direction": "DEBIT", "amount": "100"},
         {"direction": "DEBIT", "amount": "200"},
         {"direction": "CREDIT", "amount": "-300"},
     ]
-    assert [str(x) for x in side_totals(entries)] == ["600.00", "0"]
+    assert [str(x) for x in side_totals(entries)] == ["300.00", "-300.00"]
 
 
-def test_合计口径_借方红字算到贷方():
-    """借 −100 / 借 200 / 贷 100 → 借方 200、贷方 200。
+def test_合计口径_按列求和_借方红字照减():
+    """借 −100 / 借 200 / 贷 100 → 借方 100.00、贷方 100.00。
 
-    借方那个红字是冲收入用的，它顶的是贷方，不是把借方的 200 减成 100。
+    借方那个红字是冲收入用的，它就摆在本栏，合计照减 —— 两栏相等，是平的。
     """
     entries = [
         {"direction": "DEBIT", "amount": "-100"},
         {"direction": "DEBIT", "amount": "200"},
         {"direction": "CREDIT", "amount": "100"},
     ]
-    assert [str(x) for x in side_totals(entries)] == ["200.00", "200.00"]
+    assert [str(x) for x in side_totals(entries)] == ["100.00", "100.00"]
+
+
+def test_合计口径_用户那张凭证_借负333贷2225():
+    """用户 2026-10-24 指着屏幕说的那张：借 −333 / 贷 2222 / 贷 3。
+
+    合计该是「借 −333.00 / 贷 2225.00」—— 把这一列的数字加起来。
+    以前这里摆的是「借 0.00 / 贷 2558.00」（把 −333 搬去了对面），
+    看着像凭空多出 2558 —— 账上根本没有这一笔。
+    """
+    entries = [
+        {"direction": "CREDIT", "amount": "2222"},
+        {"direction": "CREDIT", "amount": "3"},
+        {"direction": "DEBIT", "amount": "-333"},
+    ]
+    assert [str(x) for x in side_totals(entries)] == ["-333.00", "2225.00"]
 
 
 def test_合计口径_正负相抵的凭证按平处理(db, book, admin_user, subjects):
-    """借100 / 借-100 / 贷50 / 贷-50：合计 150 / 150，两栏一样大 —— 就是平的，该存。
+    """借100 / 借-100 / 贷50 / 贷-50：两栏各自抵成 0，一样大 —— 就是平的，该存。
 
-    红字把负数搬去了对面，带符号那一对是 0/0，可人看着两栏相等就是平的
+    按列求和（红字照减）之后，两栏都是 0.00，两栏相等就是平的
     （2026-10-12 用户明确要求这么判）。早先把这类凭证挡在门外，前端摆的红字
     跟「差额 0.00」自相矛盾，用户一看就知道是程序判错了。
     """
