@@ -218,7 +218,6 @@
       </div>
 
       <div class="vfoot">
-        <span class="maker"><el-icon><EditPen /></el-icon> 制单人：{{ maker }}</span>
         <span class="foot-right">
           <span v-if="saving" class="muted">正在自动保存…</span>
           <span v-else-if="savedAt" class="saved-tag">已自动保存 {{ savedAt }}</span>
@@ -293,7 +292,7 @@ const SubjectFormDialog = defineAsyncComponent(() => import('@/components/Subjec
 const PrintDialog = defineAsyncComponent(() => import('@/components/PrintDialog.vue'))
 import VoucherSplitDialog from '@/components/VoucherSplitDialog.vue'
 import { rafThrottle } from '@/utils/frame'
-import { Bottom, CircleCloseFilled, EditPen, Top } from '@element-plus/icons-vue'
+import { Bottom, CircleCloseFilled, Top } from '@element-plus/icons-vue'
 
 const store = useSessionStore()
 const tabs = useTabsStore()
@@ -687,7 +686,6 @@ function setCredit(row, v) {
   row.direction = 'CREDIT'
   row.amount = v
 }
-const maker = computed(() => store.user?.real_name || store.user?.username || '—')
 /** 金额取数。只敲了一个负号的时候 ``Number('-')`` 是 NaN，
  *  NaN 一进合计，整张凭证的差额就变成 NaN，连「不平」都说不出来了。 */
 const num = (v) => {
@@ -2288,15 +2286,14 @@ watch(() => [store.bookId, store.periodId, store.currentYear, route.params.id], 
 .row-del.is-off { color: #dcdfe6; cursor: not-allowed; }
 
 .vfoot {
-  flex: 0 0 auto;                /* 页脚不参与压缩：分录再多也得留住制单人和借贷差额 */
+  flex: 0 0 auto;                /* 页脚不参与压缩：分录再多也得留住借贷差额 */
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-end;      /* 页脚只剩状态区（自动保存/借贷平衡），一律靠右 */
   align-items: center;
   gap: 16px;
   margin-top: 14px;
   font-size: 13px;
 }
-.maker { display: inline-flex; align-items: center; gap: 6px; color: #606266; }
 .foot-right { display: inline-flex; align-items: baseline; gap: 22px; }
 .foot-right b { font-variant-numeric: tabular-nums; color: var(--cwq-text); }
 
