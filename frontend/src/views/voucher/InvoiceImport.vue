@@ -229,7 +229,13 @@
         <el-alert v-if="batch.error_count" type="info" :closable="false" show-icon class="mb"
                   title="合并件里的封面、装订页、重复扫描页都不是发票：展开该行点「忽略这张」，它不会生成凭证，也不再算异常。" />
 
-        <el-table :data="batch.invoices" size="small" border row-key="id" :row-class-name="invoiceRowClass">
+        <!--
+          默认全部展开（default-expand-all）：这个表的价值就是「一眼看到每张发票
+          分了哪些项目、进了哪个科目」，默认收起等于把最该看的东西藏起来，
+          每次都要点 23 次箭头才看得全。
+          手动收起某一行仍然有效 —— 它只在数据换新（重新计算预览）时重置。
+        -->
+        <el-table :data="batch.invoices" size="small" border row-key="id" default-expand-all :row-class-name="invoiceRowClass">
           <el-table-column type="expand">
             <template #default="{ row }">
               <div class="invoice-detail">
@@ -323,8 +329,9 @@
               </div>
             </template>
           </el-table-column>
-          <el-table-column prop="page_index" label="页码" width="70" align="center">
-            <template #default="{ row }">{{ row.page_index + 1 }}</template>
+          <!-- 分页票（一张发票拆成几页印）合成后跨多页，显示成「1-3」而不是「1」 -->
+          <el-table-column prop="page_index" label="页码" width="80" align="center">
+            <template #default="{ row }">{{ pageLabel(row) }}</template>
           </el-table-column>
           <el-table-column v-if="batch.sources?.length > 1" prop="source_file" label="来源文件" min-width="170" show-overflow-tooltip />
           <el-table-column prop="invoice_no" label="发票号码" min-width="190" />
@@ -355,7 +362,9 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, FolderOpened, Plus, Refresh, Upload } from '@element-plus/icons-vue'
 import * as invoiceApi from '@/api/invoice'
 import * as subjectApi from '@/api/subject'
-import { filesFromDataTransfer, humanBytes, isIgnoredRow, partitionFiles, skipNote } from './invoice_upload'
+import {
+  DEFAULT_UPLOAD_LIMITS, filesFromDataTransfer, humanBytes, isIgnoredRow, partitionFiles, skipNote,
+} from './invoice_upload'
 import { formatDateTime } from '@/utils/datetime'
 import { useSessionStore } from '@/stores/session'
 
@@ -370,7 +379,7 @@ const skipped = ref([])
 const folderInput = ref(null)
 // 上限由后端给（/invoices/limits）。兜底值只是让接口没回来之前界面也有个数，
 // 不能当成契约 —— 真超了后端会拒，兜底值偏小的话只是提前少选几个文件。
-const uploadLimits = ref({ maxFiles: 60, maxTotalBytes: 20 * 1024 * 1024 })
+const uploadLimits = ref({ ...DEFAULT_UPLOAD_LIMITS })
 const totalBytes = computed(() => files.value.reduce((sum, file) => sum + (file.size || 0), 0))
 const uploading = ref(false)
 const committing = ref(false)
@@ -395,6 +404,12 @@ const invoiceTypeText = (v) => ({ INPUT: '进项', OUTPUT: '销项', UNKNOWN: '�
 const invoiceStatusText = (v) => ({ READY: '可生成', REJECTED: '有问题', COMMITTED: '已生成', IGNORED: '已忽略', DISCARDED: '已作废' }[v] || v)
 const invoiceType = (v) => ({ READY: 'success', REJECTED: 'danger', COMMITTED: 'success', IGNORED: 'info', DISCARDED: 'info' }[v] || 'warning')
 const itemKey = (file, index) => `${file.name}|${file.size}|${file.lastModified || index}`
+// 分页票跨了几页就显示成「起-止」；普通单页发票仍显示一个页码。
+const pageLabel = (row) => {
+  const span = Number(row.page_span || 1)
+  const first = Number(row.page_index || 0) + 1
+  return span > 1 ? `${first}-${first + span - 1}` : String(first)
+}
 // 一句话把「几张可生成 / 几张有问题 / 几张被忽略」讲全 —— 少了「已忽略」这一项
 // 的话，被合并进来的封面页会让人以为批次比预想的多。
 const batchSummaryTitle = computed(() => {

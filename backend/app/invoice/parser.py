@@ -4,7 +4,9 @@ from __future__ import annotations
 from typing import Any
 
 from app.invoice.ocr_client import OcrApiError, ocr_pdf_to_texts, optional_payload_from_env
-from app.invoice.text_parser import Invoice, extract_pages_text, parse_page
+from app.invoice.text_parser import (
+    Invoice, extract_pages_text, merge_invoice_pages, parse_page,
+)
 
 
 MIN_TEXT_LEN_PER_PAGE = 30
@@ -56,13 +58,13 @@ def parse_pdf_with_fallback(pdf_path: str, ocr: dict | None = None) -> tuple[lis
 
     ocr_configured = bool(ocr.get("api_url") and ocr.get("token"))
     if not is_text_extraction_poor(pages_text, invoices) and invoices:
-        return invoices, False
+        return merge_invoice_pages(invoices), False
     if not ocr_configured:
         if not invoices:
             raise ValueError(local_error or "PDF 未解析出任何页面")
         for invoice in invoices:
             _append_warning(invoice, "文本层解析不充分，未配置 OCR 服务兜底")
-        return invoices, False
+        return merge_invoice_pages(invoices), False
 
     try:
         ocr_pages = ocr_pdf_to_texts(
@@ -79,11 +81,13 @@ def parse_pdf_with_fallback(pdf_path: str, ocr: dict | None = None) -> tuple[lis
             raise ValueError(f"PDF 文本解析失败，OCR API 兜底也失败：{exc}") from exc
         for invoice in invoices:
             _append_warning(invoice, f"OCR API 兜底失败：{exc}")
-        return invoices, False
+        return merge_invoice_pages(invoices), False
 
     # OCR 是否使用已经通过返回值传给批次，成功本身不是需要用户修正的解析警告。
     # 这里只保留页面字段解析产生的真实问题，避免把成功的 OCR 兜底标成红色阻断项。
-    return [parse_page(index, text) for index, text in enumerate(ocr_pages)], True
+    return merge_invoice_pages(
+        [parse_page(index, text) for index, text in enumerate(ocr_pages)]
+    ), True
 
 
 def invoice_dict(invoice: Invoice) -> dict[str, Any]:

@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from decimal import Decimal
 from typing import List, Optional, Tuple
 
@@ -151,6 +151,10 @@ class InvoiceMeta:
 @dataclass
 class Invoice:
     page_index: int
+    #: 这张发票**跨了几页**。分页票（一张发票拆成几页印）合成之后是 >1；
+    #: 界面上的「页码」列据此显示成「1-3」而不是「1」——
+    #: 只显示起始页，用户会以为第 2、3 页没被读进来。
+    page_span: int = 1
     meta: InvoiceMeta = field(default_factory=InvoiceMeta)
     lines: List[InvoiceLine] = field(default_factory=list)
     raw_text: str = ""
@@ -159,6 +163,7 @@ class Invoice:
     def to_dict(self) -> dict:
         return {
             "page_index": self.page_index,
+            "page_span": self.page_span,
             "meta": {k: _jsonable(v) for k, v in asdict(self.meta).items()},
             "lines": [{k: _jsonable(v) for k, v in asdict(l).items()} for l in self.lines],
             "parse_warning": self.parse_warning,
@@ -701,6 +706,196 @@ def parse_page(page_index: int, text: str) -> Invoice:
     if not inv.meta.invoice_no:
         inv.parse_warning = (inv.parse_warning + "; " if inv.parse_warning else "") + "未识别到发票号码。"
     return inv
+
+
+#: 金额校验警告的前缀。合成发票时要**丢掉每页自己的那一条** ——
+#: 它比的是「本页明细之和」与「本页价税合计」，而分页票上每页只有小计，
+#: 本来就对不上；换一条合并之后再算的。
+_AMOUNT_WARNING_PREFIX = "金额校验未通过"
+
+#: 分页票的页脚标记，形如「共3页 第2页」。这是**最硬的证据**：
+#: 票面自己说这几页是同一张票。
+_PAGINATION_RE = re.compile(r"共\s*(\d+)\s*页")
+
+
+def pagination_marker(text: str) -> tuple[int, int] | None:
+    """页脚上的「共N页 第M页」→ ``(总页数, 本页页码)``；没有就返回 None。
+
+    只有**两样都在同一页上**才算数：「第3页」单独出现没有意义（页脚里
+    「第几页」也可能指别的），「共3页」也可能出现在别的上下文里。
+    """
+    total_match = _PAGINATION_RE.search(text or "")
+    if not total_match:
+        return None
+    total = int(total_match.group(1))
+    page_match = re.search(r"第\s*(\d+)\s*页", text or "")
+    if not page_match:
+        return None
+    page = int(page_match.group(1))
+    if page > total:
+        return None
+    return total, page
+
+
+def _lines_total(lines: List[InvoiceLine]) -> tuple[Decimal, Decimal]:
+    amount = sum((l.amount or 0 for l in lines), Decimal("0"))
+    tax = sum((l.tax or 0 for l in lines), Decimal("0"))
+    return amount, tax
+
+
+def _merge_page_group(group: List[Invoice]) -> Invoice:
+    """把同一张发票的几个页合成一张发票。
+
+    合成后的取值口径：
+
+    * **明细**：各页明细按页序接起来，再过一次折扣合并 —— 折扣行在票上
+      紧跟它所属的项目，而跨页时那个项目可能印在上一页的末尾，
+      只在页内合并会认不出归属。
+    * **价税合计**：取**与合并后明细对得上**的那一页；对不上就取最大的一张
+      （分页票的总计印在最后一页，它一定是最大的那个数）。
+    * **备注、开票人、大写金额**：总在最后那一页，空的就往后找。
+    """
+    base = group[0]
+    meta = replace(base.meta)
+    lines = merge_discount_lines([line for inv in group for line in inv.lines])
+    sum_amount, sum_tax = _lines_total(lines)
+    line_total = sum_amount + sum_tax
+
+    exact = None
+    largest = None
+    for inv in group:
+        total = inv.meta.total_incl_tax
+        if total is None:
+            continue
+        if largest is None or total > largest.meta.total_incl_tax:
+            largest = inv
+        if exact is None and abs(total - line_total) <= Decimal("0.05"):
+            exact = inv
+    best = exact or largest
+    if best is not None:
+        meta.total_excl_tax = best.meta.total_excl_tax
+        meta.total_tax = best.meta.total_tax
+        meta.total_incl_tax = best.meta.total_incl_tax
+    for inv in group:
+        if not meta.remark and inv.meta.remark:
+            meta.remark = inv.meta.remark
+        if not meta.issuer and inv.meta.issuer:
+            meta.issuer = inv.meta.issuer
+        if not meta.total_in_c_c and inv.meta.total_in_c_c:
+            meta.total_in_c_c = inv.meta.total_in_c_c
+
+    merged = Invoice(
+        page_index=base.page_index,
+        page_span=len(group),
+        meta=meta,
+        lines=lines,
+        raw_text="\n".join(inv.raw_text for inv in group),
+    )
+    # 每页自己的金额警告丢掉（比的是本页小计），其余警告留着
+    kept: List[str] = []
+    for inv in group:
+        for part in (inv.parse_warning or "").split("; "):
+            part = part.strip()
+            if part and not part.startswith(_AMOUNT_WARNING_PREFIX):
+                kept.append(part)
+    merged.parse_warning = "; ".join(kept)
+    if merged.meta.total_incl_tax is not None and merged.lines:
+        if abs(line_total - merged.meta.total_incl_tax) > Decimal("0.05"):
+            merged.parse_warning = "; ".join(filter(None, [
+                merged.parse_warning,
+                f"{_AMOUNT_WARNING_PREFIX}：明细 {sum_amount:.2f} + 税额 {sum_tax:.2f}"
+                f" = {line_total:.2f}，与价税合计 {merged.meta.total_incl_tax:.2f} 不一致。",
+            ]))
+    return merged
+
+
+def _group_is_one_invoice(group: List[Invoice]) -> bool:
+    """这几页是**一张发票**的续页，还是**同一张票传了两遍**？
+
+    两条判据，任意一条成立就当续页：
+
+    1. 票面自己标了「共N页 第M页」—— 最硬的证据；
+    2. 合并后的明细之和正好等于票上的价税合计 —— 说明这几页是**互补**的
+       （各出几行，加起来正好是整张票）。
+
+    两条都不成立就**不合并**：那样它们多半是同一张票传了两遍，
+    留着让原有的查重去报「重复发票号码」—— 查重没有被放宽。
+    """
+    for inv in group:
+        if pagination_marker(inv.raw_text):
+            return True
+    # 这里**刻意不**调用 merge_discount_lines：那个函数是原地改金额的
+    # （prev.amount += discount.amount），在这里先跑一遍、_merge_page_group
+    # 里再跑一遍，跨页的折扣行就会被**并两次** —— 金额凭空多出一截。
+    # 折扣合并只是把金额在行之间挪位置，**总和不变**，所以直接用原始行求和
+    # 得到的判据与合并后完全一样。
+    raw_lines = [line for inv in group for line in inv.lines]
+    sum_amount, sum_tax = _lines_total(raw_lines)
+    line_total = sum_amount + sum_tax
+    for inv in group:
+        total = inv.meta.total_incl_tax
+        if total is not None and abs(total - line_total) <= Decimal("0.05"):
+            return True
+    return False
+
+
+def _group_is_full(group: List[Invoice], marker: tuple[int, int] | None) -> bool:
+    """这一组已经凑齐了（该另起一组了）。
+
+    两种情形：
+
+    * 这一页自称「第1页」—— 那它是**另一张**票的第一页；
+    * 这一组已经有票面说的那么多页（共N页，凑满N页）—— 再加就是下一张了。
+
+    这条判断是「同一张票传两遍」不被误合并的关键：第二遍的第1页自称
+    「共3页 第1页」，于是另起一组，两组各合成一张发票，号码相同 ——
+    查重照旧报「重复发票号码」。
+    """
+    if not marker:
+        return False
+    total, page = marker
+    return page == 1 or len(group) >= total
+
+
+def _group_pages(invoices: List[Invoice]) -> List[List[Invoice]]:
+    """把**相邻、同号**的页分成组。"""
+    groups: List[List[Invoice]] = []
+    for inv in invoices:
+        no = inv.meta.invoice_no
+        marker = pagination_marker(inv.raw_text)
+        if groups and no and groups[-1][-1].meta.invoice_no == no \
+                and not _group_is_full(groups[-1], marker):
+            groups[-1].append(inv)
+        else:
+            groups.append([inv])
+    return groups
+
+
+def merge_invoice_pages(invoices: List[Invoice]) -> List[Invoice]:
+    """把**同一张发票的多个页**合成一张发票。
+
+    为什么需要：增值税电子发票的「分页」票会把一张发票拆成几页印，每页都
+    印着**同一个发票号码**、同一个买卖方，每页只有自己那几行明细，
+    价税合计只印在最后一页。解析层原来「一页一张发票」，于是 3 页的发票
+    被当成 3 张发票 —— 它们号码相同，于是「本次上传中有重复发票号码」
+    把整批拦下，用户看着一头雾水：明明只传了一张。
+
+    怎么分组：**相邻**且发票号码相同的页归成一组，凑满票面说的页数
+    （「共3页」）或遇到下一个「第1页」就另起一组。相邻 + 凑页数是判重
+    不被放宽的关键 —— 同一张票传两遍会分成两组，查重照旧报错。
+
+    组内还要再判一次是不是同一张票（见 ``_group_is_one_invoice``），
+    判不是就**不合并**。
+    """
+    if len(invoices) < 2:
+        return invoices
+    out: List[Invoice] = []
+    for group in _group_pages(invoices):
+        if len(group) == 1 or not _group_is_one_invoice(group):
+            out.extend(group)
+        else:
+            out.append(_merge_page_group(group))
+    return out
 
 
 def parse_pdf(pdf_path: str) -> List[Invoice]:

@@ -112,6 +112,68 @@ def test_期初解析与凭证导入共用同一套闸():
     assert uploads.unzipped_limit() == settings.import_max_unzipped_bytes
 
 
+# ------------------------------------------------- 容量契约（网关 vs 应用层）
+
+
+def _nginx_body_limit_bytes(conf_text: str) -> int:
+    """从 nginx 配置里读出 ``client_max_body_size`` 的字节数。
+
+    nginx 支持 k/m/g 后缀，这里只认配置文件里实际会用到的 m。
+    """
+    import re
+
+    m = re.search(r"client_max_body_size\s+(\d+)\s*([kmg])?\s*;", conf_text)
+    assert m, "配置里找不到 client_max_body_size —— 这条测试等于没跑"
+    value = int(m.group(1))
+    return value * {"k": 1024, "m": 1024 * 1024, "g": 1024 * 1024 * 1024}[m.group(2) or "m"]
+
+
+def _nginx_confs() -> list:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    return [root / "deploy" / "nginx" / "cwq.conf",
+            root / "deploy" / "nginx" / "acct.xins.live.conf"]
+
+
+def test_网关闸必须宽于应用层的合计闸():
+    """**网关那条先生效** —— 它小的时候，应用层那个更大的上限永远轮不到执行。
+
+    一次上传要穿过两道闸：nginx 的 ``client_max_body_size`` 限的是**整个请求体**，
+    应用层的合计闸限的是**这次上传的总字节数**。先拒的一定是网关，于是用户
+    看到的是一句 nginx 的 413（"Request Entity Too Large"），而配置里那个
+    「单次上限 50MB」成了一句没人能兑现的话。
+
+    这就是容量契约：网关必须比它服务的最大那一条更宽。
+    """
+    from app.core.config import settings
+
+    app_ceiling = max(settings.invoice_max_total_bytes, settings.import_max_bytes)
+    for conf in _nginx_confs():
+        limit = _nginx_body_limit_bytes(conf.read_text(encoding="utf-8"))
+        assert limit >= app_ceiling, (
+            f"{conf.name}: 网关只放 {limit} 字节，应用层却宣称能收 {app_ceiling} 字节 —— "
+            f"超出的那部分会先被 nginx 拒掉，应用层的上限形同虚设。"
+            f"调高应用上限时必须同步调高 client_max_body_size。"
+        )
+
+
+def test_页数闸必须够得上文件数闸():
+    """**文件数闸放到 300 也没用**，如果页数闸还留在 200。
+
+    多文件上传会先合并成一份 PDF 再解析（``invoice/storage.py merge_pdfs``），
+    合并后的总页数要过 ``invoice_max_pdf_pages``。一张发票至少一页 ——
+    页数闸低于文件数闸时，用户选满 N 个文件，最后一张照样被页数闸挡下来，
+    还报一句「请分成几批上传」，而界面上一句提示都没有。
+    """
+    from app.core.config import settings
+
+    assert settings.invoice_max_pdf_pages >= settings.invoice_max_files, (
+        f"文件数上限 {settings.invoice_max_files} 大于页数上限 {settings.invoice_max_pdf_pages}："
+        f"用户选满文件数也会被页数闸拦下，而提示说的是「分批」，不是「少传点」。"
+    )
+
+
 # --------------------------------------------------------------------- 动态
 
 

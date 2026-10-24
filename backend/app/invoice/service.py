@@ -720,6 +720,9 @@ def serialize_record(record: InvoiceRecord, subjects: dict[int, Subject] | None 
     return {
         "id": record.id,
         "page_index": record.page_index,
+        # 这张发票跨了几页（分页票合成后 >1）。界面上的「页码」列据此显示
+        # 成「1-3」—— 只给起始页的话，用户会以为第 2、3 页没被读进来。
+        "page_span": int(payload.get("page_span") or 1),
         "source_file": _text(payload.get("source_file")),
         "invoice_no": record.invoice_no or _text(meta.get("invoice_no")),
         "issue_date": record.issue_date.isoformat() if record.issue_date else _text(meta.get("issue_date")),

@@ -13,7 +13,8 @@
 import assert from 'node:assert/strict'
 
 import {
-  filesFromDataTransfer, humanBytes, isIgnoredRow, isPdfName, partitionFiles, skipNote,
+  DEFAULT_UPLOAD_LIMITS, filesFromDataTransfer, humanBytes, isIgnoredRow, isPdfName,
+  partitionFiles, skipNote,
 } from '../src/views/voucher/invoice_upload.js'
 
 const fake = (name, size = 1024, lastModified = 1) => ({ name, size, lastModified })
@@ -169,6 +170,22 @@ await t('KB / MB 两位小数', () => {
   assert.equal(humanBytes(512), '512 B')
   assert.equal(humanBytes(2048), '2.0 KB')
   assert.equal(humanBytes(5 * 1024 * 1024), '5.0 MB')
+})
+
+console.log('== 上传上限的兜底值 ==')
+// 真上限由后端 `GET /invoices/limits` 给，前端只在这之前用兜底值顶上。
+// 兜底值**偏小**才是问题：用户会在真上限到达之前就被前端拦下，
+// 而拦住他的不是真实契约，是一个还没更新的常量。所以它只能偏大。
+
+await t('给的是 300 个文件 / 50MB', () => {
+  assert.equal(DEFAULT_UPLOAD_LIMITS.maxFiles, 300)
+  assert.equal(DEFAULT_UPLOAD_LIMITS.maxTotalBytes, 50 * 1024 * 1024)
+})
+
+await t('兜底值不是同一个对象 —— 组件改它不会污染常量', () => {
+  const copy = { ...DEFAULT_UPLOAD_LIMITS }
+  copy.maxFiles = 1
+  assert.equal(DEFAULT_UPLOAD_LIMITS.maxFiles, 300)
 })
 
 console.log(`\n${pass} 通过，${fail} 失败`)
