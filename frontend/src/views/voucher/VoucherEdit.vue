@@ -31,14 +31,16 @@
            跨期间时月份大的在后。从列表带条件进来的话，就在**筛选结果集**里翻
            （条件原样带着，可以跨月跨年）；没带条件的在全账套里翻。
            插入/增加直接开一张新的。原来那个「增加分录」按钮去掉了 ——
-           分录靠回车往下加，不用专门去找按钮。 -->
-      <el-tooltip :content="neighbourScope"
-                  placement="bottom" :disabled="!neighbourScope">
-        <el-button-group>
-          <el-button :disabled="!prevId" @click="goNeighbour('prev')">前一张</el-button>
-          <el-button :disabled="!nextId" @click="goNeighbour('next')">后一张</el-button>
-        </el-button-group>
-      </el-tooltip>
+           分录靠回车往下加，不用专门去找按钮。
+           原来这里还挂着一个气泡，写着「全部凭证里的第 1634 / 2147 张」
+           （2026-10-24 用户打回）：那句话解释的是按钮**本来就在干的事**，
+           而按钮本身能不能点（:disabled）已经把「有没有前一张/后一张」说完了，
+           多这一句只是噪音 —— 跟「凭证页不摆说明条」那条规矩是同一件事。
+           所以这里只留按钮，不留气泡。 -->
+      <el-button-group>
+        <el-button :disabled="!prevId" @click="goNeighbour('prev')">前一张</el-button>
+        <el-button :disabled="!nextId" @click="goNeighbour('next')">后一张</el-button>
+      </el-button-group>
       <!-- 这四颗动作按钮（插入 / 增加 / 拆分 / 打印）挨得太开：
            Element Plus 给「相邻的按钮」加了 12px 左边距
            （.el-button + .el-button），工具条自己又有 8px 的缝，
@@ -317,8 +319,6 @@ const insertCtx = ref(null)
 // 前一张 / 后一张：带着列表筛选条件时翻结果集，没有条件时翻同期间
 const prevId = ref(null)
 const nextId = ref(null)
-// 翻的时候说清楚自己在结果集的第几张，免得以为按钮坏了
-const neighbourScope = ref('')
 // 当前正在录入的那一行，整行淡绿底：连续录入时眼睛得有个落点
 const activeRow = ref(null)
 // 鼠标正压着的那一行也算 —— 手扫到哪一行，那一行就变绿
@@ -1520,7 +1520,6 @@ async function loadNeighbour(seq) {
   if (!voucherId.value) {
     prevId.value = null
     nextId.value = null
-    neighbourScope.value = ''
     return
   }
   const myId = voucherId.value
@@ -1528,17 +1527,9 @@ async function loadNeighbour(seq) {
   if ((seq !== undefined && stale(seq)) || voucherId.value !== myId) return
   prevId.value = r.prev_id
   nextId.value = r.next_id
-  // 位置提示说清楚自己在**哪一套顺序**里的第几张，免得以为按钮坏了。
-  // 带筛选条件 → 筛选结果集里那张；不带 → 全账套的凭证序列里那张。
-  // 两套顺序都是**凭证号顺序**（期间内按号、跨期间按月份），跟列表
-  // 「凭证号顺序」那一档一致。
-  if (!Number.isFinite(r.index) || r.index < 0) {
-    neighbourScope.value = r.scope === 'filtered'
-      ? '这张不在当前筛选结果里' : ''
-  } else {
-    neighbourScope.value = (r.scope === 'filtered' ? '筛选结果' : '全部凭证')
-      + `里的第 ${r.index + 1} / ${r.total} 张`
-  }
+  // 响应里还有 index/total/scope（这套顺序里的第几张、总共几张），
+  // 前端不再用：那句话在页面上被用户打回（2026-10-24），后端这份数据
+  // 留着不碍事（接口契约与性能用例都指着它），只是不再往页面上摆。
 }
 
 /** load() 的代次标记。
@@ -1604,7 +1595,6 @@ function resetForm() {
   failedSig.value = ''
   prevId.value = null
   nextId.value = null
-  neighbourScope.value = ''
   subjectRefs.clear()
   rowEls.clear()
   sumRefs.clear()
@@ -1742,7 +1732,6 @@ async function load() {
     ensureRows(4)
     prevId.value = null
     nextId.value = null
-    neighbourScope.value = ''
   }
 }
 
