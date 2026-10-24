@@ -739,8 +739,11 @@ def _input_entries(
 
     **进项税额不单列。** 用户是小微企业，不做进项抵扣，所以发票上的税额没有
     对应的资产 —— 按用户约定整笔并入**第一条明细行**，即价税合计直接进成本费用。
-    落在哪一行是要看出来的，所以摘要标「含税」：复核时一眼能看出这笔费用为什么
-    比发票明细那行大，而不是以为录错了。
+
+    **摘要就是发票上印的项目名，不自动加「（含税）」**（用户口径：2026-10-24）。
+    摘要要回答的是「这笔钱买了什么」，往里塞系统自己加的标记，核对发票时
+    反而对不上 —— 发票上印的项目名没有这几个字。税额并到了哪一行，从明细表的
+    「税额」列和贷方价税合计看得出来。
 
     三条容易写错的：
 
@@ -756,13 +759,15 @@ def _input_entries(
     """
     entries: list[dict[str, Any]] = []
     for position, item in enumerate(_net_items(items)):
+        # 税额只加在第一条**非零**明细行上（见上面的第 3 条）。
         takes_tax = bool(tax) and position == 0
         amount = item["amount"] + tax if takes_tax else item["amount"]
         entries.append({
             "subject_id": item["subject_id"],
             "direction": "DEBIT",
             "amount": _decimal_string(amount),
-            "summary": item["summary"] + ("（含税）" if takes_tax else ""),
+            # 摘要原样用发票上的项目名 —— 不追加「（含税）」之类系统标记。
+            "summary": item["summary"],
         })
     entries.append({
         "subject_id": settlement_subject_id,

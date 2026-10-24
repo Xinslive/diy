@@ -57,12 +57,12 @@ def test_净零的项目不产生分录():
     )
     assert all(_d(e["amount"]) != 0 for e in entries), "不该留下 0 金额的分录"
     assert [e["summary"] for e in entries if e["direction"] == "DEBIT"] == [
-        "*水果*黄金蜜露（含税）", "*水果*台农芒果"], "净零的那项不该占一行"
+        "*水果*黄金蜜露", "*水果*台农芒果"], "净零的那项不该占一行"
     assert _balances(entries)
 
 
 def test_净零项排在第一条时税额落到第一条非零行上():
-    """「含税」那一行得是**真正会成行**的那行。
+    """并了税额的那一行得是**真正会成行**的那行。
 
     税额并的是第一条明细行；净零行不成行，税额要是并到它身上，
     这张票的借方就永远少一笔，凭证直接不成立。
@@ -76,7 +76,7 @@ def test_净零项排在第一条时税额落到第一条非零行上():
     )
     debits = [e for e in entries if e["direction"] == "DEBIT"]
     assert len(debits) == 1, f"只有一条借方，实际 {debits}"
-    assert debits[0]["summary"] == "*水果*黄金蜜露（含税）", "含税落在唯一成行的明细上"
+    assert debits[0]["summary"] == "*水果*黄金蜜露", "并了税额的仍是发票上的项目名"
     assert debits[0]["amount"] == "31.61"
     assert _balances(entries)
 

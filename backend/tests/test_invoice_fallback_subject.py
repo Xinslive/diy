@@ -277,7 +277,7 @@ def test_真实发票PDF_走兜底不报错(db, store, book, subjects, admin_use
     entries = preview["invoices"][0]["resolution"]["entries"]
     debit = next(e for e in entries if e["direction"] == "DEBIT")
     assert debit["subject_id"] == subjects["560201"].id
-    # 摘要用发票上的项目名（进项税额并入第一条明细行，所以摘要带「含税」标记）
+    # 摘要用发票上的项目名（进项税额并入第一条明细行，摘要不加任何系统标记）
     #
     # 「餐费」后面的「2」是**数量**，PDF 文字层把它粘在了项目名后面 ——
     # 摘要里不该有它。

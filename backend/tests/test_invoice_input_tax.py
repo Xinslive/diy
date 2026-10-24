@@ -107,8 +107,26 @@ def test_同科目的两行也各占一条借方():
     assert _balances(entries)
 
 
-def test_无税额发票不标含税():
-    """免税/零税率发票没有税额可并入，摘要不该挂一个空的「含税」。"""
+def test_摘要就是发票上的项目名():
+    """用户口径：摘要不自动加「（含税）」。
+
+    摘要回答的是「这笔钱买了什么」。发票上印的项目名里没有「（含税）」
+    三个字，系统自己加上去，核对发票时反而对不上。
+    """
+    entries = service._input_entries(
+        items=_items((1, "1000.00", "*油料*粮油米面"), (2, "2000.00", "*美容护肤品*日用杂品")),
+        tax=_d("60.00"),
+        settlement_subject_id=100,
+        total=_d("3060.00"),
+        summary="发票 XX",
+    )
+    debits = [e for e in entries if e["direction"] == "DEBIT"]
+    assert [e["summary"] for e in debits] == ["*油料*粮油米面", "*美容护肤品*日用杂品"]
+    assert all("含税" not in e["summary"] for e in entries), "摘要里不该有系统加的标记"
+
+
+def test_无税额发票的摘要也不多一个字():
+    """免税/零税率发票没有税额可并入，摘要照样只是项目名。"""
     entries = service._input_entries(
         items=_items((1, "100.00", "办公用品")),
         tax=_d("0.00"),
@@ -120,8 +138,8 @@ def test_无税额发票不标含税():
     assert _balances(entries)
 
 
-def test_并入税额的行摘要标含税():
-    """复核的人要能看出这笔费用为什么比发票明细那行大。"""
+def test_税额并到哪一行不影响摘要():
+    """税额并进第一条明细行，摘要两行都一样干净。"""
     entries = service._input_entries(
         items=_items((1, "1000.00", "办公用品"), (2, "2000.00", "房租")),
         tax=_d("60.00"),
@@ -129,8 +147,10 @@ def test_并入税额的行摘要标含税():
         total=_d("3060.00"),
         summary="发票 XX",
     )
-    marked = {e["subject_id"] for e in entries if e["summary"].endswith("（含税）")}
-    assert marked == {1}, f"只有第一条该标含税，实际 {marked}"
+    debits = [e for e in entries if e["direction"] == "DEBIT"]
+    assert [e["amount"] for e in debits] == ["1060.00", "2000.00"], "税只加第一条"
+    assert [e["summary"] for e in debits] == ["办公用品", "房租"]
+    assert _balances(entries)
 
 
 def test_明细摘要用发票项目名():
