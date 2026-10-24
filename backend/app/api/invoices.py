@@ -227,7 +227,8 @@ def get_invoice_batch(batch_id: int, book: Book = Depends(get_my_book), db: Sess
     batch = _batch(book, db, batch_id)
     records = db.scalars(select(InvoiceRecord).where(InvoiceRecord.batch_id == batch.id).order_by(InvoiceRecord.page_index)).all()
     counts = service.status_counts(db, [batch.id]).get(batch.id, {})
-    return {**service.batch_summary(batch, counts), "invoices": [service.serialize_record(record) for record in records]}
+    subjects = service.subjects_by_id(db, book.id, records)
+    return {**service.batch_summary(batch, counts), "invoices": [service.serialize_record(record, subjects) for record in records]}
 
 
 @router.post("/batches/{batch_id}/preview")

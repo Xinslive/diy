@@ -64,6 +64,23 @@ export function isIgnoredRow(row, overrides = {}) {
   return row?.status === 'IGNORED'
 }
 
+/**
+ * 这一行是不是**已经生成凭证**（已入账）。
+ *
+ * 为什么前端也要判：服务端对已入账的记录**直接跳过重算**
+ * （`service._build_preview` 里那条「已入账的不重算」），所以对一张
+ * 已生成的发票点「忽略这张」、改科目、改类型，**点了什么也不会发生**。
+ *
+ * 那就不该把这些控件摆出来 —— 摆一个按了没反应的按钮，用户只会以为
+ * 系统坏了，而不是「这一张早就定下来了」。
+ *
+ * 判定只看服务端状态：已入账的记录不会进 overrides（它压根不参与重算），
+ * 所以这里没有本地覆盖可看。
+ */
+export function isCommittedRow(row) {
+  return row?.status === 'COMMITTED'
+}
+
 export function humanBytes(n) {
   const value = Number(n) || 0
   if (value < 1024) return `${value} B`

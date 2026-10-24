@@ -186,6 +186,36 @@ def _ensure_leaf_subjects(db: Session, book_id: int, ids: list[int | None], labe
     return by_id
 
 
+def subjects_by_id(db: Session, book_id: int, records: Iterable[InvoiceRecord]) -> dict[int, Subject]:
+    """把一批记录里用到的科目 id 一次性查出来。
+
+    为什么要有：界面上「凭证预览」要显示「借 6602 管理费用 12.00」这样
+    的话，光有 ``subject_id`` 不够 —— 得把编码和名称一起带出去。
+
+    以前只有 ``_build_preview`` 内部那条路径带着科目表，批次详情接口
+    (``GET /batches/{id}``) 和预览接口的返回没带，于是界面上那串科目名
+    一直是空的，看着像「这笔钱没记到科目上」。
+
+    一次查完，不按记录逐个查 —— 一个批次几百张发票，逐个查就是几百次
+    数据库往返。
+    """
+    wanted: set[int] = set()
+    for record in records:
+        resolution = (record.payload or {}).get("resolution") or {}
+        for item in list(resolution.get("entries") or []) + list(resolution.get("line_resolution") or []):
+            value = item.get("subject_id")
+            if value is None:
+                continue
+            try:
+                wanted.add(int(value))
+            except (TypeError, ValueError):
+                continue
+    if not wanted:
+        return {}
+    rows = db.scalars(select(Subject).where(Subject.book_id == book_id, Subject.id.in_(wanted))).all()
+    return {row.id: row for row in rows}
+
+
 def _default_config(db: Session, book_id: int) -> dict[str, Any]:
     """尚未配置时的形态：**科目一律为空**，只带上身份信息。
 
@@ -793,6 +823,15 @@ def serialize_record(record: InvoiceRecord, subjects: dict[int, Subject] | None 
     for entry in resolution.get("entries") or []:
         subject = subjects.get(entry.get("subject_id"))
         entries.append({**entry, "subject_code": subject.code if subject else "", "subject_name": subject.name if subject else ""})
+    # 逐项的科目也要带上编码和名称：界面上「入账科目」那一列显示的是
+    # **最终记到哪个科目**，已入账的发票不再能改，只能显示结果。
+    line_resolution = []
+    for item in resolution.get("line_resolution") or []:
+        subject = subjects.get(item.get("subject_id"))
+        line_resolution.append({**item, "subject_code": subject.code if subject else "", "subject_name": subject.name if subject else ""})
+    resolved = {**resolution, "entries": entries}
+    if "line_resolution" in resolution:
+        resolved["line_resolution"] = line_resolution
     return {
         "id": record.id,
         "page_index": record.page_index,
@@ -808,7 +847,7 @@ def serialize_record(record: InvoiceRecord, subjects: dict[int, Subject] | None 
         "errors": list(record.errors or []),
         "meta": meta,
         "lines": lines,
-        "resolution": {**resolution, "entries": entries},
+        "resolution": resolved,
         "voucher_id": record.voucher_id,
     }
 
@@ -1041,6 +1080,7 @@ def preview_batch(db: Session, batch: InvoiceBatch, overrides: dict[str, dict] |
     db.commit()
     records = db.scalars(select(InvoiceRecord).where(InvoiceRecord.batch_id == batch.id).order_by(InvoiceRecord.page_index)).all()
     sources = sorted({_text((record.payload or {}).get("source_file")) for record in records} - {""})
+    subjects = subjects_by_id(db, batch.book_id, records)
     return {
         # 键是 ``id``，和 batch_summary / GET /batches/{id} 一致。
         #
@@ -1060,7 +1100,7 @@ def preview_batch(db: Session, batch: InvoiceBatch, overrides: dict[str, dict] |
         "committed_count": batch.committed_count or 0,
         "ocr_used": batch.ocr_used,
         "sources": sources,
-        "invoices": [serialize_record(record) for record in records],
+        "invoices": [serialize_record(record, subjects) for record in records],
     }
 
 

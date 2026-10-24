@@ -293,8 +293,23 @@
                     </tr>
                   </tbody>
                 </table>
-                <template v-else>
-                <div class="detail-toolbar">
+                <!--
+                  这里用**显式的 v-if**而不是 v-else。
+
+                  上一版在这张原生表格后面挂了一个 v-else，结果 v-else 认的
+                  是**紧挨着的那张表格**，不是原来那段「已忽略」提示 ——
+                  v-else 认的是相邻元素，中间插了东西就认错。被忽略的行在
+                  开关关着时反而摊出了整排科目下拉。
+                -->
+                <template v-if="!isIgnored(row)">
+                <!--
+                  已入账（已生成）的发票：**这一排控件一个都不能用**。
+                  服务端对已生成的记录直接跳过重算，overrides 一律不生效 ——
+                  改发票类型、改结算科目、点「忽略这张」，点了都不会发生。
+
+                  那就不摆。摆一排按了没反应的控件，用户只会以为系统坏了。
+                -->
+                <div v-if="!isCommitted(row)" class="detail-toolbar">
                   <el-form inline size="small">
                     <el-form-item label="发票类型">
                       <el-select :model-value="invoiceTypeFor(row)" :disabled="!store.canWrite" style="width: 120px" @update:model-value="(v) => setInvoiceType(row, v)">
@@ -366,13 +381,24 @@
                   <el-table-column prop="tax" label="税额" width="100" align="right" />
                   <el-table-column prop="tax_rate" label="税率" width="80" align="center" />
                   <el-table-column label="入账科目" min-width="230">
+                    <!--
+                      注意这里的 ``row``：外层展开列的参数是发票记录，
+                      内层 ``{ row: line }`` 只是把内层的行改名成了 line，
+                      所以 ``row`` 仍然是**那张发票**（不是发票里的某一行）。
+                    -->
                     <template #default="{ row: line, $index }">
+                      <!--
+                        已入账的发票改不了科目了（服务端跳过重算），
+                        摆个下拉框只会让人以为还能改 —— 直接显示
+                        「编码 名称」，这一格保持只读。
+                      -->
+                      <span v-if="isCommitted(row)" class="subject-text">{{ lineSubjectText(row, $index) }}</span>
                       <!--
                         下拉**不占满**整格：占满了「兜底」标记就被挤到第二行，
                         一个格子里两行字看着是散的。留出标记的位置，两样东西
                         同一行。
                       -->
-                      <el-select :model-value="lineSubjectFor(row, $index)" :disabled="!store.canWrite" filterable clearable :persistent="false" style="width: 160px" @update:model-value="(v) => setLineSubject(row, $index, v)">
+                      <el-select v-else :model-value="lineSubjectFor(row, $index)" :disabled="!store.canWrite" filterable clearable :persistent="false" style="width: 160px" @update:model-value="(v) => setLineSubject(row, $index, v)">
                         <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                       </el-select>
                       <!--
@@ -390,7 +416,7 @@
                 <div class="entry-preview" v-if="row.resolution?.entries?.length">
                   <span class="muted">凭证预览：</span>
                   <span v-for="(entry, index) in row.resolution.entries" :key="index" class="entry-chip">
-                    {{ entry.direction === 'DEBIT' ? '借' : '贷' }} {{ entry.subject_code }} {{ entry.subject_name }} {{ entry.amount }}
+                    {{ entry.direction === 'DEBIT' ? '借' : '贷' }} {{ entrySubjectText(entry) }} {{ entry.amount }}
                     <span v-if="entry.summary" class="entry-summary">{{ entry.summary }}</span>
                   </span>
                 </div>
@@ -441,7 +467,7 @@ import { Check, FolderOpened, Plus, Refresh, Upload } from '@element-plus/icons-
 import * as invoiceApi from '@/api/invoice'
 import * as subjectApi from '@/api/subject'
 import {
-  DEFAULT_UPLOAD_LIMITS, filesFromDataTransfer, humanBytes, isIgnoredRow, partitionFiles, skipNote,
+  DEFAULT_UPLOAD_LIMITS, filesFromDataTransfer, humanBytes, isCommittedRow, isIgnoredRow, partitionFiles, skipNote,
 } from './invoice_upload'
 import { formatDateTime } from '@/utils/datetime'
 import { useSessionStore } from '@/stores/session'
@@ -573,6 +599,28 @@ function invoiceRowClass({ row }) { return row.status === 'REJECTED' ? 'invoice-
 function lineName(line) { return line?.display_name || line?.name || '' }
 // 这行是不是落到了兜底科目上（服务端算的，不是前端猜的）。
 function isFallbackLine(row, index) { return row.resolution?.line_resolution?.[index]?.fallback === true }
+// 科目 id → 「编码 名称」。
+//
+// 服务端返回的 resolution 里已经带了编码和名称；这里再兜一层，
+// 是因为科目表按年度各有一份（同一套编码、两套 id），跨年度时前端
+// 手里的科目表可能对不上 —— 对不上就只显示 id，不编一个名字上去。
+function subjectText(id) {
+  if (id === null || id === undefined || id === '') return ''
+  const hit = subjects.value.find(item => item.id === id)
+  return hit ? subjectLabel(hit) : `科目 #${id}`
+}
+// 某一行最终记到了哪个科目（已入账的发票只能显示结果，不能改）。
+function lineSubjectText(row, index) {
+  const item = row.resolution?.line_resolution?.[index]
+  if (!item) return ''
+  if (item.subject_code) return `${item.subject_code} ${item.subject_name || ''}`.trim()
+  return subjectText(item.subject_id)
+}
+// 凭证预览里那条分录的科目：服务端给了就用服务端的，没给再查本地科目表。
+function entrySubjectText(entry) {
+  if (entry?.subject_code) return `${entry.subject_code} ${entry.subject_name || ''}`.trim()
+  return subjectText(entry?.subject_id)
+}
 // 这一行**实际入账**的金额：服务端算好的（含与发票合计对齐的那几分钱）。
 function lineAmount(row, index) {
   const effective = row.resolution?.line_amounts?.[String(index)]
@@ -616,6 +664,8 @@ async function loadBatch(row) {
 }
 function newBatch() { batch.value = null; clearFiles(); Object.keys(overrides).forEach(key => delete overrides[key]) }
 function isIgnored(row) { return isIgnoredRow(row, overrides) }
+// 已入账（已生成）的发票：服务端跳过重算，这一行**没有可执行的操作**。
+function isCommitted(row) { return isCommittedRow(row) }
 function toggleIgnored(row) { ensureOverride(row).ignored = !isIgnored(row) }
 function overridePayload() { return JSON.parse(JSON.stringify(overrides)) }
 async function recalculate() {
@@ -691,6 +741,8 @@ onMounted(loadAll)
 .picked-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .skipped-note { padding: 6px 10px; border-top: 1px dashed #e4e7ed; color: #8a6d1f; font-size: 12px; }
 .upload-footer { justify-content: space-between; margin-top: 14px; }
+/* 已入账的行里，「入账科目」是只读文字，不是下拉框 */
+.subject-text { color: #303133; font-size: 12px; }
 .ignored-note { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px; background: #f4f5f7; color: #475467; font-size: 12px; }
 .result-title { gap: 10px; }
 .mb { margin-bottom: 12px; }
