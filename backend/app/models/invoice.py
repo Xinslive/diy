@@ -27,6 +27,17 @@ class InvoiceConfig(Base, TimestampMixin):
     # 对不上才发现。留空就是「还没配」，预览时明确报「未配置结算科目」。
     input_credit_subject_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subject.id", ondelete="RESTRICT"))
     output_debit_subject_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subject.id", ondelete="RESTRICT"))
+    # 兜底科目：没命中任何科目规则的发票项目落到这里。
+    #
+    # **分进项/销项两个**，不合并成一个：进项兜底是成本费用，销项兜底是收入，
+    # 混用必有一边记错科目。
+    #
+    # 为什么要兜底：进项发票上的项目名千奇百怪（"*油料*粮油米面" 这种带
+    # 税局分类前缀的），用户不可能把见过的项目名都配成规则。配不出来的那些
+    # 以前是**整张发票报错、整批都生成不了** —— 一张怪项目就把一叠正常
+    # 发票全堵住。兜底让它们先落到一个待核对的科目上，账面先通得过。
+    input_fallback_subject_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subject.id", ondelete="RESTRICT"))
+    output_fallback_subject_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subject.id", ondelete="RESTRICT"))
 
 
 class InvoiceRule(Base, TimestampMixin):

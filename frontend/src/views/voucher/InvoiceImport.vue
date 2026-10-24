@@ -19,7 +19,7 @@
           <template #header>
             <div class="section-head">
               <span>自动制证配置</span>
-              <span class="muted">本单位税号用于自动判断进项/销项；科目需自行选择，不预填。进项发票不单列税额，价税合计直接计入成本费用</span>
+              <span class="muted">本单位税号用于自动判断进项/销项；科目需自行选择，不预填。进项发票不单列税额，价税合计直接计入成本费用。兜底科目：没命中规则的项目落到它上面</span>
             </div>
           </template>
           <!--
@@ -28,10 +28,15 @@
             换行之后按钮又落在第二行飘着，整块看着是散的。固定 label-width 加
             两列，输入框自然成一条线。
           -->
+          <!--
+            标签一律四个字（单位税号 / 销项税额 / 进项贷方 / 销项借方 /
+            进项兜底 / 销项兜底），label-width 92 刚好装下 —— 六个字的
+            「进项兜底科目」会被挤成两行，标签和输入框的起点就错开了。
+          -->
           <el-form :model="config" label-width="92px" class="invoice-config-form">
             <el-row :gutter="'0 28'">
               <el-col :xs="24" :sm="12">
-                <el-form-item label="本单位税号">
+                <el-form-item label="单位税号">
                   <el-input v-model="config.taxpayer_id" :disabled="!store.canWrite" placeholder="用于判断发票类型" />
                 </el-form-item>
               </el-col>
@@ -52,6 +57,25 @@
               <el-col :xs="24" :sm="12">
                 <el-form-item label="销项借方">
                   <el-select v-model="config.output_debit_subject_id" :disabled="!store.canWrite" filterable clearable>
+                    <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
+                  </el-select>
+                </el-form-item>
+              </el-col>
+              <!--
+                兜底科目：没命中任何科目规则的发票项目落到这里。
+                分进项/销项两个 —— 进项兜底记成本费用、销项兜底记收入，
+                混用必有一边记错。留空 = 不兜底（配不出来的项目仍然报错）。
+              -->
+              <el-col :xs="24" :sm="12">
+                <el-form-item label="进项兜底">
+                  <el-select v-model="config.input_fallback_subject_id" :disabled="!store.canWrite" filterable clearable placeholder="未配置则报错">
+                    <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
+                  </el-select>
+                </el-form-item>
+              </el-col>
+              <el-col :xs="24" :sm="12">
+                <el-form-item label="销项兜底">
+                  <el-select v-model="config.output_fallback_subject_id" :disabled="!store.canWrite" filterable clearable placeholder="未配置则报错">
                     <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                   </el-select>
                 </el-form-item>
@@ -151,7 +175,7 @@
             </div>
           </template>
           <el-alert type="info" :closable="false" show-icon class="rule-help">
-            同一优先级下取更长关键词；仍然冲突会在预览中标红，不会静默猜科目。未命中规则的发票不能确认生成凭证。
+            同一优先级下取更长关键词；仍然冲突会在预览中标红，不会静默猜科目。没命中规则的项目落到「自动制证配置」里的兜底科目（进项/销项各一个），没配兜底时不能确认生成凭证。
           </el-alert>
           <el-table :data="rules" size="small" border>
             <el-table-column label="匹配对象" width="110">
@@ -249,22 +273,50 @@
                 </div>
                 <el-table :data="row.lines" size="small" border class="line-table">
                   <el-table-column type="index" label="#" width="48" />
-                  <el-table-column prop="name" label="发票项目" min-width="260" show-overflow-tooltip />
-                  <el-table-column prop="amount" label="不含税金额" width="120" align="right" />
+                  <!--
+                    显示 display_name（发票上印的项目名，不含粘在后面的规格型号/
+                    数量），规则仍按 name 匹配 —— 见 text_parser 的说明。
+                  -->
+                  <el-table-column label="发票项目" min-width="260" show-overflow-tooltip>
+                    <template #default="{ row: line }">{{ lineName(line) }}</template>
+                  </el-table-column>
+                  <!--
+                    金额显示的是**实际入账**的那个数（resolution.line_amounts），
+                    不是 payload 里的原数 —— 两者可能差在最后一项上那几分钱
+                    （为了和发票合计对齐）。显示原数会让人以为凭证算错了。
+                  -->
+                  <el-table-column label="不含税金额" width="120" align="right">
+                    <template #default="{ row: line, $index }">{{ lineAmount(row, $index) }}</template>
+                  </el-table-column>
                   <el-table-column prop="tax" label="税额" width="100" align="right" />
                   <el-table-column prop="tax_rate" label="税率" width="80" align="center" />
                   <el-table-column label="入账科目" min-width="230">
                     <template #default="{ row: line, $index }">
-                      <el-select :model-value="lineSubjectFor(row, $index)" :disabled="!store.canWrite" filterable clearable style="width: 100%" @update:model-value="(v) => setLineSubject(row, $index, v)">
+                      <!--
+                        下拉**不占满**整格：占满了「兜底」标记就被挤到第二行，
+                        一个格子里两行字看着是散的。留出标记的位置，两样东西
+                        同一行。
+                      -->
+                      <el-select :model-value="lineSubjectFor(row, $index)" :disabled="!store.canWrite" filterable clearable style="width: 160px" @update:model-value="(v) => setLineSubject(row, $index, v)">
                         <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                       </el-select>
+                      <!--
+                        落到兜底科目的行要标出来：它是「先记着、等人核对」，
+                        不是「已经对了」。不标出来的话，界面上看不出哪几行是
+                        系统替用户猜的。
+                      -->
+                      <el-tag v-if="isFallbackLine(row, $index)" size="small" type="warning" class="fallback-tag">兜底</el-tag>
                     </template>
                   </el-table-column>
                 </el-table>
+                <div class="rounding-note" v-if="row.resolution?.rounding">
+                  最后一项已按发票合计调整 {{ row.resolution.rounding }}，各项目金额之和与发票金额一致。
+                </div>
                 <div class="entry-preview" v-if="row.resolution?.entries?.length">
                   <span class="muted">凭证预览：</span>
                   <span v-for="(entry, index) in row.resolution.entries" :key="index" class="entry-chip">
                     {{ entry.direction === 'DEBIT' ? '借' : '贷' }} {{ entry.subject_code }} {{ entry.subject_name }} {{ entry.amount }}
+                    <span v-if="entry.summary" class="entry-summary">{{ entry.summary }}</span>
                   </span>
                 </div>
                 </template>
@@ -325,7 +377,15 @@ const committing = ref(false)
 const previewing = ref(false)
 const savingConfig = ref(false)
 const savingRule = ref(false)
-const config = reactive({ taxpayer_id: '', output_tax_subject_id: null, input_credit_subject_id: null, output_debit_subject_id: null })
+// 兜底科目也在这里：saveConfig 整个 config 提交，少一个字段就等于把那一项清空。
+const config = reactive({
+  taxpayer_id: '',
+  output_tax_subject_id: null,
+  input_credit_subject_id: null,
+  output_debit_subject_id: null,
+  input_fallback_subject_id: null,
+  output_fallback_subject_id: null,
+})
 const overrides = reactive({})
 const ruleVisible = ref(false)
 const ruleForm = reactive({ match_type: 'SELLER', invoice_type: 'BOTH', keyword: '', subject_id: null, priority: 0, active: true })
@@ -399,6 +459,15 @@ function setTaxSubject(row, value) { ensureOverride(row).tax_subject_id = value 
 function setSettlementSubject(row, value) { ensureOverride(row).settlement_subject_id = value }
 function setLineSubject(row, index, value) { ensureOverride(row).line_subjects[String(index)] = value }
 function invoiceRowClass({ row }) { return row.status === 'REJECTED' ? 'invoice-row-bad' : '' }
+// 发票上印的项目名：display_name 是干净的（规格型号/数量没粘进来），没有就退回 name。
+function lineName(line) { return line?.display_name || line?.name || '' }
+// 这行是不是落到了兜底科目上（服务端算的，不是前端猜的）。
+function isFallbackLine(row, index) { return row.resolution?.line_resolution?.[index]?.fallback === true }
+// 这一行**实际入账**的金额：服务端算好的（含与发票合计对齐的那几分钱）。
+function lineAmount(row, index) {
+  const effective = row.resolution?.line_amounts?.[String(index)]
+  return effective ?? row.lines?.[index]?.amount ?? ''
+}
 
 async function loadAll() {
   if (!store.bookId) return
@@ -449,7 +518,9 @@ async function commit() {
   try { await invoiceApi.commitBatch(store.bookId, batch.value.id); ElMessage.success('凭证已生成'); await loadAll(); batch.value = null } finally { committing.value = false }
 }
 async function discard() {
-  await ElMessageBox.confirm('作废后本批次不会生成凭证，但原始 PDF 仍保留在处理历史中。确认作废吗？', '作废批次', { type: 'warning' })
+  await ElMessageBox.confirm(
+    '作废后本批次不会生成凭证，<strong>发票记录与原始 PDF 会一并删除</strong>（不保留原文件），省下磁盘空间。历史里仍能看到这批曾经传过。确认作废吗？',
+    '作废批次', { type: 'warning', dangerouslyUseHTMLString: true })
   await invoiceApi.discardBatch(store.bookId, batch.value.id)
   ElMessage.success('批次已作废'); newBatch(); await loadAll()
 }
@@ -507,6 +578,9 @@ onMounted(loadAll)
 .invoice-errors { margin: 10px 0; padding: 8px 10px; border-left: 3px solid #d93025; background: #fff5f4; color: #b42318; font-size: 12px; line-height: 1.8; }
 .line-table { margin-top: 8px; }
 .entry-preview { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; align-items: center; font-size: 12px; }
+.entry-summary { color: #667085; }
+.rounding-note { margin-top: 8px; font-size: 12px; color: #b45309; }
+.fallback-tag { margin-left: 6px; }
 .entry-chip { padding: 4px 7px; border: 1px solid #dfe6ef; background: #f8fafc; color: #344054; }
 :deep(.invoice-row-bad) { background: #fff5f4; }
 @media (max-width: 900px) {

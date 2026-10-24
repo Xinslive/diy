@@ -56,6 +56,15 @@ dl.mjs
 # 同一个道理适用于下面的 ``/plugins/``。
 /data/
 
+# 开发环境里后端进程的 CWD 是 ``backend/``，所以 ``data/invoices``（发票原件
+# 与解析结果，含购销方税号）落在 ``backend/data/invoices``。上面那条
+# ``/data/`` 是**根锚定**的，命中不到这里 —— 于是那几份 PDF 一直挂在
+# ``git status`` 里等着被 ``git add .`` 顺手带走。
+#
+# 只钉这一条具体路径，不钉 ``backend/data/``：那个目录在别的部署形态下
+# 是**源码目录**，整个目录忽略掉会让人加进去的文件凭空消失（见上面那段）。
+/backend/data/invoices/
+
 # 本地构建与演练产物：隔离浏览器演练的截图/跟踪产物（output/playwright/），
 # 以及 plugin_package.py --output 打出来的 .cwp 安装包（output/plugins/）。
 # 和上面的 .shots/ 一样：它们是「某一次构建或验证当时产出了什么」，不是源码，

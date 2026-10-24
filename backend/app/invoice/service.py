@@ -64,6 +64,10 @@ CONFIG_SUBJECT_KEYS = (
     "output_tax_subject_id",
     "input_credit_subject_id",
     "output_debit_subject_id",
+    # 兜底科目也在这张表里：它同样要校验「属于本账套、末级、启用」，
+    # 校验漏了就会把发票记到一个停用科目上。
+    "input_fallback_subject_id",
+    "output_fallback_subject_id",
 )
 
 
@@ -205,6 +209,8 @@ def get_config(db: Session, book_id: int) -> dict[str, Any]:
         "output_tax_subject_id": config.output_tax_subject_id,
         "input_credit_subject_id": config.input_credit_subject_id,
         "output_debit_subject_id": config.output_debit_subject_id,
+        "input_fallback_subject_id": config.input_fallback_subject_id,
+        "output_fallback_subject_id": config.output_fallback_subject_id,
     }
 
 
@@ -319,17 +325,29 @@ def _rule_matches(rule: InvoiceRule, invoice_type: str, counterparty: str, item:
     return bool(item) and keyword in item.casefold()
 
 
-def _resolve_rule(rules: list[InvoiceRule], invoice_type: str, counterparty: str, item: str) -> tuple[int | None, str | None]:
+def _resolve_rule(rules: list[InvoiceRule], invoice_type: str, counterparty: str, item: str) -> tuple[int | None, str | None, str]:
+    """按规则给一个发票项目找科目。
+
+    返回 ``(科目 id, 原因, 命中类型)``，命中类型只有三种：
+
+    * ``matched`` —— 命中了规则，科目就是规则里配的那个；
+    * ``unmatched`` —— 一条规则都没命中（**可以走兜底科目**）；
+    * ``conflict`` —— 命中了多条同优先级规则，且它们指向不同科目。
+
+    「没匹配上」与「冲突」必须分开。没匹配上是**用户还没配**，可以兜底；
+    冲突是**规则配重了**（同一个关键词两个科目），兜底会把配错悄悄盖住，
+    用户永远不知道自己写重了。所以冲突仍然报错。
+    """
     matched = [r for r in rules if _rule_matches(r, invoice_type, counterparty, item)]
     if not matched:
-        return None, "没有命中科目规则"
+        return None, "没有命中科目规则", "unmatched"
     matched.sort(key=lambda rule: (rule.priority, len(rule.keyword)), reverse=True)
     top = matched[0]
     tied = [rule for rule in matched if (rule.priority, len(rule.keyword)) == (top.priority, len(top.keyword))]
     subject_ids = {rule.subject_id for rule in tied}
     if len(subject_ids) > 1:
-        return None, "多条同优先级规则命中不同科目：" + "、".join(rule.keyword for rule in tied)
-    return top.subject_id, None
+        return None, "多条同优先级规则命中不同科目：" + "、".join(rule.keyword for rule in tied), "conflict"
+    return top.subject_id, None, "matched"
 
 
 def _override(record: InvoiceRecord, overrides: dict[str, dict]) -> dict[str, Any]:
@@ -410,6 +428,14 @@ def _build_preview(
             problems.append(record.parse_warning)
 
         counterparty = _counterparty(meta, invoice_type)
+        # 兜底科目分进项/销项：进项兜底记成本费用、销项兜底记收入，
+        # 混用必有一边记错。UNKNOWN 不给兜底 —— 那张发票本来就要人工判定
+        # 进项/销项，判定完自然会走对应的那一列。
+        fallback_subject_id = None
+        if invoice_type == "INPUT":
+            fallback_subject_id = config.get("input_fallback_subject_id")
+        elif invoice_type == "OUTPUT":
+            fallback_subject_id = config.get("output_fallback_subject_id")
         line_subjects: dict[int, int] = {}
         line_resolution: list[dict[str, Any]] = []
         excluded = {int(index) for index in override.get("exclude_lines", []) if str(index).isdigit()}
@@ -418,6 +444,7 @@ def _build_preview(
                 line_resolution.append({"line_index": index, "excluded": True, "subject_id": None, "reason": "人工排除"})
                 continue
             forced = (override.get("line_subjects") or {}).get(str(index))
+            fallback = False
             if forced is not None:
                 subject_id = int(forced)
                 if subject_id not in subjects:
@@ -425,7 +452,18 @@ def _build_preview(
                     continue
                 reason = "人工指定"
             else:
-                subject_id, reason = _resolve_rule(rules, invoice_type, counterparty, _text(line.get("name")))
+                subject_id, reason, kind = _resolve_rule(
+                    rules, invoice_type, counterparty, _text(line.get("name")))
+                if subject_id is None and kind == "unmatched" and fallback_subject_id:
+                    # 配不出规则的项目落到兜底科目，不再报错。
+                    #
+                    # 以前这里是**整张发票作废**：一个没见过的怪项目就把这批
+                    # 发票全堵住，而用户除了「给每个项目名都配一条规则」之外
+                    # 没有第二条路。兜底让它们先记着 —— 但要在预览里标出来，
+                    # 这些行是「等人回头核对」，不是「已经对了」。
+                    subject_id = int(fallback_subject_id)
+                    reason = "兜底科目"
+                    fallback = True
             if subject_id is None:
                 problems.append(f"第 {index + 1} 行「{_text(line.get('name')) or '未命名项目'}」{reason or '没有科目'}")
             else:
@@ -435,6 +473,7 @@ def _build_preview(
                 "excluded": False,
                 "subject_id": subject_id,
                 "reason": reason or "规则命中",
+                "fallback": fallback,
             })
 
         base = _money(meta.get("total_excl_tax"))
@@ -465,16 +504,62 @@ def _build_preview(
         if settlement_subject_id and int(settlement_subject_id) not in subjects:
             subjects.update(_ensure_leaf_subjects(db, batch.book_id, [int(settlement_subject_id)], "结算科目"))
 
-        by_subject: dict[int, Decimal] = {}
+        # 一张发票一张凭证，**按项目列支**：发票上每个项目一行借方（销项是
+        # 贷方），不再按科目合并。
+        #
+        # 原来同一科目的几行会并成一条借方。合并之后凭证上看不见这张发票
+        # 买了哪几样东西，摘要也只能写「发票 XXXXX」—— 摘要里没有项目名，
+        # 翻凭证时认不出是哪笔。逐项列支的代价是凭证长几行，换来的是
+        # 「凭证上逐项对得上发票」。
+        items: list[dict[str, Any]] = []
+        item_index: list[int] = []
         for index, subject_id in line_subjects.items():
-            by_subject[subject_id] = by_subject.get(subject_id, Decimal("0")) + _money(lines[index].get("amount"))
+            line = lines[index]
+            items.append({
+                "subject_id": subject_id,
+                "amount": _money(line.get("amount")),
+                # 摘要 = 发票上印的项目名。``display_name`` 是干净的那个
+                # （规格型号被 PDF 文字层粘在项目名后面，见 text_parser），
+                # 没有就退回原名。
+                "summary": _text(line.get("display_name")) or _text(line.get("name")) or "未命名项目",
+            })
+            item_index.append(index)
+
+        # **各项目的金额必须加总成发票的金额。**
+        #
+        # 凭证的借方是逐项列的、贷方是发票的价税合计，两边必须相等 ——
+        # 不相等的话这张凭证**借贷不平**，而用户在预览页看不出来，只在点
+        # 「确认生成」时才炸（那时整批回滚，白忙一场）。
+        #
+        # 差的**几分钱**（发票自己就这么印的）落到最后一项上：金额以发票
+        # 的合计为准，明细是它的拆解。差得多（超过 5 分）就不是舍入，
+        # 是**少解析了一项** —— 那时不能替用户编一个金额出来，让它当
+        # 异常报出去，那张发票会被标成红字等人核对。
+        rounding = Decimal("0")
+        if items:
+            line_sum = sum((item["amount"] for item in items), Decimal("0"))
+            diff = (total - tax) - line_sum
+            if diff != 0:
+                if abs(diff) <= Decimal("0.05"):
+                    items[-1]["amount"] += diff
+                    rounding = diff
+                else:
+                    problems.append(
+                        f"各项目金额合计 {line_sum} 与发票金额 {total - tax} 不一致"
+                        f"（差 {diff}），请核对发票明细")
         entries: list[dict[str, Any]] = []
         summary = f"发票 {invoice_no or '未识别'}"
-        if invoice_type == "INPUT":
-            entries = _input_entries(by_subject, line_subjects, tax,
-                                     int(settlement_subject_id), total, summary)
-        elif invoice_type == "OUTPUT":
-            entries = _output_entries(by_subject, tax, int(tax_subject_id),
+        # **科目没配齐就不生成分录。**
+        #
+        # 少了结算科目（或销项少了税额科目），这里以前是 ``int(None)`` ——
+        # 直接抛 TypeError，接口层翻成 500，用户看到的是「服务器错误」，
+        # 而真正的原因（「未配置结算科目」）就写在上面那行 ``problems`` 里，
+        # 永远轮不到显示。改成：科目不齐就**不生成分录**，让上面那句
+        # 「未配置结算科目」变成界面上看得见的红字。
+        if invoice_type == "INPUT" and settlement_subject_id:
+            entries = _input_entries(items, tax, int(settlement_subject_id), total, summary)
+        elif invoice_type == "OUTPUT" and settlement_subject_id and tax_subject_id:
+            entries = _output_entries(items, tax, int(tax_subject_id),
                                       int(settlement_subject_id), total, summary)
 
         # 科目表每个年度各有一份 —— 配置里存的科目 id 可能属于别的年度，
@@ -498,7 +583,7 @@ def _build_preview(
                     for e in entries
                 ]
 
-        if not by_subject:
+        if not items:
             problems.append("没有可入账的发票明细")
         if problems:
             record.status = "REJECTED"
@@ -519,6 +604,14 @@ def _build_preview(
                 "base": _decimal_string(base),
                 "tax": _decimal_string(tax),
                 "total": _decimal_string(total),
+                # 各行**实际入账**的金额。与 payload 里的 lines（发票上印的
+                # 原数）可能差那几分钱 —— 前端要显示的是这个，不是原数。
+                "line_amounts": {
+                    str(index): _decimal_string(item["amount"])
+                    for index, item in zip(item_index, items)
+                },
+                # 末项为对齐发票合计而调整的金额（0 表示没调整）。
+                "rounding": _decimal_string(rounding) if rounding else "",
                 "entries": entries,
                 "overrides": override,
             },
@@ -530,14 +623,17 @@ def _build_preview(
 
 
 def _input_entries(
-    by_subject: dict[int, Decimal],
-    line_subjects: dict[int, int],
+    items: list[dict[str, Any]],
     tax: Decimal,
     settlement_subject_id: int,
     total: Decimal,
     summary: str,
 ) -> list[dict[str, Any]]:
-    """进项发票的分录：明细借记不含税额，结算贷记价税合计。
+    """进项发票的分录：**每个项目一行借方**，结算贷记价税合计。
+
+    ``items`` 是发票明细逐项摊开的入账行，每项一个科目、一个金额、一个摘要
+    （摘要 = 发票上印的项目名）。**不按科目合并** —— 合并之后凭证上看不见
+    这张发票买了哪几样东西，摘要里也没有项目名。
 
     **进项税额不单列。** 用户是小微企业，不做进项抵扣，所以发票上的税额没有
     对应的资产 —— 按用户约定整笔并入**第一条明细行**，即价税合计直接进成本费用。
@@ -546,24 +642,22 @@ def _input_entries(
 
     两条容易写错的：
 
-    1. 「第一条」按 ``line_subjects`` 的最小行号取，不按 ``by_subject`` 的第一个
-       键。多行撞到同一个科目时 ``by_subject`` 会把它们合并，键的插入顺序就与
-       原始行序脱钩了 —— 那样税额会落错行，而且只在「恰好同科目」时才错。
-    2. 税额只加一次。上面按科目聚合后，同科目只留一行，所以「第一条的科目」在
-       ``by_subject`` 里唯一，``==`` 判断不会重复计。
+    1. 「第一条」是 ``items`` 的第一项 —— 它按发票明细的行序排，与科目无关。
+       合并过科目时第一条的科目可能重复出现，税额就会落错行。
+    2. 税额只加一次：只有第 0 项加，后面各项都不加。
 
     借贷恒等：借方合计 = Σ明细 + 税额 = 价税合计 = 贷方，全程 Decimal 不经过
     float，不会出现差一分。
     """
-    first_subject_id = line_subjects[min(line_subjects)] if line_subjects else None
     entries: list[dict[str, Any]] = []
-    for subject_id, amount in by_subject.items():
-        takes_tax = bool(tax) and subject_id == first_subject_id
+    for position, item in enumerate(items):
+        takes_tax = bool(tax) and position == 0
+        amount = item["amount"] + tax if takes_tax else item["amount"]
         entries.append({
-            "subject_id": subject_id,
+            "subject_id": item["subject_id"],
             "direction": "DEBIT",
-            "amount": _decimal_string(amount + tax if takes_tax else amount),
-            "summary": summary + ("（含税）" if takes_tax else ""),
+            "amount": _decimal_string(amount),
+            "summary": item["summary"] + ("（含税）" if takes_tax else ""),
         })
     entries.append({
         "subject_id": settlement_subject_id,
@@ -575,17 +669,20 @@ def _input_entries(
 
 
 def _output_entries(
-    by_subject: dict[int, Decimal],
+    items: list[dict[str, Any]],
     tax: Decimal,
     tax_subject_id: int,
     settlement_subject_id: int,
     total: Decimal,
     summary: str,
 ) -> list[dict[str, Any]]:
-    """销项发票的分录：结算借记价税合计，明细与税额贷记。
+    """销项发票的分录：结算借记价税合计，**每个项目一行贷方**，税额单列。
 
     销项税额**照旧单列** —— 那是向对方收的钱，要交出去，和进项不是一回事，
     不能跟着一起并进收入。
+
+    明细行的摘要与进项同口径：**发票上印的项目名**，这样一张凭证的贷方
+    逐行对得上发票上的每一项。
     """
     entries: list[dict[str, Any]] = [{
         "subject_id": settlement_subject_id,
@@ -593,12 +690,12 @@ def _output_entries(
         "amount": _decimal_string(total),
         "summary": summary,
     }]
-    for subject_id, amount in by_subject.items():
+    for item in items:
         entries.append({
-            "subject_id": subject_id,
+            "subject_id": item["subject_id"],
             "direction": "CREDIT",
-            "amount": _decimal_string(amount),
-            "summary": summary,
+            "amount": _decimal_string(item["amount"]),
+            "summary": item["summary"],
         })
     if tax:
         entries.append({
@@ -1004,18 +1101,30 @@ def discard_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> None:
         raise ValueError(f"该批次已是「{batch.status}」状态，不能作废")
     batch.status = "DISCARDED"
     batch.message = "已作废"
-    for record in batch.invoices:
-        record.status = "DISCARDED"
-        # 作废 = 这批不要了，发票号码要让出来给人重传。
-        #
-        # 号码并没有丢：payload 里原样留着，历史里照常看得到（serialize_record
-        # 会回落到 meta）。但那一列必须置空 —— ``uq_invoice_record_book_no``
-        # 是 book_id + invoice_no 上的唯一约束，不置空的话「作废完再传同一份
-        # PDF」会被数据库直接拒掉，用户从此再也传不进这张发票。批量导入里
-        # 「先传错、作废、再重传」是正常动作，这条约束不该把它堵死。
-        record.invoice_no = None
+    # **发票记录与原件文件一起删掉。**
+    #
+    # 为什么要删：一张几十页的合并 PDF 就有好几 MB，解析出来的 payload 更是
+    # 每页一整段原文（JSONB）。用户传错、作废、再传 —— 这些东西没人再要，
+    # 却一直占着磁盘和库。作废就是「这批不要」，留着才是浪费。
+    #
+    # 删掉记录之后，「号码要让出来给人重传」这件事**自动成立**：
+    # ``uq_invoice_record_book_no`` 是 book_id + invoice_no 上的唯一约束，
+    # 记录都没了，同一个号码自然能再传（原来要专门把 invoice_no 置空）。
+    #
+    # 批次行本身留着 —— 历史里还看得见「什么时候传过什么、被作废了」，
+    # 删掉的是**发票记录**和**原件**。
+    for record in list(batch.invoices):
+        db.delete(record)
+    if batch.file_path:
+        # 文件删不掉不该让整批作废失败：记录已经标成作废了，文件留着只是
+        # 占点地方。
+        try:
+            storage.delete(batch.file_path)
+        except OSError:
+            pass
     log(db, action="DISCARD_INVOICES", entity="invoice_batch", entity_id=batch.id,
-        user=user, book_id=batch.book_id, detail=f"作废发票批次（{batch.filename}）")
+        user=user, book_id=batch.book_id,
+        detail=f"作废发票批次并删除记录与原件（{batch.filename}）")
     db.commit()
 
 

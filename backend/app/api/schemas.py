@@ -248,12 +248,17 @@ class InvoiceConfigIn(BaseModel):
 
     没有「进项税额」科目：小微企业不做进项抵扣，进项发票的税额直接计入成本
     费用（并入第一条明细行），不需要单独一个应交税费明细科目。
+
+    兜底科目分进项、销项两个：进项兜底记成本费用，销项兜底记收入，
+    混用必有一边记错。
     """
 
     taxpayer_id: str = Field(default="", max_length=32)
     output_tax_subject_id: Optional[int] = None
     input_credit_subject_id: Optional[int] = None
     output_debit_subject_id: Optional[int] = None
+    input_fallback_subject_id: Optional[int] = None
+    output_fallback_subject_id: Optional[int] = None
 
 
 class InvoiceRuleIn(BaseModel):

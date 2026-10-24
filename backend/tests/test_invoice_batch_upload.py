@@ -280,6 +280,28 @@ def test_作废掉的批次不再挡着重新上传(db, store, configured, admin
     assert service.preview_batch(db, again)["error_count"] == 0
 
 
+def test_作废会删掉记录与原件(db, store, configured, admin_user):
+    """作废 = 「这批不要」。没人要的数据留着就是占地方。
+
+    一张几十页的合并 PDF 有好几 MB，解析出来的 payload 更是每页一整段
+    原文（JSONB）。用户传错、作废、再传 —— 这些东西没人再要。
+
+    批次行本身留着：历史里还要看得见「什么时候传过什么、被作废了」。
+    """
+    first = service.create_batch(db, configured.id, admin_user, [("要作废.pdf", _pdf_bytes("inv_a.pdf"))])
+    service.preview_batch(db, first)
+    record_id = first.invoices[0].id
+    file_path = first.file_path
+    assert (store / file_path).exists(), "原件应当已经落盘"
+
+    service.discard_batch(db, first, admin_user)
+
+    assert db.get(InvoiceRecord, record_id) is None, "发票记录应当被删掉"
+    assert not (store / file_path).exists(), "原件 PDF 应当被删掉"
+    kept = db.get(InvoiceBatch, first.id)
+    assert kept is not None and kept.status == "DISCARDED", "批次行留着，历史才看得见"
+
+
 def test_待确认的批次仍然挡住重复上传(db, store, configured, admin_user):
     """还没确认的批次要挡住 —— 否则同一份发票会被传两遍、生成两张凭证。"""
     first = service.create_batch(db, configured.id, admin_user, [("待确认.pdf", _pdf_bytes("inv_a.pdf"))])

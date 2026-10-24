@@ -969,6 +969,7 @@ def test_head_是本文件认识的那一版():
         "0033_book_year_guardrails",          # 年度一致性护栏送达存量库（重放 db_init.sql）
         "0034_mcp_token",                     # MCP 只读服务令牌：mcp_token 表
         "0035_profit_subject_setting",        # 本年利润科目可手工设定：book_year.profit_subject_code
+        "0036_invoice_fallback_subject",       # 发票兜底科目：invoice_config 的进项/销项兜底科目
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")
@@ -1235,7 +1236,7 @@ def test_跨年账套_次年只有期初没有凭证_迁移照样跑得完(scrat
         # 迁移跑完了
         ver = conn.execute(text(
             "select version_num from alembic_version")).scalar()
-        assert ver == "0035_profit_subject_setting", f"schema 只到 {ver}"
+        assert ver == "0036_invoice_fallback_subject", f"schema 只到 {ver}"
 
         # 科目表按年度拆开
         rows = conn.execute(text(

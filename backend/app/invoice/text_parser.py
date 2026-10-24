@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field, asdict
+from decimal import Decimal
 from typing import List, Optional, Tuple
 
 from app.core.config import settings
@@ -18,6 +19,18 @@ try:
     import pypdfium2 as p
 except ImportError:  # pragma: no cover - 运行环境通过 requirements 安装
     p = None
+
+
+def _jsonable(value):
+    """Decimal → 字符串。
+
+    解析结果要存进 JSONB（payload），而 JSON 没有 Decimal —— 硬塞会
+    ``TypeError``。转成字符串还有一个好处：**存进去的就是发票上印的
+    那个数**（"1.41"），不是 float 的二进制近似值（1.4100000000000001）。
+    """
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    return value
 
 
 # ---------- 文本提取 ----------
@@ -91,14 +104,30 @@ def page_count(pdf_path: str) -> int:
 @dataclass
 class InvoiceLine:
     raw: str = ""
-    name: str = ""              # 项目名（含 *类别*前缀）
+    name: str = ""              # 项目名（含 *类别*前缀；规格型号可能粘在后面）
+    # **给摘要用的项目名** —— 发票上「项目名称」那一格里印的原文。
+    #
+    # 为什么和 name 分开：PDF 的文字层没有列的信息，规格型号会紧跟项目名
+    # 粘在一起（"*油料*粮油米面6930536003708"），而**折扣行的同一格里没有
+    # 规格型号**，只有干净的 "*油料*粮油米面" —— 那是发票上印着的项目名。
+    # 两条规则（按 name 匹配、显示与摘要用 display_name）互不影响：
+    # display_name 一定是 name 的**子串**，所以用户照着界面写的关键词
+    # 按 name 匹配时一定命中（见 ``_strip_trailing_spec`` 末尾那道校验）。
+    display_name: str = ""      # 摘要/界面用的干净项目名
     spec: str = ""              # 规格型号
     unit: str = ""              # 单位
-    quantity: Optional[float] = None
-    unit_price: Optional[float] = None
-    amount: Optional[float] = None    # 不含税金额（可能为负）
+    # 金额一律用 **Decimal**，不用 float。
+    #
+    # 为什么：float 的二进制表示不精确，0.68 + 1.5 + 1.41 会算出
+    # 5.990000000000001 —— 界面上就显示出「1.4100000000000001」这种
+    # 没人看得懂的尾数，而「各项目之和 = 发票金额」这条恒等式差 1e-16
+    # 就对不上。Decimal 从**文本**直接解析（"1.41" → Decimal("1.41")），
+    # 是一位不多一位不少。
+    quantity: Optional[Decimal] = None
+    unit_price: Optional[Decimal] = None
+    amount: Optional[Decimal] = None    # 不含税金额（可能为负）
     tax_rate: str = ""          # "13%" / "1%" / "不征税"
-    tax: Optional[float] = None
+    tax: Optional[Decimal] = None
     is_discount: bool = False   # 金额为负且数量/单价为空 → 折扣行
 
 
@@ -111,9 +140,9 @@ class InvoiceMeta:
     buyer_tax_id: str = ""
     seller_name: str = ""
     seller_tax_id: str = ""
-    total_excl_tax: Optional[float] = None
-    total_tax: Optional[float] = None
-    total_incl_tax: Optional[float] = None
+    total_excl_tax: Optional[Decimal] = None
+    total_tax: Optional[Decimal] = None
+    total_incl_tax: Optional[Decimal] = None
     total_in_c_c: str = ""
     remark: str = ""
     issuer: str = ""
@@ -130,8 +159,8 @@ class Invoice:
     def to_dict(self) -> dict:
         return {
             "page_index": self.page_index,
-            "meta": asdict(self.meta),
-            "lines": [asdict(l) for l in self.lines],
+            "meta": {k: _jsonable(v) for k, v in asdict(self.meta).items()},
+            "lines": [{k: _jsonable(v) for k, v in asdict(l).items()} for l in self.lines],
             "parse_warning": self.parse_warning,
         }
 
@@ -322,16 +351,18 @@ def extract_meta(text: str) -> InvoiceMeta:
         meta.seller_name = candidates[1]
 
     amounts = RE_AMOUNT.findall(text)
-    floats = [float(x) for x in amounts]
-    for i in range(len(floats) - 2):
-        a, b, c = floats[i], floats[i + 1], floats[i + 2]
-        if abs(a + b - c) < 0.02:
+    totals = [Decimal(x) for x in amounts]
+    for i in range(len(totals) - 2):
+        a, b, c = totals[i], totals[i + 1], totals[i + 2]
+        # 判据是「不含税 + 税 = 价税合计」。阈值用 Decimal —— 拿 0.02 这个
+        # float 去比，等于把判据也变成了近似值。
+        if abs(a + b - c) < Decimal("0.02"):
             meta.total_excl_tax = a
             meta.total_tax = b
             meta.total_incl_tax = c
             break
-    if meta.total_incl_tax is None and floats:
-        meta.total_incl_tax = floats[-1]
+    if meta.total_incl_tax is None and totals:
+        meta.total_incl_tax = totals[-1]
 
     meta.total_in_c_c = find_big_amount(text)
 
@@ -440,14 +471,38 @@ def _split_items(block: str) -> List[str]:
     return items
 
 
+#: 规格型号那格里几乎只有数字/字母（条码、"100*120"、"330ml*6"），
+#: 而项目名那格是中文。用这两条判据把两者分开。
+_RE_HAS_DIGIT = re.compile(r"\d")
+_RE_HAS_HAN = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _strip_trailing_spec(cell: str) -> str:
+    """从「项目名称 + 规格型号」这一格里挑出**项目名**那一段。
+
+    PDF 的文字层没有列的信息，两个格子会被拼在一起：
+    ``"粮油米面 6930536003708"`` 其实是「项目名称=粮油米面」加
+    「规格型号=6930536003708」。摘要要的是前者。
+
+    判据是**末段像不像规格**：有数字、没有汉字。认不出来就整段留着 ——
+    摘要多几个字只是不好看，把项目名劈成两半却是错的。
+    """
+    parts = cell.split()
+    if len(parts) >= 2:
+        last = parts[-1]
+        if _RE_HAS_DIGIT.search(last) and not _RE_HAS_HAN.search(last):
+            parts = parts[:-1]
+    return "".join(parts)
+
+
 def _parse_item(raw: str) -> Optional[InvoiceLine]:
     flat = re.sub(r"\s+", " ", raw).strip()
     # 扫所有候选 TAIL_RE 匹配，挑最后合理位置
     best = None
     for cand in TAIL_RE.finditer(flat):
         try:
-            amt = float(cand.group(1))
-        except ValueError:
+            amt = Decimal(cand.group(1))
+        except (ArithmeticError, ValueError):
             continue
         # 合理性：金额必须含 .XX，且整数部分 < 9 位（避免被银行账号/合同号错位）
         if "." not in cand.group(1):
@@ -459,9 +514,10 @@ def _parse_item(raw: str) -> Optional[InvoiceLine]:
     if best is None:
         return None
     m = best
-    amount = float(m.group(1))
+    amount = amt
     tax_rate = m.group(2)
-    tax = float(m.group(3)) if m.group(3) is not None else 0.0
+    # 税额同样走 Decimal —— 「1.41」进、「1.41」出，不经 float。
+    tax = Decimal(m.group(3)) if m.group(3) is not None else Decimal("0")
     prefix = flat[: m.start()].strip()
 
     # 项目名：第一个 `*类 名*`（类名中允许空格）
@@ -496,22 +552,22 @@ def _parse_item(raw: str) -> Optional[InvoiceLine]:
         name = name[:-2]
 
     rest = raw_tail
-    quantity: Optional[float] = None
-    unit_price: Optional[float] = None
+    quantity: Optional[Decimal] = None
+    unit_price: Optional[Decimal] = None
     spec = ""
     unit = ""
 
     is_discount = amount < 0
-    floats = [float(x) for x in RE_NUMBER.findall(rest)]
+    numbers = [Decimal(x) for x in RE_NUMBER.findall(rest)]
 
     # 数量 / 单价 提取。PDF 标准列序：... 数量 单价 金额 税率 税额，
     # 但 PDF 拆行常造成前缀只剩 1 个数字（通常是数量）。所以 len==1 也按 quantity 提取。
-    if not is_discount and floats:
-        if len(floats) >= 2:
-            quantity = floats[-2]
-            unit_price = floats[-1]
+    if not is_discount and numbers:
+        if len(numbers) >= 2:
+            quantity = numbers[-2]
+            unit_price = numbers[-1]
         else:
-            quantity = floats[-1]
+            quantity = numbers[-1]
         # 倒序从 rest 中剥离这些数字字面量（最后一次出现位置）
         for v in (unit_price, quantity):
             if v is None:
@@ -520,10 +576,10 @@ def _parse_item(raw: str) -> Optional[InvoiceLine]:
             matches = list(literal_pat.finditer(rest))
             for ml in reversed(matches):
                 try:
-                    if abs(float(ml.group()) - v) < 1e-6:
+                    if abs(Decimal(ml.group()) - v) < Decimal("0.000001"):
                         rest = rest[: ml.start()] + rest[ml.end():]
                         break
-                except ValueError:
+                except (ArithmeticError, ValueError):
                     continue
 
     rest = rest.strip()
@@ -533,9 +589,28 @@ def _parse_item(raw: str) -> Optional[InvoiceLine]:
     if not is_discount:
         unit, spec = _extract_unit(rest)
 
+    # 摘要用的项目名：``spec`` 这一段是「项目名称格 + 规格型号格」，
+    # 摘掉末尾那段像规格型号的碎片，剩下的才是发票上印的项目名。
+    #
+    # ``name`` 保持原样（拼着规格型号）—— 科目规则按 name 匹配，摘要按
+    # display_name，两边互不影响。
+    display_tail = _strip_trailing_spec(spec)
+    display_name = f"*{head_cat}*{display_tail}"
+    if display_name.endswith("其他"):
+        display_name = display_name[:-2]
+    if not display_name or display_name not in name:
+        # 剥过头了就退回 name。
+        #
+        # **display_name 必须是 name 的子串**：界面上显示的是 display_name，
+        # 用户照着界面写的关键词要能被「按 name 匹配」的规则命中。剥规格
+        # 型号剥过头（多行项目名的发票上会这样）时，宁可摘要多几个字，
+        # 也不能让用户照着界面写的关键词匹配不上。
+        display_name = name
+
     return InvoiceLine(
         raw=raw,
         name=name,
+        display_name=display_name,
         spec=spec,
         unit=unit,
         quantity=quantity,
@@ -545,6 +620,56 @@ def _parse_item(raw: str) -> Optional[InvoiceLine]:
         tax=tax,
         is_discount=is_discount,
     )
+
+
+def _discount_belongs_to(item_name: str, discount_name: str) -> bool:
+    """折扣行是不是在给这个项目打折。
+
+    判据是**名字相容**：折扣行的项目名要么是上面那个项目名的前缀，
+    要么反过来。发票上折扣行紧跟在它所属的项目后面，名字是同一个
+    （只是折扣行那一格没有规格型号），所以相容就足以认领。
+
+    不用「金额相等」或「序号相邻」这种更脆的判据：前者对多张发票不通用，
+    后者在一张发票里有多行折扣时就认错了人。
+    """
+    if not item_name or not discount_name:
+        return False
+    return item_name.startswith(discount_name) or discount_name.startswith(item_name)
+
+
+def merge_discount_lines(lines: List[InvoiceLine]) -> List[InvoiceLine]:
+    """把折扣行并进它上面的项目行 —— 凭证按**项目**列支，不按发票的原始行。
+
+    发票上「项目 + 紧随其后的折扣行」是**同一个项目**的两笔金额
+    （正数 + 负数 = 净额）。凭证上要列的是净额那一条：
+    列成两行就是一条正一条负，负的那条是**红字分录** —— 用户看着别扭，
+    而红字在不少导出与报表口径里会被当成异常。
+
+    顺带解决摘要的名字：折扣行的「项目名称」格里只有项目名，没有规格型号，
+    所以它比项目行干净（"*油料*粮油米面" vs "*油料*粮油米面6930536003708"）。
+    合并时把它记成 display_name —— 摘要与界面上显示的是发票上印的那个名字。
+
+    认不出归属的折扣行**原样留着**（不硬塞给上面那个项目）：
+    那是发票上的真实一行，金额对不对交给既有的金额校验去报，
+    比悄悄并到别的项目上强。
+    """
+    out: List[InvoiceLine] = []
+    for line in lines:
+        if line.is_discount and out and _discount_belongs_to(out[-1].name, line.name):
+            prev = out[-1]
+            prev.amount = (prev.amount or 0) + (line.amount or 0)
+            prev.tax = (prev.tax or 0) + (line.tax or 0)
+            # 折扣行的项目名格子里**没有规格型号**，是发票上印的干净名字。
+            # 只在它确实是项目名的前缀时才用它 —— 这样 display_name 永远是
+            # name 的前缀，按 name 匹配的规则不会因为显示名变短而漏命中。
+            candidate = line.display_name or line.name
+            if candidate and candidate in prev.name:
+                prev.display_name = candidate
+            continue
+        if not line.display_name:
+            line.display_name = line.name
+        out.append(line)
+    return out
 
 
 def extract_lines(text: str) -> List[InvoiceLine]:
@@ -557,7 +682,7 @@ def extract_lines(text: str) -> List[InvoiceLine]:
         parsed = _parse_item(it)
         if parsed is not None:
             out.append(parsed)
-    return out
+    return merge_discount_lines(out)
 
 
 def parse_page(page_index: int, text: str) -> Invoice:
@@ -565,9 +690,10 @@ def parse_page(page_index: int, text: str) -> Invoice:
     inv.meta = extract_meta(text)
     inv.lines = extract_lines(text)
     if inv.meta.total_incl_tax is not None and inv.lines:
-        sum_amount = sum((l.amount or 0) for l in inv.lines)
-        sum_tax = sum((l.tax or 0) for l in inv.lines)
-        if abs(sum_amount + sum_tax - inv.meta.total_incl_tax) > 0.05:
+        sum_amount = sum((l.amount or 0 for l in inv.lines), Decimal("0"))
+        sum_tax = sum((l.tax or 0 for l in inv.lines), Decimal("0"))
+        # 全部 Decimal，差多少就是多少 —— 不再是 1e-16 那种「差一点」。
+        if abs(sum_amount + sum_tax - inv.meta.total_incl_tax) > Decimal("0.05"):
             inv.parse_warning = (
                 f"金额校验未通过：明细 {sum_amount:.2f} + 税额 {sum_tax:.2f}"
                 f" = {sum_amount + sum_tax:.2f}，与价税合计 {inv.meta.total_incl_tax:.2f} 不一致。"
