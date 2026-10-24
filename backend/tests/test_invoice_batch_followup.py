@@ -209,3 +209,43 @@ def test_走接口也能补生成(client, db, book, subjects, auth):
     assert final["status"] == "COMMITTED"
     assert final["committed_count"] == 2, final
     assert all(row["voucher_id"] for row in final["invoices"]), final
+
+
+def test_确认完之后批次的可生成张数归零(db, book, subjects, admin_user):
+    """确认完了就没有「待生成」的了 —— 界面不能还显示「确认生成 21 张凭证」。
+
+    不改的话那一行会自相矛盾：「共 23 张发票，21 张可生成，21 张已入账」
+    （一共才 23 张）。点下去也只会得到一句「没有待生成的发票」。
+    """
+    _config(db, book, subjects)
+    batch = _batch_with(db, book, 3)
+    service.preview_batch(db, batch)
+    service.commit_batch(db, batch, admin_user)
+
+    assert batch.committed_count == 3
+    assert batch.ready_count == 0, f"确认完了还显示可生成 {batch.ready_count} 张"
+    assert batch.error_count == 0
+
+    preview = service.preview_batch(db, batch)
+    assert preview["ready_count"] == 0
+    assert preview["committed_count"] == 3
+
+
+def test_重开批次时的状态张数是现算的(db, book, subjects, admin_user):
+    """确认完之后再打开这个批次，「可生成」要是 0，不能还是确认前那个数。
+
+    批次表里那两列是**预览那一刻**的快照，确认之后没人再更新它们。
+    不现算的话，界面会显示「共 23 张发票，23 张可生成，23 张已入账」
+    （一共才 23 张），那个「确认生成 23 张凭证」按钮也是亮的，点下去
+    只会得到一句「没有待生成的发票」。
+    """
+    _config(db, book, subjects)
+    batch = _batch_with(db, book, 3)
+    service.preview_batch(db, batch)
+    service.commit_batch(db, batch, admin_user)
+
+    counts = service.status_counts(db, [batch.id]).get(batch.id, {})
+    summary = service.batch_summary(batch, counts)
+    assert summary["ready_count"] == 0, summary
+    assert summary["committed_count"] == 3, summary
+    assert summary["error_count"] == 0, summary

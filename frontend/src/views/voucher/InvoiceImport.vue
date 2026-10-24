@@ -260,6 +260,39 @@
                   <span>已忽略：这一页不参与生成凭证，也不计为异常；确认时自动跳过。</span>
                   <el-button size="small" :disabled="!store.canWrite" @click="toggleIgnored(row)">取消忽略</el-button>
                 </div>
+                <!--
+                  「只显示未入账发票」开着的时候，**被忽略的那几张也要摊开票面
+                  明细** —— 它们同样没入账，正是要人工二次核对的那一批。
+
+                  只摊**票面内容**（项目、金额、税额、税率）：被忽略的票还没
+                  分科目、没算凭证，摊「入账科目」和「凭证预览」是摊两样还没
+                  发生的事；真要入账，点「取消忽略」再「重新计算预览」，那边
+                  的科目下拉和凭证预览就都出来了。
+
+                  这里用**原生表格**而不是 el-table：一个批次几十张被忽略的，
+                  每张再挂一个 el-table，组件开销会翻倍 —— 上一版把这张表
+                  从 47900 个 DOM 节点降到 14372，靠的就是别让组件堆起来。
+                -->
+                <table v-if="isIgnored(row) && onlyUnbooked" class="ignored-line-table">
+                  <thead>
+                    <tr>
+                      <th class="idx">#</th>
+                      <th>发票项目</th>
+                      <th class="num">不含税金额</th>
+                      <th class="num">税额</th>
+                      <th class="mid">税率</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="(line, index) in row.lines" :key="index">
+                      <td class="idx">{{ index + 1 }}</td>
+                      <td>{{ lineName(line) }}</td>
+                      <td class="num">{{ lineAmount(row, index) }}</td>
+                      <td class="num">{{ line.tax }}</td>
+                      <td class="mid">{{ line.tax_rate }}</td>
+                    </tr>
+                  </tbody>
+                </table>
                 <template v-else>
                 <div class="detail-toolbar">
                   <el-form inline size="small">
@@ -671,6 +704,13 @@ onMounted(loadAll)
 .detail-toolbar :deep(.el-form-item.row-actions .el-form-item__content) { gap: 8px; }
 .invoice-errors { margin: 10px 0; padding: 8px 10px; border-left: 3px solid #d93025; background: #fff5f4; color: #b42318; font-size: 12px; line-height: 1.8; }
 .line-table { margin-top: 8px; }
+/* 被忽略的发票摊出来的票面明细。见上面的说明：为什么不用 el-table。 */
+.ignored-line-table { margin-top: 8px; width: 100%; border-collapse: collapse; font-size: 12px; }
+.ignored-line-table th, .ignored-line-table td { border: 1px solid #ebeef5; padding: 5px 8px; text-align: left; }
+.ignored-line-table th { background: #f5f7fa; font-weight: 600; color: #606266; }
+.ignored-line-table .idx { width: 48px; }
+.ignored-line-table .num { text-align: right; }
+.ignored-line-table .mid { text-align: center; }
 .entry-preview { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; align-items: center; font-size: 12px; }
 .entry-summary { color: #667085; }
 .rounding-note { margin-top: 8px; font-size: 12px; color: #b45309; }

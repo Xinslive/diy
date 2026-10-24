@@ -218,16 +218,16 @@ def upload_invoice_batch(request: Request, files: list[UploadFile] = File(...), 
 def list_invoice_batches(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     rows = db.scalars(select(InvoiceBatch).where(InvoiceBatch.book_id == book.id).order_by(InvoiceBatch.id.desc()).limit(100)).all()
     # 一次分组查询算完所有批次的「已忽略」张数，别按批次逐个查。
-    ignored = service.ignored_counts(db, [row.id for row in rows])
-    return [service.batch_summary(row, ignored.get(row.id, 0)) for row in rows]
+    counts = service.status_counts(db, [row.id for row in rows])
+    return [service.batch_summary(row, counts.get(row.id, {})) for row in rows]
 
 
 @router.get("/batches/{batch_id}")
 def get_invoice_batch(batch_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     batch = _batch(book, db, batch_id)
     records = db.scalars(select(InvoiceRecord).where(InvoiceRecord.batch_id == batch.id).order_by(InvoiceRecord.page_index)).all()
-    ignored = sum(1 for record in records if record.status == "IGNORED")
-    return {**service.batch_summary(batch, ignored), "invoices": [service.serialize_record(record) for record in records]}
+    counts = service.status_counts(db, [batch.id]).get(batch.id, {})
+    return {**service.batch_summary(batch, counts), "invoices": [service.serialize_record(record) for record in records]}
 
 
 @router.post("/batches/{batch_id}/preview")

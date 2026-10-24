@@ -1316,6 +1316,13 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
         db.rollback()
         raise
     batch.status = "COMMITTED"
+    # 「可生成」的张数要跟着实际状态走：确认完就没有待生成的了。
+    #
+    # 不改的话，界面上会一直显示「确认生成 21 张凭证」—— 那 21 张早就入账了，
+    # 点下去只会得到一句「该批次已是 COMMITTED 状态，没有待生成的发票」；
+    # 概要那一行还会自相矛盾：「21 张可生成，21 张已入账」（可 23 张发票）。
+    batch.ready_count = 0
+    batch.error_count = sum(1 for record in records if record.status == "REJECTED")
     # 补生成时**累加**：第一次确认了 10 张、这次又补 10 张，批次的
     # 「已生成凭证」该是 20 张，不是 10 张。
     batch.committed_count = (batch.committed_count or 0) + created
@@ -1364,33 +1371,44 @@ def discard_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> None:
     db.commit()
 
 
-def ignored_counts(db: Session, batch_ids: list[int]) -> dict[int, int]:
-    """一批批次的「已忽略」张数，按批次 id 归拢。
+def status_counts(db: Session, batch_ids: list[int]) -> dict[int, dict[str, int]]:
+    """一批批次的各状态张数，按批次 id 归拢。
 
-    忽略状态记在 invoice_record.status 上，不回写批次表，所以重开一个
-    批次（GET /batches/{id}、历史列表）时必须现算。少了这一格，用户看到的
-    是「共 3 张发票：2 张可生成」—— 第 3 张既不在可生成里也不在异常里，
+    状态记在 invoice_record.status 上，**不回写批次表**，所以重开一个批次
+    （GET /batches/{id}、历史列表）时必须现算。少算一格，用户看到的就是
+    「共 3 张发票：2 张可生成」—— 第 3 张既不在可生成里也不在异常里，
     像是凭空多出来的一页。
+
+    「可生成」「有问题」这两格更要现算：批次表里那两列是**预览那一刻**的
+    快照，确认之后就没再更新过。不现算的话，界面会显示
+    「共 23 张发票，23 张可生成，23 张已入账」—— 一共才 23 张，自相矛盾；
+    那个「确认生成 23 张凭证」按钮也是亮的，点下去只会得到一句
+    「该批次已是 COMMITTED 状态，没有待生成的发票」。
     """
     if not batch_ids:
         return {}
     rows = db.execute(
-        select(InvoiceRecord.batch_id, func.count(InvoiceRecord.id))
-        .where(InvoiceRecord.batch_id.in_(batch_ids), InvoiceRecord.status == "IGNORED")
-        .group_by(InvoiceRecord.batch_id)
+        select(InvoiceRecord.batch_id, InvoiceRecord.status, func.count(InvoiceRecord.id))
+        .where(InvoiceRecord.batch_id.in_(batch_ids))
+        .group_by(InvoiceRecord.batch_id, InvoiceRecord.status)
     ).all()
-    return {batch_id: count for batch_id, count in rows}
+    out: dict[int, dict[str, int]] = {}
+    for batch_id, status, count in rows:
+        out.setdefault(batch_id, {})[status] = count
+    return out
 
 
-def batch_summary(batch: InvoiceBatch, ignored_count: int = 0) -> dict[str, Any]:
+def batch_summary(batch: InvoiceBatch, counts: dict[str, int] | None = None) -> dict[str, Any]:
+    counts = counts or {}
     return {
         "id": batch.id,
         "filename": batch.filename,
         "status": batch.status,
         "total": batch.total,
-        "ready_count": batch.ready_count,
-        "error_count": batch.error_count,
-        "ignored_count": ignored_count,
+        # 现算的状态张数；批次表里那两列是预览那一刻的快照，确认后就是旧的。
+        "ready_count": counts.get("READY", 0),
+        "error_count": counts.get("REJECTED", 0),
+        "ignored_count": counts.get("IGNORED", 0),
         "committed_count": batch.committed_count,
         "ocr_used": batch.ocr_used,
         "created_by": batch.created_by,
