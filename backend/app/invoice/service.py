@@ -400,6 +400,17 @@ def _build_preview(
     ready = 0
     errors = 0
     for record in record_rows:
+        if record.status == "COMMITTED":
+            # **已入账的不重算。**
+            #
+            # 重新预览是为了改**还没入账**的那些发票。把已入账的也算一遍，
+            # 它的状态会被改回「可生成」，下一次确认就**又生成一张凭证** ——
+            # 同一张发票入两次账，账上凭空多一笔，还查不出是哪张干的。
+            #
+            # 所以这里只把它原样带出去（界面上还要显示它已经生成了），
+            # 不重算、不改状态、不动它的 payload。
+            previews.append(serialize_record(record, subjects))
+            continue
         meta = _meta(record)
         lines = _lines(record)
         override = _override(record, overrides)
@@ -1013,7 +1024,16 @@ def create_batch(db: Session, book_id: int, user: SysUser, files: list[tuple[str
 
 
 def preview_batch(db: Session, batch: InvoiceBatch, overrides: dict[str, dict] | None = None) -> dict[str, Any]:
-    if batch.status not in ("PENDING", "REJECTED"):
+    # **已生成过的批次也允许重新预览。**
+    #
+    # 现实里很常见：20 张发票，先确认了 10 张，剩下 10 张当时点的是「忽略」。
+    # 第二天发现那 10 张其实要入账 —— 得能把它们取消忽略、重新预览、然后
+    # 补一张凭证出来。以前这里直接拒掉（"该批次已是 COMMITTED 状态"），
+    # 用户就只能把整批重新传一遍，而重传会被查重拦下（号码已经入过账）。
+    #
+    # 安全性靠的是 ``_build_preview`` 里那条规矩：**已入账的记录不重算**，
+    # 所以重新预览不会把它们变回「可生成」，也就不会生成第二张凭证。
+    if batch.status not in ("PENDING", "REJECTED", "COMMITTED"):
         raise ValueError(f"该批次已是「{batch.status}」状态，不能重新预览")
     config = get_config(db, batch.book_id)
     rules = db.scalars(select(InvoiceRule).where(InvoiceRule.book_id == batch.book_id, InvoiceRule.active.is_(True))).all()
@@ -1035,6 +1055,9 @@ def preview_batch(db: Session, batch: InvoiceBatch, overrides: dict[str, dict] |
         "ready_count": ready,
         "error_count": errors,
         "ignored_count": sum(1 for record in records if record.status == "IGNORED"),
+        # 已入账的张数。补生成（取消忽略后再确认）之后，界面要能说清
+        # 「这一批一共生成了多少张」，而不是让人拿两轮的数字自己加。
+        "committed_count": batch.committed_count or 0,
         "ocr_used": batch.ocr_used,
         "sources": sources,
         "invoices": [serialize_record(record) for record in records],
@@ -1155,15 +1178,38 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
     """
     # 这一条读的是**锁内**的状态：后到的那个请求会阻塞到前一个提交完，
     # 锁释放时重新读到 COMMITTED，于是确定性地失败（而不是各建一套）。
-    if batch.status != "PENDING":
+    #
+    # **COMMITTED 的批次还能再确认一次** —— 那是「补生成」：上一次确认时
+    # 有一批发票被点了「忽略」，后来又取消忽略要入账。那些发票还在批次里，
+    # 状态是 READY，照样该能生成凭证。
+    #
+    # 以前这里一律拒掉，用户看到的提示是「该批次已是 COMMITTED 状态，
+    # 不能确认」—— 一个也不说错的状态，却把人堵死了：唯一的出路是把
+    # 整批重新传一遍，而重传会被查重拦下（号码已经入过账）。
+    #
+    # 补生成**不会**重复入账：targets 只取 READY 的记录，已经 COMMITTED
+    # 的那些压根不在里面（见下面 targets 那一行）。
+    if batch.status not in ("PENDING", "COMMITTED"):
         raise BatchConflict(f"该批次已是「{batch.status}」状态，不能确认")
     records = db.scalars(select(InvoiceRecord).where(InvoiceRecord.batch_id == batch.id).order_by(InvoiceRecord.page_index)).all()
     if not records:
         raise ValueError("批次没有发票")
     # IGNORED 是用户点名不要的（封面页之类），既不该被拦下，也不该生成凭证。
-    if any(record.status not in ("READY", "IGNORED") for record in records):
+    # COMMITTED 是已经入账的（补生成时它们还在批次里），也不能再生成一次。
+    if any(record.status not in ("READY", "IGNORED", "COMMITTED") for record in records):
         raise ValueError("仍有发票未通过校验，请处理红色异常后再确认")
     targets = [record for record in records if record.status == "READY"]
+    # **重复提交**要挡回去。
+    #
+    # 补生成的前提是「还有没生成的发票」。一件都没有还来确认，那是双击、
+    # 并发、重试 —— 不是补生成。那种情况按老规矩给 409（冲突），
+    # 而不是回一个「成功生成了 0 张」：后者会让界面弹一句「凭证已生成」，
+    # 用户以为生成了，其实什么也没发生。
+    #
+    # 注意这跟「并发只生成一张凭证」是同一条保障：第二个请求拿到锁之后
+    # 读到的记录已经是 COMMITTED，没有 READY，于是这里 409 把它挡回去。
+    if batch.status == "COMMITTED" and not targets:
+        raise BatchConflict(f"该批次已是「{batch.status}」状态，没有待生成的发票")
     # 判重**在锁内**重读一次（第二道兜底）。第一道是批次锁本身：
     # 同一张发票若已被**别的**批次确认过，这里会挡住。
     existing = {
@@ -1270,10 +1316,14 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
         db.rollback()
         raise
     batch.status = "COMMITTED"
-    batch.committed_count = created
+    # 补生成时**累加**：第一次确认了 10 张、这次又补 10 张，批次的
+    # 「已生成凭证」该是 20 张，不是 10 张。
+    batch.committed_count = (batch.committed_count or 0) + created
     batch.committed_at = datetime.now(timezone.utc)
     batch.committed_by = user.username
-    ignored = len(records) - len(targets)
+    # 「已忽略」要**数忽略的那几张**，不能拿「总数减掉这次生成的」——
+    # 补生成时那个减法会把已经入账的那些也算成「已忽略」。
+    ignored = sum(1 for record in records if record.status == "IGNORED")
     batch.message = (f"成功生成 {created} 张凭证" + (f"，{ignored} 张已忽略" if ignored else ""))
     log(db, action="IMPORT_INVOICES", entity="invoice_batch", entity_id=batch.id,
         user=user, book_id=batch.book_id, detail=f"发票导入生成凭证 {created} 张（{batch.filename}）",

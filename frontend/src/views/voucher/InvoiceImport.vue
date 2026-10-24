@@ -212,8 +212,20 @@
               <el-tag v-if="batch.ocr_used" size="small" type="warning">OCR API 兜底</el-tag>
             </div>
             <div class="result-actions">
+              <!--
+                只看还没入账的那些。一批几十张票，生成过一轮之后剩下的那几张
+                淹在一堆「已生成」里，翻半天找不着 —— 这个开关把它们挑出来。
+              -->
+              <el-button :type="onlyUnbooked ? 'primary' : ''" @click="onlyUnbooked = !onlyUnbooked">
+                {{ onlyUnbooked ? '显示全部发票' : '只显示未入账发票' }}
+              </el-button>
               <el-button :disabled="!store.canWrite" :loading="previewing" @click="recalculate">重新计算预览</el-button>
-              <el-button type="danger" plain :disabled="!store.canWrite" @click="discard">作废批次</el-button>
+              <!--
+                已生成过的批次不能作废：凭证已经在账上了，作废批次删记录、
+                删原件，却不会把那几张凭证撤下来 —— 账上留着、记录没了，
+                更难查。所以这里直接不让点。
+              -->
+              <el-button type="danger" plain :disabled="!store.canWrite || batch.status === 'COMMITTED'" @click="discard">作废批次</el-button>
               <el-button type="primary" :disabled="!store.canWrite || batch.error_count > 0 || !batch.ready_count" :loading="committing" @click="commit">
                 确认生成 {{ batch.ready_count || 0 }} 张凭证
               </el-button>
@@ -235,7 +247,7 @@
           每次都要点 23 次箭头才看得全。
           手动收起某一行仍然有效 —— 它只在数据换新（重新计算预览）时重置。
         -->
-        <el-table :data="batch.invoices" size="small" border row-key="id" default-expand-all :row-class-name="invoiceRowClass">
+        <el-table :data="visibleInvoices" size="small" border row-key="id" default-expand-all :row-class-name="invoiceRowClass">
           <el-table-column type="expand">
             <template #default="{ row }">
               <div class="invoice-detail">
@@ -448,10 +460,24 @@ const pageLabel = (row) => {
 }
 // 一句话把「几张可生成 / 几张有问题 / 几张被忽略」讲全 —— 少了「已忽略」这一项
 // 的话，被合并进来的封面页会让人以为批次比预想的多。
+// 「只显示未入账发票」：开着的时候，表里只剩**还没生成凭证**的那些。
+//
+// 口径是「有没有凭证」，不是「状态是什么」：一张被点了忽略的发票也没
+// 入账，它该留在列表里 —— 用户就是靠这个列表把它取消忽略、补生成凭证的。
+const onlyUnbooked = ref(false)
+const visibleInvoices = computed(() => {
+  const rows = batch.value?.invoices || []
+  if (!onlyUnbooked.value) return rows
+  return rows.filter(row => !row.voucher_id)
+})
 const batchSummaryTitle = computed(() => {
   const current = batch.value
   if (!current) return ''
-  const parts = [`共 ${current.total} 张发票：${current.ready_count} 张可生成`]
+  const parts = [`共 ${current.total} 张发票`]
+  if (current.ready_count) parts.push(`${current.ready_count} 张可生成`)
+  // 已入账的张数要讲出来：补生成（取消忽略后再确认）之后，
+  // 用户得知道这一批到底生成了多少张，别把两轮加起来算重了。
+  if (current.committed_count) parts.push(`${current.committed_count} 张已入账`)
   if (current.error_count) parts.push(`${current.error_count} 张有问题`)
   if (current.ignored_count) parts.push(`${current.ignored_count} 张已忽略`)
   return parts.join('，')
