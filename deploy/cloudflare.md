@@ -104,55 +104,225 @@ nginx -t && nginx -s reload
 
 ## 4. Cloudflare 侧：缓存规则
 
-### 4.1 默认行为够用吗
+### 4.1 先分清三个层级（选错就白配）
 
-Cloudflare 的默认缓存行为（官方文档）：
+控制台里有三处都叫「缓存」的东西，**各管一件事**。混起来配，就会出现
+「我明明选了遵循源站，怎么还是不对」这种查不出原因的现象：
 
-- **按文件扩展名**决定缓存哪些，**不看 MIME**；
-- 默认缓存：`JS`、`CSS`、`SVG`、`WOFF/WOFF2/TTF`、`PDF`、`XLS/XLSX`、图片等；
+| 层级 | 在哪 | 管什么 |
+| --- | --- | --- |
+| **缓存资格 Cache eligibility** | Caching → Cache Rules → Cache eligibility | 这条 URL **能不能**进边缘缓存（Bypass cache / Eligible for cache） |
+| **Edge TTL** | 同一条 Cache Rule 里 | 进缓存之后**待多久**、要不要回源重验 |
+| **Browser TTL** | 同一条 Cache Rule 里 | **浏览器**缓存多久 —— 与边缘缓存是两回事，改它不影响 CDN |
+| **Origin Cache Control（OCC）** | Cache Rule 里（**仅企业版**能关） | 是否严格按 RFC 7234 遵守源站的 `Cache-Control`。免费 / 专业 / 商业版**默认开启且不能关** |
+
+> 「缓存级别」（Caching → Configuration → 缓存级别）现在只管**查询串**行为
+> （无查询串 / 忽略查询串 / 标准），**不再管缓存资格** —— 缓存资格已经完全
+> 由 Cache Rules 表达了。
+
+**Edge TTL 的三个选项**（这是最容易选错的下拉框）：
+
+| 选项 | 官方语义 | 本项目该怎么用 |
+| --- | --- | --- |
+| ① `bypass_by_default` | 有 `cache-control` 就按它来，**没有就不缓存** | **默认选这个** |
+| ② `respect_origin` | 有 `cache-control` 就按它来，**没有就按 Cloudflare 默认行为**（200 响应缓存 **120 分钟**） | 只在明确知道「没给头的响应也该缓存」时才用 |
+| ③ `override_origin` | 完全忽略源站头，用下拉框里指定的 TTL | **不要拿它当全局设置**（会把入口 HTML 一起缓存起来） |
+
+「遵循源站的 Cache-Control」= 选项 ②。**它是对的起点，但单独用不够**，
+原因见 4.3。
+
+### 4.2 默认行为够用吗
+
+Cloudflare 的默认缓存行为（官方文档
+[Default cache behavior](https://developers.cloudflare.com/cache/concepts/default-cache-behavior/)）：
+
+- **按文件扩展名**决定缓存哪些，**不看 MIME**、**也不看路径**；
+- 默认缓存：`JS`、`CSS`、`SVG`、`WOFF/WOFF2/TTF`、`PDF`、`XLS/XLSX`、`EXE`、图片等；
 - **默认不缓存 HTML 与 JSON**；
-- 源站给了 `Cache-Control: private / no-store / no-cache / max-age=0` 的
-  **不缓存**；给了 `public` 且 `max-age>0` 的**缓存**；
-- 免费 / 专业 / 商业版默认「尊重源站的 Cache-Control」。
+- 源站给了 `Cache-Control: private / no-store / no-cache / max-age=0` 的，
+  **不会被用来满足一次「不回源就返回」的请求**（`no-store` 则是彻底不存）；
+  给了 `public` 且 `max-age>0` 的**缓存**；
+- **源站一个 `Cache-Control` 都没给**时：按状态码走默认 Edge TTL ——
+  **200 / 206 / 301 缓存 120 分钟**、302 / 303 20 分钟、404 / 410 3 分钟；
+- 免费 / 专业 / 商业版默认开启 OCC，也就是「尊重源站的 Cache-Control」。
 
-按这套默认行为，本项目**开箱即用的部分**：
+按这套默认行为，本项目各路径的**实际**结果：
 
-| 路径 | 源站头 | Cloudflare 默认 |
+| 路径 | 源站头 | Cloudflare 默认 | 判定 |
+| --- | --- | --- | --- |
+| `/assets/*.js` `/assets/*.css` | `public, max-age=31536000, immutable` | 缓存一年 | ✅ 正是想要的 |
+| `/`（入口 HTML） | `no-cache` | 不发陈旧内容 | ✅ |
+| `/runtime-config.js` | `no-cache, must-revalidate` | 不发陈旧内容，但每次都回源重验 | ✅ 但多一跳 |
+| `/api/**`（JSON） | 多数**没有** `Cache-Control`；少数 `private, no-store` / `no-store` | 默认不缓存（JSON 不在扩展名列表里） | ✅ |
+| `/api/plugins/assets/**` | **`public, max-age=31536000, immutable`** | **缓存一年** | ⚠️ 见 4.3 |
+| `/api/books/**.xlsx`（导出） | **一个 `Cache-Control` 都没有** | **缓存 120 分钟** | ⚠️ 见 4.3 |
+| `/downloads/*.exe` | **一个 `Cache-Control` 都没有** | **缓存 120 分钟** | ⚠️ 见 4.3 |
+
+> **官方两页的口径略有出入**：[Default cache behavior](https://developers.cloudflare.com/cache/concepts/default-cache-behavior/) 写「`no-cache`
+> → 不缓存」，[Origin Cache Control](https://developers.cloudflare.com/cache/concepts/cache-control/)
+> 的指令表写「OCC 开启时 `no-cache` → **缓存但每次回源重验**、不发陈旧」。
+> **两种口径下都不会发陈旧内容**，差别只在于边缘要不要存一份。本节的规则
+> 在两种解读下都成立。
+
+### 4.3 必须自己加的 Cache Rule
+
+**光靠「遵循源站的 Cache-Control」（Edge TTL 选项 ②）不够**，两个原因：
+
+1. **它管的是「缓存多久」，管不了「哪些 URL 有资格被缓存」。** 资格是由
+   扩展名启发式 + 源站响应头**共同**决定的 —— 而本项目有三处响应头的
+   口径不对（上表三个 ⚠️），换哪个 Edge TTL 选项都救不了。
+2. **它不管「源站没给 `Cache-Control` 时怎么办」** —— 选项 ② 的答案是
+   「按 Cloudflare 默认行为缓存 120 分钟」，而这正是导出 `.xlsx` 与
+   `/downloads/*.exe` 的下场。选选项 ① 就没有这个问题。
+
+**最小集：三条规则，缺一不可**（Caching → Cache Rules → Create rule）：
+
+| # | 匹配表达式 | 缓存资格 | Edge TTL |
+| --- | --- | --- | --- |
+| ① 业务接口 | `starts_with(http.request.uri.path, "/api/")` | **Bypass cache** | — |
+| ② 运行时配置 | `http.request.uri.path eq "/runtime-config.js"` | **Bypass cache** | — |
+| ③ 静态资源 | `starts_with(http.request.uri.path, "/assets/")` | **Eligible for cache** | ① `bypass_by_default` |
+
+**表达式怎么写**：`starts with` / `ends with` 在「编辑表达式」里是**函数**，
+要写成 `starts_with(http.request.uri.path, "/api/")`；而 `eq` / `matches` /
+`wildcard` 是**操作符**，写在中间（`http.request.uri.path eq "..."`）。
+用「表达式构建器」点选的话，选「URI Path」+「starts with」+ 填 `/api/`，
+生成的就是上面那个函数调用。
+
+**同一批规则的另两种写法**（按你习惯挑）：
+
+| 规则 | `wildcard` 通配符（**全套餐**） | `matches` 正则（**仅 Business / Enterprise**） |
 | --- | --- | --- |
-| `/assets/*.js` `/assets/*.css` | `public, max-age=31536000, immutable` | 缓存 ✅ |
-| `/`（入口 HTML） | `no-cache` | 不缓存 ✅ |
-| `/runtime-config.js` | `no-cache` | **默认会缓存**（它是 `.js`）⚠️ |
-| `/api/**`（JSON） | 无 `public` | 默认不缓存 ✅ |
+| ① | `http.request.uri.path wildcard "/api/*"` | `http.request.uri.path matches r"^/api/"` |
+| ② | `http.request.uri.path wildcard "/runtime-config.js"` | `http.request.uri.path matches r"^/runtime-config\.js$"` |
+| ③ | `http.request.uri.path wildcard "/assets/*"` | `http.request.uri.path matches r"^/assets/"` |
+| ④ | `not http.request.uri.path wildcard "/assets/*"` | `not http.request.uri.path matches r"^/assets/"` |
 
-### 4.2 必须自己加的 Cache Rule
+四个必须知道的差别：
 
-**两条规则，缺一不可：**
+- **正则要 Business / Enterprise 套餐。** 官方文档写明「Access to the
+  `matches` operator requires a Cloudflare Business or Enterprise plan」——
+  免费版 / Pro 版**用不了** `matches`，只能 `wildcard` 或 `starts_with()`。
+- **`matches` 是部分匹配，`wildcard` 是全匹配** —— 所以正则**必须自带 `^`**。
+  这条在本项目**不是形式要求，是要命的**：插件资产的路径是
+  `/api/plugins/assets/{id}/{digest}/frontend/t/{token}/…`，**里面就含
+  `/assets/`**！不写 `^` 的话它会**同时**命中 ③（`/assets/` → Eligible for
+  cache），而多条规则都命中时**靠后的一条赢** —— ③ 排在 ① 后面，于是插件
+  资产被缓存一年，① 的 bypass 白配了。写上 `^` 之后它只命中 ①，正确。
+- **正则用 `r"..."` 原始字符串写。** 原始字符串里没有转义序列，内容原样交给
+  正则引擎，所以 `.` 直接写成 `\.` 就行（官方文档也推荐这么做：「the quoted
+  string syntax has complex escaping rules and can lead to unexpected
+  behaviors」）。若坚持用普通双引号 `"..."`，同一个反斜杠要写两遍
+  （`"^/runtime-config\\.js$"`）—— **这就是为什么要用 `r"..."`**。
+- **语法就是 RE2**（[RE2 官方语法表](https://github.com/google/re2/blob/main/doc/syntax.txt)；
+  Cloudflare 用的是 Rust 正则引擎，与 RE2 同源）。逐条对照：
 
-| 规则 | 匹配 | 动作 |
-| --- | --- | --- |
-| ① 运行时配置 | `http.request.uri.path eq "/runtime-config.js"` | **Bypass cache**（不缓存） |
-| ② 业务接口 | `http.request.uri.path starts_with "/api/"` | **Bypass cache** |
+  | 想要 | RE2 写法 | 能不能 |
+  | --- | --- | --- |
+  | 字面点 | `\.` | ✅ |
+  | 整段文本的首 / 尾 | `^` / `$` | ✅（默认 `m=false`，锚的是**文本**首尾，不是行首行尾） |
+  | 分组 | `(...)` / `(?:...)` | ✅ |
+  | 重复 | `*` `+` `?` `{n,m}` | ✅（但 `{n,m}` 的上下限不能超过 1000） |
+  | 忽略大小写 | `(?i)` 或标志 `i` | ✅（但路径**应该**区分大小写，别加） |
+  | **反向引用** | `\1` `\g{1}` `\k<name>` | ❌ **不支持** |
+  | **环视** | `(?=...)` `(?!...)` `(?<=...)` `(?<!)` | ❌ **不支持** |
+  | **占有量词** | `x*+` `x++` | ❌ **不支持** |
 
-**①为什么必须加**：Cloudflare 按**扩展名**决定缓存，而 `runtime-config.js`
-就是 `.js`。它决定「API 在哪」「静态资源在哪」，**每套部署都不同** ——
-缓存住了就是「改了配置不生效」。免费/专业/商业版默认尊重源站的
-`no-cache`（所以通常没事），但**企业版可以把「尊重源站」关掉**（那它就按
-默认 Edge TTL 缓存 200 响应 120 分钟）。显式加一条规则，**所有套餐行为
-一致**，也不依赖那个默认开关。
+  每条规则最多 64 个正则。
 
-**②为什么必须加**：API 响应默认不缓存（JSON 不在扩展名列表里），但
-「默认」不是「保证」：
+**规则的叠加顺序**：官方口径是「**最后一条匹配的规则获胜**」（多条都命中时，
+靠后的覆盖靠前的设置；「bypass vs eligible」这种冲突也是后者赢）。
+本节这四条**互斥或结论一致**（③④ 互斥，①② 与 ④ 都是 Bypass），
+所以**顺序怎么排都不影响结果**；但按 ①→④ 排更符合读法。
 
-- 导出接口返回的是 `.xlsx`（**在**默认缓存扩展名列表里）；
-- 请求带 `Authorization` 头时 Cloudflare 默认不缓存它，但那是**行为**
-  不是**规则**，配置一改（Cache Rules、Workers、Page Rules）就可能变；
-- 缓存住一个 API 响应 = **把 A 账套的账目发给 B**。这条规则是一道
-  便宜的保险。
+⚠️ 这个「互斥」是**靠 `^` 撑着的** —— 插件资产路径里含 `/assets/`，
+③ 一旦漏了 `^`，它就会跟 ① 同时命中（见上面那条）。所以 `^` **不是可选的**。
 
-> 规则 ② 也可以改成「只缓存 `/assets/`」（Cache everything + 路径匹配），
-> 效果一样但更直观。
+**配完自己验一遍**（本地就能跑，不用等 CDN 生效）：
 
-### 4.3 必须关掉的开关
+```bash
+printf '%s\n' /api/books/1/vouchers /api/plugins/assets/p/abc/frontend/t/tok/main.js \
+  /api/books/1/vouchers.xlsx /assets/index-CUpwOnfx.js /runtime-config.js \
+  /downloads/setup.exe /foo/assets/bar.js \
+  | rg -e '^/api/' -e '^/assets/' -e '^/runtime-config\.js$'
+```
+
+`rg` 底层就是 Rust 正则引擎（与 Cloudflare 同源），所以它验出来的行为就是
+CDN 上会发生的。期望结果：命中 `/api/` 三条 + `/assets/` 一条 +
+`/runtime-config.js` 一条；**`/foo/assets/bar.js` 不该出现** ——
+它出现了就说明 `^` 漏了。
+
+> **地址栏里的 `#` 不用管。** 本项目是 **hash 路由**
+> （`createWebHashHistory()`，`frontend/src/router/index.js`），地址栏形如
+> `https://acct.xins.live/#/books`。但 **fragment 永远不会进 HTTP 请求**
+> （RFC 3986）—— 浏览器发出去的是 `GET /`，CDN 看到的路径就是 `/`。
+> 后端 API 走的是**另一条独立请求**（`GET /api/books/...`，由 `apiBase`
+> 拼出，见 `frontend/src/config.js`），路径里同样没有 `#`。
+> 所以按 `/api/`、`/assets/` 匹配**完全不受 hash 路由影响**。
+
+**①为什么必须加**：
+
+- **插件资产**（`/api/plugins/assets/{plugin_id}/{digest}/frontend/t/{token}/…`，
+  见 `backend/app/plugins/api.py`）返回的是
+  `Cache-Control: public, max-age=31536000, immutable`。它在 `/api/` 路径下，
+  但 **Cloudflare 的默认判定只看扩展名**（`.js` / `.css` / `.png` 都在列表里），
+  **路径前缀不算** —— 于是它会被**缓存一年**。
+  后果：票据是**短期凭据**（`verify_asset_token` 校验），边缘缓存一年等于把
+  「短期」这个语义**抹掉** —— 票据过期后同一条 URL 仍然打得开，边缘直接命中，
+  压根不回源做票据校验。
+  它也躲不过 OCC 那条兜底：浏览器是用 `import()` 动态加载插件资产的
+  （`frontend/src/plugins/runtime.js`），**模块脚本不带 `Authorization` 头**，
+  OCC 的「带 Authorization 的响应必须同时有 `public` / `s-maxage` /
+  `must-revalidate` 才缓存」对它不适用。
+- **导出接口**（`/api/books/{id}/vouchers.xlsx`、`balance.xlsx`、
+  `general-ledger.xlsx`、`report.xlsx`、`detail-ledger.xlsx`、`openings.xlsx`）
+  **一个 `Cache-Control` 都没设**，只设了 `Content-Disposition`。
+  `.xlsx` 在默认缓存扩展名列表里 → 按默认 Edge TTL **缓存 120 分钟**。
+  现在之所以没出事，靠的是 axios 带上 `Authorization` 头 + OCC 那条
+  **行为**兜着。**行为不是规则** —— 哪天有人给导出接口加一句看起来很合理的
+  `Cache-Control: public, max-age=600`，它就变成「把 A 账套的账目发给 B」。
+- 代价：插件资源每次都回源。插件包不大，源站只吃插件那一部分流量，
+  **可以接受**，而且是刻意的：浏览器侧那个 `immutable` **不要动**，
+  否则票据过期后插件页会崩。
+- 想再稳一档的话，可以把 `backend/app/plugins/api.py` 里那个响应头从
+  `public, max-age=31536000, immutable` 改成 `private, max-age=31536000, immutable`
+  —— 浏览器照样缓存一年，但共享缓存按 RFC 7234 一律不存（`private` 的本义）。
+  规则 ① 已经够了，这一步是可选的加固。
+
+**②为什么必须加**：`runtime-config.js` 就是 `.js`，在默认缓存扩展名列表里。
+源站已经给了 `no-cache, must-revalidate`，所以它**不会**发陈旧内容（改了配置
+照样生效）—— 但边缘仍会存一份，**每次访问都要回源重验一次**。显式 bypass
+让它每次真回源，不占边缘存储，也少一次条件请求往返。
+另外它决定「API 在哪」「静态资源在哪」，**每套部署都不同**，不该让任何
+一个中间层去缓存它。
+
+**③怎么配**：Edge TTL 选 **① `bypass_by_default`**（有 `cache-control` 就按
+它来，没有就不缓存）。`/assets/` 的响应带着
+`public, max-age=31536000, immutable`，所以它照样缓存一年 —— 与选项 ②
+在这里结果相同，但 ① 更保守：将来新增什么路径忘了设头，就是不缓存，
+而不是默默缓存 120 分钟。
+（这条规则本身是**把默认行为显式写出来**：默认行为本来也会缓存 `/assets/`。
+留着它的价值是「显式优于隐式」—— 将来谁动 Cache Level 或加一条宽泛的
+Bypass 规则时，不会把静态资源误伤掉。）
+
+**推荐形态：再加一条兜底，做成路径白名单**
+
+上面三条覆盖了所有 ⚠️，但**没被任何规则命中的路径**（`/`、`/downloads/`、
+`/docs` 等）仍然走默认行为 —— `/downloads/*.exe` 会被缓存 120 分钟。
+想彻底关掉的话，再加一条规则：
+
+| # | 匹配表达式 | 缓存资格 | Edge TTL |
+| --- | --- | --- | --- |
+| ④ 兜底 | `not starts_with(http.request.uri.path, "/assets/")` | **Bypass cache** | — |
+
+（等价的其它写法：`not http.request.uri.path wildcard "/assets/*"`、
+`not http.request.uri.path matches r"^/assets/"`。）
+
+加上它之后，**缓存资格就从「扩展名启发式」变成了路径白名单** —— 只有
+`/assets/` 进缓存，其余一律不进。这是本项目更想要的形态：`/downloads/`
+里的 exe 几十 MB，让它每次回源反而更符合「省源站带宽」的目标。
+
+### 4.4 必须关掉的开关
 
 | 开关 | 位置 | 为什么关 |
 | --- | --- | --- |
@@ -238,8 +408,9 @@ bash deploy/verify_cdn.sh https://acct.example.com
 | 症状 | 大概率原因 | 去哪看 |
 | --- | --- | --- |
 | 页面能开，**JS 不生效**（控制台有 CORS 错误） | CDN 剥掉了 `Access-Control-Allow-Origin` | `curl -sI <资源> \| grep -i access-control`；CDN 控制台看响应头改写规则 |
-| **发布后界面没变**（还是上一版） | 入口 HTML 被 CDN 缓存了 | `curl -sI / \| grep -i cf-cache-status`；若是 HIT，缓存规则 ①/入口 HTML 规则没配 |
-| **改了 runtime-config 不生效** | `/runtime-config.js` 被缓存 | 同上，规则 ① 没配 |
+| **发布后界面没变**（还是上一版） | 入口 HTML 被 CDN 缓存了 | `curl -sI / \| grep -i cf-cache-status`；若是 HIT，说明兜底规则（4.3 的 ④）没配 |
+| **改了 runtime-config 不生效** | `/runtime-config.js` 被缓存 | 同上；4.3 的规则 ② 没配 |
+| 插件票据过期后资源**还能打开** | 插件资产被边缘缓存了一年 | `curl -sI <插件资产> \| grep -i cf-cache-status`；4.3 的规则 ① 没配 |
 | 某台机器登不进去、别人正常 | IP 维度的节流误伤（CDN 边缘 IP 分桶） | 装 `cwq-cloudflare-realip.conf`；查后端「登录防护」页面 |
 | 偶发 **524** | 接口耗时超 125 秒 | 看 Cloudflare 的 524 报表与源站慢日志 |
 | MCP 连一会儿就断 | SSE 静默 125 秒被边缘掐断 | MCP 走 DNS-only 子域 |
