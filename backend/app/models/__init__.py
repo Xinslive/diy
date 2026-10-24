@@ -15,6 +15,11 @@ from app.models.backup import (BackupRun, KEEP_DAYS, SCOPE_BOOK, SCOPE_SYSTEM, S
 from app.models.mfa import (MFA_STATUSES, STATUS_CONSUMED, STATUS_EXPIRED,
                             STATUS_PENDING, STATUS_VERIFIED, AdminMfaChallenge)
 
+# **模型层文本守卫**（必须在这里 import，不能等到用得到的时候才 import）：
+# 它靠 ``@event.listens_for`` 挂上 before_insert / before_update 钩子，
+# 晚一步 import 就等于没挂 —— 而「没挂」正是这个模块存在的理由。
+from app.models import text_guard  # noqa: F401
+
 __all__ = [
     "Base", "SysUser", "UserBook", "SystemSetting",
     "Book", "BookYear", "Period", "PeriodOpening",

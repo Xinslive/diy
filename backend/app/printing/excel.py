@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import io
-import re
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
@@ -41,32 +40,10 @@ MAX_EXPORT_ROWS = 50_000
 #: 见 ``_safe_sheet_title``。
 _ILLEGAL_TITLE_CHARS = set(r"[]:*?/\\")
 
-#: **XML 1.0 不允许出现在文档里的字符**（C0 控制字符除 TAB/LF/CR 外、
-#: C1 控制字符 U+007F–U+009F、以及 U+FFFE / U+FFFF）。
-#:
-#: Excel 底层就是 XML。openpyxl 写单元格时把字符串直接塞进 ``<t>`` 节点，
-#: 遇到这些字符 lxml 会抛：
-#:
-#:     ValueError: All strings must be XML compatible:
-#:     Unicode or ASCII, no NULL bytes or control characters
-#:
-#: 而这是**整个文件写不出来**的错：不是那一格没写上，是 xlsx 一个字节都
-#: 生成不了，接口直接 500，前端只显示「导出失败」。行数再多也一样 ——
-#: 493 行和 50 万行撞上同样一个坏字符，同样一个字节都出不来。
-#:
-#: 现实来源是**发票 PDF 的文字层**：pypdfium2 的 ``get_text_range()`` 会把
-#: UTF-16 的 BOM 在某些字形映射里漏成 U+FFFE 混进摘要，例如
-#: 「*电线电缆*广州五羊ZC\ufffeBV2.5平方线」。这份字符被原样存进
-#: ``entry.summary``，之后每一条含它的明细账/总账导出都会整份失败。
-#:
-#: 这里既在写入前清洗（``_text``），也在落盘前**统一清扫整张表**
-#: （``_scrub_workbook``），因为漏网之鱼可能来自任何一处写入点。
-_ILLEGAL_XML_CHARS = re.compile(
-    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufffe\uffff]")
-
-#: XML 1.0 允许的三个控制字符。直接删掉会改变文本长度与版面，
-#: 换成等宽空格：信息不丢，单元格也不会被撑开。
-_XML_SAFE_CONTROL = {"\x09": " ", "\x0a": " ", "\x0d": " "}
+#: XML 非法字符的**定义与清洗**都在 ``app.core.text_clean``（单一出处）。
+#: 这里只是引它 —— 打印层、发票解析层、模型守卫共用同一份规则，
+#: 三层防线才不会各洗各的、洗出三种结果。
+from app.core.text_clean import scrub_xml_chars as scrub_xml_chars  # noqa: F401
 
 
 class ExportTooLarge(ValueError):
@@ -220,24 +197,6 @@ def _text(value) -> str:
     if text[:1] in ("=", "+", "-", "@", "\t", "\r"):
         return "'" + text
     return text
-
-
-def scrub_xml_chars(text: str) -> str:
-    """去掉 XML 1.0 写不出去的控制字符，其余内容原样保留。
-
-    TAB/LF/CR 是 XML 1.0 **允许**的（换行、制表在单元格里很常见），
-    但它们会让单元格看起来像被撑开了行；这里换成等宽空格，既不丢信息，
-    也不破坏版面。
-
-    U+FFFE / U+FFFF 在 XML 里是**永久非法**的（不管有没有 BOM 上下文），
-    必须去掉 —— 它们在发票 PDF 文字层里出现过，是整份导出失败的元凶。
-    """
-    if not text:
-        return text
-    for bad, good in _XML_SAFE_CONTROL.items():
-        if bad in text:
-            text = text.replace(bad, good)
-    return _ILLEGAL_XML_CHARS.sub("", text)
 
 
 def _money_style(ws, row: int, cols: range):

@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.accounting import organize as svc_organize
 from app.accounting.audit_helper import log, voucher_snapshot
 from app.accounting.util import constraint_name, find_period, money, period_label
+from app.core.text_clean import scrub_control_chars
 from app.models import Book, Entry, Period, Subject, SysUser, Voucher
 
 # 凭证号在期间内唯一。撞号时数据库只会说「违反唯一约束」，看到的人
@@ -438,6 +439,30 @@ def validate_new_voucher(db: Session, *, book_id: int, voucher_date: date,
     return period, payload, anchor
 
 
+def _clean_entry_payload(entries: list[dict]) -> list[dict]:
+    """把分录入参里的文本字段（摘要）洗掉 XML 非法字符。
+
+    **不改动原对象**：入参可能正被调用方拿着（发票那边还要拿它算金额），
+    这里返回一份新的。
+
+    模型守卫（``app/models/text_guard.py``）也会洗一次 —— 那是给**绕过业务层**
+    的写入兜底的。业务层这一道是为了让**审计快照**也干净（它是拿入参拼的，
+    不经过 ORM 的守卫），以及让「写进库的东西」和「留在日志里的东西」一致。
+    """
+    out = []
+    for e in entries:
+        if not isinstance(e, dict):
+            out.append(e)
+            continue
+        summary = e.get("summary")
+        if isinstance(summary, str):
+            cleaned = scrub_control_chars(summary)
+            if cleaned != summary:
+                e = dict(e, summary=cleaned)
+        out.append(e)
+    return out
+
+
 def create_voucher(
     db: Session,
     *,
@@ -470,6 +495,20 @@ def create_voucher(
     ① 豁免拿不到，② ``_drop_carry_forward`` 只删签名对得上的系统凭证，
     伪造一张出来既没有特权、也不会被悄悄删掉。
     """
+    # **文本在入口就洗掉**（摘要、备注）。
+    #
+    # 为什么业务层也要洗，模型守卫（``app/models/text_guard.py``）不是已经洗了吗：
+    # 守卫只管**写进 ``entry`` 表**的行，管不到**审计快照**。
+    # ``create_voucher`` 的审计快照是拿**入参 payload** 拼的（不是从库里读回来
+    # 的），于是脏字符原样进了 ``audit_log.after`` 这个 JSONB —— 而 PostgreSQL
+    # 的 text/jsonb **根本存不了 U+0000**，那一行 INSERT 直接炸：
+    # ``unsupported Unicode escape sequence``。
+    #
+    # 也就是说：光有模型守卫，摘要里带 U+0000 时整张凭证存不进去。
+    # 在入口洗一次，下游（分录行、审计快照）拿到的就都是干净的。
+    entries = _clean_entry_payload(entries)
+    remark = scrub_control_chars(remark or "")
+
     period, payload, anchor = validate_new_voucher(
         db, book_id=book_id, voucher_date=voucher_date, entries=entries,
         period_id=period_id, insert_after_id=insert_after_id, internal=internal)
@@ -572,6 +611,14 @@ def update_voucher(
     # 本次修改**之前**的凭证号：跨期改日期时服务端会重发一个号，后面的
     # 「凭证号不能手工修改」要拿这个原号去比（比重发后的新号会误伤）。
     orig_no = voucher.voucher_no
+    # 文本在入口就洗掉（理由同 ``create_voucher``：审计快照是拿入参拼的，
+    # 模型守卫管不到它，而 audit_log 的 JSONB 存不了 U+0000）。
+    if "entries" in payload and payload["entries"] is not None:
+        payload = dict(payload)
+        payload["entries"] = _clean_entry_payload(payload["entries"])
+    if "remark" in payload and payload["remark"] is not None:
+        payload = dict(payload)
+        payload["remark"] = scrub_control_chars(payload["remark"] or "")
     period = db.get(Period, voucher.period_id)
     if period.locked:
         raise ValueError(f"{period.code} 已结账，不能修改凭证")

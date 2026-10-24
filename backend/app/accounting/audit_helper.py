@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.accounting.util import money
+from app.core.text_clean import scrub_control_chars
 from app.models import AuditLog, Entry, Voucher
 
 
@@ -84,6 +85,17 @@ def voucher_snapshot(voucher: Voucher, entries: Any = None) -> dict:
     """
     rows = [_entry_dict(e) for e in (voucher.entries if entries is None else entries)]
     rows.sort(key=lambda r: r["line_no"])
+    # **快照里的文本也要洗**。
+    #
+    # 这份快照会进 ``audit_log.after``（JSONB），而 PostgreSQL 的 jsonb
+    # **存不了 U+0000** —— 一个带 NUL 的摘要会让整条审计 INSERT 直接炸
+    # （``unsupported Unicode escape sequence``），于是凭证本身都存不进去。
+    # 另外 JSONB 也会把 U+FFFE 原样留着，将来谁拿它去做导出就会踩雷。
+    for r in rows:
+        if isinstance(r.get("summary"), str):
+            r["summary"] = scrub_control_chars(r["summary"])
+    remark = voucher.remark if isinstance(voucher.remark, str) else ""
+    remark = scrub_control_chars(remark)
     # 金额先按统一精度量化（两位小数），两套合计用的是同一批数 ——
     # 否则「界面合计」与「快照合计」还会在第 3 位小数上分道扬镳。
     for r in rows:
@@ -102,7 +114,7 @@ def voucher_snapshot(voucher: Voucher, entries: Any = None) -> dict:
         "voucher_date": _jsonable(voucher.voucher_date),
         "status": voucher.status,
         "source": voucher.source,
-        "remark": voucher.remark,
+        "remark": remark,
         "attachments": voucher.attachments,
         # 界面口径：按列求和、负数照减
         "debit": _jsonable(dr_total),
