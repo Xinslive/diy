@@ -22,6 +22,8 @@
 set -uo pipefail
 
 SCRIPT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/deploy.sh
+# 仓库根：沙箱要**真的**跑仓库里那份装配脚本，而不是拿桩糊过去。
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PASS=0; FAIL=0
 ok(){ echo "  OK   $1"; PASS=$((PASS+1)); }
 no(){ echo "  FAIL $1"; FAIL=$((FAIL+1)); }
@@ -45,6 +47,9 @@ make_artifacts(){
   echo "# new" > "$be/app/__init__.py"
   echo "print('backup')" > "$be/scripts/db_backup.py"
   echo "print('plugin status')" > "$be/scripts/plugin_status.py"
+  # 运行时配置装配脚本：**用仓库里真的那份**。桩掉它的话，沙箱就只验证了
+  # 「脚本被调用了」，而不是「配置真的被装配对了」—— 而后者才是这一步的意义。
+  cp "$REPO_ROOT/backend/scripts/emit_frontend_runtime.py" "$be/scripts/emit_frontend_runtime.py"
   echo "print('pass')" > "$be/migrations/env.py"
   # 新迁移链的标记。断言「迁移跑的是产物里那条链」全靠它。
   echo "# NEW MIGRATION CHAIN" > "$be/migrations/versions/0027_plugin_imports.py"
@@ -54,7 +59,18 @@ make_artifacts(){
   echo "rfc8785==0.1.4" > "$be/requirements.lock"
   echo "SQLAlchemy==2.1.4" >> "$be/requirements.lock"
   echo "[pytest]" > "$be/pytest.ini"
-  echo "<html>new frontend $sha</html>" > "$fe/dist/index.html"
+  # 前端产物要**像真的**：带 runtime-config.js 的引用与带哈希的资源引用。
+  # 装配脚本改的就是这两处 —— 假产物里没有它们，那一步就等于没被验证。
+  mkdir -p "$fe/dist/assets"
+  echo "console.log(1)" > "$fe/dist/assets/index-${sha}.js"
+  echo "body{}" > "$fe/dist/assets/index-${sha}.css"
+  cat > "$fe/dist/index.html" <<HTML
+<html><head>
+<script src="/runtime-config.js"></script>
+<script type="module" crossorigin src="/assets/index-${sha}.js"></script>
+<link rel="stylesheet" crossorigin href="/assets/index-${sha}.css"></head>
+<body>new frontend $sha</body></html>
+HTML
   tar -czf "$out/cwq-backend-${sha}.tar.gz" -C "$be" .
   tar -czf "$out/cwq-frontend-${sha}.tar.gz" -C "$fe" dist
   {
@@ -170,8 +186,15 @@ if [ -e .env ] && grep -q DATABASE_URL .env 2>/dev/null; then envsrc=ok; else en
 echo "alembic $* [chain=${chain}] [env=${envsrc}]" >> "$DEPDIR/calls"
 exit ${STUB_ALEMBIC_RC:-0}
 STUB
-  # db_backup.py 走 venv 里的 python，要真的吐点东西当备份
-  printf '#!/bin/sh\nif [ "$1" = "scripts/db_backup.py" ]; then echo "SELECT 1;"; exit ${STUB_BACKUP_RC:-0}; fi\necho "python $*" >> "$DEPDIR/calls"\nif [ "$1" = "scripts/plugin_status.py" ]; then exit ${STUB_PLUGIN_STATUS_RC:-0}; fi\nexit 0\n' \
+  # db_backup.py 走 venv 里的 python，要真的吐点东西当备份。
+  # **装配脚本要真的跑**（exec 到真的 python3）：这一步的价值全在
+  # 「配置真的被装配对了」，桩掉它就只剩「被调用过」这种没意义的断言。
+  #
+  # 匹配用 **basename**：deploy.sh 传的是**绝对路径**（$INCOMING/scripts/…），
+  # 按整串比对会匹配不上 —— 于是桩子只是把调用记了一笔就返回 0，
+  # 脚本其实**一次都没跑**，而「调用被记录了」这个断言照样是绿的。
+  # 这正是本文件开头说的那种恒绿测试。
+  printf '#!/bin/sh\nif [ "$(basename "$1")" = "emit_frontend_runtime.py" ]; then echo "python $*" >> "$DEPDIR/calls"; exec python3 "$@"; fi\nif [ "$1" = "scripts/db_backup.py" ]; then echo "SELECT 1;"; exit ${STUB_BACKUP_RC:-0}; fi\necho "python $*" >> "$DEPDIR/calls"\nif [ "$1" = "scripts/plugin_status.py" ]; then exit ${STUB_PLUGIN_STATUS_RC:-0}; fi\nexit 0\n' \
     > "$APP/backend/.venv/bin/python"
   chmod +x "$DEPDIR/bin"/* "$APP/backend/.venv/bin"/*
   # unit 与备份的落地位置由 deploy.sh 通过 SYSTEMD_UNIT_DIR / BACKUP_DIR 传入。
@@ -208,6 +231,14 @@ run_script_with_db_url(){
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 calls(){ cat "$DEPDIR/calls" 2>/dev/null; }
+
+# CDN 形态：静态资源基址指向 CDN、配置脚本指向源站。
+run_script_cdn(){
+  ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+    SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+    CWQ_ASSET_BASE="https://cdn.example.com/" CWQ_ORIGIN="https://acct.example.com" \
+    LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
+}
 
 # **管道里的 grep 一律不用 -q**（理由见第 16 组 code_count 的注释，
 # 那里已经把同一个坑写成了规矩）：`grep -q` 一匹配就退出 → 上游的
@@ -1227,6 +1258,72 @@ if [[ "$G_HEAD" == "0" ]]; then
   ok "断言里没有「grep | head」（不会被 head 提前退出打断）"
 else
   no "断言里仍有「grep | head」（第 ${G_HEAD} 处）—— 可能丢掉匹配行"
+fi
+
+echo
+echo "== 20. 动静分离：运行时配置在发布时装配 =="
+# --------------------------------------------------------------------------
+# 这一步的意义：**一份产物装到不同环境**。CI 每个 commit 只构建一份产物，
+# 而「API 在哪」「静态资源在哪」每套部署都不同 —— 所以它们必须在**发布时**
+# 写进产物，而不是烤进构建产物里。
+#
+# 断言的是**产物里的实际内容**（dist/runtime-config.js、dist/index.html），
+# 不是「脚本被调用过」。后者在装配逻辑写错时照样是绿的。
+# --------------------------------------------------------------------------
+
+# 默认（同源部署）：配置是同源的，资源地址不动
+setup_sandbox
+OUT=$(run_script)
+assert_ran "同源全量发布" || exit 1
+if calls_has "emit_frontend_runtime.py"; then
+  ok "发布时装配了运行时配置（用的是这一版产物里的脚本）"
+else
+  no "没有调用运行时配置装配脚本"
+fi
+if [[ -f "$APP/frontend/dist/runtime-config.js" ]]; then
+  ok "产物里有 runtime-config.js"
+else
+  no "产物里没有 runtime-config.js —— 前端读不到配置"
+fi
+if grep -cE '"apiBase":"/api"' "$APP/frontend/dist/runtime-config.js" >/dev/null 2>&1; then
+  ok "同源部署的 apiBase 是 /api（与从前完全一致）"
+else
+  no "同源部署的 apiBase 不对：$(cat "$APP/frontend/dist/runtime-config.js" 2>/dev/null)"
+fi
+if grep -cE 'src="/assets/' "$APP/frontend/dist/index.html" >/dev/null 2>&1; then
+  ok "同源部署的资源地址仍是 /assets/（没有被改成别的源）"
+else
+  no "同源部署的资源地址被改了 —— 不该动的地方动了"
+fi
+
+# CDN 形态：资源指向 CDN、配置脚本指向源站
+setup_sandbox
+OUT=$(run_script_cdn)
+assert_ran "CDN 形态全量发布" || exit 1
+if grep -cE 'src="https://cdn\.example\.com/assets/' "$APP/frontend/dist/index.html" >/dev/null 2>&1; then
+  ok "index.html 的资源地址指向 CDN"
+else
+  no "index.html 的资源地址没有指向 CDN：$(grep -oE 'src="[^"]*"' "$APP/frontend/dist/index.html" 2>/dev/null | tr '\n' ' ')"
+fi
+if grep -cE 'href="https://cdn\.example\.com/assets/' "$APP/frontend/dist/index.html" >/dev/null 2>&1; then
+  ok "CSS 的地址也指向 CDN（不是只有 JS）"
+else
+  no "CSS 仍指向源站 —— 静态分离只做了一半"
+fi
+if grep -cE '"assetBase":"https://cdn\.example\.com/"' "$APP/frontend/dist/runtime-config.js" >/dev/null 2>&1; then
+  ok "运行时配置里的 assetBase 指向 CDN"
+else
+  no "运行时配置的 assetBase 不对：$(cat "$APP/frontend/dist/runtime-config.js" 2>/dev/null)"
+fi
+if grep -cE 'src="https://acct\.example\.com/runtime-config\.js"' "$APP/frontend/dist/index.html" >/dev/null 2>&1; then
+  ok "配置脚本指向源站（配置的唯一真源在源站，不跟着 CDN 缓存走）"
+else
+  no "配置脚本没有指向源站：$(grep -oE 'src="[^"]*runtime-config[^"]*"' "$APP/frontend/dist/index.html" 2>/dev/null)"
+fi
+if grep -cE '/assets/index-' "$APP/frontend/dist/index.html" >/dev/null 2>&1; then
+  ok "资源文件名仍带内容哈希（CDN 才能长缓存）"
+else
+  no "资源地址里看不到内容哈希"
 fi
 
 echo

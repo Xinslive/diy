@@ -1,7 +1,18 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
+import { apiBase } from '@/config'
 
-export const http = axios.create({ baseURL: '/api', timeout: 30000 })
+/**
+ * API 基址来自运行时配置（见 @/config）。
+ *
+ * **为什么不是写死的 `/api`**：动静分离之后，API 可能不在源站同源位置 ——
+ * 前端挂在 CDN、API 留在源站时，浏览器发出的请求就变成跨域，`/api` 这个
+ * 相对路径会打到 CDN 域名上去（404，或者更糟：命中 CDN 上别人的路径）。
+ * 写死 `/api` 的那一刻，「前后端分域名」这件事就不可能了。
+ *
+ * 回落值是 `/api`（同源），所以不改配置时行为与从前完全一致。
+ */
+export const http = axios.create({ baseURL: apiBase, timeout: 30000 })
 
 /**
  * 登录页的地址。**唯一一份**。
@@ -74,7 +85,7 @@ export const apiUrl = (path, params = {}) => {
   const qs = new URLSearchParams(
     Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== '')
   ).toString()
-  return `/api${path}${qs ? `?${qs}` : ''}`
+  return `${apiBase}${path}${qs ? `?${qs}` : ''}`
 }
 
 // ------------------------------------------------------------------

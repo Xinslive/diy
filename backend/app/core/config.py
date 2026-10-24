@@ -335,6 +335,28 @@ class Settings(BaseSettings):
     # 里的启动告警）。
     trusted_proxies: str = ""
 
+    # 跨源白名单（逗号分隔的 origin）。**默认空 = 生产不开 CORS。**
+    #
+    # 什么时候需要它：**动静分离**之后，前端可能不在 API 的源站上 ——
+    # 静态资源挂 CDN、页面也在 CDN、API 留在源站时，浏览器发出的请求就是
+    # 跨源的，不开 CORS 的话**每一个请求都会失败**（不是某个接口坏，是
+    # 全站都白屏，浏览器控制台报 CORS 错误）。
+    #
+    # 为什么默认空而不是默认 `*`：本系统全仓没有任何 Cookie 依赖（令牌走
+    # Authorization 头 + 前端 localStorage），所以「同源」这个默认假设在
+    # 同源部署下一直是成立的 —— 把白名单留空，等于「不改部署就不开 CORS」，
+    # 也就不会因为多开一个中间件而凭空多出一轮预检请求。
+    #
+    # 写法：
+    #   * 精确 origin：``https://cdn.example.com``（**不带结尾斜杠** —— 浏览器
+    #     发的 Origin 头就没有结尾斜杠，带了永远匹配不上，而且不报错，
+    #     表现是「配了白名单还是跨源失败」）；
+    #   * 通配子域：``https://*.example.com``（``*`` 不跨 ``/``）；
+    #   * ``*`` 本身：允许任意源。只建议在「API 本来就是公开的」时用；
+    #     带了令牌的接口仍然拿不到数据（浏览器不会自动带 Authorization 头），
+    #     但未鉴权的接口会变成公开可读。
+    cors_allow_origins: str = ""
+
     # Excel 导入的容量上限（审计 P2-02）。
     #
     # Nginx 把单请求限在 50MB，那只挡住了「一个特别大的请求」，挡不住
@@ -822,6 +844,50 @@ def is_trusted_proxy(host: str | None, raw: str | None = None) -> bool:
     return any(addr in net for net in nets)
 
 
+def cors_origin_list(raw: str | None = None) -> tuple[list[str], list[str]]:
+    """把 ``CORS_ALLOW_ORIGINS`` 解析成 ``(精确 origin 列表, 正则列表)``。
+
+    逗号分隔，两边空白都吃掉。**空 = 一个都不给**（调用方据此关闭 CORS）。
+
+    写法：
+      * ``https://cdn.example.com`` —— 精确匹配，进第一个列表；
+      * ``https://*.example.com`` —— 通配子域，进第二个列表（转成正则）；
+      * ``*`` —— 允许任意源。单独处理成精确列表里的 ``"*"``（Starlette 的
+        CORSMiddleware 认这个值，会回 ``Access-Control-Allow-Origin: *``）。
+
+    **结尾斜杠会被去掉**：浏览器的 ``Origin`` 头是 ``scheme://host[:port]``，
+    **没有结尾斜杠**。白名单里写了 ``https://cdn.example.com/`` 就永远匹配
+    不上，而且**不报错** —— 表现是「配了白名单还是跨源失败」，排查时极容易
+    去看别处（后端路径？nginx？），所以这里直接抹平。
+
+    不合法的条目（不是 http/https 开头）**丢掉并告警**，不静默放过 ——
+    一个写错的 origin 条目等于没配，白名单因此短一截，却看不出来。
+    """
+    raw = settings.cors_allow_origins if raw is None else raw
+    exact: list[str] = []
+    patterns: list[str] = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part == "*":
+            exact.append("*")
+            continue
+        part = part.rstrip("/")
+        if not part.startswith("http://") and not part.startswith("https://"):
+            log.warning("CORS_ALLOW_ORIGINS 里的 %r 不是合法的 origin（要 http:// 或 https:// 开头），已忽略", part)
+            continue
+        if "*" in part:
+            # ``*`` 不跨 ``/``：``https://*.example.com`` 不匹配
+            # ``https://a.b.example.com``？—— 它**会**匹配（[^/]+ 可以含点）。
+            # 这里刻意放宽到「任意子域层级」，因为 CDN 的自定义域名层级
+            # 常常不受控；语义上等价于浏览器同源策略里的「同 eTLD+1」。
+            patterns.append("^" + re.escape(part).replace(r"\*", "[^/]+") + "$")
+        else:
+            exact.append(part)
+    return exact, patterns
+
+
 def mcp_allowed_host_list(raw: str | None = None) -> list[str]:
     """把 ``MCP_ALLOWED_HOSTS`` 解析成传输层要的 Host 白名单。
 
@@ -1046,6 +1112,27 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
             log.error(message)
             checks.append("MCP Host 白名单未配置（已告警；"
                           "要拒绝启动请设 MCP_ENFORCE_ALLOWED_HOSTS=true）")
+
+    # CORS 白名单写成 ``*`` 时提醒一句。
+    #
+    # 为什么只是提醒而不是拦住：本系统的令牌走 Authorization 头 + 前端
+    # localStorage，浏览器**不会自动带上**它 —— 所以 ``*`` 并不会让任何
+    # 带令牌的接口变成「谁都能读」。真正会变公开的是**未鉴权**的接口
+    # （健康检查、登录接口）。
+    #
+    # 但「配了 ``*``」这件事本身值得说一句：动态分离的正常形态是配**具体
+    # 的 CDN 域名**，而 CDN 的自定义域名有时会有多个（换域名、灰度），
+    # 于是有人会顺手写成 ``*`` —— 那就把「谁能读」这件事从「明确的一串」
+    # 变成了「所有人」。这里只告警：拦下来会让「换 CDN 域名」这件事
+    # 变成一次停机事故，而收益（挡住几个未鉴权接口）远小于那个代价。
+    _cors_exact, _cors_patterns = cors_origin_list(settings.cors_allow_origins)
+    if "*" in _cors_exact:
+        log.warning(
+            "CORS_ALLOW_ORIGINS 含 '*'：任意源都可以跨源读本系统的**未鉴权**接口"
+            "（带令牌的接口仍读不到 —— 浏览器不会自动带 Authorization 头）。"
+            "动静分离的常规配法是写具体的 CDN 域名，如 "
+            "CORS_ALLOW_ORIGINS=https://cdn.example.com。")
+        checks.append("CORS 白名单含 '*'（已告警；未鉴权接口对任意源可读）")
 
     return checks
 

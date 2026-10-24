@@ -250,7 +250,7 @@ cd backend && .venv/bin/python scripts/backup_to_oss.py
 ├── plugins/                  内置插件源码
 │   ├── com.cwq.periodic/     周期记账
 │   └── com.cwq.reimburse/   民宿报销
-├── deploy/                   发布脚本、systemd 单元、nginx 配置
+├── deploy/                   发布脚本、systemd 单元、nginx 配置、CDN 部署指南
 ├── tools/
 │   ├── uitest/               Playwright 一次性 UI 探测脚本（不是回归测试）
 │   └── desktop-shell/        Windows 桌面壳
@@ -302,6 +302,7 @@ cd backend && .venv/bin/python scripts/backup_to_oss.py
 | 通知与 MFA | `SMTP_*`、`NOTIFY_*`、`ADMIN_MFA_*` |
 | 备份 | `OSS_*`、`BACKUP_ENABLED`、`BACKUP_KEEP_DAILY_DAYS`、`BACKUP_KEEP_WEEKLY_DAYS` |
 | MCP | `MCP_ENABLED`、`MCP_MAX_PAGE_SIZE`、`MCP_MAX_RANGE_MONTHS`、`MCP_MAX_CALLS_PER_HOUR` |
+| 跨源（动静分离） | `CORS_ALLOW_ORIGINS`（**默认空 = 不开 CORS**；只有前端与 API 不同源时才配） |
 
 生产环境的配置校验是 **fail-closed**：缺关键项或仍在用默认密钥就拒绝启动。开发环境用 `APP_ENV=dev` 跳过。
 
@@ -453,6 +454,9 @@ cd frontend && npm test
    systemd: cwq-api.service  →  FastAPI (gunicorn/uvicorn workers)
       │                              │
    PostgreSQL 16            阿里云 OSS（账套备份）
+
+动静分离后（可选，见「动静分离与 CDN 部署」）：
+浏览器 → CDN（/assets/*，带哈希的 JS/CSS）→ 源站（入口 HTML + /api/）
 ```
 
 ### 发布铁律
@@ -483,8 +487,119 @@ cd frontend && npm test
 - `cwq.conf` —— upstream + keepalive、`/api/` 与 `/api/mcp` 反代、前端静态目录、`/api/scheduler/tick` 独立限流。
 - `acct.xins.live.conf` —— 生产站点 server_name、ACME 证书、限流。
 
----
+### 动静分离与 CDN 部署
 
+带宽紧张的小服务器上，**流量的大头不是业务数据，是前端静态资源**：
+首屏要拉一个 ~300 KB 的入口 JS 和 ~57 KB 的 CSS（未压缩；gzip 后约 110 KB + 20 KB），
+再叠上一堆按需加载的页面 chunk。把这一坨挪到 CDN，源站就只剩「一个 1.5 KB 的
+入口 HTML + 业务 JSON」—— 那才是小带宽服务器扛得住的量。
+
+仓库里已经为这件事准备好了三样东西：
+
+| 准备 | 在哪 | 作用 |
+| --- | --- | --- |
+| 静态资源带长缓存 | `deploy/nginx/*.conf` 的 `location /assets/` | `Cache-Control: public, max-age=31536000, immutable` |
+| 入口页与运行时配置**不缓存** | 同上，`location /` 与 `location = /runtime-config.js` | `Cache-Control: no-cache` —— 改了立刻生效 |
+| 静态资源带跨源头 | 同上 | `Access-Control-Allow-Origin: *` |
+
+加上**资源文件名带内容哈希**（`index-CUpwOnfx.js`），缓存一年不会出错，
+**发布后也不需要刷新 CDN 缓存**：新 HTML 指向的是新文件名。
+
+#### 形态一：Cloudflare 这类反向代理（推荐）
+
+```
+浏览器 ──HTTPS──▶ CDN 边缘
+                   ├─ /assets/*   命中边缘缓存（不回源）
+                   └─ 其它         回源 ──▶ nginx ──▶ FastAPI / 静态目录
+```
+
+**URL 不变**（还是 `https://acct.example.com/assets/xxx.js`），CDN 是反向
+代理，按路径决定缓不缓存。所以**不用改任何前端代码、不用开 CORS** ——
+页面与 API 仍然同源。
+
+要做的事：
+
+1. 域名接入 CDN，**SSL 模式选 `Full (strict)`**（`Flexible` 下源站只听
+   443，回源会被拒 → 525/522）。
+2. **安全组只放行 CDN 的网段**（`cloudflare.com/ips-v4`、`ips-v6`）——
+   不然谁都能绕过 CDN 直接打源站，带宽照样吃满。
+3. **装 nginx 的真实 IP 还原配置**（否则登录节流按 CDN 边缘 IP 分桶，
+   审计日志里也全是 CDN 地址，**且不报错**）：
+
+   ```bash
+   cp deploy/nginx/cwq-cloudflare-realip.conf /etc/nginx/cwq-include/
+   nginx -t && nginx -s reload
+   ```
+
+4. **配两条 Cache Rule**：
+   - `/runtime-config.js` → **不缓存**（它是 `.js`，Cloudflare 默认会缓存，
+     而它决定「API 在哪」，缓存住了就是「改了配置不生效」）；
+   - `/api/*` → **不缓存**（缓存住业务响应 = 把一个人的数据发给另一个人）。
+5. **关掉 Rocket Loader 与 Auto Minify**（前者会改写 `<script>` 标签，
+   本项目是 ES module；后者会重新压缩产物，与 CSP 对不上时浏览器直接拒绝执行）。
+6. 发布后自检：
+
+   ```bash
+   bash deploy/verify_cdn.sh https://acct.example.com
+   ```
+
+**已知限制**：CDN 的回源读超时是 **125 秒**（免费/专业/商业版改不了），
+超了就是 524。报表导出、MCP 的 SSE 长连接要留意（MCP 建议走 DNS-only
+子域）。上传上限免费版 100 MB —— 本系统发票批量上传上限 50 MB，够用。
+
+完整步骤、必关开关与排障对照表见 **[`deploy/cloudflare.md`](deploy/cloudflare.md)**。
+
+#### 形态二：静态资源放到另一个 CDN 域名
+
+页面在源站、资源在 CDN 域名时，资源的 URL 就成了**跨域**的。于是需要两样
+额外的东西：
+
+- **运行时配置**：告诉前端「API 在哪」「资源在哪」。这两个值**不能烤进
+  构建产物**（CI 每个 commit 只构建一份产物，要能装到不同环境），所以走
+  `dist/runtime-config.js`（一个 `window.__CWQ_RUNTIME__`），**发布时**由
+  发布脚本写进去：
+
+  ```bash
+  CWQ_ASSET_BASE=https://cdn.example.com/   # 静态资源基址
+  CWQ_ORIGIN=https://acct.example.com       # 源站（配置脚本从这儿取）
+  ```
+
+  产物里的 `index.html` 会被改成指向 CDN。**不配这两个变量就是原来的同源
+  部署，行为逐字不变。**
+
+- **后端 CORS**（页面与 API 不同源时才需要）：
+
+  ```bash
+  CORS_ALLOW_ORIGINS=https://cdn.example.com
+  ```
+
+  **不要带结尾斜杠** —— 浏览器的 `Origin` 头没有斜杠，带了就永远匹配不上，
+  而且不报错（症状是「配了白名单还是跨源失败」）。不配就是**不开 CORS**
+  （默认行为）。
+
+  后端会暴露 `Content-Disposition` 响应头 —— 不然跨域时导出文件名会全变成
+  「导出.xlsx」（后端给的好名字被丢掉，且不报错）。
+
+跨域加载 **ES module 一律走 CORS 校验**（浏览器没有「不校验」的选项），
+所以 CDN 上的静态资源必须带 `Access-Control-Allow-Origin`。
+实在加不了响应头的 CDN，可以用 `VITE_FORMAT=iife` 构建成普通脚本
+（普通脚本默认不走 CORS 校验，代价是不能代码分割，首屏多下一些代码）。
+
+#### 静态资源托管在 OSS（源站一个字节都不出）
+
+```bash
+CWQ_CDN_UPLOAD=1   # 发布时把 dist/assets/ 传到 OSS
+```
+
+配合 CDN 以 OSS 为源站，源站连静态资源都不存。
+需要 `OSS_ENDPOINT` / `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` / `OSS_BUCKET`
+（与后端备份用的是同一套凭据）。**注意 OSS bucket 要配 CORS 规则**
+（允许 GET/HEAD、来源 `*`），否则 CDN 取到的资源浏览器一样不认。
+
+不用这个开关也完全可以：多数形态用「CDN 回源」就行，源站每个文件每个 CDN
+节点只回源一次，带宽已经省下来了。
+
+---
 ## 十四、桌面客户端
 
 `tools/desktop-shell/` 把线上站点包成一个独立窗口的 Windows 程序（`CWQ.exe`）。
@@ -505,6 +620,7 @@ cd frontend && npm test
 | 文档 | 内容 |
 | --- | --- |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | 架构细节（很长，按模块逐层展开） |
+| [`deploy/cloudflare.md`](deploy/cloudflare.md) | **部署到 CDN（Cloudflare 形态）**：缓存规则、必关开关、真实 IP 还原、已知限制 |
 | [`docs/plugin-overview.md`](docs/plugin-overview.md) | 插件开发总览与快速开始 |
 | [`docs/plugin-spec.md`](docs/plugin-spec.md) | 插件清单、权限、运行时参考 |
 | [`docs/plugin-guide.md`](docs/plugin-guide.md) | 插件开发指南 |

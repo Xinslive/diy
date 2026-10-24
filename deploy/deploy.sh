@@ -74,6 +74,32 @@ APP=${APP_DIR:-/opt/cwq}
 # 一直没人看见。与 APP_DIR / ARTIFACT_DIR 同一套做法。
 : "${SYSTEMD_UNIT_DIR:=/etc/systemd/system}"
 : "${BACKUP_DIR:=/opt/cwq/backups}"
+# --------------------------------------------------------------------------
+# 动静分离：这份部署的「静态走 CDN、动态留源站」参数
+# --------------------------------------------------------------------------
+# **默认值 = 同源部署**，也就是「什么都不配就什么都不变」：
+#   CWQ_API_BASE   —— API 在哪。默认 /api（源站同源）。
+#   CWQ_ASSET_BASE —— 静态资源（JS/CSS）在哪。默认 /（源站同源）。
+#   CWQ_ORIGIN     —— 源站地址。给了就把 runtime-config.js 的引用写成
+#                     **源站的绝对地址**（页面托管在别处时需要）。
+#
+# 这三个值**不写进构建产物**：CI 每个 commit 只构建一份产物，同一份产物要能
+# 装到不同环境（生产 / 预发 / 本地）。烤进产物等于「换环境要重新构建」，
+# 而发布流程的约定是「取产物 → 装上去」。所以它们在**发布时**写进
+# dist/runtime-config.js（见下面第 5 步的「装配运行时配置」）。
+#
+# **CDN 形态怎么填**（以静态资源挂 CDN、页面与 API 留在源站为例）：
+#   CWQ_ASSET_BASE=https://cdn.example.com/
+#   CWQ_ORIGIN=https://acct.example.com
+# 此时页面与 API 同源 → **后端不需要开 CORS**；只有 CDN 上的 ES module
+# 需要跨域响应头（nginx 的 /assets/ 已经带上了）。
+: "${CWQ_API_BASE:=/api}"
+: "${CWQ_ASSET_BASE:=/}"
+: "${CWQ_ORIGIN:=}"
+# 静态资源是否上传到 OSS（CDN 的源站）。**默认不传** —— 多数形态用「CDN 回源」
+# 就行，源站每个文件只回源一次，带宽已经省下来了。开这个开关意味着
+# 「源站一个静态字节都不出」。
+: "${CWQ_CDN_UPLOAD:=0}"
 KEEP=3
 # 分支不写死（仓库默认分支改名时，写死的名字会让发布脚本在 ``set -e`` 下
 # 直接失败 —— 而那是最不该失败的时候）。发布模式不再 checkout 分支，
@@ -620,6 +646,57 @@ mkdir -p "$FRONT_IN" "$FRONT_RELEASES"
 tar --no-same-owner -xzf "$STAGE/cwq-frontend-${SHA}.tar.gz" -C "$FRONT_IN"
 if [[ ! -d "$FRONT_IN/dist" ]]; then
   die "前端产物里没有 dist/ —— 解压出来的东西不对。**前端产物没切、代码没重启。**"
+fi
+# ---------------------------------------------------------------------------
+# 装配运行时配置（动静分离）
+# ---------------------------------------------------------------------------
+# 这一步把「API 在哪」「静态资源在哪」写进 dist/runtime-config.js，并把
+# dist/index.html 里的资源地址改成静态基址。
+#
+# **为什么放在这里（切产物之前）**：改写的是即将上线的那份产物，改坏了要能
+# 一眼看出来 —— 切上去之后再发现 index.html 指向了错的域名，回退要走一遍
+# trap，而那时库已经迁过了。
+#
+# **为什么用暂存目录里的脚本**（$INCOMING/scripts/…）而不是现网那份：
+# 发布脚本的铁律之一是「依据必须是**这一版**的代码」。用现网那份意味着
+# 「这一版换了装配逻辑，但装上去的还是老逻辑」，而且现象极难解释。
+#
+# 脚本不存在 = 产物不对（这一版没有这个脚本）→ 直接停。
+EMIT_SCRIPT="$INCOMING/scripts/emit_frontend_runtime.py"
+if [[ ! -f "$EMIT_SCRIPT" ]]; then
+  die "产物里缺 scripts/emit_frontend_runtime.py —— 这一版没有运行时配置装配脚本。
+   **前端产物没切、代码没重启**（trap 会把已换的代码退回去）。"
+fi
+EMIT_ARGS=(--dist "$FRONT_IN/dist" --api-base "$CWQ_API_BASE"
+           --asset-base "$CWQ_ASSET_BASE" --version "$SHA")
+if [[ -n "$CWQ_ORIGIN" ]]; then
+  EMIT_ARGS+=(--origin "$CWQ_ORIGIN")
+fi
+log "  装配运行时配置（API 基址=${CWQ_API_BASE} 静态基址=${CWQ_ASSET_BASE}）"
+if ! "$VENV/bin/python" "$EMIT_SCRIPT" "${EMIT_ARGS[@]}"; then
+  die "运行时配置装配失败（上面是具体原因）。
+   **前端产物没切** —— 现网仍在跑上一版的前端。
+   若已切了后端代码，trap 会把它退回去；库若已迁移则**不回退**（见 trap 的说明）。"
+fi
+# ---------------------------------------------------------------------------
+# 静态资源上传到 OSS（可选，默认不做）
+# ---------------------------------------------------------------------------
+# **默认不做**：多数形态用「CDN 回源」就行 —— 源站每个文件每个 CDN 节点
+# 只回源一次，带宽已经省下来了。开这个开关意味着「源站一个静态字节都不出」，
+# 代价是静态资源从此由 OSS 托管，发布必须同时传 OSS（否则 CDN 回源取到的是
+# 上一版资源 —— 表现为「界面看着没变」，因为 HTML 指向的旧哈希文件还在）。
+if [[ "$CWQ_CDN_UPLOAD" == "1" ]]; then
+  UPLOAD_SCRIPT="$INCOMING/scripts/publish_assets.py"
+  if [[ ! -f "$UPLOAD_SCRIPT" ]]; then
+    die "CWQ_CDN_UPLOAD=1 但产物里缺 scripts/publish_assets.py。
+   **前端产物没切、代码没重启**。"
+  fi
+  log "  上传静态资源到 OSS（CDN 源站）"
+  if ! "$VENV/bin/python" "$UPLOAD_SCRIPT" --dist "$FRONT_IN/dist"; then
+    die "静态资源上传到 OSS 失败。
+   **前端产物没切** —— 现网仍在跑上一版的前端，CDN 里的资源也还是上一版。
+   修好后重新发布即可（上传是幂等的：文件名带哈希，重传同一个文件覆盖即可）。"
+  fi
 fi
 # 理由同后端那一步：--no-same-owner 挡住 CI runner 的 uid，chown 把属主
 # 显式交给服务账号。nginx 以 root 读它，两种属主都读得到，但只有后者是对的。

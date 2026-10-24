@@ -18,6 +18,7 @@ from starlette.routing import Route
 from app.api import (auth, books, invoices, ledger, mcp_admin, printing, reports,
                      scheduler, subjects, system, vouchers)
 from app.core.config import detect_env, settings
+from app.core.cors import cors_middleware_options
 from app.core.db import get_db
 from app.core.schema_version import assert_schema_ready
 
@@ -171,40 +172,20 @@ app = FastAPI(
     **api_docs_urls(),
 )
 
-# CORS 只在开发/测试环境装（审计 P2-10）。
+# CORS 的装配口径全在 app/core/cors.py 里（抽成纯函数是为了能单独测）。
+# 这里只负责「算出来的参数装上去 / 不装」。
 #
-# 原来这段是**无条件**加的，且带着一条通配正则
-# ``http://(localhost|127\.0\.0\.1):\d+`` + ``allow_credentials=True``：
-# 生产部署下，任何跑在本机 localhost 任意端口上的页面都能带着凭据
-# 跨源读本系统的任意响应。令牌存在 localStorage 而非 cookie，
-# 所以恶意源拿不到令牌、拿不到实质数据 —— 危害有限，但白名单
-# 「任何本机端口」这件事本身就不该出现在生产。
-#
-# 判环境用 ``detect_env``，和启动校验、/health 用**同一个口径**；
-# 显式 APP_ENV 没配时按 prod 处理（config.detect_env 的注释解释过为什么）。
-_cors_env = detect_env(settings)
-if _cors_env in ("dev", "test"):
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-        # **不带凭据**（审查 L-05）。原来这里是 ``allow_credentials=True``，
-        # 与「允许本机任意端口」那条通配正则叠在一起：那么**任何**跑在
-        # localhost 任意端口上的页面都能带着凭据跨源读本系统的响应。
-        #
-        # 本项目**全仓没有任何 Cookie 依赖**（没有 set_cookie、没有
-        # ``request.cookies``）—— 令牌走 ``Authorization`` 头 + 前端
-        # localStorage，**不带凭据照样工作**。而浏览器对「带凭据的跨源
-        # 请求」有额外的限制（CORS 预检更严、不能通配），去掉它对开发
-        # 没有影响，对「本机任意端口」这个过宽的口径是实打实的收紧。
-        allow_credentials=False,
-        allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+# 一句话版：**同源部署不装（默认）；前端放到别的源上时配 CORS_ALLOW_ORIGINS
+# 才装。** 详细的为什么见 app/core/cors.py。
+_cors_opts = cors_middleware_options(settings)
+if _cors_opts is not None:
+    app.add_middleware(CORSMiddleware, **_cors_opts)
+    log.info("CORS 中间件已启用：allow_origins=%s", _cors_opts.get("allow_origins") or "（仅正则）")
 else:
     # 生产：前端与 API 同源（都经 nginx 转发），不需要 CORS。
     # 留空而不是「装一个空白名单的中间件」—— 后者仍会让浏览器多跑一轮预检。
-    log.info("CORS 中间件未启用（环境=%s）：生产应由 nginx 同源提供前后端", _cors_env)
+    log.info("CORS 中间件未启用（环境=%s）：生产应由 nginx 同源提供前后端；"
+             "前端要放到别的源上时设 CORS_ALLOW_ORIGINS", detect_env(settings))
 
 
 # 外部请求号原样透传，只认这几种字符、限长 64。

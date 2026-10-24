@@ -102,6 +102,22 @@ def location_blocks(lines: list[str], header: str) -> list[list[str]]:
     —— 80 端口那个是「跳 HTTPS」，443 端口那个才是 SPA 兜底。
     只看第一个会把断言安到错误的块上（于是「加了 header 也判失败」，
     或者更糟：把它加在跳转块上反而算通过）。
+
+    ------------------------------------------------------------------
+    **块的边界必须掐准**（这里以前掐错过）
+    ------------------------------------------------------------------
+    原来的结束条件是 ``depth <= 0 and "{" in l2`` —— 而 location 块的
+    收尾那行通常**只有一个 ``}``、不含 ``{``**，于是这个条件不成立，
+    块**没有在那里结束**，而是一路吞掉了后面的块。
+
+    后果不是「多看了几行」这么轻：像「``/api/`` 段不许带
+    Access-Control-Allow-Origin」这种断言，判的其实是
+    「``/api/`` **以及它后面所有块**」—— 后面某个块带了那个头，断言就会
+    误报「``/api/`` 带了 ACAO」；反过来，要是在别的块里加了 ACAO 也可能
+    被算成「``/api/`` 的问题」。断言指错了对象，就等于没有断言。
+
+    正确的结束条件是**花括号配平**（depth 回到 0）：块头那行把 depth 变成
+    1，收尾那行把它变回 0。
     """
     blocks: list[list[str]] = []
     for i, ln in enumerate(lines):
@@ -113,7 +129,7 @@ def location_blocks(lines: list[str], header: str) -> list[list[str]]:
             code = l2.split("#", 1)[0]
             depth += code.count("{") - code.count("}")
             out.append(l2)
-            if depth <= 0 and "{" in l2:
+            if depth <= 0:
                 break
         blocks.append(out)
     return blocks
@@ -211,6 +227,56 @@ def check_structure(conf: Path) -> None:
         ok("带内容哈希的 /assets/ 仍然 immutable 一年")
     else:
         no("/assets/ 少了 immutable —— 入口已经每次重新验证了，资源不该再每次重下")
+
+    # --- 动静分离：静态资源要能跨域取，运行时配置不许被缓存 ---
+    #
+    # 这两条是「静态资源走 CDN」能成立的前提：
+    #   · /assets/ 必须带 Access-Control-Allow-Origin —— **跨域加载 ES module
+    #     一律走 CORS 校验**，没有「不校验」的选项。缺了它，CDN 上的那份
+    #     脚本会被浏览器直接拒绝执行，页面白屏（控制台一条 CORS 错误）。
+    #   · /runtime-config.js 必须 no-cache —— 它决定「API 在哪」「静态资源
+    #     在哪」，每套部署都不同。缓存住了就是「改了配置不生效」。
+    if any("Access-Control-Allow-Origin" in l for b in assets for l in b):
+        ok("/assets/ 带 Access-Control-Allow-Origin（CDN 上的 ES module 能跨域执行）")
+    else:
+        no("/assets/ 没有 Access-Control-Allow-Origin —— 资源搬到 CDN 之后浏览器会拒绝执行")
+
+    runtime_cfg = location_blocks(lines, "location = /runtime-config.js {")
+    if runtime_cfg and any("no-cache" in l for b in runtime_cfg for l in b):
+        ok("运行时配置带 no-cache（改了 API/CDN 地址立刻生效）")
+    else:
+        no("/runtime-config.js 没有 no-cache —— 配置会被缓存住，改了不生效")
+
+    # **/api/ 绝不能带 ACAO**：那是业务数据。放开跨源等于任何网站都能读
+    # 未鉴权的接口响应。这条是「别把静态那条复制到动态那条上」的钉子。
+    api_blocks = location_blocks(lines, "location /api/ {")
+    if any("Access-Control-Allow-Origin" in l for b in api_blocks for l in b):
+        no("/api/ 带了 Access-Control-Allow-Origin —— 业务数据不能对任意源开放")
+    else:
+        ok("/api/ 没有 Access-Control-Allow-Origin（业务数据不对任意源开放）")
+
+    # --- 静态资源的 Cache-Control 只能有一条 ---
+    #
+    # CDN 是靠这条头决定缓存行为的。两条（`expires` 自己那条 +
+    # add_header 那条）浏览器会合并，CDN 不一定 —— 可能挑错、或只认其中
+    # 一条，于是「带宽没降下来」而**没有任何报错**。
+    cc_lines = [l for b in assets for l in b
+                if "Cache-Control" in l and not l.strip().startswith("#")]
+    if len(cc_lines) <= 1:
+        ok("/assets/ 只有一条 Cache-Control（CDN 按它决定缓存行为）")
+    else:
+        no(f"/assets/ 有 {len(cc_lines)} 条 Cache-Control —— CDN 可能挑错其中一条，"
+           "而带宽没降下来时是没有任何报错的")
+
+    # --- Cloudflare 在前时的真实客户端 IP 还原 ---
+    #
+    # 少了它，nginx 看到的对端是 CDN 的边缘节点 IP —— 本系统那层按 IP
+    # 分桶的登录节流于是按边缘节点分桶（一个节点后面成千上万个用户共用
+    # 一个桶），审计日志里的 IP 也全是 CDN 的地址。**且不报错。**
+    if any("cwq-cloudflare-realip" in l for l in lines):
+        ok("引入了 Cloudflare 真实 IP 还原配置（通配 include：没装文件就是干净的关闭状态）")
+    else:
+        no("没有引入 Cloudflare 真实 IP 还原配置 —— CDN 在前时登录节流会按边缘 IP 分桶")
 
 
 # --------------------------------------------------------------------------
