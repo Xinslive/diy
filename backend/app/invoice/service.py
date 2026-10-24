@@ -543,8 +543,27 @@ def _build_preview(
             diff = (total - tax) - line_sum
             if diff != 0:
                 if abs(diff) <= Decimal("0.05"):
-                    items[-1]["amount"] += diff
-                    rounding = diff
+                    # 落到**最后一个非零**明细行上。
+                    #
+                    # 原来是无条件落 ``items[-1]`` —— 但最后一行可能是净额
+                    # 抵成 0 的那种（整额折扣，见 ``_net_items``）。那行最后
+                    # 不生成分录，差的几分钱就跟着它一起蒸发了：借方少了几
+                    # 分、贷方没少，这张票照样过不去 —— 而且错得没头没脑。
+                    #
+                    # 同样不能选「加上差值正好抵成 0」的行：那行本来有数，
+                    # 抵成 0 之后它也被剔掉，几分钱还是没了。
+                    target = next(
+                        (item for item in reversed(items)
+                         if item["amount"] != 0 and item["amount"] + diff != 0),
+                        None,
+                    )
+                    if target is None:
+                        problems.append(
+                            f"各项目金额合计 {line_sum} 与发票金额 {total - tax} 不一致"
+                            f"（差 {diff}），请核对发票明细")
+                    else:
+                        target["amount"] += diff
+                        rounding = diff
                 else:
                     problems.append(
                         f"各项目金额合计 {line_sum} 与发票金额 {total - tax} 不一致"
@@ -585,6 +604,21 @@ def _build_preview(
                     for e in entries
                 ]
 
+        # **借贷必须平**，而且要在这里平，不是等到「确认生成」才平。
+        #
+        # 平不了的情况是有的：整张票的明细净额全被折扣抵成 0（借方一条都
+        # 不成行），或者票面金额是 0。这类票在预览页就该标红等人看，
+        # 留到「确认生成」才炸的话，那一下是**整批回滚** —— 几十张本来
+        # 没问题的凭证陪着一张有问题的票一起白干。
+        if entries:
+            debit = sum((_money(e["amount"]) for e in entries
+                         if e["direction"] == "DEBIT"), Decimal("0"))
+            credit = sum((_money(e["amount"]) for e in entries
+                          if e["direction"] == "CREDIT"), Decimal("0"))
+            if debit != credit:
+                problems.append(f"分录借贷不平：借 {debit} / 贷 {credit}")
+        if total == 0:
+            problems.append("发票金额为 0，无法生成凭证")
         if not items:
             problems.append("没有可入账的发票明细")
         if problems:
@@ -614,6 +648,13 @@ def _build_preview(
                 },
                 # 末项为对齐发票合计而调整的金额（0 表示没调整）。
                 "rounding": _decimal_string(rounding) if rounding else "",
+                # 净额抵成 0 的明细行（整额折扣）。这些行**不生成分录** ——
+                # 前端要标出来，不然用户看见「凭证预览」里没有这一项，
+                # 会以为漏记了。
+                "zero_lines": [
+                    index for index, item in zip(item_index, items)
+                    if item["amount"] == 0
+                ],
                 "entries": entries,
                 "overrides": override,
             },
@@ -622,6 +663,24 @@ def _build_preview(
     batch.ready_count = ready
     batch.error_count = errors
     return previews, ready, errors
+
+
+def _net_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把**净额抵成 0** 的明细行剔掉。
+
+    发票上常见「整额折扣」：一行商品原价 2.04，紧跟着一行 -2.04 的折扣行，
+    净额正好抵成 0（超市的买一送一、满减就是这么印的）。解析器把折扣行并进
+    商品行，于是这行的金额是 0。
+
+    这一行**不该**变成一条 0 金额的分录：凭证上凭空多一行 0、报表上多一行
+    没有金额的格子，数据库的 ``ck_entry_amount_nonzero`` 也会拦下来 ——
+    拦下来的后果是「确认生成」时整批回滚，61 张凭证一张都生成不出来。
+
+    剔掉它**不影响恒等式**：0 加进任何和里都不变，Σ明细 仍等于 Σ可入账明细，
+    借方合计仍等于价税合计。发票上这一项照样列在预览的明细表里（金额 0.00），
+    用户看得见它被抵掉了，只是不进凭证。
+    """
+    return [item for item in items if item["amount"] != 0]
 
 
 def _input_entries(
@@ -642,17 +701,20 @@ def _input_entries(
     落在哪一行是要看出来的，所以摘要标「含税」：复核时一眼能看出这笔费用为什么
     比发票明细那行大，而不是以为录错了。
 
-    两条容易写错的：
+    三条容易写错的：
 
-    1. 「第一条」是 ``items`` 的第一项 —— 它按发票明细的行序排，与科目无关。
+    1. 「第一条」是**第一条非零明细行** —— 它按发票明细的行序排，与科目无关。
        合并过科目时第一条的科目可能重复出现，税额就会落错行。
     2. 税额只加一次：只有第 0 项加，后面各项都不加。
+    3. 净额抵成 0 的行不进分录（``_net_items``）。所以「第一条」得在剔掉
+       净零行**之后**数 —— 否则税额会落在一个根本不会成行的 0 元行上，
+       那张票的借方就永远少一笔，凭证直接不成立。
 
     借贷恒等：借方合计 = Σ明细 + 税额 = 价税合计 = 贷方，全程 Decimal 不经过
     float，不会出现差一分。
     """
     entries: list[dict[str, Any]] = []
-    for position, item in enumerate(items):
+    for position, item in enumerate(_net_items(items)):
         takes_tax = bool(tax) and position == 0
         amount = item["amount"] + tax if takes_tax else item["amount"]
         entries.append({
@@ -692,7 +754,8 @@ def _output_entries(
         "amount": _decimal_string(total),
         "summary": summary,
     }]
-    for item in items:
+    # 净额抵成 0 的明细行不成行（``_net_items``）—— 0 金额的分录不让存。
+    for item in _net_items(items):
         entries.append({
             "subject_id": item["subject_id"],
             "direction": "CREDIT",
@@ -1136,6 +1199,19 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
             record.status = "COMMITTED"
             resolution = (record.payload or {}).get("resolution") or {}
             entries = resolution.get("entries") or []
+            # **0 金额的分录不让存**（数据库的 ck_entry_amount_nonzero 也会拦）。
+            #
+            # 净额抵成 0 的明细行（整额折扣）在预览时就已经不生成分录了，
+            # 这里再滤一道是给**旧预览**兜底：这个批次可能是上一版代码算
+            # 出来的，那一版还会把抵成 0 的行变成一条 0 元的分录，点「确认
+            # 生成」就整批回滚 —— 几十张本来没问题的凭证陪着一张有问题的
+            # 票一起白干。
+            #
+            # 滤掉它不改变合计：0 加进任何和里都不变，借贷照样平。
+            entries = [e for e in entries if _money(e.get("amount")) != 0]
+            if not entries:
+                raise ValueError(
+                    f"发票 {record.invoice_no or '未识别'} 没有可入账的分录")
             # **再搬一次**：科目表每个年度各有一份，而这张凭证要记在
             # 开票日期所在的那一年。预览时已经搬过一次，这里是权威的一遍 ——
             # 预览到确认之间可能隔着一次年度结转，那之后科目表就不是同一张了。
@@ -1152,6 +1228,19 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
                     {**e, "subject_id": mapping.get(int(e["subject_id"]), int(e["subject_id"]))}
                     for e in entries
                 ]
+            # **借贷必须平**，而且报错要**点名是哪张发票**。
+            #
+            # 不点名的话，用户看到的是「自动生成凭证失败，已整体回滚：借贷
+            # 不平衡：借 179.65 / 贷 197.24」—— 一张几十张的批次里挑不出
+            # 哪张票有问题，只能把整批重传一遍。
+            debit = sum((_money(e["amount"]) for e in entries
+                         if e["direction"] == "DEBIT"), Decimal("0"))
+            credit = sum((_money(e["amount"]) for e in entries
+                          if e["direction"] == "CREDIT"), Decimal("0"))
+            if debit != credit:
+                raise ValueError(
+                    f"发票 {record.invoice_no or '未识别'} 的分录借贷不平："
+                    f"借 {debit} / 贷 {credit}")
             voucher = voucher_service.create_voucher(
                 db,
                 book_id=batch.book_id,

@@ -340,7 +340,7 @@
                   </el-table-column>
                 </el-table>
                 <div class="rounding-note" v-if="row.resolution?.rounding">
-                  最后一项已按发票合计调整 {{ row.resolution.rounding }}，各项目金额之和与发票金额一致。
+                  已有一项按发票合计调整 {{ row.resolution.rounding }}，各项目金额之和与发票金额一致。
                 </div>
                 <div class="entry-preview" v-if="row.resolution?.entries?.length">
                   <span class="muted">凭证预览：</span>
@@ -348,6 +348,15 @@
                     {{ entry.direction === 'DEBIT' ? '借' : '贷' }} {{ entry.subject_code }} {{ entry.subject_name }} {{ entry.amount }}
                     <span v-if="entry.summary" class="entry-summary">{{ entry.summary }}</span>
                   </span>
+                </div>
+                <!--
+                  净额抵成 0 的项目（整额折扣）**不进凭证**：0 金额的分录
+                  存不进去，存进去也是一行查不出是哪张票的 0。
+                  要说清楚，否则用户看见「凭证预览」里没有这一项，
+                  会以为系统漏记了。
+                -->
+                <div class="zero-note" v-if="row.resolution?.zero_lines?.length">
+                  有 {{ row.resolution.zero_lines.length }} 项折扣后净额为 0，未生成分录。
                 </div>
                 </template>
               </div>
@@ -639,6 +648,7 @@ onMounted(loadAll)
 .entry-preview { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; align-items: center; font-size: 12px; }
 .entry-summary { color: #667085; }
 .rounding-note { margin-top: 8px; font-size: 12px; color: #b45309; }
+.zero-note { margin-top: 6px; font-size: 12px; color: #667085; }
 .fallback-tag { margin-left: 6px; }
 .entry-chip { padding: 4px 7px; border: 1px solid #dfe6ef; background: #f8fafc; color: #344054; }
 :deep(.invoice-row-bad) { background: #fff5f4; }
