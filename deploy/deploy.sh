@@ -471,6 +471,63 @@ verify_artifacts() {
 }
 
 # --------------------------------------------------------------------------
+# 发布脚本自检：你现在跑的这一份，和产物里那一份是不是同一个文件
+# --------------------------------------------------------------------------
+#
+# **为什么要有这道闸。** 产物里带着发布脚本（cwq-deploy-<sha>.tar.gz），
+# 目的只有一个：让生产机跑的永远是 CI 验过的那一份。
+#
+# 如果这份脚本是从别处拷来的旧副本，那么「CI 的沙箱演练通过」这句话
+# 对这次发布就不成立 —— 脚本少做的事，发布界面照样显示成功。少一条
+# logrotate 规则、少停一次重复的备份 timer，都是这一类：**看着做完了，
+# 其实没做**。
+#
+# 判据是**内容**不是路径：同一份脚本放在哪个目录都一样，拷到别处也一样；
+# 只有内容变了才算不一致。
+verify_release_script() {
+  local dir="$1"
+  local tarball="$dir/cwq-deploy-${SHA}.tar.gz"
+
+  if [[ ! -f "$tarball" ]]; then
+    die "产物里没有 cwq-deploy-${SHA}.tar.gz —— 这不是带发布脚本的那一版产物。
+   build-artifacts 从带 deploy/ 的那次起才有它。
+   **没有改动任何东西。**（确实要用这套旧产物：ALLOW_DEPLOY_SCRIPT_MISMATCH=1）"
+  fi
+
+  local tmp want have
+  tmp=$(mktemp -d) || die "建临时目录失败。**没有改动任何东西。**"
+  if ! tar --no-same-owner -xzf "$tarball" -C "$tmp" deploy/deploy.sh 2>/dev/null; then
+    rm -rf "$tmp"
+    die "产物里的发布脚本解不开（cwq-deploy-${SHA}.tar.gz 里没有 deploy/deploy.sh）。
+   **没有改动任何东西。**"
+  fi
+  # 用 SCRIPT_DIR 拼绝对路径，不用 BASH_SOURCE[0] 直接算：脚本在第 488 行
+  # ``cd "$APP"`` 过了，相对路径的 BASH_SOURCE 到那时已经指不到文件了
+  # （测试里有「相对路径调用的发布」这一条，就是防这个）。
+  want=$(sha256sum "$tmp/deploy/deploy.sh" | awk '{print $1}')
+  have=$(sha256sum "$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")" | awk '{print $1}')
+  rm -rf "$tmp"
+
+  if [[ "$want" == "$have" ]]; then
+    log "  发布脚本与产物同版（${have:0:12}）"
+    return 0
+  fi
+
+  if [[ "${ALLOW_DEPLOY_SCRIPT_MISMATCH:-0}" != "1" ]]; then
+    die "**你现在跑的这份发布脚本，与产物里那一份不是同一个文件。**
+   跑着的：${have:0:12}
+   产物里的：${want:0:12}
+   用别处拷来的旧脚本发布，等于「CI 验过的行为」这句话对这次发布不成立 ——
+   脚本少做的事，发布界面照样显示成功。
+   正确做法：把发布脚本从产物里取出来再跑：
+     tar -xzf cwq-deploy-${SHA}.tar.gz -C <目录>
+     <目录>/deploy/deploy.sh
+   **没有改动任何东西。**（确实要放行：ALLOW_DEPLOY_SCRIPT_MISMATCH=1）"
+  fi
+  log "⚠️  发布脚本与产物不同版，已按 ALLOW_DEPLOY_SCRIPT_MISMATCH=1 放行"
+}
+
+# --------------------------------------------------------------------------
 # --check-only 必须**真的只检查**（原来就有的语义，不许悄悄改成真发布）
 # --------------------------------------------------------------------------
 if [[ "${1:-}" == "--check-only" ]]; then
@@ -507,6 +564,7 @@ fetch_artifacts "$STAGE"
 verify_artifacts "$STAGE"
 SHA=$(sed -nE 's/^sha=//p' "$STAGE/manifest.txt")
 log "  取到产物 ${SHA}"
+verify_release_script "$STAGE"
 
 log "2/7 备份当前版本"
 # 备份目录在**产物取到之后**才建。建早了的后果很小（多一个空目录），
@@ -717,6 +775,44 @@ chown_if_possible() {
   fi
 }
 
+# --------------------------------------------------------------------------
+# 把产物里的 deploy/ 铺到 $APP/deploy
+# --------------------------------------------------------------------------
+# 做法不是「换目录」而是「覆盖式铺开」：
+#   1) 先删掉旧目录里**新版没有**的文件 —— 不删的话，上一版有、这一版
+#      删掉的规则会留在 $APP/deploy 里，继续被装到 /etc/logrotate.d/，
+#      变成「在转一个已经不需要的日志」。
+#   2) 再逐个文件铺新版：**先 rm 再 cp**，不是原地覆盖。发布脚本有可能
+#      正跑在 $APP/deploy/deploy.sh 里 —— 原地截断会让 bash 读到一半的
+#      脚本，行为变得不确定（unlink 之后老 inode 还在，bash 照常读完）。
+install_release_tooling() {
+  local tarball="$STAGE/cwq-deploy-${SHA}.tar.gz"
+  local stage="$APP/.deploy.incoming.$$"
+
+  [[ -f "$tarball" ]] || return 1
+  rm -rf "$stage"; mkdir -p "$stage" || return 1
+  tar --no-same-owner -xzf "$tarball" -C "$stage" || { rm -rf "$stage"; return 1; }
+  [[ -d "$stage/deploy" ]] || { rm -rf "$stage"; return 1; }
+  mkdir -p "$APP/deploy" || { rm -rf "$stage"; return 1; }
+
+  local rel
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    [[ -e "$stage/deploy/$rel" ]] || rm -f "$APP/deploy/$rel"
+  done < <(cd "$APP/deploy" && find . -type f 2>/dev/null | sed 's|^\./||')
+
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    mkdir -p "$APP/deploy/$(dirname "$rel")"
+    rm -f "$APP/deploy/$rel"
+    cp -p "$stage/deploy/$rel" "$APP/deploy/$rel" || { rm -rf "$stage"; return 1; }
+  done < <(cd "$stage/deploy" && find . -type f 2>/dev/null | sed 's|^\./||')
+
+  chmod 755 "$APP/deploy"/*.sh 2>/dev/null || true
+  rm -rf "$stage"
+  return 0
+}
+
 log "5/7 切换代码与前端产物"
 # 走到这一步，说明依赖已按新锁装好、schema 已按新迁移链升到位。
 # **这两件事的依据都在暂存目录里，不在现网** —— 所以现在才是第一次
@@ -728,6 +824,35 @@ log "5/7 切换代码与前端产物"
 # .env 与 .venv 本来就不在仓库里）。整目录换名会把这些运行时状态一起换掉 ——
 # 密钥、虚拟环境、插件运行目录，正是最不该被一次发布顺手抹掉的东西。
 # 解包覆盖则天然只写产物里有的那几个路径。
+
+# ---------------------------------------------------------------------------
+# 先把**发布工具本身**也同步到应用根下（$APP/deploy）
+# ---------------------------------------------------------------------------
+# $APP/deploy 不是装饰：脚本查找 logrotate / systemd 规则时看的就是它。
+#
+# 生产机上那份是 2026-10-24 的旧副本：它的 logrotate/ 里只有 cwq-api，
+# **没有 cwq-backup**。而查找逻辑原先是「先 $APP/deploy、没有才看脚本自己
+# 旁边那份」—— 于是新加的备份日志轮转规则会被旧目录**遮蔽**，发布照样打印
+# 「日志轮转规则已装」，其实只装了旧的那一份。这不是假设，是这台机器上
+# 真实存在的状态。
+#
+# 每次发布都把产物里的 deploy/ 铺过去，$APP/deploy 就永远是当前这一版。
+# 查找顺序也已改成「先看脚本自己旁边那份」（那才是本次发布真正在跑的
+# 那一版），所以**正确性不依赖这一步** —— 它失败也不影响发布行为。
+#
+# **失败只告警不中止**：迁移在第 4 步就跑过了，此时中止留下的正是
+# 「库已迁移、代码没换」这个最糟的状态。脚本自己的原则是这种情况只告警。
+tooling_rc=0
+install_release_tooling || tooling_rc=$?
+if [[ "$tooling_rc" -eq 0 ]]; then
+  log "  发布工具已同步到 ${APP}/deploy（与产物同版）"
+else
+  log "⚠️  发布工具没能同步到 ${APP}/deploy —— 那份可能还是旧的"
+  log "     不影响这次发布（规则取的是脚本自己旁边那份），但下次手工跑"
+  log "     ${APP}/deploy/deploy.sh 就会是旧行为。手动补一次："
+  log "       tar -xzf cwq-deploy-${SHA}.tar.gz -C <目录> && cp -a <目录>/deploy/. ${APP}/deploy/"
+fi
+
 tar --no-same-owner -xzf "$STAGE/cwq-backend-${SHA}.tar.gz" -C "$APP/backend"
 # **归档里记的是 CI 的构建身份，不是部署机的服务账号。** build-artifacts 在
 # GitHub Actions 里打包，tar 逐条记下当时的 ``runner/runner``；而这一步是以
@@ -984,7 +1109,7 @@ enable_backup_timer() {
   fi
 
   local src=""
-  for d in "$APP/deploy/systemd" "$SCRIPT_DIR/systemd"; do
+  for d in "$SCRIPT_DIR/systemd" "$APP/deploy/systemd"; do
     if [ -f "$d/cwq-backup.timer" ]; then src="$d"; break; fi
   done
 
@@ -1036,7 +1161,7 @@ enable_oss_backup_timer() {
   fi
 
   local src=""
-  for d in "$APP/deploy/systemd" "$SCRIPT_DIR/systemd"; do
+  for d in "$SCRIPT_DIR/systemd" "$APP/deploy/systemd"; do
     if [ -f "$d/cwq-oss-backup.timer" ]; then src="$d"; break; fi
   done
   # 产物里没有这两个单元：不算失败（返回码 3），但也没装上。
@@ -1100,7 +1225,7 @@ enable_watchdog_timer() {
   fi
 
   local src=""
-  for d in "$APP/deploy/systemd" "$SCRIPT_DIR/systemd"; do
+  for d in "$SCRIPT_DIR/systemd" "$APP/deploy/systemd"; do
     if [ -f "$d/cwq-scheduler-watchdog.timer" ]; then src="$d"; break; fi
   done
 
@@ -1222,11 +1347,18 @@ fi
 # 这里渲染路径再写进 /etc/logrotate.d/，跟 unit 走同一套渲染（``render_unit`` 的
 # 替换规则完全一致：先长后短）。**装完立刻演练一次**（logrotate -d），
 # 演练报错就打出来 —— 装完不验等于没装。
+#
+# **查找顺序是「先脚本自己旁边那份，再 $APP/deploy」**，不是反过来。
+# $APP/deploy 是这台机上「上一版发布工具」的落点，它可能是旧的；而脚本
+# 自己旁边那份，是**本次发布真正在跑的这一版**。顺序反过来时，一台机器上
+# 残留的旧目录会**遮蔽**新规则：新加的 cwq-backup 规则装不上，发布照样
+# 打印「日志轮转规则已装」。生产机上就真有这么一份 2026-10-24 的旧副本
+# （它的 logrotate/ 里只有 cwq-api）。
 LOGROTATE_DIR="${LOGROTATE_DIR:-/etc/logrotate.d}"
 JOURNALD_DIR="${JOURNALD_DIR:-/etc/systemd/journald.conf.d}"
 install_logrotate_rules() {
   local src="" f dst
-  for d in "$APP/deploy/logrotate" "$SCRIPT_DIR/logrotate"; do
+  for d in "$SCRIPT_DIR/logrotate" "$APP/deploy/logrotate"; do
     if [ -d "$d" ]; then src="$d"; break; fi
   done
   [ -n "$src" ] || return 3          # 产物里没有这份规则：不算失败，但没装上
@@ -1280,7 +1412,7 @@ fi
 # 大小上限只是「满了就从头写」。
 install_journald_conf() {
   local src="" dst="$JOURNALD_DIR/cwq.conf"
-  for d in "$APP/deploy/systemd" "$SCRIPT_DIR/systemd"; do
+  for d in "$SCRIPT_DIR/systemd" "$APP/deploy/systemd"; do
     if [ -f "$d/journald-cwq.conf" ]; then src="$d"; break; fi
   done
   [ -n "$src" ] || return 3

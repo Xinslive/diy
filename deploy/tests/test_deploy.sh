@@ -73,6 +73,13 @@ make_artifacts(){
 HTML
   tar -czf "$out/cwq-backend-${sha}.tar.gz" -C "$be" .
   tar -czf "$out/cwq-frontend-${sha}.tar.gz" -C "$fe" dist
+  # 发布脚本也进产物（与 build-artifacts 一致）。
+  #
+  # 用**仓库里真的那份**：自检那条断言比的就是「产物里的 deploy.sh」与
+  # 「正在跑的 deploy.sh」的 sha256。沙箱里要是塞一份假的，这条断言就恒真，
+  # 测不到任何东西 —— 那正是「恒绿测试」的形态。
+  tar -czf "$out/cwq-deploy-${sha}.tar.gz" -C "$REPO_ROOT" \
+    --exclude='__pycache__' --exclude='*.pyc' deploy
   {
     echo "sha=${sha}"
     echo "commit=${sha}fullsha"
@@ -80,9 +87,11 @@ HTML
     echo "built_at=2026-10-15T00:00:00Z"
     echo "backend=cwq-backend-${sha}.tar.gz"
     echo "frontend=cwq-frontend-${sha}.tar.gz"
+    echo "deploy=cwq-deploy-${sha}.tar.gz"
   } > "$out/manifest.txt"
   ( cd "$out" && sha256sum ./cwq-backend-${sha}.tar.gz \
-                        ./cwq-frontend-${sha}.tar.gz > SHA256SUMS )
+                        ./cwq-frontend-${sha}.tar.gz \
+                        ./cwq-deploy-${sha}.tar.gz > SHA256SUMS )
 }
 
 # 换一版产物（内容与文件名都带新的 sha）。
@@ -1565,6 +1574,66 @@ if calls_has "systemctl disable --now cwq-oss-backup.timer"; then
   no "旧 timer 被停用了，但应用调度器明明没在管 —— 这一停就断了一条退路"
 else
   ok "旧 timer 没有被误停"
+fi
+
+echo
+echo "== 10.10 发布脚本同版自检 + \$APP/deploy 的旧副本不再遮蔽新规则 =="
+# --------------------------------------------------------------------------
+# 真实事故（2026-10-25，生产机）：$APP/deploy 是 2026-10-24 的旧副本，
+# 它的 logrotate/ 里只有 cwq-api、**没有 cwq-backup**。而查找逻辑原先是
+# 「先 $APP/deploy、没有才看脚本自己旁边那份」—— 于是新加的备份日志轮转
+# 规则被旧目录**遮蔽**：发布照样打印「日志轮转规则已装」，其实只装了旧的
+# 那一份。**看着做完了，其实没做。**
+#
+# 两条防线：
+#   1. 规则查找改成「先脚本自己旁边那份」—— 那才是本次发布真正在跑的那一版；
+#   2. 每次发布把产物里的 deploy/ 铺回 $APP/deploy，让它不再长期是旧副本。
+#
+# 还有第三道：发布脚本必须与产物同版。否则「CI 的沙箱演练通过」这句话
+# 对这次发布就不成立 —— 脚本少做的事，发布界面照样显示成功。
+# --------------------------------------------------------------------------
+
+# (a) 跑的是一份被人改过的脚本 ⇒ 中止，且现网一个字节都没动。
+setup_sandbox
+cp "$SCRIPT" "$DEPDIR/stale-deploy.sh"
+echo "# 一份被人动过的旧脚本" >> "$DEPDIR/stale-deploy.sh"
+OUT=$( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+  SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+  LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
+  bash "$DEPDIR/stale-deploy.sh" 2>&1 )
+if grep -q "与产物里那一份不是同一个文件" <<<"$OUT"; then
+  ok "发布脚本与产物不同版时被拦下"
+else
+  no "改了发布脚本照样发布 —— CI 验过的行为对这次发布就不成立了"
+fi
+if grep -q "old frontend" "$APP/frontend/dist/index.html" 2>/dev/null; then
+  ok "拦下之后现网前端没被动过"
+else
+  no "拦下了却已经把新前端换上去"
+fi
+
+# (b) $APP/deploy 是旧副本时，新规则仍然装得上（旧目录不得遮蔽）。
+setup_sandbox
+mkdir -p "$APP/deploy/logrotate"
+echo "# OLD RULE：旧副本里只有 cwq-api" > "$APP/deploy/logrotate/cwq-api"
+OUT=$(run_script)
+assert_ran "全量发布" || exit 1
+if [[ -f "$DEPDIR/logrotate/cwq-backup" ]]; then
+  ok "备份日志的轮转规则装上了 —— \$APP/deploy 的旧目录没能遮蔽它"
+else
+  no "备份日志的轮转规则没装上 —— \$APP/deploy 的旧目录把它遮蔽了"
+fi
+
+# (c) 同样的发布之后，$APP/deploy 本身被刷新成与产物同版。
+if [[ -f "$APP/deploy/logrotate/cwq-backup" ]]; then
+  ok "\$APP/deploy 被刷新成与产物同版"
+else
+  no "\$APP/deploy 还是旧副本 —— 下次手工跑它就是旧行为"
+fi
+if cmp -s "$APP/deploy/deploy.sh" "$SCRIPT" 2>/dev/null; then
+  ok "\$APP/deploy/deploy.sh 与产物里的同一份"
+else
+  no "\$APP/deploy/deploy.sh 不是产物里那一份"
 fi
 
 echo

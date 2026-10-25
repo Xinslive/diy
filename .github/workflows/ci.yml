@@ -739,6 +739,20 @@ jobs:
           # 前端：只有产物目录，不含 src / node_modules
           tar -czf "$OUT/cwq-frontend-${SHA}.tar.gz" -C frontend dist
 
+          # 发布脚本自己也进产物。
+          #
+          # **为什么。** 以前 deploy/ 不在产物里，于是生产机上跑的那份脚本是
+          # **人工 scp 过去的副本** —— CI 的「发布脚本沙箱演练」验的是仓库里
+          # 那份，生产机跑的是另一份，两边会漂移。漂移的表现不是报错，而是
+          # **脚本少做的事照样显示成功**（真实案例：生产机 $APP/deploy 是
+          # 2026-10-24 的旧副本，logrotate/ 里没有 cwq-backup，新规则被遮蔽）。
+          #
+          # 进了产物之后，生产机跑的脚本就是 CI 验过的那一份；deploy.sh 自己
+          # 还会比对「我正在跑的」与「产物里那份」的 sha256，不一致就中止
+          # （见 deploy.sh 的 verify_release_script）。
+          tar -czf "$OUT/cwq-deploy-${SHA}.tar.gz" -C . \
+            --exclude='__pycache__' --exclude='*.pyc' deploy
+
           # 清单：版本 + 构件名。生产机据此确认「拿到的是 CI 出品的那一份」。
           {
             echo "sha=${SHA}"
@@ -747,6 +761,7 @@ jobs:
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "backend=cwq-backend-${SHA}.tar.gz"
             echo "frontend=cwq-frontend-${SHA}.tar.gz"
+            echo "deploy=cwq-deploy-${SHA}.tar.gz"
           } > "$OUT/manifest.txt"
           ( cd "$OUT" && sha256sum ./*.tar.gz > SHA256SUMS )
 

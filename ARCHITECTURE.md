@@ -6085,6 +6085,69 @@ nginx / PostgreSQL / journald 各有各的规则（Debian 自带 / systemd 自�
 `sys_scheduled_task_run` 不在其中：它 0028 建表时就有了
 `ix_scheduled_task_run_finished (finished_at)`，那一处早就是对的。
 
+## 11.19 发布脚本本身也是产物（2026-10-25 加）
+
+### 11.19.1 问题：CI 验的那份脚本，不是生产跑的那份
+
+`deploy/` 目录**不在** CI 产物里。于是生产机上的发布脚本是**人工拷过去**的
+副本 —— CI 的「发布脚本沙箱演练」验的是仓库里那份，生产机跑的是另一份。
+
+漂移的表现**不是报错**，而是**脚本少做的事照样显示成功**。
+
+真实案例：2026-10-25 在生产机 `43.138.178.174` 上发现，`$APP/deploy` 是
+2026-10-24 的旧副本，它的 `logrotate/` 里只有 `cwq-api`、**没有
+`cwq-backup`**。而规则查找原先是「先 `$APP/deploy`、没有才看脚本自己旁边
+那份」，于是：
+
+* 新的备份日志轮转规则**装不上**（源目录命中了旧的那份）；
+* 发布日志照样打印「日志轮转规则已装」；
+* 备份日志继续只增不减。
+
+**「看着做完了，其实没做」** —— 这一类比崩溃更难发现。
+
+### 11.19.2 三条防线
+
+| # | 做法 | 挡住什么 |
+|---|---|---|
+| 1 | `build-artifacts` 把 `deploy/` 打进产物（`cwq-deploy-<sha>.tar.gz`） | 生产机跑的那份脚本不再依赖人工拷贝 |
+| 2 | `deploy.sh` 比对「我正在跑的」与「产物里那份」的 sha256，不一致就中止 | 有人从别处拷了旧脚本 / 手工改过脚本 |
+| 3 | 规则查找改成「**先脚本自己旁边那份**」，发布时把 `deploy/` 铺回 `$APP/deploy` | 机器上残留的旧目录不再有遮蔽权 |
+
+第 2 条的判据是**内容**不是路径：同一份脚本放在哪个目录都一样。只有内容变了
+才算不一致。紧急情况下可以 `ALLOW_DEPLOY_SCRIPT_MISMATCH=1` 放行（会留痕迹）。
+
+第 3 条里「先脚本自己旁边那份」是关键的**顺序**：脚本自己旁边那份，是**本次
+发布真正在跑的那一版**；`$APP/deploy` 那份是「上一版发布工具的落点」，可能是旧的。
+
+### 11.19.3 产物清单变了
+
+`build-artifacts` 现在出三个 tarball：
+
+```
+cwq-backend-<sha>.tar.gz    后端源码 + 迁移链 + 运行时锁
+cwq-frontend-<sha>.tar.gz   前端产物（只有 dist）
+cwq-deploy-<sha>.tar.gz     发布脚本与它要的配置（deploy/）
+```
+
+`manifest.txt` 多一行 `deploy=...`；`SHA256SUMS` 覆盖三个 tarball。
+
+### 11.19.4 仍然要人工做的一步
+
+生产机**没有 `gh`**，所以产物还是得人工投放到目标机（`ARTIFACT_DIR=`）。
+这是刻意保留的：目标机不该持有 GitHub 凭据。
+
+但流程变了：发布脚本**从产物里取**，不再从别处拷。
+
+```bash
+# 目标机上
+tar -xzf cwq-deploy-<sha>.tar.gz -C /root/cwq-release-<sha>/
+ARTIFACT_DIR=/root/cwq-release-<sha>/artifact \
+  /root/cwq-release-<sha>/deploy/deploy.sh
+```
+
+`$APP/deploy` 会在发布第 5 步被刷新成与产物同版 —— 所以「手工跑
+`$APP/deploy/deploy.sh`」这个老习惯，跑的也是当前这一版。
+
 ## 12. 测试策略
 
 | 文件 | 覆盖 |
