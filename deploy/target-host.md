@@ -116,6 +116,48 @@ CWQ_HOST_IP=1.2.3.4 deploy.sh      # 显式指定判据（测试用）
    （旧机就此下线）；
 3. 同步更新本文件与 `deploy/tuning.md` 第十一节的主机状态数字。
 
+### 怎么发布到这台机器（参数一个都不能少）
+
+**这台机器的布局不是脚本的默认值**，所以 `APP_DIR` 与 `BACKUP_DIR` **必须显式给**：
+
+| 变量 | 这台机要给的 | 脚本默认值（**别用**） |
+|---|---|---|
+| `APP_DIR` | `/www/wwwroot/acct.xins.live` | `/opt/cwq` |
+| `BACKUP_DIR` | `/www/wwwroot/acct.xins.live/backups` | `/opt/cwq/backups` |
+
+忘了给的后果**不是报错**：脚本会对着 `/opt/cwq` 装 unit、装 logrotate、
+建备份目录 —— 每一步都可能「成功」，而真正在跑的那套系统一点没变。
+（`--check-only` 里会直接露出马脚：它会显示「后端依赖: 缺失 .venv」。）
+
+这台机**没有 `gh`**（也不该有 GitHub 凭据），所以走 `ARTIFACT_DIR` 人工投放：
+
+```bash
+# 1) 本地：下载 CI 产物并校验
+gh run download <run-id> -n "cwq-deploy-<完整 sha>" -D /tmp/cwq-release-<sha12>/artifact
+( cd /tmp/cwq-release-<sha12>/artifact && sha256sum --check SHA256SUMS )
+
+# 2) 传到目标机
+scp -i <私钥> /tmp/cwq-release-<sha12>/artifact/* \
+    root@43.138.178.174:/root/cwq-release-<sha12>/artifact/
+
+# 3) 目标机上：发布脚本**从产物里取**，不手工拷贝
+cd /root/cwq-release-<sha12>
+tar -xzf artifact/cwq-deploy-<sha12>.tar.gz -C .
+chown -R root:root deploy          # 归档里记的是 CI 构建身份
+APP_DIR=/www/wwwroot/acct.xins.live \
+BACKUP_DIR=/www/wwwroot/acct.xins.live/backups \
+ARTIFACT_DIR=/root/cwq-release-<sha12>/artifact \
+bash deploy/deploy.sh
+```
+
+**发布脚本从产物里取**（2026-10-25 起）：产物里带着 `deploy/`，脚本会比对
+「我正在跑的」与「产物里那份」的 sha256，不一致就中止。详见
+ARCHITECTURE §11.19。
+
+> 归档里的文件属主是 CI 的构建身份（uid 1001）。`deploy/` 是发布工具，归
+> `root` 管；后端代码由 `deploy.sh` 自己 `--no-same-owner` 解压并归位到
+> `cwq`。
+
 ---
 
 ## 四、证书
