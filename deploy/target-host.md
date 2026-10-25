@@ -133,6 +133,51 @@ CI 有一条断言守着「`deploy.sh` 里出现的每个 `CWQ_*` 名字都登�
 |---|---|---|
 | `APP_DIR` | `/www/wwwroot/acct.xins.live` | `/opt/cwq` |
 | `BACKUP_DIR` | `/www/wwwroot/acct.xins.live/backups` | `/opt/cwq/backups` |
+| `CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR` | `1` | `0` |
+
+**`CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1` 是 2026-10-25 补上的**（§3.41 的闸门
+在这天上线）。`deploy/nginx/*.conf` 里的 `root` 写死的是 `/opt/cwq/frontend/dist`，
+而 nginx 配置**不在发布脚本的渲染范围**（这台机上同域名有两份落点，不能让脚本去改
+全局 nginx）。所以脚本现在会**明确拒绝**在非 `/opt/cwq` 的根上发布：
+
+```
+❌ APP_DIR=/www/wwwroot/acct.xins.live 不是 /opt/cwq —— 拒绝发布。
+```
+
+**这台机的 nginx 已经手工配好了**（`nginx -T` 里
+`root /www/wwwroot/acct.xins.live/frontend/dist;` 与
+`alias /www/wwwroot/acct.xins.live/downloads/;`），所以放行是安全的 ——
+放行后脚本**不会**去改 nginx，只会在发布后体检里验「线上跑的是不是刚发的那一版前端」
+（`runtime-config.js` 里的 version 对账）。
+
+> **别把这个开关加到别的机器上**：它是「这台机的 nginx 已经手工配好了」的
+> **断言**，不是「绕过检查」的开关。别的机器要换应用根，得先把它的 nginx 配好，
+> 或者让它也用 `/opt/cwq`。
+
+### 这台机的 `.env` 必须有的两行（缺了就**拒绝启动**）
+
+`backend/app/core/config.py::validate_production_settings` 是**启动闸门**：
+不满足就抛异常、**进程直接退出**。这台机的 `.env` 里必须有：
+
+```
+TRUSTED_PROXIES=127.0.0.1
+MCP_ALLOWED_HOSTS=acct.xins.live,acct.xins.live:*,test.xins.live,test.xins.live:*
+```
+
+**`MCP_ALLOWED_HOSTS` 两种写法都要给**（传输层的匹配规则是「精确命中，
+或 host 以『域名:』开头」—— 后者**要求带冒号**）：
+
+| 写法 | 匹配 | 漏了会怎样 |
+|---|---|---|
+| `acct.xins.live` | 不带端口的 Host（**nginx 传的 `$host` 就是这种**） | 每个 MCP 请求都被挡成 **421** |
+| `acct.xins.live:*` | 带端口的 Host（`acct.xins.live:443`） | 走端口访问时同样被挡成 **421** |
+
+**只写 `acct.xins.live:*` 是不够的** —— 那会让「启动闸门过去、站点起来、
+但 MCP 端点一个请求都进不去」。这真踩过（2026-10-25 那次发布）。
+
+> **起不来了怎么办**：服务会**直接退出**，`systemctl is-active cwq-api` 显示
+> `inactive`，原因在 `backend/logs/api.err.log` 的最后一段（不是 journal ——
+> 应用的日志在自己的文件里）。`journalctl -u cwq-api` 只有 systemd 那几行。
 
 忘了给的后果**不是报错**：脚本会对着 `/opt/cwq` 装 unit、装 logrotate、
 建备份目录 —— 每一步都可能「成功」，而真正在跑的那套系统一点没变。
@@ -156,7 +201,19 @@ chown -R root:root deploy          # 归档里记的是 CI 构建身份
 APP_DIR=/www/wwwroot/acct.xins.live \
 BACKUP_DIR=/www/wwwroot/acct.xins.live/backups \
 ARTIFACT_DIR=/root/cwq-release-<sha12>/artifact \
+CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 \
 bash deploy/deploy.sh
+```
+
+**发布后一定要验这两条**（发布脚本自己也会验，但它的提示指向
+`/opt/cwq/backend/logs/api.err.log` —— **这台机上是错的路径**，
+真实的日志在 `/www/wwwroot/acct.xins.live/backend/logs/api.err.log`）：
+
+```bash
+systemctl is-active cwq-api                       # 要 active
+curl -fsS http://127.0.0.1:8000/api/health        # 要 200
+curl -fsS --resolve acct.xins.live:443:127.0.0.1 \
+  https://acct.xins.live/runtime-config.js | grep <sha12>   # 线上前端要是这一版
 ```
 
 **发布脚本从产物里取**（2026-10-25 起）：产物里带着 `deploy/`，脚本会比对

@@ -1267,8 +1267,15 @@ def validate_production_settings(settings: "Settings", env: str | None = None,
             problems.append(
                 "MCP_ENABLED=true 但 MCP_ALLOWED_HOSTS 为空 —— "
                 "MCP 端点的 DNS 重绑定防护未开启（传输层不校验 Host 头）。"
-                "请设 MCP_ALLOWED_HOSTS=你的域名（如 acct.example.com:*）"
-                "（注意配错的表现是请求在传输层被挡下 400/421，不是 401）；"
+                "请设 MCP_ALLOWED_HOSTS=你的域名。"
+                "**两种写法都要给**（传输层的匹配规则是「精确命中，"
+                "或 host 以『域名:』开头」）："
+                "MCP_ALLOWED_HOSTS=acct.example.com,acct.example.com:* "
+                "（前者管不带端口的 Host —— nginx 传的 $host 就是这种；"
+                "后者管带端口的）。"
+                "**只写 `acct.example.com:*` 是不够的**：它匹配不到不带端口的 "
+                "Host，结果是「启动过去了，但每个 MCP 请求都被传输层挡成 421」。"
+                "注意配错的表现是请求在传输层被挡下 400/421，不是 401；"
                 "本机直连、不对外暴露的部署可以设 MCP_ALLOWED_HOSTS_WARN_ONLY=true "
                 "显式豁免这一项。")
 

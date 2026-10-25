@@ -167,6 +167,62 @@ def test_MCP白名单配了就放行():
     _check(_prod(mcp_enabled=True, mcp_allowed_hosts="acct.example.com:*"))
 
 
+def test_报错文案必须说清两种写法都要给():
+    """**只写 `example.com:*` 是不够的** —— 照着报错里的示例配会得到
+    「启动过去了，但每个 MCP 请求都被传输层挡成 421」。
+
+    传输层（MCP SDK 的 ``TransportSecurityMiddleware``）的匹配规则是：
+
+        * ``host in allowed_hosts`` → 精确命中；
+        * 或 ``host.startswith(base + ":")`` → **必须带冒号**。
+
+    所以 ``example.com:*`` **匹配不到不带端口的 Host**（``example.com``）——
+    而 nginx 传给后端的 ``Host`` 恰恰是 ``$host``（**不带端口**）。
+
+    这条是**真踩过**的：生产发布时按报错里的示例只写了 ``:*``，
+    启动闸门过了、站点起来了，但 MCP 端点一个请求都进不去。
+    """
+    with pytest.raises(ValueError) as e:
+        _check(_prod(mcp_enabled=True, mcp_allowed_hosts=""))
+    msg = str(e.value)
+    assert "acct.example.com,acct.example.com:*" in msg, (
+        "报错里没有给出「两种写法都要给」的完整示例 —— "
+        "照着它配会得到「启动过去了但 MCP 全被 421 挡下」")
+    assert "不带端口" in msg, msg
+
+
+def test_只写域名带端口的形式_闸门放行但传输层匹配不到裸域名():
+    """把「闸门放行」与「传输层真能匹配上」这两件事**分开**钉。
+
+    闸门只看「有没有配」；传输层看「配的那几条能不能匹配上真实的 Host」。
+    **两边都绿**才是真的绿 —— 只钉闸门那一半，会得到一个
+    「启动检查过了、但功能是坏的」的部署。
+    """
+    from mcp.server.transport_security import TransportSecurityMiddleware
+
+    def middleware(hosts):
+        return TransportSecurityMiddleware(
+            type("Sec", (), {"allowed_hosts": hosts,
+                             "allowed_origins": [],
+                             "enable_dns_rebinding_protection": True})())
+
+    # nginx 传给后端的 Host：$host —— **不带端口**。
+    host = "acct.example.com"
+
+    # 只写 :* 的形式：闸门放行（配了），但传输层匹配不上裸域名。
+    only_wildcard = ["acct.example.com:*"]
+    assert not middleware(only_wildcard)._validate_host(host), (
+        "只写 :* 竟然匹配上了裸域名 —— 那这条用例的前提不成立")
+
+    # 两种都写：裸域名与带端口都能匹配上，非法的一律匹配不上。
+    both = ["acct.example.com", "acct.example.com:*"]
+    mw = middleware(both)
+    assert mw._validate_host(host), "裸域名匹配不上"
+    assert mw._validate_host("acct.example.com:443"), "带端口匹配不上"
+    assert not mw._validate_host("evil.example"), "非法 Host 竟然放行了"
+    assert not mw._validate_host("acct.example.com.evil.test"), "后缀 spoof 放行了"
+
+
 # --------------------------------------------------------------------- 其它
 
 
