@@ -194,13 +194,21 @@ STUB
   # 按整串比对会匹配不上 —— 于是桩子只是把调用记了一笔就返回 0，
   # 脚本其实**一次都没跑**，而「调用被记录了」这个断言照样是绿的。
   # 这正是本文件开头说的那种恒绿测试。
-  printf '#!/bin/sh\nif [ "$(basename "$1")" = "emit_frontend_runtime.py" ]; then echo "python $*" >> "$DEPDIR/calls"; exec python3 "$@"; fi\nif [ "$1" = "scripts/db_backup.py" ]; then echo "SELECT 1;"; exit ${STUB_BACKUP_RC:-0}; fi\necho "python $*" >> "$DEPDIR/calls"\nif [ "$1" = "scripts/plugin_status.py" ]; then exit ${STUB_PLUGIN_STATUS_RC:-0}; fi\nexit 0\n' \
+  printf '#!/bin/sh\nif [ "$(basename "$1")" = "emit_frontend_runtime.py" ]; then echo "python $*" >> "$DEPDIR/calls"; exec python3 "$@"; fi\nif [ "$1" = "scripts/db_backup.py" ]; then echo "SELECT 1;"; exit ${STUB_BACKUP_RC:-0}; fi\necho "python $*" >> "$DEPDIR/calls"\nif [ "$1" = "scripts/plugin_status.py" ]; then exit ${STUB_PLUGIN_STATUS_RC:-0}; fi\nif [ "$1" = "scripts/scheduler_state.py" ]; then exit ${STUB_SCHEDULER_OWNS_RC:-1}; fi\nexit 0\n' \
     > "$APP/backend/.venv/bin/python"
   chmod +x "$DEPDIR/bin"/* "$APP/backend/.venv/bin"/*
+  # 调度现状探针（scripts/scheduler_state.py）要**真的存在** ——
+  # deploy.sh 会先看文件在不在，文件不在就直接判「应用调度器没在管备份」。
+  # 那个桩只会被 python 桩接走，返回码由 STUB_SCHEDULER_OWNS_RC 定：
+  #   1（默认）= 应用调度器**没**在做离站备份 → 旧的 systemd timer 应当启用
+  #   0        = 应用调度器**在**做离站备份 → 旧的 systemd timer 应当停用
+  mkdir -p "$APP/backend/scripts"
+  echo "# 沙箱桩：真正跑的是 python 桩，按 STUB_SCHEDULER_OWNS_RC 决定返回码。" \
+    > "$APP/backend/scripts/scheduler_state.py"
   # unit 与备份的落地位置由 deploy.sh 通过 SYSTEMD_UNIT_DIR / BACKUP_DIR 传入。
   # 这里必须先建出来：真实机器上 /etc/systemd/system 与 /opt/cwq/backups
   # 本来就存在，脚本不负责建；沙箱里没人建，cp 就会落不下去。
-  mkdir -p "$DEPDIR/units" "$DEPDIR/backups"
+  mkdir -p "$DEPDIR/units" "$DEPDIR/backups" "$DEPDIR/logrotate" "$DEPDIR/journald"
   : > "$DEPDIR/calls"
 }
 
@@ -212,13 +220,13 @@ CWQ_ALLOW_ANY_HOST=1
 run_script(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
-    CWQ_ALLOW_ANY_HOST=1 \
+    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 run_script_no_artifacts(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/empty-artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
-    CWQ_ALLOW_ANY_HOST=1 \
+    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 # 显式清掉 DATABASE_URL：这条只用来验证「目标库不确定时脚本会停手」。
@@ -226,7 +234,7 @@ run_script_no_artifacts(){
 run_script_no_db_url(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
-    CWQ_ALLOW_ANY_HOST=1 \
+    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
     env -u DATABASE_URL LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 # 显式给 DATABASE_URL：用来验证「.env 不存在」这条路径 —— 那条路径是
@@ -235,7 +243,7 @@ run_script_no_db_url(){
 run_script_with_db_url(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
-    CWQ_ALLOW_ANY_HOST=1 \
+    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
     DATABASE_URL="postgresql+psycopg://cwq:pw@127.0.0.1:15432/cwq" \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
@@ -245,7 +253,7 @@ calls(){ cat "$DEPDIR/calls" 2>/dev/null; }
 run_script_cdn(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
-    CWQ_ALLOW_ANY_HOST=1 \
+    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
     CWQ_ASSET_BASE="https://cdn.example.com/" CWQ_ORIGIN="https://acct.example.com" \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
@@ -690,7 +698,7 @@ run_script_staged_relative(){
   cp "$(dirname "$SCRIPT")"/systemd/* "$STAGE/systemd/"
   ( cd "$STAGE" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
-    CWQ_ALLOW_ANY_HOST=1 \
+    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash ./deploy.sh 2>&1 )
 }
 
@@ -1444,6 +1452,119 @@ if [[ "${RC}" == "0" ]]; then
   ok "CWQ_ALLOW_ANY_HOST=1 时沙箱演练照常通过"
 else
   no "沙箱演练被守卫挡住了 —— 测试与演练没法做（退出码 ${RC}）"
+fi
+
+# --------------------------------------------------------------------------
+# 10.8 日志轮转规则：**自动装**，且路径按本机布局渲染
+# --------------------------------------------------------------------------
+#
+# 为什么这是断言而不是「顺手做一下」：
+#   unit 里是 ``StandardOutput=append:…/api.log`` —— append 模式**不轮转**，
+#   没有任何东西管它的大小，日志只增不减。以前这一步是手工的（tuning.md 11.3），
+#   于是它有两个坏处：靠人记得（换机就漏），以及规则里写死路径（写错就
+#   盯着一个不存在的路径，**看着装了、其实没转**）。
+# --------------------------------------------------------------------------
+echo "== 10.8 日志轮转规则：自动装、路径渲染 =="
+
+setup_sandbox
+OUT=$(run_script)
+assert_ran "全量发布" || exit 1
+if [[ -f "$DEPDIR/logrotate/cwq-api" && -f "$DEPDIR/logrotate/cwq-backup" ]]; then
+  ok "两条 logrotate 规则都装上了"
+else
+  no "logrotate 规则没装上（实际：$(ls "$DEPDIR/logrotate" 2>/dev/null | tr '\n' ' ')）"
+fi
+if grep -q '/opt/cwq' "$DEPDIR/logrotate/cwq-api" 2>/dev/null; then
+  no "logrotate 规则里还留着 /opt/cwq —— 盯的是一个不存在的路径"
+else
+  ok "logrotate 规则按本机布局渲染（没有 /opt/cwq）"
+fi
+if grep -q "$APP/backend/logs/api.log" "$DEPDIR/logrotate/cwq-api" 2>/dev/null; then
+  ok "API 日志路径渲染到了本机应用根"
+else
+  no "API 日志路径没渲染到本机应用根"
+fi
+if grep -q "$DEPDIR/backups" "$DEPDIR/logrotate/cwq-backup" 2>/dev/null; then
+  ok "备份日志路径渲染到了本机备份目录"
+else
+  no "备份日志路径没渲染到本机备份目录 —— oss-backup.log / backup.log 无人管"
+fi
+if grep -q "日志轮转规则已装" <<<"$OUT"; then
+  ok "发布日志里明确报出日志轮转已装"
+else
+  no "发布日志没有报出日志轮转的状态"
+fi
+
+# --------------------------------------------------------------------------
+# 10.8.1 journald 的上限：**显式写死**，不靠默认值
+# --------------------------------------------------------------------------
+#
+# systemd 的默认值是「磁盘的 10%」（上限 4G）。这台机磁盘 49 G ⇒ 约 4.9 G，
+# 被 4 G 封顶 —— 够大到把备份产物的地盘挤掉，而那 4 G 里绝大部分是几个月前
+# 没人再看的启动日志。
+# --------------------------------------------------------------------------
+echo "== 10.8.1 journald 上限：自动装 =="
+
+setup_sandbox
+OUT=$(run_script)
+assert_ran "全量发布" || exit 1
+if [[ -f "$DEPDIR/journald/cwq.conf" ]]; then
+  ok "journald 上限配置装上了"
+else
+  no "journald 上限没装上 —— journal 会涨到磁盘的 10%"
+fi
+if grep -q "SystemMaxUse=" "$DEPDIR/journald/cwq.conf" 2>/dev/null; then
+  ok "journald 有明确的大小上限"
+else
+  no "journald 配置里没有 SystemMaxUse —— 靠默认值就是靠磁盘大小"
+fi
+
+# --------------------------------------------------------------------------
+# 10.9 应用调度器接管离站备份 ⇒ **停掉旧的 systemd timer**
+# --------------------------------------------------------------------------
+#
+# 两条路径干的是同一件事（ARCHITECTURE §11.13 的硬约束）。同时启用 = 每天
+# 备份两次 = 同一份数据传两遍 + 备份记录每天多 10 行。
+#
+# 判据是「最近有没有真的成功跑过」（scripts/scheduler_state.py），
+# 不是「触发密钥配了没有」—— 密钥配了而外部 cron 没部署的情况下停掉旧
+# timer 就等于离站备份彻底没了。判错的方向是安全的：最多多备一次。
+# --------------------------------------------------------------------------
+echo "== 10.9 应用调度器接管离站备份时，旧 timer 被停用 =="
+
+setup_sandbox
+OUT=$(STUB_SCHEDULER_OWNS_RC=0 run_script)
+assert_ran "全量发布" || exit 1
+if calls_has "systemctl disable --now cwq-oss-backup.timer"; then
+  ok "应用调度器在管离站备份时，旧 timer 被停用"
+else
+  no "应用调度器已经在做离站备份，旧 timer 仍然开着 —— 每天备份两次"
+fi
+if calls_has "systemctl enable --now cwq-oss-backup.timer"; then
+  no "旧 timer 在被停用的同时又被启用了 —— 那等于什么都没做"
+else
+  ok "旧 timer 没有被同时启用"
+fi
+if grep -q "离站备份由应用内调度器接管" <<<"$OUT"; then
+  ok "发布日志里说清了为什么停用"
+else
+  no "发布日志没有说明为什么停用旧 timer"
+fi
+
+# 反过来：应用调度器**没**在管（probe 返回非 0）⇒ 旧 timer 照旧启用。
+# 判错的方向必须是「多备一次」而不是「一次都不备」。
+setup_sandbox
+OUT=$(STUB_SCHEDULER_OWNS_RC=1 run_script)
+assert_ran "全量发布" || exit 1
+if calls_has "systemctl enable --now cwq-oss-backup.timer"; then
+  ok "应用调度器没在管时，旧 timer 仍然启用（不会漏备）"
+else
+  no "应用调度器没在管时旧 timer 也没启用 —— 离站备份彻底没了"
+fi
+if calls_has "systemctl disable --now cwq-oss-backup.timer"; then
+  no "旧 timer 被停用了，但应用调度器明明没在管 —— 这一停就断了一条退路"
+else
+  ok "旧 timer 没有被误停"
 fi
 
 echo
