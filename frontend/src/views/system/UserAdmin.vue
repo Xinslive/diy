@@ -186,6 +186,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import * as sysApi from '@/api/system'
 import { useSessionStore } from '@/stores/session'
+import { errorText } from '@/utils/errorText'
 
 const store = useSessionStore()
 const router = useRouter()
@@ -306,7 +307,7 @@ async function toggleRegistration(value) {
   } catch (e) {
     // 拨回去：让界面回到后端确认过的那个状态，而不是停在没保存上的假象。
     registration.value = !value
-    ElMessage.error(e?.response?.data?.detail || '保存失败')
+    ElMessage.error(errorText(e, '保存失败'))
   } finally {
     regBusy.value = false
   }
@@ -350,7 +351,7 @@ async function saveUser() {
     dlgUser.value = false
     await load()
   } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || '创建失败')
+    ElMessage.error(errorText(e, '创建失败'))
   } finally {
     busy.value = false
   }
@@ -400,7 +401,7 @@ async function savePassword() {
   try {
     await sysApi.updateUser(target.value.id, { password: newPassword.value })
   } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || '重置失败')
+    ElMessage.error(errorText(e, '重置失败'))
     return
   }
   ElMessage.success(
@@ -429,7 +430,7 @@ async function remove(row) {
     // **把后端的话原样透出来**：删不掉时最常见的原因是「这是最后一个系统
     // 管理员」—— 那句话自带处置动作（先建一个管理员），比一句「删除失败」
     // 有用得多。
-    ElMessage.error(e?.response?.data?.detail || '删除失败')
+    ElMessage.error(errorText(e, '删除失败'))
     return
   }
   ElMessage.success('已删除')

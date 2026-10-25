@@ -1,6 +1,7 @@
 """数据库事实驱动的逐 worker barrier；没有请求间授权/READY 缓存。"""
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
@@ -12,6 +13,8 @@ from app.core.config import settings
 from app.core.db import SessionLocal
 from app.plugins.errors import PluginError
 from app.plugins.models import PluginCohort, PluginRegistry, PluginWorkerRuntime
+
+log = logging.getLogger(__name__)
 
 
 def now():
@@ -82,6 +85,11 @@ class WorkerRuntime:
         self.handlers = {}
         self.hooks = {}
         self.tasks = {}
+        # 隔离模式（``PLUGIN_ISOLATION=on``）下每个插件的 worker 进程句柄。
+        # 宿主退出时要把它们收掉 —— 否则留下没人管的插件进程。
+        self.workers = {}
+        # shadow 模式下逐条比对的差异（``{插件 id: 差异列表}``）。空列表 = 一致。
+        self.isolation_diffs = {}
 
     def join(self):
         if not re.fullmatch(r"[a-f0-9]{32,64}", self.generation) or not self.started_at or not 1 <= self.expected <= 64:
@@ -142,6 +150,16 @@ class WorkerRuntime:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
+        # 先收 worker 进程，再删自己的行。
+        #
+        # 顺序有讲究：worker 进程是**子进程**，不收它就会变成孤儿
+        # （worker 自己也有「宿主没了就自杀」的兜底，但那是兜底，不是常态）。
+        for worker in list(self.workers.values()):
+            try:
+                worker.close()
+            except Exception:  # noqa: BLE001 —— 收尾不该把宿主带崩
+                log.exception("plugin worker close failed")
+        self.workers.clear()
         with SessionLocal.begin() as db:
             db.execute(delete(PluginWorkerRuntime).where(
                 PluginWorkerRuntime.generation == self.generation,

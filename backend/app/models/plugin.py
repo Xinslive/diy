@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base, TimestampMixin
@@ -10,6 +10,19 @@ from app.models.base import Base, TimestampMixin
 
 class PluginRegistry(Base, TimestampMixin):
     __tablename__ = "plugin_registry"
+    __table_args__ = (
+        # **库级 CHECK 约束，模型侧必须同名同义**（审计 P3-2 / P3-22）。
+        #
+        # 迁移 0026 里这条是**内联**写的（``access_default VARCHAR(16) NOT
+        # NULL DEFAULT 'none' CHECK (access_default = 'none')``），PostgreSQL
+        # 给内联校验自动取名 ``plugin_registry_access_default_check`` ——
+        # 模型侧必须用**这个**名字，才算同名。
+        #
+        # 它是**安全护栏**：插件默认拿不到任何用户数据，只有显式授权之后才
+        # 能碰到。写成别的名字，autogenerate（及任何以模型为准的心智模型）
+        # 就看不见这条护栏；写成别的语义，这条护栏就名存实亡了。
+        CheckConstraint("access_default = 'none'", name="plugin_registry_access_default_check"),
+    )
     plugin_id: Mapped[str] = mapped_column(String(96), primary_key=True)
     version: Mapped[str] = mapped_column(String(64))
     plugin_digest: Mapped[str] = mapped_column(String(64))
@@ -69,6 +82,23 @@ class PluginUserAccess(Base):
 
 class PluginCohort(Base):
     __tablename__ = "plugin_cohort"
+    __table_args__ = (
+        # **库级 CHECK 约束，模型侧必须同名同义**（审计 P3-2 / P3-22）。
+        #
+        # 两条都由迁移 0026 内联交付，PostgreSQL 自动取名
+        # ``plugin_cohort_id_check`` / ``plugin_cohort_expected_workers_check``。
+        #
+        # ``id = 1`` 是**单行守卫**：这张表全局只允许有一行（当前这一代
+        # 插件 worker 的租约世代）。它是库层最后一道防线 —— 应用层万一
+        # 插了第二行，租约就会分裂成两代，worker 的排他租约随之失效。
+        #
+        # ``expected_workers BETWEEN 1 AND 64`` 给的是**容量上限**：
+        # 预计 worker 数是个小整数，写成 0 或 1000 都是配置事故，
+        # 而 64 这个上限本身是排期系统的口径（见 app/plugins/workers）。
+        CheckConstraint("id = 1", name="plugin_cohort_id_check"),
+        CheckConstraint("expected_workers BETWEEN 1 AND 64",
+                        name="plugin_cohort_expected_workers_check"),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     generation: Mapped[str] = mapped_column(String(64))
     started_at: Mapped[int] = mapped_column(BigInteger)

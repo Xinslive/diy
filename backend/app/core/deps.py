@@ -23,6 +23,23 @@ bearer = HTTPBearer(auto_error=False)
 WRITE_ROLES = frozenset({"OWNER", "ACCOUNTANT"})
 READ_ONLY_ROLES = frozenset({"VIEWER"})
 
+# 高危动作撞上「近期二次验证」闸门时，回给客户端的**机器可读**错误码。
+#
+# **为什么不能只靠那句中文文案**：前端要判断「这个 403 是不是『该去重新
+# 验证』」，才能给出「去重新验证」的引导 —— 没有引导的话，管理员在令牌超过
+# 宽限期之后碰高危动作，只会看到一句 403，**界面上没有下一步**（审计 §3.2
+# 闸门扩到 13 条受管控写路由之后，这是管理员唯一会撞上的墙）。
+#
+# 拿中文文案去匹配（detail.includes("二次验证")）是**拿协议去猜协议**：
+# 文案一改就静默失效 —— 403 还是那个 403，只是没人弹引导了，管理员撞死路，
+# 而且**没有任何报错**（最难查的那一类）。
+#
+# 有稳定错误码之后，文案可以随便改；前端认的是 code，不认文案。
+# 前端那边认的就是这个字符串（frontend/src/api/client.js）——
+# 两边必须一起改，后端那条用例（test_audit_fix_admin_write_mfa_gates.py）
+# 会跨语言核对一遍。
+MFA_REAUTH_REQUIRED = "MFA_REAUTH_REQUIRED"
+
 
 def get_current_user(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
@@ -133,20 +150,34 @@ def require_recent_admin_mfa(
     if request is not None:
         payload = getattr(request.state, "auth_payload", None)
     mfa_at = (payload or {}).get("mfa_at")
-    if not mfa_at:
-        raise HTTPException(
+
+    def _need_reauth() -> HTTPException:
+        """这个 403 的**唯一**出处。
+
+        detail 是**结构化**的（``code`` + ``message``）而不是一句纯文案 ——
+        前端要靠 ``code`` 判断「这个 403 该给『去重新验证』的引导」，
+        靠文案去猜是拿协议去猜协议（见文件头 MFA_REAUTH_REQUIRED 的说明）。
+
+        两处拒（没有 ``mfa_at`` / ``mfa_at`` 太旧）走同一个函数 ——
+        同一句话有两个出处时，改了一处就可能出现「两种 403 前端认得不一样」。
+        """
+        return HTTPException(
             status.HTTP_403_FORBIDDEN,
-            f"该操作需要近期完成邮箱二次验证：请在 {grace // 60} 分钟内通过 "
-            "POST /api/auth/mfa/reauth 重新验证后再试")
+            {
+                "code": MFA_REAUTH_REQUIRED,
+                "message": f"该操作需要近期完成邮箱二次验证：请在 {grace // 60} 分钟内通过 "
+                           "POST /api/auth/mfa/reauth 重新验证后再试",
+            },
+        )
+
+    if not mfa_at:
+        raise _need_reauth()
     try:
         age = time.time() - float(mfa_at)
     except (TypeError, ValueError):
         age = None
     if age is None or age > grace:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            f"该操作需要近期完成邮箱二次验证：请在 {grace // 60} 分钟内通过 "
-            "POST /api/auth/mfa/reauth 重新验证后再试")
+        raise _need_reauth()
     return user
 
 

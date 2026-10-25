@@ -73,6 +73,9 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
   // load() 会写它：余额显示要知道这张凭证落在哪一期（科目格左下角那个数）
   const voucherPeriodId = { value: 0 }
   const lastSaved = { value: '' }
+  // 乐观锁令牌与冲突标志（审计 §3.15 的 409 契约）
+  const voucherVersion = { value: '' }
+  const versionConflict = { value: false }
   const prevId = { value: null }
   const nextId = { value: null }
   const neighbourScope = { value: '' }
@@ -85,7 +88,11 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
     form: {},
     voucherId, savedAt, insertCtx, subjectRefs, rowEls, markingRows, committedAmounts, voucherPeriod, voucherPeriodId,
     lastSaved, prevId, nextId, neighbourScope, crossBook,
-    store: { bookId: 1, periods: [], books: [] },
+    // 乐观锁令牌与冲突标志（审计 §3.15 的 409 契约）
+    voucherVersion, versionConflict,
+    // store：凭证页从它这里取「换账套前的那一本」（切账套撞号提示，见审计 §3.33）。
+    // 这里恒为 0 = 没切账套，所以不会有提示。
+    store: { bookId: 1, periods: [], books: [], takePrevBookId: () => 0 },
     listFilter: { value: {} },
     entrySig: { value: 'sig' },
     api: {
@@ -109,7 +116,8 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
     'ctx',
     `
     const { route, form, voucherId, savedAt, insertCtx, subjectRefs, rowEls, markingRows, committedAmounts,
-            voucherPeriod, voucherPeriodId, lastSaved, prevId, nextId, neighbourScope, crossBook, store, listFilter, entrySig,
+            voucherPeriod, voucherPeriodId, lastSaved, prevId, nextId, neighbourScope, crossBook,
+            voucherVersion, versionConflict, store, listFilter, entrySig,
             api, loadSubjects, ensureRows, seedCommitted, loadInsertPreview, loadNextDefaults,
             defaultDate, ElMessage, router, history, location } = ctx
     const bookName = (id) => '账套 ' + id

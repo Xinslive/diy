@@ -286,6 +286,63 @@ def side_totals(entries: list[dict]) -> tuple[Decimal, Decimal]:
 SYSTEM_SOURCES = ("CARRY_FORWARD",)
 
 
+def _missing_subjects_message(db: Session, book_id: int, year: int,
+                               missing: set[int]) -> str:
+    """「这些科目不在目标年度的科目表里」—— 报错文案。
+
+    **必须区分两种情况**（审计报告 §3.19 的修复建议原文有两句，第①句
+    「改用目标期间的年份」已做，第②句「错误文案应区分『年度不匹配』与
+    『科目真的不存在』」**一直没做**）：
+
+      · 科目**存在**，但在**别的年度**的科目表里 —— 这是**年度不匹配**。
+        用户把 2026 年的凭证改到了 2027 年，而分录科目还挂在 2026 那张表上。
+        说「科目不存在或已停用」是**错的**：那本 2027 的科目表里这个科目
+        明明存在、也明明是启用的 —— 用户会去检查科目、怀疑自己选错了，
+        而真正的原因是「科目表每个年度各有一份，跨年改期必须换科目」。
+        实测（§3.19 旁路）：该科目**确实存在**（在旧年度的那张表里），
+        报错却说它「不存在」。
+      · 科目**真的不存在**（这个账套哪个年度都没有），或者它在目标年度
+        存在但**已停用** —— 这才是「科目不存在或已停用」。
+
+    **两类混在一起时两类都要说**：先说年度不匹配的那些，再说真的不存在的。
+    """
+    # 这些 id 在这个账套的**各个年度**里分别是什么。
+    others = db.execute(
+        select(Subject.id, Subject.year, Subject.code, Subject.name, Subject.active)
+        .where(Subject.book_id == book_id, Subject.id.in_(missing))
+    ).all()
+    by_id: dict[int, list] = {}
+    for r in others:
+        by_id.setdefault(r.id, []).append(r)
+
+    other_year: list[str] = []
+    truly_missing: list[int] = []
+    for sid in sorted(missing):
+        rows = by_id.get(sid, [])
+        # 在**目标年度**存在 → 只是被 active 过滤掉了（已停用），不是年度问题
+        if any(r.year == year for r in rows):
+            truly_missing.append(sid)
+            continue
+        elsewhere = sorted(rows, key=lambda r: r.year)
+        if elsewhere:
+            r = elsewhere[-1]
+            other_year.append(f"{r.code} {r.name}（{r.year} 年）")
+        else:
+            truly_missing.append(sid)
+
+    parts: list[str] = []
+    if other_year:
+        parts.append(
+            f"分录科目属于**别的年度**的科目表：{'、'.join(other_year)}。"
+            f"科目表每个年度各有一份（{year} 年是另一批科目、另一批 id）—— "
+            f"你这张凭证落到了 {year} 年，"
+            f"请把分录科目换成 {year} 年科目表里的科目。"
+        )
+    if truly_missing:
+        parts.append(f"科目不存在或已停用: {sorted(truly_missing)}")
+    return "".join(parts)
+
+
 def _validate_entries(db: Session, book_id: int, entries: list[dict],
                       year: int,
                       allow_inactive: bool = False,
@@ -360,7 +417,7 @@ def _validate_entries(db: Session, book_id: int, entries: list[dict],
     found = {r.id for r in rows}
     missing = subject_ids - found
     if missing:
-        raise ValueError(f"科目不存在或已停用: {sorted(missing)}")
+        raise ValueError(_missing_subjects_message(db, book_id, year, missing))
 
     # 末级科目这道关口放在服务端，不能只指望前端面板不给选：
     # 接口能被直接调、导入能绕、老的行早就挂上去了 —— 前端拦一遍，这里再拦一遍，
@@ -480,6 +537,7 @@ def create_voucher(
     insert_position: str = "before",
     commit: bool = True,
     internal: bool = False,
+    enforce_date_order: bool = False,
 ) -> Voucher:
     """建一张凭证。
 
@@ -495,6 +553,13 @@ def create_voucher(
     而那条路上真正要守的不变量已经守住了 ——
     ① 豁免拿不到，② ``_drop_carry_forward`` 只删签名对得上的系统凭证，
     伪造一张出来既没有特权、也不会被悄悄删掉。
+
+    ``enforce_date_order=True`` 表示「这是界面上那张单张新建的表单，
+    新凭证会排在本期号段末尾」—— 于是它的日期不能早于本期已有的最后一张，
+    否则「整理就绪」体检会判「时序不对」，把这个月判死（既不能记账也不能结账）。
+    **默认 False**：服务层的其它调用方（导入、发票、结转）拿来的日期来自
+    原始单据或系统，不该由这里替用户改；倒序录入本身是合法业务，
+    本仓的既定解法是月底「整理凭证」按日期重排（``SORT_DATE``）。
     """
     # **文本在入口就洗掉**（摘要、备注）。
     #
@@ -526,7 +591,65 @@ def create_voucher(
         moving_ids = {m["id"] for m in moved}
         no = svc_organize.require_no(voucher_no) or slot["no"]
     else:
-        no = svc_organize.require_no(voucher_no) or next_voucher_no(db, period)
+        # **凭证字取这个期间在用的那个**（审计报告 §3.18）。
+        #
+        # 原来这里是 ``next_voucher_no(db, period)`` —— 不传前缀，
+        # 于是用默认的「记」。而这个期间的凭证字**未必是「记」**：
+        # Excel 导入的凭证直接采用表里带的号（``importer`` 里就是
+        # ``v.get("voucher_no")``），而 ``require_no`` 只校验「凭证字 + 序号」
+        # 这个**形状**、**不限制前缀** —— 所以「用友导出的 银0001」进得来。
+        #
+        # 后果：那个期间的 dominant prefix 变成「银」，而界面上正常新建一张
+        # 凭证 → 服务端发出「记0001」→ 该期立刻变成「记、银 混用」→
+        # ``assert_tidy`` 判为 blocking，而它同时是**记账**与**结账**的闸门
+        # → **这个月从此既不能记账也不能结账**。
+        # 用户看到的是一句看不懂的报错，既不知道是哪张凭证引起的，
+        # 也不知道「记0001」是系统自己刚发出去的号（凭证号在界面上是只读的）。
+        #
+        # 修法与「把一张凭证挪进另一个期间」那条路**同一口径**
+        # （``update_voucher`` 里的跨期改号）：``period_prefix`` 给出该期
+        # 出现次数最多的凭证字；期间一张都没有时回落成「记」。
+        prefix = svc_organize.period_prefix(db, period, fallback="记")
+        given_no = svc_organize.require_no(voucher_no)
+        no = given_no or next_voucher_no(db, period, prefix=prefix)
+        # **日期不能早于本期已存在的最后一张**（审计报告 §3.18 的后半句）。
+        #
+        # 新凭证拿的是本期**最大**的号（排在最后），而「整理就绪」体检要求
+        # **号序与日期同向**（``organize._time_order_issues``：号大的那张
+        # 日期反而更早 → 判「时序不对」→ 这个月既不能记账也不能结账）。
+        # 用户在界面上新建一张凭证、日期却填了本期已有凭证**之前** ——
+        # 服务端发出去的号当场把这个月判死，而用户在改日期之前
+        # 根本不知道自己填错了。
+        #
+        # **这条只在「界面上新建」那条路上查**（``enforce_date_order``），
+        # 理由逐条说清：
+        #   · 导入（``source="IMPORT"``）的日期来自 Excel，是原始单据的日期，
+        #     不是我们能替用户改的，也不该由这里拦下（整批导入会被卡死）；
+        #   · 发票（``source="INVOICE"``）的日期来自发票本身，同理；
+        #   · 结转（``internal=True``）的日期是系统定的（期末最后一天）。
+        # 而**服务层默认不查**（``enforce_date_order=False``）：日期倒着填
+        # 本身是合法的业务（补一张上周的凭证），本仓的既定解法是月底
+        # 「整理凭证」按日期重排（``SORT_DATE``），而不是当场拒绝录入。
+        # 只有界面上那张单张新建的表单，才值得当场把话说清楚。
+        #
+        # 拒绝而不是「悄悄把日期改成最后一天」：静默改用户的业务日期，
+        # 比报错坏得多（纸上写的是一天、账上记的是另一天）。
+        #
+        # 只在「号是服务端刚发的」时才查 —— 号码是调用方自己带来的
+        # （导入路径），它未必排在最后，那条时序判据就不成立。
+        if enforce_date_order and given_no is None:
+            last_date = db.scalar(
+                select(func.max(Voucher.voucher_date))
+                .where(Voucher.period_id == period.id)
+            )
+            if last_date is not None and voucher_date < last_date:
+                raise ValueError(
+                    f"凭证日期 {voucher_date} 早于 {period.code} 期已存在的最后一张"
+                    f"凭证（{last_date}）。新凭证的号会排在那张之后，日期却更早 ——"
+                    "期末结账的「时序不对」体检会把这个月拦死（既不能记账也不能结账）。"
+                    f"请把日期改到 {last_date} 或之后；确实要补一张更早的凭证，"
+                    "请用「插入凭证」把它插到该在的位置。"
+                )
 
     # 页面上会预填下一个号（/vouchers/next），两个人同时开一张就会撞号。
     # 撞了就报人话 —— 数据库只会说「违反唯一约束 uq_voucher_period_no」，
@@ -605,9 +728,138 @@ def create_voucher(
     return voucher
 
 
+class VoucherVersionConflict(ValueError):
+    """凭证版本冲突（乐观锁）。
+
+    继承 ValueError 是为了让不认识它的旧调用方也能正常报错而不是 500；
+    但**路由层必须在 ``except ValueError`` 之前**单独捕获它并返回 **409**
+    （而不是 400）—— 与 ``accounting.periods.PeriodVersionConflict`` 同一条规矩：
+    409 的语义是「你手里的版本过期了，请刷新后重试」，400 会让前端
+    以为是自己参数写错了。
+    """
+
+
+def version_token(updated_at: datetime | None) -> str:
+    """凭证的乐观锁令牌：``updated_at`` 的 ISO 文本。
+
+    用 ``updated_at`` 而不是自造一个 version 列，是因为 ``voucher`` 表上
+    **没有** version 字段 —— 而加一列要动模型与迁移，却换不来任何东西：
+    令牌本身得由客户端带着往返才有意义（见 ``update_voucher`` 里那段说明）。
+
+    **这个格式只有这一份。** 令牌是**客户端与服务端之间的一枚硬币**：
+    客户端把它读到的值原样送回来，服务端拿库里此刻的值算一个同样的东西
+    来比。两边的格式必须一模一样 —— 差一个时区写法、差一个 ``Z``，
+    比对就永远不相等，于是「带了令牌」会一律判成「版本过期」。
+
+    所以**公开出来**给 ``app/api/vouchers.py`` 的序列化用：
+    那边要把它放进响应里（客户端得先拿到令牌才带得回来），
+    而这里要拿它来比对 —— 两处必须是同一个函数，不是两份写法相同的代码
+    （审计 §4.5：同一个量只允许一个权威实现）。
+    """
+    return updated_at.isoformat() if updated_at is not None else ""
+
+
 def update_voucher(
-    db: Session, voucher: Voucher, user: SysUser, payload: dict
+    db: Session, voucher: Voucher, user: SysUser, payload: dict,
+    expected_version: str | None = None,
 ) -> Voucher:
+    # ==================================================================
+    # 并发闸门（审计报告 §3.15 —— 本仓最严重的一条）
+    # ==================================================================
+    #
+    # **原来这条写路径上没有任何并发控制**，三道闸在并发下会同时落空：
+    #
+    #   1. 应用层 ``voucher.status == "POSTED"`` —— 读的是**会话内那份
+    #      可能已经陈旧**的属性（路由层的 ``db.get`` 是普通 SELECT）；
+    #   2. 库层 ``fn_posted_voucher_guard``（voucher 的 BEFORE UPDATE 行触发器）
+    #      —— **只有当 UPDATE 语句真的产生时才执行**。而改分录走的是
+    #      「DELETE 旧 entry 行 + INSERT 新 entry 行」，voucher 行往往
+    #      **没有任何净变化**（status 本来就是 UNPOSTED，又被重新赋成
+    #      UNPOSTED，SQLAlchemy 眼里「没变」→ 根本不生成 UPDATE 语句），
+    #      于是这道守卫**一次都没跑**；
+    #   3. ``fn_entry_lock_guard`` —— 只管「期间是否已结账」，不管记账状态。
+    #
+    # 后果是「已记账凭证的金额被**静默改写**」：借贷平、试算平、科目余额、
+    # 总账、「整理就绪」体检**全过** —— 数字是错的，但没有任何一处会报错。
+    # 并发改同一张凭证还会留下 4 条重复行号的分录（同一笔钱记两遍），
+    # 而借贷仍然平。
+    #
+    # **修法与 ``split_voucher`` 同一套**（那里早就是这么写的）：
+    # **先锁住行，再重读一遍**，一切判断以锁后读到的状态为准。
+    #
+    # ---- 锁序：期间行 → 凭证行 ----
+    #
+    # 与 ``split_voucher`` / ``organize.apply_organize`` / ``close_period``
+    # 一致（**期间 → 凭证**）。这不是洁癖：反过来的顺序会与「结账」形成死锁环 ——
+    # 结账侧持有期间的 FOR UPDATE 再去 UPDATE 凭证；而本函数若先锁凭证、
+    # 之后再去动分录，分录侧的 ``fn_entry_lock_guard`` 又要拿期间的 FOR SHARE，
+    # 两边各持一把、各等另一把，PostgreSQL 只能回滚其中一方。
+    #
+    # 期间那一行用**列查询**读 ``locked``（绕开 identity map 的陈旧值），
+    # 与 ``periods._fresh_period`` 同一个写法：路由层早先 ``get_period`` 读过
+    # 这一行，本会话里它就是那份旧值 —— 别人在这期间提交过一次结账，
+    # 本会话照样看到 ``locked=False``。
+    #
+    # （``Period.code`` 是**属性**不是列 —— 它由 year/month 拼出来，
+    # 所以这里取不到它，期号从 ORM 对象上读。）
+    period_row = db.execute(
+        select(Period.id, Period.locked)
+        .where(Period.id == voucher.period_id)
+        .with_for_update()
+    ).one()
+    period = db.get(Period, period_row[0])
+    if period_row[1]:
+        raise ValueError(f"{period.code} 已结账，不能修改凭证")
+
+    # 这张凭证行也要锁：它挡的是**并发改这一张**。
+    # 锁到手后重新读一遍 —— 改的是**当下**这一张，不是进入函数时看到的那一份。
+    db.execute(
+        select(Voucher.id).where(Voucher.id == voucher.id).with_for_update()
+    ).all()
+    db.refresh(voucher)
+    db.expire(voucher, ["entries"])
+
+    # **status 必须用列查询读**（绕开 identity map）。
+    # ``db.refresh`` 已经把对象刷新过一遍，但同一个会话里 identity map 里
+    # 可能还留着别的代码路径写进去的值；列查询返回的是**行**，不经过
+    # identity map —— 读到的就是库里此刻的样子。
+    # 判据用错来源的后果很具体：会话里那份是 UNPOSTED（其实别人已经记账了），
+    # 放行 → 改写已经进账簿的数字。
+    fresh_status, fresh_updated_at = db.execute(
+        select(Voucher.status, Voucher.updated_at).where(Voucher.id == voucher.id)
+    ).one()
+
+    # ---- 乐观锁：客户端带了版本就比，不一致就抛冲突（路由层翻成 409）----
+    #
+    # **这条不是空转的。** 请求体模型 ``VoucherIn``
+    # （``app/api/schemas.py``）里**有** ``version`` 字段，前端也真的带
+    # （``frontend/src/views/voucher/VoucherEdit.vue`` 保存时送
+    # ``version: voucherVersion.value || null``，并专门处理 409）。
+    # 用例钉在 ``tests/test_audit_fix_voucher_version.py``
+    # （``test_带着过期的令牌回409``、``test_并发改分录会被409挡住``）。
+    #
+    # **但正确性的主体仍然是上面那把行锁**（悲观锁）：它拦的是
+    # 「B 的会话已经打开了页面、A 在此之后记账、B 再保存」这个真实交错 ——
+    # B 拿到锁时会读到 POSTED，被当场拒下。而乐观锁拦的是另一个交错：
+    # 「B 打开页面时 A 改过、B 手里那枚令牌已经过期」。
+    #
+    # 两者**都留着**，缺一不可：行锁管「写路径上的串行化」，乐观锁管
+    # 「人看到的那一版是不是还在」。只留行锁的话，B 会拿着**自己没看见的**
+    # 改动（别人改的）把它当成自己的意图覆盖回去 —— 行锁只保证不撕裂，
+    # 不保证不覆盖。
+    if expected_version is not None and \
+            expected_version != version_token(fresh_updated_at):
+        raise VoucherVersionConflict(
+            f"凭证 {voucher.voucher_no} 已被他人改动"
+            f"（你手上的版本 {expected_version}，库里已是 "
+            f"{version_token(fresh_updated_at)}）。"
+            "本次修改没有执行，请刷新页面确认当前内容后再改。")
+
+    # **审计快照必须取在锁后** —— 原来它取的是进入函数时那份会话内对象，
+    # 并发下那是**陈旧**的：两条 UPDATE 审计会各写一份「500 → 1000」与
+    # 「500 → 2000」的 before，而真实的中间状态是 1000 —— 第二份是假的。
+    # 审计日志是「凭证号可复用」场景下唯一的事后追溯依据（audit_helper 的立论），
+    # 快照是假的，那条立论就废了。
     before = voucher_snapshot(voucher)
     # 本次修改**之前**的凭证号：跨期改日期时服务端会重发一个号，后面的
     # 「凭证号不能手工修改」要拿这个原号去比（比重发后的新号会误伤）。
@@ -620,17 +872,17 @@ def update_voucher(
     if "remark" in payload and payload["remark"] is not None:
         payload = dict(payload)
         payload["remark"] = scrub_control_chars(payload["remark"] or "")
-    period = db.get(Period, voucher.period_id)
-    if period.locked:
-        raise ValueError(f"{period.code} 已结账，不能修改凭证")
     # 已记账 = 已进账簿，数字已经被总账/报表引用。改它必须先退回复记账状态，
     # 否则「报表里的数和凭证里写的数」会对不上，且没人知道差在哪一步。
+    #
+    # 判据用的是**上面那次列查询读到的 status**，不是会话里的属性 ——
+    # 并发下会话里那份可能是陈旧的（详见本函数开头那段说明）。
     #
     # 提示里**不能写「请在凭证列表里反记账」**：凭证列表工具栏上的
     # 「记账 / 反记账」早就撤了（结算只在期末结账那一处，见 ARCHITECTURE §4），
     # 按这句话去列表页翻的人只会找不到那个按钮。退回复记账的入口现在只有
     # 「期末结账 → 反结账」—— 它会把区间内凭证一并退回未记账。
-    if voucher.status == "POSTED":
+    if fresh_status == "POSTED":
         raise ValueError(
             f"凭证 {voucher.voucher_no} 已记账，不能修改。"
             f"请到「期末结账」对本期执行「反结账」后再改。")
@@ -681,8 +933,12 @@ def update_voucher(
                 prefix=svc_organize.period_prefix(db, new_period, fallback=own_prefix))
             renumbered = (voucher.voucher_no, new_no)
             voucher.voucher_no = new_no
-        voucher.voucher_date = new_date
-        voucher.period_id = new_period.id
+        else:
+            voucher.voucher_date = new_date
+            voucher.period_id = new_period.id
+        # **换期时，日期与期间不在这里赋值** —— 它们要等**旧分录删掉之后**
+        # 才落（见下面 entries 那段末尾的说明）。换期之前的那个期间不变，
+        # 所以 ``period`` 仍然是「这张凭证现在在哪个期」。
 
     # 凭证号不再允许人工改（用户 2026-10-19 定的：新增 / 插入 / 修改三处
     # 一律只读，只能用系统自动生成的号）。
@@ -728,10 +984,51 @@ def update_voucher(
         legacy = Counter(
             (e.subject_id, e.direction, money(e.amount)) for e in voucher.entries
         )
+        # **按目标期间的年度校验科目**（审计报告 §3.19）。
+        #
+        # 原来这里传的是 ``period.year`` —— 而 ``period`` 是**改期前**那个期间
+        # （``period`` 在本函数开头取的，``voucher.period_id = new_period.id``
+        # 在更后面才执行）。于是「把 2026 年的凭证改到 2027 年 1 月、
+        # 分录换成 2027 年科目表里的科目」这条**完全合法**的操作会被判成
+        # 「科目不存在或已停用」：服务端拿着 **2026 年**的科目表去找
+        # **2027 年**的科目 id，自然找不到。
+        #
+        # 科目表**每个年度各有一份**（迁移 0032），所以校验必须跟着
+        # 凭证**将要落在哪一年**走 —— 那就是目标期间的年度。
+        # 用户看到的是「科目不存在或已停用」，而那本 2027 科目表里这个科目
+        # 明明存在、也明明是启用的：用户会去检查科目、怀疑自己选错了，
+        # 实际是服务端拿错了年份。
+        target_year = new_period.year if new_period is not None else period.year
         grandfathered = _validate_entries(db, voucher.book_id, entries,
-                                          period.year, legacy_non_leaf=legacy)
+                                          target_year, legacy_non_leaf=legacy)
+        # ---- 先删旧分录，**再挪期间**，最后插新分录 ----
+        #
+        # 这个顺序不是审美问题，是**跨年度挪凭证能不能成的关键**。
+        #
+        # 库层的 ``fn_voucher_resync_entries``（voucher 换期后回填分录冗余列）
+        # 是 **AFTER UPDATE ON voucher** 的触发器：凭证的 period_id 一改，
+        # 它立刻把**当时还在的那几张分录**的 book_id/period_ord 刷一遍。
+        # 而 ``fn_entry_subject_year_guard``（分录的科目必须与所在期间同年度）
+        # 会在那次 UPDATE 上重新判一次 —— 于是：
+        #
+        #   凭证改期到 2027 → 触发器刷**旧分录**（科目还挂在 2026 年）→
+        #   年度护栏判定「分录的科目属于 2026 年度，不能记在 2027 年度的凭证上」
+        #   → 整笔操作当场失败。
+        #
+        # 也就是说：旧分录还在的时候挪期，**跨年度一定挪不动** ——
+        # 而「把 2026 的凭证挪到 2027 并换成 2027 的科目」是**完全合法**的操作。
+        #
+        # 拆成三步之后就顺了：
+        #   ① 删旧分录（凭证还在旧期间，删得掉）；
+        #   ② 挪凭证（触发器要刷的分录已经没有了 —— 刷不到就没事）；
+        #   ③ 插新分录（冗余列由 ``fn_entry_sync`` 按**新**期间回填，
+        #      年度护栏这时看到的是「2027 的科目挂在 2027 的凭证上」—— 通过）。
         voucher.entries.clear()
         db.flush()
+        if new_period is not None and new_period.id != voucher.period_id:
+            voucher.voucher_date = payload["voucher_date"]
+            voucher.period_id = new_period.id
+            db.flush()
         for i, e in enumerate(entries, start=1):
             voucher.entries.append(Entry(voucher_id=voucher.id, line_no=i, **e))
         # 改动内容后回到未记账，避免「已记账但内容变了」的脏状态
@@ -740,11 +1037,40 @@ def update_voucher(
         voucher.posted_by = None
     else:
         grandfathered = 0
+        # 没有提交分录时**没有旧分录可删**，挪期就直接做 ——
+        # （此时那几张分录的科目还是旧年度的，库层年度护栏会照实拒绝：
+        # 跨年度挪凭证必须同时换成目标年度的科目，那是另一道闸的事。）
+        if new_period is not None and new_period.id != voucher.period_id:
+            voucher.voucher_date = payload["voucher_date"]
+            voucher.period_id = new_period.id
 
     if "remark" in payload:
         voucher.remark = payload["remark"] or ""
     if "attachments" in payload:
         voucher.attachments = int(payload["attachments"] or 0)
+
+    # ---- 让 voucher 行**真的被 UPDATE 一遍** --------------------------------
+    #
+    # **为什么必须显式动一下。**
+    #
+    # 乐观锁令牌取的是 ``updated_at``（见 :func:`version_token`），而
+    # ``updated_at`` 由库层的 ``fn_touch_updated_at`` 触发器刷新 ——
+    # **触发器只在真的发出 UPDATE 语句时才跑**。
+    #
+    # 而「只改分录」这件事，voucher 行往往**没有任何净变化**：
+    # status 本来就是 UNPOSTED（又被赋成 UNPOSTED）、备注没动、附单据数没动
+    # → SQLAlchemy 眼里「什么都没改」→ **根本不生成 UPDATE 语句**
+    # → 触发器不跑 → **令牌不动**。
+    #
+    # 后果有两处，都很要命：
+    #   · 令牌**抓不到并发改分录** —— 而那恰恰是最常见的那一类改动；
+    #   · 客户端下一次保存拿的还是同一个令牌，比对下来「相等」——
+    #     看起来有保护，实际没有。
+    #
+    # 所以这里**显式**把 ``updated_at`` 动一下：改这张凭证 = 它被改过 =
+    # 它的最后修改时间就该变。值由触发器最终定成库里的 ``now()``，
+    # 这里只是**保证有 UPDATE 语句发出去**。
+    voucher.updated_at = datetime.now(timezone.utc)
 
     db.flush()
     log(

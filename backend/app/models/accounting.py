@@ -98,6 +98,21 @@ class Voucher(Base, TimestampMixin):
         #
         # 约束名与表达式**必须与库里逐字一致**，否则 autogenerate 会误报。
         CheckConstraint("status IN ('UNPOSTED','POSTED')", name="ck_voucher_status"),
+        # ``ck_voucher_source`` 同上（审计 P3-2 / 报告 §3.14、§3.22）。
+        #
+        # 库里这条约束是活的：``db_init.sql:23`` 把它装上，服务层传
+        # ``source="FOO"`` 会被它挡下（sqlstate 23514 check_violation）。
+        # 以前模型侧只有 ``ck_voucher_status``，于是这一条对「模型 == 库」
+        # 这条判据**结构性失效**（Alembic 不比较 CHECK 约束，缺了不会报、
+        # 补了也不会报 —— 两条路都看不见）。
+        #
+        # 名字与表达式**与库里逐字一致**（PG 会把 IN 归一化成 = ANY(ARRAY[...])，
+        # 语义等价即可）：少一条不会让服务崩，但会让所有以模型为准的心智模型、
+        # 静态检查、基于模型的测试工具对它完全失明。
+        CheckConstraint(
+            "source IN ('MANUAL','IMPORT','INVOICE','CARRY_FORWARD')",
+            name="ck_voucher_source",
+        ),
         Index("ix_voucher_book_date", "book_id", "voucher_date"),
         Index("ix_voucher_book_status", "book_id", "status"),
     )
@@ -162,6 +177,23 @@ class Entry(Base, TimestampMixin):
         # 约束，模型侧缺不缺它都看不出来，所以只能靠「同名同义」这条人工约定。
         CheckConstraint("direction IN ('DEBIT','CREDIT')", name="ck_entry_direction"),
         CheckConstraint("amount <> 0", name="ck_entry_amount_nonzero"),
+        # **同一张凭证里，行号不能重复**（审计报告 §3.15，迁移 0038）。
+        #
+        # 以前这张表**没有**这条约束，于是「同一张凭证挂两条 line_no=1」
+        # 能静默入库。并发改同一张凭证时就会真的发生：B 会话按自己那份
+        # 陈旧的分录集合「删旧插新」，而 A 会话已经把那几行删掉了 ——
+        # DELETE 命中 0 行，B 的新行照样插进去，于是这张凭证有 4 条分录、
+        # 两组重复的 line_no，借贷还平（3000 = 3000），**所有自检都查不出来**：
+        # 借贷平、试算平、科目余额、总账、「整理就绪」体检全过 —— 数字是错的，
+        # 但没有任何一处会报错。
+        #
+        # 有这条约束之后，同样的交错会在库层炸成 23505（可见的失败），
+        # 而不是留下一张「金额记了两遍」的凭证。
+        #
+        # 名字与库里那条逐字一致（迁移 0038 建的就是它）——
+        # 理由同 ``Voucher.ck_voucher_status`` 那条注释：Alembic 不比较
+        # CHECK/UNIQUE 约束的语义，模型侧与库侧只能靠「同名同义」这条人工约定。
+        UniqueConstraint("voucher_id", "line_no", name="uq_entry_voucher_line_no"),
         # 明细账逐科目取数靠它；保留，不能被下面的宽索引取代。
         Index("ix_entry_subject_ord", "book_id", "subject_id", "period_ord"),
         # 账簿最热的聚合（ledger/engine._query_movements：WHERE book_id = ?

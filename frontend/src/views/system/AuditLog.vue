@@ -4,6 +4,11 @@
       <h2 class="page-title">操作日志</h2>
       <span class="muted">凭证号可回收复用，因此删除/修改都留了完整内容快照</span>
     </div>
+    <!-- 加载失败**不能**与「没有日志」同形：断网/超时时表格会空着，
+         一条提示都没有的话，用户以为这段时间真的一条操作都没有
+         （审计 N3 / §3.25）。 -->
+    <el-alert v-if="loadError" type="error" :closable="false" show-icon class="mb"
+              :title="`加载失败：${loadError}。请检查网络后重试。`" />
     <div class="card">
       <el-table :data="logs" border size="small" v-loading="loading">
         <el-table-column label="时间" width="170">
@@ -49,7 +54,7 @@ const logs = ref([])
  * 组件还活着 —— 旧响应写进来，表格里就是另一批日志。
  * 所以这里接上守卫：这是「页内加载点」的样板。
  */
-const { loading, run, isStale } = useLatestLoad('system/audit')
+const { loading, error: loadError, run, isStale } = useLatestLoad('system/audit')
 const snapVisible = ref(false)
 const snapshot = ref(null)
 
@@ -63,7 +68,19 @@ function show(row) { snapshot.value = { before: row.before, after: row.after }; 
 
 async function load() {
   if (!store.bookId) return
-  const d = await run(() => api.auditLogs(store.bookId, 200))
+  let d
+  try {
+    d = await run(() => api.auditLogs(store.bookId, 200))
+  } catch {
+    // 加载失败**不是**「没有日志」：这两件事在页面上长得一模一样。
+    // 以前这里一声不吭：run() 把真错照原样往外抛，这里没人接 →
+    // 变成一个没人管的 promise rejection，页面上 logs 保持旧值（空表）、
+    // 零提示，用户于是以为这段时间真的一条操作都没有（审计 N3 / §3.25）。
+    //
+    // 拦截器已经弹过提示了，这里只要**接住这个错**：页面上 logs 保持原样，
+    // 顶部由 loadError 挂一条「加载失败」。
+    return
+  }
   // 过期的那一趟：条件早被用户改掉了，写进去就是「表格里是另一批日志」
   if (isStale(d)) return
   logs.value = d
@@ -73,5 +90,6 @@ watch(() => store.bookId, load)
 </script>
 
 <style scoped>
+.mb { margin-bottom: 12px; }
 .snap { max-height: 460px; overflow: auto; font-size: 12px; background: #f8fafc; padding: 12px; border-radius: 4px; }
 </style>

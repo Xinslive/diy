@@ -84,6 +84,19 @@
       :title="`已选 ${selection.length} 张凭证`"
     />
 
+    <!-- 加载失败**不能**与「没有数据」同形：断网/超时时表格会空着，
+         一条提示都没有的话，用户以为这个月真的一笔凭证都没有
+         （审计 N3 / §3.25）。 -->
+    <el-alert
+      v-if="loadError"
+      type="error"
+      :closable="false"
+      show-icon
+      class="no-print"
+      style="margin-bottom: 10px"
+      :title="`加载失败：${loadError}。请检查网络后重试。`"
+    />
+
     <div class="card">
       <el-table
         v-loading="loading"
@@ -200,7 +213,7 @@ const total = ref(0)
  * 只认最新一趟：分页 / 排序能连点，旧响应不许覆盖新数据
  * （见 composables/useLatestLoad.js）。
  */
-const { loading, run, isStale } = useLatestLoad('voucher/list')
+const { loading, error: loadError, run, isStale } = useLatestLoad('voucher/list')
 const selection = ref([])
 /** 顶栏那个期间的「整理就绪」体检结果。干净就是 null，不占地方。 */
 const check = ref(null)
@@ -329,7 +342,19 @@ async function load() {
   // 后发先至会把**旧响应**写进表格 —— 页脚停在第 4 页、表格里是第 3 页的数据。
   // 页面上的代次守卫（composables/useLatestLoad.js）与 api 层的 getLatest
   // 是两道防线，缺一不可（理由见 useLatestLoad 的文件头）。
-  const d = await run(() => api.queryVouchers(store.bookId, queryParams()))
+  let d
+  try {
+    d = await run(() => api.queryVouchers(store.bookId, queryParams()))
+  } catch {
+    // 加载失败**不是**「没有凭证」：这两件事在页面上长得一模一样。
+    // 以前这里一声不吭：run() 把真错照原样往外抛，这里没人接 →
+    // 变成一个没人管的 promise rejection，表格空着、零提示，
+    // 用户以为这个月真的一笔凭证都没有（审计 N3 / §3.25）。
+    //
+    // 拦截器已经弹过提示了，这里只要**接住这个错**：表格里的旧数据保持原样，
+    // 顶部由 loadError 挂一条「加载失败」。
+    return
+  }
   // 过期的那一趟：结果已经到了，但条件（页码/排序/期间）早被用户改掉了 ——
   // 写进去就是「表格里的数对不上页脚」。
   if (isStale(d)) return
@@ -337,7 +362,6 @@ async function load() {
   total.value = d.total
   loadCheck()
 }
-
 /**
  * 断号和时序只跟「期间」有关，跟筛选条件无关：条件栏筛的是跨年的一堆凭证，
  * 而断号说的是号段本身连不连得上。所以这里固定查顶栏那个期间，不跟着条件走。

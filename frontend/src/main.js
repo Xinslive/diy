@@ -10,7 +10,7 @@ import 'element-plus/es/components/message-box/style/css'
 import App from './App.vue'
 import router from './router'
 import './styles/main.css'
-import { onUnauthorized, onPluginRejected } from './api/client'
+import { onUnauthorized, onPluginRejected, onMfaReauth } from './api/client'
 import { createPluginRuntime } from './plugins/runtime'
 import { useTabsStore } from './stores/tabs'
 import { useSessionStore } from './stores/session'
@@ -37,5 +37,10 @@ app.use(router)
 // —— 那是 client → session → api/auth → client 的环，ESM 下不报错，
 // 只是静默拿到 undefined。见 api/client.js 里 onUnauthorized 的注释。
 onUnauthorized(() => { plugins.clear(); session.logout() })
+
+// 高危动作撞到「近期二次验证」闸门时：引导管理员走一遍重新验证，
+// 通过之后由拦截器**自动重试**那个被拦下的动作。
+// 同样地，client.js 不能直接 import store（那是环），所以在这里注入。
+onMfaReauth(() => session.requestMfaReauth())
 
 app.mount('#app')

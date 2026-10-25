@@ -321,6 +321,13 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     那是公开信息（``GET /api/auth/config`` 已经暴露它），**不泄漏任何
     关于某个用户名是否存在的信息**。
 
+    **响应时间也必须一样**（审查 §3.6）。上面那条修的是**响应形状**，
+    而「响应时间」是同一件事的另一条信道：重名分支原来在
+    :func:`hash_password` **之前**就返回了（省掉 600k 次 PBKDF2，约 51ms），
+    实测两条分支的耗时分布**完全不相交**（14.71ms vs 65.74ms）。
+    形状一样而时间不一样，等于把同一个洞从响应体挪到了响应时间上。
+    所以散列现在**提前算好、两条分支共用**（见下面那一段）。
+
     重名这件事不是消失，而是**挪到了管理员看得见的地方**：审计表里记一条
     ``REGISTER_DUPLICATE``，管理员看得到「有人在试这个手机号」。
     """
@@ -338,6 +345,23 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     # **IP 桶**记每一次尝试 —— 枚举与批量建号都撞在这里（枚举者试的是
     # **不同的**名字，每次都是「成功」响应，所以这个桶必须统计成功）。
     _bump_register_bucket(db, _register_ip_bucket(src), now)
+
+    # **口令散列提前算一次，两条分支共用**（审查 §3.6）。
+    #
+    # 原来「重名」分支在 :func:`hash_password` **之前**就返回了 —— 也就是
+    # 跳过了 600k 次 PBKDF2（约 51ms）。实测两条分支的耗时分布**完全不相交**：
+    # 重名中位数 14.71ms（max 25.25）vs 新建中位数 65.74ms（min 63.22），
+    # 差距 51ms。而**响应的形状本来就是一样的**（201 + 同一个 body）——
+    # 于是「响应时间」成了一条比响应体更精确的枚举信道：登录路径专门用
+    # ``_dummy_hash`` 堵的那个洞，在注册路径上是敞开的。
+    #
+    # 现在散列在**查重之前**算好：重名分支照常返回（只是白算了一次散列），
+    # 新建分支**复用同一个结果**。两条分支付的 PBKDF2 代价完全一样，
+    # 响应体也一模一样 —— 枚举者拿不到任何可分的东西。
+    #
+    # 为什么放在**节流判定之后**：被节流的请求不该付这 50ms —— 那条原则
+    # 是「节流期间不验证口令」的一部分（见登录路径的同一段注释）。
+    password_hash = hash_password(payload.password)
 
     if db.scalar(select(SysUser).where(SysUser.username == payload.username)):
         # **用户名桶只在重名时记** —— 「反复占用一个已经存在的账号」才是
@@ -365,7 +389,7 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     #
     # 注意管理员建号那条路径（api/system.py）**保持** ``or payload.username`` 不动：
     # 那里姓名是管理员显式填的，填了空才退回用户名，语义不同。
-    u = SysUser(username=payload.username, password_hash=hash_password(payload.password),
+    u = SysUser(username=payload.username, password_hash=password_hash,
                 real_name=(payload.real_name or "").strip() or "会计", active=True)
     db.add(u)
     db.flush()
@@ -538,7 +562,46 @@ def _record_failure(db: Session, user: SysUser) -> dict | None:
     这里**不再自己提交**：提交权交给调用方，让「失败计数 / 锁定」与
     「这一次的审计」进同一个事务 —— 分两次提交就会出现「锁上了但
     审计没写」这种最坏的中间态（正是 P1-8 那类缺口的同构形态）。
+
+    **并发下不能丢更新**（审查 §3.7）。原来这里是纯 Python 侧的
+    读改写：``user.failed_logins = (user.failed_logins or 0) + 1``，
+    而这行 ``user`` 是在 **PBKDF2（约 50ms）之前**用普通 SELECT 加载的 ——
+    于是 N 个并发请求各自读到**同一个旧值**、各自写 ``+1``，
+    **只有最后一次写生效**。
+
+    实测（阈值 3）：20 次**并发**错误口令之后，计数只到 2、锁根本没上
+    （20 次真实口令校验全部执行）；而 20 次**顺序**尝试之后是
+    ``failed_logins=0, lock_level=1``（锁上了）。**阈值 3 实际放过了 33 次。**
+    代码在每个延迟档位都把计数清零（下面两处 ``failed_logins = 0``），
+    于是丢更新的影响被进一步放大。
+
+    而 IP 维度的节流是**并发安全**的（一条原子 upsert），所以账号计数器
+    是「分布式喷洒」的**唯一**防线 —— 偏偏它就是失效的那个。
+
+    **怎么修的**：把这一行**锁住再读** —— ``SELECT ... FOR UPDATE``。
+    它把「读-改-写」整段变成临界区，并发请求在这里排队，于是每个人
+    读到的都是**上一个请求已经提交**的值，计数不会丢。
+
+    ``populate_existing=True`` 不是可选项：这一行在**同一个 Session**
+    里已经有一个实例了（登录路径前面用普通 SELECT 读过），而 ORM 默认
+    **不会**用查询结果覆盖已加载实例的属性 —— 不加这个参数，
+    ``FOR UPDATE`` 只是把行锁住、拿到的却仍是那个**陈旧的旧值**，
+    丢更新照旧。
     """
+    # 先把这一行锁住再读。``populate_existing`` 让 ORM 用锁住的行
+    # **刷新**已加载的实例（见上面的说明）。
+    #
+    # ``locked`` 与 ``user`` 是**同一个对象**（同一个 Session 的同一行），
+    # 所以下面继续写 ``user`` 即可 —— 调用方随后读到的
+    # ``user.failed_logins`` / ``user.locked_until`` 就是刷新后的值。
+    locked = db.scalar(
+        select(SysUser).where(SysUser.id == user.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked is None:
+        # 用户在这次请求期间被删掉了：没有行可锁，也就没有计数可加。
+        return None
     user.failed_logins = (user.failed_logins or 0) + 1
     if user.failed_logins >= settings.login_max_failures:
         # 轮次 +1，**不重置**：这正是递进式的「连续」所在。
@@ -1248,14 +1311,25 @@ def mfa_verify(request: Request, token: str = Query("", max_length=512),
     「token 不存在」这种可供区分的信息（区分了就能拿来数库里有多少
     挑战）。
 
-    **限流（审查 L-02）**：这个端点**必然是未认证可达的**（邮件网关会预取
+    **限流（审查 L-02 / §3.3）**：这个端点**必然是未认证可达的**（邮件网关会预取
     它），而它每次都要查一次库 —— 于是「谁都能打」等于「谁都能驱动数据库
     查询」。所以按来源计数：连续猜错（token 对不上任何挑战）超过阈值就
     退避，退避期间**连查询都不发生**。
     「已用过」「已过期」是点错链接的真人，**不计**失败。
+
+    **但桶是按「这串 token 自己」分的，不是按来源 IP**（审查 §3.3）。
+    原来的按来源分桶在「nginx 后面且 ``TRUSTED_PROXIES`` 没配」的部署里
+    是**全站共用的一个桶**：攻击者点 10 次垃圾链接就能把桶封锁 60 秒，
+    而管理员点**真**链接拿到的是 429 —— 这个端点是管理员完成二次验证的
+    **唯一**路径，于是那是「管理员再也登不进系统」，而触发它**不需要任何
+    凭据**。改成按 token 摘要分桶之后，攻击者的失败落不到受害者那串
+    token 的桶上（它本身是 256 位随机密钥，摘要算不出来）。
+    理由与取舍的完整说明见 ``app/notify/mfa.py`` 里那一节。
     """
     ip = _throttle_ip(request)
-    allowed, retry_after = mfa_service.verify_guard(ip)
+    # **限流的键 = 这串 token 自己的摘要**（见 mfa.py 的说明）。
+    token_key = mfa_service.verify_key(token)
+    allowed, retry_after = mfa_service.verify_guard(token_key)
     if not allowed:
         raise HTTPException(
             429, f"验证链接的尝试过于频繁，请 {retry_after} 秒后再试",
@@ -1265,9 +1339,9 @@ def mfa_verify(request: Request, token: str = Query("", max_length=512),
     # 只有「token 对不上任何挑战」才算失败（那是「在猜」的形态）；
     # 「已用过」「已过期」是真人点错，不计入。
     if ok:
-        mfa_service.note_verify_success(ip)
+        mfa_service.note_verify_success(token_key, ip)
     elif reason == "invalid":
-        mfa_service.note_verify_failure(ip)
+        mfa_service.note_verify_failure(token_key, ip)
     if row is not None:
         # 只给「确实对得上某条挑战」的点击留痕。随机 token 的点击**不留**
         # —— 这个链接是公共的，每次都留一条等于给审计表灌水。
@@ -1302,8 +1376,16 @@ def mfa_poll(payload: MfaChallengeIn, request: Request,
     **不要回一个 ``"access_token": null``** —— 那会让「响应里有没有
     令牌」这件事变得没法一眼看清（``"access_token" in body`` 为真，
     而它其实什么都没给）。
+
+    **轮询限流的键含 ``client_secret``**（审查 §3.4）：预算按
+    ``(challenge_id, secret 摘要)`` 记。原来只按 ``challenge_id`` 记，
+    而限流又发生在**校验 secret 之前** —— 于是攻击者拿**别人的**
+    ``challenge_id`` 配一个错的 secret 请求，被 401 拒掉（对），
+    但**受害者的轮询额度已经被扣掉了**；合法客户端接着就收到 429，
+    累计 300 次之后那个挑战**永远**没法被任何人消费。
     """
-    allowed, retry_after = mfa_service.poll_guard(payload.challenge_id)
+    allowed, retry_after = mfa_service.poll_guard(payload.challenge_id,
+                                                   payload.client_secret)
     if not allowed:
         raise HTTPException(
             429, f"验证状态轮询过于频繁，请 {retry_after} 秒后再试",

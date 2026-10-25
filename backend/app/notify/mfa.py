@@ -87,8 +87,19 @@ POLL_MAX_ATTEMPTS = 300
 
 #: 轮询限流的状态表。**进程级** —— 它要挡的是「把轮询接口当放大器」，
 #: 而这个目的用进程级状态就够了；跨进程限流需要额外的表，超出本条范围。
-#: 条目按挑战 id 存，攻击者拿随机 id 来问也进不来（查不到就 401）。
-_poll_state: dict[int, tuple[float, int]] = {}
+#:
+#: **键是 ``(challenge_id, client_secret 的摘要)``，不是单独的
+#: ``challenge_id``**（审查 §3.4）。原来按 id 存，理由写的是「攻击者拿
+#: 随机 id 来问也进不来（查不到就 401）」—— 而那个假设正是被打破的地方：
+#: :func:`poll_guard` 在**校验 ``client_secret`` 之前**就被调用，于是
+#: 攻击者拿**任意** id + **错的** secret 请求，拿到的是 401（对），
+#: 但**预算已经被扣掉了**。实测：受害者的合法客户端接着就收到 429
+#: 「请 2 秒后再试」；累计 300 次之后那个挑战**永远**没法被任何人消费
+#: —— 包括持有正确 secret 的那个人。
+#:
+#: 键里加上 secret 的摘要之后，攻击者动的是**另一个桶**：受害者的
+#: 轮询预算只有持有正确 secret 的人能碰。
+_poll_state: dict[str, tuple[float, int]] = {}
 _poll_lock = threading.Lock()
 
 #: 进程级状态表的条数上限。超过就丢掉最老的一批 —— 防止「用随机 id 刷
@@ -319,6 +330,68 @@ def create_challenge(db: Session, user: SysUser, *, reason: str = "login",
     return row, email_token, client_secret
 
 
+def expire_open_challenges(db: Session, *, reason: str = "") -> int:
+    """作废**全部**未完成的挑战（``PENDING`` 与 ``VERIFIED``）。返回作废了几条。
+
+    **为什么需要它 —— 「改收件人」就是二次验证本身的那个开关。**
+
+    管理员二次验证邮件**没有 per-user 收件人**：``sys_user`` 表里没有邮箱列，
+    全部邮件统一发给全局 ``notify_config.recipients``。于是「谁能改收件人」
+    就等于「谁能收到下一次二次验证邮件」。
+
+    复核方（2026-10-25）在实测里跑通的一条完整链条：
+
+        1. 一枚**没有** ``mfa_at`` 的管理员令牌 → ``POST /api/system/users``
+           被 403 拦下（「该操作需要近期完成邮箱二次验证…」）；
+        2. ``PUT /api/system/notify`` 改收件人为 ``attacker@evil.test`` →
+           **200**（这条路由当时没挂 ``require_recent_admin_mfa``）；
+        3. ``POST /api/auth/mfa/reauth`` → 邮件真的发到了
+           ``attacker@evil.test``；
+        4. 点开那封邮件里的链接 → 挑战变 ``VERIFIED``；
+        5. ``POST /api/auth/mfa/poll`` → 换到一枚**带** ``mfa_at`` 的令牌；
+        6. 用它建号 → **201，账号真的建出来了**。
+
+    整道 §3.2 的闸门被从侧翼击穿：``require_recent_admin_mfa`` 的全部意义是
+    「把危险动作与『令牌刚被偷』解耦」，而「改收件人」这个动作**恰恰就是让
+    二次验证生效的那个开关**。
+
+    挂上 ``require_recent_admin_mfa`` 挡住了第 2 步，但**还剩一条路径**：
+    **在改收件人之前就已经发出去的挑战**。那一封邮件是按**旧**投递目标投出去的
+    —— 如果它已经被人截获（或者旧收件人本来就是攻击者），那么「改完收件人」
+    之后点开那封旧邮件仍然能换到令牌。所以投递目标一变，就把**所有**未完成
+    的挑战作废。
+
+    **为什么连 ``VERIFIED`` 一起作废**：链接已被点开、但还没换令牌的状态，
+    同样是一张「还没用掉的凭据」。留着它等于留着一条已经铺好的路。
+
+    **不提交**：提交权交给调用方 —— 作废必须与「改收件人」在**同一个事务**
+    里，否则两者之间会有一个「配置已改、挑战还活着」的窗口。
+
+    **轮询预算也一并清掉**：这些挑战已经死了，它们的限流桶留着只是占内存
+    （见 :func:`reset_poll_state`）。
+    """
+    ids = list(db.scalars(
+        select(AdminMfaChallenge.id).where(
+            AdminMfaChallenge.status.in_([STATUS_PENDING, STATUS_VERIFIED]))
+    ).all())
+    if not ids:
+        return 0
+    # 条件写：只有「现在还是未完成」的才作废 —— 并发下另一个请求已经
+    # 消费掉的挑战不该被算进这次作废的数量里。
+    result = db.execute(
+        update(AdminMfaChallenge)
+        .where(AdminMfaChallenge.id.in_(ids),
+               AdminMfaChallenge.status.in_([STATUS_PENDING, STATUS_VERIFIED]))
+        .values(status=STATUS_EXPIRED, updated_at=func.now())
+    )
+    expired = int(result.rowcount or 0)
+    for challenge_id in ids:
+        reset_poll_state(challenge_id)
+    if expired:
+        log.info("已作废 %d 条未完成的二次验证挑战（原因：%s）", expired, reason or "未注明")
+    return expired
+
+
 def build_verify_link(link_base: str, email_token: str) -> str:
     """拼出邮件里的验证链接。"""
     base = (link_base or "").rstrip("/")
@@ -517,20 +590,36 @@ def consume_challenge(db: Session, challenge_id: int, client_secret: str,
 
 
 def reset_poll_state(challenge_id: int) -> None:
-    """清掉某个挑战的轮询计数（挑战作废时调用）。"""
+    """清掉某个挑战的轮询计数（挑战作废时调用）。
+
+    **键里含 secret 摘要，所以要按前缀清** —— 只删一个精确键会漏掉
+    「用错 secret 试过」留下的那些桶。
+    """
+    prefix = f"{challenge_id}:"
     with _poll_lock:
-        _poll_state.pop(challenge_id, None)
+        for key in [k for k in _poll_state if k.startswith(prefix)]:
+            _poll_state.pop(key, None)
 
 
-def poll_guard(challenge_id: int) -> tuple[bool, int]:
+def poll_guard(challenge_id: int, client_secret: str = "") -> tuple[bool, int]:
     """轮询限流。返回 ``(放行吗, 还要等几秒)``。
 
     **最短间隔**挡住「一秒问 20 次」，**总次数上限**挡住「每隔 2 秒问
     一整天」。两者都只影响**轮询**这一个接口，不影响验证本身。
+
+    **键含 ``client_secret`` 的摘要**（审查 §3.4）：预算按
+    ``(challenge_id, secret 摘要)`` 记，而不是按 ``challenge_id`` 记。
+    理由见上面 ``_poll_state`` 的注释 —— 按 id 记的话，攻击者用错的
+    secret 就能替受害者扣掉轮询额度（401 发生在扣额度**之后**），
+    而持有正确 secret 的合法客户端反而被挡在外面。
+
+    ``client_secret`` 传空串时（调用方拿不到 secret 的场景）退化成
+    「按 challenge_id 记」—— 那一档只挡住「同一个 id 的高频轮询」。
     """
     now = time.monotonic()
+    key = f"{challenge_id}:{hash_secret(client_secret or '')}"
     with _poll_lock:
-        last, count = _poll_state.get(challenge_id, (0.0, 0))
+        last, count = _poll_state.get(key, (0.0, 0))
         elapsed = now - last
         if elapsed < POLL_MIN_INTERVAL_SECONDS:
             wait = int(POLL_MIN_INTERVAL_SECONDS - elapsed) + 1
@@ -539,14 +628,14 @@ def poll_guard(challenge_id: int) -> tuple[bool, int]:
             return False, 60
         if len(_poll_state) >= _POLL_STATE_MAX:
             # 丢掉最老的一批，防止这张表被随机 id 撑爆。
-            for key in sorted(_poll_state, key=lambda k: _poll_state[k][0])[:256]:
-                _poll_state.pop(key, None)
-        _poll_state[challenge_id] = (now, count + 1)
+            for old in sorted(_poll_state, key=lambda k: _poll_state[k][0])[:256]:
+                _poll_state.pop(old, None)
+        _poll_state[key] = (now, count + 1)
         return True, 0
 
 
 # ---------------------------------------------------------------------------
-# 点链接接口的失败计数与退避（审查 L-02）
+# 点链接接口的失败计数与退避（审查 L-02 / §3.3）
 # ---------------------------------------------------------------------------
 #
 # ``/api/auth/mfa/verify`` **不需要鉴权** —— 它是一个公开的链接：邮件网关会
@@ -566,81 +655,183 @@ def poll_guard(challenge_id: int) -> tuple[bool, int]:
 # 粒度是**进程级**，与 :func:`poll_guard` 同一套理由：它要挡的是「把点链接
 # 当放大器」，进程级状态已经够用；跨进程限流需要额外的表，而这一点收益
 # 换不来一张新表。
+#
+# ---------------------------------------------------------------------------
+# **键改了：主键是「这串 token 自己的摘要」，来源 IP 退成二级维度**
+# （审查 §3.3）
+# ---------------------------------------------------------------------------
+#
+# 原来按**来源 IP** 记失败次数。这在「nginx 后面且 ``TRUSTED_PROXIES``
+# 没配」的部署里是一个**全站共用的桶** —— 于是：
+#
+#     攻击者点 10 次垃圾链接  →  桶被封锁 60 秒
+#     → 管理员点**真**链接      →  429「请 60 秒后再试」
+#
+# 而 ``verify`` 是管理员完成二次验证的**唯一**路径（``poll`` 依赖已创建的
+# 挑战），所以这不是「这次登录被拒」，是**管理员再也登不进系统**。
+# 攻击者只要 ~0.17 req/s 就能无限续期这个封锁。
+#
+# **为什么「按来源」这件事本身在这条路径上不成立**，值得单独说清楚 ——
+# 同样的 429 在两条路径上的可用性含义**完全不同**：
+#
+# * **登录节流的 429** = 「这一次尝试被拒了」。客户端可以换个账号、
+#   换个来源再来 —— 代价落在攻击者自己身上，**可用性没有损失**。
+# * **MFA 验证的 429** = 「管理员**永远**完不成二次验证」。这里没有
+#   fallback（除了进程环境里的 ``ADMIN_MFA_EMERGENCY_CODE``），被拒的
+#   恰恰是**唯一能走通的那条路**。这时候 429 不是「拒绝一次尝试」，
+#   是「把某个人彻底关在门外」—— 而触发它的动作**不需要任何凭据**。
+#
+# 所以这条路径上的限流**必须**按「攻击者伪造不出来、又不会全局共享」的
+# 量来分桶。``email_token`` 的 sha256 摘要正好是这么一个量：它本身
+# 就是 256 位随机密钥，攻击者**只能算自己发出去的那几串**的摘要，
+# **算不出受害者那串**的摘要。
+#
+# 于是：
+#
+# * **主键 = token 摘要**：受害者那串 token 的桶，只有**拿那串 token
+#   去点、而且点失败**才会被记 —— 而它一旦点对就成功，**永远不会进
+#   失败分支**。所以受害者的桶永远是干净的。
+# * **二级维度 = 来源 IP**：仍然记（要知道「这个来源在扫」），但它
+#   **不再单独拦人** —— 它只用来**加长**同一个 token 的封锁窗口。
+#
+# **代价要说清楚（别把它说成「更严了」）**：来源维度的「聚合拦截」
+# 没有了，于是「用一堆**各不相同**的垃圾 token 狂刷」这个形态，
+# 每个请求仍然会打一次库（那是一次**唯一索引**上的点查，
+# ``uq_admin_mfa_challenge_email_token``，不是全表扫）。
+# 换来的是：那条路径上**再也不会出现「管理员被别人的失败挡住」**
+# —— 而这正是这条限制最初要挡的东西。
+# 换句话说，这里是拿「对公开端点的放大倍数」换「管理员不会被锁在门外」，
+# 方向是刻意选的：被锁在门外的代价比多几次索引点查贵得多。
 
-#: 同一个来源在窗口内允许的「无效 token」次数。超过就退避。
-VERIFY_FAIL_LIMIT = 10
+#: 同一串 token 在窗口内允许的「无效」次数。超过就封锁**它自己**。
+#:
+#: **比原来严（原来 10）**：这个端点必然是未认证可达的，阈值越低，
+#: 「拿同一串错 token 反复试」这个形态越早就被掐掉。
+VERIFY_FAIL_LIMIT = 5
 
 #: 失败计数的有效窗口（秒）。超过这个时间的失败不累计。
 VERIFY_FAIL_WINDOW_SECONDS = 900
 
 #: 超过阈值后的退避时长（秒）。
 #:
-#: **刻意不长（60 秒）**：退避期间这个来源**一个请求都打不动**，而在
-#: ``TRUSTED_PROXIES`` 没配的部署里所有请求共用同一个来源桶（nginx →
-#: 127.0.0.1），于是「退避」会连带把**管理员自己点邮件链接**也挡住。
-#: 60 秒的窗口把这份连带影响压到最小，同时把「一次未认证请求 = 一次数据库
-#: 查询」的放大倍数压到 1/6（每分钟最多 10 次）。
+#: **刻意很短（20 秒，原来 60）**：退避期间这串 token 一个请求都打不动，
+#: 而窗口越长，「误伤」的代价越大（点错链接的真人要等更久）。
+#: 现在这条封锁**只作用于出错的那串 token**，不再牵连同一个来源的
+#: 其他人 —— 连带影响已经没有了，窗口自然可以收短。
+VERIFY_BLOCK_SECONDS = 20
+
+#: 同一个来源在窗口内的失败次数上限。
 #:
-#: 退避期一过计数就**清零**（不是接着上一次算），所以攻击者要维持封锁就得
-#: 每 60 秒再花 10 次无效请求 —— 数据库侧看到的是一个**有上界**的速率。
-VERIFY_BLOCK_SECONDS = 60
+#: **它不拦人**，只决定「这个来源出错的 token 被封锁多久」：
+#: 超过这个数就把封锁窗口乘三（见 :func:`note_verify_failure`）。
+#: 把它单列成一个常量而不是塞进 IP 桶，是为了让人一眼看出
+#: 「来源维度是二级维度」这件事。
+VERIFY_SOURCE_FAIL_LIMIT = 30
 
 #: 状态表的条数上限。超过就丢掉最老的一批 —— 防止「用随机来源刷限流表」
 #: 把内存吃光（那等于换了个形式的放大器）。
 _VERIFY_STATE_MAX = 2048
 
-#: 来源 -> (窗口起点, 失败次数, 退避到什么时候)
+#: token 摘要 -> (窗口起点, 失败次数, 退避到什么时候)
 _verify_state: dict[str, tuple[float, int, float]] = {}
+#: 来源 -> (窗口起点, 失败次数)   **二级维度**
+_verify_source_state: dict[str, tuple[float, int]] = {}
 _verify_lock = threading.Lock()
 
 
-def verify_guard(ip: str) -> tuple[bool, int]:
+def verify_key(token: str) -> str:
+    """点链接限流的**主键**：这串 token 自己的 sha256 摘要。
+
+    为什么是它：``email_token`` 本身就是 256 位随机密钥（见
+    :func:`new_secret`），攻击者**算不出受害者那串**的摘要，只能算自己
+    发出去的那几串 —— 所以按它分桶时，攻击者的失败**永远落不到**受害者
+    的桶上。
+
+    加 ``v:`` 前缀是为了不和来源键（``s:``）混在一张表里，也为了让人
+    一眼看得出这是**限流桶的键**、不是凭证本身。
+    """
+    return "v:" + hash_secret(token or "")
+
+
+def verify_source_key(source: str) -> str:
+    """点链接限流的**二级维度**：来源地址。"""
+    return "s:" + ((source or "-").strip() or "-")
+
+
+def verify_guard(token_key: str) -> tuple[bool, int]:
     """点链接接口的准入。返回 ``(放行吗, 还要等几秒)``。
 
-    **在查库之前问**：被退避的来源连那条查询都不会发生 —— 那正是这一层
+    **在查库之前问**：被退避的 token 连那条查询都不会发生 —— 那正是这一层
     要省掉的东西。
+
+    **只按 token 摘要判**（审查 §3.3）：来源 IP 不参与拦截，理由见上面
+    那一大段（「登录节流的 429」与「MFA 验证的 429」可用性含义不同）。
     """
-    key = (ip or "-").strip() or "-"
     now = time.monotonic()
     with _verify_lock:
-        started, count, blocked_until = _verify_state.get(key, (0.0, 0, 0.0))
+        started, count, blocked_until = _verify_state.get(token_key, (0.0, 0, 0.0))
         if blocked_until > now:
             return False, int(blocked_until - now) + 1
         # 退避期过了就重新计数 —— 不是「解封后接着上一次算」。
         if started and now - started > VERIFY_FAIL_WINDOW_SECONDS:
-            _verify_state.pop(key, None)
+            _verify_state.pop(token_key, None)
         return True, 0
 
 
-def note_verify_failure(ip: str) -> None:
-    """记一次「token 对不上任何挑战」。超过阈值就退避。"""
-    key = (ip or "-").strip() or "-"
+def note_verify_failure(token_key: str, source: str = "") -> None:
+    """记一次「token 对不上任何挑战」。超过阈值就封锁**这串 token**。
+
+    ``source`` 是**二级维度**：它只用来判断「这个来源是不是在狂刷」，
+    命中时把同一串 token 的封锁窗口拉长 —— 它**不拦人**。
+    """
     now = time.monotonic()
+    source_bucket = verify_source_key(source)
     with _verify_lock:
-        started, count, blocked_until = _verify_state.get(key, (0.0, 0, 0.0))
+        # ---- 二级维度：来源的失败计数 ----
+        src_started, src_count = _verify_source_state.get(source_bucket, (0.0, 0))
+        if not src_started or now - src_started > VERIFY_FAIL_WINDOW_SECONDS:
+            src_started, src_count = now, 0
+        src_count += 1
+        _verify_source_state[source_bucket] = (src_started, src_count)
+
+        # ---- 主键：这串 token 的失败计数 ----
+        started, count, blocked_until = _verify_state.get(token_key, (0.0, 0, 0.0))
         if not started or now - started > VERIFY_FAIL_WINDOW_SECONDS:
             started, count = now, 0
         count += 1
         if count >= VERIFY_FAIL_LIMIT:
-            blocked_until = now + VERIFY_BLOCK_SECONDS
+            window = VERIFY_BLOCK_SECONDS
+            if src_count >= VERIFY_SOURCE_FAIL_LIMIT:
+                # 这个来源在狂刷（同一个来源已经错了这么多次）——
+                # 同一串错 token 的封锁窗口拉长。**仍然只作用于这串 token**，
+                # 不牵连这个来源的其他人（这正是审查 §3.3 要修的那件事）。
+                window *= 3
+            blocked_until = now + window
             count = 0
         if len(_verify_state) >= _VERIFY_STATE_MAX:
             for old in sorted(_verify_state, key=lambda k: _verify_state[k][0])[:256]:
                 _verify_state.pop(old, None)
-        _verify_state[key] = (started, count, blocked_until)
+        _verify_state[token_key] = (started, count, blocked_until)
 
 
-def note_verify_success(ip: str) -> None:
-    """点对了就把计数清零 —— 正常使用不该背着旧账。"""
-    key = (ip or "-").strip() or "-"
+def note_verify_success(token_key: str, source: str = "") -> None:
+    """点对了就把计数清零 —— 正常使用不该背着旧账。
+
+    顺带把**来源**的计数也清掉：这个来源刚刚证明了自己是**拿着真链接来
+    点的人**（一次成功 = 一次口令级验证），它不该继续背着「这个来源在
+    狂刷」的旧账。
+    """
     with _verify_lock:
-        _verify_state.pop(key, None)
+        _verify_state.pop(token_key, None)
+        if source:
+            _verify_source_state.pop(verify_source_key(source), None)
 
 
 def reset_verify_state() -> None:
     """清掉点链接的失败计数。**只给测试用。**"""
     with _verify_lock:
         _verify_state.clear()
+        _verify_source_state.clear()
 
 
 # ----------------------------------------------------------------- 应急口令

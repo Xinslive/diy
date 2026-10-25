@@ -39,7 +39,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import (DateTime, ForeignKey, Index, Integer, String,
+from sqlalchemy import (CheckConstraint, DateTime, ForeignKey, Index, Integer, String,
                         UniqueConstraint)
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -87,6 +87,20 @@ class AdminMfaChallenge(Base, TimestampMixin):
         Index("ix_admin_mfa_challenge_user", "user_id"),
         # **按时间判龄用的索引**（app/maintenance.py 的保留期清理）。
         Index("ix_admin_mfa_challenge_created_at", "created_at"),
+        # **库级 CHECK 约束，模型侧必须同名同义**（审计 P3-2 / P3-22）。
+        #
+        # 约束由迁移 0030 交付，库里是活的：``status`` 写成
+        # ``status="VERIFIEDD"`` 会被它挡下（sqlstate 23514）。
+        #
+        # 以前模型侧没声明它，于是「模型 == 库」这条判据对 CHECK 约束
+        # **结构性失效**：Alembic 1.20 的 ``compare_metadata`` 根本不比较
+        # CHECK 约束，缺了不会报、补了也不会报 —— 两条路都看不见。
+        # 状态机只有四个取值（见上面的状态图），约束名与表达式与迁移里
+        # 逐字一致，换用会比较 CHECK 的工具时也不会把它当成多余的删掉。
+        CheckConstraint(
+            "status IN ('PENDING', 'VERIFIED', 'CONSUMED', 'EXPIRED')",
+            name="ck_admin_mfa_challenge_status",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

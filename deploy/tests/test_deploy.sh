@@ -112,6 +112,15 @@ setup_sandbox(){
   APP="$DEPDIR/app"
   mkdir -p "$APP/backend/.venv/bin" "$APP/backend/migrations/versions" \
            "$APP/frontend/dist" "$APP/.git"
+  # 现网 venv 的「依赖状态」标记。
+  #
+  # **这两个文件是 §3.39 的观测点。** 依赖是在第 3 步装进**现网那个** venv 的，
+  # 而回退清单里原本没有 .venv —— 于是「依赖有没有跟着回退」根本测不出来。
+  # 这里给 venv 放两个带版本的内容：pip 桩会把它们换成新版的，
+  # 发布失败之后它们必须**回到旧版**。
+  mkdir -p "$APP/backend/.venv/lib/site-packages/oldpkg"
+  echo "OLD DEPS" > "$APP/backend/.venv/lib/deps-marker"
+  echo "OLD 1.0" > "$APP/backend/.venv/lib/site-packages/oldpkg/__init__.py"
   echo "OLD backend content" > "$APP/backend/app.py"
   echo "<html>old frontend</html>" > "$APP/frontend/dist/index.html"
   # 现网（上一版）留下的锁文件与迁移链，内容都与产物里的**刻意不同**。
@@ -135,7 +144,74 @@ case "$*" in
 esac
 exit 0
 STUB
-  printf '#!/bin/sh\necho "curl $*" >> "$DEPDIR/calls"\nexit 0\n' > "$DEPDIR/bin/curl"
+  # curl 桩：**要真的模拟 nginx 干了什么**，否则前端可达性那两道闸
+  # 永远测不到东西（它们量的是「线上回来的那一份」）。
+  #
+  #   * /api/health → 后端探活（STUB_HEALTH_RC 可以打挂）
+  #   * / 与 /runtime-config.js → **从 $APP/frontend/dist 里取文件**，
+  #     就像 nginx 那样（nginx 的 root 就指着那个目录）。
+  #     于是「线上跑的是不是刚发出去的这一版」这件事变成可测的：
+  #     dist 里是新版 → 检出版本号；换成旧的 → 闸门立刻现形。
+  #   * STUB_FRONTEND_RC != 0 → 前端整个取不到（模拟 nginx 没在服务）。
+  cat > "$DEPDIR/bin/curl" <<'STUB'
+#!/bin/sh
+echo "curl $*" >> "$DEPDIR/calls"
+url=""
+for a in "$@"; do
+  case "$a" in
+    http://*|https://*) url="$a" ;;
+  esac
+done
+[ -n "$url" ] || exit 0
+case "$url" in
+  *:8000/api/health*) exit ${STUB_HEALTH_RC:-0} ;;
+esac
+if [ "${STUB_FRONTEND_RC:-0}" != "0" ]; then exit "$STUB_FRONTEND_RC"; fi
+rest="${url#*://}"
+path="/${rest#*/}"
+dist="${STUB_FRONTEND_FROM:-$DEPDIR/app/frontend/dist}"
+case "$path" in
+  */) f="$dist/index.html" ;;
+  *)  f="$dist$path" ;;
+esac
+[ -f "$f" ] || exit 22
+cat "$f"
+exit 0
+STUB
+  # ip 桩：**什么都查不到**。
+  #
+  # host_public_ip 的最后一档是「读网卡上的非回环 IPv4」—— 用真 ip 命令
+  # 的话，测试机上永远查得到一个地址，于是「认不出本机出口 IP」这个分支
+  # 在沙箱里**根本走不到**（§3.45 的 fail-open 就是从这个分支漏过去的）。
+  cat > "$DEPDIR/bin/ip" <<'STUB'
+#!/bin/sh
+exit 0
+STUB
+  # tar 桩：能**只**打挂「切换现网代码前的那次解包」（STUB_TAR_FAIL_CODE=1）。
+  #
+  # 判据是 -C 的目标目录名：``.backend.incoming.*`` 才是切换点那一次，
+  # 其余的解包（暂存目录、前端产物、发布工具、脚本自检）都放行。
+  # 这正是「tar 故障注入」这个一直缺的测试手段。
+  REAL_TAR="$(command -v tar)"
+  cat > "$DEPDIR/bin/tar" <<STUB
+#!/bin/sh
+if [ "\${STUB_TAR_FAIL_CODE:-0}" = "1" ]; then
+  dest=""
+  next=0
+  for a in "\$@"; do
+    if [ "\$next" = "1" ]; then dest="\$a"; next=0; continue; fi
+    if [ "\$a" = "-C" ]; then next=1; fi
+  done
+  case "\$dest" in
+    */.backend.incoming.*)
+      echo "tar \$*" >> "\$DEPDIR/calls"
+      echo "tar: 模拟故障（切换现网代码前的那次解包失败）" >&2
+      exit 1
+      ;;
+  esac
+fi
+exec "$REAL_TAR" "\$@"
+STUB
 
   # mv 桩：**能把「把内容挪到线上那个 dist 路径上」这一步打挂**
   # （STUB_MV_FAIL_SWAP=1）。
@@ -172,6 +248,10 @@ STUB
   # pip 桩：把「-r 指向的那份锁文件的第一行」记进 calls。
   # 2026-10-18 那次事故里 pip **返回成功**，装的是旧锁；只记「跑过 pip」
   # 等于把那次失败判成绿灯。
+  #
+  # **还要真的把现网 venv 改掉** —— 桩只记日志的话，「依赖有没有跟着回退」
+  # 这件事根本测不出来（现网 venv 一个字节没变，回退无从谈起）。
+  # 这里把 venv 里的依赖标记换成新版的，模拟「装依赖改写了现网 venv」。
   cat > "$APP/backend/.venv/bin/pip" <<'STUB'
 #!/bin/sh
 lock=""
@@ -181,6 +261,13 @@ for a in "$@"; do
   if [ "$a" = "-r" ]; then next=1; fi
 done
 echo "pip $* [lock=${lock}]" >> "$DEPDIR/calls"
+if [ "${STUB_PIP_RC:-0}" = "0" ]; then
+  # 模拟「装依赖把现网 venv 改掉了」。
+  VENV_DIR="$DEPDIR/app/backend/.venv"
+  mkdir -p "$VENV_DIR/lib/site-packages/oldpkg" 2>/dev/null
+  echo "NEW DEPS" > "$VENV_DIR/lib/deps-marker" 2>/dev/null
+  echo "NEW 2.0" > "$VENV_DIR/lib/site-packages/oldpkg/__init__.py" 2>/dev/null
+fi
 exit ${STUB_PIP_RC:-0}
 STUB
   # alembic 桩：记下**从 cwd 看**到的是新链还是旧链、以及 cwd 里的 .env 是否可用。
@@ -203,8 +290,24 @@ STUB
   # 按整串比对会匹配不上 —— 于是桩子只是把调用记了一笔就返回 0，
   # 脚本其实**一次都没跑**，而「调用被记录了」这个断言照样是绿的。
   # 这正是本文件开头说的那种恒绿测试。
-  printf '#!/bin/sh\nif [ "$(basename "$1")" = "emit_frontend_runtime.py" ]; then echo "python $*" >> "$DEPDIR/calls"; exec python3 "$@"; fi\nif [ "$1" = "scripts/db_backup.py" ]; then echo "SELECT 1;"; exit ${STUB_BACKUP_RC:-0}; fi\necho "python $*" >> "$DEPDIR/calls"\nif [ "$1" = "scripts/plugin_status.py" ]; then exit ${STUB_PLUGIN_STATUS_RC:-0}; fi\nif [ "$1" = "scripts/scheduler_state.py" ]; then exit ${STUB_SCHEDULER_OWNS_RC:-1}; fi\nexit 0\n' \
+  printf '#!/bin/sh\nif [ "$(basename "$1")" = "emit_frontend_runtime.py" ]; then echo "python $*" >> "$DEPDIR/calls"; exec python3 "$@"; fi\nif [ "$1" = "scripts/db_backup.py" ]; then\n  echo "python $*" >> "$DEPDIR/calls"\n  out=""; next=0\n  for a in "$@"; do\n    if [ "$next" = "1" ]; then out="$a"; next=0; continue; fi\n    if [ "$a" = "--out" ]; then next=1; fi\n  done\n  if [ -n "$out" ]; then\n    if [ "${STUB_BACKUP_RC:-0}" != "0" ]; then echo "backup failed (simulated)" >&2; exit "${STUB_BACKUP_RC}"; fi\n    printf "SELECT 1;\\n" > "$out.part"\n    mv "$out.part" "$out"\n  else\n    echo "SELECT 1;"\n  fi\n  exit ${STUB_BACKUP_RC:-0}\nfi\necho "python $*" >> "$DEPDIR/calls"\nif [ "$1" = "scripts/plugin_status.py" ]; then exit ${STUB_PLUGIN_STATUS_RC:-0}; fi\nif [ "$1" = "scripts/scheduler_state.py" ]; then exit ${STUB_SCHEDULER_OWNS_RC:-1}; fi\nexit 0\n' \
     > "$APP/backend/.venv/bin/python"
+  # rm 桩：**透明转发**给真的 rm。
+  #
+  # 为什么要桩：某些本地运行时把 `rm` 换成了「可恢复删除」的转发器
+  # （本机就是），而它**处理符号链接时会挂住**（实测：删软链必挂，
+  # 删普通文件、删不存在的路径都正常）。
+  #
+  # 而 deploy.sh 自己就会造出软链并删它：`atomic_symlink_swap` 里
+  # ``rm -f "${link}.swap.$$"``（deploy.sh:417）—— 前一次换软链失败时那个
+  # 残留的软链就在那儿等着被删。**这不是 deploy.sh 的问题**（真实机器上的
+  # `rm -f <软链>` 是一瞬间的事），但它会让整套测试在本机**卡死**。
+  #
+  # 沙箱里要的是「跟生产机一样的 rm」，所以这里直接转发给真的 rm。
+  cat > "$DEPDIR/bin/rm" <<'STUB'
+#!/bin/sh
+exec /bin/rm "$@"
+STUB
   chmod +x "$DEPDIR/bin"/* "$APP/backend/.venv/bin"/*
   # 调度现状探针（scripts/scheduler_state.py）要**真的存在** ——
   # deploy.sh 会先看文件在不在，文件不在就直接判「应用调度器没在管备份」。
@@ -229,13 +332,13 @@ CWQ_ALLOW_ANY_HOST=1
 run_script(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
-    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
+    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 run_script_no_artifacts(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/empty-artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
-    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
+    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 # 显式清掉 DATABASE_URL：这条只用来验证「目标库不确定时脚本会停手」。
@@ -243,7 +346,7 @@ run_script_no_artifacts(){
 run_script_no_db_url(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
-    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
+    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 \
     env -u DATABASE_URL LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
 # 显式给 DATABASE_URL：用来验证「.env 不存在」这条路径 —— 那条路径是
@@ -252,7 +355,7 @@ run_script_no_db_url(){
 run_script_with_db_url(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
-    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
+    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 \
     DATABASE_URL="postgresql+psycopg://cwq:pw@127.0.0.1:15432/cwq" \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
@@ -262,7 +365,7 @@ calls(){ cat "$DEPDIR/calls" 2>/dev/null; }
 run_script_cdn(){
   ( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
-    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
+    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 \
     CWQ_ASSET_BASE="https://cdn.example.com/" CWQ_ORIGIN="https://acct.example.com" \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" "$@" 2>&1 )
 }
@@ -283,6 +386,64 @@ calls_has(){ grep -cE -- "$1" "$DEPDIR/calls" >/dev/null 2>&1; }
 # （`grep ... | head -1` 里 head 先退，上游可能被 SIGPIPE 打断，
 #   那条还没写出来的匹配行就丢了 —— 断言会拿到空串。）
 calls_first(){ grep -m1 -F -- "$1" "$DEPDIR/calls" 2>/dev/null; }
+
+# --------------------------------------------------------------------------
+# 抠取器：把一份 shell 脚本里的**注释**（可选地连**字符串内容**一起）去掉，
+# 只留下可执行的代码，并给出它的行号。
+#
+# **为什么不能全文 grep。**
+# deploy.sh 的**注释里**就写着 `ROLLBACK_SCOPE=code`
+# （§3.34 那段「回退闸开得太晚」的说明里有一句「ROLLBACK_SCOPE=code 原来在
+# tar 之后才置位」）—— 全文 grep 找到的第一处是**注释**，不是代码。
+# 而要断言的恰恰是「**代码**里的那一处置位在覆盖之前」。
+#
+# 抠取规则（对齐 bash 的真实词法）：
+#   * 整行注释（行首 #）→ 丢掉；
+#   * 行尾注释（# 不在引号里，且前面是空白/分隔符/行首）→ 砍掉；
+#     （`a#b` 里的 # 不是注释 —— bash 的规则，抠取器也得认）
+#   * 引号里的 # → 不是注释；
+#   * mode=code 时**连字符串内容一起抹掉**（只留引号本身）——
+#     于是「字符串里恰好写着 ROLLBACK_SCOPE=code」也不算数；
+#   * mode=text 时保留字符串内容（要看「赋的值是什么」时用）。
+#
+# **抠取器自己也要有自测** —— 见第 21.1 组：一个连自己造的、答案明摆着的
+# 样本都分不出来的抠取器，测的是「自己以为的东西」。
+# --------------------------------------------------------------------------
+shell_code_lines(){
+  # $1 = 脚本文件，$2 = code | text
+  awk -v mode="${2:-code}" '
+    BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34) }
+    function scan(line,   i, n, c, q, out) {
+      out = ""; q = ""; i = 1; n = length(line)
+      while (i <= n) {
+        c = substr(line, i, 1)
+        if (q == "") {
+          if (c == "#") {
+            if (i == 1 || substr(line, i - 1, 1) ~ /[ \t;|&()<>]/) break
+            out = out c; i++; continue
+          }
+          if (c == SQ || c == DQ) { q = c; out = out c; i++; continue }
+          out = out c; i++; continue
+        } else {
+          if (c == q) { q = ""; out = out c; i++; continue }
+          if (c == "\\" && q == DQ) {
+            out = out c; i++
+            if (i <= n) { out = out substr(line, i, 1); i++ }
+            continue
+          }
+          if (mode == "code") { out = out "" } else { out = out c }
+          i++; continue
+        }
+      }
+      return out
+    }
+    { print NR "\t" scan($0) }
+  ' "$1"
+}
+# 第一条匹配的正则所在的**行号**（空 = 没找到）
+code_line_no(){ shell_code_lines "$1" "${3:-code}" | grep -m1 -E -- "$2" | cut -f1 || true; }
+# 第一条匹配的正则所在行的**代码**（去掉注释后的内容）
+code_line_text(){ shell_code_lines "$1" "${3:-code}" | grep -m1 -E -- "$2" | cut -f2- || true; }
 
 # 脚本必须真的跑起来了（取到了产物），否则下面全是空断言
 assert_ran(){
@@ -707,7 +868,7 @@ run_script_staged_relative(){
   cp "$(dirname "$SCRIPT")"/systemd/* "$STAGE/systemd/"
   ( cd "$STAGE" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
     SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
-    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
+    LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 \
     LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash ./deploy.sh 2>&1 )
 }
 
@@ -1447,6 +1608,7 @@ printf '43.138.178.174\n' > "$DEPDIR/target-marker"
 OUT=$( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
         SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
         CWQ_HOST_IP=43.138.178.174 CWQ_DEPLOY_TARGET_FILE="$DEPDIR/target-marker" \
+        CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 \
         LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" --check-only 2>&1 ); RC=$?
 if grep -qE "目标机授权标记：43\.138\.178\.174" <<<"$OUT"; then
   ok "生产机上发布被放行"
@@ -1599,7 +1761,7 @@ cp "$SCRIPT" "$DEPDIR/stale-deploy.sh"
 echo "# 一份被人动过的旧脚本" >> "$DEPDIR/stale-deploy.sh"
 OUT=$( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
   SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
-  LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 \
+  LOGROTATE_DIR="$DEPDIR/logrotate" JOURNALD_DIR="$DEPDIR/journald" CWQ_ALLOW_ANY_HOST=1 CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 \
   bash "$DEPDIR/stale-deploy.sh" 2>&1 )
 if grep -q "与产物里那一份不是同一个文件" <<<"$OUT"; then
   ok "发布脚本与产物不同版时被拦下"
@@ -1634,6 +1796,1032 @@ if cmp -s "$APP/deploy/deploy.sh" "$SCRIPT" 2>/dev/null; then
   ok "\$APP/deploy/deploy.sh 与产物里的同一份"
 else
   no "\$APP/deploy/deploy.sh 不是产物里那一份"
+fi
+
+# ===========================================================================
+# 2026-10-25 审计的回归用例（§3.34 - §3.45）
+# ===========================================================================
+#
+# 这一组每一条都对着审计里**已经复现过**的一条缺陷。
+# 写法与前面各组一致：真的把 deploy.sh 跑一遍，然后断言现网的状态。
+#
+# 沙箱自己的两个前提（它们不是「放水」，是沙箱与生产机的差异）：
+#   * CWQ_ALLOW_ANY_HOST=1 —— 目标机守卫（出口 IP 不是生产机）；
+#   * CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 —— 应用根不是 /opt/cwq。
+# 两条都有**专门的一组用例**证明它们在不放行时确实会拦住发布。
+
+ESA_MTLS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/esa-mtls.sh"
+ESA_REALIP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/esa-realip-update.sh"
+
+echo
+echo "== 21. §3.34 解包失败：现网毫发无损，且回退确实发生 =="
+# --------------------------------------------------------------------------
+# **这一条以前完全没有覆盖**：整个测试文件里没有任何 tar 故障注入
+# （第 5 组那个「corrupted」产物是在 sha256 校验阶段被拦下的，压根没走到解包）。
+#
+# 原来的写法是**就地覆盖**现网目录，而 ROLLBACK_SCOPE=code 在 tar **之后**
+# 才置位 —— 于是 tar 一失败，on_exit 看到 ROLLBACK_SCOPE=none，
+# **一行回退都不做**，现网目录停在「新旧混合、部分文件被截断」的状态。
+#
+# 现在的写法：先解到暂存目录，再覆盖；回退闸在覆盖**之前**就打开。
+# --------------------------------------------------------------------------
+setup_sandbox
+OUT=$(STUB_TAR_FAIL_CODE=1 run_script); RC=$?
+if [[ "$RC" != "0" ]]; then
+  ok "解包失败以非零退出（${RC}）"
+else
+  no "解包失败却返回成功"
+fi
+if grep -q "OLD backend content" "$APP/backend/app.py" 2>/dev/null; then
+  ok "解包失败后现网后端代码**一个字节都没动**（不是新旧混合）"
+else
+  no "解包失败后现网代码变了：$(cat "$APP/backend/app.py" 2>/dev/null || echo '<不存在>')"
+fi
+if [[ ! -e "$APP/backend/app/main.py" ]]; then
+  ok "新代码没有落进现网目录"
+else
+  no "新代码已经落进现网目录 —— 解包失败时不该动现网"
+fi
+if grep -q "回退" <<<"$OUT"; then
+  ok "回退确实被触发了（不再是「一行回退都不做」）"
+else
+  no "解包失败没有触发任何回退 —— 闸门开得太晚"
+fi
+if grep -q "old frontend" "$APP/frontend/dist/index.html" 2>/dev/null; then
+  ok "前端也没被切（失败发生在切前端之前）"
+else
+  no "前端被切了 —— 失败点比预期靠后"
+fi
+
+echo
+echo "== 21.1 §3.34 回退闸必须在「覆盖到现网代码目录」**之前**打开 =="
+# --------------------------------------------------------------------------
+# 原来这一组只有一条断言：`grep -q "回退" <<<"$OUT"`。
+# 它命中的是**依赖回退**那行日志（「↩ 回退运行时依赖：…」）——
+# 与「代码回退闸是否在覆盖之前打开」毫无关系。
+# 复核方实测：把 `ROLLBACK_SCOPE=code` 从覆盖**之前**挪到覆盖**之后**
+# （**注释全留**）→ 5/5 全绿。
+#
+# 现在钉两件事：
+#   (a) **位置**：可执行代码里 `ROLLBACK_SCOPE=code` 的行号必须**小于**
+#       「覆盖到现网代码目录」那次调用的行号。
+#       用抠取器比 —— 注释与字符串都不算数（deploy.sh 的注释里就写着
+#       「ROLLBACK_SCOPE=code」，全文 grep 会命中那一处）。
+#   (b) **行为**：注入「覆盖失败」后，现网代码必须回到上一版。
+#       闸门开在覆盖之前，覆盖失败时 trap 才拿得到闸门去回退代码；
+#       开在覆盖之后 ⇒ 闸门还没开 ⇒ 一行回退都不做 ⇒ 现网停在半新半旧。
+# --------------------------------------------------------------------------
+
+# ---- (a) 位置断言 --------------------------------------------------------
+# **抠取器先过「已知答案」的自测** —— 一个连自己造的、答案明摆着的样本都
+# 分不出来的抠取器，测的是「自己以为的东西」。
+mk_fake_gate_script(){
+  # $1 = before|after，$2 = 输出文件
+  {
+    echo '#!/usr/bin/env bash'
+    echo '# 这行注释里也写着 ROLLBACK_SCOPE=code —— 抠取器不许把它当代码。'
+    echo 'overlay_backend_code(){'
+    echo '  cp -a "$1" "$2" || return 1'
+    echo '}'
+    if [[ "$1" == "before" ]]; then
+      echo 'ROLLBACK_SCOPE=code'
+      echo 'if ! overlay_backend_code "$CODE_STAGE" "$APP/backend"; then'
+      echo '  die "x"'
+      echo 'fi'
+    else
+      echo 'if ! overlay_backend_code "$CODE_STAGE" "$APP/backend"; then'
+      echo '  die "x"'
+      echo 'fi'
+      echo 'ROLLBACK_SCOPE=code'
+    fi
+  } > "$2"
+}
+FAKE_BEFORE="$DEPDIR/fake-gate-before.sh"
+FAKE_AFTER="$DEPDIR/fake-gate-after.sh"
+mk_fake_gate_script before "$FAKE_BEFORE"
+mk_fake_gate_script after  "$FAKE_AFTER"
+GB="$(code_line_no "$FAKE_BEFORE" 'ROLLBACK_SCOPE[[:space:]]*=[[:space:]]*code')"
+OB="$(code_line_no "$FAKE_BEFORE" 'overlay_backend_code[[:space:]]+"')"
+GA="$(code_line_no "$FAKE_AFTER"  'ROLLBACK_SCOPE[[:space:]]*=[[:space:]]*code')"
+OA="$(code_line_no "$FAKE_AFTER"  'overlay_backend_code[[:space:]]+"')"
+if [[ -n "$GB" ]] && [[ -n "$OB" ]] && [[ "$GB" -lt "$OB" ]]; then
+  ok "抠取器自测：闸门在覆盖之前的样本，被判成「之前」（闸门第 ${GB} 行 / 覆盖第 ${OB} 行）"
+else
+  no "抠取器自测失败：闸门在覆盖之前却没被判出来（闸门=${GB:-<没找到>} 覆盖=${OB:-<没找到>}）"
+fi
+if [[ -n "$GA" ]] && [[ -n "$OA" ]] && [[ "$GA" -gt "$OA" ]]; then
+  ok "抠取器自测：闸门在覆盖之后的样本，被判成「之后」（闸门第 ${GA} 行 / 覆盖第 ${OA} 行）"
+else
+  no "抠取器自测失败：闸门在覆盖之后却没被判出来（闸门=${GA:-<没找到>} 覆盖=${OA:-<没找到>}）"
+fi
+# 抠取器**不许**把注释里那一处当成代码：样本里注释在第 2 行，
+# 真正的置位在第 6 行（before 样本）与第 9 行（after 样本）。
+if [[ "$GB" == "6" ]] && [[ "$GA" == "9" ]]; then
+  ok "抠取器自测：注释里那一处没有被当成代码（判成第 6/9 行，不是第 2 行）"
+else
+  no "抠取器把注释里的 ROLLBACK_SCOPE=code 当成了代码（判成 ${GB}/${GA}，应为 6/9）"
+fi
+
+# 现在量真的 deploy.sh。
+GATE_N="$(code_line_no "$SCRIPT" 'ROLLBACK_SCOPE[[:space:]]*=[[:space:]]*code')"
+OVL_N="$(code_line_no "$SCRIPT" 'overlay_backend_code[[:space:]]+"')"
+if [[ -n "$GATE_N" ]] && [[ -n "$OVL_N" ]] && [[ "$GATE_N" -lt "$OVL_N" ]]; then
+  ok "回退闸（ROLLBACK_SCOPE=code，第 ${GATE_N} 行）在覆盖到现网代码目录（第 ${OVL_N} 行）**之前**打开"
+else
+  no "回退闸不在覆盖之前（闸门=${GATE_N:-<没找到>} 覆盖=${OVL_N:-<没找到>}）—— 闸门开得太晚"
+fi
+
+# ---- (b) 行为断言：注入「覆盖失败」⇒ 现网代码必须回到上一版 --------------
+setup_sandbox
+# cp 桩：**只**在「把暂存目录覆盖到现网 backend」那一步失败。
+#
+# 判据是**源**在暂存目录（.backend.incoming.*）而**目的**是 backend/scripts/ ——
+# 按 glob 顺序 app/ 与 migrations/ 在它**之前**已经铺开，
+# 于是失败现场真的是「半新半旧」—— 那正是这条缺陷的后果。
+# 回退时的那次 cp（源在 .releases 快照里）不受影响。
+REAL_CP="$(command -v cp)"
+cat > "$DEPDIR/bin/cp" <<STUB
+#!/usr/bin/env bash
+# 源与目的要**跳过选项**再取：cp -a SRC DST 里 \$1 是选项。
+# （不跳过的话 src 拿到的是 "-a"，判据永远不成立 —— 注入静默失效，
+#  用例会「全绿」而其实什么都没测。）
+#
+# **这段 heredoc 是无引号的**（里面的变量会被展开），所以里面**不能出现反引号** ——
+# 反引号会被当成命令替换去执行。
+src=""; dest=""
+for a in "\$@"; do
+  case "\$a" in -*) continue ;; esac
+  [ -z "\$src" ] && src="\$a"
+  dest="\$a"
+done
+echo "cp \$*" >> "\$DEPDIR/cp_calls"
+if [ "\${STUB_CP_FAIL_OVERLAY:-0}" = "1" ]; then
+  case "\$src" in
+    */.backend.incoming.*)
+      if [ "\$dest" = "\$DEPDIR/app/backend/scripts/" ]; then
+        echo "cp FAILED" >> "\$DEPDIR/cp_failures"
+        echo "cp: 模拟故障（覆盖到现网代码目录中途失败）" >&2
+        exit 1
+      fi
+      ;;
+  esac
+fi
+exec "$REAL_CP" "\$@"
+STUB
+chmod +x "$DEPDIR/bin/cp"
+: > "$DEPDIR/cp_calls"
+: > "$DEPDIR/cp_failures"
+OUT=$(STUB_CP_FAIL_OVERLAY=1 run_script); RC=$?
+if [[ "$RC" != "0" ]]; then
+  ok "覆盖失败时发布失败（${RC}）"
+else
+  no "覆盖失败却返回成功"
+fi
+# **注入生效的守卫（两条都要）**：
+#   * 覆盖那一步**真的失败了**（不是「压根没触发」）；
+#   * 而失败**之前**新代码已经铺到现网（现场真的是半新半旧）。
+if [[ -s "$DEPDIR/cp_failures" ]]; then
+  ok "注入确实生效（覆盖到现网代码目录那一步真的失败了）"
+else
+  no "注入没生效：覆盖那一步压根没失败 —— 下面的断言会全部空转"
+fi
+if grep -qE '\.backend\.incoming\.[^ ]*migrations/\. .*backend/migrations/' "$DEPDIR/cp_calls" 2>/dev/null; then
+  ok "新代码在失败之前已经铺到现网（现场是半新半旧）"
+else
+  no "失败之前新代码没铺到现网 —— 现场不是半新半旧，这条断言测不到东西"
+fi
+if [[ -f "$APP/backend/migrations/versions/0021_youyou_chart_of_accounts.py" ]] \
+   && [[ ! -e "$APP/backend/migrations/versions/0027_plugin_imports.py" ]]; then
+  ok "覆盖失败后现网代码回到上一版（新迁移链没留在现网）"
+else
+  no "覆盖失败后现网代码**没有**回到上一版（半新半旧留在了现网）"
+fi
+if grep -q "OLD backend content" "$APP/backend/app.py" 2>/dev/null; then
+  ok "上一版的代码文件仍在原位"
+else
+  no "上一版的代码文件不见了"
+fi
+
+echo
+echo "== 22. §3.35 nginx -t 的输出不许落进固定 /tmp 路径 =="
+# --------------------------------------------------------------------------
+# shell 的 `>` 跟随符号链接并截断目标，而这两个脚本是以 root 跑的。
+# 固定路径 /tmp/nginx-t-*.log ⇒ 本地任意低权账号先 `ln -sf <敏感文件> <那个路径>`，
+# 运维随后以 root 跑脚本 → **root 把敏感文件截断成 nginx 的自检输出**。
+# --------------------------------------------------------------------------
+for f in "$ESA_MTLS" "$ESA_REALIP"; do
+  bn="$(basename "$f")"
+  # **只看代码行**：注释里写着「原来写的是 >/tmp/nginx-t-mtls.log」是为了
+  # 说明这个坑，不该自己被算进去（跟 deploy.sh 那边 code_only 剥注释同理）。
+  tmpw=$(grep -vE '^[[:space:]]*#' "$f" | grep -cE '>[[:space:]]*/tmp/' || true)
+  if [[ "$tmpw" == "0" ]]; then
+    ok "$bn 没有把 nginx 的输出写进固定的 /tmp 路径"
+  else
+    no "$bn 仍然把 nginx 的输出写进固定的 /tmp 路径（${tmpw} 处）"
+  fi
+  mk=$(grep -vE '^[[:space:]]*#' "$f" | grep -c 'mktemp' || true)
+  if [[ "$mk" != "0" ]]; then
+    ok "$bn 用了 mktemp 造临时文件"
+  else
+    no "$bn 没有用 mktemp —— 临时文件名可被预测"
+  fi
+  tr=$(grep -vE '^[[:space:]]*#' "$f" | grep -cE '^[[:space:]]*trap[[:space:]]' || true)
+  rmf=$(grep -vE '^[[:space:]]*#' "$f" | grep -c 'rm -f' || true)
+  if [[ "$tr" != "0" ]] && [[ "$rmf" != "0" ]]; then
+    ok "$bn 退出时会清掉临时文件（trap + rm -f）"
+  else
+    no "$bn 没有在退出时清掉临时文件（trap=${tr} rm -f=${rmf}）"
+  fi
+done
+
+# 行为级：跑一次 status，临时文件必须**用完就没了**（不留残骸）。
+setup_sandbox
+cat > "$DEPDIR/bin/mktemp" <<'STUB'
+#!/bin/sh
+p=$(/usr/bin/mktemp "$@")
+echo "$p" >> "$DEPDIR/tmpfiles"
+printf '%s' "$p"
+STUB
+chmod +x "$DEPDIR/bin/mktemp"
+: > "$DEPDIR/tmpfiles"
+( cd "$DEPDIR" && PATH="$DEPDIR/bin:$PATH" bash "$ESA_MTLS" status >/dev/null 2>&1 )
+LEFT=0
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  if [ -e "$p" ]; then LEFT=$((LEFT+1)); fi
+done < "$DEPDIR/tmpfiles"
+if [[ "$LEFT" -eq 0 ]]; then
+  ok "esa-mtls.sh 跑完后没有留下任何临时文件"
+else
+  no "esa-mtls.sh 留下了 ${LEFT} 个临时文件"
+fi
+if grep -cE '/tmp/nginx-t-mtls\.log' "$DEPDIR/tmpfiles" >/dev/null 2>&1; then
+  no "临时文件又落回固定路径 /tmp/nginx-t-mtls.log"
+else
+  ok "临时文件是随机名，不是固定路径"
+fi
+
+echo
+echo "== 22.1 §3.35 符号链接攻击：两个脚本都要挡住 =="
+# --------------------------------------------------------------------------
+# 原来这一组的行为级用例**只跑 esa-mtls.sh**，而且跑的是 `status` ——
+# 那条路径**根本不写 nginx 的输出**（status 只读配置）。
+# 对 esa-realip-update.sh 则是**零**行为级覆盖。
+#
+# 而那条字面量 grep（`>[[:space:]]*/tmp/`）只认「`>` **紧邻**路径」的写法：
+# 把路径放进变量（`NGINX_T_LOG="/tmp/xxx.log"`）后 `>` 与 `/tmp` 不再相邻
+# ⇒ 断言被绕过；而 esa-realip 另有 `TMP="$(mktemp)"` ⇒「用了 mktemp」那条也照样绿。
+#
+# 现在改成**真的打一次符号链接攻击**：
+#   * 受害文件预先放好已知内容，另存一份原件用来逐字节比对；
+#   * 把脚本里（**注释里也包括** —— 历史上正是这些注释描述的那个固定路径）
+#     出现过的每一个 /tmp 下的字面路径，都做成指向受害文件的符号链接；
+#   * 跑脚本，**走到真的写 nginx 输出的那一步**；
+#   * 受害文件必须**逐字节未变**。
+#
+# 攻击的完整形态是：「本地低权账号先 `ln -sf <敏感文件> <那个路径>`，
+# 运维随后以 root 跑脚本 → root 把敏感文件截断成 nginx 的自检输出」。
+# 这台机是共用主机，这样的账号是存在的。
+# --------------------------------------------------------------------------
+setup_sandbox
+mkdir -p "$DEPDIR/nginx/conf.d"
+cat > "$DEPDIR/nginx/conf.d/acct.xins.live.conf" <<CONF
+server {
+    listen 443 ssl;
+    server_name acct.xins.live;
+    ssl_verify_client     optional;
+    access_log  $DEPDIR/nginx/access.log cwq_mtls;
+    root /opt/cwq/frontend/dist;
+}
+CONF
+: > "$DEPDIR/fake-ca.pem"        # ESA 根证书：切强制校验前它必须存在
+printf '1.2.3.0/24\n' > "$DEPDIR/ips-ok.txt"
+# nginx 桩：**必须真的往 stdout 写东西** ——
+# 受害文件被截断的证据就是「它变成了 nginx 的自检输出」。
+cat > "$DEPDIR/bin/nginx" <<'STUB'
+#!/bin/sh
+if [ "$1" = "-T" ]; then
+  echo "# configuration file /dev/null:"
+  exit 0
+fi
+if [ "$1" = "-t" ]; then
+  echo "nginx: the test configuration is successful (ATTACKER PAYLOAD)"
+  exit 0
+fi
+exit 0
+STUB
+chmod +x "$DEPDIR/bin/nginx"
+# rm 桩在 setup_sandbox 里就装好了（那边有为什么的说明）——
+# 本组的负控要造软链、让脚本自己删它，所以**必须**绕开本机那个
+# 「可恢复删除」转发器（它删软链会挂住）。
+
+run_esa_mtls(){
+  # $1 = 脚本路径。跑 strict —— 那条路径**真的**会把 nginx 的输出写进文件。
+  # 配置每次都重造：第一次跑完它已经被改成 on 了，第二次会「无需改动」而
+  # **根本走不到 nginx -t** —— 那样攻击就不会发生，负控会假绿。
+  cat > "$DEPDIR/nginx/conf.d/acct.xins.live.conf" <<CONF
+server {
+    listen 443 ssl;
+    server_name acct.xins.live;
+    ssl_verify_client     optional;
+    access_log  $DEPDIR/nginx/access.log cwq_mtls;
+    root /opt/cwq/frontend/dist;
+}
+CONF
+  ( cd "$DEPDIR" && PATH="$DEPDIR/bin:$PATH" \
+    CWQ_MTLS_CONF="$DEPDIR/nginx/conf.d/acct.xins.live.conf" \
+    CWQ_MTLS_CA="$DEPDIR/fake-ca.pem" \
+    bash "$1" strict >/dev/null 2>&1 )
+}
+run_esa_realip(){
+  # $1 = 脚本路径
+  ( cd "$DEPDIR" && PATH="$DEPDIR/bin:$PATH" \
+    CWQ_REALIP_TARGET="$DEPDIR/realip.conf" \
+    CWQ_MTLS_CONF="$DEPDIR/nginx/conf.d/acct.xins.live.conf" \
+    bash "$1" "$DEPDIR/ips-ok.txt" >/dev/null 2>&1 )
+}
+
+for spec in "esa-mtls.sh|$ESA_MTLS|run_esa_mtls" "esa-realip-update.sh|$ESA_REALIP|run_esa_realip"; do
+  bn="${spec%%|*}"; rest="${spec#*|}"; f="${rest%%|*}"; runner="${rest##*|}"
+  VICT="$DEPDIR/victim-$bn"
+  printf 'SECRET-KEY-MATERIAL-DO-NOT-TRUNCATE\n' > "$VICT"
+  cp "$VICT" "$VICT.orig"
+  # 攻击者：脚本里出现过的每一个 /tmp 字面路径，都做成指向受害文件的符号链接。
+  LITLIST=""
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    ln -sf "$VICT" "$l" 2>/dev/null || true
+    LITLIST="$LITLIST $l"
+  done < <(grep -oE '/tmp/[A-Za-z0-9._/-]+' "$f" | sort -u)
+  if [[ -z "${LITLIST// /}" ]]; then
+    no "$bn 里找不到任何 /tmp 字面路径 —— 攻击无处可打，这条用例是空转"
+  else
+    ok "$bn 的攻击面已就位（符号链接：${LITLIST# }）"
+  fi
+  # ---- 真脚本：受害文件必须逐字节未变 --------------------------------
+  "$runner" "$f"
+  if cmp -s "$VICT" "$VICT.orig"; then
+    ok "$bn 挡住了符号链接攻击（受害文件逐字节未变）"
+  else
+    no "$bn 被符号链接攻击咬到了：受害文件被改成了——$(head -1 "$VICT" 2>/dev/null)"
+  fi
+  # ---- 负控：把路径改回固定值，同一套攻击必须咬人 ----------------------
+  # 这一步证明的不是「好脚本安全」，而是「**这套攻击真的能咬人**」——
+  # 否则上面那些全绿只是因为攻击根本没生效（恒绿测试）。
+  FIXED="$(grep -oE '/tmp/[A-Za-z0-9._/-]+' "$f" | sort -u | head -1)"
+  if [[ -z "$FIXED" ]]; then
+    no "$bn 没有可用的固定路径可用来造负控"
+  else
+    MUT="$DEPDIR/mutant-$bn.sh"
+    # **只改赋值那一行，注释全留** —— 这正是「最阴」的变异形态。
+    sed "s|^NGINX_T_LOG=.*|NGINX_T_LOG=\"$FIXED\"|" "$f" > "$MUT"
+    printf 'SECRET-KEY-MATERIAL-DO-NOT-TRUNCATE\n' > "$VICT"
+    while IFS= read -r l; do
+      [ -n "$l" ] || continue
+      ln -sf "$VICT" "$l" 2>/dev/null || true
+    done < <(grep -oE '/tmp/[A-Za-z0-9._/-]+' "$f" | sort -u)
+    "$runner" "$MUT"
+    if cmp -s "$VICT" "$VICT.orig"; then
+      no "$bn 的负控没咬人：把路径改回固定值（${FIXED}）后受害文件竟然没变 —— 这条用例是空转"
+    else
+      ok "$bn 的负控咬到了人（路径改回固定值 ${FIXED} 后受害文件被截断）—— 攻击确实有效"
+    fi
+  fi
+  # 清掉攻击者留下的符号链接（只删链接，不删受害文件）。
+  # **用沙箱里的 rm 桩** —— 本机运行时那个「可恢复删除」转发器处理软链会挂住。
+  for l in $LITLIST; do
+    [ -L "$l" ] && "$DEPDIR/bin/rm" -f "$l"
+  done
+done
+
+# ---- 结构判据：NGINX_T_LOG 的赋值必须来自 mktemp ----------------------
+# 原来的字面量 grep（`>[[:space:]]*/tmp/`）只认「`>` 紧邻路径」，
+# 路径一旦放进变量就被绕过。改成**解析赋值本身**：
+# 值不是 mktemp 造出来的 ⇒ 路径可预测 ⇒ 不合格。
+for spec in "esa-mtls.sh|$ESA_MTLS" "esa-realip-update.sh|$ESA_REALIP"; do
+  bn="${spec%%|*}"; f="${spec#*|}"
+  assign="$(code_line_text "$f" 'NGINX_T_LOG[[:space:]]*=' 'text')"
+  if [[ -z "$assign" ]]; then
+    no "$bn 里找不到 NGINX_T_LOG 的赋值"
+  elif [[ "$assign" == *mktemp* ]]; then
+    ok "$bn 的 NGINX_T_LOG 由 mktemp 造出来（路径不可预测）：${assign}"
+  else
+    no "$bn 的 NGINX_T_LOG 不是 mktemp 造的（路径可预测）：${assign}"
+  fi
+done
+
+echo
+echo "== 23. §3.36 两个备份 unit 都要有 TimeoutStartSec =="
+# --------------------------------------------------------------------------
+# `Type=oneshot` 的服务**整个执行时长**都算在 TimeoutStartSec 里，
+# 而 systemd 的 DefaultTimeoutStartSec 默认只有 90 秒 ——
+# 库长到 pg_dump 要超过 90 秒就被 SIGTERM 掐断，
+# db_backup.py 走异常路径把临时文件 unlink 掉 → **目录里一个备份都没有**。
+#
+# 对照：同批的 cwq-deploy.service 早就给了 1800。
+# --------------------------------------------------------------------------
+for u in cwq-backup.service cwq-oss-backup.service; do
+  f="$REPO_ROOT/deploy/systemd/$u"
+  if [[ ! -f "$f" ]]; then
+    no "$u 不在仓库里 —— 断言无从谈起"
+    continue
+  fi
+  v="$(grep -m1 '^TimeoutStartSec=' "$f" | cut -d= -f2 | tr -dc '0-9')"
+  if [[ -n "$v" ]] && [[ "$v" -ge 600 ]]; then
+    ok "$u 的 TimeoutStartSec=${v}s（≥600s，不会被 90s 默认值掐断）"
+  else
+    no "$u 的 TimeoutStartSec 缺失或过小（实际：${v:-<没有这一行>}）"
+  fi
+done
+# 装到机器上的那份也要有（渲染不该把它弄丢）。
+setup_sandbox
+run_script >/dev/null
+assert_ran "全量发布" || exit 1
+for u in cwq-backup.service cwq-oss-backup.service; do
+  if grep -qE '^TimeoutStartSec=[0-9]{3,}' "$DEPDIR/units/$u" 2>/dev/null; then
+    ok "装到机器上的 $u 也带着 TimeoutStartSec"
+  else
+    no "装到机器上的 $u 没有 TimeoutStartSec"
+  fi
+done
+
+# 体检还要验**产物**，不只是 timer 开没开。
+setup_sandbox
+: > "$DEPDIR/backups/db-2026-01-01.sql"     # 0 字节 = 被掐断后留下的空壳
+OUT=$(run_script); RC=$?
+if [[ "$RC" != "0" ]]; then
+  ok "最近一次备份产物是空的时，体检把发布判为失败（${RC}）"
+else
+  no "备份产物是 0 字节却返回成功 —— 那不是备份，是个空壳"
+fi
+if grep -q "备份产物是\*\*空的\*\*" <<<"$OUT"; then
+  ok "明确报出「备份产物是空的」"
+else
+  no "没有说清楚是备份产物的问题"
+fi
+setup_sandbox
+printf 'SELECT 1;\n' > "$DEPDIR/backups/db-2026-01-01.sql"
+OUT=$(run_script); RC=$?
+if [[ "$RC" == "0" ]] && grep -q "非空" <<<"$OUT"; then
+  ok "备份产物存在且非空时，体检放行"
+else
+  no "非空的备份产物反而没放行（${RC}）"
+fi
+
+echo
+echo "== 24. §3.37 迁移前的 dump 必须走 db_backup.py --out =="
+# --------------------------------------------------------------------------
+# `> "$DUMP"` 一把梭：shell 重定向**先把文件建出来**，pg_dump 随后才跑。
+# 中途失败或被打断 → 目录里留下一个 0 字节/半截的文件，**而文件名看着完全正常**。
+# assert_restorable 只查「非空 + 头部特征行」，半截 dump 的头是完整的 → 通过。
+#
+# 所以判据是：**备份失败之后不能留下任何 dump 文件**。
+# --------------------------------------------------------------------------
+if grep -vE '^[[:space:]]*#' "$SCRIPT" | grep -cE '>[[:space:]]*"\$DUMP"' >/dev/null 2>&1; then
+  no "发布脚本仍然用 shell 重定向写 dump（> \"\$DUMP\"）"
+else
+  ok "发布脚本不再用 shell 重定向写 dump"
+fi
+setup_sandbox
+OUT=$(run_script)
+assert_ran "全量发布" || exit 1
+if calls_has "db_backup.py --out"; then
+  ok "备份走的是 db_backup.py --out（临时文件 + 非空校验 + 原子改名）"
+else
+  no "备份没有走 db_backup.py --out"
+fi
+setup_sandbox
+export STUB_BACKUP_RC=1
+OUT=$(run_script)
+unset STUB_BACKUP_RC
+LEFT=""
+while IFS= read -r f; do LEFT="$f"; break; done \
+  < <(find "$APP/.releases" -name 'database-before-migration.sql' 2>/dev/null)
+if [[ -z "$LEFT" ]]; then
+  ok "备份失败后**没有留下任何 dump 文件**（不会有半截文件冒充退路）"
+else
+  no "备份失败却留下了 ${LEFT} —— 那是一个看着正常的假退路"
+fi
+# 成功的那次：dump 必须在，而且非空。
+setup_sandbox
+run_script >/dev/null
+assert_ran "全量发布" || exit 1
+DUMPF=""
+while IFS= read -r f; do DUMPF="$f"; break; done \
+  < <(find "$APP/.releases" -name 'database-before-migration.sql' 2>/dev/null)
+if [[ -n "$DUMPF" ]] && [[ -s "$DUMPF" ]]; then
+  ok "备份成功时 dump 存在且非空"
+else
+  no "备份成功后没有拿到非空的 dump：${DUMPF:-<找不到>}"
+fi
+
+echo
+echo "== 25. §3.38 打印出来的「回退库」流程必须真的能执行 =="
+# --------------------------------------------------------------------------
+# 原来打印的是一行 `db_backup.py --restore --file <dump>` ——
+# 而 dump 不带 --clean，往一个已经有数据的库里灌会撞 CREATE TABLE already exists，
+# 配合 --single-transaction + ON_ERROR_STOP=1 → **整份恢复回滚，一张表都没灌进去**。
+# 照抄的运维只会得到一次「恢复失败」。
+#
+# 所以现在打印的是**完整的两步**，并且明说会丢写入。
+# --------------------------------------------------------------------------
+setup_sandbox
+export STUB_ALEMBIC_RC=1
+OUT=$(run_script)
+unset STUB_ALEMBIC_RC
+# **断言必须限定在「打印出来的那段流程」里。**
+#
+# 原来三条都是**全文 grep 关键词** ——
+#   * 「db_schema_reset.py」被**工具安装日志**命中
+#     （「回退辅助脚本已就位（…/app/deploy/scripts/db_schema_reset.py）」）；
+#   * 「不可逆」被**别处**命中（on_exit 里「库**已经迁到新版本**……会丢掉
+#     备份之后的写入」那句，以及迁移失败时「第 1 步不可逆」那句）。
+# 于是把恢复流程里「步骤 1：清空 schema」那一行**整个删掉**（注释全留），
+# 三条断言照样全绿 —— 复核方实测 4/4 全绿。
+#
+# 现在的判据是**步骤标记 + 同现**，而不是关键词有没有出现过：
+#   * 「步骤 1：……清空……schema」这一行必须**自己**写着「不可逆」；
+#   * 清空 schema 的命令必须落在「步骤 1」与「步骤 2」**之间**；
+#   * 恢复 dump 的命令必须落在「步骤 2」**之后**。
+# 于是删掉「步骤 1」那一行 ⇒ 下面三条全红。
+#
+# 注意：流程里还有一行「（步骤 2 的退出码 4 = 数据回来了但 schema 没对齐）」——
+# 那是**既有事实**，不是「步骤 1」，所以判据不能靠「哪一行提到 schema」来定。
+STEP1="$(grep -m1 -nE '步骤 1：.*清空.*schema' <<<"$OUT" || true)"
+STEP1_N="${STEP1%%:*}"
+STEP1_TXT="${STEP1#*:}"
+if [[ -n "$STEP1_N" ]]; then
+  ok "回退流程里有「步骤 1：清空 schema」这一步"
+else
+  no "回退流程里没有「步骤 1：清空 schema」这一步 —— 照抄执行会撞 CREATE TABLE already exists"
+fi
+if [[ "$STEP1_TXT" == *"不可逆"* ]]; then
+  ok "「不可逆」长在「步骤 1」那一行上（警告长在它该在的地方，不是在别处）"
+else
+  no "「步骤 1」那一行没有「不可逆」：${STEP1_TXT:-<找不到步骤 1>}"
+fi
+# 从「步骤 1」往下取 8 行 = 打印出来的那段流程（它是连续的一小段）。
+if [[ -n "$STEP1_N" ]]; then
+  PROC="$(sed -n "${STEP1_N},$((STEP1_N + 7))p" <<<"$OUT")"
+else
+  PROC=""
+fi
+P_RESET="$(grep -m1 -n 'db_schema_reset.py' <<<"$PROC" || true)"
+P_STEP2="$(grep -m1 -nE '步骤 2：' <<<"$PROC" || true)"
+P_RESTORE="$(grep -m1 -n -- '--restore --file' <<<"$PROC" || true)"
+RESET_N="${P_RESET%%:*}"; STEP2_N="${P_STEP2%%:*}"; RESTORE_N="${P_RESTORE%%:*}"
+if [[ -n "$RESET_N" ]] && [[ -n "$STEP2_N" ]] && [[ "$RESET_N" -lt "$STEP2_N" ]]; then
+  ok "清空 schema 的命令落在「步骤 1」与「步骤 2」之间"
+else
+  no "清空 schema 的命令不在「步骤 1」与「步骤 2」之间（步骤1=${STEP1_N:-<无>} 清空=${RESET_N:-<无>} 步骤2=${STEP2_N:-<无>}）"
+fi
+if [[ -n "$RESTORE_N" ]] && [[ -n "$STEP2_N" ]] && [[ "$RESTORE_N" -gt "$STEP2_N" ]]; then
+  ok "恢复 dump 的命令落在「步骤 2」之后"
+else
+  no "恢复 dump 的命令不在「步骤 2」之后（步骤2=${STEP2_N:-<无>} 恢复=${RESTORE_N:-<无>}）"
+fi
+# 那个被引用的辅助脚本必须真的存在（否则打印出来的是一条假出路）。
+if [[ -f "$APP/deploy/scripts/db_schema_reset.py" ]]; then
+  ok "回退流程引用的辅助脚本已装到 \$APP/deploy/scripts/"
+else
+  no "回退流程引用的辅助脚本不存在 —— 打印出来的是一条假出路"
+fi
+
+echo
+echo "== 26. §3.39 依赖必须跟着代码一起回退 =="
+# --------------------------------------------------------------------------
+# 依赖是在第 3 步装进**现网那个** venv 的，而回退清单里原本没有 .venv ——
+# 于是失败回退只还原代码，**依赖留在新版** → 现网变成「旧代码 + 新依赖」。
+# 那个组合表面完全正常（进程还跑着内存里的旧代码），
+# 但**下一次 systemctl restart** 就是旧代码配新依赖。
+#
+# 观测点：venv 里的依赖标记。pip 桩会把它换成新版，回退之后必须回到旧版。
+# --------------------------------------------------------------------------
+setup_sandbox
+export STUB_ALEMBIC_RC=1
+OUT=$(run_script)
+unset STUB_ALEMBIC_RC
+if [[ "$(cat "$APP/backend/.venv/lib/deps-marker" 2>/dev/null)" == "OLD DEPS" ]]; then
+  ok "发布失败后 venv 的依赖状态回到上一版"
+else
+  no "依赖没有跟着回退（现网变成「旧代码 + 新依赖」）：$(cat "$APP/backend/.venv/lib/deps-marker" 2>/dev/null || echo '<读不到>')"
+fi
+if grep -q "OLD 1.0" "$APP/backend/.venv/lib/site-packages/oldpkg/__init__.py" 2>/dev/null; then
+  ok "被升级的那个包也换回了上一版的版本"
+else
+  no "被升级的包还是新版 —— 依赖集没回到上一版"
+fi
+# 反过来：发布**成功**时不能把依赖退回去。
+setup_sandbox
+run_script >/dev/null
+assert_ran "全量发布" || exit 1
+if [[ "$(cat "$APP/backend/.venv/lib/deps-marker" 2>/dev/null)" == "NEW DEPS" ]]; then
+  ok "发布成功时依赖保持新版（没有被误回退）"
+else
+  no "发布成功却把依赖退回去了"
+fi
+
+echo
+echo "== 26.1 §3.39(b) 发布**已生效**之后的失败：依赖**不许**回退 =="
+# --------------------------------------------------------------------------
+# §3.39 的修法（依赖跟着代码一起回退）在**迁移失败**那条路径上是对的：
+# 那时现网代码还没换（还是旧版），依赖换回旧版 → 代码与依赖同版本 ✓。
+#
+# 但它把判据写成了「这次失败了没」—— 而**发布已经生效之后**的失败
+# （前端可达性体检不过、TRUSTED_PROXIES 为空）也满足这个判据。
+# 那两条路上 ROLLBACK_SCOPE 已经是 none（代码**不回退**，保持新版），
+# 于是依赖被换回旧版 → 现网变成**新代码 + 旧依赖**：
+#   * 进程还跑着内存里的旧代码（表面完全正常）；
+#   * 但**下一次 systemctl restart** 就是新代码配旧依赖 ——
+#     那正是 §3.39 的原始失败场景，被 §3.39 自己的修法在另一条路径上引回来。
+#
+# 判据必须是不变量「**代码与依赖同版本**」，不是「失败了没」。
+# 观测点与 §3.39 一样：venv 里的依赖标记 + 现网代码的内容。
+# --------------------------------------------------------------------------
+
+# (a) 前端可达性体检失败（§3.41 的 die，落在服务重启**之后**）
+setup_sandbox
+OUT=$(STUB_FRONTEND_RC=22 run_script); RC=$?
+if [[ "$RC" != "0" ]]; then
+  ok "前端体检失败时发布失败（${RC}）"
+else
+  no "前端体检失败却返回成功"
+fi
+DEPMARK="$(cat "$APP/backend/.venv/lib/deps-marker" 2>/dev/null || echo '<读不到>')"
+if [[ "$DEPMARK" == "NEW DEPS" ]]; then
+  ok "发布已生效后失败：运行时依赖**没有**被回退（保持新版，与新版代码同版本）"
+else
+  no "发布已生效后失败：依赖被回退了（现网变成「新代码 + 旧依赖」）：${DEPMARK}"
+fi
+if grep -q "NEW backend code" "$APP/backend/app/main.py" 2>/dev/null; then
+  ok "发布已生效后失败：现网代码仍是新版（没有回退）"
+else
+  no "发布已生效后失败：现网代码不是新版了"
+fi
+
+# (b) TRUSTED_PROXIES 为空（§3.44 的 die，同样在发布生效之后）
+setup_sandbox
+echo "TRUSTED_PROXIES=" >> "$APP/backend/.env"
+OUT=$(run_script); RC=$?
+if [[ "$RC" != "0" ]]; then
+  ok "TRUSTED_PROXIES 为空时发布被阻断（${RC}）"
+else
+  no "TRUSTED_PROXIES 为空却返回成功"
+fi
+DEPMARK="$(cat "$APP/backend/.venv/lib/deps-marker" 2>/dev/null || echo '<读不到>')"
+if [[ "$DEPMARK" == "NEW DEPS" ]]; then
+  ok "发布已生效后失败（TRUSTED_PROXIES）：运行时依赖**没有**被回退"
+else
+  no "发布已生效后失败（TRUSTED_PROXIES）：依赖被回退了（新代码 + 旧依赖）：${DEPMARK}"
+fi
+if grep -q "NEW backend code" "$APP/backend/app/main.py" 2>/dev/null; then
+  ok "发布已生效后失败（TRUSTED_PROXIES）：现网代码仍是新版"
+else
+  no "发布已生效后失败（TRUSTED_PROXIES）：现网代码不是新版了"
+fi
+
+# (c) 对称面：迁移失败时**仍然**要回退依赖（§3.39 原行为不能被弄坏）
+setup_sandbox
+export STUB_ALEMBIC_RC=1
+OUT=$(run_script)
+unset STUB_ALEMBIC_RC
+if [[ "$(cat "$APP/backend/.venv/lib/deps-marker" 2>/dev/null)" == "OLD DEPS" ]]; then
+  ok "迁移失败：依赖回到上一版（§3.39 原行为没被弄坏）"
+else
+  no "迁移失败：依赖没有回退：$(cat "$APP/backend/.venv/lib/deps-marker" 2>/dev/null || echo '<读不到>')"
+fi
+if grep -q "NEW backend code" "$APP/backend/app/main.py" 2>/dev/null; then
+  no "迁移失败：现网代码变成了新版（不该动）"
+else
+  ok "迁移失败：现网代码仍是旧版（与旧依赖同版本）"
+fi
+
+echo
+echo "== 27. §3.40 残留目录清理：删老的、留新的 =="
+# --------------------------------------------------------------------------
+# 原来的判据是 `find -mtime -7` —— 那是「7 天以内修改过」，find **会打印它**，
+# 于是 `[ -n "$(find ...)" ]` 对**新**目录成立 → **删掉的是刚失败的那一次**，
+# 留下的是老的 —— 与那段注释说的**正好相反**。
+#
+# 判据必须是「输出 = 够老了 = 该删」。
+# --------------------------------------------------------------------------
+setup_sandbox
+mkdir -p "$APP/.incoming.OLD" "$APP/.artifact.OLD" "$APP/.incoming.NEW"
+# touch -t 是 POSIX 的（macOS / Linux 都支持），-d 不是。
+touch -t 202001010000 "$APP/.incoming.OLD" "$APP/.artifact.OLD"
+run_script >/dev/null
+assert_ran "全量发布" || exit 1
+if [[ ! -d "$APP/.incoming.OLD" ]]; then
+  ok "超过 7 天的残留被清掉了"
+else
+  no "超过 7 天的残留还在 —— 正是这段代码要解决的那个「只增不减」"
+fi
+if [[ ! -d "$APP/.artifact.OLD" ]]; then
+  ok "超过 7 天的产物残留也被清掉了"
+else
+  no "超过 7 天的产物残留还在"
+fi
+if [[ -d "$APP/.incoming.NEW" ]]; then
+  ok "刚失败的那一次被留着了（现场还在有效期内）"
+else
+  no "刚失败的那一次被删掉了 —— 出事时「翻现场」的东西没了"
+fi
+
+echo
+echo "== 28. §3.41 前端没在服务时，发布不许报成功 =="
+# --------------------------------------------------------------------------
+# nginx 读的是**磁盘上的 dist**，不经过后端进程 ——
+# 后端健康与「前端在不在服务」互不相干，而原来只打后端。
+#
+# 两种翻车形态都要挡住：
+#   (a) 前端整个取不到（nginx 没在服务 / root 指向别处）；
+#   (b) 前端能取到，但**不是刚发出去的这一版**（root 仍指向旧目录）。
+# --------------------------------------------------------------------------
+setup_sandbox
+OUT=$(STUB_FRONTEND_RC=22 run_script); RC=$?
+if [[ "$RC" != "0" ]]; then
+  ok "前端不可达时发布失败（${RC}）"
+else
+  no "前端不可达却返回成功"
+fi
+if grep -q "✅ 发布完成" <<<"$OUT"; then
+  no "前端不可达却打印了「✅ 发布完成」"
+else
+  ok "前端不可达时没有打印「✅ 发布完成」"
+fi
+if grep -q "前端" <<<"$OUT"; then
+  ok "明确报出了前端这一项的问题"
+else
+  no "没有说清楚是前端没在服务"
+fi
+
+# (b) nginx 继续服务上一版 → 版本对不上 → 必须失败。
+setup_sandbox
+run_script >/dev/null
+assert_ran "首次发布" || exit 1
+OLD_LINK="$(readlink "$APP/frontend/dist" 2>/dev/null || echo "")"
+use_sha "ccc222ddd333"
+export STUB_FRONTEND_FROM="$APP/frontend/$OLD_LINK"
+OUT=$(run_script); RC=$?
+unset STUB_FRONTEND_FROM
+if [[ "$RC" != "0" ]]; then
+  ok "线上跑的是上一版前端时，发布失败"
+else
+  no "线上跑的是上一版前端却返回成功"
+fi
+if grep -q "✅ 发布完成" <<<"$OUT"; then
+  no "线上跑的是上一版前端却打印了「✅ 发布完成」"
+else
+  ok "线上跑的是上一版前端时没有打印「✅ 发布完成」"
+fi
+
+echo
+echo "== 29. §3.43 0.0.0.0/0 与 ::/0 必须被拒 =="
+# --------------------------------------------------------------------------
+# 脚本头自己把「不能写 0.0.0.0/0」列为安全边界，而那个正则照单全收。
+# 装上它之后，任何能直连源站的人都能伪造自己的 IP ——
+# IP 维度的节流与审计全部失效，正是这个脚本存在的目的被反转。
+# --------------------------------------------------------------------------
+setup_sandbox
+# nginx 桩：这个脚本的最后一步是 `nginx -t`，沙箱里没有 nginx。
+cat > "$DEPDIR/bin/nginx" <<'STUB'
+#!/bin/sh
+echo "nginx $*" >> "$DEPDIR/calls"
+exit 0
+STUB
+chmod +x "$DEPDIR/bin/nginx"
+# 目标路径放到临时目录：**绝不在测试机上碰真的 /etc/nginx**。
+printf '0.0.0.0/0\n' > "$DEPDIR/ips-bad-v4.txt"
+OUT=$( cd "$DEPDIR" && PATH="$DEPDIR/bin:$PATH" \
+        CWQ_REALIP_TARGET="$DEPDIR/realip.conf" \
+        bash "$ESA_REALIP" "$DEPDIR/ips-bad-v4.txt" 2>&1 ); RC=$?
+if [[ "$RC" != "0" ]]; then
+  ok "0.0.0.0/0 被拒绝（退出码 ${RC}）"
+else
+  no "0.0.0.0/0 被照单全收 —— 装上之后任何人都能伪造自己的 IP"
+fi
+if grep -q "拒绝" <<<"$OUT"; then
+  ok "明确说了为什么拒绝"
+else
+  no "没有说清楚为什么拒绝"
+fi
+if [[ -e "$DEPDIR/realip.conf" ]]; then
+  no "拒绝了却仍然写了目标文件 —— 必须是「不改任何东西」"
+else
+  ok "被拒时一个字节都没写"
+fi
+printf '::/0\n' > "$DEPDIR/ips-bad-v6.txt"
+OUT=$( cd "$DEPDIR" && PATH="$DEPDIR/bin:$PATH" \
+        CWQ_REALIP_TARGET="$DEPDIR/realip.conf" \
+        bash "$ESA_REALIP" "$DEPDIR/ips-bad-v6.txt" 2>&1 ); RC=$?
+if [[ "$RC" != "0" ]]; then
+  ok "::/0 被拒绝（退出码 ${RC}）"
+else
+  no "::/0 被照单全收"
+fi
+# 正常的网段必须还能用（闸门不能把正当用法一起挡掉）。
+printf '1.2.3.0/24\n2409:8c54::/32\n' > "$DEPDIR/ips-ok.txt"
+OUT=$( cd "$DEPDIR" && PATH="$DEPDIR/bin:$PATH" \
+        CWQ_REALIP_TARGET="$DEPDIR/realip.conf" \
+        bash "$ESA_REALIP" "$DEPDIR/ips-ok.txt" 2>&1 ); RC=$?
+if [[ "$RC" == "0" ]]; then
+  ok "正常的网段（/24、/32）被接受并装上了"
+else
+  no "正常的网段被挡住了（${RC}）：$(tail -3 <<<"$OUT")"
+fi
+if grep -q "set_real_ip_from 1.2.3.0/24" "$DEPDIR/realip.conf" 2>/dev/null; then
+  ok "装出来的配置里确实有那条网段"
+else
+  no "装出来的配置里没有那条网段：$(cat "$DEPDIR/realip.conf" 2>/dev/null | head -5)"
+fi
+
+echo
+echo "== 30. §3.44 TRUSTED_PROXIES 为空必须阻断 =="
+# --------------------------------------------------------------------------
+# 空值不是「没配」，是「**明确配成了空**」（.env.example 的默认值就是空的）。
+# 后果：全站共用一个节流桶 → 任何匿名用户 30 次错误登录就把全公司锁 15 分钟；
+# 每一条登录审计记录的来源 IP 都退化成 127.0.0.1。
+# --------------------------------------------------------------------------
+setup_sandbox
+echo "TRUSTED_PROXIES=" >> "$APP/backend/.env"
+OUT=$(run_script); RC=$?
+if [[ "$RC" != "0" ]]; then
+  ok "TRUSTED_PROXIES 为空时发布被阻断（${RC}）"
+else
+  no "TRUSTED_PROXIES 为空却返回成功"
+fi
+if grep -q "TRUSTED_PROXIES 是空的" <<<"$OUT"; then
+  ok "明确报出「TRUSTED_PROXIES 是空的」"
+else
+  no "没有报出空值这一档"
+fi
+if grep -q "✅ 发布完成" <<<"$OUT"; then
+  no "不合格的部署却打印了「✅ 发布完成」"
+else
+  ok "不合格的部署没有打印「✅ 发布完成」"
+fi
+# 豁免：确实要接受这个风险时有一条明确的出路。
+setup_sandbox
+echo "TRUSTED_PROXIES=" >> "$APP/backend/.env"
+export CWQ_DEPLOY_ALLOW_EMPTY_TRUSTED_PROXIES=1
+OUT=$(run_script); RC=$?
+unset CWQ_DEPLOY_ALLOW_EMPTY_TRUSTED_PROXIES
+if [[ "$RC" == "0" ]]; then
+  ok "CWQ_DEPLOY_ALLOW_EMPTY_TRUSTED_PROXIES=1 时放行"
+else
+  no "豁免变量没有放行（${RC}）"
+fi
+if grep -q "✅ 发布完成" <<<"$OUT"; then
+  ok "豁免之后发布正常完成"
+else
+  no "豁免之后发布没有完成"
+fi
+
+echo
+echo "== 31. §3.45 认不出本机出口 IP 时必须拒绝（fail closed） =="
+# --------------------------------------------------------------------------
+# 原来的比较是 `[[ -n "$this_ip" && "$authorized" != "$this_ip" ]]` ——
+# this_ip 为空时整个比较被短路跳过，于是「标记文件说了算」，**任何机器都放行**。
+#
+# 沙箱里 `ip` 是桩、curl 是桩 ⇒ host_public_ip 拿不到东西 ⇒ this_ip 为空。
+# --------------------------------------------------------------------------
+setup_sandbox
+printf '43.138.178.174\n' > "$DEPDIR/target-marker"
+OUT=$( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+        SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+        CWQ_HOST_IP= CWQ_DEPLOY_TARGET_FILE="$DEPDIR/target-marker" \
+        CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 \
+        LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" --check-only 2>&1 ); RC=$?
+if [[ "$RC" != "0" ]]; then
+  ok "认不出本机出口 IP 时发布被拒绝（退出码 ${RC}）"
+else
+  no "认不出本机身份却放行了 —— 这道闸 fail-open"
+fi
+if grep -q "认不出本机出口 IP" <<<"$OUT"; then
+  ok "明确报出「认不出本机出口 IP」"
+else
+  no "没有说清楚为什么拒绝"
+fi
+if grep -q "目标机授权标记：" <<<"$OUT"; then
+  no "认不出本机身份却仍然打印了「目标机授权标记 ✅」"
+else
+  ok "没有把「读不到身份」报成「标记文件说了算」"
+fi
+# 沙箱豁免仍然放行（否则本地演练没法做）。
+OUT=$( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+        SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+        CWQ_HOST_IP= CWQ_DEPLOY_TARGET_FILE="$DEPDIR/target-marker" \
+        CWQ_ALLOW_ANY_HOST=1 CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 \
+        LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" --check-only 2>&1 ); RC=$?
+if [[ "$RC" == "0" ]]; then
+  ok "CWQ_ALLOW_ANY_HOST=1 时沙箱演练照常通过"
+else
+  no "沙箱豁免被挡住了（${RC}）"
+fi
+
+echo
+echo "== 32. §3.41(b) 应用根不是 /opt/cwq 时必须拒绝 =="
+# --------------------------------------------------------------------------
+# nginx 的 root 写死在 /opt/cwq/frontend/dist，而它**不在** render_unit 的
+# 渲染范围内 —— 换根目录后 systemd unit 与 dist 软链都切了，nginx 没切，
+# 线上跑的是上一版前端，而发布照样打印「✅ 发布完成」。
+# --------------------------------------------------------------------------
+setup_sandbox
+OUT=$( cd "$APP" && PATH="$DEPDIR/bin:$PATH" APP_DIR="$APP" ARTIFACT_DIR="$DEPDIR/artifacts" \
+        SYSTEMD_UNIT_DIR="$DEPDIR/units" BACKUP_DIR="$DEPDIR/backups" \
+        CWQ_ALLOW_ANY_HOST=1 \
+        LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 bash "$SCRIPT" --check-only 2>&1 ); RC=$?
+if [[ "$RC" != "0" ]] && grep -q "不是 /opt/cwq" <<<"$OUT"; then
+  ok "应用根不是 /opt/cwq 时发布被拒绝"
+else
+  no "应用根不是 /opt/cwq 却放行了（nginx 的 root 还写死在旧路径上）"
+fi
+if calls_has "alembic upgrade head"; then
+  no "被拒绝的发布仍然改了库"
+else
+  ok "被拒绝的发布没有产生任何副作用"
+fi
+
+echo
+echo "== 33. §3.42 生效的 vhost 与日志路径必须探测出来 =="
+# --------------------------------------------------------------------------
+# 脚本原来把两个路径**写死**了，而两个都可能不是真的：
+#   CONF=/etc/nginx/conf.d/acct.xins.live.conf  （宝塔形态不是这个）
+#   LOG=/var/log/nginx/acct.xins.live.log       （模板里写的是 /www/wwwlogs/…）
+#
+# 后果是这个脚本**永远拿不到它存在的唯一理由**（切 strict 之前要的那份证据）：
+# status 找不到 ssl_verify_client → 退出 1；日志路径不存在 → 永远「日志还没有」。
+# --------------------------------------------------------------------------
+setup_sandbox
+mkdir -p "$DEPDIR/nginx/conf.d" "$DEPDIR/nginx/wwwlogs"
+cat > "$DEPDIR/nginx/conf.d/acct.xins.live.conf" <<CONF
+server {
+    listen 443 ssl;
+    server_name acct.xins.live;
+    ssl_verify_client     optional;
+    access_log  $DEPDIR/nginx/wwwlogs/acct.xins.live.log cwq_mtls;
+    root /opt/cwq/frontend/dist;
+}
+CONF
+# nginx 桩：-T 打出「它真正加载的那一份配置」（每一份前面带 configuration file 标记）。
+cat > "$DEPDIR/bin/nginx" <<STUB
+#!/bin/sh
+if [ "\$1" = "-T" ]; then
+cat <<'CONF'
+# configuration file $DEPDIR/nginx/conf.d/acct.xins.live.conf:
+server {
+    ssl_verify_client     optional;
+    access_log  $DEPDIR/nginx/wwwlogs/acct.xins.live.log cwq_mtls;
+}
+CONF
+exit 0
+fi
+if [ "\$1" = "-t" ]; then echo "nginx: configuration file test is successful"; exit 0; fi
+exit 0
+STUB
+chmod +x "$DEPDIR/bin/nginx"
+OUT=$( cd "$DEPDIR" && PATH="$DEPDIR/bin:$PATH" bash "$ESA_MTLS" status 2>&1 )
+if grep -q "conf.d/acct.xins.live.conf" <<<"$OUT"; then
+  ok "从 nginx -T 里认出了生效的 vhost 路径"
+else
+  no "没认出生效的 vhost 路径：$(head -4 <<<"$OUT")"
+fi
+if grep -q "wwwlogs/acct.xins.live.log" <<<"$OUT"; then
+  ok "日志路径跟着生效配置的 access_log 走（不再写死）"
+else
+  no "日志路径不是从生效配置里取的：$(head -8 <<<"$OUT")"
+fi
+if grep -q "ssl_verify_client: optional" <<<"$OUT"; then
+  ok "读出了 ssl_verify_client 的当前值"
+else
+  no "读不出 ssl_verify_client 的当前值"
+fi
+# strict 必须**真的改掉**那一条指令。
+#
+# 原来那条 sed 用的是 BRE 的 ``\+`` —— 那是 GNU 的扩展，BSD sed 上匹配不到，
+# 于是配置**根本没改**却照样打印「✅ 已切到 on」。
+# 这条断言就是钉住那个「看着成功、其实什么都没做」的状态。
+: > "$DEPDIR/fake-ca.pem"     # ESA 根证书：切强制校验前它必须存在
+OUT=$( cd "$DEPDIR" && PATH="$DEPDIR/bin:$PATH" \
+        CWQ_MTLS_CONF="$DEPDIR/nginx/conf.d/acct.xins.live.conf" \
+        CWQ_MTLS_CA="$DEPDIR/fake-ca.pem" \
+        bash "$ESA_MTLS" strict 2>&1 )
+if grep -qE "^[[:space:]]*ssl_verify_client[[:space:]]+on;" "$DEPDIR/nginx/conf.d/acct.xins.live.conf"; then
+  ok "strict 真的把 ssl_verify_client 改成了 on"
+else
+  no "strict 报成功却没改到指令：$(grep -n ssl_verify_client "$DEPDIR/nginx/conf.d/acct.xins.live.conf")"
+fi
+# 找不到生效配置时，报的必须是**可操作**的提示。
+OUT=$( cd "$DEPDIR" && PATH="/usr/bin:/bin" bash "$ESA_MTLS" status 2>&1 )
+if grep -q "没找到" <<<"$OUT"; then
+  ok "找不到生效的 vhost 时明确报「没找到」"
+else
+  no "找不到生效的 vhost 时没有说清楚"
+fi
+if grep -q "nginx -T" <<<"$OUT"; then
+  ok "给了「怎么找」的命令（nginx -T | grep ssl_verify_client）"
+else
+  no "没有告诉运维怎么找生效的配置"
 fi
 
 echo

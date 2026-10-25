@@ -9,6 +9,21 @@ User=cwq
 Group=cwq
 WorkingDirectory=/opt/cwq/backend
 
+# ---------------------------------------------------------------------------
+# TimeoutStartSec：**必须显式给**，而且要比本机 dump 那条更长。
+# ---------------------------------------------------------------------------
+#
+# 与 cwq-backup.service 同一个道理（`Type=oneshot` 的整个执行时长都算在
+# TimeoutStartSec 里，而 systemd 的默认值只有 90 秒），但这条**更慢**：
+# 它除了 dump 还要做**加密 + 上传 OSS**（app/backup/service.py），
+# 超时概率高得多。
+#
+# 而且 SIGTERM **不会**跑 Python 的 finally —— 被掐断时临时文件与密文文件
+# 会留在盘上（孤儿文件）。所以这里给足时间，而不是「掐了拉倒」。
+#
+# 3600 秒（1 小时）覆盖「库很大 + 上传带宽不宽」的组合。
+TimeoutStartSec=3600
+
 EnvironmentFile=/opt/cwq/backend/.env
 
 # 产物只在本地临时落盘，上传完即删（见 app/backup/service.py::_workdir）。

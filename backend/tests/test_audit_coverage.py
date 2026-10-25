@@ -244,6 +244,115 @@ def test_改报表公式要留审计(client, auth, db, book):
             f"毒公式会留在这个账套里，后面读同一张模板的用例会莫名其妙地红。")
 
 
+# --------------------------------------------------------------------- 报表模板结构
+#
+# 审计 P3-09：报表模板的**结构改动**（改行标签、改列的取数口径、增删行列、
+# 改名、复制、删模板）以前**一条审计都不落**。
+#
+# 危害与「改公式」是同一类，但更隐蔽：把资产负债表的某列从「期末」改成
+# 「期初」，页面照样渲染出一张「正常的」资产负债表 —— 数字变了却不出错，
+# 事后翻审计流水却**没有任何一条**指向这次改动。
+#
+# 这里的清单就是那条审计动作的**覆盖清单**：少一个 action 不红，但少一个
+# action 对应的**写路径**不留痕，红的是下面这条用例。
+
+
+def test_报表模板的结构改动都要留审计(client, auth, db, book):
+    """新建 / 复制 / 改名 / 删模板 + 增删改行列 —— 每一步都要留痕。
+
+    逐条路径的细用例在 ``tests/test_audit_fix_report_template_audit.py``；
+    这里守的是「**动作清单本身**不许被悄悄改小」。
+    """
+    from app.models import ReportCol, ReportRow
+
+    # 新建（复制一份内置资产负债表基线，归属当前账套）
+    r = client.post(f"/api/reports/templates?book_id={book.id}", headers=auth,
+                    json={"name": "覆盖清单用表", "base_code": "BALANCE_SHEET"})
+    assert r.status_code == 201, r.text
+    tpl_id = r.json()["id"]
+
+    design = client.get(f"/api/reports/{tpl_id}/design?book_id={book.id}",
+                        headers=auth).json()
+    last_row = design["rows"][-1]["row_no"] + 1
+    last_col = design["cols"][-1]["col_no"] + 1
+    value_col = next(c for c in design["cols"] if c["kind"] == "BALANCE_CLOSING")
+
+    # 复制
+    r = client.post(f"/api/reports/templates/{tpl_id}/copy?book_id={book.id}",
+                    headers=auth, json={})
+    assert r.status_code == 200, r.text
+
+    # 改名
+    r = client.patch(f"/api/reports/templates/{tpl_id}?book_id={book.id}", headers=auth,
+                     json={"name": "覆盖清单改过的名字"})
+    assert r.status_code == 200, r.text
+
+    # 增行 / 改行 / 删行
+    r = client.post(f"/api/reports/templates/{tpl_id}/rows?book_id={book.id}", headers=auth,
+                    json={"row_no": last_row, "label": "覆盖清单加的行"})
+    assert r.status_code == 200, r.text
+    r = client.patch(f"/api/reports/templates/{tpl_id}/rows/{last_row}?book_id={book.id}",
+                     headers=auth, json={"label": "覆盖清单改过的行"})
+    assert r.status_code == 200, r.text
+    r = client.delete(f"/api/reports/templates/{tpl_id}/rows/{last_row}?book_id={book.id}",
+                      headers=auth)
+    assert r.status_code == 200, r.text
+
+    # 增列 / 改列（**改口径**）/ 删列
+    r = client.post(f"/api/reports/templates/{tpl_id}/cols?book_id={book.id}", headers=auth,
+                    json={"col_no": last_col, "label": "覆盖清单加的列", "kind": "PERIOD_CREDIT"})
+    assert r.status_code == 201, r.text
+    r = client.patch(f"/api/reports/templates/{tpl_id}/cols/{value_col['col_no']}"
+                     f"?book_id={book.id}", headers=auth,
+                     json={"kind": "BALANCE_OPENING"})
+    assert r.status_code == 200, r.text
+    r = client.delete(f"/api/reports/templates/{tpl_id}/cols/{last_col}?book_id={book.id}",
+                      headers=auth)
+    assert r.status_code == 200, r.text
+
+    # 反向确认：库里的结构真的改了（不然这条可能是「审计写了但库没改」的假绿）。
+    # **必须在删模板之前查** —— 删掉之后行、列都跟着没了。
+    db.expire_all()
+    assert db.query(ReportRow).filter_by(template_id=tpl_id).count() > 0
+    assert db.query(ReportCol).filter_by(template_id=tpl_id).count() > 0
+
+    # 删模板
+    r = client.delete(f"/api/reports/templates/{tpl_id}?book_id={book.id}", headers=auth)
+    assert r.status_code == 200, r.text
+
+    # ---- 清单：每个动作都得有，且都要有快照 ------------------------------
+    expected = {
+        "CREATE_REPORT_TEMPLATE": 2,      # 新建 + 复制
+        "UPDATE_REPORT_TEMPLATE": 1,      # 改名
+        "DELETE_REPORT_TEMPLATE": 1,      # 删模板
+        "UPDATE_REPORT_TEMPLATE_STRUCTURE": 6,   # 增/改/删行 + 增/改/删列
+    }
+    for action, count in expected.items():
+        rows = _logs(db, book, action)
+        assert len(rows) >= count, (
+            f"{action} 应当至少有 {count} 条审计，实际 {len(rows)} 条 —— "
+            f"有写路径没留痕")
+        for entry in rows:
+            assert entry.detail, f"{action} 的审计没有 detail：{entry}"
+            assert entry.before or entry.after, (
+                f"{action} 的审计没有留 before/after 快照：{entry}")
+
+    # **改口径**这一条要能说清「从哪个口径改到了哪个口径」——
+    # 只有「知道有人动过」是查不出事的。
+    # （结构改动有多条，这里找**改口径**的那一条，不是最后一条。）
+    kind_rows = [e for e in _logs(db, book, "UPDATE_REPORT_TEMPLATE_STRUCTURE")
+                 if "BALANCE_CLOSING" in str(e.before) + str(e.after)
+                 or "BALANCE_OPENING" in str(e.before) + str(e.after)]
+    assert kind_rows, (
+        "改列取数口径的那条审计里没有口径值 —— "
+        "「把期末改成期初」必须能从审计里看出来")
+    entry = kind_rows[-1]
+    assert entry.before.get("kind") and entry.after.get("kind"), (
+        f"改口径的审计没有 before/after 口径：{entry.before} / {entry.after}")
+    assert entry.before["kind"] != entry.after["kind"], (
+        f"改口径的审计里 before 与 after 一样：{entry.before} / {entry.after}")
+
+
 # --------------------------------------------------------------------- 授权
 
 

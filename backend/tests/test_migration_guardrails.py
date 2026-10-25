@@ -971,6 +971,8 @@ def test_head_是本文件认识的那一版():
         "0035_profit_subject_setting",        # 本年利润科目可手工设定：book_year.profit_subject_code
         "0036_invoice_fallback_subject",       # 发票兜底科目：invoice_config 的进项/销项兜底科目
         "0037_log_retention_indexes",          # 日志类表的判龄列索引（app/maintenance.py 的保留期清理要用）
+        "0038_entry_voucher_line_unique",      # entry 的 (voucher_id, line_no) 唯一约束 + 已记账凭证的分录禁写
+        "0039_voucher_idempotency",            # 新建凭证的幂等占位表（§3.28，接在 0038 之后）
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")
@@ -1063,11 +1065,18 @@ def _seed_two_year_book(eng, *, second_year_has_voucher: bool = True) -> None:
         if second_year_has_voucher:
             vouchers.append((2, 13, "记-0002", "2022-01-15", "1002", "2001", 500.00))
         for vid, pid, vno, vdate, dcode, ccode, amount in vouchers:
+            # **先按「未记账」建，把分录插完再置成「已记账」。**
+            #
+            # 库层护栏（审计报告 §3.15 加的那条）规定：**已记账凭证的分录
+            # 不许增删改** —— 而「先建已记账凭证、再插分录」正是它要挡的
+            # 那条路。真实业务里凭证与分录是一起写的（先未记账、写完分录、
+            # 再记账），所以这里照真实的写入顺序来：未记账 → 插分录 →
+            # 记一次账（``fn_posted_voucher_guard`` 允许这一次状态跳转）。
             conn.execute(text("""
                 INSERT INTO voucher (id, book_id, period_id, voucher_no, voucher_date,
                                      status, source, attachments, remark,
                                      created_at, updated_at)
-                VALUES (:id, 1, :pid, :vno, :vdate, 'POSTED', 'MANUAL', 0, '',
+                VALUES (:id, 1, :pid, :vno, :vdate, 'UNPOSTED', 'MANUAL', 0, '',
                         now(), now())
             """),
                          {"id": vid, "pid": pid, "vno": vno, "vdate": vdate})
@@ -1082,6 +1091,9 @@ def _seed_two_year_book(eng, *, second_year_has_voucher: bool = True) -> None:
             """),
                          {"vid": vid, "ord": pid, "did": int(dcode), "cid": int(ccode),
                                            "amt": amount})
+            # 分录齐了才记账 —— 与应用层的写入顺序同一口径。
+            conn.execute(text(
+                "UPDATE voucher SET status = 'POSTED' WHERE id = :id"), {"id": vid})
         # 2022-01 的期初快照 —— 指向**原来那份**（账套级）科目行
         for code, amount in (("1001", 1000.00), ("2001", -1000.00)):
             conn.execute(text("""
@@ -1237,7 +1249,9 @@ def test_跨年账套_次年只有期初没有凭证_迁移照样跑得完(scrat
         # 迁移跑完了
         ver = conn.execute(text(
             "select version_num from alembic_version")).scalar()
-        assert ver == "0037_log_retention_indexes", f"schema 只到 {ver}"
+        # 版本号跟着**迁移链的最后一环**走：0038 是 entry 唯一约束，
+        # 0039 是凭证幂等占位表（接在 0038 之后）。
+        assert ver == "0039_voucher_idempotency", f"schema 只到 {ver}"
 
         # 科目表按年度拆开
         rows = conn.execute(text(

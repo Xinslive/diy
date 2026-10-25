@@ -6,12 +6,13 @@ import json
 import re
 import sys
 from pathlib import Path
-from sqlalchemy import MetaData, Table, inspect, text
+from sqlalchemy import inspect, text
 from alembic.config import Config
 from alembic.runtime.environment import EnvironmentContext
 from alembic.script import ScriptDirectory
 from app.plugins.errors import PluginError
 from app.plugins.manifest import table_prefix, version_table
+from app.plugins.sandbox import sandboxed_module_loader
 
 
 def read_head(directory: Path) -> str:
@@ -107,6 +108,25 @@ def validate_tables(conn, manifest: dict, *, expected=None) -> list[dict]:
             if re.search(r"\b(?:insert|update|delete|select|execute|perform|create|alter|drop|truncate|copy|call)\b", trigger["source"], re.I):
                 raise PluginError("INVALID_PLUGIN_TRIGGER", "首版触发器仅允许修改 NEW 行，不能执行 SQL 或调用其他过程")
         cols = {c["name"]: c for c in meta["columns"]}
+        # 插件自有表**不许有二进制列**（BYTEA，含 BYTEA[] 这类数组形态）。
+        #
+        # 为什么在这里挡：插件表的值会原样经 ``ctx.data.read`` / ``data.insert``
+        # 回到插件手里，而插件后端将来要搬到独立进程（§7 第 6 步第 48 项）——
+        # 那条路上**返回值必须能序列化**。表的结构是**插件自己定的**，宿主在
+        # 编译期无从知道哪张表有这类列，于是「返回值能不能序列化」这件事
+        # 只能靠一条结构性保证，不能靠登记表的自觉。
+        #
+        # 实测过（2026-10-25）：没有这道闸时，声明 ``sa.LargeBinary`` 列的
+        # 插件表会被照常接受，``validate_tables`` 登记到的列类型里就有 BYTEA，
+        # 而 ``ctx.data.read`` 随后就能把 bytes 交给插件。
+        #
+        # 插件要存文件，宿主已经给了正规通道：``ctx.imports``（带容量闸、
+        # 内容去重、留存期、备份）。往自有表里塞字节是绕过那条通道，而且
+        # 不受它的容量闸管 —— 插件表可以一直长，宿主管不着。
+        for column in meta["columns"]:
+            if "BYTEA" in column["type"]:
+                raise PluginError("INVALID_TABLE_COLUMN",
+                                  "插件表不得声明二进制列（%s），文件请走导入批次通道" % column["name"])
         if decl["scope"] == "book" and ("book_id" not in cols or cols["book_id"]["nullable"] or cols["book_id"]["type"] not in {"INTEGER", "BIGINT"}):
             raise PluginError("INVALID_TABLE_SCOPE", "账套插件表必须包含非空整数 book_id")
         if decl["scope"] == "global" and "book_id" in cols:
@@ -174,9 +194,16 @@ def migrate(engine, directory: Path, manifest: dict, *, on_commit=None) -> tuple
                 script = ScriptDirectory(str(directory / "migrations"))
                 config = Config()
                 # EnvironmentContext 使用宿主连接与 version table，不运行包内 env.py。
-                with EnvironmentContext(config, script, fn=lambda rev, ctx: script._upgrade_revs("head", rev)) as env:
-                    env.configure(connection=conn, version_table=version_table(pid), version_table_schema="public", transactional_ddl=True)
-                    env.run_migrations()
+                #
+                # **alembic 自己的脚本加载器用解释器的真内建**（``__import__`` /
+                # ``exec`` / ``open`` 全在）—— 插件迁移于是是同一个逃逸链的
+                # **另一个入口**：静态扫描同样看不见 ``operator.attrgetter("__globals__")``
+                # 这种字符串形态（审计 §3.1）。所以在执行插件迁移的这一小段时间里，
+                # 把 alembic 的加载器换成**裁剪过的**那一份（见 app.plugins.sandbox）。
+                with sandboxed_module_loader():
+                    with EnvironmentContext(config, script, fn=lambda rev, ctx: script._upgrade_revs("head", rev)) as env:
+                        env.configure(connection=conn, version_table=version_table(pid), version_table_schema="public", transactional_ddl=True)
+                        env.run_migrations()
             if _non_table_objects(conn, pid) != objects_before:
                 raise PluginError("MIGRATION_SCOPE_VIOLATION", "迁移修改了未开放的 schema/函数/类型/view/外部序列")
             result = validate_tables(conn, manifest)

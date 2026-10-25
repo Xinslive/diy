@@ -8,6 +8,14 @@
 那个数低于当前值时，验证成功之后会用当前值重算一遍并写回
 （见 :func:`password_needs_rehash`）。这样提高成本不需要停机、不需要
 强制所有人改密码，也不会把谁锁在门外。
+
+**但验证的「耗时」不能跟着存量轮数走（审查 §3.5）。** 「按库里记着的
+轮数算」是为了兼容，不该顺带变成一条**用户名枚举信道**：老散列只跑
+24 万次迭代、现在的散列跑 60 万次，于是「这个账号存在但轮数低」会
+**比**「这个账号不存在」快一截（实测 34.51ms vs 64.03ms，两条分布
+完全不相交）。所以 :func:`verify_password` 会**把差额补算掉** ——
+验证路径付出的 PBKDF2 工作量恒等于当前轮数，散列串的格式与
+「登录成功后重算写回」的逻辑一个字没改。
 """
 import base64
 import hashlib
@@ -131,12 +139,38 @@ def verify_password(password: str, stored: str) -> bool:
     **按库里记着的轮数算**，不是按当前值 —— 于是老散列（24 万轮）依然登得进去，
     升级轮数不会把任何存量用户挡在门外。轮数升级由
     :func:`password_needs_rehash` + 登录路径上的重算写回来完成。
+
+    **但要把差额补算掉（审查 §3.5）。**
+
+    「按库里记着的轮数算」是为了**兼容**（老口令永远登得进去），它不该
+    顺带变成一条**账号存在性预言机**：散列里记着 24 万轮的存量账号，
+    验证只跑 24 万次迭代；而「账号不存在」那条路径走的是
+    :func:`hash_password` 造出来的 60 万轮散列。实测两条分布**完全不相交**
+    （老账号 max 46.71ms < 未知账号 min 60.09ms），于是「这个账号存在且
+    轮数低」是一个**不需要统计**就能看出来的判据 —— 而
+    :func:`password_needs_rehash` 只在**登录成功之后**才触发重算，所以
+    从没成功登录过的老账号会永远停在低轮数上。
+
+    所以这里在验证完之后**再跑一次 PBKDF2 把差额补齐**：
+    总工作量恒等于 ``_ITERATIONS``，与库里记着几轮无关。
+
+    * **不改散列串的格式**：仍然是 ``pbkdf2_sha256$<iters>$<salt>$<dk>``，
+      存量散列照旧能验、照旧能被判「该重算」。
+    * **不补算到超过当前值的情况**：库里记的轮数比当前值**高**时（那是
+      有人把 ``_ITERATIONS`` 调低了，或者库里是未来版本写的），
+      验证本来就比当前值更贵，补算只会白白加倍。这时按原样验。
+    * **补算用的是同一个口令与同一个盐**：算出来的摘要没人用 ——
+      它只是把「这一轮验证付出了多少工作量」对齐到同一个口径。
     """
     parsed = _parse_stored(stored or "")
     if parsed is None:
         return False
     iters, salt, dk = parsed
-    calc = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iters)
+    raw = password.encode()
+    calc = hashlib.pbkdf2_hmac("sha256", raw, salt, iters)
+    if iters < _ITERATIONS:
+        # 补齐差额：让这次验证的总工作量恒等于当前轮数。
+        hashlib.pbkdf2_hmac("sha256", raw, salt, _ITERATIONS - iters)
     return hmac.compare_digest(calc, dk)
 
 

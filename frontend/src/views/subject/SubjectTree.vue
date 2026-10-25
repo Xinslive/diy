@@ -6,11 +6,21 @@
       <span class="muted">科目编码规则 {{ rule }}</span>
       <span v-if="isFiltering" class="muted">命中 {{ hitCount }} 个科目</span>
       <span class="spacer" />
-      <el-button :disabled="!store.canWrite" @click="importVisible = true">
+      <!-- 「导入并覆盖」是**整年覆盖**：它跟一个正在删除的科目撞上，
+           科目表会残缺（有的删了、有的又写回来了）。所以删除在途时
+           把这一页所有写动作一起按住（审计 §7 路线图 44）。 -->
+      <el-button :disabled="!store.canWrite || busy" @click="importVisible = true">
         <el-icon><Upload /></el-icon>&nbsp;导入并覆盖
       </el-button>
-      <el-button type="primary" :disabled="!store.canWrite" @click="openCreate()">新增科目</el-button>
+      <el-button type="primary" :disabled="!store.canWrite || busy" @click="openCreate()">新增科目</el-button>
     </div>
+
+    <!-- 加载失败**不是**「没有科目」：这两件事在页面上长得一模一样。
+         拦截器弹的那条红字会消失（或者被别的提示盖掉），页面上这一条留着 ——
+         口径与账簿三视图一致（审计 §3.25）。 -->
+    <el-alert v-if="loadError" type="error" :closable="false" show-icon
+              style="margin-bottom: 10px"
+              :title="`加载失败：${loadError}。请检查网络后重试。`" />
 
     <div class="card">
       <el-table :data="filtered" row-key="id" border default-expand-all
@@ -31,9 +41,17 @@
         </el-table-column>
         <el-table-column v-if="store.canWrite" label="操作" width="190" align="center">
           <template #default="{ row }">
-            <el-button link type="primary" @click="openCreate(row)">下级</el-button>
-            <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
-            <el-button link type="danger" @click="remove(row)">删除</el-button>
+            <el-button link type="primary" :disabled="busy" @click="openCreate(row)">下级</el-button>
+            <el-button link type="primary" :disabled="busy" @click="openEdit(row)">编辑</el-button>
+            <!-- 删除是这一页唯一的写动作。双击「删除」→ 两个 DELETE 并发 →
+                 第一个删成功，第二个拿到的是 404「科目不存在」——
+                 用户刚看到「已删除」，转眼又一条红字。
+                 后端不是幂等的（`delete_subject` 先 db.get 再查引用，
+                 删过就找不到了），所以这道闸只能在前端（审计 §7 路线图 44，
+                 修法照 §3.29 / §3.30）。转圈只给**正在删的那一行**，
+                 不是满屏都在转。 -->
+            <el-button link type="danger" :disabled="busy"
+                       :loading="removingId === row.id" @click="remove(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -54,13 +72,42 @@ import SubjectFormDialog from '@/components/SubjectFormDialog.vue'
 import SubjectEditDialog from '@/components/SubjectEditDialog.vue'
 import SubjectImportDialog from '@/components/SubjectImportDialog.vue'
 import { useUrlConditions } from '@/composables/useUrlConditions'
+import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'
 import { CATEGORY_LABEL } from '@/utils/subjectCode'
 
 const store = useSessionStore()
 const tree = ref([])
-const loading = ref(false)
 const keyword = ref('')
+
+/**
+ * 科目树的加载守卫：只认最新一趟。
+ *
+ * 账套 / 年度一变，整页会重挂（MainLayout 的 viewKey），那种旧响应写进的是
+ * 一个**已经销毁的实例**，用户看不见 —— 所以要管的是**页内**的重载：
+ * 编辑弹窗保存后的 load()、导入后的 load()、删除后的 load()，三条路都可能
+ * 同时在途。慢的那一趟晚到，就把**已经被删掉的科目**又画回树上，
+ * 用户看着像「删不掉」。口径与账簿三视图一致（composables/useLatestLoad.js）。
+ */
+const { loading, error: loadError, run, isStale } = useLatestLoad('subject/tree')
+
+/**
+ * 这一页的**写动作**在途守卫（审计 §7 路线图 44 / §3.29 同款修法）。
+ *
+ * 这一页只有一个写动作：**删除科目**。双击「删除」→ 两个 DELETE 并发 →
+ * 第一个删成功，第二个拿到的是 404「科目不存在」——
+ * 用户刚看到「已删除」，转眼又一条红字，像删除失败了。
+ *
+ * 后端**不是**幂等的（`delete_subject` 先 `db.get` 再查引用，
+ * 删过就找不到了），所以这道闸只能在前端。
+ *
+ * 一次只允许一段在途：删除途中把「下级 / 编辑 / 新增 / 导入并覆盖」一起按住 ——
+ * 「导入并覆盖」是**整年覆盖**，跟一个正在删除的科目撞上，科目表会残缺。
+ */
+const busy = ref(false)
+
+/** 正在删的那一行（转圈只给这一行，不是满屏都在转）。 */
+const removingId = ref(null)
 
 /**
  * 筛选关键字 ↔ URL。
@@ -140,10 +187,18 @@ const hitCount = computed(() => {
 
 async function load() {
   if (!store.bookId || !year.value) return
-  loading.value = true
+  let d
   try {
-    tree.value = await api.subjectTree(store.bookId, { year: year.value })
-  } finally { loading.value = false }
+    d = await run(() => api.subjectTree(store.bookId, { year: year.value }))
+  } catch (e) {
+    // 加载失败**不是**「没有科目」：这两件事在页面上长得一模一样。
+    // 拦截器已经弹过提示了，这里只要别让它变成一个没人接的 rejection ——
+    // 树上留着上一次的内容，顶部由 loadError 挂一条「加载失败」。
+    return
+  }
+  // 过期的那一趟：条件早就被改掉了，写进去就是「树上还是旧账套的科目」。
+  if (isStale(d)) return
+  tree.value = d
 }
 
 function openCreate(parent = null) {
@@ -162,11 +217,42 @@ async function onImported() {
   ElMessage.success('科目表已覆盖导入')
 }
 
+/**
+ * 写动作的统一入口：同一时刻只允许一段在途。
+ *
+ * 早退放在这里，而不是每个动作里各写一遍 —— 各写一遍的话，
+ * 以后再加一个写动作就会漏掉一处（这正是这个 bug 能长期存活的原因）。
+ */
+async function withBusy(fn) {
+  if (busy.value) return
+  busy.value = true
+  try {
+    await fn()
+  } finally {
+    busy.value = false
+    removingId.value = null
+  }
+}
+
 async function remove(row) {
-  await ElMessageBox.confirm(`确认删除科目 ${row.code} ${row.name}？`, '删除', { type: 'warning' })
-  await api.deleteSubject(store.bookId, row.id)
-  ElMessage.success('已删除')
-  load()
+  await withBusy(async () => {
+    try {
+      await ElMessageBox.confirm(`确认删除科目 ${row.code} ${row.name}？`, '删除', { type: 'warning' })
+    } catch {
+      return // 用户点了「取消」—— 不是错误
+    }
+    removingId.value = row.id
+    try {
+      await api.deleteSubject(store.bookId, row.id)
+    } catch {
+      // 拦截器已经弹过原因了（科目已被凭证使用 / 存在下级 / 有期初余额）。
+      // 这里吞掉，别让「删除失败」变成一个没人接的 promise rejection ——
+      // 否则控制台里躺一条红字，而用户看到的是「已删除」。
+      return
+    }
+    ElMessage.success('已删除')
+    await load()
+  })
 }
 
 onMounted(() => {

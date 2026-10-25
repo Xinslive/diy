@@ -13,12 +13,17 @@ token 全世界都能伪造（HS256 是对称签名，密钥就是源码里那�
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 import re
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.core.escape_hatches import APP_SIDE_ESCAPE_HATCHES, APP_SIDE_ESCAPE_HATCH_FIXES
 
 log = logging.getLogger("app.core.config")
 
@@ -43,6 +48,15 @@ LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET")
 # 生产环境禁止的级别：DEBUG 会把 SQLAlchemy 的 SQL、绑定参数连同账套数据
 # 一并打进日志，而日志是被采集、被转发、被存盘的。
 PROD_FORBIDDEN_LOG_LEVELS = ("DEBUG",)
+
+# 插件后端代码的隔离模式（§7 第 6 步第 48 项）。
+#
+# 这份清单只有一处 —— 配置校验、加载器分流、文档都从这里取值，
+# 免得「配置里写了一个开关，加载器只认其中两个值」这种分叉。
+ISOLATION_OFF = "off"       # 进程内执行（现状）
+ISOLATION_SHADOW = "shadow" # 进程内执行 + worker 比对声明（只报告差异）
+ISOLATION_ON = "on"         # 只在 worker 进程里执行，宿主经 IPC 派活
+PLUGIN_ISOLATION_MODES = (ISOLATION_OFF, ISOLATION_SHADOW, ISOLATION_ON)
 
 # JWT 签名算法白名单（审计 P2-11）。
 #
@@ -335,6 +349,25 @@ class Settings(BaseSettings):
     # 里的启动告警）。
     trusted_proxies: str = ""
 
+    # 「``TRUSTED_PROXIES`` 为空」这一项要不要**只告警**（审查 §3.44）。
+    #
+    # **默认 false = 拒绝启动**（所以豁免要显式写 true）。
+    #
+    # 为什么这一项从「告警」升成了「阻断」：空白名单在反代后面是
+    # **全站共用一个来源桶**，而那不是「节流软了一点」—— 实测一个
+    # **未认证**的匿名请求发 30 次错误登录（``login_ip_max_failures=30``、
+    # ``login_ip_window_seconds=900``），就能把**全公司**的登录锁死
+    # 15 分钟，而且可以无限重复触发；同���机制下每一条登录审计的来源
+    # IP 都退化成 127.0.0.1，事后追溯彻底失效。
+    #
+    # 一条启动告警拦不住它 —— 这条告警从功能上线起就在那儿，而
+    # **照抄 ``.env.example``（``TRUSTED_PROXIES=`` 为空）的部署**
+    # 正好落在这个形态上，没人读告警。
+    #
+    # **豁免口**：``TRUSTED_PROXIES_WARN_ONLY=true``。本机直连的部署
+    # （不经过任何代理）确实不需要白名单，让它照常启动。
+    trusted_proxies_warn_only: bool = False
+
     # 跨源白名单（逗号分隔的 origin）。**默认空 = 生产不开 CORS。**
     #
     # 什么时候需要它：**动静分离**之后，前端可能不在 API 的源站上 ——
@@ -395,6 +428,19 @@ class Settings(BaseSettings):
     plugin_disk_quota_bytes: int = 1024 * 1024 * 1024
     plugin_lease_seconds: int = 30
     plugin_heartbeat_seconds: int = 5
+
+    # 插件后端代码的**隔离模型**（§7 第 6 步第 48 项）。
+    #
+    # off    —— 现状：插件代码在宿主进程里跑（进程内加固那一层，见第 49 项）。
+    # shadow —— 插件代码**仍然**在宿主进程里跑，但额外起一个 worker 进程
+    #           把同一份代码再跑一遍，逐条比对两边的声明；差异只报告，
+    #           不改变任何对外行为。这是切到 on 之前的观测期。
+    # on     —— 插件代码**只在 worker 进程里跑**；宿主按 worker 报上来的声明
+    #           重建 FastAPI 路由，业务请求经 Unix socket 派到 worker。
+    #
+    # 默认 off：切过去会改变插件的执行位置（多一次 IPC、并发被串行化），
+    # 这类变更不该由一次升级悄悄带上线。
+    plugin_isolation: str = "off"
 
     # ------------------------------------------------ MCP 只读数据服务
     #
@@ -463,16 +509,24 @@ class Settings(BaseSettings):
 
     # 是否把「MCP 没配 Host 白名单」升级成**拒绝启动**（审查 L-03）。
     #
-    # **默认 False，这是有意的。** 这一项如果默认 True，会让**照抄
-    # ``.env.example`` 的部署直接起不来** —— 那个文件里
-    # ``MCP_ALLOWED_HOSTS=`` 就是空的，而 ``MCP_ENABLED=true``。
-    # 拿可用性换一个已经有令牌兜着的风险（见 validate_production_settings
-    # 里那段说明），不划算。
+    # **现在是默认就拒绝**（只要 ``MCP_ENABLED=true``）—— 这一项保留下来
+    # 是为了兼容既有配置：它原来的语义是「默认只告警，想要 fail-closed
+    # 自己打开」，而审查 §4.3-2 认定那个默认值本身就是缺口
+    # （``MCP_ENABLED`` 默认 true，于是「照抄 .env.example 的部署」
+    # 正好落在「MCP 开着 + 白名单空」这个形态里，而启动闸门对它沉默）。
     #
-    # 所以这里的分工是：**默认只告警**（但告警级别提到 ERROR，并写进启动
-    # 校验的"已检查项"清单，让它在启动日志里显形）；**想要 fail-closed 的
-    # 部署自己打开这个开关**。
+    # 所以现在它**不再能关掉**这道闸门：把它设成 false 也不会让
+    # 「MCP 开着 + 白名单空」通过启动校验。要豁免请用
+    # ``MCP_ALLOWED_HOSTS_WARN_ONLY=true``（见下一个字段）。
     mcp_enforce_allowed_hosts: bool = False
+
+    # 「MCP 开着但没配 Host 白名单」要不要**只告警**（审查 §4.3-2）。
+    #
+    # **默认 false = 拒绝启动**（所以豁免要显式写 true）。
+    #
+    # 本机直连的部署（只监听 127.0.0.1、不对外）确实不需要白名单 ——
+    # 给它留这个口子。**但要显式写出来**，别让它成为默认。
+    mcp_allowed_hosts_warn_only: bool = False
 
     # 是否记录 MCP 读取审计。默认开。
     #
@@ -649,6 +703,20 @@ class Settings(BaseSettings):
     # 格式：``base64(32 字节随机)``。用 age / AES-GCM 这一类带认证的方案；
     # 密钥**必须与 OSS AccessKey 分开存放**，否则「拿到备份就等于拿到解密钥匙」。
     backup_encryption_key: str = ""
+
+    # 「``BACKUP_ENCRYPTION_KEY`` 没配」要不要**只告警**（审查 §3.8）。
+    #
+    # **默认 false = 拒绝启动**（所以豁免要显式写 true）。
+    #
+    # 这一项原来是**只告警**的 —— 而告警的落点在**消费者**那边
+    # （``app/backup/service.py`` 里 ``logger.warning`` 一句，然后照旧
+    # 上传**明文 gzip**）。配置里那句承诺（「生产校验会要求它非空」）
+    # 与实现对不上：``validate_production_settings`` 里**根本没有**这一项。
+    # 承诺与实现不一致比没有承诺更糟 —— 运维会以为「启动闸门管过了」。
+    #
+    # **豁免口**：``BACKUP_ENCRYPTION_KEY_WARN_ONLY=true``。明知故犯地
+    # 先用明文跑一段时间是可以的，但要**显式**写出来。
+    backup_encryption_key_warn_only: bool = False
     # 是否额外备份系统级数据（用户、授权、参数、全局基线模板）。
     backup_include_system: bool = True
     # 保留天数的天级/周级。月度恒为永久 —— 不做成可配，理由见
@@ -734,6 +802,8 @@ class Settings(BaseSettings):
             raise ValueError("插件 lease 必须至少为 heartbeat 的三倍，且不超过 3600 秒")
         if not self.plugin_root.strip():
             raise ValueError("PLUGIN_ROOT 不能为空")
+        if self.plugin_isolation not in PLUGIN_ISOLATION_MODES:
+            raise ValueError("PLUGIN_ISOLATION 只能是 off / shadow / on 之一")
         return self
 
     @field_validator("log_level")
@@ -750,6 +820,79 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"LOG_LEVEL={v!r} 不是合法日志级别，可选：{'、'.join(LOG_LEVELS)}")
         return v
+
+
+# ---------------------------------------------------------------------------
+# 逃生口清单 ↔ Settings 字段：必须一一对应
+# ---------------------------------------------------------------------------
+# 清单在 :mod:`app.core.escape_hatches`（那里还有部署侧的那几个）。
+# 这里断言两个方向：
+#
+#   · 清单里的每个名字，Settings 里都要有对应字段（少一个 = 名字写错了）；
+#   · Settings 里每个 ``*_warn_only`` 字段，都要在清单里（多一个 = **漏登记**）。
+#
+# 第二个方向才是要紧的：漏登记的开关**不会被部署闸门检查**
+# （部署脚本按清单扫持久化配置），它就成了一道没人看得见的、永远开着的口子。
+# 宁可起不来，也不要带着一个没登记的逃生口上线。
+_settings_fields = set(Settings.model_fields)
+for _hatch in APP_SIDE_ESCAPE_HATCHES:
+    if _hatch.lower() not in _settings_fields:
+        raise RuntimeError(f"逃生口清单里的 {_hatch} 在 Settings 里没有对应字段")
+for _field in sorted(_settings_fields):
+    if _field.endswith("_warn_only") and _field.upper() not in APP_SIDE_ESCAPE_HATCHES:
+        raise RuntimeError(
+            f"Settings 的 {_field} 是一个逃生口，但没有登记在 app/core/escape_hatches.py —— "
+            "漏登记的开关不会被部署闸门检查"
+        )
+
+
+def _env_file_path() -> Path:
+    """持久化配置文件的路径（与 ``Settings`` 读的是同一个）。
+
+    ``SettingsConfigDict(env_file=".env")`` 是**相对 cwd** 的，
+    所以这里也用相对路径解析 —— 两边必须指向同一个文件，
+    否则会出现「应用读的是 A、闸门查的是 B」。
+    """
+    raw = Settings.model_config.get("env_file") or ".env"
+    name = raw if isinstance(raw, str) else (raw[0] if raw else ".env")
+    return Path(name)
+
+
+def persistent_escape_hatches(env_file: Path | None = None) -> list[tuple[str, str]]:
+    """读出**持久化配置文件**里开着的逃生口（名字, 值）。
+
+    只看**文件**，不看进程环境：
+
+    * 进程环境里的同名变量是**单次运行**的豁免 ——
+      运维救急时 ``TRUSTED_PROXIES_WARN_ONLY=true .venv/bin/uvicorn ...``，
+      那一次完了就没了；
+    * 写进 ``.env`` 的是**这台机器的常态** —— 当时想的是「先这样」，
+      留下来的是「永久放松」。
+
+    后者才是要拦的：它让一道 fail-closed 的闸变成常态，而且**没有任何地方
+    会提醒**（豁免本来就是设计成安静放行的）。
+
+    解析规则与 pydantic-settings 够用即可：``KEY=value``，``#`` 之后是注释，
+    引号包着也算；真值取 ``1/true/yes/on``（大小写不敏感）。
+    """
+    path = env_file or _env_file_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return []
+    found: list[tuple[str, str]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key not in APP_SIDE_ESCAPE_HATCHES:
+            continue
+        value = value.split("#", 1)[0].strip().strip("\"'").strip()
+        if value.lower() in {"1", "true", "yes", "on"}:
+            found.append((key, value))
+    return found
 
 
 def detect_env(settings: "Settings", env: str | None = None) -> str:
@@ -904,7 +1047,53 @@ def mcp_allowed_host_list(raw: str | None = None) -> list[str]:
     return [part.strip() for part in (raw or "").split(",") if part.strip()]
 
 
-def validate_production_settings(settings: "Settings", env: str | None = None) -> list[str]:
+def _oss_backup_configured(settings: "Settings") -> bool:
+    """OSS 备份是不是**真的配上了**（按 env 层的四个参数判）。
+
+    判据与 ``app/backup/config.py::require_ready`` 一致：Endpoint /
+    AccessKey ID / AccessKey Secret / Bucket **四项齐全**才算配上。
+    少了任何一项，备份管线根本走不到上传那一步 —— 那就没有「明文躺在
+    对象存储上」这件事，也就不该拿这一项去卡启动。
+
+    **不看 ``backup_enabled``**：那是**定时器**的开关（关掉之后界面与
+    手动触发仍然可用），手动备份一样会把制品传到 OSS。所以判据是
+    「OSS 配上了」，不是「定时器开着」。
+
+    **看不到库里配的那一套**（界面上填的 OSS 参数）—— 启动期没有库
+    连接，与 ``admin_mfa_enabled`` 是同一条限制。
+
+    **库里的那一套由运行期兜底**（``app/backup/config.py::require_encrypted_ready``）——
+    它按**生效配置**判「配了 OSS 就必须配了加密密钥」，所以界面上配 OSS
+    的那条路（产品自己指给运维的那条）同样上传不了明文制品。
+    两道闸覆盖两种来源，谁都绕不过去。
+    """
+    return all((getattr(settings, name, "") or "").strip() for name in (
+        "oss_endpoint", "oss_access_key_id", "oss_access_key_secret", "oss_bucket"))
+
+
+def _backup_encryption_key_error(raw: str | None) -> str:
+    """``BACKUP_ENCRYPTION_KEY`` 有问题时返回一句**人话**；没问题返回空串。
+
+    **判据与生产者完全一致**（``app/backup/export.py::encryption_key``）：
+    base64（``validate=True``）且解码后**恰好 32 字节**。
+
+    两边必须同口径 —— 启动闸门说「合格」而导出时说「拒绝」，那这条
+    闸门就是骗人的（而且是最坏的那种骗法：它让人以为备份是加密的）。
+    """
+    value = (raw or "").strip()
+    if not value:
+        return "为空"
+    try:
+        key = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error):
+        return "不是合法的 base64"
+    if len(key) != 32:
+        return f"解码后是 {len(key)} 字节（必须是 32 字节）"
+    return ""
+
+
+def validate_production_settings(settings: "Settings", env: str | None = None,
+                                 env_file: Path | None = None) -> list[str]:
     """非 dev 环境下校验配置，不合格**拒绝启动**。
 
     返回通过项（写进启动日志，让运维能确认这次到底检了什么）。
@@ -921,6 +1110,35 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
 
     problems: list[str] = []
     secret = settings.jwt_secret or ""
+
+    # ---------------------------------------------------------------------------
+    # 逃生口不得写进**持久化配置**
+    # ---------------------------------------------------------------------------
+    # 这一条与上面几条性质不同：上面几条判的是「配置对不对」，
+    # 这一条判的是「**这张闸是不是被长期拆掉了**」。
+    #
+    # 逃生口（*_WARN_ONLY）的设计意图是「**这一次**先这样」——
+    # 进程环境里给一次（``TRUSTED_PROXIES_WARN_ONLY=true .venv/bin/uvicorn ...``）
+    # 是合规用法；写进 ``.env`` 则是把「临时放宽」变成「这台机器的常态」。
+    #
+    # 为什么必须拦：豁免本来就是**设计成安静放行**的（它只打一条告警，
+    # 然后继续跑）。三个月前某次救急留下的一行，之后就再也没人想起它 ——
+    # 而 IP 维度的登录节流、Host 白名单、备份加密**这三道闸**，
+    # 在那之后就一直是关着的，而且**没有任何地方会提醒**。
+    #
+    # 正式配法都是有的（配好就不用豁免），所以这一条不是「制造困难」，
+    # 是「别让一次救急变成永久降级」。
+    for _hatch_name, _hatch_value in persistent_escape_hatches(env_file):
+        _fix = APP_SIDE_ESCAPE_HATCH_FIXES.get(_hatch_name, "")
+        problems.append(
+            f"持久化配置（{env_file or _env_file_path()}）里开着逃生口 "
+            f"{_hatch_name}={_hatch_value} —— 逃生口只允许对**单次运行**生效，"
+            f"不允许写进配置文件：写进去它就从「临时放宽」变成了「永久降级」，"
+            f"而且没有任何地方会提醒（豁免本来就是设计成安静放行的）。"
+            + (f" 改法：{_fix}，然后把这行改回 false 或删掉。" if _fix else "")
+            + " 确实只想临时放行，就用进程环境单次启动（不落盘）："
+              f"{_hatch_name}=true .venv/bin/uvicorn ..."
+        )
 
     if secret == DEFAULT_JWT_SECRET or secret.startswith("dev-"):
         problems.append(
@@ -1019,25 +1237,125 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
             "排查请临时开，看完就改回来。")
 
     # ---------------------------------------------------------------------------
-    # MCP 的 Host 白名单：可选的 fail-closed（审查 L-03）
+    # MCP 的 Host 白名单（审查 L-03 / §4.3-2）
     #
-    # **为什么默认不拦**：``.env.example`` 里 ``MCP_ALLOWED_HOSTS=`` 就是空的，
-    # 而 ``MCP_ENABLED=true`` —— 默认就拦的话，**照抄示例的部署会直接起不来**。
+    # **口径变了：从「默认只告警」改成「MCP 开着就必须配」。**
+    #
+    # 原来的理由是「``.env.example`` 里 ``MCP_ALLOWED_HOSTS=`` 是空的，
+    # 而 ``MCP_ENABLED=true``，默认就拦的话照抄示例的部署会直接起不来」。
+    # 审查 §4.3-2 认定这个默认本身就是缺口：**MCP 端点默认开着**
+    # （``mcp_enabled=True``），于是「照抄示例」正好落在
+    # 「MCP 开着 + 白名单空」这个形态里 —— 而启动闸门对它是**完全沉默**的
+    # （既不拦，也不进 ``checks``，因为 ``MCP_ENFORCE_ALLOWED_HOSTS``
+    # 默认 false，而它只在那条开关**显式打开**时才拦）。
+    #
     # 这一项的风险（DNS 重绑定）本身有令牌兜着（端点要 Authorization 头，
-    # 浏览器侧的简单请求带不上；生产又没有 CORS 中间件），所以默认只告警是
-    # 划算的取舍。
+    # 浏览器侧的简单请求带不上；生产又没有 CORS 中间件），所以它不是一个
+    # 敞开的门 —— 但**「这一层没开」这件事必须在启动时显形**，而不是
+    # 藏在某个默认关闭的开关后面。
     #
-    # 想要 fail-closed 的部署把 ``MCP_ENFORCE_ALLOWED_HOSTS=true`` 打开，
-    # 那时它进 problems，拒绝启动。
+    # **豁免口**：``MCP_ALLOWED_HOSTS_WARN_ONLY=true``。本机直连的部署
+    # （只监听 127.0.0.1、不对外）确实不需要白名单。
     # ---------------------------------------------------------------------------
-    if (settings.mcp_enabled and settings.mcp_enforce_allowed_hosts
-            and not mcp_allowed_host_list(settings.mcp_allowed_hosts)):
-        problems.append(
-            "MCP_ALLOWED_HOSTS 为空，但 MCP_ENFORCE_ALLOWED_HOSTS=true —— "
-            "MCP 端点的 DNS 重绑定防护未开启（传输层不校验 Host 头）。"
-            "请设 MCP_ALLOWED_HOSTS=你的域名（如 acct.example.com:*）"
-            "（注意配错的表现是请求在传输层被挡下 400/421，不是 401），"
-            "或把 MCP_ENFORCE_ALLOWED_HOSTS 改回 false。")
+    if settings.mcp_enabled and not mcp_allowed_host_list(settings.mcp_allowed_hosts):
+        if settings.mcp_allowed_hosts_warn_only:
+            log.warning(
+                "MCP_ALLOWED_HOSTS 为空：MCP 端点的 DNS 重绑定防护未开启"
+                "（传输层不校验 Host 头）。已按 MCP_ALLOWED_HOSTS_WARN_ONLY=true"
+                "放行 —— 请确认本服务确实只对本机/内网开放。")
+        else:
+            problems.append(
+                "MCP_ENABLED=true 但 MCP_ALLOWED_HOSTS 为空 —— "
+                "MCP 端点的 DNS 重绑定防护未开启（传输层不校验 Host 头）。"
+                "请设 MCP_ALLOWED_HOSTS=你的域名（如 acct.example.com:*）"
+                "（注意配错的表现是请求在传输层被挡下 400/421，不是 401）；"
+                "本机直连、不对外暴露的部署可以设 MCP_ALLOWED_HOSTS_WARN_ONLY=true "
+                "显式豁免这一项。")
+
+    # ---------------------------------------------------------------------------
+    # 备份制品的加密密钥（审查 §3.8）
+    #
+    # **只在「OSS 备份真的配上了」时才要求** —— 没配 OSS 就没有备份制品，
+    # 也就没有「明文躺在对象存储上」这件事。
+    #
+    # 判据用 **env 层的 OSS 参数**（endpoint / AK id / AK secret / bucket 四项
+    # 齐全），与 ``app/backup/config.py::require_ready`` 的口径一致。
+    # **注意这里看不到库里配的 OSS 参数**（界面上填的那一套）——
+    # 与 ``admin_mfa_enabled`` 同一条限制：启动期没有库连接。
+    #
+    # **所以这一道闸不是全覆盖的**：它只管 env 层那条来源。
+    # 界面上配 OSS（产品自己指给运维的那条路）走的是**生效配置**
+    # （库里优先、env 兜底），启动期看不见它 ——
+    # 补上的是**运行期**那道闸（``app/backup/config.py::require_encrypted_ready``），
+    # 它按生效配置判「配了 OSS 就必须配了加密密钥」，并且在**上传之前**就拒绝。
+    # 两道闸覆盖两种来源。
+    #
+    # **为什么这道必须是 problems 而不是 warning**：消费者的 fail-open 分支在
+    # ``app/backup/service.py`` 里 —— 密钥为空时只打一条 warning，然后
+    # **照旧上传明文 gzip**。而配置里那句承诺（「生产校验会要求它非空」）
+    # 在这条分支上从来没兑现过：``validate_production_settings`` 里
+    # **根本没有**这一项。承诺与实现不一致，比没有承诺更糟 ——
+    # 运维会以为「启动闸门管过了」。
+    #
+    # **豁免口**：``BACKUP_ENCRYPTION_KEY_WARN_ONLY=true``（运行期那道闸同款）。
+    # ---------------------------------------------------------------------------
+    if _oss_backup_configured(settings):
+        key_error = _backup_encryption_key_error(settings.backup_encryption_key)
+        if key_error:
+            if settings.backup_encryption_key_warn_only:
+                log.warning(
+                    "BACKUP_ENCRYPTION_KEY %s —— 已按 "
+                    "BACKUP_ENCRYPTION_KEY_WARN_ONLY=true 放行："
+                    "OSS 上的备份制品将以明文 gzip 存放。", key_error)
+            else:
+                problems.append(
+                    f"BACKUP_ENCRYPTION_KEY {key_error} —— "
+                    "配了 OSS 备份就必须配备份加密密钥：备份管线是 "
+                    "gzip → SHA256 → OSS，而 SHA256 是**校验和不是加密**，"
+                    "于是 OSS 上的对象是**明文 gzip 压缩包**；桶的读权限一旦"
+                    "泄露（AK 泄露 / 桶策略过宽 / 云侧账号被盗），全部账套的"
+                    "凭证与金额就一起出去了。"
+                    "生成一把：python -c \"import base64,os;"
+                    "print(base64.b64encode(os.urandom(32)).decode())\"；"
+                    "若确实要先用明文跑，设 BACKUP_ENCRYPTION_KEY_WARN_ONLY=true。")
+
+    # ---------------------------------------------------------------------------
+    # 反向代理白名单（审查 §3.44）
+    #
+    # **这一项从「告警」升成了「阻断」**，理由与取舍写在
+    # ``Settings.trusted_proxies_warn_only`` 的注释里。一句话版本：
+    # 空白名单在反代后面是**全站共用一个来源桶**，实测一个**未认证**的
+    # 匿名请求发 30 次错误登录就能把**全公司**的登录锁死 15 分钟，
+    # 而且每条登录审计的来源 IP 都退化成 127.0.0.1。
+    #
+    # 告警拦不住它：这条告警从功能上线起就在那儿，而**照抄
+    # ``.env.example``（``TRUSTED_PROXIES=`` 为空）的部署**正好落在这个
+    # 形态上，没人读告警。
+    #
+    # **本机直连的部署**（不经过任何代理）确实不需要白名单 ——
+    # 那是 ``TRUSTED_PROXIES_WARN_ONLY=true`` 的用途。
+    # ---------------------------------------------------------------------------
+    if not trusted_proxy_networks(settings.trusted_proxies):
+        if settings.trusted_proxies_warn_only:
+            log.warning(
+                "TRUSTED_PROXIES 为空：IP 维度登录节流只按 TCP 对端计。"
+                "若本服务在反向代理后面（nginx → 127.0.0.1:8000），"
+                "所有用户会共用同一个来源地址 —— 未认证者 30 次失败登录就能"
+                "把全公司的登录锁死 15 分钟，且登录审计里的来源 IP 全部退化成"
+                "127.0.0.1。已按 TRUSTED_PROXIES_WARN_ONLY=true 放行。"
+                "当前这套分桶形态随时可查：GET /api/system/login-protection。")
+        else:
+            problems.append(
+                "TRUSTED_PROXIES 为空：IP 维度的登录节流退化成「全站一个桶」—— "
+                "只按 TCP 对端计，于是反代（nginx → 127.0.0.1:8000）后面的"
+                "所有请求共用一个来源地址。实测一个**未认证**的匿名请求发 30 次"
+                "错误登录（login_ip_max_failures=30、login_ip_window_seconds=900）"
+                "就能把**全公司**的登录锁死 15 分钟，且可无限重复触发；"
+                "同一机制下每一条登录审计的来源 IP 都退化成 127.0.0.1，"
+                "事后追溯彻底失效。"
+                "请设 TRUSTED_PROXIES=你的反向代理地址（如 127.0.0.1）后重启；"
+                "确实不经过任何代理的直连部署可设 TRUSTED_PROXIES_WARN_ONLY=true "
+                "显式豁免这一项。")
 
     if problems:
         raise ValueError(
@@ -1052,66 +1370,44 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
         "数据库密码非默认值",
         f"日志级别 {settings.log_level}（生产不允许 DEBUG）",
     ]
-    log.info("生产配置校验通过：%s", "；".join(checks))
 
-    # **告警而不是拒绝启动。** 这条部署形态（nginx → 127.0.0.1:8000，见
-    # deploy/nginx/cwq.conf）下，TRUSTED_PROXIES 留空意味着所有请求的 TCP
-    # 对端都是 127.0.0.1 —— IP 维度节流于是退化成「全站一个桶」，任何人的
-    # 连续输错都可能把所有人一起挡一会儿。软节流不至于锁死谁，但这是运维
-    # 该知道的一件事。
+    # **下面这两条都是「已经过了闸门」之后的补充说明。**
     #
-    # 为什么不当成 problem（拒绝启动）：默认配置已经在挡着一大批真实部署，
-    # 把它们全部变成「升级之后起不来」是拿可用性换一个已经由 429 兜着的风险。
-    # 宁可用一条启动告警把话说清楚。
+    # 「TRUSTED_PROXIES 为空」与「MCP 白名单为空」这两个形态**已经**
+    # 在上面处理过了：配齐了就不进这一段；没配齐时要么被**拒绝启动**
+    # （默认），要么按 ``*_WARN_ONLY=true`` 显式豁免并在那里打了一条告警。
+    # 所以这里只剩「配置是好的，但还有一条要提醒」的形态。
     if not trusted_proxy_networks(settings.trusted_proxies):
-        log.warning(
-            "TRUSTED_PROXIES 为空：IP 维度登录节流只按 TCP 对端计。"
-            "若本服务在反向代理后面（nginx → 127.0.0.1:8000），"
-            "所有用户会共用同一个来源地址，节流会误伤；"
-            "请设 TRUSTED_PROXIES=127.0.0.1（按实际对端）后重启。"
-            "不设也能工作 —— 节流是软节流，只回 429，不锁账号。"
-            "当前这套分桶形态随时可查：GET /api/system/login-protection"
-            "（管理界面「用户与授权 → 登录防护」也能看到）。")
+        # 走到这里 = 运维显式豁免了（TRUSTED_PROXIES_WARN_ONLY=true），
+        # 告警已经在上面打过；这里只把它写进「已检查项」清单，让它在
+        # 启动日志里显形。
+        checks.append("TRUSTED_PROXIES 为空（已按 TRUSTED_PROXIES_WARN_ONLY=true "
+                      "豁免；IP 维度节流按 TCP 对端分桶）")
     elif not settings.login_ip_throttle_enabled:
         log.warning(
             "LOGIN_IP_THROTTLE_ENABLED=false：IP 维度登录节流已关闭，"
             "轮换账号名的爆破将不受任何聚合限制（这是显式的 fail-open）。")
 
-    # MCP 的 DNS 重绑定防护同理：它默认**关着**（这里留空 ⇒ 传输层不做
-    # Host 校验），配了 ``MCP_ALLOWED_HOSTS`` 才开。
-    #
-    # 为什么默认关而不是「只放行 127.0.0.1」：这个端点的第一道闸是
-    # **每次请求都校验的 bearer 令牌**，而生产没有 CORS 中间件（跨源读不到
-    # 响应、也带不上 Authorization 头）—— 浏览器侧的 DNS 重绑定拿不到令牌，
-    # 读不到任何数据。fail-closed 在这里有个更糟的表现：服务看起来装好了，
-    # 却把每一个外部 agent 都挡在外面，运维看到的是一个不透明的 400/421
-    # 而不是一句配置提示。
-    #
-    # 当成**告警**而不是拒绝启动：MCP 是新增面，没配的人可能压根不用它；
-    # 而为了一个可选功能拒绝启动，代价（升级后起不来）远大于收益。
-    #
-    # **审查 L-03 之后改了两处**（仍然默认不拦）：
-    #   1. 告警级别从 warning 提到 **ERROR** —— 它是"纵深防御缺了一层"，
-    #      不该和「TRUSTED_PROXIES 为空」那条（纯部署形态提示）一个量级；
-    #   2. 这条**写进启动校验的「已检查项」清单**，于是它在启动日志里显形，
-    #      而不是淹没在一堆日志里。
-    # 想要 fail-closed 的部署把 ``MCP_ENFORCE_ALLOWED_HOSTS=true`` 打开 ——
-    # 那时它就进 problems，拒绝启动。默认不开是因为
-    # ``.env.example`` 里这一项本来就是空的，开着会让照抄示例的部署直接起不来。
-    if settings.mcp_enabled and not mcp_allowed_host_list(settings.mcp_allowed_hosts):
-        message = (
-            "MCP_ALLOWED_HOSTS 为空：MCP 端点的 DNS 重绑定防护未开启"
-            "（传输层不校验 Host 头）。端点仍需令牌才能访问，所以这不是"
-            "一个敞开的门；但若要为这一层再加一道，请设 "
-            "MCP_ALLOWED_HOSTS=你的域名（如 acct.example.com:*）后重启 —— "
-            "注意配错的表现是请求在传输层被挡下（400/421），不是 401。")
-        if settings.mcp_enforce_allowed_hosts:
-            # 强制模式已经在上面进 problems 并抛出去了，走不到这里。
-            log.error(message)
+    # MCP 的 Host 白名单：配了就在「已检查项」里显形 —— 「这一层开着」
+    # 与「这一层没开」同样值得出现在启动日志里。
+    if settings.mcp_enabled:
+        if mcp_allowed_host_list(settings.mcp_allowed_hosts):
+            checks.append("MCP Host 白名单已配置（DNS 重绑定防护开启）")
         else:
-            log.error(message)
-            checks.append("MCP Host 白名单未配置（已告警；"
-                          "要拒绝启动请设 MCP_ENFORCE_ALLOWED_HOSTS=true）")
+            # 走到这里 = 运维显式豁免了（MCP_ALLOWED_HOSTS_WARN_ONLY=true），
+            # 告警已经在上面打过。
+            checks.append("MCP Host 白名单未配置（已按 MCP_ALLOWED_HOSTS_WARN_ONLY=true "
+                          "豁免；DNS 重绑定防护未开启）")
+
+    # 备份加密密钥：配了就显形，**没配（且被显式豁免）也要显形** ——
+    # 「OSS 上的备份制品是明文」这件事必须出现在启动日志的「已检查项」里，
+    # 而不是只留在一条告警里。
+    if _oss_backup_configured(settings):
+        if _backup_encryption_key_error(settings.backup_encryption_key):
+            checks.append("备份加密密钥未配置（已按 BACKUP_ENCRYPTION_KEY_WARN_ONLY=true "
+                          "豁免；OSS 上的备份制品为明文 gzip）")
+        else:
+            checks.append("备份加密密钥已配置（OSS 上的备份制品为密文）")
 
     # CORS 白名单写成 ``*`` 时提醒一句。
     #
@@ -1134,6 +1430,7 @@ def validate_production_settings(settings: "Settings", env: str | None = None) -
             "CORS_ALLOW_ORIGINS=https://cdn.example.com。")
         checks.append("CORS 白名单含 '*'（已告警；未鉴权接口对任意源可读）")
 
+    log.info("生产配置校验通过：%s", "；".join(checks))
     return checks
 
 

@@ -377,6 +377,12 @@ def test_版本号每条语句只加一次(db, book, make_voucher):
     # **一条** INSERT 语句插 500 行分录（250 借 + 250 贷）。
     # 借贷必须配平：trg_entry_balance 是延迟到提交时校验的约束，
     # 只插借方会在 commit 时被护栏拦下，跟本条要测的东西完全无关。
+    #
+    # 行号从 **3** 起：make_voucher 自己已经建了 1、2 两行，
+    # 而 ``uq_entry_voucher_line_no``（迁移 0038）规定同一张凭证里
+    # 行号不能重复 —— 从 2 开始插会撞上它已有的那一行。
+    # （那条唯一约束挡的正是「并发改同一张凭证留下的重复分录」，
+    # 同一笔钱在账上记两遍，而借贷仍然平。）
     db.execute(
         text("""INSERT INTO entry
                  (voucher_id, book_id, period_ord, line_no, subject_id,
@@ -386,7 +392,7 @@ def test_版本号每条语句只加一次(db, book, make_voucher):
                       CASE WHEN g.i % 2 = 0 THEN :dr ELSE :cr END,
                       CASE WHEN g.i % 2 = 0 THEN 'DEBIT' ELSE 'CREDIT' END,
                       0.01, '批量'
-               FROM generate_series(2, 501) AS g(i)"""),
+               FROM generate_series(3, 502) AS g(i)"""),
         {"vid": v.id, "bid": bid, "pid": v.period_id,
          "dr": subs["1001"].id, "cr": subs["2001"].id})
     db.commit()

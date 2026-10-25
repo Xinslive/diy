@@ -9,6 +9,26 @@ User=cwq
 Group=cwq
 WorkingDirectory=/opt/cwq/backend
 
+# ---------------------------------------------------------------------------
+# TimeoutStartSec：**必须显式给**，不能靠 systemd 的默认值。
+# ---------------------------------------------------------------------------
+#
+# `Type=oneshot` 的服务，**整个执行时长**都算在 TimeoutStartSec 里面 ——
+# 不是「启动到 ready 的那一段」。而 systemd 的 DefaultTimeoutStartSec
+# 默认只有 90 秒。
+#
+# 后果不是「备份慢了一点」，而是**一个备份产物都没有**：
+# 库长到 pg_dump 要跑超过 90 秒（1.6 GB / 2 核的机器上很常见）→ systemd
+# 到点 SIGTERM → db_backup.py 的 dump_to_file 走异常路径把临时文件 unlink 掉
+# → **目录里一个备份都不剩**，unit 状态 failed。
+#
+# 而「没有备份」这件事**不报错**：timer 显示 enabled、每天到点跑、
+# 每天都失败、没人看 journal —— 比没有定时备份更危险，因为它看起来是有的。
+#
+# 1800 秒（30 分钟）是对着「库长到几 GB 时一次 pg_dump 要几分钟」给的余量。
+# 对照：同一个仓库里的 cwq-deploy.service 用的是 1800。
+TimeoutStartSec=1800
+
 EnvironmentFile=/opt/cwq/backend/.env
 
 # 保留最近 N 份。**不要去掉 --keep**：没有保留策略的每日备份会慢慢把

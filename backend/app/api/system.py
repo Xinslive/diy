@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timezone
 from typing import Optional
@@ -269,7 +270,29 @@ def list_users(user: SysUser = Depends(get_current_user), db: Session = Depends(
 
 @router.post("/users", status_code=201)
 def create_user(payload: UserIn, user: SysUser = Depends(get_current_user),
-                db: Session = Depends(get_db)):
+                db: Session = Depends(get_db),
+                _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """建号。**高危动作**，要求「近期重新认证」。
+
+    **为什么建号也要二次验证**（审查 §3.2）：契约写在
+    ``core/config.py:225`` —— 「管理员验过二次因子之后，这个窗口内做高危
+    动作（改他人口令 / **装插件** / 读 OSS 凭据 / 轮换调度密钥 / 删用户）
+    不再重复要求走邮箱」，而这一条**漏在契约之外**了。
+
+    漏掉它的代价不是「权限更大」，而是**逃逸令牌有效期**：
+    ``require_recent_admin_mfa`` 的全部意义就是把危险动作与「令牌刚被偷」
+    解耦。一枚**没有 ``mfa_at``** 的管理员令牌（MFA 开关打开之前签发的，
+    最长还有 4 小时有效）本来只能做「当次请求里的事」，但 ``POST /users``
+    能**铸出一个比令牌活得久的新凭据** —— 新账号登录后不经过二次验证，
+    于是那次偷来的令牌在 4 小时窗口之后**照样能进系统**。
+
+    而**同一份权限**（账套角色）在 ``PUT /users/{id}/books`` 上是被正确
+    拦住的：同一个洞的两条路，只堵了一条。
+
+    二次验证开关关着时这个依赖**不拦人**（见
+    ``core/deps.py::require_recent_admin_mfa``），所以挂着它不影响现有用户；
+    开关开着而通道坏了时它**一律拒绝**（fail-closed）。
+    """
     _require_admin(user)
     if db.scalar(select(SysUser).where(SysUser.username == payload.username)):
         raise HTTPException(400, f"用户名「{payload.username}」已存在")
@@ -478,8 +501,9 @@ def delete_user(user_id: int, user: SysUser = Depends(get_current_user),
 
 @router.post("/users/{user_id}/unlock")
 def unlock_user(user_id: int, user: SysUser = Depends(get_current_user),
-                db: Session = Depends(get_db)):
-    """**提前解除锁定**，不等锁定自然到期。
+                db: Session = Depends(get_db),
+                _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """**提前解除锁定**，不等锁定自然到期。**高危动作**，要求「近期重新认证」。
 
     为什么必须有这个口子：递进式锁定本身是**可被主动触发的拒绝服务** ——
     知道用户名的人连错三次就能把账号挡在门外，而锁定时长会随轮次递增。
@@ -493,6 +517,26 @@ def unlock_user(user_id: int, user: SysUser = Depends(get_current_user),
     意味着「这个账号回到了正常状态」，下一轮该从 10 分钟重新算。
     不清零的话，被反复锁的账号会一路涨到上限，管理员每解一次都要重新
     走一遍 10→20→30 的阶梯。
+
+    **为什么这一条要挂二次验证 —— 它是「放松」而不是「收紧」。**
+
+    这一条是本组管理员写路由里**唯一**一个**解除安全限制**的动作（其余
+    要么铸造凭据、要么改写凭据、要么改权限面）。它把**别人**账号上的
+    「失败计数 + 锁定」清零，也就是把**针对那个账号的撞库防线**拆掉。
+
+    于是：``POST /api/system/users/{id}/unlock`` 在 MFA 开着时若不设闸，
+    一枚**刚被偷**的管理员令牌就能反复给某个受害者账号「解锁」，让另一个人
+    对该账号的撞库**不受锁定限制**地继续下去 —— 而账号锁定是那条路径上
+    **唯一**的防线（IP 维度只挡同一个来源，分布式喷洒挡不住）。
+
+    与「吊销类路由不挂」并不矛盾：吊销是**收紧**（杀掉一个凭据），
+    解锁是**放松**（拆掉一道防线）。方向相反，处置就该相反。
+
+    **不会造成新的死锁**：被自己的锁定挡在门外的管理员**今天**也解不开
+    自己（这条路由要求管理员身份，而管理员身份要先登录）—— 所以挂这道闸
+    只是把「解封」这一步从「一次普通请求」变成「一次近期验证过的请求」，
+    没有关掉任何原本能走通的出路。真正的逃生口仍然是
+    ``scripts/mfa_admin.py --disable`` 与 ``ADMIN_MFA_EMERGENCY_CODE``。
 
     留痕：解锁是「谁在什么时候放行了谁」—— 这条在事后是要看的。
     """
@@ -759,7 +803,21 @@ def get_ocr_config(user: SysUser = Depends(get_current_user), db: Session = Depe
 
 @router.put("/ocr")
 def put_ocr_config(payload: OcrConfigPatch, user: SysUser = Depends(get_current_user),
-                   db: Session = Depends(get_db)):
+                   db: Session = Depends(get_db),
+                   _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """改外部识别服务配置（**含第三方 api_token**）。**高危动作**。
+
+    **为什么挂「近期重新认证」**：``api_token`` 是**第三方服务凭据** ——
+    能花钱、能调用别人的 OCR 服务、能被换掉（改掉之后所有识别请求都发到
+    攻击者的服务上去，而发票数据也随之而去）。改写凭据与「铸造凭据」
+    同档（§3.2 的口径：「危险动作与『令牌刚被偷』解耦」）。
+
+    与 ``PUT /api/system/backup``（写 OSS AccessKey）同一档 —— 那条早
+    就挂着这道依赖；这里是对同一条判据的补齐。
+
+    **读接口不挂**：``GET /api/system/ocr`` 只回「配没配」与末 4 位，
+    管理员在没做二次验证时也该能看见配置状态。
+    """
     _require_admin(user)
     before = system_settings.ocr_config(db)
     updates: dict[str, object] = {}
@@ -861,7 +919,52 @@ def get_notify_config(user: SysUser = Depends(get_current_user),
 @router.put("/notify")
 def put_notify_config(payload: NotifyConfigPatch,
                       user: SysUser = Depends(get_current_user),
-                      db: Session = Depends(get_db)):
+                      db: Session = Depends(get_db),
+                      _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """改邮件通知配置（SMTP 服务器/账号/口令 + **收件人**）。**高危动作**。
+
+    **为什么它必须是高危动作 —— 这一条就是二次验证本身的开关。**
+
+    管理员二次验证邮件**没有 per-user 收件人**（``sys_user`` 表里没有邮箱列），
+    全部统一发给全局 ``notify_config.recipients``。于是「谁能改收件人」就等于
+    「谁能收到下一次二次验证邮件」。
+
+    实测跑通的完整链条（复核方 2026-10-25，**修复前**）::
+
+        [旁路 0] 建号(受管控)              -> 403「该操作需要近期完成邮箱二次验证…」
+        [旁路 1] PUT /api/system/notify     -> 200（这条路由没挂二次验证）
+        [旁路 1] 现在的收件人 = ['attacker@evil.test']
+        [旁路 2] POST /api/auth/mfa/reauth  -> 200，邮件真的发给了攻击者
+        [旁路 3] 点真链接                     -> 200
+        [旁路 4] POST /api/auth/mfa/poll     -> 200，拿到一枚带 mfa_at 的令牌
+        [旁路 5] 建号(受管控)              -> 201，账号真的建出来了
+
+    也就是说：``require_recent_admin_mfa`` 挡住的那条路，可以从「改收件人」
+    这条侧翼整个绕过去 —— 而「改收件人」恰恰是**让二次验证生效的那个开关**。
+
+    **两道锁，缺一不可**：
+
+    1. **本路由挂上「近期重新认证」** —— 没有 ``mfa_at`` 的令牌改不了收件人
+       （上面前两步就被 403 打断）；
+    2. **投递目标一变，作废所有未完成的挑战**（见
+       :func:`app.notify.mfa.expire_open_challenges`）—— 挡住「先改收件人、
+       再等一个旧挑战被点开」这条路径。
+
+    **口令与 SMTP 服务器也在同一条路由上**：改 ``smtp_password`` 就是
+    **改写第三方凭据**，改 ``smtp_host`` 就是**换掉二次验证的投递通道** ——
+    两者都与「铸造/改写凭据」同档，所以一起挂这道闸。
+
+    **可用性上的取舍（刻意选 fail-closed）**：二次验证开着而 SMTP 通道坏了
+    时，这条路由也会被挡下（403），管理员**改不了** SMTP 来修通道。此时的
+    逃生口与其它高危路由一致 —— ``scripts/mfa_admin.py --disable``（明确关掉）
+    与进程环境里的 ``ADMIN_MFA_EMERGENCY_CODE``。理由是：这条路由一旦在
+    「通道坏了」的状态下放开，攻击者就能用它把通道**配到自己的服务器上**，
+    然后整道 §3.2 的闸门从侧翼被击穿 —— 那正是本次修掉的那个洞。
+
+    审计：``SYSTEM_NOTIFY_CONFIG_UPDATE`` 记 before/after（含 ``recipients``
+    与 ``password_hint``）；投递目标变更导致的挑战作废另记一条
+    ``SYSTEM_MFA_CHALLENGES_INVALIDATED``。
+    """
     _require_admin(user)
     before = notify_config.smtp_config_public(db)
     updates: dict[str, str] = {}
@@ -907,17 +1010,50 @@ def put_notify_config(payload: NotifyConfigPatch,
                ("host", "port", "username", "password_hint",
                 "from_address", "use_ssl", "use_tls", "recipients", "enabled")},
     )
+
+    # ---- 投递目标变了 ⇒ 此前发出去的一切二次验证邮件都不再可信 ----------
+    #
+    # 收件人换了、或者换掉了发信服务器（SMTP host）：此前**已经发出**的
+    # 验证邮件是按旧投递目标投出去的 —— 截获了它的人仍然能点开那条链接。
+    # 所以这里把**所有**未完成的挑战（PENDING 与 VERIFIED）作废。
+    #
+    # 只在「投递目标真的变了」时做：改个端口、改个超时不该把别人正在
+    # 进行的登录打断掉。
+    delivery_changed = (
+        before.get("recipients") != after.get("recipients")
+        or before.get("host") != after.get("host")
+    )
+    if delivery_changed:
+        expired = mfa_service.expire_open_challenges(
+            db, reason="邮件通知投递目标变更")
+        log(
+            db,
+            action="SYSTEM_MFA_CHALLENGES_INVALIDATED",
+            entity="system_setting",
+            entity_id="notify",
+            user=user,
+            detail=f"邮件通知投递目标变更，作废未完成的二次验证挑战 {expired} 条",
+            before={"recipients": before.get("recipients"), "host": before.get("host")},
+            after={"recipients": after.get("recipients"), "host": after.get("host"),
+                   "expired_challenges": expired},
+        )
     db.commit()
     return after
 
 
 @router.post("/notify/test")
 def test_notify(user: SysUser = Depends(get_current_user),
-                db: Session = Depends(get_db)):
-    """发一封测试信。
+                db: Session = Depends(get_db),
+                _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """发一封测试信。**高危动作**，要求「近期重新认证」。
 
     **收件人就是真实的收件人** —— 收不到信的地址就是配错了，而
     「配错了却显示测试成功」是最没用的测试结果。
+
+    **为什么它也要挂二次验证**：它用的是**当前**收件人 —— 也就是「改完
+    收件人之后，验证一下信能不能发出去」。这正是上面那条旁路链条里的
+    「投递通道可用性确认」那一环：没有这道闸，一个刚改完收件人的攻击者
+    就能确认自己的地址真的收得到信。
     """
     _require_admin(user)
     config = notify_config.smtp_config(db)
@@ -1060,14 +1196,31 @@ def put_backup_config(payload: BackupConfigPatch, user: SysUser = Depends(get_cu
 @router.post("/backup/test")
 def test_backup_connection(user: SysUser = Depends(get_current_user),
                            db: Session = Depends(get_db)):
-    """写一个探针对象再删掉 —— 验的是「能不能写」，那才是备份唯一要紧的事。"""
+    """写一个探针对象再删掉 —— 验的是「能不能写」，那才是备份唯一要紧的事。
+
+    **这里只验连通，不要求加密密钥。** 「能不能写」与「备份跑不跑得起来」
+    是两件事：正在配 OSS 的人会先测连通性，这时让他先配一把密钥才能测，
+    是在流程中间横插一道与本按钮无关的关卡。
+
+    但**「备份跑不起来」这件事必须在这里就说出来** —— 连通性测试通过、
+    第二天早上备份因为缺密钥而整轮失败，是最坏的一种组合
+    （界面说「连接正常」，运维就以为退路是好的）。
+    所以响应里带上 ``encryption_ready``，并在消息里说清楚。
+    """
     _require_admin(user)
     try:
         cfg = backup_config.require_ready(db)
         message = oss_client.check_connection(cfg)
     except (backup_config.ConfigIncomplete, oss_client.OssError) as exc:
         raise HTTPException(400, str(exc)) from exc
-    return {"ok": True, "message": message}
+
+    encryption_ready = backup_config.encryption_ready()
+    if not encryption_ready:
+        message = (f"{message}；但**备份加密密钥没配**（BACKUP_ENCRYPTION_KEY）—— "
+                   "此时点「立即备份」会被拒绝，备份制品也不会是密文。"
+                   "配一把：python -c \"import base64,os;"
+                   "print(base64.b64encode(os.urandom(32)).decode())\"")
+    return {"ok": True, "message": message, "encryption_ready": encryption_ready}
 
 
 @router.post("/backup/run")
@@ -1089,7 +1242,9 @@ def trigger_backup(
     username = user.username
     user_id = user.id
     try:
-        backup_config.require_ready(db)
+        # **要求制品一定是密文**（按**生效配置**判，界面上配 OSS 的那条路也在内）。
+        # 启动期那道闸只看得到 env 层 —— 启动时没有库连接。
+        backup_config.require_encrypted_ready(db)
     except backup_config.ConfigIncomplete as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -1184,7 +1339,21 @@ def list_scheduler_tasks(request: Request, user: SysUser = Depends(get_current_u
 @router.put("/scheduler/tasks/{plugin_id}/{task_name}")
 def set_scheduler_plugin_task(plugin_id: str, task_name: str, payload: SchedulerTaskPatch,
                               request: Request, user: SysUser = Depends(get_current_user),
-                              db: Session = Depends(get_db)):
+                              db: Session = Depends(get_db),
+                              _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """开关一个**插件**的定时任务。**高危动作**，要求「近期重新认证」。
+
+    **为什么挂这道闸**：插件任务跑在**宿主进程里**（除非开了插件隔离，
+    见 ``PLUGIN_ISOLATION``），所以「让某个插件任务开始/停止跑」=「让一段
+    外部代码在宿主里开始/停止执行」。它改的是**执行面**，与「铸造凭据」
+    同属一类需要与「令牌刚被偷」解耦的动作。
+
+    对比 ``POST /api/system/scheduler/secret/rotate``（轮换外部调度触发
+    密钥）—— 那条早挂着这道依赖；这里是同一条判据的补齐。
+
+    **只开关插件自己的任务**：系统任务（``owner_type != "PLUGIN"``）在这一条
+    路由上根本改不动（404），所以这里不会变成「关掉全站备份计划」的后门。
+    """
     _require_admin(user)
     now = scheduler_service.utcnow()
     scheduler_service.sync_tasks(db, getattr(request.app.state, "plugin_runtime", None), now)
@@ -1206,8 +1375,25 @@ def set_scheduler_plugin_task(plugin_id: str, task_name: str, payload: Scheduler
         if not row.enabled:
             row.next_run_at = scheduler_service._next(row.schedule, now, include_current_minute=True)
     row.enabled = payload.enabled
-    log(db, action="SCHEDULER_TASK_UPDATE", entity="scheduled_task", entity_id=row.task_key,
-        user=user, detail="更新插件定时任务开关", before={"enabled": was_enabled}, after={"enabled": row.enabled})
+    # **entity_id 必须收敛长度**（审查 §3.21）。
+    #
+    # ``audit_log.entity_id`` 是 ``String(64)``，而 ``row.task_key`` 最长可达
+    # **152 字符**（``scheduler/service.py`` 里是 ``f"plugin:{plugin_id}:{name}"``，
+    # plugin_id 上限 96、任务名上限 48）。原来把 task_key 整个塞进去 →
+    # 库层 sqlstate **22001** → **整个事务回滚**：开关的修改被撤销，
+    # 审计行也一并消失（连「有人试图改过」都没留下），而全局异常处理器
+    # 把它翻成 400「提交的内容超出了字段允许的长度」—— 与真正的病因
+    # 毫无关系。
+    #
+    # 口径与全仓其余写入点一致（``scheduler/service.py`` 的 ``_marker_id``、
+    # ``plugins/audit.py`` 的 ``plugin_id[:64]``、``api/auth.py`` 的
+    # ``username[:64]``）：**散列到 32 位**。完整的 task_key 放进
+    # ``detail`` 与 ``after`` —— 一个字都不丢，只是换了个字段放。
+    entity_id = hashlib.sha256(row.task_key.encode()).hexdigest()[:32]
+    log(db, action="SCHEDULER_TASK_UPDATE", entity="scheduled_task", entity_id=entity_id,
+        user=user, detail=f"更新插件定时任务开关：{row.task_key}",
+        before={"enabled": was_enabled, "task_key": row.task_key},
+        after={"enabled": row.enabled, "task_key": row.task_key})
     db.commit()
     return {"task_key": row.task_key, "enabled": row.enabled,
             "next_run_at": row.next_run_at.isoformat()}

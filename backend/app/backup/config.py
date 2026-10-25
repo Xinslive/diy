@@ -14,12 +14,15 @@ AK id 原样回给前端，它就会出现在浏览器历史、网络面板和�
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.core import system_settings
 from app.models import KEEP_DAYS, TIER_DAILY, TIER_MONTHLY, TIER_WEEKLY
+
+logger = logging.getLogger(__name__)
 
 # 存储 key -> (返回给调用方的名字, app.core.config.Settings 上的字段名)。
 # 与 system_settings.OCR_SPEC 同一个写法与同一个理由：这三处名字（库里存什么、
@@ -142,3 +145,87 @@ def require_ready(db: Session) -> dict[str, Any]:
             "请到「系统管理 → 数据安全」填写后重试。")
     cfg["prefix"] = (cfg["prefix"] or DEFAULT_PREFIX).strip("/")
     return cfg
+
+
+class EncryptionKeyMissing(ConfigIncomplete):
+    """OSS 备份配好了，但**备份加密密钥**没配 —— 制品会以**明文 gzip** 上传。
+
+    **继承** :class:`ConfigIncomplete` 是有意的：调用方（``scripts/backup_to_oss.py``、
+    ``api/system.py``）已经在 catch 那个异常，而「备份没配好」正是这里发生的事。
+    """
+
+
+def encryption_ready() -> bool:
+    """备份加密密钥配好了没有（**不抛异常**）。
+
+    问的是「制品会不会是密文」，不是「OSS 配了没有」——
+    给「测试连接」那个按钮用：**连通性归连通性、密文归密文**，两件事分开报。
+    正在配 OSS 的人不该被「先配一把密钥」拦住才能测连通性；
+    但「连通但备份跑不起来」这件事必须当场说出来。
+
+    判据仍然是**生产者本人**（``export.encryption_key``）：
+    它抛 ``ExportRefused`` = 配了但不合格 → 那更不能算「ready」。
+    """
+    from app.backup import export as export_mod
+
+    try:
+        return export_mod.encryption_key() is not None
+    except export_mod.ExportRefused:
+        return False
+
+
+def require_encrypted_ready(db: Session) -> dict[str, Any]:
+    """取出生效配置，**并且**要求备份制品一定是密文。
+
+    **为什么启动期的闸门不够（审计报告 §3.8 的复核结论，2026-10-25 补）。**
+
+    启动闸门（``core/config.py::validate_production_settings``）看的是
+    **env 层**的 OSS 参数 —— 启动期没有库连接，看不到**界面上填的那一套**。
+    而备份管线真正用的是**生效配置**（:func:`oss_config`：库里优先、env 兜底）。
+
+    于是「在界面上配 OSS」这条**产品自己指给运维的路**
+    （``require_ready`` 的报错原文就是「请到「系统管理 → 数据安全」填写后重试」）
+    上，启动闸门**不响**，每晚的备份就以**明文 gzip** 躺在对象存储上 ——
+    审计 §3.8 写的那条失败场景，在这条路径上**原样可达**。
+
+    所以这里把同一道闸搬到**运行期**、按**生效配置**判 ——
+    一处实现同时覆盖 env 与界面两条来源。
+
+    **判据用生产者本人**（``export.encryption_key``）：
+    它返回 None = 没配（不加密），它抛 ``ExportRefused`` = 配了但不合格。
+    不另写一份「算不算配了」的判据 —— 启动闸门说「合格」而导出说「拒绝」，
+    那这道闸就是骗人的（而且是最坏的那种骗法：它让人以为备份是加密的）。
+
+    **豁免口**与启动闸门同一个：``BACKUP_ENCRYPTION_KEY_WARN_ONLY=true``
+    （登记在 ``app/core/escape_hatches.py``）。
+    """
+    cfg = require_ready(db)
+
+    from app.backup import export as export_mod
+
+    try:
+        key = export_mod.encryption_key()
+    except export_mod.ExportRefused:
+        # 配了但不合格（不是合法 base64 / 不是 32 字节）—— 让生产者自己说为什么，
+        # 它的话最准（还带着「怎么生成」的命令）。
+        raise
+    if key is not None:
+        return cfg
+
+    if _settings().backup_encryption_key_warn_only:
+        logger.warning(
+            "OSS 备份未加密：没有配置 BACKUP_ENCRYPTION_KEY —— 已按 "
+            "BACKUP_ENCRYPTION_KEY_WARN_ONLY=true 放行，"
+            "备份制品将以明文 gzip 存放在 OSS 上。")
+        return cfg
+
+    raise EncryptionKeyMissing(
+        "OSS 备份已配置，但没有配置备份加密密钥（BACKUP_ENCRYPTION_KEY）—— "
+        "**备份制品会以明文 gzip 上传到对象存储**。"
+        "备份管线是 gzip → SHA256 → OSS，而 SHA256 是**校验和不是加密**："
+        "桶的读权限一旦泄露（AK 泄露 / 桶策略过宽 / 云侧账号被盗），"
+        "全部账套的凭证与金额就一起出去了。"
+        "生成一把：python -c \"import base64,os;"
+        "print(base64.b64encode(os.urandom(32)).decode())\"；"
+        "若确实要先用明文跑，设 BACKUP_ENCRYPTION_KEY_WARN_ONLY=true。")
+

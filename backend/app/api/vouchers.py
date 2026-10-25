@@ -19,7 +19,8 @@ from datetime import date
 from decimal import Decimal
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
+from fastapi import (APIRouter, Depends, File, HTTPException, Query, Request,
+                     Response, UploadFile)
 from pydantic import BaseModel, Field
 from sqlalchemy import func, literal, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -28,8 +29,9 @@ from sqlalchemy.orm import Session
 from app.accounting import importer as svc_import
 from app.accounting import organize as svc_organize
 from app.accounting import vouchers as svc
-from app.accounting.util import find_period, money
+from app.accounting.util import constraint_name, find_period, money
 from app.api.schemas import BatchIds, VoucherIn
+from app.core import idempotency as idem
 from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
 # 本地别名保持函数名 ``read_upload`` 不变：``tests/test_upload_capacity_matrix.py``
@@ -42,6 +44,16 @@ from app.models import (Book, Entry, ImportBatch, Period, Subject, SysUser,
 log = logging.getLogger("app.api.vouchers")
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+#: 凭证号在期间内唯一。撞号时数据库只会说「违反唯一约束」，
+#: 看到的人不知道该改哪个字段 —— 所以把它翻成人话时要认得出**是哪一条**约束。
+#:
+#: 与 ``accounting/vouchers.py``、``accounting/organize.py`` 里的那份同名常量
+#: 是**同一个约束**（三处各写一份是本仓的既有做法：它们分属不同层，
+#: 互相 import 会成环）。认约束而不是「凡 IntegrityError 都当撞号」——
+#: 别的违例（外键指向不存在、字段非空、库层 CHECK 护栏）撞上时，
+#: 报「凭证号重复」是**假话**，用户会照着改一个根本没问题的字段。
+_NO_UNIQUE = "uq_voucher_period_no"
 
 
 def _filename(name: str) -> str:
@@ -98,7 +110,8 @@ def _book_periods(db: Session, book_id: int, period_ids: set[int]) -> dict[int, 
 
 
 def _serialize(db: Session, v: Voucher, subs: dict[int, Subject] | None = None,
-               periods: dict[int, Period] | None = None) -> dict:
+               periods: dict[int, Period] | None = None,
+               version: bool = False) -> dict:
     entries = sorted(v.entries, key=lambda e: e.line_no)
     # 列表页由调用方一次取好传进来；单张场景（建/改/删后回显）这里兜底。
     subs = _book_subjects(db, v.book_id) if subs is None else subs
@@ -140,6 +153,18 @@ def _serialize(db: Session, v: Voucher, subs: dict[int, Subject] | None = None,
     # 不知道就**没有这个键**，不留一个 None 让人以为「这一张没有年度」。
     if period is not None:
         out["year"] = period.year
+    # **乐观锁令牌**（审计 §3.15）：客户端改这张凭证时把它原样送回来，
+    # 服务端拿库里此刻的值算一个同样的令牌来比 —— 不一致就 409。
+    #
+    # **只在「单张」响应里带**（``version=True``），列表与打印不带：
+    # 一次 5000 张的列表/打印，每个格子多 40 字节就是 200KB ——
+    # 而列表页不做行内编辑（编辑走单张 GET），根本用不上这个令牌。
+    #
+    # 格式由 ``accounting.vouchers.version_token`` 独家提供 ——
+    # 令牌是客户端与服务端之间的一枚硬币，两边格式必须一模一样
+    # （审计 §4.5：同一个量只允许一个权威实现）。
+    if version:
+        out["version"] = svc.version_token(v.updated_at)
     return out
 
 
@@ -193,9 +218,54 @@ def query(book: Book = Depends(get_my_book), db: Session = Depends(get_db),
 
 
 @router.post("", status_code=201)
-def create(payload: VoucherIn, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+def create(payload: VoucherIn, request: Request, response: Response,
+           book: Book = Depends(get_my_book), db: Session = Depends(get_db),
            _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user)):
+    # ------------------------------------------------------------------
+    # 幂等键（审计报告 §3.28）
+    # ------------------------------------------------------------------
+    # 没有它的时候，这条路的失败场景是：
+    #   新凭证 POST 发出 → 服务端已入库 → 响应在网络上丢了（30s 超时）
+    #   → 客户端以为自己没存上 → 再敲一个字 → 自动保存又发一次 POST
+    #   → **库里两张内容几乎相同的凭证**。
+    #
+    # 客户端「先查一下有没有存上」是**不够的**：查和写之间仍有时间窗
+    # （两次自动保存几乎同时到，两边都查不到、都去写）。
+    # 所以胜负必须由数据库当场分出来 —— 一把键对应一行占位，
+    # 抢到的人负责做完，后来的人拿既有结果回去。
+    claim_row = None
+    idem_key = request.headers.get("Idempotency-Key")
+    if idem_key is not None:
+        try:
+            key = idem.validate_key(idem_key)
+        except idem.InvalidIdempotencyKey as exc:
+            raise HTTPException(400, str(exc))
+        digest = idem.request_hash(payload.model_dump())
+        claimed, row = idem.claim(db, book_id=book.id, key=key, request_hash=digest)
+        if not claimed:
+            # 这把键已经有人用过了 —— **那次请求的结果就是答案**。
+            #
+            # 回放而不是重建：回放的那张里存的是**上一次**那一版内容，
+            # 而用户此刻在屏幕上可能又敲了几个字 —— 客户端收到回放标志后
+            # 会**补一次 PUT** 把当前内容收敛上去（见
+            # ``frontend/src/views/voucher/VoucherEdit.vue``）。
+            v = db.get(Voucher, row.voucher_id) if row.voucher_id else None
+            if v is None:
+                # 占位在、凭证不在：上一次请求要么还在跑、要么建失败了。
+                # **不能**当成「没发生过」重建一张 —— 那正是重复凭证的来源。
+                raise HTTPException(409, "同一张凭证正在创建中，请稍后重试")
+            # 回放不是新建，所以状态码是 200 而不是 201：
+            # 监控里数 201 会把一张凭证数成两张。
+            response.status_code = 200
+            response.headers["Idempotent-Replay"] = "true"
+            return _serialize(db, v, periods=_book_periods(db, book.id, {v.period_id}),
+                               version=True)
+        claim_row = row
     try:
+        # ``commit=False``：占位行、凭证、占位行里的 voucher_id
+        # 必须在**同一个事务**里落定 ——
+        # 失败了占位跟着回滚，键不会被「烧掉」（失败恰恰是最需要重试的时候）；
+        # 成功了占位与凭证一起可见，后来的同键请求立刻能回放。
         v = svc.create_voucher(
             db, book_id=book.id, user=user, voucher_date=payload.voucher_date,
             entries=[e.model_dump() for e in payload.entries], remark=payload.remark,
@@ -210,18 +280,35 @@ def create(payload: VoucherIn, book: Book = Depends(get_my_book), db: Session = 
             voucher_no=None,
             insert_after_id=payload.insert_after,
             insert_position=payload.insert_position,
+            # ``enforce_date_order``：**只有界面上这张单张新建的表单**才查
+            # 「日期不能早于本期已有的最后一张」（审计报告 §3.18）。
+            #
+            # 新凭证的号排在本期号段**末尾**，而「整理就绪」体检要求号序与
+            # 日期同向 —— 号大的那张日期反而更早，就判「时序不对」，
+            # 这个月从此既不能记账也不能结账。用户当场改个日期就行，
+            # 比月底被体检拦下再说好得多。
+            #
+            # **插入（``insert_after``）不算**：那个新号落在号段**中间**，
+            # 它本来就该允许比最后一张早 —— 那正是「插入凭证」的意义。
+            enforce_date_order=payload.insert_after is None,
             # ``internal`` 刻意**不传**：它是「系统自己生成的凭证」的唯一入口
             # （结转损益 / 年度结转在 periods.py 里以 internal=True 调本函数）。
             # 这里传下去的任何东西都来自请求体，所以 source 只能取
             # ``VoucherIn`` 那个封闭的 Literal —— CARRY_FORWARD 已经不在里面，
             # 客户端提交它会直接 422。更新走 PUT 的那条路同样改不了 source：
             # ``update_voucher`` 只认日期、分录、备注、附单据数。
+            commit=False,
         )
+        if claim_row is not None:
+            idem.complete(db, claim_row, v.id)
+        db.commit()
+        db.refresh(v)
     except (ValueError, ArithmeticError) as e:
         db.rollback()
         raise HTTPException(400, str(e))
     # 期间一次取好（一条查询），年度随凭证一起出去（见 _serialize 的说明）
-    return _serialize(db, v, periods=_book_periods(db, book.id, {v.period_id}))
+    return _serialize(db, v, periods=_book_periods(db, book.id, {v.period_id}),
+                               version=True)
 
 
 def _target_period_code(db: Session, v: Voucher, voucher_date: date | None) -> str | None:
@@ -264,23 +351,69 @@ def update(voucher_id: int, payload: VoucherIn, book: Book = Depends(get_my_book
     try:
         data = payload.model_dump()
         data["entries"] = [e.model_dump() for e in payload.entries]
-        svc.update_voucher(db, v, user, data)
+        # ``version`` 是**可选**的乐观锁令牌（服务层拿它与库里的
+        # ``updated_at`` 比，不一致就抛版本冲突 → 下面翻成 409）。
+        #
+        # **这层是通电的，不是摆设。** 请求体模型 ``VoucherIn``
+        # （那份 schema 在 ``app/api/schemas.py``）里**有** ``version`` 字段，
+        # 前端也**真的带**：``frontend/src/views/voucher/VoucherEdit.vue``
+        # 保存时送 ``version: voucherVersion.value || null``，并且专门处理
+        # 409（``e?.response?.status === 409`` 时提示「已被他人改动，请刷新」）。
+        # 用例钉在 ``tests/test_audit_fix_voucher_version.py``
+        # （``test_带着过期的令牌回409``）。
+        #
+        # **不带 = 不比**（老客户端、以及刚建出来还没拿到令牌的那一趟）：
+        # 那条路上的正确性靠服务层的**行锁**兜着 —— 并发改同一张凭证时，
+        # 后一个拿到锁会读到最新的 status / 分录，不会拿陈旧的那份去覆盖。
+        #
+        # 令牌由 ``accounting.vouchers.version_token`` 独家生成，
+        # 格式与那份**逐字一致** —— 差一个时区写法就会「带了也永远判过期」。
+        svc.update_voucher(db, v, user, data,
+                           expected_version=data.get("version"))
+    except svc.VoucherVersionConflict as e:
+        # 409：你手上的版本过期了，请刷新后重试。
+        # **必须排在 ``except ValueError`` 之前** —— 版本冲突是 ValueError 的
+        # 子类，顺序反了就变成 400（前端会当成「你参数写错了」而不是
+        # 「别人改过了」）。与 ``periods.PeriodVersionConflict`` 同一条规矩。
+        db.rollback()
+        raise HTTPException(409, str(e))
     except (ValueError, ArithmeticError) as e:
         db.rollback()
         raise HTTPException(400, str(e))
-    except IntegrityError:
-        # 兜底：重新发号与 flush 之间还有窗口（别人同一刻把同号的号占了）。
-        # 库里的唯一约束是最后一道防线，撞出来的是一条裸 IntegrityError ——
-        # 翻成人话，**不把数据库原文漏给客户端**。
+    except IntegrityError as exc:
+        # **只把「凭证号撞车」这一种翻成人话**（审计报告 §3.20）。
+        #
+        # 原来这里是**裸** ``except IntegrityError``，于是**所有**完整性违例
+        # 一律被说成「凭证号刚被另一张凭证占用，请再保存一次」——
+        # 而 23514 CheckViolation（库层护栏）说的是完全另一回事。
+        # 最典型的一次：把 2026 年的凭证改期到 2027 年、分录还挂在 2026 年的
+        # 科目上 → 库层 ``fn_entry_subject_year_guard`` 报的是
+        # 「分录的科目属于 2026 年度，不能记在 2027 年度的凭证上」，
+        # 那句**本来就该给用户看**的中文被换成了一句「凭证号被占用，
+        # 请再保存一次」—— 用户被指引去重试一个**永远不可能成功**的操作，
+        # 真正的病因（年度不一致）一次也没出现在界面上。
+        #
+        # 外键违例、非空违例同理：把它们说成「凭证号被占用」是**假话**，
+        # 用户会照着去改一个根本没问题的字段。
+        #
+        # 判据认**约束名**（``util.constraint_name``）—— 与
+        # ``accounting/vouchers.py``、``accounting/organize.py`` 同一份口径。
         db.rollback()
-        where = f"{target_code} " if target_code else "目标期间 "
-        raise HTTPException(
-            422,
-            f"凭证号 {v.voucher_no} 在{where}刚被另一张凭证占用"
-            f"（可能刚被另一条记录占用）。请再保存一次，系统会重新发号。"
-        )
+        if constraint_name(exc) == _NO_UNIQUE:
+            where = f"{target_code} " if target_code else "目标期间 "
+            raise HTTPException(
+                422,
+                f"凭证号 {v.voucher_no} 在{where}刚被另一张凭证占用"
+                f"（可能刚被另一条记录占用）。请再保存一次，系统会重新发号。"
+            )
+        # 其余的**不吞**：原样抛回全局处理器（``app/main.py`` 的
+        # ``dbapi_error_handler``）—— 我们自己写的中文护栏原文会照实透出，
+        # PG 自带的英文原文会被换成脱敏文案 + 请求号。这条路由本来就不该
+        # 把 4xx 降级成 500（见文件头那段说明），所以原样抛出即可。
+        raise
     # 期间一次取好（一条查询），年度随凭证一起出去（见 _serialize 的说明）
-    return _serialize(db, v, periods=_book_periods(db, book.id, {v.period_id}))
+    return _serialize(db, v, periods=_book_periods(db, book.id, {v.period_id}),
+                       version=True)
 
 
 def _assert_no_dead_gap(db: Session, book: Book, rows: list[Voucher]) -> None:
@@ -300,6 +433,17 @@ def _assert_no_dead_gap(db: Session, book: Book, rows: list[Voucher]) -> None:
     删一张和删一批走同一道闸（批量那几行更要命：一次删 3 张能一次性
     把整段号打乱）。判据在 ``accounting/organize.irreparable_gaps`` 里，
     与整理自己用的是**同一份**号段语义。
+
+    **判据的口径是「整理跑完之后这个号还是不是一个断号」**（不是「断号的
+    序号大不大于整理发出去的最大序号」那个启发式 —— 审计报告 §3.17 的
+    真旁路：号段顶端那张若是未记账的凭证，整理会把整段压短、那些高位空号
+    因此不再是断号，整理一次就补上了；用启发式判会把这种状态误判成死路，
+    **误拦一次本来合法的删除**）。
+
+    **报错里「已记账的那些号动不了」这句话有保证是真的**：这个闸只有在
+    「整理补不上」时才拦，而整理补不上的断号**必然**有已记账的凭证占在
+    它后面（已记账的号原样留着，把整段的上限撑着）—— 所以这里不存在
+    「其实没有已记账凭证、却让人去反结账」的死路建议。
     """
     by_period: dict[int, list[Voucher]] = {}
     for v in rows:
@@ -636,6 +780,12 @@ def next_voucher(period_id: Optional[int] = None, book: Book = Depends(get_my_bo
     号码直接调 `svc.next_voucher_no` —— **跟落库时是同一个函数**。
     预览号和实际发号必须是同一套口径，所以宁可去后端问，也不在这儿照着列表
     猜一个「最大号 +1」（期间里号是可以回收复用的，猜错就是白填一次）。
+
+    **凭证字也必须是同一个口径**（审计报告 §3.18）：这个期间在用的凭证字
+    未必是「记」（Excel 导入的用友凭证是「银」），落库时走
+    ``organize.period_prefix`` 取那个字，预览这里也必须取同一个 ——
+    否则页面上预填「记0001」、存下去却是「银0004」，用户看到的与存进去的
+    不是一回事；而真按预填的号去改，客户端又不采信手工号。
     """
     period = db.get(Period, period_id) if period_id else find_period(db, book.id, date.today())
     if period is None or period.book_id != book.id:
@@ -644,7 +794,9 @@ def next_voucher(period_id: Optional[int] = None, book: Book = Depends(get_my_bo
         select(func.max(Voucher.voucher_date))
         .where(Voucher.book_id == book.id, Voucher.period_id == period.id))
     return {
-        "voucher_no": svc.next_voucher_no(db, period),
+        "voucher_no": svc.next_voucher_no(
+            db, period,
+            prefix=svc_organize.period_prefix(db, period, fallback="记")),
         "voucher_date": last.isoformat() if last else None,
         "period_id": period.id,
         "locked": period.locked,
@@ -901,8 +1053,8 @@ def split(voucher_id: int, payload: SplitIn, book: Book = Depends(get_my_book),
     periods = _book_periods(db, book.id,
                             {result["original"].period_id, result["created"].period_id})
     return {
-        "original": _serialize(db, result["original"], subs, periods),
-        "created": _serialize(db, result["created"], subs, periods),
+        "original": _serialize(db, result["original"], subs, periods, version=True),
+        "created": _serialize(db, result["created"], subs, periods, version=True),
         "moved": result["moved"],
     }
 
@@ -913,4 +1065,5 @@ def detail(voucher_id: int, book: Book = Depends(get_my_book), db: Session = Dep
     if v is None or v.book_id != book.id:
         raise HTTPException(404, "凭证不存在")
     # 期间一次取好（一条查询），年度随凭证一起出去（见 _serialize 的说明）
-    return _serialize(db, v, periods=_book_periods(db, book.id, {v.period_id}))
+    return _serialize(db, v, periods=_book_periods(db, book.id, {v.period_id}),
+                               version=True)

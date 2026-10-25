@@ -1085,8 +1085,20 @@ def year_end(book_id: int, payload: YearEndIn, book: Book = Depends(get_my_book)
 
 
 @router.get("/{book_id}/audit-logs")
-def audit_logs(book_id: int, limit: int = Query(100, le=1000), book: Book = Depends(get_my_book),
+def audit_logs(book_id: int, limit: int = Query(100, ge=1, le=1000),
+               book: Book = Depends(get_my_book),
                db: Session = Depends(get_db), _admin: SysUser = Depends(require_admin)):
+    """账套的审计流水。
+
+    **``limit`` 必须夹下限（审计 P3-11）。** 以前这里只写了上限
+    （``le=1000``），于是 ``?limit=-1`` 会一路传到 SQL 的 ``LIMIT -1``，
+    而 PostgreSQL 对负 LIMIT 报 ``InvalidRowCountInLimitClause``
+    （sqlstate 2201W）—— 那不在 ``main.py`` 的 4xx 白名单里，于是回一句
+    **脱敏的 500**：明明是参数写错，却告诉调用方「服务器坏了」。
+    同仓兄弟接口都夹取（``system.py:537`` 的 ``min(max(limit,1),500)``、
+    ``system.py:1219``、``backup/service.py:318``），这里补齐成同一条口径：
+    ``ge=1`` 把负数与 0 直接挡在参数校验这一层，回 422。
+    """
     from app.models import AuditLog
 
     rows = db.scalars(

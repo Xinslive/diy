@@ -551,20 +551,156 @@ def _analyze_rows(rows: list[_VoucherRow]) -> dict:
     }
 
 
-def check_period(db: Session, period: Period) -> dict:
+def _period_rows(db: Session, period: Period) -> list[_VoucherRow]:
+    """这个期间的凭证行（只取体检要用的三个字段，不建 ORM 对象）。
+
+    单独抽出来是为了让 ``check_period`` 与 ``assert_tidy`` **查一次**：
+    它们要算的是同一批行（断号清单、体检结论、补不补得上），
+    查两遍就是白跑两遍 SQL。
+    """
+    return [
+        _VoucherRow(*r) for r in db.execute(
+            select(Voucher.voucher_no, Voucher.voucher_date, Voucher.status)
+            .where(Voucher.period_id == period.id).order_by(Voucher.id)
+        ).all()
+    ]
+
+
+def rows_by_period(db: Session, periods: list[Period]) -> dict[int, list[_VoucherRow]]:
+    """一次把多个期间的体检行查出来，按 ``period_id`` 分组。
+
+    **为什么不逐个期间查。** :func:`check_period` 一次只管一个期间；
+    一个五年账套六十个期间，逐个查就是六十趟 SQL。而上线前体检
+    （``scripts/data_health_check.py``）要把**所有**期间都跑一遍。
+
+    **行的口径与** :func:`_period_rows` **完全一致**（同样三个字段、
+    同样按 id 排序），不另立一套 —— 体检的判据全在 ``_analyze_rows`` 里，
+    两处喂进去的行要是口径不同，同一个期间在「整理凭证」页面和在上线前体检里
+    会得出**不同结论**，而两边都自称是「整理就绪体检」。
+
+    没有凭证的期间不在返回的字典里 —— 调用方用 ``.get(period.id, [])``
+    取，取到空列表就是「这个期间一张凭证都没有」（体检结论：干净）。
+    """
+    if not periods:
+        return {}
+    out: dict[int, list[_VoucherRow]] = {}
+    rows = db.execute(
+        select(Voucher.voucher_no, Voucher.voucher_date, Voucher.status,
+               Voucher.period_id)
+        .where(Voucher.period_id.in_([p.id for p in periods]))
+        .order_by(Voucher.id)
+    ).all()
+    for no, voucher_date, status, period_id in rows:
+        out.setdefault(int(period_id), []).append(
+            _VoucherRow(no, voucher_date, status))
+    return out
+
+
+def _assign_sequences(count: int, reserved: set[int]) -> list[int]:
+    """整理发号：第 k 张可动的凭证拿到第 k 个「不在 ``reserved`` 里」的正整数。
+
+    **全仓只有这一份发号规则。**
+
+    ``plan_organize`` 真正落库时用它；``fixable_gaps`` 判断「这个洞整理
+    补不补得上」时也用它 —— 两边一旦各写一份，「补不补得上」这句话就会
+    在整理明明能补上的时候说补不上（审计报告 §3.17 的那个真旁路：
+    复核方穷举 243 种号段组合，26 种上启发式判据与真值不一致，
+    全部是「说补不上、其实整理一次就补上了」的误报）。
+
+    ``reserved`` = 已记账凭证占着的号 —— 整理**跳过**它们，因为已记账的
+    凭证号动不了（动了那张纸就跟系统对不上）。
+    """
+    out: list[int] = []
+    n = 0
+    for _ in range(count):
+        n += 1
+        while n in reserved:
+            n += 1
+        out.append(n)
+    return out
+
+
+def _organize_resulting_rows(rows: list[_VoucherRow]) -> list[_VoucherRow]:
+    """模拟「跑完一次整理之后」这个期间的号段（**纯计算**，不查库、不落库）。
+
+    发号用 ``_assign_sequences``、凭证字用 ``_dominant_prefix_of_nos`` ——
+    与 ``plan_organize`` **同一份**实现。判据一旦用另一套发号规则，
+    它就会在整理真的能补上的时候说补不上。
+
+    **为什么要模拟，而不是用启发式算。** 断号「补不补得上」的真值是
+    **「整理跑完之后这个号还是不是一个断号」**，而断号的定义是
+    「号段 1..max 里缺的那些号」—— **max 会变**。号段顶端那张若是未记账的
+    凭证，整理会把它压到前面去，整段的 max 跟着变小，原本算作断号的
+    高位空号**因此不再是断号**（它们退出了号段）。
+
+    用「M（整理真正发出去的最大序号）」去判，会把这些洞判成「补不上」——
+    而用户被引到的那两条出路（手工补一张凑数的凭证、把整段已记账的凭证
+    退回未记账）**都是有害的**：前者是在账上凭空造一笔业务，
+    后者是为了改一个号而把已经记完账的凭证全部作废重来。
+    """
+    prefix = _dominant_prefix_of_nos([r.no for r in rows])
+    # 已记账占着的号 = 整理要跳过的（reserved）
+    reserved = {_seq_of(r.no) for r in rows if r.status == "POSTED"}
+    # 未记账的那些 = 整理能重新发号的（movable）
+    movable = [r for r in rows if r.status != "POSTED"]
+    seqs = _assign_sequences(len(movable), reserved)
+    # 已记账的号原样留着；可动的那些拿到整理发出去的新号
+    out = [r for r in rows if r.status == "POSTED"]
+    for r, seq in zip(movable, seqs):
+        out.append(_VoucherRow(f"{prefix}{seq:0{NO_WIDTH}d}", r.voucher_date, r.status))
+    return out
+
+
+def fixable_gaps(rows: list[_VoucherRow]) -> tuple[list[str], list[str]]:
+    """断号分成两堆：**「整理凭证」补得上的**、**补不上的**。
+
+    返回 ``(补得上的, 补不上的)``。**判据全仓只有这一份实现** ——
+    ``irreparable_gaps``（删除入口的闸门）与 ``assert_tidy``（记账/结账的闸门）
+    都调它。以前这两处各写一份（一份用 M、一份用 N），于是**同一条规则
+    有两个互相矛盾的答案**：删凭证时放行（说「补得上」），紧接着记账时
+    又拦下（说「补不上」），而且给的两条出路都是错的（审计报告 §3.17）。
+
+    **判据是「整理真的补不补得上」。** 具体做法：**照 ``plan_organize``
+    的规则模拟一次整理**（``_organize_resulting_rows``），然后看这个号
+    在整理之后**还是不是一个断号**。
+
+    为什么不能只看「M（整理真正发出去的最大序号）」：断号的定义是
+    「号段 1..max 里缺的那些号」，而 **max 会变**。号段顶端那张若是
+    未记账的凭证，整理会把它压到前面去，整段的 max 跟着变小 ——
+    原本算作断号的高位空号**因此不再是断号**（退出了号段），
+    整理一次就把这个洞补掉了。
+
+    复核方穷举 243 种号段组合实测出来的误报形状（全部是误报，没有反例）：
+
+        期间里只有 记0003（未记账）    → 断号 记0001、记0002
+            M 判据：记0002 > M=1 → 「补不上」   ❌
+            真值：整理把 记0003 压成 记0001，整段只剩 1 号 → 断号消失 ✅
+
+    举个算对了的例子（审计报告 §3.17 原来那个）：
+        记0001（未记账） 记0002（已记账） 记0004（未记账），记0003 被删了
+        → 整理后 记0004 → 记0003，断号消失 → 「点一次整理凭证就能补上」 ✅
+    """
+    gaps = _analyze_rows(rows)["gaps"]
+    after = set(_analyze_rows(_organize_resulting_rows(rows))["gaps"])
+    # 整理之后**仍然**是断号的 = 真正补不上的
+    stuck = [g for g in gaps if g in after]
+    fixable = [g for g in gaps if g not in after]
+    return fixable, stuck
+
+
+def check_period(db: Session, period: Period,
+                 rows: list[_VoucherRow] | None = None) -> dict:
     """一个期间的「整理就绪」体检：断号 + 时序。全程只读。
 
     这两项任一不干净，这个月就不该记账、也不该结账：号段有洞或者号序跟日期
     对不上，纸质凭证按号装订就跟系统对不上，月底封了账再想改就只能作废重记。
 
     结转损益算不算断号/时序？算。它照样占着号，缺了就是缺了。
+
+    ``rows`` 给了就用给的（``assert_tidy`` 查一次、算两遍，省一趟 SQL）；
+    不给就自己查。
     """
-    rows = [
-        _VoucherRow(*r) for r in db.execute(
-            select(Voucher.voucher_no, Voucher.voucher_date, Voucher.status)
-            .where(Voucher.period_id == period.id).order_by(Voucher.id)
-        ).all()
-    ]
+    rows = _period_rows(db, period) if rows is None else rows
     a = _analyze_rows(rows)
 
     gaps = a["gaps"]
@@ -666,13 +802,12 @@ def plan_organize(
         prefix = _dominant_prefix(rows)
         ordered = sorted(movable,
                         key=lambda v: _sort_key(v, strategy, income_of))
-        n = 0
-        for v in ordered:
-            n += 1
-            while n in reserved:
-                n += 1
+        # 发号规则在 ``_assign_sequences`` 里 —— 与 ``fixable_gaps`` 判
+        # 「这个洞整理补不补得上」时用的是**同一份**（审计报告 §3.17：
+        # 判据与执行各写一份，判据就会在整理真能补上的时候说补不上）。
+        for v, seq in zip(ordered, _assign_sequences(len(ordered), reserved)):
             plan.changes.append(
-                Change(v.id, v.voucher_no, f"{prefix}{n:0{NO_WIDTH}d}",
+                Change(v.id, v.voucher_no, f"{prefix}{seq:0{NO_WIDTH}d}",
                        v.voucher_date.isoformat(), v.status, v.source,
                        tail=is_carry_forward(v))
             )
@@ -698,22 +833,35 @@ def plan_organize(
     return plans
 
 
-def _dominant_prefix(rows: list[Voucher]) -> str:
+def _dominant_prefix_of_nos(nos: list[str]) -> str:
     """取出现次数最多的前缀，保证重编号后仍是原来的凭证字。
 
     计数走的是**归一后**的前缀。这样库里混着「记-0001」和「记0002」时，
     两边都算作「记」，重编号的结果是清一色的「记000X」—— 整理顺带把
     历史遗留的分隔符形态收敛掉，而不是让它继续繁殖（记- 票数占优时，
     原来这里会把「记-」当成凭证字原样保留下来）。
+
+    **全仓只有这一份「凭证字怎么选」的实现**：``plan_organize`` 落库时用它，
+    ``_organize_resulting_rows`` 模拟整理结果时也用它 —— 判据与执行必须
+    认同一个凭证字，否则「整理完是什么样」算出来的是另一张表。
     """
     counts: dict[str, int] = {}
-    for v in rows:
-        canon = normalize_no(v.voucher_no)
-        p, _ = split_no(canon) if canon else split_no(v.voucher_no)
+    for no in nos:
+        canon = normalize_no(no)
+        p, _ = split_no(canon) if canon else split_no(no)
         counts[p] = counts.get(p, 0) + 1
     if not counts:
         return "记"
     return max(counts.items(), key=lambda kv: (kv[1], kv[0] == "记"))[0]
+
+
+def _dominant_prefix(rows: list[Voucher]) -> str:
+    """这个账期的凭证字（出现次数最多的那个）。
+
+    口径在 ``_dominant_prefix_of_nos`` 里 —— 这里只把 ORM 行换成凭证号，
+    两处不各写一份。
+    """
+    return _dominant_prefix_of_nos([v.voucher_no for v in rows])
 
 
 def period_prefix(db: Session, period: Period, fallback: str = "记") -> str:
@@ -722,12 +870,47 @@ def period_prefix(db: Session, period: Period, fallback: str = "记") -> str:
     ``_dominant_prefix`` 只认内存里那批行，这里替它查库 —— 「把一张凭证挪进
     另一个期间」要按**目标期间**的凭证字发号：混用两个凭证字会让那个期间的
     「整理就绪」体检报「混用了多个凭证字」，记账、结账都过不去
-    （见 ``check_period``）。
+    （见 ``check_period``）。「在界面上新建凭证」也走同一口径 ——
+    凭证字写死「记」会让导入来的「银」期间立刻混用凭证字，
+    那个月从此既不能记账也不能结账（审计报告 §3.18）。
+
+    **为什么在库里分组，而不是把整期的凭证号拉回 Python。**
+    这条函数现在也在**建凭证**那条热路径上，而建凭证是批量导入里逐张调用的
+    （``import_max_vouchers`` 允许 5000 张）：整期拉回就是 O(N²) ——
+    一次导入 5000 张要拉回 1250 万行。那正是 ``next_voucher_no`` 当年
+    修掉的那个坑（见那个函数的 docstring），不能从另一个方向再挖一次。
+    所以改成**在库里按前缀分组计数**，回传的只有「前缀 + 张数」几行。
+
+    **口径与 ``_dominant_prefix`` 一致**：分组用的是「凭证号开头那段非数字」，
+    而**归一**（剥分隔符、按 ``normalize_no`` 解析）仍然在 Python 侧做 ——
+    每组取一个代表号，走**同一个** ``normalize_no`` / ``split_no``，
+    所以「记-0001」与「记0002」仍然算作同一个凭证字
+    （代表号取 ``min(voucher_no)``：同一组里的号开头那段非数字相同，
+    归一后的凭证字也相同）。
     """
-    rows = list(db.scalars(
-        select(Voucher).where(Voucher.period_id == period.id)
-    ).all())
-    return _dominant_prefix(rows) if rows else fallback
+    # 分组键 =「开头那段非数字」；开头就是数字的号（解析不出序号的那些）
+    # 整串当键，免得它们被塞进同一个 NULL 组里、由一个代表号替整组做主。
+    #
+    # 正则里用 ``[^0-9]`` 而不是 ``[^\\d]``：PostgreSQL 的方括号里
+    # ``\\d`` **不表示数字**（那是 POSIX 与 Python 的差异，
+    # ``\\d`` 在方括号里会被当成反斜杠与字母 d 两个字符）。
+    raw_prefix = func.substring(Voucher.voucher_no, r"^([^0-9]+)")
+    group_key = func.coalesce(raw_prefix, func.btrim(Voucher.voucher_no))
+    rows = db.execute(
+        select(group_key.label("p"), func.count().label("n"),
+               func.min(Voucher.voucher_no).label("sample"))
+        .where(Voucher.period_id == period.id)
+        .group_by(group_key)
+    ).all()
+    if not rows:
+        return fallback
+    counts: dict[str, int] = {}
+    for _key, n, sample in rows:
+        canon = normalize_no(sample)
+        prefix = (split_no(canon) if canon else split_no(sample))[0]
+        counts[prefix] = counts.get(prefix, 0) + int(n)
+    # 平手时取「记」—— 与 ``_dominant_prefix`` 同一份 tie-break。
+    return max(counts.items(), key=lambda kv: (kv[1], kv[0] == "记"))[0]
 
 
 def irreparable_gaps(db: Session, book_id: int, period: Period,
@@ -737,18 +920,18 @@ def irreparable_gaps(db: Session, book_id: int, period: Period,
 
     **为什么会有「补不上」的断号。** 整理只给**未记账**的凭证重新发号
     （已记账的号原样留着，见 :func:`plan_organize`），它把未记账的那些
-    压紧成 1..N（跳过已记账占着的号）。于是：
+    压紧成 1..N（跳过已记账占着的号）。于是有些洞整理**填不掉** ——
+    整理跑完之后它仍然是断号。
 
-      · 断号的序号 <= N 的 → 整理能填掉（空号正好被补上）；
-      · 断号的序号 >  N 的 → **整理填不掉**，而且整理自己还会改 0 张。
+    典型状态是「记0001（未记账） + 记0003（已记账）」—— 中间的 记0002
+    被删了：整理把 记0001 压成 记0001（它本来就是），记0003 是已记账的
+    动不了，于是 记0002 空着、整段的号段上限被 记0003 撑着，洞留在原地。
 
-    后者就是界面的死路：期间不能记账也不能结账（``assert_tidy`` 拦着），
-    而用户按报错去点「整理凭证」，点完还是这个错。典型状态是
-    「记0001（未记账） + 记0003（已记账）」—— 中间的 记0002 被删了。
-
-    算 N 时要算准：整理发号时会**跳过**已记账占着的号，所以最终发到的
-    最大序号 M = N + |已记账占着的、落在 1..N 里的号|。用 M 判「填不填得上」
-    才准 —— 用 N 判会把「其实填得上」误判成死路，把人拦在门外。
+    **判据是 ``fixable_gaps`` 那一份，不在这里另写一遍。**
+    判据的答案是「**照整理的规则模拟一次整理，这个号之后还是不是一个
+    断号**」（见 ``fixable_gaps`` 的说明）—— 以前这里用 M、
+    ``assert_tidy`` 用 N，两份实现互相矛盾（审计报告 §3.17）：
+    删凭证时放行、记账时又拦下，给的还是两条错出路。现在两边共用同一份。
 
     返回断号的凭证号（空列表 = 删掉之后号段仍然修得回来）。
     """
@@ -759,22 +942,11 @@ def irreparable_gaps(db: Session, book_id: int, period: Period,
     keep = [v for v in rows if v.id not in deleting]
     if not keep:
         return []
-    # 未记账的那些 = 整理能重新发号的（movable）
-    movable = [v for v in keep if v.status != "POSTED"]
-    # 已记账占着的号 = 整理要跳过的（reserved）
-    reserved = {_seq_of(v.voucher_no) for v in keep if v.status == "POSTED"}
-    # 整理发号后用到的最大序号：第 N 个「不在 reserved 里」的正整数
-    assigned = 0
-    top_assigned = 0
-    while assigned < len(movable):
-        top_assigned += 1
-        if top_assigned not in reserved:
-            assigned += 1
     # 断号用**与体检同一份**算法（``_analyze_rows``）算 —— 用户看到的
     # 「断在 记0002」和体检报出来的「断号 1 个：记0002」必须是同一个。
-    analysis = _analyze_rows([
+    _fixable, stuck = fixable_gaps([
         _VoucherRow(v.voucher_no, v.voucher_date, v.status) for v in keep])
-    return [g for g in analysis["gaps"] if _seq_of(g) > top_assigned]
+    return stuck
 
 
 def assert_tidy(db: Session, periods: list[Period]) -> None:
@@ -795,40 +967,36 @@ def assert_tidy(db: Session, periods: list[Period]) -> None:
     「期末结账 → 反结账」。）
 
     所以这里区分两种情况，各给各的出路：
-      * 断号**能被整理补上**（空号在未记账凭证能压紧到的范围内）→ 让用户去整理；
-      * 断号**整理补不上**（后面有已记账的凭证占着号）→ 说清两条真出路：
+      * 断号**能被整理补上**（整理跑完之后它就不再是断号）→ 让用户去整理；
+      * 断号**整理补不上**（整理跑完之后它仍然是断号）→ 说清两条真出路：
         手工补一张用这个号的凭证，或先反结账把已记账的退回未记账再整理。
+
+    **判据是 ``fixable_gaps`` 那一份，与删除入口共用**（审计报告 §3.17）。
+    以前这里用 N、``irreparable_gaps`` 用 M，两份实现互相矛盾 ——
+    「补得上」与「补不上」两个答案同时存在，用户被引到的那两条出路
+    （凭空造一张凭证 / 把整段已记账的凭证退回未记账）都是**有害**的。
+
+    **文案只陈述成立的事实。** 「它后面有已记账的凭证占着号」这句话的
+    前提是真的有一张已记账的凭证占在后面；该期间一张已记账的凭证都没有时
+    说这句话，就是把用户引向「手工补一张假凭证」或「反结账」的死路。
     """
     bad: list[str] = []
     advice: list[str] = []
     for p in periods:
         if p.locked:
             continue
-        rep = check_period(db, p)
+        # 行只查一次：断号清单（体检）与「补不补得上」（fixable_gaps）用的是同一批行。
+        rows = _period_rows(db, p)
+        rep = check_period(db, p, rows=rows)
         if not rep["blocking"]:
             continue
         bad.append(f"{rep['period']}　" + "；".join(rep["blocking"]))
         gaps = rep["gaps"]
         if not gaps:
             continue
-        # 整理把未记账的凭证压紧成 1..N（跳过已记账占着的号），
-        # 所以断号 g 能被补上的充要条件是 g <= N（N = 未记账凭证数）。
-        unposted = rep["total"] - len(rep["posted"])
-        stuck = [g for g in gaps if _seq_of(g) > unposted]
-        if stuck:
-            advice.append(
-                f"· {rep['period']} 的断号（{'、'.join(stuck)}）**「整理凭证」补不上**："
-                f"它后面有已记账的凭证占着号（整理只给未记账的凭证重新发号）。"
-                f"两条出路：① 手工补一张用「{'、'.join(stuck)}」这个号的凭证"
-                f"（导入也可以），把号段接上；"
-                f"② 到「期末结账」对 {rep['period']} 执行「反结账」，"
-                f"把已记账的凭证退回未记账，再点「整理凭证」。"
-            )
-        else:
-            advice.append(
-                f"· {rep['period']} 的断号（{'、'.join(gaps)}）："
-                f"点一次「整理凭证」就能补上（它会把未记账的凭证重新发号，空号正好被填掉）。"
-            )
+        # **补不补得上：与删除入口共用同一份判据**。
+        _fixable, stuck = fixable_gaps(rows)
+        advice.append(_gap_advice(rep["period"], rows, gaps, stuck))
     if bad:
         raise ValueError(
             "凭证还没整理干净，不能记账、也不能结账：\n"
@@ -836,6 +1004,53 @@ def assert_tidy(db: Session, periods: list[Period]) -> None:
             + "\n怎么补：\n"
             + "\n".join(advice)
         )
+
+
+def _gap_advice(period: str, rows: list[_VoucherRow], gaps: list[str],
+                stuck: list[str]) -> str:
+    """一个期间的断号该怎么处理 —— 一段话。
+
+    **只陈述成立的事实。** 「它后面有已记账的凭证占着号」这句话的前提是
+    **真的**有一张已记账的凭证占在后面 —— 该期间一张已记账的凭证都没有时，
+    说这句话就是把用户引向「手工补一张假凭证」或「反结账」这两条死路
+    （审计报告 §3.17）。
+
+    抽成独立函数（而不是写在 ``assert_tidy`` 里）：这样「这句文案在事实
+    不成立时会不会被说出口」可以**直接测**，不必去凑一个现实中凑不出的
+    号段状态。
+    """
+    if not stuck:
+        return (
+            f"· {period} 的断号（{'、'.join(gaps)}）："
+            f"点一次「整理凭证」就能补上（它会把未记账的凭证重新发号，空号正好被填掉）。"
+        )
+    # **「后面有已记账的凭证占着号」是不是真的？** 逐个断号查：有没有一张
+    # 已记账的凭证，占着一个比它更大的号。
+    #
+    # **这条恒等式成立（可以证）：** 一个断号 g 整理之后**仍然是断号**，
+    # 只可能是因为「号段的上限被一张已记账的凭证撑着」——
+    # 整理发出去的最大序号 M 之外，整理不会再发号；g <= M 的话 g 就会被填上。
+    # 所以 g 仍然空着 ⟹ g > M ⟹ 号段上限 > g ⟹ 有一张已记账的凭证占着更大的号。
+    # （下面那条「判据 == 真值」的穷举用例把这个恒等式也钉住了。）
+    posted_seqs = sorted({_seq_of(r.no) for r in rows if r.status == "POSTED"})
+    blocked = [g for g in stuck
+               if any(s > _seq_of(g) for s in posted_seqs)]
+    if blocked:
+        return (
+            f"· {period} 的断号（{'、'.join(blocked)}）**「整理凭证」补不上**："
+            f"它后面有已记账的凭证占着号（整理只给未记账的凭证重新发号）。"
+            f"两条出路：① 手工补一张用「{'、'.join(blocked)}」这个号的凭证"
+            f"（导入也可以），把号段接上；"
+            f"② 到「期末结账」对 {period} 执行「反结账」，"
+            f"把已记账的凭证退回未记账，再点「整理凭证」。"
+        )
+    # 事实不成立（这个期间一张已记账的凭证都没有）→ 不许说那句话，
+    # 也不许给「手工补一张假凭证」/「反结账」这两条出路。
+    return (
+        f"· {period} 的断号（{'、'.join(stuck)}）**「整理凭证」补不上**："
+        f"整理跑完之后这个号仍然空着，而这个期间一张已记账的凭证都没有 —— "
+        f"请先检查这个期间的凭证号段。"
+    )
 
 
 # --------------------------------------------------------------------- 执行

@@ -560,7 +560,12 @@ def test_开关开着时高危动作要近期重新认证(client, db, auth, admi
     r = client.patch(f"/api/system/users/{admin_user.id}", headers=auth,
                      json={"real_name": "改个名字"})
     assert r.status_code == 403, f"开关开着却放行了高危动作：{r.status_code} {r.text[:200]}"
-    assert "二次验证" in r.json()["detail"]
+    # detail 是**结构化**的（{code, message}）：前端要靠 code 判断
+    # 「这个 403 该给『去重新验证』的引导」（core/deps.py::MFA_REAUTH_REQUIRED）。
+    detail = r.json()["detail"]
+    assert isinstance(detail, dict), detail
+    assert detail["code"] == "MFA_REAUTH_REQUIRED", detail
+    assert "二次验证" in detail["message"]
 
 
 # --------------------------------------------------------------------- 备份配置

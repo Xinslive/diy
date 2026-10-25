@@ -37,6 +37,7 @@ from mcp.server.mcpserver import Context
 from sqlalchemy import or_, select
 
 from app.accounting.years import subjects_of
+from app.core.money import money_str_or_text
 from app.ledger.engine import LedgerEngine
 from app.models import Period, ReportTemplate, Subject
 from app.mcp.caliber import (
@@ -464,22 +465,21 @@ def _find_period(db, book_id: int, period_code: Optional[str],
 def _cell_money(cell: dict) -> dict:
     """单元格的值统一成「两位小数的字符串」。
 
-    报表求值器给的是 ``str(Decimal)``，零值会写成 ``"0"``。界面上显示的是
-    两位小数（前端统一格式化），所以这里也按同一套格式给出去 ——
-    数值一个子儿没变，只是小数位对齐，agent 念出来与界面一致。
+    报表求值器给出来的**已经是**两位小数的十进制字符串了（口径定在
+    ``app/reports/evaluate.py``，审计 §3.26），这里再走一遍同一份实现，
+    免得 MCP 变成「第三份口径」—— 界面、导出、MCP 三个出口必须是同一个数。
+
+    公式留下的文本（不是金额）**原样带出去**，别把它改成 0 ——
+    「这里有错」和「这里是零」是两件事。
+
+    **舍入规则不在这里**：``money_str_or_text`` 是 ``app/core/money.py`` 里的
+    唯一实现，报表通道（``app/reports/evaluate.py``）用的是同一份。
     """
     out = dict(cell)
     value = out.get("value")
     if value is None:
         return out
-    text = str(value).strip()
-    if not text:
-        return out
-    try:
-        out["value"] = money_str(text)
-    except ArithmeticError:
-        # 不是金额（例如公式留下的文本），原样带出去，别把它改成 0。
-        out["value"] = text
+    out["value"] = money_str_or_text(value)
     return out
 
 

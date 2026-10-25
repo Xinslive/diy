@@ -38,6 +38,11 @@
       </div>
     </div>
 
+    <!-- 加载失败**不能**与「没有数据」同形：断网/超时时表格会空着，
+         一条提示都没有的话，用户以为这个科目一整年没发生额（审计 §3.25）。 -->
+    <el-alert v-if="loadError" type="error" :closable="false" show-icon class="mb"
+              :title="`加载失败：${loadError}。请检查网络后重试。`" />
+
     <div class="card">
       <div class="report-head">
         <h2 class="report-title">明 细 账</h2>
@@ -232,7 +237,7 @@ function anchorPeriods() {
 }
 
 /** 只认最新一趟：期间/科目下拉连点时，旧响应不许覆盖新数据。 */
-const { loading, run, isStale } = useLatestLoad('ledger/detail')
+const { loading, error: loadError, run, isStale } = useLatestLoad('ledger/detail')
 
 async function load() {
   if (!store.bookId || !subjectId.value) return
@@ -240,12 +245,22 @@ async function load() {
   // 请求里压根没有 from/to，回来的数是另一段区间，页面上看着还像那么回事。
   // 与其先显示一个错的再纠正，不如等 store.periods 到位（下面的 watch 会再触发一次）。
   if (!yearPeriods.value.length) return
-  const d = await run(() => api.detail(store.bookId, {
-    subject_id: subjectId.value, from_period_id: fromId.value, period_id: toId.value,
-    from_subject_id: isComprehensive.value ? fromSubjectId.value : undefined,
-    to_subject_id: isComprehensive.value ? toSubjectId.value : undefined,
-    include_unposted: includeUnposted.value
-  }))
+  let d
+  try {
+    d = await run(() => api.detail(store.bookId, {
+      subject_id: subjectId.value, from_period_id: fromId.value, period_id: toId.value,
+      from_subject_id: isComprehensive.value ? fromSubjectId.value : undefined,
+      to_subject_id: isComprehensive.value ? toSubjectId.value : undefined,
+      include_unposted: includeUnposted.value
+    }))
+  } catch (e) {
+    // 加载失败**不是**「没有数据」：这两件事在页面上长得一模一样。
+    // 拦截器已经弹过提示了，这里只要别让它变成一个没人接的 rejection ——
+    // 页面上 data 保持原样，顶部由 loadError 挂一条「加载失败」。
+    // 以前这里一声不吭：断网/超时后表格空着、零提示，
+    // 用户以为这个科目一整年没发生额（审计 §3.25）。
+    return
+  }
   // 过期的那一趟：条件早就被改掉了，写进去就是「表里的数对不上顶栏的期间」。
   if (isStale(d)) return
   data.value = d
@@ -426,6 +441,9 @@ function exportXlsx() {
 </script>
 
 <style scoped>
+
+/* 加载失败横幅与工具条之间的距离（el-alert 默认贴着上面那一块）。 */
+.mb { margin-bottom: 12px; }
 .ledger-toolbar {
   display: flex;
   flex-direction: column;

@@ -212,6 +212,27 @@ cd backend && .venv/bin/python scripts/scheduler_watchdog.py
 cd backend && .venv/bin/python scripts/backup_to_oss.py
 ```
 
+### 审计修复的取证命令
+
+2026-10-25 那次审计的修复状态**不靠文档说了算**，靠这几条命令（退出码即结论）：
+
+```bash
+# ① 审计报告 §7 路线图 50 项：逐项找代码证据，找不到就是 FAIL
+#    退出码：0 全过 / 1 有项目 FAIL（这一条已经接进 CI 的 backend job）
+python3 tools/audit_roadmap_check.py
+
+# ② 插件沙箱的四条复核主张：不成立 = 0；--mutate 加跑变异证明
+#    （把防线改回旧行为，确认对应用例会红）
+python3 tools/audit_plugin_sandbox_recheck.py --mutate
+
+# ③ 上线前的存量数据体检（**只读**，读 .env 里那个库）
+#    退出码：0 通过 / 2 阻断（重复分录行号，不能上线）/ 3 提示 / 1 体检自己没跑成
+cd backend && .venv/bin/python scripts/data_health_check.py
+```
+
+逐条落点与机制偏离见 [`docs/audit-remediation-2026-10-25.md`](docs/audit-remediation-2026-10-25.md)，
+存量数据体检的用法与退出码含义见该文档 §1.1。
+
 ---
 
 ## 五、仓库结构
@@ -299,7 +320,7 @@ cd backend && .venv/bin/python scripts/backup_to_oss.py
 | 运行环境 | `APP_ENV`（dev / prod）、`LOG_LEVEL`、`DATABASE_URL`、`DB_POOL_*` |
 | 认证 | `JWT_SECRET`、`JWT_ALGORITHM`、`ACCESS_TOKEN_MINUTES`、`ADMIN_TOKEN_MINUTES` |
 | 登录防护 | `LOGIN_MAX_FAILURES`、`LOGIN_LOCK_MINUTES`、`LOGIN_LOCK_MAX_MINUTES`、`LOGIN_IP_*`、`TRUSTED_PROXIES` |
-| 插件 | `PLUGIN_ENABLED`、`PLUGIN_ROOT`、`PLUGIN_TRUSTED_KEYS`、`PLUGIN_REVOKED_KEYS`、`PLUGIN_MAX_*`、`PLUGIN_LEASE_SECONDS` |
+| 插件 | `PLUGIN_ENABLED`、`PLUGIN_ROOT`、`PLUGIN_TRUSTED_KEYS`、`PLUGIN_REVOKED_KEYS`、`PLUGIN_MAX_*`、`PLUGIN_LEASE_SECONDS`、`PLUGIN_ISOLATION` |
 | 导入与发票 | `IMPORT_MAX_BYTES`、`IMPORT_MAX_VOUCHERS`、`INVOICE_STORAGE_DIR`、`INVOICE_OCR_*` |
 | 通知与 MFA | `SMTP_*`、`NOTIFY_*`、`ADMIN_MFA_*` |
 | 备份 | `OSS_*`、`BACKUP_ENABLED`、`BACKUP_KEEP_DAILY_DAYS`、`BACKUP_KEEP_WEEKLY_DAYS` |
@@ -697,6 +718,7 @@ CWQ_CDN_UPLOAD=1   # 发布时把 dist/assets/ 传到 OSS
 | 文档 | 内容 |
 | --- | --- |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | 架构细节（很长，按模块逐层展开） |
+| [`docs/audit-remediation-2026-10-25.md`](docs/audit-remediation-2026-10-25.md) | **2026-10-25 审计报告的修复验收记录**：45 条发现 + 路线图 50 项的逐条落点、机制偏离、明确未做项，以及两条可复现的取证命令 |
 | [`deploy/cloudflare.md`](deploy/cloudflare.md) | **部署到 CDN（Cloudflare 形态）**：缓存规则、必关开关、真实 IP 还原、已知限制 |
 | [`deploy/esa-mtls.md`](deploy/esa-mtls.md) | **阿里云 ESA 回源双向校验（mTLS）**：源站侧配置、控制台步骤、切换与回滚、真实 IP 还原、实测结论 |
 | [`docs/plugin-overview.md`](docs/plugin-overview.md) | 插件开发总览与快速开始 |

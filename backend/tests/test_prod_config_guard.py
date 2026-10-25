@@ -25,7 +25,16 @@ GOOD_DB = "postgresql+psycopg://cwq:Str0ngP%40ssXYZwAB@db.internal:5432/cwq"
 
 
 def _prod(**kw):
-    base = dict(jwt_secret=GOOD_SECRET, database_url=GOOD_DB)
+    """一份**合规**的生产配置。
+
+    ``trusted_proxies`` 与 ``mcp_allowed_hosts`` 也在里面：这两项现在是
+    **阻断**级的（审查 §3.44 / §4.3-2），留空就起不来 —— 所以「合规」的
+    基准配置必须把它们配上（豁免口见 ``*_WARN_ONLY``，另有专门的文件
+    ``tests/test_audit_fix_prod_config_gates.py`` 逐项验）。
+    """
+    base = dict(jwt_secret=GOOD_SECRET, database_url=GOOD_DB,
+                trusted_proxies="127.0.0.1",
+                mcp_allowed_hosts="acct.example.com:*")
     base.update(kw)
     return Settings(**base)
 
@@ -308,9 +317,15 @@ def test_dev环境不要求MFA链接基址():
 #
 # MCP 的 Host 白名单（DNS 重绑定防护）。
 #
-# **默认不拦**，因为 ``.env.example`` 里 ``MCP_ALLOWED_HOSTS=`` 本来就是空的
-# （而 ``MCP_ENABLED=true``）—— 默认就拦的话，照抄示例的部署会直接起不来。
-# 想要 fail-closed 的部署自己把 ``MCP_ENFORCE_ALLOWED_HOSTS`` 打开。
+# **口径变了**：现在是「MCP 开着就必须配白名单」（审查 §4.3-2）。原来
+# 「默认不拦」的理由是「``.env.example`` 里 ``MCP_ALLOWED_HOSTS=`` 本来
+# 就是空的（而 ``MCP_ENABLED=true``），默认就拦的话照抄示例的部署会直接
+# 起不来」—— 而 ``MCP_ENABLED`` 默认 true 意味着**照抄示例的部署正好落在
+# 「MCP 开着 + 白名单空」这个形态里**，启动闸门对它是完全沉默的。
+#
+# 想要豁免的部署用 ``MCP_ALLOWED_HOSTS_WARN_ONLY=true``（本机直连、不对外
+# 的部署确实不需要白名单）。逐项的断言在
+# ``tests/test_audit_fix_prod_config_gates.py``。
 
 
 def test_MCP强制模式下没配Host白名单就拒绝启动():
@@ -320,10 +335,17 @@ def test_MCP强制模式下没配Host白名单就拒绝启动():
     assert "MCP_ALLOWED_HOSTS" in str(e.value)
 
 
-def test_MCP非强制模式下没配Host白名单仍然放行():
-    """默认部署不能因为这一项起不来 —— 风险有令牌兜着。"""
-    _check(_prod(mcp_enabled=True, mcp_enforce_allowed_hosts=False,
-                 mcp_allowed_hosts=""))
+def test_MCP非强制模式下没配Host白名单现在也拒绝启动():
+    """**口径变了**：``MCP_ENFORCE_ALLOWED_HOSTS`` 不再是开关本身。
+
+    「MCP 开着 + 白名单空」是**默认形态**（``MCP_ENABLED`` 默认 true），
+    所以它现在**一律**拒绝启动 —— 不再取决于那个默认 false 的开关。
+    豁免口是 ``MCP_ALLOWED_HOSTS_WARN_ONLY=true``。
+    """
+    with pytest.raises(ValueError) as e:
+        _check(_prod(mcp_enabled=True, mcp_enforce_allowed_hosts=False,
+                     mcp_allowed_hosts=""))
+    assert "MCP_ALLOWED_HOSTS" in str(e.value)
 
 
 # --------------------------------------------------------------------- 审查 M-13

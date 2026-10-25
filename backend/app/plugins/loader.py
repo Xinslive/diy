@@ -3,24 +3,18 @@ from __future__ import annotations
 
 from sqlalchemy.exc import SQLAlchemyError
 
-import importlib.util
 import inspect as pyinspect
 import logging
-import re
 import sys
-from functools import wraps
-from pathlib import Path
-from typing import Any, Dict, List
-from fastapi import APIRouter, Body, HTTPException, Request
-from fastapi.params import File as FastapiFile, Form as FastapiForm
-from starlette.datastructures import UploadFile as StarletteUploadFile
+from fastapi import APIRouter
 from fastapi.routing import APIRoute
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.asyncexitstack import AsyncExitStackMiddleware
 from sqlalchemy import select
 from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
-from app.core.config import settings
+from app.core.config import ISOLATION_OFF, ISOLATION_ON, ISOLATION_SHADOW, settings
 from app.core.db import SessionLocal, engine
 from app.core.deps import get_current_user
 from fastapi.security import HTTPAuthorizationCredentials
@@ -30,181 +24,59 @@ from app.plugins.installer import root_path
 from app.plugins.migrations import read_head, read_version, validate_tables
 from app.plugins.models import PluginRegistry
 from app.plugins.public_api import context_for, current_principal, current_request_id
+from app.plugins.sandbox import exec_plugin_module
+from app.plugins.sdk_rules import (
+    BODY_ANCHOR,
+    build_body_payload_wrapper,
+    validate_endpoint_signature,
+    validate_hook_handler,
+    validate_route_methods,
+    validate_route_path,
+    validate_task_handler,
+)
 from app.plugins.security import verify_directory
 from app.plugins.workers import WorkerRuntime
 
 log = logging.getLogger(__name__)
 
 
-_BODY_ANCHOR = "cwq_body"
-
-
-def _path_param_names(path):
-    return set(re.findall(r"\{([a-z][a-z0-9_]*)\}", path or ""))
-
-
-def _is_dict_annotation(annotation):
-    if annotation is dict or annotation == "dict":
-        return True
-    return getattr(annotation, "__origin__", None) is dict
-
-
-def _is_upload_param(param):
-    """文件/表单参数：multipart 请求体由 FastAPI 自己拆，不能碰。"""
-    if isinstance(param.default, (FastapiFile, FastapiForm)):
-        return True
-    for candidate in (param.annotation, getattr(param.annotation, "__origin__", None)):
-        if isinstance(candidate, type) and issubclass(candidate, StarletteUploadFile):
-            return True
-    return False
-
-
-def _with_body_payload(endpoint, path=None, methods=None):
-    """让插件 POST 处理函数能按 SDK 约定从**请求体**收到前端提交的字段。
-
-    SDK 约定前端用 JSON body 提交（``host.api.post(url, data)``，见
-    docs/plugin-guide.md），处理函数按名字收这些字段：既可能写成文档里的
-    ``def save_note(payload: dict)`` 从 payload 里取，也可能像两个插件实际那样写成
-    ``def save_rule(book_id: int, payload: dict)``。但 FastAPI 只按注解决定参数
-    去处——标了 ``dict`` 又没写 ``Body()`` 的按**查询参数**，标量没写 ``Body()`` 的
-    更是**必填查询参数**。于是 body 里的一切都收不到，接口一律回 422
-    ``Field required``：文档、插件客户端、插件三方的约定其实是一致的，只有路由
-    装配这一步漏了。
-
-    这里不改插件的函数对象（它是别人写的，且被 ``_check`` 验过签名），而是套一层
-    只改签名的壳：``__signature__`` 优先于 ``__wrapped__``，FastAPI 的
-    ``get_typed_signature`` 看到改过的签名，wrapper 再按原签名把 body 里的字段
-    分发回去，真正的实现原样保留。
-
-    兼容面必须一起守住，否则修一个坏两个：
-    - 路径参数仍由 FastAPI 从路径取（``/rules/{rule_id}/delete`` 里的 ``rule_id``）；
-    - 标量参数改成**可省查询参数**，``params={'book_id': ...}`` 这种旧调用照旧；
-    - 分发时查询串优先、body 同名字段兜底，所以前端把 book_id 放进 JSON body 也
-      照样收得到，同时请求体不能改写授权指向的账套；
-    - 文件/表单路由（``UploadFile = File(...)``）整个不包装；
-    - GET 路由与同时挂 GET 的路由完全不动。
-    """
-    if not methods or "POST" not in methods or "GET" in methods:
-        return endpoint
-    try:
-        signature = pyinspect.signature(endpoint)
-    except (TypeError, ValueError):
-        return endpoint
-    params = list(signature.parameters.values())
-    if not params or any(p.kind in (pyinspect.Parameter.POSITIONAL_ONLY,
-                                    pyinspect.Parameter.VAR_POSITIONAL,
-                                    pyinspect.Parameter.VAR_KEYWORD) for p in params):
-        return endpoint
-    if any(_is_upload_param(p) for p in params):
-        return endpoint
-    path_params = _path_param_names(path)
-    head = [p for p in params if p.name in path_params]
-    body_params = [p for p in params if p.name not in path_params]
-    if not body_params:
-        return endpoint
-    for param in head:
-        if param.default is not pyinspect.Parameter.empty:
-            # 路径参数不该有默认值，有就说明签名写得古怪，别自作主张。
-            return endpoint
-
-    dict_params = [p for p in body_params if _is_dict_annotation(p.annotation)]
-    new_params = list(head)
-    carrier_required = False
-    if dict_params:
-        # 第一个 ``dict`` 参数就是整个请求体：既是文档里的 ``def save_note(payload:
-        # dict)``，也是 ``def save_rule(book_id: int, payload: dict)`` 里 payload 的本意。
-        carrier = dict_params[0].name
-        # 载体形参自己也是「必填」的：原签名没给默认值，就意味着调用方必须给整个
-        # 请求体。少了它时给中文 422，而不是把 None 塞进插件函数让它在半路炸成 500。
-        carrier_required = dict_params[0].default is pyinspect.Parameter.empty
-        new_params.append(dict_params[0].replace(default=Body(default=None)))
-        rest = [p for p in body_params if p.name != carrier]
-    else:
-        # 全是标量（例如 ``def undo_run(book_id: int, run_id: int)``）：合成一个参数
-        # 接住整体 body，标量照旧留在查询串上，两者都能收到。
-        carrier = _BODY_ANCHOR
-        taken = {p.name for p in params}
-        suffix = 0
-        while carrier in taken:
-            suffix += 1
-            carrier = _BODY_ANCHOR + str(suffix)
-        first = body_params[0].annotation
-        origin = getattr(first, "__origin__", None)
-        # body 未必是对象：插件也可以直接收 list 或标量，按原注解照收。
-        annotation = List[Any] if (origin is list or first is list) else Dict[str, Any]
-        new_params.append(pyinspect.Parameter(
-            carrier, pyinspect.Parameter.POSITIONAL_OR_KEYWORD,
-            default=Body(default=None), annotation=annotation))
-        rest = list(body_params)
-    # 其余参数一律变成可省：FastAPI 把「简单类型 + 有默认值」的参数判成**可选**
-    # 查询参数，于是既不再 422，旧调用方的查询串也照样有效。
-    for param in rest:
-        new_params.append(param.replace(
-            default=None if param.default is pyinspect.Parameter.empty else param.default))
-
-    # body 里没给、原签名又没默认值的标量：给中文 422，而不是把 None 塞进插件函数
-    # 让它在半路炸成 500。
-    required = [p.name for p in rest if p.default is pyinspect.Parameter.empty]
-
-    @wraps(endpoint)
-    def wrapper(*args, **kwargs):
-        raw = kwargs.get(carrier)
-        if carrier_required and (not isinstance(raw, dict) or not raw):
-            # 载体是必填形参：缺 body（或 body 不是对象）是调用方的错，给 422，
-            # 不让插件在函数内部炸成 PLUGIN_EXECUTION_FAILED(500)。
-            raise HTTPException(422, "缺少请求体：%s" % carrier)
-        body = raw if isinstance(raw, dict) else {}
-        call = {param.name: kwargs.get(param.name) for param in head}
-        for param in body_params:
-            if param.name == carrier:
-                call[param.name] = raw
-                continue
-            if kwargs.get(param.name) is not None:
-                # 查询串优先。body 里的同名字段只能当**数据字段**：让它覆盖路由参数
-                # 等于让请求体改写授权目标，跨账套一致性校验（data 层比对 values
-                # 与 book_id）也就形同虚设了。
-                call[param.name] = kwargs[param.name]
-            elif isinstance(raw, dict) and param.name in raw:
-                call[param.name] = raw[param.name]
-            elif param.default is not pyinspect.Parameter.empty:
-                call[param.name] = param.default
-            else:
-                call[param.name] = None
-        for name in required:
-            if call.get(name) is None:
-                raise HTTPException(422, "缺少参数：%s" % name)
-        return endpoint(**call)
-
-    wrapper.__signature__ = signature.replace(parameters=new_params)
-    return wrapper
+# 下面两个名字是历史别名，保留是为了不打断既有引用（测试与将来 worker 侧的
+# 代理都按它们取）。**实现**在 :mod:`app.plugins.sdk_rules` ——
+# 那才是「插件 SDK 契约」的唯一一份，宿主与 worker 共用。
+_BODY_ANCHOR = BODY_ANCHOR
+_with_body_payload = build_body_payload_wrapper
 
 
 class Registrar:
-    __slots__ = ("_plugin_id", "_router", "_hooks", "_declared_hooks", "_tasks", "_declared_tasks")
+    __slots__ = ("_plugin_id", "_router", "_hooks", "_declared_hooks", "_tasks", "_declared_tasks", "_declared_routes")
 
     def __init__(self, manifest):
         self._plugin_id = manifest["id"]
         self._router = APIRouter()
         self._hooks, self._declared_hooks = {}, set(manifest.get("hooks", []))
         self._tasks, self._declared_tasks = {}, {task["name"]: task for task in manifest.get("tasks", [])}
+        # 插件**原始**的 (path, methods, endpoint)。
+        #
+        # 为什么要另存一份：``add`` 挂到 router 上的是**包过 body 载体**的
+        # 那个函数，它的 ``__signature__`` 是改写过的。shadow 比对要比的
+        # 是插件**原本**的签名（worker 侧看到的也是原本的），
+        # 拿改写后的那份去比，每条路由都会报「签名不一样」——假差异。
+        self._declared_routes: list[tuple] = []
 
     def _check(self, path, endpoint, methods):
-        if not isinstance(path, str) or not re.fullmatch(r"/(?:[a-z0-9_-]+|\{[a-z][a-z0-9_]*\})(?:/(?:[a-z0-9_-]+|\{[a-z][a-z0-9_]*\}))*|/", path):
-            raise PluginError("INVALID_PLUGIN_ROUTE", "插件路由必须是命名空间内的相对路径")
-        if path == "/_host" or path.startswith("/_host/"):
-            raise PluginError("INVALID_PLUGIN_ROUTE", "_host 是宿主服务保留路由")
-        if not set(methods) <= {"GET", "POST", "PUT", "PATCH", "DELETE"}:
-            raise PluginError("INVALID_PLUGIN_ROUTE", "插件路由方法不允许")
-        for param in pyinspect.signature(endpoint).parameters.values():
-            annotation = str(param.annotation)
-            if any(token in annotation for token in ("Request", "Response", "Session", "WebSocket", "BackgroundTasks")) or hasattr(param.default, "dependency"):
-                raise PluginError("INVALID_PLUGIN_ROUTE", "插件公开接口不能接收宿主 request/session 或自定义依赖")
+        # 判据本身在 :mod:`app.plugins.sdk_rules`（SDK 契约的唯一一份）。
+        # 这里只补一条**与本 Registrar 绑定**的判据：路由不能重复 ——
+        # 那条要看着 ``self._router`` 里已有的路由才判得出来。
+        validate_route_path(path, self._plugin_id)
+        validate_route_methods(methods)
+        validate_endpoint_signature(endpoint)
         for route in self._router.routes:
             if route.path == "/api/plugins/" + self._plugin_id + path and set(route.methods or []) & set(methods):
                 raise PluginError("PLUGIN_ROUTE_CONFLICT", "插件路由重复")
 
     def add(self, path, endpoint, methods):
         self._check(path, endpoint, methods)
+        self._declared_routes.append((path, list(methods), endpoint))
         self._router.add_api_route("/api/plugins/" + self._plugin_id + path,
             _with_body_payload(endpoint, path, methods), methods=methods,
             name=f"plugin:{self._plugin_id}:{len(self._router.routes)}")
@@ -230,22 +102,38 @@ class Registrar:
             self.add(route.path, route.endpoint, route.methods)
 
     def hook(self, name, handler):
-        if name not in self._declared_hooks or name in self._hooks or not callable(handler) or pyinspect.iscoroutinefunction(handler):
+        if name not in self._declared_hooks or name in self._hooks:
             raise PluginError("INVALID_PLUGIN_HOOK", "插件 hook 未声明、重复或不在白名单中")
+        validate_hook_handler(handler)
         self._hooks[name] = handler
 
     def task(self, name, handler):
-        if (name not in self._declared_tasks or name in self._tasks or not callable(handler)
-                or pyinspect.iscoroutinefunction(handler) or pyinspect.isgeneratorfunction(handler)
-                or pyinspect.isasyncgenfunction(handler)):
+        if name not in self._declared_tasks or name in self._tasks:
             raise PluginError("INVALID_PLUGIN_TASK", "插件定时任务未声明、重复或不能是异步函数")
-        try:
-            params = list(pyinspect.signature(handler).parameters.values())
-        except (ValueError, TypeError) as exc:
-            raise PluginError("INVALID_PLUGIN_TASK", "定时任务处理函数签名无效") from exc
-        if len(params) != 1 or params[0].kind not in (pyinspect.Parameter.POSITIONAL_ONLY, pyinspect.Parameter.POSITIONAL_OR_KEYWORD):
-            raise PluginError("INVALID_PLUGIN_TASK", "定时任务处理函数必须只接收一个 TaskContext 参数")
+        validate_task_handler(handler)
         self._tasks[name] = handler
+
+    def declarations(self) -> list[dict]:
+        """插件声明了什么（阶段 1 的 shadow 比对用）。
+
+        **与 worker 侧用的是同一份提取逻辑**
+        （:mod:`app.plugins.ipc.declarations`）—— 否则比对出来的差异分不清
+        是「插件行为真的不同」还是「两边的提取逻辑写得不一样」，
+        而后者占绝大多数。
+
+        注意这里取的是**原始 endpoint**而不是包过 body 载体的那个 ——
+        worker 侧看到的也是原始的，比对才对得上。
+        """
+        from app.plugins.ipc.declarations import describe_hook, describe_route, describe_task
+
+        declared = []
+        for path, methods, endpoint in self._declared_routes:
+            declared.append(describe_route(path, methods, endpoint))
+        for name, handler in self._hooks.items():
+            declared.append(describe_hook(name, handler))
+        for name, handler in self._tasks.items():
+            declared.append(describe_task(name, handler))
+        return declared
 
 
 def load_one(runtime, plugin):
@@ -257,12 +145,21 @@ def load_one(runtime, plugin):
         validate_tables(conn, verified.manifest, expected=plugin.tables)
     entry = directory / verified.manifest["contributes"]["backend_entry"]
     name = "cwq_plugin_" + plugin.plugin_digest
-    spec = importlib.util.spec_from_file_location(name, entry)
-    module = importlib.util.module_from_spec(spec)
+    mode = settings.plugin_isolation
+    if mode == ISOLATION_ON:
+        # **插件代码不进宿主进程** —— 它只在 worker 进程里跑，
+        # 宿主这边只有「声明 + 转发函数」。
+        _load_isolated(runtime, plugin, entry, verified)
+        return
     previous = sys.dont_write_bytecode
     sys.dont_write_bytecode = True
     try:
-        spec.loader.exec_module(module)
+        # **不走 ``spec.loader.exec_module``**：那条路用解释器的真内建
+        # （``__import__`` / ``exec`` / ``open`` 全在），等于把静态扫描
+        # 当成唯一防线。审计 §3.1 实测过一条静态扫描看不见的逃逸链
+        # （``operator.attrgetter("__globals__")`` → 整份 ``__builtins__``），
+        # 所以这里在**运行期**把内建能力裁一遍（见 app.plugins.sandbox）。
+        module = exec_plugin_module(name, entry)
     finally:
         sys.dont_write_bytecode = previous
     register = getattr(module, "register", None)
@@ -284,6 +181,107 @@ def load_one(runtime, plugin):
     runtime.hooks[plugin.plugin_id] = registrar._hooks
     runtime.tasks[plugin.plugin_id] = {name: (spec["schedule"], registrar._tasks[name], plugin.plugin_digest)
                                        for name, spec in registrar._declared_tasks.items()}
+    if mode == ISOLATION_SHADOW:
+        # **shadow 不改变任何对外行为**：插件仍然由进程内那份代码处理，
+        # 这里额外跑一遍 worker，把两边的声明逐条比对，差异只报告。
+        _shadow_compare(runtime, plugin, entry, verified, registrar.declarations())
+
+
+def _load_isolated(runtime, plugin, entry, verified):
+    """``PLUGIN_ISOLATION=on``：插件代码只在 worker 进程里跑。
+
+    宿主这一侧做三件事：
+
+    1. 起 worker，收下它的**声明**（路由 / 钩子 / 任务 + 签名）；
+    2. **再校验一遍**声明（worker 侧的校验是插件的自律，宿主这一遍才是
+       平台的规矩）；
+    3. 按声明**重建** FastAPI 路由与钩子/任务的转发函数。
+
+    插件的模块**不进宿主进程** —— 这是这一模式与进程内模式的全部差别。
+    """
+    from app.plugins.ipc.host import start_worker
+    from app.plugins.ipc.router import build_hooks, build_router, build_tasks, validate_declarations
+
+    manifest = verified.manifest
+    ctx = context_for(manifest, plugin=True)
+    handle = start_worker(plugin_id=plugin.plugin_id, digest=plugin.plugin_digest,
+                          entry=entry, manifest=manifest, ctx=ctx)
+    try:
+        validate_declarations(plugin.plugin_id, handle.declarations, manifest)
+        from app.plugins.services import router_for
+        services = router_for(manifest)
+        services.routes.extend(build_router(plugin.plugin_id, handle.declarations, handle).routes)
+        schedules = {task["name"]: {"schedule": task.get("schedule", ""),
+                                    "digest": plugin.plugin_digest}
+                     for task in manifest.get("tasks", [])}
+        runtime.handlers[plugin.plugin_id] = AsyncExitStackMiddleware(services)
+        runtime.hooks[plugin.plugin_id] = build_hooks(handle.declarations, handle)
+        runtime.tasks[plugin.plugin_id] = build_tasks(handle.declarations, handle, schedules)
+        runtime.workers[plugin.plugin_id] = handle
+    except BaseException:
+        # 装不上就把 worker 收掉 —— 否则留下一个没人管的进程。
+        handle.close()
+        raise
+
+
+def _shadow_compare(runtime, plugin, entry, verified, in_process):
+    """``PLUGIN_ISOLATION=shadow``：跑一遍 worker，把声明逐条比对。
+
+    **只报告，不改变行为。** 差异写进日志（ERROR 级，带两边的内容），
+    同时记在 ``runtime.isolation_diffs`` 上 —— 供运维与 CI 观察。
+    """
+    from app.plugins.ipc import shadow
+
+    manifest = dict(verified.manifest)
+    manifest["plugin_digest"] = plugin.plugin_digest
+    ctx = context_for(verified.manifest, plugin=True)
+    run = shadow.run_worker(entry=entry, manifest=manifest, ctx=ctx)
+    differences: list = []
+    if run.error:
+        differences = [{"kind": "worker_error", "detail": run.error}]
+        log.error("插件 shadow 比对：worker 没能跑起来 id=%s error=%s stderr=%s",
+                  plugin.plugin_id, run.error, run.stderr[-800:])
+    else:
+        differences = shadow.compare(in_process, run.declarations)
+        if differences:
+            log.error("插件 shadow 比对发现差异 id=%s differences=%s", plugin.plugin_id, differences)
+        else:
+            log.info("插件 shadow 比对一致 id=%s declarations=%s", plugin.plugin_id, len(in_process))
+    runtime.isolation_diffs[plugin.plugin_id] = differences
+
+
+def _log_isolation_posture():
+    """启动时把「插件代码跑在哪」**说清楚**。
+
+    为什么要有这一段：**隔离档位是一个配置项，而配置项不出声就等于没有**。
+    审计报告 §3.1 的根因是「插件后端代码在宿主进程内执行」——
+    独立进程那一档（``PLUGIN_ISOLATION=on``）才是那条根因的正面对策，
+    沙箱那一层只是**加固**，不是根治。
+
+    默认档是 ``off``（现网行为不变），所以**默认部署仍然是在宿主进程里跑插件**。
+    这不是缺陷，但必须是**明示**的：启动日志里说清楚当前档位、它在防什么、
+    要换档改哪个环境变量 —— 否则「默认是什么」只有翻代码才知道。
+
+    只说事实，不替运维做决定。
+    """
+    mode = settings.plugin_isolation
+    if mode == ISOLATION_ON:
+        log.info(
+            "插件隔离：插件后端代码在**独立 worker 进程**里执行，"
+            "宿主只经 IPC 派活（审计 §3.1 的正面对策）。")
+        return
+    if mode == ISOLATION_SHADOW:
+        log.info(
+            "插件隔离：shadow 档 —— 插件在**宿主进程内**跑一遍（对外行为），"
+            "同时在 worker 里再跑一遍并比对声明；有差异会记 ERROR 日志。"
+            "这一档是**比对**用的，不改变对外行为。")
+        return
+    # off：默认档
+    log.warning(
+        "插件隔离：当前是 **off** 档 —— 插件后端代码在**宿主进程内**执行，"
+        "只有静态扫描 + 运行期能力裁剪两层（审计 §3.1 的加固，不是根治）。"
+        "要切到独立进程（根治那一面）：设 PLUGIN_ISOLATION=on 并重启；"
+        "切换会改变插件的执行位置与并发特性，升级窗口里请自行评估。")
 
 
 def startup():
@@ -291,6 +289,7 @@ def startup():
     set_runtime(None)
     if not settings.plugin_enabled:
         return None
+    _log_isolation_posture()
     from app.plugins.reconcile import reconcile
     try:
         reconcile()
@@ -316,6 +315,11 @@ def startup():
                 code = exc.code if isinstance(exc, PluginError) else "LOAD_FAILED"
                 log.exception("plugin preload failed id=%s code=%s", plugin.plugin_id, code)
                 runtime.handlers.pop(plugin.plugin_id, None)
+                # 隔离模式下可能已经起过 worker —— 装不上就要收掉，
+                # 否则留下一个没人管的插件进程。
+                worker = runtime.workers.pop(plugin.plugin_id, None)
+                if worker is not None:
+                    worker.close()
                 runtime.register(plugin, "FAILED", code)
     runtime.start_heartbeat()
     set_runtime(runtime)

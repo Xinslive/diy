@@ -14,6 +14,7 @@ from app.models.backup import (BackupRun, KEEP_DAYS, SCOPE_BOOK, SCOPE_SYSTEM, S
                           STATUS_SUCCESS, TIER_DAILY, TIER_MONTHLY, TIERS, TIER_WEEKLY)
 from app.models.mfa import (MFA_STATUSES, STATUS_CONSUMED, STATUS_EXPIRED,
                             STATUS_PENDING, STATUS_VERIFIED, AdminMfaChallenge)
+from app.models.idempotency import VoucherIdempotency
 
 # **模型层文本守卫**（必须在这里 import，不能等到用得到的时候才 import）：
 # 它靠 ``@event.listens_for`` 挂上 before_insert / before_update 钩子，
@@ -33,6 +34,7 @@ __all__ = [
     "STATUS_SUCCESS", "STATUS_FAILED", "SCOPE_BOOK", "SCOPE_SYSTEM",
     "AdminMfaChallenge", "MFA_STATUSES",
     "STATUS_PENDING", "STATUS_VERIFIED", "STATUS_CONSUMED", "STATUS_EXPIRED",
+    "VoucherIdempotency",
 ]
 
 # Import for schema discovery; runtime packages never join Base.metadata.

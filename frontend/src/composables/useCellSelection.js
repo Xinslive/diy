@@ -68,9 +68,35 @@ function clear() {
   anchor = null
 }
 
-function tsvOf() {
-  const { rows, rect } = current
+function tsvOf(rows) {
+  const { rect } = current
   return rectToTsv((r, c) => rows[r]?.cells?.[c]?.innerText ?? '', rect)
+}
+
+/**
+ * 复制时用的行：**必须是还挂在文档上的那些**。
+ *
+ * 以前 `current.rows` 是按下那一刻的**快照**，表格重渲染、弹窗关闭、
+ * 路由切换之后它还留着 —— 于是 Ctrl+C 复制到的是**已经不在页面上的旧表格
+ * 内容**，而提示条还在说「已复制 N 行 × M 列」（审计 §3.32）。
+ *
+ * 现在复制前先验一次：行还挂在文档上才复制，而且**按当前表格重新取一遍行**，
+ * 免得表格重渲染之后取到的是同一张表的旧行。取不到就**放弃复制并说清楚**，
+ * 绝不把旧内容塞进剪贴板。
+ */
+function liveRows() {
+  if (!current || !current.rows?.length) return null
+  // 按下时抓的那一行已经脱离文档 → 这份选区整个作废。
+  if (!current.rows[0].isConnected) return null
+  const table = current.table
+  if (!table || !table.isConnected) return null
+  return rowsOf(table)
+}
+
+/** 选区作废了：说清楚为什么，别让人以为复制成功。 */
+function refuseCopy() {
+  ElMessage.warning('这张表已经变了，这次没有复制 —— 请重新框选')
+  clear()
 }
 
 /**
@@ -114,7 +140,8 @@ function onMouseDown(event) {
   const r = rows.indexOf(row)
   const c = Array.from(row.cells).indexOf(cell)
   anchor = { r, c, table, rows }
-  current = { rows, rect: normRect(anchor, anchor) }
+  // table 也存一份：复制时要按**当前**的表格重新取行（见 liveRows）。
+  current = { rows, table, rect: normRect(anchor, anchor) }
   paint()
 }
 
@@ -132,14 +159,24 @@ function onMouseUp() {
   anchor = null
   // 单击不写剪贴板：表格里的单击多半是打开详情，别把用户的剪贴板抢了。
   if (size.rows * size.cols < 2) return
-  writeClipboard(tsvOf())
+  const rows = liveRows()
+  if (!rows) { refuseCopy(); return }
+  writeClipboard(tsvOf(rows))
   ElMessage.success(`已复制 ${size.rows} 行 × ${size.cols} 列`)
 }
 
 /** Ctrl/Cmd+C 走浏览器的 copy 事件：单格选区也能复制，且不依赖安全上下文。 */
 function onCopy(event) {
   if (!current) return
-  event.clipboardData?.setData('text/plain', tsvOf())
+  // 选区还在，但**它指的那张表已经不是页面上的那张了** → 复制的是旧内容。
+  // 宁可复制失败，也不能把「已经不在这儿的表格」的内容塞进剪贴板。
+  const rows = liveRows()
+  if (!rows) {
+    event.preventDefault()
+    refuseCopy()
+    return
+  }
+  event.clipboardData?.setData('text/plain', tsvOf(rows))
   event.preventDefault()
 }
 
@@ -162,6 +199,14 @@ export function installCellSelection() {
   document.addEventListener('mousemove', onMouseMove, true)
   document.addEventListener('copy', onCopy)
   document.addEventListener('keydown', onKeyDown)
+  // **切页面要把选区清掉**：这个系统用 hash 路由，切一次路由就换一张表，
+  // 上一页那份选区留着的话，Ctrl+C 会复制到已经不在这儿的表格（审计 §3.32）。
+  // 监听挂在 window 上（hashchange 是 window 的事件，不经过 document）。
+  const onRouteChange = () => clear()
+  if (typeof window !== 'undefined') {
+    window.removeEventListener('hashchange', onRouteChange)
+    window.addEventListener('hashchange', onRouteChange)
+  }
   return () => {
     clear()
     document.removeEventListener('mousedown', onMouseDown, true)
@@ -169,5 +214,6 @@ export function installCellSelection() {
     document.removeEventListener('mousemove', onMouseMove, true)
     document.removeEventListener('copy', onCopy)
     document.removeEventListener('keydown', onKeyDown)
+    if (typeof window !== 'undefined') window.removeEventListener('hashchange', onRouteChange)
   }
 }

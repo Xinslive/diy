@@ -81,7 +81,11 @@
 
     <template #footer>
       <el-button @click="close">取消</el-button>
-      <el-button type="primary" :disabled="!canConfirm" @click="submit">确认拆分</el-button>
+      <!-- 在途守卫：双击「确认拆分」会并发两个 POST /vouchers/{id}/split，
+           第二次看到凭证已被截短，当场回一句「分界处必须在第 1 行到第 n-1 行之间」——
+           用户刚拆成功就看到一条红字报错（审计 §3.29）。 -->
+      <el-button type="primary" :disabled="!canConfirm || submitting" :loading="submitting"
+                 @click="submit">确认拆分</el-button>
     </template>
   </el-dialog>
 </template>
@@ -109,6 +113,8 @@ const open = computed({
 const preview = ref(null)
 const error = ref('')
 const atLine = ref(0)
+/** 「确认拆分」在途：这一趟还没回来之前，不再发第二趟。 */
+const submitting = ref(false)
 
 /**
  * 候选：服务端给的是权威的，它还没回来时先用本地算的顶上。
@@ -166,8 +172,11 @@ function close() {
 }
 
 function submit() {
-  if (!canConfirm.value) return
-  emit('confirm', { at_line: atLine.value })
+  if (!canConfirm.value || submitting.value) return
+  submitting.value = true
+  // 把「这一趟结束了」也交给父组件：成功时弹窗会关掉，失败时父组件要能
+  // 让人**再试一次** —— 所以按钮不能一直灰着（审计 §3.29）。
+  emit('confirm', { at_line: atLine.value, done: () => { submitting.value = false } })
 }
 
 // 父组件换了一张凭证（翻页）时，把上一次的结果清掉

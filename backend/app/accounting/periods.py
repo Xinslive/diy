@@ -1356,7 +1356,55 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
     # 两处各认各的就会出现「结转用 A、年度结转冲平用 B」，本年利润永远冲不平。
     profit, _ = resolve_profit_subject(db, book.id, current_year)
     retained = _subject_by_any_code(db, book.id, current_year, RETAINED_SUBJECT_CODES)
-    if profit and retained:
+    # **fail-closed：找不到「未分配利润」就报错，绝不静默跳过整段结转**
+    # （审计报告 §3.16）。
+    #
+    # 原来这里是 ``if profit and retained:`` —— ``retained`` 是 None 时，
+    # **整段「结转本年利润 → 未分配利润」被静默跳过**：没有报错、没有日志、
+    # 没有审计，接口照样返回 200、界面照样显示「结转成功」。后果是
+    # 本年利润的余额被 ``_refresh_opening`` **原样搬进下一年**，
+    # 资产负债表的「未分配利润」恒为 0，而历年累计额在「本年利润」里越堆越多。
+    #
+    # **为什么这一侧原来没有兜底、那一侧有。** ``profit``（本年利润）有
+    # 多编码兜底（``PROFIT_SUBJECT_CODES = ("3103", "4103")``），
+    # ``retained``（未分配利润）当时**只有一个条件、没有兜底** ——
+    # 这个不对称就是根因。现在 ``retained`` 也有候选编码
+    # （``RETAINED_SUBJECT_CODES``，310415 / 3104 / 4104），
+    # 而**候选全都不在**时报错 —— 因为「找不到就跳过」不是「没问题」，
+    # 是「这笔利润永远冲不平」这件事被藏起来了。
+    #
+    # 内置用友科目表含 310415 未分配利润，所以默认科目表不触发；
+    # 触发条件是用户导入自有科目表 —— 而科目导入是系统明确支持的功能。
+    #
+    # **文案按「本年利润科目在不在」分两种**（审计报告 §3.16 的后半段）：
+    # 科目表**同时**没有「本年利润」时，原来那两句
+    # 「本年利润无法结转到留存收益」「本年利润的余额原样滚到下一年」
+    # **都不成立** —— 本年利润科目根本不存在，既没有「本年利润」可结转，
+    # 也没有「本年利润的余额」可滚。用户读到的是一句描述了另一个状态的话。
+    #
+    # **报错本身必须保留**（fail-closed 是 §3.16 的正确修法，别把它放宽回去）：
+    # 缺「未分配利润」时一律停下，只改文案，不改行为。
+    if not retained:
+        if profit is None:
+            raise ValueError(
+                f"{current_year} 年的科目表里没有「未分配利润」科目"
+                f"（找过的编码：{'、'.join(RETAINED_SUBJECT_CODES)}），"
+                "年度结转在留存收益这一侧无处记账，整段结转已经停下。"
+                "（这套科目表里同样没有「本年利润」科目 —— 本年利润这一段"
+                "本来就没有余额可结转，缺的就是「未分配利润」这个科目本身。）"
+                "请先补上该科目再结转。"
+            )
+        raise ValueError(
+            f"{current_year} 年的科目表里没有「未分配利润」科目"
+            f"（找过的编码：{'、'.join(RETAINED_SUBJECT_CODES)}），"
+            "本年利润无法结转到留存收益。继续结转会让本年利润的余额"
+            "原样滚到下一年，而资产负债表的未分配利润将一直是 0。"
+            "请先补上该科目再结转。"
+        )
+    # ``profit`` 是 None 时跳过是**安全**的：那说明这套账没有「本年利润」科目，
+    # 而各期结账时的损益结平校验已经要求损益科目余额全为 0
+    # （``close_period`` 会报「还没做结转损益」），没有可冲平的数。
+    if profit:
         eng = LedgerEngine.for_ledger(db, book.id)
         bal = eng.figures(profit.id, last.ord).closing
         if bal != ZERO:

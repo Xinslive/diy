@@ -12,6 +12,7 @@
 | `UNTRUSTED_SIGNATURE` | `key_id` 不在运行环境的可信公钥列表中 | 使用已登记的发布密钥，或让管理员配置对应公钥 |
 | `TABLE_METADATA_MISMATCH` | 迁移落地的表结构与 manifest 或已登记结构不一致 | 检查迁移、表名前缀和数据库状态 |
 | `MIGRATION_SCOPE_VIOLATION` | 迁移触碰宿主表、其他插件表或不允许的外键 | 只创建插件自己的表，并按 scope 添加 `book_id` |
+| `INVALID_TABLE_COLUMN` | 插件自有表声明了二进制列（`BYTEA`） | 把文件内容改成走导入批次通道（`ctx.imports`），表里只留结构化的值 |
 | `DOWNGRADE_OR_REPLAY_REJECTED` | 版本降低或重复执行旧迁移 | 提高插件版本并新增 revision，不重放旧 revision |
 
 构建工具输出的 `plugin_digest` 是定位包内容的最好线索。上传前在打包环境执行一次 `verify`，比上传后再猜错误原因快得多。

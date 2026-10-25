@@ -15,8 +15,10 @@
           <el-select v-model="strategy" style="width: 210px">
             <el-option label="按日期升序重排并编号" value="SORT_DATE" />
             <!-- 「按当前顺序」的前提是当前顺序本身就对。时序不对还照着当前顺序压紧号，
-                 等于把乱的号段固化成整齐的乱 —— 这种月份不给选。 -->
-            <el-option label="按当前顺序重新编号" value="RENUM" :disabled="outOfOrder" />
+                 等于把乱的号段固化成整齐的乱 —— 这种月份不给选。
+                 **体检没跑成功时也不给选**：那时根本不知道顺序对不对，
+                 「不知道」不能当成「没问题」（审计 §3.27）。 -->
+            <el-option label="按当前顺序重新编号" value="RENUM" :disabled="renumBlocked" />
           </el-select>
         </el-form-item>
         <el-form-item>
@@ -36,8 +38,18 @@
         type="warning" :closable="false" show-icon class="mb"
         title="改号会让已经打印出来的纸质凭证与系统对不上。请确认改号方案后再执行。"
       />
+      <!-- 体检**在途**：不是「没问题」，是「还不知道」。这一档下不能按当前顺序压号。 -->
       <el-alert
-        v-if="outOfOrder" type="error" :closable="false" show-icon class="mb"
+        v-if="checkState === 'loading'" type="info" :closable="false" show-icon class="mb"
+        title="正在做「整理就绪」体检（断号与时序）…… 体检结果出来之前不能「按当前顺序重新编号」。"
+      />
+      <!-- 体检失败：不是「没问题」，是「不知道」。这一档下不能按当前顺序压号。 -->
+      <el-alert
+        v-if="checkFailed" type="warning" :closable="false" show-icon class="mb"
+        title="「整理就绪」体检没跑成功，不知道这个月的凭证号和日期对不对得上。请先重试体检；在此之前不能「按当前顺序重新编号」。"
+      />
+      <el-alert
+        v-if="hasOrderIssue" type="error" :closable="false" show-icon class="mb"
         :title="`${check.period} 有凭证号和日期对不上（${orderIssueText}），不能「按当前顺序重新编号」，请改用「按日期升序重排并编号」。整理好之前，这个月也不能记账、不能结账。`"
       />
     </el-card>
@@ -132,7 +144,40 @@ const loading = ref(false)
 const applying = ref(false)
 /** 当前范围的「整理就绪」体检：断号 + 时序。决定「按当前顺序重新编号」能不能用。 */
 const check = ref(null)
-const outOfOrder = computed(() => !!(check.value?.time_out_of_order || []).length)
+/**
+ * 体检**没跑成功**（上一次请求失败了）。
+ *
+ * 「不知道」不等于「没问题」：以前体检一失败 `check` 就被置成 null，
+ * 于是 `outOfOrder` 变 false，「按当前顺序重新编号」被**放开** ——
+ * 执行后号码被压紧但仍与日期错位，那个月从此「整理就绪」体检不过，
+ * 不能自动记账、也不能结账，而纸质凭证与系统也对不上（审计 §3.27）。
+ *
+ * 所以体检失败是一个**独立的状态**：这一档下 RENUM 不给用，并且要说话。
+ */
+const checkFailed = ref(false)
+/**
+ * 体检**现在是什么状态**：'idle'（还没跑）| 'loading'（在途）| 'failed'（失败）| 'ok'（跑成了）。
+ *
+ * **只有 'ok' 才允许「按当前顺序重新编号」**（审计 N5）。
+ *
+ * 为什么不能只看 checkFailed：「体检失败」是一档，「体检还没跑 / 还在跑」
+ * 是另一档 —— 后两档也是「不知道时序对不对」，而「不知道」不能当成
+ * 「没问题」。以前这两档下 RENUM 是**可选的**，绕过的正是 §3.27 的核心不变量。
+ *
+ * 状态挂在 check.value.__state 上，而不是另立一个 ref：
+ * loadCheck() 里能碰的变量越少越好（少一个就少一处「测的时候忘了喂」的坑）。
+ */
+const checkState = computed(() => check.value?.__state || 'idle')
+/** 时序真的对不上（有凭证号和日期对不上）。 */
+const hasOrderIssue = computed(() => (check.value?.time_out_of_order || []).length > 0)
+/**
+ * 「按当前顺序重新编号」能不能用：体检必须**跑成功过**，而且时序没问题。
+ *
+ * 名字沿用 outOfOrder，但语义是「这一档下不能按当前顺序压号」——
+ * 「不知道」（idle / loading / failed）跟「知道不对」（时序错位）一样都不能压。
+ */
+const outOfOrder = computed(() => checkState.value !== 'ok' || hasOrderIssue.value)
+const renumBlocked = computed(() => checkFailed.value || outOfOrder.value)
 const orderIssueText = computed(() =>
   (check.value?.time_out_of_order || [])
     .slice(0, 3)
@@ -152,15 +197,40 @@ function payload() {
 }
 
 async function loadCheck() {
-  if (!store.bookId || !store.periodId) { check.value = null; return }
+  if (!store.bookId || !store.periodId) { check.value = null; checkFailed.value = false; return }
+  // **在途也是一个状态**：这一档下 RENUM 不给用（审计 N5），
+  // 页面上要看得见「体检还在跑」，不能让人以为已经查过了。
+  check.value = { __state: 'loading' }
+  checkFailed.value = false
   try {
-    check.value = await voucherApi.voucherPeriodCheck(store.bookId, store.periodId)
+    check.value = {
+      __state: 'ok',
+      ...await voucherApi.voucherPeriodCheck(store.bookId, store.periodId)
+    }
+    checkFailed.value = false
   } catch {
-    check.value = null
+    // 失败**不等于**「没有时序问题」—— 见 checkFailed 的说明。
+    check.value = { __state: 'failed' }
+    checkFailed.value = true
   }
 }
 
 async function preview() {
+  // 体检没跑成功时，「按当前顺序重新编号」不能执行 ——
+  // 选项虽然禁掉了，可 URL 里恢复出来的 strategy 可能已经是 RENUM。
+  if (strategy.value === 'RENUM' && renumBlocked.value) {
+    // 说得清**为什么**不给整理：还没跑 / 还在跑 / 跑失败了 / 时序真的不对。
+    // 「不知道」和「知道不对」是两回事，但都不能压号（见 renumBlocked）。
+    const st = check.value?.__state || 'idle'
+    ElMessage.warning(st === 'failed'
+      ? '体检没跑成功，不知道时序对不对，先重试体检再整理'
+      : st === 'loading'
+        ? '体检还在跑，等体检结果出来再整理'
+        : st === 'idle'
+          ? '还没做体检，不知道时序对不对，先等体检结果再整理'
+          : '这个月的凭证号和日期对不上，请改用「按日期升序重排并编号」')
+    return
+  }
   loading.value = true
   try {
     plan.value = await voucherApi.organizePreview(store.bookId, payload())

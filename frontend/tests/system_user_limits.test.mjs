@@ -73,7 +73,18 @@ t('密码位数不写死在文案里 —— 提示一律跟着常量走', () => 
 })
 
 t('删除失败时把后端的话原样透出来（最后一个管理员那句自带处置动作）', () => {
-  assert.match(VIEW, /async function remove\(row\)[\s\S]*?e\?\.response\?\.data\?\.detail/)
+  // **这里断言的是「用了共享取值的那一份」**，不是「直接读 data.detail」。
+  //
+  // 直接读 ``e.response.data.detail`` 在 detail 是**结构化**时会渲染成
+  // ``[object Object]`` —— 而「近期二次验证」闸门回的 403 恰恰是结构化的
+  // （{code, message}）。所以取值统一走 utils/errorText.js（§4.5：
+  // 同一个量只允许一个权威实现）。
+  //
+  // 「原样透出」这条**意图**不再由这里的源码形态守着，改由
+  // tests/error_text.test.mjs **行为级**钉住（真的拿一个 detail 进去，
+  // 断言出来的话与后端那句逐字相同）。
+  assert.match(VIEW, /async function remove\(row\)[\s\S]*?errorText\(e,/)
+  assert.doesNotMatch(VIEW, /async function remove\(row\)[\s\S]*?e\?\.response\?\.data\?\.detail/)
 })
 
 console.log('')

@@ -55,6 +55,11 @@
       </div>
     </div>
 
+    <!-- 加载失败**不能**与「没有数据」同形：断网/超时时表格会空着，
+         一条提示都没有的话，用户以为这一期真的一笔都没有（审计 §3.25）。 -->
+    <el-alert v-if="loadError" type="error" :closable="false" show-icon class="mb"
+              :title="`加载失败：${loadError}。请检查网络后重试。`" />
+
     <div class="card">
       <div class="report-head">
         <h2 class="report-title">科目余额表</h2>
@@ -222,7 +227,7 @@ function onPeriodChange() {
 }
 
 /** 只认最新一趟：顶栏期间连点时，旧响应不许覆盖新数据（见 composables/useLatestLoad）。 */
-const { loading, run, isStale } = useLatestLoad('ledger/balance')
+const { loading, error: loadError, run, isStale } = useLatestLoad('ledger/balance')
 
 /** 过滤是纯前端的事：接口一次就把整棵树都给了，切档位不必重新取数。
  *  （原来那个复选框绑的是 @change="load"，每拨一次都白跑一趟全表。） */
@@ -236,11 +241,21 @@ const visibleRows = computed(() => {
 async function load() {
   if (!store.bookId || !periodId.value) return
   // 单期不带 from_period_id：后端据此分叉，多传一个空值会变成「一段空区间」
-  const d = await run(() => api.balance(store.bookId, {
-    period_id: periodId.value,
-    ...(isRange.value ? { from_period_id: fromId.value } : {}),
-    include_unposted: includeUnposted.value
-  }))
+  let d
+  try {
+    d = await run(() => api.balance(store.bookId, {
+      period_id: periodId.value,
+      ...(isRange.value ? { from_period_id: fromId.value } : {}),
+      include_unposted: includeUnposted.value
+    }))
+  } catch (e) {
+    // 加载失败**不是**「没有数据」：这两件事在页面上长得一模一样。
+    // 拦截器已经弹过提示了，这里只要别让它变成一个没人接的 rejection ——
+    // 页面上 data 保持原样，顶部由 loadError 挂一条「加载失败」。
+    // 以前这里一声不吭：断网/超时后表格空着、零提示，
+    // 用户以为这一期真的一笔都没有（审计 §3.25）。
+    return
+  }
   // 过期的那一趟：条件早就被改掉了，写进去就是「表里的数对不上选中的期间」。
   if (isStale(d)) return
   data.value = d
@@ -295,6 +310,9 @@ watch([periodId, fromId], load)
 </script>
 
 <style scoped>
+
+/* 加载失败横幅与工具条之间的距离（el-alert 默认贴着上面那一块）。 */
+.mb { margin-bottom: 12px; }
 .report-head { text-align: center; margin-bottom: 10px; }
 .report-title { margin: 0 0 4px; font-size: 19px; letter-spacing: 4px; }
 .report-sub { font-size: 13px; color: var(--cwq-muted); }

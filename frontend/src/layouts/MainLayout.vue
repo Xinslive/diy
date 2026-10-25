@@ -130,6 +130,12 @@
         <router-view :key="viewKey" />
       </main>
     </div>
+
+    <!-- 高危动作撞到「近期二次验证」闸门时的引导（审计 §3.2）。
+         挂在壳层而不是各个页面里：闸门管的是**全局**的 13 条受管控写路由，
+         哪个页面发起的它不知道，而没有这个对话框，管理员就只看到一句 403
+         —— 界面上没有下一步，撞死路。 -->
+    <MfaReauthDialog />
   </div>
 </template>
 
@@ -140,6 +146,7 @@ import { useSessionStore } from '@/stores/session'
 import { useTabsStore } from '@/stores/tabs'
 import { landingOf, menuKeyOf, visibleNav } from '@/router/nav'
 import { pluginEntries } from '@/plugins/runtime'
+import MfaReauthDialog from '@/components/MfaReauthDialog.vue'
 import {
   ArrowDown, Close, DArrowRight, Expand, Fold, HomeFilled, Refresh,
 } from '@element-plus/icons-vue'
@@ -315,7 +322,21 @@ function onCommand(cmd) {
  * 触发得再频也不怕：tabs.open 对已存在的标签**只改地址**，不改标题、不动脏状态，
  * 而且裸地址没变时直接返回、连存储都不写（见 stores/tabs.js 的 open）。
  */
-watch(() => `${route.name} ${route.fullPath || route.path}`, () => tabs.open(route), { immediate: true })
+watch(() => `${route.name} ${route.fullPath || route.path}`, () => {
+  tabs.open(route)
+  // **换了页面就别再提「上一本账」**：store 里那份 prevBookId 是给凭证页的
+  // 「撞号」提示用的（见 stores/session.js）。用户换到别的页面再回来，
+  // 那条提示就不该再冒出来 —— 否则会对着一个他压根没打开过的凭证说
+  // 「你原来看的是哪本账的哪张」（审计 §3.33）。
+  //
+  // **切账套不会走到这里**：切账套时路由不变（变的只是顶栏那个下拉），
+  // 所以这个 watcher 不触发，那个记号活到凭证页重挂之后被取走。
+  store.prevBookId = 0
+  // 「刚建出来的那张新凭证」也是**上一段路**的事（审计 N5）：
+  // 用户点「新增凭证」重新开一张时，不该被带回刚才那张 ——
+  // 那个记号只对「同一段路里的重挂」有用（重挂不换路由，所以这里也不会清它）。
+  store.createdVoucher = null
+}, { immediate: true })
 
 function closeTab(key) {
   const { next } = tabs.close(key, activeKey.value)

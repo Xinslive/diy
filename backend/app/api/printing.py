@@ -28,7 +28,8 @@ from sqlalchemy.orm import Session, selectinload
 from app.api.reports import _visible_template
 from app.api.vouchers import _book_subjects, _serialize
 from app.core.db import get_db
-from app.core.deps import get_book_link, get_current_user, get_my_book, require_book_write
+from app.core.deps import (get_book_link, get_current_user, get_my_book, normalize_role,
+                            require_book_write)
 from app.models import Book, Period, PrintTemplate, ReportTemplate, Subject, SysUser, UserBook, Voucher
 # ``preview`` 是轻量的（只依赖 sqlalchemy），留在模块级。
 #
@@ -616,10 +617,20 @@ def _require_global_template_write(link: UserBook, user: SysUser) -> None:
 
     fail-closed：角色认不出来一律当拒绝，不做「不是 VIEWER 就放行」的黑名单判断
     （见 ``frontend/src/stores/session.js::canWrite`` 里同一段推理）。
+
+    **角色必须先归一化再比（审计 P3-12）。** 这里原来写的是
+    ``link.role != "OWNER"`` —— 大小写敏感的原始字面量，而
+    ``app/models/system.py`` 早就写明「大小写归一化交给应用层
+    （``deps.normalize_role``）做」。于是同一份角色在
+    ``app/api/books.py``（用 ``normalize_role``）放行、在打印侧却被拒：
+    ``'owner'`` / ``'OWNER '`` / ``'OWNER\\n'`` 全都判成「不是 OWNER」。
+    方向是 fail-closed（是**误拒合法用户**，不是越权），但口径分裂本身就是
+    bug —— 一个人换个入口就改了权限。现在与 ``books.py`` 用同一个
+    ``normalize_role``，两边对同一份数据给出同一个答案。
     """
     if user.is_admin:
         return
-    if link.role != "OWNER":
+    if normalize_role(link.role) != "OWNER":
         raise HTTPException(
             403, "打印模板是账套共用的版式（账套里每个人打印时都会用到），"
                  "只有账套所有者或管理员可以修改。只想改自己那份的话，"

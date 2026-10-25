@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from starlette.responses import FileResponse
 from app.core.config import settings
 from app.core.db import get_db, SessionLocal, engine
-from app.core.deps import get_current_user, require_admin
+from app.core.deps import get_current_user, require_admin, require_recent_admin_mfa
 from app.core.uploads import UploadTooLarge, read_upload_sync
 from app.models.plugin import PluginInstallAttempt
 from app.models.system import SysUser
@@ -34,14 +34,55 @@ _ASSET_CACHE: dict[tuple[str, str], tuple] = {}
 _ASSET_CACHE_LIMIT = 16
 
 
-def management(request: Request, response: Response, user=Depends(get_current_user)):
-    response.headers.update(PRIVATE)
+def _admin_audited(request: Request, user=Depends(get_current_user)):
+    """管理员判定，**并在被拒时留痕**。
+
+    单独拆出来是因为它要**先于**二次验证判定执行：不是管理员的人
+    访问写接口时，留下的应当是 ``management_denied``（历史上就有这条
+    审计），而不是「二次验证没做」—— 后者会掩盖真正的原因。
+    """
     try:
         return require_admin(user)
     except HTTPException:
         if request.method not in {"GET", "HEAD"}:
             audit.failure("management_denied", request.path_params.get("plugin_id", "unknown"), user, "ADMIN_REQUIRED")
         raise
+
+
+def management(request: Request, response: Response, user=Depends(_admin_audited)):
+    """**读**侧依赖：只要求管理员。
+
+    GET 类路由挂这个 —— 「看一眼插件列表」不是高危动作，不该被二次
+    验证挡住（否则管理员在没做二次验证时连界面都打不开）。
+    """
+    response.headers.update(PRIVATE)
+    return user
+
+
+def management_write(request: Request, response: Response,
+                     user=Depends(_admin_audited),
+                     db: Session = Depends(get_db),
+                     _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """**写**侧依赖：管理员 **且** 近期完成过邮箱二次验证。
+
+    **为什么插件的写操作要二次验证**（审查 §3.2）：契约写在
+    ``core/config.py:225`` —— 「管理员验过二次因子之后，这个窗口内做高危
+    动作（改他人口令 / **装插件** / 读 OSS 凭据 / 轮换调度密钥 / 删用户）
+    不再重复要求走邮箱」。装插件原来**完全不在**这道闸门里 ——
+    ``grep require_recent_admin_mfa app/`` 的命中只有 ``api/system.py``
+    与 ``core/deps.py``，``app/plugins/`` 一处都没有。
+
+    它的代价不是「权限更大」，而是**逃逸令牌有效期**：插件代码跑在
+    **API 宿主进程内**（``app/plugins/loader.py``），一份装上去的插件能
+    改库、能提权。于是「拿到一枚管理员令牌」这条路上，装插件是**唯一**
+    能把临时凭据变成**永久后门**的动作 —— 而闸门恰恰就是为了防这个。
+
+    二次验证开关关着时这个依赖**不拦人**（见
+    ``core/deps.py::require_recent_admin_mfa``），所以挂着它不影响现有部署；
+    开关开着而通道坏了时它**一律拒绝**（fail-closed）。
+    """
+    response.headers.update(PRIVATE)
+    return user
 
 
 def managed(action):
@@ -104,14 +145,14 @@ def eligible_users(query: str = Query("", max_length=128), page: int = Query(1, 
 
 @router.post("/api/system/plugins/install")
 @managed("install")
-def install_plugin(file: UploadFile = File(...), user=Depends(management)):
+def install_plugin(file: UploadFile = File(...), user=Depends(management_write)):
     raw = read_upload_sync(file, limit=min(settings.plugin_max_bytes, settings.import_max_bytes))
     return install(raw, user)
 
 
 @router.post("/api/system/plugins/reconcile")
 @managed("reconcile")
-def reconcile_plugins(user=Depends(management)):
+def reconcile_plugins(user=Depends(management_write)):
     from app.plugins.reconcile import reconcile
     result = reconcile()
     with SessionLocal.begin() as db:
@@ -126,7 +167,7 @@ class KeyRevoke(BaseModel):
 
 @router.post("/api/system/plugins/revoke-key")
 @managed("revoke_key")
-def revoke_key(payload: KeyRevoke, user=Depends(management), db: Session = Depends(get_db)):
+def revoke_key(payload: KeyRevoke, user=Depends(management_write), db: Session = Depends(get_db)):
     """按 key_id 一键封禁签名密钥，并停用这把钥匙签出来的插件。
 
     撤销名单在**安装期和加载期**都判定：把 key_id 写进运行时封禁名单后，
@@ -170,7 +211,7 @@ class Prune(BaseModel):
 
 @router.post("/api/system/plugins/maintenance/prune")
 @managed("prune")
-def prune_reserved_route(payload: Prune, user=Depends(management)):
+def prune_reserved_route(payload: Prune, user=Depends(management_write)):
     """清理备份区与隔离区。
 
     默认遵守保留期；``force=True`` 立即删除**没有任何引用**的孤儿备份。
@@ -195,13 +236,13 @@ def set_enabled(db, plugin_id, user, enabled):
 
 @router.post("/api/system/plugins/{plugin_id}/enable")
 @managed("enable")
-def enable(plugin_id: str, user=Depends(management), db: Session = Depends(get_db)):
+def enable(plugin_id: str, user=Depends(management_write), db: Session = Depends(get_db)):
     return set_enabled(db, plugin_id, user, True)
 
 
 @router.post("/api/system/plugins/{plugin_id}/disable")
 @managed("disable")
-def disable(plugin_id: str, user=Depends(management), db: Session = Depends(get_db)):
+def disable(plugin_id: str, user=Depends(management_write), db: Session = Depends(get_db)):
     return set_enabled(db, plugin_id, user, False)
 
 
@@ -247,32 +288,32 @@ def change_users(db, plugin_id, user, ids=None, *, add=None, remove=None):
 
 @router.put("/api/system/plugins/{plugin_id}/users")
 @managed("users_replace")
-def replace_users(plugin_id: str, payload: UserSet, user=Depends(management), db: Session = Depends(get_db)):
+def replace_users(plugin_id: str, payload: UserSet, user=Depends(management_write), db: Session = Depends(get_db)):
     return change_users(db, plugin_id, user, payload.user_ids)
 
 
 @router.post("/api/system/plugins/{plugin_id}/users/{user_id}")
 @managed("grant")
-def grant(plugin_id: str, user_id: int, user=Depends(management), db: Session = Depends(get_db)):
+def grant(plugin_id: str, user_id: int, user=Depends(management_write), db: Session = Depends(get_db)):
     return change_users(db, plugin_id, user, add=user_id)
 
 
 @router.delete("/api/system/plugins/{plugin_id}/users/{user_id}")
 @managed("revoke")
-def revoke(plugin_id: str, user_id: int, user=Depends(management), db: Session = Depends(get_db)):
+def revoke(plugin_id: str, user_id: int, user=Depends(management_write), db: Session = Depends(get_db)):
     return change_users(db, plugin_id, user, remove=user_id)
 
 
 @router.post("/api/system/plugins/{plugin_id}/upgrade")
 @managed("upgrade")
-def upgrade(plugin_id: str, file: UploadFile = File(...), user=Depends(management)):
+def upgrade(plugin_id: str, file: UploadFile = File(...), user=Depends(management_write)):
     raw = read_upload_sync(file, limit=min(settings.plugin_max_bytes, settings.import_max_bytes))
     return install(raw, user, upgrade_id=plugin_id)
 
 
 @router.delete("/api/system/plugins/{plugin_id}")
 @managed("delete")
-def delete_plugin(plugin_id: str, user=Depends(management), db: Session = Depends(get_db)):
+def delete_plugin(plugin_id: str, user=Depends(management_write), db: Session = Depends(get_db)):
     from app.plugins.reconcile import quarantine
     with installation_lock(plugin_id):
         p = find(db, plugin_id)
@@ -305,7 +346,7 @@ class Cleanup(BaseModel):
 
 @router.post("/api/system/plugins/{plugin_id}/tables/cleanup")
 @managed("cleanup")
-def cleanup(plugin_id: str, payload: Cleanup, user=Depends(management), db: Session = Depends(get_db)):
+def cleanup(plugin_id: str, payload: Cleanup, user=Depends(management_write), db: Session = Depends(get_db)):
     with installation_lock(plugin_id):
         p = find(db, plugin_id, include_deleted=True)
         if payload.confirmation != plugin_id or not p.deleted_at:

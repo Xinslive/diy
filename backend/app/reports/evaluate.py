@@ -30,6 +30,7 @@ from typing import Optional
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.money import money_str_or_text
 from app.ledger.engine import ZERO, LedgerEngine
 from app.models import Book, Entry, Period, ReportCell, ReportCol, ReportRow, Subject, Voucher
 from app.models.book import book_first_ord, year_start_ord
@@ -527,7 +528,14 @@ def evaluate(
                 value = ctx.memoized_cell(r.row_no, c.col_no)
                 if value is None:
                     value = evaluator.run(src)
-                row_values.append({**base, "value": str(value), "formula": src, "error": ""})
+                # **报表对外的数值形态在这里定死**（审计 §3.26）。
+                # 页面、打印预览、Excel 导出、MCP 全部读这同一个输出，
+                # 所以「两位小数」只需要在这里定一次（§4.5：同一个量只允许
+                # 一个权威实现）—— 以前是各通道各舍入一次，屏幕给「0.33」、
+                # 导出给「0.3333333333333333333333333333」，对不上且无提示。
+                # 舍入规则见 app/core/money.py（与 MCP 通道共用同一份）。
+                row_values.append({**base, "value": money_str_or_text(value),
+                                   "formula": src, "error": ""})
             except FormulaError as e:
                 errors.append(f"{r.label}(第{r.row_no}行 第{c.label}列): {e}")
                 row_values.append({**base, "value": None, "formula": src, "error": str(e)})
@@ -550,7 +558,7 @@ def evaluate(
         notices.append({
             **CARRY_FORWARD_NOTICE,
             "cols": [c.col_no for c in cols if c.kind in PF_KINDS],
-            "amount": str(cf_amount),
+            "amount": money_str_or_text(cf_amount),
         })
     missing = ctx.missing_subject_codes()
     if missing:
@@ -582,7 +590,20 @@ def evaluate(
         # -- 口径标注（P1-15） --
         "carry_forward_excluded": True,           # 本次求值用的就是报表口径
         # 本期没结转就报 null：两个口径此时完全相等，没什么可标注的
-        "carry_forward_period_amount": (str(cf_amount) if cf_amount != ZERO else None),
+        "carry_forward_period_amount": (money_str_or_text(cf_amount)
+                                        if cf_amount != ZERO else None),
+        # -- 显示口径（审计 §3.26） --
+        # 报表数值一律两位小数（舍入规则见 app/core/money.py）。页面、打印
+        # 预览、Excel 导出与 MCP 读的都是这同一个值，所以四处必然一致。
+        # 这段说明随数据一起走，是为了让界面**能说出**这个口径 —— 审计
+        # §3.26 的原修复要求「导出 quantize 到两位并在界面注明」。
+        # **注意**：它不在 notices[] 里。notices 是「本期有什么特殊情况」的
+        # 通道（没结转时必须是空数组），口径说明是常驻的，两回事。
+        "display_scale": {
+            "decimals": 2,
+            "rounding": "HALF_EVEN",
+            "note": "报表数值按两位小数显示：页面、打印预览与 Excel 导出是同一个数。",
+        },
         "notices": notices,
         "period": f"{period.year}-{period.month:02d}",
         "include_unposted": include_unposted,

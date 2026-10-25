@@ -33,12 +33,14 @@ from app.core.uploads import RowBudget, UploadTooLarge, check_archive_size
 from app.plugins.errors import PluginError
 from app.plugins.manifest import canonical_payload, parse_manifest, plugin_digest, safe_path
 from app.plugins.scan_policy import (
-    ALLOWED_DUNDER_NAMES,
-    BACKEND_MODULES,
     DENIED_ATTRIBUTES,
     DENIED_NAMES_ON_CALL,
     DENIED_NAMES_ON_LOAD,
-    MIGRATION_MODULES,
+    DENIED_STRING_CAPABILITY_NAMES,
+    DENIED_STRING_DUNDER_NAMES,
+    RULES_BY_FLAVOR,
+    is_escape_module_name,
+    reflection_violations,
 )
 
 TEXT_TYPES = {".py", ".js", ".json", ".css", ".sql", ".md", ".txt"}
@@ -167,11 +169,14 @@ def verify_signature(manifest: dict, keys=None, *, historical=False):
 
 
 def _rules_for(path: str) -> dict:
+    """按插件文件所在位置取这一档的能力规则。
+
+    分档与运行期的 :data:`app.plugins.scan_policy.IMPORT_FLAVORS` 是**同一件事**
+    （规则表 :data:`RULES_BY_FLAVOR` 是唯一来源），所以两边永远一致。
+    """
     normalized = path.replace("\\", "/")
-    rules = dict(BACKEND_MODULES)
-    if normalized.startswith("migrations/"):
-        rules.update(MIGRATION_MODULES)
-    return rules
+    flavor = "migration" if normalized.startswith("migrations/") else "backend"
+    return RULES_BY_FLAVOR[flavor]
 
 
 def _scan_python(path: str, tree: ast.AST, permissions) -> list[dict]:
@@ -235,10 +240,17 @@ def _scan_python(path: str, tree: ast.AST, permissions) -> list[dict]:
                 bindings[alias.asname or name] = (rule, name)
 
     # 第二遍：危险形态。
+    #
+    # 「双下划线形态」交给权威判据 :func:`app.plugins.scan_policy.reflection_violations`
+    # 统一判 —— 运行期的沙箱在装载时用的是同一份，两边必须一致
+    # （扫描放行而运行期拒绝 = 插件装得上装不进；扫描拒绝而运行期放行 = 漏洞）。
+    for lineno, _kind in reflection_violations(tree):
+        finding("PY_REFLECTION", lineno)
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
             if node.attr.startswith("__"):
-                finding("PY_REFLECTION", node.lineno)
+                # 已由 reflection_violations 报过。
                 continue
             if node.attr in DENIED_ATTRIBUTES:
                 finding("PY_ATTRIBUTE", node.lineno)
@@ -248,26 +260,48 @@ def _scan_python(path: str, tree: ast.AST, permissions) -> list[dict]:
                 rule, symbol = bindings[base.id]
                 if rule.denies(symbol, node.attr):
                     finding("PY_ATTRIBUTE", node.lineno)
+                elif symbol is None and is_escape_module_name(node.attr):
+                    # 基座是**用 import 绑定的模块**，属性名却是一个
+                    # **不在能力清单里的标准库模块** —— 这是逃逸通道：
+                    # ``dataclasses.sys`` / ``contextlib.os`` / ``uuid.os`` /
+                    # ``json.codecs`` / ``dataclasses.builtins`` 都是这一类。
+                    # 拿到 ``dataclasses.sys`` 就等于拿到 ``sys.modules``。
+                    #
+                    # 只在「基座是模块绑定」时才判：从模块 import 出来的**符号**
+                    # （``from dataclasses import dataclass``）不是模块，
+                    # ``dataclass.sys`` 这种访问没有意义，判了就是误伤。
+                    finding("PY_MODULE_ESCAPE", node.lineno)
         elif isinstance(node, ast.Name):
             if isinstance(node.ctx, ast.Load) and node.id in DENIED_NAMES_ON_LOAD:
                 # 「取名后调用」的第一环：imp = __import__ / e = eval / f = open。
                 finding("PY_CALL", node.lineno)
-            elif (isinstance(node.ctx, ast.Load) and node.id.startswith("__")
-                  and node.id not in ALLOWED_DUNDER_NAMES):
-                # **双下划线名字按形态一律拒**（审查 S-01）。
-                # 属性形态（``x.__class__``）上面那条规则已经拦了；这里补的是
-                # **裸 Name** 形态 —— ``__builtins__`` / ``__loader__`` /
-                # ``__spec__`` / ``__dict__`` 都是这一类，属性规则看不见它们，
-                # 而它们每一个都能把内建能力重新拿回来。
-                # 白名单只有 ``__name__`` / ``__file__`` / ``__doc__`` /
-                # ``__package__`` 四个只读元信息。
-                finding("PY_REFLECTION", node.lineno)
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Subscript):
                 # func["eval"](...)：下标取函数一律拒绝。
                 finding("PY_SUBSCRIPT", node.lineno)
             elif isinstance(node.func, ast.Name) and node.func.id in DENIED_NAMES_ON_CALL:
                 finding("PY_CALL", node.lineno)
+
+    # 第三遍：字符串常量。
+    #
+    # 前面两遍都按**形态**判定（属性以 __ 开头、裸名字命中黑名单），
+    # 而字符串是形态的**盲区**：``operator.attrgetter("__globals__")`` 里那个
+    # ``"__globals__"`` 看起来只是一段普通文本，扫描器看不出它将来会变成
+    # 属性访问。审计 §3.1 实测过这条链：扫描判 CLEAN，运行期却拿到了
+    # 整份 ``__builtins__``。
+    #
+    # 运行期那层（:mod:`app.plugins.sandbox`）已经把「字符串 → 属性访问」
+    # 这条路结构上堵死了（插件拿不到 getattr / attrgetter），这里再挡一道，
+    # 是为了让「哪天有人把 getattr 放回内建白名单」这件事在**扫描期**就红。
+    #
+    # 判定刻意做得很窄：只认「整个字符串正好等于」某个被禁名字，
+    # 不做子串匹配 —— 否则中文 docstring 里出现 ``obj.__init__`` 会被误伤。
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value in DENIED_STRING_DUNDER_NAMES:
+                finding("PY_STRING_DUNDER", node.lineno)
+            elif node.value in DENIED_STRING_CAPABILITY_NAMES:
+                finding("PY_STRING_CAPABILITY", node.lineno)
     return findings
 
 

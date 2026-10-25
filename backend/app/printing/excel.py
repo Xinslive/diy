@@ -163,23 +163,60 @@ def _propagate_merged_borders(ws) -> None:
                 )
 
 
-def _num(v) -> Optional[float]:
+#: Excel 的数值格只保证 **15 位有效数字**（底层是 IEEE 754 双精度，
+#: 且 Excel 自己就按 15 位显示）。超过这个位数的金额**写不进数值格**。
+_EXCEL_MAX_SIGNIFICANT_DIGITS = 15
+
+
+def _sig_digits(d: Decimal) -> int:
+    """有效数字位数（去掉尾随零）。
+
+    **不用 ``normalize()``**：它受 Decimal 上下文精度（默认 28 位）约束，
+    位数超了会先被舍入 —— 而这里要的恰恰是「原值有几位」。
+    """
+    digits = d.as_tuple().digits
+    n = len(digits)
+    while n > 1 and digits[n - 1] == 0:
+        n -= 1
+    return n
+
+
+def _num(v) -> Optional[Decimal]:
     """金额列写进单元格的形态。
 
     **保持 Decimal，不收窄成 float**（P2-7 / P3-4）。
 
     金额在库里是 ``Numeric(20,2)``、在计算链路里是 Decimal，到导出这一步
     退回 float 就等于在最末端又把精度丢了：大额（千万级以上）float 只有
-    15~17 位有效数字，逐格累加还会漂。openpyxl 原生支持 Decimal 写单元格
-    （``data_type == 'n'``，写出的是十进制字面量），所以这里不需要理由退回 float。
+    15~17 位有效数字，逐格累加还会漂。
 
     另外注意合计曾经用 ``float`` 累加：10 × 0.1 会得到 0.9999999999999999，
     再 ``round(2)`` 仍是 1.0 看着没事，但 0.1+0.2 这类组合在几十万行上会明显偏移，
     而导出表是要交给审计方逐格核对的。改成 Decimal 累加后不存在这个问题。
+
+    **openpyxl 到底怎么写 Decimal（这段注释以前写着谎话）**
+    ------------------------------------------------------
+    旧注释说「openpyxl 原生支持 Decimal 写单元格（``data_type == 'n'``），
+    写出的是十进制字面量」—— **不成立**。openpyxl 的 ``safe_string`` 对
+    Decimal 走的是 ``"%.16g" % value``，而 ``%g`` 会先把 Decimal **转成
+    float** 再格式化。实测（openpyxl 3.1.5）::
+
+        safe_string(Decimal("0.33"))                -> "0.33"
+        safe_string(Decimal("99999999999999.99"))   -> "99999999999999.98"   # 丢一分
+        safe_string(Decimal("999999999999999.99"))  -> "1000000000000000"     # 直接失真
+
+    Excel 的数值格本身就是双精度、只保证 15 位有效数字，所以**超过 15 位的
+    金额根本写不进数值格**。那种情况**不能默默写一个错的数**（审计 §3.26：
+    屏幕与文件必须是同一个数）—— 本函数改为写成**文本**，内容是精确的十进制
+    数字（带千分位，与相邻数值格的显示一致）。Excel 里它会左对齐并带「数字
+    存为文本」的绿三角：那是**看得见**的错位，好过一个看不出差别的错数。
     """
     if v is None or v == "":
         return None
-    return Decimal(str(v))
+    d = v if isinstance(v, Decimal) else Decimal(str(v))
+    if _sig_digits(d) > _EXCEL_MAX_SIGNIFICANT_DIGITS:
+        return f"{d:,.2f}"
+    return d
 
 
 def _d(v) -> Decimal:

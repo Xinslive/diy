@@ -4682,6 +4682,49 @@ rename 原子替换软链本身（不跟随软链、不把它当目录），**�
 一旦它在界面上有入口，它就变成了产品功能 —— 于是所有人都会去用它，
 包括那些只想把账套改个名字的人。
 
+### 11.7.12 逃生口清单：系统里唯一的一份（2026-10-25 加）
+
+「逃生口」= 那些**默认阻断、但可以显式放行**的开关：默认行为是「不合格就拒绝
+启动 / 拒绝部署」，打开之后变成「只告警、继续跑」。
+
+**它们必须登记在一份清单里**，因为这类开关最危险的性质是**漏登记的那一个不会
+报错**：它既不告警也不阻断，只是安静地让一道闸失效，于是没人会再想起它。
+清单在 `backend/app/core/escape_hatches.py`，**只放数据、不放逻辑** —— 任何一处
+要回答「这是不是一个逃生口」，都从那里取。
+
+现在登记在册的：
+
+| 名字 | 侧 | 放行了什么 |
+|---|---|---|
+| `TRUSTED_PROXIES_WARN_ONLY` | 应用 | TRUSTED_PROXIES 为空时不再拒绝启动 |
+| `MCP_ALLOWED_HOSTS_WARN_ONLY` | 应用 | MCP Host 白名单为空时不再拒绝启动 |
+| `BACKUP_ENCRYPTION_KEY_WARN_ONLY` | 应用 | 备份加密密钥为空时不再拒绝启动 |
+| `CWQ_ALLOW_ANY_HOST` | 部署 | 跳过「本机是不是那台被授权的生产机」整道守卫 |
+| `CWQ_HOST_IP` | 部署 | **注入**守卫判本机身份用的那个 IP |
+| `CWQ_DEPLOY_ALLOW_EMPTY_TRUSTED_PROXIES` | 部署 | TRUSTED_PROXIES 为空时不再阻断部署 |
+| `CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR` | 部署 | 应用根不是 `/opt/cwq` 时不再阻断 |
+| `CWQ_DEPLOY_SKIP_FRONTEND_CHECK` | 部署 | 跳过前端可达性检查 |
+
+三条配套的机制：
+
+1. **应用侧的三个只允许对单次运行生效**。写进 `.env` 就是把这台机器的常态放松，
+   而豁免本来就是安静放行的、不会有人提醒 —— 所以生产环境读到持久化配置里开着
+   逃生口，**直接拒绝启动**（`validate_production_settings`）。进程环境里给一次
+   是合规用法。
+2. **CI 断言「deploy.sh 里出现的每个 `CWQ_*` 名字都登记过」**。这一条最初只扫
+   `CWQ_DEPLOY_*` 前缀，于是 `CWQ_ALLOW_ANY_HOST` 与 `CWQ_HOST_IP` 这两个**真实
+   的逃生口**正好从缝里漏过去 —— 它们既没登记，也没有任何检查覆盖。现在扫全部
+   `CWQ_*`（15 个），每个都必须被归类为逃生口 / 非逃生口开关 / 参数。
+3. **`CWQ_HOST_IP` 在脚本里打 stderr 告警**。它长得像参数，其实是逃生口：守卫
+   判「本机是不是那台被授权的机器」靠的就是这个 IP，注成被授权的 IP 就都过了。
+   豁免是设计成安静放行的，而这一条安静不得。
+
+> 写这类告警时踩过一个坑，值得记下来：`host_public_ip()` 的返回值是被
+> `this_ip="$(host_public_ip)"` **命令替换**接走的，而 `log` 写的是 stdout ——
+> 一行告警会被一起捕获进 `this_ip`，判据变成「告警文字 + IP」，标记文件比较必然
+> 不符，**生产机被误拦**。目标机守卫那 4 条用例当场变红，症状正是「生产机被
+> 误拦了」。**在被命令替换接走的函数里，输出只能走 stdout 之外的通道。**
+
 ---
 
 ## 11.8 数据安全：账套快照备份到阿里云 OSS（2026-10-17 加）
@@ -5370,6 +5413,8 @@ AttributeError: 'int' object has no attribute 'tzinfo'
 安装使用 runtime staging、文件锁、PostgreSQL session advisory lock 和 durable attempt journal。插件迁移及 MIGRATED journal 在同一 DB 事务提交，再 fsync + 同文件系统 rename，最后短事务提交 registry。文件系统和数据库不具有共同原子事务；reconcile 按已提交阶段向前恢复或隔离孤儿，结构不明时保留现场。
 
 主迁移追加 `0026_plugin_registry` 和 `0027_plugin_imports`，前 25 条保持原样。后者管理宿主导入批次、源文件和凭证来源；插件自有迁移仍与主链分离。插件分别使用 ScriptDirectory 和 `plugin_schema_version_<sha256(id)[:12]>`，只有显式安装/升级执行 DDL；启动只核对 head 和真实 metadata。业务表仅在 public 下使用 `plugin_<sha256(id)[:12]>_` 前缀，账套表必须有 book_id 和实际 FK，global 只允许配置/参考数据。迁移后核对列、PK/FK/check/index/trigger/function 及宿主结构快照，越界或不匹配即事务回滚。
+
+**插件自有表不许有二进制列**（`BYTEA`，含 `BYTEA[]`）。表里的值会原样经 `ctx.data.read` 回到插件手里，而插件后端将来要搬到独立进程（进程外架构，见 [插件规范](docs/plugin-spec.md) 的数据表一节）——那条路上返回值必须能序列化。表的结构是插件自己定的，宿主在编译期无从知道哪张表有这类列，所以这不是靠自觉：`validate_tables`（唯一看得见表实际结构的地方）直接拒绝二进制列，错误码 `INVALID_TABLE_COLUMN`。文件走导入批次通道，那条通道带容量闸、内容去重和留存期。`ctx` 各方法返回值的可序列化性登记在 `app/plugins/public_api.py::CTX_METHOD_SERIALIZATION`，覆盖性由 `tests/test_plugin_sdk_rules.py` 强制。
 
 ### 期望状态、worker 和用户授权
 

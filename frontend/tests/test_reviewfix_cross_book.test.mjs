@@ -12,6 +12,12 @@
  *
  * 这里从**真实组件源码**里抠出 resetForm() 与 load() 跑一遍，
  * 测的是页面上真在用的那段代码（与 voucher_balance.test.mjs 同一个路子）。
+ *
+ * **记号放在 store 里，不在组件里**（审计 §3.33）：切账套时凭证页会被
+ * **整个重挂**（MainLayout 的 viewKey 变了），组件内的 watch 随 scope 一起
+ * 停用 —— 以前把「上一张是哪个账套的哪张」记在 resetForm 里，那段代码
+ * **永远执行不到**，于是这句提示一次也没发出来过。现在记号放在
+ * stores/session.js 的 prevBookId 里，重挂之后才来取。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -63,6 +69,19 @@ function page(over = {}) {
         { id: 1, name: '甲账套', company_name: '甲公司' },
         { id: 2, name: '乙账套', company_name: '乙公司' },
       ],
+      /**
+       * **换账套前的那一本**（0 = 没切账套）。
+       *
+       * 这份记号在 store 里，不在组件里 —— 因为切账套时凭证页会被**整个重挂**
+       * （MainLayout 的 viewKey 变了），组件内的变量活不到那一步，
+       * 于是「已切换到账套…」那句提示永远发不出来（审计 §3.33）。
+       */
+      prevBookId: 0,
+      takePrevBookId() {
+        const prev = this.prevBookId
+        this.prevBookId = 0
+        return prev
+      },
     },
     voucherId: ref(0),
     voucherPeriod: ref(null),
@@ -83,6 +102,10 @@ function page(over = {}) {
     committedAmounts: ref(new Map()),
     crossBook: ref(null),
     formBookId: ref(1),
+    // 乐观锁令牌与冲突标志（审计 §3.15 的 409 契约）——
+    // load() 会往 voucherVersion 里写单张响应给的令牌。
+    voucherVersion: ref(''),
+    versionConflict: ref(false),
     form: { legacySubjects: [], entries: [], voucher_no: '', voucher_date: '' },
     subjectRefs: { clear() {} },
     rowEls: { clear() {} },
@@ -128,6 +151,9 @@ function page(over = {}) {
     const committedAmounts = d.committedAmounts
     const crossBook = d.crossBook
     const formBookId = d.formBookId
+    // 乐观锁令牌与冲突标志（审计 §3.15 的 409 契约）
+    const voucherVersion = d.voucherVersion
+    const versionConflict = d.versionConflict
     const form = d.form
     const subjectRefs = d.subjectRefs
     const rowEls = d.rowEls
@@ -157,30 +183,30 @@ function page(over = {}) {
   return { ...fns, deps, said, pushed }
 }
 
-test('切账套时 resetForm 记下「上一张是哪个账套的哪张」', () => {
+test('切账套时「上一本账」从 store 取到，并明示一次', async () => {
   const p = page()
-  p.deps.voucherId.value = 1581
-  p.deps.formBookId.value = 1
-  p.resetForm()
-  assert.deepEqual(p.deps.crossBook.value, { bookId: 1, voucherId: 1581 },
-    '切账套时没记下原来的凭证 —— 后面就没法提示了')
-  assert.equal(p.deps.voucherId.value, 0, 'resetForm 之后 id 应该清空')
+  p.deps.store.prevBookId = 1        // 换账套前的那一本
+  await p.load()
+  // crossBook 是**用完即清**的（提示发出去就 null），所以这里断言的是
+  // 「提示真的发出来了」—— 那才是这件事的验收标准。
+  assert.equal(p.said.length, 1, `应该明示一次：${JSON.stringify(p.said)}`)
+  assert.match(p.said[0][1], /甲公司/, '提示里要指名原账套')
+  assert.match(p.said[0][1], /#1581/, '提示里要指名原凭证的号')
+  assert.equal(p.deps.store.prevBookId, 0, '这份记号是一次性的：提示完就清')
 })
 
-test('新增页（本来就没有凭证 id）不记 —— 那不是撞号', () => {
+test('新增页（本来就没有凭证 id）不记 —— 那不是撞号', async () => {
   const p = page()
-  p.deps.voucherId.value = 0
-  p.resetForm()
+  p.deps.route.params.id = ''        // 新增页没有凭证 id
+  p.deps.store.prevBookId = 1
+  await p.load()
   assert.equal(p.deps.crossBook.value, null)
 })
 
 test('新账套恰好有同号凭证：明示一次「原凭证是账套 A 的 #1581，这里是本账套的 #1581」', async () => {
   const p = page()
-  // 模拟切账套：先 resetForm 记下旧账套，再把当前账套换成新的
-  p.deps.voucherId.value = 1581
-  p.deps.formBookId.value = 1
-  p.resetForm()
-  p.deps.formBookId.value = 2
+  // 模拟切账套：store 里记着「上一本账」，当前账套已经是新的
+  p.deps.store.prevBookId = 1
   await p.load()
 
   assert.equal(p.said.length, 1, `应该只提示一次：${JSON.stringify(p.said)}`)
@@ -196,10 +222,7 @@ test('新账套没有这个 id：报错里也要说清是从哪本账切过来�
   const p = page({
     api: { getVoucher: async () => { throw new Error('404') } },
   })
-  p.deps.voucherId.value = 1581
-  p.deps.formBookId.value = 1
-  p.resetForm()
-  p.deps.formBookId.value = 2
+  p.deps.store.prevBookId = 1
   await p.load()
 
   assert.equal(p.said.length, 1, `应该只提示一次：${JSON.stringify(p.said)}`)
@@ -212,10 +235,7 @@ test('新账套没有这个 id：报错里也要说清是从哪本账切过来�
 
 test('提示**只来一次**：后面再 load() 不重复说', async () => {
   const p = page()
-  p.deps.voucherId.value = 1581
-  p.deps.formBookId.value = 1
-  p.resetForm()
-  p.deps.formBookId.value = 2
+  p.deps.store.prevBookId = 1
   await p.load()
   assert.equal(p.said.length, 1)
   await p.load()

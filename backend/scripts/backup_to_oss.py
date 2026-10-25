@@ -124,11 +124,27 @@ def main(argv: list[str] | None = None) -> int:
                 t = tier_mod.classify(session, SCOPE_SYSTEM, None)
                 print(f"  系统数据（用户/授权/参数）  → {t}")
             print("\n试跑结束，没有上传任何东西。")
+            if not cfg_mod.encryption_ready():
+                print("⚠️  但**备份加密密钥没配**（BACKUP_ENCRYPTION_KEY）—— "
+                      "试跑不拦你，真要上传时会被拒绝（制品必须是密文）。")
             return 0
 
-        result = service.run_backup(
-            session, book_ids=args.books, force_tier=args.tier,
-            prune=not args.no_prune)
+        try:
+            result = service.run_backup(
+                session, book_ids=args.books, force_tier=args.tier,
+                prune=not args.no_prune)
+        except (cfg_mod.ConfigIncomplete, export_mod.ExportRefused) as e:
+            # **运行期那道闸**（配了 OSS 就必须配备份加密密钥）就拦在这里，
+            # 按**生效配置**判 —— 界面上配的 OSS 也在内，见
+            # ``app/backup/config.py::require_encrypted_ready``。
+            #
+            # **必须变成退出码 2，而不是裸 traceback。** systemd 只看退出码：
+            # 一次裸异常落成 exit 1（「脚本崩了」），而真相是「配置没配全」——
+            # 这在排障时是两条完全不同的路。退出码 2 的含义本来就是
+            # 「配置不全 / 没有任何东西可备」。
+            print(f"❌ {e}", file=sys.stderr)
+            _通知备份失败(f"配置不全，备份未执行：{e}")
+            return 2
         for run in result.runs:
             print(_print_run(run))
         for d in result.deleted:

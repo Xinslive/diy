@@ -16,6 +16,7 @@ export const STALE = Symbol('stale-response')
  *   · views/report/ReportView.vue      'report/render'
  *   · views/voucher/VoucherList.vue    'voucher/list'
  *   · views/system/AuditLog.vue        'system/audit'
+ *   · views/subject/SubjectTree.vue    'subject/tree'
  *
  * **依赖 MainLayout 的 viewKey 整页重挂兜底（没接这份守卫）**：
  *   账套 / 期间一变，viewKey（`${route.name}-${store.bookId}-${scope}-${refreshKey}`）
@@ -68,6 +69,19 @@ export const STALE = Symbol('stale-response')
  */
 export function useLatestLoad(key) {
   const loading = ref(false)
+  /**
+   * 最近一次**真错**的说明（空串 = 没有错）。
+   *
+   * 为什么要有它：`run()` 把真错照原样往外抛（吞掉只会让人以为查成功了），
+   * 而调用方若不接，这个抛错就变成一个**没人管的 promise rejection** ——
+   * 页面上 `data` 保持初始值，于是「加载失败」被渲染成「没有数据」。
+   * 断网或后端 30 秒超时的时候，用户看到的是一张空表、零提示，
+   * 于是以为这个科目一整年没发生额（审计 §3.25）。
+   *
+   * 所以错误要**同时**有两处落点：一条红字提示（拦截器弹的）和
+   * 一个页面上的状态（这里的 `error`）。缺了后者，失败与空数据同形。
+   */
+  const error = ref('')
   let seq = 0
 
   /**
@@ -79,11 +93,13 @@ export function useLatestLoad(key) {
     loading.value = true
     try {
       const value = await task()
+      if (mine === seq) error.value = ''
       return mine === seq ? value : STALE
     } catch (e) {
       // 被自己掐掉的那一趟、以及过期的那一趟，都不是错：过期那趟对应的
       // 条件用户早就改掉了，报错只会把红字指在一个没人再看的条件上。
       if (isCanceled(e) || mine !== seq) return STALE
+      error.value = e?.message || '加载失败'
       throw e
     } finally {
       // 只有最新一代配把 loading 收掉 —— 否则过期那趟的 finally 会把
@@ -93,9 +109,9 @@ export function useLatestLoad(key) {
   }
 
   /** 把在途的一趟直接作废（换账套时把上一个人的表抹干净用）。 */
-  function invalidate() { ++seq }
+  function invalidate() { ++seq; error.value = '' }
 
   const isStale = (v) => v === STALE
 
-  return { loading, run, invalidate, isStale }
+  return { loading, error, run, invalidate, isStale }
 }

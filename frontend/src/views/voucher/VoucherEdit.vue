@@ -113,7 +113,7 @@
                  ⊕ / ＋ 只在这一行左边冒出来 -->
             <div v-for="(row, i) in form.entries" :key="i" class="vg-row"
                :class="{ 'is-on': isOn(row) }"
-               :ref="(el) => setRowRef(el, row)"
+               :ref="(el) => setRowRef(el, i)"
                @mouseenter="hoverRow = row" @mouseleave="hoverRow = null">
             <div class="vg-act">
               <el-button class="g-ins" circle size="small" title="在本格子上面插一行"
@@ -233,6 +233,12 @@
             第 {{ form.entries.indexOf(nonLeafRows[0]) + 1 }} 行不是末级科目
           </span>
           <span v-if="blank" class="muted">还没录金额</span>
+          <!-- 有金额没科目的行不会被提交（见 payableEntries）。
+               这一档必须排在「借贷平衡」之前：它提交时不存在，
+               拿「借贷平衡 ✓」给它看就是骗人（审计 §3.23）。 -->
+          <span v-else-if="rowsMissingSubject.length" class="tag-bad">
+            第 {{ form.entries.indexOf(rowsMissingSubject[0]) + 1 }} 行还差会计科目
+          </span>
           <span v-else-if="balanced" class="tag-ok">借贷平衡 ✓</span>
           <span v-else class="tag-bad">{{ diffTag }}</span>
         </span>
@@ -276,6 +282,7 @@ import { moneyText } from '@/utils/format'
 import { centsToText, moneyCents } from '@/utils/amountGrid'
 import { displayBalanceCents } from '@/utils/balanceSign'
 import { findFirstProblem, lastFilledRowAt, rowCanBeDeleted } from '@/utils/voucherRows'
+import { setPendingFlush, takePendingFlush } from '@/utils/voucherFlush'
 import { todayLocal } from '@/utils/datetime'
 import AmountGrid from '@/components/AmountGrid.vue'
 import SubjectPicker from '@/components/SubjectPicker.vue'
@@ -761,6 +768,16 @@ function setCredit(row, v) {
   row.direction = 'CREDIT'
   row.amount = v
 }
+/* 合计以前走 money2（浮点 toFixed(2)），现在走整数分直接落成字符串（见下面的 total）：
+ * 浮点在 14 位以上就会把金额改掉，而合计与分录必须是**同一个数**。 */
+// ---- 金额：一律整数分（判平、差额、补差三处共用这一份量化结果）----
+//
+// 这一段（从本标记到「金额段结束」）是**自足**的：取值、折分、合计、判平、
+// 差额、补差全在这里，公共依赖一个都不外借。
+// tests/voucher_balance.test.mjs 就是从这里头把实现抠出来跑的 —— 所以这一段里
+// 只能用 `computed` / `form` / `moneyText` / `moneyCents` / `centsToText`，
+// 引用本段之外的任何东西都会让抠出来的实现断掉。
+
 /** 金额取数。只敲了一个负号的时候 ``Number('-')`` 是 NaN，
  *  NaN 一进合计，整张凭证的差额就变成 NaN，连「不平」都说不出来了。 */
 const num = (v) => {
@@ -768,9 +785,6 @@ const num = (v) => {
   const n = Number(v)
   return Number.isFinite(n) ? n : 0
 }
-/* 合计以前走 money2（浮点 toFixed(2)），现在走整数分直接落成字符串（见上面的 total）：
- * 浮点在 14 位以上就会把金额改掉，而合计与分录必须是**同一个数**。 */
-// ---- 金额：一律整数分（判平、差额、补差三处共用这一份量化结果）----
 //
 //  原来是 JS number 累加 + 严格相等判平，而 `100.10 + 200.20 = 300.29999999999995`
 //  不等于 `300.3` —— 于是「借 100.10 + 借 200.20 / 贷 300.30」这种完全合法的凭证
@@ -847,8 +861,46 @@ function autoBalanceNeed({ opposite, same, mine, mineSide, side }) {
   return opposite - same + (mineSide === side ? mine : -mine)
 }
 
+/**
+ * **能落库的分录** —— 显示口径与提交口径共用同一份。
+ *
+ * 判据：**有科目**（subject_id）且**金额不为 0**。
+ *
+ * 这一份是「页面上算出来的」与「发出去给后端的」之间**唯一**的桥：
+ * 合计、判平、差额、合计行、自动保存闸门、以及真正提交的那份 entries，
+ * 全部取自这里。
+ *
+ * 以前显示口径遍历**全部**行、提交口径过滤「有科目且金额非零」的行 ——
+ * 两个集合不同，于是出现过一个很难解释的现象（审计 §3.23 实测）：
+ * 第 2 行只填金额、没选科目时，页脚显示「借贷平衡 ✓」、合计行显示
+ * 「借 100.00 / 贷 100.00」，自动保存也放行；可提交时那一行被**静默丢掉**，
+ * 后端收到的是「借 100 / 贷 0」，当场回一句「借贷不平衡」。
+ * 用户看到的是「界面说平、后端说不平」，而那 100 元在屏幕上存在、在库里不存在。
+ *
+ * 现在两边取同一份集合：**页面上算平了，提交出去就一定是平的**。
+ *
+ * 「金额不为 0」用 `centsOf` 判（整数分），**不用 `num`**：
+ * `num` 只认半角负号，落格用的真正减号 U+2212 在它那里是 NaN→0，
+ * 而 `centsOf` 认得（红字凭证靠它）。用 `num` 判的话，一张 U+2212 的
+ * 红字分录会被当成「没填金额」而**整个不见**。
+ * 关键是：`centsText(centsOf(...))` 正是**发出去的那个金额** ——
+ * 判据和载荷用同一个算法，才谈得上「页面上算平了，提交出去就是平的」。
+ */
+const payableEntries = computed(() =>
+  form.entries.filter((e) => e.subject_id && centsOf(e.amount) !== 0n))
+
+/**
+ * **有金额、却没选科目**的行 —— 它们**不会被提交**（见上面那份集合）。
+ *
+ * 这一类行以前是**静默丢弃**的：页面上明明有一行数字，提交时它没了，
+ * 而后端只说「借贷不平衡」，一句都没提「你有一行没选科目」。
+ * 现在它有自己的名字：页脚明说第几行还差科目，保存时也明说。
+ */
+const rowsMissingSubject = computed(() =>
+  form.entries.filter((e) => !e.subject_id && centsOf(e.amount) !== 0n))
+
 /** 判平、差额、合计三处共用的那一份量化结果（单位：分）。 */
-const totals = computed(() => voucherTotals(form.entries))
+const totals = computed(() => voucherTotals(payableEntries.value))
 /**
  * 显示用的合计：格子里落的那两行。**单位是分**（与 totals 同源，不再自己除一次 100）——
  * 除以 100 走浮点的话，18 位整数会在这一步掉精度。
@@ -859,10 +911,13 @@ const totals = computed(() => voucherTotals(form.entries))
  * （2026-10-12 那条「正负相抵按平处理」的要求，说的就是这种凭证）。
  * 一栏从头到尾没数（没填金额、或者压根没有这一栏的分录）→ 留空：
  * 空格子比一个孤零零的 0 干净。
+ *
+ * 「录过数」也按**能落库的那一份**算：只有金额没科目的行不进合计 ——
+ * 它提交时会被丢掉，摆在合计里就是一个提交后不存在的数（审计 §3.23）。
  */
 function columnTotal(direction) {
   const sum = direction === 'DEBIT' ? totals.value.debit : totals.value.credit
-  const hasNumber = form.entries.some((e) => e.direction === direction && centsOf(e.amount) !== 0n)
+  const hasNumber = payableEntries.value.some((e) => e.direction === direction && centsOf(e.amount) !== 0n)
   return hasNumber ? centsText(sum) : ''
 }
 const total = computed(() => ({
@@ -939,6 +994,53 @@ const savedAt = ref('')        // 上一次落库的时间，页脚上给个准�
  *  人连自己在改什么都看不清了。 */
 const failedSig = ref('')
 
+/**
+ * 新建凭证的**幂等键**：这一张凭证从开始填到落库，一直是同一个键。
+ *
+ * 为什么需要它（审计 §3.28）：POST 发出 → 服务端**已入库** → 响应在网络上
+ * 丢了（30 秒超时）→ 用户以为没存上，再敲一个字 → 自动保存又 POST 一次 →
+ * 库里两张内容几乎相同的凭证。
+ *
+ * 键必须**跟着这一张凭证**，不能跟着「这一版内容」：内容一变签名就变，
+ * 而要防的恰恰是「内容变了一点之后重发」。所以它在**第一次创建**时生成，
+ * 直到这张落库为止都不换；换一张凭证（新开、翻页、换账套）才换新的。
+ *
+ * 服务端按这把键去重：同一把键只创建一张凭证，重复的请求落到**同一张**上，
+ * 不会在库里多出一张几乎一样的。
+ */
+const createKey = ref('')
+
+/**
+ * 这张凭证的**乐观锁令牌**（服务端给的 ``updated_at`` ISO 文本）。
+ *
+ * 它是「我读到的是哪一版」的凭据：保存时原样送回去，服务端拿库里此刻的
+ * 那一版比一下 —— 不一致就是「你改的是别人已经改过的那一版」。
+ *
+ * **没有它的时候，正确性靠服务端的行锁兜着**（那是主体）；
+ * 它是**第二道**：把人能看懂的那种冲突（「已被他人改动，请刷新」）
+ * 提前说清楚，而不是让后保存的人默默覆盖前一个人的改动。
+ *
+ * 每次读/写回来都换成服务端给的新值 —— 令牌是一次性的，
+ * 用旧的下一次就会被自己判成「版本过期」。
+ */
+const voucherVersion = ref('')
+
+/**
+ * **版本冲突**：服务端回过 409（这一版的令牌作废了）。
+ *
+ * 掐掉它是为了不让自动保存一路重试一路弹红字 —— 人每敲一下就重试一次，
+ * 结果一条也没存上，屏幕还被红字盖满。出路是刷新页面。
+ */
+const versionConflict = ref(false)
+
+/** 生成一把幂等键。优先用 crypto.randomUUID，拿不到就退到时间戳+随机数。 */
+function newIdempotencyKey() {
+  const rand = globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+  return `vch-${rand}`
+}
+
 /** 这一页现在有没有「能落库的分录」：至少一条有科目、金额不为 0。
  *
  *  自动保存、离开前 flush、关页签拦问，问的都是同一句话，
@@ -948,8 +1050,7 @@ const failedSig = ref('')
  *  弹一句「请至少填写一条分录」。什么都没填的人被判成保存失败，
  *  而且 ``failedSig`` 记不上它，每敲一下摘要就再弹一次。
  */
-const hasCompleteEntry = computed(() =>
-  form.entries.some((e) => e.subject_id && num(e.amount)))
+const hasCompleteEntry = computed(() => payableEntries.value.length > 0)
 
 function subjectText(id) {
   const s = subjectById.value.get(id)
@@ -967,9 +1068,24 @@ function onSubject(row) {
 // 每行的盒子也要拿到实例：回车往下写时要按行收回锚点高度，
 // 得能问出「这一行的盒子现在在滚动区里的哪个位置」。
 const rowEls = new Map()
-function setRowRef(el, row) {
-  if (el) rowEls.set(row, el)
-  else rowEls.delete(row)
+/**
+ * 键是**行下标**，不是分录对象 —— 与 ``sumRefs`` / ``amtRefs`` 一致。
+ *
+ * 以前键是分录对象，注释说「值会跟着行搬家」。搬是搬了，可搬得**不是时候**：
+ * ``v-for`` 用的是下标 key（``:key="i"``），所以删掉中间一行时 Vue 是
+ * **按位置复用 DOM** 的 —— 旧尾节点被卸载时，它那个函数式 ref 会以 ``null``
+ * 再调一次，而那个闭包捕获的是**上移后落到该下标的那一行**。
+ * 于是「刚写进去的条目」被这条陈旧的 null 调用又删掉了：
+ * 那一行从此在 ``rowEls`` 里没有条目，``keepActiveRowAnchored`` 取不到元素
+ * 直接 return —— **滚动锚定从此失效**（录到第 20 行时输入位置一路掉到屏幕底下），
+ * 同时被删行的条目永久残留在 Map 里（审计 §3.31）。
+ *
+ * 按下标键就没这个问题：那条陈旧的 null 调用删的是**已经不存在的那个下标**
+ * （尾部下标），而新下标上的条目是刚写进去的，不会被误删。
+ */
+function setRowRef(el, idx) {
+  if (el) rowEls.set(idx, el)
+  else rowEls.delete(idx)
 }
 
 // 每行的格子都要能拿到实例：回车要挨着往下走，得能直接落笔到某一行某一格
@@ -1059,7 +1175,10 @@ function keepActiveRowAnchored() {
   const box = entryScroll.value
   const row = activeRow.value
   if (!box || !row) return
-  const el = rowEls.get(row)
+  // 行盒子按**下标**存（见 setRowRef），所以这里先换成下标再取。
+  const idx = form.entries.indexOf(row)
+  if (idx < 0) return
+  const el = rowEls.get(idx)
   if (!el) return
   syncGridWidth()
   // 现在滚动区从第一条分录开始，当前行在内容里的位置不再包含表头高度。
@@ -1483,9 +1602,12 @@ function addVoucher() {
 
 const splitVisible = ref(false)
 
-/** 这一页真正填了内容的分录 —— 拆分看的是这些，不是那几行空白的占位行。 */
-const filledRows = computed(() =>
-  form.entries.filter((e) => e.subject_id && num(e.amount)))
+/** 这一页真正填了内容的分录 —— 拆分看的是这些，不是那几行空白的占位行。
+ *
+ *  与「能落库的分录」是**同一份**：有科目且金额非零。
+ *  两处各写一遍过滤条件，早晚会长歪 —— 现在共用一份。
+ */
+const filledRows = computed(() => payableEntries.value)
 
 /**
  * 能不能拆：必须是**已落库**的凭证、这张还能改、且至少两条分录。
@@ -1544,10 +1666,15 @@ async function openSplit() {
  *
  * 凭证 id 没变（还是这一张），所以地址栏不用动。
  */
-async function onSplit({ at_line }) {
+/** 拆分在途：这一趟还没回来之前，不再发第二趟（审计 §3.29）。 */
+let splitting = false
+
+async function onSplit({ at_line, done }) {
   // 用 store.bookId（与弹窗的预览、后面的重载同一个账套）：
   // 拆的是当前账套里的这张凭证 —— 账套不对时后端会 404，不会写到别家账套去。
   const bookId = store.bookId
+  if (splitting) { done?.(); return }
+  splitting = true
   try {
     const r = await api.splitVoucher(bookId, voucherId.value, { at_line })
     splitVisible.value = false
@@ -1558,6 +1685,10 @@ async function onSplit({ at_line }) {
       + ` 和 ${r.created.voucher_no}（带走后 ${r.created.entries.length} 行）`)
   } catch (e) {
     // 错误文案已经由 http 拦截器弹过了，这里不再重复报一遍
+  } finally {
+    splitting = false
+    // 成功时弹窗关掉了；失败时要让人能再试一次 —— 按钮不能一直灰着。
+    done?.()
   }
 }
 
@@ -1666,11 +1797,15 @@ function bookName(bookId) {
 
 function resetForm() {
   ++loadSeq
-  // 记下「上一张是哪个账套的哪张」—— 见上面 crossBook 的说明。
-  // 没有凭证 id（新增页）时不记：那不是「撞号」，没有需要提示的事。
-  if (voucherId.value) {
-    crossBook.value = { bookId: formBookId.value, voucherId: voucherId.value }
-  }
+  // 换一张凭证 = 换一把幂等键（这一把键只对应「这一张新建的凭证」）。
+  createKey.value = ''
+  // 换一张凭证 = 换一枚乐观锁令牌（上一张的令牌对这一张没有意义）。
+  voucherVersion.value = ''
+  // 冲突标志也是「上一张的事」—— 换一张就该重新开始。
+  versionConflict.value = false
+  // 「上一张是哪个账套的哪张」**不再在这里记** —— 见 load() 里的说明：
+  // 切账套时这个组件会被整个重挂掉，组件内记的东西活不到那一步。
+  // 跨过重挂的记号在 store 里（stores/session.js 的 prevBookId）。
   voucherId.value = 0
   voucherPeriod.value = null
   voucherPeriodId.value = 0
@@ -1712,7 +1847,42 @@ function yearOfVoucher(v) {
 
 async function load() {
   const seq = ++loadSeq
-  const myId = Number(route.params.id || 0)
+  // **路由里的 id**：打开一张存好的凭证、翻上一张/下一张时都有。
+  const routeId = Number(route.params.id || 0)
+  // **「这一张已经建出来了」这个事实**（审计 N5）。
+  //
+  // 新建凭证落库后，地址栏换成了 /vouchers/{id}，但 **router 内部还停在
+  // /vouchers/new**（走 router 会把组件整个重挂，正在填的表单、光标、绿行
+  // 全没了 —— 见 save() 里那段说明）。于是：
+  //   · 重挂（切期间、切账套、点刷新）之后，route.params.id 仍是 undefined
+  //   · → myId = 0 → 这一张被当成**全新的空凭证**
+  //   · → 下一趟自动保存**又 POST 一张**，库里多出一张几乎一样的。
+  //
+  // 那个事实记在 store 里（跨得过重挂），这里把它捡回来：
+  // **只认当前账套的那一张** —— 换账套后不能拿旧账套的 id 去新账套里查。
+  const created = store.createdVoucher
+  const mine = created && created.bookId === store.bookId ? created : null
+  const myId = routeId || (mine ? mine.id : 0)
+  // **幂等键也要跟着活下来**：响应在路上丢了的那一趟（服务端其实已经入库，
+  // 只是回执没到），重挂后靠这把键去重，服务端把请求收敛到同一张上
+  // （审计 §3.28）。没有它，重挂后就是一把新键 → 服务端当真新建一张。
+  if (!routeId && mine && mine.createKey && !createKey.value) {
+    createKey.value = mine.createKey
+  }
+  // **切账套撞号**：上一本账是从 store 里取的（见 stores/session.js 的 prevBookId）。
+  //
+  // 以前这件事记在组件内（resetForm 里），但**永远不会执行**：切账套时
+  // viewKey 变了 → router-view 先把旧组件卸载掉 → 组件内 watch 的 effect
+  // 随 scope 一起停用 → 回调根本不跑。于是「已切换到账套…」那句提示
+  // 永远发不出来，用户看着本账套的 #12，以为还是刚才那本账的那张
+  // （审计 §3.33）。
+  //
+  // 现在跨过重挂的记号放在 store 里，凭证页**重新挂载后**才来取，
+  // 所以提示这一次真的发得出来。
+  const prevBook = store.takePrevBookId()
+  if (prevBook && prevBook !== store.bookId && myId) {
+    crossBook.value = { bookId: prevBook, voucherId: myId }
+  }
   // 先认下路由里的 id：换凭证的那一瞬间，工具栏不该还挂着上一张的打印预览
   voucherId.value = myId
   savedAt.value = ''
@@ -1760,6 +1930,8 @@ async function load() {
     }
     voucherPeriod.value = store.periods.find((p) => p.id === v.period_id) || null
     voucherPeriodId.value = v.period_id   // store.periods 还没灌完时也能算余额
+    // **这枚乐观锁令牌**是从这一份读到的 —— 保存时原样送回去。
+    voucherVersion.value = v.version || ''
     // **科目表按这张凭证自己那一年取**（不是顶栏那一年）——
     // 往年凭证的分录挂在往年的科目上，用错年度的科目表，格子里全是空的。
     await loadSubjects(yearOfVoucher(v))
@@ -1873,8 +2045,21 @@ async function save() {
           : '当前期间已结账，不能修改凭证')
     return false
   }
-  const entries = form.entries
-    .filter((e) => e.subject_id && num(e.amount))
+  // **版本冲突之后不再自动保存。**
+  //
+  // 服务端回 409 = 「你改的是别人已经改过的那一版」，这一版的令牌作废了。
+  // 而自动保存是**跟着人敲字走的**：不掐掉的话，人每敲一下就重试一次、
+  // 每次都 409、每次都弹一条一样的红字 —— 吵得没法干活，而结果一条也没存上。
+  //
+  // 正确的出路是**刷新页面看当前内容**（页面上的这些改动本来也存不进去）。
+  // 这里只报一次，后面安静。
+  if (versionConflict.value) return false
+  // **提交的那一份，就是页面上算平的那一份**（见 payableEntries）。
+  // 以前这里是另一份过滤条件，于是出现过「界面说平、后端说不平」：
+  // 页脚显示「借贷平衡 ✓」、合计行显示「借 100.00 / 贷 100.00」，自动保存也放行，
+  // 可提交时那一行被静默丢掉，后端只回一句「借贷不平衡」——
+  // 而那行数字在屏幕上明明存在（审计 §3.23）。
+  const entries = payableEntries.value
     .map((e) => ({
       subject_id: e.subject_id,
       direction: e.direction,
@@ -1883,11 +2068,36 @@ async function save() {
       amount: centsText(centsOf(e.amount)),
       summary: e.summary || ''
     }))
+  // **这一版的签名**：既是「发出去的那一版」，也是「**被拦住的那一版**」。
+  //
+  // 「发出去的那一版」：请求在路上时人可能还在改，回来后要把水位定在发出去的那版，
+  // 否则这几秒里敲的东西会被当成「已保存」丢掉。
+  //
+  // 「被拦住的那一版」：下面那两条「这一版根本不允许落库」的拦截
+  // （有金额没科目、非末级科目）—— **它们也必须把签名记进 failedSig**。
+  // 不记的话，自动保存的 700ms 防抖每触发一次就再弹一条一模一样的红字：
+  // 报错成了背景噪音，人连自己在改什么都看不清了（审计 N4）。
+  //
+  // 记签名**不丢人**：提示照弹（「保存被拦住」这件事对用户依然可见），
+  // 只是**同一版**不再重复弹 —— 人改完那一行，签名一变，下一趟照常自动保存。
+  const sentSig = entrySig.value
+  // 「有金额、没科目」的行**不能静默丢掉**：它提交时不存在，可屏幕上摆着数字。
+  // 这时要说清楚是**哪一行**差什么，而不是让后端拿「借贷不平衡」当谜语。
+  if (rowsMissingSubject.value.length) {
+    const missing = rowsMissingSubject.value[0]
+    const at = form.entries.indexOf(missing) + 1
+    // 记下这一版：同一版不再自动重试（否则每敲一下就再弹一遍，见上面的 sentSig）。
+    failedSig.value = sentSig
+    ElMessage.error(`第 ${at} 行还差会计科目 —— 有金额没科目的行不会被提交，请先把它写完`)
+    return false
+  }
   if (!entries.length) { ElMessage.warning('请至少填写一条分录'); return false }
   // 非末级科目拦下来一定要出声：闷声不响的话，人只会以为存好了，
   // 而这笔分录其实根本没落库 —— 等发现时已经按它记了好几天的账。
   // 只拦**这一页新挂上去的**那些（见 newNonLeafRows）；账上原有的是服务端的事。
   if (newNonLeafRows.value.length) {
+    // 同上：这一版也被记下来，别让防抖每 700ms 弹一遍同一句话（审计 N4）。
+    failedSig.value = sentSig
     ElMessage.error(rowProblemText(newNonLeafRows.value[0]))
     return false
   }
@@ -1909,11 +2119,18 @@ async function save() {
     insert_after: !voucherId.value && insertCtx.value ? insertCtx.value.anchor_id : null,
     // 向前（占参照的号）还是向后（拿参照号 +1）。与 insert_after 同生共死。
     insert_position: !voucherId.value && insertCtx.value
-      ? (insertCtx.value.position === 'after' ? 'after' : 'before') : 'before'
+      ? (insertCtx.value.position === 'after' ? 'after' : 'before') : 'before',
+    // **乐观锁令牌**（审计 §3.15）：把这张凭证我**读到时**的版本带回去。
+    //
+    // 服务端拿库里此刻的版本比一下：不一致 → 409「已被他人改动，请刷新」。
+    // 那正是「别人改了这张、我这份还是旧的」那个真实场景 ——
+    // 以前那种情况是**静默覆盖**：谁后保存谁赢，前一个人的改动人间蒸发，
+    // 而账上看着还是平的（这正是 §3.15「数字错了但系统全绿」那一类）。
+    //
+    // **不带 = 不比**（老客户端、以及刚建出来还没拿到令牌的那一趟），
+    // 那条路上的正确性由服务端的行锁兜着。
+    version: voucherVersion.value || null
   }
-  // 记下**发出去的那一版**：请求在路上时人可能还在改，回来后要把水位定在发出去的那版，
-  // 否则这几秒里敲的东西会被当成「已保存」丢掉
-  const sentSig = entrySig.value
   const wasNew = !voucherId.value
   // 请求打到**这张表单所属的账套**，不是当下的 store.bookId：切账套那一瞬间
   // store.bookId 已经变成新的了，拿它发请求等于把上一个账套的凭证写进新账套。
@@ -1921,10 +2138,48 @@ async function save() {
   saving.value = true
   const p = (async () => {
     try {
-      const saved = wasNew
-        ? await api.createVoucher(bookId, payload)
-        : await api.updateVoucher(bookId, voucherId.value, payload)
+      // 新建才带幂等键（更新本来就有 id，重复提交也是同一条记录）。
+      if (wasNew && !createKey.value) createKey.value = newIdempotencyKey()
+      // **「这一张正在建」这件事要跨过重挂**（审计 N5）。
+      //
+      // 为什么要在**发请求之前**记：请求发出去、服务端**已经入库**、响应却在
+      // 网络上丢了 —— 这时候这一版既没有 id 也没有「已落库」的凭据，
+      // 只剩这把幂等键。记在组件里，重挂即丢；记在 store 里，重挂后还能
+      // 拿同一把键去重（服务端按键去重，见 createKey 的说明）。
+      //
+      // 记号只对「同一段路里的重挂」有用：MainLayout 的路由 watcher 会在
+      // 换页面时把它清掉（用户点「新增凭证」重新开一张时不该被带回刚才那张）。
+      if (wasNew) {
+        store.createdVoucher = { bookId, id: 0, createKey: createKey.value }
+      }
+      let saved
+      if (wasNew) {
+        const created = await api.createVoucher(bookId, payload, createKey.value)
+        // **回放**：服务端说这把键已经用过了 —— 上一次其实**落库了**，
+        // 只是响应在路上丢了（审计 §3.28）。它回给你的是**上一次**那张凭证，
+        // 里面存的是**上一次**那一版内容；而用户此刻在屏幕上又敲了几个字。
+        //
+        // 所以这里补一次 PUT，把当前内容收敛到那张凭证上 ——
+        // 不补的话，这几下敲的就白敲了（库里还是旧内容，界面却显示新的）。
+        //
+        // 补完之后 ``saved`` 取 PUT 的响应：凭证号可能因为改期而重新发过，
+        // 页面上那个只读的号得跟着换（见下面那段）。
+        saved = created.replayed
+          ? await api.updateVoucher(bookId, created.id, payload)
+          : created
+      } else {
+        saved = await api.updateVoucher(bookId, voucherId.value, payload)
+      }
       voucherId.value = saved.id
+      // 「这一张**已经建出来了**」—— 把 id 补进 store 的记号（审计 N5）：
+      // 重挂之后凭证页能认出「这不是一张新凭证，是刚才建的那张」，
+      // 下一趟自动保存走的是 PUT（改那张），不会再 POST 一张新的出来。
+      if (wasNew) {
+        store.createdVoucher = { bookId, id: saved.id, createKey: createKey.value }
+      }
+      // 换成**服务端刚给的新令牌** —— 令牌是一次性的：
+      // 留着旧的，下一趟保存就会把自己判成「版本过期」。
+      if (saved.version) voucherVersion.value = saved.version
       // **服务端可能给这张重新发过号**：改了日期跨到另一个期间，凭证号是按期间
       // 唯一的，号段也就跟着换了 —— 服务端按目标期间重新发了一个（该期最大号 + 1）。
       // 页面上那个只读的凭证号必须跟着换，否则人看着「记0009」、库里是「记0012」，
@@ -1969,6 +2224,13 @@ async function save() {
       // 这一版没存上，记下来：同一个签名不再自动重试（见 failedSig）。
       // 错误本身已经由 http 拦截器弹过了，这里不重复报一遍。
       failedSig.value = sentSig
+      // **409 = 版本冲突**：这一版的令牌作废了，后面自动保存会一路 409。
+      // 掐掉它，并**多说一句**该做什么（拦截器那句是给「为什么失败」的，
+      // 这句是给「接下来怎么办」的）。
+      if (e?.response?.status === 409) {
+        versionConflict.value = true
+        ElMessage.warning('这张凭证已被他人改动，本次修改没有保存。请刷新页面确认当前内容后再改。')
+      }
       return false
     } finally {
       saving.value = false
@@ -1994,6 +2256,12 @@ async function autoSave() {
     autoSaveTimer = setTimeout(autoSave, AUTO_SAVE_DELAY)
     return
   }
+  // 这一版刚才存失败了 —— 同一版不再自动重试（failedSig 的本意）。
+  //
+  // 以前这道判断**只在 watch 里**：已经排好的那趟定时器不看它。
+  // 于是「请求发出去了、响应丢了」这一版会被**再发一次**，
+  // 在服务端就是第二张凭证（审计 §3.28）。
+  if (entrySig.value === failedSig.value) return
   await save()
 }
 watch([entrySig, balanced], () => {
@@ -2058,7 +2326,16 @@ onBeforeUnmount(() => {
   onWindowResize.cancel()          // 还挂着的那一帧别再对着已卸载的 DOM 跑
   window.removeEventListener('resize', onWindowResize)
   window.removeEventListener('beforeunload', onBeforeUnload)
-  if (formBookId.value === store.bookId) flushIfDirty()
+  // **这一趟必须挂出去**，不能就这么丢掉（审计 §3.24）。
+  //
+  // 切期间时 viewKey 变了 → 旧组件先卸载、新组件马上挂载。
+  // 以前这里 fire-and-forget：PUT 在路上，新组件的 GET 已经在服务端排上队了 ——
+  // GET 先回，新页面显示的是**改动前**的值；用户在新页上再改一次，
+  // 自动保存 PUT 的是**整张表单**，前一版改动被无声覆盖。
+  //
+  // 现在把 promise 挂到跨组件的盒子里（utils/voucherFlush.js），
+  // 新组件 onMounted 先 await 它再 load()。
+  if (formBookId.value === store.bookId) setPendingFlush(flushIfDirty())
 })
 
 /**
@@ -2104,6 +2381,10 @@ onMounted(async () => {
   window.addEventListener('beforeunload', onBeforeUnload)
   if (!store.periodId) return
   formBookId.value = store.bookId   // 这张表单从这一刻起属于这个账套
+  // 切期间/切账套时，旧组件的「离开前那一趟 flush」可能还在路上 ——
+  // **先等它回来再取数**，否则新页面拿到的是改动前的值（审计 §3.24）。
+  const pending = takePendingFlush()
+  if (pending) { try { await pending } catch { /* flush 自己会报 */ } }
   await load()
   await nextTick(() => {
     syncGridWidth()

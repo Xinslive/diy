@@ -96,6 +96,13 @@ function saveFromSource(over = {}) {
     centsOf: (s) => Math.round(Number(s) * 100),
     centsText: (c) => (c / 100).toFixed(2),
     rowProblemText: (r) => `非末级科目 ${r.subject_id}`,
+    // 新建凭证的幂等键（审计 §3.28）：新建才带，更新不带。
+    createKey: { value: '' },
+    // 乐观锁令牌与冲突标志（审计 §3.15 的 409 契约）——
+    // save() 会读 versionConflict、往请求体里放 voucherVersion。
+    voucherVersion: { value: '' },
+    versionConflict: { value: false },
+    newIdempotencyKey: () => 'test-idem-key',
     api: { updateVoucher: async () => ({ id: 7, period_id: 5 }),
            createVoucher: async () => ({ id: 7, period_id: 5 }) },
     history: { state: null, replaceState() {} },
@@ -108,6 +115,18 @@ function saveFromSource(over = {}) {
     },
     router: { push: (p) => pushed.push(p) },
     ...over
+  }
+  // save() 取的是「能落库的那一份分录」（与页面上算平的那一份是**同一份**，
+  // 见 VoucherEdit.vue 的 payableEntries）。ctx.form 是普通对象不是 reactive，
+  // 所以这里喂两个等价的 { value: [...] }。
+  //
+  // 判据用 `centsOf`（整数分）而不是 `num` —— 与真正发出去的那个金额
+  // `centsText(centsOf(...))` 同一个算法（审计 §3.23）。
+  ctx.payableEntries = {
+    value: ctx.form.entries.filter((e) => e.subject_id && ctx.centsOf(e.amount) !== 0)
+  }
+  ctx.rowsMissingSubject = {
+    value: ctx.form.entries.filter((e) => !e.subject_id && ctx.centsOf(e.amount) !== 0)
   }
   // savingPromise 在组件里是模块级 let，save() 会写它 —— 作用域里得先有
   const factory = new Function(...Object.keys(ctx),

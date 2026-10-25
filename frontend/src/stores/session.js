@@ -1,11 +1,110 @@
 import { defineStore } from 'pinia'
+import { effectScope, watch } from 'vue'
 import * as authApi from '@/api/auth'
 import * as bookApi from '@/api/book'
+import { errorText } from '@/utils/errorText'
 
 /** 能写的角色。与后端 ROLES（app/api/system.py）保持一致。 */
 const WRITABLE_ROLES = ['OWNER', 'ACCOUNTANT']
 
-export const useSessionStore = defineStore('session', {
+/** 已经装过「切账套」守卫的 store 实例（一个 store 只装一次）。 */
+const bookWatchInstalled = new WeakSet()
+
+/**
+ * 挑战的形状：**登录**与**重新验证**共用这一个。
+ *
+ *   { challengeId, clientSecret, expiresIn, emailHint, resendAfter, sentAt }
+ *
+ * 两处的倒计时算法必须一致，所以**共用一个形状 + 共用两个算法**
+ * （§4.5：同一个量只允许一个权威实现）。
+ */
+function resendWaitOf(m, now = Date.now()) {
+  if (!m) return 0
+  const after = (m.resendAfter || 60) * 1000
+  return Math.max(0, Math.ceil((m.sentAt + after - now) / 1000))
+}
+
+function expiresInOf(m, now = Date.now()) {
+  if (!m) return 0
+  return Math.max(0, Math.ceil((m.sentAt + (m.expiresIn || 0) * 1000 - now) / 1000))
+}
+
+/**
+ * 「待重新验证」那一次的**接线**。
+ *
+ *   · ``mfaReauthPromise``：正在等的那一次（两次并发撞闸门时复用同一次）；
+ *   · ``mfaReauthSettle``：裁决函数 —— resolve(true) = 拿到了新令牌，
+ *     resolve(false) = 取消/失败，**原动作没有被执行**；
+ *   · ``mfaReauthTimer``：超时兜底。
+ *
+ * **放在模块作用域而不是 store.state**：它是**一次性的**接线，
+ * 不是可观测的状态。放 state 的话，每次都要判断「这份 resolver 是不是
+ * 已经用过了」，而且会被 Pinia 的状态快照/持久化逻辑卷进去。
+ */
+let mfaReauthPromise = null
+let mfaReauthSettle = null
+let mfaReauthTimer = null
+
+/**
+ * 重新验证的**超时兜底**。没有它，这一次等待可能**永远不结束** ——
+ * 而拦截器正**等着**这个结果（原动作就悬在那儿不落地）。
+ *
+ * 触发它的场景：对话框根本没挂出来（不在那个页面）、管理员开着对话框
+ * 走开了、浏览器把标签页挂起导致定时器不跑。
+ */
+function armMfaReauthTimeout(ms) {
+  if (mfaReauthTimer) clearTimeout(mfaReauthTimer)
+  mfaReauthTimer = setTimeout(() => {
+    mfaReauthTimer = null
+    const s = mfaReauthSettle
+    mfaReauthSettle = null
+    if (s) s(false)
+  }, ms)
+  // Node（测试）里不 unref 的话，这个定时器会让进程**不退出**。
+  // 浏览器里没有 unref，?.() 天然是 no-op。
+  mfaReauthTimer?.unref?.()
+}
+
+/**
+ * 装「切账套」的守卫：**记住切换前的那一本**。
+ *
+ * 判据是 **watch 记下来的上一代**（oldValue），跟「谁写的 bookId」**无关**。
+ *
+ *  为什么不能问「bookId 变了没有」：顶栏那行是 ``v-model="store.bookId"``，
+ *  v-model 会**先**把新账套写进 store，``@change`` 里再调 setBook 时
+ *  bookId 早就是新的了 —— 「变了没有」永远答 false，于是「换账套前的那一本」
+ *  永远记不上，凭证页那句「已切换到账套…」**一次也发不出来**（审计 §3.33；
+ *  跟上面 periodsBookId 踩的是同一个坑）。
+ *
+ *  watch 记的是「写之前那一本」：v-model 先写、直接调 setBook、别的页面改写，
+ *  都判得对。
+ *
+ *  **护栏**：只有 ``old > 0 && new > 0 && old !== new`` 才算「切账套」。
+ *  登出、账套列表里没有这一本了 —— 那些路会把 bookId 归 0，不是切账套，
+ *  不该让凭证页说一句「你从账套 A 切过来了」。
+ *
+ *  **flush: 'sync'**：切换的那一刻就把「上一本」记下来，不等调度器 ——
+ *  凭证页重挂后**立刻**就要用这个记号，不能让它等一个微任务。
+ */
+function ensureBookSwitchWatch(store) {
+  if (!store || bookWatchInstalled.has(store)) return
+  bookWatchInstalled.add(store)
+  // **装在一个 detached 的 scope 里**：watch 若是装在某个组件的 setup 里，
+  // 那个组件一卸载，守卫就跟着没了 —— 而守卫恰恰是「谁在切账套」都离不开的。
+  // detached 的 scope 不属于任何组件，活的时长跟这个 store 一样（整个应用）。
+  const scope = effectScope(true)
+  scope.run(() => {
+    watch(
+      () => store.bookId,
+      (nv, ov) => {
+        if (ov > 0 && nv > 0 && ov !== nv) store.prevBookId = ov
+      },
+      { flush: 'sync' }
+    )
+  })
+}
+
+const useSessionStoreBase = defineStore('session', {
   state: () => ({
     token: localStorage.getItem('cwq_token') || '',
     user: JSON.parse(localStorage.getItem('cwq_user') || 'null'),
@@ -18,6 +117,40 @@ export const useSessionStore = defineStore('session', {
     // 所以这里记一份「问过了」的事实，而不是从 books.length 里反推。
     booksLoaded: false,
     bookId: Number(localStorage.getItem('cwq_book') || 0),
+    /**
+     * **换账套前的那一本**（0 = 没有）。
+     *
+     *  为什么记在 store 而不是凭证页的组件里：切账套时 MainLayout 的 viewKey
+     * 变了 → 凭证页**整个重挂** → 组件内的变量（包括「上一张是哪个账套的
+     * 哪张」那个记号）全没了。而「你原来看的是哪本账的哪张」这句话，
+     * 恰恰要**跨过这次重挂**才能说清 —— 记在组件里就永远发不出来
+     * （审计 §3.33）。
+     *
+     *  一次性：提示过就清（见 takePrevBookId）。
+     *
+     *  **谁来写都不算数**：判据是「watch 记下来的上一代」，不是「谁写的
+     *  bookId」（见 ensureBookSwitchWatch 的说明）。
+     */
+    prevBookId: 0,
+    /**
+     * **刚建出来的那张新凭证**（null = 没有这回事）。
+     *
+     *  形状：``{ bookId, id, createKey }`` ——
+     *   · bookId：它属于哪本账（换账套后不能拿它去新账套里查）；
+     *   · id：落库后服务端给的凭证 id（**还没落库时是 0**）；
+     *   · createKey：这一张的幂等键（响应在路上丢了的那一趟靠它去重）。
+     *
+     *  为什么记在 store 而不是组件里：新建凭证落库后，地址栏换成了
+     *  ``/vouchers/{id}``，但 **router 内部还停在 ``/vouchers/new``**
+     *  （走 router 会把组件整个重挂，正在填的表单、光标、绿行全没了 ——
+     *  见 VoucherEdit.vue 里 save() 那段说明）。于是「这张凭证已经建出来了」
+     *  这个事实只活在组件里 → 一重挂就丢 → 重挂后又被当成一张**全新的空凭证**，
+     *  下一趟自动保存**又 POST 一张**，库里多出一张几乎一样的（审计 N5）。
+     *
+     *  一次性：**换页面就清**（MainLayout 的路由 watcher 里跟 prevBookId 一起清）——
+     *  用户点「新增凭证」重新开一张时，不该被带回刚才那张。
+     */
+    createdVoucher: null,
     periods: [],
     // **手上这批期间属于哪个账套。** 0 = 手上没有期间。
     //
@@ -54,7 +187,22 @@ export const useSessionStore = defineStore('session', {
     // **这里绝不能出现访问令牌。** 二次验证没完成之前，令牌还不存在 ——
     // 它要等邮件里的链接被点开、服务端把挑战标成已验证之后，才由**发起
     // 登录的这台机器**（凭 challenge_id + client_secret）换回来。
-    mfa: null
+    mfa: null,
+    /**
+     * 高危动作撞到「近期二次验证」闸门时的**待办**（null = 没有这回事）。
+     *
+     * 形状：``{ phase, challenge, emailHint, error }``
+     *   · phase：``'idle'``（还没发信）→ ``'sent'``（已发信，等点链接）
+     *     → ``'verifying'``（正在轮询）→ ``'failed'``（出了岔子，可重试）；
+     *   · challenge：上面那个挑战形状；
+     *   · emailHint：收件地址的掩码（``o***s@example.com``）。
+     *
+     * **为什么单独记一份而不是复用 ``mfa``**：``mfa`` 是**登录**阶段的挑战
+     * （那时还没有令牌），这里是有令牌之后为**高危动作**重新发起的挑战。
+     * 两件事不会同时发生，但**收尾方式不同**（登录成功要拉账套列表，
+     * 重新验证不要），混在一份里迟早会串。
+     */
+    mfaReauth: null
   }),
   getters: {
     isAuthed: (s) => !!s.token,
@@ -138,18 +286,14 @@ export const useSessionStore = defineStore('session', {
      * 真的会走 —— 直接在 getter 里读 ``Date.now()`` 的话，Vue 察觉不到
      * 时间变了，界面上的倒计时会一直停在同一个数。
      */
-    mfaResendWait: (s) => (now = Date.now()) => {
-      const m = s.mfa
-      if (!m) return 0
-      const after = (m.resendAfter || 60) * 1000
-      return Math.max(0, Math.ceil((m.sentAt + after - now) / 1000))
-    },
+    mfaResendWait: (s) => (now = Date.now()) => resendWaitOf(s.mfa, now),
     /** 验证链接还剩几秒过期。 */
-    mfaExpiresIn: (s) => (now = Date.now()) => {
-      const m = s.mfa
-      if (!m) return 0
-      return Math.max(0, Math.ceil((m.sentAt + (m.expiresIn || 0) * 1000 - now) / 1000))
-    }
+    mfaExpiresIn: (s) => (now = Date.now()) => expiresInOf(s.mfa, now),
+    /** 同上两条，**重新验证**那一份挑战的（形状一样，算法共用）。 */
+    mfaReauthResendWait: (s) => (now = Date.now()) =>
+      resendWaitOf(s.mfaReauth?.challenge, now),
+    mfaReauthExpiresIn: (s) => (now = Date.now()) =>
+      expiresInOf(s.mfaReauth?.challenge, now)
   },
   actions: {
     /**
@@ -183,11 +327,50 @@ export const useSessionStore = defineStore('session', {
      * 因为「这次是二次验证过来的」而有一份单独的代码。
      */
     async applySession(data) {
-      this.token = data.access_token
-      this.user = data.user
-      localStorage.setItem('cwq_token', data.access_token)
-      localStorage.setItem('cwq_user', JSON.stringify(data.user))
+      this.applyToken(data)
       await this.loadBooks()
+    },
+
+    /**
+     * **只**更新令牌与用户，不碰别的。
+     *
+     * 「登录」「二次验证换令牌」「高危动作重新验证换令牌」三处都要写令牌，
+     * 但**只有登录那两处**需要顺带拉一次账套列表 —— 重新验证发生在一次
+     * 请求的**中途**（拦截器里），那时候去拉账套列表既没必要，
+     * 又可能因为网络抖动把整条链路拖失败。
+     *
+     * @param {{access_token: string, user?: object}} data
+     */
+    applyToken(data) {
+      if (!data?.access_token) return
+      this.token = data.access_token
+      localStorage.setItem('cwq_token', data.access_token)
+      // **user 缺省就别动它**：换了令牌不等于换了人，而把 undefined
+      // 写进 localStorage 会让下次启动读到 "undefined"（JSON.parse 之后
+      // 是 null，登录态看着像没了）。
+      if (data.user) {
+        this.user = data.user
+        localStorage.setItem('cwq_user', JSON.stringify(data.user))
+      }
+    },
+
+    /**
+     * 轮询一次挑战。**登录与重新验证共用这一份**（§4.5：同一个量只允许
+     * 一个权威实现 —— 两处的「怎么算验证通过」必须一模一样）。
+     *
+     * 验证通过时**只更新令牌**（``applyToken``），不碰账套列表。
+     *
+     * @param {{challengeId: number, clientSecret: string}|null} challenge
+     * @returns {Promise<{status: 'VERIFIED'|'PENDING'|'IDLE'}>}
+     */
+    async pollChallenge(challenge) {
+      if (!challenge) return { status: 'IDLE' }
+      const data = await authApi.mfaPoll(challenge.challengeId, challenge.clientSecret)
+      if (data && data.access_token) {
+        this.applyToken({ access_token: data.access_token, user: data.user })
+        return { status: 'VERIFIED' }
+      }
+      return { status: (data && data.status) || 'PENDING' }
     },
 
     /**
@@ -203,13 +386,14 @@ export const useSessionStore = defineStore('session', {
     async pollMfa() {
       const m = this.mfa
       if (!m) return { status: 'IDLE' }
-      const data = await authApi.mfaPoll(m.challengeId, m.clientSecret)
-      if (data && data.access_token) {
+      const r = await this.pollChallenge(m)
+      if (r.status === 'VERIFIED') {
         this.mfa = null
-        await this.applySession({ access_token: data.access_token, user: data.user })
-        return { status: 'VERIFIED' }
+        // 登录这条路上令牌是**刚拿到的**，账套列表得跟着拉一次 ——
+        // 顶栏的账套下拉就是靠它填上的。
+        await this.loadBooks()
       }
-      return { status: (data && data.status) || 'PENDING' }
+      return r
     },
 
     /**
@@ -241,6 +425,152 @@ export const useSessionStore = defineStore('session', {
     /** 放弃这次二次验证，回到登录表单。**不清令牌** —— 此刻本来就没有令牌。 */
     cancelMfa() {
       this.mfa = null
+    },
+
+    // ================================================================
+    // 高危动作的「近期二次验证」闸门（审计 §3.2）
+    //
+    // 闸门扩到 13 条受管控写路由之后，管理员在令牌超过宽限期时碰这些动作，
+    // 会收到一条 403。前端**必须有下文**：不然撞死路，而且没有任何提示
+    // 告诉他该做什么（这是本轮修复前真实存在的缺口）。
+    //
+    // 这里的动作被 api/client.js 的响应拦截器调用：
+    //   requestMfaReauth() → （等管理员走完）→ true = 可以重试原动作。
+    // ================================================================
+
+    /**
+     * 高危动作撞到闸门时调用：**打开引导，等管理员走完（或取消）**。
+     *
+     * 返回 ``true`` = 拿到了带新鲜验证时刻的新令牌，调用方可以重试原动作；
+     * 返回 ``false`` = 取消/失败，**原动作没有被执行**。
+     *
+     * **两次并发撞闸门共用同一次**：两个请求同时被 403 拦下时，
+     * 只该有一封信、一个对话框 —— 否则管理员要验两次，而且第二封邮件
+     * 会把第一封作废（重发会换新挑战）。所以这里复用同一个 promise。
+     */
+    async requestMfaReauth() {
+      if (mfaReauthPromise) return mfaReauthPromise
+      this.mfaReauth = { phase: 'idle', challenge: null, emailHint: '', error: '' }
+      // 还没发信之前也得上保险：管理员可能根本不开那个对话框。
+      armMfaReauthTimeout(10 * 60 * 1000)
+      mfaReauthPromise = new Promise((resolve) => { mfaReauthSettle = resolve })
+      try {
+        return await mfaReauthPromise
+      } finally {
+        mfaReauthPromise = null
+        mfaReauthSettle = null
+        if (mfaReauthTimer) { clearTimeout(mfaReauthTimer); mfaReauthTimer = null }
+        this.mfaReauth = null
+      }
+    },
+
+    /**
+     * 发起一次「重新验证」：发信，并把挑战记下来。
+     *
+     * 服务端换的是**新挑战**（新的 challenge_id 与 client_secret），
+     * 所以旧的那对立刻作废 —— 这里记的是返回值，不是发信前的那份。
+     */
+    async startMfaReauth() {
+      const data = await authApi.mfaReauth()
+      const challenge = {
+        challengeId: data.challenge_id,
+        clientSecret: data.client_secret,
+        expiresIn: data.expires_in,
+        emailHint: data.email_hint || '',
+        resendAfter: data.resend_after || 60,
+        sentAt: Date.now()
+      }
+      this.mfaReauth = {
+        ...(this.mfaReauth || {}),
+        phase: 'sent',
+        challenge,
+        emailHint: challenge.emailHint,
+        error: ''
+      }
+      // 超时按挑战的寿命算：链接过期之后再怎么等也不会通过。
+      armMfaReauthTimeout((challenge.expiresIn + 30) * 1000)
+      return challenge
+    },
+
+    /**
+     * 重新发送验证邮件（链接丢了 / 没收到）。
+     *
+     * **最短间隔本地也拦一道**：服务端会拦（429 + Retry-After），
+     * 但让人一次次点一个注定失败的按钮，只是在制造挫败感 ——
+     * 收件箱就是通知通道本身，刷爆它等于把告警通道一起刷爆。
+     */
+    async resendMfaReauth() {
+      const c = this.mfaReauth?.challenge
+      if (!c) return { ok: false, reason: 'no_challenge' }
+      const wait = this.mfaReauthResendWait()
+      if (wait > 0) return { ok: false, reason: 'too_soon', wait }
+      const data = await authApi.mfaResend(c.challengeId, c.clientSecret)
+      const challenge = {
+        challengeId: data.challenge_id,
+        clientSecret: data.client_secret,
+        expiresIn: data.expires_in,
+        emailHint: data.email_hint || c.emailHint,
+        resendAfter: data.resend_after || 60,
+        sentAt: Date.now()
+      }
+      this.mfaReauth = { ...this.mfaReauth, phase: 'sent', challenge, emailHint: challenge.emailHint }
+      return { ok: true, data }
+    },
+
+    /**
+     * 轮询一次「重新验证」的挑战。
+     *
+     * 验证通过时**只换令牌**（``pollChallenge`` 里的 applyToken）——
+     * 账套列表不动：这个流程发生在一次请求的中途。
+     *
+     * **失败分两类**（决定「还能不能继续等」）：
+     *   · **4xx**（链接过期、挑战作废）—— 这条路走不通了，得重新发一封信；
+     *   · **网络类 / 429**（轮询太频繁）—— 下一轮还会再试，别把界面卡死。
+     */
+    async pollMfaReauth() {
+      const c = this.mfaReauth?.challenge
+      if (!c) return { status: 'IDLE' }
+      this.mfaReauth = { ...this.mfaReauth, phase: 'verifying' }
+      try {
+        const r = await this.pollChallenge(c)
+        if (r.status !== 'VERIFIED') {
+          // 还没点链接是**正常状态**，不是错误 —— 别把 phase 改成 failed。
+          this.mfaReauth = { ...this.mfaReauth, phase: 'sent' }
+        }
+        return r
+      } catch (e) {
+        const status = e?.response?.status
+        const fatal = status >= 400 && status < 500 && status !== 429
+        this.mfaReauth = {
+          ...this.mfaReauth,
+          phase: fatal ? 'failed' : 'sent',
+          error: fatal ? errorText(e, '验证失败，请重新发送验证邮件') : ''
+        }
+        return { status: fatal ? 'FAILED' : 'PENDING', error: this.mfaReauth.error }
+      }
+    },
+
+    /**
+     * 验证通过：把裁决交给调用方（拦截器会去重试原动作）。
+     */
+    finishMfaReauth() {
+      const s = mfaReauthSettle
+      mfaReauthSettle = null
+      if (s) s(true)
+    },
+
+    /**
+     * 管理员取消（或流程没走通）：**原动作没有被执行**。
+     *
+     * 这里的 ``false`` 很重要 —— 调用方据此**不重试**原动作。
+     * 把「取消」当成「通过」去重试，等于把一个管理员明确拒绝的动作
+     * 又做了一遍。
+     */
+    cancelMfaReauth() {
+      this.mfaReauth = null
+      const s = mfaReauthSettle
+      mfaReauthSettle = null
+      if (s) s(false)
     },
     /** 重新拉一次登录态。
      *  localStorage 里的 user 是登录那一刻的快照：老版本缓存的 user 没有
@@ -324,6 +654,16 @@ export const useSessionStore = defineStore('session', {
       this.mfa = null
       // 下一个人的账套列表还没问过 —— 别拿这一份空列表去判「这个人没有账套」
       this.booksLoaded = false
+      // **正在等的高危动作也要就地结束**（裁决为「没通过」）。
+      // 不结束的话：拦截器正等着这次重新验证的结果，那个被拦下的请求
+      // 会一直悬着（直到超时兜底才作罢）—— 而人已经登出了，悬着它毫无意义。
+      // 裁决成 false（不是 true）：原动作**没有**执行，不该被重试。
+      if (mfaReauthSettle) {
+        const s = mfaReauthSettle
+        mfaReauthSettle = null
+        s(false)
+      }
+      this.mfaReauth = null
       // 期间跟账套是一对：书留着的账套 id（下次登录还能落回去），
       // 但**期间必须清** —— 上一个用户停在哪一期跟下一个用户无关，
       // 留着就可能让新用户一进来顶着一个不属于他的期间。periods 一并清掉，
@@ -335,6 +675,10 @@ export const useSessionStore = defineStore('session', {
       // 跟下一个用户无关。留着就可能让新用户一进来就看见一张「待初始化」的卡片，
       // 而那本账根本不是他的。books 同理（上面已清）。
       this.initByBook = {}
+      // 「刚建出来的那张新凭证」也是**这个人的账**：上一个用户刚存的那张，
+      // 跟下一个用户无关。留着的话，下一个用户新开一张凭证就可能被
+      // 认成「刚才那张」（审计 N5）。
+      this.createdVoucher = null
       localStorage.removeItem('cwq_token')
       localStorage.removeItem('cwq_user')
       localStorage.removeItem('cwq_book')
@@ -347,6 +691,9 @@ export const useSessionStore = defineStore('session', {
      *  走 setBook，于是「localStorage 里的账套还在、期间数组却是空的」这种状态
      *  没人收拾 —— 表现就是顶栏期间下拉点开只有「无数据」。 */
     async loadBooks() {
+      // 守卫装上：顶栏的账套下拉里的选项就是这一份列表装的，
+      // 所以「用户第一次能切账套」一定晚于这一刻（见 ensureBookSwitchWatch）。
+      ensureBookSwitchWatch(this)
       this.books = await bookApi.listBooks()
       // 问过了 —— 这一句必须紧跟在列表接口后面，不能挪到 loadPeriods 之后：
       // 期间接口失败不该把「账套列表问过了」这个事实也一起抹掉。
@@ -389,8 +736,28 @@ export const useSessionStore = defineStore('session', {
       await this.loadPeriods()
     },
 
+    /**
+     * 取走「换账套前的那一本」，并清掉。
+     *
+     * 一次性：提示只该出现一次；不清的话，下一次进凭证页还会再提一遍
+     * 上一本账（「你原来看的是哪本账的哪张」变成一句莫名其妙的话）。
+     */
+    takePrevBookId() {
+      const prev = this.prevBookId
+      this.prevBookId = 0
+      return prev
+    },
+
     /** 换账套：默认进最新年度。 */
     async setBook(id) {
+      // 「换账套前的那一本」**不再在这里判断** ——
+      // 顶栏是 ``v-model="store.bookId"``：v-model 先把新账套写进 store，
+      // @change 里再进来时 bookId 早就是新的了，「变了没有」永远答 false，
+      // 于是那个记号一次也记不上（审计 §3.33）。
+      // 现在由 watch 记「写之前那一本」（见 ensureBookSwitchWatch）：
+      // 判据跟「谁写的 bookId」无关。
+      // 这里只保证守卫装上了（万一 setBook 是第一次碰这个 store）。
+      ensureBookSwitchWatch(this)
       this.bookId = id
       localStorage.setItem('cwq_book', String(id))
       // 「要不要清掉旧期间」问的是**手上的期间属于哪个账套**，不是 bookId 变没变。
@@ -534,3 +901,20 @@ export const useSessionStore = defineStore('session', {
     }
   }
 })
+
+/**
+ * 取 store —— **顺带保证「切账套」的守卫装上了**。
+ *
+ * 为什么包一层：那个守卫要赶在**第一次切账套之前**装好（顶栏的 v-model 会
+ * 先把新账套写进 store，守卫装晚了就看不见那一次切换，见 ensureBookSwitchWatch）。
+ * 而「第一次切账套之前」这个时刻，代码里没有哪个 action 一定跑过 ——
+ * 装在 action 里就等于赌「登录时一定调过 loadBooks」。
+ * 所以改成：**谁取 store，谁就装上**。取 store 是这个应用里最频繁的一件事，
+ * 守卫装上去的时机一定早于用户点顶栏。
+ */
+export function useSessionStore(...args) {
+  const store = useSessionStoreBase(...args)
+  ensureBookSwitchWatch(store)
+  return store
+}
+useSessionStore.$id = useSessionStoreBase.$id

@@ -378,6 +378,24 @@ jobs:
             exit 1
           fi
 
+      - name: §7 路线图 50 项终审（退出码就是结论）
+        working-directory: .
+        shell: bash
+        # **为什么这道闸必须真的执行。** 2026-10-25 的一轮独立复核指出：
+        # 这个脚本原来结尾无条件 ``sys.exit(0)`` —— 于是 50 项全 FAIL 时它
+        # 照样返回 0，**当不了闸门**（只能给人看）。退出码已经改成
+        # 「有项目 FAIL ⇒ 1」，这里把它接进流水线，结论才有人盯。
+        #
+        # 它是**纯标准库**脚本（只读仓库里的源码、用正则找判据），不需要
+        # 数据库、不需要装依赖 —— 所以放在 backend job 末尾当一步，
+        # 而不是新开一个 job（那要多花一份 runner 的启动时间）。
+        #
+        # 判据只认代码、不认注释：每一项都要在源码里找到可复现的证据，
+        # 找不到就是 FAIL。所以它同时也是「别把修复删了」的回归闸。
+        run: |
+          set -euo pipefail
+          python3 tools/audit_roadmap_check.py
+
   # ------------------------------------------------------------------ 前端
   frontend:
     name: 前端测试与构建
@@ -420,20 +438,51 @@ jobs:
         working-directory: frontend
         # P1-27 的病根就是「有 5 个用例但没有任何 runner」。
         # 现在 runner 接上了，但要防另一种形态：runner 在、却一个文件都没发现 ——
-        # 那还是一片绿。先看退出码（node --test 失败会非零退出），
-        # 再核对 runner 发现的测试文件数与磁盘上的文件数一致。
+        # 那还是一片绿。
+        #
+        # **这道闸原来在比一个量纲不对的东西。** 它注释写的是「核对 runner
+        # 发现的测试文件数与磁盘上的文件数一致」，而代码取的是 node 输出里
+        # 的 ``tests N`` —— 那是**用例条数**，不是文件数。于是：
+        #   * 用例数（228）≥ 文件数（75）⇒ 恒真，**少发现一个文件它也不响**；
+        #   * 它唯一真正抓住的是「runner 整个没跑起来」（0 < 75）。
+        # 注释说谎比没注释更坏 —— 尤其这道闸本来就是为了「别让人以为
+        # 护栏在起作用」。
+        #
+        # **为什么不能改成数 node 报告的文件数**：本仓有 23 个测试文件会往
+        # stdout 里打自己的 ``== 标题 ==`` 分隔行，那些行会**插进 node 的
+        # TAP/spec 流**，把文件级的结果行冲掉 —— 实测磁盘上 75 个文件，
+        # spec 输出里只剩 52 个文件级行、TAP 输出里同样只剩 52 个。
+        # 从输出里数文件数因此**不可靠**，按那个数做闸会变成误报。
+        #
+        # 所以拆成两件事，各用各的可靠来源：
+        #   ① **退出码 + 用例条数**：抓住「runner 整个没跑起来」
+        #      （与 P1-27 那个形态直接对应）；
+        #   ② **glob 覆盖**：直接查磁盘上有没有 ``*.test.mjs`` 落在
+        #      ``tests/`` 之外 —— 那种文件 runner 的 glob **扫不到**，
+        #      而且它是**不依赖任何输出解析**的可靠判断。
+        # ① 抓不到「75 个文件里漏了 1 个」，这一点在这里明说，
+        # 不让注释替代码吹牛。
         run: |
           set -euo pipefail
-          expected=$(ls tests/*.test.mjs | wc -l | tr -d ' ')
+          expected=$(find tests -name '*.test.mjs' -type f | wc -l | tr -d ' ')
           out=$(npm run test 2>&1); rc=$?
           echo "$out" | tail -20
           [ "$rc" -eq 0 ] || { echo "❌ 前端测试失败（退出码 $rc）"; exit 1; }
           got=$(sed -nE 's/.*tests ([0-9]+).*/\1/p' <<<"$out" | tail -1)
-          echo "磁盘上 ${expected} 个测试文件，runner 报告 ${got:-?} 个"
+          echo "磁盘上 ${expected} 个测试文件，runner 报告 ${got:-?} 条用例"
           if [ -z "${got:-}" ] || [ "$got" -lt "$expected" ]; then
-            echo "❌ runner 发现的测试文件比磁盘上少 —— 有用例没被执行"
+            echo "❌ runner 跑出来的用例比磁盘上的测试文件还少 —— runner 整个没跑起来？"
             exit 1
           fi
+          # ② glob 覆盖：tests/ 之外的测试文件 runner 扫不到。
+          stray=$(find . -name '*.test.mjs' -type f \
+                    -not -path './node_modules/*' -not -path './tests/*')
+          if [ -n "$stray" ]; then
+            echo "❌ 这些测试文件不在 tests/ 下，runner 的 glob 扫不到："
+            echo "$stray"
+            exit 1
+          fi
+          echo "✅ ${expected} 个测试文件都在 runner 的 glob 覆盖范围内"
 
       - name: 前端静态自检（语法，零依赖）
         working-directory: frontend

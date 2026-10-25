@@ -119,6 +119,9 @@ CREATE OR REPLACE FUNCTION fn_entry_lock_guard() RETURNS trigger AS $$
 DECLARE
     v_voucher_id bigint;
     v_locked     boolean;
+    v_status     text;
+    v_source     text;
+    v_no         text;
 BEGIN
     IF TG_OP = 'DELETE' THEN
         v_voucher_id := OLD.voucher_id;
@@ -148,6 +151,68 @@ BEGIN
 
     IF COALESCE(v_locked, false) THEN
         RAISE EXCEPTION '会计期间已结账，禁止修改凭证 (voucher_id=%)', v_voucher_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    -- ---------- ② 已记账凭证：分录也不许动（审计报告 §3.15）----------
+    --
+    -- **为什么②必须存在。** ``fn_posted_voucher_guard`` 挂在 ``voucher`` 的
+    -- BEFORE UPDATE 上，**只有当 UPDATE 语句真的产生时才执行**。而应用层
+    -- 改凭证走的是「DELETE 旧 entry 行 + INSERT 新 entry 行」，voucher 行
+    -- 往往**没有任何净变化**（status 本来就是 UNPOSTED，又被重新赋成
+    -- UNPOSTED，SQLAlchemy 眼里「没变」→ 根本不生成 UPDATE 语句）——
+    -- 于是那道守卫**一次都没跑**：
+    --   · 后果 A：已记账凭证的金额被静默改写。借贷平、试算平、科目余额、
+    --     总账、「整理就绪」体检全过 —— 数字是错的，但没有任何一处会报错；
+    --   · 后果 B：并发改同一张凭证时留下 4 条分录（两组重复的行号），
+    --     同一笔钱记了两遍，而借贷仍然平。
+    --
+    -- 分录才是账上数字的**真正载体**，所以「已记账凭证的分录不许动」
+    -- 这句话必须在这张表上兑现，哪怕应用层被绕过（psql、脚本、
+    -- 未来的运维命令）也一样。
+    --
+    -- 而且**总账是按 entry 求和的**（不看行号）—— 只堵 DELETE 是不够的：
+    -- 往一张已记账的凭证里**插**一对借贷分录，账面上的数就变了，
+    -- 而那张凭证仍然是「已记账」。所以 INSERT 与 UPDATE 一样要堵。
+    --
+    -- **口径与 voucher 侧保持一致，不多不少**：
+    --   · 已记账（POSTED）且不是结转凭证 → 拒绝增删改它的分录；
+    --   · 结转凭证（CARRY_FORWARD）→ 放行，与 ``fn_posted_voucher_guard``
+    --     里那个例外同源（「重新结转损益」要能整张删掉重做）；
+    --   · 凭证本身已经不存在（级联删除时就是这种状态）→ 不下结论，
+    --     让外键去报更准的错。
+    --
+    -- **放在期间检查之后**：一张凭证既在已结账期间里、又是已记账状态时，
+    -- 先告诉用户「这个月封了账」（那是更靠前、也更该先解决的那一步）。
+    --
+    -- **为什么用普通 SELECT 而不加锁。** 这里要的是**读**凭证的状态，
+    -- 不需要锁。加锁会引入新的锁序边（entry → voucher），而库里已有的
+    -- 锁序是「period → voucher → entry」；多一条边就多一种死锁可能。
+    -- READ COMMITTED 下每条语句都取新快照，普通 SELECT 读到的就是
+    -- 「此刻已提交的事实」—— 判据要的正是这个。
+    --
+    -- **为什么①②放在同一个函数里、而不是各自一个触发器。**
+    -- 迁移 0032（科目表按年度拆开）搬分录时会**临时关掉这个触发器**
+    -- （``_set_trigger_enabled("entry", "trg_entry_lock_guard", False)``）——
+    -- 它要改的是**已记账**的历史凭证的分录（改的是 subject_id，金额一个没动）。
+    -- 护栏放在这个函数里，迁移关掉它时两道检查一起让路；
+    -- 放在另一个触发器里，迁移就只关了①、②照样拦 ——
+    -- **迁移会在生产库上当场失败**（跨年账套的次年凭证全是已记账的）。
+    SELECT v.status, v.source, v.voucher_no INTO v_status, v_source, v_no
+      FROM voucher v WHERE v.id = v_voucher_id;
+
+    IF v_status IS NULL THEN
+        IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+        RETURN NEW;
+    END IF;
+
+    IF v_source = 'CARRY_FORWARD' THEN
+        IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+        RETURN NEW;
+    END IF;
+
+    IF v_status = 'POSTED' THEN
+        RAISE EXCEPTION '凭证 % 已记账，不能修改或删除它的分录；如需改动请先反记账', v_no
             USING ERRCODE = 'check_violation';
     END IF;
 

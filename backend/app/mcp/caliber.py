@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.accounting.organize import CASH_SUBJECT_PREFIXES, cash_flow_kind
 from app.core.config import settings
+from app.core.money import money_str as _money_str
 from app.models import Book, Period, Subject, Voucher
 
 #: 科目类别的中文映射。**以 ``api/subjects.py`` 为准** —— 那是界面上显示的
@@ -64,12 +65,13 @@ def money_str(value) -> str:
     所以这里出参一律用字符串承载金额，并带 ``currency: "CNY"``。
 
     负数是**红字**（冲销），照原样保留符号 —— 把它改成正数就丢了信息。
+
+    **实现不在这里**：舍入规则与「两位小数」这个形态只有一份，在
+    ``app/core/money.py``。报表通道（``app/reports/evaluate.py``）用的是同一份
+    —— 否则「同一个量有了两份实现」，界面与导出就又会对不上
+    （审计 §4.5 / §3.26）。这里只保留这个名字，MCP 的调用方不用改。
     """
-    if value is None:
-        return "0.00"
-    if not isinstance(value, Decimal):
-        value = Decimal(str(value))
-    return f"{value.quantize(Decimal('0.01')):f}"
+    return _money_str(value)
 
 
 def money_value(value) -> Decimal:

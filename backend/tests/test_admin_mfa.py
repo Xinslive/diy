@@ -540,9 +540,15 @@ def test_高危动作要求近期通过邮箱二次验证(client, admin_user, mf
     with pytest.raises(Exception) as exc:
         require_recent_admin_mfa(user=admin_user, db=db,
                                  request=_FakeRequest({}))
+    # detail 是**结构化**的（{code, message}）：前端要靠 code 判断
+    # 「这个 403 该给『去重新验证』的引导」，靠文案匹配是拿协议去猜协议
+    # （见 core/deps.py::MFA_REAUTH_REQUIRED 的说明）。
     detail = getattr(exc.value, "detail", "")
-    assert "重新验证" in detail
-    assert "mfa_at" not in detail
+    assert isinstance(detail, dict), detail
+    assert detail["code"] == "MFA_REAUTH_REQUIRED", detail
+    assert "重新验证" in detail["message"]
+    # **别把实现细节漏给用户**：令牌里那个字段名对用户没有意义。
+    assert "mfa_at" not in detail["message"]
 
 
 def test_二次验证过期后高危动作被拒(client, admin_user, mfa_ready,
@@ -562,7 +568,10 @@ def test_二次验证过期后高危动作被拒(client, admin_user, mfa_ready,
         with pytest.raises(Exception) as exc:
             require_recent_admin_mfa(user=admin_user, db=db,
                                      request=_FakeRequest(payload))
-        assert "重新验证" in getattr(exc.value, "detail", "")
+        detail = getattr(exc.value, "detail", "")
+        assert isinstance(detail, dict), detail
+        assert detail["code"] == "MFA_REAUTH_REQUIRED", detail
+        assert "重新验证" in detail["message"]
     finally:
         settings.admin_mfa_grace_minutes = old_grace
 

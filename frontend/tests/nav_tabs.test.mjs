@@ -431,8 +431,10 @@ function mountWatcher(initial) {
       return this.path + (q ? '?' + q : '')
     },
   })
-  // 源码里那条 watch(...) 就是被测对象：route / tabs / watch 全由外面喂进去
-  new Function('watch', 'route', 'tabs', WATCHER_SRC)(watch, route, s)
+  // 源码里那条 watch(...) 就是被测对象：route / tabs / watch / store 全由外面喂进去
+  // （store 是为了那条 watch 里「换了页面就别再提上一本账」的清理，见 session store
+  //  的 prevBookId —— 审计 §3.33）
+  new Function('watch', 'route', 'tabs', 'store', WATCHER_SRC)(watch, route, s, { prevBookId: 0 })
   return { route, tabs: s }
 }
 

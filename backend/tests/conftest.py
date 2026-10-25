@@ -471,6 +471,41 @@ def _clean_slate():
     yield
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_plugin_root(tmp_path_factory):
+    """把插件根目录从**仓库的运行时目录**挪到临时目录。
+
+    为什么必须隔离：插件的**签名密钥封禁名单**（``.revoked-keys``）就写在
+    插件根目录里，而插件根目录默认是 ``data/plugins`` —— 也就是**仓库里的
+    运行时目录**（相对 cwd）。
+
+    一条用例调了「封禁签名密钥」，名单就留在那儿了；下一次跑这套件，
+    用同一把测试密钥（``key_id="test"``，见 ``tests/plugin_helpers.package``）
+    签名的用例全部被判「密钥已撤销」。
+
+    这不是偶发抖动，是**顺序依赖**：第一次跑绿、第二次跑红。
+    实测踩过：仓库里残留一个 ``data/plugins/.revoked-keys``（内容 ``test``），
+    ``test_plugin_security.py::test_signed_package_roundtrip`` 直接红，
+    而且红得毫无道理 —— 它跟封禁没有任何关系。
+
+    更糟的是那是一次**跨进程的污染**：测试跑在开发机上，污染留在工作区里，
+    下一个人 clone 下来第一次跑就是红的。
+
+    所以这里在会话级把插件根目录指到临时目录 —— 测试再怎么写都写不进仓库，
+    也不会流到下一轮。``tests/plugin_fixtures.py`` 的 ``plugin_env`` 夹具
+    会再按用例细分到自己的 ``tmp_path``，那是更细的一层，两边不冲突。
+    """
+    from app.core.config import settings
+
+    root = tmp_path_factory.mktemp("plugin-root")
+    original = settings.plugin_root
+    settings.plugin_root = str(root)
+    try:
+        yield str(root)
+    finally:
+        settings.plugin_root = original
+
+
 # --------------------------------------------------------------------- 基础夹具
 
 

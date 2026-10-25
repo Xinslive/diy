@@ -13,7 +13,8 @@ from sqlalchemy.orm import Session
 from app.accounting.audit_helper import log
 from app.api.schemas import CellIn
 from app.core.db import get_db
-from app.core.deps import get_current_user, get_my_book, require_book_write
+from app.core.deps import (get_current_user, get_my_book, normalize_role,
+                            require_book_write)
 from app.core.uploads import UploadTooLarge, read_upload_sync as read_upload
 from app.models import (Book, Period, ReportCell, ReportCol, ReportResult, ReportRow,
                      ReportTemplate, Subject, SysUser, UserBook)
@@ -118,6 +119,16 @@ def _require_template_write(db: Session, user: SysUser, book_id: int | None) -> 
        日志的 ``book_id`` 列。
     2. **要求 OWNER**，不认「不是 VIEWER 就放行」这种黑名单判断。角色认不
        出来一律当拒绝（与 ``frontend/src/stores/session.js::canWrite`` 一致）。
+
+    **角色必须先归一化再比（审计 P3-12）。** 这里原来写的是
+    ``link.role != "OWNER"`` —— 大小写敏感的原始字面量，而
+    ``app/models/system.py`` 早就写明「大小写归一化交给应用层
+    （``deps.normalize_role``）做」。于是同一份角色在
+    ``app/api/books.py``（用 ``normalize_role``）放行、在报表侧却被拒：
+    ``'owner'`` / ``'OWNER '`` / ``'OWNER\\n'`` 全都判成「不是 OWNER」。
+    方向是 fail-closed（是**误拒合法用户**，不是越权），但口径分裂本身就是
+    bug —— 一个人换个入口就改了权限。现在与 ``books.py`` / ``printing.py``
+    用同一个 ``normalize_role``，三边对同一份数据给出同一个答案。
     """
     if book_id is None:
         raise HTTPException(
@@ -128,7 +139,7 @@ def _require_template_write(db: Session, user: SysUser, book_id: int | None) -> 
         raise HTTPException(403, "没有该账套的访问权限")
     if user.is_admin:
         return
-    if link.role != "OWNER":
+    if normalize_role(link.role) != "OWNER":
         raise HTTPException(403, "报表公式是本账套的口径，只有账套所有者或管理员可以修改")
 
 
@@ -169,10 +180,60 @@ def _require_owned_template(db: Session, template_id: int, book_id: int | None,
     return tpl
 
 
+# ===================================================================== 门禁进依赖图
+#
+# **为什么门禁不能只写在函数体第一行（审计 P3-13）。**
+#
+# FastAPI 的处理顺序是「**先解依赖，再校验请求体**」—— 所以门禁写在函数体
+# 第一行时，一个请求的**实际顺序**是：
+#
+#     1. FastAPI 校验请求体字段    → 字段不对 ⇒ 422
+#     2. 进入函数体，执行门禁      → 角色不对 ⇒ 403
+#
+# 于是「只读账号 + 一个畸形请求体」拿到的是 **422** 而不是 403。这是一条
+# **授权状态码探针**：调用方能靠状态码区分「我这个身份被拒了」与「我的
+# 请求体写错了」，而它本来连自己有没有权限都不该知道。
+#
+# 仓库自订的标准写在 ``app/api/system.py:49-64``：「门禁进依赖图之后，
+# FastAPI 在**校验请求体之前**就会先求依赖」。下面这两个依赖就是把
+# ``_require_template_write`` / ``_require_owned_template`` 挂进依赖图。
+#
+# **函数体里的那一句保留**（与 ``system.py`` 同一个做法）：它是第二层 ——
+# 有人在依赖注入上做了手脚时仍然有效，而且它让每条路由**自己**说清
+# 「这条要门禁」。两处的判据是同一个函数，语义不会分叉。
+
+
+def require_template_write(book_id: Optional[int] = None,
+                            db: Session = Depends(get_db),
+                            user: SysUser = Depends(get_current_user)) -> None:
+    """依赖图里的「改报表模板」门禁（审计 P3-13）。
+
+    判据全部来自 ``_require_template_write``，这里只负责把它**提前**到
+    请求体校验之前：``book_id`` 是查询参数、``db`` 与 ``user`` 各走各的
+    依赖，与路由自己声明的那几个同名参数读的是同一个来源。
+    """
+    _require_template_write(db, user, book_id)
+
+
+def require_owned_template(template_id: int, book_id: Optional[int] = None,
+                            db: Session = Depends(get_db),
+                            user: SysUser = Depends(get_current_user)) -> ReportTemplate:
+    """依赖图里的「改这张模板」门禁（审计 P3-13）。
+
+    ``template_id`` 是**路径参数**，依赖照样能拿到 —— FastAPI 从
+    ``request.path_params`` 里取，与路由自己声明的那个是同一个值。
+
+    判据（含「内置基线回 400、别人的模板回 404」）全部来自
+    ``_require_owned_template``，这里不重写一遍，免得两处口径分叉。
+    """
+    return _require_owned_template(db, template_id, book_id, user)
+
+
 @router.post("/templates/{template_id}/fork", status_code=201)
 def fork_template(template_id: int, book_id: Optional[int] = None,
                   user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
-                  book: Book = Depends(get_my_book)):
+                  book: Book = Depends(get_my_book),
+                  _gate: None = Depends(require_template_write)):
     """把一张模板复制一份归属当前账套 —— **写时复制的那一步**。
 
     进入设计模式时前端先调这里，于是「改内置表」的实际动作落在副本上：
@@ -289,7 +350,8 @@ def _check_formula(src: str, row_no: int, col_no: int) -> None:
 
 @router.put("/{template_id}/cells")
 def save_cells(template_id: int, payload: list[CellIn], db: Session = Depends(get_db),
-               book_id: Optional[int] = None, user=Depends(get_current_user)):
+               book_id: Optional[int] = None, user=Depends(get_current_user),
+               _gate: ReportTemplate = Depends(require_owned_template)):
     """改单元格公式。门禁与归属见 ``_require_owned_template``：
     必须是**当前账套自己那份**模板，官方内置基线不接受直接写入
     （前端在进入设计模式时已经先 ``fork`` 过一份，改的是副本）。
@@ -406,7 +468,8 @@ def _template_year(db: Session, book_id: int, year: int | None) -> int:
 @router.post("/templates/import/preview")
 def preview_template_import(file: UploadFile = File(...), book_id: Optional[int] = None,
                             user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
-                            year: Optional[int] = Query(None, description="会计年度；不传取账套当前在记的那一年")):
+                            year: Optional[int] = Query(None, description="会计年度；不传取账套当前在记的那一年"),
+                            _gate: None = Depends(require_template_write)):
     """只解析、检查当前账套科目，不创建模板。"""
     _require_template_write(db, user, book_id)
     # 必须在 try **之前**导入：``except TemplateImportError`` 子句要用的名字
@@ -440,7 +503,8 @@ def preview_template_import(file: UploadFile = File(...), book_id: Optional[int]
 @router.post("/templates/import", status_code=201)
 def import_templates(payload: ImportTemplates, book_id: Optional[int] = None,
                      user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
-                     year: Optional[int] = Query(None, description="会计年度；不传取账套当前在记的那一年")):
+                     year: Optional[int] = Query(None, description="会计年度；不传取账套当前在记的那一年"),
+                     _gate: None = Depends(require_template_write)):
     """先校验整批，再在一个事务内新建模板；不覆盖内置或已有报表。"""
     _require_template_write(db, user, book_id)
     from app.reports.importer import subject_codes, validate_formula
@@ -544,6 +608,46 @@ class ReportColPatch(BaseModel):
     label: Optional[str] = None
     kind: Optional[str] = None
     hidden: Optional[bool] = None
+    width: Optional[int] = None
+
+
+class ReportRowAddIn(BaseModel):
+    """加行的入参（审计 P3-10）。
+
+    **以前这里是裸 ``dict``。** 那意味着请求体**没有任何字段级校验**：
+    ``indent="abc"`` 会一路走到 ``int(payload.get("indent", 0) or 0)``，
+    抛出一个没人接的 ``ValueError`` —— 而 ``app/main.py`` 只注册了
+    ``DBAPIError`` 处理器，于是回一句**脱敏的 500**：明明是参数写错，
+    却告诉调用方「服务器坏了」。同文件的 ``update_row`` 用带类型的
+    ``ReportRowPatch``，畸形字段回的是 422 —— 现在加行也一样。
+
+    字段名与语义保持原样（前端 ``ReportView.vue`` 只发
+    ``{row_no, label}``），只是把「谁来保证它是整数」从运行期的
+    ``int()`` 挪到了请求体校验这一层。
+    """
+
+    #: 插在第几行。不给就插到最后一行之后（与原来 ``payload.get("row_no")
+    #: or 默认值`` 的口径一致：0 也当没给）。
+    row_no: Optional[int] = None
+    label: Optional[str] = None
+    indent: int = 0
+    bold: bool = False
+    hidden: bool = False
+    style: Optional[dict] = None
+
+
+class ReportColAddIn(BaseModel):
+    """加列的入参（审计 P3-10）。理由与 :class:`ReportRowAddIn` 相同。
+
+    ``kind`` 不给时沿用左边那一列的取数口径（见 ``add_col`` 里的注释），
+    ``width`` 不给时用默认列宽 140。
+    """
+
+    col_no: Optional[int] = None
+    label: Optional[str] = None
+    #: 取数口径。不给就沿用左边最近的那个数值列。
+    kind: Optional[str] = None
+    hidden: bool = False
     width: Optional[int] = None
 
 
@@ -662,11 +766,17 @@ def _clone_skeleton(db: Session, src_id: int, dst_id: int) -> None:
 @router.post("/templates", status_code=201)
 def create_template(payload: ReportTemplateIn, book_id: Optional[int] = None,
                     user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
-                    book: Book = Depends(get_my_book)):
+                    book: Book = Depends(get_my_book),
+                    _gate: None = Depends(require_template_write)):
     """新建报表模板：复制一份表结构，财务在此基础上改公式。
 
     新模板**一出生就归属当前账套**（``book_id``），不是「先全局、再按需
     隔离」。自建模板没有「先让所有人看到一份原版」的必要，留个归属更省心。
+
+    **依赖顺序是刻意的。** ``get_my_book`` 挂在 ``require_template_write``
+    **前面**：``book_id`` 缺省时由 ``get_my_book`` 先回 422（它把 book_id
+    声明成必填查询参数），门禁那道带解释文案的 400 依旧走不到 —— 与门禁
+    进依赖图之前的行为一致，不因为这次调整改掉一个已有的状态码。
     """
     _require_template_write(db, user, book_id)
     tpl = ReportTemplate(code=f"CUSTOM_{uuid.uuid4().hex[:10].upper()}",
@@ -696,6 +806,24 @@ def create_template(payload: ReportTemplateIn, book_id: Optional[int] = None,
         if payload.base_code else None
     if base is not None:
         _clone_skeleton(db, base.id, tpl.id)
+    # P3-09：新建一张表 = 这家单位从此多了一张**自己口径**的报表。名字、
+    # 参照的是哪张基线、复制过来多少行多少列，都得留痕 —— 否则事后看到
+    # 一张凭空出现的表，谁也说不清它是照着哪张改出来的。
+    #
+    # **必须先 flush**：这个 Session 是 ``autoflush=False`` 的
+    # （``app/core/db.py``），而 ``_clone_skeleton`` 只把行列 ``db.add``
+    # 进去、没有落库 —— 不 flush 就数，得到的会是 0。
+    db.flush()
+    rows_n = db.scalar(select(func.count()).select_from(ReportRow)
+                       .where(ReportRow.template_id == tpl.id)) or 0
+    cols_n = db.scalar(select(func.count()).select_from(ReportCol)
+                       .where(ReportCol.template_id == tpl.id)) or 0
+    log(db, action="CREATE_REPORT_TEMPLATE", entity="report_template", entity_id=tpl.id,
+        user=user, book_id=book.id,
+        detail=f"新建报表模板 {tpl.name}（{tpl.code}）",
+        after={"name": tpl.name, "code": tpl.code, "type": tpl.type,
+               "remark": tpl.remark, "base_code": payload.base_code,
+               "rows": rows_n, "cols": cols_n})
     db.commit()
     return {"id": tpl.id, "code": tpl.code, "name": tpl.name, "type": tpl.type}
 
@@ -703,7 +831,8 @@ def create_template(payload: ReportTemplateIn, book_id: Optional[int] = None,
 @router.post("/templates/{template_id}/copy")
 def copy_template(template_id: int, name: Optional[str] = None, book_id: Optional[int] = None,
                   user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
-                  book: Book = Depends(get_my_book)):
+                  book: Book = Depends(get_my_book),
+                  _gate: None = Depends(require_template_write)):
     """复制模板（含全部公式）到当前账套。改公式前先留底，财务自己就能做。
 
     源模板必须是当前账套看得见的（官方基线或本账套自己的）；副本一律归属
@@ -718,6 +847,13 @@ def copy_template(template_id: int, name: Optional[str] = None, book_id: Optiona
     db.add(tpl)
     db.flush()
     _clone_skeleton(db, src.id, tpl.id)
+    # P3-09：复制一张表 = 这张表的**口径**在另一个地方又活了一份。事后
+    # 只看审计流水的人，必须能看出「这张新表是从哪张复制来的」。
+    log(db, action="CREATE_REPORT_TEMPLATE", entity="report_template", entity_id=tpl.id,
+        user=user, book_id=book.id,
+        detail=f"复制报表模板 {src.name}（{src.code}）为 {tpl.name}",
+        before={"template_id": src.id, "code": src.code, "name": src.name},
+        after={"template_id": tpl.id, "code": tpl.code, "name": tpl.name})
     db.commit()
     return {"id": tpl.id, "code": tpl.code, "name": tpl.name}
 
@@ -725,23 +861,40 @@ def copy_template(template_id: int, name: Optional[str] = None, book_id: Optiona
 @router.patch("/templates/{template_id}")
 def update_template(template_id: int, payload: ReportTemplatePatch,
                     book_id: Optional[int] = None, user: SysUser = Depends(get_current_user),
-                    db: Session = Depends(get_db)):
+                    db: Session = Depends(get_db),
+                    _gate: ReportTemplate = Depends(require_owned_template)):
+    """改模板的名字/备注。
+
+    P3-09：**改名也是改口径**。报表清单、打印抬头、导出文件名都用这个名字，
+    改掉它就等于「这张表以后叫什么」变了 —— 审计流水里必须留下改前改后。
+    """
     tpl = _require_owned_template(db, template_id, book_id, user)
+    before = {"name": tpl.name, "remark": tpl.remark}
     if payload.name is not None:
         tpl.name = payload.name
     if payload.remark is not None:
         tpl.remark = payload.remark
+    after = {"name": tpl.name, "remark": tpl.remark}
+    if before != after:
+        log(db, action="UPDATE_REPORT_TEMPLATE", entity="report_template",
+            entity_id=template_id, user=user, book_id=book_id,
+            detail=f"修改报表模板 {template_id} 的名称/备注",
+            before=before, after=after)
     db.commit()
     return {"id": tpl.id, "name": tpl.name, "remark": tpl.remark}
 
 
 @router.delete("/templates/{template_id}")
 def delete_template(template_id: int, book_id: Optional[int] = None,
-                    user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+                    user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
+                    _gate: ReportTemplate = Depends(require_owned_template)):
     """删报表。删掉的只能是本账套自己那份；官方内置基线永远留着。
 
     删掉的是内置表的**副本**时，那个账套就回到看基线的状态 —— 这正是
     「我不想要我的改动」的那条退路，所以副本的 ``is_builtin`` 是 false。
+
+    P3-09：删掉之后**没法还原**（不像公式那样还在单元格里），所以删除
+    那一侧的快照必须留着 —— 这与「删科目要留 before」是同一条理由。
     """
     tpl = _require_owned_template(db, template_id, book_id, user)
     # 兜底，不再是主路径：基线（book_id IS NULL）已在 _require_owned_template
@@ -750,23 +903,53 @@ def delete_template(template_id: int, book_id: Optional[int] = None,
     # 会让真出现这种数据时直接删掉一张所有账套共看的表。
     if tpl.is_builtin:
         raise HTTPException(400, "内置报表模板不允许删除，可以先复制一份再改")
+    # 先把快照取出来：``db.delete`` 之后这行的属性就取不到了。
+    before = {"id": tpl.id, "code": tpl.code, "name": tpl.name, "type": tpl.type,
+              "remark": tpl.remark}
     db.delete(tpl)
+    log(db, action="DELETE_REPORT_TEMPLATE", entity="report_template",
+        entity_id=template_id, user=user, book_id=book_id,
+        detail=f"删除报表模板 {before['name']}（{before['code']}）",
+        before=before)
     db.commit()
     return {"ok": True}
 
 
 @router.patch("/templates/{template_id}/rows/{row_no}")
 def update_row(template_id: int, row_no: int, payload: ReportRowPatch, book_id: Optional[int] = None,
-               user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    """改行的标签/缩进/加粗/隐藏。
+               user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
+               _gate: ReportTemplate = Depends(require_owned_template)):
+    """改行的标签/缩进/加粗/隐藏/样式。
 
-    只靠插删行拼不出想要的表 —— 「合计行加粗」「几行不打印」都得能单独调。
+    只靠插删行拼不出想要的表 —— 「合计行加粗」「几行不打印」「改右栏项目名」
+    都得能单独调。
+
+    P3-09：行标签就是这张表上**印出来给人看的项目名**。把它从「未分配
+    利润」改成「其他综合收益」，报表照样渲染得出一张「正常的」表，数字
+    变了却不出错 —— 没有 before 就无从判断是哪改坏的（与改公式同一条
+    理由，见 ``save_cells``）。
+
+    **``style`` 也是「印给人看的项目名」，不是装饰字段。** 内置资产负债表
+    是**双栏**表，右栏（负债和所有者权益那一半）的项目名就存在
+    ``style["label_right"]`` 里（见 ``seed/builtin_reports.py``），
+    前端改右栏项目名走的就是这条路（``ReportView.vue`` 提交
+    ``{style: row.style}``）。
+
+    所以快照里**必须带上 style**：只改 style 时 if before != after 判不出
+    变化 → **一条审计都不落** —— 而报表照样渲染得出一张「正常的」资产负债表，
+    右栏的「流动负债：」被换成了「短期借款：」，数字变了却查不出来。
+    这与 §3.9 原文描述的失败场景完全同类（只是触发字段从 label 换成了 style）。
     """
     _require_owned_template(db, template_id, book_id, user)
     row = db.scalar(select(ReportRow).where(ReportRow.template_id == template_id,
                                              ReportRow.row_no == row_no))
     if row is None:
         raise HTTPException(404, "行不存在")
+    # style 要**拷贝**一份再进快照：``row.style`` 后面会被整体替换，
+    # 快照里留的是同一个对象的话 before 会跟着一起变，前后就没有差异了。
+    before = {"row_no": row_no, "label": row.label, "indent": row.indent,
+              "bold": row.bold, "hidden": row.hidden,
+              "style": dict(row.style or {})}
     if payload.label is not None:
         row.label = payload.label[:128]
     if payload.indent is not None:
@@ -777,41 +960,87 @@ def update_row(template_id: int, row_no: int, payload: ReportRowPatch, book_id: 
         row.hidden = payload.hidden
     if payload.style is not None:
         row.style = payload.style
+    after = {"row_no": row_no, "label": row.label, "indent": row.indent,
+             "bold": row.bold, "hidden": row.hidden,
+             "style": dict(row.style or {})}
+    if before != after:
+        # detail 要说清**改的是哪一头**：双栏表的右栏项目名藏在 style 里，
+        # 只写「项目「流动负债」」会让人以为改的是左栏那一行。
+        changed = []
+        if before["label"] != after["label"]:
+            changed.append("项目名")
+        if before["style"] != after["style"]:
+            changed.append("样式（双栏表的右栏项目名/缩进/加粗/横线）")
+        if before["indent"] != after["indent"]:
+            changed.append("缩进")
+        if before["bold"] != after["bold"]:
+            changed.append("加粗")
+        if before["hidden"] != after["hidden"]:
+            changed.append("隐藏")
+        log(db, action="UPDATE_REPORT_TEMPLATE_STRUCTURE", entity="report_template",
+            entity_id=template_id, user=user, book_id=book_id,
+            detail=(f"修改报表 {template_id} 第 {row_no} 行的"
+                    f"「{'、'.join(changed) or '结构'}」"),
+            before=before, after=after)
     db.commit()
     return {"ok": True, "row_no": row_no}
 
 
 @router.post("/templates/{template_id}/rows")
-def add_row(template_id: int, payload: dict, book_id: Optional[int] = None,
-            user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    """在指定位置插入一行，下方行的公式单元格整体下移，公式内容不变。"""
+def add_row(template_id: int, payload: ReportRowAddIn, book_id: Optional[int] = None,
+            user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
+            _gate: ReportTemplate = Depends(require_owned_template)):
+    """在指定位置插入一行，下方行的公式单元格整体下移，公式内容不变。
+
+    P3-09：插进来的这一行带着**项目名**，也是报表上印给人看的口径，
+    必须留痕（before 为空：这一行原先不存在）。
+    """
     _require_owned_template(db, template_id, book_id, user)
     rows = list(db.scalars(select(ReportRow).where(ReportRow.template_id == template_id)
                            .order_by(ReportRow.row_no)).all())
-    at = int(payload.get("row_no") or (rows[-1].row_no + 1 if rows else 1))
+    at = payload.row_no or (rows[-1].row_no + 1 if rows else 1)
     if at <= 0:
         raise HTTPException(400, "row_no 必须为正整数")
 
+    label = payload.label or ""
     with _shift_rows(db, template_id, at, direction=+1):
         db.add(ReportRow(template_id=template_id, row_no=at,
-                         label=str(payload.get("label", "")),
-                         indent=int(payload.get("indent", 0) or 0),
-                         bold=bool(payload.get("bold", False)),
-                         hidden=bool(payload.get("hidden", False)),
-                         style=payload.get("style") or {}))
+                         label=label,
+                         indent=payload.indent,
+                         bold=payload.bold,
+                         hidden=payload.hidden,
+                         style=payload.style or {}))
     shifted = _rewrite_formulas(db, template_id, row_shift=(at, +1))
+    # P3-09：插入一行会把下面所有行的公式引用整体挪一格 —— 口径跟着变了，
+    # 所以「插了什么进去」必须进审计。
+    log(db, action="UPDATE_REPORT_TEMPLATE_STRUCTURE", entity="report_template",
+        entity_id=template_id, user=user, book_id=book_id,
+        detail=f"在报表 {template_id} 第 {at} 行插入项目「{label}」",
+        before=None,
+        after={"row_no": at, "label": label, "indent": payload.indent,
+               "bold": payload.bold, "hidden": payload.hidden,
+               "formulas_shifted": shifted})
     db.commit()
     return {"ok": True, "row_no": at, "formulas_shifted": shifted}
 
 
 @router.delete("/templates/{template_id}/rows/{row_no}")
 def delete_row(template_id: int, row_no: int, book_id: Optional[int] = None,
-               user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+               user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
+               _gate: ReportTemplate = Depends(require_owned_template)):
+    """删一行。
+
+    P3-09：删掉的项目名与那一行上的公式**都没法还原**了，所以删除侧的
+    快照必须留着（与「删科目要留 before」同一条理由）。
+    """
     _require_owned_template(db, template_id, book_id, user)
     row = db.scalar(select(ReportRow).where(ReportRow.template_id == template_id,
                                              ReportRow.row_no == row_no))
     if row is None:
         raise HTTPException(404, "行不存在")
+    # 快照要在删除之前取：``db.delete`` 之后这行的属性就取不到了。
+    before = {"row_no": row_no, "label": row.label, "indent": row.indent,
+              "bold": row.bold, "hidden": row.hidden}
     # 目标行和它的公式单元格必须在位移之前抓住 —— 位移之后它们已经不在 row_no 上了
     doomed = list(db.scalars(select(ReportCell).where(
         ReportCell.template_id == template_id, ReportCell.row_no == row_no)).all())
@@ -823,6 +1052,11 @@ def delete_row(template_id: int, row_no: int, book_id: Optional[int] = None,
     # 改写器：引用被删行的公式按 0 处理，绝不静默别名到相邻行（审计 P1-13）。
     shifted = _rewrite_formulas(db, template_id, row_shift=(row_no + 1, -1),
                                 drop_row=row_no)
+    log(db, action="UPDATE_REPORT_TEMPLATE_STRUCTURE", entity="report_template",
+        entity_id=template_id, user=user, book_id=book_id,
+        detail=f"删除报表 {template_id} 第 {row_no} 行项目「{before['label']}」",
+        before=before,
+        after={"deleted_cells": len(doomed), "formulas_shifted": shifted})
     db.commit()
     return {"ok": True, "deleted_cells": len(doomed), "formulas_shifted": shifted}
 
@@ -835,13 +1069,18 @@ def delete_row(template_id: int, row_no: int, book_id: Optional[int] = None,
 
 
 @router.post("/templates/{template_id}/cols", status_code=201)
-def add_col(template_id: int, payload: dict, book_id: Optional[int] = None,
-            user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    """在指定位置插入一列。默认沿用左边那一列的取数口径。"""
+def add_col(template_id: int, payload: ReportColAddIn, book_id: Optional[int] = None,
+            user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
+            _gate: ReportTemplate = Depends(require_owned_template)):
+    """在指定位置插入一列。默认沿用左边那一列的取数口径。
+
+    P3-09：**取数口径（``kind``）就是这一列算的是什么数** —— 期末还是期初、
+    本期发生额还是本年累计。插一列就是往这张表的口径上加了一列，必须留痕。
+    """
     _require_owned_template(db, template_id, book_id, user)
     cols = list(db.scalars(select(ReportCol).where(ReportCol.template_id == template_id)
                            .order_by(ReportCol.col_no)).all())
-    at = int(payload.get("col_no") or (cols[-1].col_no + 1 if cols else 1))
+    at = payload.col_no or (cols[-1].col_no + 1 if cols else 1)
     if at <= 1:
         raise HTTPException(400, "列号从 2 开始，第 1 列是固定的「项目」列")
 
@@ -854,29 +1093,47 @@ def add_col(template_id: int, payload: dict, book_id: Optional[int] = None,
     value_cols = [c for c in cols if c.kind not in NON_FORMULA_KINDS]
     left = [c for c in value_cols if c.col_no < at]
     neighbour = left[-1] if left else (value_cols[0] if value_cols else None)
-    kind = str(payload.get("kind") or (neighbour.kind if neighbour else "BALANCE_CLOSING"))
+    kind = payload.kind or (neighbour.kind if neighbour else "BALANCE_CLOSING")
     if kind in NON_FORMULA_KINDS or kind not in COL_KINDS:
         raise HTTPException(400, f"未知的取数口径 {kind}，可选：{', '.join(sorted(COL_KINDS))}")
 
+    label = payload.label or "新列"
+    width = payload.width or 140
     with _shift_cols(db, template_id, at, direction=+1):
         db.add(ReportCol(template_id=template_id, col_no=at,
-                         label=str(payload.get("label") or "新列"),
+                         label=label,
                          kind=kind,
-                         hidden=bool(payload.get("hidden", False)),
-                         width=int(payload.get("width") or 140)))
+                         hidden=payload.hidden,
+                         width=width))
     shifted = _rewrite_formulas(db, template_id, col_shift=(at, +1))
+    log(db, action="UPDATE_REPORT_TEMPLATE_STRUCTURE", entity="report_template",
+        entity_id=template_id, user=user, book_id=book_id,
+        detail=f"在报表 {template_id} 第 {no_to_col(at)} 列插入「{label}」（口径 {kind}）",
+        before=None,
+        after={"col_no": at, "label": label, "kind": kind, "hidden": payload.hidden,
+               "width": width, "formulas_shifted": shifted})
     db.commit()
     return {"ok": True, "col_no": at, "letter": no_to_col(at), "formulas_shifted": shifted}
 
 
 @router.patch("/templates/{template_id}/cols/{col_no}")
 def update_col(template_id: int, col_no: int, payload: ReportColPatch, book_id: Optional[int] = None,
-               user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+               user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
+               _gate: ReportTemplate = Depends(require_owned_template)):
+    """改一列。
+
+    P3-09：**改 ``kind`` 就是改这一列取数的口径**（期末 → 期初）。页面照样
+    渲染出一张「正常的」资产负债表，数字变了却不出错，事后查审计流水却
+    没有任何一条指向这次改动 —— 审计报告点名的那条路径。改前的 ``kind``
+    与 ``label`` 必须进 before。
+    """
     _require_owned_template(db, template_id, book_id, user)
     col = db.scalar(select(ReportCol).where(ReportCol.template_id == template_id,
                                              ReportCol.col_no == col_no))
     if col is None:
         raise HTTPException(404, "列不存在")
+    before = {"col_no": col_no, "label": col.label, "kind": col.kind,
+              "hidden": col.hidden, "width": col.width}
     if payload.kind is not None and payload.kind != col.kind:
         if payload.kind not in COL_KINDS:
             raise HTTPException(400, f"未知的取数口径 {payload.kind}")
@@ -887,13 +1144,27 @@ def update_col(template_id: int, col_no: int, payload: ReportColPatch, book_id: 
         col.hidden = payload.hidden
     if payload.width is not None:
         col.width = max(60, min(600, payload.width))
+    after = {"col_no": col_no, "label": col.label, "kind": col.kind,
+             "hidden": col.hidden, "width": col.width}
+    if before != after:
+        log(db, action="UPDATE_REPORT_TEMPLATE_STRUCTURE", entity="report_template",
+            entity_id=template_id, user=user, book_id=book_id,
+            detail=(f"修改报表 {template_id} 第 {no_to_col(col_no)} 列"
+                    f"「{before['label']}」的口径/名称"),
+            before=before, after=after)
     db.commit()
     return {"ok": True, "col_no": col_no}
 
 
 @router.delete("/templates/{template_id}/cols/{col_no}")
 def delete_col(template_id: int, col_no: int, book_id: Optional[int] = None,
-               user: SysUser = Depends(get_current_user), db: Session = Depends(get_db)):
+               user: SysUser = Depends(get_current_user), db: Session = Depends(get_db),
+               _gate: ReportTemplate = Depends(require_owned_template)):
+    """删一列。
+
+    P3-09：删掉之后列的口径与那一列上的公式**都没法还原**，所以删除侧的
+    快照必须留着。
+    """
     _require_owned_template(db, template_id, book_id, user)
     col = db.scalar(select(ReportCol).where(ReportCol.template_id == template_id,
                                              ReportCol.col_no == col_no))
@@ -903,6 +1174,9 @@ def delete_col(template_id: int, col_no: int, book_id: Optional[int] = None,
         raise HTTPException(
             400, "「项目」列与「行次」列是固定列，不能删"
             if col.kind == "LINE_NO" else "「项目」列是固定列，不能删")
+    # 快照要在删除之前取：``db.delete`` 之后这行的属性就取不到了。
+    before = {"col_no": col_no, "label": col.label, "kind": col.kind,
+              "hidden": col.hidden, "width": col.width}
     # 「至少留一个数值列」必须数**真正取数的**列：把 STATIC/LINE_NO 算进去，
     # 会让一张只剩标签列和行次列的表也通过校验 —— 那种表一格数都算不出来，
     # 却能在界面上看着像一张正常的表。
@@ -923,5 +1197,11 @@ def delete_col(template_id: int, col_no: int, book_id: Optional[int] = None,
     # 引用被删列的公式会静默指向左边挪过来的那一列。
     shifted = _rewrite_formulas(db, template_id, col_shift=(col_no + 1, -1),
                                 drop_col=col_no)
+    log(db, action="UPDATE_REPORT_TEMPLATE_STRUCTURE", entity="report_template",
+        entity_id=template_id, user=user, book_id=book_id,
+        detail=(f"删除报表 {template_id} 第 {no_to_col(col_no)} 列"
+                f"「{before['label']}」（口径 {before['kind']}）"),
+        before=before,
+        after={"deleted_cells": len(doomed), "formulas_shifted": shifted})
     db.commit()
     return {"ok": True, "deleted_cells": len(doomed), "formulas_shifted": shifted}

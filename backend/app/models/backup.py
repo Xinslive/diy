@@ -18,7 +18,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import (BigInteger, DateTime, Index, Integer, String, Text)
+from sqlalchemy import (BigInteger, CheckConstraint, DateTime, Index, Integer, String,
+                        Text)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -63,6 +64,21 @@ class BackupRun(Base, TimestampMixin):
         # 上面那个前缀是 (scope, book_id, tier)，清理只按 created_at 过滤，
         # 用不上它 —— 于是每次清理一次全表扫。
         Index("ix_backup_run_created_at", "created_at"),
+        # **库级 CHECK 约束，模型侧必须同名同义**（审计 P3-2 / P3-22）。
+        #
+        # 三条都由迁移 0025 交付，库里是活的：
+        # ``scope="BOOKS"`` / ``tier="hourly"`` / ``status="ok"`` 都会被
+        # 挡下（sqlstate 23514）。这三列正是**判重与清理**的依据
+        # （``app/backup/tier.py::classify``、``prune_prefix``）：
+        # 口径一旦写错，清理就会按错误的层级删备份 —— 月度永久备份被
+        # 当成日备份清掉，是这一组护栏真正要防的事故。
+        #
+        # 以前模型侧一条都没声明，于是「模型 == 库」这条判据对 CHECK 约束
+        # **结构性失效**：Alembic 1.20 的 ``compare_metadata`` 根本不比较
+        # CHECK 约束，缺了不会报、补了也不会报 —— 两条路都看不见。
+        CheckConstraint("scope IN ('BOOK', 'SYSTEM')", name="ck_sys_backup_run_scope"),
+        CheckConstraint("tier IN ('daily', 'weekly', 'monthly')", name="ck_sys_backup_run_tier"),
+        CheckConstraint("status IN ('success', 'failed')", name="ck_sys_backup_run_status"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

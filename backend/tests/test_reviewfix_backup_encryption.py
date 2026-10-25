@@ -152,12 +152,19 @@ def test_上传走的是文件而不是把整份gzip读进内存(monkeypatch, db
     ``tmp.read_bytes()`` 会让一本大账套的快照把在线请求挤到 OOM。
     """
     from app.core import system_settings
+    from app.core.config import settings
 
     for key, value in (("oss_endpoint", "oss-cn-hangzhou.aliyuncs.com"),
                        ("oss_access_key_id", "AK"), ("oss_access_key_secret", "SK"),
                        ("oss_bucket", "acct-backup"), ("oss_prefix", "acct-backup")):
         system_settings.set_value(db, key, value)
     db.commit()
+
+    # 配了 OSS 就必须配加密密钥 —— ``run_backup`` 会在上传**之前**就拒绝
+    # 没配密钥的情形（运行期那道闸，见 ``app/backup/config.py``）。
+    # 这里给一把正常的密钥，走的是「配好了」的常态路径。
+    monkeypatch.setattr(settings, "backup_encryption_key",
+                        base64.b64encode(os.urandom(32)).decode())
 
     uploaded: list[tuple[str, int, bytes]] = []
 
@@ -176,5 +183,6 @@ def test_上传走的是文件而不是把整份gzip读进内存(monkeypatch, db
     assert uploaded, "备份没有走文件上传"
     for key, size, head in uploaded:
         assert size > 0, key
-        # 没配密钥 ⇒ 上传的是明文 gzip（gzip 魔数 1f 8b）。
-        assert head == b"\x1f\x8b", (key, head)
+        # 配了密钥 ⇒ 上传的是**密文**（魔数 CWQENC01），不是明文 gzip。
+        # 断言 gzip 魔数会把「明文上传」钉成常态，那正是审计 §3.8 要消灭的形态。
+        assert head == export_mod.ENCRYPTED_MAGIC[:2], (key, head)

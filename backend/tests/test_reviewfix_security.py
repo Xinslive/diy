@@ -29,7 +29,6 @@ import json
 import os
 import re
 import time
-import uuid
 from types import SimpleNamespace
 
 import jwt
@@ -385,13 +384,22 @@ def test_点链接猜错到阈值会退避(client):
 
     令牌是 256 位随机，猜不中 —— **不是认证绕过**；但它每次都要查一次库，
     于是「谁都能打」等于「谁都能驱动数据库查询」。所以要有退避。
+
+    **桶的键变了**（审查 §3.3）：原来按**来源 IP** 记，于是「nginx 后面
+    且 ``TRUSTED_PROXIES`` 没配」的部署里**全站共用一个桶** —— 攻击者点
+    10 次垃圾链接就能把管理员点**真**链接也挡住（那是「管理员再也登不进
+    系统」）。现在按**这串 token 自己的摘要**记：攻击者算不出受害者那串
+    的摘要，所以动不到受害者的桶。
+
+    所以这条用例的形态也变了：**同一串**错 token 反复点才会退避
+    （原来是**一串不同**的错 token 攒够次数就会退避）。
     """
     limit = mfa_service.VERIFY_FAIL_LIMIT
-    for i in range(limit):
-        r = client.get("/api/auth/mfa/verify", params={"token": f"bogus-{i}-{uuid.uuid4().hex}"})
+    for _ in range(limit):
+        r = client.get("/api/auth/mfa/verify", params={"token": "bogus-token"})
         assert r.status_code == 200, r.text
 
-    r = client.get("/api/auth/mfa/verify", params={"token": "bogus-over-the-limit"})
+    r = client.get("/api/auth/mfa/verify", params={"token": "bogus-token"})
     assert r.status_code == 429, r.text
     assert r.headers.get("Retry-After"), r.text
 

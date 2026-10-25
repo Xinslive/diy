@@ -44,6 +44,39 @@ export function onUnauthorized(fn) { clearSession = fn || clearSession }
 let pluginRejected = () => {}
 export function onPluginRejected(fn) { pluginRejected = fn }
 
+/**
+ * 「高危动作撞到二次验证闸门」的处理函数。**注入**，不 import。
+ *
+ * 理由与上面 ``clearSession`` 完全一样：重新验证要走 ``api/auth.js``
+ * （mfaReauth / mfaPoll），而 api/auth.js import 了本文件 ——
+ * client → auth → client 是个环，ESM 下不报错，只是静默拿到 undefined。
+ *
+ * 处理函数收到 403，返回 **true** 表示「已经拿到带新鲜验证时刻的新令牌，
+ * 可以重试原动作了」，返回 false / 抛错表示「没通过，原动作没执行」。
+ */
+let mfaReauthHandler = null
+export function onMfaReauth(fn) { mfaReauthHandler = fn }
+
+/**
+ * 后端「需要近期二次验证」时回的机器可读错误码。
+ *
+ * **与后端同一个字符串**（backend/app/core/deps.py::MFA_REAUTH_REQUIRED）——
+ * 那边的用例会跨语言核对一遍，改了一边忘了另一边会被测出来。
+ *
+ * **为什么不靠中文文案去匹配**：拿协议去猜协议（``detail.includes('二次验证')``）
+ * 的话，文案一改就**静默失效** —— 403 还是那个 403，只是没人弹引导了，
+ * 管理员撞死路，而且没有任何报错。
+ */
+export const MFA_REAUTH_REQUIRED = 'MFA_REAUTH_REQUIRED'
+
+/**
+ * 「这一趟已经因为 MFA 闸门重试过一次」的记号。
+ *
+ * **必须有**：重新验证之后若还是 403（宽限期是 0、通道坏了、……），
+ * 没有这个记号就会**再进一次重新验证** —— 无限循环，每一轮都发一封信。
+ */
+const MFA_RETRIED = '__cwqMfaRetried'
+
 http.interceptors.request.use((config) => {
   const token = localStorage.getItem('cwq_token')
   if (token) config.headers.Authorization = `Bearer ${token}`
@@ -52,8 +85,48 @@ http.interceptors.request.use((config) => {
 
 http.interceptors.response.use(
   (r) => r,
-  (error) => {
+  async (error) => {
     const status = error.response?.status
+    const detail = error.response?.data?.detail
+
+    // ---- 高危动作撞到「近期二次验证」闸门 ---------------------------
+    //
+    // 「该操作需要近期完成邮箱二次验证」这条 403 在闸门扩到 13 条受管控
+    // 写路由之后，是管理员**唯一**会撞上的墙（审计 §3.2）。没有下文的话，
+    // 管理员只会看到一句 403 —— 界面上没有「去重新验证」的入口，
+    // 撞死路，而且没有任何报错提示他该做什么。
+    //
+    // 这里做三件事：
+    //   1. 认错误码（不是认文案）；
+    //   2. 交给注入的处理器去做重新验证（发信 → 点链接 → 换新令牌）；
+    //   3. 拿到新令牌后**自动重试原动作**。
+    //
+    // **重试是安全的**：闸门在**依赖**里，FastAPI 先跑依赖再跑路由体 ——
+    // 被 403 拦下的那一刻，路由体**一行都没执行**，没有任何副作用。
+    // 所以原样重发一遍不会「做两遍」。
+    if (status === 403 && detail?.code === MFA_REAUTH_REQUIRED
+        && mfaReauthHandler && error.config && !error.config[MFA_RETRIED]) {
+      error.config[MFA_RETRIED] = true
+      let ok = false
+      try {
+        ok = await mfaReauthHandler(error)
+      } catch (e) {
+        // 处理器自己抛错（发信失败、轮询出错……）—— 当作「没通过」。
+        // 下面统一按失败处理，这里不把异常往上抛（那会让调用方拿到
+        // 一个与「重新验证」无关的错，掩盖真正的原因）。
+        ok = false
+      }
+      if (ok) {
+        // 重试要走 http.request(config)：请求拦截器会**重新**从 localStorage
+        // 取令牌，那儿已经是重新验证换来的新令牌了。
+        return http.request(error.config)
+      }
+      // 没通过：处理器**已经把话说清楚了**（对话框里写着为什么不行），
+      // 所以下面**不再**弹一次一样的 toast —— 同一件事说两遍只会让人
+      // 更困惑（「到底成没成」）。
+      return Promise.reject(error)
+    }
+
     if (status === 401) {
       // 令牌过期/失效。清 localStorage 之外，**必须同步清 Pinia 内存态**。
       //
@@ -70,13 +143,35 @@ http.interceptors.response.use(
       if (!location.hash.includes('/login')) location.hash = LOGIN_HASH
       return Promise.reject(error)
     }
-    const detail = error.response?.data?.detail
     if (status === 404 && detail?.code === 'PLUGIN_NOT_FOUND_OR_UNAVAILABLE') {
       const match = error.config?.url?.match(/^\/plugins\/([a-z0-9.-]+)\//)
       if (match) pluginRejected(match[1])
     }
+    // **取消不是错误**：被 abort 掉的请求同样没有 response。
+    // 它是「用户自己放弃的那一趟」（切期间时掐掉上一趟，见 getLatest），
+    // 弹一条红字是纯噪音，还会盖住同期真正需要报的错误。
+    if (isCanceled(error)) return Promise.reject(error)
     const msg = typeof detail === 'string' ? detail : Array.isArray(detail) ? detail[0]?.msg : detail?.message
     if (msg) ElMessage.error(msg)
+    else if (!error.response) {
+      // **网络失败 / 超时**：后端根本没回话，所以没有 detail 可显示。
+      // 以前这里一声不吭 —— 页面把「加载失败」渲染成「没有数据」，
+      // 用户打开总账看到一张空表、零提示，于是以为这个科目一整年没发生额
+      // （审计 §3.25）。这里补一条兜底提示，让失败**至少**有声音。
+      ElMessage.error(error.code === 'ECONNABORTED'
+        ? '请求超时（30 秒），请检查网络后重试'
+        : '网络异常：请求没有发出去或没有收到回应，请检查网络后重试')
+    } else if (status >= 500) {
+      // **服务端说「我出错了」，却没说清是什么错**（比如 500，而响应体里没有 detail）。
+      // 以前这里同样一声不吭：``if (msg)`` 不成立、``!error.response`` 也不成立 →
+      // 页面把「加载失败」渲染成「没有数据」，用户看着一张空表、零提示，
+      // 于是以为这个月真的一笔都没有（审计 N3 / §3.25）。
+      // 兜底提示：失败**至少**要有声音。
+      //
+      // 只兜 **5xx**：4xx 是「请求本身不对」（权限、参数、找不到），
+      // 那几条路前端自己清楚，弹一句笼统的话反而盖住真正的信息。
+      ElMessage.error(`服务器出错了（${status}），请稍后重试；若一直这样，请联系管理员`)
+    }
     return Promise.reject(error)
   }
 )

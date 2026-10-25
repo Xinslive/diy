@@ -193,6 +193,32 @@ ctx.data.count(TABLE, book_id=book_id, where={"label": "已完成"})
 
 清单的唯一事实来源是仓库里的 `backend/app/plugins/scan_policy.py`：每个允许的模块都写明了**为什么**允许（纯计算？内存缓冲？用户上传文件解析？），宿主据此评审新增项。
 
+## 隔离模式：插件后端代码在哪里跑
+
+宿主用 `PLUGIN_ISOLATION` 决定插件后端代码的**执行位置**：
+
+| 取值 | 插件后端代码在哪 | 对外行为 |
+|---|---|---|
+| `off`（默认） | 宿主进程内 | 与历史一致 |
+| `shadow` | 宿主进程内；**另起一个 worker 进程**把同一份代码再跑一遍，逐条比对两边的声明 | 与 `off` 完全一致；差异只记日志（ERROR 级） |
+| `on` | **只在 worker 进程里**；宿主按 worker 报上来的声明重建路由，业务请求经 Unix socket 派到 worker | 与 `off` 一致：同一份插件源码、同样的请求，给出同样的状态码与响应体 |
+
+**插件源码零改动**：三种模式用的是同一套 `register(registrar, ctx)` 表面，示例插件与本文档里的写法都不用改。切换 `PLUGIN_ISOLATION` 不需要重新打包插件。
+
+`on` 模式有三条对插件作者的约束（都是宿主侧的硬约束，在**装载期**判定）：
+
+1. **处理函数的注解，宿主要能原样重建**。宿主手里只有一份签名描述（插件在另一个进程里，函数对象过不来），它要把这份描述还原成 FastAPI 看得懂的签名 —— 还原不出来就**拒绝装载这个插件**（错误码 `PLUGIN_ISOLATION_UNSUPPORTED`），而不是塞一个 `Any` 上去让行为悄悄变掉（`Any` 与原注解对 FastAPI 的意义不同：`Any` 少一层校验，错的注解则按错的方式解析请求体）。
+
+   能原样重建的注解：`int` / `str` / `float` / `bool` / `bytes` / `dict` / `list` / `Any`、`Optional[...]` 与 `Union[...]`、`dict[str, Any]` 这类泛型、`datetime` / `date` / `Decimal` / `UUID`，以及带 `File(...)` 标记的 `UploadFile`。
+
+2. **插件拿不到宿主的对象**。`Request` / `Response` / `Session` / `WebSocket` / 自定义依赖一律拒绝 —— 这条在三种模式下都成立。
+
+3. **上传文件与二进制**走文件信封（只读临时文件 + 字节数 + 摘要），插件侧拿到的仍是同一个 `UploadFile`；`Decimal` / `datetime` 这类值跨进程时保留原类型（不会变成 `float` 或字符串）。
+
+`on` 模式的**已知代价**：同一插件的并发请求被**串行化**（协议在一个方向上只允许一个未完成的调用），每个请求多一次本机 IPC 往返。
+
+`shadow` 模式是切到 `on` 之前的观测期：它不改任何对外行为，只是把「声明在跨进程往返里丢了什么」这类问题在切换**之前**逼出来。
+
 ## 前端运行时
 
 前端模块默认导出组件工厂：
@@ -228,6 +254,7 @@ export default function createPlugin(host) {
 - `scope: "global"` 只适合配置或参考数据，不能存账套业务行；
 - 表名必须使用 `plugin_<sha256(id)[:12]>_` 前缀；例如 `com.example.periodnote` 的前缀是 `plugin_e3efc9984ace_`；
 - 不能修改宿主表、其他插件的表或跨插件外键；
+- 表里**不许有二进制列**（`BYTEA`，含 `BYTEA[]` 这类数组形态）：插件自有表的值会原样经 `ctx.data.read` 回到插件手里，一个二进制列就能让返回值带上字节。文件请走导入批次通道（`ctx.imports`），它带容量闸、内容去重与留存期；
 - 表结构、约束、索引和触发器必须与已登记的迁移结果一致。
 
 把配置写入插件自己的 book-scoped 表，并通过 `ctx.config.get/put` 做版本控制。不要把账套配置写入全局 settings，也不要在服务启动时执行隐式 DDL。

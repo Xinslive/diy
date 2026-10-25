@@ -212,6 +212,15 @@ class VoucherIn(BaseModel):
     #   after  —— 「增加凭证」= 向后插入，拿参照号 +1，只有更大的号顺位。
     # 只在 ``insert_after`` 有值时才有意义。
     insert_position: Literal["before", "after"] = "before"
+    # **乐观锁令牌**（审计 §3.15）：客户端把它读到的 ``updated_at`` 原样送回来。
+    #
+    # **不带 = 不比。** 这是**兼容**设计：老客户端一个字段都不带，
+    # 服务端照旧按行锁判断（那条是正确性的主体），不会因为缺这个字段就拒。
+    # 带了而库里已经变了 → 409「你手上的版本过期了，请刷新」。
+    #
+    # 令牌由 ``accounting.vouchers.version_token`` 独家生成，
+    # 格式与那份**逐字一致** —— 差一个时区写法就会「带了也永远判过期」。
+    version: Optional[str] = Field(default=None, max_length=64)
 
 
 class VoucherOut(BaseModel):

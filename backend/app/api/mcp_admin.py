@@ -17,6 +17,11 @@
   （建议为外部 agent 建**只授权单账套的 VIEWER 用户**）。
 
 明文令牌**只在签发/轮换的响应里返回一次**，库里只有 ``sha256`` 摘要。
+
+**二次验证的边界（2026-10-25 补）**：签发与轮换挂
+``require_recent_admin_mfa``（**铸造永久凭据** ⇒ 必须与「令牌刚被偷」解耦），
+**吊销不挂**（吊销是安全阀 —— 令牌被盗时要能立刻吊销，而那时管理员很可能
+正处在「没有 ``mfa_at``」的状态上）。
 """
 from __future__ import annotations
 
@@ -29,7 +34,7 @@ from sqlalchemy.orm import Session
 
 from app.accounting.audit_helper import log
 from app.core.db import get_db
-from app.core.deps import get_current_user, require_admin
+from app.core.deps import get_current_user, require_admin, require_recent_admin_mfa
 from app.models import Book, McpToken, SysUser, UserBook
 
 from app.mcp import auth as mcp_auth
@@ -126,12 +131,28 @@ def list_tokens(db: Session = Depends(get_db),
 
 @router.post("", status_code=201)
 def issue_token(payload: IssueIn, db: Session = Depends(get_db),
-                user: SysUser = Depends(get_current_user)):
-    """签发一个令牌。
+                user: SysUser = Depends(get_current_user),
+                _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """签发一个令牌。**高危动作**，要求「近期重新认证」。
 
     **明文只在这次响应里返回一次**，之后谁也拿不回来（库里只有摘要）。
     响应同时回带该用户可访问的账套清单 —— 让签发人当场确认 agent 将看到
     什么。
+
+    **为什么签发要挂二次验证**：这个模块自己的说明写着「**因为令牌永不过期，
+    吊销是唯一的安全阀**」—— 一枚 MCP 令牌是**永久**读凭据，比管理员的
+    访问令牌（4 小时）活得久得多。于是它就是 §3.2 说的同一类东西：
+    **能铸出比令牌活得久的新凭据**。
+
+    实测（复核方 2026-10-25，**修复前**）：一枚**没有** ``mfa_at`` 的管理员
+    令牌 → ``POST /api/system/mcp-tokens`` → **201**，拿到明文
+    （``mcp_…``，47 字符）→ 用它调 ``POST /api/mcp`` → **200**，读到了
+    「当前令牌用户有授权的账套」。那枚令牌**永久有效**，直到有人手工吊销。
+
+    所以：签发与轮换都挂 ``require_recent_admin_mfa``；**吊销不挂** ——
+    吊销是「安全阀」，管理员在令牌被盗时要能立刻吊销，而那时他可能正
+    处在「没有 ``mfa_at``」的状态下（token 刚被偷）。给安全阀加锁是把
+    安全阀焊死。
     """
     _require_admin(user)
     target = db.get(SysUser, payload.user_id)
@@ -193,12 +214,21 @@ def revoke_token(token_id: int, db: Session = Depends(get_db),
 
 @router.post("/{token_id}/rotate")
 def rotate_token(token_id: int, db: Session = Depends(get_db),
-                 user: SysUser = Depends(get_current_user)):
-    """轮换：签发新令牌，旧的进入**宽限期**。
+                 user: SysUser = Depends(get_current_user),
+                 _mfa: SysUser = Depends(require_recent_admin_mfa)):
+    """轮换：签发新令牌，旧的进入**宽限期**。**高危动作**。
 
     宽限期内旧令牌**仍然可用**，到期自动失效 —— 避免 agent 换 token 时
     断线（与 ``scheduler/service.py`` 的 ``rotate_trigger_secret`` 同一个
     做法：保留 previous 一段时间）。
+
+    **轮换与签发同档**：它同样是「铸出一枚**永不过期**的新凭据」——
+    旧的那枚进了宽限期，新的那枚从头到尾都不会过期。所以它也挂
+    ``require_recent_admin_mfa``。
+
+    **轮换的旧令牌不会因为这道闸而失效**：被拒的请求在依赖里就返回 403，
+    路由体根本不会执行 —— 旧令牌仍是旧令牌（宽限期照旧），不存在
+    「轮换被拒但旧令牌已被作废」这种把 agent 直接断线的中间态。
     """
     _require_admin(user)
     row = db.get(McpToken, token_id)

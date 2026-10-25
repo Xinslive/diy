@@ -22,6 +22,41 @@
 连接断），不开事务的话库里会留下「恢复了一半」的状态：那比没恢复更难收拾 ——
 既不是迁移前的版本，也不是完整的备份版本。有事务就是全有或全无。
 
+**恢复必须灌进一个「没有 schema 的空库」—— 原因比「表已存在」更重。**
+本脚本的 ``--restore`` **不会**自己清 schema：那是运维决定的事
+（发布脚本印出来的两步恢复流程是「先清 schema，再灌」）。为什么必须是空库，
+有两个原因，第二个是**本轮新加的护栏**带来的：
+
+  1. dump 里有 ``CREATE TABLE``，往一个已经有 schema 的库里灌会撞
+     ``already exists``；
+  2. **更隐蔽的那个**：审计报告 §3.15 新加了一条库层护栏 ——
+     「已记账凭证的分录不许增删改」，它挂在 ``entry`` 的
+     BEFORE INSERT/UPDATE/DELETE 上。而**恢复就是往库里插 entry 行**。
+     往一个**触发器已经武装**的库里灌数据，entry 侧的一整排触发器都在位上：
+     实测先撞上的是 ``fn_entry_sync``（它要按 voucher_id 回查凭证，
+     而凭证行还没灌进来 → 直接报「凭证不存在」），已记账护栏紧随其后。
+     两者都会让整份恢复回滚（``psql --single-transaction``）。
+
+     而正常的 plain 格式 dump **不会**踩到这一条 ——
+     pg_dump 把**触发器放在数据段之后**才装（实测这份 dump：
+     ``COPY public.entry`` 在第 2100 行、``COPY public.voucher`` 在第 2716 行，
+     而 ``CREATE TRIGGER trg_entry_lock_guard`` 在**第 3753 行**），
+     也就是说**灌数据的时候护栏根本还没装上**。
+
+     所以这条性质是「pg_dump 的格式约定」托着的，不是「碰巧没撞上」。
+     哪天有人图省事改成 ``--data-only`` 灌进现成的库，退路就会在
+     **真出事的那天**才断 —— 而恢复是系统唯一的退路。
+     ``tests/test_db_backup_restore.py`` 直接断言了 dump 里这个先后顺序。
+
+**为什么恢复之后还要补跑迁移。** 恢复成功 ≠ 库是完好的。dump 只记录
+「备份那一刻库里有什么」，而护栏（``uq_entry_voucher_line_no`` 唯一约束、
+「已记账凭证的分录不许动」的触发器…）是**迁移**带上去的。恢复一份**迁移
+之前**的备份，库里就没有这些护栏，而 psql 退出码是 0（成功）、日志里一句
+提示都没有 —— 恢复出来的库**看起来是好的**，而 §3.15 的三层保护在里面全部
+失效（实测能静默改掉一张已记账凭证的金额、能让重复行号入库）。
+所以恢复的判据是「数据回来了 **且** schema 在 head」，两者缺一不可
+（见 :func:`_align_schema`）。
+
 **为什么口令要绕开命令行。** 直接 ``pg_dump postgresql://user:pw@host/db``
 会把口令写进进程参数，而 ``ps`` 对同机器上的任何用户可见 —— 于是一次例行备份
 就把生产口令泄露给了所有能登进这台机器的人。这里改成把口令放进子进程的
@@ -47,6 +82,15 @@ from app.core.config import settings  # noqa: E402
 
 # pg_dump 不认 SQLAlchemy 的 ``postgresql+psycopg://`` 驱动段，先剥掉
 _DRV_PREFIX = "postgresql+psycopg://"
+
+#: 退出码：**数据恢复了，但 schema 没对齐到 head**。
+#:
+#: 它必须与「恢复失败」分开（后者是 psql 的退出码、非 0，且库里什么都没有）。
+#: 这个码的含义是「**数据在库里，但护栏没在位**」—— 库里看着是好的，
+#: 而 §3.15 那三层保护在里面全部失效。混成一个码的后果：发布流程把
+#: 「schema 没对齐」当成「恢复失败」，于是反复重跑恢复，
+#: 而真正要做的事（补迁移、查数据冲突）没人做。
+EXIT_SCHEMA_NOT_ALIGNED = 4
 
 # 客户端二进制的位置。默认在 PATH 里；容器 / 定制安装可能不在，
 # 用这两个环境变量指路 —— 找不到就报错，不静默退化成「不备份」。
@@ -270,6 +314,89 @@ def strip_unsupported_settings(sql: bytes, known: set[str]) -> tuple[bytes, list
     return b"".join(kept), removed
 
 
+def _align_schema(url: str) -> int:
+    """把恢复后的 schema 对齐到当前代码的 head。
+
+    **为什么恢复必须管这件事**
+    ------------------
+    护栏（``uq_entry_voucher_line_no`` 唯一约束、「已记账凭证的分录不许动」
+    的触发器…）是**迁移**带上去的，不是 dump 里自带的 —— dump 只记录
+    「备份那一刻库里有什么」。恢复一份**迁移之前**的备份，库里就没有这些
+    护栏；而恢复命令照样返回 0（成功），日志里也没有任何提示。
+
+    后果不是「恢复失败」，而是**恢复出来的库看起来是好的**：审计 §3.15
+    的三层保护（应用层行锁 + 库层唯一约束 + 库层触发器）在恢复后的库里
+    全部失效 —— 实测「同时改借贷两边的金额」能静默改掉一张**已记账**凭证，
+    「插重复行号」也能入库，而且借贷仍然平、所有自检全绿。
+
+    所以「恢复成功」的判据必须是「数据回来了 **且** schema 在 head」，
+    而不是「psql 退出码是 0」。这一条把「psql 成功但库是残的」从
+    **静默的错**变成**非零的退出码 + 一句说清的下一步**。
+
+    **对齐的方式是补跑迁移**，不是重新灌一遍 dump —— dump 里的 schema 是
+    备份那一刻的，再灌一遍只是回到老样子。
+
+    返回值：``0`` = 已经在 head（或已成功补齐）；``EXIT_SCHEMA_NOT_ALIGNED``
+    = 数据恢复了但 schema 没对齐 —— **数据在库里，但护栏没在**，必须人工处理。
+    """
+    from sqlalchemy import create_engine
+
+    from app.core.schema_version import (
+        SchemaVersionError,
+        assert_schema_ready,
+        current_revision,
+        head_revision,
+        upgrade_to_head,
+    )
+
+    try:
+        eng = create_engine(url)
+    except Exception as exc:                      # noqa: BLE001
+        print(f"❌ 连不上数据库，没法校验恢复后的 schema：{exc}", file=sys.stderr)
+        return EXIT_SCHEMA_NOT_ALIGNED
+
+    try:
+        head = head_revision()
+        if head is None:
+            print("❌ 代码里没有可迁移到的版本（migrations 目录没跟着代码走）—— "
+                  "恢复出来的库没法对齐 schema，护栏可能缺席。", file=sys.stderr)
+            return EXIT_SCHEMA_NOT_ALIGNED
+
+        cur = current_revision(eng)
+        if cur == head:
+            return 0
+
+        if cur is None:
+            # 这个系统建库走 alembic，dump 里一定带 alembic_version 表。
+            # 它不在 ⇒ 这份 dump 不是这个系统出来的（或是极早期的备份），
+            # alembic 无从下手（那会从头重放所有迁移，撞一鼻子 already exists）。
+            print("❌ 恢复后的库里没有 alembic_version —— 这份 dump 的 schema "
+                  "版本识别不出来，没法自动对齐（护栏可能缺席）。\n"
+                  "   请人工确认：把这份 dump 的 schema 版本对齐到当前代码的 "
+                  f"{head} 之后再投入使用。", file=sys.stderr)
+            return EXIT_SCHEMA_NOT_ALIGNED
+
+        print(f"恢复的备份停在 schema 版本 {cur}（当前代码要求 {head}）—— "
+              "护栏可能没在那份备份里，正在补跑迁移把它补齐 …", file=sys.stderr)
+        try:
+            upgrade_to_head(eng)
+        except Exception as exc:                  # noqa: BLE001
+            print(f"❌ 补迁移失败：{exc}\n"
+                  "   **数据已经恢复回来了**（数据在库里），但 schema 还停在旧版本 —— "
+                  "护栏没有在位。先按上面的报错处理数据冲突，"
+                  "再重跑迁移，然后才让应用连上来。", file=sys.stderr)
+            return EXIT_SCHEMA_NOT_ALIGNED
+
+        try:
+            assert_schema_ready(eng)
+        except SchemaVersionError as exc:
+            print(f"❌ 补完迁移后 schema 仍不对：{exc}", file=sys.stderr)
+            return EXIT_SCHEMA_NOT_ALIGNED
+        return 0
+    finally:
+        eng.dispose()
+
+
 def restore(url: str, sql: bytes) -> int:
     u = _parse(url)
     assert_restorable(sql)
@@ -288,7 +415,16 @@ def restore(url: str, sql: bytes) -> int:
             )
             sql = cleaned
 
-    return _run(restore_command(url), _env(u), stdin_bytes=sql)
+    rc = _run(restore_command(url), _env(u), stdin_bytes=sql)
+    if rc != 0:
+        return rc
+
+    # **恢复成功 ≠ 库是完好的。** dump 只记录「备份那一刻库里有什么」，
+    # 护栏是迁移带上去的 —— 恢复一份旧备份，库里就没有护栏了，而到这里
+    # psql 退出码是 0（成功）。所以「恢复成功」的判据里必须包含
+    # 「schema 在 head」，否则恢复出来的库会**看起来是好的**，
+    # 而 §3.15 的三层保护在里面全部失效（详见 _align_schema 的说明）。
+    return _align_schema(url)
 
 
 def dump_to_file(out: Path, keep: int | None = None) -> int:
@@ -367,7 +503,11 @@ def prune(directory: Path, keep: int) -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="数据库备份/恢复")
     ap.add_argument("--restore", action="store_true",
-                    help="从 stdin（或 --file）读 dump 并恢复，而不是导出")
+                    help="从 stdin（或 --file）读 dump 并恢复，而不是导出。"
+                         "恢复成功 = 数据回来了 **且** schema 已对齐到当前版本；"
+                         f"数据在但 schema 没对齐时退出码是 {EXIT_SCHEMA_NOT_ALIGNED}"
+                         "（护栏没在位，必须人工处理），"
+                         "输入不是真的 dump 时退出码是 3")
     ap.add_argument("--file", help="恢复用的 dump 文件；不给则读 stdin")
     ap.add_argument("--url", default=settings.database_url,
                     help="目标连接串，默认取配置里的 DATABASE_URL（恢复演练时指向测试库）")

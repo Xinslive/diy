@@ -238,7 +238,10 @@ console.log('== 拆分弹窗 ==')
 t('确认按钮在服务端说「可拆」之前不许点', () => {
   // 本地算的 valid 只用来画线；放行一律看服务端 ——
   // 两边口径不一致时，本地放行会推出一张不平的凭证落进库
-  assert.match(DIALOG, /:disabled="!canConfirm"/)
+  // 「服务端说可拆之前不许点」这条没变；现在还多了一层在途守卫
+  // （双击会并发两个 POST，第二次必失败 —— 审计 §3.29）。
+  assert.match(DIALOG, /:disabled="!canConfirm[^"]*"/)
+  assert.match(DIALOG, /:loading="submitting"/)
   const m = DIALOG.match(/const canConfirm = computed\([\s\S]*?\)\n/)
   assert.ok(m, '源码里找不到 canConfirm')
   assert.match(m[0], /serverCandidate\.value\.valid/)

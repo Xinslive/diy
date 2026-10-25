@@ -116,6 +116,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as api from '@/api/system'
 import { useSessionStore } from '@/stores/session'
+import { errorText } from '@/utils/errorText'
 
 const store = useSessionStore()
 const isAdmin = computed(() => store.isAdmin)
@@ -203,7 +204,7 @@ async function sendTest() {
     //
     // （全局响应拦截器也会弹一次同样的文案。那是全站既有的行为
     // —— 许多页面都靠它兜底，所以这里不去动它。）
-    ElMessage.error(e?.response?.data?.detail || '测试发送失败',
+    ElMessage.error(errorText(e, '测试发送失败'),
       { duration: 0, showClose: true })
   } finally { testing.value = false }
 }

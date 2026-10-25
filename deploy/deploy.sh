@@ -204,8 +204,21 @@ CWQ_RETIRED_HOSTS="8.155.171.57 110.42.44.53"
 # **CWQ_HOST_IP 可以显式指定**：沙箱里 curl 是桩（记录调用用的），
 # 拿不到真 IP；测试要验「识别成某台机时的行为」就得能注入。
 # 注入只影响这一处判据，不影响脚本的其他行为。
+#
+# **但它是个逃生口，所以必须出声。** 这一处判据就是目标机守卫的**全部依据**：
+# 注成被授权的 IP（43.138.178.174），标记文件那道与内置名单那道就都过了 ——
+# 于是「以为在 A 机、实际在 B 机」（两个库各自推进、调度任务被领两遍）
+# 又被放行了一次。豁免本来就设计成安静放行的，而这一条安静不得。
+# 它已登记在 backend/app/core/escape_hatches.py 的部署侧逃生口清单里。
+#
+# **告警必须走 stderr。** 这个函数的返回值是被
+# ``this_ip="$(host_public_ip)"`` **命令替换**接走的 —— 而 ``log`` 写的是
+# stdout，一行告警会被一起捕获进 ``this_ip``，于是判据变成
+# 「告警文字 + IP」，标记文件比较必然不符，**生产机被误拦**。
+# （实测踩过：目标机守卫那一节 4 条用例当场变红，症状正是「生产机被误拦了」。）
 host_public_ip() {
   if [[ -n "${CWQ_HOST_IP:-}" ]]; then
+    echo "[$(date '+%F %T')] ⚠️  CWQ_HOST_IP=${CWQ_HOST_IP} —— 目标机身份判据被注入（仅限沙箱/演练）" >&2
     printf '%s' "$CWQ_HOST_IP"
     return 0
   fi
@@ -248,7 +261,34 @@ check_deploy_target() {
     fi
   done
 
-  # ---- 第二道：目标机授权标记 ----
+  # ---- 第二道：本机身份必须能被确认 ----
+  #
+  # **这一道是第三道（标记文件）的前提。**
+  #
+  # 原来的比较写成 ``[[ -n "$this_ip" && "$authorized" != "$this_ip" ]]`` ——
+  # ``this_ip`` 为空时整个比较被**短路跳过**，于是代码直接打印
+  # 「目标机授权标记：xxx ✅」并放行。
+  #
+  # 那个空值不是理论上的：host_public_ip 的四个查询站点全不通**是实测过的**
+  # （api.ipify.org 在当前生产机上不通），而网卡上没有非回环 IPv4 的机器
+  # （NAT + 只留 lo 的容器）也确实存在。两者同时发生 → this_ip 为空 →
+  # **只要 /etc/cwq-deploy-target 存在且内容非空，任何机器都能过这道闸**。
+  #
+  # 而这道闸拦的正是「部署到旧机 → 两个库各自推进、调度任务被领两遍」
+  # （文件头那份清单）。**认不出本机身份，就不能谈「标记文件说了算」** ——
+  # 那正是 fail-open。
+  #
+  # 沙箱演练的出口：CWQ_ALLOW_ANY_HOST=1（脚本开头那道闸已经处理）。
+  if [[ -z "$this_ip" ]]; then
+    die "认不出本机出口 IP（ifconfig.me / checkip.amazonaws.com / ipinfo.io /
+     api.ipify.org 都不通，且网卡上没有非回环 IPv4）—— **无法确认本机身份**，拒绝发布。
+     这道闸拦的是「以为在 A 机、实际在 B 机」：两个库各自推进、调度任务被领两遍。
+     要发布就在目标机上放好 ${CWQ_DEPLOY_TARGET_FILE}（内容为该机 IP），
+     并确认这台机能查得到自己的出口 IP；
+     沙箱演练可用 CWQ_ALLOW_ANY_HOST=1 跳过本检查。"
+  fi
+
+  # ---- 第三道：目标机授权标记 ----
   #
   # 标记文件写着本机被授权的 IP，且必须与本机出口 IP 一致。
   # 内容不一致说明标记文件过期了 —— 那正是「以为在 A 机、实际在 B 机」的场景，
@@ -260,7 +300,7 @@ check_deploy_target() {
       die "${CWQ_DEPLOY_TARGET_FILE} 是空的 —— 目标机授权标记无效，拒绝发布。
      写上本机被授权的 IP（当前生产机是 43.138.178.174），或删掉该文件改用内置名单。"
     fi
-    if [[ -n "$this_ip" && "$authorized" != "$this_ip" ]]; then
+    if [[ "$authorized" != "$this_ip" ]]; then
       die "目标机授权标记与本机不符：${CWQ_DEPLOY_TARGET_FILE} 写的是 ${authorized}，本机出口 IP 是 ${this_ip:-未知}。
      这是「以为在 A 机、实际在 B 机」的场景 —— 拒绝发布。
      确认要在本机部署，就改该文件的内容；不是本机就别在这跑。"
@@ -269,15 +309,9 @@ check_deploy_target() {
     return 0
   fi
 
-  # ---- 第三道：没有标记文件时退回内置名单 ----
-  if [[ -z "$this_ip" ]]; then
-    die "认不出本机出口 IP，且 ${CWQ_DEPLOY_TARGET_FILE} 不存在 —— 无法确认这是不是正确的生产机，拒绝发布。
-     要发布就在目标机上放好 ${CWQ_DEPLOY_TARGET_FILE}（内容为该机 IP）；
-     沙箱演练可用 CWQ_ALLOW_ANY_HOST=1 跳过本检查。"
-  fi
-
+  # ---- 第四道：没有标记文件时退回内置名单 ----
   if [[ "$this_ip" != "43.138.178.174" ]]; then
-    die "本机出口 IP 是 ${this_ip}，不是生产机 43.138.178.174 —— 拒绝发布。
+    die "本机出口 IP 是 ${this_ip:-未知}，不是生产机 43.138.178.174 —— 拒绝发布。
      本项目只在 43.138.178.174 上部署。沙箱演练可用 CWQ_ALLOW_ANY_HOST=1 跳过。"
   fi
 
@@ -285,6 +319,52 @@ check_deploy_target() {
 }
 
 check_deploy_target
+
+# ---------------------------------------------------------------------------
+# 应用根目录：只能是 /opt/cwq（除非显式放行）
+# ---------------------------------------------------------------------------
+#
+# **为什么这条要在这里挡，而不是「装完再说」。**
+#
+# nginx 的 root 是**写死**的：``root /opt/cwq/frontend/dist;``
+# （deploy/nginx/acct.xins.live.conf:272、deploy/nginx/cwq.conf:295）。
+# deploy.sh 只会把 systemd unit 里的 /opt/cwq 渲染成 $APP
+# （render_unit），**nginx 配置不在那个渲染范围内** ——
+# 于是 APP_DIR 一换，systemd unit 与 $APP/frontend/dist 都切到新目录，
+# 而 **nginx 仍然服务旧目录** → 线上跑的是**上一版前端**
+# （表现是「界面看着没变」），若 /opt/cwq 已经不在了则整站静态资源 404。
+#
+# 而发布**照样会打印「✅ 发布完成」** —— 因为体检只打后端
+# （/api/health），从不取一次前端首页。
+#
+# 为什么不干脆把 nginx 配置也纳入渲染范围（那样就不用挡）：
+#   * 这台机上 acct.xins.live 有**两份**落点（/etc/nginx/conf.d/ 与宝塔的
+#     /www/server/panel/vhost/nginx/），装错地方就是两个 server_name
+#     相同的 server 块 —— nginx 会报 conflicting server name 而起不来；
+#   * 这台机同时跑着另外 11 个子域与 3 个 Docker 容器，
+#     让发布脚本去改全局 nginx 配置的爆炸半径太大。
+# 所以这里选**明确地拒绝**，而不是「看着发布成功」。
+#
+# **第二台机器**（ARCHITECTURE §11.7.9 提到的那种：应用根放在别处、
+# nginx 已按本机布局手工配好）用 CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 放行 ——
+# 名字与 CWQ_ALLOW_ANY_HOST=1 同一套风格。
+# ---------------------------------------------------------------------------
+: "${CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR:=0}"
+if [[ "$APP" != "/opt/cwq" ]]; then
+  if [[ "$CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR" == "1" ]]; then
+    log "  ⚠️  CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 —— 放行非标准应用根 ${APP}"
+    log "     nginx 的 root 写死在 /opt/cwq/frontend/dist，**不会**跟着渲染。"
+    log "     请确认这台机器的 nginx 已经指向 ${APP}/frontend/dist（发布后的体检会验）。"
+  else
+    die "APP_DIR=${APP} 不是 /opt/cwq —— 拒绝发布。
+     nginx 的 root 写死在 /opt/cwq/frontend/dist（deploy/nginx/*.conf），
+     换根目录后 nginx 会继续服务旧目录：线上跑的是上一版前端（表现为「界面看着没变」），
+     而发布**照样会打印「✅ 发布完成」**。
+     第二台机器（nginx 已按本机布局手工配好）可用
+       CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 deploy.sh
+     放行。**现网代码、前端产物与服务均未改动。**"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 出事时的自动回退（trap）
@@ -308,10 +388,19 @@ check_deploy_target
 #   none     —— 不回退（服务已经起来了：新版本已经上线，回退是另一件事）
 #   frontend —— 回退前端产物
 #   code     —— 回退前端产物 + 后端代码
+#
+# **依赖（.venv）的回退不在 ROLLBACK_SCOPE 里**，它有自己的判据 ——
+# 「现网代码此刻是旧版还是新版」，见 code_is_old_version 的注释。
 ROLLBACK_SCOPE=none
+VENV_SNAPSHOT_DIR=""     # 现网 venv 的快照目录（空 = 没快照，不需要回退）
 FRONT_PREV_LINK=""     # 切换前 dist 软链指向的相对路径（空 = 之前不是软链）
 FRONT_PREV_DIR=""      # 切换前 dist 是真实目录时的落点（首次改造用）
 DB_MIGRATED=0          # 迁移是否已经成功过（决定回退报告里怎么措辞）
+# 现网后端代码**有没有已经被换成新版**：
+#   0 = 还没覆盖（或覆盖失败）⇒ 现网代码仍是旧版
+#   1 = 覆盖成功             ⇒ 现网代码已是新版
+# 依赖回退的判据靠它 —— 理由见 code_is_old_version。
+CODE_SWITCHED=0
 
 # 原子换软链：一次 rename(2)，中间没有「目标不存在」的窗口。
 #
@@ -349,6 +438,60 @@ rollback_frontend() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# 「回退库」的**完整可执行**流程（打印用）
+# ---------------------------------------------------------------------------
+#
+# **为什么不能只打印一行 ``db_backup.py --restore --file <dump>``。**
+#
+# dump 是 ``pg_dump --format=plain`` 且**不带 --clean**
+# （backend/scripts/db_backup.py 的 dump_command），里面全是 ``CREATE TABLE``。
+# 往一个**已经有数据**的库里灌会撞 ``relation "xxx" already exists``；
+# 而恢复命令带 ``--single-transaction`` 与 ``ON_ERROR_STOP=1``
+# → 首个错误就**整份**恢复回滚，**一张表都灌不进去**，退出码非零。
+#
+# 仓库自己的测试注释写的就是这件事
+# （backend/tests/test_db_backup_restore.py：「真实恢复就是往空库里灌。
+# 往一个已经有数据的库里灌会撞 CREATE TABLE already exists」）。
+#
+# **还有第二个、更隐蔽的理由（2026-10-25 补）：库里若已经有 schema，
+# entry 侧的一整排触发器就在位上。**
+#
+# 审计报告 §3.15 新加了一条库层护栏：「已记账凭证的分录不许增删改」，
+# 它挂在 entry 的 BEFORE INSERT/UPDATE/DELETE 上 —— 而**恢复就是往库里
+# 插 entry 行**。往一个**触发器已经武装**的库里灌数据，entry 侧的触发器
+# 都会响：实测先撞上的是 fn_entry_sync（它要按 voucher_id 回查凭证，
+# 而凭证行还没灌进来 → 报「凭证不存在」），已记账护栏紧随其后。
+# 两者都会让整份恢复回滚（psql --single-transaction → 一张表都灌不进去）。
+#
+# 而正常的 plain 格式 dump **不会**踩到这一条 —— pg_dump 把**触发器放在
+# 数据段之后**才装，灌数据时护栏还没装上。所以这条性质是「pg_dump 的格式
+# 约定」托着的，不是碰巧没撞上。哪天有人图省事改成 --data-only 灌进现成的库，
+# 退路就会在**真出事的那天**才断 —— 而这是系统唯一的退路。
+#
+# 于是照抄那一行命令的运维只会得到一次「恢复失败」，而真正的退路
+# （清空 schema 再灌）会丢掉备份之后的全部写入 —— 脚本必须把**两步**
+# 都写出来，并把「不可逆」说清楚。
+#
+# **清空 schema 这一步不自动执行**：它会丢数据，不该由脚本在失败现场
+# 替运维做这个决定。脚本只负责把能抄的命令原样打出来。
+print_db_restore_procedure() {
+  local dump="$1"
+  log "       步骤 1：清空 public schema（**不可逆** —— ${dump} 之后的写入全部丢失）"
+  log "         cd $APP/backend && .venv/bin/python $APP/deploy/scripts/db_schema_reset.py"
+  log "       步骤 2：把 dump 灌回去（**这一步会把 schema 对齐到当前版本**）"
+  log "         cd $APP/backend && .venv/bin/python scripts/db_backup.py --restore --file ${dump}"
+  log "       （步骤 1 会把 schema 上的授权一并丢掉，灌完之后要重新确认账号权限）"
+  log "       （步骤 2 的退出码 4 = **数据回来了但 schema 没对齐**：护栏没在位，必须人工补迁移）"
+  # 为什么步骤 2 要提「对齐 schema」：护栏（entry 的行号唯一约束、
+  # 「已记账凭证的分录不许增删改」那条触发器）是**迁移**带上去的，不是 dump
+  # 里自带的 —— dump 只记录「备份那一刻库里有什么」。恢复一份迁移之前的备份，
+  # 库里就没有护栏，而 psql 退出码是 0（成功）、日志里一句提示都没有。
+  # 于是恢复出来的库**看着是好的**，而 §3.15 的三层保护在里面全部失效
+  # （实测能静默改掉一张已记账凭证的金额、能让重复行号入库，且借贷仍然平）。
+  # 所以恢复命令把「schema 在 head」并进了成功判据：对不上就是非零退出。
+}
+
 rollback_code() {
   # 从本次快照里把后端代码换回上一版。
   #
@@ -367,14 +510,112 @@ rollback_code() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# 依赖回退：把现网 venv 换回本次发布**之前**的那一份
+# ---------------------------------------------------------------------------
+#
+# **判据是「现网代码此刻是旧版还是新版」，不是「这次失败了没」。**
+#
+# 依赖是在**第 3 步**装的（pip install 进现网那个 .venv），
+# 而代码切换在**第 5 步** —— 中间隔着数据库备份与迁移。
+# 于是有一段窗口：现网代码是**旧的**、venv 却已经是**新的**。
+#
+# 那一段的失败（备份失败、迁移失败）原本**一行回退都不做**
+# （ROLLBACK_SCOPE 还是 none）—— 于是现网停在「旧代码 + 新依赖」：
+#   * 进程还在跑内存里的旧代码，**表面完全正常**；
+#   * 但**下一次 systemctl restart** 就是旧代码配新依赖；
+#   * 而发布日志里写着「已回退到上一版」—— 不，它连这句话都没有，
+#     它只是失败了，而失败现场里 venv 是新的。
+#
+# **「旧代码 + 新依赖」与「新代码 + 旧依赖」是同一个毛病的两个方向。**
+#
+# 后者更隐蔽，也正是本条修法一度在**另一条路径**上重新引入的：
+# 发布**已经生效**之后失败 —— 前端可达性体检不过（§3.41）、
+# TRUSTED_PROXIES 为空（§3.44）—— 这两道闸都落在**服务重启之后**，
+# 那时 ROLLBACK_SCOPE 已经是 none（代码不回退，保持新版）。
+# 如果依赖照旧回退，现网就变成**新代码 + 旧依赖**：
+#   * 进程还跑着内存里的旧代码（表面完全正常）；
+#   * 但**下一次 systemctl restart** 就是新代码配旧依赖 ——
+#     那正是本条缺陷的原始失败场景，被本条的修法在另一条路径上又引进来。
+#
+# 所以判据只能是**同版本**这一条不变量：
+#
+#   现网代码是旧版  ⇒  依赖也必须是旧版（一起回退）
+#   现网代码是新版  ⇒  依赖也必须是新版（**不许**回退）
+#
+# **代码是不是旧版，由两件事共同决定**（见 code_is_old_version）：
+# 覆盖有没有成功（CODE_SWITCHED），以及这一阶段会不会把代码回退
+# （ROLLBACK_SCOPE）。两者都答「否」时，发布就已生效、代码保持新版。
+#
+# **为什么用「覆盖铺开」而不是「删了重拷」。**
+# rm -rf 之后 cp -a 之间有一个「.venv 不存在」的窗口 —— 那一刻重启服务
+# 就会起不来。覆盖铺开没有这个窗口，而且**可重复执行**（幂等）：
+# 再跑一次，结果一样。
+#
+# 残留：新版本多装出来的、上一版没有的包会留在 venv 里。
+# 它们不会被旧代码用到（锁文件是上一版那份），留着无害；
+# 换来的是「不需要网络就能回退」（重装依赖要连 PyPI，网络不通时
+# 恰恰是最需要回退的时候）。
+# 现网代码此刻是**旧版**吗？
+#
+# 两个输入：
+#   CODE_SWITCHED  —— 覆盖有没有成功（1 = 现网已经是新版代码）
+#   ROLLBACK_SCOPE —— 这一阶段会不会把代码换回上一版
+#
+# 合成一条不变量：**代码与依赖必须同版本**。
+#   * 覆盖还没成功（CODE_SWITCHED=0）⇒ 现网代码没被动过，还是旧版
+#     ⇒ 依赖必须换回旧版（否则是「旧代码 + 新依赖」）。
+#   * 覆盖成功了，但这一阶段会把代码回退（ROLLBACK_SCOPE=code）
+#     ⇒ 回退之后是旧版 ⇒ 依赖也必须换回旧版。
+#   * 覆盖成功了，且这一阶段不回退代码（ROLLBACK_SCOPE=none）
+#     ⇒ 发布已生效，现网是新版 ⇒ 依赖**保持新版**，不许回退。
+#
+# 注意 on_exit 里的调用顺序：**依赖回退在代码回退之前**做，
+# 而本函数读的 ROLLBACK_SCOPE 是**on_exit 进来时**的值 ——
+# 代码回退还没有把它改掉，所以这里读到的就是「这一阶段会不会回退代码」，
+# 与 on_exit 后面真正执行 rollback_code 的判断**是同一个值**。
+code_is_old_version(){
+  [[ "$CODE_SWITCHED" != "1" || "${ROLLBACK_SCOPE}" == "code" ]]
+}
+
+rollback_venv() {
+  local snap="$VENV_SNAPSHOT_DIR"
+  [[ -n "$snap" && -d "$snap" ]] || return 0
+  [[ -d "${APP:?}/backend/.venv" ]] || return 0
+  log "  ↩ 回退运行时依赖：从 ${snap} 恢复 .venv"
+  # 铺开而不是整体换名：整体换名要 rm -rf，中间会有一个「.venv 不存在」的窗口
+  cp -a "$snap/." "${APP:?}/backend/.venv/" || return 1
+  return 0
+}
+
 on_exit() {
   local rc=$?
-  # 成功退出、或本阶段明确不回退 → 原样退出，别碰现网。
-  [[ $rc -eq 0 || "${ROLLBACK_SCOPE}" == "none" ]] && return $rc
   # 回退过程本身不许再失败：trap 里的一次失败会把原始退出码吃掉，
   # 而「发布失败」这个信号比「回退也失败」更重要。
   set +e
   trap - EXIT
+
+  # ---- 依赖回退：**先做**，判据是「现网代码是不是旧版」 ----
+  #
+  # 理由见 code_is_old_version 与 rollback_venv 的注释：
+  # **代码与依赖必须同版本**。
+  # 依赖在第 3 步就被改写了，而代码切换在第 5 步 —— 中间任何一步失败，
+  # 现网都会停在「旧代码 + 新依赖」上，而下一次重启就是那个组合；
+  # 反过来，发布**已经生效**之后再失败（ROLLBACK_SCOPE=none），
+  # 代码保持新版，依赖也必须保持新版 ——
+  # 否则现网变成「新代码 + 旧依赖」，下一次 systemctl restart 一样炸。
+  if [[ $rc -ne 0 && -n "${VENV_SNAPSHOT_DIR:-}" ]]; then
+    if code_is_old_version; then
+      rollback_venv || log "  ⚠️ 运行时依赖回退失败 —— 现网 venv 可能还是新版依赖"
+    else
+      log "  ⏭ 发布**已生效**（现网代码已是新版）—— **不回退运行时依赖**"
+      log "     代码与依赖必须同版本：代码是新版而依赖换回旧版，"
+      log "     下一次 systemctl restart 就是「新代码 + 旧依赖」。"
+    fi
+  fi
+
+  # 成功退出、或本阶段明确不回退 → 原样退出，别碰现网。
+  [[ $rc -eq 0 || "${ROLLBACK_SCOPE}" == "none" ]] && return $rc
   log "❌ 发布中断（退出码 ${rc}）—— 开始回退"
   rollback_frontend || log "  ⚠️ 前端回退失败：$APP/frontend/dist 现在是 $(readlink "$APP/frontend/dist" 2>/dev/null || echo '<不存在>')"
   if [[ "$ROLLBACK_SCOPE" == "code" ]]; then
@@ -388,10 +629,10 @@ on_exit() {
     log "     （启动闸门 fail-closed）—— **不要直接重启服务**。"
     log "     两个出路："
     log "       1) 修好之后重新发布一次（迁移幂等，alembic 会从当前 revision 接着走）—— 推荐"
-    log "       2) 回退库（先清空 schema，会丢掉备份之后的写入）："
-    log "          cd $APP/backend && .venv/bin/python scripts/db_backup.py --restore --file ${RELEASES:-<无>}/${STAMP:-<无>}/database-before-migration.sql"
+    log "       2) 回退库（**先清空 schema**，会丢掉备份之后的写入）："
+    print_db_restore_procedure "${RELEASES:-<无>}/${STAMP:-<无>}/database-before-migration.sql"
   fi
-  log "   现场保留在 ${RELEASES:-<无>}/${STAMP:-<无>} 与 ${APP}/.incoming.*"
+  log "   现场保留在 ${RELEASES:-<无>}/${STAMP:-<无>} 与 ${APP}/.incoming.* / ${APP}/.backend.incoming.*"
   exit $rc
 }
 trap on_exit EXIT
@@ -566,6 +807,35 @@ SHA=$(sed -nE 's/^sha=//p' "$STAGE/manifest.txt")
 log "  取到产物 ${SHA}"
 verify_release_script "$STAGE"
 
+# ---------------------------------------------------------------------------
+# 「回退库」用的辅助脚本：**提前**装到 $APP/deploy/scripts/
+# ---------------------------------------------------------------------------
+#
+# 为什么必须提前：第 4 步（迁移失败）与 trap 的失败报告里都要**当场**打出
+# 一条**能直接抄下来执行**的恢复指令，而那个指令指向
+# ``$APP/deploy/scripts/db_schema_reset.py``。
+#
+# 而 $APP/deploy 是第 5 步的 install_release_tooling 才铺好的 ——
+# 迁移在它**之前**。等到那时才装，迁移失败时打出来的指令就是一条
+# 「文件不存在」的假出路：那正是这份脚本被打印出来要避免的事。
+#
+# 装不上只告警：它是**退路**的一部分，不是发布正确性的闸门。
+# （退路本来就不该由「正在发布的那一版」来决定能不能用 —— 见第 4 步的说明。）
+# ---------------------------------------------------------------------------
+install_restore_helper() {
+  local src="$SCRIPT_DIR/scripts/db_schema_reset.py"
+  local dst="$APP/deploy/scripts/db_schema_reset.py"
+  [[ -f "$src" ]] || { log "  ⚠️  产物/脚本目录里没有 scripts/db_schema_reset.py —— 回退指令将不可直接执行"; return 1; }
+  mkdir -p "$APP/deploy/scripts" || return 1
+  install -m 0755 "$src" "$dst" || return 1
+  return 0
+}
+if install_restore_helper; then
+  log "  回退辅助脚本已就位（$APP/deploy/scripts/db_schema_reset.py）"
+else
+  log "  ⚠️  回退辅助脚本没装上 —— 万一要回退库，第一步得手工准备"
+fi
+
 log "2/7 备份当前版本"
 # 备份目录在**产物取到之后**才建。建早了的后果很小（多一个空目录），
 # 但它意味着「取不到产物」这件事在磁盘上留了痕迹 —— 而取不到产物正是
@@ -657,10 +927,63 @@ fi
 #
 # venv 仍然用现网那个：.venv 不在产物里（build-artifacts 显式 --exclude），
 # 也不该在 —— 换掉它等于让「测试时那一版」与「运行时那一版」又对不上。
+# **代价是「装依赖」这一步会就地改写现网那个 venv**，所以它必须留下
+# 一份能换回来的快照（下面就是）。
 if [[ ! -f "$INCOMING/requirements.lock" ]]; then
   die "产物里缺 requirements.lock —— 没有锁文件就无法保证「装出来的就是测试时那一版」。
    **现网代码、前端产物与服务均未改动。**"
 fi
+
+# ---------------------------------------------------------------------------
+# 依赖回退的准备：**先把现网 venv 存一份**
+# ---------------------------------------------------------------------------
+#
+# **为什么必须存。**
+#
+# 装依赖改的是**正在跑的那份** venv，而回退清单里原本只有
+# app/scripts/migrations/alembic.ini/requirements.lock/pytest.ini ——
+# **.venv 不在其中**。于是新版依赖装进现网之后，一旦后面任何一步失败，
+#  trap 把**代码**退回去了，**依赖却留在新版** → 现网变成「旧代码 + 新依赖」。
+#
+# 那个组合的迷惑性在于：进程还在跑内存里的旧代码，**表面完全正常**；
+# 但**下一次 systemctl restart** 就是旧代码配新依赖 ——
+# 而发布日志里写着「已回退到上一版」。
+#
+# **为什么用「复制快照」而不是「装进独立 venv 再切换」。**
+#
+# 独立 venv（装到 $INCOMING/.venv，等新代码就位了再换）听上去更干净，
+# 但它有两个硬伤：
+#   * 要**从零建一个 venv 并把全部依赖装一遍** —— 这台机只有 1.6 GB 内存、
+#     2 核，一次全新安装是分钟级的，而每次发版都付这个代价；
+#   * 换 venv 意味着 unit 里的路径要跟着换，或者要把 .venv 目录整个换名 ——
+#     而换名那一刻，**正在跑的进程**用的还是老 venv（Linux 上老 inode 还在，
+#     进程没事），但任何一次重启都会用到新的那个。这比「就地改写」更容易出事。
+#
+# 复制快照的代价是磁盘：一个 venv 约几百 MB。本机（1.6 GB 内存 / 49 GB 磁盘）
+# 上这个代价要控制住，所以**只在锁文件真的变了的时候才存** ——
+# 锁没变 ⇒ 装依赖是幂等的（同样的 == 约束，同样的版本）⇒ venv 没被改写
+# ⇒ 没有东西需要换回来。
+#
+# 快照落在 $RELEASES/$STAMP/venv，跟其它回滚材料放在一起，
+# 随 KEEP 份数一起被清掉。
+# ---------------------------------------------------------------------------
+if [[ ! -d "$VENV" ]]; then
+  die "现网 venv 不存在：${VENV} —— 没有它就无法装依赖，也没有东西需要回退。
+   首次部署请先按 deploy/tuning.md 建好 venv。
+   **现网代码、前端产物与服务均未改动。**"
+fi
+if cmp -s "$INCOMING/requirements.lock" "$APP/backend/requirements.lock" 2>/dev/null; then
+  log "  锁文件与现网一致 —— 依赖不变，venv 不会被改写，不需要依赖快照"
+else
+  log "  锁文件变了 —— 先把现网 venv 快照一份（回退时换回来）"
+  rm -rf "$RELEASES/$STAMP/venv"
+  if ! cp -a "$VENV" "$RELEASES/$STAMP/venv"; then
+    die "现网 venv 快照失败 —— **无法保证依赖能换回去**，拒绝继续。
+   现网代码、前端产物、数据库与服务均未改动。"
+  fi
+  VENV_SNAPSHOT_DIR="$RELEASES/$STAMP/venv"
+fi
+
 # ``--no-cache-dir``（2026-10-24 性能审计补上）：
 #
 # pip 默认把下载的 wheel 缓存在 ``~/.cache/pip``，**那个目录永不清**。
@@ -672,7 +995,13 @@ fi
 # 峰值，但它去掉的是「缓存无限涨盘」这一条 —— 那一条是可以零成本去掉的。
 if ! "$VENV/bin/pip" install -q --no-cache-dir -r "$INCOMING/requirements.lock"; then
   log "❌ 装运行时依赖失败"
-  log "   现网代码、前端产物与服务**均未改动**，线上仍是上一版在跑"
+  log "   现网代码、前端产物与数据库**均未改动**，线上仍是上一版在跑"
+  if [ -n "${VENV_SNAPSHOT_DIR:-}" ]; then
+    log "   依赖会被换回上一版（快照：${VENV_SNAPSHOT_DIR}）—— 由 trap 自动完成"
+  else
+    log "   ⚠️ 这次没有依赖快照（锁文件与现网一致），venv 可能被装到一半"
+    log "      对照 ${APP}/backend/requirements.lock 与 pip list 确认一下"
+  fi
   log "   常见原因是锁文件里有这台机器装不上的包；修好后重新发布即可"
   log "   新代码留在 ${INCOMING}，可以先翻看 requirements.lock 与本机环境的差异"
   exit 1
@@ -703,7 +1032,30 @@ DUMP="$RELEASES/$STAMP/database-before-migration.sql"
 # umask 077：dump 是全量账务数据，644 等于把这台机器上所有本地账号
 # （包括同机其他站点的）都变成合法读者。用子 shell 圈住，避免把 umask
 # 泄漏到后面的解压/切产物上 —— 那边的目录权限由 chown_if_possible 负责。
-if ( umask 077; ./.venv/bin/python scripts/db_backup.py > "$DUMP" 2>"$RELEASES/$STAMP/db_backup.err" ); then
+#
+# ---------------------------------------------------------------------------
+# **为什么走 db_backup.py --out，而不是 `> "$DUMP"` 一把梭**
+# ---------------------------------------------------------------------------
+#
+# shell 重定向会**先把文件建出来**，pg_dump 随后才跑。pg_dump 失败
+# （客户端没装、口令错、磁盘满）或**发布被打断**
+# （trap 'exit 143' TERM —— SSH 断连、systemd 超时都走这条路）时，
+# 那个文件**已经躺在那里了**：0 字节或半截，而文件名看着完全正常。
+#
+# db_backup.py 的 dump_to_file 把这三道保护都做了
+# （临时 .part 文件 → 非空校验 → 原子改名），注释里写的就是「为什么不能
+# `> file` 一把梭」。而**原来这里用的正是它明令禁止的写法** ——
+# 三道保护一道都没享受到。
+#
+# 后果不是「多了一个坏文件」，而是**它会被当成好文件用**：
+# assert_restorable 只检查「非空 + 文件头特征行」，而半截 dump 的**头部
+# 是完整的** → 校验通过 → psql 以 --single-transaction + ON_ERROR_STOP=1
+# 执行它，若截断点正好落在语句边界，**恢复成功退出 0，但库里只有部分数据**，
+# 且没有任何行数核对。
+#
+# 走 --out 之后：目录里出现的要么是上一份完整备份，要么是这一份完整备份，
+# **永远不会有半截**。
+if ( umask 077; ./.venv/bin/python scripts/db_backup.py --out "$DUMP" --keep 1 2>"$RELEASES/$STAMP/db_backup.err" ); then
   log "  数据库已备份到 ${DUMP}（$(wc -l < "$DUMP") 行）"
 else
   log "❌ 数据库备份失败，见 ${RELEASES}/${STAMP}/db_backup.err"
@@ -713,8 +1065,13 @@ else
   log "   新代码留在 ${INCOMING}"
   exit 1
 fi
-# 恢复命令一并打出来：出事时要靠它，而临场想起来的命令一定是错的
-log "  万一要退：cd $APP/backend && .venv/bin/python scripts/db_backup.py --restore --file ${DUMP}"
+# 恢复流程一并打出来：出事时要靠它，而临场想起来的命令一定是错的。
+#
+# 打的是**完整的两步**（清空 schema → 灌 dump），不是一行 --restore ——
+# 原因见 print_db_restore_procedure 的注释（dump 不带 --clean，
+# 往有数据的库里灌会撞 CREATE TABLE already exists，然后整份恢复回滚）。
+log "  万一要退（**会丢掉 ${DUMP} 之后的写入**，不可逆）："
+print_db_restore_procedure "$DUMP"
 
 # 迁移在**暂存目录**里跑。两条配置各自负责一半，缺一不可：
 #   ``script_location = %(here)s/migrations`` 里的 ``%(here)s`` 是
@@ -746,9 +1103,12 @@ log "  万一要退：cd $APP/backend && .venv/bin/python scripts/db_backup.py -
 if ! ( cd "$INCOMING" && "$VENV/bin/alembic" upgrade head ); then
   log "❌ 数据库迁移失败"
   log "   现网代码、前端产物与服务**都未改动**（线上跑的仍是上一版）"
+  if [ -n "${VENV_SNAPSHOT_DIR:-}" ]; then
+    log "   依赖会被换回上一版（快照：${VENV_SNAPSHOT_DIR}）—— 由 trap 自动完成"
+  fi
   log "   **但库可能已经迁了一半** —— 这是本次发布唯一动过的东西"
-  log "     退路在 ${DUMP}"
-  log "     cd $APP/backend && .venv/bin/python scripts/db_backup.py --restore --file ${DUMP}"
+  log "     退路在 ${DUMP}，**完整的两步流程**（第 1 步不可逆：会丢掉备份之后的写入）："
+  print_db_restore_procedure "$DUMP"
   log "   多数情况下**不需要动库**：迁移是幂等的，修好之后重新发布一次，"
   log "   alembic 会从当前 revision 接着往下走。"
   log "   修好 revision 后重新发布即可；新代码留在 ${INCOMING}"
@@ -853,7 +1213,97 @@ else
   log "       tar -xzf cwq-deploy-${SHA}.tar.gz -C <目录> && cp -a <目录>/deploy/. ${APP}/deploy/"
 fi
 
-tar --no-same-owner -xzf "$STAGE/cwq-backend-${SHA}.tar.gz" -C "$APP/backend"
+# ---------------------------------------------------------------------------
+# 切换后端代码：**先解到暂存目录，再覆盖到现网**
+# ---------------------------------------------------------------------------
+#
+# **原来这里是就地覆盖。**
+#
+#     tar --no-same-owner -xzf "$STAGE/cwq-backend-${SHA}.tar.gz" -C "$APP/backend"
+#
+# 那是一次**就地覆盖**：tar 逐条写进现网目录，中途失败（磁盘满 /
+# 归档成员与现网同名文件类型冲突 / 权限异常）就停在半路 ——
+# 现网目录变成「新旧混合、部分文件被截断」。
+#
+# 更要命的是**回退闸开得太晚**：ROLLBACK_SCOPE=code 原来在 tar **之后**才置位，
+# 于是 tar 一失败，on_exit 看到的是 ROLLBACK_SCOPE=none → **一行回退都不做**。
+#
+# 那个「半新半旧」的目录有两个后果：
+#   * 进程还在跑内存里的旧代码（**不致命**）；
+#   * 但**下一次 systemctl restart**（或机器重启）加载的就是这份混合代码；
+#   * 更糟的是**下一次发布**的第 2 步 `cp -a "$APP/backend" "$RELEASES/$STAMP/backend"`
+#     会把这份**混合状态**当成「上一版」存进快照 —— 之后任何回退都恢复成它。
+#
+# **现在改成两步**：
+#   1. 先把归档解到**暂存目录** ${CODE_STAGE}。tar 在这里失败 ⇒
+#      **现网一个字节都没动**（这是最要紧的：不会留下混合目录）；
+#   2. **回退闸先打开**，再把暂存目录里的内容覆盖到现网。
+#      这一步失败 ⇒ trap 拿快照把代码换回上一版（rollback_code 是幂等的）。
+#
+# 为什么第 2 步要「覆盖铺开」而不是「整个目录换名」：
+# 产物里只有 app/scripts/migrations/alembic.ini/requirements.lock/pytest.ini，
+# **不含** .env、.venv、logs/ 和 data/plugins（build-artifacts 显式 --exclude，
+# .env 与 .venv 本来就不在仓库里）。整目录换名会把这些运行时状态一起换掉 ——
+# 密钥、虚拟环境、插件运行目录，正是最不该被一次发布顺手抹掉的东西。
+#
+# 为什么这里要**再解一次包**（第 3 步已经解到 $INCOMING 了）：
+#   * $INCOMING 里有一根指向现网 .env 的软链（给 alembic 读），不能直接铺过去；
+#   * $INCOMING 已经被 alembic 跑过（会留下 __pycache__）；
+#   * **最要紧的是故障注入点**：tar 只在暂存目录里解，才谈得上
+#     「解包失败时现网毫发无损」。这个性质是本条修复的核心。
+# 多解一次的成本是几 MB 的归档 —— 换来的是「切换点自带一次校验」。
+CODE_STAGE="$APP/.backend.incoming.$$"
+rm -rf "$CODE_STAGE"
+mkdir -p "$CODE_STAGE"
+chmod 700 "$CODE_STAGE"
+log "  新代码解到暂存目录 ${CODE_STAGE}"
+if ! tar --no-same-owner -xzf "$STAGE/cwq-backend-${SHA}.tar.gz" -C "$CODE_STAGE"; then
+  rm -rf "$CODE_STAGE"
+  die "后端产物解包失败（磁盘满 / 归档成员与现网同名文件类型冲突 / 权限异常）。
+   **现网代码一个字节都没动** —— 解包是在暂存目录里做的，不是就地覆盖。
+   现网跑的还是上一版；修好后重新发布即可。"
+fi
+
+# **回退闸在这里打开，而且必须在这里打开。**
+#
+# 从这一行起，任何一步失败都要能把代码换回上一版 —— 而「换回」这件事
+# 只有闸门开着才会发生。放在 tar 之后（原来的位置）就是「tar 失败 ⇒
+# 一行回退都不做」，那正是这条缺陷本身。
+ROLLBACK_SCOPE=code
+
+log "  覆盖到现网代码目录（$APP/backend）"
+overlay_backend_code() {
+  local stage="$1" dst="$2" item base target
+  # 产物里的 .env：不存在，但万一有也不能覆盖现网的密钥。
+  for item in "$stage"/* "$stage"/.[!.]*; do
+    [ -e "$item" ] || continue
+    base="$(basename "$item")"
+    [ "$base" = ".env" ] && continue
+    target="$dst/$base"
+    if [ -e "$target" ] && [ ! -d "$target" ]; then
+      # 同名但类型不同（文件 vs 目录）：先让位，否则 cp 报「不能覆盖非目录」。
+      rm -f "$target"
+    fi
+    if [ -d "$item" ]; then
+      # 目录：铺开（合并），不删现网目录里这一版没有的子项 ——
+      # 与 tar 就地解包的行为一致，且没有「目录整个不存在」的窗口。
+      mkdir -p "$target"
+      cp -a "$item/." "$target/" || return 1
+    else
+      cp -a "$item" "$target" || return 1
+    fi
+  done
+  return 0
+}
+if ! overlay_backend_code "$CODE_STAGE" "$APP/backend"; then
+  die "把新代码覆盖到现网目录失败 —— **trap 会把代码换回上一版**（快照：${RELEASES}/${STAMP}/backend）。
+   库若已迁移则**不回退**（见 trap 的说明）。"
+fi
+# **现网代码已经是新版了。**
+# 依赖回退的判据靠它（见 code_is_old_version）：从这一刻起，
+# 「代码是旧版」只可能来自「这一阶段会把代码回退」——
+# 否则就是发布已生效、代码保持新版，依赖也必须保持新版。
+CODE_SWITCHED=1
 # **归档里记的是 CI 的构建身份，不是部署机的服务账号。** build-artifacts 在
 # GitHub Actions 里打包，tar 逐条记下当时的 ``runner/runner``；而这一步是以
 # root 跑的，GNU tar 默认**还原归档里的数字 uid/gid**。那个号落到部署机上
@@ -866,8 +1316,6 @@ tar --no-same-owner -xzf "$STAGE/cwq-backend-${SHA}.tar.gz" -C "$APP/backend"
 # 看着成功，实则不对。所以这里 --no-same-owner 解压（不让归档改属主），
 # 再显式 chown 给 SERVICE_USER。
 chown_if_possible "$APP/backend"
-# 从这里起，出事就要把代码换回上一版（见文件头「出事时的自动回退」）。
-ROLLBACK_SCOPE=code
 log "  代码已切到 ${SHA}"
 
 # ---------------------------------------------------------------------------
@@ -879,8 +1327,8 @@ log "  代码已切到 ${SHA}"
 #     mv "$FRONT_IN/dist" "$APP/frontend/dist" # 新的顶上
 #
 # 两次 rename(2) 之间，``$APP/frontend/dist`` **不存在**（新的还在暂存目录，
-# 旧的已改名）。nginx 的 ``root /opt/cwq/frontend/dist;``（cwq.conf:161、
-# acct.xins.live.conf:123）在这段时间里对**所有静态资源**返回 404 ——
+# 旧的已改名）。nginx 的 ``root /opt/cwq/frontend/dist;``（cwq.conf:295、
+# acct.xins.live.conf:272）在这段时间里对**所有静态资源**返回 404 ——
 # 不是「旧版」，是「没有」。脚本被 SIGINT/SIGTERM 打断（SSH 断连、
 # systemd TimeoutStartSec）恰好落在两行之间就是整站白屏，而且**没有任何
 # 自动恢复路径**：旧的那份躺在 $FRONT_OLD 里没人管，脚本也不会把它移回去。
@@ -1046,6 +1494,97 @@ fi
 # 到这里新版本已经确认可用：**自动回退就此关闭**。此后脚本里的任何失败
 # 都不该把已经在跑的版本换掉 —— 那是「发布后体检」那一段的语义。
 ROLLBACK_SCOPE=none
+
+# ---------------------------------------------------------------------------
+# 前端可达性：**刚发出去的前端必须真的在对外服务**
+# ---------------------------------------------------------------------------
+#
+# **为什么这道闸不能省。**
+#
+# 后端体检打的是 ``/api/health`` —— 而 nginx 读的是**磁盘上的 dist**，
+# **不经过后端进程**。于是「后端健康」与「前端在不在服务」是两件
+# 互不相干的事，而后者的失败**一声不吭**。
+#
+# 最典型的翻车形态：APP_DIR 换了根目录 → systemd unit 与
+# $APP/frontend/dist 都切到新目录，而 **nginx 的 root 还写死在
+# /opt/cwq/frontend/dist**（deploy/nginx/acct.xins.live.conf:272、
+# deploy/nginx/cwq.conf:295）—— 线上跑的是**上一版前端**
+# （表现是「界面看着没变」），若 /opt/cwq 已经不在了则整站静态资源 404。
+# 而发布**照样打印「✅ 发布完成」**。
+#
+# **判据不是「首页能打开」** —— 旧前端的首页**也**能打开，而且一模一样。
+# 判据是「**刚发出去的那一版**在服务」：runtime-config.js 里写着这一版的
+# version（由 emit_frontend_runtime.py 用 --version 写进去），
+# 拿它当判据，**旧版本立刻现形**。
+#
+# **为什么用 --resolve 而不是直接 curl 127.0.0.1。**
+# 源站的 80 端口是 301 跳 HTTPS、443 才带 server_name ——
+# 直接 curl 127.0.0.1 会落到 nginx 的**默认站点**（这台机上还有 11 个别的
+# 子域），拿到的是别的页面。--resolve 让 curl 连本机、但 Host/SNI 仍是
+# 这个站点的域名，于是 nginx 走对的 server 块。
+#
+# **为什么失败不回退**：新版本已经上线、库已经迁过。nginx 的 root 写错
+# 这件事，**回退代码解决不了**（上一版的代码同样不会被那个 root 服务）——
+# 所以这里只报清楚，不动现网。
+# ---------------------------------------------------------------------------
+: "${CWQ_FRONTEND_HEALTH_HOST:=acct.xins.live}"
+: "${CWQ_FRONTEND_HEALTH_SCHEME:=https}"
+: "${CWQ_FRONTEND_HEALTH_PORT:=443}"
+: "${CWQ_DEPLOY_SKIP_FRONTEND_CHECK:=0}"
+
+frontend_health_check() {
+  local host="$1" scheme="$2" port="$3"
+  local base="${scheme}://${host}"
+  local idx="" cfg=""
+  local resolve_arg=()
+  # 走回环 + Host/SNI 仍指向本机（--resolve 只影响连去哪里，不影响身份）。
+  resolve_arg=(--resolve "${host}:${port}:127.0.0.1")
+
+  if ! idx="$(curl -fsS -m 5 "${resolve_arg[@]}" "${base}/" 2>/dev/null)"; then
+    log "❌ 前端首页取不到：${base}/"
+    log "   nginx 没有在这个地址上提供服务（或者连不上）。"
+    log "   **刚发出去的前端没有在对外服务** —— 这一版不能算发布成功。"
+    return 1
+  fi
+  # **用 bash 的模式匹配而不是 `printf | grep -q`** ——
+  # grep -q 一匹配就退出 → 上游吃 SIGPIPE → pipefail 下整条管道非零 →
+  # 「匹配到了」被判成「没匹配」。这个坑这份脚本里已经踩过
+  # （测试文件第 19 组就是在钉它）。
+  if [[ "$idx" != *runtime-config* ]]; then
+    log "❌ ${base}/ 取到的不是前端首页（没有 runtime-config 引用）"
+    log "   这个地址上响应的不是本站的前端 —— 判据不成立，不能算通过。"
+    return 1
+  fi
+  # 版本对账：runtime-config.js 里的 version 是这一版的 sha。
+  if ! cfg="$(curl -fsS -m 5 "${resolve_arg[@]}" "${base}/runtime-config.js" 2>/dev/null)"; then
+    log "❌ ${base}/runtime-config.js 取不到 —— 无法确认线上跑的是哪一版前端"
+    return 1
+  fi
+  if [[ "$cfg" != *"$SHA"* ]]; then
+    log "❌ 线上跑的**不是刚发出去的这一版**前端：${base}/runtime-config.js 里没有 ${SHA}"
+    log "   最常见的原因：nginx 的 root 还指向别处（模板里写死的是 /opt/cwq/frontend/dist），"
+    log "   于是它服务的仍是上一版 —— 表现就是「界面看着没变」。"
+    log "   本次发布已经生效（迁移与产物切换都完成了），但**线上前端不是这一版**。"
+    return 1
+  fi
+  return 0
+}
+
+if [[ "$CWQ_DEPLOY_SKIP_FRONTEND_CHECK" == "1" ]]; then
+  log "  ⚠️  CWQ_DEPLOY_SKIP_FRONTEND_CHECK=1 —— 跳过前端可达性检查（风险自负）"
+  log "     这意味着「线上跑的是不是刚发出去的这一版前端」**没人验**。"
+else
+  if frontend_health_check "$CWQ_FRONTEND_HEALTH_HOST" "$CWQ_FRONTEND_HEALTH_SCHEME" "$CWQ_FRONTEND_HEALTH_PORT"; then
+    log "  前端在服务，且线上跑的就是这一版（${SHA}）"
+  else
+    log "   本次发布**已经生效**（迁移与产物切换都完成了），失败的是「前端在不在服务」这一项。"
+    log "   人工确认后可以这样处理："
+    log "     1) 修好 nginx 的 root（让它指向 ${APP}/frontend/dist）后 nginx -t && nginx -s reload"
+    log "     2) 用别的地址验：CWQ_FRONTEND_HEALTH_HOST=<域名> CWQ_FRONTEND_HEALTH_SCHEME=https deploy.sh"
+    log "     3) 确实不需要这道检查：CWQ_DEPLOY_SKIP_FRONTEND_CHECK=1"
+    exit 1
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 7/7 发布后体检。三项都只提醒、不阻断 ——
@@ -1264,6 +1803,67 @@ else
   log "     然后验证真的产出文件：systemctl start cwq-backup.service && ls -l ${BACKUP_DIR}/"
 fi
 
+# (1.1) 最近一次备份产物：**必须真的存在且非空**
+#
+# **为什么 timer「enabled」不够。**
+#
+# 上面那段只验了 timer **开没开**。而「开着的 timer」与「真的产出了备份」
+# 是两件事 —— 中间隔着的东西今天就坏着：
+#   * cwq-backup.service 原来**没有 TimeoutStartSec**，于是适用 systemd 的
+#     DefaultTimeoutStartSec（默认 **90 秒**）。而 `Type=oneshot` 的服务
+#     **整个执行时长**都算在 TimeoutStartSec 里 —— 库长到 pg_dump 要跑超过
+#     90 秒（1.6 GB / 2 核的机器上很常见）就被 SIGTERM 掐断，
+#     db_backup.py 的 dump_to_file 走异常路径把临时文件 unlink 掉 →
+#     **目录里一个备份都没有**，unit 状态 failed；
+#   * 那个 unit 自己的注释写着「比没有定时备份更危险，因为它看起来是有的」。
+#
+# 所以这里验的是**产物**，不是 timer 的状态。
+#
+# **两档处置**：
+#   * 产物**在，但是空的** → **阻断**。那是「备份被掐断了」的现场，
+#     留着它只会让人以为有退路。
+#   * 产物**一个都没有** → 告警。分不清是「刚装上、timer 还没跑过」
+#     还是「天天跑、天天失败」—— 而这两种情况的正确处置完全不同。
+#     确实要把它升级成阻断：CWQ_DEPLOY_REQUIRE_BACKUP_ARTIFACT=1。
+#
+# **不回退**：到这一步新版本已经上线、库已经迁过。备份坏了要修的是备份，
+# 把代码退回去解决不了任何问题。
+: "${CWQ_DEPLOY_REQUIRE_BACKUP_ARTIFACT:=0}"
+check_backup_artifact() {
+  local dir="$1" newest="" f size=0
+  [ -d "$dir" ] || { log "  ⚠️  备份目录 ${dir} 还不存在 —— 定时备份还没产出过文件（首次安装属正常）"; return 0; }
+  # 取 mtime 最新的那一份。用 shell 的 -nt 而不是 `ls -t | head` ——
+  # 后者在 pipefail 下会因为上游吃 SIGPIPE 而不稳定（这个坑这份脚本里
+  # 已经踩过一次，见测试文件第 19 组的说明）。
+  for f in "$dir"/*.sql; do
+    [ -f "$f" ] || continue
+    if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest="$f"; fi
+  done
+  if [ -z "$newest" ]; then
+    if [ "$CWQ_DEPLOY_REQUIRE_BACKUP_ARTIFACT" = "1" ]; then
+      die "备份目录 ${dir} 里**一个备份产物都没有** —— 定时备份从未成功跑过。
+     这是「比没有定时备份更危险」的那种状态：timer 显示 enabled、每天都跑、每天都失败。
+     先手工跑一次确认：systemctl start cwq-backup.service && ls -l ${dir}/
+     确认它能产出文件后重跑发布。**新版本已经上线（迁移与产物切换都完成了）。**"
+    fi
+    log "  ⚠️  备份目录 ${dir} 里**一个备份产物都没有** —— 定时备份可能从未成功跑过"
+    log "     timer 显示 enabled ≠ 备份真的产出了文件。手工验一次："
+    log "       systemctl start cwq-backup.service && ls -l ${dir}/"
+    log "     要把这一档也升级成阻断：CWQ_DEPLOY_REQUIRE_BACKUP_ARTIFACT=1"
+    return 0
+  fi
+  size=$(wc -c < "$newest" 2>/dev/null || echo 0)
+  if [ "${size:-0}" -eq 0 ]; then
+    die "最近一次备份产物是**空的**：${newest}（0 字节）
+   那不是一份备份 —— 是被掐断（或失败）之后留下的空壳。
+   手工跑一次并看日志：systemctl start cwq-backup.service && journalctl -u cwq-backup.service -n 50 --no-pager
+   **新版本已经上线（迁移与产物切换都完成了）。**"
+  fi
+  log "  最近一次备份产物：${newest}（${size} 字节，非空 ✅）"
+  return 0
+}
+check_backup_artifact "$BACKUP_DIR"
+
 # (1.2) 离站备份定时器
 #
 # 与上面的本机 dump **分开说**：两者是不同的退路。本机 dump 写在同一块盘上，
@@ -1435,8 +2035,9 @@ fi
 
 # (1.7) 发版残留目录
 #
-# ``.incoming.<pid>`` 与 ``.artifact.<pid>`` 是发布过程中的暂存目录。发布
-# **成功**时会被删掉，但**失败时故意留着**（出事时要能翻现场）。
+# ``.incoming.<pid>`` / ``.artifact.<pid>`` / ``.backend.incoming.<pid>`` 是
+# 发布过程中的暂存目录。发布**成功**时会被删掉，但**失败时故意留着**
+# （出事时要能翻现场）。
 #
 # 而「失败时留着」在长期运行下就是**只增不减**：每次失败留一个目录，
 # 每个目录里是一整份后端代码 + 产物 tar.gz（实测单个约 1.1 MB）。没人会因为
@@ -1447,10 +2048,23 @@ fi
 # 所以删暂存目录不等于删现场。
 prune_stale_staging() {
   local keep_days=7 d n=0
-  for d in "$APP"/.incoming.* "$APP"/.artifact.*; do
+  for d in "$APP"/.incoming.* "$APP"/.artifact.* "$APP"/.backend.incoming.*; do
     [ -d "$d" ] || continue
-    # 用 mtime 判龄（改名那一刻的目录 mtime）。`-` 开头的是「比 7 天新」，跳过。
-    if [ -n "$(find "$d" -maxdepth 0 -mtime "-${keep_days}" 2>/dev/null)" ]; then
+    # 用 mtime 判龄（改名那一刻的目录 mtime）。
+    #
+    # **判据是 `+${keep_days}`，不是 `-${keep_days}`** —— 这两个前缀的意思
+    # 正好相反，而原来的代码用的是 `-`：
+    #   * ``-mtime -7`` = 「**7 天以内**修改过」（find 会把它**打印出来**）；
+    #   * ``-mtime +7`` = 「**超过** 7 天」（同样会打印出来）。
+    #
+    # 原来写的是 `-`，于是 `[ -n "$(find ...)" ]` 对**新**目录成立 ——
+    # **代码删掉的是刚失败的那一次、留下的是老的**，与上面那段注释
+    # 「刚失败的那次留着，老的清掉」**正好相反**。
+    # 后果是两头都坏：出事时「翻现场」的东西被清掉了，而真正该清的
+    # 那些「只增不减、年年攒着」的反而永远留着。
+    #
+    # find 的输出非空 = 这个目录**够老**了 = 该删。
+    if [ -n "$(find "$d" -maxdepth 0 -mtime "+${keep_days}" 2>/dev/null)" ]; then
       rm -rf "$d" && n=$((n + 1))
     fi
   done
@@ -1459,7 +2073,7 @@ prune_stale_staging() {
 
 stale_n=$(prune_stale_staging || echo 0)
 if [[ "${stale_n:-0}" -gt 0 ]]; then
-  log "  清掉 ${stale_n} 个超过 7 天的发版残留目录（.incoming.* / .artifact.*）"
+  log "  清掉 ${stale_n} 个超过 7 天的发版残留目录（.incoming.* / .artifact.* / .backend.incoming.*）"
 fi
 
 # (2) TRUSTED_PROXIES 没配 → IP 维度的登录节流形同虚设
@@ -1482,6 +2096,37 @@ fi
 # 触发路径不是假设：`deploy.sh` 第 3 步的 die 只在 `DATABASE_URL`
 # 环境变量**也**为空时才拦，所以「DATABASE_URL=… deploy.sh」这条
 # 完全合法的路径下 .env 可以压根不存在。
+#
+# ---------------------------------------------------------------------------
+# **三档的处置不一样，这里说清楚为什么**
+# ---------------------------------------------------------------------------
+#
+#   * 「文件不存在」/「没有这一项」 → **只告警**。
+#     这两档说明的是「**读不到**」而不是「**读到了空的**」——
+#     而读不到的时候，`.env` 可能压根不是这份部署的配置真源
+#     （DATABASE_URL 走环境变量、配置在别处、容器注入…）。
+#     在读不到事实的情况下断言「没配」，会把「配置在别处」误伤成
+#     「部署不合格」。宁可漏报也不要误报。
+#
+#   * 「**这一项在、值是空的**」 → **阻断**。
+#     这一档是**读到了事实**：配置文件在、这一项在、值就是空的。
+#     而「空的」不是「没配」，是「**明确配成了空**」——
+#     .env.example 的默认值恰好就是空的（照抄示例部署必然落在这个形态）。
+#
+# 后果（为什么这一档必须拦）：
+#   * 后端按 fail-closed 处理：忽略 X-Forwarded-For → 全站共用
+#     127.0.0.1 一个节流桶。**任何匿名用户**连续 30 次错误登录
+#     （login_ip_max_failures=30 / login_ip_window_seconds=900）
+#     就能把**全公司**的登录锁 15 分钟，而且可以无限重复触发；
+#   * 每一条登录审计记录的来源 IP 都退化成 127.0.0.1 ——
+#     IP 维度的事后追溯彻底失效。
+#
+# **豁免**：CWQ_DEPLOY_ALLOW_EMPTY_TRUSTED_PROXIES=1
+# （与 CWQ_ALLOW_ANY_HOST=1 同一套命名风格）。
+# 确实要接受这个风险时用它 —— 比如这台机器前面**没有**反代、
+# 或者 IP 维度的限流另有实现。
+# ---------------------------------------------------------------------------
+: "${CWQ_DEPLOY_ALLOW_EMPTY_TRUSTED_PROXIES:=0}"
 ENV_FILE="$APP/backend/.env"
 if [[ ! -f "$ENV_FILE" ]]; then
   log "  ⚠️  ${ENV_FILE} 不存在 —— **无法确认** TRUSTED_PROXIES 是否配置"
@@ -1492,8 +2137,19 @@ elif ! grep -qE '^[[:space:]]*TRUSTED_PROXIES[[:space:]]*=' "$ENV_FILE"; then
   log "  ⚠️  ${ENV_FILE} 里**没有** TRUSTED_PROXIES 这一项 —— IP 维度登录节流当前形同虚设（全站共用一个桶）"
   log "     配法见 deploy/tuning.md 第八节。改完要重启 cwq-api 才生效。"
 elif grep -qE '^[[:space:]]*TRUSTED_PROXIES[[:space:]]*=[[:space:]]*"?[[:space:]]*"?[[:space:]]*$' "$ENV_FILE"; then
-  log "  ⚠️  TRUSTED_PROXIES 是空的 —— IP 维度登录节流当前形同虚设（全站共用一个桶）"
-  log "     配法见 deploy/tuning.md 第八节。改完要重启 cwq-api 才生效。"
+  if [[ "$CWQ_DEPLOY_ALLOW_EMPTY_TRUSTED_PROXIES" == "1" ]]; then
+    log "  ⚠️  TRUSTED_PROXIES 是空的 —— 已按 CWQ_DEPLOY_ALLOW_EMPTY_TRUSTED_PROXIES=1 放行"
+    log "     风险自负：全站共用一个节流桶，登录审计里的来源 IP 会退化成 127.0.0.1"
+  else
+    die "TRUSTED_PROXIES 是空的 —— **这一版的部署是不合格的**。
+   发布本身已经完成（迁移与产物切换都已生效），但：
+     * IP 维度的登录节流退化成一个**全站共用的桶** —— 任何匿名用户
+       连续 30 次错误登录就能把全公司的登录锁 15 分钟，且可无限重复触发；
+     * 每一条登录审计记录的来源 IP 都退化成 127.0.0.1，IP 维度的事后追溯失效。
+   配法见 deploy/tuning.md 第八节（生产应为 TRUSTED_PROXIES=127.0.0.1），
+   改完要重启 cwq-api 才生效。
+   确实要接受这个风险：CWQ_DEPLOY_ALLOW_EMPTY_TRUSTED_PROXIES=1 deploy.sh"
+  fi
 else
   log "  TRUSTED_PROXIES 已配置"
 fi
@@ -1501,11 +2157,11 @@ fi
 log "✅ 发布完成（${SHA}）"
 
 # 暂存目录：产物已经解压进 ${APP}，这里只是下载暂存。
-# 第 3 步解新代码用的那份暂存目录（${INCOMING}）也一并清掉 ——
-# 它只在发布过程中有用。
-# 中途失败时这两个目录都**故意留着**，方便翻现场；产物另有一份在
+# 第 3 步解新代码用的那份暂存目录（${INCOMING}）与第 5 步覆盖现网前解包的
+# 那份（${CODE_STAGE}）也一并清掉 —— 它们只在发布过程中有用。
+# 中途失败时这几个目录都**故意留着**，方便翻现场；产物另有一份在
 # ${RELEASES}/${STAMP}/artifact，所以留着并不等于「只有现场里有新代码」。
-rm -rf "$STAGE" "$INCOMING"
+rm -rf "$STAGE" "$INCOMING" "$CODE_STAGE"
 
 # 只保留最近 KEEP 份备份
 ls -dt "$RELEASES"/*/ 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -rf

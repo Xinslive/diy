@@ -1,4 +1,5 @@
 import { http, apiUrl, getLatest } from './client'
+import { isReplay } from '@/utils/idempotency'
 
 /**
  * 凭证列表：翻页 / 改页大小 / 换排序都会重发一趟，而这几处控件是**可以连点**的
@@ -26,7 +27,23 @@ export const insertPreview = (bookId, afterId, position = 'before') =>
 
 export const neighbour = (bookId, id, params) =>
   http.get(`/books/${bookId}/vouchers/${id}/neighbour`, { params }).then(r => r.data)
-export const createVoucher = (bookId, payload) => http.post(`/books/${bookId}/vouchers`, payload).then(r => r.data)
+/**
+ * 新建凭证。**带幂等键**（可选）。
+ *
+ * 幂等键让「请求发出去了、响应丢了」这件事**安全**：服务端按这把键去重，
+ * 重复的请求落到同一张凭证上，而不会在库里多出一张几乎一样的
+ * （审计 §3.28 —— 没有它的时候，重试一次就是两张凭证）。
+ *
+ * **回放（replayed）是什么意思。** 服务端发现这把键已经用过了，
+ * 就不新建，而是把**上一次建出来的那张凭证**回给你（HTTP 200 而不是 201）。
+ * 这正是「上一次其实落库了、只是响应丢了」的情形 ——
+ * 上一版内容已经在库里，而用户此刻在屏幕上可能又敲了几个字，
+ * 所以调用方要**再补一次 PUT** 把当前内容收敛上去。
+ */
+export const createVoucher = (bookId, payload, idempotencyKey) =>
+  http.post(`/books/${bookId}/vouchers`, payload,
+    idempotencyKey ? { headers: { 'Idempotency-Key': idempotencyKey } } : undefined)
+    .then(r => ({ ...r.data, replayed: isReplay(r.headers) }))
 export const updateVoucher = (bookId, id, payload) => http.put(`/books/${bookId}/vouchers/${id}`, payload).then(r => r.data)
 export const deleteVoucher = (bookId, id) => http.delete(`/books/${bookId}/vouchers/${id}`).then(r => r.data)
 

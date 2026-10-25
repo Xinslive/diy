@@ -32,6 +32,11 @@
       </div>
     </div>
 
+    <!-- 加载失败**不能**与「没有数据」同形：断网/超时时表格会空着，
+         一条提示都没有的话，用户以为这个科目一整年没发生额（审计 §3.25）。 -->
+    <el-alert v-if="loadError" type="error" :closable="false" show-icon class="mb"
+              :title="`加载失败：${loadError}。请检查网络后重试。`" />
+
     <div class="card">
       <div class="report-head">
         <!-- 用友的纸上标题就是「{科目名}总账」，屏幕与纸上同一套说法。 -->
@@ -177,7 +182,7 @@ function rowClass({ row }) {
 }
 
 /** 只认最新一趟：期间/科目下拉连点时，旧响应不许覆盖新数据（见 composables/useLatestLoad）。 */
-const { loading, run, isStale } = useLatestLoad('ledger/general')
+const { loading, error: loadError, run, isStale } = useLatestLoad('ledger/general')
 
 /** 起止只列顶栏那个年份的期间。列全部年份时，顶栏停在 2027、
  *  下拉里却能翻出 2026-06，翻过去算的是另一本账。 */
@@ -240,11 +245,21 @@ async function load() {
   if (!yearPeriods.value.length) return
   const want = subjectCode.value
   const id = idOfCode(want)
-  const d = await run(() => api.general(store.bookId, {
-    subject_id: id ?? undefined,
-    from_period_id: fromId.value, period_id: toId.value,
-    include_unposted: includeUnposted.value,
-  }))
+  let d
+  try {
+    d = await run(() => api.general(store.bookId, {
+      subject_id: id ?? undefined,
+      from_period_id: fromId.value, period_id: toId.value,
+      include_unposted: includeUnposted.value,
+    }))
+  } catch (e) {
+    // 加载失败**不是**「没有数据」：这两件事在页面上长得一模一样。
+    // 拦截器已经弹过提示了，这里只要别让它变成一个没人接的 rejection ——
+    // 页面上 data 保持原样，顶部由 loadError 挂一条「加载失败」。
+    // 以前这里一声不吭：断网/超时后表格空着、零提示，
+    // 用户以为这个科目一整年没发生额（审计 §3.25）。
+    return
+  }
   // 过期的那一趟：结果已经到了，但条件早就被用户改掉了 —— 写进去就是
   // 「表格里的数对不上顶栏的期间」。
   if (isStale(d)) return
@@ -345,6 +360,9 @@ watch(() => [store.bookId, store.currentYear, store.periods.length], () => {
 </script>
 
 <style scoped>
+
+/* 加载失败横幅与工具条之间的距离（el-alert 默认贴着上面那一块）。 */
+.mb { margin-bottom: 12px; }
 .ledger-toolbar {
   display: flex;
   flex-direction: column;

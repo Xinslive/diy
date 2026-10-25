@@ -153,6 +153,13 @@ def _prepare_upload(tmp: Path, workdir: Path, label: str) -> tuple[Path, str, in
       ``export.encryption_key`` 的说明）：两者的爆炸半径不一样。
 
     加密后的文件落在同一个临时目录里，上传完就删（临时目录里不留明文）。
+
+    **「密钥为空」这条分支现在只有一条路能走到**：
+    ``run_backup`` 开头那道 ``require_encrypted_ready`` 已经拒掉了
+    「配了 OSS 却没配加密密钥」的情形（界面配 OSS 的那条路也在内）。
+    走到这里说明要么密钥是好的，要么运维显式开了
+    ``BACKUP_ENCRYPTION_KEY_WARN_ONLY=true``（逃生口已登记在册）。
+    换句话说：**明文上传是明示的取舍，不是默认行为**。
     """
     key = export_mod.encryption_key()
     if key is None:
@@ -185,8 +192,14 @@ def run_backup(db: Session, *, actor=None, book_ids: Optional[Iterable[int]] = N
 
     ``should_stop`` 是**尽力停止**的钩子：返回 True 就停止本轮（剩下的目标
     不备份）。调度器用它把「租约已丢、该让接管者接手」这件事落成动作。
+
+    **这里要求「制品一定是密文」。** ``require_encrypted_ready`` 按**生效
+    配置**判「配了 OSS 就必须配了加密密钥」—— 界面上配 OSS 的那条路
+    （产品自己指给运维的那条）也在这道闸里，不只是 env 层那条。
+    启动期的闸门只看得到 env 层（启动期没有库连接），所以运行期这道
+    不可省。详见 ``app/backup/config.py::require_encrypted_ready``。
     """
-    cfg = cfg_mod.require_ready(db)
+    cfg = cfg_mod.require_encrypted_ready(db)
     bucket = oss_client.make_bucket(cfg)
     try:
         return _run_backup_with_bucket(

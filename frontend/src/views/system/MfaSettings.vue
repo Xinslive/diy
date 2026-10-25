@@ -101,6 +101,7 @@ import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import * as api from '@/api/system'
 import { useSessionStore } from '@/stores/session'
+import { errorText } from '@/utils/errorText'
 
 const store = useSessionStore()
 const isAdmin = computed(() => store.isAdmin)
@@ -132,7 +133,7 @@ async function toggle(value) {
   } catch (e) {
     // 拨回去：让界面回到后端确认过的那个状态。
     enabled.value = !value
-    ElMessage.error(e?.response?.data?.detail || '保存失败')
+    ElMessage.error(errorText(e, '保存失败'))
   } finally {
     busy.value = false
   }
@@ -146,7 +147,7 @@ async function save() {
     enabled.value = !!data.enabled
     ElMessage.success('已保存')
   } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || '保存失败')
+    ElMessage.error(errorText(e, '保存失败'))
   } finally {
     busy.value = false
   }

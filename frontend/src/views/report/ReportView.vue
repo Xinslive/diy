@@ -39,6 +39,12 @@
       <el-tag v-if="hiddenRowCount" type="info" effect="plain">{{ hiddenRowCount }} 行已隐藏</el-tag>
     </div>
 
+    <!-- 加载失败**不能**与「没有数据」同形：断网/超时时表里空着，
+         一条提示都没有的话，用户以为这个月的报表本来就是空的
+         （审计 N3 / §3.25）。 -->
+    <el-alert v-if="loadError" type="error" :closable="false" show-icon class="mb no-print"
+              :title="`加载失败：${loadError}。请检查网络后重试。`" />
+
     <div class="card">
       <div class="report-head">
         <h2 class="report-title">{{ template?.name }}</h2>
@@ -56,7 +62,7 @@
                 :type="noticeType(n)" :closable="false" class="mb no-print">
         <div>{{ n.text }}</div>
         <div v-if="n.amount" class="notice-sub">
-          本期结转凭证借方合计 <b class="money">{{ fmt(n.amount) }}</b>
+          本期结转凭证借方合计 <b class="money">{{ reportNumber(n.amount) }}</b>
           <template v-if="n.cols?.length">
             ；下列{{ colNameOf(n.cols) }}列按**排除结转凭证**的口径取数
           </template>
@@ -66,6 +72,17 @@
       <el-alert v-if="data.errors?.length" type="error" :closable="false" class="mb">
         <div v-for="(e, i) in data.errors" :key="i">{{ e }}</div>
       </el-alert>
+
+      <!-- 显示口径（后端 display_scale 字段，唯一的数据契约见
+           reports/evaluate.py 的返回结构）。
+           这一行字是「口径」在界面上的落点：审计 §3.26 要求「导出 quantize
+           到两位**并在界面注明**」—— 屏幕与文件既然是同一个数，就得让人
+           知道它们**该**是同一个数。
+           它刻意只是一行小字、不做成告警条：口径是常驻事实，不是「本期出了
+           什么特殊情况」—— 那种才走 notices。 -->
+      <p v-if="data.display_scale?.note" class="report-scale-note no-print">
+        {{ data.display_scale.note }}
+      </p>
 
       <div class="report-workspace" :class="{ 'has-inspector': designMode && inspectorOpen }">
         <div class="report-canvas">
@@ -120,8 +137,8 @@
                    去改模板。它们是设计工具，不是报表的一部分，所以要看它们
                    就得先开设计模式。 -->
               <div v-if="designMode" class="head-edit no-print">
-                <el-button link size="small" :title="`在 ${c.letter} 列左侧插入`" @click="insertCol(c.col_no)">⊕</el-button>
-                <el-button link size="small" :title="`删除 ${c.letter} 列`" @click="removeCol(c)">✕</el-button>
+                <el-button link size="small" :disabled="structureBusy" :title="`在 ${c.letter} 列左侧插入`" @click="insertCol(c.col_no)">⊕</el-button>
+                <el-button link size="small" :disabled="structureBusy" :title="`删除 ${c.letter} 列`" @click="removeCol(c)">✕</el-button>
               </div>
               <!-- 必须是 v-model，不能退成 :model-value。el-input 每次 input
                    之后都会用 props.modelValue 回填输入框（Element Plus
@@ -151,7 +168,7 @@
               </div>
             </th>
             <th class="c-gutter no-print" v-if="designMode">
-              <el-button link size="small" title="在末尾加一行" @click="insertRow(lastRowNo + 1)">＋行</el-button>
+              <el-button link size="small" title="在末尾加一行" :disabled="structureBusy" @click="insertRow(lastRowNo + 1)">＋行</el-button>
             </th>
           </tr>
         </thead>
@@ -161,8 +178,8 @@
             <td v-if="designMode" class="c-gutter no-print">
               <div class="gutter">
                 <span class="addr">{{ row.row_no }}</span>
-                <el-button link size="small" title="在上面插入一行" @click="insertRow(row.row_no)">⊕</el-button>
-                <el-button link size="small" title="删除本行" @click="removeRow(row)">✕</el-button>
+                <el-button link size="small" title="在上面插入一行" :disabled="structureBusy" @click="insertRow(row.row_no)">⊕</el-button>
+                <el-button link size="small" title="删除本行" :disabled="structureBusy" @click="removeRow(row)">✕</el-button>
                 <el-button link size="small" :title="row.bold ? '取消加粗' : '加粗'"
                            :type="row.bold ? 'primary' : ''" @click="toggleRow(row, 'bold')">B</el-button>
                 <el-button link size="small" :title="row.hidden ? '取消隐藏' : '隐藏（不参与打印）'"
@@ -209,7 +226,7 @@
                    同样只在设计模式出现 —— 一屏几十个 C1 C2 压在数字上方，
                    看表的人根本不需要，还会把金额读错。 -->
                 <span v-if="designMode && it.cell.addr" class="addr no-print">{{ it.cell.addr }}</span>
-                {{ it.cell.value !== null && it.cell.value !== undefined ? fmt(it.cell.value) : '' }}
+                {{ it.cell.value !== null && it.cell.value !== undefined ? reportNumber(it.cell.value) : '' }}
               </td>
             </template>
           </tr>
@@ -226,7 +243,7 @@
               <div>
                 <span class="inspector-kicker">公式编辑器</span>
                 <h3><span class="cell-badge">{{ editing.addr }}</span>{{ editing.rowLabel || '当前行' }}</h3>
-                <p>{{ editing.colLabel }} · 当前值 {{ editing.value !== null && editing.value !== undefined ? fmt(editing.value) : '（空）' }}</p>
+                <p>{{ editing.colLabel }} · 当前值 {{ editing.value !== null && editing.value !== undefined ? reportNumber(editing.value) : '（空）' }}</p>
               </div>
               <el-tag v-if="isDirty(editing.rowNo, editing.colNo)" type="warning" effect="plain">待保存</el-tag>
             </div>
@@ -371,7 +388,7 @@ import { downloadFile } from '@/api/print'
 import PrintDialog from '@/components/PrintDialog.vue'
 import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'
-import { fmt } from '@/utils/format'
+import { reportNumber } from '@/utils/format'
 import { visibleTemplates } from '@/utils/reportTemplates'
 import { MAX_SCALE, MIN_SCALE, clampScale, fitScale, naturalWidth } from '@/utils/canvasZoom'
 
@@ -384,7 +401,7 @@ const templateId = ref(Number(route.params.templateId || 0))
 const template = ref(null)
 const data = ref({ rows: [], cols: [], errors: [] })
 /** 只认最新一趟：期间/模板切换时，旧响应不许覆盖新数据（见 composables/useLatestLoad）。 */
-const { loading, run, isStale } = useLatestLoad('report/render')
+const { loading, error: loadError, run, isStale } = useLatestLoad('report/render')
 const designMode = ref(false)
 /** 公式面板默认展开（收起是为了给画布让宽度），点金额单元格会自动展开回来。 */
 const inspectorOpen = ref(true)
@@ -615,7 +632,7 @@ const addressOptions = computed(() => {
   return out
 })
 
-const addressLabel = (a) => `${a.addr} · ${a.rowLabel || '未命名'}${a.value !== null && a.value !== undefined ? ` · ${fmt(a.value)}` : ''}`
+const addressLabel = (a) => `${a.addr} · ${a.rowLabel || '未命名'}${a.value !== null && a.value !== undefined ? ` · ${reportNumber(a.value)}` : ''}`
 const builderValue = (value) => {
   const text = String(value ?? '').trim()
   if (!text) return ''
@@ -925,20 +942,47 @@ function dirtyKeysReset() {
 
 // ------------------------------------------------------------------ 行操作
 
+/**
+ * 设计模式的**结构操作**在途守卫。
+ *
+ * 双击「＋行」→ 两次 `POST /reports/{id}/rows` → 同一个 `row_no` 位置插进两行；
+ * 双击某行的「✕」→ 第一次删掉第 N 行，第二次请求**仍然带 row_no=N** →
+ * 删掉的是**上移后落到 N 的另一行**（用户根本没打算删的那一行）。
+ *
+ * 这四个动作（插行/删行/插列/删列）都是「改结构 → 重新 load」的整段，
+ * 段与段之间不能重叠，所以共用**一个** busy 就够。
+ */
+const structureBusy = ref(false)
+
+/** 结构操作的统一入口：同一时刻只允许一段在途。 */
+async function withStructureBusy(fn) {
+  if (structureBusy.value) return
+  structureBusy.value = true
+  try {
+    await fn()
+  } finally {
+    structureBusy.value = false
+  }
+}
+
 async function insertRow(at) {
-  await api.addRow(templateId.value, { row_no: at, label: '新项目' }, store.bookId)
-  await load()
-  ElMessage.success(`已在第 ${at} 行插入，下方公式引用已自动顺延`)
+  await withStructureBusy(async () => {
+    await api.addRow(templateId.value, { row_no: at, label: '新项目' }, store.bookId)
+    await load()
+    ElMessage.success(`已在第 ${at} 行插入，下方公式引用已自动顺延`)
+  })
 }
 
 async function removeRow(row) {
-  await ElMessageBox.confirm(
-    `删除「${row.label}」这一行？下方行的公式引用会自动上收，相关单元格公式也会一起删除。`,
-    '删除行', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
-  ).catch(() => Promise.reject())
-  const r = await api.deleteRow(templateId.value, row.row_no, store.bookId)
-  await load()
-  ElMessage.success(`已删除，${r.formulas_shifted} 处引用已同步修正`)
+  await withStructureBusy(async () => {
+    await ElMessageBox.confirm(
+      `删除「${row.label}」这一行？下方行的公式引用会自动上收，相关单元格公式也会一起删除。`,
+      '删除行', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+    ).catch(() => Promise.reject())
+    const r = await api.deleteRow(templateId.value, row.row_no, store.bookId)
+    await load()
+    ElMessage.success(`已删除，${r.formulas_shifted} 处引用已同步修正`)
+  })
 }
 
 // 项目名输入框的两步：打字时先写回本地，失焦时再落库。
@@ -973,19 +1017,23 @@ async function toggleRow(row, field, delta = null) {
 // ------------------------------------------------------------------ 列操作
 
 async function insertCol(at) {
-  const r = await api.addCol(templateId.value, { col_no: at, label: '新列' }, store.bookId)
-  await load()
-  ElMessage.success(`已插入 ${r.letter} 列，${r.formulas_shifted} 处引用已自动改写`)
+  await withStructureBusy(async () => {
+    const r = await api.addCol(templateId.value, { col_no: at, label: '新列' }, store.bookId)
+    await load()
+    ElMessage.success(`已插入 ${r.letter} 列，${r.formulas_shifted} 处引用已自动改写`)
+  })
 }
 
 async function removeCol(col) {
-  await ElMessageBox.confirm(
-    `删除「${col.label}」(${col.letter}) 整列？本列所有单元格公式会一并删除，引用它的公式会自动前移。`,
-    '删除列', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
-  ).catch(() => Promise.reject())
-  const r = await api.deleteCol(templateId.value, col.col_no, store.bookId)
-  await load()
-  ElMessage.success(`已删除，${r.formulas_shifted} 处引用已同步修正`)
+  await withStructureBusy(async () => {
+    await ElMessageBox.confirm(
+      `删除「${col.label}」(${col.letter}) 整列？本列所有单元格公式会一并删除，引用它的公式会自动前移。`,
+      '删除列', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+    ).catch(() => Promise.reject())
+    const r = await api.deleteCol(templateId.value, col.col_no, store.bookId)
+    await load()
+    ElMessage.success(`已删除，${r.formulas_shifted} 处引用已同步修正`)
+  })
 }
 
 // 同 draftSideLabel 上方那段：v-model 已经把新值写进 c.label，这里再跟入参比
@@ -1053,9 +1101,21 @@ async function load(keepDirty = false) {
   const tpl = allTemplates.value.find((t) => t.id === templateId.value)
   template.value = tpl
   // 只认最新一趟：期间/模板切换时，旧响应不许覆盖新数据。
-  const res = await run(() => api.render(templateId.value, {
-    book_id: store.bookId, period_id: store.periodId
-  }))
+  let res
+  try {
+    res = await run(() => api.render(templateId.value, {
+      book_id: store.bookId, period_id: store.periodId
+    }))
+  } catch {
+    // 加载失败**不是**「没有数据」：这两件事在页面上长得一模一样。
+    // 以前这里一声不吭：run() 把真错照原样往外抛，这里没人接 →
+    // 变成一个没人管的 promise rejection，表里空着、零提示，
+    // 用户以为这个月的报表本来就是空的（审计 N3 / §3.25）。
+    //
+    // 拦截器已经弹过提示了，这里只要**接住这个错**：表里的旧数据保持原样，
+    // 顶部由 loadError 挂一条「加载失败」。
+    return
+  }
   // 过期的那一趟：条件早就被改掉了，写进去就是「表里的数对不上顶栏的期间」。
   if (isStale(res)) return
   // 列字母挂在列上，行编辑按钮要用
@@ -1217,6 +1277,9 @@ th.c-head .addr { margin-top: 2px; }
 .col-meta :deep(.el-select) { width: 100%; }
 
 .notice-sub { margin-top: 4px; font-size: 12px; }
+/* 显示口径说明（一行小字，不是告警）：口径是常驻事实，不是「本期出了什么
+   特殊情况」—— 那种才走 notices（见上面的注释）。 */
+.report-scale-note { margin: 0 0 12px; font-size: 12px; color: var(--el-text-color-secondary); }
 .notice-sub .money { font-variant-numeric: tabular-nums; }
 
 th.c-gutter, td.c-gutter { background: #fbfbfc; width: 1%; white-space: nowrap; }

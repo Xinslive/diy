@@ -14,6 +14,9 @@ from app.models.book import Book
 from app.models.system import SysUser, SystemSetting
 from app.plugins import audit
 from app.plugins.access import require_plugin_access
+# ctx 暴露面的**登记表**住在纯数据模块里（worker 进程要读它，而 worker
+# 不许 import 这里的数据库）。这里只做一次再导出，见文件末尾的说明。
+from app.plugins.ctx_surface import CTX_METHOD_SERIALIZATION
 
 # 只由宿主 ASGI 门禁设置，插件不能选择调用者。
 current_principal = ContextVar("plugin_principal", default=None)
@@ -439,3 +442,10 @@ def context_for(manifest, *, plugin=False):
         # 插件面（plugin=True）**不含 confirm**：确认必须是一次独立的请求。
         exposed["imports"] = service(manifest, principal, expose_confirm=not plugin)
     return SimpleNamespace(**exposed)
+
+
+# ---------------------------------------------------------------------------
+# ctx 表面：每个方法的返回值**能不能过 JSON**
+# ---------------------------------------------------------------------------
+# 权威实现在 :mod:`app.plugins.ctx_surface`（纯数据模块，worker 也要读）；
+# 上面已 import 过来，这里只保留**为什么**它不住在这个模块里的说明。
