@@ -286,7 +286,11 @@ def test_仓库里的sh脚本没有变量紧跟非ASCII字符():
     offenders = []
     root = DEV_SH.parent
     for sh in sorted(root.rglob("*.sh")):
-        if any(x in sh.parts for x in ("node_modules", ".venv", ".run", "dist")):
+        # ``output/`` 是**本地构建产物目录**（.gitignore 里有），里面是从
+        # 证书脚本复制出来的副本 —— 它们不在版本库里，却会被 rglob 扫到。
+        # 一台机器上跑过一次证书流程，这个用例就永远红着，而仓库本身是干净的。
+        # 与 node_modules / dist 同一类：不是源码，就不该参与源码的护栏。
+        if any(x in sh.parts for x in ("node_modules", ".venv", ".run", "dist", "output")):
             continue
         for i, line in enumerate(sh.read_text(encoding="utf-8").splitlines(), 1):
             for m in pat.finditer(line):

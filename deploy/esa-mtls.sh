@@ -29,9 +29,9 @@ do_switch(){ # $1 = 目标值 (on|optional)
   local target="$1"
   local cur
   cur="$(current_mode)"
-  [[ -z "$cur" ]] && { echo "✗ 配置里找不到 ssl_verify_client 指令（$CONF）"; exit 1; }
+  [[ -z "$cur" ]] && { echo "✗ 配置里找不到 ssl_verify_client 指令（${CONF}）"; exit 1; }
   if [[ "$cur" == "$target" ]]; then
-    echo "· 当前已经是 $target，无需改动"
+    echo "· 当前已经是 ${target}，无需改动"
     return 0
   fi
   if [[ ! -r "$CA" ]]; then

@@ -137,7 +137,7 @@ if [[ -f "$TARGET" ]]; then
 fi
 install -m 0644 -o root -g root "$TMP" "$TARGET"
 rm -f "$TMP"
-echo "✅ 已写入 $TARGET（${#IPS[@]} 条网段）"
+echo "✅ 已写入 ${TARGET}（${#IPS[@]} 条网段）"
 
 if ! nginx -t >/tmp/nginx-t-realip.log 2>&1; then
   if [[ -n "$BAK" ]]; then cp -a "$BAK" "$TARGET"; echo "✗ nginx -t 失败 —— 已装回备份"; fi
