@@ -287,6 +287,16 @@ REWRITES = [
     ("/etc/nginx/cwq-include/", "{tmp}/include/"),
     ("/etc/nginx/ssl/cwq.crt", "{tmp}/ssl/cwq.crt"),
     ("/etc/nginx/ssl/cwq.key", "{tmp}/ssl/cwq.key"),
+    # ESA 回源双向校验（mTLS）的**客户端信任锚**。
+    #
+    # 2026-10-24 接入 ESA 时加的两份配置（cwq.conf / acct.xins.live.conf）里都有
+    # ``ssl_client_certificate /etc/nginx/ssl/esa/esa-client-ca.pem;`` ——
+    # nginx -t 会**真的去读那个文件**，读不到就 emerg。而这条校验在 CI 里
+    # 一直是红的：REWRITES 没给它映射位置，临时目录里也没有那个文件。
+    #
+    # 那是上一个提交（接入 ESA）留下的 CI 红灯，与 nginx 配置本身无关
+    # （生产上那份文件是放好了的）。
+    ("/etc/nginx/ssl/esa/esa-client-ca.pem", "{tmp}/ssl/esa/esa-client-ca.pem"),
     ("/www/server/panel/vhost/cert/acct.xins.live/fullchain.pem", "{tmp}/ssl/fullchain.pem"),
     ("/www/server/panel/vhost/cert/acct.xins.live/privkey.pem", "{tmp}/ssl/privkey.pem"),
     ("/www/wwwlogs/", "{tmp}/logs/"),
@@ -337,6 +347,14 @@ def make_cert(tmp: Path) -> bool:
     # cwq.crt / cwq.key 是独立 nginx 形态用的那一份
     (ssl / "cwq.crt").write_bytes((ssl / "fullchain.pem").read_bytes())
     (ssl / "cwq.key").write_bytes((ssl / "privkey.pem").read_bytes())
+    # ESA 回源双向校验的**客户端信任锚**（ssl_client_certificate）。
+    #
+    # 复用同一份自签证书就够了：nginx -t 只**解析**这个文件（读不出 PEM 就
+    # emerg），不会拿它去验任何东西 —— 真正的验签发生在运行时，而那是生产机
+    # 上放着真证书的事。
+    esa = ssl / "esa"
+    esa.mkdir(parents=True, exist_ok=True)
+    (esa / "esa-client-ca.pem").write_bytes((ssl / "fullchain.pem").read_bytes())
     return True
 
 
