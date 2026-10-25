@@ -580,7 +580,7 @@ def test_前一张后一张按凭证号顺序翻(client, auth, book, make_vouche
         r = client.get(f"/api/books/{book.id}/vouchers/{v.id}/neighbour", headers=auth)
         assert r.status_code == 200, r.text
         d = r.json()
-        assert d["scope"] == "book"      # 没带筛选条件 → 全账套的凭证序列
+        assert d["scope"] == "period"     # 没带筛选条件 → 这张所属那个月的凭证序列
         return (d["prev_id"], d["next_id"])
 
     assert nb(v1) == (None, v2.id)       # 记001 的后一张是 记002
@@ -602,19 +602,48 @@ def test_同一天的多张凭证按录入先后排(client, auth, book, make_vou
     assert (r2["prev_id"], r2["next_id"]) == (None, b.id)
 
 
-def test_前后张跨月时按月份先后(client, auth, book, make_voucher):
-    """用户 2026-10-24：「不同月里，月份越大的越后」。
+def test_不带条件时前后张停在月底(client, auth, book, make_voucher):
+    """用户 2026-10-25 打回：「某月最后一张凭证点击下一张，居然能跳后一个月
+    第一张凭证。这不对」。
 
-    所以 11 月那张的「后一张」是 12 月那张，12 月那张的「前一张」是 11 月那张 ——
-    顺序是一条连续的序列，不在月底断掉。
+    不带筛选条件时，范围是**这张凭证所属的那个月** —— 跟列表页「一个筛选条件
+    都没填 → 就看顶栏定下的那个月」是同一条规则。11 月最后一张的「后一张」
+    到此为止（空的），12 月第一张的「前一张」也是空的：不跨月。
     """
     nov = make_voucher("2026-11-28", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
     dec = make_voucher("2026-12-03", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
 
-    assert client.get(
-        f"/api/books/{book.id}/vouchers/{nov.id}/neighbour", headers=auth).json()["next_id"] == dec.id
-    assert client.get(
-        f"/api/books/{book.id}/vouchers/{dec.id}/neighbour", headers=auth).json()["prev_id"] == nov.id
+    d_nov = client.get(
+        f"/api/books/{book.id}/vouchers/{nov.id}/neighbour", headers=auth).json()
+    assert d_nov["next_id"] is None, "11 月最后一张不该跳到 12 月"
+    assert d_nov["prev_id"] is None
+    assert d_nov["scope"] == "period"
+    assert d_nov["total"] == 1          # 范围里只有它自己
+
+    d_dec = client.get(
+        f"/api/books/{book.id}/vouchers/{dec.id}/neighbour", headers=auth).json()
+    assert d_dec["prev_id"] is None, "12 月第一张不该跳回 11 月"
+    assert d_dec["next_id"] is None
+    assert d_dec["scope"] == "period"
+
+
+def test_带条件时前后张仍然可以跨月(client, auth, book, make_voucher):
+    """填了条件 → 范围放宽到全部期间，前后张照旧能跨月（跟列表同一条规则）。
+
+    跟「不带条件就停在月底」不矛盾：填条件时用户问的是「全年哪些凭证含 16」，
+    被顶栏那个月卡着反而是帮倒忙。
+    """
+    nov = make_voucher("2026-11-28", dr=[("1001", 100, "16 十一月")], cr=[("5001", 100, "x")])
+    dec = make_voucher("2026-12-03", dr=[("1001", 100, "16 十二月")], cr=[("5001", 100, "x")])
+
+    d_nov = client.get(
+        f"/api/books/{book.id}/vouchers/{nov.id}/neighbour?keyword=16", headers=auth).json()
+    assert d_nov["scope"] == "filtered"
+    assert d_nov["next_id"] == dec.id
+
+    d_dec = client.get(
+        f"/api/books/{book.id}/vouchers/{dec.id}/neighbour?keyword=16", headers=auth).json()
+    assert d_dec["prev_id"] == nov.id
 
 
 def test_同一期间里号大的那张在后(client, auth, book, make_voucher):

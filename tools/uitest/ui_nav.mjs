@@ -24,7 +24,9 @@ await page.goto(BASE, { waitUntil: 'networkidle' })
 await page.locator('input').nth(0).fill('admin')
 await page.locator('input').nth(1).fill('123456')
 await page.click('button:has-text("登录")')
-await page.waitForSelector('.el-aside', { timeout: 15000 })
+// 侧栏现在是 .sidebar（不再是 el-aside）—— 等一个已经删掉的类名，
+// 脚本会一直超时，报错还长得像「登录失败」。同 ui_voucher.mjs。
+await page.waitForSelector('.sidebar', { timeout: 15000 })
 await sleep(1600)
 await page.locator('.topbar .el-select').first().click(); await sleep(800)
 await page.locator('.el-select-dropdown__item:visible', { hasText: '启明物业' }).first().click()
@@ -103,7 +105,9 @@ if (otherId) {
 
 // ---- 2) 填了条件：范围放宽到全部期间 ----
 await page.locator('.toolbar input[placeholder="凭证号 / 摘要"]').fill('16')
-await page.locator('.toolbar').getByRole('button', { name: '查询', exact: true }).click()
+// 「查询」按钮已经撤了（VoucherList.vue）：三个输入框各自绑了回车，
+// 条件填完按回车就跑。等着一个已经删掉的按钮，报错还长得像「条件没生效」。
+await page.locator('.toolbar input[placeholder="凭证号 / 摘要"]').press('Enter')
 await sleep(1800)
 const kwDates = await dateCol()
 const kwMonths = [...new Set(kwDates.map(d => d.slice(0, 7)))]
@@ -150,6 +154,38 @@ console.log(`   （结果集最早那张是 ${firstNo}，前一张禁用：${pre
 await check('结果集第一张的「前一张」禁用', prevDisabled, true)
 await check('结果集第一张的「后一张」能走', (await neighbour('后一张')).moved, true)
 
+// ---- 3.5) 不填条件 → 前后张停在本月，不跨月 ----
+// 用户 2026-10-25 打回：「某月最后一张凭证点击下一张，居然能跳后一个月第一张凭证。这不对」。
+// 范围跟列表页同源：不填条件只看顶栏那个月，翻也只在这个月里翻 —— 到月底停住。
+//
+// 列表默认按凭证号倒序（no_desc），所以**第一行就是号最大的那张**，
+// 也就是前后张顺序里的最后一张：它的「后一张」该禁用。
+// 月内**号最小**的那张不靠「表格最后一行」找 —— 一页 50 张装不下时那是第二页的头一张。
+// 直接问接口要：按号升序取第一张。
+await page.goto(`${BASE}/#/vouchers`); await sleep(1800)
+await openRow(0)
+const monthTopId = await curId()
+const nextDisabled = await page.locator('.toolbar').getByRole('button', { name: '后一张', exact: true }).isDisabled()
+console.log(`   （本月号最大的那张是 ${monthTopId}，后一张禁用：${nextDisabled}）`)
+await check('本月最后一张的「后一张」禁用（不跳到下个月）', nextDisabled, true)
+// 但月内还是能往前翻 —— 不是把整段掐断
+const prevInMonth = await neighbour('前一张')
+await check('本月最后一张的「前一张」还能走', prevInMonth.moved, true)
+
+const monthFirstId = await page.evaluate(async (pid) => {
+  const h = { Authorization: 'Bearer ' + localStorage.getItem('cwq_token') }
+  const book = localStorage.getItem('cwq_book')
+  const d = await (await fetch(
+    `/api/books/${book}/vouchers?from_period_id=${pid}&to_period_id=${pid}&sort=no_asc&page_size=1`,
+    { headers: h })).json()
+  return (d.items || [])[0]?.id || null
+}, wanted.id)
+if (!monthFirstId) throw new Error('本月一张凭证都取不到')
+await page.goto(`${BASE}/#/vouchers/${monthFirstId}`); await sleep(2200)
+const prevDisabled2 = await page.locator('.toolbar').getByRole('button', { name: '前一张', exact: true }).isDisabled()
+console.log(`   （本月号最小的那张是 ${monthFirstId}，前一张禁用：${prevDisabled2}）`)
+await check('本月第一张的「前一张」禁用（不跳到上个月）', prevDisabled2, true)
+
 // ---- 4) 返回：回列表页，且条件没丢 ----
 await page.goto(`${BASE}/#/vouchers?kw=16`); await sleep(1800)
 await openRow(0)
@@ -176,12 +212,15 @@ await page.locator('.toolbar').getByRole('button', { name: /返回/ }).click()
 await sleep(2000)
 await check('直接打开的凭证，返回也回列表页', /#\/vouchers(\?|$)/.test(page.url()), true)
 
-// ---- 5) 顶栏换月 → 条件栏清空，重新按那个月取 ----
+// ---- 5) 顶栏换月 → 条件**不清**（2026-10-23 口径：换账套才清） ----
+// 这一段原来断言的是「换月后条件清空、列表重新按那个月取」—— 那是 2026-10-23
+// 之前的口径。现在改成「换账套清条件，换月不清」：条件填了范围就放宽到全部期间，
+// 月份本来就不参与条件，清它没有道理（见 ARCHITECTURE「凭证列表」那节）。
 await page.goto(`${BASE}/#/vouchers`); await sleep(1800)
 const monthBox = () => page.locator('.topbar .el-select').nth(2)
 await page.locator('.toolbar input[placeholder="凭证号 / 摘要"]').fill('16')
 await page.locator('.toolbar .el-input-number input').first().fill('150000')
-await page.locator('.toolbar').getByRole('button', { name: '查询', exact: true }).click()
+await page.locator('.toolbar input[placeholder="凭证号 / 摘要"]').press('Enter')
 await sleep(1800)
 const before = (await dateCol()).length
 const kwBefore = await page.locator('.toolbar input[placeholder="凭证号 / 摘要"]').inputValue()
@@ -199,18 +238,12 @@ if (!target) throw new Error(`期间下拉里除了当前 ${curMonth} 没有第�
 await page.locator('.el-select-dropdown__item:visible', { hasText: target }).first().click()
 await sleep(2000)
 console.log(`   （顶栏 ${curMonth} → ${target}，切换前列表 ${before} 行）`)
-await check('换月后凭证号条件清空了',
-  await page.locator('.toolbar input[placeholder="凭证号 / 摘要"]').inputValue(), '')
-await check('换月后金额条件也清空了',
-  await page.locator('.toolbar .el-input-number input').first().inputValue(), '')
-const afterDates = await dateCol()
-const prefixNew = await page.evaluate(async () => {
-  const h = { Authorization: 'Bearer ' + localStorage.getItem('cwq_token') }
-  const ps = await (await fetch(`/api/books/${localStorage.getItem('cwq_book')}/periods`, { headers: h })).json()
-  return (ps.find(p => String(p.id) === localStorage.getItem('cwq_period')) || {}).code || ''
-})
-await check(`换月后只显示 ${prefixNew} 的凭证`,
-  afterDates.filter(x => x && !x.startsWith(prefixNew)), [])
+await check('换月后凭证号条件还在',
+  await page.locator('.toolbar input[placeholder="凭证号 / 摘要"]').inputValue(), '16')
+await check('换月后金额条件也还在',
+  await page.locator('.toolbar .el-input-number input').first().inputValue(), '150000.00')
+// 条件还在 → 范围仍是全部期间（顶栏那个月不参与），所以列表还是那批
+await check('换月后还是那批结果（有条件时范围不看顶栏月份）', (await dateCol()).length, before)
 
 // ---- 6) 期间下拉里不再挂「未记账 N」 ----
 await monthBox().click(); await sleep(700)
@@ -219,7 +252,14 @@ const optTexts = (await page.locator('.el-select-dropdown__item:visible').allTex
 const unpostedTags = optTexts.filter(t => t.includes('未记账'))
 console.log('   （期间下拉选项：' + optTexts.slice(0, 4).join(' / ') + ' …）')
 await check('期间下拉不再显示「未记账 N」', unpostedTags, [])
-await check('已结账的标记还留着', optTexts.some(t => t.includes('已结账')), true)
+// 「已结账」标记只在这本账**真有结账期间**时才验得到 —— 一本账一个期间都没结，
+// 那时候这条验的是账的状态，不是标记没了。跟下面草稿凭证那两行一个路子：
+// 老实跳过，别把整套验收带崩。
+if (optTexts.some(t => t.includes('已结账'))) {
+  await check('已结账的标记还留着', true, true)
+} else {
+  console.log('   （这本账没有已结账的期间，「已结账」标记这条跳过）')
+}
 await page.keyboard.press('Escape'); await sleep(500)
 
 if (bad.length) console.log('   （异常响应：' + bad.join(' | ') + '）')
@@ -232,7 +272,7 @@ const want = await page.evaluate(async (pid) => {
   return n
 }, wanted.id)
 // 顶栏先拨回那个**开着**的月份再点「新增凭证」：预填的号和日期都是按顶栏期间算的，
-// 上一节把顶栏切到了 1 月（已结账），不拨回来预填出来的就是 1 月的号 ——
+// 上一节把顶栏切到了 1 月，不拨回来预填出来的就是 1 月的号 ——
 // 那是应用算对了、测试的尺子摆错了。
 await page.evaluate(id => localStorage.setItem('cwq_period', String(id)), wanted.id)
 await page.goto(`${BASE}/#/vouchers`)
@@ -255,7 +295,10 @@ const draft = await page.evaluate(async (pid) => {
   const d = await (await fetch(
     `/api/books/${book}/vouchers?status=UNPOSTED&from_period_id=${pid}&to_period_id=${pid}&page_size=1`,
     { headers: h })).json()
-  return (d.items || [])[0]?.id || null
+  const it = (d.items || [])[0]
+  // 号也一并带回来：「插入凭证」预填的**就是参照凭证自己的号**
+  // （新凭证占参照的号，参照及以后的整体顺延 +1），不是「下一个空闲号」。
+  return it ? { id: it.id, no: it.voucher_no } : null
 }, wanted.id)
 // 这一段验的是「增加凭证 / 插入凭证」两个按钮 —— 它们 `!canAdd` 时是禁的，
 // 而 canAdd 看的是**顶栏期间有没有结账**。账要是全部结完了，这条就没法验，
@@ -264,11 +307,11 @@ if (!draft) {
   console.log('   （这本账里已经没有未结账、未记账的凭证了，「增加凭证 / 插入凭证」这两项跳过）')
 } else {
 // 顶栏先拨回那个**开着**的月份：`canAdd` 看的是 `store.currentPeriod.locked`，
-// 不是这张凭证本身。上一步刚把顶栏切到 1 月（已结账），不拨回来两个按钮全是灰的，
+// 不是这张凭证本身。上一步刚把顶栏切到了 1 月，不拨回来两个按钮可能是灰的，
 // 点下去没反应，测试却会当成「按钮坏了」。
 // 从「新增凭证」那张页直接换到草稿凭证；hash 变了但**不是整页刷新**，
 // store 只在启动时读一次 localStorage，所以中途要 reload 才认新期间。
-await page.goto(`${BASE}/#/vouchers/${draft}`)
+await page.goto(`${BASE}/#/vouchers/${draft.id}`)
 await page.reload({ waitUntil: 'networkidle' })
 await sleep(2200)
 const addBtn = page.locator('.toolbar').getByRole('button', { name: '增加凭证', exact: true })
@@ -278,24 +321,30 @@ await sleep(2200)
 await check('「增加凭证」也自动填了凭证号', await noField.inputValue(), want.voucher_no)
 await check('「增加凭证」的日期规则一样', await dateField.inputValue(), want.voucher_date)
 
-// 「插入凭证」沿用当前那张的日期，但号码照样预填
-await page.goto(`${BASE}/#/vouchers/${draft}`); await sleep(2200)
+// 「插入凭证」沿用当前那张的日期，但号码照样预填 —— 预填的是**参照凭证自己的号**
+// （插入是向前占位：新凭证拿参照的号，参照及以后的顺延 +1）。
+// 拿「下一个空闲号」去对是错的 —— 那是「增加凭证」的规则。
+await page.goto(`${BASE}/#/vouchers/${draft.id}`); await sleep(2200)
 const curDate = await dateField.inputValue()
 await check('（前置）这张凭证确实能开新凭证',
   await page.locator('.toolbar').getByRole('button', { name: '插入凭证', exact: true }).isDisabled(), false)
 await page.locator('.toolbar').getByRole('button', { name: '插入凭证', exact: true }).click()
 await sleep(2200)
 await check('「插入凭证」沿用当前凭证的日期', await dateField.inputValue(), curDate)
-await check('「插入凭证」也预填了凭证号', await noField.inputValue(), want.voucher_no)
+await check('「插入凭证」预填的是参照凭证自己的号', await noField.inputValue(), draft.no)
 }
 
-// ---- 8) 凭证号三位 ----
+// ---- 8) 凭证号补零到四位 ----
+// 位数只有一个数说了算：`organize.NO_WIDTH`（发号、断号体检、整理重排都跟它走）。
+// **2026-10-16 由三位改回四位**：三位（记008）和四位（记0008）在列表里并排时，
+// 序号那几列没法上下对齐，扫一眼数不出号断在哪；四位给「一个月记几百张」留余量。
+// 这里只盯「别长过四位」—— 位数是排版，不是账（断号体检按整数序号比）。
 await page.goto(`${BASE}/#/vouchers`); await sleep(1800)
 const nos = (await page.locator('.el-table__body-wrapper tbody tr').evaluateAll(trs =>
   trs.map(tr => tr.querySelectorAll('td')[2].textContent.trim()))).filter(Boolean)
-const four = nos.filter(n => /^\D\d{4,}$/.test(n))
+const tooLong = nos.filter(n => /^\D\d{5,}$/.test(n))
 console.log('   （本月凭证号：' + nos.slice(0, 5).join('、') + ' …）')
-await check('新发的凭证号是三位', four, [])
+await check('凭证号没有长过四位', tooLong, [])
 await check('凭证号不为空', nos.every(n => n.length > 1), true)
 
 await page.screenshot({ path: OUT + 'shot-nav.png' })

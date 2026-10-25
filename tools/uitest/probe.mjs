@@ -7,7 +7,7 @@ for (const [slots, label] of [[2, 'A4(2张/页)'], [1, 'A4(1张/页)']]) {
   page.on('pageerror', e => errs.push(e.message))
   await page.goto('http://127.0.0.1:5173', { waitUntil: 'networkidle' })
   if (await page.locator('input[type=password]').count()) {
-    await page.click('button:has-text("登录")'); await page.waitForSelector('.el-aside', { timeout: 20000 }); await page.waitForTimeout(800)
+    await page.click('button:has-text("登录")'); await page.waitForSelector('.sidebar', { timeout: 20000 }); await page.waitForTimeout(800)
   }
   await page.goto('http://127.0.0.1:5173/#/print-templates', { waitUntil: 'networkidle' })
   await page.waitForTimeout(2500)

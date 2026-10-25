@@ -17,7 +17,7 @@ await page.goto(BASE, { waitUntil: 'networkidle' })
 await page.locator('input').nth(0).fill('admin')
 await page.locator('input').nth(1).fill('123456')
 await page.click('button:has-text("登录")')
-await page.waitForSelector('.el-aside', { timeout: 15000 })
+await page.waitForSelector('.sidebar', { timeout: 15000 })
 await sleep(1500)
 
 await step('① 侧栏没有「操作日志」以外的非管理员项(管理员可见)', async () => {

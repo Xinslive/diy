@@ -456,22 +456,27 @@ def test_筛选条件与列表口径一致(client, db, auth, book, mk_voucher):
 
 
 def test_无筛选时按凭证号顺序翻并给出索引(client, auth, book, mk_voucher):
-    """不带筛选条件时范围是**全账套**，顺序仍是凭证号顺序（期间内按号、跨期间按月份）。
+    """不带筛选条件时范围是**这张所属的那个月**，顺序仍是凭证号顺序（期间内按号）。
 
-    用户 2026-10-24：「同一个月里，凭证号大的在后，点击前一张，应该跳到凭证号小一号的」
-    「不同月里，月份越大的越后」。
+    用户 2026-10-24：「同一个月里，凭证号大的在后，点击前一张，应该跳到凭证号小一号的」。
+    2026-10-25 用户打回跨月那一下（「某月最后一张点下一张，居然能跳后一个月第一张」）——
+    范围因此收到本月：跟列表页「没填条件只看顶栏那个月」同一条规则。
     """
     a = mk_voucher("2026-01-05")
     b = mk_voucher("2026-01-10")
     feb = mk_voucher("2026-02-03")
 
     r = client.get(f"/api/books/{book.id}/vouchers/{a.id}/neighbour", headers=auth).json()
-    assert r == {"prev_id": None, "next_id": b.id, "scope": "book",
-                 "index": 0, "total": 3}, r
-    # 跨月那一下是连续的：1 月最后一张的后一张就是 2 月那张
+    assert r == {"prev_id": None, "next_id": b.id, "scope": "period",
+                 "index": 0, "total": 2}, r
+    # 1 月最后一张的「后一张」到此为止 —— 不跳到 2 月那张
     r2 = client.get(f"/api/books/{book.id}/vouchers/{b.id}/neighbour", headers=auth).json()
-    assert r2 == {"prev_id": a.id, "next_id": feb.id, "scope": "book",
-                  "index": 1, "total": 3}, r2
+    assert r2 == {"prev_id": a.id, "next_id": None, "scope": "period",
+                  "index": 1, "total": 2}, r2
+    # 2 月那张在本月是第一张：前后都是空的
+    r3 = client.get(f"/api/books/{book.id}/vouchers/{feb.id}/neighbour", headers=auth).json()
+    assert r3 == {"prev_id": None, "next_id": None, "scope": "period",
+                  "index": 0, "total": 1}, r3
 
 
 def test_筛选路径的index按凭证号而不是日期(client, auth, book, mk_voucher):

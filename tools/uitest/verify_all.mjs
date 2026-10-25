@@ -12,7 +12,7 @@ if (await page.locator('input[type=password]').count()) {
   await page.locator('input').nth(0).fill('admin')
   await page.locator('input').nth(1).fill('123456')
   await page.click('button:has-text("登录")')
-  await page.waitForSelector('.el-aside', { timeout: 20000 })
+  await page.waitForSelector('.sidebar', { timeout: 20000 })
   await sleep(1200)
 }
 // 清掉记住的期间，走「首次进入账套」的路径

@@ -16,7 +16,7 @@ page.on('console', (m) => { if (m.type() === 'error') bad('console error', m.tex
 // 登录
 await page.goto(BASE, { waitUntil: 'networkidle' })
 await page.click('button:has-text("登录")')
-await page.waitForSelector('.el-aside')
+await page.waitForSelector('.sidebar')
 
 // 切到一个空的未结账期间（2027 租金账套）
 await step('切到 2027 账套', async () => {

@@ -9,7 +9,7 @@ const toast = async () => (await p.locator('.el-message').allInnerTexts()).join(
 
 await p.goto('http://127.0.0.1:5173', { waitUntil: 'networkidle' })
 await p.locator('input').nth(0).fill('admin'); await p.locator('input').nth(1).fill('123456')
-await p.click('button:has-text("登录")'); await p.waitForSelector('.el-aside'); await sleep(2000)
+await p.click('button:has-text("登录")'); await p.waitForSelector('.sidebar'); await sleep(2000)
 await p.click('.el-menu-item:has-text("账套管理")'); await sleep(1200)
 const row = p.locator('.el-table__body tr').filter({ hasText: '结转流程自测' }).first()
 await row.locator('button:has-text("进入")').click(); await sleep(1800)

@@ -739,7 +739,7 @@ def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = 
               _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user),
               keyword: Optional[str] = None, min_amount: Optional[Decimal] = None,
               max_amount: Optional[Decimal] = None):
-    """前一张 / 后一张 —— 按**凭证号顺序**在全账套里前后挪。
+    """前一张 / 后一张 —— 按**凭证号顺序**在列表那个结果集里前后挪。
 
     顺序键是 ``(期间先后, 号段数字, id)``，跟列表「凭证号顺序」那一档
     **完全同一套**（``svc.order_key``）：
@@ -753,20 +753,36 @@ def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = 
     号是 记003 的那张日期比 记001 还早，点「前一张」就跳去了号更大的那边 ——
     顺序跟用户在列表里看到的完全对不上。
 
-    带筛选条件（凭证号/摘要、分录金额区间）时，在**筛选结果集**里按同一个键
-    前后挪，集合可以跨月跨年；不带条件时范围是**全账套** —— 一条规则管到底，
-    不在月份边界上停住（停住等于把一条顺序劈成两半，跨月那一下反而不连续）。
+    **翻的范围就是列表给用户看的那一批**，跟列表页那条规则同源
+    （``VoucherList.vue`` 的 ``hasFilter``）：
+
+      * **带筛选条件**（凭证号/摘要、分录金额区间）→ 在**筛选结果集**里挪，
+        集合可以跨月跨年（筛「凭证号含 16」每月一张时，8 月那张的前一张就是 7 月那张）；
+      * **不带筛选条件** → 范围是**这张凭证所属的那个月**，到月底就停住，
+        「后一张」变灰。
+
+    这里原来不带条件时范围是**全账套**、「不在月份边界上停住」，理由是
+    「停住等于把一条顺序劈成两半，跨月那一下反而不连续」—— 那条理由自己站不住：
+    跟列表页脱节的那一刻顺序就已经劈成两半了（列表停在 12 月，翻却能翻到 1 月），
+    用户在列表里看到的和翻到的对不上。2026-10-25 用户打回：
+    「某月最后一张凭证点下一张，居然能跳后一个月第一张凭证。这不对」。
+    列表页早就是这么干的（「一个筛选条件都没填 → 就看顶栏定下的那个月；
+    填了任一条件 → 放宽到全部期间」），前后张只是没跟上。
 
     全程只读，只发 4 条业务 SQL：一条取「这张 + 它的顺序位置」、一次聚合问清
     「结果集多大、这张在不在里面、它前面有几个」，前后各一条 ``LIMIT 1`` 取邻票。
     """
     # 一条查询把「这张凭证」和「它在顺序键里的位置」一起取回来：
-    # 凭证归属（校验是不是这本账的）、期间 ord、号段数字。
+    # 凭证归属（校验是不是这本账的）、所属期间、期间 ord、号段数字。
     # 合成一条是因为这里要守住「一次「前一张/后一张」只发 4 条业务查询」
     # （tests/test_perf_api_layer.py）—— 拆成「取凭证 + 取期间 + 取号段」三条就变 6 条了。
+    #
+    # ``v_period_id`` 一并取回来：范围收敛到本月时要拿它当过滤条件，
+    # 在这里搭车取比再发一条查询便宜。
     row = db.execute(
         select(
             Voucher.book_id.label("book_id"),
+            Voucher.period_id.label("v_period_id"),
             Period.ord.label("p_ord"),
             svc.no_seq().label("p_seq"),
         ).select_from(Voucher).join(Period, Voucher.period_id == Period.id)
@@ -782,7 +798,7 @@ def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = 
     if v_ord is None:
         # 期间行不在（正常不会发生：period_id 有外键约束）。没有先后可言，
         # 两头都不指 —— 总比指一张错的好。
-        return {"prev_id": None, "next_id": None, "scope": "book",
+        return {"prev_id": None, "next_id": None, "scope": "period",
                 "index": -1, "total": 0}
 
     key = svc.order_key()
@@ -793,8 +809,14 @@ def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = 
             db, book.id, keyword=keyword, min_amount=min_amount, max_amount=max_amount))
         scope = "filtered"
     else:
-        conds = [Voucher.book_id == book.id]
-        scope = "book"
+        # 不带条件 → 范围是**这张所属的那个月**，跟列表页「没填条件只看顶栏
+        # 那个月」那条规则一致。月内最后一张的「后一张」到此为止（= None）。
+        #
+        # 用 ``period_id`` 而不是「期间 ord」当条件：ord 在账套内唯一，
+        # 两者指向同一行，但 period_id 是凭证上本来就有的外键列，
+        # 走它能直接命中 ``ix_voucher_period_no`` 那条索引的前缀。
+        conds = [Voucher.book_id == book.id, Voucher.period_id == row.v_period_id]
+        scope = "period"
 
     # 一次聚合问清三件事：结果集多大、这张在不在里面、它前面有几个。
     # 「在不在里面」不能拿「前后都查不到」来代替 —— 结果集的第一张就是

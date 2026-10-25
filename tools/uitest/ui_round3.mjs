@@ -27,7 +27,7 @@ await page.goto(BASE, { waitUntil: 'networkidle' })
 await page.locator('input').nth(0).fill('admin')
 await page.locator('input').nth(1).fill('123456')
 await page.click('button:has-text("登录")')
-await page.waitForSelector('.el-aside', { timeout: 15000 })
+await page.waitForSelector('.sidebar', { timeout: 15000 })
 await sleep(1500)
 
 // 造一张 2026-12 的未记账临时凭证，用来验「回车加行」（已记账凭证是只读的）

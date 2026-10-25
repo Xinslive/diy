@@ -25,7 +25,7 @@ await p.goto(B, { waitUntil: 'networkidle' })
 await p.fill('input[type="text"]', 'admin')
 await p.fill('input[type="password"]', '123456')
 await p.click('button:has-text("登录")')
-await p.waitForSelector('.el-aside', { timeout: 15000 })
+await p.waitForSelector('.sidebar', { timeout: 15000 })
 
 // 先复制一份模板，别把内置的资产负债表改坏
 let tid = 0
