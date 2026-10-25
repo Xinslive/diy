@@ -1,0 +1,46 @@
+# /etc/logrotate.d/cwq-backup
+#
+# 备份相关的两个日志文件（systemd 的 ``StandardOutput=append:`` 落的）。
+#
+# **为什么必须管它。**
+#
+# ``append:`` 模式**不会轮转**，而且没有任何东西去管它的大小。于是
+# ``oss-backup.log`` 与 ``backup.log`` 只增不减 —— 而它们记的恰恰是
+# 「备份有没有跑、跑成功没有」这条最该留住的线。哪天磁盘被这两个文件吃满时，
+# 被吃掉的往往正是备份的现场。
+#
+# 现在的量级很小（每天几 KB），但「小」不是「有上限」：这两个文件是
+# ``append:`` 写的，**没有任何机制会让它停下来**。
+#
+# **为什么与 ``cwq-api`` 分成两个文件。** 那条规则已经在生产上装好并生效了；
+# 改它等于动一条正在工作的规则。而备份日志在**另一个目录**（``$BACKUP_DIR``），
+# 路径要渲染，单独一份更清楚 —— 备份目录是可配的（``BACKUP_DIR``），
+# 改它不影响 API 那一侧。
+#
+# **不归 logrotate 管的几样**（理由与 ``cwq-api`` 那份相同）：
+#   * nginx 的 access/error log —— Debian 自带的 ``/etc/logrotate.d/nginx`` 管；
+#   * PostgreSQL 的日志 —— Debian 自带的 ``postgresql-common`` 管；
+#   * journald —— systemd 自己有上限（``SystemMaxUse``，默认是磁盘的 10%）。
+#
+# 装法由 ``deploy.sh`` 自动完成（渲染路径 → 写 /etc/logrotate.d/cwq-backup），
+# 手工装法：
+#
+#   sed -e "s|/opt/cwq/backups|/实际备份目录|g" deploy/logrotate/cwq-backup \
+#       > /etc/logrotate.d/cwq-backup
+#   logrotate -d /etc/logrotate.d/cwq-backup    # -d 是演练，不真转
+#
+# 判据（转一次之后）：
+#   ls -lh $BACKUP_DIR/*.log*     # 应该有 oss-backup.log.1.gz，oss-backup.log 重新从小开始
+/opt/cwq/backups/*.log {
+    daily
+    # 与 cwq-api 那份同一个理由：一天里就涨到 50M 的情况当天就该处理掉。
+    # 两条同时存在时 logrotate 取**先到者**。
+    size 50M
+    rotate 7
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+    dateext
+}

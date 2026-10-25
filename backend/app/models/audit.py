@@ -16,7 +16,13 @@ from app.models.base import Base
 
 class AuditLog(Base):
     __tablename__ = "audit_log"
-    __table_args__ = (Index("ix_audit_book_time", "book_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_audit_book_time", "book_id", "created_at"),
+        # **按时间判龄用的索引**（app/maintenance.py 的保留期清理）。
+        # 上面那个带 book_id 前缀，清理时只按 created_at 过滤，用不上它 ——
+        # 于是每次清理都是一次全表扫，而这是全套系统里增长最快的一张表。
+        Index("ix_audit_created_at", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     book_id: Mapped[int | None] = mapped_column(ForeignKey("book.id", ondelete="SET NULL"))

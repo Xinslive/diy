@@ -564,16 +564,38 @@ systemctl daemon-reload && systemctl restart cwq-api
 
 ### 11.3 logrotate
 
-**2026-10-24 实测确认：`/etc/logrotate.d/` 里确实没有 cwq 相关文件。**
-`unit` 里是 `StandardOutput=append:…/api.log`（append 不轮转）——
-日志只增不减。
+**2026-10-25 起：`deploy.sh` 会自动装，不用手工。**
+
+`unit` 里是 `StandardOutput=append:…/api.log`（append 不轮转）——日志只增不减。
+以前这一步是手工的（2026-10-24 实测确认 `/etc/logrotate.d/` 里没有 cwq 相关文件），
+它有两个坏处：**靠人记得**（换机就漏），以及**规则里写死路径**（写错就盯着一个
+不存在的路径，看着装了、其实没转）。
+
+现在发布时自动渲染并安装两条规则：
+
+| 规则 | 管的文件 |
+| --- | --- |
+| `cwq-api` | `backend/logs/api.log`、`api.err.log` |
+| `cwq-backup` | `backups/oss-backup.log`、`backups/backup.log` |
+
+规则内容：`daily` + `size 50M` + `rotate 7` + `compress` + `copytruncate`。
+装完立刻 `logrotate -d` 演练一次，演练报错会打进发布日志。
+
+**手工装**（发布没跑成功时的补救）：
 
 ```bash
-cp deploy/logrotate/cwq-api /etc/logrotate.d/cwq-api
-# 把里面的 /opt/cwq 换成这台机的实际应用根
-sed -i 's|/opt/cwq|/www/wwwroot/acct.xins.live|g' /etc/logrotate.d/cwq-api
-logrotate -d /etc/logrotate.d/cwq-api    # -d 是演练，不真转
+for f in deploy/logrotate/cwq-*; do
+  sed -e "s|/opt/cwq/backups|实际备份目录|g" -e "s|/opt/cwq|实际应用根|g" \
+    "$f" > "/etc/logrotate.d/$(basename "$f")"
+done
+logrotate -d /etc/logrotate.d/cwq-api
 ```
+
+**不归这两条规则管的**（各��有各的规则，别重复管）：
+
+- nginx 的 access/error log —— Debian 自带的 `/etc/logrotate.d/nginx`（`rotate 14`）；
+- PostgreSQL 的日志 —— Debian 自带的 `postgresql-common`；
+- journald —— systemd 自己有上限（`SystemMaxUse`，默认磁盘的 10%）。
 
 ### 11.4 `.env`：三项建议显式写上
 

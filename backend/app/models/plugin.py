@@ -34,6 +34,11 @@ class PluginRegistry(Base, TimestampMixin):
 
 class PluginInstallAttempt(Base, TimestampMixin):
     __tablename__ = "plugin_install_attempt"
+    __table_args__ = (
+        # **按时间判龄用的索引**（app/maintenance.py 的保留期清理）。
+        # 清理按 created_at 过滤，没有索引就是每次清理一次全表扫。
+        Index("ix_plugin_install_attempt_created_at", "created_at"),
+    )
     attempt_id: Mapped[str] = mapped_column(String(32), primary_key=True)
     plugin_id: Mapped[str] = mapped_column(String(96), index=True)
     operation: Mapped[str] = mapped_column(String(16))

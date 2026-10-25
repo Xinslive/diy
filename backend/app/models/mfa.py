@@ -85,6 +85,8 @@ class AdminMfaChallenge(Base, TimestampMixin):
         # 「这个账号当前有没有未完成的挑战」—— 发起新挑战时要把旧的作废，
         # 这条查询按 user_id 走。
         Index("ix_admin_mfa_challenge_user", "user_id"),
+        # **按时间判龄用的索引**（app/maintenance.py 的保留期清理）。
+        Index("ix_admin_mfa_challenge_created_at", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

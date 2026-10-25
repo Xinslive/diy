@@ -14,12 +14,13 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
-from sqlalchemy import and_, delete, func, or_, select, text, update
+from sqlalchemy import and_, func, or_, select, text, update
 
 from app.accounting.audit_helper import log as write_audit
 from app.backup import service as backup_service
 from app.core import system_settings
 from app.core.db import SessionLocal
+from app.maintenance import prune_log_tables
 from app.models import (SCOPE_SYSTEM, STATUS_FAILED, TIER_DAILY, AuditLog, BackupRun,
                         ScheduledTask, ScheduledTaskRun)
 from app.models.plugin import PluginRegistry, PluginUserAccess
@@ -33,7 +34,8 @@ LEASE_SECONDS = 600
 #: 租约续期的间隔（秒）。**必须显著小于租约本身** —— 续期失败到租约过期
 #: 之间留出的时间，就是「另一个 worker 接管而前一个还在跑」的窗口。
 LEASE_RENEW_SECONDS = 60
-RUN_RETENTION_DAYS = 90
+#: 运行记录的保留期**不在这里** —— 它和其余日志类表的保留期一起放在
+#: ``app/maintenance.py``，那才是「全系统留多久」的唯一真相。
 SCHEDULER_LOCK = 0x4357515343484544
 SYSTEM_TASKS = {
     "oss_backup": {"schedule": {"type": "cron", "expression": "47 3 * * *"}},
@@ -271,9 +273,15 @@ def claim_due(runtime=None, *, now=None, max_tasks=20):
                 claim = _claim(db, row, now)
                 if claim is not None:
                     claimed.append(claim)
-        db.execute(delete(ScheduledTaskRun).where(
-            ScheduledTaskRun.finished_at.is_not(None),
-            ScheduledTaskRun.finished_at < now - timedelta(days=RUN_RETENTION_DAYS)))
+        # **日志类表的清理在这里顺手做。**
+        #
+        # 为什么放在领取任务这一步：它是系统里唯一的周期性入口 —— 再挂一个常驻
+        # 清理线程就是第二套调度器（见 ARCHITECTURE §11.13「宿主不起自己的常驻
+        # 调度循环」）；而 tick 停了会有人知道（cwq-scheduler-watchdog 专盯这
+        # 件事），于是「清理停摆」这件事也是会被发现的。
+        #
+        # 保留期全部在 app/maintenance.py 里，这里不写任何数字。
+        prune_log_tables(db, now=now)
     return claimed
 
 

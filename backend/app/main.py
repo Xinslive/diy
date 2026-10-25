@@ -95,6 +95,25 @@ async def _lifespan(application: FastAPI):
     validate_production_settings(settings)
     assert_schema_ready()
 
+    # **启动时先清一次日志类表。**
+    #
+    # 平时的清理由应用内调度器的 tick 驱动（见 app/maintenance.py）。但 tick
+    # 需要外部调度服务每分钟调一次 `/api/scheduler/tick` —— 没配触发密钥的
+    # 部署（应用调度器压根没启用）就永远没有 tick，于是那些表只增不减。
+    # 启动时清一次保证「至少不无限长」。
+    #
+    # 放在 ``assert_schema_ready()`` 之后：表还不存在时清理只会报错，
+    # 而那正是「schema 版本不对」该被启动自检挡下的场景。
+    try:
+        from app.maintenance import prune_log_tables_standalone
+
+        pruned = prune_log_tables_standalone()
+        if any(pruned.values()):
+            log.info("启动时清理过期日志记录：%s",
+                     {k: v for k, v in pruned.items() if v})
+    except Exception:                       # noqa: BLE001 - 清理失败不挡启动
+        log.warning("启动时清理过期日志记录失败（已忽略，不影响启动）", exc_info=True)
+
     from app.plugins.loader import startup as plugin_startup
 
     application.state.plugin_runtime = plugin_startup()

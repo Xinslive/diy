@@ -59,6 +59,10 @@ class BackupRun(Base, TimestampMixin):
         # 没有这份复合索引时，那条查询在记录攒够之后就是全表扫 —— 而它每跑一次
         # 备份都要对每个账套问一遍。
         Index("ix_backup_run_scope_tier_time", "scope", "book_id", "tier", "created_at"),
+        # **按时间判龄用的索引**（app/maintenance.py 的保留期清理）。
+        # 上面那个前缀是 (scope, book_id, tier)，清理只按 created_at 过滤，
+        # 用不上它 —— 于是每次清理一次全表扫。
+        Index("ix_backup_run_created_at", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

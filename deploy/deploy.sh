@@ -1017,6 +1017,14 @@ enable_backup_timer() {
 # 能跨机器故障活下来的那个副本，而它没跑。于是「我们有备份」这句话一直只
 # 在同一块盘上成立。
 #
+# 应用调度器有没有在做离站备份。**问应用自己**（scripts/scheduler_state.py），
+# 不在这里另写一套判定 —— 另写一套就意味着两处会各说各话。
+scheduler_owns_oss_backup() {
+  [ -x "$VENV/bin/python" ] || return 1
+  [ -f "$APP/backend/scripts/scheduler_state.py" ] || return 1
+  ( cd "$APP/backend" && "$VENV/bin/python" scripts/scheduler_state.py >/dev/null 2>&1 )
+}
+
 # 什么时候不装：OSS 参数没配全时不装（每天跑一次、每天失败、没人看 journal
 # —— 那比没有定时备份更危险，因为它看起来是有的）。此时给运维留一条能直接
 # 抄的命令。
@@ -1040,6 +1048,27 @@ enable_oss_backup_timer() {
     render_unit "$src/$u" "$SYSTEMD_UNIT_DIR/$u" || return 1
   done
   systemctl daemon-reload || return 1
+
+  # -------------------------------------------------------------------------
+  # 应用调度器已经在做离站备份 ⇒ **停掉这条旧路径**（返回码 6）。
+  # -------------------------------------------------------------------------
+  #
+  # 两条路径干的是**同一件事**。同时启用就是每天备份两次：OSS 上同一份数据
+  # 传两遍、``sys_backup_run`` 每天多出 10 行记录（每轮 5 个目标）、备份时间
+  # 多占一倍，而页面上看着「备份成功」—— 没人看得出多跑了一轮。
+  # ARCHITECTURE §11.13 与 docs/plugin-roadmap.md 都写着它们不能同时启用。
+  #
+  # **判据是「最近有没有真的成功跑过」，不是「触发密钥配了没有」。**
+  # 密钥配了只说明运维打算用应用调度器，不说明外部调度服务真的在调 tick ——
+  # 那种情况下停掉旧 timer 就等于**离站备份彻底没了**（备份是出事后的退路，
+  # 这条路不能因为一次发布就断掉）。
+  #
+  # 判错的方向是**安全的**：判错了最多多备一次（多传一份、多几行记录），
+  # 而不会漏备。
+  if scheduler_owns_oss_backup; then
+    systemctl disable --now cwq-oss-backup.timer
+    return 6
+  fi
 
   # OSS 参数配全了吗？**用应用自己的入口问，不另写一套判定。**
   # backup_to_oss.py --dry-run 会先 require_ready()：缺项就退出码 2，
@@ -1126,6 +1155,16 @@ elif [[ "$oss_timer_rc" -eq 0 ]]; then
   next_run=$(systemctl show cwq-oss-backup.timer -p NextElapseUSecRealtime --value 2>/dev/null || echo "")
   log "  离站备份（阿里云 OSS）已启用${next_run:+（下次：${next_run}）}"
   log "     它与本机 dump 错开半小时，两条退路都在"
+elif [[ "$oss_timer_rc" -eq 6 ]]; then
+  # **应用调度器接管了离站备份，旧 timer 已停用。**
+  #
+  # 两条路径干的是同一件事，同时启用就是每天备份两次（OSS 上同一份数据传两遍、
+  # 备份记录每天多 10 行、备份时间多占一倍）。ARCHITECTURE §11.13 的硬约束。
+  #
+  # 判据是「最近有没有真的成功跑过」，所以停用的是**确凿的重复**，不是猜测。
+  log "  离站备份由应用内调度器接管（system:oss_backup），旧的 cwq-oss-backup.timer 已停用"
+  log "     两条路径同时启用会每天备份两次：同一份数据传两遍、备份记录翻倍"
+  log "     要改回 systemd 那条：systemctl disable --now cwq-oss-backup.timer && systemctl enable --now cwq-oss-backup.timer"
 elif [[ "$oss_timer_rc" -eq 3 ]]; then
   log "  ⚠️  产物里没有 cwq-oss-backup.* 单元，离站备份定时器没装上"
   log "     离站备份现在只发生在发版时与手工触发时"
@@ -1168,6 +1207,127 @@ else
   log "         sed -e \"s|/opt/cwq|${APP}|g\" \\"
   log "           deploy/systemd/\$u > ${SYSTEMD_UNIT_DIR}/\$u; done"
   log "       systemctl daemon-reload && systemctl enable --now cwq-scheduler-watchdog.timer"
+fi
+
+# (1.6) 日志轮转规则
+#
+# **为什么必须自动装。** unit 里是 ``StandardOutput=append:…/api.log`` ——
+# append 模式**不轮转**，而且没有任何东西管它的大小。日志只增不减。
+#
+# 以前这一步是手工的（见 deploy/tuning.md 第 11.3 节），于是它有两个坏处：
+#   1. **靠人记得。** 换机、重装、新加的日志文件都会漏。
+#   2. **规则里写死路径。** 手工装的那份要自己把 /opt/cwq 改成实际应用根；
+#      改错的话 logrotate 盯的是一个不存在的路径，规则**看着装了、其实没转**。
+#
+# 这里渲染路径再写进 /etc/logrotate.d/，跟 unit 走同一套渲染（``render_unit`` 的
+# 替换规则完全一致：先长后短）。**装完立刻演练一次**（logrotate -d），
+# 演练报错就打出来 —— 装完不验等于没装。
+LOGROTATE_DIR="${LOGROTATE_DIR:-/etc/logrotate.d}"
+JOURNALD_DIR="${JOURNALD_DIR:-/etc/systemd/journald.conf.d}"
+install_logrotate_rules() {
+  local src="" f dst
+  for d in "$APP/deploy/logrotate" "$SCRIPT_DIR/logrotate"; do
+    if [ -d "$d" ]; then src="$d"; break; fi
+  done
+  [ -n "$src" ] || return 3          # 产物里没有这份规则：不算失败，但没装上
+
+  local installed=0
+  for f in "$src"/cwq-*; do
+    [ -f "$f" ] || continue
+    dst="$LOGROTATE_DIR/$(basename "$f")"
+    render_unit "$f" "$dst" || return 1
+    installed=$((installed + 1))
+  done
+  [ "$installed" -gt 0 ] || return 3
+
+  # 演练：不真转，只验规则本身（路径写错、语法错都会在这里报出来）。
+  if command -v logrotate >/dev/null 2>&1; then
+    for f in "$src"/cwq-*; do
+      [ -f "$f" ] || continue
+      local dst="$LOGROTATE_DIR/$(basename "$f")"
+      if ! logrotate -d "$dst" >/dev/null 2>&1; then
+        log "  ⚠️  logrotate 规则 $(basename "$f") 演练失败："
+        logrotate -d "$dst" 2>&1 | sed 's/^/     /' | head -10
+      fi
+    done
+  fi
+  return 0
+}
+
+logrotate_rc=0
+install_logrotate_rules >/dev/null 2>&1 || logrotate_rc=$?
+if [[ "$logrotate_rc" -eq 0 ]]; then
+  log "  日志轮转规则已装（${LOGROTATE_DIR}/cwq-*）：日志按天轮转、保留 7 份、压缩"
+  log "     这一步以前是手工的（tuning.md 11.3），靠人记得 —— 换机就漏"
+elif [[ "$logrotate_rc" -eq 3 ]]; then
+  log "  ⚠️  产物里没有 deploy/logrotate/ 规则，日志轮转没装上 —— 日志只增不减"
+else
+  log "  ⚠️  日志轮转规则安装失败 —— 日志只增不减"
+  log "     手动装一次："
+  log "       for f in deploy/logrotate/cwq-*; do \\"
+  log "         sed -e \"s|/opt/cwq/backups|${BACKUP_DIR}|g\" -e \"s|/opt/cwq|${APP}|g\" \\"
+  log "           \$f > ${LOGROTATE_DIR}/\$(basename \$f); done"
+fi
+
+# (1.6.1) journald 的上限
+#
+# systemd 的默认值是「磁盘的 10%」（上限 4G）。这台机磁盘 49 G ⇒ 上限约 4.9 G，
+# 被 4 G 封顶 —— 够大到把备份产物的地盘挤掉，而那 4 G 里绝大部分是几个月前
+# 没人再看的启动日志。
+#
+# **按大小封顶、不按年龄删**：日志的价值在「最近出事了没」，不在「三个月前的
+# 日志还在不在」。时间上限会按年龄销毁证据（某次未授权登录的痕迹），
+# 大小上限只是「满了就从头写」。
+install_journald_conf() {
+  local src="" dst="$JOURNALD_DIR/cwq.conf"
+  for d in "$APP/deploy/systemd" "$SCRIPT_DIR/systemd"; do
+    if [ -f "$d/journald-cwq.conf" ]; then src="$d"; break; fi
+  done
+  [ -n "$src" ] || return 3
+  mkdir -p "$JOURNALD_DIR" || return 1
+  render_unit "$src/journald-cwq.conf" "$dst" || return 1
+  # 改了 journald.conf 要重启 journald 才生效 —— 但**不重启也不该让发布失败**
+  # （重启 journald 对正在跑的服务无影响，可下一次发布再补）。
+  systemctl restart systemd-journald >/dev/null 2>&1 || true
+  return 0
+}
+
+journald_rc=0
+install_journald_conf >/dev/null 2>&1 || journald_rc=$?
+if [[ "$journald_rc" -eq 0 ]]; then
+  log "  journald 上限已装（${JOURNALD_DIR}/cwq.conf）：journal 总量封顶 500M"
+else
+  log "  ⚠️  journald 上限没装上 —— journal 会涨到磁盘的 10%（这台机约 4 G）"
+  log "     手动装一次：cp deploy/systemd/journald-cwq.conf ${JOURNALD_DIR}/cwq.conf && systemctl restart systemd-journald"
+fi
+
+# (1.7) 发版残留目录
+#
+# ``.incoming.<pid>`` 与 ``.artifact.<pid>`` 是发布过程中的暂存目录。发布
+# **成功**时会被删掉，但**失败时故意留着**（出事时要能翻现场）。
+#
+# 而「失败时留着」在长期运行下就是**只增不减**：每次失败留一个目录，
+# 每个目录里是一整份后端代码 + 产物 tar.gz（实测单个约 1.1 MB）。没人会因为
+# 「一个发布残留目录」去清它，于是它们一年年攒着。
+#
+# 这里只删**超过 7 天**的：刚失败的那次留着（现场还在有效期内），老的清掉。
+# 留下的那一份在 ``${RELEASES}/${STAMP}/artifact`` 里还有一份产物副本，
+# 所以删暂存目录不等于删现场。
+prune_stale_staging() {
+  local keep_days=7 d n=0
+  for d in "$APP"/.incoming.* "$APP"/.artifact.*; do
+    [ -d "$d" ] || continue
+    # 用 mtime 判龄（改名那一刻的目录 mtime）。`-` 开头的是「比 7 天新」，跳过。
+    if [ -n "$(find "$d" -maxdepth 0 -mtime "-${keep_days}" 2>/dev/null)" ]; then
+      rm -rf "$d" && n=$((n + 1))
+    fi
+  done
+  echo "$n"
+}
+
+stale_n=$(prune_stale_staging || echo 0)
+if [[ "${stale_n:-0}" -gt 0 ]]; then
+  log "  清掉 ${stale_n} 个超过 7 天的发版残留目录（.incoming.* / .artifact.*）"
 fi
 
 # (2) TRUSTED_PROXIES 没配 → IP 维度的登录节流形同虚设
