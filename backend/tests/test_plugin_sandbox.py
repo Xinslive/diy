@@ -428,13 +428,37 @@ def buffer():
     assert module.today().year >= 2024
 
 
+def _real_plugin_sources() -> list[Path]:
+    """仓库里那两份**真实**示例插件的源码入口（没有就返回空列表）。
+
+    **为什么示例插件不在版本库里**：``/plugins/`` 整目录被 ``.gitignore``
+    排除（见 .gitignore 第 104 行）—— 它装的是**本机开发用的插件源码**，
+    不是仓库的一部分。所以「仓库里真实的插件源码」这件事**只在装了插件的
+    机器上成立**。
+
+    **踩过一次**：这条用例原来直接 ``assert sources``，于是
+    **CI（干净的 checkout，没有 plugins/）必红**，而本机全绿 ——
+    一条用例只在「跑它的那台机器」上成立，说的就不是这套代码，
+    是那台机器。
+
+    所以这里**返回空列表而不是报错**：由调用方决定「没有就跳过」。
+    （与 ``test_plugin_security_scan.py::test_real_plugin_sources_pass_the_whitelist``
+    同一个口径。）
+    """
+    return sorted(PLUGIN_ROOT.glob("*/backend/main.py"))
+
+
 def test_仓库里真实的插件源码能在沙箱里加载():
     """仓库自带的两个示例插件（plugins/）必须在沙箱里跑得起来。
 
     这是「没有误伤」这条要求的最终验收：真插件跑不起来，别的都白说。
+
+    **本机没有插件源码时跳过**（不是失败）—— 示例插件不在版本库里，
+    见 ``_real_plugin_sources`` 的说明。
     """
-    sources = sorted(PLUGIN_ROOT.glob("*/backend/main.py"))
-    assert sources, "示例插件源码不在仓库里"
+    sources = _real_plugin_sources()
+    if not sources:
+        pytest.skip("本机没有该插件源码（/plugins/ 不在版本库里）")
     for plugin_dir in sources:
         module = exec_plugin_module("cwq_test_" + plugin_dir.parent.parent.name, plugin_dir)
         assert callable(module.register), f"{plugin_dir} 没有 register"
@@ -445,8 +469,14 @@ def test_真实插件源码不触发新的扫描规则():
 
     ``openpyxl`` 需要 ``upload:read`` / ``import:rw`` 能力，所以这里要带上
     权限参数 —— 否则它会在 import 那一档被拒（那是**既有**规则，与本次改动无关）。
+
+    **没有插件源码时跳过**（不是「空转即绿」）：循环体一次都没跑的话，
+    这条用例什么都没测，却显示通过 —— 那是最坏的一种绿。
     """
-    for plugin_dir in sorted(PLUGIN_ROOT.glob("*/backend/main.py")):
+    sources = _real_plugin_sources()
+    if not sources:
+        pytest.skip("本机没有该插件源码（/plugins/ 不在版本库里）")
+    for plugin_dir in sources:
         findings = scan_file("backend/main.py", plugin_dir.read_bytes(),
                              permissions={"upload:read", "import:rw"})
         assert findings == [], f"{plugin_dir}: {findings}"

@@ -18,7 +18,7 @@
 | 第 7 步（CI 规则） | 已落：`backend/tests/test_single_source_of_truth.py` + `frontend/tests/single_source.test.mjs` |
 | 机制偏离（报告建议 ≠ 实际实现） | 3 处，见 §3 |
 | 明确没有做的部分 | 2 项，见 §4 |
-| 回归 | 后端 **3554** 绿（带 PG 客户端）/ 前端 **238** 个测试文件全绿 / 部署 **242** 绿 / dev.sh 29 绿 |
+| 回归 | 后端 **3554** 绿（带 PG 客户端）/ 前端 **238** 个测试文件全绿 / 部署 **242** 绿 / dev.sh 29 绿；`app/` 行覆盖率 **89.30%**（CI 下限 88%） |
 | **第二轮独立复核** | 判 **FAIL**，三条确认问题（A-1 / A-2 / A-3）—— **已全部修完**，见 §5.8 |
 | **第三轮独立复核** | 判 **PASS_WITH_CAVEATS**：三条主张全部成立、**无回归**；留三条 caveat（F-1 终审第 6/37 项判据无牙 / F-2 新用例不 hermetic / F-3 缺「配了密钥⇒密文」断言）—— **已全部修完**，见 §5.9 |
 | **第四轮独立复核**（§3.1–§3.8） | 判 **FAIL**：§3.2 的闸门**管得太窄**（只挂 7 条路由）→ 整道闸门从侧翼被击穿。四条（N-1 改收件人 / N-2 铸 MCP 令牌 / N-3 假牙守卫 / N-4 其余路由）—— **已全部修完**，见 §5.10 |
@@ -26,6 +26,7 @@
 | **第六轮独立复核**（§3.16–§3.22） | 判 **PARTIAL**：三条（N-1 §3.17 的 M 判据 ≠「整理真能补得上」/ N-2 §3.16 文案陈述不成立事实 / N-3 §3.19 文案未区分年度不匹配）—— **已全部修完**，见 §5.12 |
 | **第七轮独立复核**（§3.23–§3.33） | 判 **FAIL**：**§3.26 根本没修**（同一个数四个通道四个值）/ **§3.33 根本没修**（`prevBookId` 被 v-model 抢先写废）+ 四条新发现 + 8 条缺行为级用例 —— **已全部修完**，见 §5.13 |
 | **第八轮独立复核**（§3.34–§3.45） | 判 **PASS_WITH_CAVEATS**：12 条代码修复**全部为真**；四条 caveat（**N-1 依赖回退会把现网变成「新代码+旧依赖」** / N-2~N-4 三处钉子漏网）—— **已全部修完**，见 §5.14 |
+| **CI 抓到的最后一条** | 新写的用例依赖了 **不在版本库里** 的示例插件源码（``/plugins/`` 被 gitignore）—— 本机全绿、**CI 必红**。已修（改成跳过，并把另一条「空转即绿」的循环一起修掉）；并补一条验收标准：**新用例必须在干净 checkout 上也成立**，「本地全绿」不能作为证据 —— 见 §5.16 |
 | **前端撞闸门之后没有下文** | 闸门扩到 13 条受管控写路由后，管理员只看到一句 403、**界面上没有下一步**（`mfaReauth()` 全仓无调用方）。已补齐「403 → 引导 → 重新验证 → **自动重试**」整条链 —— 见 §5.15 |
 | **终审判据的牙齿** | 12 处判据由「任一命中」收紧为「**都要在**」；第 43 项的反向逻辑修正；证据改为**优先报代码行**；第 26/27 项的判据收紧到**实现本身**（原来能被注释满足）。**两轮反向验证各 19/19 变红**（其中一轮**只抹代码行、留着注释**） |
 | **可复现的取证** | `tools/audit_roadmap_check.py`（§7 50 项，51/51）<br>`tools/audit_plugin_sandbox_recheck.py`（§3.1 四条主张，退出码 0 = 都不成立且都被用例钉住）<br>`backend/scripts/data_health_check.py`（§7 第 11 项存量数据体检；退出码 0/2/3 = 通过/阻断/提示）<br>`backend/tests/test_db_backup_restore.py`（备份→恢复**真实往返**；需 PG 客户端，见 §3.5） |
@@ -1164,6 +1165,53 @@ Excel 去掉文本兜底（1 failed）、MCP 另写一份实现（1 failed）。
 
 ---
 
+### 5.16 CI 抓到的最后一条：**新用例只在「本机」成立**
+
+第一次 CI（run 40188799518）红了 1 条：
+
+```
+FAILED tests/test_plugin_sandbox.py::test_仓库里真实的插件源码能在沙箱里加载
+  AssertionError: 示例插件源码不在仓库里
+```
+
+**根因**：``/plugins/`` 整目录被 ``.gitignore`` 排除（.gitignore 第 104 行）——
+那两份示例插件（``com.cwq.periodic`` / ``com.cwq.reimburse``）**不在版本库里**，
+只存在于开发机上。而本轮新写的用例直接 ``assert sources``。
+
+**后果的形态**：这条用例在**本机全绿**（插件源码就在那儿），在 **CI 必红**
+（干净的 checkout 里没有它）。也就是说它测的不是这套代码，是「跑它的那台机器」。
+这与第三轮复核的 F-2 是**同一类病**：新用例不 hermetic。
+
+**修法**：与既有的 ``test_plugin_security_scan.py`` 同一个口径 ——
+本机没有插件源码就**跳过**（并说清为什么），不是失败。
+
+**顺带修掉一条「空转即绿」**：``test_真实插件源码不触发新的扫描规则`` 原来是个
+循环，插件源码不在时循环体一次都不跑 —— 什么都没测，却显示通过。
+现在它也一起跳过。
+
+**教训（比这次修复本身更值钱）**：**「本地全绿」不等于「CI 会绿」。**
+这条用例本地跑了 3554 条全过 —— 因为它测的是**这台机上的文件**。
+所以修完之后，本地多做了一步**与 CI 完全同环境**的验证：
+
+```bash
+# 开一个干净 checkout（与 CI 的 checkout 一模一样）
+git worktree add /tmp/cwq-clean-ci HEAD
+cd /tmp/cwq-clean-ci/backend
+CWQ_TEST_DATABASE_URL="postgresql+psycopg://cwq:cwq123@localhost:15432/cwq_xxx_test" \
+  <原仓库>/backend/.venv/bin/python -m pytest -n 6 -p no:warnings -o addopts="" --tb=line
+#   → 修之前：1 failed, 3551 passed, 4 skipped（**与 CI 的失败一模一样**）
+#   → 修之后：109 passed, 2 skipped（那两条带理由跳过）
+```
+
+**它在本地精确复现了 CI 的失败**（同一条用例、同一个断言）——
+于是「是不是还有别的用例依赖本机才有的东西」这件事，一次全量跑就问完了
+（答案：只有那一条）。
+
+**验收标准因此补一条**：**新加的用例必须在干净 checkout 上也成立** ——
+「本地全绿」不能作为证据。
+
+---
+
 ## 6. 审计报告 §3.1 的四条复核主张：重新取证，**全部推翻**
 
 审计报告 §3.1 里，验证器给出的四条主张与**当前代码**对不上 ——
@@ -1199,6 +1247,11 @@ cd backend && PLUGIN_ISOLATION=shadow CWQ_TEST_DATABASE_URL="postgresql+psycopg:
 cd backend && PLUGIN_ISOLATION=on CWQ_TEST_DATABASE_URL="postgresql+psycopg://cwq:cwq123@localhost:15432/cwq_mavis_test" \
   .venv/bin/python -m pytest tests/ -k "plugin" -n 4 -p no:warnings -o addopts="" --tb=line
 #   → 466 passed
+
+# **干净 checkout 上的那一遍**（与 CI 同环境，见 §5.16）
+git worktree add /tmp/cwq-clean-ci HEAD
+cd /tmp/cwq-clean-ci/backend && <原仓库>/backend/.venv/bin/python -m pytest -n 6 ...
+#   → 与 CI 完全一致的结果（本地有 plugins/ 时多 2 条会跑，其余一样）
 
 cd frontend && npm test     # → node 汇总 **238 通过 / 0 失败**
                             #   （85 个测试文件；其中一部分用 node:test、
