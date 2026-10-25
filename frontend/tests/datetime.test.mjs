@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { formatDate, formatDateTime } from '../src/utils/datetime.js'
+import { formatDate, formatDateTime, todayLocal } from '../src/utils/datetime.js'
 
 test('接口回来的 UTC 时间按北京时间显示（这正是操作日志早前少 8 小时的原因）', () => {
   assert.equal(formatDateTime('2026-10-18T14:28:52.123456+00:00'), '2026-10-18 22:28:52')
@@ -52,4 +52,29 @@ test('不该随浏览器时区改变结果', () => {
     if (original === undefined) delete process.env.TZ
     else process.env.TZ = original
   }
+})
+
+test('todayLocal 取本地日历日期，不取 UTC 日期', () => {
+  // 北京时间 2026-10-25 01:00 = UTC 2026-10-24 17:00。
+  // 用 toISOString() 会拿到 10-24 —— 凭证日期落错一天就是落错期间。
+  const original = process.env.TZ
+  try {
+    process.env.TZ = 'UTC'
+    assert.equal(todayLocal(new Date('2026-10-24T17:00:00Z')), '2026-10-24')
+
+    process.env.TZ = 'Asia/Shanghai'
+    // 同一个瞬间，北京这边已经是 10-25 了。
+    assert.equal(todayLocal(new Date('2026-10-24T17:00:00Z')), '2026-10-25')
+
+    process.env.TZ = 'America/New_York'
+    assert.equal(todayLocal(new Date('2026-10-24T17:00:00Z')), '2026-10-24')
+  } finally {
+    if (original === undefined) delete process.env.TZ
+    else process.env.TZ = original
+  }
+})
+
+test('todayLocal 补零成 YYYY-MM-DD', () => {
+  assert.equal(todayLocal(new Date(2026, 0, 5)), '2026-01-05')
+  assert.equal(todayLocal(new Date(2026, 10, 25)), '2026-11-25')
 })

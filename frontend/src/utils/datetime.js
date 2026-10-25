@@ -56,3 +56,22 @@ export function formatDate(value) {
   const text = formatDateTime(value)
   return text.length >= 10 ? text.slice(0, 10) : text
 }
+
+/**
+ * 今天的**本地日期**（`YYYY-MM-DD`）。
+ *
+ * **为什么不能写 `new Date().toISOString().slice(0, 10)`**：
+ * `toISOString()` 给的是 **UTC** 日期 —— 北京时间 00:00–08:00 之间，
+ * 它会落到**前一天**。凭证日期按北京时间理解，落错一天就是落错期间。
+ *
+ * 另一个坑：``toLocaleDateString`` 按**浏览器**时区转换，换个设备打开
+ * 同一张单据会变成另一个日期 —— 与本文件顶部定下的「固定 +08:00」口径
+ * 也不一致。这里取的是浏览器本地日历日期，与
+ * ``VoucherEdit.vue`` 里 ``getDate()`` 的口径一致。
+ *
+ * @param {Date} [now] 便于测试注入
+ * @returns {string} `YYYY-MM-DD`
+ */
+export function todayLocal(now = new Date()) {
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+}

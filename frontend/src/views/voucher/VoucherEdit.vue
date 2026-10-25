@@ -268,6 +268,7 @@ import { moneyText } from '@/utils/format'
 import { centsToText, moneyCents } from '@/utils/amountGrid'
 import { displayBalanceCents } from '@/utils/balanceSign'
 import { findFirstProblem, lastFilledRowAt, rowCanBeDeleted } from '@/utils/voucherRows'
+import { todayLocal } from '@/utils/datetime'
 import AmountGrid from '@/components/AmountGrid.vue'
 import SubjectPicker from '@/components/SubjectPicker.vue'
 import AmountCells from '@/components/AmountCells.vue'
@@ -1744,7 +1745,12 @@ async function loadNextDefaults() {
 
 function defaultDate() {
   const p = store.currentPeriod
-  if (!p) return new Date().toISOString().slice(0, 10)
+  // **本地日期，不是 UTC。** 原来这里写的是 `toISOString().slice(0, 10)` ——
+  // 那是 UTC 日期：北京时间 00:00–08:00 之间会落到**前一天**，而下面
+  // 走 `getDate()` 的那条路是本地日期。两条路口径不一致，同一张单据
+  // 「有没有当前期间」不同就会落在不同日子上。函数上面的注释写的就是
+  // 「本地日期」，代码没兑现它。
+  if (!p) return todayLocal()
   const day = new Date().getDate()
   const d = String(Math.min(day, 28)).padStart(2, '0')
   return `${p.year}-${String(p.month).padStart(2, '0')}-${d}`

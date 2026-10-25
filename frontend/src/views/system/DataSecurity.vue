@@ -173,6 +173,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as api from '@/api/system'
+import { formatDateTime } from '@/utils/datetime'
 
 const TIER_LABEL = { daily: '天', weekly: '周', monthly: '月' }
 const TIER_TAG = { daily: 'info', weekly: 'warning', monthly: 'success' }
@@ -200,7 +201,17 @@ const form = reactive({
 const visibleRuns = computed(() =>
   scopeFilter.value === 'all' ? runs.value : runs.value.filter((r) => r.status === scopeFilter.value))
 
-const fmtTime = (t) => (t || '').replace('T', ' ').slice(0, 19)
+// **必须走 formatDateTime，不能自己截断。** 后端把每条连接的会话时区钉在 UTC
+// （见 app/core/db.py），接口回来的时间串一律是 UTC。这里要是直接
+// `replace('T',' ').slice(0,19)`，显示出来的时间会比实际早 8 小时 ——
+// 而计划任务页走的是 formatDateTime（北京时间），于是同一个备份在两个页面上
+// 对不上号：计划任务显示「2026-10-25 03:47」，本页显示「2026-10-24 19:47」，
+// 看着就像「任务跑了却没产出记录」。
+//
+// 差的不只是 8 小时，还是**一天**：每日备份的 cron 是北京时间 03:47
+// （= UTC 前一天 19:47），所以它在前一页显示 10-25，在本页显示 10-24。
+// 照着「成功记录」上的时间去本页找，自然什么都找不到。
+const fmtTime = (t) => formatDateTime(t)
 
 function fmtSize(bytes) {
   if (bytes < 1024) return `${bytes} B`
