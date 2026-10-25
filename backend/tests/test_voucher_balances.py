@@ -130,7 +130,82 @@ def test_剔除只影响本张不影响别的凭证(client, auth, db, book, peri
         == Decimal("700")
 
 
-# ------------------------------------------------------------------ 口径三：含未记账
+# ------------------------------------------------------------------ 口径三：时点余额
+
+
+def test_月中那张看到的是它之前的账不是月底的账(client, auth, db, book, periods, subjects, make_voucher):
+    """余额是**时点**的：这一张记进去之前，账上已经有多少。
+
+    用户 2026-10-25：「目前是固定显示期末余额」。
+    三张各借 100：第一张前面是 0，第二张前面是 100，第三张前面是 200 ——
+    而月底的账是 300。三张都看到 300 才是「固定显示期末余额」的那个毛病。
+
+    这里返回的是**基数**（这张之前），这张自己的分录由前端按行补回去 ——
+    所以第一张是 0，页面上显示的是 0 + 本张自己那 100 = 100。
+    """
+    v1 = make_voucher("2026-02-10", dr=[("1001", 100, "a")],
+                      cr=[("5001", 100, "a")], posted=False)
+    v2 = make_voucher("2026-02-11", dr=[("1001", 100, "b")],
+                      cr=[("5001", 100, "b")], posted=False)
+    v3 = make_voucher("2026-02-12", dr=[("1001", 100, "c")],
+                      cr=[("5001", 100, "c")], posted=False)
+    sid_ = str(subjects["1001"].id)
+    assert Decimal(_balances(client, auth, book, periods[2], voucher_id=v1.id)[sid_]) == Decimal("0")
+    assert Decimal(_balances(client, auth, book, periods[2], voucher_id=v2.id)[sid_]) == Decimal("100")
+    assert Decimal(_balances(client, auth, book, periods[2], voucher_id=v3.id)[sid_]) == Decimal("200")
+    # 不指明位置 → 整期口径：这一期记完还剩多少
+    assert Decimal(_balances(client, auth, book, periods[2])[sid_]) == Decimal("300")
+
+
+def test_插在中间的新凭证看到的是它前面的账(client, auth, db, book, periods, subjects, make_voucher):
+    """一张**还没落库**、插在某张中间的新凭证，位置由参照凭证定。
+
+    插在参照**后面** → 往后挪一号，前面只有参照那张；
+    插在参照**前面** → 占参照的号（参照自己顺延一位），前面什么都没有。
+    """
+    v1 = make_voucher("2026-02-10", dr=[("1001", 100, "a")],
+                      cr=[("5001", 100, "a")], posted=False)
+    make_voucher("2026-02-11", dr=[("1001", 100, "b")],
+                 cr=[("5001", 100, "b")], posted=False)
+    sid_ = str(subjects["1001"].id)
+    after = _balances(client, auth, book, periods[2],
+                      insert_after=v1.id, insert_position="after")
+    assert Decimal(after[sid_]) == Decimal("100"), "插在后面时，前面只有参照那张"
+    before = _balances(client, auth, book, periods[2],
+                       insert_after=v1.id, insert_position="before")
+    assert Decimal(before[sid_]) == Decimal("0"), "插在前面时，前面什么都没有"
+
+
+def test_别的期间的凭证不参与位置计算(client, auth, db, book, periods, subjects, make_voucher):
+    """位置是「**本期**里的第几张」：下个月那张号更大，但不能被减掉。
+
+    减错了会得到比期初还小的数（负数），一眼就看出不对。
+    """
+    v1 = make_voucher("2026-02-10", dr=[("1001", 100, "a")],
+                      cr=[("5001", 100, "a")], posted=False)
+    make_voucher("2026-03-10", dr=[("1001", 500, "b")],
+                 cr=[("5001", 500, "b")], posted=False)
+    sid_ = str(subjects["1001"].id)
+    assert Decimal(_balances(client, auth, book, periods[2], voucher_id=v1.id)[sid_]) == Decimal("0")
+
+
+def test_位置只认本期的那张凭证(client, auth, db, book, periods, subjects, make_voucher):
+    """别期（或别账套）的凭证 id 传上来只能当没传。
+
+    跟「跨账套那张被忽略」是同一个道理：位置算错了，基数就整块错。
+    """
+    v1 = make_voucher("2026-02-10", dr=[("1001", 100, "a")],
+                      cr=[("5001", 100, "a")], posted=False)
+    other_period = make_voucher("2026-03-10", dr=[("1001", 500, "b")],
+                                cr=[("5001", 500, "b")], posted=False)
+    sid_ = str(subjects["1001"].id)
+    # 拿 3 月那张的 id 去问 2 月 → 位置不明 → 退回整期口径（2 月的期末 = 100）
+    assert Decimal(_balances(client, auth, book, periods[2],
+                              voucher_id=other_period.id)[sid_]) == Decimal("100")
+    assert Decimal(_balances(client, auth, book, periods[2], voucher_id=v1.id)[sid_]) == Decimal("0")
+
+
+# ------------------------------------------------------------------ 口径四：含未记账
 
 
 def test_默认含未记账凭证(client, auth, db, book, periods, subjects, make_voucher):
@@ -145,7 +220,7 @@ def test_默认含未记账凭证(client, auth, db, book, periods, subjects, mak
         == Decimal("900")
 
 
-# ------------------------------------------------------------------ 口径四：期间 / 归属
+# ------------------------------------------------------------------ 口径五：期间 / 归属
 
 
 def test_按期间取余额(client, auth, db, book, periods, subjects, make_voucher):

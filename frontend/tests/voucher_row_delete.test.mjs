@@ -50,9 +50,11 @@ function makePage(entries, { locked = false } = {}) {
   const activeRow = ref(null)
   const hoverRow = ref(null)
   const markingRows = ref(new Set())
+  // removeRow 还会收掉这一行「已提交的数」（键是分录对象）—— 见 VoucherEdit.vue
+  const committedAmounts = ref(new Map())
   const readonly = ref(locked)
   const factory = new Function(
-    'form', 'readonly', 'activeRow', 'hoverRow', 'markingRows',
+    'form', 'readonly', 'activeRow', 'hoverRow', 'markingRows', 'committedAmounts',
     'rowCanBeDeleted', 'lastFilledRowAt', `
     ${ENSURE_ROWS_SRC}
     function canDeleteRowAt(i) {
@@ -61,9 +63,9 @@ function makePage(entries, { locked = false } = {}) {
     ${REMOVE_ROW_SRC}
     return { removeRow, canDeleteRowAt }
   `)
-  const api = factory(form, readonly, activeRow, hoverRow, markingRows,
+  const api = factory(form, readonly, activeRow, hoverRow, markingRows, committedAmounts,
     rowCanBeDeleted, lastFilledRowAt)
-  return { form, activeRow, hoverRow, markingRows, readonly, ...api }
+  return { form, activeRow, hoverRow, markingRows, committedAmounts, readonly, ...api }
 }
 
 /** 一条分录：给了科目就算有内容。 */

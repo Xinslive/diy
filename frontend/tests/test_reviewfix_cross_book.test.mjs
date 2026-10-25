@@ -79,6 +79,8 @@ function page(over = {}) {
     activeRow: ref(null),
     hoverRow: ref(null),
     markingRows: ref(new Set()),
+    // 「已提交的数」：键是分录对象，换凭证/切账套时一起清掉（见 VoucherEdit.vue）
+    committedAmounts: ref(new Map()),
     crossBook: ref(null),
     formBookId: ref(1),
     form: { legacySubjects: [], entries: [], voucher_no: '', voucher_date: '' },
@@ -87,6 +89,7 @@ function page(over = {}) {
     sumRefs: { clear() {} },
     amtRefs: { clear() {} },
     ensureRows: () => {},
+    seedCommitted: () => {},
     loadSubjects: async () => {},
     loadNeighbour: async () => {},
     yearOfVoucher: () => 2026,
@@ -122,6 +125,7 @@ function page(over = {}) {
     const activeRow = d.activeRow
     const hoverRow = d.hoverRow
     const markingRows = d.markingRows
+    const committedAmounts = d.committedAmounts
     const crossBook = d.crossBook
     const formBookId = d.formBookId
     const form = d.form
@@ -130,6 +134,8 @@ function page(over = {}) {
     const sumRefs = d.sumRefs
     const amtRefs = d.amtRefs
     const ensureRows = d.ensureRows
+    // 打开一张凭证后把每一行「定下来」（余额从一开始就是对的）—— 见 VoucherEdit.vue
+    const seedCommitted = d.seedCommitted
     const loadSubjects = d.loadSubjects
     const loadNeighbour = d.loadNeighbour
     const yearOfVoucher = d.yearOfVoucher

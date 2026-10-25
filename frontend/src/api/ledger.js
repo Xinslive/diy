@@ -21,7 +21,8 @@ export const general = (bookId, params) =>
   getLatest('ledger/general', `/books/${bookId}/ledger/general`, params)
 export const detail = (bookId, params) =>
   getLatest('ledger/detail', `/books/${bookId}/ledger/detail`, params)
-/** 凭证录入页每行科目格的余额（借正贷负）。voucherId 用来把这张自己剔掉。
+/** 凭证录入页每行科目格的余额（借正贷负）。传 voucher_id（或 insert_after）
+ *  是为了知道这张在期间里的**位置** —— 基数取的是「它之前」的账，不是整期期末。
  *  这条**不走** getLatest：VoucherEdit 里 loadBalances 已有自己的代次守卫
  *  （seq/balanceSeq），换过去会让「被取消」和「拉不到」走到同一个 catch，
  *  多一层要解释的耦合，而那边并不在这次要修的范围内。 */

@@ -155,7 +155,7 @@
                 :ref="(el) => setSubjectRef(el, i)"
                 :options="subjects"
                 :disabled="readonly || blocked(i)"
-                :has-bottom-hint="!!balanceText(row)"
+                :has-bottom-hint="!!balanceText(i, row)"
                 :allow-inactive="false"
                 @focusin="activeRow = row"
                 @change="onSubject(row)"
@@ -165,10 +165,12 @@
                 @picked="moveNext(i, 'subj')"
                 @left="moveSide(i, 'subj', -1)" @right="moveSide(i, 'subj', 1)"
               />
-              <!-- 辅助记账：这个科目当前还剩多少（借正贷负）。压在格子左下角，
+              <!-- 辅助记账：这个科目**到这一行为止**还剩多少（借正贷负）。压在格子左下角，
                    不占行高 —— 分录格是「从上往下写」的一张纸，正中得留给科目名。
+                   数字是**滚动**的：同一张凭证里同一科目出现三次借 100，
+                   三行分别显示 100 / 200 / 300（不是都显示 300）。
                    只读时不显示：余额是给「正在录」的人看的，核对账另有科目余额表。 -->
-              <span v-if="balanceText(row)" class="subj-balance">{{ balanceText(row) }}</span>
+              <span v-if="balanceText(i, row)" class="subj-balance">{{ balanceText(i, row) }}</span>
             </div>
             <div class="vg-cell td td-amt d" :class="{ 'is-blocked': blocked(i) }"
                  @click="warnBlocked(i)">
@@ -182,6 +184,7 @@
                 @up="moveRow(i, -1, 'd')" @down="moveRow(i, 1, 'd')"
                 @left="moveSide(i, 'd', -1)" @right="moveSide(i, 'd', 1)"
                 @balance="autoBalance(i, 'd')"
+                @commit="commitAmount(row)"
               />
             </div>
             <div class="vg-cell td td-amt c" :class="{ 'is-blocked': blocked(i) }"
@@ -196,6 +199,7 @@
                 @up="moveRow(i, -1, 'c')" @down="moveRow(i, 1, 'c')"
                 @left="moveSide(i, 'c', -1)" @right="moveSide(i, 'c', 1)"
                 @balance="autoBalance(i, 'c')"
+                @commit="commitAmount(row)"
               />
             </div>
             <!-- 删除 ⊗ 不占格子的位置：它挂在**自己这一行**的右边外面，
@@ -560,14 +564,18 @@ const balancePeriodId = computed(() => voucherPeriodId.value || store.currentPer
 
 let balanceSeq = 0
 /**
- * 拉「除本张以外」的科目余额。
+ * 拉「这张凭证**之前**」的科目余额 —— **时点余额**。
  *
- * voucherId 传上去让后端把这张自己剔掉：它是**基数**，本张正在填的分录
- * 由前端 ownDelta 补回去（见 balanceText）。两者必须分开，否则这张被算两遍 ——
- * 它 0.7 秒后就自动保存，落了库还留在账上，前端再加一次就翻倍了。
+ * 后端按这张在期间里的位置算基数：一张 100、一张 300、一张 500，
+ * 月中那张拿到的是 100（它前面那张的数），不是 900（月底的账）。
+ * 位置不明时（一张普通的新凭证，落在本期末尾）后端给的是整期期末 ——
+ * 那正好是它前面的账。
+ *
+ * 这张自己的分录由前端按行补回去（见 balanceText），后端给的基数里没有它 ——
+ * 它 0.7 秒后就自动保存，落了库还留在账上，前后端各补一次就翻倍了。
  *
  * 好处顺带白拿：基数只在这张/这期换的时候拉一次，录入过程中一个数都不发，
- * 格子里那个数是本机算出来的，敲完就变，没有「等一下才动」。
+ * 格子里那个数是本机算出来的，没有「等一下才动」。
  *
  * 代次守卫跟 load() 一个道理：翻凭证翻得快时先发的那一趟可能后到，
  * 晚到的那一趟才配写进 balances.value。
@@ -576,10 +584,16 @@ async function loadBalances() {
   const seq = ++balanceSeq
   const periodId = balancePeriodId.value
   if (!store.bookId || !periodId) { balances.value = {}; return }
+  // 一张**还没落库**、插在某张中间的新凭证：它的位置由参照凭证定
+  // （插在后面往后挪一号，插在前面占参照的号）——
+  // 跟保存时用的是同一对参数，见 payload.insert_after / insert_position。
+  const ins = (!voucherId.value && insertCtx.value) ? insertCtx.value : null
   try {
     const d = await ledgerApi.voucherBalances(store.bookId, {
       period_id: periodId,
-      voucher_id: voucherId.value || undefined
+      voucher_id: voucherId.value || undefined,
+      insert_after: ins?.anchor_id || undefined,
+      insert_position: ins?.position || undefined
     })
     if (seq !== balanceSeq) return
     balances.value = d.balances || {}
@@ -590,15 +604,63 @@ async function loadBalances() {
 }
 
 // 期间或凭证换了就重拉。voucherId 也在盯着：前一张/后一张翻的是不同凭证，
-// 各自要剔掉的是自己那张 —— 同一期里翻 balancePeriodId 不会变，光盯它就翻不动了。
-watch([balancePeriodId, voucherId], loadBalances, { immediate: true })
+// 各自要算的是**自己那个位置**的账 —— 同一期里翻 balancePeriodId 不会变，
+// 光盯它就翻不动了。
+// insertCtx 也在盯着：一张插在中间的新凭证，参照凭证换了位置就跟着变
+// （它前面是谁变了，基数就跟着变）。
+watch([balancePeriodId, voucherId, insertCtx], loadBalances, { immediate: true })
+
+// ---- 科目余额段开始（tests/voucher_running_balance.test.mjs 从这里头抠实现跑）----
+/**
+ * 每行金额的「已提交值」：敲字的过程中余额按它算，光标离开这一格才换成新值。
+ *
+ * 存的是这一行**定下来的样子**（方向 + 金额），不是光秃秃的金额 ——
+ * 方向也是值的一部分：借 100 与贷 100 对余额的影响正相反。
+ *
+ * 用**分录对象**当键而不是行号：插入、删除、翻凭证都在动行号，
+ * 按行号记的值会跟着行搬家，余额就收错了行（与 markingRows 同一个道理）。
+ *
+ * 为什么要这一层：那个余额是**照着填**的数 —— 敲一个 1 余额就跳一下，
+ * 人还没填完就被半截数牵着走（用户 2026-10-25：「我希望的是，我输入完 100，
+ * 然后光标离开这个金额格，才更新余额，也就是余额一步到位，从 300 到 400」）。
+ */
+const committedAmounts = ref(new Map())
+
+/** 这一行已提交的「样子」。没提交过 = 这一行还没填（金额 0）。 */
+function committedOf(row) {
+  return committedAmounts.value.get(row) || { direction: row?.direction || 'DEBIT', amount: '' }
+}
+
+/** 把这一行当前的样子**定下来** —— 光标离开金额格时调（见 AmountGrid 的 commit 事件）。 */
+function commitAmount(row) {
+  if (!row) return
+  committedAmounts.value.set(row, { direction: row.direction, amount: row.amount ?? '' })
+}
 
 /**
- * 这张凭证**自己**给每个科目带来的变动（借正贷负）。
+ * 把一批分录整批定下来（刚打开一张凭证时用）。
  *
- * 辅助记账要看的是「这一张存下去之后还剩多少」，不是「存之前还剩多少」：
- * 往 1001 贷方填 3000 万，那一格就该从 36,500 走到 -29,963,500。
- * 所以显示值 = 剔除本张后的账上余额 + 本张正在填的分录。
+ * 存好的凭证不是「正在敲」的状态 —— 每一行都是定下来的，
+ * 所以余额一打开就得是对的，而不是等人去碰某一格。
+ */
+function seedCommitted(entries) {
+  committedAmounts.value.clear()
+  for (const e of entries) {
+    committedAmounts.value.set(e, { direction: e.direction, amount: e.amount ?? '' })
+  }
+}
+
+/**
+ * 本张凭证里，每个科目**累计到该行为止**的净变动（借正贷负）。
+ *
+ * 辅助记账要看的是「这一行记进去之后还剩多少」，所以每一行显示的是**滚动**的数：
+ * 同一张凭证里同一个科目出现三次借 100，三行就分别显示 100 / 200 / 300
+ * （用户 2026-10-25：「每一笔分录之间时序的要能影响…的计算」）。
+ * 以前这里是「整张合计」，三行都显示 300 —— 那等于把整张当成一笔，
+ * 而录到第三行的人需要知道的是「走到第三行还剩多少」。
+ *
+ * 金额取的是**已提交值**（committedAmounts），不是正在敲的那串 ——
+ * 敲字的过程中余额不动，离开这一格才动（见 commitAmount）。
  *
  * 算一次全表，不在模板里逐行遍历 —— 每次敲键重算一遍 O(行数) 就够，
  * 摊到每行各算一次是 O(行数²)。
@@ -608,27 +670,22 @@ watch([balancePeriodId, voucherId], loadBalances, { immediate: true })
  * 打架 —— 18 位金额会在这一处差出 0.03 元。金额只在这里定点化一次，
  * 之后全是整数加减。
  */
-// ---- ownDelta 段开始（tests/test_reviewfix_own_delta.test.mjs 从这里头抠实现跑）----
-const ownDelta = computed(() => {
-  const m = {}
+const runningDelta = computed(() => {
+  const acc = new Map()      // subject_id → 累计到当前行为止的净变动
+  const out = []             // 下标 → 那一行显示的累计（与 form.entries 同序）
   for (const e of form.entries) {
-    if (!e.subject_id) continue
-    const c = centsOf(e.amount)          // 整数分（BigInt），与合计那一段同一份定点化
-    if (!c) continue
-    m[e.subject_id] = (m[e.subject_id] || 0n) + (e.direction === 'DEBIT' ? c : -c)
+    const sid = e.subject_id
+    if (!sid) { out.push(0n); continue }
+    const c = committedOf(e)
+    const cents = centsOf(c.amount)        // 整数分（BigInt），与合计那一段同一份定点化
+    if (cents) {
+      acc.set(sid, (acc.get(sid) || 0n) + (c.direction === 'DEBIT' ? cents : -cents))
+    }
+    out.push(acc.get(sid) || 0n)
   }
-  return m
+  return out
 })
-// ---- ownDelta 段结束 ----
 
-/**
- * 这一行显示的余额文本：纯数字，不带「借/贷」也不带「余额」两个字。
- *
- * 正负按科目表那一列「余额方向」定，不是按实际落在借方还是贷方：
- * 借属性借正贷负、贷属性借负贷正（见 utils/balanceSign.js）。
- * 0 显示成空 —— 一个空科目没有余额可言，写个「0.00」只会在每张凭证上多几行噪音。
- * 千分位由 moneyText 统一带，跟页脚合计、科目余额表是同一套写法。
- */
 /**
  * 哪几行正在「标记科目」。
  *
@@ -642,36 +699,47 @@ function onMarking(row, on) {
   markingRows.value = next
 }
 
-const balanceText = (row) => {
+/**
+ * 这一行显示的余额文本：纯数字，不带「借/贷」也不带「余额」两个字。
+ *
+ * 显示的是**时点余额**：这张凭证记进去、到这一行为止，账上还剩多少。
+ *
+ * 正负按科目表那一列「余额方向」定，不是按实际落在借方还是贷方：
+ * 借属性借正贷负、贷属性借负贷正（见 utils/balanceSign.js）。
+ * 0 显示成空 —— 一个空科目没有余额可言，写个「0.00」只会在每张凭证上多几行噪音。
+ * 千分位由 moneyText 统一带，跟页脚合计、科目余额表是同一套写法。
+ */
+const balanceText = (i, row) => {
   if (readonly.value) return ''          // 只读凭证是给人核对和打印的，不是给人录入的
   // 人正在这一格里敲科目：角上那个数是上一个科目的余额，
   // 摆在还没对上号的字旁边，人会照着它填金额。先收起来，选定了再给
   if (markingRows.value.has(row)) return ''
   const sid = row?.subject_id
   if (!sid) return ''
-  // balances 是「账上除本张以外」的，ownDelta 是「本张正在填的」，
-  // 两个加起来才是「这一张存下去之后的余额」。加了本张的分录，
+  // balances 是「这张之前账上已有的」，runningDelta 是「本张累计到本行为止的」，
+  // 两个加起来才是「这一行记进去之后的余额」。加了本张的分录，
   // 一个空科目也会被自己这笔钱点亮 —— 600101 原本余额是 0，
   // 借方填了 3000 万就该显示出来，而不是空着。
   //
   // **全程整数分**：
   //   · 账上余额（后端给的是 number/float）先定点成整数分 —— 只在这里转换一次，
   //     转换之后就不再有浮点；
-  //   · ownDelta 已经是整数分（见上面那一段），两段相加还是整数分；
+  //   · runningDelta 已经是整数分（见上面那一段），两段相加还是整数分；
   //   · 翻正负在整数分上做（displayBalanceCents），显示走 moneyText（整数分 → 文本）。
   // 以前这里是 `num(账上余额) + ownDelta` —— 两边都是浮点，
   // 18 位金额会差出 0.03 元，而这一格正是辅助记账时人照着填数的那个数。
   //
   // 借贷先按引擎口径（借正贷负）加总，**加完再按科目余额方向翻正负**：
   // 贷属性的科目（负债/权益/收入）借方有余额时显示负数，一眼看出录反了方向。
-  // 翻只在这一处发生，别在 ownDelta 里提前翻 —— 那样基数和增量两套符号会打架。
+  // 翻只在这一处发生，别在 runningDelta 里提前翻 —— 那样基数和增量两套符号会打架。
   const sub = subjectOf(sid)
   const base = centsOf(balances.value[sid])          // 账上余额 → 整数分
-  const delta = ownDelta.value[sid] || 0n            // 本张正在填的（整数分）
+  const delta = runningDelta.value[i] ?? 0n           // 本张累计到本行为止（整数分）
   const shown = displayBalanceCents(sub?.direction, base + delta)
   if (!shown) return ''
   return moneyText(shown)
 }
+// ---- 科目余额段结束 ----
 
 // ---- 借方/贷方是两个独立格子，数据层还是一个 direction + amount ----
 // 往借方填数就是借方，往贷方填数就是贷方；清空则只清自己那一侧。
@@ -1161,6 +1229,7 @@ function autoBalance(i, side) {
     if (!mine) return ElMessage.info('这张凭证已经平了，不用补')
     if (side === 'd') setDebit(row, '')
     else setCredit(row, '')
+    commitAmount(row)     // 这一格被清空了，也是定下来的数
     return ElMessage.info('这一格得空着，填着反而不平')
   }
   // 已经是这个数：什么都不用做，别再报一遍「已按差额补上 300」
@@ -1170,6 +1239,9 @@ function autoBalance(i, side) {
   const text = centsText(need)
   if (side === 'd') setDebit(row, text)
   else setCredit(row, text)
+  // 「=」补出来的是一个**定数**，不是正在敲的半截数 —— 当场定下来，
+  // 余额一步到位，不用等光标离开这一格。
+  commitAmount(row)
   activeRow.value = row
   // 金额从整数分直接落成文本（moneyText）：中间不经过浮点，
   // 18 位金额不会被 Number 改小（以前这里是 fmt(text) —— 文本 → 浮点 → 文本）。
@@ -1299,6 +1371,9 @@ function removeRow(i) {
     rest.delete(gone)
     markingRows.value = rest
   }
+  // 这一行「已提交的数」也一起收掉（键也是分录对象）——
+  // 留着的话，Map 里就攒着一份没人再引用的旧值。
+  committedAmounts.value.delete(gone)
 }
 
 /** 至少留 4 行空着：多数凭证两三条就录完了，但行得摆够，
@@ -1609,6 +1684,7 @@ function resetForm() {
   sumRefs.clear()
   amtRefs.clear()
   markingRows.value = new Set()
+  committedAmounts.value.clear()     // 分录对象整套换掉了，已提交的数也一起换
   activeRow.value = null
   hoverRow.value = null
   Object.assign(form, {
@@ -1646,6 +1722,8 @@ async function load() {
   // 标记状态是拿**分录对象**当键的，而分录对象刚被换了一整套 ——
   // 不清的话，上一张还在标记的行会留在集合里，白收着这张的余额
   markingRows.value = new Set()
+  // 「已提交的数」也是拿分录对象当键的，同理要清（见 commitAmount 的说明）
+  committedAmounts.value.clear()
   if (myId) {
     let v = null
     try {
@@ -1697,6 +1775,9 @@ async function load() {
       legacySubjects: v.entries.map((e) => e.subject_id)
     })
     ensureRows(4)
+    // 打开一张**存好的**凭证：每一行都是**定下来的**，不是正在敲的半截数 ——
+    // 余额一开始就得是对的（见 commitAmount）。
+    seedCommitted(form.entries)
     lastSaved.value = entrySig.value      // 刚打开的这张就是「已保存」的样子，别一进来就重存一遍
     await loadNeighbour(seq)
   } else {

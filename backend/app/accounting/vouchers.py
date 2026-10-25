@@ -15,6 +15,7 @@ from app.accounting import organize as svc_organize
 from app.accounting.audit_helper import log, voucher_snapshot
 from app.accounting.util import constraint_name, find_period, money, period_label
 from app.core.text_clean import scrub_control_chars
+from app.core.voucher_no import seq_expr
 from app.models import Book, Entry, Period, Subject, SysUser, Voucher
 
 # 凭证号在期间内唯一。撞号时数据库只会说「违反唯一约束」，看到的人
@@ -1304,16 +1305,18 @@ def _no_seq():
     ``substring(no from '(\d+)$')`` 才是这里该用的：它无匹配时返回 NULL，
     ``cast`` 得到 NULL，``coalesce`` 终于能把它收成 -1。于是脏号只是排到
     最前面（而且 create_voucher 已经在入口拦住了新脏号），不再拖垮整个列表。
+
+    实现搬到 ``app.core.voucher_no`` 了 —— 那儿是这条判据的**唯一出处**
+    （凭证录入页的时点余额也要按号段数字排序，见该模块 docstring）。
     """
-    digits = func.substring(Voucher.voucher_no, r"(\d+)$")
-    return func.coalesce(func.cast(digits, Integer), -1)
+    return seq_expr(Voucher.voucher_no)
 
 
 def no_seq():
     """凭证号里的序号（对外口）。
 
     ``_no_seq`` 是排序键的一半，列表排序和「前一张 / 后一张」都要用同一份 ——
-    两处各抠一次数字，早晚会在某个怪号上分道扬镳（库里真有 "wochakan" 这种号）。
+    两处各抠一次数字，早晚会分道扬镳（库里真有 "wochakan" 这种号）。
     """
     return _no_seq()
 

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.accounting import vouchers as svc
 from app.ledger import queries
 from app.core.db import get_db
 from app.core.deps import get_my_book
@@ -147,22 +148,58 @@ def detail(book_id: int, subject_id: int, period_id: Optional[int] = None,
     )
 
 
+def _voucher_seq(db: Session, book_id: int, period_id: int, voucher_id: int) -> Optional[int]:
+    """一张凭证的**号段数字** —— 它在期间里的位置靠这个定。
+
+    数字不在 Python 里抠：抠数字的判据只有一处（``svc.no_seq``），
+    Python 再写一份早晚会跟它分道扬镳（库里真有 "wochakan" 这种号）。
+
+    **跨账套的凭证 id 一律当没传**（返回 None）：宁可少算一张，
+    也不能把别家账的数字端回来。**不是本期的那张也一样当没传** ——
+    位置是「本期里的第几张」，跨期比不了。
+    """
+    row = db.execute(
+        select(svc.no_seq().label("seq"))
+        .select_from(Voucher)
+        .where(Voucher.id == voucher_id,
+               Voucher.book_id == book_id,
+               Voucher.period_id == period_id)
+    ).first()
+    return row.seq if row is not None else None
+
+
 @router.get("/voucher-balances")
 def voucher_balances(book_id: int, period_id: Optional[int] = None,
                      voucher_id: Optional[int] = Query(None),
+                     insert_after: Optional[int] = Query(None),
+                     insert_position: str = Query("before"),
                      book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     """凭证录入页每行科目格左下角那个数字。
 
-    传 ``voucher_id`` 是为了把这张自己剔掉 —— 它会边填边自动保存，
-    算进去的话余额跟着自己动。口径见 ``queries.voucher_subject_balances``。
+    基数取的是「**这张凭证之前**账上有多少」，不是整期期末 ——
+    一张 100、一张 300、一张 500，月中那张该看到 100，不是 900
+    （口径见 ``queries.voucher_subject_balances``）。
+
+    位置从两个口子进来：
+
+    * ``voucher_id``：已经在录的这张。它会边填边自动保存，位置得按**它**算。
+    * ``insert_after`` + ``insert_position``：一张**还没落库**、插在某张中间的新凭证。
+      插在后面 → 往后挪一号；插在前面 → 占参照的号（参照自己顺延一位）。
+
+    两个都不给（= 一张普通的新凭证，落在本期末尾）时位置不明，
+    基数退回「整期期末」—— 那正好是它前面的账。
     """
     period = _period(db, book.id, period_id)
+    position = None
     if voucher_id:
-        v = db.get(Voucher, voucher_id)
-        # 跨账套的凭证 id 一律当没传：宁可少剔一张，也不能把别家账的数字端回来
-        if v is not None and v.book_id != book.id:
-            voucher_id = None
-    balances = queries.voucher_subject_balances(db, book.id, period, exclude_voucher_id=voucher_id)
+        seq = _voucher_seq(db, book.id, period.id, voucher_id)
+        if seq is not None:
+            position = (seq, voucher_id)
+    elif insert_after:
+        seq = _voucher_seq(db, book.id, period.id, insert_after)
+        if seq is not None:
+            position = (seq + 1 if insert_position == "after" else seq, 0)
+    balances = queries.voucher_subject_balances(db, book.id, period, position=position)
     return {"period_id": period.id, "period": period.code,
             "balances": {str(k): v for k, v in balances.items()}}
 

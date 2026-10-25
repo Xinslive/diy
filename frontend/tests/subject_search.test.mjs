@@ -174,8 +174,11 @@ t('贴不贴上沿是两件事：折行(wraps) × 有余额(hasBottomHint)', () 
 })
 
 t('凭证页按这一格到底有没有余额来传 hasBottomHint', () => {
-  assert.ok(/:has-bottom-hint="!!balanceText\(row\)"/.test(VOUCHER),
-    'VoucherEdit 没把 balanceText(row) 传给 has-bottom-hint')
+  // balanceText 收两个参数了（行号 + 行）：余额是**滚动**的 ——
+  // 同一张凭证里同一科目的三行显示 100 / 200 / 300，各算各的，
+  // 所以得知道是哪一行（见 tests/voucher_running_balance.test.mjs）。
+  assert.ok(/:has-bottom-hint="!!balanceText\(i, row\)"/.test(VOUCHER),
+    'VoucherEdit 没把 balanceText(i, row) 传给 has-bottom-hint')
 })
 
 t('摘要格一直是居中的（对齐的基准没被动过）', () => {

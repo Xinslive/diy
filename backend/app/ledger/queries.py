@@ -1150,27 +1150,46 @@ def voucher_subject_balances(
     db: Session,
     book_id: int,
     period: Period,
-    exclude_voucher_id: int | None = None,
+    position: Optional[tuple[int, int]] = None,
     include_unposted: bool = True,
 ) -> dict[int, str]:
-    """凭证录入页辅助记账用的「除本张以外」科目余额：subject_id -> 期末余额(借正贷负)。
+    """凭证录入页辅助记账用的余额基数：**这张凭证之前**账上有多少（借正贷负）。
 
-    口径与科目余额表**完全同源**（同一个 ``Figures.closing``），差别只有三处，
-    每处都是为了「正在录入的这一张」不干扰自己：
+    口径与科目余额表**完全同源**（同一个 ``Figures.closing``），差别只有两处，
+    每处都是为了「正在录入的这一张」看到的是**它当时**的账：
 
-    - ``exclude_voucher_id``：剔除正在编辑的那张凭证。它会在 0.7 秒后自动保存，
-      算进去的话余额会跟着手上这张一起动 —— 你往 1001 里填 500，余额就 +500，
-      看着像「我刚存的凭证已经进账了」，其实是自己在跟自己说话。
+    - ``position`` = (号段数字, 凭证 id)：这张凭证在期间里的位置。
+      给了它，基数就不是「整期期末」，而是「**排在这张之前**的那些凭证记完之后」
+      的余额 —— 也就是这张凭证落库那一刻账上的数。
+      一张 100、一张 300、一张 500，月中那张该看到 100，不是 900
+      （用户 2026-10-25：「目前是固定显示期末余额」）。
+      位置不明（``None``）时退回「整期期末」—— 那就是「这一期记完还剩多少」，
+      也正好是一张**新**凭证（落在本期末尾）前面的账。
+
     - ``include_unposted=True``：辅助记账要看的是**这个人眼下记到哪儿了**。
       默认排除未记账的话，月底集中记账前余额全是空的，这个提示就没意义了。
-    - 只回金额不回方向：调用方要的是「一个数」，符号本身已经说明落在哪一边
-      （正=借方、负=贷方）。再拆成「方向 + 绝对值」是给表格看的，
-      塞进一个格子里只会让人多读一遍。
+
+    只回金额不回方向：调用方要的是「一个数」，符号本身已经说明落在哪一边
+    （正=借方、负=贷方）。再拆成「方向 + 绝对值」是给表格看的，
+    塞进一个格子里只会让人多读一遍。
 
     上级科目一并算出来（引擎本来就上卷）：凭证只挂在末级上，但排凭证时
     「1002 银行存款」这种非末级也可能临时选上去看一眼余额。
     """
-    eng = LedgerEngine.for_ledger(db, book_id, include_unposted,
-                                   exclude_voucher_id=exclude_voucher_id)
-    fmap = eng.compute(up_to_ord=period.ord)
-    return {sid: str(f.closing) for sid, f in fmap.items()}
+    eng = LedgerEngine.for_ledger(db, book_id, include_unposted)
+    figures = eng.compute(up_to_ord=period.ord)
+    closing = {sid: f.closing for sid, f in figures.items()}
+    if position is None:
+        return {sid: str(v) for sid, v in closing.items()}
+
+    # 本期里从这张（含）往后的那些凭证的净变动减掉 —— 减完就是「这张之前」的账。
+    # 这张**自己**也在被减掉的那一批里（位置比较用的是 >=），于是它不干扰自己：
+    # 它 0.7 秒后就自动保存，落库后还留在账上，前端再补一次就翻倍了。
+    # 它**后面**的那些凭证也一并减掉 —— 那是「还没录到的那几张」，
+    # 算进来就成了月底的余额（见 docstring）。
+    seq, voucher_id = position
+    after = eng.period_net_from_voucher(period.ord, seq, voucher_id)
+    return {
+        sid: str(closing.get(sid, ZERO) - after.get(sid, ZERO))
+        for sid in set(closing) | set(after)
+    }

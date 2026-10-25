@@ -60,7 +60,8 @@ const props = defineProps({
   modelValue: { type: [String, Number], default: '' },
   readonly: { type: Boolean, default: false }
 })
-const emit = defineEmits(['update:modelValue', 'enter', 'focus', 'up', 'down', 'left', 'right', 'balance'])
+const emit = defineEmits(['update:modelValue', 'enter', 'focus', 'up', 'down', 'left', 'right',
+  'balance', 'commit'])
 
 const el = ref(null)
 const focused = ref(false)
@@ -327,6 +328,13 @@ function onBlur() {
   sel.value = null
   clipNote.value = null  // 提示只对当下这一笔负责，人已经走了就不用再挂着
   document.removeEventListener('selectionchange', onSelectionChange)
+  // **这一格的值定了** —— 发出去让外面把「正在敲的数」换成「敲完的数」。
+  //
+  // 外面那个科目余额是照着填的数：敲一个 1 余额就跳一下，人还没填完
+  // 就被半截数牵着走（用户 2026-10-25：「我希望的是，我输入完 100，
+  // 然后光标离开这个金额格，才更新余额」）。所以提交点必须是**离开这一格**，
+  // 不是每敲一个键。
+  emit('commit')
 }
 
 /**

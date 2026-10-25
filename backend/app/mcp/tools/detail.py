@@ -39,7 +39,6 @@
 MCP SDK 解析工具注解时用的是装饰器所在模块（``tools/base.py``）的全局命名
 空间；注解一旦变成字符串，那个命名空间里就没有本模块的类型，工具注册不上。
 """
-import re
 from calendar import monthrange
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -53,6 +52,7 @@ from app.accounting.organize import is_carry_forward
 from app.accounting.vouchers import query_vouchers, side_totals
 from app.accounting.years import subjects_of
 from app.core.config import settings
+from app.core.voucher_no import seq_of
 from app.ledger.queries import (
     balance_sheet_of_accounts,
     filter_balance_rows,
@@ -286,9 +286,11 @@ def _no_seq(voucher_no: str) -> int:
     与 ``accounting/vouchers._no_seq`` 同一套判据：抠出**尾部**数字，抠不出
     给 -1（排最前）。按字符串比会踩 ``"记100" < "记099"`` 的坑（字典序），
     而凭证号恰恰是补零的。
+
+    判据本身在 ``app.core.voucher_no``（全系统唯一出处）——
+    这里原来自己写了一份 ``re.search``，两处各抠一次早晚分道扬镳。
     """
-    matched = re.search(r"(\d+)$", voucher_no or "")
-    return int(matched.group(1)) if matched else -1
+    return seq_of(voucher_no)
 
 
 def _sort_key(voucher: Voucher, period_ord: int, sort: str):

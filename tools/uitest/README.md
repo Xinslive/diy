@@ -41,19 +41,21 @@ node tools/uitest/ui_voucher.mjs
 它们的价值只有「留个记录，方便复查当时看到了什么」，所以保持原样、不进 CI。
 要长期守住某个界面行为，正确做法是在 `frontend/tests/` 里补一个用例。
 
-## 凭证页的两条可重复验收
+## 凭证页的三条可重复验收
 
-`ui_voucher_total.mjs` 与 `ui_voucher_renumber.mjs` 也是**可重复跑**的回归检查
-（与 `ui_year_chart.mjs` 同类，不同于上面那些一次性探针）：
+`ui_voucher_total.mjs`、`ui_voucher_renumber.mjs` 与 `ui_voucher_balance.mjs`
+也是**可重复跑**的回归检查（与 `ui_year_chart.mjs` 同类，不同于上面那些一次性探针）：
 
 ```
 node tools/uitest/ui_voucher_total.mjs      # 合计按列求和、负数照减
 node tools/uitest/ui_voucher_renumber.mjs    # 跨期改日期 → 服务端重发号 → 页面回写
+node tools/uitest/ui_voucher_balance.mjs     # 科目格余额：滚动 + 敲完才更新 + 时点
 ```
 
-两条都是**只读 + 写接口拦截**：真账一个字节都不动。服务端那一半（真发号、真换期）
-由 `backend/tests/test_voucher_no_edit.py`、`test_api_contracts.py` 在真库上跑；
-这两条脚本守的是**页面这一半**（合计怎么摆、换号后页面上摆的是哪个号）。
+三条都是**只读 + 写接口拦截**：真账一个字节都不动。服务端那一半（真发号、真换期、
+时点余额）由 `backend/tests/test_voucher_no_edit.py`、`test_api_contracts.py`、
+`test_voucher_balances.py` 在真库上跑；这几条脚本守的是**页面这一半**
+（合计怎么摆、换号后页面上摆的是哪个号、余额怎么滚动、敲字时动不动）。
 
 ## 唯一的例外：`ui_year_chart.mjs`
 

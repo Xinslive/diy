@@ -86,9 +86,10 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Select, and_, func, select
+from sqlalchemy import Select, and_, func, literal, select, tuple_
 from sqlalchemy.orm import Session
 
+from app.core.voucher_no import seq_expr
 from app.ledger.cache import cache_for
 from app.models import Book, Entry, Period, PeriodOpening, Subject, Voucher
 from app.models.book import book_first_ord
@@ -515,6 +516,63 @@ class LedgerEngine:
                 cell[0] += Decimal(dr)
                 cell[1] += Decimal(cr)
         return {k: (v[0], v[1]) for k, v in rolled.items()}
+
+    def period_net_from_voucher(self, period_ord: int, seq: int,
+                                voucher_id: int) -> dict[int, Decimal]:
+        """本期里**从这张凭证起（含）往后**的那些凭证，给各科目带来的净变动（借正贷负）。
+
+        凭证录入页要的是**时点余额** —— 正在录的这一张**之前**，账上已经有多少。
+        两头都得掐准：
+
+          * 这张**自己**的分录不能算进基数：它由前端按行补回去
+            （见 ``queries.voucher_subject_balances``）—— 两边分开算，
+            这张被算两遍的账就长在「基数 + 增量」上。
+          * 这张**后面**的那些凭证更不能算进来：算进来就成了「月底的余额」，
+            翻到月中的凭证上看到的也是月底的数（用户 2026-10-25：
+            「目前是固定显示期末余额」）。一张凭证 100、一张 300、一张 500，
+            月中那张该看到 100，不是 900。
+
+        顺序键取 ``(号段数字, id)`` —— 与列表「凭证号顺序」同一套
+        （``accounting.vouchers.order_key``）。同一期间内期间 ord 是常数，
+        比后两段就够。
+
+        ``voucher_id`` 传 0 表示「一张还没落库的凭证」：它将来占的号由调用方
+        算好（``seq``），库里没有比 0 更小的 id，于是同号段的老凭证都排在它**后面** ——
+        「插在谁前面」正是这个意思（插在谁后面就往后挪一号）。
+
+        **不套 ``exclude_voucher_id``**：那个闸门是「把这张从发生额里剔掉」，
+        这里要的恰恰是「把这张**连同它后面**的一起挑出来」好减掉。
+        """
+        stmt = (
+            select(
+                Entry.subject_id,
+                func.coalesce(func.sum(Entry.amount).filter(Entry.direction == "DEBIT"), ZERO),
+                func.coalesce(func.sum(Entry.amount).filter(Entry.direction == "CREDIT"), ZERO),
+            )
+            .join(Voucher, Voucher.id == Entry.voucher_id)
+            .where(Entry.book_id == self.book_id, Entry.period_ord == period_ord)
+        )
+        # 口径与 ``_query_movements`` 对齐：含不含未记账、含不含结转凭证，
+        # 两边必须一样 —— 基数少算一笔，差出来的数就是错的那个数。
+        if not self.include_unposted:
+            stmt = stmt.where(Voucher.status == "POSTED")
+        if self.exclude_carry_forward:
+            stmt = stmt.where(Voucher.source != "CARRY_FORWARD")
+        stmt = stmt.where(
+            tuple_(seq_expr(Voucher.voucher_no), Voucher.id)
+            >= tuple_(literal(seq), literal(voucher_id))
+        ).group_by(Entry.subject_id)
+
+        # 上卷到父科目：凭证只挂在末级上，但排凭证时上级也可能被临时选上去看一眼余额
+        # （与 ``_query_movements`` 同一套祖先链）。
+        rolled: dict[int, list[Decimal]] = {}
+        ancestors = self._ancestor_map()
+        for sid, dr, cr in self.db.execute(stmt).all():
+            for node in ancestors.get(sid, [sid]):
+                cell = rolled.setdefault(node, [ZERO, ZERO])
+                cell[0] += Decimal(dr)
+                cell[1] += Decimal(cr)
+        return {sid: cell[0] - cell[1] for sid, cell in rolled.items()}
 
     def _openings(self) -> dict[tuple[int, int], Decimal]:
         """期初快照上卷后的结果。跨请求复用（键里带 data_version）。"""

@@ -67,6 +67,8 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
   const rowEls = { clear() {} }
   // load() 换凭证时会把它整套清掉：标记状态拿分录对象当键，分录对象刚被换了一整套
   const markingRows = { value: new Set() }
+  // 「已提交的数」同理（键也是分录对象）：换凭证时一起清掉
+  const committedAmounts = { value: new Map() }
   const voucherPeriod = { value: null }
   // load() 会写它：余额显示要知道这张凭证落在哪一期（科目格左下角那个数）
   const voucherPeriodId = { value: 0 }
@@ -81,7 +83,7 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
   const ctx = {
     route: { params: { id: '0' }, query: {} },
     form: {},
-    voucherId, savedAt, insertCtx, subjectRefs, rowEls, markingRows, voucherPeriod, voucherPeriodId,
+    voucherId, savedAt, insertCtx, subjectRefs, rowEls, markingRows, committedAmounts, voucherPeriod, voucherPeriodId,
     lastSaved, prevId, nextId, neighbourScope, crossBook,
     store: { bookId: 1, periods: [], books: [] },
     listFilter: { value: {} },
@@ -94,6 +96,8 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
     },
     loadSubjects: async () => {},
     ensureRows: () => {},
+    // 打开一张凭证后把每一行「定下来」（余额从一开始就是对的）—— 见 VoucherEdit.vue
+    seedCommitted: () => {},
     loadInsertPreview: async () => null,
     loadNextDefaults: async () => ({ voucher_no: '记001', voucher_date: '2026-01-31' }),
     defaultDate: () => '2026-01-31',
@@ -104,9 +108,9 @@ function loadFromSource({ getVoucher, neighbour } = {}) {
   const factory = new Function(
     'ctx',
     `
-    const { route, form, voucherId, savedAt, insertCtx, subjectRefs, rowEls, markingRows, voucherPeriod,
-            voucherPeriodId, lastSaved, prevId, nextId, neighbourScope, crossBook, store, listFilter, entrySig,
-            api, loadSubjects, ensureRows, loadInsertPreview, loadNextDefaults,
+    const { route, form, voucherId, savedAt, insertCtx, subjectRefs, rowEls, markingRows, committedAmounts,
+            voucherPeriod, voucherPeriodId, lastSaved, prevId, nextId, neighbourScope, crossBook, store, listFilter, entrySig,
+            api, loadSubjects, ensureRows, seedCommitted, loadInsertPreview, loadNextDefaults,
             defaultDate, ElMessage, router, history, location } = ctx
     const bookName = (id) => '账套 ' + id
     ${staleSrc}
