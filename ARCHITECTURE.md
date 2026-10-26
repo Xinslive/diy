@@ -6074,6 +6074,59 @@ CDN 是反向代理时，**nginx 看到的对端是 CDN 的边缘节点 IP**。�
   ⇒ 发布本来就不需要刷新；真要刷新，那是运维平台的事，不该由发布脚本
   去调一家 CDN 的私有 API。
 
+### 11.17.9 静态资源的 brotli 预压缩（2026-10-26 加）
+
+生产机的 nginx **没有编译 brotli 模块**（`nginx -V` 里只有
+`--with-http_v3_module`）。要「现压」就得重编 nginx —— 那是一次动整个
+站点的生产变更，不值得只为省 15% 带宽去做。改成**构建期压好**
+（`frontend/scripts/precompress.mjs`，用 node 内置的 zlib，不加依赖），
+nginx 只负责把压好的那份发出去。
+
+**产物形态**：一棵**平行树** `dist/br/<原路径>`（`dist/assets/x.js` →
+`dist/br/assets/x.js`）。**不是** `x.js.br` 那种同目录后缀 —— nginx 靠
+扩展名决定 Content-Type，同目录后缀会让 mime.types 认不出 `.br`，
+模块脚本会被浏览器拒收（页面白屏）。平行树里文件名原样保留，
+Content-Type 照旧。
+
+**压不划算就不压**：压完比原来还大（小文件常见）就不产出那份，nginx 会
+自动退回原文件 —— 所以「某个资源没有 br 版本」是**正常状态**，不是故障。
+
+**nginx 侧四条，全是踩出来的**（`deploy/nginx/*.conf`）：
+
+1. **`/assets/` 里必须 `gzip off`。** gzip 过滤器会把「已经是 brotli 的
+   字节」再压一遍，于是响应里出现**两个** `Content-Encoding`（br + gzip）——
+   浏览器按 gzip 解完再按 br 解，拿到的是乱码，页面直接坏掉。
+   （本地 nginx 1.31.8 上实测过。）
+2. **`Content-Encoding` 必须由「实际发出的那份」判定**，也就是
+   `map $uri $cwq_br_encoding`（try_files 命中之后 `$uri` 就是实际那个
+   文件）。**不能**按「客户端要什么」给 —— 客户端要 br 但这个资源没有
+   br 版本时，那样会把没压过的字节当 brotli 发出去。
+3. **`Vary: Accept-Encoding` 必须有。** 没有它，缓存会把 br 那份发给
+   不支持 br 的客户端。
+4. **不支持 br 的客户端要落到一个单独的 location**（`@cwq_assets_plain`）
+   —— 那里才开 `gzip on`。gzip 只能在整条 location 上开关，而 br 分支
+   必须关掉它（见第 1 条），两个分支共用一条 location 就只能一起关。
+
+另外 `location ^~ /br/` 直接 404：br 树是给 nginx 自己取的
+（try_files 内部命中文件，**不经过 location 匹配**），对外的 URL 不该
+让人拿到裸的 brotli 字节。
+
+**效果**（本仓库当前产物，147 个可压文件）：原始 2118 KB → gzip 747 KB →
+brotli 639 KB，**比 gzip 再省 14%**；入口 JS 一个文件从 gzip 111 KB
+降到约 95 KB。
+
+**边界**：入口 HTML 与 `runtime-config.js` 不压（几百字节，且 no-cache）；
+插件资产不走这条（它们在 API 源上，见 11.17.4）；「资源托管到 OSS」
+那种形态下 br 树不在 OSS 上，那条形态自动退回 gzip（没有 br，但不出错）。
+
+**护栏**：`deploy/tests/nginx_conf_check.py` 里有 8 条断言盯住上面四条
+（每条都做过变异验证：改坏配置，对应断言必须变红）。
+
+**接 CDN 后的坑**：CDN 按 URL 缓存，而 br 与非 br 是**同一个 URL 的两种
+表示**，所以 CDN 必须按 `Vary: Accept-Encoding` 区分。源站这边已经把
+这个头给足了，CDN 侧若不认 Vary，就会把 br 那份发给不支持的客户端 ——
+那时候要修的是 CDN 的缓存键，不是源站。
+
 ## 11.18 日志的自动清理（2026-10-25 加）
 
 ### 11.18.1 问题：只增不减的东西，爆炸时没有声音

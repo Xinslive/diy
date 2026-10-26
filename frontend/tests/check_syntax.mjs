@@ -6,7 +6,8 @@
  *   · `src/**\/*.vue` —— 只抠出 `<script>` / `<script setup>` 那一段做语法检查
  *     （模板不是 JavaScript，`node --check` 看不了；本仓库的 .vue 里也没有
  *     `<script lang="ts">`，所以不存在「TS 片段被当 JS 检查」的情况）；
- *   · `tests/**\/*.mjs` —— 整份文件做语法检查。
+ *   · `tests/**\/*.mjs` —— 整份文件做语法检查；
+ *   · `scripts/**\/*.mjs` —— 同上（构建脚本也是仓库的一部分，构建前就该验）。
  *
  * **不做**什么（别指望它）：
  *   · 不查风格、不查命名、不查未使用的变量 —— 仓库里没有 eslint/prettier，
@@ -52,7 +53,7 @@ function scriptOf(source) {
 let checked = 0
 let tmpSeq = 0
 
-const dirs = process.argv.slice(2).length ? process.argv.slice(2) : ['src', 'tests']
+const dirs = process.argv.slice(2).length ? process.argv.slice(2) : ['src', 'tests', 'scripts']
 for (const dir of dirs) {
   const abs = join(ROOT, dir)
   let files = []

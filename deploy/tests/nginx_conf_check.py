@@ -268,6 +268,87 @@ def check_structure(conf: Path) -> None:
         no(f"/assets/ 有 {len(cc_lines)} 条 Cache-Control —— CDN 可能挑错其中一条，"
            "而带宽没降下来时是没有任何报错的")
 
+    # --- brotli 预压缩资源（2026-10-26 加）---
+    #
+    # 这几条盯的是**踩过的坑**，不是形式：
+    #   · /assets/ 里必须 gzip off —— 否则 gzip 过滤器把「已经是 brotli 的
+    #     字节」再压一遍，响应里出现**两个** Content-Encoding，
+    #     浏览器解完 gzip 再解 brotli，页面直接坏掉；
+    #   · Content-Encoding 必须由变量给出，且那个变量的判据是 **$uri**
+    #     （这次实际发出的是哪一份），不能写死 br、也不能按「客户端要什么」
+    #     给 —— 客户端要 br 但这个资源没有 br 版本时，写死就会把没压过的
+    #     字节当 brotli 发出去；
+    #   · Vary: Accept-Encoding 必须有 —— 没有它，缓存会把 br 那份发给
+    #     不支持 br 的客户端；
+    #   · br 树不许被直接访问。
+    def _http_level_map(var: str) -> str | None:
+        """某个 map 是不是在 http 级；是的话返回它的源变量名，不是返回 None。"""
+        depth = 0
+        pat = re.compile(r"^map\s+(\$\w+)\s+" + re.escape(var) + r"\s*\{")
+        for ln in lines:
+            code = ln.split("#", 1)[0].strip()
+            m = pat.match(code)
+            if m:
+                return m.group(1) if depth == 0 else ""
+            depth += code.count("{") - code.count("}")
+        return None
+
+    prefix_src = _http_level_map("$cwq_br_prefix")
+    enc_src = _http_level_map("$cwq_br_encoding")
+    if prefix_src == "$http_accept_encoding" and enc_src == "$uri":
+        ok("brotli 的两个 map 都在 http 级，且编码头的判据是 $uri（实际发出的那份）")
+    else:
+        no(f"brotli 的 map 不对：前缀 {prefix_src or '缺'}、编码头 {enc_src or '缺'}"
+           " —— 编码头必须由 $uri 判定（客户端要 br 但资源没有 br 版本时，"
+           "按客户端给就会把没压过的字节当 brotli 发出去）")
+
+    br_plain = location_blocks(lines, "location @cwq_assets_plain {")
+    if assets:
+        a = assets[0]
+        if any(l.strip() == "gzip off;" for l in a):
+            ok("/assets/ 关掉了 gzip（否则 brotli 文件会被再压一遍，出两个 Content-Encoding）")
+        else:
+            no("/assets/ 没有 gzip off —— brotli 文件会被 gzip 再压一遍，"
+               "响应里两个 Content-Encoding，浏览器解出来是乱的")
+
+        enc_hdrs = [l for l in a if "add_header" in l and "Content-Encoding" in l]
+        if enc_hdrs and all("$cwq_br_encoding" in l for l in enc_hdrs):
+            ok("/assets/ 的 Content-Encoding 由 $cwq_br_encoding 给出（按实际发出的那份判）")
+        else:
+            no(f"/assets/ 的 Content-Encoding 不是由 $cwq_br_encoding 给的：{enc_hdrs}")
+
+        if any("$cwq_br_prefix$uri" in l for l in a) and \
+                any("error_page 404 = @cwq_assets_plain;" in l for l in a):
+            ok("/assets/ 会去 br 树取，取不到就落到普通分支")
+        else:
+            no("/assets/ 没有走 br 树（$cwq_br_prefix$uri），或没有落到 @cwq_assets_plain")
+
+        if any("add_header Vary" in l and "Accept-Encoding" in l for l in a):
+            ok("/assets/ 带 Vary: Accept-Encoding（否则缓存会把 br 那份发给不支持的客户端）")
+        else:
+            no("/assets/ 没有 Vary: Accept-Encoding —— 缓存会把 brotli 那份发给不支持 br 的客户端")
+    else:
+        no("找不到 location /assets/ 块")
+
+    if br_plain:
+        b = br_plain[0]
+        if any(l.strip() == "gzip on;" for l in b):
+            ok("普通分支（@cwq_assets_plain）开着 gzip（不支持 br 的客户端靠它压缩）")
+        else:
+            no("@cwq_assets_plain 没有 gzip on —— 不支持 br 的客户端会拿到没压缩的资源")
+        if any("add_header Vary" in l and "Accept-Encoding" in l for l in b):
+            ok("普通分支也带 Vary: Accept-Encoding")
+        else:
+            no("@cwq_assets_plain 没有 Vary: Accept-Encoding")
+    else:
+        no("没有 location @cwq_assets_plain —— /assets/ 取不到 br 版本时没有去处")
+
+    br_deny = location_blocks(lines, "location ^~ /br/ {")
+    if br_deny and any("return 404;" in l for l in br_deny[0]):
+        ok("br 树不许被直接访问（对外发裸 brotli 字节，浏览器会当普通文件解）")
+    else:
+        no("没有挡掉 /br/ 的直接访问")
+
     # --- Cloudflare 在前时的真实客户端 IP 还原 ---
     #
     # 少了它，nginx 看到的对端是 CDN 的边缘节点 IP —— 本系统那层按 IP
