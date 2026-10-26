@@ -18,7 +18,9 @@
             :aria-current="it.name === activeKey ? 'page' : null"
             :class="{ active: it.name === activeKey }"
             @click="router.push({ name: it.name })"
-            @keydown.enter="router.push({ name: it.name })">
+            @keydown.enter="router.push({ name: it.name })"
+            @mouseenter="prefetch(it.name)"
+            @focus="prefetch(it.name)">
           <el-icon><component :is="it.icon" /></el-icon><span class="sb-label">{{ it.title }}</span>
         </li>
       </ul>
@@ -38,6 +40,8 @@
           class="module"
           :class="{ active: m.key === activeModule }"
           @click="onModuleClick(m)"
+          @mouseenter="prefetch(landingOf(m))"
+          @focus="prefetch(landingOf(m))"
         >
           <el-icon><component :is="m.icon" /></el-icon>{{ m.title }}
         </button>
@@ -145,6 +149,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from '@/stores/session'
 import { useTabsStore } from '@/stores/tabs'
 import { landingOf, menuKeyOf, visibleNav } from '@/router/nav'
+import { prefetchRouteChunk } from '@/utils/routePrefetch'
 import { pluginEntries } from '@/plugins/runtime'
 import MfaReauthDialog from '@/components/MfaReauthDialog.vue'
 import {
@@ -230,6 +235,19 @@ const shownModule = computed(
     || activeModuleObj.value
     || nav.value[0]
 )
+
+/**
+ * 悬停/聚焦菜单项时，把那一页的代码块先下载下来。
+ *
+ * 单页应用换页不换 HTML，换的是路由对应的 JS 代码块 —— 所以预取的对象
+ * 是「代码块」而不是「页面」。点进去时那份代码已经在浏览器里了，
+ * 不用等网络往返（几百 KB 的页面代码块，这一等就是好几秒）。
+ *
+ * 失败无所谓：预取只是快一点，不预取照样能进。
+ */
+function prefetch(name) {
+  prefetchRouteChunk(router, name)
+}
 
 /**
  * 点顶部模块：换侧栏，并在跨模块时落到这个模块的入口页
