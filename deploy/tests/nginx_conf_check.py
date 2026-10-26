@@ -147,6 +147,33 @@ def balanced(lines: list[str]) -> tuple[bool, str]:
     return True, ""
 
 
+def all_location_blocks(lines: list[str]) -> list[tuple[str, list[str]]]:
+    """所有 location 块：[(块头那一行, 块内所有行)]。
+
+    ``location_blocks()`` 是「按块头精确匹配」，这里要的是「**所有** location」——
+    因为要判的是一条**不变量**（凡是 API 段都得满足某个条件），
+    漏掉任何一个 location，那条不变量就名存实亡。
+
+    边界同样按花括号配平取。``location / {`` 与 ``location /assets/ {``
+    用 ``startswith("location ")`` + ``endswith("{")`` 一起卡，不会互相误取。
+    """
+    out: list[tuple[str, list[str]]] = []
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not (s.startswith("location ") and s.endswith("{")):
+            continue
+        depth = 0
+        block: list[str] = []
+        for l2 in lines[i:]:
+            code = l2.split("#", 1)[0]
+            depth += code.count("{") - code.count("}")
+            block.append(l2)
+            if depth <= 0:
+                break
+        out.append((s, block))
+    return out
+
+
 # --------------------------------------------------------------------------
 # 结构校验
 # --------------------------------------------------------------------------
@@ -348,6 +375,34 @@ def check_structure(conf: Path) -> None:
         ok("br 树不许被直接访问（对外发裸 brotli 字节，浏览器会当普通文件解）")
     else:
         no("没有挡掉 /br/ 的直接访问")
+
+    # --- API 响应一律不可缓存 ---
+    #
+    # **接了 CDN 之后这条从「讲究」变成「防事故」**：/api/* 的响应是
+    # **按登录用户区分**的，一旦被边缘缓存住，用户 A 的凭证会被原样发给
+    # 用户 B —— 页面照常显示，只是数据串了，**而且不报错**。
+    #
+    # proxy_hide_header 不能省：上游自己带了 Cache-Control 时，
+    # add_header 会**再发一个**，浏览器按第一个解析，行为不可预期。
+    #
+    # **四段都要写**：/api/、^/api/mcp、^/api/scheduler/tick、打印页。
+    # 少一段就是一条缝 —— 而且 nginx 的**正则 location 不继承**同级的
+    # 普通前缀 location（nginx 只挑一个最优块执行），所以 /api/ 上写了
+    # 不代表 ^/api/mcp 上也有。
+    api_blocks = [(h, b) for h, b in all_location_blocks(lines) if "/api" in h]
+    if not api_blocks:
+        no("找不到任何 /api 的 location")
+    else:
+        bad = []
+        for head, blk in api_blocks:
+            if not any("proxy_hide_header Cache-Control" in l for l in blk):
+                bad.append(head + "（没藏上游的 Cache-Control）")
+            elif not any('add_header Cache-Control "no-store"' in l for l in blk):
+                bad.append(head + "（没有 no-store）")
+        if bad:
+            no("API 段没有把响应标成不可缓存：" + "；".join(bad))
+        else:
+            ok(f"{len(api_blocks)} 个 API 段都标了 Cache-Control: no-store")
 
     # --- Cloudflare 在前时的真实客户端 IP 还原 ---
     #
