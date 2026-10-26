@@ -33,6 +33,20 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 export const BR_DIR = 'br'
 
 /**
+ * **发布流程会改写的文件，不压。**
+ *
+ * ``dist/index.html``（资源地址改写到静态基址）与 ``dist/runtime-config.js``
+ * （每套部署的 API/资源基址）都是**发布时**才定稿的 —— 构建期压出来的那份
+ * 是**旧的**。留着它就是个雷：哪天有人给这两个路径也开了 br，线上就会发出去
+ * 一份过期的 index.html（资源地址指回旧域名）或过期的 runtime-config.js
+ * （API 指到别的部署），而且现象是「偶发、难查」。
+ *
+ * 现在的 nginx 只对 /assets/ 开 br（这两个文件各有自己的 location），所以这
+ * 是「别留雷」，不是正在发生的故障。
+ */
+const DEPLOY_REWRITES = new Set(['index.html', 'runtime-config.js'])
+
+/**
  * 只压这些后缀。
  *
  * 二进制（图片、字体、wav）压了几乎不省 —— 有些还会更大，而且浏览器对
@@ -73,6 +87,7 @@ export function precompress(distDir) {
 
   for (const file of walk(dist, new Set([BR_DIR]))) {
     const rel = relative(dist, file)
+    if (DEPLOY_REWRITES.has(rel)) { skipped++; continue }
     if (!COMPRESSIBLE.has(extname(file).toLowerCase())) { skipped++; continue }
 
     const raw = readFileSync(file)

@@ -83,6 +83,24 @@ t('上一版残留的 br 文件会被清掉（不能让删掉的旧哈希还留�
   } finally { rmSync(dist, { recursive: true, force: true }) }
 })
 
+t('发布时会被改写的文件不压（index.html / runtime-config.js）', () => {
+  const dist = makeDist({
+    'index.html': '<html><script src="/runtime-config.js"></script></html>',
+    'runtime-config.js': 'window.__CWQ_RUNTIME__={"apiBase":"/api"}',
+    'assets/app.js': JS
+  })
+  try {
+    const r = precompress(dist)
+    assert.equal(r.compressed, 1, `只该压 assets/app.js，实际压了 ${r.compressed} 个`)
+    assert.ok(!existsSync(join(dist, BR_DIR, 'index.html')), 'index.html 产出了 br 版本')
+    assert.ok(!existsSync(join(dist, BR_DIR, 'runtime-config.js')), 'runtime-config.js 产出了 br 版本')
+    // **这两个文件在发布时会被改写**（资源基址、API 基址），构建期压出来的
+    // 那份是过期的 —— 留着它，哪天有人给这两个路径开了 br，线上就会发出去
+    // 一份指回旧地址的 index.html。
+    assert.ok(existsSync(join(dist, BR_DIR, 'assets/app.js')), 'assets/app.js 反而没压')
+  } finally { rmSync(dist, { recursive: true, force: true }) }
+})
+
 t('dist 不存在时直接报错（不是静默产出空目录）', () => {
   assert.throws(() => precompress(join(tmpdir(), 'cwq-br-does-not-exist-xyz')), /不存在/)
 })
