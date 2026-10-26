@@ -119,8 +119,20 @@
         <p class="tile-desc">
           把 {{ store.currentYear }} 年期末余额带成 {{ store.currentYear + 1 }} 年 1 月的期初。
         </p>
-        <el-button class="tile-btn" :loading="yearEnding" :disabled="!store.canWrite" @click="doYearEnd">
-          结转到 {{ store.currentYear + 1 }} 年
+        <!-- 未分配利润是年度结转的**目的科目**：本年利润的余额冲到它上面，
+             变成留存收益。跟本年利润科目同一套口径 —— 它**就是一个字段**，
+             值本身就是控件，选中即生效，所以没有「设置」按钮、也没有弹窗。 -->
+        <div class="tile-profit" :class="{ warn: retainedMissing }">
+          <span class="tile-profit-label">未分配利润</span>
+          <el-select v-model="retainedFormCode" class="tile-profit-select" size="small"
+                     filterable :loading="retainedLoading" :disabled="!store.canWrite"
+                     popper-class="profit-subject-popper" @change="onRetainedChange">
+            <el-option v-for="o in retainedOptions" :key="o.key" :value="o.code" :label="o.name" />
+          </el-select>
+        </div>
+        <el-button class="tile-btn" :loading="yearEnding"
+                   :disabled="!store.canWrite || retainedMissing" @click="doYearEnd">
+          {{ retainedMissing ? '先设未分配利润科目' : `结转到 ${store.currentYear + 1} 年` }}
         </el-button>
       </div>
     </div>
@@ -352,6 +364,121 @@ async function loadProfitSubjects(year) {
   }
 }
 
+/* ---- 未分配利润科目 ---- */
+/**
+ * 年度结转的**目的科目**：本年利润的余额冲到它上面，变成留存收益。
+ *
+ * 跟本年利润科目同一类问题，所以口径也一样：系统按候选编码
+ * （310415 / 3104 / 4104）自动识别，但每本账的科目表是各人自己的 ——
+ * 编码改过的有、把「未分配利润」挂在别的大类码底下的也有。
+ * 识别不出来时**年度结转就结不了**（后端 fail-closed：缺这个科目就停下），
+ * 而这里就是改它的地方。
+ *
+ * 这里摆出来的是三件不同的事（跟本年利润那一行一样，别混成一句）：
+ *   · ``subject``  —— 实际会冲到的那个科目（自动识别或手工设定）
+ *   · ``stale``    —— 手工设定指向的科目已经不在这一年的科目表里
+ *   · ``missing``  —— 两级都没有，确实找不到未分配利润科目
+ */
+const retained = ref(null)
+const retainedAsked = ref(false)
+const retainedLoading = ref(false)
+/** 这一年的**末级科目**（结转凭证只记在末级上）。 */
+const retainedSubjects = ref([])
+
+/** 确实找不到未分配利润科目（**不是**「还没问过」）。 */
+const retainedMissing = computed(() => retainedAsked.value && !!retained.value && !retained.value.subject)
+
+/** 下拉当前选中的值：``AUTO`` = 自动识别，否则是科目编码。 */
+const retainedFormCode = ref(AUTO)
+
+/**
+ * 下拉里的选项 —— 与本年利润那一行同一套摆法：
+ * 第一项是「自动识别」（选它 = 回到系统的自动口径），后面跟这一年的末级科目。
+ * 「设定值已经失效」的那一项照样列出来（藏起来的话，用户看到的是
+ * 「我明明设过，怎么没了」）。
+ */
+const retainedOptions = computed(() => {
+  const r = retained.value
+  const head = retainedMissing.value
+    ? { key: 'auto', code: AUTO, name: '未找到未分配利润科目' }
+    : {
+        key: 'auto',
+        code: AUTO,
+        name: r?.subject ? `自动识别（${r.subject.code}）` : '自动识别',
+      }
+  const rows = retainedSubjects.value.map((s) => ({
+    key: s.code, code: s.code, name: `${s.code} ${s.name}`,
+  }))
+  const setting = r?.setting_code
+  if (setting && !rows.some((x) => x.code === setting)) {
+    rows.unshift({ key: setting, code: setting, name: `${setting}（科目表里没有）` })
+  }
+  return [head, ...rows]
+})
+
+async function loadRetained() {
+  const bookId = store.bookId
+  const year = store.currentYear
+  if (!bookId || !year) {
+    retained.value = null
+    retainedAsked.value = true
+    return
+  }
+  try {
+    const r = await api.getRetainedSubject(bookId, year)
+    // 切账套/切年份时旧请求可能后到，迟到的响应会盖掉新状态
+    if (store.bookId !== bookId || store.currentYear !== year) return
+    retained.value = r
+    // 下拉当前值 = 手工设定值（没有设定就是自动识别）
+    retainedFormCode.value = r.setting_code || AUTO
+    loadRetainedSubjects(year)
+  } catch {
+    if (store.bookId !== bookId || store.currentYear !== year) return
+    // 问过了但没问到：状态按「未知」处理，**不**当成「没有未分配利润科目」——
+    // 把网络故障说成「你这本账缺科目」，用户会去查一个不存在的问题。
+    retained.value = null
+  } finally {
+    if (store.bookId === bookId && store.currentYear === year) retainedAsked.value = true
+  }
+}
+
+/**
+ * 选定即生效 —— 与本年利润科目同一套理由：这个值不是表单里一项待提交的输入，
+ * 它就是「年度结转的留存收益冲到哪儿」这个事实本身。
+ * 失败时把下拉拨回原值（界面上留着一个没存上的选择，用户会以为已经改了）。
+ */
+async function onRetainedChange(code) {
+  const year = store.currentYear
+  if (!year) return
+  const before = retained.value?.setting_code || ''
+  try {
+    const r = await api.setRetainedSubject(store.bookId, year, code === AUTO ? null : code)
+    retained.value = r
+    retainedAsked.value = true
+    ElMessage.success(r.source === 'setting'
+      ? `未分配利润科目已设为 ${r.setting_code}`
+      : '未分配利润科目回到自动识别')
+  } catch (e) {
+    retainedFormCode.value = before || AUTO
+    ElMessage.error(e?.response?.data?.detail || '设定失败')
+  }
+}
+
+/** 拉这一年的末级科目，供下拉选。 */
+async function loadRetainedSubjects(year) {
+  retainedLoading.value = true
+  try {
+    const rows = await subjectApi.subjectFlat(store.bookId, { year })
+    if (store.currentYear !== year) return
+    retainedSubjects.value = rows || []
+  } catch {
+    if (store.currentYear !== year) return
+    retainedSubjects.value = []
+  } finally {
+    if (store.currentYear === year) retainedLoading.value = false
+  }
+}
+
 /* ---- 确认弹窗 ---- */
 // 一个 Promise 化的壳：调用方写 `if (!await ask({...})) return`，
 // 取消走 resolve(false)，不再有「取消 = 未捕获异常」的老毛病。
@@ -541,9 +668,11 @@ watch([() => store.periodId, () => store.bookId], loadCarryInfo)
 // 本年利润按**年度**取：同一年的 12 个月共用一份设定，
 // 而这个设定挂的就是「这一年的科目表里的哪一个科目」。
 watch([() => store.bookId, () => store.currentPeriod?.year], loadProfit)
+watch([() => store.bookId, () => store.currentYear], loadRetained)
 onMounted(() => {
   loadCarryInfo()
   loadProfit()
+  loadRetained()
 })
 
 async function doYearEnd() {

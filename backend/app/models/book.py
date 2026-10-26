@@ -154,6 +154,17 @@ class BookYear(Base, TimestampMixin):
     # 那些本来就识别得出来的账套。
     profit_subject_code: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
+    # ---- 未分配利润科目（手工设定）----
+    #
+    # 年度结转的**目的科目**：本年利润的余额冲到这里（留存收益）。
+    # 系统按候选编码自动识别（310415 / 3104 / 4104），但每本账的科目表
+    # 是各人自己的：编码改成 310411 的有、把「未分配利润」挂在别的大类码
+    # 底下的也有。识别不到时**年度结转就结不了**，而界面上没有地方能改。
+    #
+    # 口径跟 ``profit_subject_code`` 一模一样：年度级、存**编码**不存 id、
+    # **空 = 走自动识别**（空值不是「不识别」，是「没覆盖」）。
+    retained_subject_code: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
     # ---- 初始化状态 ----
     # 第 1 步（定科目）完成的时间与来源。IMPORT = 导入了外部科目表；
     # CHART = 确认沿用标准科目表。**存量为空 = 还没做第 1 步。**

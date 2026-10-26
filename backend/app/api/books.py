@@ -18,7 +18,8 @@ from app.accounting.initialization import (OPENINGS_SOURCE_IMPORT, blocked_reaso
                                            mark_subjects_ready)
 from app.accounting.util import money
 from app.api.schemas import (BookEditIn, BookIn, BookOrderIn, CarryForwardIn, CloseIn,
-                           OpeningListIn, ProfitSubjectIn, UncloseIn, YearEndIn)
+                           OpeningListIn, ProfitSubjectIn, RetainedSubjectIn,
+                           UncloseIn, YearEndIn)
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import (get_book_link, get_current_user, get_my_book, normalize_role,
@@ -981,6 +982,88 @@ def set_profit_subject(book_id: int, year: int, payload: ProfitSubjectIn,
         after={"profit_subject_code": code or None})
     db.commit()
     return _profit_subject_state(db, book.id, year)
+
+
+@router.get("/{book_id}/years/{year}/retained-subject")
+def get_retained_subject(book_id: int, year: int, book: Book = Depends(get_my_book),
+                         db: Session = Depends(get_db)):
+    """未分配利润科目 —— 手工设定优先，其次按候选编码自动识别。
+
+    **年度结转的目的科目**：本年利润的余额冲到它上面，变成留存收益。
+
+    「设的是什么」与「实际用的是什么」分开返回，理由同
+    ``get_profit_subject``：设定值可能已经不在这一年的科目表里了。
+    """
+    _require_year(db, book.id, year)
+    return _retained_subject_state(db, book.id, year)
+
+
+@router.put("/{book_id}/years/{year}/retained-subject")
+def set_retained_subject(book_id: int, year: int, payload: RetainedSubjectIn,
+                         book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                         user: SysUser = Depends(get_current_user),
+                         # 设定会改变年度结转冲到的科目 —— 只读账套不许改
+                         _link: UserBook = Depends(require_book_write)):
+    """手工设定（或清掉）「未分配利润」科目。
+
+    校验三条，与「本年利润科目」同一套：编码不在这一年的科目表里、
+    不是末级科目、已停用 —— 都是「设了也用不了」的情况，挡在写入之前。
+    """
+    _require_year(db, book.id, year)
+    code = (payload.code or "").strip()
+    if code:
+        subject = db.scalar(
+            select(Subject).where(
+                Subject.book_id == book.id, Subject.year == year, Subject.code == code
+            )
+        )
+        if subject is None:
+            raise HTTPException(400, f"{year} 年的科目表里没有编码 {code} 的科目")
+        if not subject.is_leaf:
+            raise HTTPException(400, f"{code} {subject.name} 不是末级科目，结转凭证只能记在末级科目上")
+        if not subject.active:
+            raise HTTPException(400, f"{code} {subject.name} 已停用，不能作为未分配利润科目")
+    else:
+        subject = None
+
+    before = svc.retained_subject_setting(db, book.id, year)
+    svc.set_retained_subject_setting(db, book.id, year, code or None)
+    from app.accounting.audit_helper import log
+
+    log(db, action="UPDATE", entity="book_year", entity_id=f"{book.id}-{year}", user=user,
+        book_id=book.id,
+        detail=(f"设定 {year} 年未分配利润科目为 {code}" if code
+                else f"清掉 {year} 年未分配利润科目的手工设定（回到自动识别）"),
+        before={"retained_subject_code": before},
+        after={"retained_subject_code": code or None})
+    db.commit()
+    return _retained_subject_state(db, book.id, year)
+
+
+def _retained_subject_state(db: Session, book_id: int, year: int) -> dict:
+    """未分配利润科目的当前状态（设定值 + 实际用的那个 + 来源）。"""
+    setting = svc.retained_subject_setting(db, book_id, year)
+    subject, source = svc.resolve_retained_subject(db, book_id, year)
+    # 设定值指向的科目已经不在这一年的科目表里 → stale。
+    # 不停用设定：用户可能马上要把那张表导回来，自动清掉等于替他做决定。
+    stale = bool(setting) and (
+        db.scalar(select(Subject).where(
+            Subject.book_id == book_id, Subject.year == year, Subject.code == setting
+        )) is None
+    )
+    return {
+        "year": year,
+        "setting_code": setting,
+        "source": source,
+        "stale": stale,
+        "candidates": list(svc.RETAINED_SUBJECT_CODES),
+        "subject": (
+            {"id": subject.id, "code": subject.code, "name": subject.name,
+             "category": subject.category, "is_leaf": subject.is_leaf,
+             "active": subject.active}
+            if subject is not None else None
+        ),
+    }
 
 
 def _require_year(db: Session, book_id: int, year: int) -> None:

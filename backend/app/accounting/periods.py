@@ -232,6 +232,85 @@ def resolve_profit_subject(db: Session, book_id: int, year: int) -> tuple[Option
     return None, PROFIT_SOURCE_MISSING
 
 
+# ----------------------------------------------------------------- 未分配利润科目
+#
+# 「未分配利润」是**年度结转**的目的科目：本年利润的余额冲到它上面，
+# 变成留存收益（利润分配-未分配利润）。
+#
+# 它跟本年利润是同一类问题，所以口径完全一样（**手工设定优先**）：
+#
+#   1. 用户在「期末结账 → 年度结转」里手工指定的科目
+#      （``book_year.retained_subject_code``）
+#   2. 候选编码自动识别（``RETAINED_SUBJECT_CODES``）
+#   3. 两级都没有 → 报错（fail-closed，绝不静默跳过）
+#
+# **为什么必须能手工指定。** 候选编码（310415 / 3104 / 4104）覆盖的是
+# 用友与旧《企业会计准则》两套编号，而科目表是各人自己的：把「未分配利润」
+# 挂在别的大类码底下、改了编码的都见过。识别不出来时，年度结转就结不了 ——
+# 而**界面上没有任何地方能改**，用户只能看着一句报错。
+#
+# **为什么手工指定的必须是末级科目。** 年度结转那张凭证要真的记在它上面，
+# 而凭证只记末级（服务端会拒非末级）。这一条在接口层就挡掉，
+# 别等到结转时抛一句「不是末级科目」。
+
+#: 未分配利润科目的来源标记（取值与本年利润那套一致，界面读的是同一组词）。
+RETAINED_SOURCE_SETTING = PROFIT_SOURCE_SETTING   # 用户手工指定
+RETAINED_SOURCE_AUTO = PROFIT_SOURCE_AUTO         # 按候选编码自动识别
+RETAINED_SOURCE_MISSING = PROFIT_SOURCE_MISSING   # 两级都没有
+
+
+def retained_subject_setting(db: Session, book_id: int, year: int) -> Optional[str]:
+    """用户手工设定的「未分配利润」科目编码。**没设过就是 None**。"""
+    from app.accounting.years import book_year_of
+
+    row = book_year_of(db, book_id, year)
+    if row is None:
+        return None
+    code = (row.retained_subject_code or "").strip()
+    return code or None
+
+
+def set_retained_subject_setting(db: Session, book_id: int, year: int,
+                                  code: Optional[str]) -> Optional[str]:
+    """写下（或清掉）「未分配利润」科目的手工设定值。
+
+    年度账套行按需创建 —— 设定的对象是「这个年度的科目表里的某一个科目」，
+    没有年度行就意味着这个年度还没有科目表，而那种情况下也压根没有科目可设。
+    """
+    from app.accounting.years import book_year_of, ensure_book_year
+
+    value = (code or "").strip() or None
+    row = book_year_of(db, book_id, year)
+    if row is None:
+        book = db.get(Book, book_id)
+        if book is None:
+            raise ValueError(f"账套 {book_id} 不存在")
+        row = ensure_book_year(db, book, year)
+    row.retained_subject_code = value
+    db.flush()
+    return value
+
+
+def resolve_retained_subject(db: Session, book_id: int, year: int) -> tuple[Optional[Subject], str]:
+    """未分配利润科目。返回 ``(科目, 来源)``，找不到时科目是 ``None``。
+
+    **年度结转认手工设定**（与结转损益认本年利润手工设定是同一种做法）——
+    两处各认各的就会出现「结转冲 A、年度结转冲 B」，本年利润永远冲不平。
+    """
+    setting = retained_subject_setting(db, book_id, year)
+    if setting:
+        found = _subject_by_code(db, book_id, year, setting)
+        # 设定的科目不在这一年的科目表里（整表换过了）→ 回落自动识别，
+        # 但**不覆盖设定值**：用户设的东西还在，界面上会提示「设的是 X、
+        # 实际用的是 Y」，要不要改由用户决定。
+        if found is not None:
+            return found, RETAINED_SOURCE_SETTING
+    found = _subject_by_any_code(db, book_id, year, RETAINED_SUBJECT_CODES)
+    if found is not None:
+        return found, RETAINED_SOURCE_AUTO
+    return None, RETAINED_SOURCE_MISSING
+
+
 # --------------------------------------------------------------------- 结转科目集合
 #
 # 「哪些科目参与结转损益」**只有这一份定义**（审计 P1-1 / P1-2）。
@@ -1355,7 +1434,9 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
     # 本年利润认手工设定（``resolve_profit_subject``），与结转损益同一份口径 ——
     # 两处各认各的就会出现「结转用 A、年度结转冲平用 B」，本年利润永远冲不平。
     profit, _ = resolve_profit_subject(db, book.id, current_year)
-    retained = _subject_by_any_code(db, book.id, current_year, RETAINED_SUBJECT_CODES)
+    # 未分配利润认手工设定（``resolve_retained_subject``），与本年利润同一份口径 ——
+    # 两处各认各的就会出现「结转用 A、年度结转冲平用 B」，本年利润永远冲不平。
+    retained, _retained_source = resolve_retained_subject(db, book.id, current_year)
     # **fail-closed：找不到「未分配利润」就报错，绝不静默跳过整段结转**
     # （审计报告 §3.16）。
     #
@@ -1392,14 +1473,16 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
                 "年度结转在留存收益这一侧无处记账，整段结转已经停下。"
                 "（这套科目表里同样没有「本年利润」科目 —— 本年利润这一段"
                 "本来就没有余额可结转，缺的就是「未分配利润」这个科目本身。）"
-                "请先补上该科目再结转。"
+                "请先补上该科目再结转 —— 也可以在「期末结账 → 年度结转」里"
+                "直接指定用哪一个未分配利润科目。"
             )
         raise ValueError(
             f"{current_year} 年的科目表里没有「未分配利润」科目"
             f"（找过的编码：{'、'.join(RETAINED_SUBJECT_CODES)}），"
             "本年利润无法结转到留存收益。继续结转会让本年利润的余额"
             "原样滚到下一年，而资产负债表的未分配利润将一直是 0。"
-            "请先补上该科目再结转。"
+            "请先补上该科目再结转 —— 也可以在「期末结账 → 年度结转」里"
+            "直接指定用哪一个未分配利润科目。"
         )
     # ``profit`` 是 None 时跳过是**安全**的：那说明这套账没有「本年利润」科目，
     # 而各期结账时的损益结平校验已经要求损益科目余额全为 0
@@ -1496,6 +1579,15 @@ def year_end_carry(db: Session, book: Book, user: SysUser,
             Subject.code == src_profit)
     ) is not None:
         set_profit_subject_setting(db, book.id, target_year, src_profit)
+
+    # 3c. 「未分配利润科目」的**手工设定**同样带到新年度（理由同上）
+    src_retained = retained_subject_setting(db, book.id, current_year)
+    if src_retained and db.scalar(
+        select(Subject).where(
+            Subject.book_id == book.id, Subject.year == target_year,
+            Subject.code == src_retained)
+    ) is not None:
+        set_retained_subject_setting(db, book.id, target_year, src_retained)
 
     # 4. 下一年 1 月的期初 = 本年期末（**按编码**搬过两张科目表）
     eng = LedgerEngine.for_ledger(db, book.id)

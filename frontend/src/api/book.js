@@ -33,6 +33,17 @@ export const getProfitSubject = (id, year) =>
   http.get(`/books/${id}/years/${year}/profit-subject`).then(r => r.data)
 export const setProfitSubject = (id, year, code) =>
   http.put(`/books/${id}/years/${year}/profit-subject`, { code: code || null }).then(r => r.data)
+/**
+ * 未分配利润科目 —— **年度结转**的目的科目（本年利润的余额冲到它上面）。
+ *
+ * 与本年利润科目同一套口径：年度级、传科目编码、`code` 传 null = 回到自动识别。
+ * 系统按候选编码（310415 / 3104 / 4104）自动识别，识别不到时年度结转就结不了，
+ * 所以有这一对接口让用户自己指定。
+ */
+export const getRetainedSubject = (id, year) =>
+  http.get(`/books/${id}/years/${year}/retained-subject`).then(r => r.data)
+export const setRetainedSubject = (id, year, code) =>
+  http.put(`/books/${id}/years/${year}/retained-subject`, { code: code || null }).then(r => r.data)
 // 结转损益永远是「有旧凭证就删掉、按最新余额重算」，replace 只为兼容旧调用
 export const carryForward = (id, pid, replace = true) =>
   http.post(`/books/${id}/periods/${pid}/carry-forward`, { replace }).then(r => r.data)

@@ -354,6 +354,15 @@ class ProfitSubjectIn(BaseModel):
     code: Optional[str] = None
 
 
+class RetainedSubjectIn(BaseModel):
+    """设定「未分配利润」科目的入参。
+
+    与 :class:`ProfitSubjectIn` 同一套口径：``code`` 是**科目编码**不是 id；
+    传 ``None``（或空串）表示清掉手工设定、回到自动识别。
+    """
+    code: Optional[str] = None
+
+
 # ---- 报表 ----
 class CellIn(BaseModel):
     row_no: int
