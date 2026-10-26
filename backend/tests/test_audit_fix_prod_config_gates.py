@@ -1,16 +1,8 @@
-"""生产启动闸门：三条「只告警」必须升级成**阻断**（审查 §3.8 / §3.44 / §4.3）。
+"""生产启动闸门：两条「只告警」必须升级成**阻断**（审查 §3.44 / §4.3）。
 
-这一组钉的是**三件事的同一个形状**：配置缺了一样东西，而这件事的后果
-不是「功能不好看」，是**数据或系统被人拿走/被人锁死** —— 于是在启动时
+这一组钉的是**两件事的同一个形状**：配置缺了一样东西，而这件事的后果
+不是「功能不好看」，是**系统被人锁死 / 被人拿走** —— 于是在启动时
 就该拦住，而不是在运行期打一条告警。
-
-* **§3.8 ``BACKUP_ENCRYPTION_KEY``**：配了 OSS 备份就必须配备份加密密钥。
-  备份管线是 ``gzip → SHA256 → OSS``，而 SHA256 是**校验和不是加密** ——
-  OSS 上的对象是**明文 gzip 压缩包**；桶的读权限一旦泄露，全部账套的凭证
-  与金额就一起出去了。消费者的 fail-open 分支在
-  ``app/backup/service.py``：密钥为空时只打一条 warning，然后照旧上传明文。
-  而配置里那句承诺（「生产校验会要求它非空」）**从来没兑现过** ——
-  ``validate_production_settings`` 里根本没有这一项。
 
 * **§3.44 ``TRUSTED_PROXIES``**：留空时 IP 维度只按 TCP 对端计，于是反代
   （nginx → 127.0.0.1:8000）后面的所有请求**共用一个桶**。实测一个
@@ -21,13 +13,15 @@
   默认空 —— 于是「照抄 ``.env.example`` 的部署」正好落在「MCP 开着 +
   传输层不校验 Host 头」这个形态里，而启动闸门对它是**完全沉默**的。
 
-**三条都留了同一个形状的豁免口**（``*_WARN_ONLY=true``）：本机直连的部署
+**两条都留了同一个形状的豁免口**（``*_WARN_ONLY=true``）：本机直连的部署
 确实不需要那些配置，让它能**显式**地说「我知道我在做什么」。
+
+**§3.8 ``BACKUP_ENCRYPTION_KEY`` 那一段已于 2026-10-26 移除**：备份制品
+的静态加密改由 **OSS 服务端加密（SSE）** 承担，客户端不再加密，也就没有
+「密钥为空」这个状态需要拦了。新的事实由
+``tests/test_backup_server_side_encryption.py`` 守着。
 """
 from __future__ import annotations
-
-import base64
-import os
 
 import pytest
 
@@ -35,8 +29,6 @@ from app.core.config import Settings, validate_production_settings
 
 GOOD_SECRET = "a" * 48
 GOOD_DB = "postgresql+psycopg://cwq:Str0ngP%40ssXYZwAB@db.internal:5432/cwq"
-#: 一把合法的 32 字节 base64 密钥。
-GOOD_KEY = base64.b64encode(os.urandom(32)).decode()
 
 
 def _prod(**kw):
@@ -68,6 +60,17 @@ def _oss_ready(**kw):
     )
 
 
+def test_配了OSS备份不会因为加密密钥被拦住():
+    """**客户端加密那层已经没有了** —— 配了 OSS 就不会因为「没配备份加密
+    密钥」而被启动闸门拦住。
+
+    这条用例钉的是**移除**这件事：谁把 ``BACKUP_ENCRYPTION_KEY`` 那一项
+    加回启动校验（哪怕是"顺手补上"），这里立刻红。
+    """
+    checks = _check(_oss_ready())
+    assert any("服务端加密" in c for c in checks), checks
+
+
 # --------------------------------------------------------------------- 基线
 
 
@@ -77,42 +80,15 @@ def test_合规的生产配置通过校验():
     assert any("JWT_SECRET" in c for c in checks)
 
 
-# --------------------------------------------------------------------- §3.8
-
-
-def test_配了OSS备份就必须配备份加密密钥():
-    with pytest.raises(ValueError) as e:
-        _check(_oss_ready(backup_encryption_key=""))
-    assert "BACKUP_ENCRYPTION_KEY" in str(e.value)
-
-
-def test_备份密钥必须是合法base64():
-    with pytest.raises(ValueError) as e:
-        _check(_oss_ready(backup_encryption_key="不是base64!!"))
-    assert "BACKUP_ENCRYPTION_KEY" in str(e.value)
-
-
-def test_备份密钥必须正好32字节():
-    short = base64.b64encode(os.urandom(16)).decode()
-    with pytest.raises(ValueError) as e:
-        _check(_oss_ready(backup_encryption_key=short))
-    assert "BACKUP_ENCRYPTION_KEY" in str(e.value)
-
-
-def test_备份密钥合法就放行():
-    _check(_oss_ready(backup_encryption_key=GOOD_KEY))
-
-
-def test_没配OSS就不要求备份密钥():
-    """**没配 OSS 就没有备份制品**，也就没有「明文躺在对象存储上」这件事。"""
-    _check(_prod(backup_encryption_key=""))
-
-
-def test_备份密钥可以显式豁免():
-    """豁免口是**显式**的：知情故犯可以，但要说出来。"""
-    checks = _check(_oss_ready(backup_encryption_key="",
-                               backup_encryption_key_warn_only=True))
-    assert any("BACKUP_ENCRYPTION_KEY" in c or "明文" in c for c in checks)
+# --------------------------------------------------------------------- §3.8（已于 2026-10-26 移除）
+#
+# 原来这里钉的是「配了 OSS 备份就必须配备份加密密钥」那道启动闸。
+# 客户端加密那一层整段移除了（静态加密改由 OSS 服务端加密承担），
+# 于是没有「密钥为空」这个状态，也就没有这道闸。
+#
+# **留下的替代物**：桶上的 SSE 规则状态是**看得见的事实**，由
+# ``tests/test_backup_server_side_encryption.py`` 守着
+# （「测试连接」报出来、每轮备份记进日志、没开时告警）。
 
 
 # --------------------------------------------------------------------- §3.44
@@ -229,19 +205,16 @@ def test_只写域名带端口的形式_闸门放行但传输层匹配不到裸�
 def test_dev环境整体跳过():
     """开发机不该因为这些项起不来。"""
     validate_production_settings(
-        _prod(trusted_proxies="", mcp_allowed_hosts="",
-              backup_encryption_key=""), env="dev")
+        _prod(trusted_proxies="", mcp_allowed_hosts=""), env="dev")
 
 
 def test_一次报出全部问题():
     """配置错了就让人一项项试错，是把人往「干脆全用默认值」推。"""
     with pytest.raises(ValueError) as e:
         _check(_prod(trusted_proxies="", mcp_allowed_hosts="",
-                     backup_encryption_key="",
                      oss_endpoint="https://oss-cn-hangzhou.aliyuncs.com",
                      oss_access_key_id="ak", oss_access_key_secret="sk",
                      oss_bucket="bucket"))
     msg = str(e.value)
     assert "TRUSTED_PROXIES" in msg
     assert "MCP_ALLOWED_HOSTS" in msg
-    assert "BACKUP_ENCRYPTION_KEY" in msg

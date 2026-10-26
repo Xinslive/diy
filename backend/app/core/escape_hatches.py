@@ -8,7 +8,7 @@
 --------------------------------------------
 这份清单同时被三处用到：
 
-1. **应用侧**：:mod:`app.core.config` 读进 Settings 的那三个 ——
+1. **应用侧**：:mod:`app.core.config` 读进 Settings 的那两个 ——
    启动闸门会查它们**在持久化配置（``.env``）里是不是开着**；
 2. **部署侧**：``deploy/deploy.sh`` 自己读的那几个 ——
    它们只对**单次运行**生效（从进程环境读，不落盘）；
@@ -30,12 +30,15 @@ from __future__ import annotations
 #: 置 ``true`` 的效果是「把一道 fail-closed 的闸降级成只告警」：
 #:
 #:   * ``TRUSTED_PROXIES_WARN_ONLY``      —— TRUSTED_PROXIES 为空时不再拒绝启动；
-#:   * ``MCP_ALLOWED_HOSTS_WARN_ONLY``    —— MCP Host 白名单为空时不再拒绝启动；
-#:   * ``BACKUP_ENCRYPTION_KEY_WARN_ONLY``—— 备份加密密钥为空时不再拒绝启动。
+#:   * ``MCP_ALLOWED_HOSTS_WARN_ONLY``    —— MCP Host 白名单为空时不再拒绝启动。
+#:
+#: **备份加密不再有客户端那一层**（2026-10-26 移除）：制品的静态加密由 OSS
+#: 服务端加密（SSE）承担，本项目不再在上传前加密，也就不再有「密钥为空」
+#: 这道需要豁免的闸。服务端加密的状态是**看得见的事实**（见
+#: ``app/backup/oss_client.py::server_side_encryption``），不是一个开关。
 APP_SIDE_ESCAPE_HATCHES = (
     "TRUSTED_PROXIES_WARN_ONLY",
     "MCP_ALLOWED_HOSTS_WARN_ONLY",
-    "BACKUP_ENCRYPTION_KEY_WARN_ONLY",
 )
 
 #: 每个应用侧逃生口对应的「**正式配法**」—— 报错时直接告诉运维该怎么改。
@@ -47,8 +50,6 @@ APP_SIDE_ESCAPE_HATCH_FIXES = {
         "把 TRUSTED_PROXIES 配成反向代理地址（如 127.0.0.1）",
     "MCP_ALLOWED_HOSTS_WARN_ONLY":
         "把 MCP_ALLOWED_HOSTS 配成宿主名清单（DNS 重绑定防护）",
-    "BACKUP_ENCRYPTION_KEY_WARN_ONLY":
-        "把 BACKUP_ENCRYPTION_KEY 配成备份加密密钥（OSS 上的备份制品就是密文）",
 }
 
 #: 部署侧的逃生口：``deploy.sh`` 自己读，默认关（= 阻断）。

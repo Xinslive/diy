@@ -1,8 +1,13 @@
 """「逃生口」的登记与闸门。
 
-对应审计 §3.8 / §3.44 的收紧：那两条各自带了一个 warn-only 豁免开关
-（``BACKUP_ENCRYPTION_KEY_WARN_ONLY`` / ``CWQ_DEPLOY_ALLOW_EMPTY_TRUSTED_PROXIES``）。
+对应审计 §3.44 的收紧：那一条带了个 warn-only 豁免开关
+（``MCP_ALLOWED_HOSTS_WARN_ONLY``），部署侧还有
+``CWQ_DEPLOY_ALLOW_EMPTY_TRUSTED_PROXIES``。
 默认值是阻断，所以「条目算修好」；但只要开关开着，**生产姿态**就被削弱了。
+
+（``BACKUP_ENCRYPTION_KEY_WARN_ONLY`` 那个已于 2026-10-26 随客户端加密
+那一层一起移除 —— 静态加密改由 OSS 服务端加密承担，不再有「密钥为空」
+这个状态需要豁免。）
 
 这里把这个残余风险收口，三条断言：
 
@@ -177,7 +182,6 @@ def _production_settings():
         admin_email_mfa_link_base="https://acct.example.com",
         trusted_proxies="127.0.0.1",
         mcp_allowed_hosts="acct.example.com",
-        backup_encryption_key="a-long-backup-encryption-key-value",
     )
 
 
@@ -250,7 +254,6 @@ def test_读取逃生口时的解析规则(tmp_path):
             "# 一行注释",
             "TRUSTED_PROXIES_WARN_ONLY=true",
             'MCP_ALLOWED_HOSTS_WARN_ONLY = "1"   # 带引号和行尾注释',
-            "BACKUP_ENCRYPTION_KEY_WARN_ONLY=YES",
             "TRUSTED_PROXIES=127.0.0.1",
             "SOMETHING_ELSE=true",
         ]),
@@ -260,6 +263,5 @@ def test_读取逃生口时的解析规则(tmp_path):
     assert set(found) == {
         "TRUSTED_PROXIES_WARN_ONLY",
         "MCP_ALLOWED_HOSTS_WARN_ONLY",
-        "BACKUP_ENCRYPTION_KEY_WARN_ONLY",
     }
     assert found["MCP_ALLOWED_HOSTS_WARN_ONLY"] == "1"

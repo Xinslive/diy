@@ -676,19 +676,14 @@ class _FakeOss:
 def oss(monkeypatch, db):
     """把 OSS 参数写进设置、把客户端换成假实现，返回那个假实现。
 
-    **这里必须配一把备份加密密钥。** 「配了 OSS 就必须配了加密密钥」
-    是运行期那道闸（``app/backup/config.py::require_encrypted_ready``）的
-    口径 —— 没配密钥时 ``run_backup`` **直接拒绝**，不会上传任何字节。
-
-    所以这个夹具代表的是**「OSS 已经配好、备份能正常跑」** 的常态，
-    而不是「什么都能跑」。要求测试自己显式给出密钥，比在产品代码里
-    留一条「没配就放行」的后门要好得多：那条后门正是审计 §3.8 指认的
-    那个形态。
+    **这里不需要配任何加密密钥** —— 备份制品**不在客户端加密**了
+    （2026-10-26）：静态加密由 OSS 服务端加密（SSE）承担，而 SSE 是**桶上的
+    开关**，不在本项目的配置里。所以这个夹具代表的就是**常态**：
+    「OSS 配好，备份能正常跑」。
     """
     from app.backup import oss_client as oss_mod
     from app.backup import retention as ret
     from app.core import system_settings
-    from app.core.config import settings
 
     for key, value in (("oss_endpoint", "oss-cn-hangzhou.aliyuncs.com"),
                        ("oss_access_key_id", "AK"), ("oss_access_key_secret", "SK"),
@@ -698,9 +693,6 @@ def oss(monkeypatch, db):
                        ("backup_keep_weekly_days", "365")):
         system_settings.set_value(db, key, value)
     db.commit()
-
-    monkeypatch.setattr(settings, "backup_encryption_key",
-                        base64.b64encode(os.urandom(32)).decode())
 
     fake = _FakeOss()
     monkeypatch.setattr(oss_mod, "make_bucket", fake.make_bucket)
@@ -733,13 +725,12 @@ def test_run_backup_uploads_one_object_per_book(db, book, admin_user, oss):
     assert any("/system/" in k for k in oss.objects), sorted(oss.objects)
     # 真的传上去了，而且字节就是**那份**制品。
     #
-    # 这里断言的是**密文**而不是 gzip：夹具配了加密密钥，而
-    # ``run_backup`` 现在要求「配了 OSS 就必须配了加密密钥」——
-    # 上传到 OSS 的必然是密文。断言 gzip 魔数等于把「没配密钥时明文上传」
-    # 那个形态钉成常态，那正是审计 §3.8 要消灭的东西。
+    # 这里断言的是 **gzip 魔数**：制品**不在客户端加密**了（2026-10-26），
+    # 上传到 OSS 的就是导出层写出来的那份 gzip 本身。
+    # 静态加密由 OSS 服务端加密（SSE）承担 —— 那是**桶上的开关**，
+    # 不改变对象在这条链路上的字节。
     key = next(k for k in oss.objects if f"book-{book.id}" in k)
-    assert oss.objects[key].startswith(export_mod.ENCRYPTED_MAGIC)
-    assert not oss.objects[key].startswith(b"\x1f\x8b")
+    assert oss.objects[key].startswith(b"\x1f\x8b")
 
 
 def test_second_run_same_day_drops_to_daily(db, book, admin_user, oss):
@@ -1362,7 +1353,6 @@ def oss_sdk(monkeypatch, db):
     会被完整跑到 —— 事故就发生在这一段上。
     """
     from app.core import system_settings
-    from app.core.config import settings
 
     for key, value in (("oss_endpoint", "oss-cn-heyuan.aliyuncs.com"),
                        ("oss_access_key_id", "AK"), ("oss_access_key_secret", "SK"),
@@ -1372,10 +1362,6 @@ def oss_sdk(monkeypatch, db):
                        ("backup_keep_weekly_days", "365")):
         system_settings.set_value(db, key, value)
 
-    # 与 :func:`oss` 夹具同款：配了 OSS 就得配加密密钥，否则 ``run_backup``
-    # 会在上传**之前**就拒绝（运行期那道闸，见 app/backup/config.py）。
-    monkeypatch.setattr(settings, "backup_encryption_key",
-                        base64.b64encode(os.urandom(32)).decode())
     db.commit()
 
     fake = _FakeOss2()
@@ -1541,15 +1527,10 @@ def test_整轮失败记录要带上真实原因(db, client, auth, monkeypatch):
         system_settings.set_value(db, key, value)
     db.commit()
 
-    # 「立即备份」在派发后台任务**之前**先过运行期那道闸（配了 OSS 就必须
-    # 配了加密密钥）。不给密钥的话，请求会先被 400 拦掉、后台任务压根
-    # 不会跑 —— 那条「整轮失败」记录也就不出现，这条用例测的东西就
-    # 从「后台任务把真实原因记下来了」变成了「闸门拦住了请求」。
-    from app.core.config import settings
-
-    monkeypatch.setattr(settings, "backup_encryption_key",
-                        base64.b64encode(os.urandom(32)).decode())
-
+    # 「立即备份」在派发后台任务**之前**先过一道闸：**OSS 参数配全了没有**
+    # （按生效配置判，界面上配的也算）。参数不全的话，请求会先被 400 拦掉、
+    # 后台任务压根不会跑 —— 那条「整轮失败」记录也就不出现，这条用例测的
+    # 东西就从「后台任务把真实原因记下来了」变成了「闸门拦住了请求」。
     def boom(session, actor=None, **kw):
         raise RuntimeError("apply_retention: 'int' object has no attribute 'tzinfo'")
 

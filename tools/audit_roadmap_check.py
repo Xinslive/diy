@@ -153,11 +153,34 @@ def ev_all(*specs, flags=0):
     return out
 
 
+def ev_removed(*absent_specs, present_specs=(), flags=0):
+    """断言「这些**不在了**，而这些**在**」—— 用来钉「移除」这类改动。
+
+    **为什么不能写成 ``ev_all(...) + ev_absent(...)``**：``+`` 的语义是
+    「任一命中就算过」。一组判据缺一条、另一组命中一条，合起来照样 PASS，
+    那条判据就是假的（判据本身也要被反向验证过 —— 与
+    ``ev_all`` 存在的原因同源）。这里要求**全部**成立才给证据。
+    """
+    out = []
+    for path, pattern in absent_specs:
+        if find(path, pattern, flags):
+            print(f"        ✗ 还在：{path} 里仍然有 {pattern!r}")
+            return []
+    for path, pattern in present_specs:
+        hits = ev(path, pattern, flags, 1)
+        if not hits:
+            print(f"        ✗ 缺证据：{path} 里找不到 {pattern!r}")
+            return []
+        out.extend(hits)
+    return out
+
+
 B = "backend/app"
 BE = "backend/app/api"
 BF = "backend/app/core"
 BA = "backend/app/accounting"
 BP = "backend/app/plugins"
+BB = "backend/app/backup"
 BN = "backend/app/notify"
 
 print("=" * 78)
@@ -193,20 +216,29 @@ check(4, f"补齐同名同义的 CheckConstraint（§3.22 / §3.14）—— 实�
 check(5, "reports.py 的模板写路径补审计 log()（§3.9）",
       ev(f"{BE}/reports.py", r"\blog\("))
 
-# 判据要求**两处都在**：① 判据本身（``key_error = _backup_encryption_key_error``）
-# ② **阻断点**（那句「配了 OSS 备份就必须配备份加密密钥」）。
+# §3.8 的那条闸**已于 2026-10-26 移除**：备份制品的静态加密改由 **OSS 服务端
+# 加密（SSE）** 承担，客户端不再加密。
 #
-# **原来只查 ①**，于是把 ``problems.append(...)`` 换成 ``pass``、
-# 整个启动闸门作废之后，这一项**照样 PASS**（51/51、退出码 0）——
-# 而第 6 项的描述恰恰是「生产校验**强制**」。那是一颗假牙。
+# 原来这一项钉的是「生产校验强制 BACKUP_ENCRYPTION_KEY」——
+# 判据与**阻断点**都要在（阻断点 = 那句报错文案，它只在 problems.append 里）。
+# **原来只查判据**，于是把 ``problems.append(...)`` 换成 ``pass``、
+# 整个启动闸门作废之后，那一项**照样 PASS** —— 那是一颗假牙。
 #
-# ② 那句文案在 config.py 里**只出现一次**，且只在
-# ``problems.append(...)`` 里 —— 它出现，就意味着「不配密钥 ⇒ 拒绝启动」
-# 这件事真的被写进了启动闸门。
-check(6, "config.py 生产校验强制 BACKUP_ENCRYPTION_KEY（§3.8）"
-      "—— 判据与**阻断点**都要在（阻断点 = 那句报错文案，它只在 problems.append 里）",
-      ev_all((f"{BF}/config.py", r"key_error = _backup_encryption_key_error"),
-             (f"{BF}/config.py", r"配了 OSS 备份就必须配备份加密密钥")))
+# 现在这一项钉的是**新的事实**，而且是**反向**的：
+# ① 客户端加密那层**不在了**（密钥、加密、解密、魔数都没了）；
+# ② 桶上的 SSE 状态**看得见**（读得到 + 被调用）。
+#
+# 写成反向是刻意的：谁把客户端加密加回来（哪怕是"顺手补上"），这一项立刻
+# FAIL —— 而它当初正是审计 §3.8 的结论。
+check(6, "备份加密改为 OSS 服务端加密（2026-10-26）—— 客户端加密那层不在了，"
+      "且桶的 SSE 状态看得见（读得到 + 被调用）",
+      ev_removed((f"{BB}/export.py", r"def encryption_key"),
+                 (f"{BB}/export.py", r"def encrypt_file"),
+                 (f"{BB}/export.py", r"def decrypt_file"),
+                 (f"{BF}/config.py", r"^\s*backup_encryption_key\s*:", ),
+                 present_specs=((f"{BB}/oss_client.py", r"def server_side_encryption"),
+                                (f"{BB}/service.py", r"server_side_encryption")),
+                 flags=re.M))
 
 check(7, "system.py 的 entity_id 改用 sha256 截断到 32 位（§3.21）",
       ev(f"{BE}/system.py", r"sha256"))
@@ -363,13 +395,25 @@ check(36, "mcp_enabled=true 时强制要求 MCP_ALLOWED_HOSTS（§4.3）"
               r"if settings\.mcp_enabled and not mcp_allowed_host_list"),
              (f"{BF}/config.py", r"MCP_ENABLED=true 但 MCP_ALLOWED_HOSTS 为空")))
 
-# 与第 6 项同一条启动闸门（§3.8 在 §7 里出现两次：第 0 步与第 4 步）。
-# 判据同样要求**阻断点**在 —— 只查 ``if _oss_backup_configured(settings)``
+# 与第 6 项同一条事情（§3.8 在 §7 里出现两次：第 0 步与第 4 步）。
+# 原来这一项钉的是「条件与**阻断点**都要在」—— 只查 ``if _oss_backup_configured(settings)``
 # 这一行的话，把 ``problems.append(...)`` 换成 ``pass`` 照样 PASS。
-check(37, "配 OSS 备份时强制加密密钥（§3.8）"
-      "—— 条件与**阻断点**都要在",
-      ev_all((f"{BF}/config.py", r"if _oss_backup_configured\(settings\)"),
-             (f"{BF}/config.py", r"配了 OSS 备份就必须配备份加密密钥")))
+#
+# **2026-10-26：客户端加密那一层整段移除了**（静态加密改由 OSS 服务端加密
+# 承担），所以「阻断点」不存在了 —— 留着这条判据就等于要求一个**不存在**的
+# 闸门存在，它会永远 FAIL，而那不是「有洞」，是「判据过期了」。
+#
+# 改成与第 6 项同向的反向判据：客户端加密那层**不在**，且桶的 SSE 状态
+# **看得见**。谁把客户端加密加回来，这两项一起 FAIL。
+check(37, "备份加密已改为 OSS 服务端加密（2026-10-26）—— 客户端加密那层不在了，"
+      "且桶的 SSE 状态看得见",
+      ev_removed((f"{BB}/export.py", r"def encryption_key"),
+                 (f"{BB}/export.py", r"def encrypt_file"),
+                 (f"{BB}/export.py", r"def decrypt_file"),
+                 (f"{BF}/config.py", r"^\s*backup_encryption_key\s*:", ),
+                 present_specs=((f"{BB}/oss_client.py", r"def server_side_encryption"),
+                                (f"{BB}/service.py", r"server_side_encryption")),
+                 flags=re.M))
 
 check(38, "esa-mtls.sh 自动探测 vhost 路径与 access_log（§3.42）",
       ev("deploy/esa-mtls.sh", r"grep -E .*access_log"))

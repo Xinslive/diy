@@ -221,16 +221,20 @@ def test_备份不落到系统临时目录():
         "应当仍然允许用 CWQ_BACKUP_WORK_DIR 把工作目录挪到别处")
 
 
-def test_解密的明文快照不落系统临时目录():
-    """恢复时解出来的明文快照，临时文件必须落在磁盘目录。
+def test_恢复路径不产生明文临时文件():
+    """恢复时**不再**解出明文临时文件 —— 制品本来就不是密文（2026-10-26）。
 
-    快照大小 = 它占的内存；落在 tmpfs 上就是直接吃内存。
+    原来这里守的是「解密出来的明文快照必须落磁盘目录，不能落 /tmp」
+    （``PrivateTmp=true`` 之下那是内存盘，而快照大小 = 它占的内存）。
+
+    客户端加密那一层移除之后，制品本身就是 gzip，**根本不需要解** ——
+    于是「全量账务数据的明文副本」一个字节都不落地，那个内存风险
+    **从根上**没有了。
+
+    这条用例守的是**更强**的那个事实：``export.py`` 里不许再出现
+    ``mkstemp``。谁又把「先落一份明文临时文件」加回来，这里立刻红。
     """
     src = BACKUP_EXPORT.read_text(encoding="utf-8")
-    assert "mkstemp(" in src
-    # 每个 mkstemp 都必须带 dir=
-    for m in re.finditer(r"mkstemp\(([^)]*)\)", src, re.S):
-        args = m.group(1)
-        assert "dir=" in args, (
-            f"mkstemp 没有指定 dir=：{m.group(0)[:80]} —— "
-            "不指定就落在系统临时目录（内存盘）")
+    assert "mkstemp(" not in src, (
+        "export.py 里又出现了 mkstemp —— 客户端加密那层被加回来了？"
+        "制品不该需要先落一份明文临时文件")

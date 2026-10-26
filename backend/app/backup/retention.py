@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 from app.backup import tier as tier_mod
-from app.backup.oss_client import OssError, delete_object, iter_objects
+from app.backup.oss_client import ObjectProtected, delete_object, iter_objects
 from app.models import TIER_MONTHLY, TIER_WEEKLY
 
 # 只删我们自己格式的对象。
@@ -120,6 +120,14 @@ def apply_retention(bucket, prefix: str, keep_days: dict[str, int],
         objects = list(iter_objects(bucket, p))
         for key, age in plan_deletions(objects, t, keep, now):
             if not dry_run:
-                delete_object(bucket, key)
+                # **对象受保留策略保护（WORM / 合规保留）时，删不掉是正常的。**
+                # 那种桶里「删不掉」= 保留策略在正常工作；把它算成清理失败，
+                # 每轮备份都会报一个假故障，而真实情况是「该留的都留下了」。
+                # 所以这里跳过它，不记进 ``deleted``，也不让异常冒出去。
+                try:
+                    delete_object(bucket, key)
+                except ObjectProtected as exc:
+                    logger.info("过期产物受保留策略保护，保留：%s", exc)
+                    continue
             deleted.append(Deleted(key=key, tier=t, age_days=age))
     return deleted

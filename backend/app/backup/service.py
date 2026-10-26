@@ -139,44 +139,6 @@ def _record(db: Session, run: BackupRun) -> None:
     db.refresh(run)
 
 
-def _prepare_upload(tmp: Path, workdir: Path, label: str) -> tuple[Path, str, int]:
-    """把导出的 gzip 变成「**该上传的那份**」，返回 ``(路径, SHA256, 字节数)``。
-
-    **配了密钥就加密，没配就照旧。** 加密用的是 AES-256-GCM（带认证），
-    密钥来自 ``settings.backup_encryption_key``。
-
-    * **返回的 SHA256 是密文的** —— OSS 上真正存着的那串字节。算明文的
-      校验和会让恢复时的比对必然对不上（那是「校验和与明文不一致」的经典坑）。
-    * **密钥为空 = 不加密**，但要**明确记一条告警**：默默保持明文而没人知道，
-      比明文本身更危险。
-    * **密钥必须与 OSS AccessKey 分开存放**（见
-      ``export.encryption_key`` 的说明）：两者的爆炸半径不一样。
-
-    加密后的文件落在同一个临时目录里，上传完就删（临时目录里不留明文）。
-
-    **「密钥为空」这条分支现在只有一条路能走到**：
-    ``run_backup`` 开头那道 ``require_encrypted_ready`` 已经拒掉了
-    「配了 OSS 却没配加密密钥」的情形（界面配 OSS 的那条路也在内）。
-    走到这里说明要么密钥是好的，要么运维显式开了
-    ``BACKUP_ENCRYPTION_KEY_WARN_ONLY=true``（逃生口已登记在册）。
-    换句话说：**明文上传是明示的取舍，不是默认行为**。
-    """
-    key = export_mod.encryption_key()
-    if key is None:
-        logger.warning(
-            "OSS 备份未加密：没有配置 BACKUP_ENCRYPTION_KEY。"
-            "备份制品将以**明文 gzip** 存放在 OSS 上（任何人拿到对象即可解压）。"
-            "要加密请配置一把 base64 的 32 字节随机密钥。")
-        return tmp, export_mod.file_sha256(tmp), tmp.stat().st_size
-    cipher = _new_temp(workdir, label + "-enc")
-    try:
-        size = export_mod.encrypt_file(tmp, cipher)
-    except Exception:
-        cipher.unlink(missing_ok=True)
-        raise
-    return cipher, export_mod.file_sha256(cipher), size
-
-
 def run_backup(db: Session, *, actor=None, book_ids: Optional[Iterable[int]] = None,
                force_tier: Optional[str] = None, prune: bool = True,
                now: Optional[datetime] = None,
@@ -193,15 +155,19 @@ def run_backup(db: Session, *, actor=None, book_ids: Optional[Iterable[int]] = N
     ``should_stop`` 是**尽力停止**的钩子：返回 True 就停止本轮（剩下的目标
     不备份）。调度器用它把「租约已丢、该让接管者接手」这件事落成动作。
 
-    **这里要求「制品一定是密文」。** ``require_encrypted_ready`` 按**生效
-    配置**判「配了 OSS 就必须配了加密密钥」—— 界面上配 OSS 的那条路
-    （产品自己指给运维的那条）也在这道闸里，不只是 env 层那条。
-    启动期的闸门只看得到 env 层（启动期没有库连接），所以运行期这道
-    不可省。详见 ``app/backup/config.py::require_encrypted_ready``。
+    **这里只要求「OSS 参数配全了」**（``require_ready``，按**生效配置**判 ——
+    界面上配 OSS 的那条路也在这道闸里，不只是 env 层那条）。
+
+    **制品不在客户端加密**（2026-10-26）：备份产物的静态加密由 **OSS 服务端
+    加密（SSE）** 承担，桶上的默认加密规则对不带 SSE 头的普通上传同样生效。
+    桶的 SSE 规则状态在每轮备份里读一次并记进日志（见
+    ``app/backup/oss_client.py::server_side_encryption``）——
+    那是**事实**，不是配置承诺。
     """
-    cfg = cfg_mod.require_encrypted_ready(db)
+    cfg = cfg_mod.require_ready(db)
     bucket = oss_client.make_bucket(cfg)
     try:
+        _report_server_side_encryption(bucket)
         return _run_backup_with_bucket(
             db, cfg, bucket, actor=actor, book_ids=book_ids,
             force_tier=force_tier, prune=prune, now=now, should_stop=should_stop)
@@ -209,6 +175,27 @@ def run_backup(db: Session, *, actor=None, book_ids: Optional[Iterable[int]] = N
         # finally 而不是「跑到最后一行关」：备份里最常见的结局是**抛异常**
         # （某一本网络失败、配置被改掉）。只在成功路径上关，等于异常路径永远漏。
         oss_client.close_bucket(bucket)
+
+
+def _report_server_side_encryption(bucket) -> None:
+    """把桶的服务端加密状态记进日志。
+
+    **读不到不算失败** —— 这一轮备份与 SSE 状态无关，它只是让我们少一个
+    事实；把它算成失败，代价是「备份因为读不到一个状态而没跑」。
+    """
+    try:
+        algorithm = oss_client.server_side_encryption(bucket)
+    except Exception as exc:                             # noqa: BLE001
+        logger.warning("读不到 OSS 桶的服务端加密状态：%s（备份照常进行）", exc)
+        return
+    if algorithm:
+        logger.info("OSS 桶的服务端加密已开启（%s）：备份制品的静态加密由 OSS 承担。",
+                    algorithm)
+    else:
+        logger.warning(
+            "OSS 桶**没有开启服务端加密**（SSE）：备份制品将以明文 gzip "
+            "存在对象存储上。请到 OSS 控制台给桶配置默认加密规则"
+            "（SSE-OSS / AES256）。")
 
 
 def _run_backup_with_bucket(db: Session, cfg: dict, bucket, *, actor=None,
@@ -259,18 +246,20 @@ def _run_backup_with_bucket(db: Session, cfg: dict, bucket, *, actor=None,
             stats = export_mod.export_scope(
                 db, scope=scope, book_id=book_id, book_label=label,
                 out_path=tmp, now=now_utc)
-            upload_path, checksum, size_bytes = _prepare_upload(tmp, workdir, label)
-            cipher_path = upload_path if upload_path != tmp else None
+            # **上传的就是这份 gzip 本身**（2026-10-26 起不再在客户端加密），
+            # 所以校验和与字节数直接取导出那一层的 —— 那已经是**压缩后**、
+            # 写进文件里的那串字节，正是 OSS 上存着的那份。
+            # （原来这里要另算一遍：加密后上传的是密文，明文的校验和对不上。）
             # **按文件上传，不按内存。** 备份任务跑在 API 进程里，与在线请求
             # 共享同一个进程的内存：把整份 gzip 读进内存再上传，一本大账套的
             # 快照就能把在线请求挤到 OOM。oss2 自己分片读文件。
-            oss_client.put_file(bucket, key, str(upload_path))
+            oss_client.put_file(bucket, key, str(tmp))
             run.status = STATUS_SUCCESS
             run.oss_key = key
-            run.size_bytes = size_bytes
+            run.size_bytes = stats.size_bytes
             run.row_count = stats.rows
-            # 校验和是**密文**的 SHA256 —— OSS 上真正存着的那串字节。
-            run.checksum = checksum
+            # 校验和是 OSS 上真正存着的那串字节的 SHA256。
+            run.checksum = stats.checksum
             run.message = f"{len(stats.tables)} 张表 / {stats.rows} 行"
         except Exception as exc:                      # noqa: BLE001 - 逐个隔离
             # **失败也要落记录，而且要全文。** 「上传失败」四个字在排障时等于
@@ -280,8 +269,6 @@ def _run_backup_with_bucket(db: Session, cfg: dict, bucket, *, actor=None,
             run.message = f"{type(exc).__name__}: {exc}"
         finally:
             tmp.unlink(missing_ok=True)
-            if cipher_path is not None:
-                cipher_path.unlink(missing_ok=True)
             run.finished_at = datetime.now(timezone.utc)
             _record(db, run)
             runs.append(run)

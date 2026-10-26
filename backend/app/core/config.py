@@ -13,8 +13,6 @@ token 全世界都能伪造（HS256 是对称签名，密钥就是源码里那�
 """
 from __future__ import annotations
 
-import base64
-import binascii
 import logging
 import re
 from functools import lru_cache
@@ -690,33 +688,23 @@ class Settings(BaseSettings):
     # 定时备份总开关。关掉之后界面与手动触发仍可用，只是不再有 systemd 定时跑。
     backup_enabled: bool = True
 
-    # 备份制品的**客户端加密**密钥（审查 M-07）。
+    # 备份制品的**客户端加密**已移除（2026-10-26）。
     #
-    # **为什么必须有。** 备份管线是 ``gzip → SHA256 → OSS``，而 SHA256 是
-    # **校验和，不是加密** —— OSS 上的对象是**明文 gzip 压缩包**。备份是全系统
-    # 数据价值密度最高的单一制品：桶的读权限一旦泄露（AK 泄露 / 桶策略过宽 /
-    # 阿里云侧账号被盗），攻击者直接下载全部账套的全量凭证与金额。
+    # 原来这里有 ``backup_encryption_key``（客户端 AES-256-GCM 密钥）与
+    # ``backup_encryption_key_warn_only``（豁免开关），两者一起删掉了。
     #
-    # **留空 = 不加密**（保持现状），但生产校验会要求它非空 —— 与
-    # ``JWT_SECRET`` 同一个 fail-closed 口径。
+    # **为什么删**：备份制品的静态加密改由 **OSS 服务端加密（SSE）** 承担 ——
+    # 桶上开了默认加密规则（SSE-OSS / AES256），不带 SSE 头的普通上传同样被
+    # 服务端加密。所以本项目在上传前再加密一遍，是同一件事做两遍，而且
+    # 多出来的那一遍要自己管一把密钥（要单独存放、要能找回、丢了备份就废了）。
     #
-    # 格式：``base64(32 字节随机)``。用 age / AES-GCM 这一类带认证的方案；
-    # 密钥**必须与 OSS AccessKey 分开存放**，否则「拿到备份就等于拿到解密钥匙」。
-    backup_encryption_key: str = ""
-
-    # 「``BACKUP_ENCRYPTION_KEY`` 没配」要不要**只告警**（审查 §3.8）。
+    # **代价要说清楚**：SSE 保护的是**静态数据**（磁盘/介质层），
+    # 它**不**保护「拿到桶读权限的人」—— 那种人照样能让 OSS 替他解密。
+    # 客户端加密配一把**单独存放**的密钥时，那才是连 AK 泄露都不怕。
+    # 这是运维侧显式选的取舍，不是本项目默认的姿态。
     #
-    # **默认 false = 拒绝启动**（所以豁免要显式写 true）。
-    #
-    # 这一项原来是**只告警**的 —— 而告警的落点在**消费者**那边
-    # （``app/backup/service.py`` 里 ``logger.warning`` 一句，然后照旧
-    # 上传**明文 gzip**）。配置里那句承诺（「生产校验会要求它非空」）
-    # 与实现对不上：``validate_production_settings`` 里**根本没有**这一项。
-    # 承诺与实现不一致比没有承诺更糟 —— 运维会以为「启动闸门管过了」。
-    #
-    # **豁免口**：``BACKUP_ENCRYPTION_KEY_WARN_ONLY=true``。明知故犯地
-    # 先用明文跑一段时间是可以的，但要**显式**写出来。
-    backup_encryption_key_warn_only: bool = False
+    # 服务端加密的状态是**看得见的事实**（``app/backup/oss_client.py::
+    # server_side_encryption``），不是靠配置承诺的。
     # 是否额外备份系统级数据（用户、授权、参数、全局基线模板）。
     backup_include_system: bool = True
     # 保留天数的天级/周级。月度恒为永久 —— 不做成可配，理由见
@@ -1062,34 +1050,12 @@ def _oss_backup_configured(settings: "Settings") -> bool:
     **看不到库里配的那一套**（界面上填的 OSS 参数）—— 启动期没有库
     连接，与 ``admin_mfa_enabled`` 是同一条限制。
 
-    **库里的那一套由运行期兜底**（``app/backup/config.py::require_encrypted_ready``）——
-    它按**生效配置**判「配了 OSS 就必须配了加密密钥」，所以界面上配 OSS
-    的那条路（产品自己指给运维的那条）同样上传不了明文制品。
-    两道闸覆盖两种来源，谁都绕不过去。
+    **库里的那一套由运行期兜底**（``app/backup/config.py::require_ready``）——
+    它按**生效配置**判，所以界面上配 OSS 的那条路（产品自己指给运维的那条）
+    同样过不了。两道闸覆盖两种来源，谁都绕不过去。
     """
     return all((getattr(settings, name, "") or "").strip() for name in (
         "oss_endpoint", "oss_access_key_id", "oss_access_key_secret", "oss_bucket"))
-
-
-def _backup_encryption_key_error(raw: str | None) -> str:
-    """``BACKUP_ENCRYPTION_KEY`` 有问题时返回一句**人话**；没问题返回空串。
-
-    **判据与生产者完全一致**（``app/backup/export.py::encryption_key``）：
-    base64（``validate=True``）且解码后**恰好 32 字节**。
-
-    两边必须同口径 —— 启动闸门说「合格」而导出时说「拒绝」，那这条
-    闸门就是骗人的（而且是最坏的那种骗法：它让人以为备份是加密的）。
-    """
-    value = (raw or "").strip()
-    if not value:
-        return "为空"
-    try:
-        key = base64.b64decode(value, validate=True)
-    except (ValueError, binascii.Error):
-        return "不是合法的 base64"
-    if len(key) != 32:
-        return f"解码后是 {len(key)} 字节（必须是 32 字节）"
-    return ""
 
 
 def validate_production_settings(settings: "Settings", env: str | None = None,
@@ -1280,51 +1246,23 @@ def validate_production_settings(settings: "Settings", env: str | None = None,
                 "显式豁免这一项。")
 
     # ---------------------------------------------------------------------------
-    # 备份制品的加密密钥（审查 §3.8）
+    # 备份制品的加密：客户端那一层已移除（2026-10-26）
     #
-    # **只在「OSS 备份真的配上了」时才要求** —— 没配 OSS 就没有备份制品，
-    # 也就没有「明文躺在对象存储上」这件事。
+    # 原来这里有一道闸：「配了 OSS 备份就必须配 BACKUP_ENCRYPTION_KEY」。
+    # 它现在**不在了** —— 备份制品的静态加密改由 **OSS 服务端加密（SSE）**
+    # 承担，客户端不再加密，也就没有「密钥为空」这个状态需要拦。
     #
-    # 判据用 **env 层的 OSS 参数**（endpoint / AK id / AK secret / bucket 四项
-    # 齐全），与 ``app/backup/config.py::require_ready`` 的口径一致。
-    # **注意这里看不到库里配的 OSS 参数**（界面上填的那一套）——
-    # 与 ``admin_mfa_enabled`` 同一条限制：启动期没有库连接。
+    # **为什么启动期不再检查这件事**：它原来检查的是一个**配置项**
+    # （密钥配没配），现在它对应的是一个**桶上的属性**（SSE 规则开没开）——
+    # 后者要在启动期查，就得多一次出网调用，而启动期没有库连接、也不该
+    # 因为 OSS 慢而把整个站点拖住。它改成**运行时可见的事实**：
+    # 「测试连接」与每轮备份都会读一次桶的服务端加密状态并报出来
+    # （``app/backup/oss_client.py::server_side_encryption``）。
     #
-    # **所以这一道闸不是全覆盖的**：它只管 env 层那条来源。
-    # 界面上配 OSS（产品自己指给运维的那条路）走的是**生效配置**
-    # （库里优先、env 兜底），启动期看不见它 ——
-    # 补上的是**运行期**那道闸（``app/backup/config.py::require_encrypted_ready``），
-    # 它按生效配置判「配了 OSS 就必须配了加密密钥」，并且在**上传之前**就拒绝。
-    # 两道闸覆盖两种来源。
-    #
-    # **为什么这道必须是 problems 而不是 warning**：消费者的 fail-open 分支在
-    # ``app/backup/service.py`` 里 —— 密钥为空时只打一条 warning，然后
-    # **照旧上传明文 gzip**。而配置里那句承诺（「生产校验会要求它非空」）
-    # 在这条分支上从来没兑现过：``validate_production_settings`` 里
-    # **根本没有**这一项。承诺与实现不一致，比没有承诺更糟 ——
-    # 运维会以为「启动闸门管过了」。
-    #
-    # **豁免口**：``BACKUP_ENCRYPTION_KEY_WARN_ONLY=true``（运行期那道闸同款）。
+    # **谁该盯这件事**：运维。SSE 是桶上的开关，不在本项目的配置里；
+    # 有人把它关掉，备份就静悄悄地变成「静态不加密」—— 那时应该在
+    # 「测试连接」与备份日志里看得见，而不是靠一行注释。
     # ---------------------------------------------------------------------------
-    if _oss_backup_configured(settings):
-        key_error = _backup_encryption_key_error(settings.backup_encryption_key)
-        if key_error:
-            if settings.backup_encryption_key_warn_only:
-                log.warning(
-                    "BACKUP_ENCRYPTION_KEY %s —— 已按 "
-                    "BACKUP_ENCRYPTION_KEY_WARN_ONLY=true 放行："
-                    "OSS 上的备份制品将以明文 gzip 存放。", key_error)
-            else:
-                problems.append(
-                    f"BACKUP_ENCRYPTION_KEY {key_error} —— "
-                    "配了 OSS 备份就必须配备份加密密钥：备份管线是 "
-                    "gzip → SHA256 → OSS，而 SHA256 是**校验和不是加密**，"
-                    "于是 OSS 上的对象是**明文 gzip 压缩包**；桶的读权限一旦"
-                    "泄露（AK 泄露 / 桶策略过宽 / 云侧账号被盗），全部账套的"
-                    "凭证与金额就一起出去了。"
-                    "生成一把：python -c \"import base64,os;"
-                    "print(base64.b64encode(os.urandom(32)).decode())\"；"
-                    "若确实要先用明文跑，设 BACKUP_ENCRYPTION_KEY_WARN_ONLY=true。")
 
     # ---------------------------------------------------------------------------
     # 反向代理白名单（审查 §3.44）
@@ -1406,15 +1344,17 @@ def validate_production_settings(settings: "Settings", env: str | None = None,
             checks.append("MCP Host 白名单未配置（已按 MCP_ALLOWED_HOSTS_WARN_ONLY=true "
                           "豁免；DNS 重绑定防护未开启）")
 
-    # 备份加密密钥：配了就显形，**没配（且被显式豁免）也要显形** ——
-    # 「OSS 上的备份制品是明文」这件事必须出现在启动日志的「已检查项」里，
-    # 而不是只留在一条告警里。
+    # 备份加密：客户端那一层已移除（2026-10-26），静态加密由 **OSS 服务端
+    # 加密（SSE）** 承担。这件事要出现在启动日志的「已检查项」里 ——
+    # 不是因为它是本项目配的（它不是），而是因为**「备份是密文」这句话
+    # 必须有着落**：承诺与实现不一致比没有承诺更糟。
+    #
+    # 这里**不查**桶上的 SSE 状态：启动期没有库连接，也不该为了多一个
+    # 状态而多一次出网调用、把整个站点的启动拖住。那个状态在「测试连接」
+    # 与每轮备份里报出来（``app/backup/oss_client.py::server_side_encryption``）。
     if _oss_backup_configured(settings):
-        if _backup_encryption_key_error(settings.backup_encryption_key):
-            checks.append("备份加密密钥未配置（已按 BACKUP_ENCRYPTION_KEY_WARN_ONLY=true "
-                          "豁免；OSS 上的备份制品为明文 gzip）")
-        else:
-            checks.append("备份加密密钥已配置（OSS 上的备份制品为密文）")
+        checks.append("备份制品不在客户端加密（静态加密由 OSS 服务端加密承担；"
+                      "桶上的 SSE 规则状态见「测试连接」与备份日志）")
 
     # CORS 白名单写成 ``*`` 时提醒一句。
     #

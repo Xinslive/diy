@@ -61,6 +61,28 @@ def _通知备份失败(message: str) -> None:
         print(f"⚠️  告警邮件发送失败（已忽略）：{exc}", file=sys.stderr)
 
 
+def _打印服务端加密状态(cfg: dict) -> None:
+    """把桶的服务端加密状态打出来。
+
+    **备份制品不在客户端加密**（2026-10-26）：静态加密由 OSS 服务端加密
+    （SSE）承担。所以「桶上开了没有」这件事是**必须被看见的** ——
+    它是桶上的开关，不在本项目的配置里，读不出来时也要照实说读不出来。
+    """
+    from app.backup import oss_client
+
+    try:
+        with oss_client.oss_bucket(cfg, timeout=oss_client.OSS_PROBE_TIMEOUT) as bucket:
+            algorithm = oss_client.server_side_encryption(bucket)
+    except Exception as exc:                             # noqa: BLE001
+        print(f"⚠️  读不到桶的服务端加密状态：{exc}", file=sys.stderr)
+        return
+    if algorithm:
+        print(f"桶的服务端加密：{algorithm}（备份制品的静态加密由 OSS 承担）")
+    else:
+        print("⚠️  桶上**没有开启服务端加密**（SSE）—— 备份制品将以明文 gzip "
+              "存在对象存储上。请到 OSS 控制台给桶配置默认加密规则。")
+
+
 def _print_run(run) -> str:
     mark = "✅" if run.status == "success" else "❌"
     head = f"{mark} {run.book_label} [{run.tier}]"
@@ -124,9 +146,7 @@ def main(argv: list[str] | None = None) -> int:
                 t = tier_mod.classify(session, SCOPE_SYSTEM, None)
                 print(f"  系统数据（用户/授权/参数）  → {t}")
             print("\n试跑结束，没有上传任何东西。")
-            if not cfg_mod.encryption_ready():
-                print("⚠️  但**备份加密密钥没配**（BACKUP_ENCRYPTION_KEY）—— "
-                      "试跑不拦你，真要上传时会被拒绝（制品必须是密文）。")
+            _打印服务端加密状态(cfg)
             return 0
 
         try:
@@ -134,9 +154,8 @@ def main(argv: list[str] | None = None) -> int:
                 session, book_ids=args.books, force_tier=args.tier,
                 prune=not args.no_prune)
         except (cfg_mod.ConfigIncomplete, export_mod.ExportRefused) as e:
-            # **运行期那道闸**（配了 OSS 就必须配备份加密密钥）就拦在这里，
-            # 按**生效配置**判 —— 界面上配的 OSS 也在内，见
-            # ``app/backup/config.py::require_encrypted_ready``。
+            # **配置不全就拦在这里**，按**生效配置**判 —— 界面上配的 OSS 也在内，
+            # 见 ``app/backup/config.py::require_ready``。
             #
             # **必须变成退出码 2，而不是裸 traceback。** systemd 只看退出码：
             # 一次裸异常落成 exit 1（「脚本崩了」），而真相是「配置没配全」——

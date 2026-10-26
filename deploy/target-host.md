@@ -183,44 +183,50 @@ MCP_ALLOWED_HOSTS=acct.xins.live,acct.xins.live:*,test.xins.live,test.xins.live:
 建备份目录 —— 每一步都可能「成功」，而真正在跑的那套系统一点没变。
 （`--check-only` 里会直接露出马脚：它会显示「后端依赖: 缺失 .venv」。）
 
-### 这台机必须有的两个 systemd drop-in（**不是** `.env`）
+### 离站备份的加密：交给 **OSS 服务端加密**（2026-10-26 起）
 
-`BACKUP_ENCRYPTION_KEY_WARN_ONLY=true`（备份加密闸门的逃生口）在这台机上
-**不能写进 `backend/.env`** —— 写了就**拒绝启动**。
+本项目**不在客户端加密**备份制品了。静态加密由**桶上的默认加密规则**
+（SSE-OSS / AES256）承担 —— 它对**不带 SSE 头的普通上传**同样生效
+（实测：不带头传的对象，HEAD 回来同样带 `x-oss-server-side-encryption: AES256`）。
 
-闸门只查**持久化配置文件**（`app/core/config.py::persistent_escape_hatches`）：
-命中即判定「生产配置校验不通过」→ 进程直接退出 → 站点 502。
-这正是那道闸的设计意图：「逃生口只允许对**单次运行**生效」。
+这台机的桶 `acct963`（`oss-cn-heyuan`）已经配好：
 
-它必须放在**进程环境**里，也就是 systemd 的 drop-in：
+| 项 | 值 | 怎么确认的 |
+|---|---|---|
+| 服务端加密 | `AES256`（SSE-OSS，OSS 托管密钥） | `get_bucket_encryption()` → `sse_algorithm=AES256` |
+| 保留策略 | WORM `Locked`，**30 天** | `get_bucket_worm()` → `RetentionPeriodInDays=30` |
 
-| 文件 | 服务 |
-|---|---|
-| `/etc/systemd/system/cwq-api.service.d/10-backup-encryption-warn-only.conf` | API（**真正跑离站备份的是它**） |
-| `/etc/systemd/system/cwq-oss-backup.service.d/10-backup-encryption-warn-only.conf` | 旧的 systemd 备份路径（手工补跑用） |
+> **读桶的加密状态要用 `get_bucket_encryption()`，别用 `list_buckets()`** ——
+> 后者返回的 `BucketInfo` 里**不填** `bucket_encryption_rule` 字段
+> （oss2 2.19.1 只在 `GetBucketInfo` 那条路上填），照它读会得到
+> 「没开」这个**假阴性**。
 
-内容是一行：
+**客户端加密那一层为什么被移除**（连带移除的东西）：
 
-```ini
-[Service]
-Environment=BACKUP_ENCRYPTION_KEY_WARN_ONLY=true
-```
+* `BACKUP_ENCRYPTION_KEY` / `BACKUP_ENCRYPTION_KEY_WARN_ONLY` 两个配置项；
+* 启动闸门与运行期那道「配了 OSS 就必须配备份加密密钥」；
+* `app/backup/export.py` 里的 `encrypt_file` / `decrypt_file` /
+  `encryption_key` / `is_encrypted`。
 
-**为什么需要它**：这台机的 OSS 参数配在**库里**（`sys_setting`），所以启动闸门
-（只看 env 层）不响，但**运行期**那道闸
-（`app/backup/config.py::require_encrypted_ready`，按**生效配置**判）会响 ——
-于是应用内调度任务 `system:oss_backup` 每天失败一次。
-真实事故：2026-10-25 19:49 发布后，**2026-10-26 03:47** 的离站备份失败
-（`EncryptionKeyMissing`），并发了失败通知；上一次成功是 10-25 03:47。
+**取代它的是「看得见的事实」**：每轮备份与「测试连接」都会读一次桶的 SSE
+状态并报出来（`app/backup/oss_client.py::server_side_encryption`）。
+**它不是一道闸** —— 有人把桶上的 SSE 关掉，备份不会**被拦住**，但日志与
+界面上会立刻显示「桶上没有开启服务端加密」。这是刻意的：SSE 是**桶上的
+开关**，不在本项目的配置里。
 
-> **drop-in 不在版本库里**，重建机器就丢了 —— 丢了之后备份会**静默地**每天失败
-> （只有失败通知，没有别的提示）。装机器时记得补上这一段。
+**代价（要写下来，别到时候忘了）**：SSE 保护的是**静态数据**，
+它**不**保护「拿到桶读权限的人」—— 那种人照样能让 OSS 替他解密。
+客户端加密配一把**单独存放**的密钥时，那才是连 AK 泄露都不怕。
 
-**开着它的代价**：OSS 上的备份制品是**明文 gzip**。
-正式配法是配一把 `BACKUP_ENCRYPTION_KEY`（生成：
-`python -c "import base64,os;print(base64.b64encode(os.urandom(32)).decode())"`），
-配好后就能把这两个 drop-in 删掉。**密钥要单独存一份** ——
-它和 OSS AccessKey 放在一起，等于「拿到桶读权限就能解开所有备份」。
+**WORM 保留策略带来的两个后果**（代码里已经处理，文档要记着）：
+
+1. **保留期内的对象删不掉、也不可覆盖**（服务端报 `FileImmutable`）。
+   所以「测试连接」的探针 key **每次都是新的**（UUID），否则第二次点那个
+   按钮就会因为「覆盖被拒」而变红；探针对象删不掉，**那不算故障** ——
+   写入已经验证成功了。
+2. **到期清理遇到受保护的对象会跳过它**（不报「清理失败」）。30 天保留期
+   与本系统「天级保留 30 天」几乎同时到期，边界上的那一份可能要留到
+   保留期结束才删得掉。
 
 这台机**没有 `gh`**（也不该有 GitHub 凭据），所以走 `ARTIFACT_DIR` 人工投放：
 

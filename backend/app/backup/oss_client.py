@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import contextlib
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
@@ -51,6 +52,19 @@ OSS_PROBE_TIMEOUT = (5, 15)
 
 class OssError(Exception):
     """OSS 调用失败。消息必须能让人不看源码就知道下一步做什么。"""
+
+
+class ObjectProtected(OssError):
+    """这个对象**受保留策略保护**（WORM / 合规保留），改不动也删不掉。
+
+    **单独一个类型，而不是笼统的失败。** 开了合规保留的桶里，删除一份
+    过期备份会被服务端拒掉（``FileImmutable``）—— 那**不是故障**，那是
+    保留策略在正常工作。把它当普通错误处理，后果是「每轮备份都在报清理
+    失败」，而真实情况是「该留的都留下了」。
+
+    同样地，「测试连接」写进去的探针对象删不掉，也不该让那个按钮变红 ——
+    它要回答的问题是「能不能写」，而写入**已经成功了**。
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +386,13 @@ def iter_objects(bucket, prefix: str) -> Iterator[RemoteObject]:
 
 
 def delete_object(bucket, key: str) -> None:
+    """删一个对象。
+
+    **对象受保留策略保护时抛 :class:`ObjectProtected`** —— 不是普通的
+    :class:`OssError`。开了合规保留（WORM）的桶里，过期备份是**删不掉**的，
+    而那正是保留策略要的效果；把它算成「清理失败」，每轮备份都会报一个
+    假故障，而真实情况是「该留的都留下了」。
+    """
     oss2 = _import_oss2()
     try:
         bucket.delete_object(key)
@@ -380,7 +401,51 @@ def delete_object(bucket, key: str) -> None:
         # 本来就不该报错，否则一次并发清理会报出一堆假错。
         return
     except oss2.exceptions.OssError as exc:
+        if _is_immutable(exc):
+            raise ObjectProtected(
+                f"对象受保留策略保护，删不掉：{key} —— "
+                "桶启用了 WORM / 合规保留（保留期内对象不可删除、不可覆盖）。"
+                f"{_note_for(bucket)}") from exc
         raise OssError(f"删除失败：{key} → {exc}{_note_for(bucket)}") from exc
+
+
+def _is_immutable(exc) -> bool:
+    """这个 OSS 错误是不是「对象受保留策略保护」。
+
+    **认代码，不认文案。** OSS 返回的是 ``FileImmutable``（409）；
+    认文案会在 SDK 换措辞时静默失效，而失效的方向恰好是坏的：
+    「受保护」被当成「真故障」。
+    """
+    code = getattr(exc, "code", None) or ""
+    if not code:
+        # 少数错误把 Code 塞在 details 里（oss2 2.19.1 的 ServerError 会）。
+        details = getattr(exc, "details", None) or {}
+        code = details.get("Code", "") if isinstance(details, dict) else ""
+    return str(code) == "FileImmutable"
+
+
+def server_side_encryption(bucket) -> Optional[str]:
+    """桶的**服务端加密**算法（``AES256``，或 KMS 的键 id）；**没开返回 None**。
+
+    读的是桶上的**默认加密规则**（``GetBucketEncryption``）。它对
+    **不带 SSE 头的普通上传**同样生效 —— 实测：不带头上传的对象，
+    HEAD 回来同样带 ``x-oss-server-side-encryption: AES256``。
+    所以「桶上开了默认加密」= 「我们传上去的东西在静态层面是密文」。
+
+    **为什么本项目要读它**：备份制品**不再在客户端加密**（2026-10-26），
+    静态加密改由 OSS 承担。而 SSE 是**桶上的开关**，不在本项目的配置里 ——
+    有人把它关掉，备份就静悄悄地变成「静态不加密」。所以这里把它读出来
+    报给人看：它是一个**事实**，不是一个靠配置承诺的说法。
+    """
+    oss2 = _import_oss2()
+    try:
+        result = bucket.get_bucket_encryption()
+    except oss2.exceptions.NoSuchServerSideEncryptionRule:
+        # 桶上没配默认加密规则 = 没开 SSE。
+        return None
+    except oss2.exceptions.OssError as exc:
+        raise OssError(f"读取桶的服务端加密配置失败：{exc}{_note_for(bucket)}") from exc
+    return getattr(result, "sse_algorithm", None) or None
 
 
 def check_connection(cfg: dict[str, Any]) -> str:
@@ -392,7 +457,16 @@ def check_connection(cfg: dict[str, Any]) -> str:
     列前缀（``prefix`` 本身，列不到东西也没关系）才是与「上传」同一条授权路径。
     """
     prefix = (cfg.get("prefix") or "").strip("/")
-    key = f"{prefix}/.healthcheck" if prefix else ".healthcheck"
+    # **探针 key 必须每次都是新的。** 开了 WORM / 合规保留的桶里，
+    # 已存在的对象**不可覆盖** —— 用同一个固定 key 的话，第二次点这个按钮
+    # 就会在 PUT 上被服务端拒掉（``FileImmutable``），按钮从此永远是红的，
+    # 而实际上「能不能写」早就验证过了。
+    #
+    # 用 **UUID 而不是时间戳**：时间戳有毫秒级分辨率，两次调用落在同一毫秒
+    # 就撞成同一个 key —— 而「两个管理员同时点这个按钮」完全可能。
+    # 撞上之后第二次会撞上 FileImmutable，按钮变红，而原因是「自己撞了自己」。
+    tag = uuid.uuid4().hex[:16]
+    key = f"{prefix}/.healthcheck-{tag}" if prefix else f".healthcheck-{tag}"
     probe = b"cwq oss healthcheck\n"
     # 短超时 + 用完关池：这个调用是**给人点的按钮**，等一分钟才报错不可接受，
     # 而一个只用来判断通不通的连接留着不放就是白占 fd。
@@ -400,5 +474,13 @@ def check_connection(cfg: dict[str, Any]) -> str:
         # 写一个极小的探测对象再删掉：只做 HEAD/GET 的话，AK 到底能不能写
         # 根本没被验证过，而「能不能写」正是这里唯一要紧的问题。
         put_bytes(bucket, key, probe)
-        delete_object(bucket, key)
+        try:
+            delete_object(bucket, key)
+        except ObjectProtected:
+            # **写入已经成功了** —— 删不掉只是因为这个桶开了合规保留。
+            # 这个按钮要回答的问题是「能不能写」，答案已经有了。
+            # 探针对象会留在桶里（21 字节），受保留策略保护，过期后由
+            # OSS 侧的生命周期规则或人工清理收走。
+            return (f"可写入 {cfg['bucket'].strip()}/{key.rsplit('/', 1)[0] or ''}"
+                    f"（探针对象受保留策略保护，无法删除；写入已验证成功）")
     return f"可写入 {cfg['bucket'].strip()}/{key.rsplit('/', 1)[0] or ''}"

@@ -1198,29 +1198,46 @@ def test_backup_connection(user: SysUser = Depends(get_current_user),
                            db: Session = Depends(get_db)):
     """写一个探针对象再删掉 —— 验的是「能不能写」，那才是备份唯一要紧的事。
 
-    **这里只验连通，不要求加密密钥。** 「能不能写」与「备份跑不跑得起来」
-    是两件事：正在配 OSS 的人会先测连通性，这时让他先配一把密钥才能测，
-    是在流程中间横插一道与本按钮无关的关卡。
+    **这里只验连通。** 「能不能写」与「备份跑不跑得起来」是两件事。
 
-    但**「备份跑不起来」这件事必须在这里就说出来** —— 连通性测试通过、
-    第二天早上备份因为缺密钥而整轮失败，是最坏的一种组合
+    但**「备份的静态加密由谁承担」这件事必须在这里就说出来** ——
+    备份制品**不在客户端加密**（2026-10-26），静态加密由 **OSS 服务端加密
+    （SSE）** 承担，而 SSE 是**桶上的开关**，不在本项目的配置里。
+    连通性测试通过、而桶上其实没开默认加密，是最坏的一种组合
     （界面说「连接正常」，运维就以为退路是好的）。
-    所以响应里带上 ``encryption_ready``，并在消息里说清楚。
+    所以响应里带上 ``server_side_encryption``（桶上实际的加密算法），
+    并在消息里说清楚。
     """
     _require_admin(user)
     try:
         cfg = backup_config.require_ready(db)
         message = oss_client.check_connection(cfg)
+        algorithm = _bucket_server_side_encryption(cfg)
     except (backup_config.ConfigIncomplete, oss_client.OssError) as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    encryption_ready = backup_config.encryption_ready()
-    if not encryption_ready:
-        message = (f"{message}；但**备份加密密钥没配**（BACKUP_ENCRYPTION_KEY）—— "
-                   "此时点「立即备份」会被拒绝，备份制品也不会是密文。"
-                   "配一把：python -c \"import base64,os;"
-                   "print(base64.b64encode(os.urandom(32)).decode())\"")
-    return {"ok": True, "message": message, "encryption_ready": encryption_ready}
+    if algorithm:
+        message = (f"{message}；桶的**服务端加密已开启**（{algorithm}）—— "
+                   "备份制品的静态加密由 OSS 承担（客户端不再加密）。")
+    else:
+        message = (f"{message}；但**桶上没有开启服务端加密**（SSE）—— "
+                   "备份制品将以明文 gzip 存在对象存储上。请到 OSS 控制台给桶"
+                   "配置默认加密规则（SSE-OSS / AES256）。")
+    return {"ok": True, "message": message, "server_side_encryption": algorithm}
+
+
+def _bucket_server_side_encryption(cfg: dict) -> Optional[str]:
+    """桶的服务端加密算法；**读不到就当没有**（不把这个按钮变成红色的原因）。
+
+    读不到 SSE 状态不该让「测试连接」失败 —— 这个按钮要回答的是
+    「能不能写」，而那个答案已经拿到了。SSE 读不到只是让我们少一个事实，
+    所以这里降级成 ``None``，消息里会照实说「没开 / 读不到」。
+    """
+    try:
+        with oss_client.oss_bucket(cfg, timeout=oss_client.OSS_PROBE_TIMEOUT) as bucket:
+            return oss_client.server_side_encryption(bucket)
+    except Exception:                                   # noqa: BLE001
+        return None
 
 
 @router.post("/backup/run")
@@ -1242,9 +1259,9 @@ def trigger_backup(
     username = user.username
     user_id = user.id
     try:
-        # **要求制品一定是密文**（按**生效配置**判，界面上配 OSS 的那条路也在内）。
+        # **要求 OSS 参数配全**（按**生效配置**判，界面上配 OSS 的那条路也在内）。
         # 启动期那道闸只看得到 env 层 —— 启动时没有库连接。
-        backup_config.require_encrypted_ready(db)
+        backup_config.require_ready(db)
     except backup_config.ConfigIncomplete as exc:
         raise HTTPException(400, str(exc)) from exc
 

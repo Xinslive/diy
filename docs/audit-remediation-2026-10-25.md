@@ -1401,3 +1401,62 @@ cd backend && .venv/bin/python scripts/data_health_check.py
 - 审计报告 `output/AUDIT-REPORT-2026-10-25.md` **本身未被改动** —— 它是只读的输入
   （md5 `4c93913957ca7fdd3d6e748cf166eabf`）。
 - `output/` 整个被 `.gitignore` 排除，所以验收记录放在**受跟踪的** `docs/` 下。
+
+---
+
+## 9. 2026-10-26：§3.8 / §3.44 的备份加密那一项**被推翻**（客户端加密移除）
+
+**这一节记的是一次「整改被推翻」，不是又一次整改。** §3.8 与 §3.44 里
+「配了 OSS 备份就必须配备份加密密钥」那条闸，以及配套的
+`BACKUP_ENCRYPTION_KEY` / `BACKUP_ENCRYPTION_KEY_WARN_ONLY`，**整段移除了**。
+
+**为什么推翻**：运维侧启用并配置了 **OSS 服务端加密（SSE）**（桶
+`acct963` 的默认加密规则 `AES256`）。SSE 对**不带 SSE 头的普通上传**同样
+生效 —— 实测：不带头传的对象，`HEAD` 回来同样带
+`x-oss-server-side-encryption: AES256`。客户端那一层与 SSE 做的是**同一件事**，
+而客户端那一层要**自己管一把钥匙**（单独存放、能找回、还得有人记得）。
+
+**代价（写在这里，不要到时候忘了）**：SSE 保护的是**静态数据**，
+它**不**保护「拿到桶读权限的人」—— 那种人照样能让 OSS 替他解密。
+客户端加密配一把**单独存放**的密钥时，那才是连 AK 泄露都不怕。
+**这是运维侧显式选的取舍。**
+
+**取代它的是「看得见的事实」，不是一道闸**：每轮备份与「测试连接」都读一次
+桶的 SSE 状态（`app/backup/oss_client.py::server_side_encryption`）并报出来。
+有人把桶上的 SSE 关掉，备份**不会被拦住**，但日志与界面上会立刻显示
+「桶上没有开启服务端加密」。
+
+**连带改掉的**：
+
+| 原机制 | 现状 |
+|---|---|
+| `Settings.backup_encryption_key` / `..._warn_only` | **删除** |
+| `escape_hatches.APP_SIDE_ESCAPE_HATCHES` 里的 `BACKUP_ENCRYPTION_KEY_WARN_ONLY` | **移出清单** |
+| 启动闸门里「配了 OSS 就必须配备份加密密钥」 | **删除** |
+| `app/backup/config.py::require_encrypted_ready` / `encryption_ready` | **删除** |
+| `app/backup/export.py::encryption_key` / `encrypt_file` / `decrypt_file` / `is_encrypted` | **删除** |
+| `/backup/test` 的 `encryption_ready` 字段 | 换成 `server_side_encryption`（桶**实际的**算法） |
+| 校验和记在**密文**上 | 记在**上传的那串字节**上（本来就是同一串了） |
+| 恢复时先落一份明文临时文件 | **直接读 gzip**（制品本来就不是密文） |
+
+**顺带修掉的两个真问题**（由「桶上开了 WORM 合规保留（30 天）」暴露，
+与加密无关，但同一个子系统）：
+
+1. 「测试连接」的探针对象**写完删不掉**（服务端报 `FileImmutable`）——
+   原来那个按钮会直接变红。修法：探针 key 改成**每次新的 UUID**
+   （不是时间戳：毫秒级分辨率下两次调用会撞成同一个 key），
+   而删不掉**不算故障**（写入已经验证成功了）。
+2. 到期清理遇到**受保留策略保护**的对象时，报「清理失败」——
+   那是保留策略在正常工作。修法：跳过它，不算失败。
+
+**用例**：`backend/tests/test_backup_server_side_encryption.py`（新）、
+`backend/tests/test_reviewfix_backup_upload.py`（原 `..._backup_encryption.py`
+改名，只留 H-07「上传不许把整份 gzip 读进内存」——它是**内存**的性质，
+与加密无关）。两份只针对旧机制的用例文件
+（`test_audit_fix_backup_encryption_runtime.py` / `test_reviewfix_backup_encryption.py`）
+已删除 —— 它们守的那道闸不存在了。
+
+`tools/audit_roadmap_check.py` 的第 6 项也**反向**改写了：
+原来钉「生产校验**强制** BACKUP_ENCRYPTION_KEY」，现在钉
+「客户端加密那层**不在了**，且桶的 SSE 状态**看得见**」——
+谁把客户端加密加回来（哪怕是"顺手补上"），这一项立刻 FAIL。
