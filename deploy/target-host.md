@@ -183,6 +183,45 @@ MCP_ALLOWED_HOSTS=acct.xins.live,acct.xins.live:*,test.xins.live,test.xins.live:
 建备份目录 —— 每一步都可能「成功」，而真正在跑的那套系统一点没变。
 （`--check-only` 里会直接露出马脚：它会显示「后端依赖: 缺失 .venv」。）
 
+### 这台机必须有的两个 systemd drop-in（**不是** `.env`）
+
+`BACKUP_ENCRYPTION_KEY_WARN_ONLY=true`（备份加密闸门的逃生口）在这台机上
+**不能写进 `backend/.env`** —— 写了就**拒绝启动**。
+
+闸门只查**持久化配置文件**（`app/core/config.py::persistent_escape_hatches`）：
+命中即判定「生产配置校验不通过」→ 进程直接退出 → 站点 502。
+这正是那道闸的设计意图：「逃生口只允许对**单次运行**生效」。
+
+它必须放在**进程环境**里，也就是 systemd 的 drop-in：
+
+| 文件 | 服务 |
+|---|---|
+| `/etc/systemd/system/cwq-api.service.d/10-backup-encryption-warn-only.conf` | API（**真正跑离站备份的是它**） |
+| `/etc/systemd/system/cwq-oss-backup.service.d/10-backup-encryption-warn-only.conf` | 旧的 systemd 备份路径（手工补跑用） |
+
+内容是一行：
+
+```ini
+[Service]
+Environment=BACKUP_ENCRYPTION_KEY_WARN_ONLY=true
+```
+
+**为什么需要它**：这台机的 OSS 参数配在**库里**（`sys_setting`），所以启动闸门
+（只看 env 层）不响，但**运行期**那道闸
+（`app/backup/config.py::require_encrypted_ready`，按**生效配置**判）会响 ——
+于是应用内调度任务 `system:oss_backup` 每天失败一次。
+真实事故：2026-10-25 19:49 发布后，**2026-10-26 03:47** 的离站备份失败
+（`EncryptionKeyMissing`），并发了失败通知；上一次成功是 10-25 03:47。
+
+> **drop-in 不在版本库里**，重建机器就丢了 —— 丢了之后备份会**静默地**每天失败
+> （只有失败通知，没有别的提示）。装机器时记得补上这一段。
+
+**开着它的代价**：OSS 上的备份制品是**明文 gzip**。
+正式配法是配一把 `BACKUP_ENCRYPTION_KEY`（生成：
+`python -c "import base64,os;print(base64.b64encode(os.urandom(32)).decode())"`），
+配好后就能把这两个 drop-in 删掉。**密钥要单独存一份** ——
+它和 OSS AccessKey 放在一起，等于「拿到桶读权限就能解开所有备份」。
+
 这台机**没有 `gh`**（也不该有 GitHub 凭据），所以走 `ARTIFACT_DIR` 人工投放：
 
 ```bash
