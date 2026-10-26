@@ -191,6 +191,14 @@ RE_INVOICE_NO = re.compile(r"(?<!\d)(\d{20})(?!\d)")
 RE_DATE = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
 RE_TAX_ID = re.compile(r"\b([0-9A-Z]{18,20})\b")
 RE_AMOUNT = re.compile(r"(?:¥|￥)\s*(\d+(?:\.\d+)?)")
+#: 「合 计」那一行：``¥不含税金额``，后面可能跟 ``¥税额``。
+#: 免税/不征税的票，税额那一栏印的是 ``*``（不是数字）—— 电信服务那张票
+#: 印的就是「¥199.50 *」。
+RE_SUM_LINE = re.compile(
+    r"[¥￥]\s*(?P<excl>\d+(?:\.\d+)?)"
+    r"(?:\s*[¥￥]\s*(?P<tax>\d+(?:\.\d+)?))?"
+    r"(?:\s*\*)?"
+)
 RE_ISSUER = re.compile(r"开票人[:：]\s*(\S+)")
 #: 明细区的表头。**每个字之间都允许有空白** ——
 #:
@@ -216,6 +224,21 @@ RE_TABLE_HEADER = re.compile(r"项\s*目\s*名\s*称")
 #: 建筑服务票的表头里有这一列，说明明细的**名字区是三个格子**：
 #: 项目名称、建筑服务发生地、建筑项目名称。别的版式没有它。
 BUILDING_SERVICE_HEADER = re.compile(r"建\s*筑\s*服\s*务\s*发\s*生\s*地")
+#: 通行费（高速公路通行费）版式的表头：多出「车牌号 车辆类型 通行日期起
+#: 通行日期止」四列，**没有**「单位 数量 单价」那三列。
+#:
+#: 这一版式必须单独认 —— 通用办法「取最后两个数字当数量与单价」会把
+#: **通行日期**（20260419 这种 8 位数）当成数量和单价：金额碰巧是对的，
+#: 数量与单价却是彻底的胡说，还会跟着进到凭证的明细里。
+TOLL_HEADER = re.compile(r"车\s*牌\s*号|车\s*辆\s*类\s*型|通\s*行\s*日\s*期")
+#: 车牌号：省份字 + 字母 + 5~6 位数字字母（如「闽C889BJ」）。
+#: 通行费那一版式里，这一列是**最好认的锚点** —— 锚点之前就是项目名称。
+_TOLL_PLATE_RE = re.compile(r"^[\u4e00-\u9fff][A-Z][A-Z0-9]{5,6}$")
+#: 通行日期（YYYYMMDD，票面上是 8 位连写，如 20260419）。
+_TOLL_DATE_RE = re.compile(r"^\d{8}$")
+#: 票面把**空的规格型号**印成「无」。只认「独立成词」的「无」——
+#: 「无碳钢」这种照旧不动。
+RE_NONE_CELL = re.compile(r"(?<!\w)无(?!\w)")
 RE_BIG_AMOUNT_HEADER = re.compile(r"价税合计（大写）\s*（小写）")
 # 大写金额（「价税合计（大写）」那一行）。
 #
@@ -236,15 +259,31 @@ RE_BIG_AMOUNT_DIGITS = re.compile(r"[零壹贰叁肆伍陆柒捌玖拾佰仟万�
 RE_BIG_AMOUNT_TAIL = re.compile(r"\s*¥\d+(?:\.\d+)?")
 END_MARKERS = ("合 计", "价税合计", "合计：", "价税合计（大写）")
 # 末尾：金额 + 税率（不征税/免税/%）+ 可选税额
+#
+# **税率那一栏印的是星号「\*」** —— 免税的票就这么印（电信服务那张票：
+# 「… 无 项 1 199.5 199.50 * *」，金额 199.50、税额没有、价税合计 199.50）。
+# 原来这条正则只认「数字% / 不征税 / 免税」，于是**整行都匹配不上**，
+# ``_parse_item`` 直接返回 None —— 那一行的明细就没了。
+# 一张 35 页的票里有 9 页是这种版式，全是电信费：9 张票一行明细都提不出来，
+# 报「没有可入账的发票明细」。
+#
+# 税额那一栏同样可以是星号（不征税/免税的票没有税额数字），它表示 **0**。
 TAIL_RE = re.compile(
-    r"(-?\d+(?:\.\d+)?)\s+(\d+%|不征税|免税)(?:\s+(-?\d+(?:\.\d+)?))?"
+    r"(-?\d+(?:\.\d+)?)\s+(\d+%|不征税|免税|\*)"
+    r"(?:\s+(?:(-?\d+(?:\.\d+)?)|(\*)))?"
 )
 # 项目名末尾的常见单位词白名单。仅在前导空白存在时剥，避免误伤产品名本身
 # 以这些字结尾的合法情况（如"扫把"/"配件"/"机票款"等）。中英文单字/缩写/2-3 字单位。
+#
+# **「车」「平方米」「季度」「项」是实测补上的**（一张 35 页的票上就撞见
+# 这四个）：垃圾清运费按「车」计、电梯保养按「季度」计、面积按「平方米」
+# 计、电信服务按「项」计。白名单里没有它们的时候，这一格就会**漏进项目名**
+# ——「*生活服务*垃圾清运费车」「*生产生活服务*电梯保养季度」，
+# 摘要也跟着变成那样，用户在界面上看到的就是票上没有的字。
 _UNIT_TAIL_RE = re.compile(
     r"[ \t]+("
-    r"个|只|条|根|张|片|块|包|本|页|颗|粒|枚|台|对|双|盒|袋|瓶|箱|桶|罐|打|辆|艘|架|部|座|份|把|支|件|套|捆|副|卷|册|具|扇|幅|帧|亩|次|步|趟|回|遍|场|局|排|列|群|组|付|束|团|堆|"
-    r"千克|公斤|克|斤|两|吨|毫克|微克|毫米|厘米|分米|米|千米|公里|英寸|英尺|码|海里|升|毫升|小时|分钟|秒钟|千瓦时|元|角|分|天|周|月|年|季|度|"
+    r"个|只|条|根|张|片|块|包|本|页|颗|粒|枚|台|对|双|盒|袋|瓶|箱|桶|罐|打|辆|车|艘|架|部|座|份|把|支|件|套|捆|副|卷|册|具|扇|幅|帧|亩|次|步|趟|回|遍|场|局|排|列|群|组|付|束|团|堆|项|"
+    r"平方米|千克|公斤|克|斤|两|吨|毫克|微克|毫米|厘米|分米|米|千米|公里|英寸|英尺|码|海里|升|毫升|小时|分钟|秒钟|千瓦时|元|角|分|天|周|月|年|季度|季|度|"
     r"kg|KG|g|G|mg|MG|lb|oz|l|L|ml|ML|m|cm|mm|km|MM|KM|inch|ft|yd|mi|pcs|PCS|pc|PC|set|SET|pair|PAIR|dozen|DOZ|gross|kV|KV|kw|KW|kwh|KWH|hp"
     r")\s*$"
 )
@@ -255,14 +294,14 @@ RE_CHINESE_SHORT = re.compile(r"([一-鿿]{1,3})\s*$")
 _UNIT_TOKENS = frozenset({
     # 中文 1 字
     "个", "只", "条", "根", "张", "片", "块", "包", "本", "页", "颗", "粒", "枚",
-    "台", "对", "双", "盒", "袋", "瓶", "箱", "桶", "罐", "打", "辆", "艘", "架",
+    "台", "对", "双", "盒", "袋", "瓶", "箱", "桶", "罐", "打", "辆", "车", "艘", "架",
     "部", "座", "份", "把", "支", "件", "套", "捆", "副", "卷", "册", "具", "扇",
     "幅", "帧", "亩", "次", "步", "趟", "回", "遍", "场", "局", "排", "列", "群",
-    "组", "付", "束", "团", "堆", "吨",
+    "组", "付", "束", "团", "堆", "项", "吨",
     # 中文 2-3 字
     "千克", "公斤", "克", "斤", "两", "钱", "毫克", "微克", "毫米", "厘米", "分米",
-    "米", "千米", "公里", "英寸", "英尺", "码", "海里", "升", "毫升", "小时", "分钟",
-    "秒钟", "千瓦时", "千瓦", "元", "角", "分", "天", "周", "月", "年", "季", "度",
+    "米", "平方米", "千米", "公里", "英寸", "英尺", "码", "海里", "升", "毫升", "小时", "分钟",
+    "秒钟", "千瓦时", "千瓦", "元", "角", "分", "天", "周", "月", "年", "季", "季度", "度",
     # 英文 / 缩写
     "kg", "KG", "g", "G", "mg", "MG", "lb", "oz",
     "l", "L", "ml", "ML", "m³", "cm³",
@@ -293,7 +332,7 @@ LABEL_LINE_RE = re.compile(
     r"名称|名称：|名称:|统一社会信用代码/纳税人识别号：|"
     r"统一社会信用代码/纳税人识别号:|电子发票（普通发票）|电子发票|"
     r"发票号码：|发票号码:|开票日期：|开票日期:|开票人：|开票人:|"
-    r"备|注|成品油|（大写）|（小写）|"
+    r"备|注|成品油|通\s*行\s*费|（大写）|（小写）|"
     r"[零壹贰叁肆伍陆柒捌玖拾佰仟万亿圆角分整]+)$"
 )
 
@@ -308,12 +347,42 @@ RE_COMPANY_HINT = re.compile(
     r"供应商|提供商|经销|代理|经营部|经营|店|铺|站|社|部|处|厂|行|馆|阁|堂)"
 )
 
+#: 表头里那些**列名**。一张票的表头是好几列的标题拼在一行上的 ——
+#: 通行费那张票印的是「项目名称 车牌号 车辆类型 通行日期起 通行日期止
+#: 金 额 税率/征收率 税 额」。
+#:
+#: 老办法是「按像不像公司名」挑买卖方，而「通**行**日期」里的「行」正好
+#: 命中公司名后缀表（银行支行）—— **整行表头被当成了购方公司名**，
+#: 真正的销方（高速公路公司）挤不进前两个候选，直接被丢掉。
+#:
+#: 后果比"认错名字"更糟：购方成了表头、**销方成了用户自己公司**，
+#: 凭证上的对方单位就写成了自己 —— 金额全对，账却是错的。
+RE_COLUMN_TITLE = re.compile(
+    r"项目名称|规格型号|车牌号|车辆类型|通行日期|建筑服务发生地|建筑项目名称|"
+    r"金\s*额|税\s*额|税\s*率|征收率|单\s*位|数\s*量|单\s*价"
+)
+
+#: 中文之间的空格。PDF 文字层有时把一个汉字单独放一格
+#: （「福 建 省 泉 州紫欣工贸有限公司」），那是**排版**产物，不是名字里的空格。
+#: 只夹在两个汉字之间的空白才去掉；英文词之间的空格留着（"ABC Trading Co"）。
+RE_CJK_GAP = re.compile(r"(?<=[\u4e00-\u9fff])[ \t]+(?=[\u4e00-\u9fff])")
+
+
+def _column_title_count(line: str) -> int:
+    """这一行里有几个**列名**。≥2 个就说明它是一张票的表头，不是公司名。"""
+    return len({m.group(0) for m in RE_COLUMN_TITLE.finditer(line)})
+
 
 def _looks_like_company(line: str) -> bool:
     s = line.strip()
     if len(s) < 4 or len(s) > 60:
         return False
     if LABEL_LINE_RE.match(s):
+        return False
+    # **表头不是公司名。** 一行里出现两个以上列名（项目名称、车牌号、金额…）
+    # 就是票面的表头，不是买卖方 —— 见 ``RE_COLUMN_TITLE`` 那段说明：
+    # 认错的后果是「销方写成用户自己公司」，账错得悄无声息。
+    if _column_title_count(s) >= 2:
         return False
     if RE_INVOICE_NO.match(s):
         return False
@@ -349,6 +418,53 @@ def find_big_amount(text: str) -> str:
     return ""
 
 
+def _extract_totals(text: str) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+    """「合 计」与「价税合计」那两行里的三个金额。
+
+    返回 ``(不含税金额, 税额, 价税合计)``；认不出来时三个都是 None。
+
+    票面上这两行长这样：
+
+    * 有税的票：``¥442.48 ¥57.52`` / ``伍佰圆整 ¥500.00``
+    * 免税或不征税的票：``¥199.50 *`` / ``壹佰玖拾玖圆伍角整 ¥199.50``
+      —— 税额那一栏印的是 ``*``，**不是数字**。
+
+    老办法是「在全文里凑三个 ¥ 数字」，免税/不征税的票只有**两个**
+    （不含税与价税合计各一个），凑不出来 —— 于是不含税金额与税额双双
+    是 None，界面上「合计」那一栏空着，看着像没解析出来。
+
+    判据是**行**：第一条带 ¥ 的行是「合 计」行；带**大写金额**的那一行
+    是「价税合计」行。认不出就返回 None，由调用方退回老办法。
+    """
+    lines = [line.strip() for line in text.splitlines()]
+
+    sum_line = None
+    for line in lines:
+        if RE_AMOUNT.search(line):
+            sum_line = line
+            break
+    if sum_line is None:
+        return (None, None, None)
+    m = RE_SUM_LINE.search(sum_line)
+    if not m:
+        return (None, None, None)
+    excl = Decimal(m.group("excl"))
+    tax = Decimal(m.group("tax")) if m.group("tax") else Decimal("0")
+
+    incl = None
+    for line in lines:
+        for big in RE_BIG_AMOUNT_DIGITS.finditer(line):
+            tail = RE_BIG_AMOUNT_TAIL.match(line, big.end())
+            if tail:
+                incl = Decimal(tail.group(0).strip().lstrip("¥￥"))
+                break
+        if incl is not None:
+            break
+    if incl is None:
+        return (None, None, None)
+    return (excl, tax, incl)
+
+
 def extract_meta(text: str) -> InvoiceMeta:
     meta = InvoiceMeta()
 
@@ -380,7 +496,9 @@ def extract_meta(text: str) -> InvoiceMeta:
     candidates: list[str] = []
     seen: set[str] = set()
     for line in raw_no_invoice_no.split("\n"):
-        s = line.strip()
+        # 汉字之间的空格是 PDF 排版产物（「福 建 省 泉 州紫欣工贸有限公司」），
+        # 去掉它才是票面上印的那个名字。
+        s = RE_CJK_GAP.sub("", line.strip())
         if not s or s in seen:
             continue
         if _looks_like_company(s):
@@ -393,19 +511,29 @@ def extract_meta(text: str) -> InvoiceMeta:
     if len(candidates) >= 2:
         meta.seller_name = candidates[1]
 
-    amounts = RE_AMOUNT.findall(text)
-    totals = [Decimal(x) for x in amounts]
-    for i in range(len(totals) - 2):
-        a, b, c = totals[i], totals[i + 1], totals[i + 2]
-        # 判据是「不含税 + 税 = 价税合计」。阈值用 Decimal —— 拿 0.02 这个
-        # float 去比，等于把判据也变成了近似值。
-        if abs(a + b - c) < Decimal("0.02"):
-            meta.total_excl_tax = a
-            meta.total_tax = b
-            meta.total_incl_tax = c
-            break
-    if meta.total_incl_tax is None and totals:
-        meta.total_incl_tax = totals[-1]
+    # 合计：**先按行取**「合 计」与「价税合计」那两行 —— 免税/不征税的票
+    # 税额那一栏印的是星号，只有两个 ¥ 数字，靠「凑三个」是凑不出来的。
+    excl, tax, incl = _extract_totals(text)
+    if incl is not None and abs(excl + tax - incl) < Decimal("0.02"):
+        meta.total_excl_tax = excl
+        meta.total_tax = tax
+        meta.total_incl_tax = incl
+    else:
+        # 按行认不出来（票面不是常见版式）→ 退回老办法：在全文里凑
+        # 「不含税 + 税 = 价税合计」那三个数。
+        amounts = RE_AMOUNT.findall(text)
+        totals = [Decimal(x) for x in amounts]
+        for i in range(len(totals) - 2):
+            a, b, c = totals[i], totals[i + 1], totals[i + 2]
+            # 判据是「不含税 + 税 = 价税合计」。阈值用 Decimal —— 拿 0.02 这个
+            # float 去比，等于把判据也变成了近似值。
+            if abs(a + b - c) < Decimal("0.02"):
+                meta.total_excl_tax = a
+                meta.total_tax = b
+                meta.total_incl_tax = c
+                break
+        if meta.total_incl_tax is None and totals:
+            meta.total_incl_tax = totals[-1]
 
     meta.total_in_c_c = find_big_amount(text)
 
@@ -427,7 +555,8 @@ def extract_meta(text: str) -> InvoiceMeta:
         # PDF 把"购买方信息"等拆成单字行："购"/"买"/"方"/"销"/"售"/"信"/"息" 等
         single_char_labels = set("购买方销售信息合计价税备注规格型号数量单位金额税率征收率")
         for line in after_lines[1:]:
-            s = line.strip()
+            # 汉字之间的空格是排版产物，去掉（见 RE_CJK_GAP）。
+            s = RE_CJK_GAP.sub("", line.strip())
             if not s:
                 continue
             # 日期（如 2026年08月28日）：含"年"和"日"
@@ -544,10 +673,39 @@ def _strip_trailing_spec(cell: str) -> str:
     return "".join(parts)
 
 
+def _split_toll_cells(raw_tail: str) -> tuple[str, str]:
+    """通行费版式的那一行：``名称 [车牌号] [车辆类型] [通行日期起] [通行日期止]``。
+
+    返回 ``(项目名称, 车牌号)``。
+
+    **车牌号是这一版式里最好认的一列**（省份字 + 字母 + 5~6 位），
+    用它当锚点：锚点之前就是项目名称。
+    「通 行 费」那种被 PDF 拆成单字的行也不怕 —— 名字由锚点**之前**的
+    那些字拼成，拆成几个 token 也照样拼得回去。
+
+    认不出车牌号时退回「末尾的通行日期」当锚点（日期是 8 位连写，
+    比「车辆类型」可靠得多 —— 「客车」「货车」这些词本身也可能是项目名的一部分）。
+    """
+    tokens = raw_tail.split()
+    for index, token in enumerate(tokens):
+        if _TOLL_PLATE_RE.match(token):
+            return "".join(tokens[:index]), token
+    for index in range(len(tokens) - 1, -1, -1):
+        if _TOLL_DATE_RE.match(tokens[index]):
+            return "".join(tokens[:index]), ""
+    return "".join(tokens), ""
+
+
 def _parse_item(raw: str, header: str = "") -> Optional[InvoiceLine]:
     flat = re.sub(r"\s+", " ", raw).strip()
     # 扫所有候选 TAIL_RE 匹配，挑最后合理位置
+    #
+    # **「税率印成星号」的匹配单独放一档。** 星号既是「免税」的记号，
+    # 也是项目名里的分隔符 —— 一行末尾若是「… 13.00 *」（星号是名字的
+    # 终止符），星号档的匹配会认成「金额 13.00、税率 *」，把真正的金额
+    # 与税额丢掉。所以：**有真税率的匹配优先**，实在没有才用星号档。
     best = None
+    best_star = None
     for cand in TAIL_RE.finditer(flat):
         try:
             amt = Decimal(cand.group(1))
@@ -559,13 +717,24 @@ def _parse_item(raw: str, header: str = "") -> Optional[InvoiceLine]:
         head = cand.group(1).split(".")[0].lstrip("-").lstrip("0") or "0"
         if len(head) > 8:
             continue
-        best = cand
+        if cand.group(2) == "*":
+            best_star = cand
+        else:
+            best = cand
+    if best is None:
+        best = best_star
     if best is None:
         return None
     m = best
     amount = amt
     tax_rate = m.group(2)
+    if tax_rate == "*":
+        # 票面把「免税」印成星号。界面上直接显示「*」没人看得懂，
+        # 而这一栏是给人看的 —— 显示「免税」，语义与票面一致
+        # （免税的票没有税额，进项不可抵扣）。
+        tax_rate = "免税"
     # 税额同样走 Decimal —— 「1.41」进、「1.41」出，不经 float。
+    # 税额那一栏印星号（免税/不征税）时就是 0。
     tax = Decimal(m.group(3)) if m.group(3) is not None else Decimal("0")
     prefix = flat[: m.start()].strip()
 
@@ -578,10 +747,27 @@ def _parse_item(raw: str, header: str = "") -> Optional[InvoiceLine]:
     # 一样压成无空白，避免 *X Y* 这种伪空格残留。
     head_cat = re.sub(r"\s+", "", head_cat)
     raw_tail = name_match.group(2).strip().rstrip("*").strip()
+    # 票面把**空的规格型号**印成「无」—— 电信服务那张票就是这么印的
+    # （「*电信服务*电信服务 无 项 1 199.5 199.50 * *」）。那个「无」是
+    # 「没有」的意思：它既不是项目名的一部分，也不是一个规格型号。
+    # 只认「独立成词」的「无」（前后都不是字）—— 「无碳钢」这种照旧不动。
+    raw_tail = RE_NONE_CELL.sub(" ", raw_tail)
     # 项目名截断：第二个 * 之后起算的第二个空格及以后的内容视为单位/数量/单价等泄漏，丢弃。
     # rest 仍使用 raw_tail 完整内容，以便继续抽取 unit/quantity/unit_price。
     _parts = raw_tail.split()
-    if BUILDING_SERVICE_HEADER.search(header) and len(_parts) >= 3:
+    # **通行费版式**：这一版式压根没有「单位 数量 单价」那几列 ——
+    # 名字区后面是「车牌号 车辆类型 通行日期起 通行日期止」四列。
+    # 老办法「取最后两个数字当数量与单价」会把**通行日期**（20260419 这种
+    # 8 位数）当成数量和单价：金额碰巧是对的，数量与单价却是彻底的胡说。
+    is_toll = bool(TOLL_HEADER.search(header))
+    if is_toll:
+        # 车牌号是这一版式里**最好认**的一列，用它当锚点，锚点之前就是项目名。
+        name_tail, _plate = _split_toll_cells(raw_tail)
+        if _plate:
+            # 车牌号拼在名字后面（跟别处「名字带规格型号」一个口径），
+            # 这样摘要里能看出是哪辆车 —— 通行费的摘要没有车牌号等于没头没脑。
+            name_tail = name_tail + _plate
+    elif BUILDING_SERVICE_HEADER.search(header) and len(_parts) >= 3:
         # **建筑服务票**：名字区是**三个**格子 —— 项目名称、建筑服务发生地、
         # 建筑项目名称。
         #
@@ -619,7 +805,9 @@ def _parse_item(raw: str, header: str = "") -> Optional[InvoiceLine]:
 
     # 数量 / 单价 提取。PDF 标准列序：... 数量 单价 金额 税率 税额，
     # 但 PDF 拆行常造成前缀只剩 1 个数字（通常是数量）。所以 len==1 也按 quantity 提取。
-    if not is_discount and numbers:
+    #
+    # **通行费版式不适用**：它没有这两列，那两个 8 位数是通行日期。
+    if not is_discount and numbers and not is_toll:
         if len(numbers) >= 2:
             quantity = numbers[-2]
             unit_price = numbers[-1]
@@ -643,7 +831,11 @@ def _parse_item(raw: str, header: str = "") -> Optional[InvoiceLine]:
     # 单位词提取：用 _UNIT_TOKENS 白名单替代原来的 RE_CHINESE_SHORT 末尾 1-3 字启发式，
     # 避免"设基金/服务/费"等被错识别为 unit，并补上 kg/pcs/m 等英文/缩写单位。
     spec = rest
-    if not is_discount:
+    if is_toll:
+        # 通行费没有「单位」列，规格型号那一格放的是**车牌号**。
+        unit = ""
+        spec = _plate
+    elif not is_discount:
         unit, spec = _extract_unit(rest)
 
     # 摘要用的项目名：``spec`` 这一段是「项目名称格 + 规格型号格」，
