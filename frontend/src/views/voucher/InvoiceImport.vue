@@ -213,12 +213,30 @@
             </div>
             <div class="result-actions">
               <!--
-                只看还没入账的那些。一批几十张票，生成过一轮之后剩下的那几张
-                淹在一堆「已生成」里，翻半天找不着 —— 这个开关把它们挑出来。
+                只看还没入账的那些，**默认就是开着的**。
+
+                一批几十张票，生成过一轮之后剩下的那几张淹在一堆「已生成」
+                里，翻半天找不着 —— 未入账的那批才是待办清单。默认开着，
+                打开这个页面看到的就是「还剩多少要做」，不用每次先点一下
+                开关才看到正事。
+
+                口径是「这张发票有没有凭证」，不是「状态是什么」：被点了忽略
+                的票也没入账，它留在列表里 —— 用户就是靠这张列表把它取消
+                忽略、补生成凭证的。
               -->
-              <el-button :type="onlyUnbooked ? 'primary' : ''" @click="onlyUnbooked = !onlyUnbooked">
+              <!--
+                按钮**不做成主按钮**：这一排里只有「确认生成」是主操作，
+                开关要是也染成主色，两个蓝按钮并排，谁是正事就说不清了。
+                开关的状态由旁边那一句说明。
+              -->
+              <el-button @click="onlyUnbooked = !onlyUnbooked">
                 {{ onlyUnbooked ? '显示全部发票' : '只显示未入账发票' }}
               </el-button>
+              <!--
+                开着的时候，当前视野与藏起来的张数都要讲出来：不然
+                「共 100 张」而表里只有 51 行，看着像丢了 49 张发票。
+              -->
+              <span v-if="onlyUnbooked" class="muted result-hint">{{ filterHint }}</span>
               <el-button :disabled="!store.canWrite" :loading="previewing" @click="recalculate">重新计算预览</el-button>
               <!--
                 已生成过的批次不能作废：凭证已经在账上了，作废批次删记录、
@@ -248,6 +266,14 @@
           手动收起某一行仍然有效 —— 它只在数据换新（重新计算预览）时重置。
         -->
         <el-table :data="visibleInvoices" size="small" border row-key="id" default-expand-all :row-class-name="invoiceRowClass">
+          <!--
+            整批都已入账的时候，开了筛选的表就是空的 —— 空表本身不说明
+            「没有了」还是「筛掉了」，所以这里把话讲全：都入账了，点一下
+            就能看全部。
+          -->
+          <template #empty>
+            <div class="invoice-empty">{{ emptyHint }}</div>
+          </template>
           <el-table-column type="expand">
             <template #default="{ row }">
               <div class="invoice-detail">
@@ -521,13 +547,34 @@ const pageLabel = (row) => {
 // 的话，被合并进来的封面页会让人以为批次比预想的多。
 // 「只显示未入账发票」：开着的时候，表里只剩**还没生成凭证**的那些。
 //
+// 默认**开着**（用户 2026-10-26 要求）：这个页面是「还剩多少票要入账」
+// 的待办清单，默认把已入账的藏起来，打开就看到正事。已入账的那些并没有
+// 消失 —— 点「显示全部发票」随时能翻出来，数目也会在旁边讲清楚。
+//
 // 口径是「有没有凭证」，不是「状态是什么」：一张被点了忽略的发票也没
 // 入账，它该留在列表里 —— 用户就是靠这个列表把它取消忽略、补生成凭证的。
-const onlyUnbooked = ref(false)
+const onlyUnbooked = ref(true)
+const allInvoices = computed(() => batch.value?.invoices || [])
 const visibleInvoices = computed(() => {
-  const rows = batch.value?.invoices || []
+  const rows = allInvoices.value
   if (!onlyUnbooked.value) return rows
   return rows.filter(row => !row.voucher_id)
+})
+// 被筛掉的那几张（已生成凭证的）—— 用来把「藏了多少」讲清楚。
+const bookedCount = computed(() => allInvoices.value.filter(row => row.voucher_id).length)
+// 开关开着时讲清楚当前视野：看得到几张、藏起来几张。
+const filterHint = computed(() => {
+  const visible = visibleInvoices.value.length
+  const hidden = bookedCount.value
+  if (!hidden) return `当前显示未入账的 ${visible} 张`
+  return `当前显示未入账的 ${visible} 张，已隐藏 ${hidden} 张已入账发票`
+})
+// 空表时要讲清楚是「筛掉了」还是「本来就没有」—— 空表本身不说明任何事。
+const emptyHint = computed(() => {
+  if (onlyUnbooked.value && bookedCount.value) {
+    return `这批 ${bookedCount.value} 张发票都已入账 —— 点「显示全部发票」看全部记录。`
+  }
+  return '这个批次还没有发票记录。'
 })
 const batchSummaryTitle = computed(() => {
   const current = batch.value
@@ -745,6 +792,9 @@ onMounted(loadAll)
 .subject-text { color: #303133; font-size: 12px; }
 .ignored-note { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px; background: #f4f5f7; color: #475467; font-size: 12px; }
 .result-title { gap: 10px; }
+/* 筛选提示：紧挨着开关，小字灰 —— 别跟按钮抢注意力。 */
+.result-hint { font-size: 12px; white-space: nowrap; }
+.invoice-empty { color: var(--el-text-color-secondary); padding: 8px 0; }
 .mb { margin-bottom: 12px; }
 .rule-help { margin-bottom: 12px; }
 .invoice-detail { padding: 2px 10px 12px 44px; }

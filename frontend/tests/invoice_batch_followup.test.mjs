@@ -1,13 +1,16 @@
 /**
  * 发票批次的两件事（src/views/voucher/InvoiceImport.vue）：
  *
- *  ① 「只显示未入账发票」的开关；
+ *  ① 「只显示未入账发票」的开关，**默认是开着的**（用户 2026-10-26 要求）；
  *  ② 已确认过的批次要能**补生成**剩下的发票，所以「作废批次」在那种批次上
  *     必须是禁用的 —— 作废会删记录、删原件，却撤不下已经在账上的凭证。
  *
  * 第 ① 条的口径是「这张发票有没有凭证」，不是「它是什么状态」：
  * 被点了忽略的发票也没入账，它得留在列表里 —— 用户就是靠这个列表
  * 把它取消忽略、补生成凭证的。
+ *
+ * 默认开着还有两条配套：藏起来的张数要讲出来（不然看着像丢了发票），
+ * 整批都已入账时空表要把话讲全（不然看着像这批没东西）。
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -28,7 +31,11 @@ t('批次头有这个开关', () => {
 })
 
 t('开关接的是一个 ref', () => {
-  assert.match(VIEW, /const onlyUnbooked = ref\(false\)/)
+  assert.match(VIEW, /const onlyUnbooked = ref\((true|false)\)/)
+})
+
+t('默认只显示未入账发票（默认开着）', () => {
+  assert.match(VIEW, /const onlyUnbooked = ref\(true\)/)
 })
 
 t('表格的数据源是过滤后的那份', () => {
@@ -45,6 +52,24 @@ t('过滤口径是「没有凭证」，不是状态', () => {
 
 t('开关开着时按钮变成「显示全部发票」', () => {
   assert.match(VIEW, /onlyUnbooked \? '显示全部发票' : '只显示未入账发票'/)
+})
+
+t('藏起来的张数要讲出来', () => {
+  assert.match(VIEW, /const bookedCount = computed/)
+  assert.match(VIEW, /const filterHint = computed/)
+  assert.match(VIEW, /已隐藏 \$\{hidden\} 张已入账发票/)
+  assert.match(VIEW, /v-if="onlyUnbooked" class="muted result-hint"/)
+})
+
+t('开关不抢主按钮的样式', () => {
+  // 这一排里只有「确认生成」该是主按钮；开关染成主色就分不清谁是正事。
+  assert.doesNotMatch(VIEW, /onlyUnbooked \? 'primary'/)
+})
+
+t('整批都已入账时，空表把话讲全', () => {
+  assert.match(VIEW, /<template #empty>/)
+  assert.match(VIEW, /const emptyHint = computed/)
+  assert.match(VIEW, /都已入账 —— 点「显示全部发票」看全部记录。/)
 })
 
 console.log('== 已生成过的批次不能作废 ==')
