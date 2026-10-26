@@ -6132,6 +6132,44 @@ brotli 639 KB，**比 gzip 再省 14%**；入口 JS 一个文件从 gzip 111 KB
 这个头给足了，CDN 侧若不认 Vary，就会把 br 那份发给不支持的客户端 ——
 那时候要修的是 CDN 的缓存键，不是源站。
 
+### 11.17.10 源站的 HTTP/3（QUIC）（2026-10-26 加）
+
+生产机的 nginx 是 **1.26.3 + OpenSSL 3.5.7**，两条前提都满足：编译参数里有
+`--with-http_v3_module`，而 OpenSSL 3.5 起带了原生 QUIC API（3.5 之前
+OpenSSL 的 QUIC API 反复变更，nginx 1.26 那条线认不了）。实测起实例后
+`curl --http3-only` 拿到 `HTTP/3 200`。
+
+**为什么源站也要开 h3**：客户端与 ESA 之间**已经是** HTTP/3 了（ESA 自己在发
+`alt-svc: h3=":443"`），源站开 h3 服务的是**绕过 CDN 直连源站的那部分流量**。
+DNS 是按线路解析的 —— 有一条线走 ESA，另一条仍直连源站，那条线的用户
+拿不到任何 CDN 收益，只能靠源站自己的协议能力。
+
+**三条指令，缺一条都不行**：
+
+    listen 443 quic reuseport;   # 同一端口号、不同协议：TCP 是 TLS，UDP 是 QUIC
+    http3 on;
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
+
+**为什么 `listen` 要另起一条而不是改原来那条**：TCP 与 UDP 是两套协议，
+同一个端口号可以同时监听，但要**两条 `listen`**。
+
+**Alt-Svc 必须逐个 location 写，这是 nginx 的一个坑**：`add_header` 是
+**逐层替换不是合并** —— 某一层只要写了任何一条 `add_header`，上一层那几条
+就**全部不继承**。所以只在 server 层写一条 Alt-Svc 是不够的：凡是自带
+`add_header` 的 location（`/assets/`、`/api/` …）都会把它顶掉，于是那些
+路径上的响应**没有** Alt-Svc，浏览器压根不知道可以用 h3。
+护栏断言盯的是这条**不变量**（凡是自带 `add_header` 的 location 都得宣告
+Alt-Svc），而不是「某个地方有一行」—— 后者挡不住将来新增一个 location
+忘了写。
+
+**UDP 443 还要在云厂商安全组里放行**，那不是 nginx 管得到的事。没放行的话
+TCP 一切照常，只是 HTTP/3 从外面连不上 —— **静默降级**，不报错。
+
+**版本要求比 `http2 on;` 更严**：`http2 on;` 只要 nginx >= 1.25.1，
+而 `http3 on;` 还要**编译了 v3 模块**。CI 装的是 nginx.org 官方包
+（1.25.5），实测能解析 `http3 on;`（`syntax is ok`）—— 但**版本号高不等于
+带模块**，所以这条要单独验过，不能靠版本推断。
+
 ### 11.17.11 API 响应一律不可缓存（2026-10-26 加，接 CDN 之后）
 
 `/api/*` 的响应是**按登录用户区分**的：同一条 URL，不同用户拿到的是不同内容。

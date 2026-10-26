@@ -147,6 +147,29 @@ def balanced(lines: list[str]) -> tuple[bool, str]:
     return True, ""
 
 
+def server_block_with(lines: list[str], needle: str) -> list[str] | None:
+    """包含 needle 的那个 server 块（按花括号配平）；找不到返回 None。"""
+    for i, ln in enumerate(lines):
+        if ln.strip() != "server {":
+            continue
+        depth = 0
+        block: list[str] = []
+        for l2 in lines[i:]:
+            code = l2.split("#", 1)[0]
+            depth += code.count("{") - code.count("}")
+            block.append(l2)
+            if depth <= 0:
+                break
+        if any(needle in l for l in block):
+            return block
+    return None
+
+
+def _indent_of(line: str) -> int:
+    """行首空格数（tab 按 1 记）。用来区分「哪一层」写的指令。"""
+    return len(line) - len(line.lstrip(" \t"))
+
+
 def all_location_blocks(lines: list[str]) -> list[tuple[str, list[str]]]:
     """所有 location 块：[(块头那一行, 块内所有行)]。
 
@@ -375,6 +398,61 @@ def check_structure(conf: Path) -> None:
         ok("br 树不许被直接访问（对外发裸 brotli 字节，浏览器会当普通文件解）")
     else:
         no("没有挡掉 /br/ 的直接访问")
+
+    # --- HTTP/3（QUIC）与 Alt-Svc 宣告 ---
+    #
+    # **为什么源站要开 HTTP/3**：走 ESA 的客户端与 ESA 之间已经是 HTTP/3
+    # （ESA 已经在发 alt-svc: h3=":443"），源站开 h3 服务的是**绕过 CDN
+    # 直连源站的那部分流量** —— 也就是按线路解析里没走 ESA 的那条线。
+    #
+    # **Alt-Svc 为什么必须逐个 location 写**：nginx 的 add_header 是
+    # **逐层替换不是合并** —— 某一层只要写了任何一条 add_header，
+    # 上一层那几条就**全部不继承**。所以只在 server 层写一条 Alt-Svc
+    # 是不够的：凡是自带 add_header 的 location（/assets/、/api/ …）
+    # 都会把它顶掉，于是那些路径上的响应**没有** Alt-Svc ——
+    # 浏览器压根不知道可以用 h3。
+    #
+    # 这条断言盯的是**不变量**（凡是自带 add_header 的 location 都得
+    # 宣告 Alt-Svc），而不是「某个地方有一行」—— 后者挡不住将来新增
+    # 一个 location 忘了写。
+    srv = server_block_with(lines, "listen 443 ssl;")
+    if srv is None:
+        no("找不到含 listen 443 ssl 的 server 块")
+    else:
+        if any(l.strip() == "listen 443 quic reuseport;" for l in srv):
+            ok("HTTPS 段开了 QUIC 监听（同一端口号、不同协议：TCP 是 TLS，UDP 是 QUIC）")
+        else:
+            no("HTTPS 段没有 listen 443 quic reuseport —— HTTP/3 不会生效")
+        if any(l.strip() == "http3 on;" for l in srv):
+            ok("HTTPS 段开了 http3 on;")
+        else:
+            no("HTTPS 段没有 http3 on;")
+        # **必须按缩进区分层级**：srv 是整个 server 块的行，**包含**
+        # 里面每一个 location 的行。只判「块里有没有 Alt-Svc」的话，
+        # location 里那份会把 server 层那份顶掉 —— 断言看着在盯
+        # server 层，实际盯的是「整块里随便哪一处有」。
+        # server 层自己的指令缩进是 4 空格，location 里的是 8 空格。
+        if any(_indent_of(l) == 4 and "Alt-Svc" in l for l in srv):
+            ok("HTTPS 段宣告了 Alt-Svc")
+        else:
+            no("HTTPS 段（server 层）没有 Alt-Svc —— 浏览器不知道可以用 h3")
+
+        missing_alt = []
+        for head, blk in all_location_blocks(lines):
+            if not any(l.strip().startswith("add_header") for l in blk):
+                continue
+            # 同理：location 自己的 Alt-Svc 是 8 空格缩进，
+            # 不能拿「块里任意深度出现 Alt-Svc」当数。
+            if not any(_indent_of(l) == 8 and "Alt-Svc" in l for l in blk):
+                missing_alt.append(head)
+        if missing_alt:
+            no(
+                f"{len(missing_alt)} 个自带 add_header 的 location 没有 Alt-Svc："
+                + "；".join(missing_alt)
+                + "（add_header 逐层替换不继承 —— 这些路径上浏览器拿不到 h3 宣告）"
+            )
+        else:
+            ok("凡是自带 add_header 的 location 都宣告了 Alt-Svc")
 
     # --- API 响应一律不可缓存 ---
     #
