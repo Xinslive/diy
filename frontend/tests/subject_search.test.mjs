@@ -1,12 +1,15 @@
 /**
  * 科目面板的搜索（**线上那份 `utils/subjectSearch.js`**）。
  *
- * 用户报的两件事都钉在这里：
- *   ① 搜「5001」时整条链一路摊开，面板推出几十行 —— 搜索结果**默认只摊到第二级**，
- *      更深的自己点 ▸ 往下走（rowOpen 那条规矩）。
+ * 用户报的三件事都钉在这里：
+ *   ① 搜「5001」时整条链一路摊开，面板推出几十行 —— 指不出名来时
+ *      **默认只摊到第二级**，更深的自己点 ▸ 往下走（rowOpen 那条规矩）。
  *   ② 只摊两层之后「三级那条命中的怎么找得到」—— 命中项的**整条祖先路**都得留在
  *      结果里（searchHitIds 那条规矩）。以前只回溯一级，搜 100202 会冒出一条
  *      没有上级的孤儿科目。
+ *   ③ 手动敲了**三级科目的编码**，面板却只摆到二级，要找的那条压根看不见 ——
+ *      摊多深改成**跟着指名的科目走**：输入一级显示到二级、输入二级显示到三级、
+ *      输入三级显示到四级（searchNamed → autoDepth）。
  *
  * 另有纯源码断言守住两个页面真的走了这套判定（明细账默认 1001 库存现金）。
  */
@@ -19,7 +22,7 @@ const ROOT = fileURLToPath(new URL('../', import.meta.url))
 const VITE = await createServer({
   root: ROOT, logLevel: 'error', server: { middlewareMode: true }
 })
-const { rowOpen, searchHitIds, SEARCH_AUTO_DEPTH } =
+const { rowOpen, searchHitIds, searchNamed, levelOf, SEARCH_AUTO_DEPTH } =
   await VITE.ssrLoadModule('/src/utils/subjectSearch.js')
 
 const PICKER = fs.readFileSync(new URL('../src/components/SubjectPicker.vue', import.meta.url), 'utf8')
@@ -38,16 +41,23 @@ const TREE = [
   { id: 8, code: '5001010101', name: '5号店', parent_id: 7 }
 ]
 const code = (kw) => TREE.filter((s) => searchHitIds(TREE, kw).has(s.id)).map((s) => s.code)
-/** 照组件那套 walk 拍平：命中留下，摊开才往下走 */
+/**
+ * 照组件那套 walk 拍平：命中留下，摊开才往下走。
+ *
+ * 摊多深跟组件一样：指名的那条是第几级就摊到第几+1 级，
+ * 指不出名来才退回 SEARCH_AUTO_DEPTH（只摊到第二级）。
+ */
 const shown = (kw, expanded = new Set()) => {
   const h = searchHitIds(TREE, kw)
+  const named = searchNamed(TREE, kw)
+  const autoDepth = named?.level ?? SEARCH_AUTO_DEPTH
   const out = []
   const kidsOf = (id) => TREE.filter((s) => s.parent_id === id)
   const walk = (list, depth) => {
     for (const n of list) {
-      if (h && !h.has(n.id)) continue
+      if (h && !h.has(n.id) && !named?.childIds.has(n.id)) continue
       out.push(`${'  '.repeat(depth)}${n.code}`)
-      if (rowOpen({ hasKids: kidsOf(n.id).length > 0, depth, searching: true, expanded, id: n.id })) {
+      if (rowOpen({ hasKids: kidsOf(n.id).length > 0, depth, searching: true, expanded, id: n.id, autoDepth })) {
         walk(kidsOf(n.id), depth + 1)
       }
     }
@@ -139,12 +149,75 @@ t('搜不到就是空集，不是 null', () => {
   assert.equal(searchHitIds(TREE, 'zzz').size, 0)
 })
 
+console.log('== 输入第几级，就显示到第几+1级 ==')
+
+t('输入一级科目 → 显示到二级', () => {
+  assert.equal(searchNamed(TREE, '5001').level, 1)
+  assert.deepEqual(shown('5001'), ['5001', '  500101'])
+})
+
+t('输入二级科目 → 显示到三级', () => {
+  assert.equal(searchNamed(TREE, '500101').level, 2)
+  assert.deepEqual(shown('500101'), ['5001', '  500101', '    50010101'])
+})
+
+t('输入三级科目 → 显示到四级', () => {
+  // 用户报的那一条：手动敲了三级科目的编码，面板上却只摆到二级，
+  // 要找的那条压根看不见 —— 现在它自己露出来了。
+  assert.equal(searchNamed(TREE, '50010101').level, 3)
+  assert.deepEqual(shown('50010101'), ['5001', '  500101', '    50010101', '      5001010101'])
+})
+
+t('输入四级科目 → 树到底了，就到这儿', () => {
+  assert.equal(searchNamed(TREE, '5001010101').level, 4)
+  assert.deepEqual(shown('5001010101'), ['5001', '  500101', '    50010101', '      5001010101'])
+})
+
+t('按名字指名也一样算数（下级名字对不上，单列出来才看得见）', () => {
+  // 「星创空间」是二级科目 → 它的下级「1层」也得摆出来。
+  // 下级名字跟关键字对不上、匹配不着，不单列就看不见。
+  assert.equal(searchNamed(TREE, '星创空间').level, 2)
+  assert.deepEqual(shown('星创空间'), ['5001', '  500101', '    50010101'])
+})
+
+t('只有它一条命中时，指的就是它（敲片段也认）', () => {
+  assert.equal(searchNamed(TREE, '建设银').level, 3)
+  assert.deepEqual(shown('建设银'), ['1002', '  100201', '    100202'])
+})
+
+t('指不出名来（命中一堆）→ 仍旧只摊到第二级', () => {
+  // 这是「浏览这一片」，不是「找这一条」：照旧摊到第二级，别把面板撑爆。
+  assert.equal(searchNamed(TREE, '1'), null)
+  assert.deepEqual(shown('1'), ['1001', '1002', '  100201', '5001', '  500101'])
+})
+
+t('压根没命中就是指不出名来，退回默认摊开深度', () => {
+  assert.equal(searchNamed(TREE, 'zzz'), null)
+  assert.equal(rowOpen({ hasKids: true, depth: 0, searching: true, autoDepth: SEARCH_AUTO_DEPTH }), true)
+  assert.equal(rowOpen({ hasKids: true, depth: 1, searching: true, autoDepth: SEARCH_AUTO_DEPTH }), false)
+})
+
+t('「第几级」是顺着 parent_id 数的，不看 level 字段', () => {
+  const one = TREE.find((s) => s.code === '5001')
+  assert.equal(levelOf(TREE, one), 1)
+  assert.equal(levelOf(TREE, TREE.find((s) => s.code === '500101')), 2)
+  assert.equal(levelOf(TREE, TREE.find((s) => s.code === '50010101')), 3)
+  assert.equal(levelOf(TREE, TREE.find((s) => s.code === '5001010101')), 4)
+})
+
 console.log('== 两个页面真的走这套判定 ==')
 
 t('SubjectPicker 用的是 utils/subjectSearch 那份 rowOpen / searchHitIds', () => {
   assert.ok(/from '@\/utils\/subjectSearch'/.test(PICKER), 'SubjectPicker 没引 utils/subjectSearch')
   assert.ok(/rowOpen\(\{/.test(PICKER), '面板的 ▸/▾ 判定没走 rowOpen')
   assert.ok(/searchHitIds\(props\.options, keyword\.value\)/.test(PICKER), '筛选没走 searchHitIds')
+})
+
+t('SubjectPicker 把 autoDepth 接上 rowOpen（摊多深跟着指名的科目走）', () => {
+  assert.ok(/searchNamed\(props\.options, keyword\.value\)/.test(PICKER), '面板没算「这串输入指名了哪条科目」')
+  assert.ok(/named\.value\?\.level \?\? SEARCH_AUTO_DEPTH/.test(PICKER), 'autoDepth 没跟着指名的科目走')
+  assert.ok(/autoDepth: autoDepth\.value/.test(PICKER), 'rowOpen 没接上 autoDepth')
+  assert.ok(/named\.value\?\.childIds\.has\(n\.id\)/.test(PICKER), '被指名科目的下级没单列出来')
 })
 
 t('depth 是当参数传进去的，不是从 n 上读', () => {

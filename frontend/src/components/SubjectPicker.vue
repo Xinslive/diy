@@ -66,7 +66,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { CATEGORY_LABEL, ensurePinyin, matchSubject, needsPinyin } from '@/utils/subjectCode'
-import { rowOpen, searchHitIds } from '@/utils/subjectSearch'
+import { rowOpen, searchHitIds, searchNamed, SEARCH_AUTO_DEPTH } from '@/utils/subjectSearch'
 import { perFrame, rafThrottle } from '@/utils/frame'
 
 const props = defineProps({
@@ -251,12 +251,43 @@ const hit = computed(() => {
 })
 
 /**
+ * 这一串输入**指名了哪一条科目** —— 指名了就照它那一级摊开（判定在
+ * utils/subjectSearch.js 的 searchNamed）。
+ *
+ *  两种算指名：编码/名称**全等**，或者**只有它一条**命中。
+ *  指不出名来（敲的是片段、命中一大片）就是 null —— 那是「浏览这一片」，
+ *  按默认规矩只摊到第二级，不然一堆下级把面板撑爆。
+ *
+ *  跟 hit 一样**必须读一次 dictReady**：拼音首字母的匹配结果存在模块级的
+ *  普通 Map 里，不是响应式的；不把它列进依赖表，字典到位后这一轮算出来的
+ *  「指不出名来」就不会重算。
+ */
+const named = computed(() => {
+  dictReady.value
+  return searching.value ? searchNamed(props.options, keyword.value) : null
+})
+
+/**
+ * 搜索时摊到第几级：**指名的那条是第几级，就摊到它的下一级** ——
+ * 输入一级显示到二级、输入二级显示到三级、输入三级显示到四级。
+ *
+ *  这条规矩治的是「手动敲了三级科目的编码，面板上却只摆到二级、
+ * 要找的那条压根看不见」：以前摊多深是写死的（SEARCH_AUTO_DEPTH），
+ * 不管人敲的是几级。写死是为了防「下级太多把面板撑爆」，
+ * 可指得出名来的时候不存在撑爆 —— 那一支只有一条路。
+ *
+ *  指不出名来才回到写死的 SEARCH_AUTO_DEPTH（只摊到第二级）。
+ */
+const autoDepth = computed(() => named.value?.level ?? SEARCH_AUTO_DEPTH)
+
+/**
  * 这一支摊不摊开 —— 面板上那个 ▸ / ▾ 就读它，两边得一处算：
  * 箭头说「收着」而下级明明在，人只会以为是坏的。
  *
- *  搜索时**只自动摊到第二级**：编码是前缀命中，搜「5001」时 500101、50010101、
- *  5001010101 一个个全算命中，整条链一路摊开就推出几十行，要找的那条末级
- *  反而淹在里头。更深的照旧摆 ▸，人自己点下去。
+ *  搜索时按 autoDepth 摊：指名了就摊到指名那级的下一级，
+ *  指不出名来才只摊到第二级（编码是前缀命中，搜「5001」时 500101、
+ *  50010101、5001010101 一个个全算命中，整条链一路摊开就推出几十行，
+ *  要找的那条末级反而淹在里头）。更深的照旧摆 ▸，人自己点下去。
  */
 // depth 从外面传进来，不从 n 上读：visible 里那圈 walk 手里的是 options 里的**原始**
 // 科目（没带 depth），照着 n.depth 读会一律当成 0 —— 面板上看着箭头都收着了，
@@ -264,7 +295,8 @@ const hit = computed(() => {
 const isOpen = (n, depth = 0) => rowOpen({
   hasKids: hasKids(n), depth,
   searching: searching.value, expanded: expanded.value,
-  collapsed: collapsed.value, id: n.id
+  collapsed: collapsed.value, id: n.id,
+  autoDepth: autoDepth.value
 })
 
 const kidsOf2 = (id) => tree.value.get(id) || []
@@ -303,7 +335,11 @@ const visible = computed(() => {
       const kids = kidsOf(n.id)
       // 搜的时候只留命中那条连同它的整条路（hit 里已经带上了各级祖先）；
       // 收窄的时候只留那一支；都不适用时，摆在哪个一级目录下就画哪一支
-      const keep = h ? h.has(n.id)
+      //
+      // 被指名的那条科目的**直接下级**也留着：按名字指名的场合，
+      // 下级名字不一样、匹配不上，不单列出来就看不见 ——
+      // 「输入二级显示到三级」这条对按名字找也一样算数。
+      const keep = h ? (h.has(n.id) || (named.value?.childIds.has(n.id) ?? false))
         : br ? br.keep.has(n.id)
           : true
       if (!keep) continue

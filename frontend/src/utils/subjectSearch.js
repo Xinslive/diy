@@ -8,6 +8,10 @@ import { matchSubject } from './subjectCode'
  *  编码是前缀命中 —— 搜「5001」，5001、500101、50010101、5001010101 一个个
  *  全都算命中。整条链一路摊开，面板一下子推出几十行，要找的那条末级
  *  反而淹在里头。更深的照旧摆 ▸，点一下 / 按 → 自己往下走。
+ *
+ *  这是**指不出名来**时的默认：人敲的是个片段，命中一大片，
+ *  那是「浏览这一片」，不是「找这一条」。
+ *  指得出名来时（``searchNamed``）不按这个数走 —— 见那个函数。
  */
 export const SEARCH_AUTO_DEPTH = 1
 
@@ -36,10 +40,73 @@ export function searchHitIds(options, kw) {
 }
 
 /**
+ * 这条科目在树里是**第几级**（一级科目是 1）。
+ *
+ *  顺着 parent_id 一级一级数，不看 level 字段 ——
+ *  字段是库里存的那一份，改挂父级之后要等后端重算才准
+ *  （见 backend/app/api/subjects.py 的 _recalc_levels），面板这边等不得。
+ */
+export function levelOf(options, s) {
+  const byId = new Map(options.map((x) => [x.id, x]))
+  const seen = new Set()
+  let level = 1
+  let cur = s
+  while (cur && cur.parent_id != null && !seen.has(cur.parent_id)) {
+    seen.add(cur.parent_id)
+    const parent = byId.get(cur.parent_id)
+    if (!parent) break
+    level++
+    cur = parent
+  }
+  return level
+}
+
+/**
+ * 这一串输入**指名了哪一条（或哪几条）科目**。
+ *
+ *  指名只有两种：
+ *    ① 编码或名称**全等** —— 人把这一条科目的编码/名字整个敲进来了；
+ *    ② **只有它一条**命中 —— 敲的是片段，但全表里只有这一条对得上。
+ *
+ *  命中一大片就**指不出名来**：那是「浏览这一片」，不是「找这一条」。
+ *  这两种都指不出来（关键字是空的、或者压根没命中）时，返回 null ——
+ *  调用方退回 SEARCH_AUTO_DEPTH 那条默认规矩（只摊到第二级）。
+ *
+ *  返回值：
+ *    level    —— 被指名的科目是第几级。面板据此摊开：**输入第几级就显示到第几+1 级**
+ *                （输入一级显示到二级、输入二级显示到三级、输入三级显示到四级）。
+ *    ids      —— 被指名的那些科目自己。
+ *    childIds —— 它们的**直接下级**：按名字指名的场合，下级名字不一样、匹配不上，
+ *                不单列出来就看不见 —— 「输入二级显示到三级」这条对名字也该算数。
+ */
+export function searchNamed(options, kw) {
+  const k = String(kw ?? '').trim().toLowerCase()
+  if (!k) return null
+  const hits = []
+  for (const s of options) if (matchSubject(s, k)) hits.push(s)
+  if (!hits.length) return null
+  const exact = hits.filter((s) => {
+    const code = String(s.code ?? '').trim().toLowerCase()
+    const name = String(s.name ?? '').trim().toLowerCase()
+    return code === k || name === k
+  })
+  const named = exact.length ? exact : (hits.length === 1 ? hits : [])
+  if (!named.length) return null
+  const ids = new Set(named.map((s) => s.id))
+  const childIds = new Set()
+  for (const s of options) if (s.parent_id != null && ids.has(s.parent_id)) childIds.add(s.id)
+  const level = Math.max(...named.map((s) => levelOf(options, s)))
+  return { level, ids, childIds }
+}
+
+/**
  * 这一支摊不摊开（面板上那个 ▸ / ▾）。
  *
  *  不搜：只看人点过的 —— 面板打开是一张一级目录，收窄到已填的那一支也是靠它。
- *  搜：默认只自动摊到 SEARCH_AUTO_DEPTH 那一级，更深的收着。
+ *  搜：按级数自动摊开 —— 摊到 ``autoDepth`` 那一级，更深的收着。
+ *  ``autoDepth`` 不是写死的：指名了某一级的科目就按那一级来
+ *  （``searchNamed`` → 输入三级显示到四级），指不出名来才用默认的
+ *  ``SEARCH_AUTO_DEPTH``（只摊到第二级，免得一堆下级把面板撑爆）。
  *
  *  但**人点过的一律作数**，两个方向都是：
  *  点深一层的 ▸ 要真能摊开（不然第三级以后走不进去），
