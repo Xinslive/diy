@@ -6040,6 +6040,61 @@ CDN 是反向代理时，**nginx 看到的对端是 CDN 的边缘节点 IP**。�
 填错地方的后果是「CDN 网段填进后端」→ 后端开始信任 X-Forwarded-For 里
 客户端可以随便写的那个 → 攻击者每次换一个头就换一个桶。
 
+### 11.17.6.1 ESA 在前时的真实客户端 IP：凭**令牌**还原，不用付费的回源网段
+
+Cloudflare 那套 `set_real_ip_from <CDN 网段>` 需要一份**权威的网段清单**。
+ESA 的对应功能（「安全防护 → 源站防护 → 复制 IP 地址」，或 OpenAPI
+`esa:GetOriginProtection`）是**付费的**，本项目没有买 —— 所以走另一条路。
+
+**ESA 回源时自带两个可用的东西**（2026-10-26 实测）：
+
+| 头 | 内容 | 谁写的 |
+| --- | --- | --- |
+| `ali-real-client-ip` | **真实客户端 IP** | ESA（默认就带，控制台不用配） |
+| `X-CWQ-Origin-Token` | 一个只有 ESA 知道的固定值 | 运维在控制台「回源请求头」里配 |
+
+**为什么必须加令牌这一道闸**：源站 IP 是公开的（`43.138.178.174` 直连就能
+打进来），而且源站会把这个头原样转给后端。实测直连时自己塞
+`ali-real-client-ip: 6.6.6.6`，源站**照单全收**。裸信它 = 把「登录节流的
+分桶钥匙」交给任何能连到源站的人（每个请求换一个头就换一个桶）。
+
+**为什么不用 mTLS 当闸门**（源站已经开了回源双向校验，直觉上「证书验过
+就说明是 ESA」）：源站装的信任锚是 `OU=Alibaba Cloud SSL Certificate
+Authority` —— 那是**阿里云的公共 SSL 签发 CA**（ESA 的客户端证书链是
+`Alibaba Cloud ESA Origin Certificate` → `Alibaba Cloud ESA Origin CA` →
+这一支）。它给全阿里的 HTTPS 站点签发过证书，而 nginx 默认**不校验证书
+用途**（clientAuth）—— 于是「握手成功」根本不能证明「对方是 ESA」。
+令牌没有这个问题：它只有一个来源。
+
+**口径**（`deploy/nginx/cwq.conf` / `deploy/nginx/acct.xins.live.conf` 里
+三个 map，见 `deploy/esa-clientip.md`）：
+
+```
+$cwq_client_ip = 令牌对得上 ? ESA 说的 ali-real-client-ip : $remote_addr
+```
+
+它同时写进后端的 `X-Real-IP` 与 `X-Forwarded-For`：前者决定**登录节流的
+分桶维度**（不再是边缘节点），后者决定**审计日志记谁**。后端代码**不用改**
+——它本来就有两套口径（`_throttle_ip` 判定用、`_client_ip` 审计用），
+nginx 只要把「该信的 IP」放到这两个头里就行。
+
+**令牌不在版本库里**：它是 `/etc/nginx/cwq-include/cwq-esa-token.conf`
+（`root:root` `600`）里的一行 map 条目，站点配置用**通配** include 引它 ——
+文件不在时 `nginx -t` 照过、行为退回「按 TCP 对端计」。也就是「还没配令牌」
+是干净的关闭状态，而不是 nginx 起不来。
+
+**残余风险**（写在这里是为了将来有人问「为什么不用更简单的办法」）：
+
+1. 令牌在 ESA 控制台里是明文 —— 能看控制台的人就能伪造源站请求里的
+   `ali-real-client-ip`。这比裸信好得多，但不是零风险。
+2. 令牌键很长（48 个十六进制字符），而 nginx 默认的 `map_hash_bucket_size`
+   只有 64 字节 —— 装不下时整份配置加载失败（`could not build map_hash`），
+   且现场很隐蔽（reload 失败 → 旧进程继续服务 → 新配置一条都没上去）。
+   所以必须显式 `map_hash_bucket_size 128`，CI 里有一条用例装上**真的长**的
+   假令牌跑 `nginx -t` 守着这个坑。
+3. 将来若买了 ESA 的源站防护（付费），它的回源网段可以作为**第二道**闸，
+   但不要替掉令牌 —— 网段会变，漏了新区段会静默退化。
+
 ### 11.17.7 跨域时的 CORS 口径
 
 **默认不开。** `CORS_ALLOW_ORIGINS` 默认空 → 生产不装 CORS 中间件 →

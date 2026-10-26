@@ -492,6 +492,132 @@ def check_structure(conf: Path) -> None:
     else:
         no("没有引入 Cloudflare 真实 IP 还原配置 —— CDN 在前时登录节流会按边缘 IP 分桶")
 
+    # --- ESA 在前时的真实客户端 IP（凭令牌还原）---
+    #
+    # ESA 在前面时，后端拿到的默认是**边缘节点 IP**。后果有两条，**都不报错**：
+    #   * 登录节流按边缘节点分桶 —— 一个节点后面成千上万个用户共用一个桶，
+    #     一个人在连着试错，同一节点上的其他人一起被挡（误伤）；
+    #   * 审计日志里的 IP 全是节点地址 —— 出事查不到人。
+    #
+    # ESA 回源时会带一个头 ``ali-real-client-ip``（真实客户端 IP），但
+    # **源站是公开的**：直连就能打进来，自己塞一个 ``ali-real-client-ip:
+    # 6.6.6.6`` 源站照单全收（实测）。所以这个头必须**过令牌闸门**才认 ——
+    # 裸信它 = 把限流的分桶钥匙交给任何能连到源站的人（每个请求换一个头
+    # 就换一个桶，IP 维度限流等于不存在）。
+    #
+    # 每条断言盯一个具体的「出事方式」：
+    #   1. 闸门存在（令牌在独立文件里）；
+    #   2. 令牌文件用**通配** include —— 没装是「不信任」的关闭状态，
+    #      而不是 nginx 起不来；
+    #   3. 令牌**不能**硬编码在站点配置里（会进版本库）；
+    #   4. 兜底必须是 $remote_addr —— 令牌对不上时按 TCP 对端计；
+    #   5. 后端拿到的头必须走 $cwq_client_ip；
+    #   6. map 必须定义在 log_format **之前**（见下面那条注释）。
+
+    def _map_body(src: str, var: str) -> str | None:
+        """取「目标是 var 的那个 map」的块体。
+
+        注意 map 那一行有两个变量：``map <源> <目标> {``。按「行尾是目标」
+        来认，别只找 ``map <目标>`` —— 那样一个都匹配不上。
+        """
+        src_lines = src.splitlines()
+        for i, ln in enumerate(src_lines):
+            s = ln.strip()
+            if s.startswith("map ") and s.rstrip().endswith(var + " {"):
+                body = []
+                for l2 in src_lines[i + 1:]:
+                    body.append(l2)
+                    if l2.rstrip() == "}":
+                        break
+                return "\n".join(body)
+        return None
+
+    tok_body = _map_body(raw, "$cwq_esa_token_ok")
+    if tok_body is not None and "cwq-esa-token" in tok_body:
+        ok("ESA 真实 IP 过了令牌闸门（令牌在独立文件里，不进版本库）")
+    else:
+        no("ESA 真实 IP 没有令牌闸门 —— 源站 IP 是公开的，裸信 ali-real-client-ip "
+           "等于把登录节流的分桶钥匙交给任何能连到源站的人")
+
+    if tok_body and re.search(
+            r"include\s+/etc/nginx/cwq-include/cwq-esa-token\*\.conf\s*;", tok_body):
+        ok("令牌文件用通配 include（没装 = 不信任的关闭状态，而不是 nginx 起不来）")
+    else:
+        no("令牌文件的 include 不是通配 —— 文件没装时 nginx 会直接起不来，"
+           "而「还没配令牌」本该是干净的关闭状态")
+
+    if re.search(r'"[0-9a-f]{24,}"', raw):
+        no("站点配置里出现了硬编码的长十六进制串 —— 令牌不该进版本库")
+    else:
+        ok("站点配置里没有硬编码令牌")
+
+    cip_body = _map_body(raw, "$cwq_client_ip")
+    if cip_body and re.search(r"default\s+\$remote_addr\s*;", cip_body):
+        ok("令牌对不上时按 TCP 对端计（不会退化成「相信这个头」）")
+    else:
+        no("$cwq_client_ip 的兜底不是 $remote_addr —— 令牌对不上时会拿"
+           "边缘节点地址、甚至伪造值当客户端 IP")
+
+    if any("proxy_set_header" in l and "$http_ali_real_client_ip" in l for l in lines):
+        no("ali-real-client-ip 被直接 proxy 给后端 —— 它只能经令牌闸门"
+           "（$cwq_client_ip）使用")
+    else:
+        ok("ali-real-client-ip 只经令牌闸门使用")
+
+    api_hdr = [(h, b) for h, b in all_location_blocks(lines) if "/api" in h]
+    bad_hdr = []
+    for head, blk in api_hdr:
+        if not any(re.search(r"proxy_set_header\s+X-Real-IP\s+\$cwq_client_ip\s*;", l)
+                   for l in blk):
+            bad_hdr.append(head + "（X-Real-IP）")
+        if not any(re.search(r"proxy_set_header\s+X-Forwarded-For\s+\$cwq_client_ip\s*;", l)
+                   for l in blk):
+            bad_hdr.append(head + "（X-Forwarded-For）")
+    if bad_hdr:
+        no("后端拿到的还是边缘节点 IP：" + "；".join(bad_hdr)
+           + "（登录节流会按边缘节点分桶，审计日志查不到人）")
+    elif api_hdr:
+        ok(f"{len(api_hdr)} 个 API 段都把真实客户端 IP 交给后端")
+
+    if 'cip="$cwq_client_ip"' in raw:
+        ok("访问日志带 cip= 字段（真实客户端 IP 肉眼可见）")
+    else:
+        no("访问日志没有 cip= 字段 —— 真实 IP 还原了也看不出来")
+
+    # $cwq_client_ip 必须**在本文件里有定义**。它被 log_format 与四段
+    # proxy_set_header 同时用着 —— 变量不存在的话 nginx 直接
+    # ``[emerg] unknown "$cwq_client_ip" variable`` 起不来。
+    # 那时的现场最坑：reload 失败 → **旧进程继续服务** → 新配置一条都没
+    # 上去，而访问日志一切正常（看日志根本看不出配置没生效）。
+    # 令牌键很长（48 个十六进制字符），而 nginx 默认的 map_hash_bucket_size
+    # 只有 64 字节 —— 一个桶装不下「键 + 值指针 + 链表指针」（≈ 键长 + 17）。
+    # 装不下时 nginx 报 ``could not build map_hash, you should increase
+    # map_hash_bucket_size: 64``，**整份配置加载失败**。生产上就是这个形态。
+    m_bucket = re.search(r"map_hash_bucket_size\s+(\d+)\s*;", raw)
+    if not m_bucket:
+        no("没有设置 map_hash_bucket_size —— 令牌键（48 个十六进制字符）比默认的 "
+           "64 字节长，nginx 会 could not build map_hash，整份配置加载失败")
+    else:
+        size = int(m_bucket.group(1))
+        if size >= 96:
+            ok(f"map_hash_bucket_size 调到 {size}（令牌键 48 字符，默认的 64 装不下）")
+        else:
+            no(f"map_hash_bucket_size 只有 {size} —— 令牌键 48 个字符，一个桶装不下"
+               "「键 + 值指针 + 链表指针」，nginx 会 could not build map_hash 起不来")
+
+    b_idx = raw.find("map_hash_bucket_size")
+    m_idx = raw.find("map $http_x_cwq_origin_token")
+    if b_idx != -1 and m_idx != -1 and b_idx < m_idx:
+        ok("map_hash_bucket_size 写在令牌 map 之前")
+    else:
+        no("map_hash_bucket_size 必须写在令牌 map 之前 —— map 创建时才读这个值")
+
+    if _map_body(raw, "$cwq_client_ip") is not None:
+        ok("$cwq_client_ip 在本文件里有定义（变量缺失会让 nginx 起不来）")
+    else:
+        no("本文件里没有定义 $cwq_client_ip 的 map —— log_format 与四段 "
+           "proxy_set_header 都用它，nginx 会 unknown variable 起不来")
+
 
 # --------------------------------------------------------------------------
 # 真的 nginx -t
@@ -538,6 +664,14 @@ RL_ZONE = """# 限流的 http 级一半：定义 zone
 limit_req_zone  $binary_remote_addr zone=cwq_api:10m rate=20r/s;
 limit_conn_zone $binary_remote_addr zone=cwq_api_conn:10m;
 """
+# ESA 真实 IP 的令牌文件（**形状照抄生产**，值是假的）。
+#
+# 令牌键刻意用 48 个十六进制字符 —— 这么长是有原因的：nginx 默认的
+# map_hash_bucket_size 只有 64 字节，装不下「键 + 值指针 + 链表指针」
+# （≈ 键长 + 17 字节），于是 ``could not build map_hash`` → 整份配置加载失败。
+# 用一个短的假令牌就测不出这个坑（短键装得下）。
+ESA_TOKEN = '"0123456789abcdef0123456789abcdef0123456789abcdef" 1;\n'
+
 RL_API = """# 限流的 location 级一半：引用 zone
 limit_req  zone=cwq_api burst=40 nodelay;
 limit_conn cwq_api_conn 50;
@@ -748,6 +882,21 @@ def check_real_nginx(root: Path, *, require_nginx: bool = False) -> None:
             else:
                 no(f"{label}：按文档启用限流后 nginx -t 失败 —— "
                    "限流开关在这一形态下开不了\n{out}")
+
+            # (3) **装了令牌文件**的真实形态（生产就是这个形态）。
+            #     令牌键是 48 个十六进制字符，比 nginx 默认的
+            #     map_hash_bucket_size（64 字节）长 —— 装不下时 nginx 报
+            #     ``could not build map_hash``，**整份配置加载失败**，
+            #     而失败现场很隐蔽：reload 失败 → 旧进程继续服务 →
+            #     新配置一条都没上去，访问日志一切正常。
+            #     所以这里要用**真的长**的假令牌，不能用短的糊弄过去。
+            (tmp / "include" / "cwq-esa-token.conf").write_text(ESA_TOKEN, encoding="utf-8")
+            passed, out = run_nginx_t(nginx, body, tmp)
+            if passed:
+                ok(f"{label}：装了令牌文件后 nginx -t 通过")
+            else:
+                no(f"{label}：装了令牌文件后 nginx -t 失败 —— 令牌键比 "
+                   "map_hash_bucket_size 还长，配置根本加载不上去\n{out}")
 
             # (3) 独立形态：**拿掉 host-map，nginx 必须起不来**。
             #     这是配置刻意设计的 fail-closed —— 少了跳转白名单就宁可
