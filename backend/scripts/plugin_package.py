@@ -40,6 +40,10 @@ def build(source: Path, private_path: Path, key_id: str, output: Path):
         # Finder metadata is not a plugin asset; keep it outside the signed file set.
         if path.is_file() and path.name == '.DS_Store':
             continue
+        # 编译缓存同样不是插件资源。本地跑过插件的用例就可能在源码目录里留下
+        # __pycache__；把它打进包里，安装闸门会以 RESOURCE_TYPE 拒掉整个包。
+        if '__pycache__' in path.parts or path.suffix in ('.pyc', '.pyo'):
+            continue
         if path.is_file() and path.name != 'plugin.json':
             if path.resolve() in {private_path.resolve(), output.resolve()}:
                 raise ValueError('私钥/输出包不能位于源目录中')

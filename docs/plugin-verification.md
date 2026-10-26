@@ -366,14 +366,16 @@ cd frontend && node --test
 
 ```bash
 # 仓库根目录；只允许使用专用测试库，pytest 会重建隔离库 schema。
-backend/.venv/bin/python -m pytest -n 3 --ignore=backend/tests/test_plugin_periodic.py backend/tests -ra --tb=short
+backend/.venv/bin/python -m pytest -n 3 backend/tests -ra --tb=short
 backend/.venv/bin/python -m pytest -n 3 backend/tests/test_scheduler.py backend/tests/test_plugin_manifest.py backend/tests/test_plugin_loader.py backend/tests/test_schema_version.py backend/tests/test_migration_guardrails.py -ra --tb=short
 npm --prefix frontend test
 npm --prefix frontend run build
 bash deploy/tests/test_deploy.sh
 ```
 
-尚未纳入版本管理的周期记账插件测试已单独诊断：创建规则请求返回 `422`（缺少 query 中的 `book_id`），随后 fixture 清理插件表遇到数据库锁等待。这发生在插件业务接口阶段，未计作调度器通过证据，也未覆盖该工作区插件的业务实现。
+`backend/tests/test_plugin_periodic.py` 直接跑，不用再 `--ignore`：插件源码在 `plugins/`（该目录被 gitignore），干净 checkout 里没有源码，**用例会整体跳过**而不是失败；本机有源码时它会连真实插件一起装进隔离测试库，走 HTTP 验 `/variables`。
+
+尚未纳入版本管理的周期记账插件测试已单独诊断：创建规则请求返回 `422`（缺少 query 中的 `book_id`），随后 fixture 清理插件表遇到数据库锁等待。这发生在插件业务接口阶段，未计作调度器通过证据，也未覆盖该工作区插件的业务实现。**2026-10-26 更正**：该用例已重写并纳入版本管理（22 条，含端到端安装与 HTTP 调用），上面的诊断不再适用。
 
 本轮未重跑真实浏览器、Docker 镜像构建或远程 CI，也未创建外部一分钟调用任务。上线需先迁移到 `0030_admin_email_mfa`，生成调度密钥并配置外部调用；旧 `cwq-oss-backup.timer` 不应同时启用，既有本地 pg_dump 定时器继续保持关闭。部署步骤见 [README](../README.md#启用定时调度)。
 

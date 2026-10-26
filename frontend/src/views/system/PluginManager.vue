@@ -5,7 +5,7 @@
   <div class="page">
     <div class="heading">
       <div><h2>扩展管理</h2><p>安装、运行状态和使用授权分别管理。安装后需重启服务，且默认没有可使用的用户。</p></div>
-      <div class="tools"><el-button :loading="loading" @click="load">刷新状态</el-button><el-button :loading="busy" @click="openDiagnostics">恢复 / 诊断</el-button><el-button type="primary" :disabled="!enabled || busy" @click="chooseFile()">安装扩展</el-button></div>
+      <div class="tools"><el-button :loading="loading" @click="load">刷新状态</el-button><el-button :loading="busy" @click="openDiagnostics">恢复 / 诊断</el-button><el-button type="primary" :disabled="!enabled || busy" title="上传一个全新的扩展包；已安装的扩展要换版本，请在下方列表里点「升级」" @click="chooseFile()">安装扩展</el-button></div>
     </div>
     <el-alert v-if="!enabled" title="扩展平台未开启。请由运维配置受信任签名公钥及运行目录，再开启 PLUGIN_ENABLED 并重启服务。" type="info" :closable="false" show-icon />
     <el-alert v-else title="扩展在服务进程内运行。只安装经审查、由受信任发布者签名的代码；签名与扫描不能隔离恶意代码。" type="warning" :closable="false" show-icon />
@@ -15,7 +15,7 @@
       <el-table-column label="运行状态" min-width="175"><template #default="{ row }"><el-tag :type="statusType(row)">{{ row.deleted ? '已卸载，表保留' : statusLabel(row.runtime_status) }}</el-tag><div class="muted">期望：{{ row.desired_enabled ? '启用' : '禁用' }}</div><div v-if="row.error_code" class="error-code">{{ row.error_code }}</div></template></el-table-column>
       <el-table-column label="使用授权" width="135"><template #default="{ row }"><span>{{ row.user_count }} 人</span><el-button link type="primary" :disabled="row.deleted" @click="openUsers(row)">管理用户</el-button></template></el-table-column>
       <el-table-column label="业务表" width="100"><template #default="{ row }"><el-button link type="primary" @click="openTables(row)">{{ row.table_count }} 张</el-button></template></el-table-column>
-      <el-table-column label="操作" min-width="255"><template #default="{ row }"><div class="row-tools" v-if="!row.deleted"><el-button size="small" :disabled="busy || !enabled" @click="toggle(row)">{{ row.desired_enabled ? '禁用' : '启用' }}</el-button><el-button size="small" :disabled="busy || !enabled || row.runtime_status !== 'DISABLED'" @click="chooseFile(row)">升级</el-button><el-button size="small" type="danger" plain :disabled="busy || row.runtime_status !== 'DISABLED'" @click="remove(row)">卸载</el-button></div><el-button v-else size="small" type="danger" plain :disabled="busy || !row.table_count" @click="cleanup(row)">清理保留表</el-button><div v-if="row.runtime_status === 'PENDING_RESTART'" class="muted">等待运维重启全部 worker</div></template></el-table-column>
+      <el-table-column label="操作" min-width="255"><template #default="{ row }"><div class="row-tools" v-if="!row.deleted"><el-button size="small" :disabled="busy || !enabled" @click="toggle(row)">{{ row.desired_enabled ? '禁用' : '启用' }}</el-button><el-button size="small" :disabled="busy || !enabled || row.runtime_status !== 'DISABLED'" :title="upgradeHint(row)" @click="chooseFile(row)">升级</el-button><el-button size="small" type="danger" plain :disabled="busy || row.runtime_status !== 'DISABLED'" @click="remove(row)">卸载</el-button></div><el-button v-else size="small" type="danger" plain :disabled="busy || !row.table_count" @click="cleanup(row)">清理保留表</el-button><div v-if="row.runtime_status === 'PENDING_RESTART'" class="muted">等待运维重启全部 worker</div></template></el-table-column>
     </el-table>
 
     <el-dialog v-model="usersDialog" :title="`${target?.name || ''} · 使用授权`" width="700px" destroy-on-close>
@@ -88,6 +88,13 @@ async function load() {
   finally { loading.value = false }
 }
 function chooseFile(row = null) { upgradeTarget.value = row; fileInput.value.value = ''; fileInput.value.click() }
+/** 升级按钮为什么灰着 —— 宿主要求换包前旧代码先停下来（停用 + 重启）。
+ *  不说清楚的话，用户只会看到一只按不动的按钮，不知道下一步该做什么。 */
+function upgradeHint(row) {
+  if (row.runtime_status === 'DISABLED') return '上传新版本安装包'
+  if (row.desired_enabled) return '要先点「禁用」并重启服务：旧代码还在跑的时候不能换包'
+  return '等运维重启服务后，这个按钮才可点'
+}
 async function upload(event) {
   const file = event.target.files?.[0]
   if (!file) return

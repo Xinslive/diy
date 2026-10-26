@@ -277,7 +277,14 @@ def install(data: bytes, user, *, upgrade_id=None):
                     if not {t["name"] for t in old.tables} <= {t["name"] for t in manifest.get("tables", [])}:
                         raise PluginError("DESTRUCTIVE_MIGRATION_REJECTED", "首版升级不得移除已登记的插件表", 409)
                 elif old is not None:
-                    raise PluginError("PLUGIN_ALREADY_EXISTS", "插件 id 已登记；保留表卸载后需恢复旧版本而不能重新安装", 409)
+                    # 两种「已登记」要分开说：一种是扩展还装着（换版本走
+                    # 「升级」，且要先停用并重启），另一种是卸载后保留了业务表
+                    # （那种情况只能按原版本恢复，不能当新插件装）。原来两种
+                    # 情况共用一句话，用户照着做只会撞同一堵墙。
+                    if old.deleted_at:
+                        raise PluginError("PLUGIN_ALREADY_EXISTS", "插件 id 已登记；保留表卸载后需恢复旧版本而不能重新安装", 409)
+                    raise PluginError("PLUGIN_ALREADY_EXISTS", "该扩展已安装；要换版本请在扩展列表里点「升级」"
+                                 "（升级前需先停用并重启服务）", 409)
                 for existing in db.scalars(select(PluginRegistry.plugin_id)):
                     if existing != pid and table_prefix(existing) == table_prefix(pid):
                         raise PluginError("PLUGIN_PREFIX_COLLISION", "插件表名前缀发生冲突", 409)
