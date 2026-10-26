@@ -70,6 +70,33 @@ def _pin_session_timezone(dbapi_conn, _record) -> None:
     dbapi_conn.commit()
 
 
+@event.listens_for(engine, "connect")
+def _bound_lock_wait(dbapi_conn, _record) -> None:
+    """给每条连接设一把「等锁上限」。
+
+    **没有上限，一次锁冲突就能把请求挂到天荒地老。**
+
+    PostgreSQL 的 ``lock_timeout`` 默认是 0（无限等），本项目也从没改过它。
+    于是只要两个事务撞上同一行锁，后来的那个就在 ``SELECT ... FOR UPDATE``
+    上一直等下去 —— 客户端早就超时断开了（回源 30 秒 → 499），
+    **服务端那个请求还留在原地**：连接占着、worker 线程占着、事务不结束。
+
+    2026-10-26 生产上就是这么挂的（紫欣工贸账套 11，2025 → 2026 年度结转）：
+    每重试一次就叠一个挂死的请求，后一个把前一个堵死，
+    最后连 ``systemctl stop`` 都停不下来（uvicorn 要等在途请求，
+    90 秒后 SIGKILL 才把那一堆事务连锅端）。
+
+    15 秒：应用自己的事务都在亚秒级（实测一次年度结转 0.3 秒），
+    15 秒是几十倍余量；它又比回源的 30 秒短 —— 宁可让请求**快速失败**
+    （用户看到一句报错），也不要留一个挂死的请求在生产上耗连接、耗线程。
+    """
+    with dbapi_conn.cursor() as cur:
+        cur.execute("SET lock_timeout = '15s'")
+    # 与上面 SET TIME ZONE 同一个道理：SET 是**事务性**的，
+    # 不提交就随连接归还池时的 rollback 一起消失。
+    dbapi_conn.commit()
+
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, class_=Session)
 
 
