@@ -113,3 +113,30 @@ test('变量插入：多个变量依次插入不会互相吃掉', t => {
   step = insertVariableText(step.text, '上月区间', step.caret)
   assert.equal(step.text, '{本月区间}{上月区间}')
 })
+
+test('变量清单：插到选中的那条分录，按各条自己的光标位置插', t => {
+  if (skip(t)) return
+  const { variableInsertPlan } = plugin
+  const entries = [{ summary: '养老保险费' }, { summary: '' }]
+
+  // 清单只有一份，插到哪条由清单自己决定：选第 2 条就插第 2 条。
+  const second = variableInsertPlan(entries, 1, '本月区间', {})
+  assert.equal(second.index, 1)
+  assert.equal(second.text, '{本月区间}')
+
+  // 记过光标就插在光标处，光标位置按分录各记一份。
+  const withCaret = variableInsertPlan(entries, 0, '本月区间', { 'entry:0': 2 })
+  assert.equal(withCaret.text, '养老{本月区间}保险费')
+  assert.equal(withCaret.caret, 8)
+  // 第 2 条没有光标记录，不能借用第 1 条的。
+  assert.equal(variableInsertPlan(entries, 1, '本月区间', { 'entry:0': 2 }).text, '{本月区间}')
+
+  // 没记过光标：插到末尾，不是开头（插到开头看着像插错了位置）。
+  assert.equal(variableInsertPlan(entries, 0, '本月区间', {}).text, '养老保险费{本月区间}')
+
+  // 目标越界（那条分录被删了之类）就落到第 1 条，不越界。
+  assert.equal(variableInsertPlan(entries, 9, '本月区间', {}).index, 0)
+
+  // 没有分录就没什么可插。
+  assert.equal(variableInsertPlan([], 0, '本月区间', {}), null)
+})
