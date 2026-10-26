@@ -174,13 +174,29 @@ await check('也没有「更多」下拉', await bar().getByRole('button', { nam
 await check('也没了「按科目重排选中凭证的分录」', await page.locator('text=按科目重排选中凭证的分录').count(), 0)
 
 // 腾出来的宽度给了这两个：常用操作不该埋在二级菜单里
-await check('「整理凭证」摆到明面上了', await bar().getByRole('button', { name: '整理凭证', exact: true }).count(), 1)
 await check('「导入凭证」也摆到明面上了', await bar().getByRole('button', { name: '导入凭证', exact: true }).count(), 1)
 await check('不再叫「从 Excel 导入」', await bar().getByRole('button', { name: '从 Excel 导入', exact: true }).count(), 0)
 
-// 结算走期末处理那边 —— 这里点一下「整理凭证」应该真的跳过去
-await bar().getByRole('button', { name: '整理凭证', exact: true }).click(); await sleep(1200)
-await check('「整理凭证」跳到整理页', /#\/vouchers\/organize/.test(page.url()), true)
+// 「整理凭证」这个按钮撤了（用户 2026-10-26 批注）：它是个会改号的动作，
+// 摆在日常看账的这一排里最容易顺手点着。
+await check('工具栏里没有「整理凭证」了', await bar().getByRole('button', { name: '整理凭证', exact: true }).count(), 0)
+
+// 「打印」默认藏着，勾了凭证才冒出来（用户 2026-10-26 批注）。
+// 撤掉的那一版是「没勾选也摆一个『打印预览』」—— 点开是整个期间的几百张，
+// 一屏预览不出来；而且它跟「打印所选」长得一模一样，范围却完全相反。
+await check('没勾选时工具栏里没有「打印」', await bar().getByRole('button', { name: /打印/ }).count(), 0)
+const firstCheck = page.locator('.el-table__body-wrapper tbody tr').first().locator('.el-checkbox').first()
+await firstCheck.click(); await sleep(700)
+await check('勾了一张之后「打印所选」冒出来了', await bar().getByRole('button', { name: /打印所选/ }).count(), 1)
+await check('按钮上写着这次打几张',
+  (await bar().getByRole('button', { name: /打印所选/ }).first().innerText()).includes('1'), true)
+// 取消勾选，按钮就该收回去 —— 它跟的是勾选，不是「进来过一次就赖着」
+await firstCheck.click(); await sleep(700)
+await check('取消勾选后「打印」又收起来了', await bar().getByRole('button', { name: /打印/ }).count(), 0)
+
+// 撤的是**按钮**，不是**功能**：整理页还在，断号时提醒里的「去整理」还得有路可走。
+await page.goto(`${BASE}/#/vouchers/organize`); await sleep(1600)
+await check('整理页还在', /#\/vouchers\/organize/.test(page.url()), true)
 
 // ---- 整理凭证页：方式就两个，「断号检查」不再是选项，「范围」也撤了 ----
 await sleep(1600)

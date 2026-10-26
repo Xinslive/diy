@@ -43,14 +43,24 @@
       <!-- 「记账 / 反记账」撤了：期末结账里的「结账」本来就会把本期未记账的
            全部记上（`_auto_post`），「反结账」原路退回。同一件事两个入口，
            走了一个就忘了另一个，月底对不上账又要从头捋。
-           腾出来的宽度正好够把原来塞在「更多」里的两个常用项摆到明面上 ——
-           一个只剩一个选项的下拉框，本身就是个没意义的容器。 -->
-      <el-button @click="printVouchers">
-        <el-icon><Printer /></el-icon>&nbsp;{{ selection.length ? `打印所选（${selection.length}）` : '打印预览' }}
+
+           「打印」默认**藏起来，勾了凭证才冒出来**（用户 2026-10-26 批注）。
+           没勾选时那个按钮叫「打印预览」，点开是**整个期间的几百张** ——
+           一屏预览不出来，就只是个「点了会变多」的动作；更麻烦的是它跟
+           「打印所选」长得一模一样，范围却完全相反，一眼看过去分不出
+           这次要打几张。勾了之后按钮才出现，文案写死成「打印所选（N）」——
+           范围和文案一致，不用再靠同一个按钮换字来暗示范围变了。
+
+           「整理凭证」也撤了（用户 2026-10-26 批注）：它是个会**改号**的动作，
+           摆在日常看账的这一排里最容易顺手点着。断号/时序不对时，上方那条
+           提醒里的「去整理」照样能跳过去 —— 提醒才是在「真需要整理」的
+           时候出现的地方。整理页本身还在（#/vouchers/organize），只是
+           不再摆在这个工具栏上。 -->
+      <el-button v-if="selection.length" @click="printVouchers">
+        <el-icon><Printer /></el-icon>&nbsp;打印所选（{{ selection.length }}）
       </el-button>
 
       <template v-if="store.canWrite">
-        <el-button :icon="Sort" @click="router.push('/vouchers/organize')">整理凭证</el-button>
         <el-button :icon="Upload" @click="router.push('/vouchers/import')">导入凭证</el-button>
         <el-button type="primary" @click="$router.push('/vouchers/new')">新增凭证</el-button>
       </template>
@@ -191,7 +201,7 @@
 import { computed, defineAsyncComponent, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Printer, Sort, Upload } from '@element-plus/icons-vue'
+import { Printer, Upload } from '@element-plus/icons-vue'
 import * as api from '@/api/voucher'
 // **打印弹窗按需加载**（2026-10-24 性能审计改）：它是 9.5 KB raw /
 // 4.1 KB gzip，而凭证列表页上**大多数人根本不打印** —— 静态 import
@@ -394,19 +404,27 @@ const notReady = computed(() => {
 const printVisible = ref(false)
 const printPath = computed(() => `/books/${store.bookId}/print/vouchers.html`)
 /**
- * 打印范围：勾选了就只打勾选的，没勾选就打整个期间。
- * 「打印所选」和「打印预览」共用这一份范围 —— 两个按钮指的是同一件事的两种范围，
- * 不该各自算一遍，否则两边的凭证数会悄悄对不上。
+ * 打印范围：**只打勾选的那几张**。
+ *
+ * 「打印」这个按钮只在勾选之后才出现（见模板里的说明），所以这里**没有**
+ * 「没勾选就打整个期间」这条退路了 —— 范围就是人看着屏幕勾出来的那一批。
+ *
+ * 范围在**点按钮的那一刻**定格（`printScope`），而不是一直跟着 `selection` 走：
+ * `PrintDialog` 盯着 `params` 变就重画预览，一旦范围会中途变宽（勾选被清空
+ * → `voucher_ids` 没了 → 悄悄变成整个期间），屏幕上看的是几张、纸上出来
+ * 的是几百张，还不带任何提示。定格住，点的时候是几张，打出来的就是几张。
  */
+const printScope = ref([])
 const printParams = computed(() => {
   const params = { period_id: store.periodId }
-  if (selection.value.length) {
-    params.voucher_ids = selection.value.map((voucher) => voucher.id).join(',')
+  if (printScope.value.length) {
+    params.voucher_ids = printScope.value.join(',')
   }
   return params
 })
 
 function printVouchers() {
+  printScope.value = selection.value.map((voucher) => voucher.id)
   printVisible.value = true
 }
 
