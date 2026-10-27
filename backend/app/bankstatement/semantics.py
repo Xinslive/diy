@@ -91,6 +91,12 @@ class ParsedStatement:
     diagnosis: list[str] = field(default_factory=list)
     grid_preview: list[list[str]] = field(default_factory=list)
     fingerprint: str = ""
+    #: 这一份是**走 OCR 认出来的**（不是读 PDF 文字层）。
+    #:
+    #: 界面上要说出来，原因有两个：OCR 是**识别**、会认错字（文字层是精确
+    #: 取字），而这份文件的正文**离开过本机**（交给外部 OCR 服务）。这两件事
+    #: 用户有权知道。
+    via_ocr: bool = False
 
     @property
     def income_total(self) -> Decimal:

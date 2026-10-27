@@ -196,8 +196,10 @@ def _diagnosis_of(parsed: semantics.ParsedStatement) -> dict[str, Any]:
 def _ocr_grid(db: Session, data: bytes) -> Optional[Any]:
     """扫描件对账单 → OCR → 网格。
 
-    **只在「整份 PDF 没有文本层」时才走这里** —— 有文本层却解析不出来，
-    那是版面认错（第一层的问题），OCR 同样认不对，白花一次钱。
+    **什么时候走这里**：① 整份 PDF 没有文本层（扫描件）；② 文字层解析出来
+    **自检没通过**（诊断非空）—— 2026-10-27 实测过第二种：Linux 上 pdfium
+    算出来的字形框退化，表头认不出来，解析结果「18050.00」被截成「1805」
+    却**不报错**。这时 OCR 是第二意见，它看的是渲染出来的图像，没有这个问题。
 
     没配 OCR 服务时返回 ``None``，由调用方给出**明确的报错**并保留原件：
     扫描件对账单在没有人来读的时候，是没法变成流水行的。
@@ -257,34 +259,78 @@ def _pdf_grid(db: Session, data: bytes) -> Any:
     return grid
 
 
+def _ocr_parse(db: Session, data: bytes) -> Optional[semantics.ParsedStatement]:
+    """OCR 兜底 → 解析结果。
+
+    OCR 没配、调用失败、或者 OCR 之后仍然认不出表头时给 ``None``。
+    """
+    from app.bankstatement import semantics
+
+    grid = _ocr_grid(db, data)
+    if grid is None:
+        return None
+    try:
+        parsed = semantics.parse_grid(grid)
+    except Exception:  # noqa: BLE001 —— 兜底这条路崩了也不能带倒主路径
+        return None
+    if parsed.header_row < 0 and not parsed.rows:
+        return None
+    parsed.via_ocr = True
+    return parsed
+
+
 def _parse_pdf(db: Session, data: bytes) -> semantics.ParsedStatement:
-    """解析一份 PDF 对账单。
+    """解析一份 PDF 对账单 —— **两路解析 + 严格自检**。
 
-    三层：
+    **为什么要有两路。** 文字层（按坐标还原）是本地的、精确取字、通常也更快；
+    但它依赖 pdfium 算出来的**字形框**，而**同一份 pdfium 源码在不同平台上
+    编出来的行为不一样**：2026-10-27 实测，Linux 上 CID 字体的字形框高度
+    退化成 0，整张表的表头认不出来，于是**静默**退回「纯文本流切分」那一层，
+    产出「18050.00」被截成「1805」、合计对不上、方向认不出这种结果 ——
+    **而且不报错**。OCR 那一路没有这个问题（它看的是渲染出来的图像），
+    实测同一份文件，OCR 给出的结果与金标准逐项吻合。
 
-    1. 文字对象的坐标还原（准）；
-    2. 纯文本流切分（粗，取不到坐标时）；
-    3. 扫描件 → 外部 OCR。
+    **为什么 OCR 是「第二意见」而不是首选。** 文字层是精确取字（不猜），
+    不花钱、不外发数据；OCR 是识别（会认错字），慢一些，正文要过一遍外部
+    服务。OCR 的额度每天两万次、实际一个月用不到十次，所以「再问一次」的
+    成本可以忽略 —— 但文字层已经自检通过时，没必要多走一趟。
 
-    三层都不成 → **明确报错**，并把原件留下（原件先落盘再报错，
-    用户可以下载下来手工处理 —— 这比一句「解析失败」有用）。
+    **严格自检。** 一份解析结果「可信」的判据是**它自己的诊断为空**：文件
+    自称的笔数与收支合计对得上、没有认不出方向的行、余额接得上、至少解析出
+    一行。诊断非空 = 某处对不上，**这时候不采信它**，换另一路；两路都不干净，
+    就把诊断带出去（台账状态是「部分解析」，而制证那一关本来就会把认不出的
+    行挡下来，不会让它变成凭证）。
     """
     from app.bankstatement import pdf_table
 
-    if not pdf_table.has_text_layer(data):
-        grid = _ocr_grid(db, data)
-        if grid is None:
-            raise ValueError(
-                "这份 PDF 没有文本层（是扫描件），而系统没有配置 OCR 服务，"
-                "无法自动识别。原件已保留，可下载后手工整理，"
-                "或先把对账单导出成 Excel 再上传。")
-        parsed = semantics.parse_grid(grid)
-        if parsed.header_row < 0 and not parsed.rows:
-            raise ValueError(
-                "这份 PDF 是扫描件，OCR 之后仍然认不出表头。"
-                "可以先在电脑上把对账单导出成 Excel 再上传")
-        return parsed
-    return semantics.parse_statement(data)
+    text_parsed: Optional[semantics.ParsedStatement] = None
+    if pdf_table.has_text_layer(data):
+        try:
+            text_parsed = semantics.parse_statement(data)
+        except ValueError:
+            # 文字层认不出表头 —— 不是终局，换 OCR 再问一次。
+            text_parsed = None
+        if text_parsed is not None and not text_parsed.diagnosis:
+            return text_parsed
+
+    ocr_parsed = _ocr_parse(db, data)
+    if ocr_parsed is not None and not ocr_parsed.diagnosis:
+        # OCR 这一路自检全过 —— 比不过它就别用文字层那份。
+        return ocr_parsed
+
+    # 两路都不干净（或只有一路）：取**问题更少**的那一份，并把诊断带出去。
+    if text_parsed is not None and ocr_parsed is not None:
+        return text_parsed if len(text_parsed.diagnosis) <= len(ocr_parsed.diagnosis) \
+            else ocr_parsed
+    if text_parsed is not None:
+        return text_parsed
+    if ocr_parsed is not None:
+        return ocr_parsed
+
+    raise ValueError(
+        "这份 PDF 解析不出来：文字层认不出表头，OCR 兜底也没成功"
+        "（系统没有配置 OCR 服务，或 OCR 服务没认出表头）。"
+        "可以把对账单导出成 Excel 再上传。")
 
 
 def _parse_with_profile(db: Session, book_id: int, data: bytes,
@@ -410,7 +456,8 @@ def upload_statement(db: Session, book_id: int, user: SysUser, filename: str,
         expense_total=parsed.expense_total,
         row_count=len(parsed.rows),
         parse_status=(PARSE_PARTIAL if parsed.diagnosis else PARSE_OK),
-        parse_message="；".join(parsed.diagnosis),
+        parse_message=("；".join(parsed.diagnosis)
+                       + ("（这一份是用 OCR 识别的）" if parsed.via_ocr else "")),
         diagnosis=_diagnosis_of(parsed),
         uploaded_by=getattr(user, "username", "") or "",
     )

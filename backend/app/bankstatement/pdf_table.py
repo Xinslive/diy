@@ -65,6 +65,30 @@ class _Run:
         return max(0.5, self.top - self.bottom)
 
 
+#: 取字时把文字对象的矩形往外放这么多点。
+#:
+#: **为什么必须放，而且只放一点点。**
+#:
+#: pdfium 的取字是「字符的框与矩形**相交**就算命中」。而**同一份 pdfium
+#: 源码在不同平台编出来的行为不一样**：这一批对账单用的是 CID 字体，
+#: macOS 上 pdfium 能算出每个字的字形框（有正常高度），Linux 上算出来
+#: 的却是**高度为 0** 的框。于是：
+#:
+#: * 文字对象自己的矩形在 Linux 上高度退化成 0（竖直方向一个字符都碰不到
+#:   → 整段文字取不到，表头因此认不出来，整份对账单解析崩掉）；
+#: * 文字对象矩形的右边界还会**少覆盖最后一个字**（末字的框宽度退化成 0），
+#:   「18050.00」取出来变成「1805」。
+#:
+#: 往外放一点，缺口就补上了。**为什么不能多放**：放多了会把**相邻行**
+#: 的字吃进来（实测放 3pt 时，一行会变成「打印日期:……\r\n活期账号……」），
+#: 那是比少一个字更坏的结果 —— 串进来的邻居金额会被当成本行的数。
+#:
+#: **0.25pt 是实测出来的安全值**：macOS 上加不加它，取出来的文字**逐字相同**
+#: （三份 PDF 样例、71 个文字对象全对得上）；Linux 上它足以把高度退化成 0
+#: 的那些对象救回来。
+_TEXT_PAD = 0.25
+
+
 def _extract_runs(page) -> tuple[list[_Run], Any]:
     """一页上的所有文字对象，外加这一页的 textpage。"""
     import pypdfium2 as pdfium
@@ -86,7 +110,8 @@ def _extract_runs(page) -> tuple[list[_Run], Any]:
         if (right - left) < 1.0:
             continue
         try:
-            text = textpage.get_text_bounded(left, bottom, right, top)
+            text = textpage.get_text_bounded(left - _TEXT_PAD, bottom - _TEXT_PAD,
+                                             right + _TEXT_PAD, top + _TEXT_PAD)
         except Exception:  # noqa: BLE001
             continue
         text = _clean(text)
@@ -316,6 +341,15 @@ def _extract_grid_by_runs(data: bytes) -> Grid | None:
     # 行 = 以日期列当锚
     date_index = _find_date_column(columns, data_runs)
     rows: list[list[str]] = []
+    # **必须先给个空列表**：下面只有「找到日期列」那条分支会往里塞东西，
+    # 而没有日期列时（表头认不出日期、或者数据行里没有日期样式）会走另一
+    # 条分支 —— 那时这个变量压根没被赋值过，最后一行拿它拼 Grid 就会
+    # 抛 UnboundLocalError。
+    #
+    # **这条路径不是理论上的**：pdfium 在不同平台算出来的字形框不一样，
+    # 一旦某一层在某个平台上多走了一步「没有日期列」的分支，这个异常就
+    # 会炸在这里（2026-10-27 的 CI 就是在 Linux 上炸的）。
+    footer_lines: list[str] = []
     if date_index is not None:
         date_runs = [run for run in data_runs if _assign_column(run, columns) == date_index]
         cells = _date_cells(date_runs)
@@ -593,7 +627,11 @@ def grid_from_text_lines(lines: list[str]) -> Grid | None:
 def has_text_layer(data: bytes) -> bool:
     """这份 PDF 有没有文本层。
 
-    **没有文本层 = 扫描件** —— 那才轮到 OCR 兜底。有文本层却解析不出来
-    的话是版面认错（第一层的问题），OCR 同样认不对，白花一次钱。
+    **没有文本层 = 扫描件** —— 那一定得靠 OCR。
+
+    **有文本层却解析不出来，不等于「OCR 也认不对」**（原来的注释是这么写的，
+    那个前提被证伪了）：2026-10-27 实测，Linux 上 pdfium 算出来的 CID 字形框
+    高度退化成 0，表头根本认不出来 —— 是**版面坐标不可用**，不是「这份文件
+    OCR 也读不懂」。同一份文件走 OCR，给出的结果与金标准逐项吻合。
     """
     return bool(plain_text_lines(data))

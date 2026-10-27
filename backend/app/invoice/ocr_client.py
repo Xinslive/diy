@@ -10,9 +10,11 @@ Token 只从配置读取，日志与异常信息均不回显认证头。
 """
 from __future__ import annotations
 
+import html
 import ipaddress
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -323,6 +325,44 @@ def _markdown_pages(jsonl: str) -> list[str]:
     return pages
 
 
+#: OCR 返回的表格是 **HTML**（``<table><tr><td>``），不是 Markdown 管道表。
+#: Markdown 管道表是「一条表格占一行」的形态，HTML 表格往往是**一整行**
+#: ——不拆开的话，一整张表会变成**一行文本**，下游按行切的逻辑就全废了。
+_HTML_TABLE = re.compile(r"<table[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
+_HTML_ROW = re.compile(r"<tr[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
+_HTML_CELL = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.IGNORECASE | re.DOTALL)
+_HTML_TAG = re.compile(r"<[^>]+>")
+
+
+def _html_table_to_lines(table_html: str) -> list[str]:
+    """一段 HTML 表格 → 若干行文本（每行是这一行各格的空格连接）。
+
+    **格子里换行的是同一个值被拆成几行** —— 银行对账单里「18050.00」
+    在版面上是「1805」与「0.00」上下两行。所以格内换行**不加分隔符**地
+    接起来（``18050.00``），这与文字层那一层拼格子的做法一致
+    （``pdf_table._row_cells`` 同样是「".join(...)」）。
+
+    分隔符不加分，格与格之间才加空格 —— 行与行之间的列数因此对得上表头，
+    下游「段数与表头相同 → 按位置对号入座」那一档才认得出。
+    """
+    lines: list[str] = []
+    for row_html in _HTML_ROW.findall(table_html):
+        cells: list[str] = []
+        for cell_html in _HTML_CELL.findall(row_html):
+            text = _HTML_TAG.sub(" ", cell_html)
+            text = html.unescape(text)
+            # OCR 用**字面的两个字符** ``\n`` 表示格内换行（不是真换行），
+            # 两者都要处理 —— 只当真换行的话，格子里会留下「1805\n0.00」
+            # 这么一串字面量，金额当场认不出来。
+            text = text.replace("\\n", "")
+            text = re.sub(r"[\r\n\t]+", "", text)
+            text = re.sub(r"\s{2,}", " ", text).strip()
+            cells.append(text)
+        if cells:
+            lines.append(" ".join(cells))
+    return lines
+
+
 def _markdown_to_plain_text(markdown: str) -> str:
     """保留表格单元格文本，让既有标签/正则解析器可以继续工作。"""
     out: list[str] = []
@@ -331,6 +371,10 @@ def _markdown_to_plain_text(markdown: str) -> str:
         if not line or line.startswith("<!--"):
             continue
         if line.startswith("![") or line.startswith("<img"):
+            continue
+        # HTML 表格：整块拆成「一行一格」的文本行。
+        if line.startswith("<table"):
+            out.extend(_html_table_to_lines(line))
             continue
         if line.startswith("|") and line.endswith("|"):
             cells = [cell.strip() for cell in line.strip("|").split("|")]
@@ -344,6 +388,39 @@ def _markdown_to_plain_text(markdown: str) -> str:
         if line:
             out.append(line)
     return "\n".join(out)
+
+
+def _normalize_optional_payload(raw: Any) -> dict[str, Any]:
+    """``optionalPayload`` 必须是**对象**，不能是「对象的 JSON 字符串」。
+
+    **为什么要有这一层。** 这一项配置是从库里读的**文本**（管理页上它就是
+    一个 JSON 文本框），而服务端要的是一个 JSON **对象**。直接把那段文本
+    丢给 ``json.dumps``，发出去的就是**一段被引号包起来的字符串** ——
+    服务端解析出来是个字符串而不是对象，于是任务直接失败，而且报的是
+    「系统错误-聚合」这种**看不出原因**的错。
+
+    **实测（2026-10-27）**：生产上 OCR 通道配置齐全（端点、token、模型
+    都在库里），但每一份文件都失败；把同一份文件按官方示例的写法直接调，
+    同样的 token、同样的模型，**当场就成功**。差别只有这一个字段的类型。
+
+    两种入参都收：字典直接用；字符串先解析，解析不出来就当空对象 ——
+    **宁可少传可选参数，也不能把整个任务搞失败**（那几个开关只影响
+    版面预处理的方向分类/去扭曲/图表识别，缺了不影响文字识别）。
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            value = json.loads(text)
+        except ValueError:
+            return {}
+        return value if isinstance(value, dict) else {}
+    return {}
 
 
 def ocr_pdf_to_texts(
@@ -363,7 +440,12 @@ def ocr_pdf_to_texts(
         raise OcrApiError("缺少 requests 依赖，请安装 requests 后再使用 OCR API")
 
     headers = {"Authorization": f"bearer {token}"}
-    data = {"model": model, "optionalPayload": json.dumps(optional_payload, ensure_ascii=False)}
+    # optionalPayload 必须是**对象**。配置里存的是文本，直接 dumps 会多套
+    # 一层引号，服务端解析出来是个字符串而不是对象，任务会以
+    # 「系统错误-聚合」失败 —— 见 :func:`_normalize_optional_payload`。
+    data = {"model": model,
+            "optionalPayload": json.dumps(_normalize_optional_payload(optional_payload),
+                                          ensure_ascii=False)}
     try:
         with open(pdf_path, "rb") as handle:
             response = requests.post(
