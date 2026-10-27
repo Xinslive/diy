@@ -75,6 +75,16 @@ def upload_statement(
             db, book.id, user, file.filename or "对账单", data, account_subject_id)
         db.commit()
         return result
+    except service.StatementParseError as exc:
+        # 解析失败时 service 已经把原件与 FAILED 台账记录放进当前事务；
+        # 这里要先提交，再把业务错误翻成 400，否则 rollback 会把失败记录
+        # 一并抹掉，只留下磁盘上的孤儿原件。
+        try:
+            db.commit()
+        except SQLAlchemyError as db_exc:
+            db.rollback()
+            raise _db_error(request, db_exc) from db_exc
+        raise HTTPException(400, str(exc)) from exc
     except ValueError as exc:
         db.rollback()
         raise HTTPException(400, str(exc)) from exc
@@ -209,11 +219,17 @@ def post_row_direction(row_id: int, payload: BankStatementRowDirectionIn, reques
 def plan_vouchers(statement_id: int, request: Request, book: Book = Depends(get_my_book),
                   db: Session = Depends(get_db),
                   _link: UserBook = Depends(require_book_write)):
-    """算可制证清单与去重结论。**不写凭证。**"""
+    """算可制证清单与去重结论。**不写凭证，但会持久化去重标记。**"""
     try:
-        return service.plan_vouchers(db, book.id, statement_id)
+        result = service.plan_vouchers(db, book.id, statement_id)
+        db.commit()
+        return result
     except ValueError as exc:
+        db.rollback()
         raise HTTPException(400, str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _db_error(request, exc) from exc
 
 
 @router.post("/{statement_id}/commit-vouchers")

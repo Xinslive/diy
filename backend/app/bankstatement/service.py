@@ -38,6 +38,7 @@ from app.models import (
     BankStatementRule,
     Book,
     Entry,
+    InvoiceRecord,
     Subject,
     SysUser,
     Voucher,
@@ -80,6 +81,10 @@ DEFAULT_DEDUPE_WINDOW_DAYS = 7
 #: 流水行允许的最大条数。超了直接报错，不截断 ——
 #: 截断出来的对账单会让余额对不上，而用户看不出少了尾巴。
 MAX_STATEMENT_ROWS = 20000
+
+
+class StatementParseError(ValueError):
+    """解析失败但原件与失败记录已经写入当前事务。"""
 
 
 def _dec(value: Any) -> Optional[Decimal]:
@@ -376,7 +381,7 @@ def upload_statement(db: Session, book_id: int, user: SysUser, filename: str,
         # 的记录，界面上看得见「这份没解析出来」，也能下载原件。
         _record_failed_statement(db, book_id, subject, filename, data,
                                   container, str(exc))
-        raise ValueError(
+        raise StatementParseError(
             f"{exc}（原件已保留，可在对账单列表里下载后手工处理）") from exc
     if len(parsed.rows) > MAX_STATEMENT_ROWS:
         raise ValueError(
@@ -1172,10 +1177,15 @@ def commit_vouchers(db: Session, book_id: int, statement_id: int,
     或「对方科目被停用了」，为这一行把整批都赔进去不划算 ——
     用户能看到哪几行没成、为什么没成，改完再点一次就行。
 
-    **幂等**：行级条件更新（``status == OPEN`` 才改）保证重复提交不会
-    生成第二张凭证。
+    **幂等**：先锁住流水行，再在锁内只处理 ``status == OPEN`` 的候选，
+    保证重复提交不会生成第二张凭证。
     """
     statement = _statement(db, book_id, statement_id)
+    # 两个请求可能同时拿到同一份 plan。先锁住整份对账单的流水行，再重算
+    # 清单；后到的请求会等前一个事务提交，随后看到 POSTED 状态而不再制证。
+    db.scalars(select(BankStatementRow).where(
+        BankStatementRow.statement_id == statement.id
+    ).with_for_update()).all()
     plan = plan_vouchers(db, book_id, statement_id)
     created: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
@@ -1272,8 +1282,9 @@ def reconcile_balance(db: Session, book_id: int, statement_id: int,
     差额 = 对账单期末余额 − 账面余额（**含未记账**）。
 
     差额用「本账户还没入账的流水净额」解释：那笔还没入账的流水净额
-    就是「银行那边已经变了、账上还没变」的那部分。两者近似相等时，
-    这笔差额**有了解释**；否则就是「原因待查」。
+    就是「银行那边已经变了、账上还没变」的那部分。预览阶段暂时被发票
+    认领的行仍算未入账，只有对应发票已经提交并生成凭证后才排除。两者
+    近似相等时，这笔差额**有了解释**；否则就是「原因待查」。
 
     对账单没有余额列时**不报红** —— 「对账单未提供余额列，无法核对」
     是一条事实陈述，不是错误。
@@ -1315,7 +1326,23 @@ def reconcile_balance(db: Session, book_id: int, statement_id: int,
         BankStatementRow.statement_id == statement.id,
         BankStatementRow.status == STATUS_OPEN,
         BankStatementRow.direction.in_((DIRECTION_IN, DIRECTION_OUT)),
+        BankStatementRow.matched_voucher_id.is_(None),
     )).all()
+    claimed_invoice_ids = {
+        int(row.matched_invoice_record_id)
+        for row in open_rows
+        if row.matched_invoice_record_id is not None
+    }
+    committed_invoice_ids: set[int] = set()
+    if claimed_invoice_ids:
+        committed_invoice_ids = set(db.scalars(select(InvoiceRecord.id).where(
+            InvoiceRecord.id.in_(claimed_invoice_ids),
+            InvoiceRecord.status == "COMMITTED",
+        )).all())
+    # 预览阶段的发票认领仍未入账，必须继续算入未入账净额；只有发票已
+    # 提交并生成凭证后，流水才被账面覆盖。
+    open_rows = [row for row in open_rows
+                 if row.matched_invoice_record_id not in committed_invoice_ids]
     net = Decimal("0")
     for row in open_rows:
         if row.amount is None:

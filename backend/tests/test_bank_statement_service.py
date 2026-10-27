@@ -14,7 +14,8 @@ from sqlalchemy import select
 
 from app.bankstatement import service
 from app.core.config import settings
-from app.models import BankStatement, BankStatementRow, Subject, Voucher
+from app.models import (BankStatement, BankStatementRow, InvoiceBatch,
+                         InvoiceRecord, Subject, Voucher)
 from app.models.bankstatement import (
     DIRECTION_IN,
     DIRECTION_OUT,
@@ -485,6 +486,41 @@ def test_余额核对_差额被未入账流水解释(db, book, admin_user, uploa
     assert Decimal(result["difference"]) == net
     assert result["verdict"] == "EXPLAINED", result
     assert "未入账流水" in result["explanation"]
+
+
+def test_余额核对_已提交发票覆盖的流水不算未入账(db, book, admin_user, uploaded,
+                                             subjects, make_voucher):
+    """发票已生成凭证后，流水上的发票认领不应继续制造未入账差额。"""
+    statement = db.get(BankStatement, uploaded["id"])
+    rows = service.list_rows(db, book.id, uploaded["id"])
+    inflow = next(r for r in rows if r["direction"] == DIRECTION_IN and r["amount"])
+    target = db.get(BankStatementRow, inflow["id"])
+    for row in db.scalars(select(BankStatementRow).where(
+            BankStatementRow.statement_id == statement.id,
+            BankStatementRow.id != target.id)).all():
+        row.status = STATUS_IGNORED
+
+    statement.closing_balance = Decimal("1000.00")
+    make_voucher(inflow["tx_date"],
+                 dr=[(statement.account_subject_id, Decimal("1000.00"), "调平")],
+                 cr=[(subjects["560301"].id, Decimal("1000.00"), "调平")])
+    batch = InvoiceBatch(book_id=book.id, filename="已提交.pdf", file_path="",
+                         status="COMMITTED", total=1, created_by="tester")
+    db.add(batch)
+    db.flush()
+    record = InvoiceRecord(
+        batch_id=batch.id, book_id=book.id, page_index=0,
+        invoice_type="OUTPUT", status="COMMITTED", payload={})
+    db.add(record)
+    db.flush()
+    target.matched_invoice_record_id = record.id
+    db.commit()
+
+    result = service.reconcile_balance(db, book.id, uploaded["id"])
+    assert result["difference"] == "0.00"
+    assert Decimal(result["unposted_net"]) == Decimal("0")
+    assert result["unposted_count"] == 0
+    assert result["verdict"] == "MATCH"
 
 
 def test_余额核对_没有余额列时不报红(db, book, admin_user, cash, store):

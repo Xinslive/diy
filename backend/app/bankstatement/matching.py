@@ -31,7 +31,7 @@ from app.models import BankStatement, BankStatementRow
 from app.models.bankstatement import (
     DIRECTION_IN,
     DIRECTION_OUT,
-    STATUS_IGNORED,
+    STATUS_OPEN,
 )
 
 #: 发票类型 → 流水方向。销项是「收钱」，找**收入**行；进项是「付钱」，
@@ -50,7 +50,8 @@ def candidates_for(db: Session, book_id: int, amount: Decimal,
                    direction: str) -> list[dict[str, Any]]:
     """金额与方向都对得上的流水行。
 
-    已经被别的发票占用的行**不在这里** —— 一行流水只被一张发票占用。
+    只有仍为 ``OPEN`` 且没有被发票占用的行才在这里 —— 已入账的流水不能
+    因为旧的预览候选再次被认领。
     """
     if direction not in (DIRECTION_IN, DIRECTION_OUT):
         return []
@@ -61,7 +62,7 @@ def candidates_for(db: Session, book_id: int, amount: Decimal,
             BankStatementRow.book_id == book_id,
             BankStatementRow.direction == direction,
             BankStatementRow.amount == amount,
-            BankStatementRow.status != STATUS_IGNORED,
+            BankStatementRow.status == STATUS_OPEN,
             BankStatementRow.matched_invoice_record_id.is_(None),
         )
         .order_by(BankStatementRow.tx_date, BankStatementRow.id)
@@ -124,10 +125,20 @@ def release_claims(db: Session, record_ids: Iterable[int]) -> None:
     )
 
 
-def claim(db: Session, row_id: int, record_id: int) -> None:
-    """把一条流水标记为「被这张发票占用」。"""
-    db.execute(
+def claim(db: Session, row_id: int, record_id: int) -> bool:
+    """把一条仍开放的流水标记为「被这张发票占用」。
+
+    ``candidates_for`` 与真正写入之间可能夹着一次制证请求，所以这里必须
+    再做一次条件更新：如果流水已经入账或被别的发票占用，认领失败而不是
+    把旧候选重新写成「属于这张发票」。
+    """
+    result = db.execute(
         update(BankStatementRow)
-        .where(BankStatementRow.id == row_id)
+        .where(
+            BankStatementRow.id == row_id,
+            BankStatementRow.status == STATUS_OPEN,
+            BankStatementRow.matched_invoice_record_id.is_(None),
+        )
         .values(matched_invoice_record_id=int(record_id))
     )
+    return result.rowcount == 1

@@ -21,6 +21,7 @@ import pytest
 from sqlalchemy import select
 
 from app.bankstatement import service
+from app.bankstatement import matching
 from app.core.config import settings
 from app.invoice import service as invoice_service
 from app.models import BankStatementRow, InvoiceBatch, InvoiceRecord, Subject
@@ -299,6 +300,49 @@ def test_流水已被别的发票占用_这一张回落(db, book, admin_user, su
         db, batch, [], invoice_service.get_config(db, book.id), {})
     resolution = previews[0]["resolution"]
     assert resolution["settlement_source"] == "CONFIG", resolution
+
+
+def test_已入账流水不能再匹配发票(db, book, admin_user, subjects, store,
+                                  invoice_store):
+    """生成流水凭证后，旧的发票预览候选不能再次占用这条流水。"""
+    cash = _cash(db, book)
+    statement = _upload(db, book, admin_user, cash, [(1, "100.00", None, "货款")])
+    row = db.scalars(select(BankStatementRow).where(
+        BankStatementRow.statement_id == statement["id"])).one()
+    service.set_row_direction(db, book.id, row.id, "IN")
+    service.update_row(db, book.id, row.id, {
+        "plan_subject_id": subjects["560202"].id})
+    created = service.commit_vouchers(db, book.id, statement["id"], admin_user)
+    assert created["created_count"] == 1, created
+    db.refresh(row)
+    assert row.status == "POSTED"
+    assert row.matched_invoice_record_id is None
+
+    _config(db, book, subjects)
+    batch, _record_row = _record(
+        db, book, total="100.00", base="100.00", tax="0.00",
+        invoice_type="OUTPUT", invoice_no="24417000000000000016")
+    previews, ready, errors = invoice_service._build_preview(
+        db, batch, [], invoice_service.get_config(db, book.id), {})
+    resolution = previews[0]["resolution"]
+    assert resolution["settlement_source"] == "CONFIG", resolution
+
+
+def test_过期发票候选不能认领已入账流水(db, book, admin_user, subjects, store,
+                                      invoice_store):
+    """认领写入本身也要检查 OPEN，覆盖查询后到写入前的竞态。"""
+    cash = _cash(db, book)
+    statement = _upload(db, book, admin_user, cash, [(1, "100.00", None, "货款")])
+    row = db.scalars(select(BankStatementRow).where(
+        BankStatementRow.statement_id == statement["id"])).one()
+    batch, record = _record(
+        db, book, total="100.00", base="100.00", tax="0.00",
+        invoice_type="OUTPUT", invoice_no="24417000000000000017")
+    row.status = "POSTED"
+    db.commit()
+    assert matching.claim(db, row.id, record.id) is False
+    db.refresh(row)
+    assert row.matched_invoice_record_id is None
 
 
 def test_同批次里先到先得(db, book, admin_user, subjects, store, invoice_store):

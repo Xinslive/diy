@@ -55,6 +55,22 @@ def _upload(client, auth, book, cash, name="cmb_csv.xlsx"):
     )
 
 
+def _blank_pdf() -> bytes:
+    """一份只有空白页、没有文本层的 PDF。"""
+    import io
+
+    import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument.new()
+    try:
+        document.new_page(595, 842)
+        buffer = io.BytesIO()
+        document.save(buffer)
+        return buffer.getvalue()
+    finally:
+        document.close()
+
+
 # ---------------------------------------------------------------------- 上传
 
 
@@ -85,6 +101,23 @@ def test_上传后能列出对账单(client, auth, db, book, cash, store):
     # **列表里就带着差额** —— 页面不用再发一轮请求去拼这些数字
     assert "reconcile" in items[0]
     assert "status_counts" in items[0]
+
+
+def test_解析失败接口仍保留FAILED台账与原件(client, auth, db, book, cash, store):
+    r = client.post(
+        f"/api/books/{book.id}/bank-statements",
+        headers=auth,
+        files={"file": ("扫描件.pdf", _blank_pdf(), "application/pdf")},
+        data={"account_subject_id": str(cash.id)},
+    )
+    assert r.status_code == 400, r.text
+    assert "原件已保留" in r.json()["detail"], r.text
+
+    db.expire_all()
+    statement = db.scalars(select(BankStatement)).one()
+    assert statement.parse_status == "FAILED"
+    assert "没有文本层" in statement.parse_message
+    assert (store / statement.file_path).exists()
 
 
 def test_上传时要选现金科目(client, auth, book, cash, store):

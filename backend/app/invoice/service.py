@@ -456,10 +456,10 @@ def _release_statement_claims(db: Session, batch: InvoiceBatch,
     matching.release_claims(db, [row.id for row in targets])
 
 
-def _claim_statement_row(db: Session, row_id: int, record_id: int) -> None:
+def _claim_statement_row(db: Session, row_id: int, record_id: int) -> bool:
     from app.bankstatement import matching
 
-    matching.claim(db, row_id, record_id)
+    return matching.claim(db, row_id, record_id)
 
 
 def _statement_settlement(db: Session, book_id: int, total: Decimal,
@@ -674,14 +674,21 @@ def _build_preview(
                     f"命中流水：{matched['filename']} 第 {matched['seq']} 行"
                     f"（{matched['tx_date']}，{matched['account_subject_code']}"
                     f" {matched['account_name']}）")
-                _claim_statement_row(db, matched["row_id"], record.id)
-                claimed_rows.add(matched["row_id"])
-            else:
+                if _claim_statement_row(db, matched["row_id"], record.id):
+                    claimed_rows.add(matched["row_id"])
+                else:
+                    # 候选查询与条件更新之间可能已经有人制证/认领；
+                    # 这张发票必须回落配置，不能把过期候选写进凭证快照。
+                    matched = None
+                    settlement_subject_id = None
+                    settlement_note = "流水已被其他操作占用或已入账，需人工指定"
+            if matched is None:
                 settlement_subject_id = config.get(
                     "input_credit_subject_id" if invoice_type == "INPUT"
                     else "output_debit_subject_id")
                 settlement_source = "CONFIG"
-                settlement_note = hint
+                if not settlement_note:
+                    settlement_note = hint
         # 只有销项需要税额科目。小微企业不做进项抵扣（用户约定），进项的税额
         # 直接计入成本费用，不落到任何应交税费明细科目上。
         tax_subject_id = None
