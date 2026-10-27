@@ -284,7 +284,7 @@
                 -->
                 <div v-if="isIgnored(row)" class="ignored-note">
                   <span>已忽略：这一页不参与生成凭证，也不计为异常；确认时自动跳过。</span>
-                  <el-button size="small" :disabled="!store.canWrite" @click="toggleIgnored(row)">取消忽略</el-button>
+                  <el-button size="small" :disabled="!store.canWrite" :loading="ignoringId === row.id" @click="toggleIgnored(row)">取消忽略</el-button>
                 </div>
                 <!--
                   「只显示未入账发票」开着的时候，**被忽略的那几张也要摊开票面
@@ -370,7 +370,7 @@
                       去掉标签后按钮组自己右对齐，位置比原来更靠边。
                     -->
                     <el-form-item class="row-actions">
-                      <el-button size="small" :disabled="!store.canWrite" @click="toggleIgnored(row)">忽略这张</el-button>
+                      <el-button size="small" :disabled="!store.canWrite" :loading="ignoringId === row.id" @click="toggleIgnored(row)">忽略这张</el-button>
                       <!--
                         只有**有问题**的发票才给这个按钮：解析成功的发票重跑一遍
                         不会变好，而按钮一多就分不清哪个是真需要点的。
@@ -517,6 +517,8 @@ const previewing = ref(false)
 // 正在重新解析的那一张（按钮上的 loading）。用 id 而不是布尔量 ——
 // 一批几十张发票，哪一张转圈要能看出来。
 const reparsingId = ref(null)
+// 正在点名忽略/取消忽略的那一行。用来挡重复点击，也是按钮上的转圈。
+const ignoringId = ref(null)
 const savingConfig = ref(false)
 const savingRule = ref(false)
 // 兜底科目也在这里：saveConfig 整个 config 提交，少一个字段就等于把那一项清空。
@@ -713,8 +715,58 @@ function newBatch() { batch.value = null; clearFiles(); Object.keys(overrides).f
 function isIgnored(row) { return isIgnoredRow(row, overrides) }
 // 已入账（已生成）的发票：服务端跳过重算，这一行**没有可执行的操作**。
 function isCommitted(row) { return isCommittedRow(row) }
-function toggleIgnored(row) { ensureOverride(row).ignored = !isIgnored(row) }
 function overridePayload() { return JSON.parse(JSON.stringify(overrides)) }
+
+/**
+ * 把服务端算完的这一批**就地**合并进当前批次。
+ *
+ * 为什么不整批换掉：整批换掉 → el-table 的 data 变成新数组 →
+ * ``default-expand-all`` 重新摊开几十张票（那一堆 DOM 节点就是页面卡
+ * 的原因）。用户点「忽略这张」想看的就是这张的说明，换完它却给收起来了。
+ *
+ * 计数、状态这些整体换；发票行按 id 换 —— 展开状态留着。
+ */
+function mergeBatchPayload(payload) {
+  const current = batch.value
+  if (!current) { batch.value = payload; return }
+  const { invoices, ...rest } = payload
+  Object.assign(current, rest)
+  const fresh = new Map((invoices || []).map(row => [row.id, row]))
+  for (const row of current.invoices || []) {
+    const updated = fresh.get(row.id)
+    if (updated) Object.assign(row, updated)
+  }
+}
+
+/**
+ * 点名忽略（或取消忽略）一张发票，**立刻落库**。
+ *
+ * 以前这一步只是翻一个本地标记：状态那一列还停在「可生成」/「有问题」，
+ * 用户得再点一次「重新计算预览」才看得出改没改成。而忽略是用户**已经
+ * 做好**的决定 —— 合并件里的封面页、装订页、重复扫描页，一眼就知道不是
+ * 发票，不该逼着人再点一次才能看到结果。
+ *
+ * 落库失败要把本地意图收回来：界面显示的状态不能和库里对不上。
+ */
+async function toggleIgnored(row) {
+  const next = !isIgnored(row)
+  const had = Object.prototype.hasOwnProperty.call(overrides[row.id] || {}, 'ignored')
+  const before = overrides[row.id]?.ignored
+  ensureOverride(row).ignored = next
+  ignoringId.value = row.id
+  try {
+    const payload = await invoiceApi.setRecordIgnored(
+      store.bookId, batch.value.id, row.id, next, overridePayload())
+    mergeBatchPayload(payload)
+    ElMessage.success(next ? '已忽略这张发票' : '已取消忽略')
+  } catch (err) {
+    if (had) overrides[row.id].ignored = before
+    else delete overrides[row.id].ignored
+    ElMessage.error(err?.response?.data?.detail || (next ? '忽略失败' : '取消忽略失败'))
+  } finally {
+    ignoringId.value = null
+  }
+}
 async function recalculate() {
   previewing.value = true
   try { batch.value = await invoiceApi.previewBatch(store.bookId, batch.value.id, overridePayload()); ElMessage.success('预览已重新计算') } finally { previewing.value = false }

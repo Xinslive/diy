@@ -299,6 +299,19 @@ class InvoicePreviewIn(BaseModel):
     overrides: dict[str, dict] = Field(default_factory=dict)
 
 
+class InvoiceIgnoreIn(BaseModel):
+    """点名忽略/取消忽略一张发票。
+
+    忽略是**用户已经做好的决定**，所以这个动作自己就落库，不该让人再点
+    一次「重新计算预览」才能看到状态变过来。
+    """
+
+    ignored: bool
+    # 一起带上当前的人工覆盖项：取消忽略时这一张要**重新算一遍**，
+    # 用户在这张上改过的发票类型和科目得跟着生效。
+    overrides: dict[str, dict] = Field(default_factory=dict)
+
+
 # ---- 期间 ----
 class CarryForwardIn(BaseModel):
     """结转损益的入参。

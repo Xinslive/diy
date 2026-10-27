@@ -34,5 +34,19 @@ export const previewBatch = (bookId, id, overrides = {}) =>
  */
 export const reparseRecord = (bookId, batchId, recordId, overrides = {}) =>
   http.post(`/books/${bookId}/invoices/batches/${batchId}/records/${recordId}/reparse`, { overrides }, { timeout: 660000 }).then(r => r.data)
+/**
+ * 点名忽略（或取消忽略）一张发票，**立刻落库**。
+ *
+ * 以前「忽略这张」只是前端的一个本地标记：状态那一列不会变，用户还得
+ * 再点一次「重新计算预览」才知道改没改成。忽略是用户已经做好的决定
+ * （合并件里的封面页、装订页一眼就知道不是发票），不该让人再点一次
+ * 才能看到结果。
+ *
+ * 服务端只重算**这一张**：别的记录上还没点「重新计算预览」的改动不跟着
+ * 落库。
+ */
+export const setRecordIgnored = (bookId, batchId, recordId, ignored, overrides = {}) =>
+  http.post(`/books/${bookId}/invoices/batches/${batchId}/records/${recordId}/ignore`,
+    { ignored, overrides }).then(r => r.data)
 export const commitBatch = (bookId, id) => http.post(`/books/${bookId}/invoices/batches/${id}/commit`).then(r => r.data)
 export const discardBatch = (bookId, id) => http.post(`/books/${bookId}/invoices/batches/${id}/discard`).then(r => r.data)

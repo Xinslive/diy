@@ -10,7 +10,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.api.schemas import InvoiceConfigIn, InvoicePreviewIn, InvoiceRuleIn, InvoiceRulePatch
+from app.api.schemas import (InvoiceConfigIn, InvoiceIgnoreIn, InvoicePreviewIn,
+                             InvoiceRuleIn, InvoiceRulePatch)
 from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
@@ -283,6 +284,36 @@ def preview_invoice_batch(batch_id: int, request: Request, payload: InvoicePrevi
     batch = _batch(book, db, batch_id)
     try:
         return service.preview_batch(db, batch, (payload.overrides if payload else {}))
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _db_error(request, exc) from exc
+
+
+@router.post("/batches/{batch_id}/records/{record_id}/ignore")
+def set_invoice_record_ignored(batch_id: int, record_id: int, request: Request,
+                               payload: InvoiceIgnoreIn,
+                               book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+                               _link: UserBook = Depends(require_book_write)):
+    """点名忽略（或取消忽略）一张发票，**立刻落库**。
+
+    「忽略这张」是用户已经做好的决定 —— 合并件里的封面页、装订页、重复
+    扫描页，一眼就知道不是发票。点完就该看到状态变成「已忽略」，不该
+    还要再点一次「重新计算预览」才知道改没改成。
+
+    只重算这一张：别的记录上还没点「重新计算预览」的改动不跟着落库。
+    """
+    batch = _batch(book, db, batch_id)
+    record = db.scalar(
+        select(InvoiceRecord).where(InvoiceRecord.id == record_id,
+                                     InvoiceRecord.batch_id == batch.id))
+    if record is None:
+        raise HTTPException(404, "这张发票不在这个批次里")
+    try:
+        return service.set_record_ignored(db, batch, record, payload.ignored,
+                                          payload.overrides)
     except ValueError as exc:
         db.rollback()
         raise HTTPException(400, str(exc)) from exc

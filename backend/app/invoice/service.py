@@ -386,6 +386,34 @@ def _override(record: InvoiceRecord, overrides: dict[str, dict]) -> dict[str, An
     return dict(overrides.get(str(record.id)) or {})
 
 
+def _is_ignored(record: InvoiceRecord, override: dict[str, Any]) -> bool:
+    """这一张现在算不算「已被点名忽略」。
+
+    判定顺序和前端的 ``isIgnoredRow`` 一致：
+
+    1. 覆盖项里**明确**写了 ignored —— 照它走（True 是点名忽略，
+       False 是取消忽略）；
+    2. 覆盖项没提 —— 回落到**已经落库的状态**。
+
+    第 2 条是「重新计算预览不该抹掉已忽略」的关键。以前这里只认覆盖项：
+    从历史里重开一个批次、点一次「重新计算预览」，那些早就点名忽略的
+    发票就被重新算成「可生成」—— 用户已经做好的决定，被一次重算悄悄
+    抹掉。忽略是**结论**，不是待算的草稿，草稿才会被下一次重算盖掉。
+
+    注意覆盖项优先于落库状态：用户点「取消忽略」时前端会明确发
+    ``ignored=False``，那一条必须能盖过库里记着的「已忽略」。
+    """
+    flag = override.get("ignored")
+    if flag is True:
+        return True
+    if flag is False:
+        return False
+    if record.status == "IGNORED":
+        return True
+    resolution = (record.payload or {}).get("resolution") or {}
+    return bool(resolution.get("ignored"))
+
+
 def _type_from_taxpayer(meta: dict[str, Any], taxpayer_id: str) -> str:
     if not taxpayer_id:
         return "UNKNOWN"
@@ -409,7 +437,15 @@ def _build_preview(
     rules: list[InvoiceRule],
     config: dict[str, Any],
     overrides: dict[str, dict],
+    only_ids: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
+    """重算预览。
+
+    ``only_ids`` 给定时**只重算这几张**：其余记录的落库状态原样保留。
+    「忽略这一张」走的就是这条路 —— 别的记录上还没点「重新计算预览」的
+    改动不跟着落库（点一下忽略封面页，不该顺手把用户还没确认的科目
+    改动一起存了）。
+    """
     record_rows = sorted(batch.invoices, key=lambda row: row.page_index)
     default_ids = [config.get(key) for key in CONFIG_SUBJECT_KEYS]
     subjects = _ensure_leaf_subjects(db, batch.book_id, default_ids, "发票默认科目")
@@ -430,6 +466,8 @@ def _build_preview(
     ready = 0
     errors = 0
     for record in record_rows:
+        if only_ids is not None and str(record.id) not in only_ids:
+            continue
         if record.status == "COMMITTED":
             # **已入账的不重算。**
             #
@@ -444,7 +482,7 @@ def _build_preview(
         meta = _meta(record)
         lines = _lines(record)
         override = _override(record, overrides)
-        if override.get("ignored"):
+        if _is_ignored(record, override):
             # 用户点名「这张不算发票」：合并 PDF 里的封面、装订页、重复扫描页。
             # 不给它编造科目，也不把它算进可生成/有问题 —— 两头都不该拦下整批。
             record.status = "IGNORED"
@@ -701,8 +739,11 @@ def _build_preview(
             },
         }
         previews.append(serialize_record(record, subjects))
-    batch.ready_count = ready
-    batch.error_count = errors
+    if only_ids is None:
+        # 只重算了几张的时候，ready/errors 只是那几张的张数 —— 回写到批次表上
+        # 会把整批的快照写坏。这种情况下批次表那两列由调用方按现算结果更新。
+        batch.ready_count = ready
+        batch.error_count = errors
     return previews, ready, errors
 
 
@@ -1132,9 +1173,25 @@ def preview_batch(db: Session, batch: InvoiceBatch, overrides: dict[str, dict] |
     rules = db.scalars(select(InvoiceRule).where(InvoiceRule.book_id == batch.book_id, InvoiceRule.active.is_(True))).all()
     _, ready, errors = _build_preview(db, batch, rules, config, overrides or {})
     db.commit()
+    return _preview_payload(db, batch, ready=ready, errors=errors)
+
+
+def _preview_payload(
+    db: Session,
+    batch: InvoiceBatch,
+    ready: int | None = None,
+    errors: int | None = None,
+) -> dict[str, Any]:
+    """预览/忽略接口的返回体。
+
+    ``ready``/``errors`` 是**这一轮重算**数出来的张数；不给就按落库的
+    状态现算（``status_counts``）。整批重算时两者是一回事，只重算一张
+    时只有现算才对 —— 那时 ``_build_preview`` 的计数器只覆盖那一张。
+    """
     records = db.scalars(select(InvoiceRecord).where(InvoiceRecord.batch_id == batch.id).order_by(InvoiceRecord.page_index)).all()
     sources = sorted({_text((record.payload or {}).get("source_file")) for record in records} - {""})
     subjects = subjects_by_id(db, batch.book_id, records)
+    counts = status_counts(db, [batch.id]).get(batch.id, {})
     return {
         # 键是 ``id``，和 batch_summary / GET /batches/{id} 一致。
         #
@@ -1146,9 +1203,9 @@ def preview_batch(db: Session, batch: InvoiceBatch, overrides: dict[str, dict] |
         "status": batch.status,
         "message": batch.message,
         "total": batch.total,
-        "ready_count": ready,
-        "error_count": errors,
-        "ignored_count": sum(1 for record in records if record.status == "IGNORED"),
+        "ready_count": counts.get("READY", 0) if ready is None else ready,
+        "error_count": counts.get("REJECTED", 0) if errors is None else errors,
+        "ignored_count": counts.get("IGNORED", 0),
         # 已入账的张数。补生成（取消忽略后再确认）之后，界面要能说清
         # 「这一批一共生成了多少张」，而不是让人拿两轮的数字自己加。
         "committed_count": batch.committed_count or 0,
@@ -1156,6 +1213,50 @@ def preview_batch(db: Session, batch: InvoiceBatch, overrides: dict[str, dict] |
         "sources": sources,
         "invoices": [serialize_record(record, subjects) for record in records],
     }
+
+
+def set_record_ignored(
+    db: Session,
+    batch: InvoiceBatch,
+    record: InvoiceRecord,
+    ignored: bool,
+    overrides: dict[str, dict] | None = None,
+) -> dict[str, Any]:
+    """点名忽略（或取消忽略）一张发票，**立刻落库**。
+
+    为什么不能只在前端记一个本地标记：那样「状态」那一列永远停在
+    「可生成」/「有问题」，用户得再点一次「重新计算预览」才看得出改动。
+    而忽略是**用户已经做好的决定** —— 合并件里的封面页、装订页、重复
+    扫描页，一眼就知道不是发票。不该逼着人再点一次才能看到结果。
+
+    只重算**这一张**（``_build_preview(only_ids=...)``）：别的记录上还没
+    点「重新计算预览」的改动不跟着落库。点一下忽略封面页，不该顺手把
+    用户还没确认的科目改动一起存了。
+
+    取消忽略时这一张要**重新算一遍**：它从「已忽略」回到正常的科目解析
+    与金额校验，该报的问题要重新报出来（当年没配置的结算科目、缺发票号
+    这些，得让人重新处理，而不是无声地变成「可生成」）。
+    """
+    if record.status == "COMMITTED":
+        raise ValueError("已生成凭证的发票不能忽略")
+    if batch.status not in ("PENDING", "REJECTED", "COMMITTED"):
+        raise ValueError(f"该批次已是「{batch.status}」状态，不能改忽略状态")
+    # 这一张自己的覆盖项：取消忽略时要把它一起重算，用户在这张上改过
+    # 的发票类型和科目要跟着生效。别的记录的覆盖项不参与。
+    row_override = {**((overrides or {}).get(str(record.id)) or {})}
+    row_override["ignored"] = bool(ignored)
+    config = get_config(db, batch.book_id)
+    rules = db.scalars(select(InvoiceRule).where(InvoiceRule.book_id == batch.book_id, InvoiceRule.active.is_(True))).all()
+    _build_preview(db, batch, rules, config, {str(record.id): row_override},
+                   only_ids={str(record.id)})
+    # 先把状态刷进库，再按现算的分布回写批次表上那两列快照 —— 那两列是
+    # 预览那一刻的快照，只重算一张时不能拿那一张的张数去覆盖整批。
+    db.flush()
+    counts = status_counts(db, [batch.id]).get(batch.id, {})
+    batch.ready_count = counts.get("READY", 0)
+    batch.error_count = counts.get("REJECTED", 0)
+    db.commit()
+    return _preview_payload(db, batch)
 
 
 def reparse_record(
