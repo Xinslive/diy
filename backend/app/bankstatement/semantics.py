@@ -221,7 +221,15 @@ def parse_date(value: Any) -> tuple[date | None, str]:
             parsed = datetime.strptime(compact, fmt)
         except ValueError:
             continue
-        return parsed.date(), parsed.strftime("%H:%M:%S")
+        if any(token in fmt for token in ("%H", "%M", "%S")):
+            return parsed.date(), parsed.strftime("%H:%M:%S")
+        # **只有日期的写法不要编一个时间出来。** ``strptime("20260901",
+        # "%Y%m%d")`` 会得到 00:00:00，而那是**编的** —— 调用方会以为
+        # 「时间确实是零点」，于是不再去看旁边那列「交易时间」。
+        # 农商行那份 Excel 就是日期一列、时间一列分开的：时间被丢掉之后，
+        # 同一天里的多笔流水排不出先后，**余额链接不上**，末行余额是
+        # 「哪一笔之后的」就成了猜。
+        return parsed.date(), ""
     # 「2026-09-01」这种带分隔符的两位年份写法（09/01/2026）也认一下
     for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y"):
         try:
@@ -244,6 +252,38 @@ def looks_like_date(text: str) -> bool:
     """这个格子看起来是不是日期。"""
     parsed, _time = parse_date(text)
     return parsed is not None
+
+
+def parse_time(value: Any) -> str:
+    """一个单元格 → 时间文本（``HH:MM:SS``）。
+
+    **为什么要单独一个函数**：``parse_date`` 吃的是**日期**，而「交易时间」
+    那一列里装的是**纯时间**（``16:55:22``）。把它交给 ``parse_date`` 会
+    什么也得不到（纯时间不在任何日期格式里）—— 时间就此丢掉。
+
+    **丢掉的时间是有代价的**：同一天里有多笔流水时，光有日期排不出先后，
+    **余额链就接不上**。招商那份就是（两笔 09-28 的流水一进一出，时分秒
+    一丢就分不出谁在前，「末行余额是哪笔之后的」就成了猜），而**接不上的
+    余额链意味着推不出期末余额**，期末余额对账整个用不了。
+
+    认得：``16:55:22`` / ``16:55`` / ``16时55分22秒``（全角也认）。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%H:%M:%S")
+    text = str(value).strip().translate(_FULLWIDTH)
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", "", text)
+    match = re.search(r"(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?", compact)
+    if not match:
+        return ""
+    hour, minute = int(match.group(1)), int(match.group(2))
+    second = int(match.group(3) or 0)
+    if hour > 23 or minute > 59 or second > 59:
+        return ""
+    return f"{hour:02d}:{minute:02d}:{second:02d}"
 
 
 # ----------------------------------------------------------------------
@@ -695,8 +735,62 @@ def parse_grid(grid: Grid, *, column_mapping: dict[str, int] | None = None,
         result.diagnosis.append(f"有 {dateless} 行没有日期，未计入流水{detail}")
 
     result.meta = extract_meta(meta_lines + footer_lines, result.rows)
+    if result.meta.closing_balance is None:
+        # 文件**没写**期末余额，但余额列里其实有 —— 从余额列推。
+        result.meta.closing_balance = _closing_from_rows(result.rows, result.meta)
     _self_check(result)
     return result
+
+
+def _closing_from_rows(rows: list[StatementRow],
+                       meta: StatementMeta) -> Decimal | None:
+    """从**余额列**推出期末余额。
+
+    **为什么需要**：不少银行的对账单**只有流水、没有「期末余额」行** ——
+    农商行那份 Excel 就是这样（表头有「账户余额」列，页尾只有「收入合计」）。
+    少了这个数，期末余额对账（对账单期末余额 vs 账面余额）整个用不了，
+    界面只显示一句「对账单未提供余额列，无法核对」—— 而**余额列明明有**。
+
+    **推法**：余额列记的是**每笔交易之后**的余额（实测 14 份真实样例里
+    绝大多数如此），所以**时间上最后一笔的余额就是期末余额**。
+
+    **时间上最后**，不是「文件里最后一行」：有的银行倒序印流水（最新的在
+    最上面），还有的同一天里有多笔 —— 靠「日期 + 时分秒」排才排得对。
+
+    **什么时候不推**（宁可留空，也不要给一个错的数）：
+
+    - 余额链**接不上**（相邻两笔的余额差 ≠ 后一笔的金额）→ 余额列的语义
+      不是「交易后余额」，或者中间有没被解析出来的行；
+    - 文件自己报了总笔数/收支合计，而解析出来的对不上 → **漏了行**，
+      那么末行余额根本不是期末余额；
+    - 一行余额都没有。
+    """
+    dated = [row for row in rows if row.balance is not None and row.tx_date is not None]
+    if not dated:
+        return None
+    ordered = sorted(dated, key=lambda row: (row.tx_date, row.tx_time or ""))
+
+    # 余额链校验：相邻两笔（时间顺序）的余额差，应当等于**后一笔**的金额
+    # —— 余额记的是交易之后的。
+    chain = [row for row in ordered if row.amount is not None]
+    for previous, current in zip(chain, chain[1:]):
+        delta = abs(current.balance - previous.balance)
+        if abs(delta - abs(current.amount)) > Decimal("0.05"):
+            return None
+
+    # 文件自报的数字与解析结果对不上 → 漏了行 → 末行余额不是期末余额。
+    if meta.declared_total_count is not None and meta.declared_total_count != len(rows):
+        return None
+    if all(row.direction in ("IN", "OUT") for row in rows):
+        income = sum((row.amount for row in rows
+                      if row.direction == "IN" and row.amount is not None), Decimal("0"))
+        expense = sum((row.amount for row in rows
+                       if row.direction == "OUT" and row.amount is not None), Decimal("0"))
+        if meta.declared_income_total is not None and meta.declared_income_total != income:
+            return None
+        if meta.declared_expense_total is not None and meta.declared_expense_total != expense:
+            return None
+    return ordered[-1].balance
 
 
 def _build_row(seq: int, cells: list[str], mapping: dict[str, int],
@@ -713,7 +807,7 @@ def _build_row(seq: int, cells: list[str], mapping: dict[str, int],
         date_text = value("POSTING_DATE")
     row.tx_date, row.tx_time = parse_date(date_text)
     if not row.tx_time:
-        _unused, row.tx_time = parse_date(value("TIME"))
+        row.tx_time = parse_time(value("TIME"))
 
     row.amount = parse_amount(value("AMOUNT"))
     amount_in = parse_amount(value("IN"))

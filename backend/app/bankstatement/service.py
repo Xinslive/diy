@@ -696,14 +696,62 @@ def _parse_with_profile(db: Session, book_id: int, data: bytes,
     return parsed, profile
 
 
+def _must_keep(row: BankStatementRow) -> bool:
+    """这一行身上有没有**重建就丢不得**的东西。
+
+    有三样：已经生成过凭证（``matched_voucher_id``）、已经被发票占用
+    （``matched_invoice_record_id``）、用户点名不算（``IGNORED``）。
+
+    重建行会把这三样冲掉 —— 凭证还在账上，那几行却变成了「来路不明」，
+    人也就再也查不到那笔钱从哪来。
+    """
+    return (row.matched_voucher_id is not None
+            or row.matched_invoice_record_id is not None
+            or row.status == STATUS_IGNORED)
+
+
+def _match_old_rows(keep_rows: list[BankStatementRow],
+                    new_rows: list[Any]) -> Optional[dict[int, BankStatementRow]]:
+    """旧行 → 新行（按 seq 对回去）。
+
+    **按「日期 + 金额 + 方向」三项匹配**：这三样合起来在一份对账单里
+    基本唯一。**匹配不唯一或者匹配不上，就返回 ``None``** ——
+    宁可不做，也不能把凭证挂到别的行上：那比缺一个方向糟得多
+    （那是把甲流水的金额记到乙头上）。
+
+    返回 ``{新行的 seq: 旧行}``。
+    """
+    if not keep_rows:
+        return {}
+    index: dict[tuple[Any, ...], list[int]] = {}
+    for row in new_rows:
+        key = (row.tx_date, row.amount, row.direction)
+        index.setdefault(key, []).append(row.seq)
+    matched: dict[int, BankStatementRow] = {}
+    used: set[int] = set()
+    for old in keep_rows:
+        key = (old.tx_date, old.amount, old.direction)
+        candidates = [seq for seq in index.get(key, []) if seq not in used]
+        if len(candidates) != 1:
+            return None
+        used.add(candidates[0])
+        matched[candidates[0]] = old
+    return matched
+
+
 def _store_rows(db: Session, statement: BankStatement,
                 parsed: semantics.ParsedStatement,
-                rules: list[BankStatementRule]) -> None:
+                rules: list[BankStatementRule],
+                carry: Optional[dict[int, BankStatementRow]] = None
+                ) -> None:
     """把解析出来的行写进库里。
 
     **行不丢。** 方向认不出来的行照样入库（标 ``problems``）——
     丢掉的话用户永远不知道自己漏了一笔钱，而「方向未知」在界面上
     一眼就能看见、人工一点就定好了。
+
+    **``carry`` 是「重建行时对不回去的东西」**（重新解析用）：已经生成过
+    凭证 / 已被发票占用 / 被用户忽略的行，把那些状态原样搬过去。
     """
     db.execute(delete(BankStatementRow).where(
         BankStatementRow.statement_id == statement.id))
@@ -716,6 +764,12 @@ def _store_rows(db: Session, statement: BankStatement,
             # 有笔钱没对上。标成 NONE（不是 PENDING）是为了让界面把它
             # 归到「先定方向」而不是「先定科目」那两类里。
             plan_status = PLAN_NONE
+        old = (carry or {}).get(row.seq)
+        if old is not None:
+            # 搬回去：凭证、发票占用、忽略状态、人工指定的对方科目。
+            status = old.status
+            subject_id = old.plan_subject_id or subject_id
+            plan_status = old.plan_status
         db.add(BankStatementRow(
             statement_id=statement.id,
             book_id=statement.book_id,
@@ -731,6 +785,9 @@ def _store_rows(db: Session, statement: BankStatement,
             counterparty_account=row.counterparty_account,
             extra=dict(row.extra or {}),
             status=status,
+            matched_voucher_id=(old.matched_voucher_id if old is not None else None),
+            matched_invoice_record_id=(
+                old.matched_invoice_record_id if old is not None else None),
             plan_subject_id=subject_id,
             plan_status=plan_status,
             problems=list(row.problems or []),
@@ -865,19 +922,19 @@ def reparse_statement(db: Session, book_id: int, statement_id: int, *,
     - ``column_mapping`` 给了 → 按用户手工指定的列重跑；
     - 没给 → 重读原件自动重跑（解析器改了规则之后用）。
 
-    **重跑会重建全部行。** 已经生成过凭证的行不能这么干 —— 那些行带着
-    ``matched_voucher_id``，重建就没了，账上那几张凭证就变成了「来路不明」。
-    所以有行已经入账时，这里直接拒绝并点名。
+    **重跑会重建全部行。** 已经生成过凭证的行带着 ``matched_voucher_id``，
+    重建就没了 —— 账上那几张凭证就变成了「来路不明」。所以那些行要**对回去**：
+    按「日期 + 金额 + 方向」三项唯一匹配（见 :func:`_match_old_rows`），
+    把「已生成凭证 / 已被发票占用 / 被用户忽略」这些状态原样搬回新行。
+
+    **对不回去就整次拒绝** —— 宁可不做，也不能把凭证挂到别的行上。
+    （2026-10-27 之前这里是「一律拒绝」：用户有一份对账单，9 行已经生成过
+    凭证，于是连「刷新一下期末余额」都做不了 —— 而他要的正是这个。）
     """
     statement = _statement(db, book_id, statement_id)
-    posted = db.scalar(select(func.count()).select_from(BankStatementRow).where(
-        BankStatementRow.statement_id == statement.id,
-        BankStatementRow.status != STATUS_OPEN,
-    )) or 0
-    if posted:
-        raise ValueError(
-            f"这份对账单已经有 {posted} 行生成过凭证或被忽略，不能重新解析 —— "
-            "重建行会丢掉与凭证的关联。请先删除这份对账单再重新上传。")
+    old_rows = db.scalars(select(BankStatementRow).where(
+        BankStatementRow.statement_id == statement.id)).all()
+    keep = [row for row in old_rows if _must_keep(row)]
     if not storage.exists(statement.file_path):
         raise ValueError("原件已不在磁盘上，无法重新解析")
 
@@ -889,6 +946,18 @@ def reparse_statement(db: Session, book_id: int, statement_id: int, *,
     else:
         parsed = semantics.parse_statement(
             data, column_mapping=column_mapping, header_row=header_row)
+    # **把「重建就丢不得」的行对回去。** 重建行会冲掉「已生成凭证 /
+    # 已被发票占用 / 被用户忽略」这些标记 —— 凭证还在账上，那几行却变成
+    # 了「来路不明」。对回去的依据是「日期 + 金额 + 方向」三项唯一匹配；
+    # **对不上就整次拒绝**，不硬挂（挂错了等于把甲流水的金额记到乙头上）。
+    carry = _match_old_rows(keep, parsed.rows)
+    if carry is None:
+        raise ValueError(
+            "重新解析之后，账上已经生成过凭证（或已被发票占用、或被你点名"
+            "忽略）的那些流水对不回去了 —— 新解析出来的行里找不到同一天、"
+            "同金额、同方向的那一行。不能硬挂：挂错了等于把甲流水的金额"
+            "记到乙头上。请把这份对账单删掉重新上传（原文件还在），"
+            "或者先把对应的凭证删掉。")
     period_start, period_end = _effective_period(parsed)
     # 排掉它自己：重解析的那一份当然「已经有一份」。
     _guard_duplicate(db, book_id, statement.account_subject_id,
@@ -908,7 +977,7 @@ def reparse_statement(db: Session, book_id: int, statement_id: int, *,
     statement.parse_message = _parse_message(parsed)
     statement.diagnosis = _diagnosis_of(parsed)
     rules = list_rules(db, book_id)
-    _store_rows(db, statement, parsed, rules)
+    _store_rows(db, statement, parsed, rules, carry=carry)
     db.flush()
     return serialize_statement(db, statement)
 
@@ -1503,10 +1572,30 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
 
 
 def _summary_for(row: BankStatementRow) -> str:
-    if row.summary:
-        return row.summary
+    """凭证上那一行的**摘要**。
+
+    **用途优先，摘要兜底**（用户定的口径，2026-10-27）。
+
+    **为什么**：对账单上「摘要」与「用途」两列装的不是一回事 ——
+    **摘要是「怎么走的」，用途是「为什么」**。农商行那份就是：
+
+    | 摘要 | 用途 |
+    |---|---|
+    | 转入 | 办公室租金 |
+    | 支取 | 归还借款 |
+    | 短信收费 | （空） |
+
+    凭证摘要是给人看的：「办公室租金」比「转入」有用得多；而「转入」这种
+    话在同一个月的几十张凭证里全都一样，翻凭证时认不出是哪笔。
+
+    **没有用途的行照旧用摘要** —— 平安那份两列都有，摘要='快捷支付'、
+    用途='支付宝-消费刘硕妮'，后者更具体；光大那份压根没有用途列，
+    于是摘要照旧顶上。
+    """
     if row.purpose:
         return row.purpose
+    if row.summary:
+        return row.summary
     who = row.counterparty_name or "对方"
     return f"银行{'收' if row.direction == DIRECTION_IN else '付'} {who}"
 
@@ -1659,8 +1748,13 @@ def reconcile_balance(db: Session, book_id: int, statement_id: int,
     认领的行仍算未入账，只有对应发票已经提交并生成凭证后才排除。两者
     近似相等时，这笔差额**有了解释**；否则就是「原因待查」。
 
-    对账单没有余额列时**不报红** —— 「对账单未提供余额列，无法核对」
-    是一条事实陈述，不是错误。
+    对账单算不出期末余额时**不报红** —— 「对账单没有可用的期末余额，
+    无法核对」是一条事实陈述，不是错误。
+
+    **「算不出」比「没有」常见**：绝大多数对账单**压根不写「期末余额」**
+    （只有流水），所以这个数是从**余额列**推出来的 —— 见
+    :func:`app.bankstatement.semantics._closing_from_rows`。推不出来时
+    （余额链接不上、或者文件自报的笔数对不上）才真的没有。
     """
     statement = db.get(BankStatement, statement_id)
     if statement is None or statement.book_id != book_id:
@@ -1668,7 +1762,7 @@ def reconcile_balance(db: Session, book_id: int, statement_id: int,
     if statement.closing_balance is None:
         return {
             "available": False,
-            "reason": "对账单未提供余额列，无法核对",
+            "reason": "对账单没有可用的期末余额，无法核对",
         }
     subject_id = statement.account_subject_id
     when = statement.period_end or statement.period_start

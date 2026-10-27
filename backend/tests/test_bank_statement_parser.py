@@ -431,6 +431,112 @@ def test_PDF里折行的长户名被合并():
 
 
 # ----------------------------------------------------------------------
+# 期末余额：文件没写就从余额列推
+# ----------------------------------------------------------------------
+
+def test_文件没写期末余额时从余额列推出来():
+    """**绝大多数对账单没有「期末余额」行**，只有流水。
+
+    少了这个数，期末余额对账（对账单期末余额 vs 账面余额）整个用不了，
+    界面只显示一句「对账单未提供余额列，无法核对」—— 而**余额列明明有**。
+
+    农商行那份就是：表头有「账户余额」列，页尾只有「收入合计」。
+    """
+    parsed = _parse("nongshang_xlsx.xlsx")
+    # 文件自己没写期末余额 —— 推出的这个数是**从余额列算出来的**
+    assert parsed.meta.closing_balance == Decimal("37339984.00")
+    # 它必须等于**时间上最后一笔**的余额
+    last = max(parsed.rows, key=lambda row: (row.tx_date, row.tx_time))
+    assert last.balance == parsed.meta.closing_balance
+
+
+def test_时间上最后一笔不是文件里最后一行时也要取对():
+    """有的银行**倒序印**流水（最新的在最上面）。
+
+    平安那份就是这样 —— 文件第一行是 09-30，最后一行是 09-02。
+    按文件顺序取「最后一行」会取到**期初**那边的余额。
+    """
+    parsed = _parse("pingan.xls")
+    assert parsed.meta.closing_balance == Decimal("4948238.00")
+    # 文件里的第一行才是时间上最后那笔
+    assert parsed.rows[0].tx_date.isoformat() == "2026-09-30"
+    assert parsed.rows[0].balance == parsed.meta.closing_balance
+
+
+def test_余额链接不上时不推期末余额():
+    """宁可留空，也不要给一个错的数。
+
+    余额链接不上意味着：要么余额列不是「交易后余额」，要么中间有没被
+    解析出来的行 —— 这两种情况下「末行余额」都不是期末余额。
+    """
+    from app.bankstatement import semantics
+    from app.bankstatement.grid import Grid, cell_text
+
+    data = _data("nongshang_xlsx.xlsx")
+    grid = semantics.read_grids(data)[0]
+    parsed = semantics.parse_statement(data)
+    balance_column = parsed.column_mapping["BALANCE"]
+    rows = list(grid.rows)
+    # 找**数据行**（余额那一格是一个数）：前几行是「开始日期」那类抬头，
+    # 改它们没有意义。
+    index = next(i for i, row in enumerate(rows)
+                 if i > 0 and cell_text(row[balance_column]).replace(",", "").replace(".", "").isdigit()
+                 and len(cell_text(row[balance_column])) > 4)
+    broken = list(rows[index])
+    broken[balance_column] = "1.00"       # 把这一行的余额改坏
+    rows[index] = broken
+    trimmed = Grid(container=grid.container, sheet=grid.sheet, rows=rows,
+                   meta=grid.meta, footer=grid.footer)
+    result = semantics.parse_grid(trimmed)
+    assert result.meta.closing_balance is None, result.meta.closing_balance
+
+
+def test_文件自报的总笔数对不上时不推期末余额():
+    """**漏了行**的时候，末行余额根本不是期末余额。
+
+    这里只改**文件自报的笔数**（余额链不动），好把这条守卫单独钉住 ——
+    否则「链断了」也会让它不推，两条原因混在一起就看不出是哪条在起作用。
+    """
+    from app.bankstatement import semantics
+    from app.bankstatement.grid import Grid, cell_text
+
+    grid = semantics.read_grids(_data("cib_pdf.pdf"))[0]
+    rows = list(grid.rows)
+    index = next(i for i, row in enumerate(rows)
+                 if i > 0 and "本期总笔数" in " ".join(cell_text(c) for c in row))
+    lied = list(rows[index])
+    lied[0] = "本期总笔数：5"            # 文件说自己 5 笔（其实只有 4 笔）
+    rows[index] = lied
+    # 把「期末账户余额」那一行摘掉 —— 只留「从余额列推」这一条路
+    meta = [line for line in grid.meta if "期末账户余额" not in line]
+    trimmed = Grid(container=grid.container, sheet=grid.sheet, rows=rows,
+                   meta=meta, footer=grid.footer)
+    result = semantics.parse_grid(trimmed)
+    assert result.meta.declared_total_count == 5
+    assert result.meta.closing_balance is None, result.meta.closing_balance
+
+
+def test_交易时间列被认出来():
+    """「交易时间」那一列装的是**纯时间**（``16:55:22``）。
+
+    它被丢掉是有代价的：同一天里多笔流水排不出先后，**余额链接不上**。
+    招商那份当天有两笔，一进一出，时分秒一丢就分不出谁在前。
+    """
+    parsed = _parse("cmb_csv.xlsx")
+    times = [row.tx_time for row in parsed.rows]
+    assert all(time for time in times), times
+    assert "16:55:22" in times, times
+    # 时间齐了，余额链就接得上 —— 期末余额也才推得出来
+    assert parsed.meta.closing_balance == Decimal("42319711.00")
+
+
+def test_没有余额列时当然推不出期末余额():
+    parsed = _parse("cib_construction_pdf.pdf")
+    # 这份文件自己写了「期末账户余额」，走的是文件自报那条路
+    assert parsed.meta.closing_balance == Decimal("9777291.00")
+
+
+# ----------------------------------------------------------------------
 # 全量夹具 vs 金标准
 # ----------------------------------------------------------------------
 
@@ -444,6 +550,11 @@ def test_每份样例都与金标准一致(name):
     assert str(parsed.income_total) == golden["income_total"], name
     assert str(parsed.expense_total) == golden["expense_total"], name
     assert parsed.column_mapping == golden["column_mapping"], name
+    # 期末余额：文件写了就是文件自报的那个，没写就是**从余额列推出来的**那个
+    if golden.get("closing_balance") is None:
+        assert parsed.meta.closing_balance is None, name
+    else:
+        assert str(parsed.meta.closing_balance) == golden["closing_balance"], name
     if golden.get("period_start"):
         assert parsed.meta.period_start.isoformat() == golden["period_start"], name
         assert parsed.meta.period_end.isoformat() == golden["period_end"], name

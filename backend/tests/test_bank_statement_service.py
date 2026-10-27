@@ -359,6 +359,37 @@ def test_制证_source是IMPORT_备注点明来源(db, book, admin_user, uploade
     assert voucher.attachments == 1, "对账单凭证要标「有一张附件」（那张对账单）"
 
 
+def test_制证_凭证摘要用用途_没有用途才用摘要(db, book, admin_user, uploaded, subjects):
+    """**用途优先，摘要兜底**（用户定的口径，2026-10-27）。
+
+    对账单上「摘要」与「用途」装的不是一回事：**摘要是「怎么走的」，
+    用途是「为什么」**。农商行那份就是「转入 / 办公室租金」——
+    凭证摘要是给人看的，「办公室租金」比「转入」有用得多；而「转入」
+    这种话在同一个月的几十张凭证里全都一样，翻凭证时认不出是哪笔。
+    """
+    rows = service.list_rows(db, book.id, uploaded["id"])
+    first, second = rows[0], rows[1]
+    # 第一行两列都有，第二行只有摘要
+    for row, purpose in ((first, "办公室租金"), (second, "")):
+        db_row = db.get(BankStatementRow, row["id"])
+        db_row.summary = "转入"
+        db_row.purpose = purpose
+        db.flush()
+        service.set_row_direction(db, book.id, row["id"], DIRECTION_IN)
+        service.update_row(db, book.id, row["id"], {
+            "plan_subject_id": subjects["560202"].id})
+
+    service.commit_vouchers(db, book.id, uploaded["id"], admin_user)
+    by_remark = {voucher.remark: voucher
+                 for voucher in db.scalars(select(Voucher).order_by(Voucher.id)).all()}
+    with_purpose = by_remark[f"流水对账 {uploaded['filename']}#{first['seq']}"]
+    without_purpose = by_remark[f"流水对账 {uploaded['filename']}#{second['seq']}"]
+    assert {entry.summary for entry in with_purpose.entries} == {"办公室租金"}, \
+        [entry.summary for entry in with_purpose.entries]
+    assert {entry.summary for entry in without_purpose.entries} == {"转入"}, \
+        [entry.summary for entry in without_purpose.entries]
+
+
 def test_制证_重复提交幂等(db, book, admin_user, uploaded, subjects):
     _prepare_row(db, book, uploaded, subjects)
     first = service.commit_vouchers(db, book.id, uploaded["id"], admin_user)
@@ -580,13 +611,57 @@ def test_重新解析_按人工指定的列(db, book, admin_user, cash, store):
     assert again["row_count"] == statement["row_count"]
 
 
-def test_重新解析_已有凭证的行时拒绝(db, book, admin_user, uploaded, subjects):
-    """重建行会丢掉与凭证的关联 —— 那些凭证就变成了「来路不明」。"""
+def test_重新解析_已生成凭证的行把关联对回去(db, book, admin_user, uploaded, subjects):
+    """重建行会丢掉与凭证的关联 —— 所以那些行要**对回去**。
+
+    对不回去就整次拒绝（不能硬挂：挂错了等于把甲流水的金额记到乙头上）。
+    """
     _prepare_row(db, book, uploaded, subjects)
     service.commit_vouchers(db, book.id, uploaded["id"], admin_user)
+    before = db.scalars(
+        select(BankStatementRow).where(
+            BankStatementRow.statement_id == uploaded["id"],
+            BankStatementRow.matched_voucher_id.is_not(None))).all()
+    assert before, "前置条件：有行已经生成过凭证"
+
+    result = service.reparse_statement(db, book.id, uploaded["id"])
+    after = db.scalars(
+        select(BankStatementRow).where(
+            BankStatementRow.statement_id == uploaded["id"],
+            BankStatementRow.matched_voucher_id.is_not(None))).all()
+    assert len(after) == len(before), "凭证的关联丢了 —— 那张凭证就成了「来路不明」"
+    assert ({row.matched_voucher_id for row in after}
+            == {row.matched_voucher_id for row in before})
+    assert result["row_count"] == uploaded["row_count"]
+
+
+def test_重新解析_对不回去就整次拒绝(db, book, admin_user, uploaded, subjects):
+    """**宁可不做，也不能把凭证挂到别的行上。**
+
+    那一行被人改过（金额与文件里对不上），于是按「日期 + 金额 + 方向」
+    对不回去 —— 这时候要**整次拒绝**，并说清为什么。
+    """
+    _prepare_row(db, book, uploaded, subjects)
+    service.commit_vouchers(db, book.id, uploaded["id"], admin_user)
+    vouchered = db.scalars(
+        select(BankStatementRow).where(
+            BankStatementRow.statement_id == uploaded["id"],
+            BankStatementRow.matched_voucher_id.is_not(None))).first()
+    assert vouchered is not None
+    vouchered.amount = Decimal("999999.99")      # 改坏它，让它对不回去
+    db.flush()
+
     with pytest.raises(ValueError) as excinfo:
         service.reparse_statement(db, book.id, uploaded["id"])
-    assert "凭证" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "凭证" in message, message
+    assert "对不回去" in message, message
+    # 拒绝之后**什么都没变**：原来的关联还在
+    still = db.scalars(
+        select(BankStatementRow).where(
+            BankStatementRow.statement_id == uploaded["id"],
+            BankStatementRow.matched_voucher_id.is_not(None))).all()
+    assert len(still) == 1
 
 
 def test_行数超限报错(db, book, admin_user, cash, store):

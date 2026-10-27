@@ -1,6 +1,6 @@
 {
   "ccb.xls": {
-    "closing_balance": null,
+    "closing_balance": "4778443.00",
     "column_mapping": {
       "BALANCE": 5,
       "CP_ACCOUNT": 8,
@@ -38,7 +38,7 @@
     "row_count": 45
   },
   "ceb_corp_pdf.pdf": {
-    "closing_balance": null,
+    "closing_balance": "130500700.00",
     "column_mapping": {
       "AMOUNT": 4,
       "BALANCE": 5,
@@ -75,7 +75,7 @@
     "row_count": 2
   },
   "ceb_personal.xls": {
-    "closing_balance": null,
+    "closing_balance": "1037602.00",
     "column_mapping": {
       "BALANCE": 4,
       "CP_ACCOUNT": 5,
@@ -111,7 +111,7 @@
     "row_count": 32
   },
   "ceb_personal2.xls": {
-    "closing_balance": null,
+    "closing_balance": "7910021.00",
     "column_mapping": {
       "BALANCE": 4,
       "CP_ACCOUNT": 5,
@@ -223,7 +223,7 @@
     "row_count": 4
   },
   "cmb_csv.xlsx": {
-    "closing_balance": null,
+    "closing_balance": "42319711.00",
     "column_mapping": {
       "BALANCE": 4,
       "DATE": 0,
@@ -258,7 +258,7 @@
     "row_count": 5
   },
   "cmbc_xlsx.xlsx": {
-    "closing_balance": null,
+    "closing_balance": "75844188.00",
     "column_mapping": {
       "BALANCE": 4,
       "CP_ACCOUNT": 7,
@@ -295,7 +295,7 @@
     "row_count": 5
   },
   "nongshang_base.xls": {
-    "closing_balance": null,
+    "closing_balance": "73518615.00",
     "column_mapping": {
       "BALANCE": 8,
       "CP_ACCOUNT": 5,
@@ -333,7 +333,7 @@
     "row_count": 24
   },
   "nongshang_html.xls": {
-    "closing_balance": null,
+    "closing_balance": "21782357.00",
     "column_mapping": {
       "AMOUNT": 3,
       "BALANCE": 4,
@@ -370,7 +370,7 @@
     "row_count": 31
   },
   "nongshang_html2.xls": {
-    "closing_balance": null,
+    "closing_balance": "16804393.00",
     "column_mapping": {
       "AMOUNT": 3,
       "BALANCE": 4,
@@ -407,7 +407,7 @@
     "row_count": 7
   },
   "nongshang_xlsx.xlsx": {
-    "closing_balance": null,
+    "closing_balance": "37339984.00",
     "column_mapping": {
       "BALANCE": 8,
       "CP_ACCOUNT": 9,
@@ -446,7 +446,7 @@
     "row_count": 26
   },
   "nongshang_xlsx2.xlsx": {
-    "closing_balance": null,
+    "closing_balance": "599338.00",
     "column_mapping": {
       "BALANCE": 8,
       "CP_ACCOUNT": 9,
@@ -485,7 +485,7 @@
     "row_count": 2
   },
   "pingan.xls": {
-    "closing_balance": null,
+    "closing_balance": "4948238.00",
     "column_mapping": {
       "AMOUNT": 6,
       "BALANCE": 7,
