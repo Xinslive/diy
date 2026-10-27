@@ -1445,3 +1445,59 @@ def test_0042_跑第二遍数据不丢(scratch_at_0041):
     with eng.connect() as conn:
         n = conn.execute(text("SELECT count(*) FROM bank_statement_row_subject")).scalar()
         assert n == 2, f"重跑之后对方科目行没了（剩 {n} 行）"
+
+
+def test_0042_多行指向同一个科目也搬得过去(scratch_at_0041):
+    """生产上的真实形状：**许多行指向同一个对方科目**。
+
+    生产库那批对账单里，10 行流水的对方科目**全是同一个**（同一笔「代发」
+    的对手方），金额各不相同。这条形状必须被钉住：
+
+    * 约束是 ``UNIQUE (row_id, subject_id)``，**不是** ``UNIQUE(subject_id)`` ——
+      多行同科目**不该**被挡（真按科目唯一，生产这 10 行会直接迁移失败）；
+    * 搬过去之后**每行的金额还必须跟着自己那一行走**。金额一旦串行，
+      凭证上的分录金额就是别人的 —— 而账还是平的（借方合计没变），
+      错得毫无痕迹。
+
+    造 10 行（生产那批的形状），全部指向 subject 2，金额各不相同。
+    """
+    eng, _ = scratch_at_0041
+    _seed_statement_rows(eng)
+    with eng.begin() as conn:
+        for i in range(10):
+            conn.execute(text("""
+                INSERT INTO bank_statement_row (id, statement_id, book_id, seq,
+                                               tx_date, direction, amount, balance,
+                                               summary, purpose, counterparty_name,
+                                               counterparty_account, extra, status,
+                                               matched_voucher_id,
+                                               matched_invoice_record_id,
+                                               plan_subject_id, plan_status, problems,
+                                               created_at, updated_at)
+                VALUES (:id, 1, 1, :seq, :tx_date, 'OUT', :amount, 0.00, '代发', '',
+                        '同一家对手方', '', '{}'::jsonb, 'POSTED', NULL, NULL, 2, 'RULE',
+                        '[]'::jsonb, now(), now())
+            """), {"id": 4 + i, "seq": 4 + i, "tx_date": f"2026-09-{10 + i:02d}",
+                   "amount": 49000.00 + i})
+        # 显式给了 id，序列得跟上 —— 否则后面再插入会撞主键
+        conn.execute(text(
+            "SELECT setval(pg_get_serial_sequence('bank_statement_row', 'id'), 13)"))
+
+    _upgrade(eng, "head")
+
+    with eng.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT r.seq, s.subject_id, s.amount
+            FROM bank_statement_row r
+            JOIN bank_statement_row_subject s ON s.row_id = r.id
+            WHERE r.seq >= 4
+            ORDER BY r.seq
+        """)).all()
+        assert len(rows) == 10, (
+            f"10 行应当都搬过去（多行同科目不该被唯一约束挡住），实际 {len(rows)}")
+        for seq, subject_id, amount in rows:
+            assert subject_id == 2, f"第 {seq} 行的对方科目搬错了：{subject_id}"
+            assert amount == 49000.00 + (seq - 4), (
+                f"第 {seq} 行的金额串行了：{amount}（这一行自己的金额是 "
+                f"{49000.00 + (seq - 4)}）")
+
