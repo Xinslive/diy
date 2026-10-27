@@ -10,17 +10,16 @@ Token 只从配置读取，日志与异常信息均不回显认证头。
 """
 from __future__ import annotations
 
-import html
 import ipaddress
 import json
 import os
-import re
 import socket
 import threading
 import time
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
+from app.core import html_table
 from app.core.config import settings
 from app.invoice.text_parser import scrub_control_chars
 
@@ -281,11 +280,14 @@ def _error_detail(response: requests.Response) -> str:
 
 
 def _markdown_pages(jsonl: str) -> list[str]:
-    """把 API 返回的 JSONL 结果展开为按页排列的文本。
+    """把 API 返回的 JSONL 结果展开为按页排列的 **markdown 原文**。
 
     **页数与文字总量都有上限**（审查 H-07）：OCR 的页数来自 PDF，而 PDF 的
     页数已经被 ``merge_pdfs`` 限过；这里再限一次，是为了让「OCR 兜底」这条
     路**不成为绕过页数上限的口子**（文本层解析超限时正是它接手）。
+
+    字符数按**摊平后的文字**算 —— markdown 原文里那些 HTML 标签不算正文，
+    但它们占的字符数远超正文，所以上限按摊平后的量算才是准的。
     """
     pages: list[str] = []
     max_pages = max(1, int(settings.invoice_max_pdf_pages))
@@ -309,8 +311,7 @@ def _markdown_pages(jsonl: str) -> list[str]:
             markdown = layout.get("markdown") or {}
             text = markdown.get("text") if isinstance(markdown, dict) else ""
             if text:
-                plain = _markdown_to_plain_text(str(text))
-                total += len(plain)
+                total += len(markdown_to_plain_text(str(text)))
                 if len(pages) + 1 > max_pages:
                     raise OcrApiError(
                         f"OCR 结果有超过 {max_pages} 页，超过单次上限；"
@@ -319,7 +320,7 @@ def _markdown_pages(jsonl: str) -> list[str]:
                     raise OcrApiError(
                         f"OCR 结果的文字共 {total} 个字符，超过单次上限 "
                         f"{max_chars} 个字符；请把文件分批上传")
-                pages.append(plain)
+                pages.append(str(text))
     if not pages:
         raise OcrApiError("OCR 任务已完成，但结果中没有找到页面文本")
     return pages
@@ -328,42 +329,18 @@ def _markdown_pages(jsonl: str) -> list[str]:
 #: OCR 返回的表格是 **HTML**（``<table><tr><td>``），不是 Markdown 管道表。
 #: Markdown 管道表是「一条表格占一行」的形态，HTML 表格往往是**一整行**
 #: ——不拆开的话，一整张表会变成**一行文本**，下游按行切的逻辑就全废了。
-_HTML_TABLE = re.compile(r"<table[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
-_HTML_ROW = re.compile(r"<tr[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
-_HTML_CELL = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.IGNORECASE | re.DOTALL)
-_HTML_TAG = re.compile(r"<[^>]+>")
+#: 拆开的那份实现放在 :mod:`app.core.html_table`（发票与对账单两边共用）。
+def markdown_html_tables(markdown: str) -> list[str]:
+    """markdown 里那些 HTML 表格（原文，不拆格）。
 
-
-def _html_table_to_lines(table_html: str) -> list[str]:
-    """一段 HTML 表格 → 若干行文本（每行是这一行各格的空格连接）。
-
-    **格子里换行的是同一个值被拆成几行** —— 银行对账单里「18050.00」
-    在版面上是「1805」与「0.00」上下两行。所以格内换行**不加分隔符**地
-    接起来（``18050.00``），这与文字层那一层拼格子的做法一致
-    （``pdf_table._row_cells`` 同样是「".join(...)」）。
-
-    分隔符不加分，格与格之间才加空格 —— 行与行之间的列数因此对得上表头，
-    下游「段数与表头相同 → 按位置对号入座」那一档才认得出。
+    **为什么单独暴露它**：对账单解析要的是**格子的边界**，而不是把表格
+    摊平成文字行 —— 摊平会丢掉空格子（「序号」那一列常常是空的），
+    列数于是与表头对不上。发票那边只要文字，这一层用不到。
     """
-    lines: list[str] = []
-    for row_html in _HTML_ROW.findall(table_html):
-        cells: list[str] = []
-        for cell_html in _HTML_CELL.findall(row_html):
-            text = _HTML_TAG.sub(" ", cell_html)
-            text = html.unescape(text)
-            # OCR 用**字面的两个字符** ``\n`` 表示格内换行（不是真换行），
-            # 两者都要处理 —— 只当真换行的话，格子里会留下「1805\n0.00」
-            # 这么一串字面量，金额当场认不出来。
-            text = text.replace("\\n", "")
-            text = re.sub(r"[\r\n\t]+", "", text)
-            text = re.sub(r"\s{2,}", " ", text).strip()
-            cells.append(text)
-        if cells:
-            lines.append(" ".join(cells))
-    return lines
+    return html_table.find_tables(markdown or "")
 
 
-def _markdown_to_plain_text(markdown: str) -> str:
+def markdown_to_plain_text(markdown: str) -> str:
     """保留表格单元格文本，让既有标签/正则解析器可以继续工作。"""
     out: list[str] = []
     for raw in markdown.splitlines():
@@ -374,7 +351,7 @@ def _markdown_to_plain_text(markdown: str) -> str:
             continue
         # HTML 表格：整块拆成「一行一格」的文本行。
         if line.startswith("<table"):
-            out.extend(_html_table_to_lines(line))
+            out.extend(html_table.table_to_lines(line))
             continue
         if line.startswith("|") and line.endswith("|"):
             cells = [cell.strip() for cell in line.strip("|").split("|")]
@@ -388,6 +365,10 @@ def _markdown_to_plain_text(markdown: str) -> str:
         if line:
             out.append(line)
     return "\n".join(out)
+
+
+#: 旧名保留：内部与测试都还在用。
+_markdown_to_plain_text = markdown_to_plain_text
 
 
 def _normalize_optional_payload(raw: Any) -> dict[str, Any]:
@@ -423,7 +404,7 @@ def _normalize_optional_payload(raw: Any) -> dict[str, Any]:
     return {}
 
 
-def ocr_pdf_to_texts(
+def ocr_pdf_to_markdown(
     pdf_path: str,
     *,
     job_url: str,
@@ -433,7 +414,13 @@ def ocr_pdf_to_texts(
     timeout_seconds: int = 600,
     poll_seconds: float = 5.0,
 ) -> list[str]:
-    """提交本地 PDF、轮询任务并下载 JSONL 页面文本。"""
+    """提交本地 PDF、轮询任务并下载 JSONL，返回**每页的 markdown 原文**。
+
+    **为什么单独暴露 markdown 原文**：对账单解析要的是**表格的结构**
+    （HTML 表格），把它摊平成文字行就丢了格边界 —— 空格子（「序号」那一列
+    常常是空的）一丢，列数与表头对不上，下游只能靠猜。发票那边只要文字，
+    用 :func:`ocr_pdf_to_texts` 就够。
+    """
     if not job_url or not token:
         raise OcrApiError("未配置 OCR API URL 或 token")
     if requests is None:
@@ -498,6 +485,33 @@ def ocr_pdf_to_texts(
         time.sleep(max(0.2, poll_seconds))
 
     raise OcrApiError(f"OCR 任务超过 {timeout_seconds} 秒仍未完成")
+
+
+def ocr_pdf_to_texts(
+    pdf_path: str,
+    *,
+    job_url: str,
+    token: str,
+    model: str,
+    optional_payload: dict[str, Any],
+    timeout_seconds: int = 600,
+    poll_seconds: float = 5.0,
+) -> list[str]:
+    """提交本地 PDF、轮询任务并下载 JSONL 页面**文本**。
+
+    markdown 原文那一层是 :func:`ocr_pdf_to_markdown`；这一层把它摊平成
+    纯文字（发票解析要的是文字，对账单要的是表格结构）。
+    """
+    pages = ocr_pdf_to_markdown(
+        pdf_path,
+        job_url=job_url,
+        token=token,
+        model=model,
+        optional_payload=optional_payload,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+    )
+    return [markdown_to_plain_text(page) for page in pages]
 
 
 def optional_payload_from_env(raw: str) -> dict[str, Any]:

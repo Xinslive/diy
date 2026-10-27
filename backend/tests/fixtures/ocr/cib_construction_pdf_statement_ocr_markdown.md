@@ -1,0 +1,16 @@
+## 交易明细对账单
+
+打印日期:2026-10-06 本期时间范围:2026-09-01 00:00:00 至 2026-09-30 23:59:59
+
+活期账号：15*****62 币种：人民币
+
+户名：丁物业管理有限公司 开户行：兴业银行泉州泉秀支行
+
+期末账户余额：9777291.00
+
+
+<table border=1 style='margin: auto; word-wrap: break-word;'><tr><td style='text-align: center; word-wrap: break-word;'>交易时间</td><td style='text-align: center; word-wrap: break-word;'>摘要</td><td style='text-align: center; word-wrap: break-word;'>凭证代号</td><td style='text-align: center; word-wrap: break-word;'>支出</td><td style='text-align: center; word-wrap: break-word;'>收入</td><td style='text-align: center; word-wrap: break-word;'>收支方向</td><td style='text-align: center; word-wrap: break-word;'>账户余额</td><td style='text-align: center; word-wrap: break-word;'>对方账号</td><td style='text-align: center; word-wrap: break-word;'>对方户名</td></tr><tr><td style='text-align: center; word-wrap: break-word;'>2026-09-22 09:04:19</td><td style='text-align: center; word-wrap: break-word;'>汇款汇入</td><td style='text-align: center; word-wrap: break-word;'></td><td style='text-align: center; word-wrap: break-word;'>0.00</td><td style='text-align: center; word-wrap: break-word;'>750000.00</td><td style='text-align: center; word-wrap: break-word;'>收入</td><td style='text-align: center; word-wrap: break-word;'>9777291.00</td><td style='text-align: center; word-wrap: break-word;'>59********0100 甲贸易有限公司</td><td style='text-align: center; word-wrap: break-word;'></td></tr><tr><td style='text-align: center; word-wrap: break-word;'>2026-09-21 01:47:42</td><td style='text-align: center; word-wrap: break-word;'>存款利息</td><td style='text-align: center; word-wrap: break-word;'></td><td style='text-align: center; word-wrap: break-word;'>0.00</td><td style='text-align: center; word-wrap: break-word;'>1172.00</td><td style='text-align: center; word-wrap: break-word;'>收入</td><td style='text-align: center; word-wrap: break-word;'>9027291.00</td><td style='text-align: center; word-wrap: break-word;'>15********88*88</td><td style='text-align: center; word-wrap: break-word;'>乙实业有限公司</td></tr><tr><td style='text-align: center; word-wrap: break-word;'>2026-09-14 17:28:13</td><td style='text-align: center; word-wrap: break-word;'>财税库行-税费/社保</td><td style='text-align: center; word-wrap: break-word;'></td><td style='text-align: center; word-wrap: break-word;'>70932.00</td><td style='text-align: center; word-wrap: break-word;'>0.00</td><td style='text-align: center; word-wrap: break-word;'>支出</td><td style='text-align: center; word-wrap: break-word;'>9026119.00</td><td style='text-align: center; word-wrap: break-word;'>15********128*28</td><td style='text-align: center; word-wrap: break-word;'>丙供应链有限公司</td></tr><tr><td style='text-align: center; word-wrap: break-word;'>2026-09-12 14:55:06</td><td style='text-align: center; word-wrap: break-word;'>财税库行-税费/社保</td><td style='text-align: center; word-wrap: break-word;'></td><td style='text-align: center; word-wrap: break-word;'>149843.00</td><td style='text-align: center; word-wrap: break-word;'>0.00</td><td style='text-align: center; word-wrap: break-word;'>支出</td><td style='text-align: center; word-wrap: break-word;'>9097051.00</td><td style='text-align: center; word-wrap: break-word;'>15********128*28</td><td style='text-align: center; word-wrap: break-word;'>丙供应链有限公司</td></tr></table>
+
+本期总收入金额：751172.00
+
+本期总支出金额：220775.00

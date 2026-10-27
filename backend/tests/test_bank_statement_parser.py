@@ -28,11 +28,50 @@ import pytest
 from app.bankstatement import formats, semantics
 
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "statements"
+OCR_FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "ocr"
 GOLDENS = json.loads((FIXTURES / "goldens.json").read_text(encoding="utf-8"))
 
 
 def _data(name: str) -> bytes:
     return (FIXTURES / name).read_bytes()
+
+
+def _parse(name: str) -> semantics.ParsedStatement:
+    """按**生产的口径**解析一份样例。
+
+    **为什么不直接调 ``semantics.parse_statement``**：PDF 文字层在 Linux 上
+    **读不全** —— pdfium 算出来的 CID 字形框高度退化成 0（ARCHITECTURE
+    §11.20 有实测数据），纯中文的对象整行取不到字，**单字对象**（光大那份
+    的「借/贷」）更是整个不进文字层，于是方向认不出来。
+
+    生产上走的是「**两路解析 + 严格自检**」：文字层自检不过就问一次 OCR。
+    测试要验的是**生产那条路**，所以这里同样接上 OCR 兜底 —— 否则这条用例
+    只是在验证「pdfium 在某个平台上的脾气」。
+
+    OCR 那一路用**真实 OCR 输出**当夹具（``fixtures/ocr/``，是 2026-10-27
+    用生产那套配置跑出来的），不是现场调外部服务 —— CI 里没有那个服务，
+    也不该有。
+
+    **没有 OCR 夹具的样例**（Excel 那些）走文字层那一路 —— 它们的解析不依赖
+    pdfium 的字形框，跨平台一致。
+    """
+    from unittest.mock import patch
+
+    from app.bankstatement import service
+
+    data = _data(name)
+    fixture = OCR_FIXTURES / f"{pathlib.Path(name).stem}_statement_ocr_markdown.md"
+    if not fixture.exists():
+        return semantics.parse_statement(data)
+
+    # 走**生产那条**转换链（OCR markdown → 网格），不是测试自己拼一遍：
+    # 拼出来的链与生产不是同一条，就等于没测生产那条。
+    grid = service._grid_from_ocr_markdown(
+        [fixture.read_text(encoding="utf-8")])
+    assert grid is not None, f"{name} 的 OCR 夹具没解析出网格"
+
+    with patch.object(service, "_ocr_grid", return_value=grid):
+        return service._parse_pdf(None, data)
 
 
 # ----------------------------------------------------------------------
@@ -90,7 +129,7 @@ def test_表头行不是写死的第一行(name):
     十几行。所以判据是「扫全表，找到认出的字段最多的那一行」，
     而不是「取第 0 行」或「取第 5 行」。
     """
-    parsed = semantics.parse_statement(_data(name))
+    parsed = _parse(name)
     assert parsed.header_row > 0, (
         f"{name} 的表头被当成第一行了 —— 那说明表头定位写死了位置")
     # 表头行本身必须真的像表头：认得出列名。
@@ -107,7 +146,7 @@ def test_表头之前的元信息被抽走():
     抽不出来的话，「本户是谁」（判方向要用）与「期末余额多少」
     （余额核对要用）就都没了。
     """
-    parsed = semantics.parse_statement(_data("ccb.xls"))
+    parsed = _parse("ccb.xls")
     assert parsed.meta.account_no or parsed.meta.account_name, (
         "表头上面的元信息没抽出来")
     assert parsed.meta.period_start is not None
@@ -132,7 +171,7 @@ def test_双行表头能合并():
 # ----------------------------------------------------------------------
 
 def test_建行_记账日与交易日期分开_业务日期取交易日期():
-    parsed = semantics.parse_statement(_data("ccb.xls"))
+    parsed = _parse("ccb.xls")
     mapping = parsed.column_mapping
     assert mapping["DATE"] != mapping["POSTING_DATE"], (
         "建行同时给记账日与交易日期，两列必须分开认")
@@ -147,9 +186,9 @@ def date_of(text: str):
 
 def test_方向列与收入支出列_不能互相顶替():
     """兴业那份 PDF 给的是「借/贷」方向列；农商给的是收入/支出两列。"""
-    cib = semantics.parse_statement(_data("cib_pdf.pdf"))
+    cib = _parse("cib_pdf.pdf")
     assert "DIRECTION" in cib.column_mapping
-    nongshang = semantics.parse_statement(_data("nongshang_xlsx.xlsx"))
+    nongshang = _parse("nongshang_xlsx.xlsx")
     assert "IN" in nongshang.column_mapping
     assert "OUT" in nongshang.column_mapping
 
@@ -159,13 +198,13 @@ def test_摘要与用途分得开():
 
     流水科目规则能按这两列分别配规则，所以认错列会让规则全部失灵。
     """
-    parsed = semantics.parse_statement(_data("nongshang_xlsx.xlsx"))
+    parsed = _parse("nongshang_xlsx.xlsx")
     mapping = parsed.column_mapping
     assert "SUMMARY" in mapping or "PURPOSE" in mapping
 
 
 def test_对方账号与对方户名分得开():
-    parsed = semantics.parse_statement(_data("ccb.xls"))
+    parsed = _parse("ccb.xls")
     mapping = parsed.column_mapping
     assert "CP_ACCOUNT" in mapping and "CP_NAME" in mapping
     assert mapping["CP_ACCOUNT"] != mapping["CP_NAME"]
@@ -181,7 +220,7 @@ def test_收入支出两列_按大于零判而不是按有没有值():
     看「非空」会把 0.00 当成一笔收入 —— 于是每一行都同时有收入和支出，
     全表变成「方向未知」。
     """
-    parsed = semantics.parse_statement(_data("nongshang_xlsx.xlsx"))
+    parsed = _parse("nongshang_xlsx.xlsx")
     known = [row for row in parsed.rows if row.direction != "UNKNOWN"]
     assert known, "一份 31 行的农商对账单不该一行方向都认不出"
     for row in known:
@@ -193,7 +232,7 @@ def test_方向列_借是支出贷是收入():
 
     银行账上「贷方发生额」= 余额增加 = 收钱；会计上银行存款增加记借方。
     """
-    parsed = semantics.parse_statement(_data("cib_pdf.pdf"))
+    parsed = _parse("cib_pdf.pdf")
     for row in parsed.rows:
         if row.direction == "IN":
             assert row.amount and row.amount > 0
@@ -305,7 +344,7 @@ def test_Excel序列号也认():
 
 def test_自检_文件自称的笔数与金额对得上():
     """农商那份文件自己写着「收入 N 笔」，解析出来必须一样。"""
-    parsed = semantics.parse_statement(_data("nongshang_base.xls"))
+    parsed = _parse("nongshang_base.xls")
     meta = parsed.meta
     if meta.declared_income_count is not None:
         actual = sum(1 for row in parsed.rows if row.direction == "IN")
@@ -347,7 +386,7 @@ def test_文件自报的总笔数与解析行数一致():
     文件说 4 笔，解析出 3 笔，那就是漏了一行。
     """
     for name in ("cib_pdf.pdf", "cib_construction_pdf.pdf"):
-        parsed = semantics.parse_statement(_data(name))
+        parsed = _parse(name)
         assert parsed.meta.declared_total_count == len(parsed.rows), name
         assert parsed.diagnosis == [], name
 
@@ -373,7 +412,7 @@ def test_少一行时总笔数对不上要报出来():
 
 
 def test_PDF解析出行数与金额():
-    parsed = semantics.parse_statement(_data("cib_pdf.pdf"))
+    parsed = _parse("cib_pdf.pdf")
     assert parsed.container == "PDF"
     assert len(parsed.rows) == GOLDENS["cib_pdf.pdf"]["row_count"]
     assert str(parsed.income_total) == GOLDENS["cib_pdf.pdf"]["income_total"]
@@ -385,7 +424,7 @@ def test_PDF里折行的长户名被合并():
     不合并的话对方户名就只剩半截 —— 而流水科目规则正是按户名配的，
     折断的户名永远匹配不上。
     """
-    parsed = semantics.parse_statement(_data("ceb_corp_pdf.pdf"))
+    parsed = _parse("ceb_corp_pdf.pdf")
     names = [row.counterparty_name for row in parsed.rows]
     assert any(len(name) >= 6 for name in names), names
     assert not any(name.endswith("（") or name.endswith("(") for name in names)
@@ -398,7 +437,7 @@ def test_PDF里折行的长户名被合并():
 @pytest.mark.parametrize("name", sorted(GOLDENS))
 def test_每份样例都与金标准一致(name):
     golden = GOLDENS[name]
-    parsed = semantics.parse_statement(_data(name))
+    parsed = _parse(name)
     assert parsed.container == golden["container"], name
     assert parsed.header_row == golden["header_row"], name
     assert len(parsed.rows) == golden["row_count"], name
@@ -424,7 +463,7 @@ def test_每份样例都与金标准一致(name):
 @pytest.mark.parametrize("name", sorted(GOLDENS))
 def test_首末行与金标准一致(name):
     golden = GOLDENS[name]
-    parsed = semantics.parse_statement(_data(name))
+    parsed = _parse(name)
     if not parsed.rows:
         pytest.skip(f"{name} 没有流水行")
     first = golden.get("first")

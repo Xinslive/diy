@@ -18,8 +18,10 @@
 """
 from __future__ import annotations
 
+import copy
 import logging
 import os
+import re
 import tempfile
 from datetime import date, timedelta
 from decimal import Decimal
@@ -166,6 +168,42 @@ def _opening_balance(parsed: semantics.ParsedStatement) -> Optional[Decimal]:
     return closing - parsed.income_total + parsed.expense_total
 
 
+def _ocr_note(parsed: semantics.ParsedStatement) -> str:
+    """OCR 参与过这一份解析吗 —— 参与过就要在界面上说出来。
+
+    **为什么必须说**：OCR 是**识别**（会认错字），而文字层是精确取字；
+    更要紧的是，OCR 这一路把**文件正文送出了本机**（交给外部 OCR 服务）。
+    这两件事用户有权知道。
+
+    **两种说法**：整份都是 OCR 认的（``via_ocr``），与两路合并、
+    其中一半是 OCR 补的（``via_merge``）—— 后者更要说清楚，
+    因为金额是精确取来的、方向是识别来的。
+    """
+    if parsed.via_merge:
+        return "这一份是文字层与 OCR 合并识别的"
+    if parsed.via_ocr:
+        return "这一份是用 OCR 识别的"
+    return ""
+
+
+def _parse_message(parsed: semantics.ParsedStatement) -> str:
+    """解析说明（界面上那段话）。
+
+    三件事都在这儿说清楚：**哪里对不上**（自检的诊断）、**OCR 有没有参与**
+    （正文出没出本机）、**两路认得有没有不一样**。
+    """
+    parts: list[str] = []
+    if parsed.diagnosis:
+        parts.append("；".join(parsed.diagnosis))
+    note = _ocr_note(parsed)
+    if note:
+        parts.append(note)
+    if parsed.merge_conflicts:
+        parts.append(
+            f"两路解析有 {len(parsed.merge_conflicts)} 处认得不一样，已按自检结果取舍")
+    return "；".join(parts)
+
+
 def _diagnosis_of(parsed: semantics.ParsedStatement) -> dict[str, Any]:
     return {
         "container": parsed.container,
@@ -174,6 +212,7 @@ def _diagnosis_of(parsed: semantics.ParsedStatement) -> dict[str, Any]:
         "header_cells": parsed.header_cells,
         "column_mapping": parsed.column_mapping,
         "notes": list(parsed.diagnosis),
+        "merge_conflicts": list(parsed.merge_conflicts),
         "grid_preview": parsed.grid_preview,
         "fingerprint": parsed.fingerprint,
         "meta": {
@@ -205,20 +244,19 @@ def _ocr_grid(db: Session, data: bytes) -> Optional[Any]:
     扫描件对账单在没有人来读的时候，是没法变成流水行的。
     """
     from app.core.system_settings import ocr_config
-    from app.invoice.ocr_client import (OcrApiError, ocr_pdf_to_texts,
+    from app.invoice.ocr_client import (OcrApiError, ocr_pdf_to_markdown,
                                         optional_payload_from_env)
 
     config = ocr_config(db)
     if not (config.get("api_url") and config.get("token")):
         return None
-    from app.bankstatement import pdf_table
 
     handle = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     try:
         handle.write(data)
         handle.close()
         try:
-            pages = ocr_pdf_to_texts(
+            pages = ocr_pdf_to_markdown(
                 handle.name,
                 job_url=config["api_url"],
                 token=config["token"],
@@ -236,11 +274,52 @@ def _ocr_grid(db: Session, data: bytes) -> Optional[Any]:
             os.unlink(handle.name)
         except OSError:
             pass
+
+    return _grid_from_ocr_markdown(pages)
+
+
+def _grid_from_ocr_markdown(pages: list[str]) -> Optional[Any]:
+    """OCR 给回来的 markdown（按页）→ 网格。
+
+    **表格优先**：OCR 认出的是 HTML 表格，**格边界要原样保留** ——
+    摊平成空格分隔的文字行会丢掉空格子（「序号」那一列常常是空的），
+    列数于是与表头对不上，下游只能靠猜（实测光大那份的金额被猜成了
+    「1.00」—— 序号那一列的值）。
+
+    抽成独立函数是为了让**测试走同一条转换链** —— 测试自己拼一遍的链
+    与生产不是同一条，就等于没测生产那条。
+    """
+    from app.bankstatement import pdf_table
+    from app.invoice.ocr_client import markdown_html_tables, markdown_to_plain_text
+
+    tables: list[str] = []
+    meta_lines: list[str] = []
+    footer_lines: list[str] = []
+    for page in pages:
+        text = str(page or "")
+        found = markdown_html_tables(text)
+        if not found:
+            continue
+        tables.extend(found)
+        before, _sep, after = text.partition(found[0])
+        meta_lines.extend(_plain_lines(markdown_to_plain_text(before)))
+        footer_lines.extend(_plain_lines(markdown_to_plain_text(after)))
+    if tables:
+        grid = pdf_table.grid_from_html_tables(
+            tables, meta_lines=meta_lines, footer_lines=footer_lines)
+        if grid is not None:
+            return grid
+
     lines = [line for page in pages for line in str(page or "").splitlines()
              if line.strip()]
     if not lines:
         return None
     return pdf_table.grid_from_text_lines(lines)
+
+
+def _plain_lines(text: str) -> list[str]:
+    """一段文字 → 去掉空行的文本行。"""
+    return [line.strip() for line in str(text or "").splitlines() if line.strip()]
 
 
 def _pdf_grid(db: Session, data: bytes) -> Any:
@@ -279,6 +358,219 @@ def _ocr_parse(db: Session, data: bytes) -> Optional[semantics.ParsedStatement]:
     return parsed
 
 
+#: 合并时逐行比对的字段。
+#:
+#: 方向、金额、余额、对方账号这四个**能自校验**（方向是 IN/OUT、金额与
+#: 账号是数字串）—— 认错了当场能看出来。对方户名、摘要、用途是**自由
+#: 文本**，没法自校验，所以从 OCR 补它们时要额外设一道闸：见
+#: :data:`_FREE_TEXT_FIELDS`。
+_MERGE_FIELDS = (
+    "direction", "amount", "balance",
+    "counterparty_account", "counterparty_name", "summary", "purpose",
+)
+
+#: 自由文本字段：从 OCR 补值时，**纯数字**的一律不收。
+#:
+#: **为什么**：OCR 认歪列时，错位的那一格通常是**数字**（金额、余额、
+#: 账号）。光大那份实测就多识别出一个空格子，金额列整体右移一位 ——
+#: 「对方名称」那一栏落进来的是一串余额数字。自由文本没法自校验，
+#: 于是只能按形态拒掉最可疑的那一类。
+_FREE_TEXT_FIELDS = ("counterparty_name", "summary", "purpose")
+
+#: 纯数字（含千分位、小数点、负号、空格）。
+_NUMERIC_ONLY = re.compile(r"^[\d.,\s\-]+$")
+
+#: 字段的中文名（诊断里要给人看）。
+_FIELD_LABELS = {
+    "direction": "收支方向",
+    "amount": "金额",
+    "balance": "余额",
+    "counterparty_account": "对方账号",
+    "counterparty_name": "对方户名",
+    "summary": "摘要",
+    "purpose": "用途",
+}
+
+#: meta 里参与合并的字段（文件自己报出来的那些）。
+_META_FIELDS = (
+    "account_no", "account_name", "bank_name", "currency",
+    "period_start", "period_end", "closing_balance",
+    "declared_income_count", "declared_income_total",
+    "declared_expense_count", "declared_expense_total",
+    "declared_total_count",
+)
+
+
+def _field_value(row: semantics.StatementRow, field: str) -> Any:
+    """一个字段的「有效值」—— 没有值时返回 ``None``。
+
+    方向认不出时是 ``"UNKNOWN"``，那**不算**有值。
+    """
+    value = getattr(row, field)
+    if field == "direction":
+        return value if value not in (None, "", "UNKNOWN") else None
+    if field in ("amount", "balance"):
+        return value if value is not None else None
+    text = str(value or "").strip()
+    return text or None
+
+
+def _meta_value(meta: semantics.StatementMeta, field: str) -> Any:
+    value = getattr(meta, field)
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+def _merge_parsed(base: semantics.ParsedStatement,
+                  other: semantics.ParsedStatement
+                  ) -> tuple[semantics.ParsedStatement, bool]:
+    """两路解析**逐行合并**：每行从「有那个字段」的那一路取值。
+
+    **什么时候需要**：Linux 上文字层会**丢单字对象**（光大那份的「借/贷」
+    是两个单字，pdfium 整个不进文字层），于是方向认不出；而 OCR 那一路把
+    金额列认歪了（多识别出一个空格子，金额列整体右移一位），于是金额
+    认不出。**两边各有一半**，合起来才是一行完整的流水。
+
+    **对齐要求**：行数相同、**日期序列相同**。对不上就**不合并** —— 合并错
+    行比缺一个方向更糟（那是把甲流水的金额记到乙头上）。
+
+    **谁说了算：自检。** 合并有两种口径 ——「文字层优先」（精确取字，
+    但 Linux 上可能被截断）与「OCR 优先」（识别，但可能把列认歪）。
+    两种各建一份，**各自跑一遍自检，谁的诊断更少谁赢**（一样多时取
+    文字层优先）。
+
+    裁判当得起这个位子：自检拿的是**文件自己报的数字**（笔数、收支
+    合计），那是外部的、不受我们影响的基准。实测：光大那份的 OCR 金额列
+    整体错位一位，于是「OCR 优先」那份合并结果的合计与文件自称的对不上，
+    而「文字层优先」那份分毫不差 —— 裁判选中的正是对的那一个。
+
+    **返回值**：``(结果, 有没有真的合并)``。合并了才需要重跑自检。
+    """
+    if len(base.rows) != len(other.rows) or not base.rows:
+        return base, False
+    base_dates = [str(row.tx_date) for row in base.rows]
+    other_dates = [str(row.tx_date) for row in other.rows]
+    if base_dates != other_dates:
+        return base, False
+
+    best: Optional[tuple[int, semantics.ParsedStatement, bool]] = None
+    for prefer_ocr in (False, True):
+        candidate = copy.deepcopy(base)
+        counterpart = copy.deepcopy(other)
+        changed = _apply_merge(candidate, counterpart, prefer_ocr=prefer_ocr)
+        semantics.self_check(candidate)
+        # 只数**自检**的结论：解析期的结论（表头认不出）两份一样，
+        # 拿来比较没有意义。
+        score = candidate.check_notes_count
+        if best is None or score < best[0]:
+            best = (score, candidate, changed)
+    assert best is not None
+    return best[1], best[2]
+
+
+def _apply_merge(base: semantics.ParsedStatement,
+                 other: semantics.ParsedStatement,
+                 *, prefer_ocr: bool) -> bool:
+    """把另一路的值并进 ``base``（**原地改**）。返回「有没有真的补上东西」。
+
+    ``prefer_ocr`` 决定同一字段上**谁优先**：``False`` = 文字层优先，
+    ``True`` = OCR 优先。优先的那一路没有值时，另一路补上。
+
+    **两路认得不一样时记一笔**：不是静默地挑一个 —— 差异要能被人看见
+    （:attr:`ParsedStatement.merge_conflicts`）。但**不因此判这份解析不可信**：
+    哪一份对，由自检说了算（见 :func:`_merge_parsed`）。
+    """
+    if base.via_ocr:
+        text, ocr = other, base
+    else:
+        text, ocr = base, other
+    primary, secondary = (ocr, text) if prefer_ocr else (text, ocr)
+
+    conflicts: list[str] = []
+    changed = False
+    for index in range(len(base.rows)):
+        primary_row = primary.rows[index]
+        secondary_row = secondary.rows[index]
+        target = base.rows[index]
+        for field in _MERGE_FIELDS:
+            tvalue = _field_value(text.rows[index], field)
+            ovalue = _field_value(ocr.rows[index], field)
+            if tvalue is not None and ovalue is not None and tvalue != ovalue:
+                conflicts.append(
+                    f"第 {index + 1} 行的{_FIELD_LABELS[field]}两路认得不一样"
+                    f"（文字层 {tvalue}、OCR {ovalue}）")
+            pvalue = _field_value(primary_row, field)
+            svalue = _field_value(secondary_row, field)
+            chosen = pvalue if pvalue is not None else svalue
+            if chosen is None:
+                continue
+            # 自由文本字段**不收纯数字**：OCR 认歪列时，错位的那一格通常
+            # 是数字（金额、余额、账号）。光大那份实测：对方名称那一栏
+            # 落进来的是一串余额数字。
+            from_ocr = chosen == ovalue and tvalue != ovalue
+            if (from_ocr and field in _FREE_TEXT_FIELDS
+                    and _NUMERIC_ONLY.match(str(chosen))):
+                fallback = tvalue if tvalue is not None else None
+                if fallback is None:
+                    conflicts.append(
+                        f"第 {index + 1} 行的{_FIELD_LABELS[field]}只在一路里有，"
+                        f"而它是「{chosen}」——像串错列的数字，已略过")
+                    continue
+                chosen = fallback
+                from_ocr = False
+            if _field_value(target, field) != chosen:
+                changed = True
+            setattr(target, field, chosen)
+            if field == "direction" and from_ocr:
+                # 方向是从 OCR 认出来的 —— 依据要跟着换，否则界面上写的
+                # 依据是文字层那一份（那一路根本没认出方向）。
+                target.extra["direction_basis"] = "OCR 识别"
+
+        # 行上的**问题清单**要跟着合并结果走：方向补齐了，「方向未知」这条
+        # 就不能留着 —— 它会让这一行被标成「先定方向」，既不能制证也不能
+        # 跟发票匹配（:_store_rows 就是按它判的）。
+        target.problems = [problem for problem in target.problems
+                           if problem not in ("方向未知", "没有金额", "金额为 0")]
+        if target.amount is None:
+            target.problems.append("没有金额")
+        elif target.amount <= 0:
+            target.problems.append("金额为 0")
+        if target.direction == "UNKNOWN":
+            target.problems.append("方向未知")
+
+        # extra 里的零散字段（交易类型、记账日…）也互补：文字层的优先。
+        for key, value in (ocr.rows[index].extra or {}).items():
+            if key == "direction_basis":
+                continue
+            if not (target.extra or {}).get(key) and value:
+                target.extra[key] = value
+                changed = True
+
+    # meta 也合并：文件自己报的数字是**判据**（自检拿它跟解析结果对账），
+    # 缺了它，自检就少了一条能发现漏行的通路。
+    merged_meta = semantics.StatementMeta()
+    for field in _META_FIELDS:
+        tvalue = _meta_value(text.meta, field)
+        ovalue = _meta_value(ocr.meta, field)
+        if tvalue is not None:
+            setattr(merged_meta, field, tvalue)
+            if ovalue is not None and ovalue != tvalue:
+                conflicts.append(
+                    f"文件自报的「{field}」两路认得不一样"
+                    f"（文字层 {tvalue}、OCR {ovalue}）")
+        elif ovalue is not None:
+            setattr(merged_meta, field, ovalue)
+            changed = True
+    base.meta = merged_meta
+
+    base.merge_conflicts = conflicts
+    if changed:
+        base.via_merge = True
+    return changed
+
 def _parse_pdf(db: Session, data: bytes) -> semantics.ParsedStatement:
     """解析一份 PDF 对账单 —— **两路解析 + 严格自检**。
 
@@ -298,13 +590,14 @@ def _parse_pdf(db: Session, data: bytes) -> semantics.ParsedStatement:
     **严格自检。** 一份解析结果「可信」的判据是**它自己的诊断为空**：文件
     自称的笔数与收支合计对得上、没有认不出方向的行、余额接得上、至少解析出
     一行。诊断非空 = 某处对不上，**这时候不采信它**，换另一路；两路都不干净，
-    就把诊断带出去（台账状态是「部分解析」，而制证那一关本来就会把认不出的
-    行挡下来，不会让它变成凭证）。
+    就取**更完整**的那一份（字段齐全优先），并把诊断带出去（台账状态是
+    「部分解析」，而制证那一关本来就会把认不出的行挡下来，不会让它变成凭证）。
     """
     from app.bankstatement import pdf_table
 
     text_parsed: Optional[semantics.ParsedStatement] = None
-    if pdf_table.has_text_layer(data):
+    has_text_layer = pdf_table.has_text_layer(data)
+    if has_text_layer:
         try:
             text_parsed = semantics.parse_statement(data)
         except ValueError:
@@ -318,19 +611,53 @@ def _parse_pdf(db: Session, data: bytes) -> semantics.ParsedStatement:
         # OCR 这一路自检全过 —— 比不过它就别用文字层那份。
         return ocr_parsed
 
-    # 两路都不干净（或只有一路）：取**问题更少**的那一份，并把诊断带出去。
+    # 两路都不干净（或只有一路）：取**更完整**的那一份，再逐行合并。
     if text_parsed is not None and ocr_parsed is not None:
-        return text_parsed if len(text_parsed.diagnosis) <= len(ocr_parsed.diagnosis) \
+        base = text_parsed if _completeness(text_parsed) >= _completeness(ocr_parsed) \
             else ocr_parsed
+        other = ocr_parsed if base is text_parsed else text_parsed
+        merged, changed = _merge_parsed(base, other)
+        if changed:
+            # 合并补上的字段可能让自检的结论变了样（方向补齐了，
+            # 「有 N 行认不出收支方向」这条就该消失）—— **重跑一遍自检**。
+            #
+            # 这一步曾经是**空转**的：合并是原地改 ``base`` 并把它返回，
+            # 于是「合并过没有」永远判不出来，自检从来没重跑过 ——
+            # 诊断里一直挂着一条已经不成立的抱怨。
+            semantics.self_check(merged)
+        return merged
     if text_parsed is not None:
         return text_parsed
     if ocr_parsed is not None:
         return ocr_parsed
 
+    # 报错要说清**卡在哪一步**：是压根没有文字层（扫描件），还是文字层
+    # 在但表头认不出来 —— 这两件事用户要做的下一步不一样。
+    reason = "文字层认不出表头" if has_text_layer else "没有文本层"
     raise ValueError(
-        "这份 PDF 解析不出来：文字层认不出表头，OCR 兜底也没成功"
+        f"这份 PDF 解析不出来：{reason}，OCR 兜底也没成功"
         "（系统没有配置 OCR 服务，或 OCR 服务没认出表头）。"
         "可以把对账单导出成 Excel 再上传。")
+
+
+def _completeness(parsed: semantics.ParsedStatement) -> int:
+    """一份解析结果「有多完整」—— 用来在两路之间取舍。
+
+    **字段齐全的行最值钱**（金额与方向都有，用户确认一下就能用）；
+    其次是只有金额的（方向可以人工指定，比金额容易填）；
+    再次是只有方向的；什么都没有的行最没用。
+    """
+    score = 0
+    for row in parsed.rows:
+        has_amount = row.amount is not None
+        has_direction = row.direction != "UNKNOWN"
+        if has_amount and has_direction:
+            score += 4
+        elif has_amount:
+            score += 2
+        elif has_direction:
+            score += 1
+    return score
 
 
 def _parse_with_profile(db: Session, book_id: int, data: bytes,
@@ -456,8 +783,7 @@ def upload_statement(db: Session, book_id: int, user: SysUser, filename: str,
         expense_total=parsed.expense_total,
         row_count=len(parsed.rows),
         parse_status=(PARSE_PARTIAL if parsed.diagnosis else PARSE_OK),
-        parse_message=("；".join(parsed.diagnosis)
-                       + ("（这一份是用 OCR 识别的）" if parsed.via_ocr else "")),
+        parse_message=_parse_message(parsed),
         diagnosis=_diagnosis_of(parsed),
         uploaded_by=getattr(user, "username", "") or "",
     )
@@ -579,7 +905,7 @@ def reparse_statement(db: Session, book_id: int, statement_id: int, *,
     statement.expense_total = parsed.expense_total
     statement.row_count = len(parsed.rows)
     statement.parse_status = (PARSE_PARTIAL if parsed.diagnosis else PARSE_OK)
-    statement.parse_message = "；".join(parsed.diagnosis)
+    statement.parse_message = _parse_message(parsed)
     statement.diagnosis = _diagnosis_of(parsed)
     rules = list_rules(db, book_id)
     _store_rows(db, statement, parsed, rules)

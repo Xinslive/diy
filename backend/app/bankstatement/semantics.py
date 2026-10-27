@@ -97,6 +97,26 @@ class ParsedStatement:
     #: 取字），而这份文件的正文**离开过本机**（交给外部 OCR 服务）。这两件事
     #: 用户有权知道。
     via_ocr: bool = False
+    #: 这一份是**两路合并**出来的（文字层 + OCR 各认出一半，缺的那半
+    #: 从另一路补上）。界面上同样要说出来：合并就意味着 OCR 参与了，
+    #: 正文离开过本机。
+    via_merge: bool = False
+    #: 两路解析**认得不一样**的地方（哪一行、哪个字段、两路各是什么）。
+    #:
+    #: 这不是「解析失败」—— 哪一份对由自检裁定（见
+    #: :func:`app.bankstatement.service._merge_parsed`），但差异要**能被人
+    #: 看见**：一份文件两路读出来不一样，本身就是值得知道的事。
+    merge_conflicts: list[str] = field(default_factory=list)
+    #: 自检结论在 ``diagnosis`` 里的**位置**。诊断分两段：前面是**解析期**
+    #: 的结论（表头认不出、有 N 行没日期），后面是**自检**的结论（自称
+    #: 笔数对不上、方向认不出、余额接不上）。
+    #:
+    #: 记这个位置是为了**重跑自检时只换自己那一段** —— 合并补上字段之后
+    #: 自检的结论会变样（方向补齐了，「有 N 行认不出收支方向」就该消失），
+    #: 而解析期的结论（表头认不出）与别人追加的诊断不能被顺手清掉。
+    check_notes_start: int = 0
+    #: 上一轮自检产生了几条结论（重跑时据此精确地摘掉那一段）。
+    check_notes_count: int = 0
 
     @property
     def income_total(self) -> Decimal:
@@ -773,38 +793,75 @@ def fingerprint_of(container: str, header_cells: list[str]) -> str:
 # 自检
 # ----------------------------------------------------------------------
 
+def self_check(result: ParsedStatement) -> None:
+    """自检的**公开入口**。
+
+    **什么时候要重跑**：两路解析（文字层 + OCR）的结果合并之后 ——
+    补上的字段可能让诊断变了样（方向补齐了，「有 N 行认不出收支方向」
+    这条就该消失；合计补齐了，「文件自称收入合计 X，解析出 0」也该消失）。
+
+    **重跑是安全的**：自检只换 ``diagnosis`` 里**自己那一段**
+    （见 :attr:`ParsedStatement.check_notes_start`），解析期的结论与别人
+    追加的诊断都原样保留。
+    """
+    _self_check(result)
+
+
 def _self_check(result: ParsedStatement) -> None:
-    """跟文件自己报的总笔数、总金额对一遍。
+    """自检：把结论记进诊断的**自检段**。
+
+    **为什么要分段**：自检是「拿解析结果跟文件自己报的数字对一遍」，
+    而解析结果**会变**（两路合并会补上字段）。结论一变，诊断就得跟着变，
+    否则界面上会一直挂着一条已经不成立的抱怨（「有 2 行认不出收支方向」
+    —— 而方向早就补齐了）。所以自检必须**可重跑**，而且重跑时只能动
+    自己那几条，不能把解析期的结论（「表头认不出」）一起清掉。
+    """
+    # 先把上一轮自检的结论摘掉（别人在自检之后追加的诊断原样保留）。
+    end = min(result.check_notes_start + result.check_notes_count,
+              len(result.diagnosis))
+    extra = result.diagnosis[end:]
+    result.diagnosis = result.diagnosis[:result.check_notes_start] + extra
+    result.check_notes_start = len(result.diagnosis)
+    result.check_notes_count = 0
+
+    notes = _check_notes(result)
+    result.diagnosis.extend(notes)
+    result.check_notes_count = len(notes)
+
+
+def _check_notes(result: ParsedStatement) -> list[str]:
+    """跟文件自己报的总笔数、总金额对一遍 —— 结论清单。
 
     对不上**不拦下解析** —— 漏一行比多一行更难查，但它必须被说出来：
     页面上的「解析诊断」会写「文件自称 24 笔，解析出 22 笔」。
     """
+    notes: list[str] = []
     meta = result.meta
     income_count = sum(1 for row in result.rows if row.direction == "IN")
     expense_count = sum(1 for row in result.rows if row.direction == "OUT")
     unknown_count = sum(1 for row in result.rows if row.direction == "UNKNOWN")
 
     if meta.declared_income_count is not None and meta.declared_income_count != income_count:
-        result.diagnosis.append(
+        notes.append(
             f"文件自称收入 {meta.declared_income_count} 笔，解析出 {income_count} 笔")
     if meta.declared_expense_count is not None and meta.declared_expense_count != expense_count:
-        result.diagnosis.append(
+        notes.append(
             f"文件自称支出 {meta.declared_expense_count} 笔，解析出 {expense_count} 笔")
     if meta.declared_income_total is not None and meta.declared_income_total != result.income_total:
-        result.diagnosis.append(
+        notes.append(
             f"文件自称收入合计 {meta.declared_income_total}，解析出 {result.income_total}")
     if meta.declared_expense_total is not None and meta.declared_expense_total != result.expense_total:
-        result.diagnosis.append(
+        notes.append(
             f"文件自称支出合计 {meta.declared_expense_total}，解析出 {result.expense_total}")
     if meta.declared_total_count is not None:
         # 文件只给总笔数时（兴业那种模板），拿它跟解析出的总行数对，
         # 差几笔就是漏了几行 —— 这正是「余额对不上」最常见的原因。
         total = income_count + expense_count
         if meta.declared_total_count != total:
-            result.diagnosis.append(
+            notes.append(
                 f"文件自称共 {meta.declared_total_count} 笔，解析出 {total} 笔")
     if unknown_count:
-        result.diagnosis.append(f"有 {unknown_count} 行认不出收支方向，需要人工指定")
+        notes.append(f"有 {unknown_count} 行认不出收支方向，需要人工指定")
 
     # 余额连续性：上一行余额 ± 本行金额 = 本行余额
     broken = 0
@@ -831,7 +888,8 @@ def _self_check(result: ParsedStatement) -> None:
                 broken += 1
         previous = row
     if broken:
-        result.diagnosis.append(f"有 {broken} 行的余额接不上前一行（可能漏了行或方向认错）")
+        notes.append(f"有 {broken} 行的余额接不上前一行（可能漏了行或方向认错）")
 
     if not result.rows:
-        result.diagnosis.append("没有解析出任何流水行")
+        notes.append("没有解析出任何流水行")
+    return notes

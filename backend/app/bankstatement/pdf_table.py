@@ -33,6 +33,7 @@ from typing import Any
 
 from app.bankstatement.aliases import match_field
 from app.bankstatement.grid import Grid
+from app.core import html_table
 
 #: 一段文字算「像一个日期」的判据：整段里**只有一个**日期样式。
 _DATE_PATTERN = re.compile(r"\d{8}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}")
@@ -89,6 +90,39 @@ class _Run:
 _TEXT_PAD = 0.25
 
 
+#: 文字对象矩形的**高度**低于这个值就算退化。
+_MIN_RUN_HEIGHT = 1.0
+
+
+def _restore_run_height(obj, bottom: float, top: float) -> tuple[float, float]:
+    """高度退化成 0 的文字对象 → 按字体大小把矩形**向上**撑开。
+
+    **为什么要有这一步。** 取字那一步已经被 ``_TEXT_PAD`` 修好了（字取得到），
+    但**行分组**还要靠竖直方向的重叠 —— 高度为 0 的矩形与同一条线上的其它
+    文字**重叠率为 0**，于是它们各自成行，表头那一行被拆成 9 个「行」，
+    表头认不出来（表头得分 1 < 2），第一层直接放弃。
+
+    **为什么向上撑开而不是向下**：PDF 的 y 轴朝上，而 Linux 上退化出来的那个
+    y 值就是**基线**（字形的下沿）—— 与 macOS 上同一个对象的矩形下沿对得上
+    （实测 610.8 对 609.91）。所以矩形应当从基线往上长。
+
+    **高度为什么取字体大小**：``get_font_size()`` 由**文本矩阵**算出来，
+    与字形轮廓无关，**跨平台一致**（Linux 与 macOS 上都返回 8.0）。
+    字形轮廓恰恰是 Linux 上算不出来的那一样。
+
+    macOS 上这段是**空操作** —— 那些矩形的高度本来就是正常的（实测 7.5~7.6）。
+    """
+    if top - bottom >= _MIN_RUN_HEIGHT:
+        return bottom, top
+    try:
+        size = float(obj.get_font_size())
+    except Exception:  # noqa: BLE001 —— 取不到字号就保持原样
+        size = 0.0
+    if size <= 0:
+        return bottom, top
+    return bottom, bottom + size
+
+
 def _extract_runs(page) -> tuple[list[_Run], Any]:
     """一页上的所有文字对象，外加这一页的 textpage。"""
     import pypdfium2 as pdfium
@@ -102,13 +136,14 @@ def _extract_runs(page) -> tuple[list[_Run], Any]:
             left, bottom, right, top = obj.get_bounds()
         except Exception:  # noqa: BLE001
             continue
-        if right - left <= 0 and top - bottom <= 0:
-            continue
         # 宽度退化到 1pt 以下的文字块是**不可见的残留**：PDF 里的表单域
         # 名字（``elect_sign``）与换行标记都长这样。留着它，账户余额那一格
         # 会变成「elect_sign90,272.91」，金额当场解析不出来。
         if (right - left) < 1.0:
             continue
+        if right - left <= 0 and top - bottom <= 0:
+            continue
+        bottom, top = _restore_run_height(obj, bottom, top)
         try:
             text = textpage.get_text_bounded(left - _TEXT_PAD, bottom - _TEXT_PAD,
                                              right + _TEXT_PAD, top + _TEXT_PAD)
@@ -610,6 +645,76 @@ def extract_grid_from_text(data: bytes) -> Grid | None:
     if not lines:
         return None
     return grid_from_text_lines(lines)
+
+
+def html_table_to_rows(table_html: str) -> list[list[str]]:
+    """一段 HTML 表格 → 行（每行是这一行各格的文本，**空格子也占位**）。
+
+    **为什么要保留空格子**：对账单里「序号」「凭证号」这类列经常是空的。
+    把格子摊平成空格分隔的文字行之后，token 数就与表头对不上，下游只能
+    掉进「按内容猜列」那一档 —— 实测光大那份的金额被猜成了「1.00」
+    （序号那一列的值）。**格边界必须原样保留**。
+
+    实现放在 :mod:`app.core.html_table`（发票那边也要拆表格，两边共用一份）。
+    """
+    return html_table.table_to_rows(table_html)
+
+
+def grid_from_html_table(table_html: str, *, meta_lines: list[str] | None = None,
+                         footer_lines: list[str] | None = None) -> Grid | None:
+    """OCR 给回来的 HTML 表格 → 网格。
+
+    **什么时候用它**：文字层读不全的时候（Linux 上 pdfium 的单字对象整个
+    不进文字层，方向列的「借/贷」认不出来）。OCR 看的是渲染出来的图像，
+    表格是**认得出结构**的，于是这里直接按格子建网格。
+
+    第一行是表头，其余是数据行 —— 与坐标那一层的网格形状一致。
+    """
+    rows = html_table_to_rows(table_html)
+    if len(rows) < 2:
+        return None
+    width = len(rows[0])
+    if width < 2:
+        return None
+    # 列数不齐的行要**补齐或截断**：少一格的行会让下游按位置取列时错位。
+    fixed: list[list[str]] = []
+    for row in rows:
+        if len(row) < width:
+            row = row + [""] * (width - len(row))
+        fixed.append(row[:width])
+    return Grid(container="PDF", sheet="PDF", rows=fixed,
+                meta=list(meta_lines or []), footer=list(footer_lines or []))
+
+
+def grid_from_html_tables(tables: list[str], *, meta_lines: list[str] | None = None,
+                          footer_lines: list[str] | None = None) -> Grid | None:
+    """多张表（多页）→ 一张网格。
+
+    **第一张表的表头是网格的表头**，之后各页的表头行**跳过**（同一张表
+    在每页上重复印了一遍），数据行依次接上 —— 与坐标那一层「多页拼一张
+    网格」的形状一致。
+    """
+    rows: list[list[str]] = []
+    width = 0
+    for table_html in tables:
+        table_rows = html_table_to_rows(table_html)
+        if not table_rows:
+            continue
+        if not rows:
+            width = len(table_rows[0])
+            rows.append(table_rows[0])
+            body = table_rows[1:]
+        else:
+            # 后面的页：表头行跳过（列数与第一页一致时才跳，否则当成数据行）
+            body = table_rows[1:] if len(table_rows[0]) == width else table_rows
+        for row in body:
+            if len(row) < width:
+                row = row + [""] * (width - len(row))
+            rows.append(row[:width])
+    if len(rows) < 2 or width < 2:
+        return None
+    return Grid(container="PDF", sheet="PDF", rows=rows,
+                meta=list(meta_lines or []), footer=list(footer_lines or []))
 
 
 def grid_from_text_lines(lines: list[str]) -> Grid | None:
