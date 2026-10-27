@@ -64,6 +64,21 @@ t('规则页签的提示里指路到兜底科目', () => {
   assert.match(rules, /兜底科目/)
 })
 
+t('规则列表把 BOTH 显示成中文', () => {
+  assert.match(VIEW, /BOTH:\s*'进项和销项'/)
+})
+
+t('结算科目优先显示服务端计算出的实际科目', () => {
+  assert.match(VIEW, /function settlementSubjectFor\(row\)/)
+  assert.match(VIEW, /resolution\.entries\?\.find\(\(item\) => item\.direction === direction\)/)
+})
+
+t('发票类型、税额科目、结算科目与操作按钮保持一行', () => {
+  assert.match(VIEW, /class="detail-toolbar-form"/)
+  assert.match(VIEW, /flex-wrap: nowrap/)
+  assert.match(VIEW, /overflow-x: auto/)
+})
+
 console.log('== 按项目列支：摘要就是发票的项目名 ==')
 
 t('明细表的「发票项目」列显示 display_name', () => {

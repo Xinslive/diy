@@ -342,9 +342,9 @@
                   那就不摆。摆一排按了没反应的控件，用户只会以为系统坏了。
                 -->
                 <div v-if="!isCommitted(row)" class="detail-toolbar">
-                  <el-form inline size="small">
+                  <el-form inline size="small" class="detail-toolbar-form">
                     <el-form-item label="发票类型">
-                      <el-select :model-value="invoiceTypeFor(row)" :disabled="!store.canWrite" style="width: 120px" @update:model-value="(v) => setInvoiceType(row, v)">
+                      <el-select :model-value="invoiceTypeFor(row)" :disabled="!store.canWrite" style="width: 74px" @update:model-value="(v) => setInvoiceType(row, v)">
                         <el-option label="进项" value="INPUT" /><el-option label="销项" value="OUTPUT" />
                       </el-select>
                     </el-form-item>
@@ -357,7 +357,7 @@
                         「科目下拉数 × 科目表行数」个组件一次性堆出来，
                         就是这个页面卡成这样的原因。
                       -->
-                      <el-select :model-value="taxSubjectFor(row)" :disabled="!store.canWrite" filterable :persistent="false" style="width: 210px" @update:model-value="(v) => setTaxSubject(row, v)">
+                      <el-select :model-value="taxSubjectFor(row)" :disabled="!store.canWrite" filterable :persistent="false" style="width: 128px" @update:model-value="(v) => setTaxSubject(row, v)">
                         <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                       </el-select>
                     </el-form-item>
@@ -365,7 +365,7 @@
                       <span class="muted">不单列，并入第一条明细行</span>
                     </el-form-item>
                     <el-form-item label="结算科目">
-                      <el-select :model-value="settlementSubjectFor(row)" :disabled="!store.canWrite" filterable :persistent="false" style="width: 210px" @update:model-value="(v) => setSettlementSubject(row, v)">
+                      <el-select :model-value="settlementSubjectFor(row)" :disabled="!store.canWrite" filterable :persistent="false" style="width: 142px" @update:model-value="(v) => setSettlementSubject(row, v)">
                         <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                       </el-select>
                       <!--
@@ -590,7 +590,7 @@ const statementHint = computed(() => {
   if (!statementCount.value) return '未加载对账单，结算科目取自动制证配置里的科目'
   return `已加载 ${statementCount.value} 份对账单，点「重新计算预览」按金额与收支方向重新匹配结算科目`
 })
-const invoiceTypeText = (v) => ({ INPUT: '进项', OUTPUT: '销项', UNKNOWN: '未判断' }[v] || v || '未判断')
+const invoiceTypeText = (v) => ({ INPUT: '进项', OUTPUT: '销项', BOTH: '进项和销项', UNKNOWN: '未判断' }[v] || v || '未判断')
 const invoiceStatusText = (v) => ({ READY: '可生成', REJECTED: '有问题', COMMITTED: '已生成', IGNORED: '已忽略', DISCARDED: '已作废' }[v] || v)
 const invoiceType = (v) => ({ READY: 'success', REJECTED: 'danger', COMMITTED: 'success', IGNORED: 'info', DISCARDED: 'info' }[v] || 'warning')
 const itemKey = (file, index) => `${file.name}|${file.size}|${file.lastModified || index}`
@@ -692,7 +692,16 @@ function taxSubjectFor(row) {
 }
 function settlementSubjectFor(row) {
   const input = invoiceTypeFor(row) === 'INPUT'
-  return overrides[row.id]?.settlement_subject_id || (input ? config.input_credit_subject_id : config.output_debit_subject_id)
+  const manual = overrides[row.id]?.settlement_subject_id
+  if (manual) return manual
+  const resolution = row.resolution
+  const effectiveType = invoiceTypeFor(row)
+  if (resolution && (!resolution.invoice_type || resolution.invoice_type === effectiveType)) {
+    const direction = input ? 'CREDIT' : 'DEBIT'
+    const entry = resolution.entries?.find((item) => item.direction === direction)
+    if (entry?.subject_id) return entry.subject_id
+  }
+  return input ? config.input_credit_subject_id : config.output_debit_subject_id
 }
 function setInvoiceType(row, value) { ensureOverride(row).invoice_type = value }
 function setTaxSubject(row, value) { ensureOverride(row).tax_subject_id = value }
@@ -909,8 +918,11 @@ onMounted(loadAll)
 .mb { margin-bottom: 12px; }
 .rule-help { margin-bottom: 12px; }
 .invoice-detail { padding: 2px 10px 12px 44px; }
-.detail-toolbar { padding: 4px 0 8px; border-bottom: 1px solid #edf0f4; }
-.detail-toolbar :deep(.el-form-item) { margin-bottom: 5px; }
+.detail-toolbar { overflow-x: auto; padding: 4px 0 8px; border-bottom: 1px solid #edf0f4; }
+.detail-toolbar :deep(.detail-toolbar-form) { display: flex; flex-wrap: nowrap; align-items: center; width: max-content; min-width: 100%; gap: 4px; }
+.detail-toolbar :deep(.el-form-item) { flex: 0 0 auto; margin: 0; }
+.detail-toolbar :deep(.el-form-item__label) { width: 52px; padding-right: 4px; white-space: nowrap; }
+.detail-toolbar :deep(.el-form-item__content) { display: flex; min-width: 0; align-items: center; gap: 4px; }
 /* 去掉「这张」那个标签之后，按钮组自己站到这一行的最右边 —— 它是这一张
    发票的操作，不是跟「发票类型 / 税额 / 结算科目」并列的一项。 */
 .detail-toolbar :deep(.el-form-item.row-actions) { margin-left: auto; margin-right: 0; }
@@ -937,7 +949,7 @@ onMounted(loadAll)
   .result-actions { width: 100%; flex-wrap: wrap; }
   .invoice-detail { padding-left: 8px; }
 }
-.settlement-badge { margin-left: 8px; }
+.settlement-badge { margin-left: 0; }
 .settlement-note {
   display: flex;
   align-items: center;

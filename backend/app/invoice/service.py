@@ -964,7 +964,8 @@ def _output_entries(
         "summary": summary,
     }]
     # 净额抵成 0 的明细行不成行（``_net_items``）—— 0 金额的分录不让存。
-    for item in _net_items(items):
+    credited_items = _net_items(items)
+    for item in credited_items:
         entries.append({
             "subject_id": item["subject_id"],
             "direction": "CREDIT",
@@ -972,11 +973,18 @@ def _output_entries(
             "summary": item["summary"],
         })
     if tax:
+        # 销项税额也是贷方分录，摘要沿用这张发票的项目名，不重复写发票号。
+        # 多项目税额是一笔汇总，按出现顺序列出不重复的项目名。
+        tax_summary = "、".join(dict.fromkeys(
+            str(item.get("summary") or "").strip()
+            for item in credited_items
+            if str(item.get("summary") or "").strip()
+        )) or summary
         entries.append({
             "subject_id": tax_subject_id,
             "direction": "CREDIT",
             "amount": _decimal_string(tax),
-            "summary": summary + "（销项税额）",
+            "summary": tax_summary,
         })
     return entries
 

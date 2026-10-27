@@ -91,8 +91,10 @@ def test_销项的净零项也不产生分录():
         summary="发票 XX",
     )
     assert all(_d(e["amount"]) != 0 for e in entries)
+    # 销项税额的摘要**沿用这张发票的项目名**（不重复写发票号）：
+    # 税额是一笔汇总，摘要里列出这张票上的项目，看凭证就知道这笔钱是什么。
     assert [e["summary"] for e in entries if e["direction"] == "CREDIT"] == [
-        "咨询服务", "培训服务", "发票 XX（销项税额）"]
+        "咨询服务", "培训服务", "咨询服务、培训服务"]
     assert _balances(entries)
 
 

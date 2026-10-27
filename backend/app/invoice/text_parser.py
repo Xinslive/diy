@@ -491,25 +491,46 @@ def extract_meta(text: str) -> InvoiceMeta:
     if len(ids) >= 2:
         meta.seller_tax_id = ids[1]
 
-    # 公司名：用 tax_id 在文本中的位置反推 —— buyer_tax_id 之前的最近真公司名；两者之间的真公司名为 seller
-    # 按 cleaned（未归一化、去发票号）顺序扫所有"像公司名"的行，前两个对应 buyer/seller
-    candidates: list[str] = []
+    # 公司名称要和税号对应，不能直接取全文最前面两个「像公司名」的行。
+    # 不动产发票会在买卖方信息之前印「不动产经营租赁服务」；「经营」也会
+    # 命中公司名特征，旧逻辑于是把项目类别当购方，后面的真实买卖方整体错位。
+    candidates: list[tuple[int, str]] = []
+    tax_id_lines: list[tuple[str, int]] = []
     seen: set[str] = set()
-    for line in raw_no_invoice_no.split("\n"):
+    for line_index, line in enumerate(raw_no_invoice_no.split("\n")):
         # 汉字之间的空格是 PDF 排版产物（「福 建 省 泉 州紫欣工贸有限公司」），
         # 去掉它才是票面上印的那个名字。
         s = RE_CJK_GAP.sub("", line.strip())
-        if not s or s in seen:
-            continue
-        if _looks_like_company(s):
-            candidates.append(s)
+        if s and s not in seen and _looks_like_company(s):
+            candidates.append((line_index, s))
             seen.add(s)
+        compact = line
+        previous = None
+        while previous != compact:
+            previous = compact
+            compact = re.sub(r"([0-9A-Z])\s(?=[0-9A-Z])", r"\1", compact)
+        tax_id_lines.extend((tax_id, line_index) for tax_id in RE_TAX_ID.findall(compact))
+
+    # 文本层里公司名通常紧挨对应税号之前。按每个税号找最近的公司名，
+    # 而不是把税号前的票种/项目类别当成买方。找不到对应名称时留空，交给
+    # 规则未命中提示人工处理，不从远处猜一个可能错误的对方名称。
+    if ids and len(tax_id_lines) == len(ids):
+        def name_for_tax_id(tax_id: str) -> str:
+            line_index = next((index for value, index in tax_id_lines if value == tax_id), None)
+            if line_index is None:
+                return ""
+            return next((name for candidate_index, name in reversed(candidates)
+                         if candidate_index < line_index), "")
+
+        meta.buyer_name = name_for_tax_id(ids[0])
+        if len(ids) >= 2:
+            meta.seller_name = name_for_tax_id(ids[1])
+    else:
+        # 兼容税号被 PDF 拆到多行等无法定位行号的旧版式。
+        if len(candidates) >= 1:
+            meta.buyer_name = candidates[0][1]
         if len(candidates) >= 2:
-            break
-    if len(candidates) >= 1:
-        meta.buyer_name = candidates[0]
-    if len(candidates) >= 2:
-        meta.seller_name = candidates[1]
+            meta.seller_name = candidates[1][1]
 
     # 合计：**先按行取**「合 计」与「价税合计」那两行 —— 免税/不征税的票
     # 税额那一栏印的是星号，只有两个 ¥ 数字，靠「凑三个」是凑不出来的。

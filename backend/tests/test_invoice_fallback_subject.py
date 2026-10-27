@@ -45,7 +45,8 @@ def _config(db, book, subjects, **overrides):
 
 def _make_record(db, book, *, lines, invoice_type="INPUT", page_index=0,
                  invoice_no="24417000000099999999", total="106.00",
-                 base="100.00", tax="6.00", seller="某供应商有限公司"):
+                 base="100.00", tax="6.00", seller="某供应商有限公司",
+                 buyer="测试公司"):
     """造一张发票记录 —— 用来测「一张发票多个项目」这种夹具里没有的形状。"""
     batch = InvoiceBatch(book_id=book.id, filename="造出来的.pdf", file_path="",
                           status="PENDING", total=1, created_by="tester")
@@ -58,7 +59,7 @@ def _make_record(db, book, *, lines, invoice_type="INPUT", page_index=0,
             "meta": {
                 "invoice_no": invoice_no, "issue_date": "2026-10-01",
                 "seller_name": seller, "seller_tax_id": "91310000MA0000000X",
-                "buyer_name": "测试公司", "buyer_tax_id": BUYER_TAX_ID,
+                "buyer_name": buyer, "buyer_tax_id": BUYER_TAX_ID,
                 "total_excl_tax": base, "total_tax": tax, "total_incl_tax": total,
             },
             "lines": lines,
@@ -259,6 +260,34 @@ def test_结算行摘要还是发票号(db, book, subjects):
     previews, _, _ = service._build_preview(db, _batch, [], service.get_config(db, book.id), {})
     credit = next(e for e in previews[0]["resolution"]["entries"] if e["direction"] == "CREDIT")
     assert credit["summary"] == "发票 24417000000099999999"
+
+
+def test_销项按购方名称命中供应商客户规则(db, book, subjects, admin_user):
+    """销项的客户名称来自购方，匹配后贷方按项目名列支。"""
+    _config(db, book, subjects,
+            output_debit_subject_id=subjects["1002"].id,
+            output_tax_subject_id=subjects["22210106"].id)
+    service.create_rule(db, book.id, admin_user, {
+        "match_type": "SELLER", "invoice_type": "OUTPUT",
+        "keyword": "测试租户", "subject_id": subjects["5001"].id,
+        "priority": 0, "active": True,
+    })
+    batch, _record = _make_record(
+        db, book, invoice_type="OUTPUT", buyer="测试租户有限公司",
+        lines=[_line("*生产生活服务*房屋租赁", "100.00", "3.00")],
+        total="103.00", base="100.00", tax="3.00")
+
+    from app.models import InvoiceRule
+
+    previews, ready, errors = service._build_preview(
+        db, batch, db.query(InvoiceRule).all(), service.get_config(db, book.id), {})
+
+    assert errors == 0 and ready == 1, previews[0]["errors"]
+    resolution = previews[0]["resolution"]
+    assert resolution["counterparty"] == "测试租户有限公司"
+    revenue = next(e for e in resolution["entries"]
+                   if e["direction"] == "CREDIT" and e["subject_id"] == subjects["5001"].id)
+    assert revenue["summary"] == "*生产生活服务*房屋租赁"
 
 
 # --------------------------------------------------------------- 端到端：真 PDF

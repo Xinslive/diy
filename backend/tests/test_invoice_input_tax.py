@@ -198,7 +198,7 @@ def test_销项税额照旧单列贷方():
     assert len(tax_lines) == 1, "销项税额应当仍然单独一行"
     assert tax_lines[0]["direction"] == "CREDIT"
     assert tax_lines[0]["amount"] == "60.00"
-    assert tax_lines[0]["summary"].endswith("（销项税额）")
+    assert tax_lines[0]["summary"] == "服务费"
     assert _balances(entries)
 
 
@@ -215,6 +215,10 @@ def test_销项明细逐项列支且摘要用项目名():
     credits = [e for e in entries if e["direction"] == "CREDIT" and e["subject_id"] != 2221]
     assert [e["summary"] for e in credits] == ["咨询服务", "培训服务"]
     assert [e["amount"] for e in credits] == ["1000.00", "500.00"]
+    tax_line = next(e for e in entries if e["subject_id"] == 2221)
+    assert tax_line["summary"] == "咨询服务、培训服务"
+    assert "发票" not in tax_line["summary"]
+    assert "销项税额" not in tax_line["summary"]
     assert _balances(entries)
 
 
