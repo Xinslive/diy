@@ -312,6 +312,60 @@ class InvoiceIgnoreIn(BaseModel):
     overrides: dict[str, dict] = Field(default_factory=dict)
 
 
+# ---- 流水对账 ----
+class BankStatementRowPatchIn(BaseModel):
+    """改一行流水。
+
+    ``plan_subject_id`` 传 ``None`` 表示「清掉对方科目」——那会把这一行
+    退回「待确认」，而不是把它变成「已定」。
+    """
+
+    plan_subject_id: Optional[int] = None
+    status: Optional[Literal["OPEN", "IGNORED"]] = None
+
+
+class BankStatementRowDirectionIn(BaseModel):
+    """人工指定收支方向。``IN`` = 账户余额增加（收钱）。"""
+
+    direction: Literal["IN", "OUT"]
+
+
+class BankStatementReparseIn(BaseModel):
+    """重新解析一份对账单。
+
+    ``column_mapping`` 给了就是**按人工指定的列重跑**（自动映射失败时那条路）；
+    不给就是重读原件按最新规则自动重跑。
+    """
+
+    column_mapping: dict[str, int] = Field(default_factory=dict)
+    header_row: Optional[int] = None
+
+
+class BankStatementRuleIn(BaseModel):
+    """流水科目规则：某列里的关键词 → 对方科目。"""
+
+    match_field: Literal["SUMMARY", "PURPOSE", "CP_NAME"] = "SUMMARY"
+    keyword: str = Field(min_length=1, max_length=128)
+    subject_id: int
+    priority: int = Field(default=0, ge=-1000, le=1000)
+    active: bool = True
+
+
+class BankStatementRulePatch(BaseModel):
+    match_field: Optional[Literal["SUMMARY", "PURPOSE", "CP_NAME"]] = None
+    keyword: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    subject_id: Optional[int] = None
+    priority: Optional[int] = Field(default=None, ge=-1000, le=1000)
+    active: Optional[bool] = None
+
+
+class BankStatementProfileIn(BaseModel):
+    """记住一种对账单格式的列映射。"""
+
+    fingerprint: str = Field(min_length=1, max_length=64)
+    column_mapping: dict[str, int]
+
+
 # ---- 期间 ----
 class CarryForwardIn(BaseModel):
     """结转损益的入参。

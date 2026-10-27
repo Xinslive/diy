@@ -8,6 +8,12 @@ from app.models.report import ReportCell, ReportCol, ReportResult, ReportRow, Re
 from app.models.printing import PrintTemplate
 from app.models.importing import ImportBatch
 from app.models.invoice import InvoiceBatch, InvoiceConfig, InvoiceRecord, InvoiceRule
+from app.models.bankstatement import (DIRECTION_IN, DIRECTION_OUT,
+                                     DIRECTION_UNKNOWN, PLAN_MANUAL, PLAN_NONE,
+                                     PLAN_PENDING, PLAN_RULE, STATUS_IGNORED,
+                                     STATUS_OPEN, STATUS_POSTED, BankStatement,
+                                     BankStatementProfile, BankStatementRow,
+                                     BankStatementRule)
 from app.models.audit import AuditLog
 from app.models.mcp import McpToken
 from app.models.backup import (BackupRun, KEEP_DAYS, SCOPE_BOOK, SCOPE_SYSTEM, STATUS_FAILED,
@@ -29,6 +35,10 @@ __all__ = [
     "ReportTemplate", "ReportRow", "ReportCol", "ReportCell", "ReportResult",
     "PrintTemplate", "AuditLog", "ImportBatch", "McpToken",
     "InvoiceConfig", "InvoiceRule", "InvoiceBatch", "InvoiceRecord",
+    "BankStatement", "BankStatementRow", "BankStatementRule", "BankStatementProfile",
+    "DIRECTION_IN", "DIRECTION_OUT", "DIRECTION_UNKNOWN",
+    "STATUS_OPEN", "STATUS_POSTED", "STATUS_IGNORED",
+    "PLAN_NONE", "PLAN_RULE", "PLAN_MANUAL", "PLAN_PENDING",
     "BackupRun", "TIERS", "KEEP_DAYS",
     "TIER_DAILY", "TIER_WEEKLY", "TIER_MONTHLY",
     "STATUS_SUCCESS", "STATUS_FAILED", "SCOPE_BOOK", "SCOPE_SYSTEM",

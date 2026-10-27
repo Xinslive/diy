@@ -239,6 +239,12 @@
               <span v-if="onlyUnbooked" class="muted result-hint">{{ filterHint }}</span>
               <el-button :disabled="!store.canWrite" :loading="previewing" @click="recalculate">重新计算预览</el-button>
               <!--
+                已加载了几份对账单 —— 没有对账单时，发票的结算科目只能回落到
+                「自动制证配置」里那个；有对账单时，点一次「重新计算预览」
+                就会按「金额 + 收支方向」重新匹配。
+              -->
+              <span class="muted result-hint">{{ statementHint }}</span>
+              <!--
                 已生成过的批次不能作废：凭证已经在账上了，作废批次删记录、
                 删原件，却不会把那几张凭证撤下来 —— 账上留着、记录没了，
                 更难查。所以这里直接不让点。
@@ -362,6 +368,19 @@
                       <el-select :model-value="settlementSubjectFor(row)" :disabled="!store.canWrite" filterable :persistent="false" style="width: 210px" @update:model-value="(v) => setSettlementSubject(row, v)">
                         <el-option v-for="s in subjects" :key="s.id" :label="subjectLabel(s)" :value="s.id" />
                       </el-select>
+                      <!--
+                        结算科目**从哪来**：人工指定 / 对账单识别 / 配置科目。
+
+                        不标出来的话，用户看到科目被自动改过却不知道为什么 ——
+                        而这个科目决定的是钱记到哪个银行账户上，改错了要到
+                        对不上账时才发现。徽标把这件事摆到明面上。
+                      -->
+                      <el-tag
+                        v-if="settlementSource(row)"
+                        size="small"
+                        :type="settlementSourceType(row)"
+                        class="settlement-badge"
+                      >{{ settlementSourceText(row) }}</el-tag>
                     </el-form-item>
                     <!--
                       没有标签：原来那个「这张」是个从两栏布局里剩下的残骸 ——
@@ -383,6 +402,13 @@
                       >重新解析</el-button>
                     </el-form-item>
                   </el-form>
+                </div>
+                <!--
+                  结算科目的来源说明：命中了哪条流水、命中的是哪个账户，
+                  或者为什么没命中（多账户同额 / 没有对账单）。
+                -->
+                <div v-if="settlementNote(row)" class="settlement-note">
+                  <el-icon><InfoFilled /></el-icon>{{ settlementNote(row) }}
                 </div>
                 <div v-if="row.errors?.length" class="invoice-errors">
                   <div v-for="error in row.errors" :key="error">{{ error }}</div>
@@ -489,8 +515,9 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Check, FolderOpened, Plus, Refresh, Upload } from '@element-plus/icons-vue'
+import { Check, FolderOpened, InfoFilled, Plus, Refresh, Upload } from '@element-plus/icons-vue'
 import * as invoiceApi from '@/api/invoice'
+import * as statementApi from '@/api/bankstatement'
 import * as subjectApi from '@/api/subject'
 import {
   DEFAULT_UPLOAD_LIMITS, filesFromDataTransfer, humanBytes, isCommittedRow, isIgnoredRow, partitionFiles, skipNote,
@@ -531,10 +558,38 @@ const config = reactive({
   output_fallback_subject_id: null,
 })
 const overrides = reactive({})
+// 已加载的对账单份数 —— 页头要讲清楚「结算科目能不能自动认出来」，
+// 取决于有没有对账单可匹配。
+const statementCount = ref(0)
 const ruleVisible = ref(false)
 const ruleForm = reactive({ match_type: 'SELLER', invoice_type: 'BOTH', keyword: '', subject_id: null, priority: 0, active: true })
 
 const subjectLabel = (s) => `${s.code} ${s.name}`
+
+/**
+ * 结算科目的来源。
+ *
+ * 三种：MANUAL 人工指定 / STATEMENT 对账单识别 / CONFIG 自动制证配置。
+ * **界面上必须标出来** —— 结算科目决定钱记到哪个银行账户，
+ * 「这个科目为什么跟我配的不一样」是用户第一个会问的问题。
+ */
+const settlementSource = (row) => row?.resolution?.settlement_source || ''
+const settlementSourceText = (row) => ({
+  MANUAL: '人工指定',
+  STATEMENT: '对账单识别',
+  CONFIG: '配置科目',
+}[settlementSource(row)] || settlementSource(row))
+const settlementSourceType = (row) => ({
+  MANUAL: 'info',
+  STATEMENT: 'success',
+  CONFIG: 'warning',
+}[settlementSource(row)] || 'info')
+const settlementNote = (row) => row?.resolution?.settlement_note || ''
+
+const statementHint = computed(() => {
+  if (!statementCount.value) return '未加载对账单，结算科目取自动制证配置里的科目'
+  return `已加载 ${statementCount.value} 份对账单，点「重新计算预览」按金额与收支方向重新匹配结算科目`
+})
 const invoiceTypeText = (v) => ({ INPUT: '进项', OUTPUT: '销项', UNKNOWN: '未判断' }[v] || v || '未判断')
 const invoiceStatusText = (v) => ({ READY: '可生成', REJECTED: '有问题', COMMITTED: '已生成', IGNORED: '已忽略', DISCARDED: '已作废' }[v] || v)
 const invoiceType = (v) => ({ READY: 'success', REJECTED: 'danger', COMMITTED: 'success', IGNORED: 'info', DISCARDED: 'info' }[v] || 'warning')
@@ -678,14 +733,18 @@ function lineAmount(row, index) {
 
 async function loadAll() {
   if (!store.bookId) return
-  const [cfg, flat, ruleRows, batches, limits] = await Promise.all([
+  const [cfg, flat, ruleRows, batches, limits, statements] = await Promise.all([
     invoiceApi.getConfig(store.bookId),
     // **年度必带**：科目表每个年度各有一份（后端迁移 0032）
     subjectApi.subjectFlat(store.bookId, { year: store.currentYear }),
     invoiceApi.listRules(store.bookId),
-    invoiceApi.listBatches(store.bookId), invoiceApi.getLimits(store.bookId).catch(() => null)
+    invoiceApi.listBatches(store.bookId), invoiceApi.getLimits(store.bookId).catch(() => null),
+    // 已加载的对账单份数。**拉不到不算错** —— 没建过流水对账的账套拿不到
+    // 什么，页头上写一句「未加载对账单」就够了，不该弹一个红条。
+    statementApi.listStatements(store.bookId).catch(() => [])
   ])
   if (limits) uploadLimits.value = { maxFiles: limits.max_files, maxTotalBytes: limits.max_total_bytes }
+  statementCount.value = (statements || []).length
   Object.assign(config, cfg)
   subjects.value = flat
   rules.value = ruleRows
@@ -877,5 +936,14 @@ onMounted(loadAll)
   .section-head { align-items: flex-start; flex-direction: column; }
   .result-actions { width: 100%; flex-wrap: wrap; }
   .invoice-detail { padding-left: 8px; }
+}
+.settlement-badge { margin-left: 8px; }
+.settlement-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  padding: 2px 0 8px;
 }
 </style>

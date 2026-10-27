@@ -1,0 +1,529 @@
+{
+  "ccb.xls": {
+    "closing_balance": null,
+    "column_mapping": {
+      "BALANCE": 5,
+      "CP_ACCOUNT": 8,
+      "CP_NAME": 9,
+      "DATE": 1,
+      "EXTRA": 6,
+      "IN": 4,
+      "OUT": 3,
+      "POSTING_DATE": 0,
+      "SUMMARY": 7,
+      "TIME": 2
+    },
+    "container": "XLS",
+    "declared_expense_total": null,
+    "declared_income_total": null,
+    "declared_total_count": null,
+    "diagnosis": [],
+    "expense_total": "12829592.00",
+    "first": {
+      "amount": "104550.00",
+      "balance": "7965204.00",
+      "direction": "IN",
+      "tx_date": "2026-09-01"
+    },
+    "header_row": 4,
+    "income_total": "9747381.00",
+    "last": {
+      "amount": "20000.00",
+      "balance": "4778443.00",
+      "direction": "OUT",
+      "tx_date": "2026-09-30"
+    },
+    "period_end": "2026-09-30",
+    "period_start": "2026-09-01",
+    "row_count": 45
+  },
+  "ceb_corp_pdf.pdf": {
+    "closing_balance": null,
+    "column_mapping": {
+      "AMOUNT": 4,
+      "BALANCE": 5,
+      "CP_ACCOUNT": 6,
+      "CP_NAME": 7,
+      "DATE": 1,
+      "DIRECTION": 3,
+      "EXTRA": 0,
+      "SUMMARY": 9,
+      "TIME": 2
+    },
+    "container": "PDF",
+    "declared_expense_total": null,
+    "declared_income_total": "130500700.00",
+    "declared_total_count": null,
+    "diagnosis": [],
+    "expense_total": "0",
+    "first": {
+      "amount": "700.00",
+      "balance": "130500700.00",
+      "direction": "IN",
+      "tx_date": "2026-09-21"
+    },
+    "header_row": 0,
+    "income_total": "130500700.00",
+    "last": {
+      "amount": "130500000.00",
+      "balance": "130500000.00",
+      "direction": "IN",
+      "tx_date": "2026-09-17"
+    },
+    "period_end": "2026-09-21",
+    "period_start": "2026-09-17",
+    "row_count": 2
+  },
+  "ceb_personal.xls": {
+    "closing_balance": null,
+    "column_mapping": {
+      "BALANCE": 4,
+      "CP_ACCOUNT": 5,
+      "CP_NAME": 6,
+      "DATE": 0,
+      "IN": 3,
+      "OUT": 2,
+      "SUMMARY": 7,
+      "TIME": 1
+    },
+    "container": "XLS",
+    "declared_expense_total": "32524500.00",
+    "declared_income_total": "32521396.00",
+    "declared_total_count": null,
+    "diagnosis": [],
+    "expense_total": "32524500.00",
+    "first": {
+      "amount": "976500.00",
+      "balance": "2017206.00",
+      "direction": "IN",
+      "tx_date": "2026-09-01"
+    },
+    "header_row": 7,
+    "income_total": "32521396.00",
+    "last": {
+      "amount": "3300000.00",
+      "balance": "1037602.00",
+      "direction": "OUT",
+      "tx_date": "2026-09-30"
+    },
+    "period_end": "2026-09-30",
+    "period_start": "2026-09-01",
+    "row_count": 32
+  },
+  "ceb_personal2.xls": {
+    "closing_balance": null,
+    "column_mapping": {
+      "BALANCE": 4,
+      "CP_ACCOUNT": 5,
+      "CP_NAME": 6,
+      "DATE": 0,
+      "IN": 3,
+      "OUT": 2,
+      "SUMMARY": 7,
+      "TIME": 1
+    },
+    "container": "XLS",
+    "declared_expense_total": "500.00",
+    "declared_income_total": "7910521.00",
+    "declared_total_count": null,
+    "diagnosis": [],
+    "expense_total": "500.00",
+    "first": {
+      "amount": "500.00",
+      "balance": "500.00",
+      "direction": "IN",
+      "tx_date": "2026-09-02"
+    },
+    "header_row": 9,
+    "income_total": "7910521.00",
+    "last": {
+      "amount": "4900000.00",
+      "balance": "7910021.00",
+      "direction": "IN",
+      "tx_date": "2026-09-30"
+    },
+    "period_end": "2026-09-30",
+    "period_start": "2026-09-02",
+    "row_count": 6
+  },
+  "cib_construction_pdf.pdf": {
+    "closing_balance": "9777291.00",
+    "column_mapping": {
+      "BALANCE": 6,
+      "CP_ACCOUNT": 7,
+      "CP_NAME": 8,
+      "DATE": 0,
+      "DIRECTION": 5,
+      "EXTRA": 2,
+      "IN": 4,
+      "OUT": 3,
+      "SUMMARY": 1,
+      "TIME": 0
+    },
+    "container": "PDF",
+    "declared_expense_total": "220775.00",
+    "declared_income_total": "751172.00",
+    "declared_total_count": 4,
+    "diagnosis": [],
+    "expense_total": "220775.00",
+    "first": {
+      "amount": "750000.00",
+      "balance": "9777291.00",
+      "direction": "IN",
+      "tx_date": "2026-09-22"
+    },
+    "header_row": 0,
+    "income_total": "751172.00",
+    "last": {
+      "amount": "149843.00",
+      "balance": "9097051.00",
+      "direction": "OUT",
+      "tx_date": "2026-09-12"
+    },
+    "period_end": "2026-09-22",
+    "period_start": "2026-09-12",
+    "row_count": 4
+  },
+  "cib_pdf.pdf": {
+    "closing_balance": "77601210.00",
+    "column_mapping": {
+      "BALANCE": 6,
+      "CP_ACCOUNT": 7,
+      "CP_NAME": 8,
+      "DATE": 0,
+      "DIRECTION": 5,
+      "EXTRA": 2,
+      "IN": 4,
+      "OUT": 3,
+      "SUMMARY": 1,
+      "TIME": 0
+    },
+    "container": "PDF",
+    "declared_expense_total": "1568050.00",
+    "declared_income_total": "228000.00",
+    "declared_total_count": 4,
+    "diagnosis": [],
+    "expense_total": "1568050.00",
+    "first": {
+      "amount": "18050.00",
+      "balance": "76311160.00",
+      "direction": "OUT",
+      "tx_date": "2026-09-26"
+    },
+    "header_row": 0,
+    "income_total": "228000.00",
+    "last": {
+      "amount": "50000.00",
+      "balance": "77601210.00",
+      "direction": "OUT",
+      "tx_date": "2026-09-03"
+    },
+    "period_end": "2026-09-26",
+    "period_start": "2026-09-03",
+    "row_count": 4
+  },
+  "cmb_csv.xlsx": {
+    "closing_balance": null,
+    "column_mapping": {
+      "BALANCE": 4,
+      "DATE": 0,
+      "IN": 2,
+      "OUT": 3,
+      "SUMMARY": 6,
+      "TIME": 1,
+      "TX_TYPE": 5
+    },
+    "container": "CSV",
+    "declared_expense_total": null,
+    "declared_income_total": null,
+    "declared_total_count": null,
+    "diagnosis": [],
+    "expense_total": "0",
+    "first": {
+      "amount": "872100.00",
+      "balance": "42319711.00",
+      "direction": "IN",
+      "tx_date": "2026-09-28"
+    },
+    "header_row": 14,
+    "income_total": "41296541.00",
+    "last": {
+      "amount": "36000000.00",
+      "balance": "37023170.00",
+      "direction": "IN",
+      "tx_date": "2026-09-12"
+    },
+    "period_end": "2026-09-28",
+    "period_start": "2026-09-12",
+    "row_count": 5
+  },
+  "cmbc_xlsx.xlsx": {
+    "closing_balance": null,
+    "column_mapping": {
+      "BALANCE": 4,
+      "CP_ACCOUNT": 7,
+      "CP_NAME": 8,
+      "DATE": 0,
+      "EXTRA": 1,
+      "IN": 3,
+      "OUT": 2,
+      "PURPOSE": 6,
+      "TIME": 0
+    },
+    "container": "XLSX",
+    "declared_expense_total": "30010530.00",
+    "declared_income_total": "100007401.00",
+    "declared_total_count": null,
+    "diagnosis": [],
+    "expense_total": "30010530.00",
+    "first": {
+      "amount": "9780.00",
+      "balance": "5837537.00",
+      "direction": "OUT",
+      "tx_date": "2026-09-12"
+    },
+    "header_row": 17,
+    "income_total": "100007401.00",
+    "last": {
+      "amount": "7401.00",
+      "balance": "75844188.00",
+      "direction": "IN",
+      "tx_date": "2026-09-21"
+    },
+    "period_end": "2026-09-21",
+    "period_start": "2026-09-12",
+    "row_count": 5
+  },
+  "nongshang_base.xls": {
+    "closing_balance": null,
+    "column_mapping": {
+      "BALANCE": 8,
+      "CP_ACCOUNT": 5,
+      "CP_NAME": 6,
+      "DATE": 0,
+      "IN": 2,
+      "OUT": 3,
+      "PURPOSE": 10,
+      "SUMMARY": 9,
+      "TIME": 1,
+      "TX_TYPE": 4
+    },
+    "container": "XLS",
+    "declared_expense_total": null,
+    "declared_income_total": null,
+    "declared_total_count": null,
+    "diagnosis": [],
+    "expense_total": "9105327.00",
+    "first": {
+      "amount": "144000.00",
+      "balance": "72121214.00",
+      "direction": "IN",
+      "tx_date": "2026-09-01"
+    },
+    "header_row": 4,
+    "income_total": "10646728.00",
+    "last": {
+      "amount": "591800.00",
+      "balance": "73518615.00",
+      "direction": "OUT",
+      "tx_date": "2026-09-24"
+    },
+    "period_end": "2026-09-24",
+    "period_start": "2026-09-01",
+    "row_count": 24
+  },
+  "nongshang_html.xls": {
+    "closing_balance": null,
+    "column_mapping": {
+      "AMOUNT": 3,
+      "BALANCE": 4,
+      "CP_ACCOUNT": 5,
+      "CP_NAME": 6,
+      "DATE": 0,
+      "DIRECTION": 2,
+      "PURPOSE": 8,
+      "SUMMARY": 7,
+      "TX_TYPE": 1
+    },
+    "container": "HTML",
+    "declared_expense_total": null,
+    "declared_income_total": null,
+    "declared_total_count": null,
+    "diagnosis": [],
+    "expense_total": "0",
+    "first": {
+      "amount": "104100.00",
+      "balance": "17707136.00",
+      "direction": "IN",
+      "tx_date": "2026-09-01"
+    },
+    "header_row": 3,
+    "income_total": "4179321.00",
+    "last": {
+      "amount": "162100.00",
+      "balance": "21782357.00",
+      "direction": "IN",
+      "tx_date": "2026-09-30"
+    },
+    "period_end": "2026-09-30",
+    "period_start": "2026-09-01",
+    "row_count": 31
+  },
+  "nongshang_html2.xls": {
+    "closing_balance": null,
+    "column_mapping": {
+      "AMOUNT": 3,
+      "BALANCE": 4,
+      "CP_ACCOUNT": 5,
+      "CP_NAME": 6,
+      "DATE": 0,
+      "DIRECTION": 2,
+      "PURPOSE": 8,
+      "SUMMARY": 7,
+      "TX_TYPE": 1
+    },
+    "container": "HTML",
+    "declared_expense_total": null,
+    "declared_income_total": null,
+    "declared_total_count": null,
+    "diagnosis": [],
+    "expense_total": "3000200.00",
+    "first": {
+      "amount": "4900000.00",
+      "balance": "5203315.00",
+      "direction": "IN",
+      "tx_date": "2026-09-03"
+    },
+    "header_row": 5,
+    "income_total": "19501278.00",
+    "last": {
+      "amount": "3000000.00",
+      "balance": "16804393.00",
+      "direction": "OUT",
+      "tx_date": "2026-09-30"
+    },
+    "period_end": "2026-09-30",
+    "period_start": "2026-09-03",
+    "row_count": 7
+  },
+  "nongshang_xlsx.xlsx": {
+    "closing_balance": null,
+    "column_mapping": {
+      "BALANCE": 8,
+      "CP_ACCOUNT": 9,
+      "CP_NAME": 10,
+      "DATE": 2,
+      "EXTRA": 0,
+      "IN": 6,
+      "OUT": 7,
+      "PURPOSE": 13,
+      "SUMMARY": 12,
+      "TIME": 3,
+      "TX_TYPE": 5
+    },
+    "container": "XLSX",
+    "declared_expense_total": null,
+    "declared_income_total": null,
+    "declared_total_count": null,
+    "diagnosis": [],
+    "expense_total": "50182028.00",
+    "first": {
+      "amount": "456000.00",
+      "balance": "73125401.00",
+      "direction": "IN",
+      "tx_date": "2026-09-01"
+    },
+    "header_row": 7,
+    "income_total": "14852611.00",
+    "last": {
+      "amount": "240000.00",
+      "balance": "37339984.00",
+      "direction": "OUT",
+      "tx_date": "2026-09-24"
+    },
+    "period_end": "2026-09-24",
+    "period_start": "2026-09-01",
+    "row_count": 26
+  },
+  "nongshang_xlsx2.xlsx": {
+    "closing_balance": null,
+    "column_mapping": {
+      "BALANCE": 8,
+      "CP_ACCOUNT": 9,
+      "CP_NAME": 10,
+      "DATE": 2,
+      "EXTRA": 0,
+      "IN": 6,
+      "OUT": 7,
+      "PURPOSE": 13,
+      "SUMMARY": 12,
+      "TIME": 3,
+      "TX_TYPE": 5
+    },
+    "container": "XLSX",
+    "declared_expense_total": null,
+    "declared_income_total": null,
+    "declared_total_count": null,
+    "diagnosis": [],
+    "expense_total": "0",
+    "first": {
+      "amount": "366.00",
+      "balance": "599337.00",
+      "direction": "IN",
+      "tx_date": "2026-09-21"
+    },
+    "header_row": 7,
+    "income_total": "367.00",
+    "last": {
+      "amount": "1.00",
+      "balance": "599338.00",
+      "direction": "IN",
+      "tx_date": "2026-09-29"
+    },
+    "period_end": "2026-09-29",
+    "period_start": "2026-09-21",
+    "row_count": 2
+  },
+  "pingan.xls": {
+    "closing_balance": null,
+    "column_mapping": {
+      "AMOUNT": 6,
+      "BALANCE": 7,
+      "DATE": 0,
+      "EXTRA": 10,
+      "PAYEE_ACCOUNT": 4,
+      "PAYEE_NAME": 3,
+      "PAYER_ACCOUNT": 2,
+      "PAYER_NAME": 1,
+      "PURPOSE": 9,
+      "SUMMARY": 8,
+      "TIME": 0,
+      "TX_TYPE": 5
+    },
+    "container": "XLS",
+    "declared_expense_total": null,
+    "declared_income_total": null,
+    "declared_total_count": null,
+    "diagnosis": [
+      "有 3 行没有日期，未计入流水（例如：庚科技有限公司、辛餐饮管理有限公司、21875）"
+    ],
+    "expense_total": "184330.00",
+    "first": {
+      "amount": "110587.00",
+      "balance": "4948238.00",
+      "direction": "OUT",
+      "tx_date": "2026-09-30"
+    },
+    "header_row": 1,
+    "income_total": "2184711.00",
+    "last": {
+      "amount": "807408.00",
+      "balance": "3755265.00",
+      "direction": "IN",
+      "tx_date": "2026-09-02"
+    },
+    "period_end": "2026-09-30",
+    "period_start": "2026-09-02",
+    "row_count": 15
+  }
+}

@@ -431,6 +431,75 @@ def _decimal_string(value: Decimal) -> str:
     return format(value.quantize(Decimal("0.01")), "f")
 
 
+# ----------------------------------------------------------------------
+# 结算科目：对账单识别
+# ----------------------------------------------------------------------
+
+
+def _release_statement_claims(db: Session, batch: InvoiceBatch,
+                               record_rows: list[InvoiceRecord],
+                               only_ids: set[str] | None) -> None:
+    """重算预览之前，把「本批次里还没提交的发票」占用的流水放掉。
+
+    只重算一张（``only_ids``）时只放那一张的 —— 别的发票占着的流水不能动，
+    那是真的有主了。
+    """
+    from app.bankstatement import matching
+
+    targets = [
+        row for row in record_rows
+        if row.status != "COMMITTED"
+        and (only_ids is None or str(row.id) in only_ids)
+    ]
+    if not targets:
+        return
+    matching.release_claims(db, [row.id for row in targets])
+
+
+def _claim_statement_row(db: Session, row_id: int, record_id: int) -> None:
+    from app.bankstatement import matching
+
+    matching.claim(db, row_id, record_id)
+
+
+def _statement_settlement(db: Session, book_id: int, total: Decimal,
+                           invoice_type: str, claimed_rows: set[int]
+                           ) -> tuple[dict[str, Any] | None, str]:
+    """按「金额 + 收支方向」去对账单里找这条发票的结算账户。
+
+    返回 ``(命中的流水, 提示语)``。命中不了时提示语说明为什么 ——
+    「多账户同额」与「没命中」在界面上要显示成不同的两句话，因为用户
+    要做的动作不一样（一个要去指定账户，一个去确认钱还没到账）。
+
+    **命中不到就回落配置科目，绝不猜。** 猜出来的结算科目会让凭证上的
+    银行账户是错的，而那种错要等到对不上账时才发现。
+    """
+    from app.bankstatement import matching
+
+    direction = matching.direction_for_invoice(invoice_type)
+    if not direction or total == 0:
+        return None, ""
+    candidates = [
+        item for item in matching.candidates_for(db, book_id, total, direction)
+        if item["row_id"] not in claimed_rows
+    ]
+    if not candidates:
+        return None, ""
+    hit, hint = matching.pick(candidates)
+    if hit is None:
+        return None, hint
+    # 命中的那个科目必须是**本账套的末级启用科目** —— 对账单可以是别的
+    # 账套传进来的（跨账套共享一个网银账户的情况），那种科目不能拿来记账。
+    subject = db.get(Subject, hit["account_subject_id"])
+    if subject is None or subject.book_id != book_id:
+        return None, "命中的账户科目不属于本账套，需人工指定"
+    if not subject.is_leaf:
+        return None, "命中的账户科目不是末级科目，需人工指定"
+    if not subject.active:
+        return None, "命中的账户科目已停用，需人工指定"
+    return hit, ""
+
+
 def _build_preview(
     db: Session,
     batch: InvoiceBatch,
@@ -447,6 +516,15 @@ def _build_preview(
     改动一起存了）。
     """
     record_rows = sorted(batch.invoices, key=lambda row: row.page_index)
+    # **重算之前先放掉「本批次里还没提交的发票」占用的流水。**
+    #
+    # 用户在预览里把一张发票的金额改了之后，原来占着的那条流水应当重新
+    # 变成「没人用」—— 否则改完之后：那条流水永远显示「已被发票占用」，
+    # 而真正该占它的发票（金额改过的那张）反而匹配不上，回落到配置科目。
+    #
+    # **已提交的发票不放**：它们的凭证已经在账上，放掉会让同一条流水
+    # 再被一张新发票认领一次。
+    _release_statement_claims(db, batch, record_rows, only_ids)
     default_ids = [config.get(key) for key in CONFIG_SUBJECT_KEYS]
     subjects = _ensure_leaf_subjects(db, batch.book_id, default_ids, "发票默认科目")
     for rule in rules:
@@ -465,6 +543,9 @@ def _build_preview(
     previews: list[dict[str, Any]] = []
     ready = 0
     errors = 0
+    # 本次重算里**已经被占用的流水**。同一批次内一行流水只被一张发票占用，
+    # 后来的发票只能回落配置科目。
+    claimed_rows: set[int] = set()
     for record in record_rows:
         if only_ids is not None and str(record.id) not in only_ids:
             continue
@@ -568,9 +649,39 @@ def _build_preview(
             total = base + tax
         if total != base + tax:
             problems.append(f"金额校验不一致：不含税 {base} + 税额 {tax} != 价税合计 {total}")
-        settlement_subject_id = override.get("settlement_subject_id") or config.get(
-            "input_credit_subject_id" if invoice_type == "INPUT" else "output_debit_subject_id"
-        )
+        # **结算科目的取值序：人工指定 > 对账单识别 > 自动制证配置。**
+        #
+        # 为什么要有对账单这一层：发票上不写「从哪个账户付的钱」，
+        # 而对账单知道。用户在「流水对账」里把网银导出的对账单绑到
+        # 具体的 1002 子科目上之后，这张发票的结算科目就该自动跟过去，
+        # 不用每张发票手工选一次 —— 尤其是一笔发票对应一个专用账户时。
+        #
+        # 命中不唯一（多账户同额）或者压根没命中时，**一律回落配置科目**，
+        # 并在 ``settlement_source``/``settlement_note`` 里说清为什么 ——
+        # 绝不猜。
+        settlement_source = ""
+        settlement_note = ""
+        settlement_subject_id = override.get("settlement_subject_id")
+        if settlement_subject_id:
+            settlement_source = "MANUAL"
+        else:
+            matched, hint = _statement_settlement(
+                db, batch.book_id, total, invoice_type, claimed_rows)
+            if matched is not None:
+                settlement_subject_id = matched["account_subject_id"]
+                settlement_source = "STATEMENT"
+                settlement_note = (
+                    f"命中流水：{matched['filename']} 第 {matched['seq']} 行"
+                    f"（{matched['tx_date']}，{matched['account_subject_code']}"
+                    f" {matched['account_name']}）")
+                _claim_statement_row(db, matched["row_id"], record.id)
+                claimed_rows.add(matched["row_id"])
+            else:
+                settlement_subject_id = config.get(
+                    "input_credit_subject_id" if invoice_type == "INPUT"
+                    else "output_debit_subject_id")
+                settlement_source = "CONFIG"
+                settlement_note = hint
         # 只有销项需要税额科目。小微企业不做进项抵扣（用户约定），进项的税额
         # 直接计入成本费用，不落到任何应交税费明细科目上。
         tax_subject_id = None
@@ -714,6 +825,10 @@ def _build_preview(
             **(record.payload or {}),
             "resolution": {
                 "invoice_type": invoice_type,
+                # 结算科目**从哪来**：MANUAL 人工指定 / STATEMENT 对账单识别 /
+                # CONFIG 自动制证配置。界面上要给用户看这三个标签。
+                "settlement_source": settlement_source,
+                "settlement_note": settlement_note,
                 "line_resolution": line_resolution,
                 "counterparty": counterparty,
                 "base": _decimal_string(base),

@@ -974,6 +974,7 @@ def test_head_是本文件认识的那一版():
         "0038_entry_voucher_line_unique",      # entry 的 (voucher_id, line_no) 唯一约束 + 已记账凭证的分录禁写
         "0039_voucher_idempotency",            # 新建凭证的幂等占位表（§3.28，接在 0038 之后）
         "0040_retained_subject_setting",       # 未分配利润科目可手工设定：book_year.retained_subject_code
+        "0041_bank_statement",                 # 流水对账四张表：对账单 / 流水行 / 科目规则 / 格式画像
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")
@@ -1251,8 +1252,9 @@ def test_跨年账套_次年只有期初没有凭证_迁移照样跑得完(scrat
         ver = conn.execute(text(
             "select version_num from alembic_version")).scalar()
         # 版本号跟着**迁移链的最后一环**走：0038 是 entry 唯一约束，
-        # 0039 是凭证幂等占位表，0040 是未分配利润科目的手工设定列。
-        assert ver == "0040_retained_subject_setting", f"schema 只到 {ver}"
+        # 0039 是凭证幂等占位表，0040 是未分配利润科目的手工设定列，
+        # 0041 是流水对账的四张表。
+        assert ver == "0041_bank_statement", f"schema 只到 {ver}"
 
         # 科目表按年度拆开
         rows = conn.execute(text(

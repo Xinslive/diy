@@ -44,6 +44,8 @@ const routes = [
       { path: 'vouchers/organize', name: 'voucher-organize', component: () => import('@/views/voucher/VoucherOrganize.vue'), meta: { title: '整理凭证', requiresBook: true } },
       { path: 'vouchers/import', name: 'voucher-import', component: () => import('@/views/voucher/VoucherImport.vue'), meta: { title: '凭证导入', requiresBook: true } },
       { path: 'vouchers/invoices', name: 'invoice-import', component: () => import('@/views/voucher/InvoiceImport.vue'), meta: { title: '发票导入', requiresBook: true } },
+      // 流水对账：与「发票导入」**同级**的独立功能（不是发票导入的附属）。
+      { path: 'vouchers/reconciliation', name: 'flow-reconciliation', component: () => import('@/views/bank/FlowReconciliation.vue'), meta: { title: '流水对账', requiresBook: true } },
       { path: 'print-templates', name: 'print-templates', component: () => import('@/views/print/PrintTemplate.vue'), meta: { title: '打印模板', requiresBook: true } },
       { path: 'users', name: 'users', component: () => import('@/views/system/UserAdmin.vue'), meta: { title: '用户与授权', adminOnly: true } },
       // 个人资料：**不占侧栏**，入口在右上角的账号菜单里。

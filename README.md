@@ -57,7 +57,20 @@
 | 期初余额 | 手工录入，或用友 U8 / 畅捷通 `.xls` 导入 |
 | 报表模板 | 用友 UFO 5.10 / 8.00 的 `.rep` / `.rbk` 模板迁移 |
 | 发票 | PDF 批量上传 → 文本层提取（可选 OCR）→ 字段解析 → 生成凭证草稿 |
+| 银行对账单 | Excel / 网页版 / CSV / PDF 上传 → 流水行 → 一张流水一张凭证；命中流水的发票自动切到对应银行账户 |
 | 插件 | 插件自己的导入通道，走宿主统一的上传与审批流程 |
+
+### 流水对账
+
+- **是什么**：与「发票导入」**同级**的独立功能（侧栏：填制凭证 / 发票导入 / 流水对账 / 期末结账）。
+- **上传什么**：网银导出的对账单 —— `.xls` / `.xlsx` / 网页版表格 / CSV / PDF 都认，
+  **按文件内容识别格式，不看扩展名**（这一批真实样例里就有三份扩展名是假的）。
+- **绑账户**：一份对账单绑定一个现金科目（1002 下面的子科目，一账户一份）。
+- **两件事**：① 流水按规则生成凭证（一张流水一张凭证）；② 发票按「金额 + 收支方向」
+  命中流水后，结算科目自动跟到那个账户上 —— 命中不到就回落到「自动制证配置」里的科目并说明原因。
+- **对账**：对账单期末余额 vs 账面余额（含未记账），差额用「未入账流水净额」解释。
+- **认不出来的格式**：页面上手工指定各列是什么，当场重解析；确认后「记住这个格式」，
+  下次同一家银行的文件自动套用。
 
 ### 报表与打印
 
@@ -241,12 +254,13 @@ cd backend && .venv/bin/python scripts/data_health_check.py
 .
 ├── backend/                  FastAPI 后端
 │   ├── app/
-│   │   ├── api/              路由层（12 个 router + schemas）
+│   │   ├── api/              路由层（13 个 router + schemas）
 │   │   ├── accounting/       会计业务服务（凭证、期间、年度、初始化、整理、导入）
 │   │   ├── ledger/           账簿聚合引擎与查询
 │   │   ├── reports/          报表公式引擎、求值、模板导入
 │   │   ├── printing/         打印模板、Excel 生成、预览适配
 │   │   ├── invoice/          发票解析、OCR、存储
+│   │   ├── bankstatement/    银行对账单解析（容器 / 网格 / 语义三层）、台账、流水制证
 │   │   ├── plugins/          插件加载、安装、签名、权限、hook、worker
 │   │   ├── mcp/              MCP 服务与 10 个工具
 │   │   ├── scheduler/        计划任务调度
@@ -255,7 +269,7 @@ cd backend && .venv/bin/python scripts/data_health_check.py
 │   │   ├── seed/             内置报表、用友 422 科目表、凭证号
 │   │   ├── models/           SQLAlchemy 模型
 │   │   └── core/             配置、数据库、鉴权、锁定、schema 版本、审计
-│   ├── migrations/           Alembic 迁移（35 版）
+│   ├── migrations/           Alembic 迁移（41 版）
 │   ├── scripts/              初始化、播种、备份、预检、supervisor、插件工具
 │   └── tests/                pytest 用例
 ├── frontend/                 Vue 3 前端
@@ -298,6 +312,8 @@ cd backend && .venv/bin/python scripts/data_health_check.py
 | `/api/books/{book_id}/subjects` | 科目树、扁平列表、常用科目、增改删、科目导入 |
 | `/api/books/{book_id}/vouchers` | 凭证增删改查、记账 / 反记账、批量删除、整理、导入、拆分、期间检查 |
 | `/api/books/{book_id}/invoices` | 发票配置与规则、批次上传 / 预览 / 提交 / 作废 |
+| `/api/books/{book_id}/bank-statements` | 对账单上传 / 重新解析 / 流水行 / 制证计划与提交 / 余额核对 / 原件下载 |
+| `/api/books/{book_id}/bank-statement-rules`、`…-profiles` | 流水科目规则、格式画像 |
 | `/api/books/{book_id}/ledger` | 余额表、总账、明细账、凭证余额 |
 | `/api/books/{book_id}/print` | 打印模板、凭证 / 余额表 / 总账 / 明细账 / 报表的 `.html` 与 `.xlsx`、预览 |
 | `/api/reports` | 报表模板、设计与渲染、单元格、行列增删改、复制、模板导入 |

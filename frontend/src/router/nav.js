@@ -20,12 +20,20 @@ export const NAV = [
     // 基础资料 → 账套管理。没写 landing 的取第一项。
     landing: 'vouchers',
     items: [
-      { name: 'vouchers', title: '凭证', icon: Document },
+      // 「凭证」改叫「填制凭证」：这一项是**手工一张张填**凭证，
+      // 而下面还有「发票导入」与「流水对账」两个**从外部单据生成**凭证的入口。
+      // 三个都叫「凭证」的话，侧栏上分不清哪个是手工、哪个是导入。
+      { name: 'vouchers', title: '填制凭证', icon: Document },
       // 这两个是偶尔才用一次的批量工具，不占侧栏常驻位置。路由照旧，
       // 菜单里拿 hidden 过滤掉；title 仍留在 NAV 里，标签页标题才认得出。
       { name: 'voucher-organize', title: '整理凭证', icon: Sort, hidden: true },
       { name: 'voucher-import', title: '凭证导入', icon: Upload, hidden: true },
       { name: 'invoice-import', title: '发票导入', icon: Tickets },
+      // 流水对账与发票导入是**同级**的两个功能：一个读发票，一个读银行对账单，
+      // 两者通过「发票的结算科目」互相配合（发票按金额+收支方向命中流水后，
+      // 结算科目自动跟到那个账户上）。放在发票导入与期末结账之间 ——
+      // 它的产出（凭证）也归到「填制凭证」那一条线上。
+      { name: 'flow-reconciliation', title: '流水对账', icon: Coin },
       // 结账是录完凭证之后的下一步，跟着「凭证」这一条线走最顺；
       // 原来它跟打印模板混在一个「期末与输出」模块里，两件事互不相干。
       { name: 'periods', title: '期末结账', icon: CircleCheck },

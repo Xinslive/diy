@@ -82,15 +82,35 @@ t('非管理员看不到「操作日志 / 用户与授权」', () => {
   // 「数据安全」也是管理员页：它管的是 AccessKey，普通会计不该看见。
   assert.ok(!names.includes('data-security'), '非管理员看到了数据安全')
 })
-t('管理员侧栏是 19 项（整理凭证 / 凭证导入 标了 hidden 不进侧栏）', () => {
+t('管理员侧栏是 20 项（整理凭证 / 凭证导入 标了 hidden 不进侧栏）', () => {
   const names = visibleNav(true).flatMap(m => m.items.map(i => i.name))
   // 这条是**钉子**：加一项菜单就要回来改这个数。少改说明菜单没进侧栏，
   // 多改说明它进了不该进的地方（hidden 失效、adminOnly 失效）。
   // 19 = 18 + 「二次验证」（管理员邮箱二次验证设置页，2026-10-20 新增）。
-  assert.equal(names.length, 19, `实际 ${names.length}`)
+  // 20 = 19 + 「流水对账」（2026-10-27，与发票导入同级的独立功能）。
+  assert.equal(names.length, 20, `实际 ${names.length}`)
   assert.ok(names.includes('mfa-settings'), '二次验证设置页没进侧栏')
   assert.ok(!names.includes('voucher-organize'), '整理凭证又冒进侧栏了')
   assert.ok(!names.includes('voucher-import'), '凭证导入又冒进侧栏了')
+})
+
+t('「凭证」改叫「填制凭证」：手工填的那一项要跟两个导入入口分得开', () => {
+  const voucher = NAV.flatMap(m => m.items).find(i => i.name === 'vouchers')
+  assert.equal(voucher.title, '填制凭证', '侧栏里还叫「凭证」')
+})
+
+t('「流水对账」在「发票导入」与「期末结账」之间，且与发票导入同级', () => {
+  const items = NAV.find(m => m.key === 'voucher').items
+  const names = items.map(i => i.name)
+  assert.ok(names.includes('flow-reconciliation'), '流水对账没进菜单')
+  const atInvoice = names.indexOf('invoice-import')
+  const atFlow = names.indexOf('flow-reconciliation')
+  const atPeriods = names.indexOf('periods')
+  assert.ok(atInvoice < atFlow, '流水对账不在发票导入后面')
+  assert.ok(atFlow < atPeriods, '流水对账不在期末结账前面')
+  // **同一个模块里的平级项** —— 它不是「发票导入」的子功能。
+  assert.equal(items.find(i => i.name === 'invoice-import').title, '发票导入')
+  assert.equal(items.find(i => i.name === 'flow-reconciliation').title, '流水对账')
 })
 t('hidden 的项仍留在 NAV 里，标签页标题才认得出', () => {
   // 侧栏看不见 ≠ 页面没了：直接敲地址要能进，标签页也得叫得出名字

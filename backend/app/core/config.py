@@ -544,6 +544,10 @@ class Settings(BaseSettings):
 
     # 发票原件与解析结果的本地留存目录。数据库只保存相对文件名，便于迁移部署。
     invoice_storage_dir: str = "data/invoices"
+    # 银行对账单原件的本地留存目录。**与发票原件分开存** ——
+    # 两者删改的频率、保留期、访问权限都不一样，混在一个目录里，
+    # 「清空历史发票附件」这种操作会顺手把用户的银行原件也带走。
+    statement_storage_dir: str = "data/statements"
     # 发票上传上限（审计 P2-12）。
     #
     # 原来是 100MB，而网关的 ``client_max_body_size`` 是 21m —— 两者矛盾，
