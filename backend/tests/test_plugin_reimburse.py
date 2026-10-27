@@ -8,6 +8,7 @@
 import importlib.util
 import json
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -112,6 +113,53 @@ def test_clean_overrides_drops_junk_and_keeps_valid():
 def test_clean_overrides_ignores_non_dict():
     assert plugin._clean_overrides(None) == {}
     assert plugin._clean_overrides(["7"]) == {}
+
+
+# ---------------------------------------------------------------------------
+# 摘要
+# ---------------------------------------------------------------------------
+
+def _voucher_inputs(template="{sheet}报销明细"):
+    sheet = {"name": "优客9月", "title": "优客9月份报销明细单", "month": 9, "items": [
+        {"line": 3, "text": "保洁工资", "amount": Decimal("100"),
+         "date": "", "excluded": False},
+    ]}
+    config = {
+        "counterparty_code": "1001", "pending_code": "221104", "unmatched_mode": "pending",
+        "default_code": "", "default_mark_pending": True, "date_mode": "default",
+        "default_date": "2026-09-30", "remark_template": template, "attachments": 1,
+        "merge_same_subject": False,
+        "subject_rules": [{"all": ["工资"], "any": [], "not": [], "code": "560107"}],
+    }
+    index = {
+        "1001": {"id": 1, "code": "1001", "name": "库存现金", "active": True, "is_leaf": True},
+        "221104": {"id": 3, "code": "221104", "name": "应付社会保险费", "active": True, "is_leaf": True},
+        "560107": {"id": 2, "code": "560107", "name": "员工工资", "active": True, "is_leaf": True},
+    }
+    return sheet, config, index
+
+
+def test_credit_summary_comes_from_remark_template():
+    """贷方摘要取「摘要模板」，不是表页名 —— 规则页改一次两边一起变。"""
+    sheet, config, index = _voucher_inputs("{sheet}代发{month}月")
+    built, _warnings = plugin._build_voucher(sheet, config, index, [])
+    assert built is not None
+    credit = [e for e in built["draft"]["entries"] if e["direction"] == "CREDIT"]
+    assert len(credit) == 1
+    assert credit[0]["summary"] == "优客9月代发9月"
+    # 借方摘要还是工作簿那一行的原样文字
+    debit = [e for e in built["draft"]["entries"] if e["direction"] == "DEBIT"]
+    assert debit[0]["summary"] == "保洁工资"
+    # 凭证头备注同源
+    assert built["draft"]["remark"] == "优客9月代发9月"
+
+
+def test_credit_summary_falls_back_to_sheet_remark():
+    """模板留空时退回「表页名+报销明细」，不会给出空摘要。"""
+    sheet, config, index = _voucher_inputs("")
+    built, _warnings = plugin._build_voucher(sheet, config, index, [])
+    credit = [e for e in built["draft"]["entries"] if e["direction"] == "CREDIT"]
+    assert credit[0]["summary"] == "优客9月报销明细"
 
 
 # ---------------------------------------------------------------------------
