@@ -3,7 +3,7 @@
 **这两份报告从哪儿来。**
 
 * ``ACCT-render_report-缺陷报告.md``：``render_report`` 在「目标期间自身含有
-  已记账凭证」时抛协议错 ``-32602``，且记账前给���的报表数字是错的、
+  已记账凭证」时抛协议错 ``-32602``，且记账前给你的报表数字是错的、
   错误被 ``-32602`` 吞掉。
 * ``ACCT-MCP-工具评估与优化建议.md``：全量工具评估，15 条建议
   （P0 四条 / P1 五条 / P2 六条）。
@@ -820,7 +820,7 @@ def test_科目查询_查空时提示其它年度有同编码科目(db, book, pr
                     keyword="1002")
 
     assert out["items"], "2026 年度的 1002 应该查得到"
-    # 换个不存在的年度查同���个编码 → 应给出跨年提示
+    # 换个不存在的年度查同一个编码 → 应给出跨年提示
     empty = call_tool("find_subjects", principal, book_id=book.id, year=2027,
                       keyword="999999")
     assert empty["items"] == []

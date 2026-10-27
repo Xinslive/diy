@@ -181,7 +181,7 @@ def test_一张表清理失败不影响其余表(db, monkeypatch):
     """**清理失败不许把别的事带下水。**
 
     这里把 ``audit_log`` 那一格的删除弄成抛异常（用一个不存在的列模拟），
-    其余几张表必须照常清掉 —— 而��是「audit_log 失败 → 整轮清理回滚」。
+    其余几张表必须照常清掉 —— 而不是「audit_log 失败 → 整轮清理回滚」。
     """
     _audit(db, NOW - timedelta(days=400))
     _backup_run(db, NOW - timedelta(days=400))

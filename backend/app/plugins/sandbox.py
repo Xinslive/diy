@@ -107,7 +107,7 @@ ALLOWED_BUILTINS = frozenset({
     #
     # 挑拣过的版本漏了 ``UnicodeError``，而真实插件的 csv 解析就是
     # ``except (UnicodeError, csv.Error)`` —— 少一个名字，插件在运行期
-    # 直接 NameError，扫��器却是 CLEAN（静态扫描看不见内建名）。
+    # 直接 NameError，扫描器却是 CLEAN（静态扫描看不见内建名）。
     #
     # 异常类本身不带能力：能 ``raise`` 一个异常不等于能拿到宿主的资源。
     # 真正的风险在 **BaseException 里的非 Exception 三个**：
