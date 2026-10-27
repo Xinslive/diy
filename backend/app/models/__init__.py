@@ -12,7 +12,8 @@ from app.models.bankstatement import (DIRECTION_IN, DIRECTION_OUT,
                                      DIRECTION_UNKNOWN, PLAN_MANUAL, PLAN_NONE,
                                      PLAN_PENDING, PLAN_RULE, STATUS_IGNORED,
                                      STATUS_OPEN, STATUS_POSTED, BankStatement,
-                                     BankStatementProfile, BankStatementRow,
+                                     BankStatementConfig, BankStatementProfile,
+                                     BankStatementRow, BankStatementRowSubject,
                                      BankStatementRule)
 from app.models.audit import AuditLog
 from app.models.mcp import McpToken
@@ -36,6 +37,7 @@ __all__ = [
     "PrintTemplate", "AuditLog", "ImportBatch", "McpToken",
     "InvoiceConfig", "InvoiceRule", "InvoiceBatch", "InvoiceRecord",
     "BankStatement", "BankStatementRow", "BankStatementRule", "BankStatementProfile",
+    "BankStatementRowSubject", "BankStatementConfig",
     "DIRECTION_IN", "DIRECTION_OUT", "DIRECTION_UNKNOWN",
     "STATUS_OPEN", "STATUS_POSTED", "STATUS_IGNORED",
     "PLAN_NONE", "PLAN_RULE", "PLAN_MANUAL", "PLAN_PENDING",

@@ -975,6 +975,7 @@ def test_head_是本文件认识的那一版():
         "0039_voucher_idempotency",            # 新建凭证的幂等占位表（§3.28，接在 0038 之后）
         "0040_retained_subject_setting",       # 未分配利润科目可手工设定：book_year.retained_subject_code
         "0041_bank_statement",                 # 流水对账四张表：对账单 / 流水行 / 科目规则 / 格式画像
+        "0042_bank_statement_row_subjects",    # 流水对方科目改成子表（科目+金额）+ 流水凭证摘要模板
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")
@@ -1253,8 +1254,8 @@ def test_跨年账套_次年只有期初没有凭证_迁移照样跑得完(scrat
             "select version_num from alembic_version")).scalar()
         # 版本号跟着**迁移链的最后一环**走：0038 是 entry 唯一约束，
         # 0039 是凭证幂等占位表，0040 是未分配利润科目的手工设定列，
-        # 0041 是流水对账的四张表。
-        assert ver == "0041_bank_statement", f"schema 只到 {ver}"
+        # 0041 是流水对账的四张表，0042 是流水对方科目子表 + 摘要模板。
+        assert ver == "0042_bank_statement_row_subjects", f"schema 只到 {ver}"
 
         # 科目表按年度拆开
         rows = conn.execute(text(
@@ -1280,3 +1281,167 @@ def test_跨年账套_次年只有期初没有凭证_迁移照样跑得完(scrat
                    sum(case when direction='CREDIT' then amount else 0 end)
             FROM entry""")).one()
         assert r[0] == r[1] == 1000.00, f"借贷被改了：{r}"
+
+
+# ================================================================ 9. 0042 真的把对方科目搬进了子表
+#
+# 这一节测的是**迁移把数据搬对了**，不是「版本号对得上」。
+#
+# 为什么非要有它：对方科目从「行上的一个 id」改成子表时，旧数据要搬过去。
+# 搬不过去的后果是**静默的**：界面上那一行的对方科目变空了（查不到子表行），
+# 而金额还是对的 —— 凭证生成不了（没有对方科目），界面看着像「规则没命中」，
+# 而真相是「数据没搬过来」。
+# 生产上那批对账单是**已经上传过的**，迁移不搬就等于把它们的对方科目
+# 全部弄丢，而且**没有任何报错**。
+#
+# **顺带钉住「金额为 0 的行搬不过去」这件事**：子表有 ``amount > 0`` 的
+# CHECK，而 0 金额的行本来也进不了制证 —— 这类行的 ``plan_status`` 必须
+# 被改回 ``PENDING``，界面上要显示成「待确认科目」，而不是留一个指向
+# 空处的「已定」。
+
+@pytest.fixture
+def scratch_at_0041():
+    """一个停在 0041 的独立 schema —— 对方科目还是行上的一个 id。"""
+    name = "scratch_bs"
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {name} CASCADE")
+        conn.exec_driver_sql(f"CREATE SCHEMA {name}")
+    eng = create_engine(
+        TEST_DB_URL, connect_args={"options": f"-c search_path={name}"})
+    _upgrade(eng, "0041_bank_statement")
+    yield eng, name
+    eng.dispose()
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {name} CASCADE")
+
+
+def _seed_statement_rows(eng) -> None:
+    """在 0041 的形态下造一份对账单与三行流水。
+
+    * 第 1 行：规则命中的对方科目 + 正常金额 → 应当被搬成子表一行；
+    * 第 2 行：人工指定的对方科目 + 正常金额 → 同样要搬，来源是 MANUAL；
+    * 第 3 行：对方科目在，但金额是 0 → **搬不过去**（子表 CHECK 挡 0 金额），
+      plan_status 要被改回 PENDING。
+
+    全用裸 SQL：0041 的表结构与 HEAD 的 ORM 不完全一样。
+    """
+    with eng.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO book (id, company_name, name, start_year, start_month,
+                              subject_code_rule, status, data_version,
+                              created_at, updated_at)
+            VALUES (1, '回填测试公司', '回填账套', 2026, 1, '4-2-2-2', 'ACTIVE', 0,
+                    now(), now())
+        """))
+        conn.execute(text("""
+            INSERT INTO book_year (id, book_id, year, subject_code_rule,
+                                   init_subjects_at, init_subjects_source,
+                                   created_at, updated_at)
+            VALUES (1, 1, 2026, '4-2-2-2', now(), 'CHART', now(), now())
+        """))
+        conn.execute(text("""
+            INSERT INTO period (id, book_id, year, month, ord, locked, version,
+                                created_at, updated_at)
+            VALUES (1, 1, 2026, 9, 9, false, 1, now(), now())
+        """))
+        for sid, code, name_ in ((1, "1001", "库存现金"), (2, "5602", "管理费用")):
+            conn.execute(text("""
+                INSERT INTO subject (id, book_id, year, code, name, level, category,
+                                     direction, is_leaf, carry_forward, qty_calc,
+                                     aux_calc, fx_calc, sort_no, active, ext_attrs,
+                                     created_at, updated_at)
+                VALUES (:id, 1, 2026, :code, :name, 1, 'A', 'DEBIT', true, false,
+                        false, false, false, 0, true, '{}'::jsonb, now(), now())
+            """), {"id": sid, "code": code, "name": name_})
+        conn.execute(text("""
+            INSERT INTO bank_statement (id, book_id, account_subject_id,
+                                        account_subject_code, filename, file_path,
+                                        container_format, bank_name, account_no,
+                                        account_name, period_start, period_end,
+                                        row_count, parse_status, parse_message,
+                                        diagnosis, uploaded_by, created_at, updated_at)
+            VALUES (1, 1, 1, '1001', '9月.csv', '/tmp/x.csv', 'CSV', '测试银行',
+                    '6222', '基本户', '2026-09-01', '2026-09-30', 3, 'OK', '',
+                    '{}'::jsonb, 'tester', now(), now())
+        """))
+        conn.execute(text("""
+            INSERT INTO bank_statement_row (id, statement_id, book_id, seq,
+                                             tx_date, direction, amount, balance,
+                                             summary, purpose, counterparty_name,
+                                             counterparty_account, extra, status,
+                                             matched_voucher_id,
+                                             matched_invoice_record_id,
+                                             plan_subject_id, plan_status, problems,
+                                             created_at, updated_at)
+            VALUES (1, 1, 1, 1, '2026-09-03', 'OUT', 500.00, 500.00, '付租金', '',
+                    '某某公司', '', '{}'::jsonb, 'OPEN', NULL, NULL, 2, 'RULE',
+                    '[]'::jsonb, now(), now()),
+                   (2, 1, 1, 2, '2026-09-04', 'OUT', 800.00, -300.00, '付货款', '',
+                    '另一家', '', '{}'::jsonb, 'OPEN', NULL, NULL, 2, 'MANUAL',
+                    '[]'::jsonb, now(), now()),
+                   (3, 1, 1, 3, '2026-09-05', 'OUT', 0.00, -300.00, '零钱', '',
+                    '第三方', '', '{}'::jsonb, 'OPEN', NULL, NULL, 2, 'RULE',
+                    '[]'::jsonb, now(), now())
+        """))
+
+
+def test_0042_把旧的对方科目搬进了子表(scratch_at_0041):
+    eng, _ = scratch_at_0041
+    _seed_statement_rows(eng)
+    _upgrade(eng, "head")
+
+    with eng.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT r.seq, s.subject_id, s.amount, s.source
+            FROM bank_statement_row r
+            JOIN bank_statement_row_subject s ON s.row_id = r.id
+            ORDER BY r.seq
+        """)).all()
+        assert len(rows) == 2, f"应当搬过来两行，实际 {rows}"
+        assert rows[0][1] == 2 and rows[0][2] == 500.00, f"金额没搬对：{rows[0]}"
+        assert rows[0][3] == "RULE", f"来源没搬对：{rows[0]}"
+        assert rows[1][3] == "MANUAL", f"来源没搬对：{rows[1]}"
+
+        # 旧列没了
+        cols = conn.execute(text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'bank_statement_row' AND column_name = 'plan_subject_id'
+        """)).all()
+        assert cols == [], "旧的单值列还留着 —— 两份真相会漂"
+
+
+def test_0042_零金额的行退回待确认(scratch_at_0041):
+    """0 金额的行搬不过去（子表 CHECK 挡 0 金额）—— 状态要改回 PENDING。"""
+    eng, _ = scratch_at_0041
+    _seed_statement_rows(eng)
+    _upgrade(eng, "head")
+
+    with eng.connect() as conn:
+        row = conn.execute(text("""
+            SELECT plan_status FROM bank_statement_row WHERE seq = 3
+        """)).one()
+        assert row[0] == "PENDING", (
+            f"0 金额的行该退回「待确认科目」，实际 {row[0]}")
+        n = conn.execute(text("""
+            SELECT count(*) FROM bank_statement_row_subject s
+            JOIN bank_statement_row r ON r.id = s.row_id WHERE r.seq = 3
+        """)).scalar()
+        assert n == 0, "0 金额的行不该有对方科目行"
+
+
+def test_0042_跑第二遍数据不丢(scratch_at_0041):
+    """迁移必须**能重跑** —— 而重跑时旧列已经没了。
+
+    这条路径真的会走：``tests/test_migration_guardrails.py`` 里有一条用例
+    把结构打回旧形态、stamp 回旧版、再 upgrade 到 head。
+    """
+    eng, _ = scratch_at_0041
+    _seed_statement_rows(eng)
+    _upgrade(eng, "head")
+    # 再打回旧形态、重跑一遍
+    _upgrade(eng, "0041_bank_statement")
+    _upgrade(eng, "head")
+
+    with eng.connect() as conn:
+        n = conn.execute(text("SELECT count(*) FROM bank_statement_row_subject")).scalar()
+        assert n == 2, f"重跑之后对方科目行没了（剩 {n} 行）"

@@ -1,0 +1,262 @@
+"""一行流水的**多个**对方科目（科目 + 金额）。
+
+**为什么要有这组用例。** 一笔流水可能对应好几个科目：一笔 1000 元的付款
+里 800 是房租、200 是押金。对方科目与金额是一一对应的，所以金额必须跟着
+科目走 —— 而「合计必须等于流水金额」是这件事唯一说得通的硬约束。
+
+三条要盯住的：
+
+1. **合计必须等于流水金额** —— 不等的话凭证借贷不平（或者更糟：平了但
+   钱记在错误的科目上）；
+2. **制证时按组分录** —— 一行流水生成一张凭证，但分录不止两条；
+3. **规则命中给的是一条** —— 规则没有金额，配不出「800 房租 + 200 押金」
+   这种拆分来，而拆分的金额只有用户知道（凭发票、凭单据）。
+"""
+from __future__ import annotations
+
+import pathlib
+from decimal import Decimal
+
+import pytest
+from sqlalchemy import select
+
+from app.bankstatement import service
+from app.core.config import settings
+from app.models import Entry, Subject, Voucher
+from app.models.bankstatement import (
+    DIRECTION_IN,
+    DIRECTION_OUT,
+    PLAN_MANUAL,
+    PLAN_PENDING,
+    PLAN_RULE,
+)
+
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "statements"
+
+
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "statement_storage_dir", str(tmp_path / "statements"))
+    return tmp_path / "statements"
+
+
+@pytest.fixture
+def cash(db, book):
+    parent = db.scalar(select(Subject).where(
+        Subject.book_id == book.id, Subject.year == book.start_year,
+        Subject.code == "1002"))
+    assert parent is not None
+    parent.is_leaf = False
+    db.flush()
+    sub = Subject(
+        book_id=book.id, year=book.start_year, code="100201", name="基本户",
+        parent_id=parent.id, level=parent.level + 1, category="ASSET",
+        direction="DEBIT", is_leaf=True, carry_forward=False, sort_no=1,
+        active=True,
+    )
+    db.add(sub)
+    db.commit()
+    db.refresh(sub)
+    return sub
+
+
+@pytest.fixture
+def statement(db, book, admin_user, cash, store):
+    data = (FIXTURES / "cmb_csv.xlsx").read_bytes()
+    return service.upload_statement(db, book.id, admin_user, "招商9月.xlsx",
+                                    data, cash.id)
+
+
+def _row(db, book, statement):
+    rows = service.list_rows(db, book.id, statement["id"])
+    return next(r for r in rows if r["direction"] in (DIRECTION_IN, DIRECTION_OUT)
+                and r["amount"])
+
+
+def _half(amount: str) -> tuple[str, str]:
+    total = Decimal(amount)
+    first = (total / 2).quantize(Decimal("0.01"))
+    return str(first), str(total - first)
+
+
+# ----------------------------------------------------------------------
+# 写入
+# ----------------------------------------------------------------------
+
+def test_一行流水可以拆到多个对方科目(statement, db, book, subjects):
+    row = _row(db, book, statement)
+    first, second = _half(row["amount"])
+    result = service.update_row(db, book.id, row["id"], {
+        "plan_subjects": [
+            {"subject_id": subjects["560202"].id, "amount": first},
+            {"subject_id": subjects["560204"].id, "amount": second},
+        ]})
+    assert result["plan_status"] == PLAN_MANUAL
+    assert len(result["plan_subjects"]) == 2
+    assert result["plan_subject_total"] == row["amount"], (
+        "合计必须等于流水金额")
+    assert {i["subject_id"] for i in result["plan_subjects"]} == {
+        subjects["560202"].id, subjects["560204"].id}
+
+
+def test_合计不等于流水金额要拒绝(statement, db, book, subjects):
+    row = _row(db, book, statement)
+    with pytest.raises(ValueError) as exc:
+        service.update_row(db, book.id, row["id"], {
+            "plan_subjects": [
+                {"subject_id": subjects["560202"].id, "amount": "1.00"},
+            ]})
+    assert "不一致" in str(exc.value), f"提示没说出为什么不能改：{exc.value}"
+
+
+def test_同一个科目在一行里出现两次要拒绝(statement, db, book, subjects):
+    row = _row(db, book, statement)
+    first, second = _half(row["amount"])
+    with pytest.raises(ValueError) as exc:
+        service.update_row(db, book.id, row["id"], {
+            "plan_subjects": [
+                {"subject_id": subjects["560202"].id, "amount": first},
+                {"subject_id": subjects["560202"].id, "amount": second},
+            ]})
+    assert "两次" in str(exc.value), f"提示没说出为什么不能改：{exc.value}"
+
+
+def test_金额必须是正数(statement, db, book, subjects):
+    row = _row(db, book, statement)
+    with pytest.raises(ValueError):
+        service.update_row(db, book.id, row["id"], {
+            "plan_subjects": [
+                {"subject_id": subjects["560202"].id, "amount": "0"},
+            ]})
+
+
+def test_非末级科目要拒绝(statement, db, book, subjects):
+    """5602 管理费用下面挂了子科目 —— 凭证只记末级，流水计划也一样。"""
+    row = _row(db, book, statement)
+    with pytest.raises(ValueError) as exc:
+        service.update_row(db, book.id, row["id"], {
+            "plan_subjects": [
+                {"subject_id": subjects["5602"].id, "amount": row["amount"]},
+            ]})
+    assert "末级" in str(exc.value)
+
+
+def test_停用科目要拒绝(statement, db, book, subjects):
+    row = _row(db, book, statement)
+    subject = subjects["560202"]
+    subject.active = False
+    db.commit()
+    db.expire_all()
+    with pytest.raises(ValueError) as exc:
+        service.update_row(db, book.id, row["id"], {
+            "plan_subjects": [
+                {"subject_id": subjects["560202"].id, "amount": row["amount"]},
+            ]})
+    assert "停用" in str(exc.value)
+
+
+def test_清空对方科目退回待确认(statement, db, book, subjects):
+    row = _row(db, book, statement)
+    service.update_row(db, book.id, row["id"], {
+        "plan_subjects": [
+            {"subject_id": subjects["560202"].id, "amount": row["amount"]},
+        ]})
+    result = service.update_row(db, book.id, row["id"], {"plan_subjects": []})
+    assert result["plan_subjects"] == []
+    assert result["plan_status"] == PLAN_PENDING
+
+
+def test_两种写法不能同时给(statement, db, book, subjects):
+    row = _row(db, book, statement)
+    with pytest.raises(ValueError):
+        service.update_row(db, book.id, row["id"], {
+            "plan_subject_id": subjects["560202"].id,
+            "plan_subjects": [
+                {"subject_id": subjects["560202"].id, "amount": row["amount"]},
+            ]})
+
+
+# ----------------------------------------------------------------------
+# 规则
+# ----------------------------------------------------------------------
+
+def test_规则命中给的是一条_金额就是流水金额(statement, db, book, admin_user, subjects):
+    """规则没有金额，配不出拆分来 —— 所以规则命中只给一条。"""
+    rows = service.list_rows(db, book.id, statement["id"])
+    keyword = rows[0]["summary"][:4]
+    service.create_rule(db, book.id, admin_user, {
+        "match_field": "SUMMARY", "keyword": keyword,
+        "subject_id": subjects["560202"].id, "priority": 0, "active": True})
+    rows = service.list_rows(db, book.id, statement["id"])
+    hit = [r for r in rows if r["summary"].startswith(keyword)]
+    assert hit, "找不到摘要以关键词开头的行"
+    assert hit[0]["plan_status"] == PLAN_RULE
+    assert len(hit[0]["plan_subjects"]) == 1
+    assert hit[0]["plan_subjects"][0]["amount"] == hit[0]["amount"]
+
+
+# ----------------------------------------------------------------------
+# 制证
+# ----------------------------------------------------------------------
+
+def test_制证按组生成分录(statement, db, book, admin_user, subjects):
+    """一行流水 → 一张凭证，但分录是「现金一条 + 对方两条」。"""
+    row = _row(db, book, statement)
+    first, second = _half(row["amount"])
+    service.update_row(db, book.id, row["id"], {
+        "plan_subjects": [
+            {"subject_id": subjects["560202"].id, "amount": first},
+            {"subject_id": subjects["560204"].id, "amount": second},
+        ]})
+    db.commit()
+
+    result = service.commit_vouchers(db, book.id, statement["id"], admin_user)
+    assert result["created_count"] == 1, f"制证失败：{result['failures']}"
+    voucher = db.get(Voucher, result["created"][0]["voucher_id"])
+    entries = db.scalars(select(Entry).where(
+        Entry.voucher_id == voucher.id).order_by(Entry.line_no)).all()
+    assert len(entries) == 3, f"应当是三条分录（现金 + 两个对方科目），实际 {len(entries)}"
+
+    debit = sum((e.amount for e in entries if e.direction == "DEBIT"), Decimal("0"))
+    credit = sum((e.amount for e in entries if e.direction == "CREDIT"), Decimal("0"))
+    assert debit == credit, "凭证借贷不平"
+    assert debit == Decimal(row["amount"]), "分录合计不等于流水金额"
+
+    # 现金那一条的方向：流水 IN（收钱）记借方，OUT 记贷方。
+    cash_entry = [e for e in entries if e.subject_id == subjects["100201"].id]
+    assert len(cash_entry) == 1
+    expect = "DEBIT" if row["direction"] == DIRECTION_IN else "CREDIT"
+    assert cash_entry[0].direction == expect
+
+    # 对方两条：各记各的金额。
+    others = {e.subject_id: e.amount for e in entries
+              if e.subject_id != subjects["100201"].id}
+    assert others == {subjects["560202"].id: Decimal(first),
+                      subjects["560204"].id: Decimal(second)}
+
+
+def test_制证前对方科目金额对不上就跳过(statement, db, book, admin_user, subjects):
+    """合计对不上的行不进候选 —— 凭证会不平衡。
+
+    这里是**第二道闸**：写入口（``_parse_plan_payload``）已经挡住了，
+    但金额可能在这之后被别处改过（行是旧的、别的路径写的）。所以制证
+    之前还要再判一次。
+    """
+    from app.models import BankStatementRowSubject
+
+    row = _row(db, book, statement)
+    service.update_row(db, book.id, row["id"], {
+        "plan_subjects": [
+            {"subject_id": subjects["560202"].id, "amount": row["amount"]},
+        ]})
+    # 绕过写入口直接改库，模拟「别处写进去的脏数据」。
+    child = db.scalars(select(BankStatementRowSubject).where(
+        BankStatementRowSubject.row_id == row["id"])).first()
+    child.amount = Decimal("1.00")
+    db.commit()
+    db.expire_all()
+
+    plan = service.plan_vouchers(db, book.id, statement["id"])
+    target = next(s for s in plan["skipped"] if s["id"] == row["id"])
+    assert "对不上" in target["reason"], f"没被拦住：{target['reason']}"
+    assert row["id"] not in [c["id"] for c in plan["candidates"]]

@@ -30,6 +30,15 @@ from app.models.bankstatement import (
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "statements"
 
 
+def plan_subject_ids(row) -> list[int]:
+    """这一行的对方科目 id 列表（可能不止一个）。
+
+    **对方科目是子表了**（一行流水可以拆到好几个科目上），所以断言不再看
+    单个 id，而是看这个列表。
+    """
+    return [item["subject_id"] for item in row["plan_subjects"]]
+
+
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     """对账单原件落到临时目录 —— 绝不写进仓库的 data/statements。"""
@@ -172,7 +181,7 @@ def test_人工指定对方科目后状态变成MANUAL(uploaded, db, book, subje
     result = service.update_row(db, book.id, target["id"], {
         "plan_subject_id": subjects["560202"].id})
     assert result["plan_status"] == PLAN_MANUAL
-    assert result["plan_subject_id"] == subjects["560202"].id
+    assert plan_subject_ids(result) == [subjects["560202"].id]
 
 
 def test_忽略一行(uploaded, db, book):
@@ -200,7 +209,7 @@ def test_规则命中则填对方科目_没命中标待确认(db, book, admin_us
     hit = [r for r in rows if r["summary"].startswith(keyword)]
     assert hit, "找不到摘要以关键词开头的行"
     assert hit[0]["plan_status"] == PLAN_RULE
-    assert hit[0]["plan_subject_id"] == subjects["560202"].id
+    assert plan_subject_ids(hit[0]) == [subjects["560202"].id]
     others = [r for r in rows if not r["summary"].startswith(keyword)]
     assert all(r["plan_status"] == PLAN_PENDING for r in others)
 
@@ -221,7 +230,7 @@ def test_同级规则取更长关键词(db, book, admin_user, cash, store, subje
         "subject_id": subjects["560301"].id, "priority": 0, "active": True})
     rows = service.list_rows(db, book.id, statement["id"])
     target = [r for r in rows if r["summary"].startswith(summary[:6])]
-    assert target and target[0]["plan_subject_id"] == subjects["560301"].id, (
+    assert target and plan_subject_ids(target[0]) == [subjects["560301"].id], (
         "同优先级时该取更长的那个关键词")
 
 
@@ -246,7 +255,7 @@ def test_优先级大的赢(db, book, admin_user, cash, store, subjects):
         "subject_id": subjects["560301"].id, "priority": 10, "active": True})
     rows = service.list_rows(db, book.id, statement["id"])
     target = [r for r in rows if r["summary"].startswith(summary[:4])]
-    assert target and target[0]["plan_subject_id"] == subjects["560301"].id, (
+    assert target and plan_subject_ids(target[0]) == [subjects["560301"].id], (
         "优先级高的规则没赢")
 
 

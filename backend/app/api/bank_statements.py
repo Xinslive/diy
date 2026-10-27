@@ -13,8 +13,11 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.api.schemas import (BankStatementReparseIn, BankStatementRowPatchIn,
-                             BankStatementRowDirectionIn, BankStatementProfileIn,
+from app.api.schemas import (BankStatementConfigIn, BankStatementReparseIn,
+                             BankStatementRowDirectionIn,
+                             BankStatementRowPatchIn,
+                             BankStatementRowReclassifyIn,
+                             BankStatementProfileIn,
                              BankStatementRuleIn, BankStatementRulePatch)
 from app.core.db import get_db
 from app.core.deps import get_current_user, get_my_book, require_book_write
@@ -248,6 +251,72 @@ def commit_vouchers(statement_id: int, request: Request, book: Book = Depends(ge
     except SQLAlchemyError as exc:
         db.rollback()
         raise _db_error(request, exc) from exc
+
+
+@router.post("/rows/{row_id}/reclassify")
+def post_row_reclassify(row_id: int, payload: BankStatementRowReclassifyIn,
+                        request: Request, book: Book = Depends(get_my_book),
+                        db: Session = Depends(get_db),
+                        _link: UserBook = Depends(require_book_write),
+                        user: SysUser = Depends(get_current_user)):
+    """把一条流水对应的那条分录的科目改掉。
+
+    **只改现金那一侧**：从「记在 1001 库存现金上的那笔」挪到「这份对账单
+    绑定的账户（1002）」上。对方侧一个字都不动。
+
+    改的是一张真凭证，所以走凭证编辑那条路：期间已结账、凭证已记账、
+    并发改动 —— 这些闸门与审计留痕都在那儿。
+    """
+    from app.accounting import vouchers as voucher_service
+
+    try:
+        result = service.reclassify_row_subject(
+            db, book.id, row_id, payload.entry_id, user)
+        db.commit()
+        return result
+    except voucher_service.VoucherVersionConflict as exc:
+        # 409：凭证在别处被改过了。**必须排在 ValueError 之前** ——
+        # 版本冲突是 ValueError 的子类，顺序反了就变成 400（前端会当成
+        # 「参数写错了」而不是「别人改过了」）。与 api/vouchers.py 同款。
+        db.rollback()
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc))
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _db_error(request, exc)
+
+
+# ----------------------------------------------------------------------
+# 账套级配置（凭证摘要模板）
+# ----------------------------------------------------------------------
+
+config_router = APIRouter(prefix="/api/books/{book_id}/bank-statement-config",
+                           tags=["流水对账"])
+
+
+@config_router.get("")
+def get_config(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
+    """这个账套的流水配置。**没配过也给一份**（模板为空 = 用内置口径）。"""
+    return service.serialize_config(service.get_config(db, book.id))
+
+
+@config_router.put("")
+def put_config(payload: BankStatementConfigIn, request: Request,
+               book: Book = Depends(get_my_book), db: Session = Depends(get_db),
+               _link: UserBook = Depends(require_book_write)):
+    """整体替换这个账套的流水配置（**幂等**：没有就建，有了就改**）。"""
+    try:
+        result = service.save_config(db, book.id, payload.model_dump())
+        db.commit()
+        return result
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc))
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _db_error(request, exc)
 
 
 # ----------------------------------------------------------------------

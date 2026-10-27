@@ -269,8 +269,7 @@
             <div class="section-head">
               <span>流水明细</span>
               <span class="muted">
-                未入账、方向已知、对方科目已定的流水才会生成凭证；
-                「待确认」的先在下面指定对方科目
+                默认只显示对账单上解析出来的内容；方向、对方科目、状态收在「对账信息」里
               </span>
             </div>
           </template>
@@ -297,86 +296,114 @@
             <span v-if="plan" class="muted">
               可生成 {{ plan.candidate_count }} 条
               <template v-if="plan.pending_count">，待确认科目 {{ plan.pending_count }} 条</template>
+              <template v-if="plan.unknown_count">，待确认方向 {{ plan.unknown_count }} 条</template>
             </span>
+            <!-- **账上已有同一笔、只是记错了账户**：默认收起时也要看得见，
+                 否则用户根本不知道有笔钱记错了地方 -->
+            <el-tag
+              v-if="reclassifyCount"
+              type="warning"
+              effect="plain"
+              class="flow-tag-button"
+              @click="showExtra = true"
+            >
+              账上已有对应分录 {{ reclassifyCount }} 行 · 展开看
+            </el-tag>
+            <el-checkbox v-model="showExtra" class="flow-toggle">对账信息</el-checkbox>
           </div>
 
-          <el-table :data="rows" v-loading="loadingRows" empty-text="先选一份对账单">
-            <el-table-column label="#" width="56" prop="seq" />
-            <el-table-column label="日期" width="110">
+          <el-table
+            :data="rows"
+            v-loading="loadingRows"
+            size="small"
+            class="flow-rows-table"
+            empty-text="先选一份对账单"
+          >
+            <!-- 默认列：只有对账单上解析出来的那些 -->
+            <el-table-column label="#" width="46" prop="seq" />
+            <el-table-column label="日期" width="96">
               <template #default="{ row }">{{ row.tx_date || '—' }}</template>
             </el-table-column>
-            <el-table-column label="摘要" min-width="180" show-overflow-tooltip>
+            <el-table-column label="摘要" min-width="150" show-overflow-tooltip>
               <template #default="{ row }">{{ row.summary || '—' }}</template>
             </el-table-column>
-            <el-table-column label="用途" min-width="140" show-overflow-tooltip>
+            <el-table-column label="用途" min-width="120" show-overflow-tooltip>
               <template #default="{ row }">{{ row.purpose || '—' }}</template>
             </el-table-column>
-            <el-table-column label="对方户名" min-width="150" show-overflow-tooltip>
+            <el-table-column label="对方户名" min-width="130" show-overflow-tooltip>
               <template #default="{ row }">{{ row.counterparty_name || '—' }}</template>
             </el-table-column>
-            <el-table-column label="收入" width="120" align="right">
+            <el-table-column label="收入" width="104" align="right">
               <template #default="{ row }">
                 <span v-if="row.direction === 'IN'">{{ money(row.amount) }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="支出" width="120" align="right">
+            <el-table-column label="支出" width="104" align="right">
               <template #default="{ row }">
                 <span v-if="row.direction === 'OUT'">{{ money(row.amount) }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="余额" width="120" align="right">
+            <el-table-column label="余额" width="104" align="right">
               <template #default="{ row }">{{ money(row.balance) }}</template>
             </el-table-column>
-            <el-table-column label="方向" width="110">
+
+            <!-- 「对账信息」栏：默认收起 -->
+            <el-table-column v-if="showExtra" label="方向" width="92">
               <template #default="{ row }">
                 <el-tag v-if="row.direction !== 'UNKNOWN'" size="small" :type="row.direction === 'IN' ? 'success' : 'warning'">
                   {{ row.direction === 'IN' ? '收入' : '支出' }}
                 </el-tag>
-                <template v-else>
-                  <el-select
-                    :model-value="row.direction"
-                    size="small"
-                    placeholder="指定方向"
-                    class="flow-direction"
-                    :disabled="!store.canWrite"
-                    @change="(v) => doSetDirection(row, v)"
-                  >
-                    <el-option label="收入" value="IN" />
-                    <el-option label="支出" value="OUT" />
-                  </el-select>
-                </template>
-              </template>
-            </el-table-column>
-            <el-table-column label="对方科目" width="220">
-              <template #default="{ row }">
                 <el-select
-                  :model-value="row.plan_subject_id"
+                  v-else
+                  :model-value="row.direction"
                   size="small"
-                  filterable clearable :persistent="false"
-                  placeholder="待确认"
-                  class="flow-subject"
-                  :disabled="!store.canWrite || row.status !== 'OPEN'"
-                  @change="(v) => doSetSubject(row, v)"
+                  placeholder="指定方向"
+                  class="flow-direction"
+                  :disabled="!store.canWrite"
+                  @change="(v) => doSetDirection(row, v)"
                 >
-                  <el-option
-                    v-for="s in subjects"
-                    :key="s.id"
-                    :label="subjectLabel(s)"
-                    :value="s.id"
-                  />
+                  <el-option label="收入" value="IN" />
+                  <el-option label="支出" value="OUT" />
                 </el-select>
-                <div v-if="row.plan_status === 'RULE'" class="muted small">规则命中</div>
-                <div v-else-if="row.plan_status === 'MANUAL'" class="muted small">人工指定</div>
               </template>
             </el-table-column>
-            <el-table-column label="状态" width="120">
+            <el-table-column v-if="showExtra" label="对方科目" min-width="240">
+              <template #default="{ row }">
+                <div v-if="row.plan_subjects?.length" class="flow-plan">
+                  <el-tag
+                    v-for="item in row.plan_subjects"
+                    :key="item.subject_id"
+                    size="small"
+                    type="info"
+                    effect="plain"
+                    class="flow-plan-tag"
+                  >
+                    {{ planSubjectText(item) }}
+                  </el-tag>
+                </div>
+                <span v-else class="muted small">待确认</span>
+                <el-button link type="primary" size="small" @click="openPlan(row)">
+                  {{ row.plan_subjects?.length ? '调整' : '指定' }}
+                </el-button>
+              </template>
+            </el-table-column>
+            <el-table-column v-if="showExtra" label="状态" width="168">
               <template #default="{ row }">
                 <el-tag size="small" :type="stateType(row.voucher_state)">
                   {{ stateText(row.voucher_state) }}
                 </el-tag>
+                <el-button
+                  v-if="row.reclassify_candidates?.length"
+                  link
+                  type="warning"
+                  size="small"
+                  @click="openReclassify(row)"
+                >
+                  可改科目
+                </el-button>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="120" fixed="right">
+            <el-table-column v-if="showExtra" label="操作" width="96" fixed="right">
               <template #default="{ row }">
                 <el-button
                   link
@@ -394,13 +421,34 @@
 
       <!-- ============================================================ 科目规则 -->
       <el-tab-pane label="流水科目规则" name="rules">
+        <el-card shadow="never" class="flow-config-card">
+          <template #header>
+            <div class="section-head">
+              <span>凭证摘要模板（账套级）</span>
+              <span class="muted">
+                对账单上的「摘要」那一列各家银行写法不一，凭证摘要要能改；
+                可用占位符：摘要 / 用途 / 对方户名 / 日期 / 金额 / 方向 / 序号
+              </span>
+            </div>
+          </template>
+          <div class="flow-config-row">
+            <el-input
+              v-model="configForm.summary_template"
+              placeholder="留空 = 用内置口径（用途优先、摘要兜底）"
+              class="flow-config-input"
+            />
+            <el-button :disabled="!store.canWrite" @click="saveConfigForm">保存</el-button>
+          </div>
+        </el-card>
+
         <el-card shadow="never">
           <template #header>
             <div class="section-head">
               <span>流水科目规则</span>
               <span class="muted">
                 按摘要 / 用途 / 对方户名里的关键词定对方科目；
-                优先级大的赢，同级取更长的关键词
+                优先级大的赢，同级取更长的关键词。
+                每条规则可以单独设摘要模板（盖过账套级）
               </span>
             </div>
           </template>
@@ -423,6 +471,13 @@
             <el-form-item label="优先级">
               <el-input-number v-model="ruleForm.priority" :step="1" style="width: 110px" />
             </el-form-item>
+            <el-form-item label="摘要模板">
+              <el-input
+                v-model="ruleForm.summary_template"
+                placeholder="留空 = 用账套级"
+                style="width: 200px"
+              />
+            </el-form-item>
             <el-form-item>
               <el-button type="primary" :disabled="!store.canWrite" :loading="savingRule" @click="saveRule">
                 新增规则
@@ -434,12 +489,22 @@
             <el-table-column label="匹配列" width="110">
               <template #default="{ row }">{{ row.match_label }}</template>
             </el-table-column>
-            <el-table-column label="关键词" prop="keyword" min-width="160" />
-            <el-table-column label="对方科目" min-width="200">
+            <el-table-column label="关键词" prop="keyword" min-width="140" />
+            <el-table-column label="对方科目" min-width="180">
               <template #default="{ row }">{{ row.subject_code }} {{ row.subject_name }}</template>
             </el-table-column>
-            <el-table-column label="优先级" prop="priority" width="90" />
-            <el-table-column label="启用" width="90">
+            <el-table-column label="摘要模板" min-width="220">
+              <template #default="{ row }">
+                <el-input
+                  :model-value="row.summary_template"
+                  size="small"
+                  placeholder="留空 = 用账套级"
+                  @change="(v) => saveRuleTemplate(row, v)"
+                />
+              </template>
+            </el-table-column>
+            <el-table-column label="优先级" prop="priority" width="80" />
+            <el-table-column label="启用" width="80">
               <template #default="{ row }">{{ row.active ? '是' : '否' }}</template>
             </el-table-column>
             <el-table-column label="操作" width="90">
@@ -453,6 +518,86 @@
         </el-card>
       </el-tab-pane>
     </el-tabs>
+
+    <!-- ======================================================== 对方科目 -->
+    <el-dialog v-model="planDialog.open" title="对方科目" width="580px">
+      <div class="muted small">
+        一笔流水可能对应好几个科目（房租 + 押金、货款 + 运费）。
+        各个科目的金额加起来要等于流水金额
+        <strong>{{ money(planDialog.row?.amount) }}</strong>，否则凭证会不平衡。
+      </div>
+      <div v-for="(item, index) in planDialog.items" :key="index" class="flow-plan-row">
+        <el-select
+          v-model="item.subject_id"
+          filterable clearable :persistent="false"
+          placeholder="选科目"
+          class="flow-plan-select"
+        >
+          <el-option
+            v-for="s in subjects"
+            :key="s.id"
+            :label="subjectLabel(s)"
+            :value="s.id"
+          />
+        </el-select>
+        <el-input-number
+          v-model="item.amount"
+          :min="0"
+          :step="100"
+          :precision="2"
+          :controls="false"
+          class="flow-plan-amount"
+        />
+        <el-button link type="danger" @click="removePlanItem(index)">删</el-button>
+      </div>
+      <el-button link type="primary" @click="addPlanItem">+ 再加一个科目</el-button>
+      <div class="flow-plan-total" :class="planTotalOk ? 'is-ok' : 'is-bad'">
+        合计 {{ planTotalText }} / 流水金额 {{ money(planDialog.row?.amount) }}
+        <span v-if="!planTotalOk"> —— 差 {{ planTotalDiffText }}</span>
+      </div>
+      <template #footer>
+        <el-button @click="planDialog.open = false">取消</el-button>
+        <el-button
+          type="primary"
+          :disabled="!planTotalOk"
+          :loading="savingPlan"
+          @click="savePlan"
+        >
+          保存
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ======================================================== 改科目 -->
+    <el-dialog v-model="reclassifyDialog.open" title="账上已有同一笔分录" width="640px">
+      <div class="muted small">
+        账上已经有一笔记在别的现金科目上的分录，可能就是这一笔钱。
+        确认后把它的**现金那一侧**改成这个账户（{{ accountLabel }}），
+        对方侧不动 —— 对方侧该记成什么科目，流水这一侧判不出来。
+      </div>
+      <div
+        v-for="item in reclassifyDialog.row?.reclassify_candidates || []"
+        :key="item.entry_id"
+        class="flow-reclassify-item"
+      >
+        <div class="flow-reclassify-text">
+          <div>{{ reclassifyCandidateText(item) }}</div>
+          <div class="muted small">
+            {{ item.summary || '（无摘要）' }} · 凭证日期 {{ item.voucher_date }}
+          </div>
+          <div v-if="item.block_reason" class="flow-warn small">{{ item.block_reason }}</div>
+        </div>
+        <el-button
+          type="primary"
+          size="small"
+          :disabled="!item.changeable || !store.canWrite"
+          :loading="reclassifying"
+          @click="doReclassify(item)"
+        >
+          改成 {{ accountLabel }}
+        </el-button>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -464,8 +609,10 @@ import * as api from '@/api/bankstatement'
 import * as subjectApi from '@/api/subject'
 import { reportNumber } from '@/utils/format'
 import {
-  FIELD_OPTIONS, canCommit, diffClass, fieldLabel, settlementSourceText,
-  settlementSourceType, toColumnMapping, voucherStateText, voucherStateType,
+  FIELD_OPTIONS, canCommit, diffClass, fieldLabel, planSubjectCents,
+  planSubjectText, planTotalDiff, planTotalMatches, reclassifyCandidateText,
+  reclassifyRowCount, settlementSourceText, settlementSourceType,
+  toColumnMapping, unknownTemplateFields, voucherStateText, voucherStateType,
 } from './flow_state'
 import { useSessionStore } from '@/stores/session'
 
@@ -487,14 +634,33 @@ const uploading = ref(false)
 const reparsing = ref(false)
 const committing = ref(false)
 const savingRule = ref(false)
+const savingPlan = ref(false)
+const reclassifying = ref(false)
 const pickedFile = ref(null)
 const diagPanels = ref([])
 const manualMapping = reactive({})
 
+/**
+ * 「对账信息」栏：**默认收起**。
+ *
+ * 明细页默认只显示对账单上解析出来的内容（日期、摘要、用途、对方户名、
+ * 收入、支出、余额）；方向、对方科目、状态这些「账上才有的东西」收在
+ * 这里 —— 它们要改、要判断，但看一眼流水本身用不着。
+ */
+const showExtra = ref(false)
+
+/** 对方科目编辑弹窗。 */
+const planDialog = reactive({ open: false, row: null, items: [] })
+/** 改科目弹窗。 */
+const reclassifyDialog = reactive({ open: false, row: null })
+
 const uploadForm = reactive({ account_subject_id: null })
 const ruleForm = reactive({
   match_field: 'SUMMARY', keyword: '', subject_id: null, priority: 0, active: true,
+  summary_template: '',
 })
+/** 账套级「凭证摘要模板」。 */
+const configForm = reactive({ summary_template: '' })
 
 const subjectLabel = (s) => `${s.code} ${s.name}`
 
@@ -504,6 +670,37 @@ const cashSubjects = computed(() => subjects.value.filter(
 ))
 
 const canUpload = computed(() => !!pickedFile.value && !!uploadForm.account_subject_id)
+
+/** 有多少行「账上可能已有同一笔、只是记错了账户」。 */
+const reclassifyCount = computed(() => reclassifyRowCount(rows.value))
+
+/** 当前这份对账单。 */
+const activeStatement = computed(
+  () => statements.value.find((s) => s.id === activeStatementId.value) || null)
+
+/** 改科目的目标账户（这份对账单绑定的那个）。 */
+const accountLabel = computed(() => {
+  const s = activeStatement.value
+  if (!s) return '本账户'
+  return [s.account_subject_code, s.account_subject_name].filter(Boolean).join(' ')
+})
+
+/** 对方科目的合计与流水金额是否一致。 */
+const planTotalOk = computed(() => {
+  const row = planDialog.row
+  if (!row) return false
+  if (!planDialog.items.length) return false
+  if (planDialog.items.some((item) => !item.subject_id)) return false
+  return planTotalMatches(planDialog.items, row.amount)
+})
+
+const planTotalText = computed(
+  () => money((planSubjectCents(planDialog.items) / 100).toFixed(2)))
+
+const planTotalDiffText = computed(() => {
+  const diff = Math.abs(planTotalDiff(planDialog.items, planDialog.row?.amount))
+  return money((diff / 100).toFixed(2))
+})
 
 /**
  * 金额显示：**走 ``utils/format`` 的 ``reportNumber``**，
@@ -547,16 +744,18 @@ const manualMappingCount = computed(() => Object.keys(manualMapping).filter(
 async function loadAll() {
   loading.value = true
   try {
-    const [list, flat, ruleList, profileList] = await Promise.all([
+    const [list, flat, ruleList, profileList, cfg] = await Promise.all([
       api.listStatements(store.bookId),
       subjectApi.subjectFlat(store.bookId, { year: store.currentYear }),
       api.listRules(store.bookId),
       api.listProfiles(store.bookId),
+      api.getConfig(store.bookId),
     ])
     statements.value = list || []
     subjects.value = flat || []
     rules.value = ruleList || []
     profiles.value = profileList || []
+    configForm.summary_template = cfg?.summary_template || ''
     if (current.value) {
       const again = statements.value.find((s) => s.id === current.value.id)
       if (again) current.value = again
@@ -565,6 +764,44 @@ async function loadAll() {
     ElMessage.error(e?.response?.data?.detail || '加载失败')
   } finally {
     loading.value = false
+  }
+}
+
+/**
+ * 保存账套级的「凭证摘要模板」。
+ *
+ * **不认识的占位符当场拦下**（后端也会拒，但那时用户已经填完一整张表单）。
+ */
+async function saveConfigForm() {
+  const unknown = unknownTemplateFields(configForm.summary_template)
+  if (unknown.length) {
+    ElMessage.warning(`占位符 {${unknown.join('} {')} } 不认识，可用：摘要 / 用途 / 对方户名 / 日期 / 金额 / 方向 / 序号`)
+    return
+  }
+  try {
+    const saved = await api.saveConfig(store.bookId, {
+      summary_template: configForm.summary_template,
+    })
+    configForm.summary_template = saved?.summary_template || configForm.summary_template
+    ElMessage.success('已保存摘要模板')
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '保存失败')
+  }
+}
+
+/** 改某条规则的摘要模板（规则级盖过账套级）。 */
+async function saveRuleTemplate(rule, value) {
+  const template = value || ''
+  const unknown = unknownTemplateFields(template)
+  if (unknown.length) {
+    ElMessage.warning(`占位符 {${unknown.join('} {')} } 不认识`)
+    return
+  }
+  try {
+    await api.updateRule(store.bookId, rule.id, { summary_template: template })
+    ElMessage.success('已保存这条规则的摘要模板')
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '保存失败')
   }
 }
 
@@ -670,12 +907,74 @@ async function doSetDirection(row, direction) {
   }
 }
 
-async function doSetSubject(row, subjectId) {
+/**
+ * 打开「对方科目」弹窗。
+ *
+ * **一行流水可以有好几个对方科目**，所以弹窗里是一张可增删的小表：
+ * 每一行一个科目 + 一份金额。
+ */
+function openPlan(row) {
+  planDialog.row = row
+  const items = (row.plan_subjects || []).map((item) => ({
+    subject_id: item.subject_id,
+    amount: Number(item.amount) || 0,
+  }))
+  planDialog.items = items.length
+    ? items
+    : [{ subject_id: null, amount: Number(row.amount) || 0 }]
+  planDialog.open = true
+}
+
+function addPlanItem() {
+  planDialog.items.push({ subject_id: null, amount: 0 })
+}
+
+function removePlanItem(index) {
+  planDialog.items.splice(index, 1)
+}
+
+async function savePlan() {
+  const row = planDialog.row
+  if (!row || !planTotalOk.value) return
+  savingPlan.value = true
   try {
-    await api.patchRow(store.bookId, row.id, { plan_subject_id: subjectId || null })
+    await api.patchRow(store.bookId, row.id, {
+      plan_subjects: planDialog.items.map((item) => ({
+        subject_id: item.subject_id,
+        amount: String(item.amount),
+      })),
+    })
+    planDialog.open = false
     await loadRows()
+    ElMessage.success('已保存对方科目')
   } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || '设置对方科目失败')
+    ElMessage.error(e?.response?.data?.detail || '保存对方科目失败')
+  } finally {
+    savingPlan.value = false
+  }
+}
+
+/** 打开「改科目」弹窗：账上可能与这一行是同一笔的分录。 */
+function openReclassify(row) {
+  reclassifyDialog.row = row
+  reclassifyDialog.open = true
+}
+
+async function doReclassify(item) {
+  const row = reclassifyDialog.row
+  if (!row) return
+  reclassifying.value = true
+  try {
+    const result = await api.reclassifyRow(store.bookId, row.id, item.entry_id)
+    reclassifyDialog.open = false
+    await loadRows()
+    await loadAll()
+    ElMessage.success(
+      `已把 ${result.from_subject.code} 改成 ${result.to_subject.code}，这条流水算已入账`)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '改科目失败')
+  } finally {
+    reclassifying.value = false
   }
 }
 
@@ -719,6 +1018,7 @@ async function saveRule() {
     await api.createRule(store.bookId, { ...ruleForm })
     ruleForm.keyword = ''
     ruleForm.subject_id = null
+    ruleForm.summary_template = ''
     await loadAll()
     ElMessage.success('已新增规则')
   } catch (e) {
@@ -814,11 +1114,57 @@ onMounted(() => {
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
-  margin-bottom: 12px;
+  margin-bottom: 8px;
 }
 .flow-select { width: 340px; }
 .flow-direction { width: 92px; }
 .flow-subject { width: 200px; }
+/** 「对账信息」开关靠右，别跟生成按钮挤在一起。 */
+.flow-toggle { margin-left: auto; }
+.flow-tag-button { cursor: pointer; }
+
+/* 流水明细表要**紧凑**：一行流水一眼能扫过去，而不是一屏放不了十行。 */
+.flow-rows-table :deep(.el-table__cell) { padding: 4px 0; }
+.flow-rows-table :deep(.cell) { line-height: 1.5; }
+
+/* 对方科目：一行可以有好几个，用标签平铺。 */
+.flow-plan { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 2px; }
+.flow-plan-tag { font-size: 12px; }
+
+/* 对方科目编辑弹窗：一行 = 科目 + 金额 + 删。 */
+.flow-plan-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.flow-plan-select { flex: 1 1 auto; min-width: 220px; }
+.flow-plan-amount { flex: 0 0 140px; }
+.flow-plan-total {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--el-border-color-lighter);
+  font-size: 13px;
+}
+.flow-plan-total.is-ok { color: var(--el-color-success); }
+.flow-plan-total.is-bad { color: var(--el-color-danger); }
+
+/* 改科目弹窗：一行一条候选。 */
+.flow-reclassify-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.flow-reclassify-text { min-width: 0; }
+.flow-warn { color: var(--el-color-warning-dark-2); }
+
+/* 账套级摘要模板那一行。 */
+.flow-config-card { margin-bottom: 12px; }
+.flow-config-row { display: flex; gap: 8px; align-items: center; }
+.flow-config-input { max-width: 520px; }
 .diag-grid {
   display: flex;
   gap: 24px;

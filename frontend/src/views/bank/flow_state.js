@@ -115,3 +115,105 @@ export const toColumnMapping = (mapping) => {
   }
   return out
 }
+
+// ----------------------------------------------------------------------
+// 对方科目（一行流水可以有好几个）
+// ----------------------------------------------------------------------
+
+/**
+ * 金额换算成**分**（整数）。
+ *
+ * **为什么不在这里直接加减浮点。** 金额是两位小数的十进制字符串，
+ * `0.1 + 0.2` 在双精度里是 `0.30000000000000004` —— 合计与流水金额
+ * 比不相等时，界面会说「对不上」，而实际上它是对的。钱不容许这种误差，
+ * 所以先换成整数分再算。
+ */
+export const toCents = (value) => {
+  if (value === '' || value === null || value === undefined) return 0
+  const text = String(value).trim()
+  if (!text) return 0
+  const negative = text.startsWith('-')
+  const body = negative ? text.slice(1) : text
+  const [intPart = '0', decPart = ''] = body.split('.')
+  const cents = Number(intPart || '0') * 100 + Number((decPart + '00').slice(0, 2))
+  return negative ? -cents : cents
+}
+
+/**
+ * 对方科目的金额合计（单位：分）。
+ *
+ * @param {Array} subjects 后端给的 ``plan_subjects``
+ * @returns {number} 合计（分）
+ */
+export const planSubjectCents = (subjects) =>
+  (subjects || []).reduce((sum, item) => sum + toCents(item?.amount), 0)
+
+/**
+ * 对方科目合计**是不是等于**流水金额。
+ *
+ * 差一分钱都不算 —— 凭证会不平衡。
+ */
+export const planTotalMatches = (subjects, amount) =>
+  planSubjectCents(subjects) === toCents(amount)
+
+/**
+ * 对方科目合计与流水金额差多少（分）。**0 = 一致**。
+ */
+export const planTotalDiff = (subjects, amount) =>
+  planSubjectCents(subjects) - toCents(amount)
+
+/** 对方科目的显示文本：`6602 业务招待费 800.00`。 */
+export const planSubjectText = (item) => {
+  if (!item) return ''
+  const name = [item.subject_code, item.subject_name].filter(Boolean).join(' ')
+  return name ? `${name} ${item.amount}` : String(item.amount ?? '')
+}
+
+/** 一个科目的来源说法。 */
+export const planSubjectSourceText = (source) =>
+  (source === 'RULE' ? '规则命中' : source === 'MANUAL' ? '人工指定' : source || '')
+
+// ----------------------------------------------------------------------
+// 改科目（账上已有分录 → 挪到本账户）
+// ----------------------------------------------------------------------
+
+/** 有多少行「账上可能已有同一笔、只是记错了账户」。 */
+export const reclassifyRowCount = (rows) =>
+  (rows || []).filter((row) => (row.reclassify_candidates || []).length > 0).length
+
+/** 候选的显示文本：`记在 1001 库存现金 上的 5,000.00（凭证 记0003）`。 */
+export const reclassifyCandidateText = (item) => {
+  if (!item) return ''
+  const subject = [item.subject_code, item.subject_name].filter(Boolean).join(' ')
+  const amount = item.amount ?? ''
+  const voucher = item.voucher_no ? `（凭证 ${item.voucher_no}）` : ''
+  return `记在 ${subject} 上的 ${amount}${voucher}`
+}
+
+// ----------------------------------------------------------------------
+// 凭证摘要模板
+// ----------------------------------------------------------------------
+
+/** 摘要模板里能用的占位符。**与后端 ``service.SUMMARY_TEMPLATE_FIELDS`` 一一对应。** */
+export const SUMMARY_TEMPLATE_FIELDS = [
+  '摘要', '用途', '对方户名', '日期', '金额', '方向', '序号',
+]
+
+/**
+ * 模板里有没有不认识的占位符。
+ *
+ * **前端也查一遍**，是为了当场告诉用户「这个占位符不认识」——
+ * 后端存的时候也会拒，但那时用户已经填完一整张表单了。
+ */
+export const unknownTemplateFields = (template) => {
+  const text = String(template || '')
+  const found = []
+  const re = /\{([^{}]*)\}/g
+  let match
+  while ((match = re.exec(text)) !== null) {
+    if (!SUMMARY_TEMPLATE_FIELDS.includes(match[1]) && !found.includes(match[1])) {
+      found.push(match[1])
+    }
+  }
+  return found
+}

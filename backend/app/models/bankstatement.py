@@ -6,7 +6,7 @@
 一张按发票生成的凭证。少了这一段，钱在账上就是**凭空少了一笔**，而科目余额
 表永远只会显示一个差值，不告诉你是哪一笔、对不上。
 
-所以这里存三样东西：
+所以这里存六样东西：
 
 1. **对账单**（:class:`BankStatement`）—— 一份原始文件连同它的账户信息、
    期间与期末余额。原件必须留存：解析器会改，规则会变，解析错了要能重来。
@@ -17,6 +17,14 @@
    关键词 → 对方科目。**与发票科目规则分表**：两者的匹配对象、粒度与
    生命周期都不一样（发票规则按供应商/项目名匹配一行发票，这里按关键词
    匹配一条流水），塞进一张表会让两边都开始「半可用」。
+4. **流水对方科目**（:class:`BankStatementRowSubject`）—— 一行流水的对方
+   科目**可能不止一个**（一笔 1000 元的付款里 800 是房租、200 是押金）。
+   所以对方科目是**子表**而不是行上的一个 id：金额要跟着科目走，
+   合计必须等于流水金额。
+5. **流水科目规则画像**（:class:`BankStatementProfile`）—— 记住某种对账单
+   的列映射该怎么做。
+6. **账套级流水配置**（:class:`BankStatementConfig`）—— 每个账套一份，
+   装「流水凭证摘要模板」这类全局口径。
 
 **为什么金额都是 Numeric(18, 2) 而不是 float。** 银行流水是钱的记录，
 浮点在 0.1 + 0.2 这类地方会露出 0.30000000000000004；对账要拿金额**相等**
@@ -35,6 +43,7 @@ from typing import Optional
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -163,13 +172,60 @@ class BankStatementRow(Base, TimestampMixin):
         ForeignKey("voucher.id", ondelete="SET NULL"))
     matched_invoice_record_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("invoice_record.id", ondelete="SET NULL"))
-    plan_subject_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("subject.id", ondelete="RESTRICT"))
+    #: 对方科目定下来了没有：NONE 还没算 / RULE 规则命中 / MANUAL 人工指定 /
+    #: PENDING 规则没命中，等人工指定。
+    #:
+    #: **它是「这一行有没有对方科目」的摘要，不是对方科目本身。**
+    #: 对方科目本体在 :class:`BankStatementRowSubject` 里（可能好几个）。
     plan_status: Mapped[str] = mapped_column(String(16), default=PLAN_NONE, nullable=False)
     #: 这一行的问题（方向未知、金额为 0、两侧都有发生额……）。
     problems: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
 
     statement: Mapped["BankStatement"] = relationship(back_populates="rows")
+    #: 对方科目（可能不止一个，见 :class:`BankStatementRowSubject`）。
+    plan_subjects: Mapped[list["BankStatementRowSubject"]] = relationship(
+        back_populates="row", cascade="all, delete-orphan",
+        order_by="BankStatementRowSubject.sort_no")
+
+
+class BankStatementRowSubject(Base, TimestampMixin):
+    """一行流水的**对方科目** —— 可能不止一个。
+
+    **为什么是子表而不是行上的一个 id。** 一笔流水可能对应好几个科目：
+    一笔 1000 元的付款里 800 是房租、200 是押金；一笔收款里既有货款又有
+    运费。对方科目与**金额**是一一对应的，所以金额必须跟着科目走 ——
+    塞进行上的单值列里，就只能记「一个科目 + 一笔总额」，而那一笔总额
+    到底记在哪个科目上就成了猜的。
+
+    **金额的硬约束：这一行所有科目的金额合计必须等于流水金额。**
+    合计对不上时凭证会不平衡（或者更糟：平了但记在错误的科目上）。
+    这条校验在服务层做（:func:`app.bankstatement.service.update_row`），
+    表层用 CHECK 守住「金额不能是 0 或负数」。
+
+    **外键是 RESTRICT**：被流水计划引用的科目不能被删 —— 与旧的
+    ``plan_subject_id`` 同一条语义，替掉它不能把这道闸弄丢。
+    """
+
+    __tablename__ = "bank_statement_row_subject"
+    __table_args__ = (
+        Index("ix_bank_statement_row_subject_row", "row_id", "sort_no"),
+        # 同一行里同一个科目只出现一次：两个同名科目的分录几乎总是手滑，
+        # 而它会让凭证多出一条看不出错的分录。要拆同一个科目请合并金额。
+        UniqueConstraint("row_id", "subject_id", name="uq_bank_statement_row_subject"),
+        CheckConstraint("amount > 0", name="ck_bank_statement_row_subject_amount"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    row_id: Mapped[int] = mapped_column(
+        ForeignKey("bank_statement_row.id", ondelete="CASCADE"), nullable=False)
+    subject_id: Mapped[int] = mapped_column(
+        ForeignKey("subject.id", ondelete="RESTRICT"), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    #: RULE（规则命中）/ MANUAL（人工指定）。
+    source: Mapped[str] = mapped_column(String(16), default=PLAN_MANUAL, nullable=False)
+    sort_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    row: Mapped["BankStatementRow"] = relationship(back_populates="plan_subjects")
 
 
 class BankStatementRule(Base, TimestampMixin):
@@ -197,7 +253,32 @@ class BankStatementRule(Base, TimestampMixin):
         ForeignKey("subject.id", ondelete="RESTRICT"), nullable=False)
     priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    #: 这条规则命中时，生成的凭证用哪个摘要模板。**空 = 用账套级默认**
+    #: （:class:`BankStatementConfig`）。见 :func:`app.bankstatement.service.render_summary`。
+    summary_template: Mapped[str] = mapped_column(String(256), default="", nullable=False)
     created_by: Mapped[Optional[str]] = mapped_column(String(64))
+
+
+class BankStatementConfig(Base, TimestampMixin):
+    """每个账套一份的流水对账配置。
+
+    **现在只有一项：凭证摘要模板。** 但它必须有地方放 —— 挂在规则上的是
+    「这条规则专用」，而「这个账套的流水凭证摘要长什么样」是账套级口径，
+    两者缺一不可：运费流水与工资流水的摘要多半不一样，而它们都走同一个
+    账套。
+    """
+
+    __tablename__ = "bank_statement_config"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    book_id: Mapped[int] = mapped_column(
+        ForeignKey("book.id", ondelete="CASCADE"), nullable=False, unique=True)
+    #: 流水生成凭证时用的摘要模板。**空 = 内置口径**（用途优先、摘要兜底、
+    #: 再兜底「银行收/付 + 对方户名」）。
+    #:
+    #: 占位符：``{摘要}`` ``{用途}`` ``{对方户名}`` ``{日期}`` ``{金额}``
+    #: ``{方向}`` ``{账户}``。模板写错时**退回内置口径**，不让整批制证失败。
+    summary_template: Mapped[str] = mapped_column(String(256), default="", nullable=False)
 
 
 class BankStatementProfile(Base, TimestampMixin):

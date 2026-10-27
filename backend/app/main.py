@@ -258,7 +258,8 @@ async def request_id_middleware(request: Request, call_next):
 
 for r in (auth.router, system.router, scheduler.router, books.router, subjects.router, vouchers.router, invoices.router,
           ledger.router, reports.router, printing.router, mcp_admin.router,
-          bank_statements.router, bank_statements.rules_router, bank_statements.profiles_router):
+          bank_statements.router, bank_statements.rules_router,
+          bank_statements.profiles_router, bank_statements.config_router):
     app.include_router(r)
 
 

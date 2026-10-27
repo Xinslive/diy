@@ -32,15 +32,18 @@ from sqlalchemy.orm import Session
 
 from app.accounting import vouchers as voucher_service
 from app.accounting.util import find_period, money
-from app.bankstatement import formats, semantics, storage
+from app.bankstatement import formats, matching, semantics, storage
 from app.models import (
     BankStatement,
+    BankStatementConfig,
     BankStatementProfile,
     BankStatementRow,
+    BankStatementRowSubject,
     BankStatementRule,
     Book,
     Entry,
     InvoiceRecord,
+    Period,
     Subject,
     SysUser,
     Voucher,
@@ -753,8 +756,12 @@ def _store_rows(db: Session, statement: BankStatement,
     **``carry`` 是「重建行时对不回去的东西」**（重新解析用）：已经生成过
     凭证 / 已被发票占用 / 被用户忽略的行，把那些状态原样搬过去。
     """
+    # **旧行的对方科目要先读出来**：下面那句 DELETE 会把子表里的行
+    # 级联删掉 —— 晚一步读就全没了，而那些是用户手工指定的科目与金额。
+    old_children = _children_of(db, [row.id for row in (carry or {}).values()])
     db.execute(delete(BankStatementRow).where(
         BankStatementRow.statement_id == statement.id))
+    pending: list[tuple[BankStatementRow, list[BankStatementRowSubject]]] = []
     for row in parsed.rows:
         subject_id, plan_status = _rule_subject(rules, row)
         status = STATUS_OPEN
@@ -765,12 +772,25 @@ def _store_rows(db: Session, statement: BankStatement,
             # 归到「先定方向」而不是「先定科目」那两类里。
             plan_status = PLAN_NONE
         old = (carry or {}).get(row.seq)
+        children: list[BankStatementRowSubject] = []
         if old is not None:
-            # 搬回去：凭证、发票占用、忽略状态、人工指定的对方科目。
+            # 搬回去：凭证、发票占用、忽略状态、对方科目（连金额一起搬）。
             status = old.status
-            subject_id = old.plan_subject_id or subject_id
             plan_status = old.plan_status
-        db.add(BankStatementRow(
+            children = list(old_children.get(old.id) or [])
+        elif subject_id and row.amount is not None and row.amount > 0:
+            # 规则命中的行：一条子表行，金额就是这一行的流水金额。
+            #
+            # **金额为 0 / 未知的行不给建子表行** —— 子表有 ``amount > 0``
+            # 的 CHECK，而 0 金额的行压根进不了制证（库层
+            # ``ck_entry_amount_nonzero`` 也会挡）。这种行标成 NONE：
+            # 它等的是「金额」，不是「对方科目」。
+            children = [BankStatementRowSubject(
+                subject_id=subject_id, amount=row.amount,
+                source=PLAN_RULE, sort_no=1)]
+        elif subject_id:
+            plan_status = PLAN_NONE
+        new_row = BankStatementRow(
             statement_id=statement.id,
             book_id=statement.book_id,
             seq=row.seq,
@@ -788,10 +808,19 @@ def _store_rows(db: Session, statement: BankStatement,
             matched_voucher_id=(old.matched_voucher_id if old is not None else None),
             matched_invoice_record_id=(
                 old.matched_invoice_record_id if old is not None else None),
-            plan_subject_id=subject_id,
             plan_status=plan_status,
             problems=list(row.problems or []),
-        ))
+        )
+        db.add(new_row)
+        pending.append((new_row, children))
+    db.flush()
+    # 子表行要等父行拿到 id 才建得出来。
+    for new_row, children in pending:
+        for index, child in enumerate(children, start=1):
+            new_row.plan_subjects.append(BankStatementRowSubject(
+                subject_id=child.subject_id, amount=child.amount,
+                source=child.source, sort_no=index))
+    db.flush()
 
 
 def upload_statement(db: Session, book_id: int, user: SysUser, filename: str,
@@ -1025,11 +1054,24 @@ def list_rules(db: Session, book_id: int) -> list[BankStatementRule]:
     ).all())
 
 
-def _rule_subject(rules: Iterable[BankStatementRule],
-                  row: semantics.StatementRow) -> tuple[Optional[int], str]:
-    """这一行该记到哪个对方科目。
+def _pseudo_row(row: BankStatementRow) -> semantics.StatementRow:
+    """把库里的一行流水变成「规则匹配要的那种行」。
 
-    命中规则 → ``(科目 id, RULE)``；没命中 → ``(None, PENDING)``。
+    规则匹配看的是摘要 / 用途 / 对方户名三列，而这三列在库里直接就是
+    同名字段 —— 中间这一层转换写在一处，免得两处各写一遍、改了一处忘了
+    另一处（那会让「规则命中了但制证没按规则走」这种错看起来像随机故障）。
+    """
+    return semantics.StatementRow(
+        seq=row.seq,
+        summary=row.summary,
+        purpose=row.purpose,
+        counterparty_name=row.counterparty_name,
+    )
+
+
+def _rule_hit(rules: Iterable[BankStatementRule],
+              row: semantics.StatementRow) -> Optional[BankStatementRule]:
+    """命中的那一条规则（没有命中就是 ``None``）。
 
     **同优先级时取更长的关键词**：「手续费」与「跨行转账手续费」优先级一样时，
     长的那个更具体。「跨行转账手续费」里也含「手续费」，但前者更可能是
@@ -1055,6 +1097,16 @@ def _rule_subject(rules: Iterable[BankStatementRule],
             best = rule
         elif rule.priority == best.priority and len(rule.keyword) > len(best.keyword):
             best = rule
+    return best
+
+
+def _rule_subject(rules: Iterable[BankStatementRule],
+                  row: semantics.StatementRow) -> tuple[Optional[int], str]:
+    """这一行该记到哪个对方科目。
+
+    命中规则 → ``(科目 id, RULE)``；没命中 → ``(None, PENDING)``。
+    """
+    best = _rule_hit(rules, row)
     if best is None:
         return None, PLAN_PENDING
     return best.subject_id, PLAN_RULE
@@ -1089,12 +1141,33 @@ def create_rule(db: Session, book_id: int, user: SysUser, payload: dict[str, Any
         subject_id=subject.id,
         priority=int(payload.get("priority") or 0),
         active=bool(payload.get("active", True)),
+        summary_template=_summary_template_of(payload),
         created_by=getattr(user, "username", "") or "",
     )
     db.add(rule)
     db.flush()
     _replan_rules(db, book_id)
     return serialize_rule(db, rule)
+
+
+def _summary_template_of(payload: dict[str, Any]) -> str:
+    """取摘要模板并校验。
+
+    **模板写错不许存**：一个不认识的占位符会让渲染退回内置口径，
+    而那正是用户以为「我设了模板但没生效」时最难受的一种情况 ——
+    与其存下来让人看不出来，不如当场说清「这个占位符不认识」。
+    """
+    template = _text(payload.get("summary_template"))
+    if not template:
+        return ""
+    if len(template) > 256:
+        raise ValueError("摘要模板太长了（最多 256 个字）")
+    for field in re.findall(r"\{([^{}]*)\}", template):
+        if field not in SUMMARY_TEMPLATE_FIELDS:
+            raise ValueError(
+                f"摘要模板里的「{{{field}}}」不是可用的占位符。"
+                f"可用的是：{'、'.join('{' + f + '}' for f in SUMMARY_TEMPLATE_FIELDS)}")
+    return template
 
 
 def update_rule(db: Session, book_id: int, rule_id: int,
@@ -1119,6 +1192,8 @@ def update_rule(db: Session, book_id: int, rule_id: int,
         rule.priority = int(payload["priority"])
     if "active" in payload and payload["active"] is not None:
         rule.active = bool(payload["active"])
+    if "summary_template" in payload:
+        rule.summary_template = _summary_template_of(payload)
     db.flush()
     _replan_rules(db, book_id)
     return serialize_rule(db, rule)
@@ -1139,24 +1214,32 @@ def _replan_rules(db: Session, book_id: int) -> None:
 
     只重算**还没定下来**的行：人工指定过的（``MANUAL``）不动 ——
     那是用户亲手挑的，不该被一条新规则覆盖掉。
+
+    规则命中给的是**一条**对方科目（金额就是这一行的流水金额）。
+    一条规则只有一个科目 —— 规则没有金额，配不出「800 房租 + 200 押金」
+    这种拆分来，而拆分的金额只有用户知道（凭发票、凭单据）。
+    要拆就人工指定。
     """
     rules = list_rules(db, book_id)
     rows = db.scalars(select(BankStatementRow).where(
         BankStatementRow.book_id == book_id,
         BankStatementRow.plan_status != PLAN_MANUAL,
     )).all()
+    children = _children_of(db, [row.id for row in rows])
     for row in rows:
-        pseudo = semantics.StatementRow(
-            seq=row.seq,
-            summary=row.summary,
-            purpose=row.purpose,
-            counterparty_name=row.counterparty_name,
-        )
+        pseudo = _pseudo_row(row)
         subject_id, plan_status = _rule_subject(rules, pseudo)
-        row.plan_subject_id = subject_id
         if row.direction == DIRECTION_UNKNOWN:
             # 方向都没定，「对方科目待确认」这句话是错的 —— 它等的是方向。
             plan_status = PLAN_NONE
+        items: list[dict[str, Any]] = []
+        if subject_id and row.amount is not None and row.amount > 0:
+            items = [{"subject_id": subject_id, "amount": row.amount,
+                      "source": PLAN_RULE}]
+        elif subject_id:
+            plan_status = PLAN_NONE
+        _write_plan_subjects(db, row, items, PLAN_RULE,
+                             existing=children.get(row.id) or [])
         row.plan_status = plan_status
     db.flush()
 
@@ -1173,7 +1256,40 @@ def serialize_rule(db: Session, rule: BankStatementRule) -> dict[str, Any]:
         "subject_name": subject.name if subject else "",
         "priority": rule.priority,
         "active": rule.active,
+        "summary_template": rule.summary_template or "",
     }
+
+
+# ----------------------------------------------------------------------
+# 账套级配置（凭证摘要模板）
+# ----------------------------------------------------------------------
+
+def get_config(db: Session, book_id: int) -> Optional[BankStatementConfig]:
+    """这个账套的流水配置。**没有就返回 ``None``** —— 那表示「还没配过」，
+    不是「配了个空的」。"""
+    return db.scalar(select(BankStatementConfig).where(
+        BankStatementConfig.book_id == book_id))
+
+
+def serialize_config(config: BankStatementConfig | None) -> dict[str, Any]:
+    return {
+        "book_id": config.book_id if config else 0,
+        "summary_template": (config.summary_template if config else "") or "",
+        "template_fields": list(SUMMARY_TEMPLATE_FIELDS),
+    }
+
+
+def save_config(db: Session, book_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    """存这个账套的流水配置。**存过一次之后就用那一份**（不覆盖成空）。"""
+    template = _summary_template_of(payload)
+    config = get_config(db, book_id)
+    if config is None:
+        config = BankStatementConfig(book_id=book_id, summary_template=template)
+        db.add(config)
+    else:
+        config.summary_template = template
+    db.flush()
+    return serialize_config(config)
 
 
 # ----------------------------------------------------------------------
@@ -1262,6 +1378,105 @@ def _subjects_of(db: Session, book_id: int,
     return {row.id: row for row in rows}
 
 
+# ----------------------------------------------------------------------
+# 对方科目（可能不止一个）
+# ----------------------------------------------------------------------
+
+def _children_of(db: Session,
+                 row_ids: Iterable[int]) -> dict[int, list[BankStatementRowSubject]]:
+    """一次读完若干行的对方科目，按行分组。
+
+    **一次查询，不是一行一次。** 流水明细页一次要显示几百行，逐行去查
+    对方科目就是几百次往返 —— 那是最容易把页面拖慢的一种写法，而这里的
+    数据结构（行 → 若干条）天生就该一次读完。
+    """
+    ids = [int(i) for i in row_ids if i]
+    if not ids:
+        return {}
+    rows = db.scalars(
+        select(BankStatementRowSubject)
+        .where(BankStatementRowSubject.row_id.in_(ids))
+        .order_by(BankStatementRowSubject.row_id, BankStatementRowSubject.sort_no,
+                  BankStatementRowSubject.id)
+    ).all()
+    grouped: dict[int, list[BankStatementRowSubject]] = {}
+    for item in rows:
+        grouped.setdefault(item.row_id, []).append(item)
+    return grouped
+
+
+def _plan_total(items: Iterable[BankStatementRowSubject]) -> Decimal:
+    return sum((Decimal(str(item.amount)) for item in items), Decimal("0"))
+
+
+def _serialize_plan_subjects(items: list[BankStatementRowSubject],
+                             subjects: dict[int, Subject]) -> list[dict[str, Any]]:
+    """对方科目列表 → 界面上要的形状。"""
+    out: list[dict[str, Any]] = []
+    for item in items:
+        subject = subjects.get(item.subject_id)
+        out.append({
+            "subject_id": item.subject_id,
+            "subject_code": subject.code if subject else "",
+            "subject_name": subject.name if subject else "",
+            "amount": str(item.amount),
+            "source": item.source,
+        })
+    return out
+
+
+def _write_plan_subjects(db: Session, row: BankStatementRow,
+                         items: list[dict[str, Any]], source: str,
+                         existing: list[BankStatementRowSubject] | None = None
+                         ) -> None:
+    """把一行的对方科目整个换掉。
+
+    **整体替换，不做增量合并。** 理由与接口层的 ``exclude_unset=True``
+    同款：增量合并一旦漏了「删掉其中一条」这条路，就会出现「界面上删了、
+    库里还在」的幽灵科目 —— 而它会被算进制证金额里。
+
+    调用方负责校验（科目合法、金额为正、合计等于流水金额）。
+
+    **写完把关系属性 expire 掉**：会话里那份 ``row.plan_subjects`` 可能还
+    留着刚删掉的旧行（它是被 ``db.delete`` 删的，不是从集合里摘掉的），
+    谁再读它就会读到已经不在库里的行。expire 之后下次访问重新读库。
+    """
+    olds = list(existing) if existing is not None else list(row.plan_subjects)
+    for old in olds:
+        db.delete(old)
+    db.flush()
+    for index, item in enumerate(items, start=1):
+        db.add(BankStatementRowSubject(
+            row_id=row.id,
+            subject_id=int(item["subject_id"]),
+            amount=money(item["amount"]),
+            source=item.get("source") or source,
+            sort_no=index,
+        ))
+    db.flush()
+    db.expire(row, ["plan_subjects"])
+
+
+def _plan_status_of(items: list[Any],
+                    direction: str) -> str:
+    """这一行的对方科目状态。
+
+    - 一条都没有 → 方向还没定就是 ``NONE``，方向定了就是 ``PENDING``；
+    - 全是规则命中 → ``RULE``；
+    - 只要有人工指定过 → ``MANUAL``（人工优先：用户亲手挑过的不许被规则盖掉）。
+
+    ``items`` 可以是子表行，也可以是 ``{subject_id, amount, source}`` 那种
+    字典 —— 两种形状在两个地方用（读的时候是行，写的时候是字典）。
+    """
+    if not items:
+        return PLAN_NONE if direction == DIRECTION_UNKNOWN else PLAN_PENDING
+    sources = [item.get("source") if isinstance(item, dict) else item.source
+               for item in items]
+    if PLAN_MANUAL in sources:
+        return PLAN_MANUAL
+    return PLAN_RULE
+
+
 def serialize_statement(db: Session, statement: BankStatement,
                         engine: Any = None) -> dict[str, Any]:
     subject = db.get(Subject, statement.account_subject_id)
@@ -1337,19 +1552,28 @@ def list_rows(db: Session, book_id: int, statement_id: int, *,
     rows = db.scalars(select(BankStatementRow).where(
         BankStatementRow.statement_id == statement.id
     ).order_by(BankStatementRow.seq)).all()
-    subjects = _subjects_of(db, book_id, [
-        row.plan_subject_id for row in rows if row.plan_subject_id])
-    return [serialize_row(db, row, subjects) for row in rows]
+    children = _children_of(db, [row.id for row in rows])
+    subject_ids = {item.subject_id for items in children.values() for item in items}
+    subjects = _subjects_of(db, book_id, subject_ids)
+    # **一次查询出全部「可以改科目的分录」候选**（不是一行一次）。
+    candidates = matching.reclassify_candidates(db, book_id, statement, rows)
+    return [serialize_row(db, row, subjects, children.get(row.id) or [],
+                          candidates.get(row.id) or [])
+            for row in rows]
 
 
 def serialize_row(db: Session, row: BankStatementRow,
-                  subjects: dict[int, Subject] | None = None) -> dict[str, Any]:
+                  subjects: dict[int, Subject] | None = None,
+                  plan_subjects: list[BankStatementRowSubject] | None = None,
+                  reclassify: list[dict[str, Any]] | None = None
+                  ) -> dict[str, Any]:
     subjects = subjects or {}
-    subject = subjects.get(row.plan_subject_id) if row.plan_subject_id else None
-    if subject is None and row.plan_subject_id:
-        subject = db.get(Subject, row.plan_subject_id)
-    return {
-        "id": row.id,
+    items = list(row.plan_subjects) if plan_subjects is None else list(plan_subjects)
+    plans: list[dict[str, Any]] = []
+    for item in reclassify or []:
+        reason = matching.reclassify_block_reason(item)
+        plans.append({**item, "changeable": not reason, "block_reason": reason})
+    return {        "id": row.id,
         "statement_id": row.statement_id,
         "seq": row.seq,
         "tx_date": row.tx_date.isoformat() if row.tx_date else "",
@@ -1365,16 +1589,22 @@ def serialize_row(db: Session, row: BankStatementRow,
         "status": row.status,
         "matched_voucher_id": row.matched_voucher_id,
         "matched_invoice_record_id": row.matched_invoice_record_id,
-        "plan_subject_id": row.plan_subject_id,
-        "plan_subject_code": subject.code if subject else "",
-        "plan_subject_name": subject.name if subject else "",
+        #: 对方科目（可能不止一个）。每条带自己的金额。
+        "plan_subjects": _serialize_plan_subjects(items, subjects),
+        #: 对方科目金额合计。**制证时它必须等于流水金额。**
+        "plan_subject_total": str(_plan_total(items)),
         "plan_status": row.plan_status,
         "problems": row.problems or [],
         "voucher_state": _voucher_state(row),
+        #: 账上「可能与这一行是同一笔」的分录（记在别的现金科目上的）。
+        #: 有候选 = 这笔钱可能已经入过账了，只是记错了账户。
+        "reclassify_candidates": plans,
     }
 
 
-def _voucher_state(row: BankStatementRow) -> str:
+def _voucher_state(row: BankStatementRow,
+                   plan_subjects: list[BankStatementRowSubject] | None = None
+                   ) -> str:
     """这一行现在能不能制证，为什么不能。
 
     界面上用**颜色 + 文字**把四种情况分开，因为它们要做的动作不同：
@@ -1392,7 +1622,8 @@ def _voucher_state(row: BankStatementRow) -> str:
         return "NOAMOUNT"
     if row.plan_status == PLAN_PENDING:
         return "PENDING"
-    if row.plan_status in (PLAN_RULE, PLAN_MANUAL) and row.plan_subject_id:
+    items = list(row.plan_subjects) if plan_subjects is None else list(plan_subjects)
+    if row.plan_status in (PLAN_RULE, PLAN_MANUAL) and items:
         return "READY"
     return "NONE"
 
@@ -1401,30 +1632,86 @@ def _voucher_state(row: BankStatementRow) -> str:
 # 逐行操作
 # ----------------------------------------------------------------------
 
+def _parse_plan_payload(db: Session, book_id: int, row: BankStatementRow,
+                         payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """把「对方科目」这一段请求体变成子表行。
+
+    **两种写法**：
+
+    - ``plan_subjects`` —— 列表，每项 ``{subject_id, amount}``。这是正规
+      写法，一行流水可以拆到好几个科目上。
+    - ``plan_subject_id`` —— 单个科目 id，金额 = 这一行的流水金额。
+      这是「就一个科目」的简写，留着是因为它太常用了（界面上改一个科目
+      不该被迫凑一个列表出来）。
+
+    两种都给了要报错 —— 那说明调用方自己也没想清楚要哪个。
+    """
+    has_list = "plan_subjects" in payload and payload["plan_subjects"] is not None
+    has_single = "plan_subject_id" in payload
+    if has_list and has_single:
+        raise ValueError("对方科目只能给一种：plan_subjects（列表）或 plan_subject_id（单个）")
+    raw: Any = None
+    if has_list:
+        raw = payload.get("plan_subjects")
+    elif has_single:
+        single = payload.get("plan_subject_id")
+        if single in (None, "", 0):
+            raw = []
+        else:
+            raw = [{"subject_id": single, "amount": str(row.amount or "")}]
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("对方科目必须是一个列表")
+    items: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    total = Decimal("0")
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ValueError("对方科目的每一项都要有科目与金额")
+        subject_id = entry.get("subject_id")
+        if subject_id in (None, "", 0):
+            raise ValueError("对方科目不能为空")
+        try:
+            subject = db.get(Subject, int(subject_id))
+        except (TypeError, ValueError):
+            raise ValueError("对方科目的 id 必须是整数")
+        if subject is None or subject.book_id != book_id:
+            raise ValueError("选择的科目不属于本账套")
+        if not subject.is_leaf:
+            raise ValueError(f"「{subject.code} {subject.name}」不是末级科目")
+        if not subject.active:
+            raise ValueError(f"「{subject.code} {subject.name}」已停用")
+        if subject.id in seen:
+            raise ValueError(
+                f"「{subject.code} {subject.name}」在这一行里出现了两次 —— "
+                "要记两笔请把金额合并到一条上")
+        seen.add(subject.id)
+        amount = _dec(entry.get("amount"))
+        if amount is None or amount <= 0:
+            raise ValueError(f"「{subject.code} {subject.name}」的金额必须大于 0")
+        items.append({"subject_id": subject.id, "amount": amount,
+                      "source": PLAN_MANUAL})
+        total += amount
+    # **合计必须等于流水金额** —— 凭证借贷不平，或者更糟：平了但钱记在
+    # 错误的科目上。流水金额为 0 / 未知的行不校验（它压根进不了制证）。
+    if items and row.amount is not None and row.amount > 0 and total != row.amount:
+        raise ValueError(
+            f"对方科目金额合计 {total} 与流水金额 {row.amount} 不一致 —— "
+            "凭证会不平衡。请调整各科目的金额")
+    return items
+
+
 def update_row(db: Session, book_id: int, row_id: int,
                payload: dict[str, Any]) -> dict[str, Any]:
-    """改一行：指定对方科目，或忽略 / 恢复这一行。"""
+    """改一行：指定对方科目（可能好几个），或忽略 / 恢复这一行。"""
     row = db.get(BankStatementRow, row_id)
     if row is None or row.book_id != book_id:
         raise ValueError("流水行不存在")
-    if "plan_subject_id" in payload:
-        subject_id = payload.get("plan_subject_id")
-        if subject_id in (None, "", 0):
-            row.plan_subject_id = None
-            # 方向还没定的行**不是**「待确认科目」，是「待确认方向」——
-            # 两件事在界面上是不同的提示，别混成一个。
-            row.plan_status = (PLAN_PENDING if row.direction != DIRECTION_UNKNOWN
-                               else PLAN_NONE)
-        else:
-            subject = db.get(Subject, int(subject_id))
-            if subject is None or subject.book_id != book_id:
-                raise ValueError("选择的科目不属于本账套")
-            if not subject.is_leaf:
-                raise ValueError(f"「{subject.code} {subject.name}」不是末级科目")
-            if not subject.active:
-                raise ValueError(f"「{subject.code} {subject.name}」已停用")
-            row.plan_subject_id = subject.id
-            row.plan_status = PLAN_MANUAL
+    if "plan_subjects" in payload or "plan_subject_id" in payload:
+        items = _parse_plan_payload(db, book_id, row, payload)
+        _write_plan_subjects(db, row, items, PLAN_MANUAL)
+        row.plan_status = _plan_status_of(items, row.direction)
     if "status" in payload and payload["status"]:
         status = payload["status"]
         if status not in (STATUS_OPEN, STATUS_IGNORED):
@@ -1513,14 +1800,17 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
     rows = db.scalars(select(BankStatementRow).where(
         BankStatementRow.statement_id == statement.id
     ).order_by(BankStatementRow.seq)).all()
-    rules = list_rules(db, book_id)
-    subjects = _subjects_of(db, book_id, [row.plan_subject_id for row in rows])
+    children = _children_of(db, [row.id for row in rows])
+    subject_ids = {item.subject_id for items in children.values() for item in items}
+    subjects = _subjects_of(db, book_id, subject_ids)
 
     candidates: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for row in rows:
+        items = children.get(row.id) or []
         if row.status == STATUS_IGNORED:
-            skipped.append({**serialize_row(db, row, subjects), "reason": "已忽略"})
+            skipped.append({**serialize_row(db, row, subjects, items),
+                            "reason": "已忽略"})
             continue
         # ---- 去重（已有凭证）----
         matched = _voucher_matches(
@@ -1541,24 +1831,34 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
             row.matched_voucher_id = None
         if row.status == STATUS_POSTED:
             skipped.append({
-                **serialize_row(db, row, subjects),
+                **serialize_row(db, row, subjects, items),
                 "reason": f"已入账（凭证 #{row.matched_voucher_id}）",
             })
             continue
         if row.matched_invoice_record_id:
-            skipped.append({**serialize_row(db, row, subjects),
+            skipped.append({**serialize_row(db, row, subjects, items),
                             "reason": "已被发票占用"})
             continue
         if row.direction == DIRECTION_UNKNOWN:
-            skipped.append({**serialize_row(db, row, subjects), "reason": "方向未知"})
+            skipped.append({**serialize_row(db, row, subjects, items),
+                            "reason": "方向未知"})
             continue
         if row.amount is None or row.amount <= 0:
-            skipped.append({**serialize_row(db, row, subjects), "reason": "金额为 0"})
+            skipped.append({**serialize_row(db, row, subjects, items),
+                            "reason": "金额为 0"})
             continue
-        if row.plan_status == PLAN_PENDING or not row.plan_subject_id:
-            skipped.append({**serialize_row(db, row, subjects), "reason": "对方科目待确认"})
+        if row.plan_status == PLAN_PENDING or not items:
+            skipped.append({**serialize_row(db, row, subjects, items),
+                            "reason": "对方科目待确认"})
             continue
-        candidates.append(serialize_row(db, row, subjects))
+        # **对方科目金额合计必须等于流水金额** —— 不等的话凭证会不平衡。
+        # 正常情况下写入口就挡住了（:func:`_parse_plan_payload`），
+        # 这里是第二道：金额改过了、行是旧的、或者别处写进去的。
+        if _plan_total(items) != row.amount:
+            skipped.append({**serialize_row(db, row, subjects, items),
+                            "reason": "对方科目金额与流水金额对不上"})
+            continue
+        candidates.append(serialize_row(db, row, subjects, items))
     db.flush()
     return {
         "statement_id": statement.id,
@@ -1567,14 +1867,13 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
         "skipped": skipped,
         "candidate_count": len(candidates),
         "pending_count": len([s for s in skipped if s["reason"] == "对方科目待确认"]),
+        "unknown_count": len([s for s in skipped if s["reason"] == "方向未知"]),
         "window_days": window_days,
     }
 
 
-def _summary_for(row: BankStatementRow) -> str:
-    """凭证上那一行的**摘要**。
-
-    **用途优先，摘要兜底**（用户定的口径，2026-10-27）。
+def _default_summary(row: BankStatementRow) -> str:
+    """内置的凭证摘要口径：**用途优先，摘要兜底**（用户定的口径，2026-10-27）。
 
     **为什么**：对账单上「摘要」与「用途」两列装的不是一回事 ——
     **摘要是「怎么走的」，用途是「为什么」**。农商行那份就是：
@@ -1598,6 +1897,75 @@ def _summary_for(row: BankStatementRow) -> str:
         return row.summary
     who = row.counterparty_name or "对方"
     return f"银行{'收' if row.direction == DIRECTION_IN else '付'} {who}"
+
+
+#: 摘要模板里能用的占位符。
+#:
+#: **刻意用中文**：模板是给记账的人写的，而他们看到的是对账单上的中文列名
+#: （摘要 / 用途 / 对方户名）。占位符跟界面上看到的字对得上，才不用去查
+#: 一份「变量表」。
+SUMMARY_TEMPLATE_FIELDS = ("摘要", "用途", "对方户名", "日期", "金额", "方向", "序号")
+
+
+class _TemplateValues(dict):
+    """模板取值。**不认识的占位符直接报错** —— 那样才能退回内置口径，
+    而不是悄悄渲染成半截文字。"""
+
+    def __missing__(self, key):
+        raise KeyError(key)
+
+
+def render_summary(row: BankStatementRow, template: str = "") -> str:
+    """按模板渲染这一行的凭证摘要。
+
+    **模板写错就退回内置口径**（:func:`_default_summary`），不让整批制证
+    失败 —— 一条流水的摘要模板写错了，不该让这一份对账单的其他流水都
+    生成不出凭证。
+    """
+    text = _text(template)
+    if text:
+        values = _TemplateValues({
+            "摘要": row.summary or "",
+            "用途": row.purpose or "",
+            "对方户名": row.counterparty_name or "",
+            "日期": row.tx_date.isoformat() if row.tx_date else "",
+            "金额": str(row.amount) if row.amount is not None else "",
+            "方向": ("收入" if row.direction == DIRECTION_IN
+                     else "支出" if row.direction == DIRECTION_OUT else ""),
+            "序号": str(row.seq),
+        })
+        try:
+            out = text.format_map(values).strip()
+        except (KeyError, IndexError, ValueError):
+            out = ""
+        if out:
+            return out
+    return _default_summary(row)
+
+
+def _row_summary(row: BankStatementRow, template: str = "") -> str:
+    return render_summary(row, template)
+
+
+def _summary_template_for(rules: list[BankStatementRule],
+                           config: Optional[BankStatementConfig],
+                           row: BankStatementRow,
+                           items: list[BankStatementRowSubject]) -> str:
+    """这一行用哪个摘要模板。
+
+    **取值序 = 规则级 > 账套级 > 内置口径。**
+
+    规则级只在「这条流水是**那条规则**定的科目」时才算数 —— 人工指定过
+    的行（``MANUAL``）不该被某条规则的摘要模板改掉，那是用户自己挑的科目、
+    自己写的摘要。
+    """
+    if any(item.source == PLAN_RULE for item in items):
+        rule = _rule_hit(rules, _pseudo_row(row))
+        if rule is not None and rule.summary_template:
+            return rule.summary_template
+    if config is not None and config.summary_template:
+        return config.summary_template
+    return ""
 
 
 def _remap_subjects(db: Session, book_id: int, year: int,
@@ -1651,6 +2019,11 @@ def commit_vouchers(db: Session, book_id: int, statement_id: int,
     plan = plan_vouchers(db, book_id, statement_id)
     created: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    # 规则与账套配置**各读一次**，不是一行读一次：这一份对账单可能有几百行，
+    # 一行一次查询就是几百次往返。
+    rules = list_rules(db, book_id)
+    config = get_config(db, book_id)
+    children = _children_of(db, [item["id"] for item in plan["candidates"]])
 
     for item in plan["candidates"]:
         row = db.get(BankStatementRow, item["id"])
@@ -1658,7 +2031,11 @@ def commit_vouchers(db: Session, book_id: int, statement_id: int,
             continue
         savepoint = db.begin_nested()
         try:
-            voucher = _make_voucher_for_row(db, book_id, statement, row, user)
+            plan_items = children.get(row.id) or []
+            voucher = _make_voucher_for_row(
+                db, book_id, statement, row, user,
+                plan_subjects=plan_items,
+                summary_template=_summary_template_for(rules, config, row, plan_items))
             row.status = STATUS_POSTED
             row.matched_voucher_id = voucher.id
             savepoint.commit()
@@ -1684,11 +2061,19 @@ def commit_vouchers(db: Session, book_id: int, statement_id: int,
 
 
 def _make_voucher_for_row(db: Session, book_id: int, statement: BankStatement,
-                          row: BankStatementRow, user: SysUser):
-    """一条流水 → 一张凭证。"""
+                          row: BankStatementRow, user: SysUser, *,
+                          plan_subjects: list[BankStatementRowSubject] | None = None,
+                          summary_template: str = ""):
+    """一条流水 → 一张凭证。
+
+    **对方科目可以有好几个**，所以分录不止两条：现金那一条 + 对方那几条。
+    对方各条自己的金额加起来正好等于流水金额（写入口已经校验过，
+    :func:`_parse_plan_payload`），所以这张凭证必然借贷平。
+    """
     if row.tx_date is None:
         raise ValueError("这一行没有日期，定不了凭证日期")
-    if not row.plan_subject_id:
+    items = list(plan_subjects) if plan_subjects is not None else list(row.plan_subjects)
+    if not items:
         raise ValueError("对方科目还没确定")
     period = find_period(db, book_id, row.tx_date)
     if period.locked:
@@ -1696,27 +2081,30 @@ def _make_voucher_for_row(db: Session, book_id: int, statement: BankStatement,
 
     mapping, missing = _remap_subjects(
         db, book_id, period.year,
-        [statement.account_subject_id, row.plan_subject_id])
+        [statement.account_subject_id] + [item.subject_id for item in items])
     if missing:
         raise ValueError(
             f"这些科目在 {period.year} 年度的科目表里不存在：{'、'.join(missing)}。"
             "请在流水科目规则里改成本年度的科目")
     cash_id = mapping.get(statement.account_subject_id, statement.account_subject_id)
-    other_id = mapping.get(row.plan_subject_id, row.plan_subject_id)
 
-    amount = money(row.amount)
-    summary = _summary_for(row)
+    summary = render_summary(row, summary_template)
+    entries: list[dict[str, Any]] = []
     if row.direction == DIRECTION_IN:
-        # 收钱：银行存款增加记**借方**（会计口径），对方记贷方。
-        entries = [
-            {"subject_id": cash_id, "direction": "DEBIT", "amount": amount, "summary": summary},
-            {"subject_id": other_id, "direction": "CREDIT", "amount": amount, "summary": summary},
-        ]
+        # 收钱：现金增加记**借方**（会计口径），对方记贷方。
+        entries.append({"subject_id": cash_id, "direction": "DEBIT",
+                        "amount": money(row.amount), "summary": summary})
+        for item in items:
+            other_id = mapping.get(item.subject_id, item.subject_id)
+            entries.append({"subject_id": other_id, "direction": "CREDIT",
+                            "amount": money(item.amount), "summary": summary})
     else:
-        entries = [
-            {"subject_id": other_id, "direction": "DEBIT", "amount": amount, "summary": summary},
-            {"subject_id": cash_id, "direction": "CREDIT", "amount": amount, "summary": summary},
-        ]
+        for item in items:
+            other_id = mapping.get(item.subject_id, item.subject_id)
+            entries.append({"subject_id": other_id, "direction": "DEBIT",
+                            "amount": money(item.amount), "summary": summary})
+        entries.append({"subject_id": cash_id, "direction": "CREDIT",
+                        "amount": money(row.amount), "summary": summary})
     return voucher_service.create_voucher(
         db,
         book_id=book_id,
@@ -1731,6 +2119,103 @@ def _make_voucher_for_row(db: Session, book_id: int, statement: BankStatement,
         source="IMPORT",
         commit=False,
     )
+
+
+def reclassify_row_subject(db: Session, book_id: int, row_id: int,
+                            entry_id: int, user: SysUser) -> dict[str, Any]:
+    """把一条流水对应的那条分录的科目改掉。
+
+    **只改现金那一侧**：把「记在 1001 库存现金上的那笔」改成「记在这份
+    对账单绑定的账户（1002 银行存款）上」。对方侧一个字都不动。
+
+    **为什么只改现金那一侧**：银行流水只说「转了 5000 块」，不说是买什么，
+    所以流水这一侧判不出对方科目该怎么改；而钱在哪个账户上，流水说得
+    死死的 —— 这份对账单绑的就是那个账户。用户要改对方侧，去凭证里改。
+
+    **为什么目标科目只能是这份对账单绑定的账户**：改成别的账户的话，这笔
+    钱就不在这个账户上了，而这份对账单的期末余额就是拿这个账户去核对的
+    —— 改了之后差额会凭空冒出来，且这笔流水还会被当成「没入账」再制一张
+    凭证（同一笔钱记两次）。所以这里不做「随便改成哪个科目」的灵活，
+    只做「记错账户 → 挪回这个账户」这一件确定的事。
+
+    **改的是一张真凭证，所以走凭证编辑那条路**
+    （:func:`app.accounting.vouchers.update_voucher`）：期间已结账、
+    凭证已记账、科目年度不对、并发改动 —— 这些闸门与审计留痕都在那儿，
+    自己另写一条 UPDATE 就等于把它们全绕过去了。
+    """
+    row = db.get(BankStatementRow, row_id)
+    if row is None or row.book_id != book_id:
+        raise ValueError("流水行不存在")
+    statement = db.get(BankStatement, row.statement_id)
+    if statement is None or statement.book_id != book_id:
+        raise ValueError("对账单不存在")
+    entry = db.get(Entry, entry_id)
+    if entry is None or entry.book_id != book_id:
+        raise ValueError("这条分录不存在")
+    voucher = db.get(Voucher, entry.voucher_id)
+    if voucher is None or voucher.book_id != book_id:
+        raise ValueError("这条分录所属的凭证不存在")
+    old_subject = db.get(Subject, entry.subject_id)
+    if old_subject is None or not _looks_cash(old_subject):
+        raise ValueError("这条分录不是记在现金科目上的 —— 改它没有意义")
+    target = db.get(Subject, statement.account_subject_id)
+    if target is None or target.book_id != book_id:
+        raise ValueError("这份对账单绑定的账户科目不属于本账套")
+    if not target.is_leaf:
+        raise ValueError("这份对账单绑定的账户科目不是末级科目")
+    if not target.active:
+        raise ValueError("这份对账单绑定的账户科目已停用")
+    if entry.subject_id == target.id:
+        raise ValueError("这条分录已经记在这个账户上了 —— 它已经是入账状态")
+    if voucher.status != "UNPOSTED":
+        raise ValueError(
+            f"凭证 {voucher.voucher_no} 已记账，不能改。"
+            "请先到「期末结账」对本期执行「反结账」后再改。")
+    period = db.get(Period, voucher.period_id)
+    if period is None:
+        raise ValueError("这张凭证所属的会计期间不存在")
+    if period.locked:
+        raise ValueError(f"{period.code} 已结账，不能修改凭证")
+
+    # 科目表每个年度各有一份 —— 目标科目要搬到这张凭证所在的那一年。
+    mapping, missing = _remap_subjects(db, book_id, period.year, [target.id])
+    if missing:
+        raise ValueError(
+            f"这些科目在 {period.year} 年度的科目表里不存在：{'、'.join(missing)}")
+    new_target_id = mapping.get(target.id, target.id)
+
+    entries: list[dict[str, Any]] = []
+    for item in sorted(voucher.entries, key=lambda e: e.line_no):
+        entries.append({
+            "subject_id": (new_target_id if item.id == entry.id
+                           else int(item.subject_id)),
+            "direction": item.direction,
+            "amount": money(item.amount),
+            "summary": item.summary or "",
+            "aux_ref": item.aux_ref or {},
+        })
+    # **带乐观锁令牌**：并发改同一张凭证时，后一个会拿到 409 而不是把前一个
+    # 的改动覆盖回去（那张凭证的分录会被整体重建，不比对就会丢改动）。
+    token = voucher_service.version_token(voucher.updated_at)
+    voucher_service.update_voucher(db, voucher, user, {"entries": entries},
+                                   expected_version=token)
+    # **这一行现在就是「已入账」了**：钱已经在本账户上了。
+    #
+    # 不等下一次 ``plan_vouchers`` 去推 —— 那条推法是「扫一遍有没有同账户
+    # 同金额的分录」，推得出来，但用户刚点完「改科目」、界面上却还显示着
+    # 「待确认科目」，会以为没改成。
+    row.status = STATUS_POSTED
+    row.matched_voucher_id = voucher.id
+    db.flush()
+    return {
+        "row_id": row.id,
+        "voucher_id": voucher.id,
+        "voucher_no": voucher.voucher_no,
+        "from_subject": {"id": old_subject.id, "code": old_subject.code,
+                         "name": old_subject.name},
+        "to_subject": {"id": new_target_id, "code": target.code,
+                       "name": target.name},
+    }
 
 
 # ----------------------------------------------------------------------

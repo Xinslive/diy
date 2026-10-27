@@ -313,15 +313,46 @@ class InvoiceIgnoreIn(BaseModel):
 
 
 # ---- 流水对账 ----
+class BankStatementRowSubjectIn(BaseModel):
+    """一行流水上的**一个**对方科目。
+
+    **金额是必填的**：一行流水的对方科目金额合计必须等于流水金额，
+    所以每个科目都得带上自己那份金额。
+    """
+
+    subject_id: int
+    amount: Decimal
+
+
 class BankStatementRowPatchIn(BaseModel):
     """改一行流水。
 
-    ``plan_subject_id`` 传 ``None`` 表示「清掉对方科目」——那会把这一行
-    退回「待确认」，而不是把它变成「已定」。
+    ``plan_subjects`` 传一个列表 = 把这一行的对方科目**整个换掉**
+    （可能有好几个，每个带自己的金额）；传空列表 = 清掉（退回「待确认科目」）。
+
+    ``plan_subject_id`` 是「就一个科目」的简写 —— 金额自动取这一行的流水金额。
+    两种写法只能给一种：都给了说明调用方自己也没想清楚要哪个。
     """
 
+    plan_subjects: Optional[list[BankStatementRowSubjectIn]] = None
     plan_subject_id: Optional[int] = None
     status: Optional[Literal["OPEN", "IGNORED"]] = None
+
+
+class BankStatementRowReclassifyIn(BaseModel):
+    """把一条流水对应的那条分录的科目改掉。
+
+    ``entry_id`` 是**要改的那条分录**（不是凭证）—— 改的是现金那一侧：
+    从「记在 1001 上的那笔」挪到「这份对账单绑定的账户上」。
+    """
+
+    entry_id: int
+
+
+class BankStatementConfigIn(BaseModel):
+    """账套级流水配置。**现在是凭证摘要模板**，以后还会有别的。"""
+
+    summary_template: str = Field(default="", max_length=256)
 
 
 class BankStatementRowDirectionIn(BaseModel):
@@ -349,6 +380,8 @@ class BankStatementRuleIn(BaseModel):
     subject_id: int
     priority: int = Field(default=0, ge=-1000, le=1000)
     active: bool = True
+    #: 这条规则命中时，生成的凭证用哪个摘要模板。**空 = 用账套级默认。**
+    summary_template: str = Field(default="", max_length=256)
 
 
 class BankStatementRulePatch(BaseModel):
@@ -357,6 +390,7 @@ class BankStatementRulePatch(BaseModel):
     subject_id: Optional[int] = None
     priority: Optional[int] = Field(default=None, ge=-1000, le=1000)
     active: Optional[bool] = None
+    summary_template: Optional[str] = Field(default=None, max_length=256)
 
 
 class BankStatementProfileIn(BaseModel):

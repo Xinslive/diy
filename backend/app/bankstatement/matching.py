@@ -21,13 +21,15 @@
 """
 from __future__ import annotations
 
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
-from app.models import BankStatement, BankStatementRow
+from app.accounting.organize import CASH_SUBJECT_PREFIXES
+from app.models import BankStatement, BankStatementRow, Entry, Period, Subject, Voucher
 from app.models.bankstatement import (
     DIRECTION_IN,
     DIRECTION_OUT,
@@ -142,3 +144,120 @@ def claim(db: Session, row_id: int, record_id: int) -> bool:
         .values(matched_invoice_record_id=int(record_id))
     )
     return result.rowcount == 1
+
+
+# ----------------------------------------------------------------------
+# 流水 ↔ 账上已有的现金分录（改科目用）
+# ----------------------------------------------------------------------
+
+def _cash_entries(db: Session, book_id: int, lo: date, hi: date) -> list[Any]:
+    """现金科目上的分录（连同凭证与期间的信息），一次读完。
+
+    **只取现金科目**：改科目的意思是「把记在 1001 上的那笔挪到 1002」，
+    而记在费用科目上的分录跟银行流水没有「同一笔钱」这层关系 ——
+    那个方向是**对方科目**的事，流水这一侧判不了。
+    """
+    return db.execute(
+        select(
+            Entry.id, Entry.voucher_id, Entry.subject_id, Entry.direction,
+            Entry.amount, Entry.summary, Entry.line_no,
+            Voucher.voucher_no, Voucher.voucher_date, Voucher.status,
+            Subject.code, Subject.name,
+            Period.year, Period.month, Period.locked,
+        )
+        .join(Voucher, Voucher.id == Entry.voucher_id)
+        .join(Subject, Subject.id == Entry.subject_id)
+        .join(Period, Period.id == Voucher.period_id)
+        .where(
+            Voucher.book_id == book_id,
+            Entry.book_id == book_id,
+            or_(*[Subject.code.startswith(prefix)
+                  for prefix in CASH_SUBJECT_PREFIXES]),
+            Voucher.voucher_date >= lo,
+            Voucher.voucher_date <= hi,
+        )
+    ).all()
+
+
+def reclassify_candidates(db: Session, book_id: int, statement: BankStatement,
+                          rows: Iterable[BankStatementRow],
+                          window_days: int = 7) -> dict[int, list[dict[str, Any]]]:
+    """一批流水行 → 每行的「账上可能对应的分录」。
+
+    返回 ``{行 id: [候选...]}``。没有候选的行不在返回里。
+
+    **判据四件套（与「已入账」那套同源，但对象不同）**：同一个现金科目族
+    （1001/1002/1012）、金额相等、**现金侧方向对应**、凭证日期在流水日
+    ±N 天内。
+
+    与 ``_voucher_matches`` 的区别只有一处，但那一处是关键：
+
+    - ``_voucher_matches`` 找的是**这个账户上**的分录 —— 用来判断
+      「这笔已经入过账了，别再制一张」；
+    - 这里找的是**别的现金科目上**的分录（1001，而这份对账单绑的是 1002）
+      —— 用来判断「账上已经有一笔记在 1001 上的钱，跟这一行是同一笔，
+      该把它挪过来，而不是再造一张凭证」。
+
+    **同一个账户上的不算候选**：那种情况由「已入账」那条路处理，
+    界面上它显示的是「已入账」，而不是「可以改科目」。
+    """
+    dated = [row for row in rows
+             if row.tx_date is not None and row.amount is not None
+             and row.amount > 0 and row.direction in (DIRECTION_IN, DIRECTION_OUT)]
+    if not dated:
+        return {}
+    lo = min(row.tx_date for row in dated) - timedelta(days=window_days)
+    hi = max(row.tx_date for row in dated) + timedelta(days=window_days)
+    entries = _cash_entries(db, book_id, lo, hi)
+
+    # 按「金额 + 现金侧方向」分桶：一次查询出全部候选，逐行在桶里取。
+    buckets: dict[tuple[str, str], list[Any]] = {}
+    for entry in entries:
+        buckets.setdefault(
+            (str(Decimal(str(entry.amount))), entry.direction), []).append(entry)
+
+    result: dict[int, list[dict[str, Any]]] = {}
+    for row in dated:
+        # **银行账的方向与会计凭证相反**：流水 IN（收钱）= 现金增加 = 借方。
+        entry_direction = "DEBIT" if row.direction == DIRECTION_IN else "CREDIT"
+        items: list[dict[str, Any]] = []
+        for entry in buckets.get((str(Decimal(str(row.amount))), entry_direction), []):
+            if entry.subject_id == statement.account_subject_id:
+                continue
+            if abs((entry.voucher_date - row.tx_date).days) > window_days:
+                continue
+            items.append({
+                "entry_id": int(entry.id),
+                "voucher_id": int(entry.voucher_id),
+                "voucher_no": entry.voucher_no,
+                "voucher_date": entry.voucher_date.isoformat(),
+                "voucher_status": entry.status,
+                "line_no": int(entry.line_no),
+                "subject_id": int(entry.subject_id),
+                "subject_code": entry.code,
+                "subject_name": entry.name,
+                "amount": str(entry.amount),
+                "direction": entry.direction,
+                "summary": entry.summary or "",
+                # ``Period.code`` 是**属性**不是列（由 year/month 拼出来），
+                # 所以这里自己拼一份，格式与它逐字一致。
+                "period_code": f"{entry.year}-{entry.month:02d}",
+                "locked": bool(entry.locked),
+            })
+        if items:
+            items.sort(key=lambda item: (item["voucher_date"], item["voucher_id"]))
+            result[row.id] = items
+    return result
+
+
+def reclassify_block_reason(entry: dict[str, Any]) -> str:
+    """这条候选为什么改不了（能改就是空串）。
+
+    **已记账的凭证动不得** —— 库层护栏 ``fn_entry_lock_guard`` 挡着，
+    应用层 ``update_voucher`` 也挡着。已结账的期间同理。
+    """
+    if entry.get("voucher_status") == "POSTED":
+        return "凭证已记账，不能改（先到「期末结账」反结账）"
+    if entry.get("locked"):
+        return f"{entry.get('period_code') or ''} 已结账，不能改".strip()
+    return ""

@@ -91,8 +91,25 @@ function saveBlob(data, name) {
 export const deleteStatement = (bookId, id) =>
   http.delete(`/books/${bookId}/bank-statements/${id}`).then(r => r.data)
 
+/**
+ * 改一行流水的**对方科目**。
+ *
+ * `planSubjects` 传数组 = 整组换掉（可能好几个科目，每个带自己的金额，
+ * 合计必须等于流水金额）；传 `null` = 清空。`planSubjectId` 是「就一个
+ * 科目」的简写（金额自动取流水金额），两种不能同时给。
+ */
 export const patchRow = (bookId, rowId, payload) =>
   http.patch(`/books/${bookId}/bank-statements/rows/${rowId}`, payload).then(r => r.data)
+
+/**
+ * 把一条流水对应的那条分录的**科目**改掉（记在 1001 上的那笔 → 本账户）。
+ *
+ * **只改现金那一侧**，对方侧不动。走的是凭证编辑那条路，所以已记账 /
+ * 已结账的凭证会被挡下（400），并发改动会回 409。
+ */
+export const reclassifyRow = (bookId, rowId, entryId) =>
+  http.post(`/books/${bookId}/bank-statements/rows/${rowId}/reclassify`,
+    { entry_id: entryId }).then(r => r.data)
 
 export const setRowDirection = (bookId, rowId, direction) =>
   http.post(`/books/${bookId}/bank-statements/rows/${rowId}/direction`, { direction }).then(r => r.data)
@@ -102,6 +119,12 @@ export const planVouchers = (bookId, id) =>
 
 export const commitVouchers = (bookId, id) =>
   http.post(`/books/${bookId}/bank-statements/${id}/commit-vouchers`, {}, { timeout: 120000 }).then(r => r.data)
+
+// ---- 账套级配置（凭证摘要模板） ----
+export const getConfig = (bookId) =>
+  http.get(`/books/${bookId}/bank-statement-config`).then(r => r.data)
+export const saveConfig = (bookId, payload) =>
+  http.put(`/books/${bookId}/bank-statement-config`, payload).then(r => r.data)
 
 // ---- 流水科目规则 ----
 export const listRules = (bookId) =>

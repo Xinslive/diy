@@ -297,12 +297,12 @@ def test_只改状态不该顺手清掉对方科目(client, auth, db, book, cash
     r = client.patch(
         f"/api/books/{book.id}/bank-statements/rows/{rows[0]['id']}",
         headers=auth, json={"plan_subject_id": subjects["560202"].id})
-    assert r.json()["plan_subject_id"] == subjects["560202"].id
+    assert [i["subject_id"] for i in r.json()["plan_subjects"]] == [subjects["560202"].id]
 
     r = client.patch(
         f"/api/books/{book.id}/bank-statements/rows/{rows[0]['id']}",
         headers=auth, json={"status": "IGNORED"})
     assert r.status_code == 200, r.text
-    assert r.json()["plan_subject_id"] == subjects["560202"].id, (
+    assert [i["subject_id"] for i in r.json()["plan_subjects"]] == [subjects["560202"].id], (
         "只改状态就把对方科目清空了")
     assert r.json()["status"] == "IGNORED"
