@@ -173,7 +173,15 @@ def test_金额对不上就匹配不上(statement, db, book, admin_user, subject
     assert hit["reclassify_candidates"] == []
 
 
-def test_超出七天窗口就匹配不上(statement, db, book, admin_user, subjects):
+def test_跨过主窗口的仍会列为候选但标成跨期(statement, db, book, admin_user, subjects):
+    """日期差在主窗口（7 天）之外、但在提示窗口（30 天）之内 —— **照样列出来**，
+    只是标成跨期、让人工确认。
+
+    为什么不能一刀切掉：银行流水与会计记账的日期本来就会差 —— 跨月入账、
+    月末才记账、票到才付款，都是常事。按 7 天砍掉，等于把「这笔钱记错在
+    1001 上」的那类候选整个藏起来，用户在界面上永远看不到「可改科目」，
+    于是又去制一张新凭证 —— 同一笔钱记两遍。
+    """
     from datetime import date, timedelta
 
     row = _first_row(db, book, statement)
@@ -185,8 +193,53 @@ def test_超出七天窗口就匹配不上(statement, db, book, admin_user, subj
 
     rows = service.list_rows(db, book.id, statement["id"])
     hit = next(r for r in rows if r["id"] == row["id"])
+    candidates = hit["reclassify_candidates"]
+    assert candidates, "跨期的候选不该被一刀切掉（用户就靠它找回记错账户的钱）"
+    first = candidates[0]
+    assert first["in_window"] is False, "跨过主窗口的必须标成跨期"
+    assert first["days_diff"] == 8, f"日期差没算对：{first}"
+    # 跨期不等于不能改 —— 它是「改了要人确认」，不是「改不了」。
+    assert first["changeable"] is True
+    assert first["block_reason"] == ""
+
+
+def test_主窗口之内的候选不算跨期(statement, db, book, admin_user, subjects):
+    from datetime import date, timedelta
+
+    row = _first_row(db, book, statement)
+    when = date.fromisoformat(row["tx_date"]) - timedelta(days=3)
+    shifted = {"amount": row["amount"], "tx_date": when.isoformat(),
+               "direction": row["direction"]}
+    _voucher_on_cash(db, book, admin_user, subjects, shifted)
+    db.expire_all()
+
+    rows = service.list_rows(db, book.id, statement["id"])
+    hit = next(r for r in rows if r["id"] == row["id"])
+    candidates = hit["reclassify_candidates"]
+    assert candidates
+    assert candidates[0]["in_window"] is True, "主窗口之内的不该标成跨期"
+    assert candidates[0]["days_diff"] == 3
+
+
+def test_超出提示窗口就匹配不上(statement, db, book, admin_user, subjects):
+    """超过 30 天就不提示了 —— 再宽就全是噪音（同额在现实里不稀有）。
+
+    生产实测：同额同向的候选在 ±7 天 0 条、±30 天 3 条、±60 天 4 条、
+    ±90 天 6 条（73 天、87 天那两条几乎肯定是不同的钱）。
+    """
+    from datetime import date, timedelta
+
+    row = _first_row(db, book, statement)
+    when = date.fromisoformat(row["tx_date"]) - timedelta(days=31)
+    shifted = {"amount": row["amount"], "tx_date": when.isoformat(),
+               "direction": row["direction"]}
+    _voucher_on_cash(db, book, admin_user, subjects, shifted)
+    db.expire_all()
+
+    rows = service.list_rows(db, book.id, statement["id"])
+    hit = next(r for r in rows if r["id"] == row["id"])
     assert hit["reclassify_candidates"] == [], (
-        "窗口外的分录不该被当成同一笔钱")
+        "超出提示窗口的分录不该被当成同一笔钱")
 
 
 # ----------------------------------------------------------------------
@@ -274,6 +327,28 @@ def test_已记账的凭证改不了(statement, db, book, admin_user, subjects):
     still = db.scalars(select(Entry).where(
         Entry.voucher_id == voucher.id).order_by(Entry.line_no)).first()
     assert still.subject_id == subjects["1001"].id, "拒绝之后不该动过分录"
+
+
+def test_跨期的候选确认之后也改得动(statement, db, book, admin_user, subjects):
+    """跨期是「多问一句」，**不是「改不了」**。
+
+    界面上跨期的候选点下去会弹一次确认；确认之后后端该照改不误 ——
+    如果这里也拦，用户确认完了还是改不动，那次确认就白问了。
+    """
+    from datetime import date, timedelta
+
+    row = _first_row(db, book, statement)
+    when = date.fromisoformat(row["tx_date"]) - timedelta(days=20)
+    shifted = {"amount": row["amount"], "tx_date": when.isoformat(),
+               "direction": row["direction"]}
+    voucher = _voucher_on_cash(db, book, admin_user, subjects, shifted)
+    entry = db.scalars(select(Entry).where(
+        Entry.voucher_id == voucher.id).order_by(Entry.line_no)).first()
+    db.expire_all()
+
+    result = service.reclassify_row_subject(db, book.id, row["id"], entry.id, admin_user)
+    assert result["from_subject"]["code"] == "1001"
+    assert result["to_subject"]["code"] == "100201"
 
 
 def test_不能改不是现金科目的分录(statement, db, book, admin_user, subjects):

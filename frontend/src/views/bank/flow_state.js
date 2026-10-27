@@ -190,6 +190,33 @@ export const reclassifyCandidateText = (item) => {
   return `记在 ${subject} 上的 ${amount}${voucher}`
 }
 
+/**
+ * 这条候选是不是**跨期**的（日期差超出了主匹配窗口）。
+ *
+ * 跨期的**不是不能改** —— 是要人确认一下：银行流水与会计记账的日期本来
+ * 就会差（跨月入账是常事），但差得多了也可能压根不是同一笔钱。
+ * 所以它照样列出来，只是标出来、点下去时多问一句。
+ *
+ * 判断用 `in_window === false` 而不是「没有 in_window 就是跨期」：后端
+ * 没给这个字段时（老数据、接口出错）宁可不提示，也不能把正常候选全标成
+ * 跨期。
+ */
+export const isCrossPeriod = (item) => !!item && item.in_window === false
+
+/** 跨期候选的提示文字。窗口内的返回空串。 */
+export const reclassifyCrossPeriodText = (item) => {
+  if (!isCrossPeriod(item)) return ''
+  const days = Number(item.days_diff ?? 0)
+  return `日期相差 ${days} 天，请确认是不是同一笔`
+}
+
+/** 跨期候选点下去时的二次确认文案。 */
+export const reclassifyCrossPeriodConfirm = (item) => {
+  const days = Number(item?.days_diff ?? 0)
+  return `这笔流水与该凭证的日期相差 ${days} 天。`
+    + '日期差得多也可能不是同一笔钱——确认要把它的现金科目改到本账户吗？'
+}
+
 // ----------------------------------------------------------------------
 // 凭证摘要模板
 // ----------------------------------------------------------------------

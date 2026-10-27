@@ -574,6 +574,8 @@
         账上已经有一笔记在别的现金科目上的分录，可能就是这一笔钱。
         确认后把它的**现金那一侧**改成这个账户（{{ accountLabel }}），
         对方侧不动 —— 对方侧该记成什么科目，流水这一侧判不出来。
+        <br />
+        日期差得比较远的（跨月入账是常事）会标出来，**确认是不是同一笔**再改。
       </div>
       <div
         v-for="item in reclassifyDialog.row?.reclassify_candidates || []"
@@ -584,6 +586,9 @@
           <div>{{ reclassifyCandidateText(item) }}</div>
           <div class="muted small">
             {{ item.summary || '（无摘要）' }} · 凭证日期 {{ item.voucher_date }}
+          </div>
+          <div v-if="isCrossPeriod(item)" class="flow-warn small">
+            ⚠ {{ reclassifyCrossPeriodText(item) }}
           </div>
           <div v-if="item.block_reason" class="flow-warn small">{{ item.block_reason }}</div>
         </div>
@@ -609,9 +614,10 @@ import * as api from '@/api/bankstatement'
 import * as subjectApi from '@/api/subject'
 import { reportNumber } from '@/utils/format'
 import {
-  FIELD_OPTIONS, canCommit, diffClass, fieldLabel, planSubjectCents,
+  FIELD_OPTIONS, canCommit, diffClass, fieldLabel, isCrossPeriod, planSubjectCents,
   planSubjectText, planTotalDiff, planTotalMatches, reclassifyCandidateText,
-  reclassifyRowCount, settlementSourceText, settlementSourceType,
+  reclassifyCrossPeriodConfirm, reclassifyCrossPeriodText, reclassifyRowCount,
+  settlementSourceText, settlementSourceType,
   toColumnMapping, unknownTemplateFields, voucherStateText, voucherStateType,
 } from './flow_state'
 import { useSessionStore } from '@/stores/session'
@@ -963,6 +969,24 @@ function openReclassify(row) {
 async function doReclassify(item) {
   const row = reclassifyDialog.row
   if (!row) return
+  // **跨期的要多问一句。** 日期差得多也可能压根不是另一笔钱 —— 不问就改，
+  // 等于把不相干的一笔现金分录挪了科目，那比「没匹配到」糟得多：
+  // 错的是账，不是「没提示」。
+  if (isCrossPeriod(item)) {
+    try {
+      await ElMessageBox.confirm(
+        reclassifyCrossPeriodConfirm(item),
+        '请确认是不是同一笔',
+        {
+          type: 'warning',
+          confirmButtonText: '是同一笔，改科目',
+          cancelButtonText: '再想想',
+        },
+      )
+    } catch {
+      return   // 用户点了「再想想」—— 什么都不做
+    }
+  }
   reclassifying.value = true
   try {
     const result = await api.reclassifyRow(store.bookId, row.id, item.entry_id)

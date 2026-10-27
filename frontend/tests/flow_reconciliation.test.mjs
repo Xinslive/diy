@@ -22,6 +22,7 @@ const {
   toColumnMapping, voucherStateText, voucherStateType, FIELD_OPTIONS,
   toCents, planSubjectCents, planTotalMatches, planTotalDiff, planSubjectText,
   reclassifyRowCount, reclassifyCandidateText, unknownTemplateFields,
+  isCrossPeriod, reclassifyCrossPeriodText, reclassifyCrossPeriodConfirm,
   SUMMARY_TEMPLATE_FIELDS,
 } = STATE
 
@@ -225,6 +226,34 @@ t('候选的显示文本说清楚「记在哪个科目上」', () => {
   assert.match(text, /库存现金/)
   assert.match(text, /5000\.00/)
   assert.match(text, /记0003/)
+})
+
+t('跨期的候选认得出来', () => {
+  assert.equal(isCrossPeriod({ in_window: false, days_diff: 28 }), true)
+  assert.equal(isCrossPeriod({ in_window: true, days_diff: 3 }), false)
+  // 后端没给这个字段时（老数据、接口出错）宁可不提示
+  assert.equal(isCrossPeriod({ days_diff: 28 }), false)
+  assert.equal(isCrossPeriod(null), false)
+})
+
+t('跨期候选要写出日期差，让人确认是不是同一笔', () => {
+  assert.match(reclassifyCrossPeriodText({ in_window: false, days_diff: 28 }), /28/)
+  assert.match(reclassifyCrossPeriodText({ in_window: false, days_diff: 28 }), /同一笔/)
+  // 窗口内的不写这句
+  assert.equal(reclassifyCrossPeriodText({ in_window: true, days_diff: 3 }), '')
+})
+
+t('二次确认的话要说清风险', () => {
+  const msg = reclassifyCrossPeriodConfirm({ in_window: false, days_diff: 28 })
+  assert.match(msg, /28/)
+  assert.match(msg, /同一笔/)
+})
+
+t('页面上：跨期候选有提示，且点下去要再确认一次', () => {
+  assert.match(VIEW, /isCrossPeriod/)
+  assert.match(VIEW, /reclassifyCrossPeriodText/)
+  assert.match(VIEW, /reclassifyCrossPeriodConfirm/)
+  assert.match(VIEW, /ElMessageBox\.confirm/)
 })
 
 console.log('== 凭证摘要模板 ==')

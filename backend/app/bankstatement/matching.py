@@ -44,6 +44,27 @@ DIRECTION_FOR_INVOICE = {
 }
 
 
+#: 流水 ↔ 账上分录的**主匹配窗口**：凭证日期离流水日期不超过这么多天，
+#: 就当是同一笔（改科目时直接给，不必多问一句）。
+MATCH_WINDOW_DAYS = 7
+
+#: **跨期提示窗口**：日期差超过主窗口、但不超过这个天数的分录，**照样列出来**
+#: 作为候选，只是标出日期差、让用户人工确认是不是同一笔。
+#:
+#: 为什么要有这一层：银行流水与会计记账的日期**本来就会差** —— 跨月入账、
+#: 月末才记账、票到才付款，都是常事。按 7 天一刀切，等于把「这笔钱记错在
+#: 1001 上」的那类候选整个藏起来，用户在界面上永远看不到「可改科目」，
+#: 于是又去制一张新凭证 —— 同一笔钱记两遍。
+#:
+#: 为什么是 30 天：跨月（28 天左右）是最常见的那种差，再往上就明显不是
+#: 同一笔了 —— 生产实测：同额同向的候选在 ±7 天 0 条、±30 天 3 条、
+#: ±60 天 4 条、±90 天 6 条（73 天、87 天那两条几乎肯定是不同的钱）。
+#: 窗口越大噪音越多，而「同额」在现实里一点都不稀有。
+#:
+#: **这是口径，不是事实** —— 改这个值会改变界面上出现多少候选。
+EXTENDED_WINDOW_DAYS = 30
+
+
 def direction_for_invoice(invoice_type: str) -> Optional[str]:
     return DIRECTION_FOR_INVOICE.get(invoice_type)
 
@@ -181,7 +202,9 @@ def _cash_entries(db: Session, book_id: int, lo: date, hi: date) -> list[Any]:
 
 def reclassify_candidates(db: Session, book_id: int, statement: BankStatement,
                           rows: Iterable[BankStatementRow],
-                          window_days: int = 7) -> dict[int, list[dict[str, Any]]]:
+                          window_days: int = MATCH_WINDOW_DAYS,
+                          extended_window_days: int = EXTENDED_WINDOW_DAYS,
+                          ) -> dict[int, list[dict[str, Any]]]:
     """一批流水行 → 每行的「账上可能对应的分录」。
 
     返回 ``{行 id: [候选...]}``。没有候选的行不在返回里。
@@ -200,14 +223,16 @@ def reclassify_candidates(db: Session, book_id: int, statement: BankStatement,
 
     **同一个账户上的不算候选**：那种情况由「已入账」那条路处理，
     界面上它显示的是「已入账」，而不是「可以改科目」。
+
+    **跨期的候选要列出来，但标出来让人工确认。** 见 ``EXTENDED_WINDOW_DAYS``。
     """
     dated = [row for row in rows
              if row.tx_date is not None and row.amount is not None
              and row.amount > 0 and row.direction in (DIRECTION_IN, DIRECTION_OUT)]
     if not dated:
         return {}
-    lo = min(row.tx_date for row in dated) - timedelta(days=window_days)
-    hi = max(row.tx_date for row in dated) + timedelta(days=window_days)
+    lo = min(row.tx_date for row in dated) - timedelta(days=extended_window_days)
+    hi = max(row.tx_date for row in dated) + timedelta(days=extended_window_days)
     entries = _cash_entries(db, book_id, lo, hi)
 
     # 按「金额 + 现金侧方向」分桶：一次查询出全部候选，逐行在桶里取。
@@ -224,7 +249,8 @@ def reclassify_candidates(db: Session, book_id: int, statement: BankStatement,
         for entry in buckets.get((str(Decimal(str(row.amount))), entry_direction), []):
             if entry.subject_id == statement.account_subject_id:
                 continue
-            if abs((entry.voucher_date - row.tx_date).days) > window_days:
+            days_diff = abs((entry.voucher_date - row.tx_date).days)
+            if days_diff > extended_window_days:
                 continue
             items.append({
                 "entry_id": int(entry.id),
@@ -243,9 +269,17 @@ def reclassify_candidates(db: Session, book_id: int, statement: BankStatement,
                 # 所以这里自己拼一份，格式与它逐字一致。
                 "period_code": f"{entry.year}-{entry.month:02d}",
                 "locked": bool(entry.locked),
+                # **跨期提示**：日期差多少天，以及它算不算「就在这个窗口里」。
+                # 窗口外的候选照样列出来，但界面上要让人工确认是不是同一笔 ——
+                # 跨月入账（9 月的流水、8 月底记的账）是常事，按 7 天一刀切
+                # 就等于把「记错在 1001 上」的那种钱藏起来，用户永远找不到。
+                "days_diff": days_diff,
+                "in_window": days_diff <= window_days,
             })
         if items:
-            items.sort(key=lambda item: (item["voucher_date"], item["voucher_id"]))
+            # 窗口内的排前面；窗口外的按「差得少」排 —— 最像的那笔在最上面。
+            items.sort(key=lambda item: (not item["in_window"], item["days_diff"],
+                                         item["voucher_date"], item["voucher_id"]))
             result[row.id] = items
     return result
 
