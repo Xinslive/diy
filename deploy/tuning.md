@@ -591,7 +591,7 @@ done
 logrotate -d /etc/logrotate.d/cwq-api
 ```
 
-**不归这两条规则管的**（各��有各的规则，别重复管）：
+**不归这两条规则管的**（各有各的规则，别重复管）：
 
 - nginx 的 access/error log —— Debian 自带的 `/etc/logrotate.d/nginx`（`rotate 14`）；
 - PostgreSQL 的日志 —— Debian 自带的 `postgresql-common`；

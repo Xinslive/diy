@@ -188,7 +188,7 @@ await step('存疑凭证跟着顶栏的会计期间走', async () => {
   const view = async () => {
     const rows = await page.locator('.flow-suspicious-table tr.el-table__row').count()
     if (rows) return { rows, text: '' }
-    const empty = page.locator('.el-empty__description')
+    const empty = page.locator('.el-empty:visible .el-empty__description')
     return { rows: 0, text: (await empty.count()) ? (await empty.first().innerText()).trim() : '' }
   }
 
@@ -224,6 +224,21 @@ await step('存疑凭证跟着顶栏的会计期间走', async () => {
     }
   }
   if (!after.rows && !after.text) throw new Error('空态连文案都没有')
+
+  // **顶上那行计数也要带期间限定**（2026-10-28 上线后自查补的）：
+  // 原来写死「没有存疑凭证。」，不带期间 —— 用户读到它会以为**整本账**
+  // 都没有存疑凭证，而不是「这个月没有」。跟空态那句是同一个毛病的两处。
+  const summary = page.locator('.flow-suspicious-summary')
+  if (!(await summary.count())) throw new Error('存疑凭证那个卡片顶上没有计数行')
+  const summaryText = (await summary.first().innerText()).trim()
+  if (!after.rows) {
+    if (summaryText === '没有存疑凭证。') {
+      throw new Error('计数行那句没带期间限定：「没有存疑凭证。」')
+    }
+    if (!summaryText.includes('这个期间')) {
+      throw new Error(`计数行没说是哪个期间：「${summaryText}」`)
+    }
+  }
 })
 
 await page.screenshot({ path: `${OUT}/readonly_period.png` })

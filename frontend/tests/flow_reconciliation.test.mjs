@@ -27,7 +27,7 @@ const {
   renderSummary, summaryTemplateValuesText, SUMMARY_TEMPLATE_EXAMPLES,
   SUMMARY_TEMPLATE_FIELDS, planSubjectSummary, defaultExpandedRowIds,
   suspiciousRows, statementsInPeriod, statementsOtherPeriods,
-  suspiciousCounts, suspiciousOtherPeriods,
+  suspiciousCounts, suspiciousOtherPeriods, suspiciousNoCountText,
   bankAccountSubjects,
 } = STATE
 
@@ -726,6 +726,32 @@ t('页面上：存疑凭证的计数用过滤后的那份，不许直接用后�
 t('存疑凭证还没加载完时，不许说「没有存疑凭证」（那是句假话）', () => {
   assert.match(VIEW, /loadingSuspicious/)
   assert.match(VIEW, /v-loading="loadingSuspicious"/)
+})
+
+t('计数行为 0 时，那句「没有存疑凭证」必须带上期间限定', () => {
+  // **同一屏上两句话，一句带期间一句不带** —— 用户读到不带的那句，
+  // 会以为整本账都没有存疑凭证，而不是「这个月没有」。
+  assert.equal(suspiciousNoCountText(2026, 5), '这个期间没有存疑凭证。')
+  // 期间没定下来时不能说「这个期间」（那是「还不知道要看哪个月」）
+  assert.equal(suspiciousNoCountText(), '没有存疑凭证。')
+  assert.equal(suspiciousNoCountText(2026, undefined), '没有存疑凭证。')
+  assert.equal(suspiciousNoCountText(undefined, 5), '没有存疑凭证。')
+  // 页面上用的是它，不许又写死一句不带期间的
+  assert.match(VIEW, /suspiciousNoCountText/)
+  assert.match(VIEW, /suspiciousNoCountTextOf\(/)
+  const summary = VIEW.slice(
+    VIEW.indexOf('flow-suspicious-summary'),
+    VIEW.indexOf('flow-suspicious-summary') + 1200)
+  assert.doesNotMatch(summary, /^\s*没有存疑凭证。\s*$/m)
+})
+
+t('计数行为 0 时，空态那句也要说清是哪个期间（两处口径一致）', () => {
+  // 顶上那行与空态那行是**同一个毛病的两处** —— 两处都得带期间。
+  assert.match(VIEW, /\$\{year\} 年 \$\{month\} 月没有存疑凭证/)
+  // 顶上那行那句写在 flow_state.js 里（那边是纯函数，能直接跑）
+  const STATE_SRC = fs.readFileSync(
+    new URL('../src/views/bank/flow_state.js', import.meta.url), 'utf8')
+  assert.match(STATE_SRC, /这个期间没有存疑凭证/)
 })
 
 // =====================================================================

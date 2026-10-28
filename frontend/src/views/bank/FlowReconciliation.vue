@@ -656,7 +656,7 @@
               共 <b>{{ suspiciousTotal }}</b> 张存疑凭证。
             </template>
             <template v-else>
-              没有存疑凭证。
+              {{ suspiciousNoCountText }}
             </template>
             <!-- **邻期的分录不判定，但要说个数** —— 用户看得见「那几个月还有
                  几笔没说法」，而不是以为它们不存在。 -->
@@ -873,6 +873,7 @@ import {
   bankAccountSubjects,
   statementsInPeriod, statementsOtherPeriods,
   suspiciousCounts, suspiciousOtherPeriods as suspiciousOtherPeriodsOf,
+  suspiciousNoCountText as suspiciousNoCountTextOf,
   suspiciousRows as suspiciousRowsOf,
   toColumnMapping, unknownTemplateFields, voucherStateText, voucherStateType,
   summaryTemplateValuesText,
@@ -1310,6 +1311,21 @@ const suspiciousTotal = computed(() => suspiciousCountsOf.value.total)
 /** 邻期未判定的分录数 —— **要说出来**，否则用户以为那些分录不存在。 */
 const suspiciousNearCount = computed(
   () => suspiciousCountsOf.value.near)
+
+/**
+ * **计数行为 0 时该说的那句**（2026-10-28 上线后自查补的）。
+ *
+ * 原来这里写死「没有存疑凭证。」—— **不带任何期间限定**：
+ * 用户顶栏停在 5 月读到它，会以为**整本账**都没有存疑凭证，
+ * 而不是「这个月没有」。而空态那句（「2026 年 5 月没有存疑凭证」）
+ * 是带期间的 —— **同一屏上两句话，一句带期间一句不带**。
+ *
+ * 非空的那句（「共 N 张存疑凭证。」）不用带：表就摆在下面，一目了然。
+ */
+const suspiciousNoCountText = computed(() => suspiciousNoCountTextOf(
+  store.currentPeriod?.year,
+  store.currentPeriod?.month,
+))
 
 /** 内部转账的张数 —— 单独拎出来，免得用户以为漏了。 */
 const suspiciousInternalCount = computed(
