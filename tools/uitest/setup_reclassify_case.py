@@ -66,6 +66,7 @@ def main() -> int:
         row.status = "OPEN"
         row.plan_status = "PENDING"
         row.matched_voucher_id = None
+        row.summary_override = ""
         # **挪到未结账的期间** —— dev 账套 2026-09~11 都结账了，
         # 凭证落在结账期间里根本建不出来（库层会挡）。
         row.tx_date = ROW_DATE

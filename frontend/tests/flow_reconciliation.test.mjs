@@ -25,7 +25,7 @@ const {
   reclassifyRowCount, reclassifyCandidateText, unknownTemplateFields,
   isCrossPeriod, reclassifyCrossPeriodText, reclassifyCrossPeriodConfirm,
   renderSummary, summaryTemplateValuesText, SUMMARY_TEMPLATE_EXAMPLES,
-  SUMMARY_TEMPLATE_FIELDS,
+  SUMMARY_TEMPLATE_FIELDS, effectiveSummary,
 } = STATE
 
 const VIEW = fs.readFileSync(
@@ -57,14 +57,17 @@ function rulesTableBlock() {
 }
 
 /**
- * 去掉 HTML 注释。
+ * 去掉注释（**HTML 的与 CSS 的都要去**）。
  *
  * 这些 .vue 里**注释写得很长**（把「为什么这么改」也写在旁边），而注释里
- * 出现某个词（哪怕是「预览」「toggleRowExpansion」）并不等于界面上有它。
- * 断言「界面上没有 X」时必须先剥掉注释，否则会被自己写的说明文字绊倒。
+ * 出现某个词（哪怕是「预览」「toggleRowExpansion」「已入账…定死」）并不等于
+ * 界面上有它。断言「界面上没有 X」时必须先剥掉注释，否则会被自己写的说明
+ * 文字绊倒 —— 而这段代码里连 ``<style>`` 里的说明文字都算注释。
  */
 function stripComments(text) {
-  return text.replace(/<!--[\s\S]*?-->/g, '')
+  return text
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
 }
 
 let pass = 0, fail = 0
@@ -247,9 +250,21 @@ t('已生成凭证的行不能再指定对方科目', () => {
   assert.equal(canEditPlanSubject({ matched_voucher_id: null }), true)
   assert.equal(canEditPlanSubject({ matched_voucher_id: 12 }), false)
   assert.equal(canEditPlanSubject(null), false)
-  // 界面必须置灰，并把出路写在旁边
+  // 界面必须置灰
   assert.match(VIEW, /:disabled="!canEditPlanSubject\(row\)"/)
-  assert.match(VIEW, /已入账，科目由凭证定死，要改请改凭证/)
+})
+
+t('「已入账定死」那句话与提示框都不再出现在界面上', () => {
+  // 用户要求（2026-10-28）：不要那行红字，也不要那个弹出提示。
+  // 一行行都挂着一句警告，看着像出了事，其实只是「这一行已经制过证了」。
+  //
+  // **只认界面上的东西**：这些 .vue 的注释里满是解释，注释里写着这句话
+  // 不等于界面上有它 —— 所以先剥掉注释再断言。
+  const shown = stripComments(VIEW)
+  assert.doesNotMatch(shown, /已入账，科目由凭证定死/, '那句红字还在')
+  assert.doesNotMatch(shown, /对方科目由凭证定死/, '那个提示框还在')
+  // 提示框整个拆掉了（原来包着按钮的那层 el-tooltip）
+  assert.doesNotMatch(shown, /已入账的对方科目由凭证定死/)
 })
 
 t('默认就显示的那些列是流水解析出来的内容', () => {
@@ -260,6 +275,38 @@ t('默认就显示的那些列是流水解析出来的内容', () => {
 
 t('表格用紧凑尺寸', () => {
   assert.match(VIEW, /<el-table[\s\S]*?size="small"[\s\S]*?class="flow-rows-table"/)
+})
+
+console.log('== 指定科目时能自定义凭证摘要 ==')
+
+t('最终用哪一句摘要：人工写的优先，没写才用规则算的', () => {
+  assert.equal(effectiveSummary({ summary_override: '备用金', default_summary: '办公室租金' }),
+    '备用金')
+  assert.equal(effectiveSummary({ summary_override: '', default_summary: '办公室租金' }),
+    '办公室租金')
+  // 人工写的是空白（只有空格）时**不算写过** —— 交回规则去算
+  assert.equal(effectiveSummary({ summary_override: '   ', default_summary: '办公室租金' }),
+    '办公室租金')
+  assert.equal(effectiveSummary({}), '')
+  assert.equal(effectiveSummary(null), '')
+})
+
+t('弹窗里有摘要输入框，默认带出规则算出来的那句', () => {
+  // 界面上要有「凭证摘要」这一栏
+  assert.match(VIEW, /凭证摘要/)
+  assert.match(VIEW, /v-model="planDialog\.summary"/)
+  // 打开弹窗时把「按规则算出来的那句」填进去
+  assert.match(VIEW, /planDialog\.summary = effectiveSummary\(row\)/)
+  // 留空 = 交回规则
+  assert.match(VIEW, /留空 = 按规则\/模板自动生成/)
+})
+
+t('没动过摘要框就不带 summary —— 那些行要继续跟着规则走', () => {
+  // 不动的行如果也被存下来，规则改了之后它们就不跟着变了 ——
+  // 而用户根本没碰过它们。
+  assert.match(VIEW, /summaryTouched/)
+  assert.match(VIEW, /if \(planDialog\.summaryTouched\)/)
+  assert.match(VIEW, /payload\.summary = \(planDialog\.summary \|\| ''\)\.trim\(\)/)
 })
 
 console.log('== 一行流水对应多个对方科目 ==')

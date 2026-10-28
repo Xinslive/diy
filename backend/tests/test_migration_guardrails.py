@@ -976,9 +976,33 @@ def test_head_是本文件认识的那一版():
         "0040_retained_subject_setting",       # 未分配利润科目可手工设定：book_year.retained_subject_code
         "0041_bank_statement",                 # 流水对账四张表：对账单 / 流水行 / 科目规则 / 格式画像
         "0042_bank_statement_row_subjects",    # 流水对方科目改成子表（科目+金额）+ 流水凭证摘要模板
+        "0043_bank_statement_row_summary",      # 流水行可以人工指定凭证摘要（bank_statement_row.summary_override）
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")
+
+
+def test_revision_id_不超过32字符():
+    """``alembic_version.version_num`` 是 ``VARCHAR(32)`` —— 超了当场炸。
+
+    **炸在半路**：迁移把库升到一半失败（上一个 revision 已 stamp、这一个
+    没上），而测试与发布流程都以为迁移成功了 —— 症状是「库结构不完整」
+    与「迁移报告成功」同时出现，极难定位。
+
+    真实案例（2026-10-28）：``0043_bank_statement_row_summary_override``
+    是 40 个字符，迁移跑到 stamp 那一步才报
+    ``StringDataRightTruncation``。所以这条钉子钉在**起名**那一刻 ——
+    名字超了就别写进迁移链。
+    """
+    from alembic.script import ScriptDirectory
+
+    from app.core.schema_version import _config
+
+    revisions = [r.revision for r in ScriptDirectory.from_config(_config()).walk_revisions()]
+    assert revisions, "一条 revision 都没有 —— 迁移目录出问题了"
+    over = [rev for rev in revisions if len(rev) > 32]
+    assert not over, (
+        f"这些 revision id 超过 32 字符，alembic_version.version_num 装不下：{over}")
 
 
 # ================================================================ 8. 0032 真的把数据搬对了
@@ -1254,8 +1278,9 @@ def test_跨年账套_次年只有期初没有凭证_迁移照样跑得完(scrat
             "select version_num from alembic_version")).scalar()
         # 版本号跟着**迁移链的最后一环**走：0038 是 entry 唯一约束，
         # 0039 是凭证幂等占位表，0040 是未分配利润科目的手工设定列，
-        # 0041 是流水对账的四张表，0042 是流水对方科目子表 + 摘要模板。
-        assert ver == "0042_bank_statement_row_subjects", f"schema 只到 {ver}"
+        # 0041 是流水对账的四张表，0042 是流水对方科目子表 + 摘要模板，
+        # 0043 是流水行的人工摘要列。
+        assert ver == "0043_bank_statement_row_summary", f"schema 只到 {ver}"
 
         # 科目表按年度拆开
         rows = conn.execute(text(

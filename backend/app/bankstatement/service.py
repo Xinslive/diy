@@ -1563,15 +1563,23 @@ def list_rows(db: Session, book_id: int, statement_id: int, *,
     subjects = _subjects_of(db, book_id, subject_ids)
     # **一次查询出全部「可以改科目的分录」候选**（不是一行一次）。
     candidates = matching.reclassify_candidates(db, book_id, statement, rows)
-    return [serialize_row(db, row, subjects, children.get(row.id) or [],
-                          candidates.get(row.id) or [])
-            for row in rows]
+    # 规则与账套配置**各读一次**：算每一行「按规则算出来的摘要」要用，
+    # 一行一次查询就是几百次往返。
+    rules, config = _summary_context(db, book_id)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        items = children.get(row.id) or []
+        out.append(serialize_row(
+            db, row, subjects, items, candidates.get(row.id) or [],
+            default_summary=_default_summary_for(row, items, rules, config)))
+    return out
 
 
 def serialize_row(db: Session, row: BankStatementRow,
                   subjects: dict[int, Subject] | None = None,
                   plan_subjects: list[BankStatementRowSubject] | None = None,
-                  reclassify: list[dict[str, Any]] | None = None
+                  reclassify: list[dict[str, Any]] | None = None,
+                  default_summary: str = "",
                   ) -> dict[str, Any]:
     subjects = subjects or {}
     items = list(row.plan_subjects) if plan_subjects is None else list(plan_subjects)
@@ -1602,6 +1610,11 @@ def serialize_row(db: Session, row: BankStatementRow,
         "plan_status": row.plan_status,
         "problems": row.problems or [],
         "voucher_state": _voucher_state(row),
+        #: **人工写过的凭证摘要**（空 = 没写过，制证时按规则算）。
+        "summary_override": row.summary_override or "",
+        #: **按规则算出来的那个摘要** —— 界面上给「摘要」输入框当默认值，
+        #: 让用户看到「不改的话会是什么」，改了就用他写的那个。
+        "default_summary": default_summary,
         #: 账上「可能与这一行是同一笔」的分录（记在别的现金科目上的）。
         #: 有候选 = 这笔钱可能已经入过账了，只是记错了账户。
         "reclassify_candidates": plans,
@@ -1710,7 +1723,12 @@ def _parse_plan_payload(db: Session, book_id: int, row: BankStatementRow,
 
 def update_row(db: Session, book_id: int, row_id: int,
                payload: dict[str, Any]) -> dict[str, Any]:
-    """改一行：指定对方科目（可能好几个），或忽略 / 恢复这一行。"""
+    """改一行：指定对方科目（可能好几个），或忽略 / 恢复这一行。
+
+    **摘要也可以一起改**（``summary``）：留空 = 交回规则/模板去算；
+    写了 = 这一行就用这句。摘要与对方科目是**两件事**，所以它们各写各的：
+    「这笔记到 6602、摘要写『备用金』」是常见搭配。
+    """
     row = db.get(BankStatementRow, row_id)
     if row is None or row.book_id != book_id:
         raise ValueError("流水行不存在")
@@ -1742,8 +1760,23 @@ def update_row(db: Session, book_id: int, row_id: int,
         if row.matched_voucher_id:
             raise ValueError("这一行已经生成了凭证，不能忽略")
         row.status = status
+    if "summary" in payload:
+        # **人工摘要**：留空 = 交回规则/模板去算（不是「把摘要清成空」）。
+        #
+        # 已生成凭证的行同样不许改 —— 那张凭证已经写死了摘要，改这一列
+        # **不会**回头去改凭证，两边就对不上（与对方科目那条闸同一个道理）。
+        if row.matched_voucher_id:
+            raise ValueError("这一行已经生成了凭证，摘要由凭证定死 —— 要改请改那张凭证。")
+        row.summary_override = _text(payload.get("summary"))
     db.flush()
-    return serialize_row(db, row)
+    # 返回时把「按规则算出来的那个摘要」也带上：界面上那个输入框要显示
+    # **当前**该用的摘要 —— 人工改了对方科目之后，规则级的模板可能不再适用
+    # （规则级模板只在「这条科目是规则定的」时候算数），默认值得跟着变。
+    rules, config = _summary_context(db, book_id)
+    return serialize_row(
+        db, row,
+        default_summary=_default_summary_for(
+            row, list(row.plan_subjects), rules, config))
 
 
 def set_row_direction(db: Session, book_id: int, row_id: int,
@@ -1879,14 +1912,23 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
     subject_ids = {item.subject_id for items in children.values() for item in items}
     subjects = _subjects_of(db, book_id, subject_ids)
 
+    # 规则与账套配置各读一次（算「按规则算出来的摘要」要用）。
+    rules, config = _summary_context(db, book_id)
+
+    def _ser(row: BankStatementRow, items: list[BankStatementRowSubject]) -> dict[str, Any]:
+        return serialize_row(
+            db, row, subjects, items,
+            default_summary=_default_summary_for(row, items, rules, config))
+
     candidates: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for row in rows:
         items = children.get(row.id) or []
         if row.status == STATUS_IGNORED:
-            skipped.append({**serialize_row(db, row, subjects, items),
+            skipped.append({**_ser(row, items),
                             "reason": "已忽略"})
             continue
+        # ---- 去重（已有凭证）----
         # **人工确认过的标记优先**：这一行已经标着「已入账」且指着某张凭证时，
         # 先核实那张凭证**是不是还覆盖这一行** —— 覆盖了就保留它，不让下面
         # 那次启发式扫描去顶掉用户的确认。
@@ -1915,34 +1957,34 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
                 row.matched_voucher_id = None
         if row.status == STATUS_POSTED:
             skipped.append({
-                **serialize_row(db, row, subjects, items),
+                **_ser(row, items),
                 "reason": f"已入账（凭证 #{row.matched_voucher_id}）",
             })
             continue
         if row.matched_invoice_record_id:
-            skipped.append({**serialize_row(db, row, subjects, items),
+            skipped.append({**_ser(row, items),
                             "reason": "已被发票占用"})
             continue
         if row.direction == DIRECTION_UNKNOWN:
-            skipped.append({**serialize_row(db, row, subjects, items),
+            skipped.append({**_ser(row, items),
                             "reason": "方向未知"})
             continue
         if row.amount is None or row.amount <= 0:
-            skipped.append({**serialize_row(db, row, subjects, items),
+            skipped.append({**_ser(row, items),
                             "reason": "金额为 0"})
             continue
         if row.plan_status == PLAN_PENDING or not items:
-            skipped.append({**serialize_row(db, row, subjects, items),
+            skipped.append({**_ser(row, items),
                             "reason": "对方科目待确认"})
             continue
         # **对方科目金额合计必须等于流水金额** —— 不等的话凭证会不平衡。
         # 正常情况下写入口就挡住了（:func:`_parse_plan_payload`），
         # 这里是第二道：金额改过了、行是旧的、或者别处写进去的。
         if _plan_total(items) != row.amount:
-            skipped.append({**serialize_row(db, row, subjects, items),
+            skipped.append({**_ser(row, items),
                             "reason": "对方科目金额与流水金额对不上"})
             continue
-        candidates.append(serialize_row(db, row, subjects, items))
+        candidates.append(_ser(row, items))
     db.flush()
     return {
         "statement_id": statement.id,
@@ -2027,8 +2069,52 @@ def render_summary(row: BankStatementRow, template: str = "") -> str:
     return _default_summary(row)
 
 
+def _effective_summary(row: BankStatementRow, template: str = "") -> str:
+    """这一张凭证的摘要**最终用哪一句**。
+
+    **人工写的优先**（``summary_override``），没写才按模板算。
+
+    **为什么人工的优先，而不是模板的优先**：模板是**账套级 / 规则级**的
+    口径，它管的是「这一类流水通常该怎么写摘要」；而人工写的那一句是
+    **这一笔**的。用户既然明确写了，就该用他写的那句 —— 这也正是界面上
+    那个输入框存在的意义。
+
+    **留空 = 交回规则**：清空那个输入框 = 不想改 = 跟着规则走（不是
+    「摘要留空」）。
+    """
+    override = (row.summary_override or "").strip()
+    if override:
+        return override
+    return render_summary(row, template)
+
+
 def _row_summary(row: BankStatementRow, template: str = "") -> str:
     return render_summary(row, template)
+
+
+def _summary_context(db: Session, book_id: int) -> tuple[
+        list[BankStatementRule], Optional[BankStatementConfig]]:
+    """算摘要要用的两样东西：**规则**与**账套配置**。
+
+    **各读一次，不是一行一次**：一份对账单几百行，一行一次查询就是几百次
+    往返 —— 而这两样东西整份对账单是同一份。
+    """
+    return list_rules(db, book_id), get_config(db, book_id)
+
+
+def _default_summary_for(row: BankStatementRow,
+                          items: list[BankStatementRowSubject],
+                          rules: list[BankStatementRule],
+                          config: Optional[BankStatementConfig]) -> str:
+    """这一行**按规则算出来的**凭证摘要。
+
+    **人工没写摘要时制证用的就是它**；界面上它也是「摘要」输入框的默认值
+    —— 让用户先看见「不改会是什么」，改了就用他写的那个。
+
+    取值序（规则级 > 账套级 > 内置口径）与制证时**完全一致**：
+    :func:`_summary_template_for` 是同一段代码，不另写一份。
+    """
+    return render_summary(row, _summary_template_for(rules, config, row, items))
 
 
 def _summary_template_for(rules: list[BankStatementRule],
@@ -2172,7 +2258,7 @@ def _make_voucher_for_row(db: Session, book_id: int, statement: BankStatement,
             "请在流水科目规则里改成本年度的科目")
     cash_id = mapping.get(statement.account_subject_id, statement.account_subject_id)
 
-    summary = render_summary(row, summary_template)
+    summary = _effective_summary(row, summary_template)
     entries: list[dict[str, Any]] = []
     if row.direction == DIRECTION_IN:
         # 收钱：现金增加记**借方**（会计口径），对方记贷方。

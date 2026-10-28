@@ -180,6 +180,18 @@ class BankStatementRow(Base, TimestampMixin):
     plan_status: Mapped[str] = mapped_column(String(16), default=PLAN_NONE, nullable=False)
     #: 这一行的问题（方向未知、金额为 0、两侧都有发生额……）。
     problems: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
+    #: **人工指定的凭证摘要**。留空 = 跟着规则/模板走（见
+    #: ``app.bankstatement.service.render_summary``）。
+    #:
+    #: **为什么单独一列，而不是每次都现算。** 规则算出来的摘要（用途优先、
+    #: 摘要兜底、模板占位符）适合**大多数**行，但总有行不对：某个客户的付款
+    #: 该写成「备用金」而不是「办公室租金」，而规则管不了「这一笔例外」。
+    #: 人工改过的那几行不该被「重新解析 / 重新制证」冲掉 —— 所以改过的
+    #: 摘要**存下来**。
+    #:
+    #: **它不与规则抢真相**：留空时制证仍然按模板算；只有用户**明确改过**
+    #: 才用这一列。两者的优先级由服务层那一行代码决定，不在别处另判。
+    summary_override: Mapped[str] = mapped_column(Text, default="", nullable=False)
 
     statement: Mapped["BankStatement"] = relationship(back_populates="rows")
     #: 对方科目（可能不止一个，见 :class:`BankStatementRowSubject`）。

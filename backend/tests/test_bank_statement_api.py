@@ -192,6 +192,118 @@ def test_忽略一行(client, auth, db, book, cash, store):
     assert r.json()["voucher_state"] == "IGNORED"
 
 
+# ---------------------------------------------------------------------- 凭证摘要
+
+
+def test_行接口带出按规则算出来的摘要(client, auth, db, book, cash, store):
+    """界面上那个「凭证摘要」输入框的**默认值**从这儿来。
+
+    它必须是**后端算出来的那一句**（规则级模板 → 账套级模板 → 内置口径），
+    不是前端自己拼的 —— 前端另拼一份，两边迟早漂：输入框里一句话、
+    生成的凭证上另一句话。
+    """
+    created = _upload(client, auth, book, cash).json()
+    rows = client.get(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/rows",
+        headers=auth).json()
+    # 还没有人工摘要
+    assert rows[0]["summary_override"] == ""
+    # 默认摘要有内容（这份对账单没设模板，走内置口径：用途优先、摘要兜底）
+    assert rows[0]["default_summary"], "没有算出默认摘要"
+
+
+def test_指定科目时可以带摘要(client, auth, db, book, cash, store, subjects):
+    created = _upload(client, auth, book, cash).json()
+    rows = client.get(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/rows",
+        headers=auth).json()
+    r = client.patch(
+        f"/api/books/{book.id}/bank-statements/rows/{rows[0]['id']}",
+        headers=auth, json={"plan_subject_id": subjects["560202"].id,
+                            "summary": "备用金"})
+    assert r.status_code == 200, r.text
+    assert r.json()["summary_override"] == "备用金"
+
+    rows = client.get(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/rows",
+        headers=auth).json()
+    assert rows[0]["summary_override"] == "备用金"
+    # **默认摘要还在**：那是「没改的话会是什么」，输入框要靠它当底稿
+    assert rows[0]["default_summary"]
+
+
+def test_摘要留空等于交回规则(client, auth, db, book, cash, store, subjects):
+    """清空那个输入框 = 「我不想改」= 跟着规则走，**不是**「摘要留空」。"""
+    created = _upload(client, auth, book, cash).json()
+    rows = client.get(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/rows",
+        headers=auth).json()
+    client.patch(
+        f"/api/books/{book.id}/bank-statements/rows/{rows[0]['id']}",
+        headers=auth, json={"summary": "备用金"})
+    r = client.patch(
+        f"/api/books/{book.id}/bank-statements/rows/{rows[0]['id']}",
+        headers=auth, json={"summary": ""})
+    assert r.status_code == 200, r.text
+    assert r.json()["summary_override"] == ""
+
+
+def test_人工摘要优先于规则算出来的那句(client, auth, db, book, cash, store, subjects):
+    """人工写的那句**就是凭证上那句**。
+
+    这是这个功能的核心：输入框里写什么，凭证上就是什么。
+    """
+    from app.models import Entry
+
+    created = _upload(client, auth, book, cash).json()
+    rows = client.get(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/rows",
+        headers=auth).json()
+    client.patch(
+        f"/api/books/{book.id}/bank-statements/rows/{rows[0]['id']}",
+        headers=auth, json={"plan_subject_id": subjects["560202"].id,
+                            "summary": "备用金"})
+    client.post(
+        f"/api/books/{book.id}/bank-statements/rows/{rows[0]['id']}/direction",
+        headers=auth, json={"direction": "IN"})
+    client.post(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/commit-vouchers",
+        headers=auth)
+
+    row = db.get(BankStatementRow, rows[0]["id"])
+    assert row.matched_voucher_id, "这一行应该已经制证了"
+    summaries = {e.summary for e in db.scalars(
+        select(Entry).where(Entry.voucher_id == row.matched_voucher_id)).all()}
+    assert summaries == {"备用金"}, f"凭证上的摘要不对：{summaries}"
+
+
+def test_已入账的行不许改摘要(client, auth, db, book, cash, store, subjects):
+    """凭证已经写死了摘要 —— 改流水行**不会**回头改凭证，两边会对不上。
+
+    所以这条与「对方科目不许改」是同一条闸（同一个判据
+    ``matched_voucher_id``）。
+    """
+    created = _upload(client, auth, book, cash).json()
+    rows = client.get(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/rows",
+        headers=auth).json()
+    client.patch(
+        f"/api/books/{book.id}/bank-statements/rows/{rows[0]['id']}",
+        headers=auth, json={"plan_subject_id": subjects["560202"].id})
+    client.post(
+        f"/api/books/{book.id}/bank-statements/rows/{rows[0]['id']}/direction",
+        headers=auth, json={"direction": "IN"})
+    client.post(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/commit-vouchers",
+        headers=auth)
+
+    r = client.patch(
+        f"/api/books/{book.id}/bank-statements/rows/{rows[0]['id']}",
+        headers=auth, json={"summary": "改成别的"})
+    assert r.status_code == 400, r.text
+    assert "凭证" in r.json()["detail"]
+
+
 # ---------------------------------------------------------------------- 制证
 
 

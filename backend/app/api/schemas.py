@@ -332,11 +332,15 @@ class BankStatementRowPatchIn(BaseModel):
 
     ``plan_subject_id`` 是「就一个科目」的简写 —— 金额自动取这一行的流水金额。
     两种写法只能给一种：都给了说明调用方自己也没想清楚要哪个。
+
+    ``summary`` 是**这一行的凭证摘要**：给了就用它（留空 = 交回规则/模板
+    去算）。它与对方科目是**两件事**，各写各的。
     """
 
     plan_subjects: Optional[list[BankStatementRowSubjectIn]] = None
     plan_subject_id: Optional[int] = None
     status: Optional[Literal["OPEN", "IGNORED"]] = None
+    summary: Optional[str] = Field(default=None, max_length=256)
 
 
 class BankStatementRowReclassifyIn(BaseModel):

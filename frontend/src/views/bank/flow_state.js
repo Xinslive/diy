@@ -334,6 +334,20 @@ export const renderSummary = (template, row) => {
 }
 
 /**
+ * 这一行**最终会用哪一句摘要**。
+ *
+ * **人工写过的优先**（`summary_override`），没写才用后端按规则算出来的那个
+ * （`default_summary`）。
+ *
+ * **为什么不在前端算**：规则命中哪一条、该用规则级还是账套级还是内置口径的
+ * 模板 —— 那套判断在**后端**（`service._summary_template_for`）。前端另写
+ * 一份，两边迟早漂：预览里一句话、生成的凭证上另一句话。
+ * 所以后端把「算出来的那个」一并给过来，这里只做「人工的优先」这一下。
+ */
+export const effectiveSummary = (row) =>
+  (row?.summary_override || '').trim() || (row?.default_summary || '').trim()
+
+/**
  * 现成的示例模板 —— **给用户照抄的**，不用自己想。
  *
  * 一个「看不懂」的模板功能，光列占位符是不够的：用户不知道该拼成什么样。

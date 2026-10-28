@@ -379,30 +379,35 @@
                       </el-tag>
                     </div>
                     <span v-else class="muted small">待确认</span>
-                    <!-- **已入账的行不许再指定科目。**
-                         凭证已经把那个科目定死了（分录里写着），只改流水行、
-                         不改凭证，两边就对不上 —— 而且界面上看不出来。
-                         所以按钮置灰，并把出路写在旁边：**改凭证**。 -->
-                    <el-tooltip
-                      :disabled="canEditPlanSubject(row)"
-                      content="已入账的对方科目由凭证定死 —— 要改请改那张凭证（或用「可改科目」）"
-                      placement="top"
+                    <!-- **已入账的对方科目由凭证定死** —— 所以那颗按钮是灰的。
+                         这句话不再摆在界面上（2026-10-28 用户要求去掉）：
+                         一行行都挂着一句警告，看着像出了事，其实只是
+                         「这一行已经制过证了」。 -->
+                    <el-button
+                      link
+                      type="primary"
+                      size="small"
+                      :disabled="!canEditPlanSubject(row)"
+                      @click="openPlan(row)"
                     >
-                      <span>
-                        <el-button
-                          link
-                          type="primary"
-                          size="small"
-                          :disabled="!canEditPlanSubject(row)"
-                          @click="openPlan(row)"
-                        >
-                          {{ row.plan_subjects?.length ? '调整' : '指定' }}
-                        </el-button>
-                      </span>
-                    </el-tooltip>
-                    <span v-if="!canEditPlanSubject(row)" class="flow-warn small">
-                      已入账，科目由凭证定死，要改请改凭证
-                    </span>
+                      {{ row.plan_subjects?.length ? '调整' : '指定' }}
+                    </el-button>
+                  </div>
+                  <div class="flow-extra-item">
+                    <span class="flow-extra-label">摘要</span>
+                    <!-- **这一行会用哪一句凭证摘要** —— 人工写过的优先，
+                         没写过的就是规则算出来的那句。
+                         **摆出来是必须的**：写了却看不见，等于没写 ——
+                         用户没法确认「我改的那句还在不在」。 -->
+                    <span>{{ effectiveSummary(row) || '—' }}</span>
+                    <el-tag
+                      v-if="row.summary_override"
+                      size="small"
+                      type="warning"
+                      effect="plain"
+                    >
+                      人工指定
+                    </el-tag>
                   </div>
                   <div class="flow-extra-item">
                     <span class="flow-extra-label">状态</span>
@@ -654,6 +659,25 @@
         各个科目的金额加起来要等于流水金额
         <strong>{{ money(planDialog.row?.amount) }}</strong>，否则凭证会不平衡。
       </div>
+      <!-- **凭证摘要**：跟着规则算出来的那句摆在框里，用户可以直接改。
+           规则管的是「这一类流水通常怎么写摘要」，总有行不对 ——
+           某一笔该记「备用金」而不是「办公室租金」，那就手改一句。
+           **没改过就等于没改**：框里的内容原样交回去时，制证仍然按规则算
+           （清空 = 交回规则），改过的才用他写的。 -->
+      <div class="flow-plan-summary">
+        <span class="flow-extra-label">凭证摘要</span>
+        <el-input
+          v-model="planDialog.summary"
+          placeholder="留空 = 按规则/模板自动生成"
+          clearable
+          @input="planDialog.summaryTouched = true"
+          @clear="planDialog.summaryTouched = true"
+        />
+        <div class="muted small">
+          框里这句是**按规则算出来的**（规则级模板 → 账套级模板 → 内置口径）。
+          改了就用你写的；没改就还是它。
+        </div>
+      </div>
       <div v-for="(item, index) in planDialog.items" :key="index" class="flow-plan-row">
         <el-select
           v-model="item.subject_id"
@@ -742,7 +766,8 @@ import * as api from '@/api/bankstatement'
 import * as subjectApi from '@/api/subject'
 import { reportNumber } from '@/utils/format'
 import {
-  FIELD_OPTIONS, canCommit, canEditPlanSubject, canToggleIgnore, diffClass, fieldLabel,
+  FIELD_OPTIONS, canCommit, canEditPlanSubject, canToggleIgnore, diffClass, effectiveSummary,
+  fieldLabel,
   isCrossPeriod, planSubjectCents,
   planSubjectText, planTotalDiff, planTotalMatches, reclassifyCandidateText,
   reclassifyCrossPeriodConfirm, reclassifyCrossPeriodText, reclassifyRowCount,
@@ -798,7 +823,23 @@ const manualMapping = reactive({})
  */
 
 /** 对方科目编辑弹窗。 */
-const planDialog = reactive({ open: false, row: null, items: [] })
+const planDialog = reactive({
+  open: false,
+  row: null,
+  items: [],
+  /** 凭证摘要输入框里的内容。 */
+  summary: '',
+  /**
+   * **用户动过这个框没有。**
+   *
+   * 没动过 → 保存时**不带** summary → 后端继续按规则算。
+   * 动了 → 把框里的字存成这一行的人工摘要。
+   *
+   * **为什么不直接每次都存**：不动的那些行如果也被存下来，规则改了之后
+   * 它们就不跟着变了 —— 而用户根本没碰过它们，凭什么被冻住。
+   */
+  summaryTouched: false,
+})
 /** 改科目弹窗。 */
 const reclassifyDialog = reactive({ open: false, row: null })
 
@@ -1115,6 +1156,10 @@ function openPlan(row) {
   planDialog.items = items.length
     ? items
     : [{ subject_id: null, amount: Number(row.amount) || 0 }]
+  // **摘要框默认带上「按规则算出来的那句」** —— 用户先看见「不改会是什么」，
+  // 要改再改。（人工写过的优先；后端给的两样都在这里。）
+  planDialog.summary = effectiveSummary(row)
+  planDialog.summaryTouched = false
   planDialog.open = true
 }
 
@@ -1131,12 +1176,18 @@ async function savePlan() {
   if (!row || !planTotalOk.value) return
   savingPlan.value = true
   try {
-    await api.patchRow(store.bookId, row.id, {
+    const payload = {
       plan_subjects: planDialog.items.map((item) => ({
         subject_id: item.subject_id,
         amount: String(item.amount),
       })),
-    })
+    }
+    // **只有用户动过摘要框才带 summary** —— 没动过的行继续跟着规则走
+    // （规则改了要跟着变）。带空字符串 = 「交回规则去算」。
+    if (planDialog.summaryTouched) {
+      payload.summary = (planDialog.summary || '').trim()
+    }
+    await api.patchRow(store.bookId, row.id, payload)
     planDialog.open = false
     await loadRows()
     ElMessage.success('已保存对方科目')
@@ -1354,7 +1405,7 @@ onMounted(() => {
 .flow-extra-item {
   display: flex;
   align-items: center;
-  /* 换行是**往下**换 —— 「已入账，科目由凭证定死…」那句提示较长，
+  /* 换行是**往下**换 —— 对方科目那一格可能有好几个科目标签，
      不许它把这一行撑宽（撑宽就又是左右滑动条）。 */
   flex-wrap: wrap;
   gap: 8px;
@@ -1419,6 +1470,14 @@ onMounted(() => {
   gap: 8px;
   margin-bottom: 8px;
 }
+/* 凭证摘要：一张凭证一句摘要，所以它是**整个弹窗**的事，不跟着某一行科目走。 */
+.flow-plan-summary {
+  margin: 10px 0 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.flow-plan-summary .flow-extra-label { display: block; margin-bottom: 4px; }
+.flow-plan-summary .muted { margin-top: 4px; line-height: 1.6; }
 .flow-plan-select { flex: 1 1 auto; min-width: 220px; }
 .flow-plan-amount { flex: 0 0 140px; }
 .flow-plan-total {
