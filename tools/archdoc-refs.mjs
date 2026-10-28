@@ -25,6 +25,15 @@
  * 所以「可解」的判据是「在这些文档的标题里能找到」，而不是「在本文档里能找到」——
  * 后者会把几百处合法的外部引用判成断链，判据一旦有噪声就没人看。
  *
+ * **⚠ 一条被 CI 抓出来的纪律：编号全集必须只来自版本控制。**
+ * 审计报告那一套编号（§3.1–§3.45）定义在 `output/` 下，而 `output/` 是
+ * gitignore 的 —— 本地有、CI 的干净 checkout 没有。第一版用目录遍历收集
+ * 编号，结果**本地绿、CI 红**（CI run 40723257346），两边各自都"对"，
+ * 却没人说得清哪边是判据：本地那份绿只是运气。
+ * 现在全集只取三样，全都在版本控制里：本文档自己的编号、**git 跟踪的** .md
+ * 的编号（`git ls-files`，不是目录遍历）、以及 `tools/archdoc-external.json`
+ * 里登记的外部编号（补 `output/` 那些没进仓库的文档）。
+ *
  * 用法：
  *   node tools/archdoc-refs.mjs            # 校验
  *   node tools/archdoc-refs.mjs --update   # 按当前文档重写基线（新增章节后跑）
@@ -32,11 +41,13 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { execFileSync } from 'node:child_process'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const REPO = path.resolve(HERE, '..')
 const DOC = path.join(REPO, 'ARCHITECTURE.md')
 const BASELINE = path.join(HERE, 'archdoc-sections.json')
+const EXTERNAL = path.join(HERE, 'archdoc-external.json')
 
 const UPDATE = process.argv.includes('--update')
 
@@ -109,6 +120,30 @@ function walk(dir, found = []) {
   return found
 }
 
+/**
+ * **git 跟踪的**文件（`.md`）。
+ *
+ * 不用目录遍历是有意的：目录遍历会把 gitignore 的东西也算进来
+ * （本仓库的 `output/` 下压着审计报告），于是闸门的判定取决于
+ * 「你本机恰好有没有那些文件」—— 本地绿、CI 红，谁也说不清哪边对。
+ * `git ls-files` 给的是仓库真正承认的内容，任何 checkout 都一样。
+ * 不是 git 仓库时退回目录遍历（本地手工排查用）。
+ */
+function trackedFiles(filter) {
+  try {
+    const out = execFileSync('git', ['ls-files'], { cwd: REPO, encoding: 'utf8' })
+    return out.split('\n').filter(Boolean)
+      .map(f => path.join(REPO, f))
+      .filter(f => filter(f))
+  } catch {
+    return walk(REPO).filter(filter)
+  }
+}
+
+function trackedMarkdownFiles() {
+  return trackedFiles(f => path.extname(f) === '.md')
+}
+
 function compareNumbers(a, b) {
   const pa = a.split('.').map(Number)
   const pb = b.split('.').map(Number)
@@ -146,15 +181,35 @@ function main() {
   // **被检查的那份文档要用它自己的编号入集。** 否则拿旧版文档来测时，
   // 集合里混进了仓库当前版的编号 —— 旧版里的坏引用会「解析得到」，
   // 闸门于是对着一份有缺陷的文档说通过。检查什么，就以什么为准。
+  //
+  // **全集的来源必须与 checkout 无关。** 这里只取三样：
+  //   ① 被检查的文档自己的编号；
+  //   ② **git 跟踪的** .md 的编号（用 git ls-files，不用目录遍历）；
+  //   ③ `tools/archdoc-external.json` 登记的外部编号。
+  //
+  // ②为什么不用目录遍历：审计报告那一套编号定义在 `output/` 下，而 `output/`
+  // 是 gitignore 的 —— 本地有、CI 的干净 checkout 没有。目录遍历会让闸门
+  // **本地绿、CI 红**，而且两边都"对"，谁也说不清哪边是判据。
+  // （实测踩过：CI run 40723257346 就是这么红的。）
+  // ③补的就是这个缺口：那几份文档的编号由显式注册表提供，跟着版本控制走。
   const universe = new Map()
   const owner = new Map()
-  const docFiles = walk(REPO).filter(f => path.extname(f) === '.md')
+  const docFiles = trackedMarkdownFiles()
   for (const full of docFiles) {
     const rel = path.relative(REPO, full)
     if (full === DOC && docPath !== DOC) continue
     const { sections: s } = parseSections(fs.readFileSync(full, 'utf8'))
     for (const [num, title] of s) {
       if (!universe.has(num)) { universe.set(num, title); owner.set(num, rel) }
+    }
+  }
+  // 外部编号注册表
+  if (fs.existsSync(EXTERNAL)) {
+    const ext = JSON.parse(fs.readFileSync(EXTERNAL, 'utf8'))
+    for (const [src, nums] of Object.entries(ext.sources || {})) {
+      for (const num of nums) {
+        if (!universe.has(num)) { universe.set(num, src); owner.set(num, src) }
+      }
     }
   }
   // 被检查的文档本身优先入集（它的编号才是「自己的」）
@@ -196,7 +251,9 @@ function main() {
   for (const r of bodyRefs) check(r.num, `${docLabel}:${r.line}`)
 
   let repoCount = 0
-  for (const file of walk(REPO)) {
+  // 只扫**被跟踪的**文件：CI 的干净 checkout 里只有这些，
+  // 扫本地那些 gitignore 的文件会让两边的引用点数量对不上。
+  for (const file of trackedFiles(f => SCAN_EXT.has(path.extname(f)))) {
     const rel = path.relative(REPO, file)
     if (SKIP_FILES.has(rel) || rel.startsWith('tools' + path.sep)) continue
     fs.readFileSync(file, 'utf8').split('\n').forEach((line, i) => {

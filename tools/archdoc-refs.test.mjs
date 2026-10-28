@@ -95,3 +95,53 @@ test('新增编号没登记进基线 → 拦住（基线是账本，缺条目就
   assert.match(out, /未登记进基线/)
   assert.match(out, /11\.7\.15/)
 })
+
+/**
+ * **判定不能依赖「本机恰好有那些文件」。**
+ *
+ * 踩过的坑：审计报告那一套编号（§3.1–§3.45）定义在 `output/` 下，而
+ * `output/` 是 gitignore 的。于是闸门**本地绿、CI 红** —— 两边各自都"对"，
+ * 却没人说得清哪边是判据。本地那份绿是运气。
+ *
+ * 这条测试造一个「只有 git 跟踪的文件」的干净环境（没有 output/），
+ * 断言闸门照样通过。它守住的是：**编号全集必须来自版本控制**，
+ * 而不是来自工作目录里碰巧有什么。
+ */
+test('干净 checkout（没有 output/ 那些未跟踪文件）下闸门照样通过', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'archdoc-clean-'))
+  execFileSync('git', ['init', '-q'], { cwd: tmp })
+
+  const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: REPO })
+    .toString().split('\0').filter(Boolean)
+  for (const rel of tracked) {
+    const src = path.join(REPO, rel)
+    const dst = path.join(tmp, rel)
+    if (!fs.existsSync(src)) continue
+    fs.mkdirSync(path.dirname(dst), { recursive: true })
+    fs.copyFileSync(src, dst)
+  }
+  // 工作区里还没提交的工具改动也要带过去
+  for (const rel of ['tools/archdoc-refs.mjs', 'tools/archdoc-sections.json', 'tools/archdoc-external.json']) {
+    const src = path.join(REPO, rel)
+    const dst = path.join(tmp, rel)
+    fs.mkdirSync(path.dirname(dst), { recursive: true })
+    fs.copyFileSync(src, dst)
+  }
+  execFileSync('git', ['add', '-A'], { cwd: tmp })
+
+  assert.ok(!fs.existsSync(path.join(tmp, 'output')), '测试环境里不该有 output/ —— 那正是要排除的东西')
+
+  let code = 1
+  let out = ''
+  try {
+    out = execFileSync('node', [path.join(tmp, 'tools', 'archdoc-refs.mjs')], {
+      cwd: tmp, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    code = 0
+  } catch (e) {
+    out = `${e.stdout || ''}${e.stderr || ''}`
+    code = e.status ?? 1
+  }
+  assert.equal(code, 0, `干净 checkout 下闸门不该红，却红了：\n${out}`)
+  assert.match(out, /段号契约成立/)
+})
