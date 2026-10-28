@@ -838,6 +838,56 @@ def test_别的账套的凭证查不到前后张(client, auth, db, book, make_vo
     assert code in (403, 404), f"不该返回 {code}"
 
 
+def test_只读账号也能翻前后张(client, auth, db, book, make_voucher, plain_user, plain_auth):
+    """**只读账号翻凭证是「看」，不是改** —— 不该被写权限挡住。
+
+    2026-10-28 修的老遗留：``neighbour`` 原来挂 ``require_book_write``，
+    于是只读账号一打开凭证页就吃一个 403。前端没兜住，那个 403 一路抛到
+    ``load()`` 外面 —— **凭证页的表格列宽对齐跟着不执行了**，界面上还弹一条
+    「当前账套为只读权限」，而那张凭证明明好好地显示着。
+
+    更要紧的是**前后端不是同一个判据**：凭证页的「前一张 / 后一张」两颗按钮
+    **不按 ``canWrite`` 藏**（只读账号看得见它们），也就是说前端摆出了这个
+    能力，后端却在拒 —— 正是本项目最忌讳的那件事。
+
+    所以这里要钉住：**VIEWER 调 neighbour 拿到 200，而且前后张给得对**。
+    """
+    from app.models import UserBook
+
+    v1 = make_voucher("2026-01-05", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")],
+                      voucher_no="记0001")
+    v2 = make_voucher("2026-01-06", dr=[("1001", 200, "x")], cr=[("5001", 200, "x")],
+                      voucher_no="记0002")
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="VIEWER"))
+    db.commit()
+
+    r = client.get(f"/api/books/{book.id}/vouchers/{v1.id}/neighbour", headers=plain_auth)
+    assert r.status_code == 200, f"只读账号翻凭证被拒了：{r.status_code} {r.text[:200]}"
+    d = r.json()
+    assert d["prev_id"] is None
+    assert d["next_id"] == v2.id
+
+    r2 = client.get(f"/api/books/{book.id}/vouchers/{v2.id}/neighbour", headers=plain_auth)
+    assert r2.status_code == 200, r2.text[:200]
+    assert r2.json()["prev_id"] == v1.id
+
+
+def test_没授权的账套仍然查不到前后张(client, db, book, make_voucher, plain_user, plain_auth):
+    """**只读 ≠ 有授权**：没被授权的账套，照样 403/404。
+
+    上面那条把 ``require_book_write`` 换成了 ``get_book_link`` ——
+    换的是「有没有授权」这一道，不是「有没有授权」也一起放开了。
+    """
+    from app.models import Book
+    other = db.scalar(select(Book).where(Book.id != book.id).limit(1))
+    if other is None:
+        return
+    v = make_voucher("2026-01-05", dr=[("1001", 100, "x")], cr=[("5001", 100, "x")])
+    code = client.get(f"/api/books/{other.id}/vouchers/{v.id}/neighbour",
+                      headers=plain_auth).status_code
+    assert code in (403, 404), f"不该返回 {code}"
+
+
 # ===================================================================== 插入凭证
 
 

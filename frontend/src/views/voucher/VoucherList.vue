@@ -376,9 +376,22 @@ async function load() {
  * 断号和时序只跟「期间」有关，跟筛选条件无关：条件栏筛的是跨年的一堆凭证，
  * 而断号说的是号段本身连不连得上。所以这里固定查顶栏那个期间，不跟着条件走。
  * 体检是只读的，失败就当没提醒 —— 列表该显示的还得显示。
+ *
+ * **只读账号压根不调它**（2026-10-28 修只读账号的假错误时改的）：
+ * 这个体检是**「整理凭证」那道写动作的配套接口** —— 它说的是「这个期间能不能
+ * 整理」。只读账号不能整理，那条提醒对它没有可执行的下一步，摆出来只是噪音；
+ * 而后端按设计把它按写权限挡住了，于是只读账号打开这一页就吃一个 403。
+ *
+ * **前端那个 ``catch`` 吞不掉那条红字** —— 红字是全局 http 拦截器弹的。
+ * 所以两件事一起做：只读账号不调它（不发这趟请求），并且那一趟标了 ``silent``，
+ * 万一还是被拒，拦截器也不出声。
+ *
+ * **两端结论一致才是要紧的**：前端不调、后端也拒 —— 「只读账号拿不到这个体检」。
+ * （对比 ``neighbour``：那个是前端摆着按钮、后端却拒，结论不一致，才要放开后端。）
  */
 async function loadCheck() {
   if (!store.bookId || !store.periodId) { check.value = null; return }
+  if (!store.canWrite) { check.value = null; return }
   try {
     const r = await api.voucherPeriodCheck(store.bookId, store.periodId)
     check.value = r

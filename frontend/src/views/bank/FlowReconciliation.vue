@@ -641,7 +641,7 @@
            期间就是判定的那把尺子 —— 离开它就说不清「这一笔凭什么可疑」。
            -->
       <el-tab-pane label="存疑凭证" name="suspicious">
-        <el-card shadow="never">
+        <el-card shadow="never" v-loading="loadingSuspicious">
           <template #header>
             <div class="section-head">
               <span>存疑凭证</span>
@@ -668,10 +668,28 @@
             </span>
           </div>
 
+          <!-- **空态用插槽**：文案是**动态**的（「这个期间没有」与
+               「压根没有对账单」两句话），写死成字符串就说不了第一种。 -->
           <el-empty
             v-if="!suspiciousRows.length"
-            description="没有存疑凭证 —— 账上每一笔银行账户分录都能在流水里找到对应的行"
-          />
+            :description="suspiciousEmptyText"
+          >
+            <!-- **别的期间还有**：不是没有存疑凭证，是不在这个月 ——
+                 不说清楚、又不给条路，用户只会以为功能坏了。 -->
+            <div v-if="suspiciousOtherPeriods.length" class="flow-empty-other">
+              <span class="muted small">别的期间还有：</span>
+              <el-button
+                v-for="p in suspiciousOtherPeriods"
+                :key="`${p.year}-${p.month}`"
+                link
+                type="primary"
+                size="small"
+                @click="jumpToPeriod(p)"
+              >
+                {{ p.label }}（{{ p.count }} 张）
+              </el-button>
+            </div>
+          </el-empty>
           <el-table
             v-else
             :data="suspiciousRows"
@@ -854,6 +872,7 @@ import {
   renderSummary, settlementSourceText, settlementSourceType,
   bankAccountSubjects,
   statementsInPeriod, statementsOtherPeriods,
+  suspiciousCounts, suspiciousOtherPeriods as suspiciousOtherPeriodsOf,
   suspiciousRows as suspiciousRowsOf,
   toColumnMapping, unknownTemplateFields, voucherStateText, voucherStateType,
   summaryTemplateValuesText,
@@ -956,6 +975,9 @@ const otherPeriods = computed(() => statementsOtherPeriods(
  * （大多数时候根本没有存疑凭证）—— 每次进来都查一遍是白查。
  */
 const suspicious = ref(null)
+
+/** 存疑凭证是懒加载的 —— 加载完之前不许说「没有存疑凭证」（那是句假话）。 */
+const loadingSuspicious = ref(false)
 
 const loading = ref(false)
 const loadingRows = ref(false)
@@ -1263,24 +1285,77 @@ async function loadAll() {
  * 期间就是判定的那把尺子）；界面上把它们摊平成一张表、每行带上账户与期间 ——
  * 那样一眼能扫完，又不会把「哪个账户」丢在折叠层里。
  */
-const suspiciousRows = computed(() => suspiciousRowsOf(suspicious.value?.groups))
+const suspiciousRows = computed(() => suspiciousRowsOf(
+  suspicious.value?.groups,
+  store.currentPeriod?.year,
+  store.currentPeriod?.month,
+))
+
+/**
+ * 顶上的三个数：**只数页面上摆着的那些**。
+ *
+ * **不许直接用后端给的总数** —— 后端数的是全账套（所有对账单分组），
+ * 而列表已经按顶栏期间过滤过了。拿全账套的总数配一张过滤过的表，
+ * 界面上就是「共 1 张存疑凭证」配一张空表。
+ */
+const suspiciousCountsOf = computed(() => suspiciousCounts(
+  suspicious.value?.groups,
+  store.currentPeriod?.year,
+  store.currentPeriod?.month,
+))
 
 /** 一共几张存疑凭证。 */
-const suspiciousTotal = computed(() => suspicious.value?.total_suspicious || 0)
+const suspiciousTotal = computed(() => suspiciousCountsOf.value.total)
 
 /** 邻期未判定的分录数 —— **要说出来**，否则用户以为那些分录不存在。 */
 const suspiciousNearCount = computed(
-  () => suspicious.value?.total_near_period_uncounted || 0)
+  () => suspiciousCountsOf.value.near)
 
 /** 内部转账的张数 —— 单独拎出来，免得用户以为漏了。 */
 const suspiciousInternalCount = computed(
-  () => suspicious.value?.total_internal_transfer || 0)
+  () => suspiciousCountsOf.value.internal)
+
+/**
+ * **空态文案**：跟台账一样分两种。
+ *
+ * * 「没有存疑凭证 —— 账上每一笔银行账户分录都能在流水里找到对应的行」
+ *   —— 这是**全账套**的话（没有对账单时压根没判过）；
+ * * 「2026 年 5 月没有存疑凭证」
+ *   —— 这个期间确实没有。**要把期间写出来**：用户顶栏停在 5 月、账上只有
+ *   9 月的对账单时，页面空着，不说清楚是哪个期间，用户只会以为功能坏了。
+ */
+const suspiciousEmptyText = computed(() => {
+  const groups = suspicious.value?.groups || []
+  const year = store.currentPeriod?.year
+  const month = store.currentPeriod?.month
+  if (!groups.length) {
+    return '没有存疑凭证 —— 账上每一笔银行账户分录都能在流水里找到对应的行'
+  }
+  return year && month
+    ? `${year} 年 ${month} 月没有存疑凭证`
+    : '这个期间没有存疑凭证'
+})
+
+/**
+ * **别的期间还有几张存疑凭证** —— 空态里给一条路，别让用户以为东西丢了。
+ *
+ * 跟台账那个「别的期间还有 N 份」是同一个用法：顶栏停在 5 月、9 月才有
+ * 存疑凭证时，页面空着 —— 不说清楚、又不给条路，用户只会以为功能坏了。
+ */
+const suspiciousOtherPeriods = computed(() => suspiciousOtherPeriodsOf(
+  suspicious.value?.groups,
+  store.currentPeriod?.year,
+  store.currentPeriod?.month,
+))
 
 async function loadSuspicious() {
+  loadingSuspicious.value = true
   try {
     suspicious.value = await api.getSuspiciousVouchers(store.bookId)
   } catch (e) {
     ElMessage.error(e?.response?.data?.detail || '加载存疑凭证失败')
+  } finally {
+    loadingSuspicious.value = false
   }
 }
 
@@ -1422,16 +1497,58 @@ async function openRows(statement) {
   await loadRows()
 }
 
+/**
+ * 拉一份对账单的流水行，以及「可制证清单」。
+ *
+ * **两件事要分开失败**（2026-10-28 修只读账号的假错误时改的）：
+ *
+ * 流水行是这一页的主体 —— 它挂了才叫「加载流水失败」。
+ *
+ * 「可制证清单」（``planVouchers``）是**制证用**的东西，而那个接口**会写库**
+ * （它要持久化去重标记），所以后端给它挂了写权限。于是 VIEWER 一打开
+ * 「流水明细」就必然吃一个 403 —— **而流水行其实好好地显示出来了**。
+ * 原来两个请求写在同一个 ``try`` 里，那个 403 把整段 catch 带走，
+ * 弹出一条「当前账套为只读权限」：用户看着满屏正常的流水，却被告诫自己
+ * 没权限 —— 假错误。
+ *
+ * 现在的做法：
+ *
+ * 1. **只读账号压根不调它**（``store.canWrite`` 为假就跳过）——
+ *    省一趟往返，也不产生那个 403，控制台干净；
+ * 2. 万一还是 403（权限判断与服务端不一致、角色刚被改过），**单独降级**：
+ *    ``plan`` 置空、不弹错。**拿不到可制证清单，不等于整页加载失败。**
+ */
 async function loadRows() {
   if (!activeStatementId.value) return
   loadingRows.value = true
   try {
     rows.value = await api.listRows(store.bookId, activeStatementId.value)
-    plan.value = await api.planVouchers(store.bookId, activeStatementId.value)
   } catch (e) {
     ElMessage.error(e?.response?.data?.detail || '加载流水失败')
   } finally {
     loadingRows.value = false
+  }
+  // **制证清单单独一趟**：它失败不许连累上面那些流水行。
+  await loadPlan()
+}
+
+/** 「可制证清单」：只读账号拿不到也不需要（它是制证用的）。 */
+async function loadPlan() {
+  if (!activeStatementId.value) return
+  if (!store.canWrite) {
+    plan.value = null
+    return
+  }
+  try {
+    plan.value = await api.planVouchers(store.bookId, activeStatementId.value)
+  } catch (e) {
+    // **静默降级**：拿不到清单只是「这一页少一块」，不是「页面坏了」。
+    // 真出别的错（比如 500），让它照常报出来 —— 别把真错一起吞掉。
+    const status = e?.response?.status
+    if (status !== 403) {
+      ElMessage.error(e?.response?.data?.detail || '加载可制证清单失败')
+    }
+    plan.value = null
   }
 }
 

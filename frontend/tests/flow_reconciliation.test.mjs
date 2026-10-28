@@ -27,6 +27,7 @@ const {
   renderSummary, summaryTemplateValuesText, SUMMARY_TEMPLATE_EXAMPLES,
   SUMMARY_TEMPLATE_FIELDS, planSubjectSummary, defaultExpandedRowIds,
   suspiciousRows, statementsInPeriod, statementsOtherPeriods,
+  suspiciousCounts, suspiciousOtherPeriods,
   bankAccountSubjects,
 } = STATE
 
@@ -591,6 +592,196 @@ t('摊平函数对空输入不炸', () => {
   assert.deepEqual(suspiciousRows(null), [])
   assert.deepEqual(suspiciousRows([]), [])
   assert.deepEqual(suspiciousRows([{ vouchers: null }]), [])
+})
+
+// =====================================================================
+// 存疑凭证跟着顶栏的会计期间走（2026-10-28 用户批注：
+// 「列表显示的内容，应该要受右上角选择的期间的限制」）
+//
+// 生产实测就是这个错位：顶栏停在 2026 年 5 月，页面上却摆着 9 月的
+// 记0015 —— 用户会以为自己看错了地方。
+// =====================================================================
+
+/** 两组：一组 9 月的（跟生产同形），一组 5 月的。 */
+function twoPeriodGroups() {
+  return [
+    {
+      account_code: '100202',
+      account_name: '农商银行青年支行',
+      period_start: '2026-09-01',
+      period_end: '2026-09-24',
+      period_text: '2026-09-01 ~ 2026-09-24',
+      suspicious_count: 1,
+      near_period_uncounted: 16,
+      internal_transfer_count: 2,
+      vouchers: [{ voucher_id: 1, voucher_no: '记0015', voucher_date: '2026-09-15' }],
+    },
+    {
+      account_code: '100201',
+      account_name: '兴业银行泉州泉秀支行',
+      period_start: '2026-05-02',
+      period_end: '2026-05-26',
+      period_text: '2026-05-02 ~ 2026-05-26',
+      suspicious_count: 3,
+      near_period_uncounted: 1,
+      internal_transfer_count: 0,
+      vouchers: [{ voucher_id: 2, voucher_no: '记0007', voucher_date: '2026-05-11' }],
+    },
+  ]
+}
+
+t('存疑凭证跟着顶栏的期间走：9 月的期间看不见 5 月那一条', () => {
+  const rows = suspiciousRows(twoPeriodGroups(), 2026, 9)
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].voucher_no, '记0015')
+
+  const rowsMay = suspiciousRows(twoPeriodGroups(), 2026, 5)
+  assert.equal(rowsMay.length, 1)
+  assert.equal(rowsMay[0].voucher_no, '记0007')
+
+  // 8 月：两份对账单都不与它有交集 → 一条都不该摆
+  assert.deepEqual(suspiciousRows(twoPeriodGroups(), 2026, 8), [])
+})
+
+t('顶栏的期间没定下来时不过滤 —— 那不是「这个月没有」，是「还不知道要看哪个月」', () => {
+  const groups = twoPeriodGroups()
+  assert.equal(suspiciousRows(groups, null, null).length, 2)
+  assert.equal(suspiciousRows(groups, 2026, null).length, 2)
+  assert.equal(suspiciousRows(groups).length, 2)
+})
+
+t('计数只数页面上摆着的那些 —— 不许出现「共 1 张」配一张空表', () => {
+  // **这是本次改动最容易漏的一处**：后端给的 total_suspicious 是**全账套**的，
+  // 而行已经按期间过滤过了。拿全账套的总数配一张过滤过的表，
+  // 界面上就是「共 1 张存疑凭证」配一张空表。
+  const may = suspiciousCounts(twoPeriodGroups(), 2026, 5)
+  assert.equal(may.total, 3)
+  assert.equal(may.near, 1)
+  assert.equal(may.internal, 0)
+
+  const sep = suspiciousCounts(twoPeriodGroups(), 2026, 9)
+  assert.equal(sep.total, 1)
+  assert.equal(sep.near, 16)
+  assert.equal(sep.internal, 2)
+
+  // 8 月：两组都不在 → 三个数都是 0
+  const aug = suspiciousCounts(twoPeriodGroups(), 2026, 8)
+  assert.deepEqual(aug, { total: 0, near: 0, internal: 0 })
+})
+
+t('计数在「后端没给 suspicious_count」时按行数算 —— 页面摆了几张，共几张就得是几', () => {
+  const groups = [{ period_start: '2026-09-01', period_end: '2026-09-24',
+    vouchers: [{ voucher_id: 1 }, { voucher_id: 2 }] }]
+  assert.equal(suspiciousCounts(groups, 2026, 9).total, 2)
+})
+
+t('别的期间还有几张存疑凭证（空态里给一条路）', () => {
+  // 顶栏停在 8 月 → 两份对账单都在别的期间 → 空态要说得清「别的期间还有几张」
+  const others = suspiciousOtherPeriods(twoPeriodGroups(), 2026, 8)
+  assert.equal(others.length, 2)
+  assert.deepEqual(others.map((p) => [p.label, p.count]), [
+    ['2026 年 5 月', 3], ['2026 年 9 月', 1],
+  ])
+  // 顶栏停在 9 月 → 只剩 5 月那一份
+  const one = suspiciousOtherPeriods(twoPeriodGroups(), 2026, 9)
+  assert.equal(one.length, 1)
+  assert.equal(one[0].label, '2026 年 5 月')
+  assert.equal(one[0].count, 3)
+})
+
+t('存疑凭证的期间过滤：行、计数、空态三处用的都是同一把尺子', () => {
+  // **同一个判据**（`overlapsPeriod`）—— 三处各判一次的话，
+  // 界面上会出现「空态说别的期间有，点进去却看不到」的鬼故事。
+  const groups = twoPeriodGroups()
+  assert.equal(suspiciousRows(groups, 2026, 9).length,
+    suspiciousCounts(groups, 2026, 9).total)
+  // 别的期间那几组，跟「当前期间」的组**不重不漏**
+  const others = suspiciousOtherPeriods(groups, 2026, 9)
+  const otherTotal = others.reduce((n, p) => n + p.count, 0)
+  const allTotal = groups.reduce((n, g) => n + g.suspicious_count, 0)
+  assert.equal(otherTotal + suspiciousCounts(groups, 2026, 9).total, allTotal)
+})
+
+t('页面上：存疑凭证的空态说清是哪个期间，并给一条「别的期间还有」的路', () => {
+  // 不说清楚是哪个期间，用户只会以为功能坏了（跟台账当初那个错位同款）。
+  assert.match(VIEW, /suspiciousEmptyText/)
+  assert.match(VIEW, /\$\{year\} 年 \$\{month\} 月没有存疑凭证/)
+  assert.match(VIEW, /suspiciousOtherPeriods/)
+  assert.match(VIEW, /别的期间还有：/)
+  assert.match(VIEW, /\{\{ p\.label \}\}（\{\{ p\.count \}\} 张）/)
+  // 空态里那行按钮要真能切期间
+  assert.match(VIEW, /@click="jumpToPeriod\(p\)"/)
+})
+
+t('页面上：存疑凭证的计数用过滤后的那份，不许直接用后端的全账套总数', () => {
+  assert.match(VIEW, /suspiciousCountsOf\.value\.total/)
+  assert.match(VIEW, /suspiciousCountsOf\.value\.near/)
+  assert.match(VIEW, /suspiciousCountsOf\.value\.internal/)
+  // 后端那两个「全账套」总数不许再被直接用
+  assert.doesNotMatch(VIEW, /total_suspicious/)
+  assert.doesNotMatch(VIEW, /total_near_period_uncounted/)
+  assert.doesNotMatch(VIEW, /total_internal_transfer/)
+})
+
+t('存疑凭证还没加载完时，不许说「没有存疑凭证」（那是句假话）', () => {
+  assert.match(VIEW, /loadingSuspicious/)
+  assert.match(VIEW, /v-loading="loadingSuspicious"/)
+})
+
+// =====================================================================
+// 只读账号不许看到假的权限错误（2026-10-28 修的老遗留）
+// =====================================================================
+
+t('只读账号不调「可制证清单」—— 那个接口会写库，必然 403', () => {
+  // 只读账号打开「流水明细」时，plan-vouchers 必然 403 —— 而**流水行其实
+  // 好好地显示着**。原来两个请求写在同一个 try 里，那个 403 把整段 catch
+  // 带走，弹出一条「当前账套为只读权限」：用户看着满屏正常的流水，却被
+  // 告知自己没权限 —— 假错误。
+  assert.match(VIEW, /if \(!store\.canWrite\) \{\s*plan\.value = null\s*return/)
+  // 流水行与制证清单**分开失败**
+  assert.match(VIEW, /rows\.value = await api\.listRows/)
+  assert.match(VIEW, /await loadPlan\(\)/)
+})
+
+t('制证清单拿不到只是「少一块」，不许变成「整页加载失败」', () => {
+  const code = stripComments(VIEW)
+  const at = code.indexOf('async function loadPlan')
+  assert.ok(at > 0, '找不到 loadPlan')
+  const block = code.slice(at, code.indexOf('async function', at + 10))
+  // 403 静默；别的错照常报（别把真错一起吞掉）
+  assert.match(block, /status !== 403/)
+  assert.match(block, /plan\.value = null/)
+})
+
+t('「这一趟的失败是预期的」由拦截器闭嘴 —— 调用方自己降级', () => {
+  // 不加这个机制，403 的红字是**拦截器**弹的，调用处 catch 拦不住它。
+  const CLIENT = fs.readFileSync(
+    new URL('../src/api/client.js', import.meta.url), 'utf8')
+  assert.match(CLIENT, /error\.config\?\.silent/)
+  const BANK = fs.readFileSync(
+    new URL('../src/api/bankstatement.js', import.meta.url), 'utf8')
+  assert.match(BANK, /plan-vouchers`[^)]*silent: true/s)
+  const VOUCHER = fs.readFileSync(
+    new URL('../src/api/voucher.js', import.meta.url), 'utf8')
+  assert.match(VOUCHER, /neighbour`[^)]*silent: true/s)
+})
+
+t('凭证页的「前一张/后一张」拿不到时，不许把 load() 一起带崩', () => {
+  // 原来 loadNeighbour 没兜住，那个 403 一路抛到 load() 外面 ——
+  // 而 load() 的最后一句正是 await loadNeighbour(seq)，于是
+  // **onMounted 里那句 await nextTick(() => syncGridWidth()) 跟着不执行了**：
+  // 凭证页的表格列宽没对齐。
+  const V = fs.readFileSync(
+    new URL('../src/views/voucher/VoucherEdit.vue', import.meta.url), 'utf8')
+  const code = stripComments(V)
+  const at = code.indexOf('async function loadNeighbour')
+  assert.ok(at > 0, '找不到 loadNeighbour')
+  const block = code.slice(at, code.indexOf('async function', at + 10))
+  assert.match(block, /catch \(e\)/)
+  // 403 静默（别把只读权限弹成错误），别的错照常报
+  assert.match(block, /status !== 403/)
+  // 兜底成「两头都没有」：按钮于是灰着
+  assert.match(block, /r = \{ prev_id: null, next_id: null \}/)
 })
 
 t('每一行只说结论：说清「对账单里没找到这笔流水」，不摆近似解释的线索', () => {

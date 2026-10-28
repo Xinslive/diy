@@ -33,7 +33,7 @@ from app.accounting.util import constraint_name, find_period, money
 from app.api.schemas import BatchIds, VoucherIn
 from app.core import idempotency as idem
 from app.core.db import get_db
-from app.core.deps import get_current_user, get_my_book, require_book_write
+from app.core.deps import get_book_link, get_current_user, get_my_book, require_book_write
 # 本地别名保持函数名 ``read_upload`` 不变：``tests/test_upload_capacity_matrix.py``
 # 按这个名字守「每个上传入口都调了共享容量闸」，而这里要的其实是它的同步版
 # ``uploads.read_upload_sync``（端点已改成同步 ``def``，不能再 await）。
@@ -847,6 +847,20 @@ def period_check(period_id: Optional[int] = None, book: Book = Depends(get_my_bo
     「断号检查」不再是整理凭证里的一个选项了 —— 用户不该为了看一眼有没有断号
     先想明白该选哪个「方式」。这里把体检单独开一个口：凭证列表页顶上说一声，
     整理凭证页拿它决定「按当前顺序重新编号」能不能用。
+
+    **为什么挂着写权限（2026-10-28 想清楚之后保留的）**：
+
+    这个接口一行都不写，可它是**「整理凭证」这道写动作的配套接口** ——
+    整理凭证页拿它决定「按当前顺序重新编号」能不能用。而只读账号不能整理，
+    那条「这个期间有断号」对它也**没有可执行的下一步**，摆出来只是噪音。
+
+    所以后端这里继续按写权限拒（结论：「只读账号拿不到这个体检」），而
+    **前端也不去调它**（见 ``VoucherList.vue`` 的 ``loadCheck``）——
+    **两端结论一致**才是要紧的。
+
+    对比一下 ``neighbour``（前一张/后一张）：那个接口的前后端结论**本来就不一致**
+    —— 前端把两颗按钮摆给只读账号看，后端却在拒，那才是「界面能点、点了被拒」。
+    所以它放开了，而这里没有。**别照着 neighbour 把这里也放开。**
     """
     period = db.get(Period, period_id) if period_id else find_period(db, book.id, date.today())
     if period is None or period.book_id != book.id:
@@ -888,7 +902,7 @@ def _filtered_scope(db: Session, book_id: int, *, keyword: Optional[str] = None,
 
 @router.get("/{voucher_id}/neighbour")
 def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-              _link: UserBook = Depends(require_book_write), user: SysUser = Depends(get_current_user),
+              _link: UserBook = Depends(get_book_link), user: SysUser = Depends(get_current_user),
               keyword: Optional[str] = None, min_amount: Optional[Decimal] = None,
               max_amount: Optional[Decimal] = None):
     """前一张 / 后一张 —— 按**凭证号顺序**在列表那个结果集里前后挪。
@@ -923,6 +937,30 @@ def neighbour(voucher_id: int, book: Book = Depends(get_my_book), db: Session = 
 
     全程只读，只发 4 条业务 SQL：一条取「这张 + 它的顺序位置」、一次聚合问清
     「结果集多大、这张在不在里面、它前面有几个」，前后各一条 ``LIMIT 1`` 取邻票。
+
+    **为什么这里挂的是 ``get_book_link`` 而不是 ``require_book_write``**
+    （2026-10-28 修只读账号的假错误时改的）：
+
+    这个接口**一行都不写** —— 它只是问「这张的前后各是哪一张」。
+    可它原来挂的是写权限，于是 VIEWER 一打开凭证页就吃一个 403，
+    前端（``VoucherEdit.vue`` 的 ``loadNeighbour``）又没兜住，
+    那个 403 一路抛到 ``load()`` 外面：**凭证页的表格宽度对齐（``syncGridWidth``）
+    跟着不执行了**，界面上还弹一条「当前账套为只读权限」——
+    而那张凭证明明好好地显示着。
+
+    更要紧的是**前后端不是同一个判据**：凭证页的「前一张 / 后一张」两颗按钮
+    **不按 ``canWrite`` 藏**（只读账号看得见，只是因为拿不到 id 才灰着），
+    也就是说前端摆出了这个能力，后端却在拒 —— 正是本项目最忌讳的那件事。
+
+    所以这里放开成「只查有没有授权」：只读会计翻凭证是**看**，不是改。
+    数据也不多给：``prev_id / next_id`` 指的是同一本账里的凭证，
+    而只读账号本来就能列、能读这本账的全部凭证。
+
+    **别照着这个把别的 GET 也放开**：``/next``（新开一张的预填值）、
+    ``/insert-preview``（插入凭证）、``/split-preview``（拆分预览）、
+    ``/period-check``（整理就绪体检）虽然同样只读，但它们是**写动作的配套接口**
+    —— 只读账号压根没有那些按钮，那些接口对 VIEWER 是够不着的路径，
+    挂着写权限是为了「那些动作不许 VIEWER 做」这件事只在一处判。
     """
     # 一条查询把「这张凭证」和「它在顺序键里的位置」一起取回来：
     # 凭证归属（校验是不是这本账的）、所属期间、期间 ord、号段数字。

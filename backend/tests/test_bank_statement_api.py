@@ -600,6 +600,30 @@ def test_只读账号不能制证(client, auth, db, book, cash, store, plain_aut
     assert r.status_code == 403, r.text
 
 
+def test_只读账号连可制证清单都调不了(client, auth, db, book, cash, store,
+                                       plain_user, plain_auth):
+    """**后端这道闸不许放松**（2026-10-28 修只读账号的假错误时钉的）。
+
+    「可制证清单」那个接口（``plan-vouchers``）**会写库** —— 它要持久化去重
+    标记，所以后端给它挂了写权限。于是 VIEWER 打开「流水明细」时那一趟必然
+    403，而**流水行其实好好地显示着**。
+
+    修的是**前端**（只读账号压根不调它；万一调了也静默降级），不是这道闸：
+    闸门放松了，只读账号就能改库里的去重标记了 —— 那才是真的出事了。
+    """
+    from app.models import UserBook
+
+    created = _upload(client, auth, book, cash).json()
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="VIEWER"))
+    db.commit()
+
+    r = client.post(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/plan-vouchers",
+        headers=plain_auth)
+    assert r.status_code == 403, (
+        f"只读账号竟然调得了可制证清单：{r.status_code} {r.text[:200]}")
+
+
 # ---------------------------------------------------------------------- 规则与画像
 
 

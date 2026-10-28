@@ -404,12 +404,25 @@ export const summaryTemplateValuesText = (row) => {
  * 判定的那把尺子）。界面上把它们摊平成一张表、每行带上账户与期间 ——
  * 那样一眼能扫完，又不会把「哪个账户」丢在折叠层里。
  *
+ * **按顶栏选中的会计期间过滤**（2026-10-28 用户批注：「列表显示的内容，
+ * 应该要受右上角选择的期间的限制」）：顶栏停在 5 月却满屏 9 月的存疑凭证，
+ * 用户只会以为自己看错了地方 —— 跟台账当初那个毛病一模一样。
+ *
+ * 口径与台账**同一把尺子**（``overlapsPeriod``）：一份对账单与那个月
+ * **有交集**就算在里面。存疑凭证是**按对账单分组**的，离开那份对账单
+ * 就说不清「凭什么可疑」，用它所属的期间来过滤，与页面的结构自洽。
+ *
+ * **期间没定下来时不过滤**（跟台账一样）：那不是「这个月没有存疑凭证」，
+ * 那是「还不知道要看哪个月」—— 拿它当空列表会把用户的东西藏起来。
+ *
  * @param {Array} groups 后端返回的分组
+ * @param {number} [year] 顶栏选中的年
+ * @param {number} [month] 顶栏选中的月（1-12）
  * @returns {Array} 摊平后的行
  */
-export const suspiciousRows = (groups) => {
+export const suspiciousRows = (groups, year, month) => {
   const out = []
-  for (const group of groups || []) {
+  for (const group of suspiciousGroupsInPeriod(groups, year, month)) {
     for (const voucher of group?.vouchers || []) {
       out.push({
         ...voucher,
@@ -420,6 +433,74 @@ export const suspiciousRows = (groups) => {
     }
   }
   return out
+}
+
+/**
+ * **落在该期间里的那些分组**（摊平与计数都用它 —— 一处过滤，两处用）。
+ *
+ * 抽出来是因为**摊平与计数必须判得一样**：行按「有交集」过滤了，而计数
+ * 还在数全部的组，界面上就会出现「共 1 张存疑凭证」配一张空表。
+ */
+const suspiciousGroupsInPeriod = (groups, year, month) => {
+  const list = groups || []
+  if (!year || !month) return list
+  return list.filter((g) => overlapsPeriod(g, year, month))
+}
+
+/**
+ * 一组里有几张存疑凭证。
+ *
+ * **数「行」而不是只信后端那个计数**：``suspicious_count`` 是后端给的，
+ * 万一它没带（老接口、老数据），就按摊平出来的行数算 —— **页面上摆了几张，
+ * 「共 N 张」就得是 N**，两处不能各数各的。
+ */
+const suspiciousCountOf = (g) => {
+  const n = Number(g?.suspicious_count)
+  if (Number.isFinite(n)) return n
+  return (g?.vouchers || []).length
+}
+
+/**
+ * **这一页顶上的三个数**：存疑几张、邻期几条、内部转账几张。
+ *
+ * **都只数落在该期间里的那些组** —— 跟 ``suspiciousRows`` 同一把尺子。
+ * 「共 N 张」说的是**页面上摆着的那 N 张**，不是全账套的总数。
+ */
+export const suspiciousCounts = (groups, year, month) => {
+  const kept = suspiciousGroupsInPeriod(groups, year, month)
+  const sum = (key) => kept.reduce((n, g) => n + (Number(g?.[key]) || 0), 0)
+  return {
+    total: kept.reduce((n, g) => n + suspiciousCountOf(g), 0),
+    near: sum('near_period_uncounted'),
+    internal: sum('internal_transfer_count'),
+  }
+}
+
+/**
+ * **别的期间还有几张存疑凭证**（空态里给一条路）。
+ *
+ * 与 ``statementsOtherPeriods`` 同一个形状，**单位不同**：那边数「份」，
+ * 这边数「张」（凭证）。
+ *
+ * **为什么空态要说这个**：顶栏停在 5 月、账上只有 9 月的对账单时，
+ * 页面空着 —— 不说清楚、又不给条路，用户只会以为功能坏了
+ * （跟台账当初那个错位是同一个毛病）。
+ */
+export const suspiciousOtherPeriods = (groups, year, month) => {
+  const map = new Map()
+  for (const g of groups || []) {
+    if (!g?.period_start) continue
+    if (overlapsPeriod(g, year, month)) continue
+    const key = String(g.period_start).slice(0, 7)
+    if (!map.has(key)) {
+      const [y, m] = key.split('-').map(Number)
+      map.set(key, { year: y, month: m, label: `${y} 年 ${m} 月`, count: 0 })
+    }
+    map.get(key).count += suspiciousCountOf(g)
+  }
+  return [...map.values()]
+    .filter((p) => p.count > 0)
+    .sort((a, b) => a.year - b.year || a.month - b.month)
 }
 
 /**

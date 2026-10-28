@@ -1575,6 +1575,9 @@ function insertVoucher() {
 
 /** 问后端要插入位的预填值。拿不到就退回普通新开一张 —— 别把整页卡住。 */
 async function loadInsertPreview(afterId, position = 'before') {
+  // **只读账号不调它**（2026-10-28）：与 ``loadNextDefaults`` 同理 ——
+  // 「插入凭证」是写动作，它的预填值（占哪个号、谁要顺位）只读账号用不上。
+  if (!store.canWrite) return null
   try {
     return await api.insertPreview(store.bookId, afterId, position)
   } catch {
@@ -1736,7 +1739,29 @@ async function loadNeighbour(seq) {
     return
   }
   const myId = voucherId.value
-  const r = await api.neighbour(store.bookId, myId, listFilter.value)
+  let r = null
+  try {
+    r = await api.neighbour(store.bookId, myId, listFilter.value)
+  } catch (e) {
+    // **失败不许抛出去**（2026-10-28 修只读账号的假错误时改的）：
+    //
+    // 原来这里没有 try/catch，那个 403 一路抛到 ``load()`` 外面 ——
+    // 而 ``load()`` 的最后一句正是 ``await loadNeighbour(seq)``，
+    // 于是 **onMounted 里那句 ``await nextTick(() => syncGridWidth())``
+    // 跟着不执行了**：凭证页的表格列宽没对齐。
+    //
+    // 界面上还弹一条「当前账套为只读权限」—— 可那张凭证明明好好地
+    // 显示着，用户只会被这句无关的话唬住。
+    //
+    // 拿不到前后张只是「翻不动」，不是「这张凭证打不开」。
+    const status = e?.response?.status
+    if (status !== 403 && status !== 404) {
+      // **真错照样要说**（500、网络断了）：别把真问题一起吞掉。
+      ElMessage.error(e?.response?.data?.detail || '加载前后张失败')
+    }
+    // 兜底成「两头都没有」：按钮于是灰着 —— 这正是「翻不动」该有的样子。
+    r = { prev_id: null, next_id: null }
+  }
   if ((seq !== undefined && stale(seq)) || voucherId.value !== myId) return
   prevId.value = r.prev_id
   nextId.value = r.next_id
@@ -1999,6 +2024,10 @@ async function load() {
 
 /** 问后端要「新开一张」的预填值。拿不到就退回空号 + 本地日期，别把整页卡住。 */
 async function loadNextDefaults() {
+  // **只读账号不调它**（2026-10-28）：这是「新建凭证」那道**写动作**的预填值，
+  // 而只读账号不能新建凭证 —— 那个号与日期对它没有用，后端按设计也拒了它。
+  // 不调，就不发这趟请求，也就不会有那个 403。
+  if (!store.canWrite) return {}
   try {
     return await api.nextVoucher(store.bookId, store.periodId)
   } catch {

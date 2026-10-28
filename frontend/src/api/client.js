@@ -151,6 +151,17 @@ http.interceptors.response.use(
     // 它是「用户自己放弃的那一趟」（切期间时掐掉上一趟，见 getLatest），
     // 弹一条红字是纯噪音，还会盖住同期真正需要报的错误。
     if (isCanceled(error)) return Promise.reject(error)
+    // **这一趟的失败是「预期之中」**：调用方在请求上标了 ``silent``。
+    //
+    // 有些请求拿不到**本来就该拿不到** —— 比如「可制证清单」那个接口会写库
+    // （要持久化去重标记），后端按设计把只读账号挡在外面；只读账号打开
+    // 「流水明细」时那一趟必然 403，而**流水行其实好好地显示着**。
+    // 这种失败弹一条红字是**假错误**：用户看着满屏正常的数据，却被告知
+    // 「当前账套为只读权限」，还以为自己点错了什么。
+    //
+    // 标了 ``silent`` 的请求失败时**拦截器不出声**，由调用方自己降级
+    // （``catch`` 里那一段）—— 该弹的红字一条都不少，只少这一类。
+    if (error.config?.silent) return Promise.reject(error)
     const msg = typeof detail === 'string' ? detail : Array.isArray(detail) ? detail[0]?.msg : detail?.message
     if (msg) ElMessage.error(msg)
     else if (!error.response) {

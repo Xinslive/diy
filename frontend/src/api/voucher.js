@@ -15,18 +15,38 @@ import { isReplay } from '@/utils/idempotency'
 export const queryVouchers = (bookId, params) =>
   getLatest('voucher/list', `/books/${bookId}/vouchers`, params)
 export const getVoucher = (bookId, id) => http.get(`/books/${bookId}/vouchers/${id}`).then(r => r.data)
-/** 新开一张时预填的凭证号 + 期间最后一张的日期。号码由后端发，和落库同源。 */
+/**
+ * 新开一张时预填的凭证号 + 期间最后一张的日期。号码由后端发，和落库同源。
+ *
+ * **标了 ``silent``**（2026-10-28）：这是**写动作的预填值**，而写动作后端是按
+ * 写权限闸着的 —— 只读账号调它必然 403。它拿不到是**正常的**（只读账号本来
+ * 就不许新建凭证），弹一条红字只会吓人。调用方本来就兜住了（``loadNextDefaults``
+ * 拿不到就退回空号 + 本地日期），所以这里让拦截器也闭嘴。
+ */
 export const nextVoucher = (bookId, periodId) =>
-  http.get(`/books/${bookId}/vouchers/next`, { params: periodId ? { period_id: periodId } : {} }).then(r => r.data)
+  http.get(`/books/${bookId}/vouchers/next`,
+    { params: periodId ? { period_id: periodId } : {}, silent: true }).then(r => r.data)
 
-/** 插入位的预填：插在谁前面/后面、这张拿哪个号、谁要顺位。只算不改。
- *  position：before = 向前插入（占参照自己的号），after = 向后插入（拿参照号 +1）。 */
+/**
+ * 插入位的预填：插在谁前面/后面、这张拿哪个号、谁要顺位。只算不改。
+ * position：before = 向前插入（占参照自己的号），after = 向后插入（拿参照号 +1）。
+ *
+ * **标了 ``silent``**：与 ``nextVoucher`` 同理 —— 它是**写动作**的预填值，
+ * 只读账号拿不到是正常的（调用方 ``loadInsertPreview`` 拿不到就退回普通新开一张）。
+ */
 export const insertPreview = (bookId, afterId, position = 'before') =>
   http.get(`/books/${bookId}/vouchers/insert-preview`,
-    { params: { after_id: afterId, position } }).then(r => r.data)
+    { params: { after_id: afterId, position }, silent: true }).then(r => r.data)
 
+/**
+ * 前一张 / 后一张。
+ *
+ * **标了 ``silent``**（2026-10-28）：这一趟失败**不该**由拦截器弹红字 ——
+ * 「翻不动」不是错误（头一张/尾一张本来就没有邻居），而真出错了由调用方
+ * 自己报（见 ``VoucherEdit.vue`` 的 ``loadNeighbour``）。
+ */
 export const neighbour = (bookId, id, params) =>
-  http.get(`/books/${bookId}/vouchers/${id}/neighbour`, { params }).then(r => r.data)
+  http.get(`/books/${bookId}/vouchers/${id}/neighbour`, { params, silent: true }).then(r => r.data)
 /**
  * 新建凭证。**带幂等键**（可选）。
  *
@@ -64,9 +84,17 @@ export const splitVoucher = (bookId, id, payload) =>
 // 但前端没有、也不该在这里再包一层。
 
 // ---- 整理凭证 ----
-/** 单期间「整理就绪」体检（断号 + 时序），只读。列表页的提醒、记账/结账的闸门都看它。 */
+/**
+ * 单期间「整理就绪」体检（断号 + 时序），只读。列表页的提醒、记账/结账的闸门都看它。
+ *
+ * **标了 ``silent``**（2026-10-28）：体检是**只读**的，而只读账号也要看这一条
+ * 诊断。拿不到就当没提醒（调用方 ``loadCheck`` 本来就是这么写的：
+ * 「体检是只读的，失败就当没提醒 —— 列表该显示的还得显示」）——
+ * 但红字是**拦截器**弹的，调用方的 ``catch`` 吞不掉，所以这里让拦截器也闭嘴。
+ */
 export const voucherPeriodCheck = (bookId, periodId) =>
-  http.get(`/books/${bookId}/vouchers/period-check`, { params: { period_id: periodId } }).then(r => r.data)
+  http.get(`/books/${bookId}/vouchers/period-check`,
+    { params: { period_id: periodId }, silent: true }).then(r => r.data)
 export const organizePreview = (bookId, payload) =>
   http.post(`/books/${bookId}/vouchers/organize/preview`, payload).then(r => r.data)
 export const organize = (bookId, payload) =>

@@ -114,8 +114,18 @@ export const reclassifyRow = (bookId, rowId, entryId) =>
 export const setRowDirection = (bookId, rowId, direction) =>
   http.post(`/books/${bookId}/bank-statements/rows/${rowId}/direction`, { direction }).then(r => r.data)
 
+/**
+ * 「可制证清单」—— 这一份对账单能生成哪些凭证。
+ *
+ * **标了 ``silent``**（2026-10-28）：这个接口**会写库**（持久化去重标记），
+ * 所以后端给它挂了写权限，只读账号调用必然 403。而只读账号打开「流水明细」
+ * 时，**流水行其实好好地显示着** —— 那个 403 只是一条**假错误**。
+ * 标上 ``silent``，失败时拦截器就不出声，由调用方自己降级
+ * （见 ``FlowReconciliation.vue`` 的 ``loadPlan``）。
+ */
 export const planVouchers = (bookId, id) =>
-  http.post(`/books/${bookId}/bank-statements/${id}/plan-vouchers`).then(r => r.data)
+  http.post(`/books/${bookId}/bank-statements/${id}/plan-vouchers`, {}, { silent: true })
+    .then(r => r.data)
 
 export const commitVouchers = (bookId, id) =>
   http.post(`/books/${bookId}/bank-statements/${id}/commit-vouchers`, {}, { timeout: 120000 }).then(r => r.data)
