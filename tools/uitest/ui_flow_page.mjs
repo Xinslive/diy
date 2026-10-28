@@ -288,6 +288,108 @@ await step('套用示例模板，预览也变', async () => {
   console.log(`   预览：${text}`)
 })
 
+// ---- 规则表格里**不摆输入框**，改走「编辑」（2026-10-28 用户批注） ----
+//
+// 用户原话：「又不能改，不要用输入框，不然还以为能在这里输入内容呢」。
+// 那个行内输入框绑的是 @change —— **失焦就写库**，写没写成功只有一条
+// toast 才知道；它看起来能改、其实是个暗改入口。
+await step('规则表格里的摘要模板是纯文本，改走「编辑」', async () => {
+  const KEYWORD = '__uitest_rule__'
+  const TPL = '{摘要}-{金额}'
+  await page.click('.el-tabs__item:has-text("科目规则")')
+  await page.waitForTimeout(1200)
+  const form = page.locator('.flow-rule-form')
+
+  // ---- 0) 先清掉上一轮可能留下的同名规则 ----
+  //
+  // **上一轮失败时可能没跑到清理** —— 那条同名规则还在，新建就会撞
+  // 「关键词重复」（400），于是脚本看的是**残留那条**（还带着上一轮
+  // 塞进去的模板），验的就不是这一轮做出来的东西了。
+  const stale = page.locator('.el-table:visible tr.el-table__row').filter({ hasText: KEYWORD })
+  if (await stale.count()) {
+    await stale.locator('button:has-text("删除")').click()
+    await page.waitForTimeout(1800)
+    if (await page.locator('.el-table:visible tr.el-table__row').filter({ hasText: KEYWORD }).count()) {
+      throw new Error('上一轮留下的同名规则删不掉')
+    }
+  }
+
+  // ---- 1) 新增一条（模板留空） ----
+  await form.locator('.el-form-item:has-text("关键词") input').fill(KEYWORD)
+  await form.locator('.el-form-item:has-text("对方科目") input').click()
+  await page.waitForTimeout(600)
+  await page.locator('.el-select-dropdown__item:visible').first().click()
+  await page.waitForTimeout(300)
+  await form.locator('.el-form-item:has-text("摘要模板") input').fill('')
+  await form.locator('button:has-text("新增规则")').click()
+  await page.waitForTimeout(1800)
+
+  const row = page.locator('.el-table:visible tr.el-table__row').filter({ hasText: KEYWORD })
+  if (await row.count() !== 1) throw new Error(`规则表里没找到刚建的那条（${await row.count()} 行）`)
+
+  // ---- 2) 摘要模板那一格不许有输入框；没设模板就写「默认规则」 ----
+  const cell = row.locator('td:nth-child(4)')
+  if (await cell.locator('input').count()) throw new Error('摘要模板那一格还有输入框')
+  const cellText = (await cell.innerText()).trim()
+  if (cellText !== '默认规则') throw new Error(`空模板该显示「默认规则」，实际「${cellText}」`)
+
+  // ---- 3) 点「编辑」→ 表单被填上、按钮变成「保存修改」 ----
+  await row.locator('button:has-text("编辑")').click()
+  await page.waitForTimeout(900)
+  const kw = await form.locator('.el-form-item:has-text("关键词") input').inputValue()
+  if (kw !== KEYWORD) throw new Error(`点「编辑」后表单没被填上：${kw}`)
+  if (!(await form.locator('button:has-text("保存修改")').count())) {
+    throw new Error('按钮没变成「保存修改」')
+  }
+  if (!(await page.locator('.flow-rule-editing').count())) {
+    throw new Error('没有「正在修改哪一条」的提示')
+  }
+
+  // ---- 4) 在编辑态里给个模板 → 保存 → 那一格显示模板本身 ----
+  await form.locator('.el-form-item:has-text("摘要模板") input').fill(TPL)
+  await form.locator('button:has-text("保存修改")').click()
+  await page.waitForTimeout(2200)
+  const row2 = page.locator('.el-table:visible tr.el-table__row').filter({ hasText: KEYWORD })
+  if (await row2.count() !== 1) throw new Error('保存之后规则表里找不到那条了')
+  const cell2 = row2.locator('td:nth-child(4)')
+  if (await cell2.locator('input').count()) throw new Error('保存后又冒出输入框了')
+  const text2 = (await cell2.innerText()).trim()
+  if (text2 !== TPL) throw new Error(`保存后那一格显示的不是模板本身：「${text2}」`)
+
+  // ---- 5) 清理：把刚建的那条删掉，别在 dev 库里留垃圾 ----
+  await row2.locator('button:has-text("删除")').click()
+  await page.waitForTimeout(1800)
+  if (await page.locator('.el-table:visible tr.el-table__row').filter({ hasText: KEYWORD }).count()) {
+    throw new Error('刚建的那条规则没删掉')
+  }
+})
+
+// ---- 页签记在地址栏：跳去改凭证再回来，还在同一页 ----
+//
+// 用户批注：「点击跳转后，再回到流水对账页面就回到默认页面「对账单」了，
+// 一旦遇到大量需要修改的，就要不听得切换页面来「存疑凭证」」。
+await step('跳去改凭证再回来，还在「存疑凭证」那一页', async () => {
+  await page.click('.el-tabs__item:has-text("存疑凭证")')
+  await page.waitForTimeout(2500)
+  const url = page.url()
+  if (!url.includes('tab=suspicious')) throw new Error(`地址栏里没记下页签：${url}`)
+
+  const jump = page.locator('.flow-suspicious-table button:has-text("修改凭证")').first()
+  if (!(await jump.count())) throw new Error('存疑凭证那一页没有可跳的按钮')
+  await jump.click()
+  await page.waitForTimeout(2500)
+  if (page.url().includes('reconciliation')) throw new Error('根本没跳走')
+
+  await page.goBack()
+  await page.waitForTimeout(3000)
+  if (!page.url().includes('tab=suspicious')) {
+    throw new Error(`回来之后地址栏丢了页签：${page.url()}`)
+  }
+  const active = (await page.locator('.el-tabs__item.is-active').innerText()).trim()
+  if (!active.includes('存疑凭证')) throw new Error(`回来后不在「存疑凭证」页签：${active}`)
+  console.log(`   回来后地址栏：${page.url()}`)
+})
+
 console.log(errors.length ? `\n有问题：${errors.length}` : '\n没问题')
 await browser.close()
 process.exit(errors.length ? 1 : 0)

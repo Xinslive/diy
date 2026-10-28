@@ -760,11 +760,64 @@ t('流水明细页签那段说明去掉了', () => {
 })
 
 t('摘要模板输入框的提示写的是「留空使用默认规则」', () => {
-  // 用户批注：提示改成「留空使用默认规则」。两处都要改：新增规则表单里
-  // 那一个、规则表格每行那一个。
+  // 用户批注：提示改成「留空使用默认规则」。
+  //
+  // **2026-10-28 地方变了**：规则表格里那个行内输入框去掉了（用户批注
+  // 「不要用输入框，不然还以为能在这里输入内容呢」），所以现在**只有表单里
+  // 那一处** —— 改模板走「编辑」把规则调进表单。
   const n = (VIEW.match(/placeholder="留空使用默认规则"/g) || []).length
-  assert.equal(n, 2, `占位符应该有两处，实际 ${n} 处`)
+  assert.equal(n, 1, `占位符应该只有表单里那一处，实际 ${n} 处`)
   assert.doesNotMatch(VIEW, /留空 = 用内置口径/, '旧文案还在')
+})
+
+t('规则表格里的摘要模板是纯文本，不是输入框（2026-10-28 用户批注）', () => {
+  // 用户原话：「又不能改，不要用输入框，不然还以为能在这里输入内容呢」。
+  //
+  // 那个行内输入框绑的是 ``@change`` —— **失焦就写库**，写没写成功只有
+  // 一条 toast 才知道；它看起来能改、其实是个暗改入口。
+  const start = VIEW.indexOf('<el-table :data="rules"')
+  assert.ok(start > 0, '没找到规则表格')
+  // **只切那一张表** —— 后面还有「对方科目弹窗」里的输入框（那是另一回事）
+  const end = VIEW.indexOf('</el-table>', start)
+  const table = VIEW.slice(start, end)
+  assert.doesNotMatch(table, /<el-input/, '规则表格里还有输入框')
+  assert.doesNotMatch(VIEW, /saveRuleTemplate/, '行内编辑那个函数还在')
+  // 值还是要摆出来 —— 不占一列也别把信息丢了
+  assert.match(table, /row\.summary_template/)
+  // 要改有明确的入口
+  assert.match(table, /startEditRule\(row\)/)
+})
+
+t('规则编辑走表单：点「编辑」把那条规则调进表单', () => {
+  assert.match(VIEW, /@click="startEditRule\(row\)"/)
+  assert.match(VIEW, /editingRuleId \? '保存修改' : '新增规则'/)
+  assert.match(VIEW, /function startEditRule\(row\)/)
+  assert.match(VIEW, /function cancelEditRule\(\)/)
+  // **改的时候只发表单上有的字段** —— ``active`` 不在表单里（表格只显示它），
+  // 发了就会把一条被停用的规则**偷偷改回启用**。
+  assert.match(VIEW, /api\.updateRule\(store\.bookId, editing, payload\)/)
+  assert.doesNotMatch(VIEW, /api\.updateRule\([^)]*\{\s*\.\.\.ruleForm\s*\}/)
+})
+
+t('说明里不再写「每条规则可以单独设摘要模板」（2026-10-28 用户批注）', () => {
+  // 断言的是**剥掉注释后的模板** —— 注释里提到某个词不等于界面上有它。
+  const view = stripComments(VIEW)
+  assert.doesNotMatch(view, /每条规则可以单独设摘要模板/, '那句说明还在')
+})
+
+t('页签记在地址栏里：跳去改凭证再回来，还在同一页', () => {
+  // 用户批注：「点击跳转后，再回到流水对账页面就回到默认页面「对账单」了，
+  // 一旦遇到大量需要修改的，就要不听得切换页面来「存疑凭证」」。
+  //
+  // **记在组件变量里救不了**：跳走时组件被卸载，变量没了。
+  assert.match(VIEW, /useRoute/)
+  assert.match(VIEW, /route\.query\.tab/)
+  assert.match(VIEW, /rememberTab\(name\)/)
+  assert.match(VIEW, /router\.replace\(\{ query:/)
+  // 不认识的页签名回落到「对账单」 —— 地址栏是人能改的
+  assert.match(VIEW, /TAB_NAMES\.includes\(name\) \? name : 'statements'/)
+  // **带着页签进来时，那一页的数据要自己拉**（存疑凭证是懒加载的）
+  assert.match(VIEW, /if \(tab\.value === 'suspicious'\) loadSuspicious\(\)/)
 })
 
 t('台账空态用插槽显示动态文案', () => {
@@ -804,7 +857,9 @@ t('页面上不再有账套级摘要模板（2026-10-28 下线）', () => {
 })
 
 t('规则级摘要模板留着（那才是「这一类流水用另一种说法」）', () => {
-  assert.match(VIEW, /saveRuleTemplate/)
+  // **改模板走表单**（2026-10-28 用户批注：不要用输入框）—— 表单里那一处
+  // 摘要模板输入框留着（占位符、示例、预览都还在），表格里的行内编辑去掉了。
+  assert.match(VIEW, /<el-form-item label="摘要模板">/)
   assert.match(VIEW, /ruleForm\.summary_template/)
   assert.match(VIEW, /SUMMARY_TEMPLATE_EXAMPLES/)
   // **占位符插到规则级模板里** —— 只有一个去处了，不必再问「插到哪一份」

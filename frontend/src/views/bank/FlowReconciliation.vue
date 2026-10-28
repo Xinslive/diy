@@ -497,10 +497,13 @@
           <template #header>
             <div class="section-head">
               <span>科目规则</span>
+              <!-- **说明里只讲「这页干什么」**（2026-10-28 用户批注去掉
+                   「每条规则可以单独设摘要模板（盖过内置口径）」那一句）：
+                   规则级模板这件事在下面那张表单里明明白白摆着，
+                   再在标题上写一遍只是多一行字。 -->
               <span class="muted">
                 按摘要 / 用途 / 对方户名里的关键词定对方科目；
                 优先级大的赢，同级取更长的关键词。
-                每条规则可以单独设摘要模板（盖过内置口径）
               </span>
             </div>
           </template>
@@ -532,10 +535,19 @@
             </el-form-item>
             <el-form-item>
               <el-button type="primary" :disabled="!store.canWrite" :loading="savingRule" @click="saveRule">
-                新增规则
+                {{ editingRuleId ? '保存修改' : '新增规则' }}
+              </el-button>
+              <!-- **编辑中给一条退路**：不然点完「保存修改」之后，
+                   表单还摆着刚才那条内容，看不出是「还在改」还是「忘了保存」。 -->
+              <el-button v-if="editingRuleId" :disabled="!store.canWrite" @click="cancelEditRule">
+                取消
               </el-button>
             </el-form-item>
           </el-form>
+          <!-- **正在改哪一条**（编辑态才出现） -->
+          <div v-if="editingRuleId" class="flow-rule-editing">
+            正在修改规则「{{ editingRuleKeyword }}」—— 改完点「保存修改」，不想改了点「取消」。
+          </div>
           <!-- 新增规则的模板：占位符能点、还有预览（不然用户看不懂） -->
           <div class="flow-template-help">
             <span class="muted small">点一下插入：</span>
@@ -580,12 +592,15 @@
             </el-table-column>
             <el-table-column label="摘要模板" min-width="220">
               <template #default="{ row }">
-                <el-input
-                  :model-value="row.summary_template"
-                  size="small"
-                  placeholder="留空使用默认规则"
-                  @change="(v) => saveRuleTemplate(row, v)"
-                />
+                <!-- **纯文本，不是输入框**（2026-10-28 用户批注：
+                     「又不能改，不要用输入框，不然还以为能在这里输入内容呢」）。
+
+                     那个行内输入框绑的是 ``@change`` —— **失焦就写库**，
+                     写没写成功只有一条 toast 才知道；它看起来能改、其实是个
+                     暗改入口。摆个会骗人的框，不如把值摆出来：要改就点
+                     「编辑」，改的动作都在上面那张表单里明处发生。 -->
+                <span v-if="row.summary_template">{{ row.summary_template }}</span>
+                <span v-else class="muted">默认规则</span>
                 <!-- **已保存的规则不再逐行给预览。**
                      预览是**写模板时**才需要的东西：模板长什么样，得当场看着
                      一行流水才知道。规则存下来之后，用途是在凭证上（那张凭证的
@@ -598,8 +613,14 @@
             <el-table-column label="启用" width="80">
               <template #default="{ row }">{{ row.active ? '是' : '否' }}</template>
             </el-table-column>
-            <el-table-column label="操作" width="90">
+            <el-table-column label="操作" width="140">
               <template #default="{ row }">
+                <!-- **编辑走上面那张表单**（2026-10-28）：表格只负责「看」，
+                     改的动作有明确的入口 —— 点「编辑」把那条规则调进表单，
+                     占位符、示例、预览都还在那儿。 -->
+                <el-button link type="primary" :disabled="!store.canWrite" @click="startEditRule(row)">
+                  编辑
+                </el-button>
                 <el-button link type="danger" :disabled="!store.canWrite" @click="doDeleteRule(row)">
                   删除
                 </el-button>
@@ -817,7 +838,7 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Refresh, Upload } from '@element-plus/icons-vue'
 import * as api from '@/api/bankstatement'
@@ -842,7 +863,39 @@ import { useSessionStore } from '@/stores/session'
 
 const store = useSessionStore()
 const router = useRouter()
-const tab = ref('statements')
+const route = useRoute()
+
+/** 这一页的四个页签（合法值）。 */
+const TAB_NAMES = ['statements', 'rows', 'rules', 'suspicious']
+
+/**
+ * **当前页签：记在路由的 query 里**（`?tab=suspicious`）。
+ *
+ * **为什么不能只记在组件里**（2026-10-28 用户批注）：
+ * 「存疑凭证」那页每行给一条路 ——「修改凭证」跳到凭证页去改。改完回到
+ * 流水对账，**页签又回到默认的「对账单」** —— 要改十几张就得来回切十几次。
+ *
+ * 组件里的变量救不了这个：跳走时组件被卸载，变量没了。
+ * **query 还在地址栏里** —— 浏览器后退、从侧栏重新点进来、刷新页面，
+ * 全都回到你刚才那一页。侧栏那个页签条目也带着这个 query
+ * （`stores/tabs.js` 记的是带 query 的 `full`），所以从侧栏点回来也一样。
+ *
+ * **不认识的页签名一律回落到「对账单」** —— 地址栏是人能改的，
+ * 塞个 `?tab=abc` 不该把页面弄成空白。
+ */
+const tab = ref(initialTab())
+
+function initialTab() {
+  const raw = route?.query?.tab
+  const name = Array.isArray(raw) ? raw[0] : raw
+  return TAB_NAMES.includes(name) ? name : 'statements'
+}
+
+/** 把当前页签写进地址栏。 */
+function rememberTab(name) {
+  if (route.query.tab === name) return
+  router.replace({ query: { ...route.query, tab: name } })
+}
 
 const statements = ref([])
 const subjects = ref([])
@@ -1004,6 +1057,54 @@ const ruleForm = reactive({
   match_field: 'SUMMARY', keyword: '', subject_id: null, priority: 0, active: true,
   summary_template: '',
 })
+
+/**
+ * **正在编辑的规则**（空 = 新增模式）。
+ *
+ * **为什么编辑要走这张表单，而不是在表格里摆个输入框**（2026-10-28 用户批注：
+ * 「又不能改，不要用输入框，不然还以为能在这里输入内容呢」）：
+ * 那个行内输入框绑的是 ``@change`` —— **失焦就写库**，而且写没写成功
+ * 只有一条 toast 才知道；它看起来能改、其实是个暗改入口。摆个纯文本 +
+ * 「编辑」按钮之后，改的动作都在明处：占位符、示例、预览都还在。
+ */
+const editingRuleId = ref(null)
+/** 编辑中那条规则的关键词（提示语里要写出来，让人知道在改哪一条）。 */
+const editingRuleKeyword = ref('')
+
+/** 表单清空成「新增」的样子。 */
+function resetRuleForm() {
+  ruleForm.match_field = 'SUMMARY'
+  ruleForm.keyword = ''
+  ruleForm.subject_id = null
+  ruleForm.priority = 0
+  ruleForm.active = true
+  ruleForm.summary_template = ''
+}
+
+/**
+ * 开始改一条规则：把上面那张表单调成**编辑态**。
+ *
+ * **要点是把表单滚到看得见的地方** —— 点了「编辑」却看不到表单，
+ * 等于没反应。
+ */
+function startEditRule(row) {
+  editingRuleId.value = row.id
+  editingRuleKeyword.value = row.keyword
+  ruleForm.match_field = row.match_field
+  ruleForm.keyword = row.keyword
+  ruleForm.subject_id = row.subject_id
+  ruleForm.priority = row.priority
+  ruleForm.summary_template = row.summary_template || ''
+  const form = document.querySelector('.flow-rule-form')
+  if (form?.scrollIntoView) form.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
+/** 放弃修改，回到「新增」模式。 */
+function cancelEditRule() {
+  editingRuleId.value = null
+  editingRuleKeyword.value = ''
+  resetRuleForm()
+}
 
 /**
  * 把占位符插到模板里（接到末尾）。
@@ -1195,6 +1296,8 @@ async function loadSuspicious() {
 function onTabChange(name) {
   if (name === 'suspicious') loadSuspicious()
   if (name === 'rows' && activeStatementId.value) loadRows()
+  // **记住这一页**（见 tab 那个注释）—— 跳去改凭证再回来，还在同一页。
+  rememberTab(name)
 }
 
 /**
@@ -1227,23 +1330,12 @@ function openVoucher(id) {
   router.push({ name: 'voucher-edit', params: { id } })
 }
 
-/**
- * 改某条规则的摘要模板（规则级盖过内置口径）。
+/*
+ * **规则模板没有行内编辑了**（2026-10-28 用户批注）：
+ * 原来表格里是一个输入框（失焦即写库），看着能改、其实是个暗改入口
+ * （写没写成功只有一条 toast 才知道），而读的人会以为那只是个能看的地方。
+ * 改模板现在走上面那张表单：点表格里的「编辑」→ 模板进表单 → 「保存修改」。
  */
-async function saveRuleTemplate(rule, value) {
-  const template = value || ''
-  const unknown = unknownTemplateFields(template)
-  if (unknown.length) {
-    ElMessage.warning(`占位符 {${unknown.join('} {')} } 不认识`)
-    return
-  }
-  try {
-    await api.updateRule(store.bookId, rule.id, { summary_template: template })
-    ElMessage.success('已保存这条规则的摘要模板')
-  } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || '保存失败')
-  }
-}
 
 function onFile(file) {
   pickedFile.value = file.raw
@@ -1578,16 +1670,36 @@ async function saveRule() {
     ElMessage.warning('关键词与对方科目都要填')
     return
   }
+  // **占位符写错当场说** —— 后端也会拒，但那是提交之后的事了。
+  const unknown = unknownTemplateFields(ruleForm.summary_template)
+  if (unknown.length) {
+    ElMessage.warning(`占位符 {${unknown.join('} {')} } 不认识`)
+    return
+  }
   savingRule.value = true
+  const editing = editingRuleId.value
+  // **只发表单上有的字段**：``active`` 不在表单里（表格只显示它），
+  // 发了就会把一条被停用的规则**偷偷改回启用**。
+  const payload = {
+    match_field: ruleForm.match_field,
+    keyword: ruleForm.keyword,
+    subject_id: ruleForm.subject_id,
+    priority: ruleForm.priority,
+    summary_template: ruleForm.summary_template,
+  }
   try {
-    await api.createRule(store.bookId, { ...ruleForm })
-    ruleForm.keyword = ''
-    ruleForm.subject_id = null
-    ruleForm.summary_template = ''
+    if (editing) {
+      await api.updateRule(store.bookId, editing, payload)
+    } else {
+      await api.createRule(store.bookId, { ...payload, active: true })
+    }
+    editingRuleId.value = null
+    editingRuleKeyword.value = ''
+    resetRuleForm()
     await loadAll()
-    ElMessage.success('已新增规则')
+    ElMessage.success(editing ? '已保存这条规则' : '已新增规则')
   } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || '新增规则失败')
+    ElMessage.error(e?.response?.data?.detail || (editing ? '保存规则失败' : '新增规则失败'))
   } finally {
     savingRule.value = false
   }
@@ -1596,6 +1708,9 @@ async function saveRule() {
 async function doDeleteRule(row) {
   try {
     await api.deleteRule(store.bookId, row.id)
+    // **正在编辑的就是这一条** → 表单得回到「新增」的样子，
+    // 不然下一次点「保存修改」会 PATCH 一条已经不存在的规则。
+    if (editingRuleId.value === row.id) cancelEditRule()
     await loadAll()
   } catch (e) {
     ElMessage.error(e?.response?.data?.detail || '删除规则失败')
@@ -1648,8 +1763,11 @@ async function rememberFormat() {
   }
 }
 
-onMounted(() => {
-  loadAll()
+onMounted(async () => {
+  await loadAll()
+  // **带着 ?tab=suspicious 进来的**（从凭证页改完回来、或刷新页面）：
+  // 存疑凭证是**懒加载**的 —— 只把页签选上不会有数据，得自己拉一次。
+  if (tab.value === 'suspicious') loadSuspicious()
 })
 </script>
 
@@ -1732,6 +1850,14 @@ onMounted(() => {
    ------------------------------------------------------------------
    **这一块是给「看不懂模板」这件事用的** —— 所以占位符能点、示例能套、
    预览能看到真东西长什么样。三样缺一样，用户就只能猜。 */
+
+/* **正在改哪一条规则**（编辑态才出现）——
+   一行小字，但少了它就看不出「这张表单现在是在改哪一条」。 */
+.flow-rule-editing {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--el-color-warning-dark-2);
+}
 .flow-template-help {
   display: flex;
   flex-wrap: wrap;
