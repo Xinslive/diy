@@ -56,6 +56,10 @@ jobs:
   #    不会** —— 引用照样「解析得到」，点过去看到的是另一件事。
   #    实测踩过两个：同一个编号指向两个标题；「见 §11.13.4」指不到任何东西。
   #    所以除了跑闸门，还要跑闸门自己的反向测试 —— 只会通过的闸门等于没有闸门。
+  #
+  # ③ 文档与重建脚本的输出必须一致：重建脚本是这份文档**规范形式的唯一来源**。
+  #    没有这道闸的话，有人手工改了文档，下一个人跑重建就会发现自己的改动
+  #    被静默顶回去 —— 而改动确实「提交过了」，看起来什么都没发生。
   docs:
     name: 架构文档目录锚点与段号契约
     runs-on: ubuntu-latest
@@ -68,6 +72,11 @@ jobs:
 
       - name: 装锚点计算依赖
         run: npm --prefix tools/archdoc-toc ci
+
+      - name: 文档必须与重建脚本的输出一致
+        run: |
+          python3 tools/archdoc-regroup.py
+          git diff --exit-code ARCHITECTURE.md
 
       - name: 目录锚点必须全部命中
         run: node tools/archdoc-toc.mjs
