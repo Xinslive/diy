@@ -23,6 +23,7 @@ const {
   toCents, planSubjectCents, planTotalMatches, planTotalDiff, planSubjectText,
   reclassifyRowCount, reclassifyCandidateText, unknownTemplateFields,
   isCrossPeriod, reclassifyCrossPeriodText, reclassifyCrossPeriodConfirm,
+  renderSummary, summaryTemplateValuesText, SUMMARY_TEMPLATE_EXAMPLES,
   SUMMARY_TEMPLATE_FIELDS,
 } = STATE
 
@@ -130,15 +131,23 @@ t('页面提供「记住这个格式」与「按指定重新解析」', () => {
 
 console.log('== 流水明细页：默认只显示解析出来的内容 ==')
 
-t('方向、对方科目、状态都收在「对账信息」栏里（默认收起）', () => {
+t('方向、对方科目、状态收在「对账信息」里（默认收起，且是往下展开）', () => {
   // 收起状态 = showExtra 默认 false
   assert.match(VIEW, /const showExtra = ref\(false\)/)
-  // 这三列都挂在 showExtra 上
+  // **往下展开**：用展开行，不是往右加列。
+  // 加列会把表格撑宽 → 窄屏上冒出左右滑动条，一边横拖一边看很难受。
+  assert.match(VIEW, /type="expand"/)
+  assert.match(VIEW, /class="flow-extra"/)
+  // 三样都在展开行里
   for (const label of ['方向', '对方科目', '状态']) {
-    assert.match(
+    assert.match(VIEW, new RegExp(`>${label}</span>`), `${label} 不在展开行里`)
+  }
+  // **不许**再有那三个「往右加」的列
+  for (const label of ['方向', '对方科目', '状态']) {
+    assert.doesNotMatch(
       VIEW,
       new RegExp(`<el-table-column v-if="showExtra" label="${label}"`),
-      `${label} 列没收进「对账信息」栏`)
+      `${label} 还在当列 —— 那就会把表格撑宽、出左右滑动条`)
   }
 })
 
@@ -254,6 +263,66 @@ t('页面上：跨期候选有提示，且点下去要再确认一次', () => {
   assert.match(VIEW, /reclassifyCrossPeriodText/)
   assert.match(VIEW, /reclassifyCrossPeriodConfirm/)
   assert.match(VIEW, /ElMessageBox\.confirm/)
+})
+
+console.log('== 摘要模板：预览的口径必须与后端一致 ==')
+
+// 前端的预览要显示「这条流水最后会长成什么样」—— 预览与真生成的摘要对不上，
+// 那预览就等于没有预览。而这两处是两套代码（JS 与 Python），所以**共用一份
+// 基准文件**：各自钉一条用例读它，口径一漂移至少有一边红。
+const RENDER_CASES = JSON.parse(fs.readFileSync(
+  new URL('../../backend/tests/fixtures/summary_template_render_cases.json', import.meta.url),
+  'utf8'))
+
+t('渲染口径与后端共用同一份基准', () => {
+  assert.ok(RENDER_CASES.cases.length > 0, '基准文件是空的 —— 那这条用例等于没跑')
+  for (const c of RENDER_CASES.cases) {
+    const out = renderSummary(c.template, c.row)
+    assert.equal(out, c.expected, `${c.name}：预览渲染出 ${out}，基准写的是 ${c.expected}`)
+  }
+})
+
+t('预览拿不到那一列的值时，取空而不是 "undefined"', () => {
+  const out = renderSummary('{用途}-{对方户名}', {
+    seq: 1, tx_date: '2026-09-14', direction: 'IN', amount: '10.00',
+    summary: '转入', purpose: '', counterparty_name: '',
+  })
+  assert.equal(out, '-', `空值不该渲染成 undefined/null：${out}`)
+})
+
+t('不认识的占位符原样留着（正在输入的人要看得出打错了）', () => {
+  const out = renderSummary('{用途}-{摘}', {
+    seq: 1, tx_date: '2026-09-14', direction: 'IN', amount: '10.00',
+    summary: '转入', purpose: '房租', counterparty_name: '',
+  })
+  assert.match(out, /\{摘\}/, `不认识的占位符该原样留着：${out}`)
+})
+
+t('有现成的示例模板可照抄', () => {
+  assert.ok(SUMMARY_TEMPLATE_EXAMPLES.length >= 3, '示例太少，用户没得抄')
+  for (const ex of SUMMARY_TEMPLATE_EXAMPLES) {
+    assert.ok(ex.label && ex.template, `示例要既有名字又有模板：${JSON.stringify(ex)}`)
+    assert.deepEqual(unknownTemplateFields(ex.template), [],
+      `示例里的占位符必须都是认识的：${ex.template}`)
+  }
+})
+
+t('预览要摆出那一行的字段值（否则用户会把摘要误当成用途）', () => {
+  const text = summaryTemplateValuesText({
+    seq: 1, tx_date: '2026-09-28', direction: 'IN', amount: '872100.00',
+    summary: '杨育军', purpose: '', counterparty_name: '',
+  })
+  assert.match(text, /摘要=杨育军/, `字段值没摆出来：${text}`)
+  assert.match(text, /用途=（空）/, `空值要标出来：${text}`)
+  assert.match(text, /金额=872100\.00/, `金额没摆出来：${text}`)
+})
+
+t('页面上有占位符按钮、示例与预览', () => {
+  assert.match(VIEW, /insertPlaceholder/)
+  assert.match(VIEW, /SUMMARY_TEMPLATE_EXAMPLES/)
+  assert.match(VIEW, /configPreviewText/)
+  assert.match(VIEW, /rulePreviewText/)
+  assert.match(VIEW, /renderSummary/)
 })
 
 console.log('== 凭证摘要模板 ==')

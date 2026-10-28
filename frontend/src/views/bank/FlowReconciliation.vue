@@ -269,7 +269,8 @@
             <div class="section-head">
               <span>流水明细</span>
               <span class="muted">
-                默认只显示对账单上解析出来的内容；方向、对方科目、状态收在「对账信息」里
+                默认只显示对账单上解析出来的内容；方向、对方科目、状态收在「对账信息」里，
+                点行首箭头**往下展开**（不加列，不会出左右滑动条）
               </span>
             </div>
           </template>
@@ -299,13 +300,14 @@
               <template v-if="plan.unknown_count">，待确认方向 {{ plan.unknown_count }} 条</template>
             </span>
             <!-- **账上已有同一笔、只是记错了账户**：默认收起时也要看得见，
-                 否则用户根本不知道有笔钱记错了地方 -->
+                 否则用户根本不知道有笔钱记错了地方。
+                 点它直接把**这些行展开**（往下展开），不用自己再一格格点箭头。 -->
             <el-tag
               v-if="reclassifyCount"
               type="warning"
               effect="plain"
               class="flow-tag-button"
-              @click="showExtra = true"
+              @click="expandRowsWithCandidates"
             >
               账上已有对应分录 {{ reclassifyCount }} 行 · 展开看
             </el-tag>
@@ -313,12 +315,93 @@
           </div>
 
           <el-table
+            ref="rowsTable"
             :data="rows"
             v-loading="loadingRows"
             size="small"
             class="flow-rows-table"
             empty-text="先选一份对账单"
           >
+            <!-- 「对账信息」：**往下展开**，不是往右加列。
+                 早先那版是加 4 个列（方向/对方科目/状态/操作），列一多表格就被
+                 撑宽 → 出现**左右滑动条**，而这张表在窄屏上本来就挤 —— 于是
+                 用户得一边横拖一边看，改起来很难受。
+                 改成展开行后**列数恒定**，表格宽度不变，横向永远不会溢出；
+                 想看哪一行就点哪一行的箭头。 -->
+            <el-table-column v-if="showExtra" type="expand" width="42">
+              <template #default="{ row }">
+                <div class="flow-extra">
+                  <div class="flow-extra-item">
+                    <span class="flow-extra-label">方向</span>
+                    <el-tag
+                      v-if="row.direction !== 'UNKNOWN'"
+                      size="small"
+                      :type="row.direction === 'IN' ? 'success' : 'warning'"
+                    >
+                      {{ row.direction === 'IN' ? '收入' : '支出' }}
+                    </el-tag>
+                    <el-select
+                      v-else
+                      :model-value="row.direction"
+                      size="small"
+                      placeholder="指定方向"
+                      class="flow-direction"
+                      :disabled="!store.canWrite"
+                      @change="(v) => doSetDirection(row, v)"
+                    >
+                      <el-option label="收入" value="IN" />
+                      <el-option label="支出" value="OUT" />
+                    </el-select>
+                  </div>
+                  <div class="flow-extra-item">
+                    <span class="flow-extra-label">对方科目</span>
+                    <div v-if="row.plan_subjects?.length" class="flow-plan">
+                      <el-tag
+                        v-for="item in row.plan_subjects"
+                        :key="item.subject_id"
+                        size="small"
+                        type="info"
+                        effect="plain"
+                        class="flow-plan-tag"
+                      >
+                        {{ planSubjectText(item) }}
+                      </el-tag>
+                    </div>
+                    <span v-else class="muted small">待确认</span>
+                    <el-button link type="primary" size="small" @click="openPlan(row)">
+                      {{ row.plan_subjects?.length ? '调整' : '指定' }}
+                    </el-button>
+                  </div>
+                  <div class="flow-extra-item">
+                    <span class="flow-extra-label">状态</span>
+                    <el-tag size="small" :type="stateType(row.voucher_state)">
+                      {{ stateText(row.voucher_state) }}
+                    </el-tag>
+                    <el-button
+                      v-if="row.reclassify_candidates?.length"
+                      link
+                      type="warning"
+                      size="small"
+                      @click="openReclassify(row)"
+                    >
+                      可改科目
+                    </el-button>
+                  </div>
+                  <div class="flow-extra-item">
+                    <span class="flow-extra-label">操作</span>
+                    <el-button
+                      link
+                      type="danger"
+                      :disabled="!store.canWrite || row.status !== 'OPEN'"
+                      @click="doIgnore(row)"
+                    >
+                      {{ row.status === 'IGNORED' ? '恢复' : '忽略' }}
+                    </el-button>
+                  </div>
+                </div>
+              </template>
+            </el-table-column>
+
             <!-- 默认列：只有对账单上解析出来的那些 -->
             <el-table-column label="#" width="46" prop="seq" />
             <el-table-column label="日期" width="96">
@@ -346,75 +429,6 @@
             <el-table-column label="余额" width="104" align="right">
               <template #default="{ row }">{{ money(row.balance) }}</template>
             </el-table-column>
-
-            <!-- 「对账信息」栏：默认收起 -->
-            <el-table-column v-if="showExtra" label="方向" width="92">
-              <template #default="{ row }">
-                <el-tag v-if="row.direction !== 'UNKNOWN'" size="small" :type="row.direction === 'IN' ? 'success' : 'warning'">
-                  {{ row.direction === 'IN' ? '收入' : '支出' }}
-                </el-tag>
-                <el-select
-                  v-else
-                  :model-value="row.direction"
-                  size="small"
-                  placeholder="指定方向"
-                  class="flow-direction"
-                  :disabled="!store.canWrite"
-                  @change="(v) => doSetDirection(row, v)"
-                >
-                  <el-option label="收入" value="IN" />
-                  <el-option label="支出" value="OUT" />
-                </el-select>
-              </template>
-            </el-table-column>
-            <el-table-column v-if="showExtra" label="对方科目" min-width="240">
-              <template #default="{ row }">
-                <div v-if="row.plan_subjects?.length" class="flow-plan">
-                  <el-tag
-                    v-for="item in row.plan_subjects"
-                    :key="item.subject_id"
-                    size="small"
-                    type="info"
-                    effect="plain"
-                    class="flow-plan-tag"
-                  >
-                    {{ planSubjectText(item) }}
-                  </el-tag>
-                </div>
-                <span v-else class="muted small">待确认</span>
-                <el-button link type="primary" size="small" @click="openPlan(row)">
-                  {{ row.plan_subjects?.length ? '调整' : '指定' }}
-                </el-button>
-              </template>
-            </el-table-column>
-            <el-table-column v-if="showExtra" label="状态" width="168">
-              <template #default="{ row }">
-                <el-tag size="small" :type="stateType(row.voucher_state)">
-                  {{ stateText(row.voucher_state) }}
-                </el-tag>
-                <el-button
-                  v-if="row.reclassify_candidates?.length"
-                  link
-                  type="warning"
-                  size="small"
-                  @click="openReclassify(row)"
-                >
-                  可改科目
-                </el-button>
-              </template>
-            </el-table-column>
-            <el-table-column v-if="showExtra" label="操作" width="96" fixed="right">
-              <template #default="{ row }">
-                <el-button
-                  link
-                  type="danger"
-                  :disabled="!store.canWrite || row.status !== 'OPEN'"
-                  @click="doIgnore(row)"
-                >
-                  {{ row.status === 'IGNORED' ? '恢复' : '忽略' }}
-                </el-button>
-              </template>
-            </el-table-column>
           </el-table>
         </el-card>
       </el-tab-pane>
@@ -438,6 +452,47 @@
               class="flow-config-input"
             />
             <el-button :disabled="!store.canWrite" @click="saveConfigForm">保存</el-button>
+          </div>
+          <!-- 占位符做成**能点的**：不用手打，打错了当场看得见 -->
+          <div class="flow-template-help">
+            <span class="muted small">点一下插入：</span>
+            <el-tag
+              v-for="field in SUMMARY_TEMPLATE_FIELDS"
+              :key="field"
+              size="small"
+              effect="plain"
+              class="flow-placeholder-tag"
+              @click="insertPlaceholder(configForm.summary_template, field, 'config')"
+            >
+              {{ '{' + field + '}' }}
+            </el-tag>
+          </div>
+          <!-- **示例**：给几条现成的，用户照抄就行 -->
+          <div class="flow-template-help">
+            <span class="muted small">示例（点一下套用）：</span>
+            <el-tag
+              v-for="ex in SUMMARY_TEMPLATE_EXAMPLES"
+              :key="ex.label"
+              size="small"
+              type="info"
+              effect="plain"
+              class="flow-placeholder-tag"
+              @click="configForm.summary_template = ex.template"
+            >
+              {{ ex.label }}
+            </el-tag>
+          </div>
+          <!-- **预览**：用当前这份对账单的第一行流水真渲染一遍 -->
+          <div class="flow-template-preview">
+            <span class="muted small">{{ previewLabel }}</span>
+            <span class="flow-template-preview-text">{{ configPreviewText }}</span>
+            <span v-if="unknownTemplateFields(configForm.summary_template).length"
+              class="flow-warn small">
+              ⚠ 「{{ unknownTemplateFields(configForm.summary_template).join('」「') }}」不是可用的占位符
+            </span>
+            <div class="flow-template-values muted small">
+              那一行的值：{{ previewValuesText }}
+            </div>
           </div>
         </el-card>
 
@@ -484,6 +539,39 @@
               </el-button>
             </el-form-item>
           </el-form>
+          <!-- 新增规则的模板：占位符能点、还有预览（不然用户看不懂） -->
+          <div class="flow-template-help">
+            <span class="muted small">点一下插入：</span>
+            <el-tag
+              v-for="field in SUMMARY_TEMPLATE_FIELDS"
+              :key="field"
+              size="small"
+              effect="plain"
+              class="flow-placeholder-tag"
+              @click="insertPlaceholder(ruleForm.summary_template, field, 'rule')"
+            >
+              {{ '{' + field + '}' }}
+            </el-tag>
+            <span class="muted small">示例：</span>
+            <el-tag
+              v-for="ex in SUMMARY_TEMPLATE_EXAMPLES"
+              :key="ex.label"
+              size="small"
+              type="info"
+              effect="plain"
+              class="flow-placeholder-tag"
+              @click="ruleForm.summary_template = ex.template"
+            >
+              {{ ex.label }}
+            </el-tag>
+          </div>
+          <div class="flow-template-preview">
+            <span class="muted small">{{ previewLabel }}</span>
+            <span class="flow-template-preview-text">{{ rulePreviewText }}</span>
+            <div class="flow-template-values muted small">
+              那一行的值：{{ previewValuesText }}
+            </div>
+          </div>
 
           <el-table :data="rules" empty-text="还没有规则 —— 没有规则的流水会标成「待确认」">
             <el-table-column label="匹配列" width="110">
@@ -501,6 +589,11 @@
                   placeholder="留空 = 用账套级"
                   @change="(v) => saveRuleTemplate(row, v)"
                 />
+                <!-- 每条规则也给个预览 —— 模板写在这里，用途却是在凭证上 -->
+                <div class="flow-template-preview flow-template-preview--cell">
+                  <span class="muted small">预览：</span>
+                  <span class="flow-template-preview-text">{{ renderSummary(row.summary_template, previewRow) }}</span>
+                </div>
               </template>
             </el-table-column>
             <el-table-column label="优先级" prop="priority" width="80" />
@@ -607,7 +700,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Refresh, Upload } from '@element-plus/icons-vue'
 import * as api from '@/api/bankstatement'
@@ -617,8 +710,10 @@ import {
   FIELD_OPTIONS, canCommit, diffClass, fieldLabel, isCrossPeriod, planSubjectCents,
   planSubjectText, planTotalDiff, planTotalMatches, reclassifyCandidateText,
   reclassifyCrossPeriodConfirm, reclassifyCrossPeriodText, reclassifyRowCount,
-  settlementSourceText, settlementSourceType,
+  renderSummary, settlementSourceText, settlementSourceType,
   toColumnMapping, unknownTemplateFields, voucherStateText, voucherStateType,
+  summaryTemplateValuesText,
+  SUMMARY_TEMPLATE_EXAMPLES, SUMMARY_TEMPLATE_FIELDS,
 } from './flow_state'
 import { useSessionStore } from '@/stores/session'
 
@@ -630,6 +725,8 @@ const subjects = ref([])
 const rules = ref([])
 const profiles = ref([])
 const rows = ref([])
+/** 流水明细表 —— 「展开」要用它的实例去展开指定的行。 */
+const rowsTable = ref(null)
 const plan = ref(null)
 const current = ref(null)
 const activeStatementId = ref(null)
@@ -647,13 +744,36 @@ const diagPanels = ref([])
 const manualMapping = reactive({})
 
 /**
- * 「对账信息」栏：**默认收起**。
+ * 「对账信息」栏：**默认收起**，而且是**往下展开**（不是往右加列）。
  *
  * 明细页默认只显示对账单上解析出来的内容（日期、摘要、用途、对方户名、
  * 收入、支出、余额）；方向、对方科目、状态这些「账上才有的东西」收在
  * 这里 —— 它们要改、要判断，但看一眼流水本身用不着。
+ *
+ * **为什么不加列**：加了列表格就被撑宽，窄屏上会冒出**左右滑动条** ——
+ * 一边横拖一边看，账对起来很难受。改成展开行后列数恒定，横向不会溢出。
  */
 const showExtra = ref(false)
+
+/**
+ * 把「账上已有对应分录」的那些行**直接展开**。
+ *
+ * 「对账信息」既然是往下展开的，光把开关打开还不够 —— 用户还得自己一格格
+ * 点行首箭头才看得到。这里替他展开那些真正需要看的行。
+ *
+ * **要等 nextTick**：「对账信息」是 ``v-if`` 控制的展开列，开关一开，表格要
+ * 重渲染一遍，此时之前的展开状态没了 —— 不等就会展开不上。
+ */
+function expandRowsWithCandidates() {
+  showExtra.value = true
+  nextTick(() => {
+    const table = rowsTable.value
+    if (!table) return
+    rows.value.forEach((row) => {
+      if (row.reclassify_candidates?.length) table.toggleRowExpansion(row, true)
+    })
+  })
+}
 
 /** 对方科目编辑弹窗。 */
 const planDialog = reactive({ open: false, row: null, items: [] })
@@ -667,6 +787,51 @@ const ruleForm = reactive({
 })
 /** 账套级「凭证摘要模板」。 */
 const configForm = reactive({ summary_template: '' })
+
+/**
+ * 把占位符插到模板里（接到末尾）。
+ *
+ * **为什么做成能点的**：占位符是中文的（「{对方户名}」），手打既慢又容易打错，
+ * 而「看不懂」正是这个功能最大的问题 —— 能点一下就有的东西，不该让人背。
+ */
+function insertPlaceholder(current, field, target) {
+  const piece = `{${field}}`
+  if (target === 'rule') ruleForm.summary_template = `${current || ''}${piece}`
+  else configForm.summary_template = `${current || ''}${piece}`
+}
+
+/**
+ * 预览拿哪一行流水渲染：**当前这份对账单的第一行**。
+ *
+ * 预览的作用是让人**看懂模板怎么拼**，不是预告「这条流水最后会生成什么摘要」
+ * —— 那个得等真的制了凭证才说得准。
+ */
+const previewRow = computed(() => rows.value[0] || null)
+
+/** 预览那句说明：**要说清楚拿哪一行渲染的**，否则用户会以为那就是结果。 */
+const previewLabel = computed(() => {
+  const row = previewRow.value
+  if (!row) return '先选一份对账单，下面的预览才有内容'
+  return `预览（用第 ${row.seq} 行流水演示模板效果）：`
+})
+
+/** 账套级模板的预览。 */
+const configPreviewText = computed(
+  () => renderSummary(configForm.summary_template, previewRow.value))
+
+/** 新增规则里那个模板的预览。 */
+const rulePreviewText = computed(
+  () => renderSummary(ruleForm.summary_template, previewRow.value))
+
+/**
+ * 预览那一行的**各个字段的值**。
+ *
+ * 只给渲染结果是不够的：模板渲染为空时后端会退回内置口径（用途优先、摘要
+ * 兜底），预览显示的也就是内置口径那个结果 —— 只看结果，用户会把「摘要」
+ * 误当成「用途」。把字段值摆出来，一眼就看得明白。
+ */
+const previewValuesText = computed(
+  () => (previewRow.value ? summaryTemplateValuesText(previewRow.value) : ''))
 
 const subjectLabel = (s) => `${s.code} ${s.name}`
 
@@ -1151,9 +1316,79 @@ onMounted(() => {
 .flow-rows-table :deep(.el-table__cell) { padding: 4px 0; }
 .flow-rows-table :deep(.cell) { line-height: 1.5; }
 
+/* 「对账信息」是**展开行**（往下展开），不是往右加的列 —— 所以列数恒定，
+   横向不会溢出，也就不会有左右滑动条。
+   展开行里的内容横向并排，窄了自动换行；换行是往下换，绝不撑宽表格。 */
+.flow-extra {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 28px;
+  padding: 2px 0;
+}
+.flow-extra-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.flow-extra-label {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+.flow-rows-table :deep(.el-table__expanded-cell) {
+  padding: 6px 12px 8px 46px;
+  background: var(--el-fill-color-lighter);
+}
+
 /* 对方科目：一行可以有好几个，用标签平铺。 */
 .flow-plan { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 2px; }
 .flow-plan-tag { font-size: 12px; }
+
+/* 摘要模板：占位符 / 示例 / 预览
+   ------------------------------------------------------------------
+   **这一块是给「看不懂模板」这件事用的** —— 所以占位符能点、示例能套、
+   预览能看到真东西长什么样。三样缺一样，用户就只能猜。 */
+.flow-template-help {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+.flow-placeholder-tag {
+  cursor: pointer;
+  user-select: none;
+}
+.flow-placeholder-tag:hover { opacity: 0.75; }
+.flow-template-preview {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  background: var(--el-fill-color-lighter);
+  min-height: 28px;
+}
+.flow-template-preview--cell {
+  margin-top: 4px;
+  padding: 2px 6px;
+  background: transparent;
+  min-height: 0;
+}
+.flow-template-preview-text {
+  font-size: 13px;
+  color: var(--el-text-color-primary);
+  word-break: break-all;
+}
+.flow-template-values {
+  width: 100%;
+  word-break: break-all;
+  line-height: 1.6;
+}
 
 /* 对方科目编辑弹窗：一行 = 科目 + 金额 + 删。 */
 .flow-plan-row {

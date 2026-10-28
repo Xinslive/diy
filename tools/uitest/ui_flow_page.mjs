@@ -102,52 +102,60 @@ await step('明细行确实加载出来了', async () => {
   console.log(`   行高 ${height}px，共 ${rows} 行`)
 })
 
-// ---- 展开「对账信息」 ----
-await step('展开对账信息', async () => {
+/**
+ * **没有横向滚动条** —— 这是用户提的要求：早先那版把方向/对方科目/状态做成
+ * **往右加的列**，列一多表格就被撑宽，窄屏上只能横着拖着看。
+ *
+ * 判据不是「看起来没溢出」，而是**真的量一遍**：滚动容器的 scrollWidth
+ * 超过 clientWidth 就说明有横向溢出。
+ */
+const measureOverflow = () => page.evaluate(() => {
+  const wrap = document.querySelector('.flow-rows-table .el-scrollbar__wrap')
+    || document.querySelector('.flow-rows-table .el-table__body-wrapper')
+  if (!wrap) return null
+  return { scrollWidth: wrap.scrollWidth, clientWidth: wrap.clientWidth }
+})
+
+await step('默认形态没有横向滚动条', async () => {
+  const m = await measureOverflow()
+  if (m && m.scrollWidth > m.clientWidth + 1) {
+    throw new Error(`表格横向溢出了（要出左右滑动条了）：${JSON.stringify(m)}`)
+  }
+  if (m) console.log(`   内容宽 ${m.scrollWidth}px / 可视宽 ${m.clientWidth}px`)
+})
+
+// ---- 展开「对账信息」：**往下展开**，不是往右加列 ----
+await step('勾上「对账信息」后行首出现展开箭头', async () => {
   // el-checkbox 的**根元素**就带 flow-toggle（不是它里面有 .el-checkbox）
   await page.locator('.flow-toggle').first().click()
   await page.waitForTimeout(800)
+  const icons = await page.locator('.flow-rows-table .el-table__expand-icon').count()
+  if (icons < 3) throw new Error(`行首没有展开箭头（${icons} 个）`)
+})
+
+await step('点行首箭头，内容在**行的下方**展开', async () => {
+  await page.locator('.flow-rows-table .el-table__expand-icon').first().click()
+  await page.waitForTimeout(700)
+  const extra = page.locator('.flow-extra')
+  if (await extra.count() !== 1) throw new Error(`展开行不对（${await extra.count()} 个）`)
+  const text = await extra.innerText()
+  for (const label of ['方向', '对方科目', '状态']) {
+    if (!text.includes(label)) throw new Error(`展开行里少了「${label}」：${text}`)
+  }
 })
 await page.screenshot({ path: `${OUT}/flow_compact_expanded.png` })
 
-await step('展开后能看到方向/对方科目/状态', async () => {
-  const headers = await page.locator('.flow-rows-table thead th').allInnerTexts()
-  const text = headers.join('|')
-  for (const label of ['方向', '对方科目', '状态']) {
-    if (!text.includes(label)) throw new Error(`展开后少了「${label}」列：${text}`)
+await step('**展开后也没有横向滚动条**', async () => {
+  const m = await measureOverflow()
+  if (m && m.scrollWidth > m.clientWidth + 1) {
+    throw new Error(`展开后表格横向溢出了：${JSON.stringify(m)}`)
   }
+  if (m) console.log(`   内容宽 ${m.scrollWidth}px / 可视宽 ${m.clientWidth}px`)
 })
 
-// 展开后列变多，表格会横向滚动 —— 「操作」是固定列，会盖住右侧列。
-// 这里滚到最右，确认「状态」列的内容**完整可见**（没被固定列盖掉一半）。
-await step('横滚到最右时状态列完整可见', async () => {
-  await page.evaluate(() => {
-    const body = document.querySelector('.flow-rows-table .el-scrollbar__wrap')
-      || document.querySelector('.flow-rows-table .el-table__body-wrapper')
-    if (body) body.scrollLeft = body.scrollWidth
-  })
-  await page.waitForTimeout(600)
-  const cell = page.locator('.flow-rows-table tbody tr').first().locator('td')
-    .filter({ hasText: /待确认|已制证|已入账|已忽略|待制证/ }).first()
-  if (await cell.count()) {
-    const box = await cell.boundingBox()
-    const table = await page.locator('.flow-rows-table').boundingBox()
-    if (box && table && box.x + box.width > table.x + table.width + 1) {
-      throw new Error(`状态列被固定列盖住了：${JSON.stringify(box)} / ${JSON.stringify(table)}`)
-    }
-  }
-  await page.screenshot({ path: `${OUT}/flow_compact_scrolled.png` })
-  await page.evaluate(() => {
-    const body = document.querySelector('.flow-rows-table .el-scrollbar__wrap')
-      || document.querySelector('.flow-rows-table .el-table__body-wrapper')
-    if (body) body.scrollLeft = 0
-  })
-  await page.waitForTimeout(400)
-})
-
-// ---- 对方科目弹窗 ----
-await step('打开对方科目弹窗', async () => {
-  await page.locator('.flow-rows-table tbody tr').first()
+// ---- 对方科目弹窗（从**展开行里**点） ----
+await step('展开行里能打开对方科目弹窗', async () => {
+  await page.locator('.flow-extra')
     .locator('button:has-text("指定"), button:has-text("调整")').first().click()
   await page.waitForTimeout(700)
   await page.screenshot({ path: `${OUT}/flow_plan_dialog.png` })
@@ -161,6 +169,55 @@ await step('能再加一个科目（拆成两个）', async () => {
   const rows = await page.locator('.flow-plan-row').count()
   if (rows < 2) throw new Error(`加完之后只有 ${rows} 行`)
   await page.screenshot({ path: `${OUT}/flow_plan_dialog_two.png` })
+})
+
+// ---- 流水科目规则页：摘要模板的「占位符 / 示例 / 预览」 ----
+//
+// 用户说过这个功能「有点看不懂」—— 所以界面上必须三样齐全：
+// 占位符能点、示例能套、预览能看到真东西长什么样。
+await step('切到流水科目规则页', async () => {
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(500)
+  await page.click('.el-tabs__item:has-text("流水科目规则")')
+  await page.waitForTimeout(900)
+})
+
+await step('账套级模板：点一下占位符就插进去', async () => {
+  const input = page.locator('.flow-config-input input').first()
+  await input.fill('')
+  await page.locator('.flow-placeholder-tag').filter({ hasText: '{用途}' }).first().click()
+  await page.waitForTimeout(400)
+  const v = await input.inputValue()
+  if (!v.includes('{用途}')) throw new Error(`点占位符没插进去：${v}`)
+})
+
+await step('预览跟着模板实时变', async () => {
+  const preview = page.locator('.flow-template-preview-text').first()
+  const text = (await preview.innerText()).trim()
+  if (!text) throw new Error('预览是空的')
+  console.log(`   预览：${text}`)
+  await page.screenshot({ path: `${OUT}/flow_template_preview.png` })
+})
+
+await step('套用示例模板，预览也变', async () => {
+  const input = page.locator('.flow-config-input input').first()
+  await input.fill('')
+  // 挑一条**三个字段都有值**的示例 —— dev 库里第一行流水的「用途」与
+  // 「对方户名」都是空的，套「用途 + 对方」会渲染成「-」（那是对的，
+  // 但验不出东西）。「日期 + 摘要 + 金额」这三个字段都有值。
+  await page.locator('.flow-placeholder-tag')
+    .filter({ hasText: '日期 + 摘要 + 金额' }).first().click()
+  await page.waitForTimeout(500)
+  const v = await input.inputValue()
+  if (!v.includes('{日期}') || !v.includes('{摘要}') || !v.includes('{金额}')) {
+    throw new Error(`示例模板没套进去：${v}`)
+  }
+  const text = (await page.locator('.flow-template-preview-text').first().innerText()).trim()
+  // 渲染出来必须**有实际内容**（不是空、也不是只剩分隔符）
+  if (!text || !/[0-9A-Za-z一-龥]/.test(text)) {
+    throw new Error(`预览没渲染出内容：${text}`)
+  }
+  console.log(`   预览：${text}`)
 })
 
 console.log(errors.length ? `\n有问题：${errors.length}` : '\n没问题')

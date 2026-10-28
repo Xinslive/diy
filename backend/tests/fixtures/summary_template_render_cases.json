@@ -1,0 +1,104 @@
+{
+  "_说明": "摘要模板渲染的**唯一一份基准**。前端预览（frontend/src/views/bank/flow_state.js 的 renderSummary）与后端（backend/app/bankstatement/service.py 的 render_summary）各自钉一条用例读它 —— 口径一漂移，至少有一边会红。前端预览要是和真生成的摘要对不上，那预览就等于没有预览。",
+  "_字段": "row 里的 tx_date / amount 是字符串，后端那条用例读的时候要转成 date / Decimal（前端那边直接用字符串）。",
+  "cases": [
+    {
+      "name": "用途 + 对方户名",
+      "template": "{用途}-{对方户名}",
+      "row": {
+        "seq": 7,
+        "tx_date": "2026-09-14",
+        "direction": "IN",
+        "amount": "5000.00",
+        "summary": "转入",
+        "purpose": "办公室租金",
+        "counterparty_name": "某某公司"
+      },
+      "expected": "办公室租金-某某公司"
+    },
+    {
+      "name": "日期 + 摘要 + 金额",
+      "template": "{日期}-{摘要}-{金额}",
+      "row": {
+        "seq": 8,
+        "tx_date": "2026-09-15",
+        "direction": "OUT",
+        "amount": "1200.50",
+        "summary": "支取",
+        "purpose": "",
+        "counterparty_name": ""
+      },
+      "expected": "2026-09-15-支取-1200.50"
+    },
+    {
+      "name": "方向 + 序号",
+      "template": "{方向}第{序号}笔",
+      "row": {
+        "seq": 12,
+        "tx_date": "2026-09-20",
+        "direction": "OUT",
+        "amount": "300.00",
+        "summary": "手续费",
+        "purpose": "",
+        "counterparty_name": ""
+      },
+      "expected": "支出第12笔"
+    },
+    {
+      "name": "空模板 → 内置口径（用途优先）",
+      "template": "",
+      "row": {
+        "seq": 3,
+        "tx_date": "2026-09-02",
+        "direction": "IN",
+        "amount": "800.00",
+        "summary": "快捷支付",
+        "purpose": "支付宝-消费刘某某",
+        "counterparty_name": "刘某某"
+      },
+      "expected": "支付宝-消费刘某某"
+    },
+    {
+      "name": "空模板且没有用途 → 内置口径（摘要兜底）",
+      "template": "   ",
+      "row": {
+        "seq": 4,
+        "tx_date": "2026-09-03",
+        "direction": "OUT",
+        "amount": "50.00",
+        "summary": "短信收费",
+        "purpose": "",
+        "counterparty_name": ""
+      },
+      "expected": "短信收费"
+    },
+    {
+      "name": "模板里的占位符取到空值 → 退回内置口径（预览显示的就是它）",
+      "template": "{用途}",
+      "row": {
+        "seq": 1,
+        "tx_date": "2026-09-28",
+        "direction": "IN",
+        "amount": "872100.00",
+        "summary": "杨育军",
+        "purpose": "",
+        "counterparty_name": ""
+      },
+      "expected": "杨育军"
+    },
+    {
+      "name": "空模板且摘要用途都没有 → 内置口径最后一档",
+      "template": "",
+      "row": {
+        "seq": 5,
+        "tx_date": "2026-09-04",
+        "direction": "IN",
+        "amount": "60.00",
+        "summary": "",
+        "purpose": "",
+        "counterparty_name": ""
+      },
+      "expected": "银行收 对方"
+    }
+  ]
+}

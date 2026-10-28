@@ -244,3 +244,83 @@ export const unknownTemplateFields = (template) => {
   }
   return found
 }
+
+/**
+ * 模板取值。**与后端 `service.render_summary` 里的取值一一对应**。
+ *
+ * 值本身按「取到什么就用什么」：对账单上那一列是空的就取空串 —— 模板里的
+ * 占位符换成空的，渲染出来就是少一段，而不是冒出个「None」。
+ */
+export const summaryTemplateValues = (row) => ({
+  '摘要': row?.summary || '',
+  '用途': row?.purpose || '',
+  '对方户名': row?.counterparty_name || '',
+  '日期': row?.tx_date || '',
+  '金额': row?.amount ?? '',
+  '方向': row?.direction === 'IN' ? '收入' : (row?.direction === 'OUT' ? '支出' : ''),
+  '序号': row?.seq ?? '',
+})
+
+/**
+ * 内置口径（没设模板时的样子）：**用途优先，摘要兜底**。
+ *
+ * 与后端 `service._default_summary` 同口径 —— 预览要让人看到「不设模板
+ * 时长什么样」，不然用户没有参照。
+ */
+export const defaultSummaryText = (row) => {
+  if (row?.purpose) return row.purpose
+  if (row?.summary) return row.summary
+  const who = row?.counterparty_name || '对方'
+  return `银行${row?.direction === 'IN' ? '收' : '付'} ${who}`
+}
+
+/**
+ * 按模板渲染摘要 —— **与后端 `service.render_summary` 同口径**。
+ *
+ * 口径漂移的后果是「预览里长这样、生成的凭证上长那样」，那就等于没有预览。
+ * 所以两边**共用一份基准**（`backend/tests/fixtures/summary_template_render_cases.json`），
+ * 各自钉一条用例：口径一改，至少有一边会红。
+ *
+ * **有一处故意的不同**：模板里出现**不认识的**占位符时，后端是整段渲染失败
+ * → 退回内置口径；这里改成**原样留着**（`{摘}` 就显示 `{摘}`）。
+ * 因为前端预览是给**正在输入的人**看的 —— 打到一半的 `{摘` 要是直接变成
+ * 默认口径，用户会以为模板没生效。而已保存的模板里不会有不认识的占位符
+ * （后端存的时候就拒了），所以这个不同**不影响真实生成的摘要**。
+ */
+export const renderSummary = (template, row) => {
+  const text = String(template || '').trim()
+  if (!text) return defaultSummaryText(row)
+  const values = summaryTemplateValues(row)
+  const out = text.replace(/\{([^{}]*)\}/g, (whole, key) =>
+    (Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : whole))
+  const trimmed = out.trim()
+  return trimmed || defaultSummaryText(row)
+}
+
+/**
+ * 现成的示例模板 —— **给用户照抄的**，不用自己想。
+ *
+ * 一个「看不懂」的模板功能，光列占位符是不够的：用户不知道该拼成什么样。
+ * 这几条覆盖了最常见的几种拼法，点一下就填进输入框。
+ */
+export const SUMMARY_TEMPLATE_EXAMPLES = [
+  { label: '只取用途', template: '{用途}' },
+  { label: '用途 + 对方', template: '{用途}-{对方户名}' },
+  { label: '日期 + 用途', template: '{日期}-{用途}' },
+  { label: '日期 + 摘要 + 金额', template: '{日期}-{摘要}-{金额}' },
+]
+
+/**
+ * 那一行各字段的值 —— **预览要把它一起摆出来**。
+ *
+ * 为什么：模板渲染出来是空的时候，后端会**退回内置口径**（用途优先、摘要
+ * 兜底），预览显示的也就是内置口径那个结果。只给结果的话，用户会看见
+ * 「{用途} → 杨育军」，而「杨育军」其实是**摘要** —— 他会以为用途字段是
+ * 杨育军。把字段值摆出来，他一眼就看出「用途是空的，所以换了摘要顶上」。
+ */
+export const summaryTemplateValuesText = (row) => {
+  const values = summaryTemplateValues(row)
+  return SUMMARY_TEMPLATE_FIELDS
+    .map((field) => `${field}=${values[field] === '' ? '（空）' : values[field]}`)
+    .join('　')
+}

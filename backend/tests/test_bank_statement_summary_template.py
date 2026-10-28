@@ -194,3 +194,43 @@ def test_人工指定的行用账套级模板(statement, db, book, admin_user, s
     assert result["created_count"] == 1, f"制证失败：{result['failures']}"
     summary = _voucher_summary(db, result["created"][0]["voucher_id"])
     assert summary == f"账套级 {row['summary']}", f"人工指定的行不该用规则级模板：{summary}"
+
+
+# ----------------------------------------------------------------------
+# 渲染口径：前后端共用**一份基准**
+# ----------------------------------------------------------------------
+#
+# 前端的「预览」要显示「这条流水最后会长成什么样」—— 预览与真生成的摘要
+# 对不上，那预览就等于没有预览。而这两处是**两套代码**（Python 与 JS），
+# 所以它们共用一份基准文件：各自钉一条用例读它。口径一漂移，至少有一边红。
+#
+# 基准放在 fixtures 里而不是各写一份期望值 —— 期望值写两遍，它迟早会漂。
+
+_RENDER_CASES = (pathlib.Path(__file__).resolve().parent / "fixtures"
+                 / "summary_template_render_cases.json")
+
+
+def test_渲染口径与前端预览共用同一份基准():
+    import json
+    from datetime import date
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    cases = json.loads(_RENDER_CASES.read_text(encoding="utf-8"))
+    assert cases["cases"], "基准文件是空的 —— 那这条用例等于没跑"
+
+    for case in cases["cases"]:
+        raw = case["row"]
+        row = SimpleNamespace(
+            seq=raw["seq"],
+            tx_date=date.fromisoformat(raw["tx_date"]),
+            direction=raw["direction"],
+            amount=Decimal(raw["amount"]),
+            summary=raw["summary"],
+            purpose=raw["purpose"],
+            counterparty_name=raw["counterparty_name"],
+        )
+        out = service.render_summary(row, case["template"])
+        assert out == case["expected"], (
+            f"{case['name']}：渲染出 {out!r}，基准写的是 {case['expected']!r}"
+            f"（前端预览用的是同一份基准，两边对不上就是口径漂了）")
