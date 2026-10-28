@@ -29,7 +29,13 @@
             </div>
           </template>
           <el-form :model="uploadForm" label-width="92px" class="flow-upload-form">
-            <el-row :gutter="'0 28'">
+            <!-- **gutter 只能是数字。**
+                 原来这里写的是 ``:gutter="'0 28'"``（想表达「横向 0、纵向 28」），
+                 而 el-row 的 gutter 只认 Number —— 传字符串会算出 NaN，
+                 margin 变成 ``NaNpx`` 被浏览器丢掉，于是**两栏贴着、窄屏上也没有
+                 28px 的竖间距**，控制台还一直报 prop 类型错。
+                 横向不要间距就写 0，纵向的间距由下面的 CSS 给。 -->
+            <el-row :gutter="0" class="flow-upload-row">
               <el-col :xs="24" :sm="10">
                 <el-form-item label="现金科目">
                   <el-select
@@ -269,7 +275,8 @@
             <div class="section-head">
               <span>流水明细</span>
               <span class="muted">
-                默认只显示对账单上解析出来的内容；方向、对方科目、状态点行首箭头**往下展开**（不加列，不会出左右滑动条）
+                每行的「对账信息」（方向、对方科目、状态、操作）**默认展开**；
+                嫌占地方就用行首箭头收起（不加列，不会出左右滑动条）
               </span>
             </div>
           </template>
@@ -298,39 +305,40 @@
               <template v-if="plan.pending_count">，待确认科目 {{ plan.pending_count }} 条</template>
               <template v-if="plan.unknown_count">，待确认方向 {{ plan.unknown_count }} 条</template>
             </span>
-            <!-- **账上已有同一笔、只是记错了账户**：默认收起时也要看得见，
+            <!-- **账上已有同一笔、只是记错了账户**：这几行要提醒用户，
                  否则用户根本不知道有笔钱记错了地方。
-                 点它直接把**这些行展开**（往下展开），不用自己再一格格点箭头。 -->
+                 （行默认就是展开的，所以这里只报个数，不再做「点我展开」的动作。） -->
             <el-tag
               v-if="reclassifyCount"
               type="warning"
               effect="plain"
-              class="flow-tag-button"
-              @click="expandRowsWithCandidates"
             >
-              账上已有对应分录 {{ reclassifyCount }} 行 · 展开看
+              账上已有对应分录 {{ reclassifyCount }} 行
             </el-tag>
           </div>
 
           <el-table
-            ref="rowsTable"
             :data="rows"
             v-loading="loadingRows"
             size="small"
             class="flow-rows-table"
             empty-text="先选一份对账单"
+            :default-expand-all="true"
           >
             <!-- 「对账信息」：**往下展开**，不是往右加列。
                  早先那版是加 4 个列（方向/对方科目/状态/操作），列一多表格就被
                  撑宽 → 出现**左右滑动条**，而这张表在窄屏上本来就挤 —— 于是
                  用户得一边横拖一边看，改起来很难受。
-                 改成展开行后**列数恒定**，表格宽度不变，横向永远不会溢出；
-                 想看哪一行就点哪一行的箭头。
+                 改成展开行后**列数恒定**，表格宽度不变，横向永远不会溢出。
+
+                 **默认展开**（``:default-expand-all``）：方向、对方科目、状态这三样
+                 是对账时**每行都要看**的东西，让用户一格格点箭头才看得见，等于
+                 把主要工作藏起来了。默认摊开，要收起用行首箭头。
 
                  **展开箭头一直都在**：曾经前面还挂一个「对账信息」勾选开关，
                  不勾就没有箭头 —— 于是「不看对账信息的人」和「要改对账信息的人」
-                 看到的是**两张不同的表**。用户原话：「默认收起就行，去掉勾选
-                 对账信息的开关」。现在只剩一个动作：点行首箭头，往下展开。 -->
+                 看到的是**两张不同的表**。用户原话：「去掉勾选对账信息的开关」。
+                 现在只剩一个动作：点行首箭头，往下展开/收起。 -->
             <el-table-column type="expand" width="42">
               <template #default="{ row }">
                 <div class="flow-extra">
@@ -458,7 +466,9 @@
       </el-tab-pane>
 
       <!-- ============================================================ 科目规则 -->
-      <el-tab-pane label="流水科目规则" name="rules">
+      <!-- 名字就「科目规则」：这一页管的是「按关键词定对方科目」，
+           前面那个「流水」是废话 —— 页签叫「流水对账」已经交代了上下文。 -->
+      <el-tab-pane label="科目规则" name="rules">
         <el-card shadow="never" class="flow-config-card">
           <template #header>
             <div class="section-head">
@@ -523,7 +533,7 @@
         <el-card shadow="never">
           <template #header>
             <div class="section-head">
-              <span>流水科目规则</span>
+              <span>科目规则</span>
               <span class="muted">
                 按摘要 / 用途 / 对方户名里的关键词定对方科目；
                 优先级大的赢，同级取更长的关键词。
@@ -613,11 +623,12 @@
                   placeholder="留空 = 用账套级"
                   @change="(v) => saveRuleTemplate(row, v)"
                 />
-                <!-- 每条规则也给个预览 —— 模板写在这里，用途却是在凭证上 -->
-                <div class="flow-template-preview flow-template-preview--cell">
-                  <span class="muted small">预览：</span>
-                  <span class="flow-template-preview-text">{{ renderSummary(row.summary_template, previewRow) }}</span>
-                </div>
+                <!-- **已保存的规则不再逐行给预览。**
+                     预览是**写模板时**才需要的东西：模板长什么样，得当场看着
+                     一行流水才知道。规则存下来之后，用途是在凭证上（那张凭证的
+                     摘要是什么样子），一行一格地铺开预览只会把表格撑得又高又乱，
+                     真正要盯的几行反而被淹了。
+                     所以：**新增规则时预览一下**（上面那块），存完就干净了。 -->
               </template>
             </el-table-column>
             <el-table-column label="优先级" prop="priority" width="80" />
@@ -724,7 +735,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Refresh, Upload } from '@element-plus/icons-vue'
 import * as api from '@/api/bankstatement'
@@ -750,8 +761,6 @@ const subjects = ref([])
 const rules = ref([])
 const profiles = ref([])
 const rows = ref([])
-/** 流水明细表 —— 「展开」要用它的实例去展开指定的行。 */
-const rowsTable = ref(null)
 const plan = ref(null)
 const current = ref(null)
 const activeStatementId = ref(null)
@@ -769,37 +778,24 @@ const diagPanels = ref([])
 const manualMapping = reactive({})
 
 /**
- * 「对账信息」栏：**默认收起**，而且是**往下展开**（不是往右加列）。
+ * 「对账信息」栏：**默认展开**，而且是**往下展开**（不是往右加列）。
  *
- * 明细页默认只显示对账单上解析出来的内容（日期、摘要、用途、对方户名、
- * 收入、支出、余额）；方向、对方科目、状态这些「账上才有的东西」收在
- * 展开行里 —— 它们要改、要判断，但看一眼流水本身用不着。
+ * 方向、对方科目、状态这三样是**对账时每行都要看**的东西 —— 让用户一格格点
+ * 行首箭头才看得见，等于把主要工作藏起来了。所以默认摊开；嫌占地方就用
+ * 行首箭头收起。表格本身仍然只显示对账单上解析出来的内容（日期、摘要、
+ * 用途、对方户名、收入、支出、余额）作为行首那一条。
  *
  * **为什么不加列**：加了列表格就被撑宽，窄屏上会冒出**左右滑动条** ——
  * 一边横拖一边看，账对起来很难受。改成展开行后列数恒定，横向不会溢出。
  *
  * **没有开关**：展开箭头一直都在（曾经过来是「勾上『对账信息』才出现箭头」，
  * 那样「不看对账信息的人」和「要改对账信息的人」看到的是两张不同的表）。
- * 现在只剩一个动作：点行首箭头，往下展开。
- */
-
-/**
- * 把「账上已有对应分录」的那些行**直接展开**。
+ * 现在只剩一个动作：点行首箭头，往下展开/收起。
  *
- * 「对账信息」是往下展开的，光把箭头摆在那儿还不够 —— 用户还得自己一格格
- * 点行首箭头才看得到。这里替他展开那些真正需要看的行。
- *
- * **要等 nextTick**：表格要重渲染一遍，展开状态才认得上行；不等就会展开不上。
+ * **默认展开是 el-table 的 ``:default-expand-all``**：它在**数据每次换掉**时
+ * 都会重新摊开（换对账单、刷新流水之后依然展开）。自己拿 toggleRowExpansion
+ * 一格格展开做不到这一点 —— 那是「展开一次」，不是「默认展开」。
  */
-function expandRowsWithCandidates() {
-  nextTick(() => {
-    const table = rowsTable.value
-    if (!table) return
-    rows.value.forEach((row) => {
-      if (row.reclassify_candidates?.length) table.toggleRowExpansion(row, true)
-    })
-  })
-}
 
 /** 对方科目编辑弹窗。 */
 const planDialog = reactive({ open: false, row: null, items: [] })
@@ -1324,6 +1320,12 @@ onMounted(() => {
 .small { font-size: 12px; }
 .picked { margin-left: 12px; font-size: 12px; }
 .flow-upload-form { max-width: 900px; }
+/* 窄屏上两个字段会**上下叠起来**（xs=24）—— 叠起来时得留点竖间距，
+   否则「现金科目」和「对账单」贴成一片。宽屏并排时不加这个间距。 */
+.flow-upload-row :deep(.el-col) { margin-bottom: 18px; }
+@media (min-width: 768px) {
+  .flow-upload-row :deep(.el-col) { margin-bottom: 0; }
+}
 .flow-rows-toolbar {
   display: flex;
   align-items: center;
@@ -1334,7 +1336,6 @@ onMounted(() => {
 .flow-select { width: 340px; }
 .flow-direction { width: 92px; }
 .flow-subject { width: 200px; }
-.flow-tag-button { cursor: pointer; }
 
 /* 流水明细表要**紧凑**：一行流水一眼能扫过去，而不是一屏放不了十行。 */
 .flow-rows-table :deep(.el-table__cell) { padding: 4px 0; }
@@ -1399,12 +1400,6 @@ onMounted(() => {
   border-radius: 4px;
   background: var(--el-fill-color-lighter);
   min-height: 28px;
-}
-.flow-template-preview--cell {
-  margin-top: 4px;
-  padding: 2px 6px;
-  background: transparent;
-  min-height: 0;
 }
 .flow-template-preview-text {
   font-size: 13px;

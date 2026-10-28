@@ -31,6 +31,42 @@ const {
 const VIEW = fs.readFileSync(
   new URL('../src/views/bank/FlowReconciliation.vue', import.meta.url), 'utf8')
 
+/**
+ * 抠出**流水明细那张表**的 ``<el-table>`` 开标签（含全部属性）。
+ *
+ * 为什么不用正则去猜：流水对账这个 .vue 里有三张 el-table（对账单台账、科目规则、
+ * 流水明细），「默认展开」这种事必须**钉在流水明细那张**上 —— 钉错了表，
+ * 用例照样绿，而默认展开根本没生效。
+ */
+function rowsTableTag() {
+  const at = VIEW.indexOf('class="flow-rows-table"')
+  assert.ok(at > 0, '找不到流水明细表')
+  const start = VIEW.lastIndexOf('<el-table', at)
+  const end = VIEW.indexOf('>', at)
+  assert.ok(start > 0 && end > at, '流水明细表的开标签抠不出来')
+  return VIEW.slice(start, end + 1)
+}
+
+/** 抠出**科目规则那张表**（:data="rules"）的整段。 */
+function rulesTableBlock() {
+  const at = VIEW.indexOf(':data="rules"')
+  assert.ok(at > 0, '找不到科目规则表')
+  const end = VIEW.indexOf('</el-table>', at)
+  assert.ok(end > at, '科目规则表抠不出整段')
+  return VIEW.slice(at, end)
+}
+
+/**
+ * 去掉 HTML 注释。
+ *
+ * 这些 .vue 里**注释写得很长**（把「为什么这么改」也写在旁边），而注释里
+ * 出现某个词（哪怕是「预览」「toggleRowExpansion」）并不等于界面上有它。
+ * 断言「界面上没有 X」时必须先剥掉注释，否则会被自己写的说明文字绊倒。
+ */
+function stripComments(text) {
+  return text.replace(/<!--[\s\S]*?-->/g, '')
+}
+
 let pass = 0, fail = 0
 const t = (name, fn) => {
   try { fn(); console.log('  OK  ', name); pass++ }
@@ -130,9 +166,9 @@ t('页面提供「记住这个格式」与「按指定重新解析」', () => {
   assert.match(VIEW, /按指定重新解析/)
 })
 
-console.log('== 流水明细页：默认只显示解析出来的内容 ==')
+console.log('== 流水明细页：对账信息默认展开 ==')
 
-t('方向、对方科目、状态收在展开行里（默认收起，且是往下展开）', () => {
+t('方向、对方科目、状态收在展开行里（默认展开，且是往下展开）', () => {
   // **往下展开**：用展开行，不是往右加列。
   // 加列会把表格撑宽 → 窄屏上冒出左右滑动条，一边横拖一边看很难受。
   assert.match(VIEW, /type="expand"/)
@@ -144,7 +180,7 @@ t('方向、对方科目、状态收在展开行里（默认收起，且是往�
   // **不许**再有那三个「往右加」的列
   //
   // 只看**流水明细这张表**（``.flow-rows-table``）—— 同一个 .vue 里还有
-  // 对账单台账（「状态」列）与流水科目规则（「对方科目」列）两张表，
+  // 对账单台账（「状态」列）与科目规则（「对方科目」列）两张表，
   // 那些列是正经的，别一起禁掉。
   const rowsTableStart = VIEW.indexOf('class="flow-rows-table"')
   assert.ok(rowsTableStart > 0, '找不到流水明细表')
@@ -157,14 +193,32 @@ t('方向、对方科目、状态收在展开行里（默认收起，且是往�
   }
 })
 
+t('默认展开：每行的对账信息一开始就在眼前', () => {
+  // 方向 / 对方科目 / 状态是**每行都要看**的东西，让用户一格格点箭头才看得见，
+  // 等于把主要工作藏起来了。
+  assert.match(rowsTableTag(), /:default-expand-all="true"/,
+    '流水明细表没开 default-expand-all —— 行还是默认收起的')
+})
+
+t('默认展开不是「展开一次」：换对账单、刷新之后依然展开', () => {
+  // ``:default-expand-all`` 在**数据每次换掉**时都会重新摊开；
+  // 自己拿 toggleRowExpansion 一格格展开做不到这一点 ——
+  // 那是「展开一次」（换份对账单就又收起了），不是「默认展开」。
+  const code = stripComments(VIEW)
+  assert.doesNotMatch(code, /toggleRowExpansion\(/,
+    '还用着一次性展开冒充「默认展开」')
+  assert.doesNotMatch(code, /expandRowsWithCandidates/,
+    '展开候选行的老辅助函数已经用不上了')
+})
+
 t('展开箭头一直都在：没有「对账信息」勾选开关', () => {
-  // 用户原话：「默认收起就行，去掉勾选对账信息的开关」。
+  // 用户原话：「去掉勾选对账信息的开关」。
   // 曾经过去是「勾上『对账信息』才出现行首箭头」—— 那样「不看对账信息的人」
   // 和「要改对账信息的人」看到的是**两张不同的表**。
   assert.doesNotMatch(VIEW, /showExtra/, '还有 showExtra 这个开关状态')
   assert.doesNotMatch(VIEW, /对账信息<\/el-checkbox>/, '「对账信息」勾选开关还在')
   assert.doesNotMatch(VIEW, /class="flow-toggle"/, '「对账信息」勾选开关还在')
-  // 展开列**没有** v-if —— 箭头常在，行默认收起
+  // 展开列**没有** v-if —— 箭头常在，行默认展开
   assert.match(VIEW, /<el-table-column type="expand"/)
 })
 
@@ -370,6 +424,28 @@ t('页面上有占位符按钮、示例与预览', () => {
   assert.match(VIEW, /configPreviewText/)
   assert.match(VIEW, /rulePreviewText/)
   assert.match(VIEW, /renderSummary/)
+})
+
+t('已保存的规则不再逐行给预览；新增规则时预览一下就够', () => {
+  // 预览是**写模板时**才需要的东西：模板长什么样，得当场看着一行流水才知道。
+  // 规则存下来之后用途在凭证上，一行一格铺开预览只会把表格撑得又高又乱。
+  //
+  // **只认界面上的东西**：这些 .vue 的注释里满是解释（「预览是写模板时才需要…」），
+  // 注释里写着「预览」不等于界面上有预览 —— 所以先剥掉注释再断言。
+  const block = stripComments(rulesTableBlock())
+  assert.doesNotMatch(block, /renderSummary\(/, '规则表里还在逐行渲染预览')
+  assert.doesNotMatch(block, /预览/, '规则表里还有预览')
+  // 但**新增规则**那块的预览必须还在（rulePreviewText）
+  assert.match(VIEW, /rulePreviewText/)
+  assert.match(VIEW, /configPreviewText/)
+})
+
+console.log('== 页签的名字 ==')
+
+t('页签叫「科目规则」，不是「流水科目规则」', () => {
+  // 页签本身就叫「流水对账」，前面再缀一个「流水」是废话。
+  assert.match(VIEW, /<el-tab-pane label="科目规则" name="rules">/)
+  assert.doesNotMatch(VIEW, /流水科目规则/, '界面里还有「流水科目规则」')
 })
 
 console.log('== 凭证摘要模板 ==')
