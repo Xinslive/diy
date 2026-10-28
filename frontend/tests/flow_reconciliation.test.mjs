@@ -25,7 +25,7 @@ const {
   reclassifyRowCount, reclassifyCandidateText, unknownTemplateFields,
   isCrossPeriod, reclassifyCrossPeriodText, reclassifyCrossPeriodConfirm,
   renderSummary, summaryTemplateValuesText, SUMMARY_TEMPLATE_EXAMPLES,
-  SUMMARY_TEMPLATE_FIELDS, effectivePlanSubjectSummary, planSubjectSummary,
+  SUMMARY_TEMPLATE_FIELDS, planSubjectSummary, defaultExpandedRowIds,
 } = STATE
 
 const VIEW = fs.readFileSync(
@@ -169,7 +169,7 @@ t('页面提供「记住这个格式」与「按指定重新解析」', () => {
   assert.match(VIEW, /按指定重新解析/)
 })
 
-console.log('== 流水明细页：对账信息默认展开 ==')
+console.log('== 流水明细页：对账信息默认摊开（但只摊「还有活要干的行」）==')
 
 t('方向、对方科目、状态收在展开行里（默认展开，且是往下展开）', () => {
   // **往下展开**：用展开行，不是往右加列。
@@ -196,22 +196,44 @@ t('方向、对方科目、状态收在展开行里（默认展开，且是往�
   }
 })
 
-t('默认展开：每行的对账信息一开始就在眼前', () => {
-  // 方向 / 对方科目 / 状态是**每行都要看**的东西，让用户一格格点箭头才看得见，
-  // 等于把主要工作藏起来了。
-  assert.match(rowsTableTag(), /:default-expand-all="true"/,
-    '流水明细表没开 default-expand-all —— 行还是默认收起的')
+t('默认摊开的是「还有活要干的行」；已入账、被发票占用的收起', () => {
+  // 用户要求（2026-10-28）：「已入账的流水明细默认收起」、
+  // 「被发票占用的流水……也默认收起」。
+  //
+  // **判据 = 对方科目还能不能改**：还能改 = 还有活；不能改 = 账上（或发票上）
+  // 已经有定论了 —— 那些行的对账信息看一眼就够，全摊开反而把要处理的那
+  // 几行淹了。
+  const rows = [
+    { id: 1, matched_voucher_id: null, matched_invoice_record_id: null },
+    { id: 2, matched_voucher_id: 9, matched_invoice_record_id: null },
+    { id: 3, matched_voucher_id: null, matched_invoice_record_id: 4 },
+    { id: 4, matched_voucher_id: null, matched_invoice_record_id: null },
+  ]
+  assert.deepEqual(defaultExpandedRowIds(rows), [1, 4])
+  assert.deepEqual(defaultExpandedRowIds([]), [])
+  assert.deepEqual(defaultExpandedRowIds(null), [])
 })
 
-t('默认展开不是「展开一次」：换对账单、刷新之后依然展开', () => {
-  // ``:default-expand-all`` 在**数据每次换掉**时都会重新摊开；
-  // 自己拿 toggleRowExpansion 一格格展开做不到这一点 ——
-  // 那是「展开一次」（换份对账单就又收起了），不是「默认展开」。
+t('按行控制展开要用 row-key + expand-row-keys，不能用 default-expand-all', () => {
+  // ``:default-expand-all`` 是「全展或全不展」，没有「哪些行展」这一说 ——
+  // 要按行控制就只能用 ``row-key`` + ``:expand-row-keys``。
+  //
+  // **少 row-key 会当场抛错**：``setExpandRowKeys`` 里第一句就是
+  // ``assertRowKey()``（row-key 没配就 throw "[ElTable] prop row-key is required"）。
+  const tag = rowsTableTag()
+  assert.match(tag, /row-key="id"/, '流水明细表没配 row-key')
+  assert.match(tag, /:expand-row-keys="expandedRowIds"/, '没按行控制展开')
+  assert.doesNotMatch(tag, /:default-expand-all/, '还在用 default-expand-all')
+})
+
+t('用户手动开过/关过的行不会被下一次刷新弹回去', () => {
+  // ``:expand-row-keys`` 一变，el-table 把展开状态**整个换成**那批 key
+  // （setExpandRowKeys 是赋值，不是合并）—— 而数据每换一次那个数组都会重算。
+  // 不把用户的动作记下来，他刚点开的行就被弹回去了。
   const code = stripComments(VIEW)
-  assert.doesNotMatch(code, /toggleRowExpansion\(/,
-    '还用着一次性展开冒充「默认展开」')
-  assert.doesNotMatch(code, /expandRowsWithCandidates/,
-    '展开候选行的老辅助函数已经用不上了')
+  assert.match(code, /rowExpandOverrides/)
+  assert.match(code, /@expand-change="onExpandChange"/)
+  assert.match(code, /function onExpandChange\(row, expandedRows\)/)
 })
 
 t('展开箭头一直都在：没有「对账信息」勾选开关', () => {
@@ -242,7 +264,7 @@ t('「忽略」之后「恢复」必须还能点', () => {
   assert.match(VIEW, /:disabled="!store\.canWrite \|\| !canToggleIgnore\(row\)"/)
 })
 
-console.log('== 已入账的流水：对方科目由凭证定死 ==')
+console.log('== 已入账 / 被发票占用的流水：对方科目不由流水这边定 ==')
 
 t('已生成凭证的行不能再指定对方科目', () => {
   // 只改流水行、不改凭证，两边就对不上 —— 而且界面上看不出来。
@@ -252,6 +274,18 @@ t('已生成凭证的行不能再指定对方科目', () => {
   assert.equal(canEditPlanSubject(null), false)
   // 界面必须置灰
   assert.match(VIEW, /:disabled="!canEditPlanSubject\(row\)"/)
+})
+
+t('被发票占用的行也不能再指定对方科目', () => {
+  // 发票那张凭证的分录是**发票自己**算出来的，流水这边只贡献结算账户 ——
+  // 流水行上填的对方科目**根本不会进那张凭证**。让用户去填一个不生效的
+  // 东西，是骗人。判据与后端同一条（matched_invoice_record_id）。
+  assert.equal(canEditPlanSubject({
+    matched_voucher_id: null, matched_invoice_record_id: null,
+  }), true)
+  assert.equal(canEditPlanSubject({
+    matched_voucher_id: null, matched_invoice_record_id: 7,
+  }), false)
 })
 
 t('「已入账定死」那句话与提示框都不再出现在界面上', () => {
@@ -278,20 +312,6 @@ t('表格用紧凑尺寸', () => {
 })
 
 console.log('== 指定科目时：每个对方科目各有一句凭证摘要 ==')
-
-t('每个科目的摘要：人工写的优先，没写才用规则算的', () => {
-  const row = { default_summary: '办公室租金' }
-  assert.equal(effectivePlanSubjectSummary({ summary_override: '备用金' }, row),
-    '备用金')
-  assert.equal(effectivePlanSubjectSummary({ summary_override: '' }, row),
-    '办公室租金')
-  // 人工写的是空白（只有空格）时**不算写过** —— 交回规则去算
-  assert.equal(effectivePlanSubjectSummary({ summary_override: '   ' }, row),
-    '办公室租金')
-  assert.equal(effectivePlanSubjectSummary({}, row), '办公室租金')
-  assert.equal(effectivePlanSubjectSummary(null, row), '办公室租金')
-  assert.equal(effectivePlanSubjectSummary(null, null), '')
-})
 
 t('人工摘要取自对方科目那一项，不是整张凭证', () => {
   assert.equal(planSubjectSummary({ summary_override: '备用金' }), '备用金')
@@ -330,11 +350,12 @@ t('没动过摘要框就不带 summary —— 那些科目要继续跟着规则�
   assert.match(VIEW, /entry\.summary = \(item\.summary \|\| ''\)\.trim\(\)/)
 })
 
-t('展开行里能看到每个科目用的是哪一句，人工写的要标出来', () => {
-  // **写了却看不见，等于没写** —— 用户没法确认「我改的那句还在不在」。
+t('流水明细页上不显示「凭证摘要」', () => {
+  // 用户要求：摘要只在「对方科目」弹窗里设，页面上不摆。
+  // 断言的是**剥掉注释后的模板** —— 注释里提到某个词不等于界面上有它。
   const view = stripComments(VIEW)
-  assert.match(view, /effectivePlanSubjectSummary\(item, row\)/)
-  assert.match(view, /v-if="planSubjectSummary\(item\)"/)
+  const expanded = view.slice(view.indexOf('type="expand"'), view.indexOf('</el-table>'))
+  assert.doesNotMatch(expanded, /凭证摘要/)
 })
 
 t('换了科目，摘要框回到默认 —— 显示的与存下来的一致', () => {

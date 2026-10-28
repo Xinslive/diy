@@ -1,10 +1,11 @@
 /**
  * 流水对账页的**界面自查**：上传一份夹具对账单，把「流水明细」页的两种
- * 形态都截下来 —— 默认收起「对账信息」的样子、展开后的样子、对方科目
+ * 形态都截下来 —— 摊开「对账信息」的样子、收起来的样子、对方科目
  * 编辑弹窗、改科目弹窗。
  *
- * **它验的是「看起来对不对」**：列的疏密、默认收起、弹窗里能不能把一笔
- * 流水拆到两个科目上 —— 这些单元测与后端用例都验不了。
+ * **它验的是「看起来对不对」**：列的疏密、默认摊开的是不是「还有活要干的
+ * 行」、弹窗里能不能把一笔流水拆到两个科目上 —— 这些单元测与后端用例都
+ * 验不了。
  *
  * 用法：node tools/uitest/ui_flow_page.mjs
  */
@@ -83,11 +84,14 @@ await step('切到流水明细并选中这份对账单', async () => {
 })
 await page.screenshot({ path: `${OUT}/flow_compact_default.png` })
 
-await step('默认收起时看不到方向/对方科目/状态列', async () => {
+await step('「方向/对方科目/状态」不是列（它们在展开行里）', async () => {
+  // **默认摊开的是「还有活要干的行」**（2026-10-28 改）—— 摊开的是**展开
+  // 行里的内容**，那三样**仍然不是表格列**：列一多表格就被撑宽，窄屏上
+  // 只能横着拖着看。
   const headers = await page.locator('.flow-rows-table thead th').allInnerTexts()
   const text = headers.join('|')
   for (const label of ['方向', '对方科目', '状态']) {
-    if (text.includes(label)) throw new Error(`「${label}」列默认不该出现：${text}`)
+    if (text.includes(label)) throw new Error(`「${label}」不该是列：${text}`)
   }
   for (const label of ['日期', '摘要', '用途', '对方户名', '收入', '支出', '余额']) {
     if (!text.includes(label)) throw new Error(`默认列少了「${label}」：${text}`)
@@ -137,11 +141,29 @@ await step('行首一直有展开箭头（没有「对账信息」开关）', as
 })
 
 await step('点行首箭头，内容在**行的下方**展开', async () => {
-  await page.locator('.flow-rows-table .el-table__expand-icon').first().click()
+  // **默认摊开的是「还有活要干的行」**（2026-10-28 改）—— 所以第一行很可能
+  // **本来就是展开的**。这时再点箭头是**收起**，脚本不能假设「点了就是展开」。
+  // 展开内容在**紧跟数据行之后的另一个 <tr> 里**（Element Plus 的展开行是
+  // 独立的一行），**不在数据行自己身上**。
+  const row = page.locator('.flow-rows-table tbody tr.el-table__row').first()
+  const icon = row.locator('.el-table__expand-icon').first()
+  const wasExpanded = (await icon.getAttribute('aria-expanded')) === 'true'
+  if (wasExpanded) {
+    // 先收起，顺手验一下「收」这条路也通
+    await icon.click()
+    await page.waitForTimeout(600)
+    const gone = row.locator('xpath=following-sibling::tr[1]')
+    if (await gone.locator('.flow-extra').count() !== 0) {
+      throw new Error('点了箭头没收起来')
+    }
+  }
+  await icon.click()
   await page.waitForTimeout(700)
-  const extra = page.locator('.flow-extra')
-  if (await extra.count() !== 1) throw new Error(`展开行不对（${await extra.count()} 个）`)
-  const text = await extra.innerText()
+  const expanded = row.locator('xpath=following-sibling::tr[1]')
+  if (await expanded.locator('.flow-extra').count() !== 1) {
+    throw new Error('展开内容不在紧跟其后的那一行里')
+  }
+  const text = await expanded.locator('.flow-extra').innerText()
   for (const label of ['方向', '对方科目', '状态']) {
     if (!text.includes(label)) throw new Error(`展开行里少了「${label}」：${text}`)
   }
@@ -158,8 +180,23 @@ await step('**展开后也没有横向滚动条**', async () => {
 
 // ---- 对方科目弹窗（从**展开行里**点） ----
 await step('展开行里能打开对方科目弹窗', async () => {
-  await page.locator('.flow-extra')
-    .locator('button:has-text("指定"), button:has-text("调整")').first().click()
+  // **默认摊开的可能不止一行**（2026-10-28 改：还有活要干的行都摊开），
+  // 所以不能直接拿「第一个 .flow-extra」—— 那一行可能是已入账的，
+  // 它的「指定/调整」按钮是**灰的**，点了没反应。
+  // 找**第一个按钮点得动**的展开行。
+  const extras = page.locator('.flow-rows-table .flow-extra')
+  const n = await extras.count()
+  let clicked = false
+  for (let i = 0; i < n; i++) {
+    const btn = extras.nth(i).locator(
+      'button:has-text("指定"), button:has-text("调整")').first()
+    if (!(await btn.count())) continue
+    if (await btn.isDisabled()) continue
+    await btn.click()
+    clicked = true
+    break
+  }
+  if (!clicked) throw new Error('没有一行能打开对方科目弹窗')
   await page.waitForTimeout(700)
   await page.screenshot({ path: `${OUT}/flow_plan_dialog.png` })
   const rows = await page.locator('.flow-plan-row').count()
@@ -174,14 +211,16 @@ await step('能再加一个科目（拆成两个）', async () => {
   await page.screenshot({ path: `${OUT}/flow_plan_dialog_two.png` })
 })
 
-// ---- 流水科目规则页：摘要模板的「占位符 / 示例 / 预览」 ----
+// ---- 科目规则页：摘要模板的「占位符 / 示例 / 预览」 ----
 //
 // 用户说过这个功能「有点看不懂」—— 所以界面上必须三样齐全：
 // 占位符能点、示例能套、预览能看到真东西长什么样。
-await step('切到流水科目规则页', async () => {
+await step('切到科目规则页', async () => {
   await page.keyboard.press('Escape')
   await page.waitForTimeout(500)
-  await page.click('.el-tabs__item:has-text("流水科目规则")')
+  // **页签叫「科目规则」，不是「流水科目规则」** —— 前面那个「流水」是废话，
+  // 页签叫「流水对账」已经交代了上下文了。（脚本按老名字点会一直超时。）
+  await page.click('.el-tabs__item:has-text("科目规则")')
   await page.waitForTimeout(900)
 })
 

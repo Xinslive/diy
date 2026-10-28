@@ -323,7 +323,9 @@
             size="small"
             class="flow-rows-table"
             empty-text="先选一份对账单"
-            :default-expand-all="true"
+            row-key="id"
+            :expand-row-keys="expandedRowIds"
+            @expand-change="onExpandChange"
           >
             <!-- 「对账信息」：**往下展开**，不是往右加列。
                  早先那版是加 4 个列（方向/对方科目/状态/操作），列一多表格就被
@@ -331,9 +333,14 @@
                  用户得一边横拖一边看，改起来很难受。
                  改成展开行后**列数恒定**，表格宽度不变，横向永远不会溢出。
 
-                 **默认展开**（``:default-expand-all``）：方向、对方科目、状态这三样
-                 是对账时**每行都要看**的东西，让用户一格格点箭头才看得见，等于
-                 把主要工作藏起来了。默认摊开，要收起用行首箭头。
+                 **默认展开的是「还有活要干的行」**（方向未定、对方科目待确认、
+                 还没入账）；**已入账的、被发票占用的默认收起** —— 那些行的
+                 对账信息看一眼就够了，全摊开反而把要处理的那几行淹了。
+                 用户手动开过的行留着（用户开过就说明他在看）。
+
+                 **不能用 ``:default-expand-all``**：它是「全展或全不展」，
+                 没有「哪些行展」这一说。要按行控制就得用
+                 ``row-key`` + ``:expand-row-keys``。
 
                  **展开箭头一直都在**：曾经前面还挂一个「对账信息」勾选开关，
                  不勾就没有箭头 —— 于是「不看对账信息的人」和「要改对账信息的人」
@@ -392,32 +399,6 @@
                     >
                       {{ row.plan_subjects?.length ? '调整' : '指定' }}
                     </el-button>
-                  </div>
-                  <div class="flow-extra-item">
-                    <span class="flow-extra-label">凭证摘要</span>
-                    <!-- **每个对方科目各显示自己那一句** —— 写了却看不见，
-                         等于没写：用户没法确认「我改的那句还在不在」。
-                         所以人工写过的要标出来。 -->
-                    <div v-if="row.plan_subjects?.length" class="flow-plan">
-                      <div
-                        v-for="item in row.plan_subjects"
-                        :key="item.subject_id"
-                        class="flow-plan-summary-row"
-                      >
-                        <span class="flow-plan-summary-subject">{{ planSubjectText(item) }}</span>
-                        <span class="muted">→</span>
-                        <span>{{ effectivePlanSubjectSummary(item, row) || '—' }}</span>
-                        <el-tag
-                          v-if="planSubjectSummary(item)"
-                          size="small"
-                          type="warning"
-                          effect="plain"
-                        >
-                          人工
-                        </el-tag>
-                      </div>
-                    </div>
-                    <span v-else class="muted small">—</span>
                   </div>
                   <div class="flow-extra-item">
                     <span class="flow-extra-label">状态</span>
@@ -785,8 +766,8 @@ import * as api from '@/api/bankstatement'
 import * as subjectApi from '@/api/subject'
 import { reportNumber } from '@/utils/format'
 import {
-  FIELD_OPTIONS, canCommit, canEditPlanSubject, canToggleIgnore, diffClass,
-  effectivePlanSubjectSummary,
+  FIELD_OPTIONS, canCommit, canEditPlanSubject, canToggleIgnore, defaultExpandedRowIds,
+  diffClass,
   fieldLabel,
   isCrossPeriod, planSubjectCents, planSubjectSummary,
   planSubjectText, planTotalDiff, planTotalMatches, reclassifyCandidateText,
@@ -823,7 +804,7 @@ const diagPanels = ref([])
 const manualMapping = reactive({})
 
 /**
- * 「对账信息」栏：**默认展开**，而且是**往下展开**（不是往右加列）。
+ * 「对账信息」栏：**往下展开**（不是往右加列）。
  *
  * 方向、对方科目、状态这三样是**对账时每行都要看**的东西 —— 让用户一格格点
  * 行首箭头才看得见，等于把主要工作藏起来了。所以默认摊开；嫌占地方就用
@@ -837,10 +818,58 @@ const manualMapping = reactive({})
  * 那样「不看对账信息的人」和「要改对账信息的人」看到的是两张不同的表）。
  * 现在只剩一个动作：点行首箭头，往下展开/收起。
  *
- * **默认展开是 el-table 的 ``:default-expand-all``**：它在**数据每次换掉**时
- * 都会重新摊开（换对账单、刷新流水之后依然展开）。自己拿 toggleRowExpansion
- * 一格格展开做不到这一点 —— 那是「展开一次」，不是「默认展开」。
+ * **默认摊开的是「还有活要干的行」**（见
+ * :func:`flow_state.defaultExpandedRowIds`）：已入账的、被发票占用的
+ * 默认收起 —— 那些行的对账信息看一眼就够，全摊开反而把要处理的那几行淹了。
  */
+
+/**
+ * **用户手动开过 / 关过的行**（行 id → true / false）。
+ *
+ * **为什么单独记一份**：``:expand-row-keys`` 一变，el-table 会把展开状态
+ * **整个换成**那批 key（``setExpandRowKeys`` 是赋值，不是合并）。而数据每
+ * 换一次（刷新流水、忽略一行、生成凭证）那个数组都会重算 —— 不记这一份，
+ * 用户刚点开的行就被弹回去了。
+ *
+ * 记的是**用户的意愿**，不是「当前状态」：开了记 true，关了记 false。
+ * 没记过的行按默认来（还有活 → 摊开；已办完 → 收起）。
+ */
+const rowExpandOverrides = ref(new Map())
+
+/**
+ * 当前要展开的行 id —— 绑到 el-table 的 ``:expand-row-keys``。
+ *
+ * **判据与用户意愿都算进去**：默认摊开的是「还有活要干的行」，用户手动
+ * 开过/关过的以用户为准。
+ */
+const expandedRowIds = computed(() => {
+  const base = new Set(defaultExpandedRowIds(rows.value))
+  const overrides = rowExpandOverrides.value
+  const out = []
+  for (const row of rows.value) {
+    const override = overrides.get(row.id)
+    const expanded = override !== undefined ? override : base.has(row.id)
+    if (expanded) out.push(row.id)
+  }
+  return out
+})
+
+/**
+ * 用户点了行首箭头。
+ *
+ * **只记用户的动作，不改展开数组本身** —— 展开数组一变，el-table 就把
+ * 状态整个换掉，那正是我们要避开的事。
+ *
+ * @param {object} row 被点的那一行
+ * @param {Array} expandedRows 现在展开着的行
+ */
+function onExpandChange(row, expandedRows) {
+  if (!row || row.id === undefined || row.id === null) return
+  const isOpen = (expandedRows || []).some((item) => item && item.id === row.id)
+  const next = new Map(rowExpandOverrides.value)
+  next.set(row.id, isOpen)
+  rowExpandOverrides.value = next
+}
 
 /** 对方科目编辑弹窗。 */
 const planDialog = reactive({
@@ -850,7 +879,7 @@ const planDialog = reactive({
    * 每一个对方科目一行：`subject_id` + `amount` + **它自己的摘要**。
    *
    * 摘要挂在**每一项**上，不是整个弹窗一个 —— 凭证上每条分录的摘要本来
-   * 就是各自独立的字段（见 ``flow_state.effectivePlanSubjectSummary``）。
+   * 就是各自独立的字段（见 ``flow_state.planSubjectSummary``）。
    */
   items: [],
 })

@@ -1803,6 +1803,19 @@ def update_row(db: Session, book_id: int, row_id: int,
             raise ValueError(
                 "这一行已经生成了凭证，对方科目由凭证定死 —— "
                 "要改请改那张凭证（或用「可改科目」）。")
+        # **被发票占用的行，对方科目也不许再改。**
+        #
+        # 发票那张凭证的分录是**发票自己**算出来的（``app/invoice/service.py``
+        # 用的是预览时算出来的 ``resolution.entries``），流水这一侧只贡献
+        # **结算账户**。所以流水行上填的对方科目**根本不会进那张凭证** ——
+        # 让用户去填一个不生效的东西是骗人，填了还会以为「就这么记了」。
+        #
+        # 这条闸与前端那一条**同一个判据**（``matched_invoice_record_id``）：
+        # 两边各判一次的话，迟早出现「界面能点、点了被拒」或反过来的毛病。
+        if row.matched_invoice_record_id:
+            raise ValueError(
+                "这一行已被发票占用，对方科目由发票决定 —— "
+                "要改请改发票上的科目。")
         items = _parse_plan_payload(db, book_id, row, payload)
         _write_plan_subjects(db, row, items, PLAN_MANUAL)
         row.plan_status = _plan_status_of(items, row.direction)

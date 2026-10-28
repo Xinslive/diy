@@ -115,14 +115,37 @@ export const canToggleIgnore = (row) =>
  * 改科目是**改凭证**的动作：要么去凭证里改，要么用「可改科目」
  * （它走 ``accounting.vouchers.update_voucher``，凭证与流水一起改）。
  *
- * **判据必须与后端同一条**：后端那道闸看的是 ``matched_voucher_id``
- * （``app/bankstatement/service.py::update_row``），这里也看它 ——
- * 两边各判一次的话，迟早出现「界面能点、点了被拒」或反过来的毛病。
+ * **被发票占用的行也不行。** 发票那张凭证的分录是**发票自己**算出来的
+ * （``app/invoice/service.py`` 用的是预览时算出来的 ``resolution.entries``），
+ * 流水这一侧只贡献**结算账户**。所以流水行上填的对方科目**根本不会进那张
+ * 凭证** —— 让用户去填一个不生效的东西，是骗人；填了还会以为「就这么记了」。
+ *
+ * **判据必须与后端同一条**：后端那道闸看的是 ``matched_voucher_id`` 与
+ * ``matched_invoice_record_id``（``app/bankstatement/service.py::update_row``），
+ * 这里也看它们 —— 两边各判一次的话，迟早出现「界面能点、点了被拒」或
+ * 反过来的毛病。
  *
  * @param {object|null} row 流水行
  * @returns {boolean}
  */
-export const canEditPlanSubject = (row) => !!row && !row.matched_voucher_id
+export const canEditPlanSubject = (row) =>
+  !!row && !row.matched_voucher_id && !row.matched_invoice_record_id
+
+/**
+ * **默认展开**的行 id。
+ *
+ * **摊开的是「还有活要干的行」** —— 方向未定、对方科目待确认、还没入账。
+ * **已入账的、被发票占用的默认收起**：那些行的对账信息看一眼就够，
+ * 全摊开反而把该处理的那几行淹在一堆「已经办完了」的行里。
+ *
+ * **判据就是「对方科目还能不能改」**（{@link canEditPlanSubject}）——
+ * 还能改 = 还有活；不能改 = 账上（或发票上）已经有定论了。
+ *
+ * @param {Array} rows 流水行
+ * @returns {number[]} 要展开的行 id
+ */
+export const defaultExpandedRowIds = (rows) =>
+  (rows || []).filter((row) => canEditPlanSubject(row)).map((row) => row.id)
 
 /**
  * 余额差额的着色。
@@ -345,24 +368,6 @@ export const renderSummary = (template, row) => {
  * @returns {string}
  */
 export const planSubjectSummary = (item) => (item?.summary_override || '').trim()
-
-/**
- * 这一条对方科目**最终会用哪一句摘要**。
- *
- * **人工写过的优先**（`summary_override`），没写才用行级规则算出来的那句
- * （`default_summary`）。
- *
- * **为什么不在前端算**：规则命中哪一条、该用规则级还是账套级还是内置口径的
- * 模板 —— 那套判断在**后端**（`service._summary_template_for`）。前端另写
- * 一份，两边迟早漂：输入框里一句话、生成的凭证上另一句话。
- * 所以后端把「算出来的那个」一并给过来，这里只做「人工的优先」这一下。
- *
- * @param {object|null} item 对方科目
- * @param {object|null} row 流水行
- * @returns {string}
- */
-export const effectivePlanSubjectSummary = (item, row) =>
-  planSubjectSummary(item) || (row?.default_summary || '').trim()
 
 /**
  * 现成的示例模板 —— **给用户照抄的**，不用自己想。

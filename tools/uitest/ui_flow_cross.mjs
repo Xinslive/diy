@@ -76,8 +76,14 @@ try {
     const row = page.locator('.flow-rows-table tbody tr.el-table__row')
       .filter({ hasText: '__uitest_cross__' })
     if (await row.count() !== 1) throw new Error(`没找到测试流水行（${await row.count()} 行）`)
-    await row.locator('.el-table__expand-icon').first().click()
-    await page.waitForTimeout(800)
+    const icon = row.locator('.el-table__expand-icon').first()
+    // **默认摊开的是「还有活要干的行」**（2026-10-28 改）—— 这一行还没入账、
+    // 没被发票占用，所以它**很可能本来就是展开的**。这时再点箭头是**收起**。
+    const already = (await icon.getAttribute('aria-expanded')) === 'true'
+    if (!already) {
+      await icon.click()
+      await page.waitForTimeout(800)
+    }
     expanded = row.locator('xpath=following-sibling::tr[1]')
     if (await expanded.locator('.flow-extra').count() !== 1) {
       throw new Error('展开内容不在紧跟其后的那一行里')

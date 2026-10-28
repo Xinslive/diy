@@ -457,6 +457,113 @@ def test_已入账的行不许改摘要(client, auth, db, book, cash, store, sub
     assert "凭证" in r.json()["detail"]
 
 
+# ------------------------------------------------------------------ 发票占用
+
+
+def _占用一张发票(db, book, row_id) -> None:
+    """把一行流水标成「被这张发票占用」。
+
+    **发票那张凭证的分录是发票自己算出来的**（``app/invoice/service.py``
+    用的是预览时算出来的 ``resolution.entries``），流水这一侧只贡献**结算
+    账户** —— 所以流水行上填的对方科目**根本不会进那张凭证**。
+    """
+    from app.models import InvoiceBatch, InvoiceRecord
+
+    batch = InvoiceBatch(book_id=book.id, filename="测试发票.pdf",
+                         file_path="test/invoice.pdf")
+    db.add(batch)
+    db.flush()
+    record = InvoiceRecord(batch_id=batch.id, book_id=book.id, page_index=1)
+    db.add(record)
+    db.flush()
+    row = db.get(BankStatementRow, row_id)
+    row.matched_invoice_record_id = record.id
+    db.commit()
+
+
+def test_被发票占用的行不许指定科目(client, auth, db, book, cash, store, subjects):
+    """发票占用的行，对方科目**由发票决定** —— 流水这边不许填。
+
+    **为什么**：发票那张凭证的分录是发票自己算出来的，流水行上填的对方科目
+    根本不进那张凭证。让用户去填一个不生效的东西，是骗人；填了还会以为
+    「就这么记了」。
+
+    **判据与前端同一条**（``matched_invoice_record_id``）：两边各判一次的话，
+    迟早出现「界面能点、点了被拒」或反过来的毛病。
+    """
+    created = _upload(client, auth, book, cash).json()
+    rows = client.get(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/rows",
+        headers=auth).json()
+    row = rows[0]
+    _占用一张发票(db, book, row["id"])
+
+    r = client.patch(
+        f"/api/books/{book.id}/bank-statements/rows/{row['id']}",
+        headers=auth, json={"plan_subject_id": subjects["560202"].id})
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert "发票" in detail, detail
+
+    # **没被占用的那一行照样能改** —— 这道闸只挡被占用的行
+    r = client.patch(
+        f"/api/books/{book.id}/bank-statements/rows/{rows[1]['id']}",
+        headers=auth, json={"plan_subject_id": subjects["560202"].id})
+    assert r.status_code == 200, r.text
+
+
+def test_被发票占用的行不会被制证(client, auth, db, book, cash, store, subjects):
+    """被发票占用的行**不进制证候选** —— 它由发票那张凭证管。
+
+    （这条是既有行为，钉在这里是因为「发票占用 → 流水这边什么都别做」
+    是一整套：不能指定科目、不能制证。）
+
+    **这条不能空跑**：那行如果本来就没有对方科目，它会被「对方科目待确认」
+    挡掉 —— 那跟发票没关系，断言照样过。所以先把这一行**做成合法的制证
+    候选**（对方科目齐、方向也定了），确认它真的进了候选池，再让发票来
+    占住它 —— 这时候它掉出候选池才**只可能**是发票占用的功劳。
+    """
+    created = _upload(client, auth, book, cash).json()
+    rows = client.get(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/rows",
+        headers=auth).json()
+    row = rows[0]
+    # 先把它做成**合法的制证候选**
+    r = client.patch(
+        f"/api/books/{book.id}/bank-statements/rows/{row['id']}",
+        headers=auth, json={"plan_subjects": [
+            {"subject_id": subjects["560202"].id, "amount": row["amount"]}]})
+    assert r.status_code == 200, r.text
+    client.post(
+        f"/api/books/{book.id}/bank-statements/rows/{row['id']}/direction",
+        headers=auth, json={"direction": "IN"})
+    plan = client.post(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/plan-vouchers",
+        headers=auth).json()
+    assert any(c["id"] == row["id"] for c in plan["candidates"]), (
+        "这一行本来就不是制证候选 —— 后面那句断言就成空跑了")
+
+    # 现在这张发票来占住它
+    _占用一张发票(db, book, row["id"])
+
+    plan = client.post(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/plan-vouchers",
+        headers=auth).json()
+    assert not any(c["id"] == row["id"] for c in plan["candidates"]), (
+        "被发票占用的行不该进制证候选 —— 那会与发票那张凭证记同一笔钱")
+    skipped = [s for s in plan["skipped"] if s["id"] == row["id"]]
+    assert skipped and "发票" in skipped[0]["reason"], plan
+
+    client.post(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/commit-vouchers",
+        headers=auth)
+
+    db.expire_all()
+    row = db.get(BankStatementRow, rows[0]["id"])
+    assert row.matched_voucher_id is None, (
+        "被发票占用的行不该被流水制证 —— 那会与发票那张凭证记同一笔钱")
+
+
 # ---------------------------------------------------------------------- 制证
 
 
