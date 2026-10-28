@@ -396,3 +396,28 @@ export const summaryTemplateValuesText = (row) => {
     .map((field) => `${field}=${values[field] === '' ? '（空）' : values[field]}`)
     .join('　')
 }
+
+/**
+ * **存疑凭证**：账上有、对账单里找不到对应流水的那些凭证。
+ *
+ * 后端按**对账单**分组返回（一份对账单 = 一个账户 + 一段期间，期间就是
+ * 判定的那把尺子）。界面上把它们摊平成一张表、每行带上账户与期间 ——
+ * 那样一眼能扫完，又不会把「哪个账户」丢在折叠层里。
+ *
+ * @param {Array} groups 后端返回的分组
+ * @returns {Array} 摊平后的行
+ */
+export const suspiciousRows = (groups) => {
+  const out = []
+  for (const group of groups || []) {
+    for (const voucher of group?.vouchers || []) {
+      out.push({
+        ...voucher,
+        account_code: group.account_code,
+        account_name: group.account_name,
+        period_text: group.period_text,
+      })
+    }
+  }
+  return out
+}

@@ -275,10 +275,16 @@ class BankStatementRule(Base, TimestampMixin):
 class BankStatementConfig(Base, TimestampMixin):
     """每个账套一份的流水对账配置。
 
-    **现在只有一项：凭证摘要模板。** 但它必须有地方放 —— 挂在规则上的是
-    「这条规则专用」，而「这个账套的流水凭证摘要长什么样」是账套级口径，
-    两者缺一不可：运费流水与工资流水的摘要多半不一样，而它们都走同一个
-    账套。
+    **现在只有一个已经下线的字段**（账套级凭证摘要模板，2026-10-28 下线）。
+    摘要口径改成了「规则级模板 > 内置口径」，不再有账套级这一层。
+
+    **表留着、列留着**，是因为删列要动迁移链，而这件事本身没有收益：
+    服务层已经不再读它（``_summary_template_for`` 里没有这条分支），
+    写它也会被 :func:`app.bankstatement.service.save_config` 清空 ——
+    一个「留在库里但谁也不认」的字段，比「库里根本没有」更让人误解。
+
+    留着它还有一个好处：**老数据不丢**。万一将来又要恢复账套级模板，
+    那些值还在库里，不用让用户重新填一遍。
     """
 
     __tablename__ = "bank_statement_config"
@@ -286,8 +292,8 @@ class BankStatementConfig(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
     book_id: Mapped[int] = mapped_column(
         ForeignKey("book.id", ondelete="CASCADE"), nullable=False, unique=True)
-    #: 流水生成凭证时用的摘要模板。**空 = 内置口径**（用途优先、摘要兜底、
-    #: 再兜底「银行收/付 + 对方户名」）。
+    #: 流水生成凭证时用的摘要模板。**已废弃（2026-10-28 下线）** ——
+    #: 空 = 内置口径（用途优先、摘要兜底、再兜底「银行收/付 + 对方户名」）。
     #:
     #: 占位符：``{摘要}`` ``{用途}`` ``{对方户名}`` ``{日期}`` ``{金额}``
     #: ``{方向}`` ``{账户}``。模板写错时**退回内置口径**，不让整批制证失败。

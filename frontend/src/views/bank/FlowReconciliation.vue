@@ -15,7 +15,7 @@
       </div>
     </div>
 
-    <el-tabs v-model="tab" class="flow-tabs">
+    <el-tabs v-model="tab" class="flow-tabs" @tab-change="onTabChange">
       <!-- ============================================================ 对账单 -->
       <el-tab-pane label="对账单" name="statements">
         <el-card shadow="never" class="flow-upload-card">
@@ -465,67 +465,15 @@
       <!-- 名字就「科目规则」：这一页管的是「按关键词定对方科目」，
            前面那个「流水」是废话 —— 页签叫「流水对账」已经交代了上下文。 -->
       <el-tab-pane label="科目规则" name="rules">
-        <el-card shadow="never" class="flow-config-card">
-          <template #header>
-            <div class="section-head">
-              <span>凭证摘要模板（账套级）</span>
-              <span class="muted">
-                对账单上的「摘要」那一列各家银行写法不一，凭证摘要要能改；
-                可用占位符：摘要 / 用途 / 对方户名 / 日期 / 金额 / 方向 / 序号
-              </span>
-            </div>
-          </template>
-          <div class="flow-config-row">
-            <el-input
-              v-model="configForm.summary_template"
-              placeholder="留空 = 用内置口径（用途优先、摘要兜底）"
-              class="flow-config-input"
-            />
-            <el-button :disabled="!store.canWrite" @click="saveConfigForm">保存</el-button>
-          </div>
-          <!-- 占位符做成**能点的**：不用手打，打错了当场看得见 -->
-          <div class="flow-template-help">
-            <span class="muted small">点一下插入：</span>
-            <el-tag
-              v-for="field in SUMMARY_TEMPLATE_FIELDS"
-              :key="field"
-              size="small"
-              effect="plain"
-              class="flow-placeholder-tag"
-              @click="insertPlaceholder(configForm.summary_template, field, 'config')"
-            >
-              {{ '{' + field + '}' }}
-            </el-tag>
-          </div>
-          <!-- **示例**：给几条现成的，用户照抄就行 -->
-          <div class="flow-template-help">
-            <span class="muted small">示例（点一下套用）：</span>
-            <el-tag
-              v-for="ex in SUMMARY_TEMPLATE_EXAMPLES"
-              :key="ex.label"
-              size="small"
-              type="info"
-              effect="plain"
-              class="flow-placeholder-tag"
-              @click="configForm.summary_template = ex.template"
-            >
-              {{ ex.label }}
-            </el-tag>
-          </div>
-          <!-- **预览**：用当前这份对账单的第一行流水真渲染一遍 -->
-          <div class="flow-template-preview">
-            <span class="muted small">{{ previewLabel }}</span>
-            <span class="flow-template-preview-text">{{ configPreviewText }}</span>
-            <span v-if="unknownTemplateFields(configForm.summary_template).length"
-              class="flow-warn small">
-              ⚠ 「{{ unknownTemplateFields(configForm.summary_template).join('」「') }}」不是可用的占位符
-            </span>
-            <div class="flow-template-values muted small">
-              那一行的值：{{ previewValuesText }}
-            </div>
-          </div>
-        </el-card>
+        <!-- **账套级摘要模板已下线（2026-10-28）** —— 用户原话：「完全使用
+             内置口径就可以了，不要让用户更改」。
 
+             摘要模板是**一个要学语法的东西**（占位符、渲染规则），而它真正
+             解决的问题很小 —— 让摘要写成什么样。放在账套级，意味着每个账套
+             都要有人先学会这套语法才敢用；大部分账套一句都不需要改。
+
+             **规则级模板留着** —— 那是「这一类流水（运费、工资）要用另一种
+             说法」的表达方式，与关键词规则放在一起才对得上语境。 -->
         <el-card shadow="never">
           <template #header>
             <div class="section-head">
@@ -533,7 +481,7 @@
               <span class="muted">
                 按摘要 / 用途 / 对方户名里的关键词定对方科目；
                 优先级大的赢，同级取更长的关键词。
-                每条规则可以单独设摘要模板（盖过账套级）
+                每条规则可以单独设摘要模板（盖过内置口径）
               </span>
             </div>
           </template>
@@ -559,7 +507,7 @@
             <el-form-item label="摘要模板">
               <el-input
                 v-model="ruleForm.summary_template"
-                placeholder="留空 = 用账套级"
+                placeholder="留空 = 用内置口径"
                 style="width: 200px"
               />
             </el-form-item>
@@ -578,7 +526,7 @@
               size="small"
               effect="plain"
               class="flow-placeholder-tag"
-              @click="insertPlaceholder(ruleForm.summary_template, field, 'rule')"
+              @click="insertPlaceholder(ruleForm.summary_template, field)"
             >
               {{ '{' + field + '}' }}
             </el-tag>
@@ -616,7 +564,7 @@
                 <el-input
                   :model-value="row.summary_template"
                   size="small"
-                  placeholder="留空 = 用账套级"
+                  placeholder="留空 = 用内置口径"
                   @change="(v) => saveRuleTemplate(row, v)"
                 />
                 <!-- **已保存的规则不再逐行给预览。**
@@ -641,6 +589,97 @@
           </el-table>
         </el-card>
       </el-tab-pane>
+
+      <!-- ========================================================== 存疑凭证 -->
+      <!-- 流水对账的**另一半**。
+
+           流水明细页那条路：「对账单上有、账上没有」→ 生成凭证。
+           这一页这条路：「账上有、对账单上没有」→ 那是**错账** ——
+           钱记在了不该记的地方，或者根本不该记。
+
+           **按对账单分组**：一份对账单 = 一个账户 + 一段期间，
+           期间就是判定的那把尺子 —— 离开它就说不清「这一笔凭什么可疑」。
+           -->
+      <el-tab-pane label="存疑凭证" name="suspicious">
+        <el-card shadow="never">
+          <template #header>
+            <div class="section-head">
+              <span>存疑凭证</span>
+              <span class="muted">
+                账上有、对账单里找不到对应流水的那些凭证 —— 多半是账户或金额记错了
+              </span>
+            </div>
+          </template>
+
+          <div class="flow-suspicious-summary muted small">
+            <template v-if="suspiciousTotal">
+              共 <b>{{ suspiciousTotal }}</b> 张存疑凭证。
+            </template>
+            <template v-else>
+              没有存疑凭证。
+            </template>
+            <!-- **邻期的分录不判定，但要说个数** —— 用户看得见「那几个月还有
+                 几笔没说法」，而不是以为它们不存在。 -->
+            <span v-if="suspiciousNearCount">
+              另有 {{ suspiciousNearCount }} 条邻期分录未判定（那几个月还没有对账单）。
+            </span>
+            <span v-if="suspiciousInternalCount">
+              另有 {{ suspiciousInternalCount }} 张内部转账（钱在自家账户之间挪，不算错账）。
+            </span>
+          </div>
+
+          <el-empty
+            v-if="!suspiciousRows.length"
+            description="没有存疑凭证 —— 账上每一笔现金分录都能在流水里找到对应的行"
+          />
+          <el-table
+            v-else
+            :data="suspiciousRows"
+            class="flow-suspicious-table"
+            size="small"
+          >
+            <el-table-column label="对账单" min-width="190">
+              <template #default="{ row }">
+                <div>{{ row.account_code }} {{ row.account_name }}</div>
+                <div class="muted small">{{ row.period_text }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column label="凭证号" width="100">
+              <template #default="{ row }">{{ row.voucher_no }}</template>
+            </el-table-column>
+            <el-table-column label="日期" width="105">
+              <template #default="{ row }">{{ row.voucher_date }}</template>
+            </el-table-column>
+            <el-table-column label="摘要" min-width="150" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.summary || '—' }}</template>
+            </el-table-column>
+            <el-table-column label="金额" width="130" align="right">
+              <template #default="{ row }">{{ money(row.amount) }}</template>
+            </el-table-column>
+            <el-table-column label="为什么可疑" min-width="260">
+              <template #default="{ row }">
+                <div>{{ row.reason }}</div>
+                <!-- **线索**：没有线索的「疑问」是没用的疑问 —— 用户要能
+                     立刻看出是金额错了、还是日期错了。 -->
+                <div
+                  v-for="(clue, ci) in row.clues"
+                  :key="ci"
+                  class="muted small"
+                >
+                  流水第 {{ clue.seq }} 行 · {{ clue.tx_date }} · {{ money(clue.amount) }}
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="150">
+              <template #default="{ row }">
+                <el-button link type="primary" size="small" @click="openVoucher(row.voucher_id)">
+                  去改这张凭证
+                </el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-card>
+      </el-tab-pane>
     </el-tabs>
 
     <!-- ======================================================== 对方科目 -->
@@ -651,7 +690,7 @@
         <strong>{{ money(planDialog.row?.amount) }}</strong>，否则凭证会不平衡。
         <br />
         <strong>每个科目的凭证摘要各写各的</strong>：框里那句是
-        <strong>按规则算出来的</strong>（规则级模板 → 账套级模板 → 内置口径），
+        <strong>按规则算出来的</strong>（规则级模板 → 内置口径），
         改了就用你写的；没改就还是它。留空 = 交回规则去算。
       </div>
       <div v-for="(item, index) in planDialog.items" :key="index" class="flow-plan-row">
@@ -760,6 +799,7 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Refresh, Upload } from '@element-plus/icons-vue'
 import * as api from '@/api/bankstatement'
@@ -773,6 +813,7 @@ import {
   planSubjectText, planTotalDiff, planTotalMatches, reclassifyCandidateText,
   reclassifyCrossPeriodConfirm, reclassifyCrossPeriodText, reclassifyRowCount,
   renderSummary, settlementSourceText, settlementSourceType,
+  suspiciousRows as suspiciousRowsOf,
   toColumnMapping, unknownTemplateFields, voucherStateText, voucherStateType,
   summaryTemplateValuesText,
   SUMMARY_TEMPLATE_EXAMPLES, SUMMARY_TEMPLATE_FIELDS,
@@ -780,6 +821,7 @@ import {
 import { useSessionStore } from '@/stores/session'
 
 const store = useSessionStore()
+const router = useRouter()
 const tab = ref('statements')
 
 const statements = ref([])
@@ -790,6 +832,14 @@ const rows = ref([])
 const plan = ref(null)
 const current = ref(null)
 const activeStatementId = ref(null)
+
+/**
+ * **存疑凭证**：账上有、对账单里找不到对应流水的那些凭证。
+ *
+ * **懒加载**：它要扫一遍账上所有现金分录，而用户未必会去看它
+ * （大多数时候根本没有存疑凭证）—— 每次进来都查一遍是白查。
+ */
+const suspicious = ref(null)
 
 const loading = ref(false)
 const loadingRows = ref(false)
@@ -891,19 +941,18 @@ const ruleForm = reactive({
   match_field: 'SUMMARY', keyword: '', subject_id: null, priority: 0, active: true,
   summary_template: '',
 })
-/** 账套级「凭证摘要模板」。 */
-const configForm = reactive({ summary_template: '' })
 
 /**
  * 把占位符插到模板里（接到末尾）。
  *
  * **为什么做成能点的**：占位符是中文的（「{对方户名}」），手打既慢又容易打错，
  * 而「看不懂」正是这个功能最大的问题 —— 能点一下就有的东西，不该让人背。
+ *
+ * **只有规则级模板了**（2026-10-28 账套级模板下线）—— 所以不必再问
+ * 「插到哪一份」。
  */
-function insertPlaceholder(current, field, target) {
-  const piece = `{${field}}`
-  if (target === 'rule') ruleForm.summary_template = `${current || ''}${piece}`
-  else configForm.summary_template = `${current || ''}${piece}`
+function insertPlaceholder(current, field) {
+  ruleForm.summary_template = `${current || ''}{${field}}`
 }
 
 /**
@@ -920,10 +969,6 @@ const previewLabel = computed(() => {
   if (!row) return '先选一份对账单，下面的预览才有内容'
   return `预览（用第 ${row.seq} 行流水演示模板效果）：`
 })
-
-/** 账套级模板的预览。 */
-const configPreviewText = computed(
-  () => renderSummary(configForm.summary_template, previewRow.value))
 
 /** 新增规则里那个模板的预览。 */
 const rulePreviewText = computed(
@@ -1021,18 +1066,16 @@ const manualMappingCount = computed(() => Object.keys(manualMapping).filter(
 async function loadAll() {
   loading.value = true
   try {
-    const [list, flat, ruleList, profileList, cfg] = await Promise.all([
+    const [list, flat, ruleList, profileList] = await Promise.all([
       api.listStatements(store.bookId),
       subjectApi.subjectFlat(store.bookId, { year: store.currentYear }),
       api.listRules(store.bookId),
       api.listProfiles(store.bookId),
-      api.getConfig(store.bookId),
     ])
     statements.value = list || []
     subjects.value = flat || []
     rules.value = ruleList || []
     profiles.value = profileList || []
-    configForm.summary_template = cfg?.summary_template || ''
     if (current.value) {
       const again = statements.value.find((s) => s.id === current.value.id)
       if (again) current.value = again
@@ -1045,28 +1088,56 @@ async function loadAll() {
 }
 
 /**
- * 保存账套级的「凭证摘要模板」。
+ * 存疑凭证清单（**摊平成一张表**）。
  *
- * **不认识的占位符当场拦下**（后端也会拒，但那时用户已经填完一整张表单）。
+ * 后端按**对账单**分组返回（一份对账单 = 一个账户 + 一段期间，
+ * 期间就是判定的那把尺子）；界面上把它们摊平成一张表、每行带上账户与期间 ——
+ * 那样一眼能扫完，又不会把「哪个账户」丢在折叠层里。
  */
-async function saveConfigForm() {
-  const unknown = unknownTemplateFields(configForm.summary_template)
-  if (unknown.length) {
-    ElMessage.warning(`占位符 {${unknown.join('} {')} } 不认识，可用：摘要 / 用途 / 对方户名 / 日期 / 金额 / 方向 / 序号`)
-    return
-  }
+const suspiciousRows = computed(() => suspiciousRowsOf(suspicious.value?.groups))
+
+/** 一共几张存疑凭证。 */
+const suspiciousTotal = computed(() => suspicious.value?.total_suspicious || 0)
+
+/** 邻期未判定的分录数 —— **要说出来**，否则用户以为那些分录不存在。 */
+const suspiciousNearCount = computed(
+  () => suspicious.value?.total_near_period_uncounted || 0)
+
+/** 内部转账的张数 —— 单独拎出来，免得用户以为漏了。 */
+const suspiciousInternalCount = computed(
+  () => suspicious.value?.total_internal_transfer || 0)
+
+async function loadSuspicious() {
   try {
-    const saved = await api.saveConfig(store.bookId, {
-      summary_template: configForm.summary_template,
-    })
-    configForm.summary_template = saved?.summary_template || configForm.summary_template
-    ElMessage.success('已保存摘要模板')
+    suspicious.value = await api.getSuspiciousVouchers(store.bookId)
   } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || '保存失败')
+    ElMessage.error(e?.response?.data?.detail || '加载存疑凭证失败')
   }
 }
 
-/** 改某条规则的摘要模板（规则级盖过账套级）。 */
+/**
+ * 切页签。
+ *
+ * **存疑凭证那一页懒加载**（见 ``suspicious`` 那条注释）。
+ */
+function onTabChange(name) {
+  if (name === 'suspicious') loadSuspicious()
+}
+
+/**
+ * 去改那张凭证。
+ *
+ * **这一页只负责「指出问题」，不负责「改」** —— 错账的改法各不相同
+ * （改账户、改金额、删凭证），写死一种改法只会改错。给一条路：直接跳到
+ * 那张凭证去改。
+ */
+function openVoucher(id) {
+  router.push({ name: 'voucher-edit', params: { id } })
+}
+
+/**
+ * 改某条规则的摘要模板（规则级盖过内置口径）。
+ */
 async function saveRuleTemplate(rule, value) {
   const template = value || ''
   const unknown = unknownTemplateFields(template)
@@ -1609,10 +1680,12 @@ onMounted(() => {
 .flow-reclassify-text { min-width: 0; }
 .flow-warn { color: var(--el-color-warning-dark-2); }
 
-/* 账套级摘要模板那一行。 */
-.flow-config-card { margin-bottom: 12px; }
-.flow-config-row { display: flex; gap: 8px; align-items: center; }
-.flow-config-input { max-width: 520px; }
+/* 存疑凭证那一页顶上的那行统计。 */
+.flow-suspicious-summary {
+  margin-bottom: 10px;
+  line-height: 1.6;
+}
+
 .diag-grid {
   display: flex;
   gap: 24px;

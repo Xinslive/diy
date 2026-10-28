@@ -24,6 +24,7 @@ from app.core.deps import get_current_user, get_my_book, require_book_write
 # 共享容量闸：读字节数有上限，超了翻成 413（见 app/core/uploads.py）。
 from app.core.uploads import (UploadTooLarge, human_bytes, read_upload_sync as read_upload)
 from app.bankstatement import service
+from app.bankstatement import suspicious
 from app.models import Book, SysUser, UserBook
 
 router = APIRouter(prefix="/api/books/{book_id}/bank-statements", tags=["流水对账"])
@@ -91,6 +92,27 @@ def upload_statement(
     except ValueError as exc:
         db.rollback()
         raise HTTPException(400, str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _db_error(request, exc) from exc
+
+
+@router.get("/suspicious-vouchers")
+def get_suspicious_vouchers(request: Request, book: Book = Depends(get_my_book),
+                             db: Session = Depends(get_db)):
+    """存疑凭证：账上有、对账单里找不到对应流水的那些凭证。
+
+    **这是流水对账的另一半**：流水明细页那条路是「对账单上有、账上没有」
+    → 生成凭证；这一路是「账上有、对账单上没有」→ 那是错账。
+
+    **必须声明在 ``/{statement_id}`` 之前** —— 否则 FastAPI 会先拿
+    ``/suspicious-vouchers`` 去匹配那一条，把 "suspicious-vouchers" 当成
+    statement_id 解析，接口回 422。
+
+    **只读**：它是给人「找错账」的清单，不改任何东西 —— 所以 VIEWER 也能看。
+    """
+    try:
+        return suspicious.suspicious_vouchers(db, book.id)
     except SQLAlchemyError as exc:
         db.rollback()
         raise _db_error(request, exc) from exc
@@ -299,16 +321,24 @@ config_router = APIRouter(prefix="/api/books/{book_id}/bank-statement-config",
 @config_router.get("")
 def get_config(book: Book = Depends(get_my_book), db: Session = Depends(get_db)):
     """这个账套的流水配置。**没配过也给一份**（模板为空 = 用内置口径）。"""
-    return service.serialize_config(service.get_config(db, book.id))
+    return service.serialize_config(service.get_config(db, book.id), book.id)
 
 
 @config_router.put("")
 def put_config(payload: BankStatementConfigIn, request: Request,
                book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                _link: UserBook = Depends(require_book_write)):
-    """整体替换这个账套的流水配置（**幂等**：没有就建，有了就改**）。"""
+    """整体替换这个账套的流水配置（**幂等**：没有就建，有了就改**）。
+
+    **账套级摘要模板已下线（2026-10-28）** —— 带着这个字段来会拿到 400
+    与一句说清新口径的话（见 :func:`app.bankstatement.service.save_config`）。
+
+    **用 ``exclude_unset=True``**：请求体已经被 pydantic 按 schema 过滤过
+    了（``model_dump()`` 会把没传的字段也填上默认值，于是「没传」与
+    「传了空串」分不开 —— 而这两者的区别正是这道闸的判据）。
+    """
     try:
-        result = service.save_config(db, book.id, payload.model_dump())
+        result = service.save_config(db, book.id, payload.model_dump(exclude_unset=True))
         db.commit()
         return result
     except ValueError as exc:

@@ -1277,25 +1277,48 @@ def get_config(db: Session, book_id: int) -> Optional[BankStatementConfig]:
         BankStatementConfig.book_id == book_id))
 
 
-def serialize_config(config: BankStatementConfig | None) -> dict[str, Any]:
+def serialize_config(config: BankStatementConfig | None,
+                     book_id: int = 0) -> dict[str, Any]:
+    """账套级配置的对外形状。
+
+    ``summary_template`` **已下线（2026-10-28）**，这里仍然返回它、值恒为空
+    —— 删掉字段会让还在用旧版本的客户端直接崩（拿到 ``undefined``），
+    而崩溃比「拿到一个空值」更难排查。真正的拒绝在
+    :func:`save_config`。
+    """
     return {
-        "book_id": config.book_id if config else 0,
-        "summary_template": (config.summary_template if config else "") or "",
+        "book_id": config.book_id if config else book_id,
+        #: **已废弃**：账套级摘要模板下线了，现在一律用内置口径。
+        "summary_template": "",
         "template_fields": list(SUMMARY_TEMPLATE_FIELDS),
     }
 
 
 def save_config(db: Session, book_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    """存这个账套的流水配置。**存过一次之后就用那一份**（不覆盖成空）。"""
-    template = _summary_template_of(payload)
+    """存这个账套的流水配置。
+
+    **账套级摘要模板已下线（2026-10-28）**，所以这个接口现在**只做一件事
+    —— 明确告诉调用方「这个字段没有了」**。
+
+    **为什么不能静默丢掉**：请求体在进到这里之前已经被 pydantic 按 schema
+    过滤过了（``model_dump(exclude_unset=True)``），一个「不认识」的字段
+    会被**静默丢掉** —— 接口回 200、库里什么都没变。老客户端（或者某个
+    脚本）继续发这个字段时，用户以为「改了摘要模板」，实际什么都没发生。
+    「写了却看不见，等于没写」—— 所以这里显式报错，并把新口径说清楚。
+    """
+    if "summary_template" in payload:
+        raise ValueError(
+            "账套级摘要模板已经下线 —— 现在一律用内置口径（用途优先、摘要兜底）。"
+            "要改某一类流水的摘要，请用**规则级模板**（科目规则页上每条规则那一列）。")
     config = get_config(db, book_id)
-    if config is None:
-        config = BankStatementConfig(book_id=book_id, summary_template=template)
-        db.add(config)
-    else:
-        config.summary_template = template
+    if config is not None:
+        # 存过一次之后一律清空：**别让一个已经不再生效的值留在库里**，
+        # 免得以后有人看到它以为还能用。
+        config.summary_template = ""
+    # **没有配置可存时也不建空行** —— 这个表现在没有用途了，
+    # 建一行空的只是让人以为「这个账套配过什么」。
     db.flush()
-    return serialize_config(config)
+    return serialize_config(config, book_id)
 
 
 # ----------------------------------------------------------------------
@@ -1595,13 +1618,13 @@ def list_rows(db: Session, book_id: int, statement_id: int, *,
     candidates = matching.reclassify_candidates(db, book_id, statement, rows)
     # 规则与账套配置**各读一次**：算每一行「按规则算出来的摘要」要用，
     # 一行一次查询就是几百次往返。
-    rules, config = _summary_context(db, book_id)
+    rules = _summary_context(db, book_id)
     out: list[dict[str, Any]] = []
     for row in rows:
         items = children.get(row.id) or []
         out.append(serialize_row(
             db, row, subjects, items, candidates.get(row.id) or [],
-            default_summary=_default_summary_for(row, items, rules, config)))
+            default_summary=_default_summary_for(row, items, rules)))
     return out
 
 
@@ -1831,11 +1854,11 @@ def update_row(db: Session, book_id: int, row_id: int,
     # 要显示**当前**该用的摘要 —— 人工改了对方科目之后，规则级的模板可能
     # 不再适用（规则级模板只在「这条科目是规则定的」时候算数），
     # 默认值得跟着变。
-    rules, config = _summary_context(db, book_id)
+    rules = _summary_context(db, book_id)
     return serialize_row(
         db, row,
         default_summary=_default_summary_for(
-            row, list(row.plan_subjects), rules, config))
+            row, list(row.plan_subjects), rules))
 
 
 def set_row_direction(db: Session, book_id: int, row_id: int,
@@ -1972,12 +1995,12 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
     subjects = _subjects_of(db, book_id, subject_ids)
 
     # 规则与账套配置各读一次（算「按规则算出来的摘要」要用）。
-    rules, config = _summary_context(db, book_id)
+    rules = _summary_context(db, book_id)
 
     def _ser(row: BankStatementRow, items: list[BankStatementRowSubject]) -> dict[str, Any]:
         return serialize_row(
             db, row, subjects, items,
-            default_summary=_default_summary_for(row, items, rules, config))
+            default_summary=_default_summary_for(row, items, rules))
 
     candidates: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -2153,49 +2176,62 @@ def _row_summary(row: BankStatementRow, template: str = "") -> str:
     return render_summary(row, template)
 
 
-def _summary_context(db: Session, book_id: int) -> tuple[
-        list[BankStatementRule], Optional[BankStatementConfig]]:
-    """算摘要要用的两样东西：**规则**与**账套配置**。
+def _summary_context(db: Session, book_id: int) -> list[BankStatementRule]:
+    """算摘要要用的东西：**规则**。
 
-    **各读一次，不是一行一次**：一份对账单几百行，一行一次查询就是几百次
-    往返 —— 而这两样东西整份对账单是同一份。
+    **只读一次，不是一行一次**：一份对账单几百行，一行一次查询就是几百次
+    往返 —— 而规则整份对账单是同一份。
+
+    **不再读账套级配置**（2026-10-28）：账套级摘要模板已下线，摘要一律
+    「规则级 > 内置口径」。为什么下线见
+    :func:`_summary_template_for`。
     """
-    return list_rules(db, book_id), get_config(db, book_id)
+    return list_rules(db, book_id)
 
 
 def _default_summary_for(row: BankStatementRow,
                           items: list[BankStatementRowSubject],
-                          rules: list[BankStatementRule],
-                          config: Optional[BankStatementConfig]) -> str:
+                          rules: list[BankStatementRule]) -> str:
     """这一行**按规则算出来的**凭证摘要。
 
     **人工没写摘要时制证用的就是它**；界面上它也是「摘要」输入框的默认值
     —— 让用户先看见「不改会是什么」，改了就用他写的那个。
 
-    取值序（规则级 > 账套级 > 内置口径）与制证时**完全一致**：
+    取值序（规则级 > 内置口径）与制证时**完全一致**：
     :func:`_summary_template_for` 是同一段代码，不另写一份。
     """
-    return render_summary(row, _summary_template_for(rules, config, row, items))
+    return render_summary(row, _summary_template_for(rules, row, items))
 
 
 def _summary_template_for(rules: list[BankStatementRule],
-                           config: Optional[BankStatementConfig],
                            row: BankStatementRow,
                            items: list[BankStatementRowSubject]) -> str:
     """这一行用哪个摘要模板。
 
-    **取值序 = 规则级 > 账套级 > 内置口径。**
+    **取值序 = 规则级 > 内置口径。**
 
     规则级只在「这条流水是**那条规则**定的科目」时才算数 —— 人工指定过
     的行（``MANUAL``）不该被某条规则的摘要模板改掉，那是用户自己挑的科目、
     自己写的摘要。
+
+    **账套级模板已下线（2026-10-28）** —— 用户原话：「完全使用内置口径
+    就可以了，不要让用户更改」。
+
+    为什么下线：摘要模板是**一个要学语法的东西**（占位符、渲染规则），
+    而它真正解决的问题其实很小 —— 让摘要写成什么样。把它放在账套级，
+    意味着每个账套都要有人先学会这套语法才敢用；大部分账套其实一句都
+    不需要改，用内置口径（「用途优先、摘要兜底」）就挺好。**规则级模板
+    留着** —— 那是「这一类流水（运费、工资）要用另一种说法」的表达方式，
+    与关键词规则放在一起才对得上语境，天然是可选的。
+
+    写在这里而不是只写在前端：**前端删掉输入框，后端还认这个字段的话，
+    就是一个「界面上没有、却还在生效」的口径** —— 用户改不了它，
+    却一直被它影响。
     """
     if any(item.source == PLAN_RULE for item in items):
         rule = _rule_hit(rules, _pseudo_row(row))
         if rule is not None and rule.summary_template:
             return rule.summary_template
-    if config is not None and config.summary_template:
-        return config.summary_template
     return ""
 
 
@@ -2266,7 +2302,7 @@ def commit_vouchers(db: Session, book_id: int, statement_id: int,
             voucher = _make_voucher_for_row(
                 db, book_id, statement, row, user,
                 plan_subjects=plan_items,
-                summary_template=_summary_template_for(rules, config, row, plan_items))
+                summary_template=_summary_template_for(rules, row, plan_items))
             row.status = STATUS_POSTED
             row.matched_voucher_id = voucher.id
             savepoint.commit()

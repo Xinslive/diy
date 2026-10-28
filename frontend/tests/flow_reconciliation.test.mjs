@@ -26,6 +26,7 @@ const {
   isCrossPeriod, reclassifyCrossPeriodText, reclassifyCrossPeriodConfirm,
   renderSummary, summaryTemplateValuesText, SUMMARY_TEMPLATE_EXAMPLES,
   SUMMARY_TEMPLATE_FIELDS, planSubjectSummary, defaultExpandedRowIds,
+  suspiciousRows,
 } = STATE
 
 const VIEW = fs.readFileSync(
@@ -527,9 +528,10 @@ t('预览要摆出那一行的字段值（否则用户会把摘要误当成用�
 t('页面上有占位符按钮、示例与预览', () => {
   assert.match(VIEW, /insertPlaceholder/)
   assert.match(VIEW, /SUMMARY_TEMPLATE_EXAMPLES/)
-  assert.match(VIEW, /configPreviewText/)
+  // **只有规则级模板了**（账套级已下线）—— 预览也只有那一个
   assert.match(VIEW, /rulePreviewText/)
   assert.match(VIEW, /renderSummary/)
+  assert.doesNotMatch(VIEW, /configPreviewText/, '账套级模板的预览还在')
 })
 
 t('已保存的规则不再逐行给预览；新增规则时预览一下就够', () => {
@@ -543,7 +545,7 @@ t('已保存的规则不再逐行给预览；新增规则时预览一下就够',
   assert.doesNotMatch(block, /预览/, '规则表里还有预览')
   // 但**新增规则**那块的预览必须还在（rulePreviewText）
   assert.match(VIEW, /rulePreviewText/)
-  assert.match(VIEW, /configPreviewText/)
+  assert.doesNotMatch(VIEW, /configPreviewText/, '账套级模板的预览还在')
 })
 
 console.log('== 页签的名字 ==')
@@ -554,8 +556,77 @@ t('页签叫「科目规则」，不是「流水科目规则」', () => {
   assert.doesNotMatch(VIEW, /流水科目规则/, '界面里还有「流水科目规则」')
 })
 
-console.log('== 凭证摘要模板 ==')
+console.log('== 存疑凭证：账上有、对账单里找不到对应流水的那些凭证 ==')
 
+t('流水对账有第 4 个页签「存疑凭证」', () => {
+  // 这是流水对账的**另一半**：流水明细页那条路是「对账单上有、账上没有」
+  // → 生成凭证；这一路是「账上有、对账单上没有」→ 那是错账。
+  assert.match(VIEW, /<el-tab-pane label="存疑凭证" name="suspicious">/)
+  // **页签顺序**：对账单 → 流水明细 → 科目规则 → 存疑凭证
+  const labels = [...VIEW.matchAll(/<el-tab-pane label="([^"]+)"/g)].map((m) => m[1])
+  assert.deepEqual(labels, ['对账单', '流水明细', '科目规则', '存疑凭证'])
+})
+
+t('存疑凭证按对账单分组，摊平成一张表时带上账户与期间', () => {
+  const groups = [{
+    account_code: '100202',
+    account_name: '农商银行青年支行',
+    period_text: '2026-09-01 ~ 2026-09-24',
+    vouchers: [
+      { voucher_id: 1, voucher_no: '记0015', reason: '金额对不上' },
+      { voucher_id: 2, voucher_no: '记0016', reason: '找不到对应流水' },
+    ],
+  }]
+  const rows = suspiciousRows(groups)
+  assert.equal(rows.length, 2)
+  // **每行都要带上「哪个账户、哪段期间」** —— 离开它就说不清凭什么可疑
+  assert.equal(rows[0].account_code, '100202')
+  assert.equal(rows[0].period_text, '2026-09-01 ~ 2026-09-24')
+  assert.equal(rows[0].voucher_no, '记0015')
+  assert.equal(rows[1].voucher_no, '记0016')
+})
+
+t('摊平函数对空输入不炸', () => {
+  assert.deepEqual(suspiciousRows(null), [])
+  assert.deepEqual(suspiciousRows([]), [])
+  assert.deepEqual(suspiciousRows([{ vouchers: null }]), [])
+})
+
+t('每一行都要说清「为什么可疑」，并把线索摆出来', () => {
+  // **没有线索的「疑问」是没用的疑问** —— 用户要能立刻看出是金额错了
+  // 还是日期错了。
+  assert.match(VIEW, /\{\{ row\.reason \}\}/)
+  assert.match(VIEW, /row\.clues/)
+  assert.match(VIEW, /流水第 \{\{ clue\.seq \}\} 行/)
+})
+
+t('顶部统计说清三件事：几张存疑 / 邻期未判定 / 内部转账', () => {
+  // 邻期那笔**不判定**，但要报个数 —— 用户看得见「那几个月还有几笔没说法」，
+  // 而不是以为它们不存在。
+  assert.match(VIEW, /suspiciousTotal/)
+  assert.match(VIEW, /suspiciousNearCount/)
+  assert.match(VIEW, /suspiciousInternalCount/)
+  assert.match(VIEW, /邻期分录未判定/)
+  assert.match(VIEW, /内部转账/)
+})
+
+t('「去改这张凭证」跳到那张凭证去改', () => {
+  // 这一页只负责**指出问题**，不负责「改」—— 错账的改法各不相同，
+  // 写死一种改法只会改错。
+  assert.match(VIEW, /去改这张凭证/)
+  assert.match(VIEW, /openVoucher\(row\.voucher_id\)/)
+  assert.match(VIEW, /name: 'voucher-edit'/)
+})
+
+t('存疑凭证那一页是懒加载的', () => {
+  // 它要扫一遍账上所有现金分录，而用户未必会去看它 —— 每次进来都查一遍
+  // 是白查。
+  assert.match(VIEW, /@tab-change="onTabChange"/)
+  assert.match(VIEW, /if \(name === 'suspicious'\) loadSuspicious\(\)/)
+  assert.match(VIEW, /api\.getSuspiciousVouchers/)
+})
+
+console.log('== 凭证摘要模板 ==')
 t('占位符清单与后端一致', () => {
   assert.deepEqual(SUMMARY_TEMPLATE_FIELDS,
     ['摘要', '用途', '对方户名', '日期', '金额', '方向', '序号'])
@@ -567,11 +638,33 @@ t('不认识的占位符要能查出来', () => {
   assert.deepEqual(unknownTemplateFields('{摘要}{瞎写的}'), ['瞎写的'])
 })
 
-t('页面能设账套级与规则级摘要模板', () => {
-  assert.match(VIEW, /凭证摘要模板（账套级）/)
-  assert.match(VIEW, /configForm\.summary_template/)
+t('页面上不再有账套级摘要模板（2026-10-28 下线）', () => {
+  // 用户原话：「去掉账套级摘要模板的设置，完全使用内置口径就可以了，
+  // 不要让用户更改」。
+  //
+  // **断言的是剥掉注释后的模板** —— 注释里提到某个词不等于界面上有它。
+  const view = stripComments(VIEW)
+  assert.doesNotMatch(view, /凭证摘要模板（账套级）/, '账套级模板那块还在')
+  assert.doesNotMatch(view, /configForm/, '账套级模板的表单还在')
+  assert.doesNotMatch(view, /saveConfigForm/, '账套级模板的保存还在')
+  // **它也不能还在发那个请求** —— 后端会回 400（那个字段已经下线）。
+  assert.doesNotMatch(view, /api\.saveConfig/, '还在发账套级配置')
+  assert.doesNotMatch(view, /api\.getConfig/, '还在拉账套级配置')
+})
+
+t('规则级摘要模板留着（那才是「这一类流水用另一种说法」）', () => {
   assert.match(VIEW, /saveRuleTemplate/)
-  assert.match(VIEW, /summary_template/)
+  assert.match(VIEW, /ruleForm\.summary_template/)
+  assert.match(VIEW, /SUMMARY_TEMPLATE_EXAMPLES/)
+  // **占位符插到规则级模板里** —— 只有一个去处了，不必再问「插到哪一份」
+  assert.match(VIEW, /insertPlaceholder\(ruleForm\.summary_template, field\)/)
+  assert.doesNotMatch(VIEW, /insertPlaceholder\([^)]*,\s*'config'\)/)
+})
+
+t('规则级模板的说明写的是「盖过内置口径」', () => {
+  // 「盖过账套级」已经不对了 —— 账套级没有了
+  assert.doesNotMatch(VIEW, /盖过账套级/)
+  assert.doesNotMatch(VIEW, /用账套级/)
 })
 
 console.log('')

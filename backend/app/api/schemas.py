@@ -367,7 +367,20 @@ class BankStatementRowReclassifyIn(BaseModel):
 
 
 class BankStatementConfigIn(BaseModel):
-    """账套级流水配置。**现在是凭证摘要模板**，以后还会有别的。"""
+    """账套级流水配置。
+
+    **``summary_template`` 已废弃（2026-10-28）** —— 账套级摘要模板下线了，
+    摘要一律「规则级 > 内置口径」。
+
+    **字段留着不删，是为了能「明确报错」**：请求体进服务层之前已经被
+    pydantic 按 schema 过滤过（``model_dump(exclude_unset=True)``），一个
+    「不认识」的字段会被**静默丢掉** —— 接口回 200、库里什么都没变，老
+    客户端以为「改了摘要模板」而实际毫无影响。留着它，服务层就能接住并
+    说清「这个字段没有了，现在用规则级模板或内置口径」。
+
+    真正被拒的是**显式带上这个字段**的请求；**完全不带**的请求照常通过
+    （``exclude_unset`` 保证了「没传」与「传了空串」分得开）。
+    """
 
     summary_template: str = Field(default="", max_length=256)
 

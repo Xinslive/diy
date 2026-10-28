@@ -120,7 +120,22 @@ export const planVouchers = (bookId, id) =>
 export const commitVouchers = (bookId, id) =>
   http.post(`/books/${bookId}/bank-statements/${id}/commit-vouchers`, {}, { timeout: 120000 }).then(r => r.data)
 
-// ---- 账套级配置（凭证摘要模板） ----
+/**
+ * **存疑凭证**：账上有、对账单里找不到对应流水的那些凭证。
+ *
+ * 流水对账的另一半：`planVouchers` 那条路是「对账单上有、账上没有」→
+ * 生成凭证；这一路是「账上有、对账单上没有」→ 那是**错账**。
+ *
+ * **只读接口**：它是给人找错账的清单，不改任何东西 —— 只读账号也能看。
+ */
+export const getSuspiciousVouchers = (bookId) =>
+  http.get(`/books/${bookId}/bank-statements/suspicious-vouchers`).then(r => r.data)
+
+// ---- 账套级配置 ----
+//
+// **账套级摘要模板已下线（2026-10-28）** —— 一律用内置口径。
+// 这两个函数留着是为了**还能拿到一句明确的报错**（而不是静默丢掉字段）：
+// 老客户端继续发 `summary_template` 时，服务层会回 400 并说清新口径。
 export const getConfig = (bookId) =>
   http.get(`/books/${bookId}/bank-statement-config`).then(r => r.data)
 export const saveConfig = (bookId, payload) =>
