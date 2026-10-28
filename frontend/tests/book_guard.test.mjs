@@ -117,22 +117,23 @@ t('守卫走的是 utils 里那一份判定，不在守卫里另写一套', () =
   assert.match(ROUTER, /import \{ needsBookRedirect \}/, '都没 import 判定函数')
 })
 
-t('判「没有账套」之前先保证列表问过了', () => {
-  assert.match(ROUTER, /requiresBook[\s\S]{0,400}?await store\.loadBooks\(\)/,
-    '守卫没有先拉账套列表就判空 —— 会误伤有账套的人')
-  assert.match(ROUTER, /await store\.loadBooks\(\)[\s\S]{0,400}?needsBookRedirect\(/,
-    '判定发生在拉列表之前')
+t('判「没有账套」之前启动 bootstrap，并在结果回来后再决定是否回账套管理', () => {
+  assert.match(ROUTER, /requiresBook[\s\S]{0,500}?store\.bootstrap\(\)/,
+    '守卫没有启动上下文初始化 —— 深链接会失去后台校验')
+  assert.match(ROUTER, /store\.bootstrap\(\)[\s\S]{0,500}?needsBookRedirect\(/,
+    '路由没有保留当前上下文的即时判定')
 })
 
 t('拉列表失败时放行，不把人困住', () => {
-  assert.match(ROUTER, /catch \{[\s\S]{0,200}?\}/, '拉账套列表失败没有兜底')
+  assert.match(ROUTER, /store\.bootstrap\(\)[\s\S]{0,500}?\.catch\(\(\) => \{\}\)/,
+    'bootstrap 失败时没有兜底放行')
 })
 
 console.log('')
 console.log('== 「问过了」这个事实存在哪 ==')
 
 t('loadBooks 成功之后把 booksLoaded 置为 true', () => {
-  assert.match(SESSION, /this\.books = await bookApi\.listBooks\(\)[\s\S]{0,200}?this\.booksLoaded = true/,
+  assert.match(SESSION, /this\.books = await bookApi\.listBooks\(\{ cache: false \}\)[\s\S]{0,200}?this\.booksLoaded = true/,
     '拉完账套列表没有记下「问过了」')
 })
 

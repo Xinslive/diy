@@ -1,6 +1,6 @@
 import { http } from './client'
 
-export const listBooks = () => http.get('/books').then(r => r.data)
+export const listBooks = (config = {}) => http.get('/books', config).then(r => r.data)
 export const createBook = (payload) => http.post('/books', payload).then(r => r.data)
 /**
  * 保存账套磁贴的**个人**排序。
@@ -12,7 +12,7 @@ export const createBook = (payload) => http.post('/books', payload).then(r => r.
 export const saveBookOrder = (ids) => http.put('/books/order', { book_ids: ids }).then(r => r.data)
 export const getBook = (id) => http.get(`/books/${id}`).then(r => r.data)
 export const updateBook = (id, payload) => http.put(`/books/${id}`, payload).then(r => r.data)
-export const listPeriods = (id) => http.get(`/books/${id}/periods`).then(r => r.data)
+export const listPeriods = (id, config = {}) => http.get(`/books/${id}/periods`, config).then(r => r.data)
 // 期初跟着顶栏的**年度**走：一笔期初 = 一个会计年度的起点，
 // 切到哪个月都不影响它指向哪一份数。不传就是账套的启用年度。
 export const setOpenings = (id, rows, year) =>

@@ -80,12 +80,13 @@ router.beforeEach(async (to) => {
   // **先问过再判断**：列表还没拉回来时 books 是空的，那是「还没问」不是「没有」。
   // 直接拿空数组去判，会把有账套的用户在打开深链接的那一瞬间也踢回账套管理。
   if (to.meta.requiresBook && !store.booksLoaded) {
-    try {
-      await store.loadBooks()
-    } catch {
-      // 拉不到账套列表就别拦人：宁可放他进去看到空表，也不要把他困在账套管理。
-      // 这时候 booksLoaded 仍是 false，判定不会把他当成「没有账套的人」。
-    }
+    // 路由切换不等待上下文请求；目标页面先挂载自己的骨架，bootstrap 在后台完成。
+    void store.bootstrap().then(() => {
+      if (store.booksLoaded && !store.books.length
+          && router.currentRoute.value.fullPath === to.fullPath) {
+        void router.replace({ name: 'books' })
+      }
+    }).catch(() => {})
   }
   if (needsBookRedirect({
     requiresBook: to.meta.requiresBook,

@@ -79,6 +79,30 @@ body {
 
 .muted { color: var(--cwq-muted); }
 
+/* 路由代码块尚未到达时使用的页面级骨架。使用不改变布局的中性块，
+   数据回来后直接替换，不盖住已经可用的旧内容。 */
+.cwq-page-skeleton { padding: 16px; min-height: 280px; }
+.cwq-skeleton-head,
+.cwq-skeleton-toolbar,
+.cwq-skeleton-row { display: flex; align-items: center; gap: 10px; }
+.cwq-skeleton-head { justify-content: space-between; margin-bottom: 14px; }
+.cwq-skeleton-toolbar { padding: 10px 12px; margin-bottom: 12px; border: 1px solid var(--cwq-border); background: #fff; border-radius: 6px; }
+.cwq-skeleton-line,
+.cwq-skeleton-block,
+.cwq-skeleton-cell { display: block; background: #e9edf3; border-radius: 4px; animation: cwq-skeleton-pulse 1.25s ease-in-out infinite; }
+.cwq-skeleton-title { width: 180px; height: 22px; }
+.cwq-skeleton-action { width: 84px; height: 30px; }
+.cwq-skeleton-block { width: 96px; height: 30px; }
+.cwq-skeleton-table { overflow: hidden; border: 1px solid var(--cwq-border); background: #fff; border-radius: 6px; }
+.cwq-skeleton-row { min-height: 42px; padding: 8px 12px; border-bottom: 1px solid #f0f2f5; }
+.cwq-skeleton-row:last-child { border-bottom: 0; }
+.cwq-skeleton-cell { height: 16px; flex: 1; }
+.cwq-skeleton-cell:first-child { flex: 1.6; }
+.context-sync { color: var(--cwq-muted); font-size: 12px; white-space: nowrap; }
+.context-error { color: var(--cwq-danger); }
+@keyframes cwq-skeleton-pulse { 0%, 100% { opacity: .58; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .cwq-skeleton-line, .cwq-skeleton-block, .cwq-skeleton-cell { animation: none; } }
+
 .tag-ok { color: var(--cwq-ok); font-weight: 600; }
 .tag-bad { color: var(--cwq-danger); font-weight: 600; }
 

@@ -3,12 +3,47 @@ import { effectScope, watch } from 'vue'
 import * as authApi from '@/api/auth'
 import * as bookApi from '@/api/book'
 import { errorText } from '@/utils/errorText'
+import queryCache from '@/data/queryCache'
 
 /** 能写的角色。与后端 ROLES（app/api/system.py）保持一致。 */
 const WRITABLE_ROLES = ['OWNER', 'ACCOUNTANT']
 
 /** 已经装过「切账套」守卫的 store 实例（一个 store 只装一次）。 */
 const bookWatchInstalled = new WeakSet()
+const bootstrapPromises = new WeakMap()
+const CONTEXT_SNAPSHOT_KEY = 'cwq_context_v1'
+
+function readContextSnapshot(userId) {
+  if (!userId) return null
+  try {
+    const value = JSON.parse(localStorage.getItem(CONTEXT_SNAPSHOT_KEY) || 'null')
+    if (!value || String(value.userId) !== String(userId)) return null
+    if (!Array.isArray(value.books) || !Array.isArray(value.periods)) return null
+    return value
+  } catch {
+    return null
+  }
+}
+
+function writeContextSnapshot(store) {
+  if (!store.user?.id) return
+  localStorage.setItem(CONTEXT_SNAPSHOT_KEY, JSON.stringify({
+    version: 1,
+    userId: store.user.id,
+    savedAt: Date.now(),
+    books: store.books,
+    bookId: store.bookId,
+    periodId: store.periodId,
+    periods: store.periods,
+  }))
+}
+
+function snapshotState() {
+  let user = null
+  try { user = JSON.parse(localStorage.getItem('cwq_user') || 'null') } catch { /* stale snapshot */ }
+  const snapshot = readContextSnapshot(user?.id)
+  return { user, snapshot }
+}
 
 /**
  * 挑战的形状：**登录**与**重新验证**共用这一个。
@@ -97,7 +132,10 @@ function ensureBookSwitchWatch(store) {
     watch(
       () => store.bookId,
       (nv, ov) => {
-        if (ov > 0 && nv > 0 && ov !== nv) store.prevBookId = ov
+        if (ov > 0 && nv > 0 && ov !== nv) {
+          store.prevBookId = ov
+          queryCache.remove({ scope: 'book', bookId: ov })
+        }
       },
       { flush: 'sync' }
     )
@@ -105,18 +143,24 @@ function ensureBookSwitchWatch(store) {
 }
 
 const useSessionStoreBase = defineStore('session', {
-  state: () => ({
+  state: () => {
+    const { user, snapshot } = snapshotState()
+    const rememberedBookId = Number(localStorage.getItem('cwq_book') || snapshot?.bookId || 0)
+    const rememberedPeriodId = Number(localStorage.getItem('cwq_period') || snapshot?.periodId || 0)
+    return {
     token: localStorage.getItem('cwq_token') || '',
-    user: JSON.parse(localStorage.getItem('cwq_user') || 'null'),
-    books: [],
+    user,
+    // 账套与期间只保存元数据快照；凭证、余额、报表和日志明细不会进入这里。
+    books: snapshot?.books || [],
     // 账套列表**问过了没有**。
     //
     // 空数组有两种完全不同的含义：「一个账套都没有」和「还没去问」。
     // 路由守卫要据此决定「没有账套就把人送回账套管理」—— 拿「还没问」当成
     // 「没有」，会把有账套的用户在打开深链接的那一瞬间踢回账套管理。
     // 所以这里记一份「问过了」的事实，而不是从 books.length 里反推。
-    booksLoaded: false,
-    bookId: Number(localStorage.getItem('cwq_book') || 0),
+    booksLoaded: Boolean(snapshot),
+    contextStatus: snapshot ? 'snapshot' : 'idle',
+    bookId: rememberedBookId,
     /**
      * **换账套前的那一本**（0 = 没有）。
      *
@@ -151,7 +195,7 @@ const useSessionStoreBase = defineStore('session', {
      *  用户点「新增凭证」重新开一张时，不该被带回刚才那张。
      */
     createdVoucher: null,
-    periods: [],
+    periods: snapshot?.periods || [],
     // **手上这批期间属于哪个账套。** 0 = 手上没有期间。
     //
     //  为什么非要单独记一份：判断「要不要清掉旧期间」不能看 bookId 变没变。
@@ -162,8 +206,8 @@ const useSessionStoreBase = defineStore('session', {
     //
     //  真正该问的是「手上这批期间是谁的」。这个判据跟「谁来写 bookId」无关，
     //  所以 v-model 先写、还是直接调 setBook，都判得对。
-    periodsBookId: 0,
-    periodId: Number(localStorage.getItem('cwq_period') || 0),
+    periodsBookId: snapshot?.bookId || 0,
+    periodId: rememberedPeriodId,
     // 刚建好的账套。放在 store 而不是组件里，是因为建完第一个账套时
     // bookId 会从 0 变成新账套，MainLayout 的 viewKey 一变整个页面就重新挂载，
     // 组件内的 newBookId 会被丢掉，「下一步录期初余额」的提示就没了。
@@ -203,7 +247,8 @@ const useSessionStoreBase = defineStore('session', {
      * 重新验证不要），混在一份里迟早会串。
      */
     mfaReauth: null
-  }),
+    }
+  },
   getters: {
     isAuthed: (s) => !!s.token,
     // 直接用后端下发的字段，别在前端拿用户名另立一套标准
@@ -244,6 +289,8 @@ const useSessionStoreBase = defineStore('session', {
      *  这种账套的页面永远卡在「不查」。
      */
     periodsReady: (s) => s.bookId > 0 && s.periodsBookId === s.bookId,
+    contextReady: (s) => s.contextStatus === 'ready',
+    contextRefreshing: (s) => s.contextStatus === 'refreshing' || s.contextStatus === 'snapshot',
     /** 当前账套能不能写。**失败时关闭（fail-closed）**。
      *
      *  原来是 ``s.currentBook?.role !== 'VIEWER'`` —— 黑名单写法。
@@ -328,7 +375,7 @@ const useSessionStoreBase = defineStore('session', {
      */
     async applySession(data) {
       this.applyToken(data)
-      await this.loadBooks()
+      await this.bootstrap()
     },
 
     /**
@@ -343,6 +390,11 @@ const useSessionStoreBase = defineStore('session', {
      */
     applyToken(data) {
       if (!data?.access_token) return
+      if (data.user?.id != null && this.user?.id != null
+          && String(data.user.id) !== String(this.user.id)) {
+        queryCache.clear()
+        localStorage.removeItem(CONTEXT_SNAPSHOT_KEY)
+      }
       this.token = data.access_token
       localStorage.setItem('cwq_token', data.access_token)
       // **user 缺省就别动它**：换了令牌不等于换了人，而把 undefined
@@ -391,7 +443,7 @@ const useSessionStoreBase = defineStore('session', {
         this.mfa = null
         // 登录这条路上令牌是**刚拿到的**，账套列表得跟着拉一次 ——
         // 顶栏的账套下拉就是靠它填上的。
-        await this.loadBooks()
+        await this.bootstrap()
       }
       return r
     },
@@ -589,6 +641,83 @@ const useSessionStoreBase = defineStore('session', {
     },
 
     /**
+     * 一次请求取得用户、账套和当前期间。快照已经存在时页面可以先用快照挂载，
+     * 这里只负责在后台把权威结果写回；同一个 store 的并发调用共享 promise。
+     */
+    async bootstrap({ force = false } = {}) {
+      if (!this.token) return null
+      const previous = bootstrapPromises.get(this)
+      if (previous && !force) return previous
+      if (previous && force) return previous
+
+      this.contextStatus = this.books.length ? 'refreshing' : 'loading'
+      const promise = (async () => {
+        try {
+          const data = await authApi.bootstrap(this.bookId, this.periodId)
+          if (!data || !Array.isArray(data.books) || !Array.isArray(data.periods)) {
+            await this.loadBooks()
+            this.contextStatus = 'ready'
+            return { books: this.books, periods: this.periods, user: this.user }
+          }
+          this.applyBootstrap(data)
+          return data
+        } catch (error) {
+          // 前后端短暂不同步时沿用旧的两个接口，避免新前端阻断登录。
+          const status = error?.response?.status
+          if (status === 404 || status === 405) {
+            await this.loadBooks()
+            this.contextStatus = 'ready'
+            return { books: this.books, periods: this.periods, user: this.user }
+          }
+          this.contextStatus = this.books.length ? 'snapshot-error' : 'error'
+          throw error
+        } finally {
+          bootstrapPromises.delete(this)
+        }
+      })()
+      bootstrapPromises.set(this, promise)
+      return promise
+    },
+
+    /** 将 bootstrap 的权威结果写入 Pinia，并更新仅包含上下文元数据的快照。 */
+    applyBootstrap(data = {}) {
+      ensureBookSwitchWatch(this)
+      if (data.user) {
+        this.user = data.user
+        localStorage.setItem('cwq_user', JSON.stringify(data.user))
+      }
+      this.books = Array.isArray(data.books) ? data.books : []
+      this.booksLoaded = true
+      const merged = {}
+      for (const b of this.books) {
+        const prev = this.initByBook[b.id] || {}
+        if (!b.init) {
+          if (Object.keys(prev).length) merged[b.id] = prev
+          continue
+        }
+        const y = b.init.year
+        merged[b.id] = y != null ? { ...prev, [y]: b.init } : prev
+      }
+      this.initByBook = merged
+      const wantedBook = Number(data.selected_book_id || this.bookId || 0)
+      const nextBook = this.books.find((book) => book.id === wantedBook) || this.books[0]
+      this.bookId = nextBook?.id || 0
+      this.periods = nextBook && Array.isArray(data.periods) ? data.periods : []
+      this.periodsBookId = nextBook?.id || 0
+      const requestedPeriod = Number(data.selected_period_id || this.periodId || 0)
+      const selected = this.periods.find((period) => period.id === requestedPeriod)
+        || this.periods.find((period) => !period.locked)
+        || this.periods[this.periods.length - 1]
+      this.periodId = selected?.id || 0
+      if (this.bookId) localStorage.setItem('cwq_book', String(this.bookId))
+      else localStorage.removeItem('cwq_book')
+      if (this.periodId) localStorage.setItem('cwq_period', String(this.periodId))
+      else localStorage.removeItem('cwq_period')
+      this.contextStatus = 'ready'
+      writeContextSnapshot(this)
+    },
+
+    /**
      * 把「改了姓名」这件事写回本地状态。
      *
      * **为什么不能只改 localStorage**：store 里的 ``user`` 与 storage 里那份
@@ -654,6 +783,7 @@ const useSessionStoreBase = defineStore('session', {
       this.mfa = null
       // 下一个人的账套列表还没问过 —— 别拿这一份空列表去判「这个人没有账套」
       this.booksLoaded = false
+      this.contextStatus = 'idle'
       // **正在等的高危动作也要就地结束**（裁决为「没通过」）。
       // 不结束的话：拦截器正等着这次重新验证的结果，那个被拦下的请求
       // 会一直悬着（直到超时兜底才作罢）—— 而人已经登出了，悬着它毫无意义。
@@ -684,6 +814,8 @@ const useSessionStoreBase = defineStore('session', {
       localStorage.removeItem('cwq_book')
       localStorage.removeItem('cwq_period')
       this.lastCreatedBookId = 0
+      localStorage.removeItem(CONTEXT_SNAPSHOT_KEY)
+      queryCache.clear()
     },
     /** 拉账套列表，并保证当前账套/期间一定能落到一个有效值上。
      *
@@ -694,10 +826,11 @@ const useSessionStoreBase = defineStore('session', {
       // 守卫装上：顶栏的账套下拉里的选项就是这一份列表装的，
       // 所以「用户第一次能切账套」一定晚于这一刻（见 ensureBookSwitchWatch）。
       ensureBookSwitchWatch(this)
-      this.books = await bookApi.listBooks()
+      this.books = await bookApi.listBooks({ cache: false })
       // 问过了 —— 这一句必须紧跟在列表接口后面，不能挪到 loadPeriods 之后：
       // 期间接口失败不该把「账套列表问过了」这个事实也一起抹掉。
       this.booksLoaded = true
+      this.contextStatus = 'ready'
       // 列表里的 init 是**刚取回来的**，比 initByBook 里的任何一份都新，
       // 所以要顺手覆盖掉那份缓存。
       //
@@ -734,6 +867,7 @@ const useSessionStoreBase = defineStore('session', {
       if (!this.bookId) this.bookId = this.books[0]?.id || 0
       if (this.bookId) localStorage.setItem('cwq_book', String(this.bookId))
       await this.loadPeriods()
+      writeContextSnapshot(this)
     },
 
     /**
@@ -786,7 +920,7 @@ const useSessionStoreBase = defineStore('session', {
         this.periodsBookId = 0
         return
       }
-      const periods = await bookApi.listPeriods(bookId)
+      const periods = await bookApi.listPeriods(bookId, { cache: false })
       // 期间是**账套的属性**：请求在路上时用户可能又切了账套。
       // 旧账套的那份这时候回来，直接盖上去就是「拿着 A 的期间查 B」。
       // 所以只在账套还是那个账套时才落。
@@ -797,6 +931,7 @@ const useSessionStoreBase = defineStore('session', {
         // 记住的期间已经不存在（换年度 / 反结账）—— 落在「还在用的」那一期
         this.setPeriod(this.defaultPeriodId(this.defaultYear()))
       }
+      writeContextSnapshot(this)
     },
     /** 默认停在的期间（用户 2026-10-11 定的口径）：
      *
@@ -895,6 +1030,7 @@ const useSessionStoreBase = defineStore('session', {
       this.periodId = id || 0
       if (id) localStorage.setItem('cwq_period', String(id))
       else localStorage.removeItem('cwq_period')
+      writeContextSnapshot(this)
     },
     periodCodeOf(id) {
       return this.periods.find((p) => p.id === id)?.code || ''

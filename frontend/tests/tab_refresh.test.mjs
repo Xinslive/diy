@@ -46,8 +46,8 @@ t('刷新是真的重挂当前页：viewKey 带上刷新计数', () => {
   // 所以要让 key 变一变、让当前页重挂。
   assert.match(LAYOUT, /refreshKey\.value \+= 1/)
   assert.match(LAYOUT, /\$\{scope\}-\$\{refreshKey\.value\}/)
-  // 刷新前先拉账套/期间：顶栏的月份下拉是全局上下文
-  assert.match(LAYOUT, /await store\.loadBooks\(\)/)
+  // 刷新前先后台校验账套/期间：顶栏的月份下拉是全局上下文
+  assert.match(LAYOUT, /await store\.bootstrap\(\{ force: true \}\)/)
 })
 
 console.log('')

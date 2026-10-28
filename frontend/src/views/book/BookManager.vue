@@ -16,7 +16,9 @@
       </el-button>
     </div>
 
+    <PageSkeleton v-if="loading && !store.books.length" />
     <section
+      v-else
       class="book-grid"
       v-loading="loading"
       aria-label="账套列表"
@@ -192,6 +194,7 @@ import { Edit, Folder, Plus, Right } from '@element-plus/icons-vue'
 import * as api from '@/api/book'
 import { useSessionStore } from '@/stores/session'
 import BookInitDialog from '@/components/BookInitDialog.vue'
+import PageSkeleton from '@/components/PageSkeleton.vue'
 import { hasInit, initStep, STEP_DONE } from '@/utils/bookInit'
 import { dropInto, moveBy, moveDelta, moveTo, orderIds, sameOrder } from '@/utils/bookOrder'
 import { startYearOptions } from '@/utils/startYear'
@@ -479,22 +482,24 @@ watch(() => store.currentPeriod?.year, (y) => {
   if (b && y && b.years?.some((x) => x.year === y)) picked[b.id] = y
 })
 
-onMounted(async () => {
-  loading.value = true
-  try {
-    await store.loadBooks()
-    const b = store.currentBook
-    if (b && store.currentPeriod?.year) picked[b.id] = store.currentPeriod.year
-    // 重挂载后把「刚建好账套」的向导接回来，并直接弹出来，
-    // 免得用户建完账不知道下一步该录期初
-    const last = store.lastCreatedBookId
-    if (last && store.books.some((x) => x.id === last)) {
-      initBookId.value = last
-      initVisible.value = true
-    }
-  } finally {
-    loading.value = false
+function syncBookView() {
+  const b = store.currentBook
+  if (b && store.currentPeriod?.year) picked[b.id] = store.currentPeriod.year
+  // 重挂载后把「刚建好账套」的向导接回来，并直接弹出来，免得用户建完账不知道下一步该录期初。
+  const last = store.lastCreatedBookId
+  if (last && store.books.some((x) => x.id === last)) {
+    initBookId.value = last
+    initVisible.value = true
   }
+}
+
+onMounted(() => {
+  loading.value = !store.books.length
+  syncBookView()
+  void store.bootstrap()
+    .then(() => syncBookView())
+    .catch(() => {})
+    .finally(() => { loading.value = false })
 })
 </script>
 

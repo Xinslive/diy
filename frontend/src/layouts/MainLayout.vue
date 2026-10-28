@@ -54,6 +54,10 @@
       <el-select v-model="store.bookId" class="ctx-select" @change="onBookChange">
         <el-option v-for="b in store.books" :key="b.id" :label="b.name" :value="b.id" />
       </el-select>
+      <span v-if="store.contextRefreshing" class="context-sync" aria-live="polite">同步中</span>
+      <span v-if="syncError" class="context-sync context-error" aria-live="polite" :title="syncError">
+        同步失败，显示上次数据
+      </span>
       <el-select v-model="selYear" class="ctx-select ctx-year" @change="onYearChange">
         <el-option v-for="y in availableYears" :key="y" :label="`${y} 年`" :value="y" />
       </el-select>
@@ -130,9 +134,19 @@
       </el-dropdown>
     </div>
 
-      <main class="content">
-        <router-view :key="viewKey" />
-      </main>
+    <main class="content">
+      <PageSkeleton v-if="showRouteSkeleton" />
+      <div v-show="!showRouteSkeleton" class="route-page">
+        <router-view v-slot="{ Component }">
+          <Suspense timeout="0">
+            <component :is="Component" :key="viewKey" />
+            <template #fallback>
+              <PageSkeleton />
+            </template>
+          </Suspense>
+        </router-view>
+      </div>
+    </main>
     </div>
 
     <!-- 高危动作撞到「近期二次验证」闸门时的引导（审计 §3.2）。
@@ -144,7 +158,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useSessionStore } from '@/stores/session'
 import { useTabsStore } from '@/stores/tabs'
@@ -152,6 +166,8 @@ import { landingOf, menuKeyOf, visibleNav } from '@/router/nav'
 import { prefetchRouteChunk } from '@/utils/routePrefetch'
 import { pluginEntries } from '@/plugins/runtime'
 import MfaReauthDialog from '@/components/MfaReauthDialog.vue'
+import PageSkeleton from '@/components/PageSkeleton.vue'
+import queryCache from '@/data/queryCache'
 import {
   ArrowDown, Close, DArrowRight, Expand, Fold, HomeFilled, Refresh,
 } from '@element-plus/icons-vue'
@@ -160,6 +176,68 @@ const store = useSessionStore()
 const tabs = useTabsStore()
 const route = useRoute()
 const router = useRouter()
+
+const routeDataLoading = ref(false)
+const showRouteSkeleton = computed(() => routeDataLoading.value || store.contextStatus === 'loading')
+const syncError = ref('')
+const syncErrorKey = ref('')
+const pendingInitialQueries = new Set()
+let routeLoadGeneration = 0
+let routeLoadTimer = null
+
+function settleRouteLoad(generation, delay = 100) {
+  clearTimeout(routeLoadTimer)
+  routeLoadTimer = setTimeout(() => {
+    if (generation !== routeLoadGeneration || pendingInitialQueries.size) return
+    if (store.contextStatus === 'loading') return
+    routeDataLoading.value = false
+  }, delay)
+}
+
+function beginRouteLoad() {
+  const generation = ++routeLoadGeneration
+  clearTimeout(routeLoadTimer)
+  pendingInitialQueries.clear()
+  syncError.value = ''
+  syncErrorKey.value = ''
+  routeDataLoading.value = true
+  // Let cached requests paint first. A cache miss keeps the skeleton until the
+  // shared query emits success/error; requests outside the cache layer get a
+  // short fallback window instead of a blank route.
+  settleRouteLoad(generation, 40)
+}
+
+watch(() => store.contextStatus, (status) => {
+  if (status === 'ready' || status === 'error' || status === 'snapshot-error') {
+    const generation = routeLoadGeneration
+    void nextTick(() => settleRouteLoad(generation, 100))
+  }
+})
+
+const stopQueryTracking = queryCache.subscribeAll((event) => {
+  if (event.type === 'fetching' && !event.background && routeDataLoading.value) {
+    pendingInitialQueries.add(event.key)
+    clearTimeout(routeLoadTimer)
+  } else if ((event.type === 'success' || event.type === 'error')
+      && pendingInitialQueries.delete(event.key)) {
+    settleRouteLoad(routeLoadGeneration, 100)
+  }
+
+  const currentBookTag = store.bookId ? `book:${store.bookId}` : ''
+  const tags = event.entry?.tags || []
+  const belongsToCurrentContext = !currentBookTag
+    || tags.includes(currentBookTag)
+    || !tags.some((tag) => /^book:\d+$/.test(tag))
+  if (!belongsToCurrentContext) return
+
+  if (event.type === 'error' && event.background) {
+    syncError.value = '后台刷新失败，当前页面仍显示上次可用数据'
+    syncErrorKey.value = event.key
+  } else if (event.type === 'success' && syncErrorKey.value === event.key) {
+    syncError.value = ''
+    syncErrorKey.value = ''
+  }
+})
 
 const nav = computed(() => visibleNav(store.isAdmin, pluginEntries.value))
 
@@ -196,12 +274,14 @@ const viewKey = computed(() => {
  */
 const refreshKey = ref(0)
 const refreshing = ref(false)
+watch(viewKey, beginRouteLoad, { immediate: true, flush: 'sync' })
 
 async function refreshView() {
   if (refreshing.value) return
   refreshing.value = true
   try {
-    await store.loadBooks()
+    queryCache.invalidate({ scope: 'book', bookId: store.bookId })
+    await store.bootstrap({ force: true })
   } catch {
     // 拉不到也让页面重挂：它自己取数时会再报一次错。
     // 在这里吞掉、页面却还是旧数据，才是最坏的那种「点了没反应」。
@@ -381,8 +461,13 @@ watch(
   }
 )
 
-onMounted(async () => {
-  await store.refreshMe()
-  if (!store.books.length || !store.periods.length) await store.loadBooks()
+onMounted(() => {
+  // 上下文快照已经能让壳层立即渲染；权威 bootstrap 在后台完成。
+  void store.bootstrap().catch(() => {})
+})
+
+onUnmounted(() => {
+  clearTimeout(routeLoadTimer)
+  stopQueryTracking()
 })
 </script>

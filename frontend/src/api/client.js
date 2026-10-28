@@ -1,6 +1,8 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import { apiBase } from '@/config'
+import queryCache, { CACHE_DEFAULTS } from '@/data/queryCache'
+import { QUERY_CACHE_VERSION } from '@/data/queryKeys'
 
 /**
  * API 基址来自运行时配置（见 @/config）。
@@ -84,7 +86,10 @@ http.interceptors.request.use((config) => {
 })
 
 http.interceptors.response.use(
-  (r) => r,
+  (r) => {
+    invalidateAfterMutation(r.config)
+    return r
+  },
   async (error) => {
     const status = error.response?.status
     const detail = error.response?.data?.detail
@@ -187,6 +192,158 @@ http.interceptors.response.use(
   }
 )
 
+const uncachedGet = http.get.bind(http)
+
+function safeStorage(key) {
+  try { return typeof localStorage === 'undefined' ? null : localStorage.getItem(key) }
+  catch { return null }
+}
+
+function requestPath(url) {
+  try { return new URL(url, apiBase || location.origin).pathname.toLowerCase() }
+  catch { return String(url || '').split('?')[0].toLowerCase() }
+}
+
+function requestBookId(path, params) {
+  const inPath = path.match(/\/books\/(\d+)(?:\/|$)/)
+  const fromParams = params?.book_id ?? params?.bookId
+  if (inPath) return Number(inPath[1])
+  if (fromParams && Number.isFinite(Number(fromParams))) return Number(fromParams)
+  const current = Number(safeStorage('cwq_book') || 0)
+  return current || null
+}
+
+function userNamespace() {
+  const token = safeStorage('cwq_token') || ''
+  try {
+    const user = JSON.parse(safeStorage('cwq_user') || 'null')
+    if (user?.id != null) return `user:${user.id}`
+  } catch { /* stale user snapshot; token still isolates the request */ }
+  return token ? `token:${token.slice(-16)}` : 'anonymous'
+}
+
+function canCacheGet(path, config = {}) {
+  if (config.cache === false || config.skipCache) return false
+  if (config.responseType && config.responseType !== 'json') return false
+  if (/(?:^|\/)api\/(?:auth|plugins)(?:\/|$)/.test(path)
+      || /^(?:\/)?(?:auth|plugins)(?:\/|$)/.test(path)) return false
+  if (/(?:^|[/-])(?:download|export|upload|parse|next|neighbour|neighbor|mfa|poll|tick)(?:[-/]|$)/.test(path)) return false
+  if (/\/print\/preview(?:\/|$)/.test(path)) return false
+  if (/\/print(?:\/|$)/.test(path) && !/\/print\/templates(?:\/|$)/.test(path)) return false
+  return true
+}
+
+function queryProfile(path) {
+  if (/\/books\/\d+\/periods(?:\/|$)/.test(path)
+      || /\/system\/(?:users|permissions|roles)(?:\/|$)/.test(path)
+      || /period-check/.test(path)
+      || /\/books\/\d+\/init(?:\/|$)/.test(path)) return 'immediate'
+  if (/\/ledger\/|\/balance(?:\/|$)|\/reports\/\d+\/render/.test(path)) return 'ledger'
+  if (/\/books(?:\/|$)|\/subjects(?:\/|$)|\/print-templates(?:\/|$)|\/templates(?:\/|$)/.test(path)) return 'metadata'
+  return 'list'
+}
+
+function queryTags(path, bookId) {
+  const tags = []
+  if (/\/vouchers?(?:\/|$)|\/invoices?(?:\/|$)|\/bank-statements?(?:\/|$)/.test(path)) tags.push('vouchers')
+  if (/\/ledger\/|\/balance(?:\/|$)/.test(path)) tags.push('ledger')
+  if (/\/reports?(?:\/|$)/.test(path)) tags.push('reports')
+  if (/\/subjects?(?:\/|$)/.test(path)) tags.push('subjects')
+  if (/\/periods?(?:\/|$)/.test(path)) tags.push('periods')
+  if (/\/books?(?:\/|$)/.test(path)) tags.push('books')
+  if (/audit/.test(path)) tags.push('audit')
+  if (/\/users?(?:\/|$)|permissions|roles/.test(path)) tags.push('users')
+  if (/print|template/.test(path)) tags.push('templates')
+  if (/scheduler/.test(path)) tags.push('scheduler')
+  if (!tags.length) tags.push(`resource:${path.split('/').filter(Boolean).slice(1, 3).join(':') || 'api'}`)
+  if (bookId) tags.push(`book:${bookId}`)
+  return tags
+}
+
+function axiosCachedResponse(data, config) {
+  return { data, status: 200, statusText: 'OK', headers: {}, config }
+}
+
+function requestCacheKey(path, config = {}) {
+  const params = config.params instanceof URLSearchParams
+    ? Object.fromEntries([...config.params.entries()].sort(([a], [b]) => a.localeCompare(b)))
+    : (config.params || {})
+  return [
+    QUERY_CACHE_VERSION,
+    'http-get',
+    userNamespace(),
+    Number(safeStorage('cwq_book') || 0) || null,
+    Number(safeStorage('cwq_period') || 0) || null,
+    path,
+    params,
+  ]
+}
+
+http.get = function cachedGet(url, config = {}) {
+  const path = requestPath(url)
+  if (!canCacheGet(path, config)) return uncachedGet(url, config)
+
+  const key = requestCacheKey(path, config)
+  const bookId = requestBookId(path, config.params)
+  const profile = queryProfile(path)
+  const policy = CACHE_DEFAULTS[profile]
+  const tags = queryTags(path, bookId)
+  const scope = bookId ? 'book' : 'user'
+  const snapshot = queryCache.peek(key)
+  const networkConfig = { ...config }
+  delete networkConfig.cache
+  delete networkConfig.skipCache
+
+  const fetchData = () => uncachedGet(url, {
+    ...networkConfig,
+    cache: false,
+    silent: true,
+    __cwqBackground: true,
+  }).then((response) => response.data)
+  if (snapshot) {
+    if (snapshot.stale) {
+      void queryCache.fetch(key, fetchData, {
+        ...policy, profile, tags, scope, cacheBackground: true
+      }).catch(() => {})
+    }
+    return Promise.resolve(axiosCachedResponse(snapshot.data, config))
+  }
+
+  return queryCache.fetch(key, fetchData, { ...policy, profile, tags, scope })
+    .then((data) => axiosCachedResponse(data, config))
+}
+
+function invalidationFor(path) {
+  if (/\/auth(?:\/|$)/.test(path)) return []
+  if (/\/vouchers?(?:\/|$)|\/invoices?(?:\/|$)|\/bank-statements?(?:\/|$)/.test(path)) {
+    return ['vouchers', 'ledger', 'reports', 'periods', 'audit']
+  }
+  if (/\/subjects?(?:\/|$)/.test(path)) return ['subjects', 'ledger', 'reports', 'voucher-form', 'audit']
+  if (/\/periods?(?:\/|$)|\/openings?(?:\/|$)|year-end|carry-forward/.test(path)) {
+    return ['books', 'periods', 'vouchers', 'ledger', 'reports', 'openings', 'audit']
+  }
+  if (/\/reports?(?:\/|$)|report-template/.test(path)) return ['reports', 'templates', 'audit']
+  if (/\/users?(?:\/|$)|permissions|roles/.test(path)) return ['users', 'context', 'books', 'audit']
+  if (/\/books?(?:\/|$)/.test(path)) return ['books', 'context', 'periods', 'subjects', 'audit']
+  if (/\/print|template/.test(path)) return ['templates']
+  return ['audit']
+}
+
+function invalidateAfterMutation(config = {}) {
+  const method = String(config.method || 'get').toLowerCase()
+  if (method === 'get' || config.__cwqBackground) return
+  const path = requestPath(config.url)
+  const tags = invalidationFor(path)
+  if (!tags.length) return
+  const bookId = requestBookId(path, config.params)
+  const globalMutation = /\/(?:books|users|permissions|roles)(?:\/|$)/.test(path)
+    || /\/auth(?:\/|$)/.test(path)
+  queryCache.invalidate({
+    tags,
+    ...(!globalMutation && bookId ? { scope: 'book', bookId } : {}),
+  })
+}
+
 export const apiUrl = (path, params = {}) => {
   const qs = new URLSearchParams(
     Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== '')
@@ -198,7 +355,7 @@ export const apiUrl = (path, params = {}) => {
 // 「只要最新一趟」的 GET：切期间/切账套时用来掐掉上一趟还在途的请求。
 // ------------------------------------------------------------------
 
-/** key → 那一趟的 AbortController。只登记**此刻还在飞**的那些。 */
+/** key → endpoint-level latest request. Different query conditions replace the old one. */
 const inflight = new Map()
 
 /**
@@ -222,16 +379,43 @@ const inflight = new Map()
  *  @returns {Promise<any>} 直接给 data，省得每个调用方再 .then(r => r.data)
  */
 export async function getLatest(key, url, params) {
-  inflight.get(key)?.abort()
-  const ctl = new AbortController()
-  inflight.set(key, ctl)
-  try {
-    const r = await http.get(url, { params, signal: ctl.signal })
-    return r.data
-  } finally {
-    // 只摘自己这一趟：期间可能已经换人了
-    if (inflight.get(key) === ctl) inflight.delete(key)
+  const path = requestPath(url)
+  const cacheKey = requestCacheKey(path, { params })
+  const serialized = JSON.stringify(cacheKey)
+  const previous = inflight.get(key)
+  if (previous && previous.serialized !== serialized) previous.controller.abort()
+  if (previous && previous.serialized === serialized) {
+    return previous.promise
   }
+
+  const ctl = new AbortController()
+  const bookId = requestBookId(path, params)
+  const profile = queryProfile(path)
+  const policy = CACHE_DEFAULTS[profile]
+  const tags = queryTags(path, bookId)
+  const scope = bookId ? 'book' : 'user'
+  const snapshot = queryCache.peek(cacheKey)
+  const request = () => uncachedGet(url, {
+    params,
+    signal: ctl.signal,
+    cache: false,
+  }).then((r) => r.data)
+  const promise = snapshot
+    ? (snapshot.stale
+        ? queryCache.fetch(cacheKey, request, { ...policy, profile, tags, scope })
+        : Promise.resolve(snapshot.data))
+    : queryCache.fetch(cacheKey, request, { ...policy, profile, tags, scope })
+  const record = { controller: ctl, serialized, promise }
+  inflight.set(key, record)
+  promise.finally(() => {
+    // 只摘自己这一趟：期间可能已经换人了
+    if (inflight.get(key) === record) inflight.delete(key)
+  }).catch(() => {})
+  if (snapshot?.stale) {
+    // The old value is immediately usable; the network refresh is shared above.
+    return snapshot.data
+  }
+  return promise
 }
 
 /**

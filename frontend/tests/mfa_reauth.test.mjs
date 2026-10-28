@@ -37,6 +37,7 @@ const vite = await createServer({
 })
 const { http, onMfaReauth, MFA_REAUTH_REQUIRED } =
   await vite.ssrLoadModule('/src/api/client.js')
+const { default: queryCache } = await vite.ssrLoadModule('/src/data/queryCache.js')
 const { useSessionStore } = await vite.ssrLoadModule('/src/stores/session.js')
 const { setActivePinia, createPinia } = await import('pinia')
 
@@ -78,6 +79,7 @@ let pinia
 function freshStore() {
   pinia = createPinia()
   setActivePinia(pinia)
+  queryCache.clear()
   localStorage._m = {}
   const s = useSessionStore()
   s.$reset()
