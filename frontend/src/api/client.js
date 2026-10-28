@@ -227,6 +227,18 @@ function canCacheGet(path, config = {}) {
   if (config.responseType && config.responseType !== 'json') return false
   if (/(?:^|\/)api\/(?:auth|plugins)(?:\/|$)/.test(path)
       || /^(?:\/)?(?:auth|plugins)(?:\/|$)/.test(path)) return false
+  // 管理端（/system/*）一律不进应用级缓存。
+  //
+  // **为什么**：管理端每个接口都是「写完立刻读」—— 装完扩展看列表、存完配置看回值、
+  // 建完用户看名单。而作废缓存的 ``invalidationFor()`` 只认业务标签
+  // （vouchers/ledger/…），**不认 /system 这个命名空间**：写到 /system/plugins/install
+  // 只会作废 'audit' 标签的条目，而扩展列表这条的标签是 'resource:plugins'，
+  // 两边对不上 → 写完之后读到的还是写之前的值，要等 staleTime（15s）过期才恢复。
+  //
+  // 管理页本来就不是热点路径，缓存对它没有收益，风险却是实打实的
+  // （2026-10-28：装完扩展列表不刷新，CI 的签名插件演练直接超时）。
+  if (/(?:^|\/)api\/system(?:\/|$)/.test(path)
+      || /^(?:\/)?system(?:\/|$)/.test(path)) return false
   if (/(?:^|[/-])(?:download|export|upload|parse|next|neighbour|neighbor|mfa|poll|tick)(?:[-/]|$)/.test(path)) return false
   if (/\/print\/preview(?:\/|$)/.test(path)) return false
   if (/\/print(?:\/|$)/.test(path) && !/\/print\/templates(?:\/|$)/.test(path)) return false
@@ -301,6 +313,20 @@ http.get = function cachedGet(url, config = {}) {
     __cwqBackground: true,
   }).then((response) => response.data)
   if (snapshot) {
+    // **被写操作作废过的键：这一趟必须回网络。**
+    //
+    // 作废（invalidated）和「放久了过期」（stale）是两回事：
+    //   · 过期 → 先把旧值给界面，后台刷新（这是缓存该做的事）；
+    //   · 作废 → 刚刚有写操作发生过，界面上要看到的必须是**写之后**的数据。
+    //
+    // 以前两种都当成「过期」处理，于是作废之后的第一趟读**先拿旧值**：
+    // 页面把旧值写进表格，后台刷新虽然把缓存更新了，但页面没订阅这个缓存
+    // （视图层用的是裸 http.get / getLatest，不是 useCachedQuery），
+    // 于是界面就一直停在写之前的状态 —— 「凭证存好了，回列表却看不到它」。
+    if (snapshot.invalidated) {
+      return queryCache.fetch(key, fetchData, { ...policy, profile, tags, scope })
+        .then((data) => axiosCachedResponse(data, config))
+    }
     if (snapshot.stale) {
       void queryCache.fetch(key, fetchData, {
         ...policy, profile, tags, scope, cacheBackground: true
@@ -411,6 +437,11 @@ export async function getLatest(key, url, params) {
     // 只摘自己这一趟：期间可能已经换人了
     if (inflight.get(key) === record) inflight.delete(key)
   }).catch(() => {})
+  if (snapshot?.invalidated) {
+    // 刚刚有写操作把这个键作废了 → 这一趟要等**写之后**的新值。
+    // 凭证页存完凭证回到列表，走的就是这条：拿旧值 = 「存好了却看不见」。
+    return promise
+  }
   if (snapshot?.stale) {
     // The old value is immediately usable; the network refresh is shared above.
     return snapshot.data

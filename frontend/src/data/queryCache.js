@@ -116,6 +116,9 @@ export const queryCache = {
       data: entry.data,
       updatedAt: entry.updatedAt,
       stale: isStale(entry),
+      // 「因为有写操作而作废」和「只是放久了过期」是两回事：
+      // 前者必须回网络重取（界面不能停在写之前），后者可以先给旧值再后台刷新。
+      invalidated: entry.invalidated === true,
       age: now() - entry.updatedAt,
       tags: [...entry.tags],
       scope: entry.scope,
