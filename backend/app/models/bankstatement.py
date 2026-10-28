@@ -180,18 +180,6 @@ class BankStatementRow(Base, TimestampMixin):
     plan_status: Mapped[str] = mapped_column(String(16), default=PLAN_NONE, nullable=False)
     #: 这一行的问题（方向未知、金额为 0、两侧都有发生额……）。
     problems: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
-    #: **人工指定的凭证摘要**。留空 = 跟着规则/模板走（见
-    #: ``app.bankstatement.service.render_summary``）。
-    #:
-    #: **为什么单独一列，而不是每次都现算。** 规则算出来的摘要（用途优先、
-    #: 摘要兜底、模板占位符）适合**大多数**行，但总有行不对：某个客户的付款
-    #: 该写成「备用金」而不是「办公室租金」，而规则管不了「这一笔例外」。
-    #: 人工改过的那几行不该被「重新解析 / 重新制证」冲掉 —— 所以改过的
-    #: 摘要**存下来**。
-    #:
-    #: **它不与规则抢真相**：留空时制证仍然按模板算；只有用户**明确改过**
-    #: 才用这一列。两者的优先级由服务层那一行代码决定，不在别处另判。
-    summary_override: Mapped[str] = mapped_column(Text, default="", nullable=False)
 
     statement: Mapped["BankStatement"] = relationship(back_populates="rows")
     #: 对方科目（可能不止一个，见 :class:`BankStatementRowSubject`）。
@@ -236,6 +224,19 @@ class BankStatementRowSubject(Base, TimestampMixin):
     #: RULE（规则命中）/ MANUAL（人工指定）。
     source: Mapped[str] = mapped_column(String(16), default=PLAN_MANUAL, nullable=False)
     sort_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    #: **人工指定的这一条对方科目的凭证摘要**。留空 = 跟着规则/模板走
+    #: （见 ``app.bankstatement.service.render_summary``）。
+    #:
+    #: **为什么挂在对方科目上，而不是挂在流水行上。** 一张凭证有 N+1 条
+    #: 分录（现金那一条 + 对方那 N 条），每条分录的摘要**本来就是各自独立
+    #: 的字段**（``entry.summary``，凭证编辑页里逐条可改）。流水这一侧若只有
+    #: 一个「整张凭证的摘要」，就管不了「这笔钱记到哪个科目上、那个科目该
+    #: 写什么话」—— 一笔 5000 元的付款拆成「房租 800 + 押金 200」，两个
+    #: 科目该写的话本来就不一样。摘要的粒度跟着**分录**走，就跟着对方科目走。
+    #:
+    #: **它不与规则抢真相**：留空时制证仍然按模板算；只有用户**明确改过**
+    #: 才用这一列。两者的优先级由服务层那一行代码决定，不在别处另判。
+    summary_override: Mapped[str] = mapped_column(Text, default="", nullable=False)
 
     row: Mapped["BankStatementRow"] = relationship(back_populates="plan_subjects")
 

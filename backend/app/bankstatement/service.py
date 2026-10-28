@@ -1417,7 +1417,12 @@ def _plan_total(items: Iterable[BankStatementRowSubject]) -> Decimal:
 
 def _serialize_plan_subjects(items: list[BankStatementRowSubject],
                              subjects: dict[int, Subject]) -> list[dict[str, Any]]:
-    """对方科目列表 → 界面上要的形状。"""
+    """对方科目列表 → 界面上要的形状。
+
+    ``summary_override`` 是**这一条对方科目**的人工摘要（没有人工写就是
+    空串）。界面上那 N 个摘要框靠它回填 —— 写过的要显示出来，
+    没写过的显示规则算出来的那句（那是行级的 ``default_summary``）。
+    """
     out: list[dict[str, Any]] = []
     for item in items:
         subject = subjects.get(item.subject_id)
@@ -1427,6 +1432,7 @@ def _serialize_plan_subjects(items: list[BankStatementRowSubject],
             "subject_name": subject.name if subject else "",
             "amount": str(item.amount),
             "source": item.source,
+            "summary_override": item.summary_override or "",
         })
     return out
 
@@ -1443,21 +1449,45 @@ def _write_plan_subjects(db: Session, row: BankStatementRow,
 
     调用方负责校验（科目合法、金额为正、合计等于流水金额）。
 
+    **唯一被「带过去」的是人工摘要 —— 而且只跟着同一个科目走。**
+    请求体里没带 ``summary`` 的那一条，沿用**它原来那个科目**上的人工
+    摘要；换了个科目（从 6602 改成 6601）就**不带走** —— 那是另一个科目
+    的话，不该接着上一个人写的那句。
+
+    **这不是一般的增量合并**：科目、金额、来源一律整体替换，只有
+    「同一科目上那句人工写的摘要」跟着走。因为它是**这一笔**的结论，
+    而结论不该因为界面上重开了一次弹窗就丢掉。
+
     **写完把关系属性 expire 掉**：会话里那份 ``row.plan_subjects`` 可能还
     留着刚删掉的旧行（它是被 ``db.delete`` 删的，不是从集合里摘掉的），
     谁再读它就会读到已经不在库里的行。expire 之后下次访问重新读库。
     """
     olds = list(existing) if existing is not None else list(row.plan_subjects)
+    # **先记下旧的人工摘要，再删** —— 删完就查不到了。
+    kept: dict[int, str] = {}
+    for old in olds:
+        text = (old.summary_override or "").strip()
+        if text:
+            kept[old.subject_id] = text
     for old in olds:
         db.delete(old)
     db.flush()
     for index, item in enumerate(items, start=1):
+        subject_id = int(item["subject_id"])
+        # ``summary`` **没给** = 沿用同一科目上原来那句（``None``）；
+        # **给了空串** = 用户清空了它 = 交回规则去算。
+        raw = item.get("summary")
+        if raw is None:
+            summary = kept.get(subject_id, "")
+        else:
+            summary = _text(raw)
         db.add(BankStatementRowSubject(
             row_id=row.id,
-            subject_id=int(item["subject_id"]),
+            subject_id=subject_id,
             amount=money(item["amount"]),
             source=item.get("source") or source,
             sort_no=index,
+            summary_override=summary,
         ))
     db.flush()
     db.expire(row, ["plan_subjects"])
@@ -1610,10 +1640,10 @@ def serialize_row(db: Session, row: BankStatementRow,
         "plan_status": row.plan_status,
         "problems": row.problems or [],
         "voucher_state": _voucher_state(row),
-        #: **人工写过的凭证摘要**（空 = 没写过，制证时按规则算）。
-        "summary_override": row.summary_override or "",
-        #: **按规则算出来的那个摘要** —— 界面上给「摘要」输入框当默认值，
-        #: 让用户看到「不改的话会是什么」，改了就用他写的那个。
+        #: **按规则算出来的那个摘要** —— 界面上给每一个对方科目的摘要框
+        #: 当默认值，让用户看到「不改的话会是什么」，改了就用他写的那个。
+        #: **它是行级的**：模板管的是「这一类流水通常怎么写摘要」，
+        #: 而对方科目的那几句各自写在 ``plan_subjects`` 里。
         "default_summary": default_summary,
         #: 账上「可能与这一行是同一笔」的分录（记在别的现金科目上的）。
         #: 有候选 = 这笔钱可能已经入过账了，只是记错了账户。
@@ -1664,6 +1694,11 @@ def _parse_plan_payload(db: Session, book_id: int, row: BankStatementRow,
       不该被迫凑一个列表出来）。
 
     两种都给了要报错 —— 那说明调用方自己也没想清楚要哪个。
+
+    **每一项还可以带自己的 ``summary``** —— 这一条对方科目的凭证摘要。
+    **没带**（``None``）= 沿用这个科目上原来那句；**带了空串** = 用户清空了
+    它 = 交回规则去算。这两者的区别不能糊掉：糊掉的话「清空摘要」与
+    「没碰摘要框」会变成同一件事。
     """
     has_list = "plan_subjects" in payload and payload["plan_subjects"] is not None
     has_single = "plan_subject_id" in payload
@@ -1709,8 +1744,12 @@ def _parse_plan_payload(db: Session, book_id: int, row: BankStatementRow,
         amount = _dec(entry.get("amount"))
         if amount is None or amount <= 0:
             raise ValueError(f"「{subject.code} {subject.name}」的金额必须大于 0")
+        # 摘要：**没给就是 ``None``**（沿用原来那句），给空串就是「交回规则」。
+        summary = entry.get("summary")
+        if summary is not None and not isinstance(summary, str):
+            raise ValueError("凭证摘要必须是字符串")
         items.append({"subject_id": subject.id, "amount": amount,
-                      "source": PLAN_MANUAL})
+                      "source": PLAN_MANUAL, "summary": summary})
         total += amount
     # **合计必须等于流水金额** —— 凭证借贷不平，或者更糟：平了但钱记在
     # 错误的科目上。流水金额为 0 / 未知的行不校验（它压根进不了制证）。
@@ -1725,13 +1764,24 @@ def update_row(db: Session, book_id: int, row_id: int,
                payload: dict[str, Any]) -> dict[str, Any]:
     """改一行：指定对方科目（可能好几个），或忽略 / 恢复这一行。
 
-    **摘要也可以一起改**（``summary``）：留空 = 交回规则/模板去算；
-    写了 = 这一行就用这句。摘要与对方科目是**两件事**，所以它们各写各的：
-    「这笔记到 6602、摘要写『备用金』」是常见搭配。
+    **摘要跟着对方科目走**：每个对方科目可以带自己的 ``summary``，
+    写在 ``plan_subjects`` 的每一项里（见 :func:`_parse_plan_payload`）。
+    一行流水只有一个「整张凭证的摘要」那种写法已经被去掉了 ——
+    原因见 :func:`_make_voucher_for_row`。
     """
     row = db.get(BankStatementRow, row_id)
     if row is None or row.book_id != book_id:
         raise ValueError("流水行不存在")
+    # **旧的行级摘要写法，明确报错而不是当没看见。**
+    #
+    # 请求体在进到这里之前已经被 pydantic 按 schema 过滤过了
+    # （``model_dump(exclude_unset=True)``），所以一个「不认识」的字段
+    # 会被**静默丢掉** —— 界面上写了一句摘要、接口回 200、库里什么都没变。
+    # 「写了却看不见，等于没写」。所以这里把它接住并说清楚该往哪儿写。
+    if "summary" in payload and payload["summary"] is not None:
+        raise ValueError(
+            "凭证摘要现在按对方科目分别设置 —— 请把摘要写在 plan_subjects "
+            "的每一项里（每个科目一句）。")
     if "plan_subjects" in payload or "plan_subject_id" in payload:
         # **已经生成过凭证的行，对方科目不许再改。**
         #
@@ -1746,6 +1796,9 @@ def update_row(db: Session, book_id: int, row_id: int,
         # 这条闸与前端那一条**同一个判据**（``matched_voucher_id``）：
         # 两边各判一次的话，迟早会出现「界面能点、点了被拒」或反过来的
         # 那种最难查的毛病。
+        #
+        # **摘要也在这道闸里面**：摘要是那条分录上的字段，凭证已经写死了它，
+        # 改流水行**不会**回头改凭证，两边就对不上（同一个道理）。
         if row.matched_voucher_id:
             raise ValueError(
                 "这一行已经生成了凭证，对方科目由凭证定死 —— "
@@ -1760,18 +1813,11 @@ def update_row(db: Session, book_id: int, row_id: int,
         if row.matched_voucher_id:
             raise ValueError("这一行已经生成了凭证，不能忽略")
         row.status = status
-    if "summary" in payload:
-        # **人工摘要**：留空 = 交回规则/模板去算（不是「把摘要清成空」）。
-        #
-        # 已生成凭证的行同样不许改 —— 那张凭证已经写死了摘要，改这一列
-        # **不会**回头去改凭证，两边就对不上（与对方科目那条闸同一个道理）。
-        if row.matched_voucher_id:
-            raise ValueError("这一行已经生成了凭证，摘要由凭证定死 —— 要改请改那张凭证。")
-        row.summary_override = _text(payload.get("summary"))
     db.flush()
-    # 返回时把「按规则算出来的那个摘要」也带上：界面上那个输入框要显示
-    # **当前**该用的摘要 —— 人工改了对方科目之后，规则级的模板可能不再适用
-    # （规则级模板只在「这条科目是规则定的」时候算数），默认值得跟着变。
+    # 返回时把「按规则算出来的那个摘要」也带上：界面上那几个摘要输入框
+    # 要显示**当前**该用的摘要 —— 人工改了对方科目之后，规则级的模板可能
+    # 不再适用（规则级模板只在「这条科目是规则定的」时候算数），
+    # 默认值得跟着变。
     rules, config = _summary_context(db, book_id)
     return serialize_row(
         db, row,
@@ -2069,20 +2115,22 @@ def render_summary(row: BankStatementRow, template: str = "") -> str:
     return _default_summary(row)
 
 
-def _effective_summary(row: BankStatementRow, template: str = "") -> str:
-    """这一张凭证的摘要**最终用哪一句**。
+def _subject_summary(item: BankStatementRowSubject, row: BankStatementRow,
+                     template: str = "") -> str:
+    """**这一条对方科目**的凭证摘要**最终用哪一句**。
 
     **人工写的优先**（``summary_override``），没写才按模板算。
 
     **为什么人工的优先，而不是模板的优先**：模板是**账套级 / 规则级**的
     口径，它管的是「这一类流水通常该怎么写摘要」；而人工写的那一句是
-    **这一笔**的。用户既然明确写了，就该用他写的那句 —— 这也正是界面上
-    那个输入框存在的意义。
+    **这一个科目**的 —— 「这笔记到 6602、摘要写『备用金』」是常见搭配，
+    而同一笔里的另一个科目（押金、运费）该写的话不一样。用户既然明确
+    写了，就该用他写的那句 —— 这也正是界面上那个输入框存在的意义。
 
     **留空 = 交回规则**：清空那个输入框 = 不想改 = 跟着规则走（不是
     「摘要留空」）。
     """
-    override = (row.summary_override or "").strip()
+    override = (item.summary_override or "").strip()
     if override:
         return override
     return render_summary(row, template)
@@ -2239,6 +2287,14 @@ def _make_voucher_for_row(db: Session, book_id: int, statement: BankStatement,
     **对方科目可以有好几个**，所以分录不止两条：现金那一条 + 对方那几条。
     对方各条自己的金额加起来正好等于流水金额（写入口已经校验过，
     :func:`_parse_plan_payload`），所以这张凭证必然借贷平。
+
+    **每条分录用自己的摘要。** 对方那几条各有各的一句（人工写过的优先，
+    否则按模板算）——「这笔记到 6602、摘要写『备用金』」与「同一笔记到
+    6601、摘要写『收取押金』」是两个科目的事，不该被一句话管住。
+
+    **现金那一条用行级的那句**（规则/模板算出来的）：它是**整笔**的描述
+    ——钱进出了这个账户，而账户这一侧没有「按科目分开」这回事。要改它，
+    去凭证里改那一条分录（凭证编辑页里逐条可改）。
     """
     if row.tx_date is None:
         raise ValueError("这一行没有日期，定不了凭证日期")
@@ -2258,23 +2314,26 @@ def _make_voucher_for_row(db: Session, book_id: int, statement: BankStatement,
             "请在流水科目规则里改成本年度的科目")
     cash_id = mapping.get(statement.account_subject_id, statement.account_subject_id)
 
-    summary = _effective_summary(row, summary_template)
+    # **现金那一条**：整笔的描述，按模板算。
+    cash_summary = render_summary(row, summary_template)
     entries: list[dict[str, Any]] = []
     if row.direction == DIRECTION_IN:
         # 收钱：现金增加记**借方**（会计口径），对方记贷方。
         entries.append({"subject_id": cash_id, "direction": "DEBIT",
-                        "amount": money(row.amount), "summary": summary})
+                        "amount": money(row.amount), "summary": cash_summary})
         for item in items:
             other_id = mapping.get(item.subject_id, item.subject_id)
             entries.append({"subject_id": other_id, "direction": "CREDIT",
-                            "amount": money(item.amount), "summary": summary})
+                            "amount": money(item.amount),
+                            "summary": _subject_summary(item, row, summary_template)})
     else:
         for item in items:
             other_id = mapping.get(item.subject_id, item.subject_id)
             entries.append({"subject_id": other_id, "direction": "DEBIT",
-                            "amount": money(item.amount), "summary": summary})
+                            "amount": money(item.amount),
+                            "summary": _subject_summary(item, row, summary_template)})
         entries.append({"subject_id": cash_id, "direction": "CREDIT",
-                        "amount": money(row.amount), "summary": summary})
+                        "amount": money(row.amount), "summary": cash_summary})
     return voucher_service.create_voucher(
         db,
         book_id=book_id,

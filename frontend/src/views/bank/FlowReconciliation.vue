@@ -394,20 +394,30 @@
                     </el-button>
                   </div>
                   <div class="flow-extra-item">
-                    <span class="flow-extra-label">摘要</span>
-                    <!-- **这一行会用哪一句凭证摘要** —— 人工写过的优先，
-                         没写过的就是规则算出来的那句。
-                         **摆出来是必须的**：写了却看不见，等于没写 ——
-                         用户没法确认「我改的那句还在不在」。 -->
-                    <span>{{ effectiveSummary(row) || '—' }}</span>
-                    <el-tag
-                      v-if="row.summary_override"
-                      size="small"
-                      type="warning"
-                      effect="plain"
-                    >
-                      人工指定
-                    </el-tag>
+                    <span class="flow-extra-label">凭证摘要</span>
+                    <!-- **每个对方科目各显示自己那一句** —— 写了却看不见，
+                         等于没写：用户没法确认「我改的那句还在不在」。
+                         所以人工写过的要标出来。 -->
+                    <div v-if="row.plan_subjects?.length" class="flow-plan">
+                      <div
+                        v-for="item in row.plan_subjects"
+                        :key="item.subject_id"
+                        class="flow-plan-summary-row"
+                      >
+                        <span class="flow-plan-summary-subject">{{ planSubjectText(item) }}</span>
+                        <span class="muted">→</span>
+                        <span>{{ effectivePlanSubjectSummary(item, row) || '—' }}</span>
+                        <el-tag
+                          v-if="planSubjectSummary(item)"
+                          size="small"
+                          type="warning"
+                          effect="plain"
+                        >
+                          人工
+                        </el-tag>
+                      </div>
+                    </div>
+                    <span v-else class="muted small">—</span>
                   </div>
                   <div class="flow-extra-item">
                     <span class="flow-extra-label">状态</span>
@@ -653,54 +663,63 @@
     </el-tabs>
 
     <!-- ======================================================== 对方科目 -->
-    <el-dialog v-model="planDialog.open" title="对方科目" width="580px">
+    <el-dialog v-model="planDialog.open" title="对方科目" width="640px">
       <div class="muted small">
         一笔流水可能对应好几个科目（房租 + 押金、货款 + 运费）。
         各个科目的金额加起来要等于流水金额
         <strong>{{ money(planDialog.row?.amount) }}</strong>，否则凭证会不平衡。
-      </div>
-      <!-- **凭证摘要**：跟着规则算出来的那句摆在框里，用户可以直接改。
-           规则管的是「这一类流水通常怎么写摘要」，总有行不对 ——
-           某一笔该记「备用金」而不是「办公室租金」，那就手改一句。
-           **没改过就等于没改**：框里的内容原样交回去时，制证仍然按规则算
-           （清空 = 交回规则），改过的才用他写的。 -->
-      <div class="flow-plan-summary">
-        <span class="flow-extra-label">凭证摘要</span>
-        <el-input
-          v-model="planDialog.summary"
-          placeholder="留空 = 按规则/模板自动生成"
-          clearable
-          @input="planDialog.summaryTouched = true"
-          @clear="planDialog.summaryTouched = true"
-        />
-        <div class="muted small">
-          框里这句是**按规则算出来的**（规则级模板 → 账套级模板 → 内置口径）。
-          改了就用你写的；没改就还是它。
-        </div>
+        <br />
+        <strong>每个科目的凭证摘要各写各的</strong>：框里那句是
+        <strong>按规则算出来的</strong>（规则级模板 → 账套级模板 → 内置口径），
+        改了就用你写的；没改就还是它。留空 = 交回规则去算。
       </div>
       <div v-for="(item, index) in planDialog.items" :key="index" class="flow-plan-row">
-        <el-select
-          v-model="item.subject_id"
-          filterable clearable :persistent="false"
-          placeholder="选科目"
-          class="flow-plan-select"
-        >
-          <el-option
-            v-for="s in subjects"
-            :key="s.id"
-            :label="subjectLabel(s)"
-            :value="s.id"
+        <div class="flow-plan-line">
+          <el-select
+            v-model="item.subject_id"
+            filterable clearable :persistent="false"
+            placeholder="选科目"
+            class="flow-plan-select"
+            @change="onPlanSubjectChange(item)"
+          >
+            <el-option
+              v-for="s in subjects"
+              :key="s.id"
+              :label="subjectLabel(s)"
+              :value="s.id"
+            />
+          </el-select>
+          <el-input-number
+            v-model="item.amount"
+            :min="0"
+            :step="100"
+            :precision="2"
+            :controls="false"
+            class="flow-plan-amount"
           />
-        </el-select>
-        <el-input-number
-          v-model="item.amount"
-          :min="0"
-          :step="100"
-          :precision="2"
-          :controls="false"
-          class="flow-plan-amount"
-        />
-        <el-button link type="danger" @click="removePlanItem(index)">删</el-button>
+          <el-button link type="danger" @click="removePlanItem(index)">删</el-button>
+        </div>
+        <!-- **摘要跟着这个科目走** —— 不是整张凭证一句。
+             一笔拆成「业务招待费 + 房屋租赁费」时，这两个科目该写的话
+             本来就不一样（「招待客户」「办公室房租」），一句话管不住。 -->
+        <div class="flow-plan-summary">
+          <span class="flow-extra-label">凭证摘要</span>
+          <el-input
+            v-model="item.summary"
+            placeholder="留空 = 按规则/模板自动生成"
+            clearable
+            @input="item.summaryTouched = true"
+            @clear="item.summaryTouched = true"
+          />
+          <el-tag
+            v-if="item.summary && item.summary !== item.defaultSummary"
+            size="small"
+            type="warning"
+            effect="plain"
+          >
+            人工
+          </el-tag>
+        </div>
       </div>
       <el-button link type="primary" @click="addPlanItem">+ 再加一个科目</el-button>
       <div class="flow-plan-total" :class="planTotalOk ? 'is-ok' : 'is-bad'">
@@ -766,9 +785,10 @@ import * as api from '@/api/bankstatement'
 import * as subjectApi from '@/api/subject'
 import { reportNumber } from '@/utils/format'
 import {
-  FIELD_OPTIONS, canCommit, canEditPlanSubject, canToggleIgnore, diffClass, effectiveSummary,
+  FIELD_OPTIONS, canCommit, canEditPlanSubject, canToggleIgnore, diffClass,
+  effectivePlanSubjectSummary,
   fieldLabel,
-  isCrossPeriod, planSubjectCents,
+  isCrossPeriod, planSubjectCents, planSubjectSummary,
   planSubjectText, planTotalDiff, planTotalMatches, reclassifyCandidateText,
   reclassifyCrossPeriodConfirm, reclassifyCrossPeriodText, reclassifyRowCount,
   renderSummary, settlementSourceText, settlementSourceType,
@@ -826,19 +846,13 @@ const manualMapping = reactive({})
 const planDialog = reactive({
   open: false,
   row: null,
-  items: [],
-  /** 凭证摘要输入框里的内容。 */
-  summary: '',
   /**
-   * **用户动过这个框没有。**
+   * 每一个对方科目一行：`subject_id` + `amount` + **它自己的摘要**。
    *
-   * 没动过 → 保存时**不带** summary → 后端继续按规则算。
-   * 动了 → 把框里的字存成这一行的人工摘要。
-   *
-   * **为什么不直接每次都存**：不动的那些行如果也被存下来，规则改了之后
-   * 它们就不跟着变了 —— 而用户根本没碰过它们，凭什么被冻住。
+   * 摘要挂在**每一项**上，不是整个弹窗一个 —— 凭证上每条分录的摘要本来
+   * 就是各自独立的字段（见 ``flow_state.effectivePlanSubjectSummary``）。
    */
-  summaryTouched: false,
+  items: [],
 })
 /** 改科目弹窗。 */
 const reclassifyDialog = reactive({ open: false, row: null })
@@ -1145,30 +1159,71 @@ async function doSetDirection(row, direction) {
  * 打开「对方科目」弹窗。
  *
  * **一行流水可以有好几个对方科目**，所以弹窗里是一张可增删的小表：
- * 每一行一个科目 + 一份金额。
+ * 每一行一个科目 + 一份金额 + **一句自己的凭证摘要**。
  */
 function openPlan(row) {
   planDialog.row = row
+  // **摘要框默认带上「按规则算出来的那句」** —— 用户先看见「不改会是什么」，
+  // 要改再改。（人工写过的优先；后端给的两样都在这里。）
+  const defaultSummary = (row.default_summary || '').trim()
   const items = (row.plan_subjects || []).map((item) => ({
     subject_id: item.subject_id,
     amount: Number(item.amount) || 0,
+    summary: planSubjectSummary(item) || defaultSummary,
+    defaultSummary,
+    /**
+     * **用户动过这个框没有。**
+     *
+     * 没动过 → 保存时**不带** summary → 后端继续按规则算。
+     * 动了 → 把框里的字存成这个科目的人工摘要。
+     *
+     * **为什么不直接每次都存**：没碰过它的科目如果也被存下来，规则改了
+     * 之后它们就不跟着变了 —— 而用户根本没碰过它们，凭什么被冻住。
+     */
+    summaryTouched: false,
   }))
   planDialog.items = items.length
     ? items
-    : [{ subject_id: null, amount: Number(row.amount) || 0 }]
-  // **摘要框默认带上「按规则算出来的那句」** —— 用户先看见「不改会是什么」，
-  // 要改再改。（人工写过的优先；后端给的两样都在这里。）
-  planDialog.summary = effectiveSummary(row)
-  planDialog.summaryTouched = false
+    : [{
+      subject_id: null,
+      amount: Number(row.amount) || 0,
+      summary: defaultSummary,
+      defaultSummary,
+      summaryTouched: false,
+    }]
   planDialog.open = true
 }
 
 function addPlanItem() {
-  planDialog.items.push({ subject_id: null, amount: 0 })
+  const defaultSummary = (planDialog.row?.default_summary || '').trim()
+  planDialog.items.push({
+    subject_id: null,
+    amount: 0,
+    summary: defaultSummary,
+    defaultSummary,
+    summaryTouched: false,
+  })
 }
 
 function removePlanItem(index) {
   planDialog.items.splice(index, 1)
+}
+
+/**
+ * **换了科目，摘要就回到默认。**
+ *
+ * 摘要**跟着科目走** —— 后端那条规则是「同一个科目上那句人工摘要才跟着
+ * 走，换了科目就不带走」（``_write_plan_subjects``）。所以换了科目之后，
+ * 框里若还留着上一个科目的话，那句话**根本不会被存下来** ——
+ * 而界面上还显示着它，等于「显示的没生效」。
+ *
+ * 让界面与存储对齐：换科目 → 框里回到「按规则算出来的那句」，
+ * 并且标记成**没动过**（于是保存时不带 summary，由规则说了算）。
+ * 想留着自己那句话的用户，改完科目再重打一遍就是了。
+ */
+function onPlanSubjectChange(item) {
+  item.summary = item.defaultSummary
+  item.summaryTouched = false
 }
 
 async function savePlan() {
@@ -1177,15 +1232,18 @@ async function savePlan() {
   savingPlan.value = true
   try {
     const payload = {
-      plan_subjects: planDialog.items.map((item) => ({
-        subject_id: item.subject_id,
-        amount: String(item.amount),
-      })),
-    }
-    // **只有用户动过摘要框才带 summary** —— 没动过的行继续跟着规则走
-    // （规则改了要跟着变）。带空字符串 = 「交回规则去算」。
-    if (planDialog.summaryTouched) {
-      payload.summary = (planDialog.summary || '').trim()
+      plan_subjects: planDialog.items.map((item) => {
+        const entry = {
+          subject_id: item.subject_id,
+          amount: String(item.amount),
+        }
+        // **只有用户动过这个科目的摘要框才带 summary** —— 没动过的继续
+        // 跟着规则走（规则改了要跟着变）。带空字符串 = 「交回规则去算」。
+        if (item.summaryTouched) {
+          entry.summary = (item.summary || '').trim()
+        }
+        return entry
+      }),
     }
     await api.patchRow(store.bookId, row.id, payload)
     planDialog.open = false
@@ -1464,21 +1522,42 @@ onMounted(() => {
 }
 
 /* 对方科目编辑弹窗：一行 = 科目 + 金额 + 删。 */
+/* 一个对方科目 = 一块：上面一行（科目 + 金额 + 删），下面一行（它自己的摘要）。 */
 .flow-plan-row {
+  margin-bottom: 12px;
+  padding: 10px 12px 4px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 4px;
+}
+.flow-plan-line {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 8px;
 }
-/* 凭证摘要：一张凭证一句摘要，所以它是**整个弹窗**的事，不跟着某一行科目走。 */
+/* 凭证摘要：**跟着这个科目走** —— 不是整张凭证一句。 */
 .flow-plan-summary {
-  margin: 10px 0 14px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid var(--el-border-color-lighter);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 6px;
 }
-.flow-plan-summary .flow-extra-label { display: block; margin-bottom: 4px; }
-.flow-plan-summary .muted { margin-top: 4px; line-height: 1.6; }
-.flow-plan-select { flex: 1 1 auto; min-width: 220px; }
+.flow-plan-summary .flow-extra-label {
+  flex: 0 0 auto;
+  margin: 0;
+}
+.flow-plan-summary :deep(.el-input) { flex: 1 1 auto; }
+/* 展开行里「科目 → 摘要」的对应关系。 */
+.flow-plan-summary-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  line-height: 1.8;
+}
+.flow-plan-summary-subject {
+  color: var(--el-text-color-regular);
+}
+.flow-plan-select { flex: 1 1 auto; min-width: 200px; }
 .flow-plan-amount { flex: 0 0 140px; }
 .flow-plan-total {
   margin-top: 10px;

@@ -334,18 +334,35 @@ export const renderSummary = (template, row) => {
 }
 
 /**
- * 这一行**最终会用哪一句摘要**。
+ * 这一条对方科目的**人工摘要**（没写过就是空串）。
  *
- * **人工写过的优先**（`summary_override`），没写才用后端按规则算出来的那个
+ * **人工摘要挂在对方科目上，不是挂在流水行上。** 一张凭证有 N+1 条分录，
+ * 每条分录的摘要本来就是各自独立的字段 —— 「这笔记到 6602、摘要写
+ * 『备用金』」与「同一笔记到 6601、摘要写『收取押金』」是两个科目的事，
+ * 一句话管不住。
+ *
+ * @param {object|null} item 对方科目（``plan_subjects`` 里的一项）
+ * @returns {string}
+ */
+export const planSubjectSummary = (item) => (item?.summary_override || '').trim()
+
+/**
+ * 这一条对方科目**最终会用哪一句摘要**。
+ *
+ * **人工写过的优先**（`summary_override`），没写才用行级规则算出来的那句
  * （`default_summary`）。
  *
  * **为什么不在前端算**：规则命中哪一条、该用规则级还是账套级还是内置口径的
  * 模板 —— 那套判断在**后端**（`service._summary_template_for`）。前端另写
- * 一份，两边迟早漂：预览里一句话、生成的凭证上另一句话。
+ * 一份，两边迟早漂：输入框里一句话、生成的凭证上另一句话。
  * 所以后端把「算出来的那个」一并给过来，这里只做「人工的优先」这一下。
+ *
+ * @param {object|null} item 对方科目
+ * @param {object|null} row 流水行
+ * @returns {string}
  */
-export const effectiveSummary = (row) =>
-  (row?.summary_override || '').trim() || (row?.default_summary || '').trim()
+export const effectivePlanSubjectSummary = (item, row) =>
+  planSubjectSummary(item) || (row?.default_summary || '').trim()
 
 /**
  * 现成的示例模板 —— **给用户照抄的**，不用自己想。

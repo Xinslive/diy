@@ -66,7 +66,10 @@ def main() -> int:
         row.status = "OPEN"
         row.plan_status = "PENDING"
         row.matched_voucher_id = None
-        row.summary_override = ""
+        # **摘要现在挂在对方科目上**（每个科目一句），行上已经没有
+        # 「整张凭证的摘要」那一列了 —— 要清的是子表里那些科目各自的摘要。
+        for subject_row in row.plan_subjects:
+            subject_row.summary_override = ""
         # **挪到未结账的期间** —— dev 账套 2026-09~11 都结账了，
         # 凭证落在结账期间里根本建不出来（库层会挡）。
         row.tx_date = ROW_DATE

@@ -25,7 +25,7 @@ const {
   reclassifyRowCount, reclassifyCandidateText, unknownTemplateFields,
   isCrossPeriod, reclassifyCrossPeriodText, reclassifyCrossPeriodConfirm,
   renderSummary, summaryTemplateValuesText, SUMMARY_TEMPLATE_EXAMPLES,
-  SUMMARY_TEMPLATE_FIELDS, effectiveSummary,
+  SUMMARY_TEMPLATE_FIELDS, effectivePlanSubjectSummary, planSubjectSummary,
 } = STATE
 
 const VIEW = fs.readFileSync(
@@ -277,36 +277,74 @@ t('表格用紧凑尺寸', () => {
   assert.match(VIEW, /<el-table[\s\S]*?size="small"[\s\S]*?class="flow-rows-table"/)
 })
 
-console.log('== 指定科目时能自定义凭证摘要 ==')
+console.log('== 指定科目时：每个对方科目各有一句凭证摘要 ==')
 
-t('最终用哪一句摘要：人工写的优先，没写才用规则算的', () => {
-  assert.equal(effectiveSummary({ summary_override: '备用金', default_summary: '办公室租金' }),
+t('每个科目的摘要：人工写的优先，没写才用规则算的', () => {
+  const row = { default_summary: '办公室租金' }
+  assert.equal(effectivePlanSubjectSummary({ summary_override: '备用金' }, row),
     '备用金')
-  assert.equal(effectiveSummary({ summary_override: '', default_summary: '办公室租金' }),
+  assert.equal(effectivePlanSubjectSummary({ summary_override: '' }, row),
     '办公室租金')
   // 人工写的是空白（只有空格）时**不算写过** —— 交回规则去算
-  assert.equal(effectiveSummary({ summary_override: '   ', default_summary: '办公室租金' }),
+  assert.equal(effectivePlanSubjectSummary({ summary_override: '   ' }, row),
     '办公室租金')
-  assert.equal(effectiveSummary({}), '')
-  assert.equal(effectiveSummary(null), '')
+  assert.equal(effectivePlanSubjectSummary({}, row), '办公室租金')
+  assert.equal(effectivePlanSubjectSummary(null, row), '办公室租金')
+  assert.equal(effectivePlanSubjectSummary(null, null), '')
 })
 
-t('弹窗里有摘要输入框，默认带出规则算出来的那句', () => {
-  // 界面上要有「凭证摘要」这一栏
-  assert.match(VIEW, /凭证摘要/)
-  assert.match(VIEW, /v-model="planDialog\.summary"/)
-  // 打开弹窗时把「按规则算出来的那句」填进去
-  assert.match(VIEW, /planDialog\.summary = effectiveSummary\(row\)/)
+t('人工摘要取自对方科目那一项，不是整张凭证', () => {
+  assert.equal(planSubjectSummary({ summary_override: '备用金' }), '备用金')
+  assert.equal(planSubjectSummary({ summary_override: '' }), '')
+  assert.equal(planSubjectSummary({}), '')
+  assert.equal(planSubjectSummary(null), '')
+})
+
+t('弹窗里每个科目一个摘要框，默认带出规则算出来的那句', () => {
+  const view = stripComments(VIEW)
+  // 摘要框绑在**每一项**上（v-for 里的 item），不是一个框管全部
+  assert.match(view, /v-model="item\.summary"/)
+  // 打开弹窗时把「按规则算出来的那句」填进去 —— 人工写过的优先
+  assert.match(view, /summary: planSubjectSummary\(item\) \|\| defaultSummary/)
   // 留空 = 交回规则
-  assert.match(VIEW, /留空 = 按规则\/模板自动生成/)
+  assert.match(view, /留空 = 按规则\/模板自动生成/)
+  // 「人工」标记看的是**当前值与默认值是否不同** —— 不是「动过没有」。
+  // 看「动过没有」的话，**已经存下来的人工摘要重新打开时反而不显示标记**，
+  // 用户以为它没生效。
+  assert.match(view, /v-if="item\.summary && item\.summary !== item\.defaultSummary"/)
 })
 
-t('没动过摘要框就不带 summary —— 那些行要继续跟着规则走', () => {
-  // 不动的行如果也被存下来，规则改了之后它们就不跟着变了 ——
+t('界面上不再有「整张凭证一句摘要」的那个框', () => {
+  const view = stripComments(VIEW)
+  // **顶部的那个框已经去掉了** —— 它管的是整张凭证所有分录，
+  // 而摘要的粒度是对方科目。
+  assert.doesNotMatch(view, /planDialog\.summary/)
+  assert.doesNotMatch(view, /row\.summary_override/)
+})
+
+t('没动过摘要框就不带 summary —— 那些科目要继续跟着规则走', () => {
+  // 不动的科目如果也被存下来，规则改了之后它们就不跟着变了 ——
   // 而用户根本没碰过它们。
   assert.match(VIEW, /summaryTouched/)
-  assert.match(VIEW, /if \(planDialog\.summaryTouched\)/)
-  assert.match(VIEW, /payload\.summary = \(planDialog\.summary \|\| ''\)\.trim\(\)/)
+  assert.match(VIEW, /if \(item\.summaryTouched\)/)
+  assert.match(VIEW, /entry\.summary = \(item\.summary \|\| ''\)\.trim\(\)/)
+})
+
+t('展开行里能看到每个科目用的是哪一句，人工写的要标出来', () => {
+  // **写了却看不见，等于没写** —— 用户没法确认「我改的那句还在不在」。
+  const view = stripComments(VIEW)
+  assert.match(view, /effectivePlanSubjectSummary\(item, row\)/)
+  assert.match(view, /v-if="planSubjectSummary\(item\)"/)
+})
+
+t('换了科目，摘要框回到默认 —— 显示的与存下来的一致', () => {
+  // 摘要**跟着科目走**：后端「同一个科目上那句才跟着走，换了科目就不带走」。
+  // 框里若还留着上一个科目的话，界面上显示着、存的时候却不生效 ——
+  // 「显示的没生效」比「没显示」更坏。
+  assert.match(VIEW, /@change="onPlanSubjectChange\(item\)"/)
+  assert.match(VIEW, /function onPlanSubjectChange\(item\) \{/)
+  assert.match(VIEW, /item\.summary = item\.defaultSummary/)
+  assert.match(VIEW, /item\.summaryTouched = false/)
 })
 
 console.log('== 一行流水对应多个对方科目 ==')

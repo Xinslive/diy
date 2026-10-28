@@ -977,6 +977,7 @@ def test_head_是本文件认识的那一版():
         "0041_bank_statement",                 # 流水对账四张表：对账单 / 流水行 / 科目规则 / 格式画像
         "0042_bank_statement_row_subjects",    # 流水对方科目改成子表（科目+金额）+ 流水凭证摘要模板
         "0043_bank_statement_row_summary",      # 流水行可以人工指定凭证摘要（bank_statement_row.summary_override）
+        "0044_row_subject_summary",             # 摘要下沉到对方科目（bank_statement_row_subject.summary_override）
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")
@@ -1279,8 +1280,8 @@ def test_跨年账套_次年只有期初没有凭证_迁移照样跑得完(scrat
         # 版本号跟着**迁移链的最后一环**走：0038 是 entry 唯一约束，
         # 0039 是凭证幂等占位表，0040 是未分配利润科目的手工设定列，
         # 0041 是流水对账的四张表，0042 是流水对方科目子表 + 摘要模板，
-        # 0043 是流水行的人工摘要列。
-        assert ver == "0043_bank_statement_row_summary", f"schema 只到 {ver}"
+        # 0043 是流水行的人工摘要列，0044 把摘要下沉到对方科目。
+        assert ver == "0044_row_subject_summary", f"schema 只到 {ver}"
 
         # 科目表按年度拆开
         rows = conn.execute(text(
