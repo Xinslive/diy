@@ -40,6 +40,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ---------------------------------------------------------------- 文档校验
+  # 放在最前面：它跑得最快，失败也最容易看懂。
+  #
+  # **这道闸守的是「目录里的链接点得进去」。**
+  # 架构文档 8000 多行，目录是唯一的入口；锚点一旦对不上，
+  # 目录看着完全正常，点进去却落到页首 —— 而且没有任何报错会响。
+  #
+  # 锚点由 github-slugger 算（和 GitHub 渲染时同一套规则），
+  # **不自己复刻一份实现**：复刻过的两份已经证明会和真实行为对不上。
+  docs:
+    name: 架构文档目录锚点
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: 装锚点计算依赖
+        run: npm --prefix tools/archdoc-toc ci
+
+      - name: 目录锚点必须全部命中
+        run: node tools/archdoc-toc.mjs
+
   # ------------------------------------------------------------------ 后端
   backend:
     name: 后端全量测试

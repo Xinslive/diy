@@ -1,0 +1,9 @@
+{
+  "name": "archdoc-toc",
+  "private": true,
+  "description": "校验 ARCHITECTURE.md 目录锚点的辅助依赖（github-slugger）",
+  "type": "module",
+  "dependencies": {
+    "github-slugger": "2.0.0"
+  }
+}
