@@ -371,3 +371,134 @@ def test_不属于本账套的分录改不了(statement, db, book, admin_user, s
     with pytest.raises(ValueError) as exc:
         service.reclassify_row_subject(db, book.id, row["id"], 999999, admin_user)
     assert "分录" in str(exc.value), f"提示没说出为什么不能改：{exc.value}"
+
+
+# ----------------------------------------------------------------------
+# 「已入账」这个标记的寿命
+# ----------------------------------------------------------------------
+
+def test_跨期改完之后再算清单不会退回待确认科目(statement, db, book, admin_user, subjects):
+    """改完之后**再算一次清单**，这一行必须还是「已入账」。
+
+    回归：改科目那一步会把这一行标成已入账（``matched_voucher_id`` 指向那张
+    凭证），可清单是**每次打开界面都重算**的 —— 重算时那张凭证因为日期差
+    20 天（超出 7 天的去重窗口）根本扫不到，于是标记被收回，行状态从
+    「已入账」退回「待确认科目」。用户明明刚确认过，看着却像没改成。
+
+    生产实测就是这个问题：对账单 1 的 row#24（差 28 天）、row#26（差 16 天）
+    两行都这样。
+    """
+    from datetime import date, timedelta
+
+    row = _first_row(db, book, statement)
+    when = date.fromisoformat(row["tx_date"]) - timedelta(days=20)
+    shifted = {"amount": row["amount"], "tx_date": when.isoformat(),
+               "direction": row["direction"]}
+    voucher = _voucher_on_cash(db, book, admin_user, subjects, shifted)
+    entry = db.scalars(select(Entry).where(
+        Entry.voucher_id == voucher.id).order_by(Entry.line_no)).first()
+    db.expire_all()
+
+    service.reclassify_row_subject(db, book.id, row["id"], entry.id, admin_user)
+    db.expire_all()
+
+    # **照着界面的次序来**：改完科目前端会立刻重算清单（plan-vouchers）。
+    plan = service.plan_vouchers(db, book.id, statement["id"])
+    db.expire_all()
+
+    rows = service.list_rows(db, book.id, statement["id"])
+    hit = next(r for r in rows if r["id"] == row["id"])
+    assert hit["voucher_state"] == "POSTED", (
+        f"改完科目又算了一次清单，状态就退回去了：{hit['voucher_state']}")
+    skipped = [s for s in plan["skipped"] if s["id"] == row["id"]]
+    assert skipped and skipped[0]["reason"].startswith("已入账"), (
+        f"清单里没有把它标成已入账：{skipped}")
+
+
+def test_同期的改完之后再算清单也还是已入账(statement, db, book, admin_user, subjects):
+    """主窗口之内的那一类也不能被重算带走 —— 同一件事的两种日期。"""
+    row = _first_row(db, book, statement)
+    voucher = _voucher_on_cash(db, book, admin_user, subjects, row)
+    entry = db.scalars(select(Entry).where(
+        Entry.voucher_id == voucher.id).order_by(Entry.line_no)).first()
+    db.expire_all()
+
+    service.reclassify_row_subject(db, book.id, row["id"], entry.id, admin_user)
+    db.expire_all()
+    service.plan_vouchers(db, book.id, statement["id"])
+    db.expire_all()
+
+    rows = service.list_rows(db, book.id, statement["id"])
+    hit = next(r for r in rows if r["id"] == row["id"])
+    assert hit["voucher_state"] == "POSTED"
+
+
+def test_凭证删掉之后标记照样收回来(statement, db, book, admin_user, subjects):
+    """「已入账」这个标记是**借来的** —— 凭证没了，标记就得还回去。
+
+    回收标记的用意是「用户把那张凭证删了之后，这一行应该重新成为候选」。
+    修了「跨期候选被误收」之后，这条老路不能跟着瘫掉，否则那一行会永远
+    赖在「已入账」上，再也制不出凭证。
+    """
+    row = _first_row(db, book, statement)
+    voucher = _voucher_on_cash(db, book, admin_user, subjects, row)
+    entry = db.scalars(select(Entry).where(
+        Entry.voucher_id == voucher.id).order_by(Entry.line_no)).first()
+    db.expire_all()
+
+    service.reclassify_row_subject(db, book.id, row["id"], entry.id, admin_user)
+    db.commit()
+    db.expire_all()
+
+    service.voucher_service.delete_voucher(db, voucher, admin_user)
+    db.commit()
+    db.expire_all()
+
+    service.plan_vouchers(db, book.id, statement["id"])
+    db.expire_all()
+
+    rows = service.list_rows(db, book.id, statement["id"])
+    hit = next(r for r in rows if r["id"] == row["id"])
+    assert hit["voucher_state"] != "POSTED", (
+        "凭证都删了，这一行还赖着「已入账」—— 它再也制不出凭证了")
+    assert hit["matched_voucher_id"] is None
+
+
+def test_凭证后来被挪走之后标记照样收回来(statement, db, book, admin_user, subjects):
+    """保留标记的另一个条件：**那张凭证现在还覆盖这一行**。
+
+    用户把科目改过来之后，如果又把这笔现金挪回别的账户，那一行就不再被
+    那张凭证覆盖了 —— 这时标记必须收回去，否则它会一直显示「已入账」，
+    而钱其实记在别的账户上，对账时差额永远对不上。
+    """
+    row = _first_row(db, book, statement)
+    voucher = _voucher_on_cash(db, book, admin_user, subjects, row)
+    entry = db.scalars(select(Entry).where(
+        Entry.voucher_id == voucher.id).order_by(Entry.line_no)).first()
+    db.expire_all()
+
+    service.reclassify_row_subject(db, book.id, row["id"], entry.id, admin_user)
+    db.commit()
+    db.expire_all()
+
+    # 又把这笔现金挪回 1001（等于用户自己反悔了）。
+    voucher = db.get(Voucher, voucher.id)
+    entries = [{"subject_id": subjects["1001"].id, "direction": e.direction,
+                "amount": str(e.amount), "summary": e.summary or "",
+                "aux_ref": e.aux_ref or {}}
+               for e in sorted(voucher.entries, key=lambda x: x.line_no)]
+    token = service.voucher_service.version_token(voucher.updated_at)
+    service.voucher_service.update_voucher(db, voucher, admin_user,
+                                           {"entries": entries},
+                                           expected_version=token)
+    db.commit()
+    db.expire_all()
+
+    service.plan_vouchers(db, book.id, statement["id"])
+    db.expire_all()
+
+    rows = service.list_rows(db, book.id, statement["id"])
+    hit = next(r for r in rows if r["id"] == row["id"])
+    assert hit["voucher_state"] != "POSTED", (
+        "现金侧都被挪走了，这一行还赖着「已入账」")
+    assert hit["matched_voucher_id"] is None

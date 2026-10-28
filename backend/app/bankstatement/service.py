@@ -1808,6 +1808,58 @@ def _voucher_matches(db: Session, book_id: int, subject_id: int,
     return [(int(vid), vdate) for vid, vdate in rows]
 
 
+def _voucher_covers_row(db: Session, book_id: int, statement: BankStatement,
+                        row: BankStatementRow,
+                        voucher_id: Optional[int]) -> bool:
+    """这张凭证是不是还「覆盖」这一行流水。
+
+    「覆盖」= 凭证上有一条分录同时满足三件事：**科目就是这份对账单绑定的
+    账户**、**方向对得上**、**金额相等**。
+
+    **为什么按科目编码比，不按 id**：科目表每个年度各有一份（2026 的 1002 与
+    2027 的 1002 是两行不同的记录），跨年搬科目时 id 会变
+    （见 :func:`_remap_subjects`）。按 id 比，跨年那一笔就认不出自己刚标过
+    的那张凭证。
+
+    **为什么不看日期**：日期窗口是「这一行对应哪张凭证」的**启发式** ——
+    同一天同金额同科目的两笔款是常事（付两笔一样的运费），用窗口把两者
+    分开。但用户已经通过「可改科目」**人工确认过**是哪一张凭证了，这时再拿
+    启发式去推翻它，就会把人工确认的结果吞掉：跨期 16~30 天的候选一改完，
+    那张凭证在 ±7 天的扫描里根本看不见，标记当场被收回，行状态从「已入账」
+    退回「待确认科目」—— 用户明明刚确认过，看着却像没改成。
+
+    所以回收标记之前先问一句「**你标的那张凭证还在不在、还对不对得上**」。
+    凭证被删了、金额改了、现金侧又挪走了 —— 那才该收回。
+    """
+    if not voucher_id:
+        return False
+    voucher = db.get(Voucher, voucher_id)
+    if voucher is None or voucher.book_id != book_id:
+        return False
+    if voucher.status not in ("POSTED", "UNPOSTED"):
+        return False
+    if row.amount is None or row.direction not in (DIRECTION_IN, DIRECTION_OUT):
+        return False
+    account = db.get(Subject, statement.account_subject_id)
+    if account is None:
+        return False
+    # **银行账的方向与会计凭证相反**：流水 IN（收钱）= 现金增加 = 借方。
+    entry_direction = "DEBIT" if row.direction == DIRECTION_IN else "CREDIT"
+    hit = db.execute(
+        select(Entry.id)
+        .join(Subject, Subject.id == Entry.subject_id)
+        .where(
+            Entry.voucher_id == voucher.id,
+            Subject.book_id == book_id,
+            Subject.code == account.code,
+            Entry.direction == entry_direction,
+            Entry.amount == row.amount,
+        )
+        .limit(1)
+    ).first()
+    return hit is not None
+
+
 def plan_vouchers(db: Session, book_id: int, statement_id: int,
                   *, window_days: int = DEFAULT_DEDUPE_WINDOW_DAYS) -> dict[str, Any]:
     """算一份对账单里哪些流水可以制证、哪些已经入过账。
@@ -1835,23 +1887,32 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
             skipped.append({**serialize_row(db, row, subjects, items),
                             "reason": "已忽略"})
             continue
-        # ---- 去重（已有凭证）----
-        matched = _voucher_matches(
-            db, book_id, statement.account_subject_id,
-            row.amount or Decimal("0"), row.direction, row.tx_date, window_days)
-        if matched:
-            voucher_id, voucher_date = matched[0]
-            row.status = STATUS_POSTED
-            row.matched_voucher_id = voucher_id
-        elif row.status == STATUS_POSTED and not row.matched_voucher_id:
-            # 之前标过已入账，现在查不到那张凭证了（多半是被删了）——
-            # 收回标记，这一行重新成为候选。
-            row.status = STATUS_OPEN
-        elif row.status == STATUS_POSTED:
-            # 标记还在，但匹配到的凭证已经不是那张了（比如金额改了）。
-            # 重新判一次。
-            row.status = STATUS_OPEN
-            row.matched_voucher_id = None
+        # **人工确认过的标记优先**：这一行已经标着「已入账」且指着某张凭证时，
+        # 先核实那张凭证**是不是还覆盖这一行** —— 覆盖了就保留它，不让下面
+        # 那次启发式扫描去顶掉用户的确认。
+        #
+        # 为什么要先核实：扫描靠日期窗口（±7 天）找「哪张凭证」，而用户点
+        # 「可改科目」时已经**人工确认过**是哪一张了。跨期 16~30 天的候选
+        # 尤其明显 —— 改完之后那张凭证在 ±7 天的扫描里根本看不见，标记当场
+        # 被收回，行状态从「已入账」退回「待确认科目」。用户明明刚确认过，
+        # 看着却像没改成。
+        covered = bool(
+            row.status == STATUS_POSTED and row.matched_voucher_id
+            and _voucher_covers_row(db, book_id, statement, row,
+                                    row.matched_voucher_id))
+        if not covered:
+            matched = _voucher_matches(
+                db, book_id, statement.account_subject_id,
+                row.amount or Decimal("0"), row.direction, row.tx_date, window_days)
+            if matched:
+                voucher_id, voucher_date = matched[0]
+                row.status = STATUS_POSTED
+                row.matched_voucher_id = voucher_id
+            elif row.status == STATUS_POSTED:
+                # 标记还在，但那张凭证已经对不上这一行了（多半是被删了，
+                # 也可能金额改了、现金侧又挪走了）—— 收回标记，重新判一次。
+                row.status = STATUS_OPEN
+                row.matched_voucher_id = None
         if row.status == STATUS_POSTED:
             skipped.append({
                 **serialize_row(db, row, subjects, items),
