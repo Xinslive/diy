@@ -18,7 +18,8 @@ import fs from 'node:fs'
 
 const STATE = await import('../src/views/bank/flow_state.js')
 const {
-  canCommit, diffClass, fieldLabel, settlementSourceText, settlementSourceType,
+  canCommit, canEditPlanSubject, canToggleIgnore, diffClass, fieldLabel,
+  settlementSourceText, settlementSourceType,
   toColumnMapping, voucherStateText, voucherStateType, FIELD_OPTIONS,
   toCents, planSubjectCents, planTotalMatches, planTotalDiff, planSubjectText,
   reclassifyRowCount, reclassifyCandidateText, unknownTemplateFields,
@@ -131,9 +132,7 @@ t('页面提供「记住这个格式」与「按指定重新解析」', () => {
 
 console.log('== 流水明细页：默认只显示解析出来的内容 ==')
 
-t('方向、对方科目、状态收在「对账信息」里（默认收起，且是往下展开）', () => {
-  // 收起状态 = showExtra 默认 false
-  assert.match(VIEW, /const showExtra = ref\(false\)/)
+t('方向、对方科目、状态收在展开行里（默认收起，且是往下展开）', () => {
   // **往下展开**：用展开行，不是往右加列。
   // 加列会把表格撑宽 → 窄屏上冒出左右滑动条，一边横拖一边看很难受。
   assert.match(VIEW, /type="expand"/)
@@ -143,12 +142,60 @@ t('方向、对方科目、状态收在「对账信息」里（默认收起，�
     assert.match(VIEW, new RegExp(`>${label}</span>`), `${label} 不在展开行里`)
   }
   // **不许**再有那三个「往右加」的列
+  //
+  // 只看**流水明细这张表**（``.flow-rows-table``）—— 同一个 .vue 里还有
+  // 对账单台账（「状态」列）与流水科目规则（「对方科目」列）两张表，
+  // 那些列是正经的，别一起禁掉。
+  const rowsTableStart = VIEW.indexOf('class="flow-rows-table"')
+  assert.ok(rowsTableStart > 0, '找不到流水明细表')
+  const rowsTableBlock = VIEW.slice(rowsTableStart, VIEW.indexOf('</el-table>', rowsTableStart))
   for (const label of ['方向', '对方科目', '状态']) {
     assert.doesNotMatch(
-      VIEW,
-      new RegExp(`<el-table-column v-if="showExtra" label="${label}"`),
-      `${label} 还在当列 —— 那就会把表格撑宽、出左右滑动条`)
+      rowsTableBlock,
+      new RegExp(`<el-table-column[^>]*label="${label}"`),
+      `${label} 还在流水明细表里当列 —— 那就会把表格撑宽、出左右滑动条`)
   }
+})
+
+t('展开箭头一直都在：没有「对账信息」勾选开关', () => {
+  // 用户原话：「默认收起就行，去掉勾选对账信息的开关」。
+  // 曾经过去是「勾上『对账信息』才出现行首箭头」—— 那样「不看对账信息的人」
+  // 和「要改对账信息的人」看到的是**两张不同的表**。
+  assert.doesNotMatch(VIEW, /showExtra/, '还有 showExtra 这个开关状态')
+  assert.doesNotMatch(VIEW, /对账信息<\/el-checkbox>/, '「对账信息」勾选开关还在')
+  assert.doesNotMatch(VIEW, /class="flow-toggle"/, '「对账信息」勾选开关还在')
+  // 展开列**没有** v-if —— 箭头常在，行默认收起
+  assert.match(VIEW, /<el-table-column type="expand"/)
+})
+
+console.log('== 忽略 / 恢复：点完忽略还要点得回来 ==')
+
+t('「忽略」之后「恢复」必须还能点', () => {
+  // 用户原话：「流水明细点击忽略之后怎么没办法点击恢复？」
+  //
+  // 曾经条件写成 ``row.status !== 'OPEN'``：忽略之后状态变成 IGNORED，
+  // 按钮**自己把自己禁用了** —— 文案写着「恢复」，却永远点不动。
+  // 判据必须是「状态在这两者之一」。
+  assert.equal(canToggleIgnore({ status: 'OPEN' }), true)
+  assert.equal(canToggleIgnore({ status: 'IGNORED' }), true)
+  // 已生成凭证的行不许改这个状态（后端也这么挡）
+  assert.equal(canToggleIgnore({ status: 'POSTED' }), false)
+  assert.equal(canToggleIgnore(null), false)
+  // 模板里用的就是这个判据，别在 .vue 里另写一份
+  assert.match(VIEW, /:disabled="!store\.canWrite \|\| !canToggleIgnore\(row\)"/)
+})
+
+console.log('== 已入账的流水：对方科目由凭证定死 ==')
+
+t('已生成凭证的行不能再指定对方科目', () => {
+  // 只改流水行、不改凭证，两边就对不上 —— 而且界面上看不出来。
+  // 判据与后端同一条（matched_voucher_id），两边各判一次迟早出「能点却被拒」。
+  assert.equal(canEditPlanSubject({ matched_voucher_id: null }), true)
+  assert.equal(canEditPlanSubject({ matched_voucher_id: 12 }), false)
+  assert.equal(canEditPlanSubject(null), false)
+  // 界面必须置灰，并把出路写在旁边
+  assert.match(VIEW, /:disabled="!canEditPlanSubject\(row\)"/)
+  assert.match(VIEW, /已入账，科目由凭证定死，要改请改凭证/)
 })
 
 t('默认就显示的那些列是流水解析出来的内容', () => {

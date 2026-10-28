@@ -67,16 +67,27 @@ try {
     await page.locator('.el-select-dropdown__item:visible').first().click()
     await page.waitForTimeout(1500)
   })
-  await step('展开对账信息', async () => {
-    await page.locator('.flow-toggle').first().click()
+  // **展开内容在紧跟数据行之后的另一个 <tr> 里**（Element Plus 的展开行是
+  // 独立的一行），**不在数据行自己身上** —— 找错地方会以为按钮不见了。
+  // （这个坑是 2026-10-28 改成展开行时留下的：那时脚本还在找数据行里的
+  //  按钮，于是「可改科目」永远找不到。）
+  let expanded = null
+  await step('展开那一行（箭头一直都在，不用勾开关）', async () => {
+    const row = page.locator('.flow-rows-table tbody tr.el-table__row')
+      .filter({ hasText: '__uitest_cross__' })
+    if (await row.count() !== 1) throw new Error(`没找到测试流水行（${await row.count()} 行）`)
+    await row.locator('.el-table__expand-icon').first().click()
     await page.waitForTimeout(800)
+    expanded = row.locator('xpath=following-sibling::tr[1]')
+    if (await expanded.locator('.flow-extra').count() !== 1) {
+      throw new Error('展开内容不在紧跟其后的那一行里')
+    }
   })
 
   await step('测试流水那行有「可改科目」入口', async () => {
-    const row = page.locator('.flow-rows-table tbody tr').filter({ hasText: '__uitest_cross__' })
-    if (await row.count() !== 1) throw new Error(`没找到测试流水行（${await row.count()} 行）`)
-    const btn = row.locator('button:has-text("可改科目")')
-    if (await btn.count() !== 1) throw new Error('测试流水行没有「可改科目」按钮')
+    if (!expanded) throw new Error('上一步没展开成')
+    const btn = expanded.locator('button:has-text("可改科目")')
+    if (await btn.count() !== 1) throw new Error('展开行里没有「可改科目」按钮')
     await btn.click()
     await page.waitForTimeout(900)
   })

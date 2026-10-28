@@ -125,10 +125,13 @@ await step('默认形态没有横向滚动条', async () => {
 })
 
 // ---- 展开「对账信息」：**往下展开**，不是往右加列 ----
-await step('勾上「对账信息」后行首出现展开箭头', async () => {
-  // el-checkbox 的**根元素**就带 flow-toggle（不是它里面有 .el-checkbox）
-  await page.locator('.flow-toggle').first().click()
-  await page.waitForTimeout(800)
+await step('行首一直有展开箭头（没有「对账信息」开关）', async () => {
+  // 曾经过去是「勾上『对账信息』才出现箭头」—— 那样「不看对账信息的人」与
+  // 「要改对账信息的人」看到的是**两张不同的表**。
+  // 用户原话：「默认收起就行，去掉勾选对账信息的开关」。
+  if (await page.locator('.flow-toggle').count()) {
+    throw new Error('还有「对账信息」勾选开关')
+  }
   const icons = await page.locator('.flow-rows-table .el-table__expand-icon').count()
   if (icons < 3) throw new Error(`行首没有展开箭头（${icons} 个）`)
 })

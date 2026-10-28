@@ -260,3 +260,93 @@ def test_制证前对方科目金额对不上就跳过(statement, db, book, admi
     target = next(s for s in plan["skipped"] if s["id"] == row["id"])
     assert "对不上" in target["reason"], f"没被拦住：{target['reason']}"
     assert row["id"] not in [c["id"] for c in plan["candidates"]]
+
+
+# ----------------------------------------------------------------------
+# 已入账 / 已忽略：状态与科目的可改性
+# ----------------------------------------------------------------------
+#
+# 这两条是**用户在实际使用里撞出来的**：
+#
+# 1. 「流水明细点击忽略之后怎么没办法点击恢复？」—— 挡住的不是后端，是
+#    界面上的那个按钮（条件写成 ``status !== 'OPEN'``，忽略之后自己把自己
+#    禁用了）。后端本来就允许恢复，这里钉住它**不许退**。
+# 2. 「状态是已入账的流水，设置成不可以再指定科目了！」—— 已入账的流水，
+#    科目**由凭证定死**：只改流水行、不改凭证，两边就对不上，而且界面上
+#    看不出来。要改，改的是凭证。
+
+
+def test_已忽略的行可以恢复(statement, db, book):
+    """点完「忽略」还要点得回来 —— 这是后端本来就允许的，别把它堵死。"""
+    row = _row(db, book, statement)
+    service.update_row(db, book.id, row["id"], {"status": "IGNORED"})
+    db.commit()
+    result = service.update_row(db, book.id, row["id"], {"status": "OPEN"})
+    assert result["status"] == "OPEN"
+
+
+def test_已入账的行不能再指定对方科目(statement, db, book, admin_user, subjects):
+    """凭证已经把科目定死了 —— 流水行不许再单独改它。"""
+    row = _row(db, book, statement)
+    service.update_row(db, book.id, row["id"], {
+        "plan_subjects": [
+            {"subject_id": subjects["560202"].id, "amount": row["amount"]},
+        ]})
+    db.commit()
+    created = service.commit_vouchers(db, book.id, statement["id"], admin_user)
+    assert created["created_count"] == 1, f"制证失败：{created['failures']}"
+    db.expire_all()
+
+    with pytest.raises(ValueError) as exc:
+        service.update_row(db, book.id, row["id"], {
+            "plan_subjects": [
+                {"subject_id": subjects["560204"].id, "amount": row["amount"]},
+            ]})
+    msg = str(exc.value)
+    assert "凭证" in msg, f"提示没说出为什么不能改：{msg}"
+    db.rollback()
+
+    # **改不动**：科目还是原来那个（没被偷偷改掉）
+    db.expire_all()
+    after = next(r for r in service.list_rows(db, book.id, statement["id"])
+                 if r["id"] == row["id"])
+    assert [i["subject_id"] for i in after["plan_subjects"]] == [subjects["560202"].id]
+
+
+def test_规则重算不动已入账的行(statement, db, book, admin_user, subjects):
+    """规则改的是「还没入账的行该怎么记」，碰不到已经记好的账。
+
+    这是**另一扇门**：用户点不了「指定」，可改一条规则，全量重算一样会
+    把已入账行的对方科目改掉 —— 一样是两边对不上、一样看不出来。
+    """
+    rows = service.list_rows(db, book.id, statement["id"])
+    keyword = rows[0]["summary"][:4]
+    rule = service.create_rule(db, book.id, admin_user, {
+        "match_field": "SUMMARY", "keyword": keyword,
+        "subject_id": subjects["560202"].id, "priority": 0, "active": True})
+    db.commit()
+
+    row = next(r for r in service.list_rows(db, book.id, statement["id"])
+               if r["summary"].startswith(keyword))
+    assert row["plan_status"] == PLAN_RULE, row["plan_status"]
+
+    created = service.commit_vouchers(db, book.id, statement["id"], admin_user)
+    assert created["created_count"] >= 1, created
+    db.expire_all()
+
+    posted = next(r for r in service.list_rows(db, book.id, statement["id"])
+                  if r["id"] == row["id"])
+    assert posted["status"] == "POSTED", posted["status"]
+    assert [i["subject_id"] for i in posted["plan_subjects"]] == [subjects["560202"].id]
+
+    # 删掉那条规则 → 全量重算。没修的话，已入账那行的科目会被清掉，
+    # 界面上显示成「待确认科目」—— 而它其实早记好了。
+    service.delete_rule(db, book.id, rule["id"])
+    db.commit()
+    db.expire_all()
+
+    after = next(r for r in service.list_rows(db, book.id, statement["id"])
+                 if r["id"] == row["id"])
+    assert [i["subject_id"] for i in after["plan_subjects"]] == [subjects["560202"].id], (
+        "已入账的行被规则改了科目 —— 它与账上的凭证对不上，且看不出来")
+    assert after["plan_status"] == PLAN_RULE, after["plan_status"]

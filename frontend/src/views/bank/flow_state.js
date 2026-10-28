@@ -89,6 +89,42 @@ export const voucherStateType = (state) => VOUCHER_STATE_TYPE[state] || 'info'
 export const canCommit = (plan) => !!plan && Number(plan.candidate_count || 0) > 0
 
 /**
+ * 「忽略 / 恢复」这一颗按钮**能不能点**。
+ *
+ * 只有**没生成凭证**的行能改这个状态 —— 后端也这么挡
+ * （``app/bankstatement/service.py::update_row``：``matched_voucher_id`` 存在就拒）。
+ *
+ * **这里曾经写错过一次**，而且错得最隐蔽：条件写成 ``row.status !== 'OPEN'``。
+ * 于是「忽略」之后状态变成 ``IGNORED``，按钮**自己把自己禁用了** ——
+ * 文案明明写着「恢复」，却永远点不动。用户原话：
+ * 「流水明细点击忽略之后怎么没办法点击恢复？」
+ *
+ * 判据必须是「**状态在这两者之一**」，不是「状态等于某一个」。
+ *
+ * @param {object|null} row 流水行
+ * @returns {boolean}
+ */
+export const canToggleIgnore = (row) =>
+  !!row && (row.status === 'OPEN' || row.status === 'IGNORED')
+
+/**
+ * 「指定 / 调整对方科目」这颗按钮**能不能点**。
+ *
+ * **已经生成过凭证的行不行。** 凭证已经把那个科目定死了（分录里写着），
+ * 只改流水行、不改凭证，两边就对不上 —— 而且界面上看不出来。
+ * 改科目是**改凭证**的动作：要么去凭证里改，要么用「可改科目」
+ * （它走 ``accounting.vouchers.update_voucher``，凭证与流水一起改）。
+ *
+ * **判据必须与后端同一条**：后端那道闸看的是 ``matched_voucher_id``
+ * （``app/bankstatement/service.py::update_row``），这里也看它 ——
+ * 两边各判一次的话，迟早出现「界面能点、点了被拒」或反过来的毛病。
+ *
+ * @param {object|null} row 流水行
+ * @returns {boolean}
+ */
+export const canEditPlanSubject = (row) => !!row && !row.matched_voucher_id
+
+/**
  * 余额差额的着色。
  *
  * 三档：对上了（绿）、能被未入账流水解释（黄）、原因待查（红）。

@@ -1215,6 +1215,11 @@ def _replan_rules(db: Session, book_id: int) -> None:
     只重算**还没定下来**的行：人工指定过的（``MANUAL``）不动 ——
     那是用户亲手挑的，不该被一条新规则覆盖掉。
 
+    **已经生成过凭证的行也不重算** —— 凭证里写着那个科目，重算会把流水行
+    改成别的科目，两边对不上且看不出来（与 :func:`update_row` 那道闸同一件事：
+    已入账的对方科目由凭证定死）。规则改的是「还没入账的行该怎么记」，
+    碰不到已经记好的账。
+
     规则命中给的是**一条**对方科目（金额就是这一行的流水金额）。
     一条规则只有一个科目 —— 规则没有金额，配不出「800 房租 + 200 押金」
     这种拆分来，而拆分的金额只有用户知道（凭发票、凭单据）。
@@ -1224,6 +1229,7 @@ def _replan_rules(db: Session, book_id: int) -> None:
     rows = db.scalars(select(BankStatementRow).where(
         BankStatementRow.book_id == book_id,
         BankStatementRow.plan_status != PLAN_MANUAL,
+        BankStatementRow.matched_voucher_id.is_(None),
     )).all()
     children = _children_of(db, [row.id for row in rows])
     for row in rows:
@@ -1709,6 +1715,23 @@ def update_row(db: Session, book_id: int, row_id: int,
     if row is None or row.book_id != book_id:
         raise ValueError("流水行不存在")
     if "plan_subjects" in payload or "plan_subject_id" in payload:
+        # **已经生成过凭证的行，对方科目不许再改。**
+        #
+        # 凭证已经把那个科目定死了（分录里写着）。只改流水行、不改凭证，
+        # 两边就对不上 —— 而且**看不出来**：界面上写着「对方科目 210101
+        # 郑紫臻」，账上的凭证却是 210202，直到对账时才发现。改科目是**改
+        # 凭证**的动作，不是改流水行的动作。
+        #
+        # 出路有两条，都在这一页上：改那张凭证本身；或用「可改科目」——
+        # 它走 ``accounting.vouchers.update_voucher``，凭证与流水一起改。
+        #
+        # 这条闸与前端那一条**同一个判据**（``matched_voucher_id``）：
+        # 两边各判一次的话，迟早会出现「界面能点、点了被拒」或反过来的
+        # 那种最难查的毛病。
+        if row.matched_voucher_id:
+            raise ValueError(
+                "这一行已经生成了凭证，对方科目由凭证定死 —— "
+                "要改请改那张凭证（或用「可改科目」）。")
         items = _parse_plan_payload(db, book_id, row, payload)
         _write_plan_subjects(db, row, items, PLAN_MANUAL)
         row.plan_status = _plan_status_of(items, row.direction)

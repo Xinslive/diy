@@ -269,8 +269,7 @@
             <div class="section-head">
               <span>流水明细</span>
               <span class="muted">
-                默认只显示对账单上解析出来的内容；方向、对方科目、状态收在「对账信息」里，
-                点行首箭头**往下展开**（不加列，不会出左右滑动条）
+                默认只显示对账单上解析出来的内容；方向、对方科目、状态点行首箭头**往下展开**（不加列，不会出左右滑动条）
               </span>
             </div>
           </template>
@@ -311,7 +310,6 @@
             >
               账上已有对应分录 {{ reclassifyCount }} 行 · 展开看
             </el-tag>
-            <el-checkbox v-model="showExtra" class="flow-toggle">对账信息</el-checkbox>
           </div>
 
           <el-table
@@ -327,8 +325,13 @@
                  撑宽 → 出现**左右滑动条**，而这张表在窄屏上本来就挤 —— 于是
                  用户得一边横拖一边看，改起来很难受。
                  改成展开行后**列数恒定**，表格宽度不变，横向永远不会溢出；
-                 想看哪一行就点哪一行的箭头。 -->
-            <el-table-column v-if="showExtra" type="expand" width="42">
+                 想看哪一行就点哪一行的箭头。
+
+                 **展开箭头一直都在**：曾经前面还挂一个「对账信息」勾选开关，
+                 不勾就没有箭头 —— 于是「不看对账信息的人」和「要改对账信息的人」
+                 看到的是**两张不同的表**。用户原话：「默认收起就行，去掉勾选
+                 对账信息的开关」。现在只剩一个动作：点行首箭头，往下展开。 -->
+            <el-table-column type="expand" width="42">
               <template #default="{ row }">
                 <div class="flow-extra">
                   <div class="flow-extra-item">
@@ -368,9 +371,30 @@
                       </el-tag>
                     </div>
                     <span v-else class="muted small">待确认</span>
-                    <el-button link type="primary" size="small" @click="openPlan(row)">
-                      {{ row.plan_subjects?.length ? '调整' : '指定' }}
-                    </el-button>
+                    <!-- **已入账的行不许再指定科目。**
+                         凭证已经把那个科目定死了（分录里写着），只改流水行、
+                         不改凭证，两边就对不上 —— 而且界面上看不出来。
+                         所以按钮置灰，并把出路写在旁边：**改凭证**。 -->
+                    <el-tooltip
+                      :disabled="canEditPlanSubject(row)"
+                      content="已入账的对方科目由凭证定死 —— 要改请改那张凭证（或用「可改科目」）"
+                      placement="top"
+                    >
+                      <span>
+                        <el-button
+                          link
+                          type="primary"
+                          size="small"
+                          :disabled="!canEditPlanSubject(row)"
+                          @click="openPlan(row)"
+                        >
+                          {{ row.plan_subjects?.length ? '调整' : '指定' }}
+                        </el-button>
+                      </span>
+                    </el-tooltip>
+                    <span v-if="!canEditPlanSubject(row)" class="flow-warn small">
+                      已入账，科目由凭证定死，要改请改凭证
+                    </span>
                   </div>
                   <div class="flow-extra-item">
                     <span class="flow-extra-label">状态</span>
@@ -392,7 +416,7 @@
                     <el-button
                       link
                       type="danger"
-                      :disabled="!store.canWrite || row.status !== 'OPEN'"
+                      :disabled="!store.canWrite || !canToggleIgnore(row)"
                       @click="doIgnore(row)"
                     >
                       {{ row.status === 'IGNORED' ? '恢复' : '忽略' }}
@@ -707,7 +731,8 @@ import * as api from '@/api/bankstatement'
 import * as subjectApi from '@/api/subject'
 import { reportNumber } from '@/utils/format'
 import {
-  FIELD_OPTIONS, canCommit, diffClass, fieldLabel, isCrossPeriod, planSubjectCents,
+  FIELD_OPTIONS, canCommit, canEditPlanSubject, canToggleIgnore, diffClass, fieldLabel,
+  isCrossPeriod, planSubjectCents,
   planSubjectText, planTotalDiff, planTotalMatches, reclassifyCandidateText,
   reclassifyCrossPeriodConfirm, reclassifyCrossPeriodText, reclassifyRowCount,
   renderSummary, settlementSourceText, settlementSourceType,
@@ -748,24 +773,25 @@ const manualMapping = reactive({})
  *
  * 明细页默认只显示对账单上解析出来的内容（日期、摘要、用途、对方户名、
  * 收入、支出、余额）；方向、对方科目、状态这些「账上才有的东西」收在
- * 这里 —— 它们要改、要判断，但看一眼流水本身用不着。
+ * 展开行里 —— 它们要改、要判断，但看一眼流水本身用不着。
  *
  * **为什么不加列**：加了列表格就被撑宽，窄屏上会冒出**左右滑动条** ——
  * 一边横拖一边看，账对起来很难受。改成展开行后列数恒定，横向不会溢出。
+ *
+ * **没有开关**：展开箭头一直都在（曾经过来是「勾上『对账信息』才出现箭头」，
+ * 那样「不看对账信息的人」和「要改对账信息的人」看到的是两张不同的表）。
+ * 现在只剩一个动作：点行首箭头，往下展开。
  */
-const showExtra = ref(false)
 
 /**
  * 把「账上已有对应分录」的那些行**直接展开**。
  *
- * 「对账信息」既然是往下展开的，光把开关打开还不够 —— 用户还得自己一格格
+ * 「对账信息」是往下展开的，光把箭头摆在那儿还不够 —— 用户还得自己一格格
  * 点行首箭头才看得到。这里替他展开那些真正需要看的行。
  *
- * **要等 nextTick**：「对账信息」是 ``v-if`` 控制的展开列，开关一开，表格要
- * 重渲染一遍，此时之前的展开状态没了 —— 不等就会展开不上。
+ * **要等 nextTick**：表格要重渲染一遍，展开状态才认得上行；不等就会展开不上。
  */
 function expandRowsWithCandidates() {
-  showExtra.value = true
   nextTick(() => {
     const table = rowsTable.value
     if (!table) return
@@ -1308,8 +1334,6 @@ onMounted(() => {
 .flow-select { width: 340px; }
 .flow-direction { width: 92px; }
 .flow-subject { width: 200px; }
-/** 「对账信息」开关靠右，别跟生成按钮挤在一起。 */
-.flow-toggle { margin-left: auto; }
 .flow-tag-button { cursor: pointer; }
 
 /* 流水明细表要**紧凑**：一行流水一眼能扫过去，而不是一屏放不了十行。 */
@@ -1329,6 +1353,9 @@ onMounted(() => {
 .flow-extra-item {
   display: flex;
   align-items: center;
+  /* 换行是**往下**换 —— 「已入账，科目由凭证定死…」那句提示较长，
+     不许它把这一行撑宽（撑宽就又是左右滑动条）。 */
+  flex-wrap: wrap;
   gap: 8px;
   min-width: 0;
 }
