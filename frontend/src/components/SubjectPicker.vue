@@ -524,8 +524,18 @@ function autosize() {
   const lh = perFrame('SubjectPicker.lineHeight',
     () => parseFloat(getComputedStyle(el).lineHeight)) || 22
   const max = lh * 2
+  const prev = el.style.height
   el.style.height = 'auto'
   const need = el.scrollHeight
+  // **量到 0 不是「这一格是空的」，是「这一格此刻没有布局盒」**
+  // （整棵子树 display:none 那一类，scrollHeight 量出来就是 0）。
+  // 写成 0 高，这一格的科目名就永远看不见了 ——
+  // 用户 2026-10-28 报「会计科目不显示」「表格错位」，根子都在这一行。
+  // 把高度放回原样：内容多高就显示多高，等页面有盒子了再重量。
+  if (!need) {
+    el.style.height = prev
+    return
+  }
   el.style.height = Math.min(need, max) + 'px'
   el.style.overflowY = need > max ? 'auto' : 'hidden'
   // 一行就跟着摘要格一起居中；折成两行时贴上沿 —— 但**只在这一格左下角真的有余额时**，

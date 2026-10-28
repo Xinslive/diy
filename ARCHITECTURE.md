@@ -370,6 +370,81 @@ locator.waitFor: Timeout 30000ms exceeded.
 
 ---
 
+## 1.9 页面骨架不许把页面「藏没了」：没有盒子就量不准（2026-10-28 加）
+
+### 现象：三件事，一个根
+
+2026-10-28 用户在生产上连报三件事，看起来像三个 bug：
+
+1. 凭证详情页的「会计科目」列**不显示科目名**（摘要列也空）；
+2. 表格**错位** —— 金额数字跟表头的竖线对不齐，合计行跟分录行也对不齐；
+3. 时好时坏：从凭证列表首次进入看不到科目，点「前一张/后一张」有时又正常。
+
+第 3 条是关键：**同一个页面、同一个接口，有时是好的**。
+数据没问题、请求全部 200、干净标签页打开又是正常的 ——
+那就说明问题不在数据，在**时序**。
+
+### 根因：壳层的骨架用 `display:none` 把路由页藏了
+
+壳层（`MainLayout`）在路由数据没到齐的时候摆一个页面级骨架（`PageSkeleton`），
+路由页要暂时让位。**让位的方式是 `v-show`** —— 而 `v-show` 就是 `display:none`：
+整棵子树**没有布局盒**。
+
+而页面里有三处**量自己尺寸**的地方，它们量到的全是 0：
+
+| 量尺寸的地方 | 量的是什么 | 量到 0 之后写成 | 后果 |
+|---|---|---|---|
+| `VoucherEdit.syncGridWidth()` | `entryScroll.clientWidth` | `--vg-grid-width: 0px` | 表头与合计行塌成 0 宽，列宽退回各列最小值 → **竖线与分录行对不齐** |
+| `VoucherEdit.autosizeSum()` | `el.scrollHeight` | `height: 0px` | **摘要永远看不见** |
+| `SubjectPicker.autosize()` | `el.scrollHeight` | `height: 0px` | **科目名永远看不见** |
+
+「时好时坏」就是**赛跑**：量尺寸发生在骨架撤下之前还是之后，
+决定这一页是好的还是坏的。
+
+生产现场的取证（`query(kind='dom')` 直接读行内样式）：
+
+```html
+<div class="entry-wrap" style="--vg-grid-width: 0px;">          ← 列宽量成 0
+<textarea class="cell-input" style="height: 0px; ...">          ← 摘要量成 0
+<textarea class="sp-input"  style="height: 0px; ...">          ← 科目量成 0
+```
+
+三个数字都是 0，而**数据就在 DOM 里**（`value="在建工程/开发间接费/工资"`）。
+数据在、格子是 0 高 —— 字当然看不见。
+
+### 两条硬约束
+
+1. **要藏一个页面，用 `visibility: hidden`，不许用 `display: none`。**
+   `visibility` 藏的是**眼睛**，不是**盒子**：`clientWidth` / `scrollHeight`
+   照旧量得到。要让位还得离开正常流（`position: absolute; inset: 0`），
+   骨架才有地方摆，不把页面顶下去。
+   （本机 Playwright 实测：同一段结构，`display:none` 量到 0 / 0，
+   `absolute + visibility:hidden` 量到的与正常状态**完全一致**。）
+2. **量到 0 不等于「内容是空的」——这两件事必须分开。**
+   任何把量到的尺寸写进样式的地方，量到 0 时**不许写 0**：
+   把高度放回原样（内容多高显示多高），把宽度保持 CSS 里的默认值，
+   等页面有盒子了再重量。
+
+### 推论
+
+- **「页面藏起来」是个高危动作。**
+  它不只让页面看不见，还会**让页面里的所有测量全错** ——
+  而这种错往往在页面重新显示之后仍然留着（样式已经写进去了）。
+- **量尺寸的地方要能自愈**：凭证表用 `ResizeObserver` 盯着分录区，
+  盒子回来就重量一次；只跑一次的 `syncGridWidth()` 撞上「还没盒子」就永远错了。
+- **百分比高度依赖完整的链**：
+  `.content` → 路由页 → `.voucher-page` / `.print-page`（这两页是 `height:100%` 的整页）。
+  中间少一层（路由页高度是 auto），百分比高度就落到 auto，整页不再占满内容区。
+  所以路由页自己也要 `height: 100%`。
+
+回归测试：`frontend/tests/route_skeleton_layout.test.mjs`（10 条）。
+测法仍是本仓的老规矩：**从真实源码里抠出实现来跑** ——
+`syncGridWidth` / `autosizeSum` / `SubjectPicker.autosize` 三段都是原样抠出来执行的，
+再拿一个「没有布局盒」的假元素喂它们。
+（这条测试在修复前红 7 条、修复后绿 10 条。）
+
+---
+
 ## 2. 账簿引擎：四原语
 
 所有账簿和报表的数字，最终都来自这四个原语：

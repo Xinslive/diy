@@ -318,7 +318,34 @@ body {
 /* 悬停时给一点点反馈，不然一条光溜溜的灰带看不出能不能点 */
 .sb-off .sb-list li:hover { background: #e3e8f0; }
 
-.content { flex: 1; min-height: 0; overflow: auto; }
+.content { flex: 1; min-height: 0; overflow: auto; position: relative; }
+
+/* ── 路由页：数据还在路上时**不能 display:none** ──────────────────────
+   壳层在数据没到齐的时候摆一个骨架（PageSkeleton），路由页要暂时让位。
+   原来让位用的是 v-show —— 那就是 display:none：整棵子树**没有布局盒**。
+
+   后果不是「看不见」，是「量错」：页面里凡是量自己尺寸的地方，
+   量到的全是 0 ——
+     · 凭证表的 syncGridWidth() 量出 clientWidth = 0 →
+       --vg-grid-width 写成 0px → 表头与合计行塌成 0 宽，
+       列宽退回各列的最小值，竖线跟分录行再也对不齐（金额数字对不上格）；
+     · 摘要格与科目格的 autosize 量出 scrollHeight = 0 →
+       height 写成 0px → **那一格的字永远看不见**（用户 2026-10-28 报
+       「会计科目不显示」「摘要空的」「表格错位」——三件事同一个原因）。
+
+   所以这里改成：**绝对定位 + visibility:hidden**。
+     · absolute 让它离开正常流，骨架才有地方摆（不把页面顶下去）；
+     · visibility:hidden 只藏不删 —— **盒子还在，宽高照旧量得到**；
+     · 顺带把 height 补回 100%：.voucher-page / .print-page 那两页
+       是 height:100% 的整页，高度链是 .content → 路由页 → 页面，
+       中间少了一层，百分比高度就落到了 auto 上，整页不再占满内容区。 */
+.route-page { height: 100%; }
+.route-page.is-pending {
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
 
 /* ── 期间下拉：月份在左、「已结账」贴右，且上下居中 ──────────────────
    选项行是 .el-select-dropdown__item，display 是 list-item 不是 flex，

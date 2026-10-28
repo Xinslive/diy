@@ -4,7 +4,11 @@
        flex 链上的容器都要 min-height:0，否则分录区会被内容撑开，失去内部滚动。 -->
   <div class="page voucher-page">
     <div class="toolbar no-print">
-      <el-button @click="backToList">← 返回</el-button>
+      <!-- 文案写「凭证列表」而不是「返回」（2026-10-28 用户报）：
+           这一格不是「回到上一页」，是「回到凭证列表」——
+           顶上那一排是前一张/后一张，页脚是别的账表，说「返回」只说明往回走，
+           往回走到哪儿得靠人猜。写清楚去哪儿，点的人才知道点完会看到什么。 -->
+      <el-button @click="backToList">凭证列表</el-button>
       <el-divider direction="vertical" />
       <span class="muted">凭证号</span>
       <!-- 只读：号由系统按期间自动生成，新增 / 插入 / 修改三处都不许手工改
@@ -1115,9 +1119,19 @@ function autosizeSum(el, measured) {
   const lh = parseFloat(getComputedStyle(el).lineHeight) || 21
   const max = lh * 2
   let need = measured
+  const prev = el.style.height
   if (need === undefined) {
     el.style.height = 'auto'
     need = el.scrollHeight
+  }
+  // **量到 0 不是「内容高度是 0」，是「这一格此刻没有布局盒」**
+  // （整棵子树 display:none 那一类，scrollHeight 量出来就是 0）。
+  // 把 0 写进 height，这一格就永远 0 高 —— 摘要看不见了
+  // （用户 2026-10-28 报「摘要空的」「会计科目不显示」，同一个原因）。
+  // 这时候把高度放回原样：内容多高就显示多高，等页面有盒子了再重量。
+  if (!need) {
+    el.style.height = prev
+    return
   }
   el.style.height = Math.min(need, max) + 'px'
   el.style.overflowY = need > max ? 'auto' : 'hidden'
@@ -1166,9 +1180,14 @@ function syncGridWidth() {
   const box = entryScroll.value
   const wrap = box?.parentElement
   if (!box || !wrap) return
-  // entry-scroll 的 clientWidth 包含左右 padding，但不包含垂直滚动条；
-  // 扣掉两条动作留白后，就是表头、分录、合计三段应该共用的实际宽度。
-  wrap.style.setProperty('--vg-grid-width', `${Math.max(0, box.clientWidth - 100)}px`)
+  const w = box.clientWidth
+  // **页面此刻没有布局盒**（整棵子树 display:none 那一类）：量到的是 0，
+  // 不是真实宽度。把 0 写下去，表头与合计行就塌成 0 宽 ——
+  // 列宽退回各列的最小值，竖线跟分录行再也对不齐（2026-10-28 用户报「表格错位」）。
+  // 这时候宁可先不改：CSS 里那个 calc(100% - 100px) 是能用的近似值，
+  // 等页面有盒子了，下面的 ResizeObserver 会再量一次准的。
+  if (!w) return
+  wrap.style.setProperty('--vg-grid-width', `${Math.max(0, w - 100)}px`)
 }
 
 function keepActiveRowAnchored() {
@@ -2353,6 +2372,8 @@ function onBeforeUnload(e) {
 onBeforeUnmount(() => {
   clearTimeout(autoSaveTimer)
   onWindowResize.cancel()          // 还挂着的那一帧别再对着已卸载的 DOM 跑
+  gridResizeObserver?.disconnect()  // 别让观察器替已卸载的 DOM 记着尺寸
+  gridResizeObserver = null
   window.removeEventListener('resize', onWindowResize)
   window.removeEventListener('beforeunload', onBeforeUnload)
   // **这一趟必须挂出去**，不能就这么丢掉（审计 §3.24）。
@@ -2392,6 +2413,18 @@ function reAutosizeSums() {
 const onWindowResize = rafThrottle(reAutosizeSums)
 
 /**
+ * 列宽的「补测」：页面从**没有布局盒**变成有盒子的那一刻，重量一次。
+ *
+ * 挂载后那趟 syncGridWidth() 只跑一次，而它跑的时候页面可能还量不到宽度
+ * （骨架撤下之前，整棵子树没有盒子）。这一趟补测就是等盒子回来再量一次：
+ * 分录区的尺寸一变（骨架撤下、窗口缩放、侧栏收起）就重新量。
+ *
+ * 观察的是 .entry-scroll 自己 —— 它的高度由内容决定，
+ * 宽度由外层给；改 --vg-grid-width 不会反过来改它的大小，不会有自激循环。
+ */
+let gridResizeObserver = null
+
+/**
  * 离开这一页前把改动补上；补不上就问一句，不让人无声无息地丢掉半张凭证。
  *
  * 取消确认框会 reject（「cancel」），不接住就是一个未处理的 rejection ——
@@ -2408,6 +2441,10 @@ onBeforeRouteLeave(async () => {
 onMounted(async () => {
   window.addEventListener('resize', onWindowResize)
   window.addEventListener('beforeunload', onBeforeUnload)
+  if (typeof ResizeObserver !== 'undefined' && entryScroll.value) {
+    gridResizeObserver = new ResizeObserver(() => syncGridWidth())
+    gridResizeObserver.observe(entryScroll.value)
+  }
   if (!store.periodId) return
   formBookId.value = store.bookId   // 这张表单从这一刻起属于这个账套
   // 切期间/切账套时，旧组件的「离开前那一趟 flush」可能还在路上 ——

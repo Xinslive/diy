@@ -136,7 +136,11 @@
 
     <main class="content">
       <PageSkeleton v-if="showRouteSkeleton" />
-      <div v-show="!showRouteSkeleton" class="route-page">
+      <!-- 数据还在路上时，这一层**不能 display:none**（见 main.css 里 .route-page 的说明）。
+           v-show 就是 display:none：那一藏，整棵子树没有布局盒，
+           页面里量自己尺寸的地方量到的全是 0 —— 凭证表的列宽塌成 0、
+           摘要与科目名塌成 0 高，界面看着像「没数据」，其实是「没盒子」。 -->
+      <div class="route-page" :class="{ 'is-pending': showRouteSkeleton }">
         <router-view v-slot="{ Component }">
           <Suspense timeout="0">
             <component :is="Component" :key="viewKey" />
