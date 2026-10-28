@@ -3,10 +3,6 @@
     <div class="flow-head">
       <div>
         <h2>流水对账</h2>
-        <p>
-          上传网银导出的对账单，把它绑到具体的现金科目（1002 下面的子科目）上；
-          流水可以自动生成凭证，发票的结算科目也会自动跟到对应账户。
-        </p>
       </div>
       <div class="flow-head-actions">
         <el-button :disabled="!store.canWrite" @click="loadAll">
@@ -37,7 +33,7 @@
                  横向不要间距就写 0，纵向的间距由下面的 CSS 给。 -->
             <el-row :gutter="0" class="flow-upload-row">
               <el-col :xs="24" :sm="10">
-                <el-form-item label="现金科目">
+                <el-form-item label="资产科目">
                   <el-select
                     v-model="uploadForm.account_subject_id"
                     :disabled="!store.canWrite"
@@ -93,22 +89,49 @@
               </span>
             </div>
           </template>
-          <el-table :data="statements" v-loading="loading" empty-text="还没有上传过对账单">
-            <el-table-column label="账户" min-width="170">
-              <template #default="{ row }">
-                <div>{{ row.account_subject_code }} {{ row.account_subject_name }}</div>
-                <div class="muted small">{{ row.account_name || row.account_no || '—' }}</div>
-              </template>
-            </el-table-column>
-            <el-table-column label="文件" min-width="180">
+          <el-table :data="visibleStatements" v-loading="loading">
+            <!-- **空态用插槽**：这个文案是**动态**的（「还没上传过」与
+                 「这个期间还没有」两句话），写死成字符串就说不了第二种。 -->
+            <template #empty>
+              <div class="flow-empty-period">
+                <span class="muted">{{ statementsEmptyText }}</span>
+                <!-- **别的期间还有**：不是没有对账单，是不在这个月 ——
+                     不说清楚、又不给条路，用户只会以为功能坏了。
+                     （生产实测就是这个错位：顶栏停在 2026 年 2 月，
+                     账上的对账单是 9 月的。） -->
+                <div v-if="otherPeriods.length" class="flow-empty-other">
+                  <span class="muted small">别的期间还有：</span>
+                  <el-button
+                    v-for="p in otherPeriods"
+                    :key="`${p.year}-${p.month}`"
+                    link
+                    type="primary"
+                    size="small"
+                    @click="jumpToPeriod(p)"
+                  >
+                    {{ p.label }}（{{ p.count }} 份）
+                  </el-button>
+                </div>
+              </div>
+            </template>
+            <el-table-column label="文件" min-width="200">
               <template #default="{ row }">
                 <div>{{ row.filename }}</div>
-                <div class="muted small">{{ row.container_label }} · {{ row.row_count }} 行</div>
-              </template>
-            </el-table-column>
-            <el-table-column label="期间" width="150">
-              <template #default="{ row }">
-                {{ row.period_start || '—' }} ~ {{ row.period_end || '—' }}
+                <!-- **期间**：原来它自己占一列（用户批注「期间不要单独一列
+                     显示了，弄到文件列去」）。 -->
+                <div class="muted small">
+                  {{ row.period_start || '—' }} ~ {{ row.period_end || '—' }}
+                </div>
+                <!-- **账户**：原来它也自己占一列（用户批注「这一列去掉」）。
+                     一并挪到文件列下面 —— 不占列，但也别把「这份对账单绑在
+                     哪个账户上」弄丢了：那是判断这堆流水属于谁的前提。
+                     户名（从银行对账单里解析出来的）也留着。 -->
+                <div class="muted small">
+                  {{ row.account_subject_code }} {{ row.account_subject_name }}
+                  <template v-if="row.account_name || row.account_no">
+                    · {{ row.account_name || row.account_no }}
+                  </template>
+                </div>
               </template>
             </el-table-column>
             <el-table-column label="收支合计" width="180">
@@ -274,16 +297,12 @@
           <template #header>
             <div class="section-head">
               <span>流水明细</span>
-              <span class="muted">
-                每行的「对账信息」（方向、对方科目、状态、操作）**默认展开**；
-                嫌占地方就用行首箭头收起（不加列，不会出左右滑动条）
-              </span>
             </div>
           </template>
           <div class="flow-rows-toolbar">
             <el-select v-model="activeStatementId" placeholder="选择对账单" class="flow-select" @change="loadRows">
               <el-option
-                v-for="s in statements"
+                v-for="s in visibleStatements"
                 :key="s.id"
                 :label="`${s.filename}（${s.period_start || '?'} ~ ${s.period_end || '?'}）`"
                 :value="s.id"
@@ -507,7 +526,7 @@
             <el-form-item label="摘要模板">
               <el-input
                 v-model="ruleForm.summary_template"
-                placeholder="留空 = 用内置口径"
+                placeholder="留空使用默认规则"
                 style="width: 200px"
               />
             </el-form-item>
@@ -564,7 +583,7 @@
                 <el-input
                   :model-value="row.summary_template"
                   size="small"
-                  placeholder="留空 = 用内置口径"
+                  placeholder="留空使用默认规则"
                   @change="(v) => saveRuleTemplate(row, v)"
                 />
                 <!-- **已保存的规则不再逐行给预览。**
@@ -630,7 +649,7 @@
 
           <el-empty
             v-if="!suspiciousRows.length"
-            description="没有存疑凭证 —— 账上每一笔现金分录都能在流水里找到对应的行"
+            description="没有存疑凭证 —— 账上每一笔银行账户分录都能在流水里找到对应的行"
           />
           <el-table
             v-else
@@ -638,12 +657,6 @@
             class="flow-suspicious-table"
             size="small"
           >
-            <el-table-column label="对账单" min-width="190">
-              <template #default="{ row }">
-                <div>{{ row.account_code }} {{ row.account_name }}</div>
-                <div class="muted small">{{ row.period_text }}</div>
-              </template>
-            </el-table-column>
             <el-table-column label="凭证号" width="100">
               <template #default="{ row }">{{ row.voucher_no }}</template>
             </el-table-column>
@@ -658,22 +671,27 @@
             </el-table-column>
             <el-table-column label="为什么可疑" min-width="260">
               <template #default="{ row }">
+                <!-- **只说结论**（2026-10-28 用户定的口径）：按金额没匹配到
+                     就是存疑，一句话说清「对账单里没找到这笔流水」就行。
+                     不要拿「前后有一笔流水、金额对不上」那种近似解释去替换它 ——
+                     读起来像「差一点就匹配上了」，会让人以为只是日期差了几天，
+                     于是去改日期而不是改金额。 -->
                 <div>{{ row.reason }}</div>
-                <!-- **线索**：没有线索的「疑问」是没用的疑问 —— 用户要能
-                     立刻看出是金额错了、还是日期错了。 -->
-                <div
-                  v-for="(clue, ci) in row.clues"
-                  :key="ci"
-                  class="muted small"
-                >
-                  流水第 {{ clue.seq }} 行 · {{ clue.tx_date }} · {{ money(clue.amount) }}
+                <!-- **账户与期间**：原来那列（「对账单」）去掉了，但「这笔钱
+                     记在哪个账户、属于哪份对账单」是判断存疑的前提 ——
+                     挪到这一格里，不占一列，也丢不了信息。
+                     **账户一行、期间一行**（2026-10-28 用户批注）：挤在一行
+                     时这一格会自己折行，读起来「账户…· 期间」黏在一起。 -->
+                <div class="muted small">
+                  {{ row.account_code }} {{ row.account_name }}
                 </div>
+                <div class="muted small">{{ row.period_text }}</div>
               </template>
             </el-table-column>
             <el-table-column label="操作" width="150">
               <template #default="{ row }">
                 <el-button link type="primary" size="small" @click="openVoucher(row.voucher_id)">
-                  去改这张凭证
+                  修改凭证
                 </el-button>
               </template>
             </el-table-column>
@@ -762,8 +780,8 @@
     <!-- ======================================================== 改科目 -->
     <el-dialog v-model="reclassifyDialog.open" title="账上已有同一笔分录" width="640px">
       <div class="muted small">
-        账上已经有一笔记在别的现金科目上的分录，可能就是这一笔钱。
-        确认后把它的**现金那一侧**改成这个账户（{{ accountLabel }}），
+        账上已经有一笔记在别的账户上的分录，可能就是这一笔钱。
+        确认后把它的**账户那一侧**改成这个账户（{{ accountLabel }}），
         对方侧不动 —— 对方侧该记成什么科目，流水这一侧判不出来。
         <br />
         日期差得比较远的（跨月入账是常事）会标出来，**确认是不是同一笔**再改。
@@ -798,7 +816,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Refresh, Upload } from '@element-plus/icons-vue'
@@ -813,6 +831,8 @@ import {
   planSubjectText, planTotalDiff, planTotalMatches, reclassifyCandidateText,
   reclassifyCrossPeriodConfirm, reclassifyCrossPeriodText, reclassifyRowCount,
   renderSummary, settlementSourceText, settlementSourceType,
+  bankAccountSubjects,
+  statementsInPeriod, statementsOtherPeriods,
   suspiciousRows as suspiciousRowsOf,
   toColumnMapping, unknownTemplateFields, voucherStateText, voucherStateType,
   summaryTemplateValuesText,
@@ -834,9 +854,52 @@ const current = ref(null)
 const activeStatementId = ref(null)
 
 /**
+ * **当前期间里的那些对账单**（2026-10-28 用户批注：「根据这里选中的期间，
+ * 来显示对账单」）。
+ *
+ * 顶栏的年 + 月就是这一页的筛选条件 —— 别处的页面（凭证、账簿）都跟着
+ * 顶栏走，流水对账不能例外：顶着「2026 年 2 月」却满屏 9 月的对账单，
+ * 用户会以为自己看错了地方。
+ *
+ * 期间没定下来（`currentPeriod` 还没有）时**不过滤** —— 那不是「这个月
+ * 没有对账单」，那是「还不知道要看哪个月」。
+ */
+const visibleStatements = computed(() => statementsInPeriod(
+  statements.value,
+  store.currentPeriod?.year,
+  store.currentPeriod?.month,
+))
+
+/**
+ * 空态文案要分两种：**一个对账单都没有**（还没上传过）与
+ * **有但都不在这个期间**（顶栏选的是别的月）—— 后者说「还没上传过」
+ * 会让用户以为东西丢了。
+ *
+ * 后面那个**要把期间写出来**：用户顶栏停在 2 月、账上只有 9 月的对账单，
+ * 页面空着 —— 不说清楚是哪个期间，用户只会以为功能坏了。
+ */
+const statementsEmptyText = computed(() => {
+  if (!statements.value.length) return '还没有上传过对账单'
+  const year = store.currentPeriod?.year
+  const month = store.currentPeriod?.month
+  return year && month
+    ? `${year} 年 ${month} 月还没有对账单`
+    : '这个期间还没有对账单'
+})
+
+/**
+ * **别的期间还有哪些对账单** —— 空态里给一条路，别让用户以为东西丢了。
+ */
+const otherPeriods = computed(() => statementsOtherPeriods(
+  statements.value,
+  store.currentPeriod?.year,
+  store.currentPeriod?.month,
+))
+
+/**
  * **存疑凭证**：账上有、对账单里找不到对应流水的那些凭证。
  *
- * **懒加载**：它要扫一遍账上所有现金分录，而用户未必会去看它
+ * **懒加载**：它要扫一遍账上所有银行账户分录，而用户未必会去看它
  * （大多数时候根本没有存疑凭证）—— 每次进来都查一遍是白查。
  */
 const suspicious = ref(null)
@@ -986,10 +1049,15 @@ const previewValuesText = computed(
 
 const subjectLabel = (s) => `${s.code} ${s.name}`
 
-/** 现金类科目：1001 库存现金、1002 银行存款、1012 其他货币资金。 */
-const cashSubjects = computed(() => subjects.value.filter(
-  (s) => ['1001', '1002', '1012'].some((p) => String(s.code || '').startsWith(p)),
-))
+/**
+ * **可绑定的账户**：只有 1002 银行存款（含它的明细科目）。
+ *
+ * **与后端同一个判据**（`backend/app/bankstatement/caliber.py`）：
+ * 1001 库存现金（抽屉里的现金）与 1012 其他货币资金（支付宝/微信的备付金）
+ * 都不是银行账户 —— 网银导出的对账单对不上它们。后端也按同一份口径拒，
+ * 两边各判一次的话，迟早出现「界面选不了、接口却收下」。
+ */
+const cashSubjects = computed(() => bankAccountSubjects(subjects.value))
 
 const canUpload = computed(() => !!pickedFile.value && !!uploadForm.account_subject_id)
 
@@ -1119,10 +1187,34 @@ async function loadSuspicious() {
  * 切页签。
  *
  * **存疑凭证那一页懒加载**（见 ``suspicious`` 那条注释）。
+ *
+ * 切到「流水明细」时：如果已经选好了对账单（见 ``visibleStatements`` 那个
+ * watch，它会替用户选好这个期间的第一份），把流水拉出来 —— 否则用户
+ * 看到的是一张空表，还以为这个期间没有流水。
  */
 function onTabChange(name) {
   if (name === 'suspicious') loadSuspicious()
+  if (name === 'rows' && activeStatementId.value) loadRows()
 }
+
+/**
+ * 顶栏换了会计期间 → 这一页要跟着换。
+ *
+ * **当前选中的那份不在新期间里，就换到新期间的第一份**（并把流水拉出来）。
+ * 留着上一份，用户会拿着 9 月的流水去看 2 月 —— 或者更糟：下拉里选不中，
+ * 页面却还留着上一份的行。
+ */
+watch(visibleStatements, async (list) => {
+  if (!list.length) {
+    activeStatementId.value = null
+    rows.value = []
+    plan.value = null
+    return
+  }
+  if (activeStatementId.value && list.some((s) => s.id === activeStatementId.value)) return
+  activeStatementId.value = list[0].id
+  if (tab.value === 'rows') await loadRows()
+})
 
 /**
  * 去改那张凭证。
@@ -1157,6 +1249,52 @@ function onFile(file) {
   pickedFile.value = file.raw
 }
 
+/**
+ * 把顶栏的会计期间切到某份对账单所属的那个月。
+ *
+ * **为什么需要它**：这一页的对账单列表跟着顶栏的期间走，而顶栏的期间
+ * 是**会计期间**（账套开了哪些月）—— 对账单是哪个月，是从文件里解析出来
+ * 的。用户上传一份 9 月的对账单，顶栏却停在 2 月，那它就落在筛选之外。
+ *
+ * 切不过去的情况只有一种：账套里压根没开那个月。这时候说清楚去哪儿开，
+ * 别让用户以为上传失败了。
+ *
+ * @returns {Promise<boolean>} 有没有切成功
+ */
+async function switchToStatementPeriod(statement) {
+  const ps = statement?.period_start
+  if (!ps) return false
+  const [year, month] = String(ps).split('-').map(Number)
+  if (!year || !month) return false
+  return goToPeriod(year, month)
+}
+
+/**
+ * 把顶栏的会计期间切到某个年月。
+ *
+ * 切不过去的情况只有一种：账套里压根没开那个月。这时候说清楚去哪儿开，
+ * 别让用户以为上传失败了、或者以为功能坏了。
+ *
+ * @returns {boolean} 有没有切成功
+ */
+function goToPeriod(year, month) {
+  const period = (store.periods || []).find(
+    (p) => p.year === year && p.month === month)
+  if (!period) {
+    ElMessage.warning(
+      `${year} 年 ${month} 月不是账套里的会计期间 —— `
+      + '请先在「期末结账」里开这个月。')
+    return false
+  }
+  if (store.periodId !== period.id) store.setPeriod(period.id)
+  return true
+}
+
+/** 空态里的「切到那个期间」。 */
+function jumpToPeriod(p) {
+  goToPeriod(p.year, p.month)
+}
+
 async function doUpload() {
   if (!canUpload.value) return
   uploading.value = true
@@ -1168,6 +1306,13 @@ async function doUpload() {
     await loadAll()
     current.value = statements.value.find((s) => s.id === created.id) || null
     resetManualMapping()
+    // **这份对账单不在顶栏选中的期间里** → 把顶栏切到它所属的期间。
+    //
+    // 不切的话，它刚上传完就从列表里「消失」了（列表按期间过滤），
+    // 用户会以为没上传成功 —— 东西明明在库里，却看不见。
+    if (current.value && !visibleStatements.value.some((s) => s.id === current.value.id)) {
+      await switchToStatementPeriod(current.value)
+    }
     ElMessage.success(`已解析 ${created.row_count} 行`)
     tab.value = 'statements'
   } catch (e) {
@@ -1366,7 +1511,7 @@ async function doReclassify(item) {
   const row = reclassifyDialog.row
   if (!row) return
   // **跨期的要多问一句。** 日期差得多也可能压根不是另一笔钱 —— 不问就改，
-  // 等于把不相干的一笔现金分录挪了科目，那比「没匹配到」糟得多：
+  // 等于把不相干的一笔银行账户分录挪了科目，那比「没匹配到」糟得多：
   // 错的是账，不是「没提示」。
   if (isCrossPeriod(item)) {
     try {
@@ -1530,7 +1675,7 @@ onMounted(() => {
 .picked { margin-left: 12px; font-size: 12px; }
 .flow-upload-form { max-width: 900px; }
 /* 窄屏上两个字段会**上下叠起来**（xs=24）—— 叠起来时得留点竖间距，
-   否则「现金科目」和「对账单」贴成一片。宽屏并排时不加这个间距。 */
+   否则「资产科目」和「对账单」贴成一片。宽屏并排时不加这个间距。 */
 .flow-upload-row :deep(.el-col) { margin-bottom: 18px; }
 @media (min-width: 768px) {
   .flow-upload-row :deep(.el-col) { margin-bottom: 0; }
@@ -1684,6 +1829,21 @@ onMounted(() => {
 .flow-suspicious-summary {
   margin-bottom: 10px;
   line-height: 1.6;
+}
+
+/* 台账空态：「这个期间还没有」下面那行「别的期间还有 …」。 */
+.flow-empty-period {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+.flow-empty-other {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+  justify-content: center;
 }
 
 .diag-grid {

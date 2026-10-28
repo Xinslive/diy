@@ -36,7 +36,7 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.accounting.organize import CASH_SUBJECT_PREFIXES
+from app.bankstatement.caliber import OWN_MONEY_SUBJECT_PREFIXES
 from app.models import BankStatement, BankStatementRow, Entry, Subject, Voucher
 from app.models.bankstatement import DIRECTION_IN, DIRECTION_OUT
 
@@ -117,10 +117,23 @@ def _entries_on_account(db: Session, book_id: int, subject_id: int,
 
 
 def _internal_transfer_vouchers(db: Session, voucher_ids: set[int]) -> set[int]:
-    """哪些凭证是**内部转账**（现金侧不止一个科目）。
+    """哪些凭证是**内部转账**（自家账户之间挪钱）。
 
-    钱在自家账户之间挪（1001 现金 ↔ 1002 银行）：银行流水里本来就没有
-    这一行 —— 它不是错账，只是没走银行。
+    钱在自家账户之间挪（1001 抽屉里的现金 ↔ 1002 银行 ↔ 1012 支付宝）：
+    银行流水里本来就没有这一行 —— 它不是错账，只是没走银行。
+
+    **这里用的是「全系统的货币资金口径」（1001/1002/1012），不是这一条线
+    那个窄口径**（``caliber`` 里只认 1002）—— 两个问题问的不是一回事：
+
+    * 「这份对账单能绑在哪个账户上、拿哪边的分录去跟银行流水对」→
+      只能是银行账户（1002）；
+    * 「这笔钱是不是在自家账户之间挪」→ 抽屉里的现金、支付宝里的钱
+      **都是自家的钱**，一样算内部转账。
+
+    口径混了会出**假存疑**：取现（借 1001 / 贷 1002）如果按窄口径判，
+    1001 侧不算「自家账户」，那张凭证就只剩 1002 一个现金侧 → 不算内部
+    转账 → 1002 那一侧被判成「对账单里找不到对应流水」。取现存现每天
+    都发生，这么判会凭空多出一堆「错账」。
 
     **一次查完，不一条一条查** —— 候选可能有几十张，逐条查就是 N+1。
     """
@@ -132,9 +145,8 @@ def _internal_transfer_vouchers(db: Session, voucher_ids: set[int]) -> set[int]:
         .where(Entry.voucher_id.in_(voucher_ids))
     ).all()
     cash_by_voucher: dict[int, set[int]] = {}
-    codes: dict[int, str] = {}
     for voucher_id, code in rows:
-        if code.startswith(CASH_SUBJECT_PREFIXES):
+        if code.startswith(OWN_MONEY_SUBJECT_PREFIXES):
             cash_by_voucher.setdefault(voucher_id, set()).add(code)
     return {vid for vid, codes_set in cash_by_voucher.items()
             if len(codes_set) >= 2}
@@ -144,8 +156,9 @@ def _clues(rows: list[BankStatementRow], entry: Entry,
            voucher_date: date) -> list[dict[str, Any]]:
     """给这条存疑分录找**线索** —— 它最可能错在哪。
 
-    **没有线索的「疑问」是没用的疑问。** 用户看到「找不到对应流水」不知道
-    该去改什么；看到「金额对得上，但流水日期差 40 天」就知道该看日期。
+    **只进 API，不上界面**（2026-10-28 用户定的口径：页面上只说
+    「对账单里没找到对应这笔的流水」，不要拿线索去编一个近似解释）。
+    线索留着是为了**排查时能一眼看出**是金额错了还是日期错了。
 
     两种线索：
 
@@ -191,18 +204,25 @@ def _clues(rows: list[BankStatementRow], entry: Entry,
     return out
 
 
-def _reason(clues: list[dict[str, Any]]) -> str:
-    """一句话说清「为什么可疑」—— 页面上直接显示这句。"""
-    by_kind = {c["kind"]: c for c in clues}
-    if "AMOUNT" in by_kind:
-        c = by_kind["AMOUNT"]
-        return (f"金额对得上，但流水那笔在 {c['tx_date']}，"
-                f"差 {c['days_diff']} 天")
-    if "DATE" in by_kind:
-        c = by_kind["DATE"]
-        return (f"{c['tx_date']} 前后有一笔流水，金额是 {c['amount']}，"
-                f"对不上")
-    return "这份对账单的流水里没有同金额、也没有同日期附近的记录"
+def _reason() -> str:
+    """一句话说清「为什么可疑」—— 页面上直接显示这句。
+
+    **只说结论，不编故事**（2026-10-28 用户定的口径）。
+
+    判据就一条：**按金额没匹配到**。这一条就是存疑的**全部**理由。
+
+    以前这里写的是「2026-09-15 前后有一笔流水，金额是 8588.00，对不上」
+    （或者「金额对得上，但流水那笔在 X 月 X 日，差 40 天」）—— 那是拿
+    「日期附近有个流水」去**近似解释**一笔根本对不上的账。读起来像
+    「差一点就匹配上了」，反而让人以为没匹配上只是日期差了几天，
+    于是去改日期而不是改金额 —— 改错地方了。
+
+    所以统一一句话：**对账单里没有找到对应这笔的流水**。
+
+    线索（``clues``）仍然算、仍然进 API：它是给排查用的诊断信息，
+    **但不上界面**（页面上只显示这句话 + 账户与期间）。
+    """
+    return "对账单里没有找到对应这笔的流水"
 
 
 def _one_statement(db: Session, book_id: int,
@@ -290,7 +310,8 @@ def _one_statement(db: Session, book_id: int,
             "amount": str(entry.amount),
             "direction": entry.direction,
             "summary": entry.summary or "",
-            "reason": _reason(clues),
+            "reason": _reason(),
+            # 线索只进 API、不上界面（见 ``_reason`` 的说明）。
             "clues": clues,
         })
 

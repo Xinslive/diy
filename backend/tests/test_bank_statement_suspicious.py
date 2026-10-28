@@ -147,12 +147,17 @@ def test_清单里带对账单与账户的来龙去脉(client, auth, db, book, c
     assert group["row_count"] == 5
 
 
-def test_金额对得上但日期差得远_给出线索(client, auth, db, book, cash, store,
-                                          make_voucher, subjects):
-    """**没有线索的「疑问」是没用的疑问。**
+def test_金额对得上但日期差得远_理由直说_线索仍留给排查(client, auth, db, book,
+                                                              cash, store,
+                                                              make_voucher, subjects):
+    """**理由只说结论，线索留给排查**（2026-10-28 用户定的口径）。
 
-    同一笔金额在流水里出现过、只是日期差了 20 天 —— 用户一看就知道该看
-    日期，而不是对着一个光秃秃的「找不到对应流水」发愁。
+    同一笔金额在流水里出现过、只是日期差了 20 天 —— 页面上只写
+    「对账单里没有找到对应这笔的流水」，**不**写「金额对得上但日期差 20 天」
+    那种近似解释（读起来像「差一点就匹配上了」，会让人去改日期而不是改金额）。
+
+    线索仍然算出来、仍然进 API —— 排查的时候能一眼看出是金额错了
+    还是日期错了，只是**不上界面**。
     """
     _upload(client, auth, book, cash)
     # 金额与 seq1 完全相同，但凭证日期比流水早 10 天 —— 落在 ±30 天窗口内，
@@ -172,8 +177,12 @@ def test_金额对得上但日期差得远_给出线索(client, auth, db, book, 
                  cr=[(subjects["560202"].id, "99999.99", "收入")])
     body = _suspicious(client, auth, book)
     voucher = body["groups"][0]["vouchers"][0]
-    assert "金额对不上" in voucher["reason"] or "对不上" in voucher["reason"], (
-        voucher["reason"])
+    # **理由只说结论**（2026-10-28 用户定的口径）：按金额没匹配到就是存疑。
+    # 不要写成「前后有一笔流水，金额是 X，对不上」—— 那是拿近似解释冒充理由，
+    # 读起来像「差一点就匹配上了」，会让人去改日期而不是改金额。
+    assert voucher["reason"] == "对账单里没有找到对应这笔的流水", voucher["reason"]
+    # 线索仍然算、仍然进 API（给排查用），但**不是**理由
+    assert voucher["clues"], "线索应该仍然留给排查用"
 
 
 def test_内部转账不算疑问(client, auth, db, book, cash, store,

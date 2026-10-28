@@ -26,7 +26,8 @@ const {
   isCrossPeriod, reclassifyCrossPeriodText, reclassifyCrossPeriodConfirm,
   renderSummary, summaryTemplateValuesText, SUMMARY_TEMPLATE_EXAMPLES,
   SUMMARY_TEMPLATE_FIELDS, planSubjectSummary, defaultExpandedRowIds,
-  suspiciousRows,
+  suspiciousRows, statementsInPeriod, statementsOtherPeriods,
+  bankAccountSubjects,
 } = STATE
 
 const VIEW = fs.readFileSync(
@@ -592,12 +593,35 @@ t('摊平函数对空输入不炸', () => {
   assert.deepEqual(suspiciousRows([{ vouchers: null }]), [])
 })
 
-t('每一行都要说清「为什么可疑」，并把线索摆出来', () => {
-  // **没有线索的「疑问」是没用的疑问** —— 用户要能立刻看出是金额错了
-  // 还是日期错了。
+t('每一行只说结论：说清「对账单里没找到这笔流水」，不摆近似解释的线索', () => {
+  // **只说结论**（2026-10-28 用户定的口径）：按金额没匹配到就是存疑。
+  // 以前界面写「2026-09-15 前后有一笔流水，金额是 8588.00，对不上」——
+  // 那是拿「日期附近有个流水」近似解释一笔根本对不上的账，读起来像
+  // 「差一点就匹配上了」，会让人以为只是日期差了几天，去改日期而不是改金额。
   assert.match(VIEW, /\{\{ row\.reason \}\}/)
-  assert.match(VIEW, /row\.clues/)
-  assert.match(VIEW, /流水第 \{\{ clue\.seq \}\} 行/)
+  // 线索**不上界面**（后端仍然算、仍然进 API，给排查用）
+  assert.doesNotMatch(VIEW, /row\.clues/, '界面上还在渲染线索')
+  assert.doesNotMatch(VIEW, /流水第 \{\{ clue\.seq \}\} 行/, '界面上还在摆流水行线索')
+})
+
+t('存疑凭证表没有「对账单」这一列，账户与期间挪到「为什么可疑」格里', () => {
+  // 用户批注：这一列不显示。但「这笔钱记在哪个账户、属于哪份对账单」
+  // 是判断存疑的前提 —— 挪进「为什么可疑」格，不占一列也不丢信息。
+  const suspiciousPane = VIEW.slice(VIEW.indexOf('name="suspicious"'))
+  assert.doesNotMatch(suspiciousPane, /<el-table-column label="对账单"/,
+    '存疑凭证表里还有「对账单」列')
+  assert.match(suspiciousPane, /row\.account_code \}\} \{\{ row\.account_name \}\}/)
+  assert.match(suspiciousPane, /row\.period_text/)
+  // **账户一行、期间一行**（用户批注）：挤在一行时这一格会自己折行，
+  // 读起来「账户…· 期间」黏在一起。
+  assert.doesNotMatch(suspiciousPane, /row\.account_name \}\} · \{\{ row\.period_text \}\}/,
+    '账户与期间还挤在同一行')
+})
+
+t('页面顶部那段流水对账说明已经去掉', () => {
+  // 用户批注：去掉这段提示。
+  assert.doesNotMatch(VIEW, /上传网银导出的对账单，把它绑到具体的现金科目/,
+    '顶部说明还在')
 })
 
 t('顶部统计说清三件事：几张存疑 / 邻期未判定 / 内部转账', () => {
@@ -610,10 +634,12 @@ t('顶部统计说清三件事：几张存疑 / 邻期未判定 / 内部转账',
   assert.match(VIEW, /内部转账/)
 })
 
-t('「去改这张凭证」跳到那张凭证去改', () => {
+t('「修改凭证」跳到那张凭证去改', () => {
   // 这一页只负责**指出问题**，不负责「改」—— 错账的改法各不相同，
   // 写死一种改法只会改错。
-  assert.match(VIEW, /去改这张凭证/)
+  // 按钮文案：2026-10-28 用户批注，「去改这张凭证」缩成「修改凭证」。
+  assert.match(VIEW, /修改凭证/)
+  assert.doesNotMatch(VIEW, /去改这张凭证/, '按钮文案还是旧的')
   assert.match(VIEW, /openVoucher\(row\.voucher_id\)/)
   assert.match(VIEW, /name: 'voucher-edit'/)
 })
@@ -624,6 +650,131 @@ t('存疑凭证那一页是懒加载的', () => {
   assert.match(VIEW, /@tab-change="onTabChange"/)
   assert.match(VIEW, /if \(name === 'suspicious'\) loadSuspicious\(\)/)
   assert.match(VIEW, /api\.getSuspiciousVouchers/)
+})
+
+console.log('== 对账单跟着顶栏的会计期间走 ==')
+
+t('按顶栏选中的期间过滤对账单（交集口径）', () => {
+  const list = [
+    { id: 1, period_start: '2026-09-01', period_end: '2026-09-24' },  // 9 月内
+    { id: 2, period_start: '2026-09-28', period_end: '2026-10-03' },  // 跨月
+    { id: 3, period_start: '2026-08-01', period_end: '2026-08-31' },  // 8 月
+    { id: 4, period_start: null, period_end: null },                  // 老数据
+  ]
+  // 9 月：1 号在、3 号（8 月）不在、2 号跨月 → **在**（交集口径）
+  assert.deepEqual(statementsInPeriod(list, 2026, 9).map((s) => s.id), [1, 2, 4])
+  // 10 月：2 号跨月 → 在
+  assert.deepEqual(statementsInPeriod(list, 2026, 10).map((s) => s.id), [2, 4])
+  // 8 月
+  assert.deepEqual(statementsInPeriod(list, 2026, 8).map((s) => s.id), [3, 4])
+  // **期间没定下来时不过滤** —— 那不是「这个月没有对账单」，
+  // 是「还不知道要看哪个月」，拿它当空列表会把用户的东西藏起来。
+  assert.equal(statementsInPeriod(list, null, null).length, 4)
+  assert.equal(statementsInPeriod(list, 2026, null).length, 4)
+  assert.deepEqual(statementsInPeriod(null, 2026, 9), [])
+})
+
+t('别的期间还有哪些对账单（空态里给一条路）', () => {
+  const list = [
+    { id: 1, period_start: '2026-09-01', period_end: '2026-09-24' },
+    { id: 2, period_start: '2026-09-28', period_end: '2026-10-03' },
+    { id: 3, period_start: '2026-08-01', period_end: '2026-08-31' },
+  ]
+  // 停在 2 月 → 9 月那两份（period_start 都在 9 月）算「别的期间」，
+  // 8 月那份算另一组 —— **按起始日归组**，跨月的那份归到它起始的那个月。
+  const others = statementsOtherPeriods(list, 2026, 2)
+  assert.equal(others.length, 2)
+  assert.deepEqual(others.map((o) => o.label), ['2026 年 8 月', '2026 年 9 月'])
+  assert.equal(others[1].count, 2)
+  // 停在 9 月 → 8 月那份算「别的期间」
+  assert.deepEqual(
+    statementsOtherPeriods(list, 2026, 9).map((o) => o.label), ['2026 年 8 月'])
+  // 没有别的期间时是空的（不必显示那一行）
+  assert.deepEqual(statementsOtherPeriods(
+    [{ id: 3, period_start: '2026-08-01', period_end: '2026-08-31' }], 2026, 8), [])
+})
+
+t('页面上对账单列表用的是按期间过滤后的那份', () => {
+  // 用户批注：「根据这里选中的期间，来显示对账单」。
+  // 表格与流水明细页签的**选择器**都要过滤 —— 只过滤表格的话，
+  // 下拉里还是能选到别的月份的对账单，等于没过滤。
+  assert.match(VIEW, /visibleStatements/)
+  assert.match(VIEW, /statementsInPeriod\(/)
+  assert.match(VIEW, /:data="visibleStatements"/)
+  assert.match(VIEW, /v-for="s in visibleStatements"/)
+  // 期间换了要跟着换选中项
+  assert.match(VIEW, /watch\(visibleStatements/)
+  // 空态要分两种说法
+  assert.match(VIEW, /这个期间还没有对账单/)
+  // 上传后不在当前期间 → 切过去（否则刚上传就「消失」）
+  assert.match(VIEW, /switchToStatementPeriod/)
+})
+
+console.log('== 可绑定的账户：只有 1002 银行存款 ==')
+
+t('1001 库存现金与 1012 第三方支付备付金都不给选', () => {
+  // 用户口径（2026-10-28）：先说「一定要排除 1012」「我只会用到 1001 和
+  // 1002」，随后又说「1001 没有对账单，可以把 1001 也排除」——
+  // 所以这一条线只认 **1002 银行存款**。
+  //
+  // **与后端同一个判据**（backend/app/bankstatement/caliber.py）：
+  // 后端也按同一份口径拒，两边各判一次的话，迟早出现
+  // 「界面选不了、接口却收下」。
+  const subjects = [
+    { id: 1, code: '1001', name: '库存现金' },
+    { id: 2, code: '1002', name: '银行存款' },
+    { id: 3, code: '100201', name: '基本户' },
+    { id: 4, code: '1012', name: '其他货币资金' },
+    { id: 5, code: '101201', name: '支付宝' },
+    { id: 6, code: '1122', name: '应收账款' },
+  ]
+  assert.deepEqual(bankAccountSubjects(subjects).map((s) => s.code),
+    ['1002', '100201'])
+  assert.deepEqual(bankAccountSubjects(null), [])
+  // 页面上用的就是这份名单
+  assert.match(VIEW, /bankAccountSubjects\(subjects\.value\)/)
+})
+
+console.log('== 流水对账页的表头与文案（2026-10-28 逐条批注） ==')
+
+t('对账单台账没有「账户」列也没有「期间」列，都挪到文件列里', () => {
+  // 用户批注：「这一列去掉」（账户）、「期间不要单独一列显示了，弄到文件列去」。
+  // 但「这份对账单绑在哪个账户上、属于哪段期间」是判断这堆流水的前提 ——
+  // 挪到文件名下面，不占列也不丢信息。
+  const table = VIEW.slice(VIEW.indexOf('对账单台账'))
+  assert.doesNotMatch(table, /<el-table-column label="账户"/, '台账里还有「账户」列')
+  assert.doesNotMatch(table, /<el-table-column label="期间"/, '台账里还有「期间」列')
+  assert.match(table, /row\.account_subject_code \}\} \{\{ row\.account_subject_name \}\}/)
+  // 户名（从银行对账单解析出来的）也不能丢
+  assert.match(table, /row\.account_name \|\| row\.account_no/)
+  assert.match(table, /row\.period_start \|\| '—' \}\} ~ \{\{ row\.period_end/)
+  // 文件列第二行换成的是**期间**（原来那一行是「PDF 对账单 · 6 行」）
+  assert.doesNotMatch(table, /row\.container_label \}\} · \{\{ row\.row_count \}\} 行/,
+    '文件列里还在显示容器类型与行数')
+})
+
+t('流水明细页签那段说明去掉了', () => {
+  // 用户批注：去掉这个。
+  assert.doesNotMatch(VIEW, /嫌占地方就用行首箭头收起/,
+    '流水明细那段说明还在')
+})
+
+t('摘要模板输入框的提示写的是「留空使用默认规则」', () => {
+  // 用户批注：提示改成「留空使用默认规则」。两处都要改：新增规则表单里
+  // 那一个、规则表格每行那一个。
+  const n = (VIEW.match(/placeholder="留空使用默认规则"/g) || []).length
+  assert.equal(n, 2, `占位符应该有两处，实际 ${n} 处`)
+  assert.doesNotMatch(VIEW, /留空 = 用内置口径/, '旧文案还在')
+})
+
+t('台账空态用插槽显示动态文案', () => {
+  // 「还没上传过」与「这个期间还没有」是**两句话**，不能写死。
+  // 后面那个还要把**是哪个期间**写出来 —— 顶栏停在 2 月、账上只有 9 月的
+  // 对账单，页面空着；不说清楚用户只会以为功能坏了。
+  assert.match(VIEW, /<template #empty>/)
+  assert.match(VIEW, /statementsEmptyText/)
+  assert.match(VIEW, /还没有上传过对账单/)
+  assert.match(VIEW, /月还没有对账单/)
 })
 
 console.log('== 凭证摘要模板 ==')

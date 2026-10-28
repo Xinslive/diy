@@ -10,6 +10,7 @@
  * 用法：node tools/uitest/ui_flow_page.mjs
  */
 import { chromium } from 'playwright'
+import { gotoStatementPeriod, selectStatement } from './lib/statement_period.mjs'
 
 const BASE = 'http://127.0.0.1:5173'
 const OUT = '/Volumes/KIOXIA/home/Documents/ChatGPT/财务记账系统/.shots'
@@ -56,11 +57,28 @@ await step('打开流水对账页', async () => {
   await page.waitForTimeout(1500)
 })
 
+// ---- 顶栏的期间要先对上对账单所属的期间 ----
+//
+// **2026-10-28 起台账按顶栏的会计期间过滤**（用户批注「根据这里选中的期间，
+// 来显示对账单」）。顶栏默认停在「最靠前的一个未结账月份」（dev 库里是 12 月），
+// 而对账单在 9 月 —— 不先切过去，下拉是空的、后面每一步都超时。
+await step('台账跟着顶栏的期间走：别的期间的对账单能一键跳过去', async () => {
+  const r = await gotoStatementPeriod(page)
+  if (r.mode === 'none') {
+    console.log('   这本账还没有对账单 —— 下面走上传')
+    return
+  }
+  if (r.mode === 'switched') {
+    console.log(`   空态写着「${r.emptyText.replace(/\n/g, ' | ')}」`)
+    console.log(`   点了「${r.label}」→ 顶栏切过去了，列表里有 ${r.rows} 份`)
+  } else {
+    console.log('   顶栏已经停在有对账单的期间上')
+  }
+})
+
 // ---- 上传一份夹具对账单（已经有了就跳过：同账户同期间只允许一份） ----
 await step('准备一份对账单', async () => {
-  await page.click('.el-tabs__item:has-text("对账单")')
-  await page.waitForTimeout(900)
-  const hasRows = await page.locator('.el-table__body tbody tr').count()
+  const hasRows = await page.locator('.el-table:visible tr.el-table__row').count()
   if (hasRows > 0) { ok('已有一份对账单，跳过上传'); return }
   const subjectSelect = page.locator('.flow-upload-form .el-select').first()
   await subjectSelect.click()
@@ -75,12 +93,7 @@ await step('准备一份对账单', async () => {
 
 // ---- 流水明细页：默认形态 ----
 await step('切到流水明细并选中这份对账单', async () => {
-  await page.click('.el-tabs__item:has-text("流水明细")')
-  await page.waitForTimeout(800)
-  await page.locator('.flow-select').click()
-  await page.waitForTimeout(500)
-  await page.locator('.el-select-dropdown__item:visible').first().click()
-  await page.waitForTimeout(1500)
+  await selectStatement(page)
 })
 await page.screenshot({ path: `${OUT}/flow_compact_default.png` })
 
@@ -224,8 +237,21 @@ await step('切到科目规则页', async () => {
   await page.waitForTimeout(900)
 })
 
-await step('账套级模板：点一下占位符就插进去', async () => {
-  const input = page.locator('.flow-config-input input').first()
+// **规则级模板**（2026-10-28：账套级模板已下线，那张卡片整个没了，
+// 脚本不能再找它 —— 找不到就 fill 超时，后面几步全崩）。
+const ruleTemplateInput = () =>
+  page.locator('.el-form-item:has-text("摘要模板") input').first()
+
+await step('页面上没有账套级模板卡片了（2026-10-28 下线）', async () => {
+  // 钉住这次下线：账套级摘要模板一张卡片都不许再有。
+  const accountLevel = await page.locator('.flow-config-card').count()
+  if (accountLevel > 0) throw new Error(`还有 ${accountLevel} 张账套级模板卡片`)
+  const body = await page.locator('body').innerText()
+  if (body.includes('账套级')) throw new Error('界面上还有「账套级」的字样')
+})
+
+await step('规则级模板：点一下占位符就插进去', async () => {
+  const input = ruleTemplateInput()
   await input.fill('')
   await page.locator('.flow-placeholder-tag').filter({ hasText: '{用途}' }).first().click()
   await page.waitForTimeout(400)
@@ -242,7 +268,7 @@ await step('预览跟着模板实时变', async () => {
 })
 
 await step('套用示例模板，预览也变', async () => {
-  const input = page.locator('.flow-config-input input').first()
+  const input = ruleTemplateInput()
   await input.fill('')
   // 挑一条**三个字段都有值**的示例 —— dev 库里第一行流水的「用途」与
   // 「对方户名」都是空的，套「用途 + 对方」会渲染成「-」（那是对的，

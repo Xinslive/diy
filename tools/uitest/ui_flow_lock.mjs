@@ -17,6 +17,7 @@
  */
 import { chromium } from 'playwright'
 import { execFileSync } from 'node:child_process'
+import { gotoStatementPeriod, selectStatement } from './lib/statement_period.mjs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
@@ -105,13 +106,15 @@ try {
     await page.locator('.sidebar li').filter({ hasText: '流水对账' }).first().click()
     await page.waitForTimeout(1500)
   })
+  // **先切到对账单所属的期间**（2026-10-28 起台账跟着顶栏的期间走），
+  // 否则「选择对账单」下拉是空的 —— 后面每一步都在等一个不存在的元素。
+  await step('把顶栏期间切到对账单所属的期间', async () => {
+    const r = await gotoStatementPeriod(page)
+    if (r.mode === 'none') throw new Error('这本账没有对账单 —— 造数据的脚本得先准备一份')
+    if (r.mode === 'switched') console.log(`   点了「${r.label}」跳过去了`)
+  })
   await step('切到流水明细并选中对账单', async () => {
-    await page.click('.el-tabs__item:has-text("流水明细")')
-    await page.waitForTimeout(800)
-    await page.locator('.flow-select').click()
-    await page.waitForTimeout(500)
-    await page.locator('.el-select-dropdown__item:visible').first().click()
-    await page.waitForTimeout(1500)
+    await selectStatement(page)
   })
 
   // ---- 1) 忽略之后，「恢复」必须点得动 ----
@@ -166,11 +169,16 @@ try {
     }
   })
 
-  await step('旁边写着为什么不能改、以及出路', async () => {
+  await step('行里写着「已入账」，但不再挂那句警告', async () => {
+    // **「已入账，科目由凭证定死，要改请改凭证」那句在 2026-10-28 按用户要求
+    // 去掉了**（commit 49b74b1）：一行行都挂着一句警告，看着像出了事，其实
+    // 只是「这一行已经制过证了」。所以这里钉的是**当前**的口径 ——
+    // 状态那一格写「已入账」（用户看得出为什么按钮是灰的），但不喊警告。
     const extra = await expandRow('已入账的流水')
     const text = (await extra.textContent()) || ''
-    if (!text.includes('已入账，科目由凭证定死，要改请改凭证')) {
-      throw new Error(`没写明为什么不能改：${text}`)
+    if (!text.includes('已入账')) throw new Error(`状态那一格没写「已入账」：${text}`)
+    if (text.includes('要改请改凭证')) {
+      throw new Error('又挂上「要改请改凭证」那句警告了 —— 用户 2026-10-28 要求去掉')
     }
   })
   await page.screenshot({ path: `${OUT}/flow_lock_posted.png` })

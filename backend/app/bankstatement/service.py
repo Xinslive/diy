@@ -66,13 +66,15 @@ from app.models.bankstatement import (
 
 log = logging.getLogger("cwq")
 
-#: 现金类科目的编码前缀。1001 库存现金、1002 银行存款、1012 其他货币资金。
+#: 现金类科目的编码前缀 —— **这一条线自己的口径**，见
+#: ``app.bankstatement.caliber``（只认 1002 银行存款；1001 库存现金与
+#: 1012 其他货币资金都不算）。
 #:
-#: **为什么是前缀而不是「用户勾选这是现金科目」**：这两个前缀就是
-#: 「钱放在哪」的三个去处，认错了会影响余额核对（拿存货跟银行流水比）。
+#: **为什么是前缀而不是「用户勾选这是现金科目」**：这个前缀就是
+#: 「钱放在哪」的判据，认错了会影响余额核对（拿存货跟银行流水比）。
 #: 界面上仍然让用户**具体选一个明细科目** —— 前缀只用来做「这该不会是个
 #: 费用科目吧」的提示，不代替用户的选择。
-CASH_SUBJECT_PREFIXES = ("1001", "1002", "1012")
+from app.bankstatement.caliber import CASH_SUBJECT_PREFIXES, account_subject_code
 
 #: 去重窗口（天）：凭证日期在流水日前后这么多天之内、同一现金科目、
 #: 同方向、同金额，就当成「这笔已经入过账了」。
@@ -112,15 +114,23 @@ def _text(value: Any) -> str:
 def cash_subject(db: Session, book_id: int, subject_id: int) -> Subject:
     """取一个**可绑定的现金科目**，并给出人话的错误原因。
 
-    三道校验，缺一不可：
+    四道校验，缺一不可：
 
     - 属于本账套 —— 跨账套绑科目等于把 A 公司的流水记到 B 公司的账上；
+    - **是这一条线认的现金科目**（1002 银行存款族，见 ``caliber``）——
+      1001 库存现金与 1012 第三方支付备付金都不是银行账户，绑了这份
+      对账单永远对不上（**前端的下拉也不给选，这里是同一道闸**：
+      两边各判一次的话，迟早出现「界面选不了、接口却收下」）；
     - 末级 —— 绑到「1002 银行存款」这种上级科目上，凭证会被库层守卫拦下；
     - 启用 —— 停用科目是「不再用了」，往里记钱等于记进一口井里。
     """
     subject = db.get(Subject, subject_id)
     if subject is None or subject.book_id != book_id:
         raise ValueError("选择的科目不属于本账套")
+    if not _looks_cash(subject):
+        raise ValueError(
+            f"「{subject.code} {subject.name}」不是银行账户 —— "
+            "对账单只能绑到 1002 银行存款下面的明细科目")
     if not subject.is_leaf:
         raise ValueError(
             f"「{subject.code} {subject.name}」不是末级科目，"
@@ -1544,7 +1554,8 @@ def serialize_statement(db: Session, statement: BankStatement,
         "id": statement.id,
         "book_id": statement.book_id,
         "account_subject_id": statement.account_subject_id,
-        "account_subject_code": statement.account_subject_code,
+        # **科目码取活科目，没有了才回落快照** —— 理由见 caliber.account_subject_code。
+        "account_subject_code": account_subject_code(subject, statement),
         "account_subject_name": subject.name if subject else "",
         "filename": statement.filename,
         "container_format": statement.container_format,

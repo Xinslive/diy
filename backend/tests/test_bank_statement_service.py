@@ -126,19 +126,94 @@ def test_不同账户同一期间可以各传一份(db, book, admin_user, cash, 
                              data, other.id)
 
 
+def test_改了科目编码后台账显示新码(db, book, admin_user, uploaded):
+    """**科目编码是可以改的**（``SubjectEditIn.code``）—— 改完台账不能还摆着旧码。
+
+    快照列（``account_subject_code``）是上传那一刻的副本，用户改码它不会跟着变。
+    直接拿快照显示的话，台账上就是「旧码 + 新名」：1001 库存现金 与
+    100201 银行存款只差一位，肉眼扫过去根本看不出哪里不对
+    （实测：dev 库里一份绑在 100201 上的对账单，界面上摆的是「1001」）。
+
+    **名称一直取活科目，码也该从同一个地方来** —— 两边不一致比哪边旧更糟。
+    """
+    subject = db.get(Subject, uploaded["account_subject_id"])
+    statement = db.get(BankStatement, uploaded["id"])
+    assert subject.code == "100201"
+    subject.code = "100203"
+    db.commit()
+
+    data = service.serialize_statement(db, statement)
+    assert data["account_subject_code"] == "100203"
+    assert data["account_subject_name"] == subject.name
+    # 快照**不动**（它是「当年绑的是哪个账户」的记录），但显示时不用它。
+    assert statement.account_subject_code == "100201"
+
+
+def test_科目行不在了才回落快照里的码(uploaded):
+    """科目行真的没了（老数据、或绕过了外键的手工操作），
+    快照是「这份对账单当年绑的是哪个账户」的唯一线索，不能丢。"""
+    from app.bankstatement.caliber import account_subject_code
+
+    class _NoSubject:
+        code = "不该被用到"
+
+    class _Gone:
+        account_subject_code = "100201"
+
+    assert account_subject_code(_NoSubject(), _Gone()) == "不该被用到"
+    assert account_subject_code(None, _Gone()) == "100201"
+
+
 def test_非末级科目不能绑(db, book, admin_user, store):
-    """「1101 短期投资」下面挂了四个明细科目，它自己不是末级。
+    """「1002 银行存款」下面挂了几个明细科目，它自己不是末级。
 
     绑到它上面的话，凭证会被库层守卫拦下（分录只能挂末级科目）。
+
+    **用的必须是银行账户**（2026-10-28 口径变了：这一条线只认 1002）——
+    拿 1101 短期投资来测，会先撞上「不是银行账户」那道闸，压根走不到
+    「末级科目」这一关，验的就不是想验的东西了。
+
+    「非末级」这个状态得自己造：科目表补齐之后，1002 下面没有明细时它
+    自己就是末级（真实用户则是挂了几个子账户）。
     """
     parent = db.scalar(select(Subject).where(
         Subject.book_id == book.id, Subject.year == book.start_year,
-        Subject.code == "1101"))
-    assert parent is not None and not parent.is_leaf
+        Subject.code == "1002"))
+    assert parent is not None
+    parent.is_leaf = False
+    db.flush()
+    db.add(Subject(
+        book_id=book.id, year=book.start_year, code="100201", name="基本户",
+        parent_id=parent.id, level=parent.level + 1, category="ASSET",
+        direction="DEBIT", is_leaf=True, carry_forward=False, sort_no=1,
+        active=True,
+    ))
+    db.commit()
     data = (FIXTURES / "cmb_csv.xlsx").read_bytes()
     with pytest.raises(ValueError) as excinfo:
         service.upload_statement(db, book.id, admin_user, "招商9月.xlsx", data, parent.id)
     assert "末级科目" in str(excinfo.value)
+
+
+def test_不是银行账户的科目不能绑(db, book, admin_user, store):
+    """1001 库存现金、1012 第三方支付备付金、1101 短期投资 —— 都不是银行账户。
+
+    **网银导出的对账单对不上它们**（2026-10-28 用户定的口径：这一条线只认
+    1002 银行存款）。前端的下拉也不给选，这里是**同一道闸** —— 两边各判
+    一次的话，迟早出现「界面选不了、接口却收下」。
+    """
+    for code in ("1001", "1012", "1101"):
+        subject = db.scalar(select(Subject).where(
+            Subject.book_id == book.id, Subject.year == book.start_year,
+            Subject.code == code))
+        if subject is None:
+            continue
+        data = (FIXTURES / "cmb_csv.xlsx").read_bytes()
+        with pytest.raises(ValueError) as excinfo:
+            service.upload_statement(
+                db, book.id, admin_user, "招商9月.xlsx", data, subject.id)
+        assert "不是银行账户" in str(excinfo.value), (
+            f"{code} 应该被「不是银行账户」挡下，实际：{excinfo.value}")
 
 
 def test_跨账套看不到别人的对账单(db, book, uploaded, admin_user):

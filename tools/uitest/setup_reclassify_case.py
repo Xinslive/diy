@@ -27,7 +27,9 @@ from app.models.bankstatement import BankStatement, BankStatementRow  # noqa: E4
 STATEMENT_ID = 1
 ROW_SEQ = 3
 ACCOUNT_CODE = "100201"      # 对账单绑定的账户（银行存款）
-CASH_CODE = "1001"           # 候选凭证的现金侧（库存现金）
+CASH_CODE = "100202"         # 候选凭证的现金侧（**另一个**银行账户）
+#                            # 2026-10-28 口径变了：这一条线只认 1002 银行存款，
+#                            # 1001 库存现金不算 —— 银行流水对不上抽屉里的现金。
 OFFSET_DAYS = 20             # 跨期天数：> 7 天（去重窗口），<= 30 天（候选窗口）
 ROW_DATE = date(2026, 12, 5)  # 挪到未结账的期间（dev 账套 2026-09~11 都结账了）
 TAG = "uitest-可改科目"
@@ -61,6 +63,9 @@ def main() -> int:
         print(f"对账单 {STATEMENT_ID} 原账户 {statement.account_subject_id} "
               f"-> {ACCOUNT_CODE}({account.id})")
         statement.account_subject_id = account.id
+        # **快照列要一起改** —— 它是「这份对账单绑的是哪个账户」的副本。
+        # 只改 id 不改码，快照会停在旧科目码上（台账上就成了「旧码 + 新名」）。
+        statement.account_subject_code = account.code
 
         # 这一行回到「待确认科目」的干净状态。
         row.status = "OPEN"

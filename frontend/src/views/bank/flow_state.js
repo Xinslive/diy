@@ -421,3 +421,103 @@ export const suspiciousRows = (groups) => {
   }
   return out
 }
+
+/**
+ * 一份对账单是否与某个会计期间**有交集**。
+ *
+ * 抽出来是因为两处要用它，而且**必须用同一个判据**：一份对账单能不能在
+ * 顶栏那个月看到（``statementsInPeriod``），与它算不算「别的期间的那些」
+ * （``statementsOtherPeriods``）—— 两边判得不一样，界面上就会出现
+ * 「空态说别的期间有，点进去却看不到」的鬼故事。
+ *
+ * @param {object} s 对账单
+ * @param {number} year 年
+ * @param {number} month 月（1-12）
+ * @returns {boolean}
+ */
+const overlapsPeriod = (s, year, month) => {
+  if (!year || !month) return true
+  if (!s?.period_start || !s?.period_end) return true
+  const monthStart = Date.UTC(year, month - 1, 1)
+  const monthEnd = Date.UTC(year, month, 0, 23, 59, 59, 999)
+  const start = Date.parse(`${s.period_start}T00:00:00Z`)
+  const end = Date.parse(`${s.period_end}T23:59:59Z`)
+  if (Number.isNaN(start) || Number.isNaN(end)) return true
+  return end >= monthStart && start <= monthEnd
+}
+
+/**
+ * **可绑定的账户**：只有 1002 银行存款（含它的明细科目）。
+ *
+ * **与后端同一个判据**（`backend/app/bankstatement/caliber.py`）：
+ * 1001 库存现金（抽屉里的现金）与 1012 其他货币资金（支付宝/微信的备付金）
+ * 都不是银行账户 —— 网银导出的对账单对不上它们。后端也按同一份口径拒，
+ * 两边各判一次的话，迟早出现「界面选不了、接口却收下」。
+ *
+ * 抽成纯函数是为了能直接测 —— 这个名单写死在 .vue 里就只能靠正则去猜。
+ *
+ * @param {Array} subjects 账套的科目表
+ * @returns {Array} 可绑定的那些
+ */
+export const bankAccountSubjects = (subjects) => (subjects || []).filter(
+  (s) => String(s?.code || '').startsWith('1002'))
+
+/**
+ * **按顶栏选中的会计期间过滤对账单**（2026-10-28 用户批注：
+ * 「根据这里选中的期间，来显示对账单」）。
+ *
+ * 口径：**与该期间有交集**就算在里面。
+ *
+ * 为什么用「交集」而不是「起始日落在那个月」：银行对账单不一定卡在月初到
+ * 月末 —— 有的到 09-24（月末前就出了），有的跨月（09-28 ~ 10-03）。
+ * 按「起始日在哪个月」判，后一种会被判成「10 月的对账单」而被 9 月藏起来；
+ * 按交集判，两种都落在它们该在的地方。
+ *
+ * **期间没定下来时不过滤**（`year`/`month` 缺一不可）：那不是「这个月没有
+ * 对账单」，那是「还不知道要看哪个月」—— 拿它当空列表会把用户的东西藏起来。
+ *
+ * **没有期间的老数据不藏**：一份对账单没有 period_start/period_end，说明
+ * 它是解析不出期间来的老东西，藏起来等于凭空消失。宁可多显示一份，
+ * 也别让用户以为没上传过。
+ *
+ * @param {Array} statements 后端返回的全部对账单
+ * @param {number} year 顶栏选中的年
+ * @param {number} month 顶栏选中的月（1-12）
+ * @returns {Array} 落在该期间里的对账单
+ */
+export const statementsInPeriod = (statements, year, month) => {
+  const list = statements || []
+  if (!year || !month) return list
+  return list.filter((s) => overlapsPeriod(s, year, month))
+}
+
+/**
+ * **别的期间还有哪些对账单**（按期间归并）。
+ *
+ * 为什么要有它：顶栏的期间是**会计期间**（账套开了哪些月），而对账单是
+ * 哪个月从文件里解析出来的。生产实测就是这个错位 —— 顶栏停在 2026 年
+ * 2 月，账上的对账单是 9 月的。这时候页面空着，用户只会以为功能坏了。
+ *
+ * 所以空态里要说清楚：**不是没有对账单，是不在这个月**，并且给一条路
+ * 直接切过去。
+ *
+ * @param {Array} statements 全部对账单
+ * @param {number} year 顶栏选中的年
+ * @param {number} month 顶栏选中的月
+ * @returns {Array} [{ year, month, label, count }]，按期间从早到晚排
+ */
+export const statementsOtherPeriods = (statements, year, month) => {
+  const groups = new Map()
+  for (const s of statements || []) {
+    if (!s?.period_start) continue
+    if (overlapsPeriod(s, year, month)) continue
+    const key = String(s.period_start).slice(0, 7)
+    if (!groups.has(key)) {
+      const [y, m] = key.split('-').map(Number)
+      groups.set(key, { year: y, month: m, label: `${y} 年 ${m} 月`, count: 0 })
+    }
+    groups.get(key).count += 1
+  }
+  return [...groups.values()].sort(
+    (a, b) => a.year - b.year || a.month - b.month)
+}

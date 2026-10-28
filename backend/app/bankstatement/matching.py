@@ -28,7 +28,7 @@ from typing import Any, Iterable, Optional
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
-from app.accounting.organize import CASH_SUBJECT_PREFIXES
+from app.bankstatement.caliber import CASH_SUBJECT_PREFIXES, account_subject_code
 from app.models import BankStatement, BankStatementRow, Entry, Period, Subject, Voucher
 from app.models.bankstatement import (
     DIRECTION_IN,
@@ -79,8 +79,11 @@ def candidates_for(db: Session, book_id: int, amount: Decimal,
     if direction not in (DIRECTION_IN, DIRECTION_OUT):
         return []
     rows = db.execute(
-        select(BankStatementRow, BankStatement)
+        select(BankStatementRow, BankStatement, Subject)
         .join(BankStatement, BankStatement.id == BankStatementRow.statement_id)
+        # **左连接**：那一年的科目行没了也要把候选列出来 ——
+        # 那时「这份流水属于哪个账户」只剩快照里那一份线索。
+        .outerjoin(Subject, Subject.id == BankStatement.account_subject_id)
         .where(
             BankStatementRow.book_id == book_id,
             BankStatementRow.direction == direction,
@@ -99,10 +102,11 @@ def candidates_for(db: Session, book_id: int, amount: Decimal,
         "statement_id": statement.id,
         "filename": statement.filename,
         "account_subject_id": statement.account_subject_id,
-        "account_subject_code": statement.account_subject_code,
+        # **活科目优先，快照兜底**（理由见 caliber.account_subject_code）。
+        "account_subject_code": account_subject_code(subject, statement),
         "account_name": statement.account_name or statement.account_no,
         "bank_name": statement.bank_name,
-    } for row, statement in rows]
+    } for row, statement, subject in rows]
 
 
 def pick(candidates: Iterable[dict[str, Any]]) -> tuple[Optional[dict[str, Any]], str]:

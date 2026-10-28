@@ -14,6 +14,7 @@
  */
 import { chromium } from 'playwright'
 import { execFileSync } from 'node:child_process'
+import { gotoStatementPeriod, selectStatement } from './lib/statement_period.mjs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
@@ -59,13 +60,15 @@ try {
     await page.locator('.sidebar li').filter({ hasText: '流水对账' }).first().click()
     await page.waitForTimeout(1500)
   })
+  // **先切到对账单所属的期间**（2026-10-28 起台账跟着顶栏的期间走），
+  // 否则「选择对账单」下拉是空的 —— 后面每一步都在等一个不存在的元素。
+  await step('把顶栏期间切到对账单所属的期间', async () => {
+    const r = await gotoStatementPeriod(page)
+    if (r.mode === 'none') throw new Error('这本账没有对账单 —— 造数据的脚本得先准备一份')
+    if (r.mode === 'switched') console.log(`   点了「${r.label}」跳过去了`)
+  })
   await step('切到流水明细并选中这份对账单', async () => {
-    await page.click('.el-tabs__item:has-text("流水明细")')
-    await page.waitForTimeout(800)
-    await page.locator('.flow-select').click()
-    await page.waitForTimeout(500)
-    await page.locator('.el-select-dropdown__item:visible').first().click()
-    await page.waitForTimeout(1500)
+    await selectStatement(page)
   })
   // **展开内容在紧跟数据行之后的另一个 <tr> 里**（Element Plus 的展开行是
   // 独立的一行），**不在数据行自己身上** —— 找错地方会以为按钮不见了。
