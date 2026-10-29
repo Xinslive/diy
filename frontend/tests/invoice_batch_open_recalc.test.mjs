@@ -67,6 +67,18 @@ t('重算完把结果就地合并进去（不整批换掉）', () => {
   assert.match(m[0], /mergeBatchPayload\(payload\)/)
 })
 
+t('回来晚了、批次已经换掉了就丢掉这一趟', () => {
+  // 用户在等这一趟的时候又点开了别的批次 —— 晚到的响应是**另一个批次**的，
+  // 照合会把那个批次的计数盖到当前批次上（张数、可生成数全乱）。
+  // 「打开就自动重算」让这个竞态比从前容易撞上：连开两个批次就有两趟在路上。
+  const m = VIEW.match(/async function autoRecalculate\(\) \{[\s\S]*?\n\}/)
+  assert.ok(m, '找不到 autoRecalculate')
+  assert.match(m[0], /batch\.value\?\.id !== current\.id/)
+  assert.ok(
+    m[0].indexOf('batch.value?.id !== current.id') < m[0].indexOf('mergeBatchPayload(payload)'),
+    '校验必须排在合并之前')
+})
+
 console.log('== 两段提示去掉了 ==')
 
 t('「当前显示未入账 N 张」不见了', () => {

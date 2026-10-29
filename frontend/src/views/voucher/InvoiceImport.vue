@@ -782,6 +782,15 @@ async function autoRecalculate() {
   previewing.value = true
   try {
     const payload = await invoiceApi.previewBatch(store.bookId, current.id, overridePayload())
+    // **回来的可能是另一个批次的** —— 用户在等这一趟的时候又点开了别的批次。
+    //
+    // 「打开就自动重算」让这个竞态比从前容易撞上：以前要用户点按钮才会发请求，
+    // 现在连开两个批次就有两趟请求在路上。晚到的那一趟若照合，会把
+    // **另一个批次**的计数盖到当前批次上（张数、可生成数全乱）。
+    //
+    // 认批次靠 id（`current.id` 此刻还在手上）。id 对不上就**丢掉这一趟** ——
+    // 它算的是那个批次，不该贴在这儿；用户真要看它，再点开一次就是了。
+    if (batch.value?.id !== current.id) return
     mergeBatchPayload(payload)
   } catch (err) {
     // 重算失败不挡着页面：批次详情已经显示出来了，用户照样能看能改。
