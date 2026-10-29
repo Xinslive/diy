@@ -48,9 +48,11 @@ async function sharedcardScenario({ admin, staff, state, sharedcard }) {
     // 跑的是**仓库里那个真的插件包**（plugins/com.cwq.sharedcard），不是替身。
     // 它守的是共享卡这条主线在真实浏览器里成立：
     // 建卡 → 两本账各认领（同一张卡、科目编码不同）→ 上传**一份**对账单 →
-    // 规则归属 → 人工复核 → 卡级余额核对（哪本账少记了多少）。
+    // **人工指定归属** → 卡级余额核对（哪本账少记了多少）。
     //
     // **插件不制证**（1.1.0 起）—— 所以这里没有「生成凭证」那一步。
+    // **插件也没有归属规则**（1.2.0 起）—— 每一行都人工指定，所以这里
+    // 没有「加规则」「按规则归属」那两步。
 
     // ① 管理员建卡 —— 卡是**全局表**，宿主只放行管理员写全局表。
     await admin.page.goto(state.url + `/#/plugin/${sharedcard.id}`)
@@ -87,24 +89,19 @@ async function sharedcardScenario({ admin, staff, state, sharedcard }) {
       await detail.locator('.sc-table').filter({ hasText: code }).waitFor()
     }
 
-    // ④ 归属规则：丙供应链 → 第一本账，丁物业 → 第二本账。
-    //    加完规则**不许被踢回别的页签**（同一张卡上的操作不该被自己打断）。
-    await detail.getByRole('button', { name: '归属规则', exact: true }).click()
-    for (const [bookId, pattern] of [[state.sharedcardBookId, '丙供应链'], [state.sharedcardOtherBookId, '丁物业']]) {
-      await detail.getByRole('combobox', { name: '归到账套', exact: true }).selectOption(String(bookId))
-      await detail.getByRole('textbox', { name: '关键词', exact: true }).fill(pattern)
-      await detail.getByRole('button', { name: '添加', exact: true }).click()
-      await detail.locator('.sc-table').filter({ hasText: pattern }).waitFor()
-      assert.equal(await detail.getByRole('button', { name: '归属规则', exact: true }).count(), 1)
-    }
+    // ④ **没有归属规则**（1.2.0 起）：页签里不该有它，卡详情只有三个页签。
+    //    规则是「按对方户名/摘要去猜」，猜错就是把钱记到别的账上 —— 插件不猜。
+    assert.equal(await detail.getByRole('button', { name: '归属规则', exact: true }).count(), 0)
+    assert.equal(await detail.locator('.sc-tabs .sc-tab').count(), 3)
 
     // ⑤ 上传**唯一一份**对账单（真实民生银行 Excel，5 行）
+    //    **不为它选账套** —— 它是「为这张共享卡上传的」，那个下拉不该在。
     await detail.getByRole('button', { name: '对账单', exact: true }).click()
-    await detail.getByRole('combobox', { name: '替哪本账上传', exact: true }).selectOption(String(state.sharedcardBookId))
+    assert.equal(await detail.getByRole('combobox', { name: '替哪本账上传', exact: true }).count(), 0)
     await detail.locator('input.sc-file-input').setInputFiles(state.statementFixture)
     await detail.locator('.sc-table').filter({ hasText: 'cmbc_xlsx.xlsx' }).waitFor()
 
-    // ⑥ 打开对账单，按规则归属
+    // ⑥ 打开对账单：**5 行都还没归属**（1.2.0 起没有规则自动判定了）
     await detail.getByRole('button', { name: '打开', exact: true }).click()
     const stmtPane = staff.page.getByTestId('sc-statement')
     await stmtPane.waitFor()
@@ -123,29 +120,64 @@ async function sharedcardScenario({ admin, staff, state, sharedcard }) {
         return cells.filter(row => row.textContent.includes('未归属')).length === want
       }, expected)
     }
-    await stmtPane.getByRole('button', { name: '按规则归属', exact: true }).click()
-    assert.equal(await waitMetric('已归属', '2'), '已归属2')
-    assert.equal(await waitMetric('待复核', '3'), '待复核3')
-    await waitUnassignedRows(3)
+    assert.equal(await waitMetric('已归属', '0'), '已归属0')
+    assert.equal(await waitMetric('待复核', '5'), '待复核5')
+    await waitUnassignedRows(5)
 
-    // ⑦ 三行没命中规则 —— 人工指定到第一本账
+    // ⑥-0 **一行都还没归属时**，核对页不能说「对得上、没有少记」——
+    //    没比过的数不能说成比过了。两处文案都要带限定：合计卡上的提示，
+    //    和「谁少记了」那块空态。
+    await stmtPane.getByRole('button', { name: '返回', exact: true }).click()
+    await staff.page.getByTestId('sc-cards').waitFor()
+    await sc.locator('.sc-card-click').filter({ hasText: '浏览器演练共享卡' }).click()
+    await detail.getByRole('button', { name: '余额核对', exact: true }).click()
+    await detail.getByRole('button', { name: '核对余额', exact: true }).click()
+    // 合计卡：说清「少记/多记」现在还不可靠。
+    await detail.locator('.sc-hint').filter({ hasText: '还没归属的 5 行没算进' }).waitFor()
+    // 「谁少记了」：没有已归属的少记，但**不能**说「对得上、没有少记」。
+    const emptyShort = detail.locator('.sc-card').filter({ hasText: '谁少记了' }).first()
+    await emptyShort.waitFor()
+    const emptyShortText = (await emptyShort.innerText()).replace(/\s+/g, '')
+    assert.match(emptyShortText, /还有5行没归属/)
+    assert.doesNotMatch(emptyShortText, /对得上/)
+
+    // 回到对账单继续指定归属。
+    await detail.getByRole('button', { name: '对账单', exact: true }).click()
+    await detail.getByRole('button', { name: '打开', exact: true }).click()
+    await staff.page.getByTestId('sc-statement').waitFor()
+    assert.equal(await waitMetric('行数', '5'), '行数5')
+    assert.equal(await waitMetric('已归属', '0'), '已归属0')
+    assert.equal(await waitMetric('待复核', '5'), '待复核5')
+    await waitUnassignedRows(5)
+
+    // ⑥-1 「丁物业管理」那一笔归到**第二本账**（它就是那本账的往来款）。
+    const dingRow = stmtPane.locator('.sc-tr').filter({ hasText: '丁物业管理' })
+    assert.equal(await dingRow.count(), 1)
+    await dingRow.locator('input[type=checkbox]').check()
+    await stmtPane.getByRole('combobox', { name: '人工归到', exact: true }).selectOption(String(state.sharedcardOtherBookId))
+    await stmtPane.getByRole('button', { name: '指定归属', exact: true }).click()
+    assert.equal(await waitMetric('已归属', '1'), '已归属1')
+    assert.equal(await waitMetric('待复核', '4'), '待复核4')
+    await waitUnassignedRows(4)
+
+    // ⑥-2 其余 4 行归到第一本账
     const pending = stmtPane.locator('.sc-tr').filter({ hasText: '未归属' })
     const pendingCount = await pending.count()
-    assert.equal(pendingCount, 3)
+    assert.equal(pendingCount, 4)
     for (let index = 0; index < pendingCount; index++) {
       await pending.nth(index).locator('input[type=checkbox]').check()
     }
-    await stmtPane.locator('.sc-toolbar-inset').filter({ hasText: '已勾选 3 行' }).waitFor()
+    await stmtPane.locator('.sc-toolbar-inset').filter({ hasText: '已勾选 4 行' }).waitFor()
     await stmtPane.getByRole('combobox', { name: '人工归到', exact: true }).selectOption(String(state.sharedcardBookId))
     await stmtPane.getByRole('button', { name: '指定归属', exact: true }).click()
     assert.equal(await waitMetric('待复核', '0'), '待复核0')
     await waitUnassignedRows(0)
 
-    // ⑧ **插件不制证** —— 界面上不该有「生成凭证」这个入口。
+    // ⑦ **插件不制证** —— 界面上不该有「生成凭证」这个入口。
     assert.equal(await stmtPane.getByRole('button', { name: '生成凭证', exact: true }).count(), 0)
     await staff.page.screenshot({ path: fileURLToPath(new URL('plugin-sharedcard-rows.png', output)), fullPage: true })
 
-    // ⑨ 卡级余额核对：**各账套该科目的本期发生额 vs 该记的收款/支出**。
+    // ⑧ 卡级余额核对：**各账套该科目的本期发生额 vs 该记的收款/支出**。
     //    演练里两本账都**没有记过凭证** —— 所以账上一分没动，
     //    「少记」就等于各自该记的金额：第一本账
     //    收款 100,007,401 + 支出 10,530，第二本账支出 30,000,000。
@@ -169,7 +201,7 @@ async function sharedcardScenario({ admin, staff, state, sharedcard }) {
     assert.match(shortText, /共享卡演练账套甲.*少记100,017,931\.00/)
     assert.match(shortText, /共享卡演练账套乙.*少记30,000,000\.00/)
     await staff.page.screenshot({ path: fileURLToPath(new URL('plugin-sharedcard-balance.png', output)), fullPage: true })
-    console.log('PASS shared card: one statement across two books, rule allocation, manual review, card-level reconciliation (no vouchers)')
+    console.log('PASS shared card: one statement across two books, all rows allocated by hand, card-level reconciliation (no rules, no vouchers)')
 }
 
 try {

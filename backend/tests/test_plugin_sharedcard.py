@@ -8,9 +8,9 @@
 **这个插件只对账，不制证**（1.1.0 起）：凭证是用户自己在账上录的，插件不替
 用户猜对方科目。所以这里守的是**核对**，不是记账：
 
-1. **归属正确**：规则命中与人工复核都能把行判给对的账套。
-2. **少记看得出来**：各账套该科目的**本期净发生额**（账上动了多少）与
-   **归属流水净额**（该记多少）一减，就是这本账少记了多少。
+1. **归属正确**：每一行由用户**人工指定**归属（1.2.0 起没有规则自动判定了）。
+2. **少记看得出来**：各账套该科目的**本期发生额**（账上动了多少）与
+   **该记的**（对账单说该有多少）分借贷两侧比，就是这本账少记了多少。
 3. **不污染宿主**：宿主的对账单台账一行不多 —— 共享卡的对账单是插件实体，
    不是宿主那一份。
 
@@ -156,6 +156,34 @@ def cash_subjects(db, books3):
     return out
 
 
+@pytest.fixture
+def outsider_book(db, admin_user):
+    """一本**不在任何共享卡成员里**的账套，而且它在 ``book_list`` 里排在最前。
+
+    宿主 ``book_list`` 的顺序是 ``sort_order → company_name → name`` —— 而
+    ``company_name`` 是**用户自己起的名字**。所以要测「存储落在成员账套」这条
+    规则，得有一本**排第一却不是成员**的账：否则「碰巧排第一」也能让这条规则
+    看起来成立 —— 那样的闸门没有牙。
+    """
+    from app.accounting.periods import create_periods
+    from app.accounting.years import ensure_book_year
+    from app.seed.chart_of_accounts import install_chart
+
+    book = Book(company_name="AAA非成员公司", name="非成员账套",
+                start_year=2026, start_month=1)
+    db.add(book)
+    db.flush()
+    create_periods(db, book)
+    install_chart(db, book.id)
+    by = ensure_book_year(db, book, 2026)
+    by.init_subjects_at = datetime.now(timezone.utc)
+    by.init_subjects_source = "CHART"
+    db.add(UserBook(user_id=admin_user.id, book_id=book.id, role="OWNER"))
+    db.commit()
+    db.refresh(book)
+    return book
+
+
 def _json(response):
     assert response.status_code == 200, response.text
     return response.json()
@@ -257,12 +285,13 @@ def test_对方科目与默认对方科目被显式拒绝(shared, client, auth, 
     assert bad.status_code == 422
     assert "不制证" in bad.json()["detail"]
 
+    # 规则接口整块下线了（1.2.0 起）—— 老调用方再调它，要拿到**一句说清
+    # 原因的**话，而不是没有信息量的 404。
     bad = client.post(shared + f"/cards/{card_id}/rules", headers=auth, json={
         "book_id": item["book"].id, "match_field": "cp_name",
-        "match_mode": "contains", "pattern": "丙供应链",
-        "target_subject_code": item["counter"].code})
+        "match_mode": "contains", "pattern": "丙供应链"})
     assert bad.status_code == 422
-    assert "不制证" in bad.json()["detail"]
+    assert "下线" in bad.json()["detail"]
 
 
 def test_制证路由已经下线(shared, client, auth, loaded):
@@ -284,7 +313,7 @@ def test_插件不再声明凭证权限(shared, client, auth, db):
     assert registry is not None
     permissions = (registry.manifest_metadata or {}).get("permissions") or []
     assert "voucher:write" not in permissions, permissions
-    assert registry.version == "1.1.0", registry.version
+    assert registry.version == "1.2.0", registry.version
 
 
 def test_卡可以删(shared, client, auth, loaded, cash_subjects):
@@ -345,54 +374,56 @@ def test_建卡是管理员动作_普通账号看到的是能照着做的话(sha
 
 
 # ---------------------------------------------------------------------------
-# 2. 归属规则引擎
+# 2. 归属规则：整块下线（1.2.0 起）
 # ---------------------------------------------------------------------------
 
-def _card_with_members(shared, client, auth, cash_subjects, rules):
+def _card_with_members(shared, client, auth, cash_subjects):
+    """建一张卡并把三个账套都挂上去。"""
     card_id = _json(client.post(shared + "/cards", headers=auth,
-                                json={"name": "规则用卡"}))["card"]["id"]
+                                json={"name": "共享卡"}))["card"]["id"]
     for item in cash_subjects:
         _json(client.post(shared + f"/cards/{card_id}/members", headers=auth, json={
             "book_id": item["book"].id, "subject_code": item["cash"].code}))
-    for rule in rules:
-        _json(client.post(shared + f"/cards/{card_id}/rules", headers=auth, json=rule))
     return card_id
 
 
-def test_规则命中优先级大的(shared, client, auth, cash_subjects):
-    """两条规则都命中时，优先级大的那条说了算。"""
-    card_id = _card_with_members(shared, client, auth, cash_subjects, [
-        {"book_id": cash_subjects[0]["book"].id, "priority": 10,
-         "match_field": "cp_name", "match_mode": "contains", "pattern": "实业"},
-        {"book_id": cash_subjects[1]["book"].id, "priority": 99,
-         "match_field": "cp_name", "match_mode": "contains", "pattern": "实业"},
-    ])
-    rules = _json(client.get(shared + f"/cards/{card_id}/rules", headers=auth))["rules"]
-    assert len(rules) == 2
-    assert {rule["priority"] for rule in rules} == {10, 99}
+def test_规则接口已下线_说清原因而不是404(shared, client, auth, cash_subjects):
+    """**下线一个功能也要说清楚为什么** —— 不能回一句没有信息量的 404。
+
+    老页面（还没刷新的浏览器标签）会继续调这些接口。回 404 的话用户只会
+    以为插件坏了；回一句「这个功能没有了，每一行都要人工指定归属」才是
+    同一件事的两种说法。
+    """
+    card_id = _card_with_members(shared, client, auth, cash_subjects)
+    for method, path, body in (
+        ("get", f"/cards/{card_id}/rules", None),
+        ("post", f"/cards/{card_id}/rules", {"book_id": cash_subjects[0]["book"].id,
+                                             "match_field": "cp_name",
+                                             "match_mode": "contains", "pattern": "实业"}),
+        ("patch", f"/cards/{card_id}/rules/1", {"pattern": "实业"}),
+        ("delete", f"/cards/{card_id}/rules/1", None),
+    ):
+        response = client.request(method.upper(), shared + path, headers=auth, json=body)
+        assert response.status_code == 422, (method, path, response.text)
+        assert "下线" in response.json()["detail"], response.text
 
 
-def test_同优先级指向不同账套时不猜(shared, client, auth, cash_subjects):
-    """两条同优先级的规则命中同一行、却指向不同账套 —— 进冲突队列，不自动归。"""
-    card_id = _card_with_members(shared, client, auth, cash_subjects, [
-        {"book_id": cash_subjects[0]["book"].id, "priority": 50,
-         "match_field": "cp_name", "match_mode": "contains", "pattern": "实业"},
-        {"book_id": cash_subjects[1]["book"].id, "priority": 50,
-         "match_field": "cp_name", "match_mode": "contains", "pattern": "实业"},
-    ])
-    # 规则本身建得起来（两条都合法），但它们会互相打架。
-    rules = _json(client.get(shared + f"/cards/{card_id}/rules", headers=auth))["rules"]
-    assert len(rules) == 2
+def test_按规则自动归属已下线(shared, client, auth, loaded):
+    """「按规则自动归属」是规则的下游 —— 规则没了，它也就没有意义了。"""
+    stmt_id = loaded["stmt_id"]
+    response = client.post(shared + f"/statements/{stmt_id}/allocate", headers=auth)
+    assert response.status_code == 422, response.text
+    assert "下线" in response.json()["detail"], response.text
 
 
-def test_写错的正则在保存时就被挡下(shared, client, auth, cash_subjects):
-    """错正则要**当场**说清楚，而不是等归属跑完才发现一条都没命中。"""
-    card_id = _card_with_members(shared, client, auth, cash_subjects, [])
-    bad = client.post(shared + f"/cards/{card_id}/rules", headers=auth, json={
-        "book_id": cash_subjects[0]["book"].id, "match_field": "cp_name",
-        "match_mode": "regex", "pattern": "[未闭合"})
-    assert bad.status_code == 422
-    assert "正则" in bad.json()["detail"]
+def test_流水行不再有规则命中信息(shared, client, auth, loaded):
+    """没有规则，就没有「命中/冲突」这种现算的结论 —— 字段也不该再有。"""
+    stmt_id = loaded["stmt_id"]
+    rows = _json(client.get(shared + f"/statements/{stmt_id}/rows", headers=auth,
+                            params={"limit": 50}))["rows"]
+    assert rows
+    for row in rows:
+        assert "match" not in row, row
 
 
 # ---------------------------------------------------------------------------
@@ -401,33 +432,41 @@ def test_写错的正则在保存时就被挡下(shared, client, auth, cash_subj
 
 @pytest.fixture
 def loaded(shared, client, auth, books3, cash_subjects):
-    """上传一份对账单并按规则归属。
+    """上传一份对账单，并**人工指定**一部分行的归属。
 
-    归属规则：丙供应链 → 第一本账；丁物业 → 第二本账；戊建材 → 第三本账。
-    另外两行（乙实业、结息）**没有规则命中**，留在复核队列里。
+    1.2.0 起没有规则自动判定：每一行由用户指定归属。这里模拟用户的动作 ——
+    丙供应链 → 第一本账；丁物业 → 第二本账；戊建材 → 第三本账。
+    另外两行（乙实业、结息）**先不指定**，留在复核队列里。
+
+    **上传时不传 ``book_id``** —— 界面不再让用户为对账单选账套（它是「为这张
+    共享卡上传的」）。所以这里走的正是界面那条路，而不是绕开它。
     """
-    card_id = _card_with_members(shared, client, auth, cash_subjects, [
-        {"book_id": cash_subjects[0]["book"].id, "priority": 50,
-         "match_field": "cp_name", "match_mode": "contains", "pattern": "丙供应链"},
-        {"book_id": cash_subjects[1]["book"].id, "priority": 50,
-         "match_field": "cp_name", "match_mode": "contains", "pattern": "丁物业"},
-        {"book_id": cash_subjects[2]["book"].id, "priority": 50,
-         "match_field": "cp_name", "match_mode": "contains", "pattern": "戊建筑材料"},
-    ])
+    card_id = _card_with_members(shared, client, auth, cash_subjects)
     data = (FIXTURES / SAMPLE).read_bytes()
     uploaded = _json(client.post(shared + f"/cards/{card_id}/statements", headers=auth,
-                                 params={"book_id": cash_subjects[0]["book"].id},
                                  files={"files": (SAMPLE, data, "application/octet-stream")}))
     assert uploaded["rows"] == 5, uploaded
-    allocated = _json(client.post(shared + f"/statements/{uploaded['statement_id']}/allocate",
-                                  headers=auth))
-    assert allocated["created"] == 3, allocated
-    assert allocated["unmatched"] == 2, allocated
-    return {"card_id": card_id, "stmt_id": uploaded["statement_id"], "uploaded": uploaded}
+    stmt_id = uploaded["statement_id"]
+    rows = _json(client.get(shared + f"/statements/{stmt_id}/rows", headers=auth,
+                            params={"limit": 50}))["rows"]
+    plan = {"丙供应链": cash_subjects[0], "丁物业": cash_subjects[1],
+            "戊建筑材料": cash_subjects[2]}
+    assigned = 0
+    for row in rows:
+        for key, item in plan.items():
+            if key in (row.get("cp_name") or ""):
+                body = _json(client.post(shared + f"/statements/{stmt_id}/assign", headers=auth,
+                                         json={"rows": [row["id"]],
+                                               "book_id": item["book"].id,
+                                               "reason": "人工指定"}))
+                assigned += body["assigned"]
+                break
+    assert assigned == 3, assigned
+    return {"card_id": card_id, "stmt_id": stmt_id, "uploaded": uploaded}
 
 
 def test_上传与归属(shared, client, auth, loaded):
-    """5 行：3 行命中规则、2 行没命中（进复核队列）。"""
+    """5 行：3 行人工指定了归属，2 行还没指定（进复核队列）。"""
     stmt_id = loaded["stmt_id"]
     detail = _json(client.get(shared + f"/statements/{stmt_id}", headers=auth))
     assert detail["row_count"] == 5
@@ -436,6 +475,61 @@ def test_上传与归属(shared, client, auth, loaded):
     assert detail["income_total"] == "100007401.00"
     assert detail["expense_total"] == "30010530.00"
     assert detail["closing_balance"] == "75844188.00"
+
+
+def test_上传不用选账套_是为这个共享卡上传的(shared, client, auth, cash_subjects):
+    """**不为这份对账单选账套** —— 它是「为这张共享卡上传的」。
+
+    界面不再有「替哪本账上传」那个下拉：这份对账单属于**这张卡**，不属于任何
+    一本账。存在哪本账的表里只是**存储位置**（账套级备份/导出要覆盖得到它），
+    由后端自己挑第一本可写的 —— 不是用户要做的选择。
+    """
+    card_id = _card_with_members(shared, client, auth, cash_subjects)
+    data = (FIXTURES / SAMPLE).read_bytes()
+    uploaded = _json(client.post(shared + f"/cards/{card_id}/statements", headers=auth,
+                                 files={"files": (SAMPLE, data, "application/octet-stream")}))
+    assert uploaded["rows"] == 5, uploaded
+    # 存储位置由后端挑，但它得落在这张卡的**成员账套**里 —— 不能是「碰巧排
+    # 第一」的那本账（宿主 `book_list` 按 company_name 排，那是用户自己起的
+    # 名字，排第一是随机的）。
+    assert uploaded["book_id"] in [item["book"].id for item in cash_subjects]
+    # 这份对账单挂在这张卡名下（卡 → 对账单 → 流水行，一条线）。
+    listed = _json(client.get(shared + f"/cards/{card_id}/statements", headers=auth))["statements"]
+    assert [item["id"] for item in listed] == [uploaded["statement_id"]]
+
+
+def test_显式指定存储账套仍然可用(shared, client, auth, cash_subjects):
+    """``book_id`` 降级成**存储位置提示**（API 层面），界面不再传它。
+
+    老脚本还会传 —— 传了就照用（不然就是一次「传了却没生效」的静默丢弃），
+    但它**不是「替谁上传」**：归属仍然靠人工指定。
+    """
+    card_id = _card_with_members(shared, client, auth, cash_subjects)
+    data = (FIXTURES / SAMPLE).read_bytes()
+    uploaded = _json(client.post(shared + f"/cards/{card_id}/statements", headers=auth,
+                                 params={"book_id": cash_subjects[1]["book"].id},
+                                 files={"files": (SAMPLE, data, "application/octet-stream")}))
+    assert uploaded["book_id"] == cash_subjects[1]["book"].id
+    assert uploaded["rows"] == 5, uploaded
+
+
+def test_存储落在成员账套_不是碰巧排第一的那本(shared, client, auth, cash_subjects,
+                                              outsider_book):
+    """存储账套**必须是这张卡的成员**。
+
+    宿主 ``book_list`` 按 ``company_name`` 排 —— 那是用户自己起的名字，「第一本」
+    是**随机**的一本。所以「碰巧排第一」也能让「落在成员账套」这条规则看起来成立；
+    这条用例专门放一本**排第一却不是成员**的账来把它钉死。
+    """
+    member_ids = {item["book"].id for item in cash_subjects}
+    assert outsider_book.id not in member_ids
+    card_id = _card_with_members(shared, client, auth, cash_subjects)
+    data = (FIXTURES / SAMPLE).read_bytes()
+    uploaded = _json(client.post(shared + f"/cards/{card_id}/statements", headers=auth,
+                                 files={"files": (SAMPLE, data, "application/octet-stream")}))
+    assert uploaded["book_id"] != outsider_book.id, \
+        "对账单存到了不是这张卡成员的那本账里"
+    assert uploaded["book_id"] in member_ids
 
 
 def test_同卡同期重复上传被拒(shared, client, auth, loaded, cash_subjects):
@@ -452,7 +546,20 @@ def test_未归属的行进复核队列(shared, client, auth, loaded):
     queue = _json(client.get(shared + "/queue", headers=auth))["queue"]
     assert len(queue) == 1
     assert queue[0]["pending"] == 2
-    assert queue[0]["conflicts"] == 0
+    # 1.2.0 起没有规则了，「规则冲突」这个概念也一并没了。
+    assert "conflicts" not in queue[0], queue[0]
+
+
+def test_复核队列给的是卡名不是归属账套(shared, client, auth, loaded):
+    """队列里那列得说**哪张卡**，不能说「归属账套」。
+
+    「归属」在 1.2.0 起是**用户人工指定**的事；之前那一列写的其实是这份对账单
+    存在哪本账的表里（存储位置）。两个概念混在一列里，用户会以为归属是插件
+    定的 —— 而插件不替用户猜。
+    """
+    queue = _json(client.get(shared + "/queue", headers=auth))["queue"]
+    assert len(queue) == 1
+    assert queue[0]["card_name"] == "共享卡", queue[0]
 
 
 def test_人工指定归属后队列清空(shared, client, auth, loaded, cash_subjects):
@@ -706,13 +813,16 @@ def test_账套级备份覆盖插件的六张表(shared, client, auth, db, loade
     from app.backup.export import export_scope, read_snapshot, SCOPE_BOOK
 
     card_id = loaded["card_id"]
-    first = cash_subjects[0]["book"].id
-    second = cash_subjects[1]["book"].id
+    # **备份「对账单实际落在的那本账」** —— 存储账套是后端挑的（1.2.0 起优先
+    # 这张卡的成员账套），测试不能假设是哪一本：假设错了，断言就变成在测
+    # 「数据碰巧落在第一本」而不是「数据落在哪本就覆盖到哪本」。
+    owner = loaded["uploaded"]["book_id"]
+    assert owner in [item["book"].id for item in cash_subjects]
 
     path = tmp_path / "book.json.gz"
     with SessionLocal() as session:
-        export_scope(session, scope=SCOPE_BOOK, book_id=first,
-                     book_label=first, out_path=path)
+        export_scope(session, scope=SCOPE_BOOK, book_id=owner,
+                     book_label=owner, out_path=path)
     data = read_snapshot(path)
 
     prefix = "plugin_275b391c351a_"
@@ -726,11 +836,14 @@ def test_账套级备份覆盖插件的六张表(shared, client, auth, db, loade
     assert cards[0]["id"] == card_id
 
     # book 级的五张：只有本账套的行（库里另有另外两本账的行）。
-    for suffix in ("member", "rule", "stmt", "row", "alloc"):
+    for suffix in ("member", "stmt", "row", "alloc"):
         rows = data["tables"][prefix + suffix]["rows"]
         assert rows, "%s 表在归档里是空的" % suffix
-        assert {row["book_id"] for row in rows} == {first}, \
+        assert {row["book_id"] for row in rows} == {owner}, \
             "%s 表混进了别的账套的行" % suffix
+    # 规则表**还在归档里**（迁移链不改，表还在），但它已经是空表 ——
+    # 1.2.0 起规则整块下线，建不出规则来了。
+    assert data["tables"][prefix + "rule"]["rows"] == []
 
     # 库里明明有另外两本账的行 —— 证明上面的「只有本账套」是**过滤**出来的，
     # 不是因为库里本来就只有一本账。

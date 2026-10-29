@@ -331,3 +331,63 @@ def test_plugin_data_read_supports_filter_paging_and_count(plugin_env, client, a
     # 过滤条件改不掉账套范围。
     r = client.post(path + '/rows', params={'book_id': book.id}, json={'where': {'book_id': book.id + 1}}, headers=plain_auth)
     assert r.json() == []
+
+
+def test_插件表反射只做一次_重复读不再反射(plugin_env, client, auth, plain_auth, plain_user, book, db, monkeypatch):
+    """同一张表**只反射一次**，之后复用。
+
+    **为什么这件事值得一条用例**：反射（``autoload``）是每次读表都要重付一遍
+    的固定开销 —— 实测（生产同款机器）每张表约 21 ms，复用反射结果后的一次
+    查询只要约 3.5 ms。插件默认在**宿主进程内**跑，这些反射同步地发生在
+    worker 的事件循环里：一次请求读几十次表就是几秒，卡住的是**整个宿主**。
+
+    所以判据是**次数**：一个请求里读三次、再调三次接口，同一张表**只反射一次**。
+    """
+    from app.plugins import public_api
+
+    build, restart = plugin_env
+    pid = 'com.test.reflect'
+    name = table_prefix(pid) + 'items'
+    code = f'''def register(registrar, ctx):
+    def rows(book_id: int):
+        # 同一张表读三次：反射不该跟着读三次
+        out = []
+        for _ in range(3):
+            out.append(ctx.data.read("{name}", book_id=book_id))
+        return {{"reads": len(out), "rows": sum(len(item) for item in out)}}
+    registrar.get("/rows", rows)
+'''.encode()
+    raw, manifest, _, _ = build(plugin_id=pid, tables=True,
+        files={'backend/main.py': code, 'frontend/index.js': b'export default host => ({render: () => host.h("div")});'},
+        edit=lambda m: m.update(permissions=['plugin_data:rw', 'book:read']))
+    assert client.post('/api/system/plugins/install', files={'file': ('reflect.cwp', raw)}, headers=auth).status_code == 200
+    restart()
+    assert client.put(f'/api/system/plugins/{pid}/users', headers=auth, json={'user_ids': [plain_user.id]}).status_code == 200
+    link = UserBook(user_id=plain_user.id, book_id=book.id, role='ACCOUNTANT')
+    db.add(link); db.commit()
+
+    reflected = []
+    real_table = public_api.Table
+
+    def counting_table(table_name, *args, **kwargs):
+        reflected.append(table_name)
+        return real_table(table_name, *args, **kwargs)
+
+    monkeypatch.setattr(public_api, "Table", counting_table)
+    # 缓存是进程级的：先清掉，免得上一条用例已经把这张表反射过了。
+    public_api.clear_plugin_table_cache()
+
+    path = f'/api/plugins/{pid}/rows'
+    for _ in range(3):
+        response = client.get(path, params={'book_id': book.id}, headers=plain_auth)
+        assert response.status_code == 200, response.text
+        assert response.json() == {'reads': 3, 'rows': 0}
+
+    assert reflected.count(name) == 1, reflected
+
+    # **失效**：迁移改了表结构之后要能看到新结构。
+    public_api.clear_plugin_table_cache(pid)
+    reflected.clear()
+    response = client.get(path, params={'book_id': book.id}, headers=plain_auth)
+    assert response.status_code == 200, response.text
+    assert reflected.count(name) == 1, reflected

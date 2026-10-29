@@ -24,6 +24,7 @@ from app.plugins.installer import install, installation_lock, make_backup, prune
 from app.plugins.manifest import DIGEST_RE, safe_path, version_table
 from app.plugins.migrations import validate_tables
 from app.plugins.models import PluginRegistry, PluginUserAccess, PluginWorkerRuntime
+from app.plugins.public_api import clear_plugin_table_cache
 from app.plugins.security import ASSET_TICKET_SEGMENT, add_revoked_key, asset_token, verify_asset_token, verify_directory
 from app.plugins.workers import status, require_stopped, live_cutoff
 
@@ -363,6 +364,9 @@ def cleanup(plugin_id: str, payload: Cleanup, user=Depends(management_write), db
             if table.name in {m["name"] for m in metadata}:
                 table.drop(db.connection())
         db.execute(text(f'DROP TABLE IF EXISTS public."{version_table(plugin_id)}"'))
+        # 表没了，反射缓存里的 Table 也不能再留着（留着的话下一次读会拿旧结构
+        # 去查一张不存在的表）。
+        clear_plugin_table_cache(plugin_id)
         p.tables, p.migration_head, p.backup_path = [], "", backup
         p.error_code = "TABLES_CLEANED"
         audit.event(db, "cleanup", plugin_id, user=user, version=p.version, digest=p.plugin_digest)

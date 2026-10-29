@@ -20,6 +20,7 @@ from app.plugins.errors import PluginError
 from app.plugins.manifest import table_prefix
 from app.plugins.migrations import migrate
 from app.plugins.models import PluginInstallAttempt, PluginRegistry, PluginWorkerRuntime
+from app.plugins.public_api import clear_plugin_table_cache
 from app.plugins.security import verify_archive
 from app.plugins.workers import require_stopped
 
@@ -301,6 +302,9 @@ def install(data: bytes, user, *, upgrade_id=None):
                 conn.execute(update(PluginInstallAttempt).where(PluginInstallAttempt.attempt_id == attempt_id).values(
                     status="MIGRATED", migration_head=head, tables=metadata))
             migrate(engine, staging, manifest, on_commit=migrated)
+            # **迁移改了表结构，反射缓存要作废**（见 public_api 的缓存说明）：
+            # 这一刻旧代码可能还在跑，它下一次读表应当看到**新**结构。
+            clear_plugin_table_cache(pid)
             active.parent.mkdir(mode=0o700, exist_ok=True)
             os.rename(staging, active)  # 同一 root 内，不 copy、不覆盖。
             _sync_directory(active.parent)
