@@ -24,12 +24,12 @@ async function login(username) {
 }
 async function manager(page) { await page.goto(state.url + '/#/plugins'); await page.getByRole('heading', { name: '扩展管理' }).waitFor() }
 function row(page, id) { return page.getByRole('row').filter({ hasText: id }) }
-async function grant(page, id, enabled) {
+async function grant(page, id, enabled, username = 'plugin-staff') {
   await row(page, id).getByRole('button', { name: '管理用户' }).click()
   const dialog = page.getByRole('dialog').filter({ hasText: '使用授权' })
-  await dialog.getByRole('textbox', { name: '搜索可授权用户' }).fill('plugin-staff')
+  await dialog.getByRole('textbox', { name: '搜索可授权用户' }).fill(username)
   await dialog.getByRole('button', { name: '搜索', exact: true }).click()
-  const box = dialog.getByRole('checkbox', { name: '授权 plugin-staff', exact: true })
+  const box = dialog.getByRole('checkbox', { name: `授权 ${username}`, exact: true })
   if (await box.isChecked() !== enabled) await box.locator('xpath=ancestor::label').click()
   assert.equal(await box.isChecked(), enabled)
   const saved = page.waitForResponse(r => r.url().endsWith(`/api/system/plugins/${id}/users`) && r.request().method() === 'PUT')
@@ -37,6 +37,143 @@ async function grant(page, id, enabled) {
   assert.equal((await saved).status(), 200)
   await dialog.waitFor({ state: 'hidden' })
 }
+// 共享卡场景：单独成一个函数，调用处才好**大声**跳过。
+//
+// **插件源码不在 git 里**（/plugins/ 是 gitignore 的，见 .gitignore 第 104 行）：
+// 干净 checkout 里没有它 —— 那时这一段整个不跑。悄悄少跑一段比红着更坏
+// （红着会有人来看），所以调用处要打一行 SKIP 而不是无声跳过。
+async function sharedcardScenario({ admin, staff, state, sharedcard }) {
+    // ───────────────────────────────────────── 共享卡对账：一张卡、两个账套、一份对账单
+    //
+    // 跑的是**仓库里那个真的插件包**（plugins/com.cwq.sharedcard），不是替身。
+    // 它守的是共享卡这条主线在真实浏览器里成立：
+    // 建卡 → 两本账各认领（同一张卡、科目编码不同）→ 上传**一份**对账单 →
+    // 规则归属 → 人工复核 → 分账套制证 → 卡级余额核对。
+
+    // ① 管理员建卡 —— 卡是**全局表**，宿主只放行管理员写全局表。
+    await admin.page.goto(state.url + `/#/plugin/${sharedcard.id}`)
+    const adminSc = admin.page.getByTestId('sharedcard')
+    await adminSc.waitFor()
+    await adminSc.getByRole('textbox', { name: '卡名', exact: true }).fill('浏览器演练共享卡')
+    await adminSc.getByRole('button', { name: '创建', exact: true }).click()
+    await adminSc.locator('.sc-card-click').filter({ hasText: '浏览器演练共享卡' }).waitFor()
+
+    // ② 会计账号做日常：建卡按钮**置灰**并说清为什么（不是点一下再报错）。
+    await staff.page.goto(state.url + `/#/plugin/${sharedcard.id}`)
+    const sc = staff.page.getByTestId('sharedcard')
+    await sc.waitFor()
+    await staff.page.getByTestId('sc-cards').waitFor()
+    assert.equal(await sc.getByRole('button', { name: '创建', exact: true }).isDisabled(), true)
+    await sc.locator('.sc-hint').filter({ hasText: '只有系统管理员能新建' }).waitFor()
+
+    // ③ 两本账各认领这张卡 —— 同一张卡，科目编码不同。
+    //    第一本账记在 1002 银行存款，第二本账记在 **1001 库存现金**：
+    //    宿主那条流水对账线只认 1002，共享卡这条线**两个族都认**（插件的独门）。
+    await sc.locator('.sc-card-click').filter({ hasText: '浏览器演练共享卡' }).click()
+    const detail = staff.page.getByTestId('sc-card-detail')
+    await detail.waitFor()
+    for (const [bookId, code] of [[state.sharedcardBookId, '1002'], [state.sharedcardOtherBookId, '1001']]) {
+      await detail.getByRole('combobox', { name: '账套', exact: true }).selectOption(String(bookId))
+      const subject = detail.getByRole('combobox', { name: '现金科目', exact: true })
+      await subject.locator(`option[value="${code}"]`).waitFor({ state: 'attached' })
+      await subject.selectOption(code)
+      const counter = detail.getByRole('combobox', { name: '默认对方科目', exact: true })
+      await counter.locator('option[value="2241"]').waitFor({ state: 'attached' })
+      await counter.selectOption('2241')
+      await detail.getByRole('button', { name: '添加', exact: true }).click()
+      await detail.locator('.sc-table').filter({ hasText: code }).waitFor()
+    }
+
+    // ④ 归属规则：丙供应链 → 第一本账，丁物业 → 第二本账。
+    //    加完规则**不许被踢回别的页签**（同一张卡上的操作不该被自己打断）。
+    await detail.getByRole('button', { name: '归属规则', exact: true }).click()
+    for (const [bookId, pattern] of [[state.sharedcardBookId, '丙供应链'], [state.sharedcardOtherBookId, '丁物业']]) {
+      await detail.getByRole('combobox', { name: '归到账套', exact: true }).selectOption(String(bookId))
+      await detail.getByRole('textbox', { name: '关键词', exact: true }).fill(pattern)
+      await detail.getByRole('button', { name: '添加', exact: true }).click()
+      await detail.locator('.sc-table').filter({ hasText: pattern }).waitFor()
+      assert.equal(await detail.getByRole('button', { name: '归属规则', exact: true }).count(), 1)
+    }
+
+    // ⑤ 上传**唯一一份**对账单（真实民生银行 Excel，5 行）
+    await detail.getByRole('button', { name: '对账单', exact: true }).click()
+    await detail.getByRole('combobox', { name: '替哪本账上传', exact: true }).selectOption(String(state.sharedcardBookId))
+    await detail.locator('input.sc-file-input').setInputFiles(state.statementFixture)
+    await detail.locator('.sc-table').filter({ hasText: 'cmbc_xlsx.xlsx' }).waitFor()
+
+    // ⑥ 打开对账单，按规则归属
+    await detail.getByRole('button', { name: '打开', exact: true }).click()
+    const stmtPane = staff.page.getByTestId('sc-statement')
+    await stmtPane.waitFor()
+    const waitMetric = async (label, expected) => {
+      await stmtPane.locator('.sc-metric').filter({ hasText: label + expected }).waitFor()
+      const item = stmtPane.locator('.sc-metric').filter({ hasText: label })
+      return (await item.innerText()).replace(/\s+/g, '')
+    }
+    assert.equal(await waitMetric('行数', '5'), '行数5')
+    // **行列表是另一次请求**：指标先到、行后到。断言行之前必须等行刷新完 ——
+    // 不等就会测到上一屏的数据（分配前看到 5 行未归属，分配后还是 5 行）。
+    const waitUnassignedRows = async expected => {
+      await staff.page.waitForFunction((want) => {
+        const cells = [...document.querySelectorAll('[data-testid="sc-statement"] .sc-tr')]
+          .filter(row => !row.classList.contains('sc-th'))
+        return cells.filter(row => row.textContent.includes('未归属')).length === want
+      }, expected)
+    }
+    await stmtPane.getByRole('button', { name: '按规则归属', exact: true }).click()
+    assert.equal(await waitMetric('已归属', '2'), '已归属2')
+    assert.equal(await waitMetric('待复核', '3'), '待复核3')
+    await waitUnassignedRows(3)
+
+    // ⑦ 三行没命中规则 —— 人工指定到第一本账
+    const pending = stmtPane.locator('.sc-tr').filter({ hasText: '未归属' })
+    const pendingCount = await pending.count()
+    assert.equal(pendingCount, 3)
+    for (let index = 0; index < pendingCount; index++) {
+      await pending.nth(index).locator('input[type=checkbox]').check()
+    }
+    await stmtPane.locator('.sc-toolbar-inset').filter({ hasText: '已勾选 3 行' }).waitFor()
+    await stmtPane.getByRole('combobox', { name: '人工归到', exact: true }).selectOption(String(state.sharedcardBookId))
+    await stmtPane.getByRole('button', { name: '指定归属', exact: true }).click()
+    assert.equal(await waitMetric('待复核', '0'), '待复核0')
+    await waitUnassignedRows(0)
+
+    // ⑧ 分账套制证：第一本账 4 张、第二本账 1 张
+    await stmtPane.getByRole('button', { name: '生成凭证', exact: true }).click()
+    assert.equal(await waitMetric('已制证', '5'), '已制证5')
+    // **行列表也刷新完**才算完：指标与行是两次请求，指标先到、行后到。
+    // 不等这一下，截图/断言会撞在那个窗口里 —— 看到「已制证 5」与每行
+    // 「待制证」并排的假象，还以为页面的状态是坏的。
+    await staff.page.waitForFunction(() => {
+      const cells = [...document.querySelectorAll('[data-testid="sc-statement"] .sc-tr')]
+        .filter(row => !row.classList.contains('sc-th'))
+      return cells.length === 5 && cells.every(row => row.textContent.includes('已制证'))
+    })
+    await staff.page.screenshot({ path: fileURLToPath(new URL('plugin-sharedcard-vouchers.png', output)), fullPage: true })
+
+    // ⑨ 卡级余额核对。
+    //    样例的期初余额是 5,847,317.00，演练里**没有**建期初凭证 ——
+    //    所以差额恰好等于期初余额，而「剩下的」也恰好等于它：
+    //    这说明差额解释是通的（已归属未制证/未归属/归错科目三项都是 0）。
+    await stmtPane.getByRole('button', { name: '返回', exact: true }).click()
+    await staff.page.getByTestId('sc-cards').waitFor()
+    await sc.locator('.sc-card-click').filter({ hasText: '浏览器演练共享卡' }).click()
+    await detail.getByRole('button', { name: '余额核对', exact: true }).click()
+    await detail.getByRole('button', { name: '核对余额', exact: true }).click()
+    const kv = async label => {
+      const item = detail.locator('.sc-kv').filter({ hasText: label })
+      await item.waitFor()
+      return (await item.innerText()).replace(/\s+/g, '')
+    }
+    assert.equal(await kv('各账套账面余额合计'), '各账套账面余额合计69,996,871.00')
+    assert.equal(await kv('对账单期末余额'), '对账单期末余额75,844,188.00')
+    assert.equal(await kv('差额'), '差额5,847,317.00')
+    assert.equal(await kv('解释合计'), '解释合计0.00')
+    assert.equal(await kv('剩下的'), '剩下的5,847,317.00')
+    await staff.page.screenshot({ path: fileURLToPath(new URL('plugin-sharedcard-balance.png', output)), fullPage: true })
+    console.log('PASS shared card: one statement across two books, rule allocation, manual review, per-book vouchers, card-level balance reconciliation')
+}
+
 try {
   const admin = await login('plugin-admin')
   await manager(admin.page)
@@ -50,6 +187,9 @@ try {
       assert.match(await row(admin.page, bundle.id).innerText(), /等待重启/)
       assert.match(await row(admin.page, bundle.id).innerText(), /0 人/)
       await grant(admin.page, bundle.id, true)
+      // 共享卡的**卡是全局表**，宿主只放行管理员写全局表 —— 所以管理员本人
+      // 也必须被授权，否则这条线上没人能建卡。
+      if (bundle.id === 'com.cwq.sharedcard') await grant(admin.page, bundle.id, true, 'plugin-admin')
     }
     await admin.page.screenshot({ path: fileURLToPath(new URL('plugin-install.png', output)), fullPage: true })
     console.log('PASS UI install, pending restart, zero initial grants, user search/picker/save')
@@ -57,13 +197,23 @@ try {
     const normal = state.packages[0], bad = state.packages[1]
     const adminToken = await admin.page.evaluate(() => localStorage.getItem('cwq_token'))
     const adminManifest = await admin.context.request.get(state.url + '/api/plugins/manifest', { headers: { Authorization: `Bearer ${adminToken}` } })
-    assert.deepEqual(await adminManifest.json(), { plugins: [] })
+    // **共享卡有没有打进演练，决定这一轮断言什么**。
+    //
+    // 插件源码不在 git 里（/plugins/ 是 gitignore 的）：干净 checkout 里没有它，
+    // 那时这一轮只跑另外三个插件 —— 名单与数量都跟着**实际打进演练的包**走。
+    // 写死一个数就会在少跑场景的那一轮里红，而红的原因与被测的东西无关。
+    const sharedcard = state.packages.find(p => p.id === 'com.cwq.sharedcard')
+    // 管理员**默认**拿不到任何插件 —— 授权是显式的，管理员身份不等于授权。
+    // 这条线上只显式给管理员授了共享卡（卡是全局表，只有管理员能建），
+    // 所以管理员的名单里**只有它一个**。
+    assert.deepEqual((await adminManifest.json()).plugins.map(p => p.id),
+      sharedcard ? ['com.cwq.sharedcard'] : [])
     const staff = await login('plugin-staff')
     const token = await staff.page.evaluate(() => localStorage.getItem('cwq_token'))
     const manifest = await staff.context.request.get(state.url + '/api/plugins/manifest', { headers: { Authorization: `Bearer ${token}` } })
     assert.match(manifest.headers()['cache-control'], /(?:^|,\s*)no-store(?:,|$)/)
     const granted = (await manifest.json()).plugins
-    assert.equal(granted.length, 3)
+    assert.equal(granted.length, sharedcard ? 4 : 3)
     const assets = granted.find(p => p.id === normal.id)
     // **资产 URL 里带一张短期票据**（backend/app/plugins/security.py::asset_token），
     // 长这样：/api/plugins/assets/<id>/<digest>/frontend/_t/<到期秒>.<签名>/index.js
@@ -179,6 +329,13 @@ try {
     await staff.page.locator('.ctx-select').first().click()
     await staff.page.locator('li[role="option"]').filter({ hasText: /^插件隔离演练账套$/ }).click()
     console.log('PASS CSV book config, real multipart upload, preview edit, global book switch preserves draft, refresh recovery, manual confirm, atomic submit and idempotent replay')
+    // ───────────────────────────────────────── 共享卡对账：一张卡、两个账套、一份对账单
+    if (sharedcard) {
+      await sharedcardScenario({ admin, staff, state, sharedcard })
+    } else {
+      console.log('SKIP shared card: 干净 checkout 里没有 plugins/com.cwq.sharedcard'
+        + '（插件不入库）—— 这一段场景**没有跑**')
+    }
     await staff.page.goto(state.url + `/#/plugin/${normal.id}`)
     await staff.page.getByTestId('plugin-note').waitFor()
     const outsider = await login('plugin-other')
@@ -189,6 +346,9 @@ try {
     const refused = await outsider.context.request.get(state.url + `/api/plugins/${normal.id}/notes?book_id=${state.bookId}`, { headers: { Authorization: `Bearer ${otherToken}` } })
     assert.equal(refused.status(), 404)
     assert.equal((await refused.json()).detail.code, 'PLUGIN_NOT_FOUND_OR_UNAVAILABLE')
+    // 管理员页面上一段被导航去看共享卡插件了 —— 授权名单在**扩展管理页**上，
+    // 回去再点「管理用户」。
+    await manager(admin.page)
     await grant(admin.page, normal.id, false)
     const oldToken = await staff.context.request.get(state.url + `/api/plugins/${normal.id}/notes?book_id=${state.bookId}`, { headers: { Authorization: `Bearer ${token}` } })
     assert.equal(oldToken.status(), 404)

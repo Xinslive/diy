@@ -52,20 +52,29 @@ def main():
     with SessionLocal.begin() as db:
         users = [SysUser(username=name, password_hash=hash_password(password), active=True, is_admin=name=='plugin-admin', real_name=name) for name in ['plugin-admin','plugin-staff','plugin-other']]
         db.add_all(users); db.flush()
-        book = Book(company_name='浏览器测试公司', name='插件隔离演练账套', start_year=2026, start_month=1)
-        db.add(book); db.flush(); create_periods(db, book)
-        install_chart(db, book.id)
-        # 初始化状态挂在**年度**上（book_year，迁移 0032）
-        by = ensure_book_year(db, book, 2026)
-        by.init_subjects_at = datetime.now(timezone.utc); by.init_subjects_source = 'CHART'
-        db.add_all([UserBook(user_id=user.id, book_id=book.id, role='OWNER' if user.is_admin else 'ACCOUNTANT', sort_order=0) for user in users])
-        book_id = book.id
-        other = Book(company_name='浏览器测试公司', name='切换演练账套', start_year=2026, start_month=1)
-        db.add(other); db.flush(); create_periods(db, other); install_chart(db, other.id)
-        by2 = ensure_book_year(db, other, 2026)
-        by2.init_subjects_at = datetime.now(timezone.utc); by2.init_subjects_source = 'CHART'
-        db.add_all([UserBook(user_id=user.id, book_id=other.id, role='OWNER' if user.is_admin else 'ACCOUNTANT', sort_order=1) for user in users])
-        other_id = other.id
+
+        def make_book(name, sort_order):
+            """造一本**空**账套（12 个期间 + 标准科目表）并授权给三个账号。
+
+            共享卡那两本是**单独造的**：共享卡要断言「各账套加起来恰好等于
+            这张卡」，账上多一分钱（别的场景留下的凭证）这条断言就不成立了 ——
+            那种耦合会让演练变成「两个场景互相影响」的玄学。
+            """
+            b = Book(company_name='浏览器测试公司', name=name, start_year=2026, start_month=1)
+            db.add(b); db.flush(); create_periods(db, b)
+            install_chart(db, b.id)
+            # 初始化状态挂在**年度**上（book_year，迁移 0032）
+            by = ensure_book_year(db, b, 2026)
+            by.init_subjects_at = datetime.now(timezone.utc); by.init_subjects_source = 'CHART'
+            db.add_all([UserBook(user_id=user.id, book_id=b.id,
+                                 role='OWNER' if user.is_admin else 'ACCOUNTANT',
+                                 sort_order=sort_order) for user in users])
+            return b.id
+
+        book_id = make_book('插件隔离演练账套', 0)
+        other_id = make_book('切换演练账套', 1)
+        sharedcard_book_id = make_book('共享卡演练账套甲', 2)
+        sharedcard_other_id = make_book('共享卡演练账套乙', 3)
     processes, handles = [], []
     with tempfile.TemporaryDirectory(prefix='cwq-plugin-browser-') as tmp:
         temporary = Path(tmp)
@@ -85,11 +94,33 @@ def main():
         failed = build(failed_source, temporary/'key.pem', 'browser-test', failed_path)
         csv_path = temporary/'csv.cwp'
         csv_plugin = build(ROOT/'docs/plugin-import-example', temporary/'key.pem', 'browser-test', csv_path)
+        # 共享卡对账：**真的那个插件包**（仓库 plugins/ 下的磁盘目录），
+        # 不是另写一份演练用的替身 —— 浏览器里跑的那份必须是将来装到用户
+        # 机器上的那一份。
+        #
+        # **插件源码不在 git 里**（/plugins/ 是 gitignore 的，见 .gitignore
+        # 第 104 行）：干净 checkout 里没有它。那就**跳过这一段**，而不是让
+        # 整条演练失败 —— 但要**大声**跳过：悄悄少跑一段场景比红着更坏
+        # （红着会有人来看，悄悄少跑没人知道）。
+        sharedcard_source = ROOT/'plugins/com.cwq.sharedcard'
+        sharedcard_path = temporary/'sharedcard.cwp'
+        sharedcard = None
+        if sharedcard_source.is_dir():
+            sharedcard = build(sharedcard_source, temporary/'key.pem', 'browser-test', sharedcard_path)
+        else:
+            print('· 跳过共享卡场景：干净 checkout 里没有 plugins/com.cwq.sharedcard'
+                  '（插件不入库，见 .gitignore）—— 这段场景**没有跑**')
         api_port, web_port = free_port(), free_port()
         env = dict(os.environ, PLUGIN_ROOT=str(temporary/'plugins'), PLUGIN_TRUSTED_KEYS=json.dumps(keys), CWQ_API_WORKERS='2')
         state_file = temporary/'state.json'
         state_file.write_text(json.dumps({'url': f'http://127.0.0.1:{web_port}', 'password': password, 'bookId': book_id, 'otherBookId': other_id,
-            'packages': [{'id':normal['id'], 'path':str(package_path)}, {'id':failed['id'], 'path':str(failed_path)}, {'id':csv_plugin['id'], 'path':str(csv_path)}]}))
+            # 共享卡**自己的**两本账：不与别的场景共用，余额断言才成立得了。
+            'sharedcardBookId': sharedcard_book_id, 'sharedcardOtherBookId': sharedcard_other_id,
+            # 对账单样例：真实的民生银行 Excel（5 行，收入支出都有）。
+            'statementFixture': str(ROOT/'backend/tests/fixtures/statements/cmbc_xlsx.xlsx'),
+            'packages': [{'id':normal['id'], 'path':str(package_path)}, {'id':failed['id'], 'path':str(failed_path)},
+                         {'id':csv_plugin['id'], 'path':str(csv_path)}]
+                         + ([{'id':sharedcard['id'], 'path':str(sharedcard_path)}] if sharedcard else [])}))
         def start_backend():
             log = (temporary/('backend-'+str(len(handles))+'.log')).open('w')
             handles.append(log)
@@ -107,7 +138,9 @@ def main():
             api = start_backend()
             subprocess.run([sys.executable,'scripts/plugin_status.py','--wait','20'], cwd=ROOT/'backend', env=env, check=True)
             subprocess.run(['node','tools/uitest/plugin_e2e.mjs','verify',str(state_file)], cwd=ROOT, check=True)
-            verify_data_and_retained_uninstall(api, start_backend, api_port, env, temporary, book_id, password, normal['id'], failed['id'], csv_plugin['id'])
+            verify_data_and_retained_uninstall(api, start_backend, api_port, env, temporary, book_id, password,
+                                               normal['id'], failed['id'], csv_plugin['id'],
+                                               sharedcard['id'] if sharedcard else None)
             print('PASS isolated signed-plugin browser E2E with production bundle/CSP and supervisor workers=2')
         except BaseException:
             for log in handles:
@@ -129,7 +162,7 @@ def main():
 
 
 
-def verify_data_and_retained_uninstall(api, start_backend, port, env, temporary, book_id, password, normal_id, failed_id, csv_id):
+def verify_data_and_retained_uninstall(api, start_backend, port, env, temporary, book_id, password, normal_id, failed_id, csv_id, sharedcard_id):
     """真实示例的恢复演练和保留表卸载；所有生命周期修改经过管理 API。"""
     import httpx
     url = f'http://127.0.0.1:{port}'
@@ -176,7 +209,9 @@ print('PASS signed example backup v2 dry-run, FK restore and sequence reset')
         inserted = http.post(f'/api/plugins/{normal_id}/notes', json={'book_id':book_id,'label':'恢复后序列验证'}, headers=staff)
         assert inserted.status_code == 200, inserted.text
         assert inserted.json()['id'] > before.json()[0]['id']
-        for pid in (normal_id, failed_id, csv_id):
+        for pid in (normal_id, failed_id, csv_id, sharedcard_id):
+            if not pid:
+                continue
             response = http.post(f'/api/system/plugins/{pid}/disable', headers=admin)
             assert response.status_code == 200 and response.json()['status'] == 'pending_restart', response.text
         assert http.delete(f'/api/system/plugins/{normal_id}', headers=admin).status_code == 409
