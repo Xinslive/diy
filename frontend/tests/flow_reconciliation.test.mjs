@@ -1075,23 +1075,26 @@ t('「上传并解析」与资产科目、对账单在同一行', () => {
   assert.match(row, /label="资产科目"/)
   assert.match(row, /label="对账单"/)
   assert.match(row, /上传并解析/)
-  // 三栏在同一行里 —— 不是三个 el-row 各摆一样
-  assert.equal((row.match(/<el-col/g) || []).length, 3,
-    '上传那行应该正好三栏')
+  // **两栏** —— 三个控件在两栏里（主按钮跟「选择文件」同栏），
+  // 多出来的那一栏就是「按钮离选择文件隔那么远」的来源
+  assert.equal((row.match(/<el-col/g) || []).length, 2,
+    '上传那行应该正好两栏')
 })
 
-t('第三栏不带 label：按钮跟上面两个输入框左边对齐', () => {
-  // el-form 会给**没有 label** 的表单项按表单的 label-width 留出缩进，
-  // 按钮正好跟输入框的左边对齐 —— 不用自己写死像素值。
-  const start = VIEW.indexOf('class="flow-upload-action-col"')
-  assert.ok(start > 0, '找不到上传按钮那一栏')
-  const end = VIEW.indexOf('</el-col>', start)
-  const col = stripComments(VIEW.slice(start, end))
-  assert.match(col, /<el-form-item class="flow-upload-action">/)
-  assert.doesNotMatch(col, /<el-form-item[^>]*label=/,
-    '第三栏不该有 label（有 label 就对不齐输入框了）')
-  // 表单本身的 label-width 要在（第三栏的缩进靠它）
-  assert.match(VIEW, /<el-form :model="uploadForm" label-width="92px"/)
+t('「上传并解析」紧挨着「选择文件」（2026-10-29 用户批注）', () => {
+  // 用户原话：「上传按钮隔那么远干嘛」。
+  //
+  // 挑完文件紧接着就是「解析」—— 两个按钮必须在**同一个表单项**里，
+  // 中间只隔着 12px。隔着几百像素的空地，两个动作看着不像连着的。
+  const start = VIEW.indexOf('class="flow-upload-file"')
+  assert.ok(start > 0, '找不到「对账单」那一栏')
+  const end = VIEW.indexOf('</el-form-item>', start)
+  const item = stripComments(VIEW.slice(start, end))
+  assert.match(item, /选择文件/, '这一栏里没有「选择文件」')
+  assert.match(item, /上传并解析/, '这一栏里没有「上传并解析」')
+  // 间距由 CSS 的 gap 说了算（Element Plus 只给**相邻**按钮 12px 左边距，
+  // 这里两个按钮不是相邻兄弟，所以间距全靠 gap）
+  assert.match(VIEW, /\.flow-upload-file :deep\(\.el-form-item__content\) \{ gap: 4px 12px; \}/)
 })
 
 t('已选的文件名不会把卡片撑宽', () => {

@@ -28,13 +28,16 @@
                  28px 的竖间距**，控制台还一直报 prop 类型错。
                  横向不要间距就写 0，纵向的间距由下面的 CSS 给。 -->
             <!-- **三样东西一行**：资产科目、对账单、「上传并解析」。
-                 原来「上传并解析」自己占一行，摆在下面 —— 一步操作被拆成
+                 原来「上传并解析」自己占一行、摆在下面 —— 一步操作被拆成
                  两行看，用户得再往下扫一眼才找得到主按钮。
-                 第三栏的 el-form-item **不带 label**：el-form 会按表单的
-                 label-width 给它的内容留出 92px 的缩进，于是按钮正好跟上面
-                 两个输入框的左边对齐（不用自己写死像素值）。 -->
+
+                 而它**必须紧挨着「选择文件」**（用户批注：「上传按钮隔那么远
+                 干嘛」）：挑完文件紧接着就是「解析」，中间隔着几百像素的
+                 空地，两个动作看着不像连着的。所以两个按钮**同属「对账单」
+                 那一栏** —— 不另起一栏：另起一栏就得再吃一次 label 的缩进，
+                 中间那段空白又回来了。 -->
             <el-row :gutter="0" class="flow-upload-row">
-              <el-col :xs="24" :sm="9">
+              <el-col :xs="24" :sm="10">
                 <el-form-item label="资产科目">
                   <el-select
                     v-model="uploadForm.account_subject_id"
@@ -51,8 +54,8 @@
                   </el-select>
                 </el-form-item>
               </el-col>
-              <el-col :xs="24" :sm="7">
-                <el-form-item label="对账单">
+              <el-col :xs="24" :sm="14">
+                <el-form-item label="对账单" class="flow-upload-file">
                   <el-upload
                     :auto-upload="false"
                     :show-file-list="false"
@@ -64,10 +67,6 @@
                       <el-icon><Upload /></el-icon>选择文件
                     </el-button>
                   </el-upload>
-                </el-form-item>
-              </el-col>
-              <el-col :xs="24" :sm="8" class="flow-upload-action-col">
-                <el-form-item class="flow-upload-action">
                   <el-button
                     type="primary"
                     :disabled="!store.canWrite || !canUpload"
@@ -1934,7 +1933,7 @@ onMounted(async () => {
 /* 已选文件名：显示在「上传并解析」旁边。
    **宁可换行，也不缩成半个字** —— flex 子项默认会缩（缩到只剩几个像素），
    所以这里显式 ``flex: none``：名字放得下就跟在按钮后面，
-   放不下就换到按钮下面一行（左边跟按钮对齐，见下面的 gap）。
+   放不下就换到按钮下面一行（左边跟「选择文件」对齐，见下面的 gap）。
    换行后仍然**不许把卡片撑宽**：超出容器就截断（省略号 + title 提示）。 */
 .picked {
   font-size: 12px;
@@ -1944,8 +1943,10 @@ onMounted(async () => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 按钮与文件名之间 12px；换行时上下留 4px。 */
-.flow-upload-action :deep(.el-form-item__content) { gap: 4px 12px; }
+/* 「选择文件」「上传并解析」与文件名之间 12px；换行时上下留 4px。
+   间距**只由这里说了算** —— Element Plus 会给相邻按钮 12px 左边距，
+   再叠一个 gap 就变成 24px 了。 */
+.flow-upload-file :deep(.el-form-item__content) { gap: 4px 12px; }
 .flow-upload-form { max-width: 900px; }
 /* 窄屏上这几个字段会**上下叠起来**（xs=24）—— 叠起来时得留点竖间距，
    否则「资产科目」和「对账单」贴成一片。宽屏并排时不加这个间距。 */
@@ -1953,9 +1954,9 @@ onMounted(async () => {
 @media (min-width: 768px) {
   .flow-upload-row :deep(.el-col) { margin-bottom: 0; }
 }
-/* 第三栏（上传并解析）里的按钮不许被挤扁 —— 文件名该截断就截断，
+/* 这一栏里的按钮不许被挤扁 —— 文件名该截断就截断，
    按钮是主操作，尺寸必须稳。 */
-.flow-upload-action :deep(.el-button) { flex: none; }
+.flow-upload-file :deep(.el-button) { flex: none; }
 .flow-rows-toolbar {
   display: flex;
   align-items: center;
