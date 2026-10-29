@@ -16,6 +16,10 @@ from app.accounting.audit_helper import log, voucher_snapshot
 from app.accounting.util import constraint_name, find_period, money, period_label
 from app.core.text_clean import scrub_control_chars
 from app.core.voucher_no import seq_expr
+# 删凭证时要把「由它生成的发票」放回可生成 —— 那个模块**不 import 任何
+# accounting 模块**，所以这里 import 它不会成环（app.invoice.service 会
+# import 本模块，所以那一个不能在这里 import）。
+from app.invoice.release import release_records_for_vouchers
 from app.models import Book, Entry, Period, Subject, SysUser, Voucher
 
 # 凭证号在期间内唯一。撞号时数据库只会说「违反唯一约束」，看到的人
@@ -1119,6 +1123,16 @@ def delete_voucher(db: Session, voucher: Voucher, user: SysUser,
         detail=f"删除凭证 {voucher.voucher_no}",
         before=snapshot,
     )
+    # **把这张凭证生成出来的发票放回「可生成」。**
+    #
+    # 不放回去的话，账上那笔账没了，而那张发票还挂着「已生成」的标记 ——
+    # 服务端对「已生成」的记录跳过重算，它不会变回「可生成」，
+    # 于是用户**再也用这张发票生成不了凭证**。
+    #
+    # 放在 ``db.delete`` 之前：这时 ``voucher_id`` 还指着这张凭证，
+    # 找得到要放掉的是哪几张；等删完，外键的 ``ON DELETE SET NULL``
+    # 已经把 ``voucher_id`` 清空了，就认不出是哪几张发票了。
+    release_records_for_vouchers(db, [voucher.id])
     db.delete(voucher)
     if commit:
         db.commit()

@@ -980,6 +980,7 @@ def test_head_是本文件认识的那一版():
         "0044_row_subject_summary",             # 摘要下沉到对方科目（bank_statement_row_subject.summary_override）
         "0045_bank_statement_review",           # 待复核那一档：记下否掉的是哪张凭证（bank_statement_row.rejected_voucher_id）
         "0046_row_subject_dup_ok",              # 放开「同一个科目在一行里只能出现一次」（删 uq_bank_statement_row_subject）
+        "0047_invoice_voucher_release",         # 修数据：凭证被删掉的发票记录还停在「已生成」（放回「可生成」+ 重数批次的已入账张数）
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")
@@ -1284,8 +1285,9 @@ def test_跨年账套_次年只有期初没有凭证_迁移照样跑得完(scrat
         # 0041 是流水对账的四张表，0042 是流水对方科目子表 + 摘要模板，
         # 0043 是流水行的人工摘要列，0044 把摘要下沉到对方科目，
         # 0045 是流水行「否掉的是哪张凭证」那一列，
-        # 0046 放开「同一个科目在一行里只能出现一次」。
-        assert ver == "0046_row_subject_dup_ok", f"schema 只到 {ver}"
+        # 0046 放开「同一个科目在一行里只能出现一次」，
+        # 0047 把「凭证已删、发票还停在已生成」的记录放回「可生成」。
+        assert ver == "0047_invoice_voucher_release", f"schema 只到 {ver}"
 
         # 科目表按年度拆开
         rows = conn.execute(text(
@@ -1531,3 +1533,161 @@ def test_0042_多行指向同一个科目也搬得过去(scratch_at_0041):
                 f"第 {seq} 行的金额串行了：{amount}（这一行自己的金额是 "
                 f"{49000.00 + (seq - 4)}）")
 
+
+
+# ================================================================ 5. 0047 的数据修复
+#
+# 0047 不改结构，只**修数据**：把「凭证已经被删掉、发票记录还停在『已生成』」
+# 的那些孤儿放回「可生成」。
+#
+# 这里盯的是**后果** —— 那些记录在修复之前是卡死的：状态说已生成、账上什么
+# 都没有，服务端跳过重算、也不让它们进「确认生成」的目标，于是用户再也用
+# 这张发票生成不了凭证。
+
+
+def _seed_invoice_orphans(eng) -> None:
+    """造一个批次：三张发票，其中一张的凭证已经被删了。
+
+    全用裸 SQL：这套用例跑在**迁移建出来的** schema 上，ORM 那边的
+    ``subject.year`` 之类的列在迁移到一半时还不存在。
+    """
+    with eng.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO book (id, company_name, name, start_year, start_month,
+                              subject_code_rule, status, data_version,
+                              created_at, updated_at)
+            VALUES (1, '孤儿测试公司', '孤儿账套', 2021, 1, '4-2-2-2', 'ACTIVE', 0,
+                    now(), now())
+        """))
+        # 期间挂的是**年度**（book_year），不是账套 —— 那是 0032 之后的结构。
+        conn.execute(text("""
+            INSERT INTO book_year (id, book_id, year, subject_code_rule,
+                                   created_at, updated_at)
+            VALUES (1, 1, 2021, '4-2-2-2', now(), now())
+        """))
+        conn.execute(text("""
+            INSERT INTO period (id, book_id, year, month, ord, locked,
+                                version, created_at, updated_at)
+            VALUES (1, 1, 2021, 1, 1, false, 1, now(), now())
+        """))
+        # 两张凭证：第 1、3 张各对应一张发票；第 2 张发票的凭证已经被删了
+        # （下面插记录时它的 voucher_id 是空的 —— 那就是「孤儿」的形状）。
+        for vid in (1, 3):
+            conn.execute(text("""
+                INSERT INTO voucher (id, book_id, period_id, voucher_no, voucher_date,
+                                    status, source, attachments, remark, ext_attrs,
+                                    created_at, updated_at)
+                VALUES (:id, 1, 1, :vno, '2021-01-15', 'UNPOSTED', 'INVOICE', 1, '',
+                        '{}'::jsonb, now(), now())
+            """), {"id": vid, "vno": f"记-{vid:04d}"})
+        conn.execute(text("""
+            INSERT INTO invoice_batch (id, book_id, filename, file_path, status, total,
+                                       ready_count, error_count, committed_count,
+                                       ocr_used, message, created_by,
+                                       created_at, updated_at)
+            VALUES (1, 1, '一月.pdf', '', 'COMMITTED', 3, 0, 0, 3, false,
+                    '成功生成 3 张凭证', 'tester', now(), now())
+        """))
+        # 三张发票：第 2 张是孤儿（voucher_id 为空、状态却还是「已生成」）。
+        rows = [
+            (1, "24417000000000000001", 1),      # 有凭证
+            (2, "24417000000000000002", None),   # ← 孤儿
+            (3, "24417000000000000003", 3),      # 有凭证
+        ]
+        for rid, number, voucher_id in rows:
+            conn.execute(text("""
+                INSERT INTO invoice_record (id, batch_id, book_id, page_index,
+                                            invoice_no, invoice_type, status,
+                                            parse_warning, errors, payload, voucher_id,
+                                            created_at, updated_at)
+                VALUES (:id, 1, 1, :page, :number, 'INPUT', 'COMMITTED', '',
+                        '[]'::jsonb, '{}'::jsonb, :voucher, now(), now())
+            """), {"id": rid, "page": rid - 1, "number": number, "voucher": voucher_id})
+        conn.execute(text(
+            "SELECT setval(pg_get_serial_sequence('invoice_record', 'id'), 10)"))
+        conn.execute(text(
+            "SELECT setval(pg_get_serial_sequence('voucher', 'id'), 10)"))
+
+
+def test_0047_把凭证已删的发票放回可生成(migrated_scratch):
+    """孤儿记录（状态还停在「已生成」、凭证已经没了）要变回「可生成」。
+
+    不变回去的话，它永远变不出凭证 —— 用户删了凭证之后就再也用这张
+    发票生成不了凭证。
+    """
+    eng, _ = migrated_scratch
+    _seed_invoice_orphans(eng)
+    _stamp(eng, "0046_row_subject_dup_ok")
+    _upgrade(eng, "head")
+
+    with eng.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT id, status, voucher_id FROM invoice_record ORDER BY id")).all()
+        statuses = {r[0]: (r[1], r[2]) for r in rows}
+        assert statuses[1] == ("COMMITTED", 1), statuses
+        assert statuses[3] == ("COMMITTED", 3), statuses
+        assert statuses[2] == ("READY", None), (
+            f"孤儿记录没有被放回「可生成」：{statuses[2]}")
+
+
+def test_0047_重数批次的已入账张数(migrated_scratch):
+    """批次的「已生成凭证」张数要按实际重数一遍。
+
+    原来记着 3 张（删凭证时没人回头改它），实际只剩 2 张 ——
+    界面上的「N 张已入账」要与账上对得上。
+    """
+    eng, _ = migrated_scratch
+    _seed_invoice_orphans(eng)
+    _stamp(eng, "0046_row_subject_dup_ok")
+    _upgrade(eng, "head")
+
+    with eng.connect() as conn:
+        count = conn.execute(text(
+            "SELECT committed_count FROM invoice_batch WHERE id = 1")).scalar()
+        assert count == 2, f"批次的已入账张数没重数：{count}"
+
+
+def test_0047_凭证全没了的批次回到待确认(migrated_scratch):
+    """一张都没剩时，「已生成」那一栏是骗人的。"""
+    eng, _ = migrated_scratch
+    _seed_invoice_orphans(eng)
+    with eng.begin() as conn:
+        # 把另两张发票的凭证也删掉 —— 这一批就一张都没剩了。
+        conn.execute(text("DELETE FROM voucher WHERE id IN (1, 3)"))
+    _stamp(eng, "0046_row_subject_dup_ok")
+    _upgrade(eng, "head")
+
+    with eng.connect() as conn:
+        batch = conn.execute(text(
+            "SELECT status, committed_count FROM invoice_batch WHERE id = 1")).one()
+        assert batch[0] == "PENDING", f"批次还写着「已生成」：{batch}"
+        assert batch[1] == 0, f"批次的已入账张数该是 0：{batch}"
+
+
+def test_0047_重复执行不改变结果(migrated_scratch):
+    """幂等：运维会重跑。重跑不该把已经修好的数据又弄乱。"""
+    eng, _ = migrated_scratch
+    _seed_invoice_orphans(eng)
+    _stamp(eng, "0046_row_subject_dup_ok")
+    _upgrade(eng, "head")
+    with eng.connect() as conn:
+        before = conn.execute(text(
+            "SELECT id, status, voucher_id FROM invoice_record ORDER BY id")).all()
+        count_before = conn.execute(text(
+            "SELECT committed_count FROM invoice_batch WHERE id = 1")).scalar()
+    # 再跑一遍这一条 revision（不 stamp，直接重跑它的 upgrade）。
+    rev = _load_rev("0047_invoice_voucher_release.py")
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    with eng.begin() as conn:
+        ctx = MigrationContext.configure(conn)
+        with Operations.context(ctx):
+            rev.upgrade()
+    with eng.connect() as conn:
+        after = conn.execute(text(
+            "SELECT id, status, voucher_id FROM invoice_record ORDER BY id")).all()
+        count_after = conn.execute(text(
+            "SELECT committed_count FROM invoice_batch WHERE id = 1")).scalar()
+    assert after == before, f"重跑把数据弄乱了：{before} → {after}"
+    assert count_after == count_before, f"重跑改了计数：{count_before} → {count_after}"

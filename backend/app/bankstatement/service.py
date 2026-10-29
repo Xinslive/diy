@@ -2946,9 +2946,14 @@ def reconcile_balance(db: Session, book_id: int, statement_id: int,
     }
     committed_invoice_ids: set[int] = set()
     if claimed_invoice_ids:
+        # **「已提交」的判据是「有凭证」。** 凭证被删掉之后，发票记录还停在
+        # 「已生成」的状态上，可它其实**已经不在账上**了 —— 那笔账不存在，
+        # 对账单上这一行就仍然没被账面覆盖，得算进未入账净额里。
+        # 只看状态的话，这笔钱会凭空从「没对上」里消失。
         committed_invoice_ids = set(db.scalars(select(InvoiceRecord.id).where(
             InvoiceRecord.id.in_(claimed_invoice_ids),
             InvoiceRecord.status == "COMMITTED",
+            InvoiceRecord.voucher_id.is_not(None),
         )).all())
     # 预览阶段的发票认领仍未入账，必须继续算入未入账净额；只有发票已
     # 提交并生成凭证后，流水才被账面覆盖。

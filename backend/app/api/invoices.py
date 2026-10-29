@@ -274,7 +274,14 @@ def get_invoice_batch(batch_id: int, book: Book = Depends(get_my_book), db: Sess
     records = db.scalars(select(InvoiceRecord).where(InvoiceRecord.batch_id == batch.id).order_by(InvoiceRecord.page_index)).all()
     counts = service.status_counts(db, [batch.id]).get(batch.id, {})
     subjects = service.subjects_by_id(db, book.id, records)
-    return {**service.batch_summary(batch, counts), "invoices": [service.serialize_record(record, subjects) for record in records]}
+    # **``sources`` 也要带上。** 界面上「来源文件」那一列看的就是它，
+    # 而那一列只在**多于一个来源文件**时才摆出来 —— 不带的话，批次页
+    # 上那一列是空的，点一次「重新计算预览」才看见（预览接口带）。
+    return {
+        **service.batch_summary(batch, counts),
+        "sources": service.batch_sources(db, batch.id),
+        "invoices": [service.serialize_record(record, subjects) for record in records],
+    }
 
 
 @router.post("/batches/{batch_id}/preview")

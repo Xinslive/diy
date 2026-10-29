@@ -54,11 +54,18 @@ t('开关开着时按钮变成「显示全部发票」', () => {
   assert.match(VIEW, /onlyUnbooked \? '显示全部发票' : '只显示未入账发票'/)
 })
 
-t('藏起来的张数要讲出来', () => {
+t('藏起来的张数不再用灰字提示（用户 2026-10-29 批注去掉）', () => {
+  // 那句「当前显示未入账 N 张，已隐藏 M 张已入账发票」去掉了 ——
+  // 张数在上面的概要里已经写着（「共 N 张发票，N 张可生成，N 张已入账」），
+  // 再摆一段灰字只是占掉主操作的位置。
+  // 断言的是**模板里不再渲染它**，不是「这句话在文件里不出现」——
+  // 注释里提一句「这句去掉了」是正常的。
+  assert.doesNotMatch(VIEW, /\{\{\s*filterHint\s*\}\}/)
+  assert.doesNotMatch(VIEW, /const filterHint = computed/)
+  // 计数本身还在（概要里那一句）。
   assert.match(VIEW, /const bookedCount = computed/)
-  assert.match(VIEW, /const filterHint = computed/)
-  assert.match(VIEW, /已隐藏 \$\{hidden\} 张已入账发票/)
-  assert.match(VIEW, /v-if="onlyUnbooked" class="muted result-hint"/)
+  assert.match(VIEW, /const batchSummaryTitle = computed/)
+  assert.match(VIEW, /张已入账/)
 })
 
 t('开关不抢主按钮的样式', () => {

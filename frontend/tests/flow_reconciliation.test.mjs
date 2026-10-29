@@ -124,11 +124,17 @@ t('发票导入页把来源标出来', () => {
   assert.match(INVOICE, /对账单识别/)
 })
 
-t('发票导入页讲清楚有没有对账单可匹配', () => {
+t('发票导入页打开批次就自动重新计算，结算科目自动按对账单匹配', () => {
   const INVOICE = fs.readFileSync(
     new URL('../src/views/voucher/InvoiceImport.vue', import.meta.url), 'utf8')
-  assert.match(INVOICE, /statementHint/)
-  assert.match(INVOICE, /statementCount/)
+  // 结算科目是按「金额 + 收支方向」去对账单流水上认的，而对账单常常是
+  // **后来**才传进来的。以前要用户自己点一次「重新计算预览」才认得出来
+  // —— 现在打开批次就自动算一次（用户 2026-10-29 要求）。
+  assert.match(INVOICE, /async function autoRecalculate/)
+  assert.match(INVOICE, /await autoRecalculate\(\)/)
+  // 那句「已加载 N 份对账单，点「重新计算预览」…」随之过期，去掉了。
+  assert.doesNotMatch(INVOICE, /\{\{\s*statementHint\s*\}\}/)
+  assert.doesNotMatch(INVOICE, /const statementCount = ref/)
 })
 
 console.log('== 流水行状态 ==')

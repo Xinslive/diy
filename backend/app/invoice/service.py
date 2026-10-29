@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -382,8 +382,122 @@ def _resolve_rule(rules: list[InvoiceRule], invoice_type: str, counterparty: str
     return top.subject_id, None, "matched"
 
 
-def _override(record: InvoiceRecord, overrides: dict[str, dict]) -> dict[str, Any]:
-    return dict(overrides.get(str(record.id)) or {})
+def _persisted_overrides(record: InvoiceRecord) -> dict[str, Any]:
+    """这张发票**上次落库**的人工覆盖项。
+
+    存在 ``payload.resolution.overrides`` 里 —— 预览算完时一起写进去的，
+    所以它是「用户上次做好的决定」的存根。
+    """
+    resolution = (record.payload or {}).get("resolution") or {}
+    saved = resolution.get("overrides")
+    return dict(saved) if isinstance(saved, dict) else {}
+
+
+def _subject_ids_in(override: dict[str, Any]) -> list[int | None]:
+    """一份覆盖项里用到的**科目 id**。
+
+    三个位置：税额科目、结算科目、逐项科目（``line_subjects`` 的每个值）。
+    """
+    ids: list[int | None] = [
+        override.get("tax_subject_id"),
+        override.get("settlement_subject_id"),
+    ]
+    ids.extend((override.get("line_subjects") or {}).values())
+    return ids
+
+
+def _usable_subject_ids(db: Session, book_id: int, ids: Iterable[int | None]) -> set[int]:
+    """这些 id 里，哪些是**现在还能用**的科目。
+
+    「能用」= 属于本账套 + 启用 + 末级 —— 与 ``_ensure_leaf_subjects`` 的
+    判据逐字一致，区别只在于：那边遇到不能用的会**抛错**，这里把不能用的
+    **剔掉**。两处判据必须一致，否则会出现「这里放过去了、那边又炸了」。
+    """
+    wanted = {int(v) for v in ids if v is not None}
+    if not wanted:
+        return set()
+    rows = db.scalars(
+        select(Subject).where(Subject.book_id == book_id, Subject.id.in_(wanted))
+    ).all()
+    return {row.id for row in rows if row.active and row.is_leaf}
+
+
+def _sanitize_saved_override(override: dict[str, Any], usable: set[int]) -> dict[str, Any]:
+    """把「落库的覆盖项」里指向**已不可用科目**的部分剔掉。
+
+    为什么要剔：落库的覆盖项是**历史**。用户上次挑的科目，今天可能已经
+    停用或不再是末级了。照用的话，预览会直接报错
+    （``_ensure_leaf_subjects`` 见到停用科目会抛「人工覆盖科目包含已停用科目」），
+    **整个批次都打不开** —— 一张票的历史决定拖垮了另外几十张。
+
+    剔掉之后，那一项回落规则/配置科目；界面上「结算科目来源」会从
+    「人工指定」变回「配置科目」，用户看得见，不是悄悄换的。
+    """
+    out = dict(override)
+    for key in ("tax_subject_id", "settlement_subject_id"):
+        value = out.get(key)
+        if value is not None and int(value) not in usable:
+            out.pop(key)
+    lines = out.get("line_subjects")
+    if isinstance(lines, dict):
+        kept = {k: v for k, v in lines.items() if v is None or int(v) in usable}
+        if kept:
+            out["line_subjects"] = kept
+        else:
+            out.pop("line_subjects")
+    return out
+
+
+def _saved_overrides_by_record(db: Session, book_id: int,
+                               records: list[InvoiceRecord]) -> dict[int, dict[str, Any]]:
+    """每张发票**落库的**人工覆盖项（已剔掉指向不可用科目的那些）。
+
+    一次查完所有科目，别按记录逐个查 —— 一个批次几百张发票，逐个查就是
+    几百次数据库往返。
+    """
+    saved: dict[int, dict[str, Any]] = {}
+    wanted: list[int | None] = []
+    for record in records:
+        item = _persisted_overrides(record)
+        if not item:
+            continue
+        saved[record.id] = item
+        wanted.extend(_subject_ids_in(item))
+    usable = _usable_subject_ids(db, book_id, wanted)
+    return {rid: _sanitize_saved_override(item, usable) for rid, item in saved.items()}
+
+
+def _override(record: InvoiceRecord, overrides: dict[str, dict],
+              saved: dict[str, Any] | None = None) -> dict[str, Any]:
+    """这一张的人工覆盖项：**落库的**与**这次传进来的**合并。
+
+    落库的垫底（那是用户上次做好的决定），这次传进来的盖在上面
+    （那是用户刚做的决定，更近）。
+
+    **为什么不能只用传进来的。**
+
+    前端只在用户**动过**某一行时才有那一行的覆盖项 —— 它不知道用户
+    在上一次会话里改过什么。于是刷新页面、或从历史里重开一个批次时，
+    一次「重新计算预览」就会把用户人工改过的科目、发票类型**全部冲掉**，
+    悄悄按规则重算一遍。页面上看着像「改过」，账上记的却是另一个科目。
+
+    这跟「忽略是结论、不是待算的草稿」是同一条道理
+    （见 :func:`_is_ignored`）：人工改过的地方是**结论**，
+    重算是拿草稿去盖结论。
+
+    ``line_subjects`` 是**逐项**的字典，要合而不是整个换 ——
+    否则新传进来的 ``{1: X}`` 会把落库的 ``{0: Y}`` 顶掉。
+    """
+    persisted = saved if saved is not None else _persisted_overrides(record)
+    incoming = overrides.get(str(record.id)) or {}
+    merged = {**persisted, **incoming}
+    lines = {
+        **(persisted.get("line_subjects") or {}),
+        **(incoming.get("line_subjects") or {}),
+    }
+    if lines:
+        merged["line_subjects"] = lines
+    return merged
 
 
 def _is_ignored(record: InvoiceRecord, override: dict[str, Any]) -> bool:
@@ -443,12 +557,18 @@ def _release_statement_claims(db: Session, batch: InvoiceBatch,
 
     只重算一张（``only_ids``）时只放那一张的 —— 别的发票占着的流水不能动，
     那是真的有主了。
+
+    **已提交的发票不放**：它们的凭证已经在账上，放掉会让同一条流水
+    再被一张新发票认领一次。
+
+    **例外是「孤儿」**：状态还停在「已生成」、可凭证已经被删了的那种 ——
+    它的凭证不在账上，放掉它占着的流水是放回一张本来就空着的位置。
     """
     from app.bankstatement import matching
 
     targets = [
         row for row in record_rows
-        if row.status != "COMMITTED"
+        if not (row.status == "COMMITTED" and row.voucher_id is not None)
         and (only_ids is None or str(row.id) in only_ids)
     ]
     if not targets:
@@ -539,6 +659,13 @@ def _build_preview(
         ])
         override_subject_ids.extend((override.get("line_subjects") or {}).values())
     subjects.update(_ensure_leaf_subjects(db, batch.book_id, override_subject_ids, "人工覆盖科目"))
+    # **落库的**人工覆盖项：先剔掉指向已不可用科目的那些，再垫在这次
+    # 传进来的覆盖项底下（见 :func:`_override` 的说明）。
+    #
+    # 这一步与上面那句严格校验是**两件事**：上面校验的是用户**刚点**的
+    # （选错了要当场报错），这里处理的是**历史**（科目可能已经停用，
+    # 历史不该拖垮整个批次）。
+    saved_overrides = _saved_overrides_by_record(db, batch.book_id, record_rows)
 
     previews: list[dict[str, Any]] = []
     ready = 0
@@ -549,7 +676,7 @@ def _build_preview(
     for record in record_rows:
         if only_ids is not None and str(record.id) not in only_ids:
             continue
-        if record.status == "COMMITTED":
+        if record.status == "COMMITTED" and record.voucher_id is not None:
             # **已入账的不重算。**
             #
             # 重新预览是为了改**还没入账**的那些发票。把已入账的也算一遍，
@@ -560,9 +687,16 @@ def _build_preview(
             # 不重算、不改状态、不动它的 payload。
             previews.append(serialize_record(record, subjects))
             continue
+        # **孤儿记录**（状态还停在「已生成」、可凭证已经被删了）落到下面
+        # 按正常记录重算：科目重新解析、状态回到「可生成」，用户就能重新
+        # 生成一张凭证。
+        #
+        # 上面那条「已入账的不重算」对它**不成立** —— 它的凭证已经不在账上了。
+        # 不当孤儿处理，它就永远变不回「可生成」：服务端跳过重算，
+        # 「确认生成」也只认「可生成」的那几张。
         meta = _meta(record)
         lines = _lines(record)
-        override = _override(record, overrides)
+        override = _override(record, overrides, saved_overrides.get(record.id))
         if _is_ignored(record, override):
             # 用户点名「这张不算发票」：合并 PDF 里的封面、装订页、重复扫描页。
             # 不给它编造科目，也不把它算进可生成/有问题 —— 两头都不该拦下整批。
@@ -1287,6 +1421,24 @@ def _create_batch(db: Session, book_id: int, user: SysUser,
     return batch
 
 
+def batch_sources(db: Session, batch_id: int) -> list[str]:
+    """这一批是**几个来源文件**拼起来的。
+
+    界面上「来源文件」那一列只在**多于一个来源文件**时才摆出来
+    （一个文件时那列是废话）。而那一列摆不摆得出来，看的是这份名单 ——
+    所以凡是返回批次详情的地方都得带上它。
+
+    以前只有预览接口（``_preview_payload``）带了，批次详情接口
+    （``GET /batches/{id}``）没带：于是用户打开批次页时那一列是空的，
+    得点一次「重新计算预览」才看见 —— 像是这列数据要算出来才有，
+    其实它一直都在库里。
+    """
+    rows = db.scalars(
+        select(InvoiceRecord.payload).where(InvoiceRecord.batch_id == batch_id)
+    ).all()
+    return sorted({_text((row or {}).get("source_file")) for row in rows} - {""})
+
+
 def preview_batch(db: Session, batch: InvoiceBatch, overrides: dict[str, dict] | None = None) -> dict[str, Any]:
     # **已生成过的批次也允许重新预览。**
     #
@@ -1319,7 +1471,7 @@ def _preview_payload(
     时只有现算才对 —— 那时 ``_build_preview`` 的计数器只覆盖那一张。
     """
     records = db.scalars(select(InvoiceRecord).where(InvoiceRecord.batch_id == batch.id).order_by(InvoiceRecord.page_index)).all()
-    sources = sorted({_text((record.payload or {}).get("source_file")) for record in records} - {""})
+    sources = batch_sources(db, batch.id)
     subjects = subjects_by_id(db, batch.book_id, records)
     counts = status_counts(db, [batch.id]).get(batch.id, {})
     return {
@@ -1523,7 +1675,16 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
     # COMMITTED 是已经入账的（补生成时它们还在批次里），也不能再生成一次。
     if any(record.status not in ("READY", "IGNORED", "COMMITTED") for record in records):
         raise ValueError("仍有发票未通过校验，请处理红色异常后再确认")
-    targets = [record for record in records if record.status == "READY"]
+    # **目标 = 「可生成」的 + 「孤儿」的。**
+    #
+    # 孤儿是那种状态还写着「已生成」、可凭证已经被删掉的记录：它其实**不在
+    # 账上**，那就该能重新生成一张。只按状态取目标的话，它永远进不来，
+    # 用户删了凭证之后就再也用这张发票生成不了凭证。
+    targets = [
+        record for record in records
+        if record.status == "READY"
+        or (record.status == "COMMITTED" and record.voucher_id is None)
+    ]
     # **重复提交**要挡回去。
     #
     # 补生成的前提是「还有没生成的发票」。一件都没有还来确认，那是双击、
@@ -1537,11 +1698,15 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
         raise BatchConflict(f"该批次已是「{batch.status}」状态，没有待生成的发票")
     # 判重**在锁内**重读一次（第二道兜底）。第一道是批次锁本身：
     # 同一张发票若已被**别的**批次确认过，这里会挡住。
+    #
+    # **判据是「有凭证」**：凭证已经被删掉的那几张不算「已入账」——
+    # 它们本来就是要重新生成一票的，别自己把自己挡住。
     existing = {
         value for value in db.scalars(select(InvoiceRecord.invoice_no).where(
             InvoiceRecord.book_id == batch.book_id,
             InvoiceRecord.invoice_no.is_not(None),
             InvoiceRecord.status == "COMMITTED",
+            InvoiceRecord.voucher_id.is_not(None),
         )).all() if value
     }
     numbers = [record.invoice_no for record in targets if record.invoice_no]
@@ -1551,16 +1716,29 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
     created = 0
     try:
         for record in targets:
-            # **条件写**：只有 READY 的记录能被认领。
+            # **条件写**：只有「可生成」的（以及「孤儿」）记录能被认领。
             #
             # 这是第二道兜底（第一道是批次锁）：万一将来有别的路径绕过批次锁
-            # 直接改这张记录，``rowcount != 1`` 就说明它已经不是 READY 了
+            # 直接改这张记录，``rowcount != 1`` 就说明它已经不是「可生成」了
             # （被别的批次确认过，或已被作废），这里必须停下 ——
             # 否则同一张发票会生成第二张凭证。
+            #
+            # 「孤儿」（状态是「已生成」但凭证已删）也能被认领：它其实不在
+            # 账上，重新生成一张是对的。认领时顺手把 voucher_id 清空 ——
+            # 新凭证的 id 紧接着就写上去了。
             claimed = db.execute(
                 update(InvoiceRecord)
-                .where(InvoiceRecord.id == record.id, InvoiceRecord.status == "READY")
-                .values(status="COMMITTED")
+                .where(
+                    InvoiceRecord.id == record.id,
+                    or_(
+                        InvoiceRecord.status == "READY",
+                        and_(
+                            InvoiceRecord.status == "COMMITTED",
+                            InvoiceRecord.voucher_id.is_(None),
+                        ),
+                    ),
+                )
+                .values(status="COMMITTED", voucher_id=None)
                 .execution_options(synchronize_session=False)
             )
             if claimed.rowcount != 1:
@@ -1568,6 +1746,7 @@ def commit_batch(db: Session, batch: InvoiceBatch, user: SysUser) -> dict[str, A
             # 上面那条 UPDATE 已经把库里的状态改掉了；ORM 这边还拿着旧值，
             # 手动同步一份，免得随后的 flush 又按旧值写回去。
             record.status = "COMMITTED"
+            record.voucher_id = None
             resolution = (record.payload or {}).get("resolution") or {}
             entries = resolution.get("entries") or []
             # **0 金额的分录不让存**（数据库的 ck_entry_amount_nonzero 也会拦）。
@@ -1712,10 +1891,27 @@ def status_counts(db: Session, batch_ids: list[int]) -> dict[int, dict[str, int]
     """
     if not batch_ids:
         return {}
+    # **「已生成」的判据是「有凭证」，不是「状态写着已生成」。**
+    #
+    # 凭证被删掉之后，数据库的外键 ``ON DELETE SET NULL`` 会把
+    # ``voucher_id`` 清空，而 ``status`` 还停在「COMMITTED」——
+    # 那条记录其实**已经不在账上了**，却会被算进「已入账」那一格。
+    #
+    # 后果是界面上「可生成」永远是 0、「确认生成 N 张凭证」那个按钮
+    # 永远是灰的：用户明明有一张没入账的票，却再也点不动它。
+    #
+    # 所以这里按「有没有凭证」来分类：没有凭证的「已生成」一律算「可生成」。
+    effective = case(
+        (
+            and_(InvoiceRecord.status == "COMMITTED", InvoiceRecord.voucher_id.is_(None)),
+            "READY",
+        ),
+        else_=InvoiceRecord.status,
+    )
     rows = db.execute(
-        select(InvoiceRecord.batch_id, InvoiceRecord.status, func.count(InvoiceRecord.id))
+        select(InvoiceRecord.batch_id, effective.label("status"), func.count(InvoiceRecord.id))
         .where(InvoiceRecord.batch_id.in_(batch_ids))
-        .group_by(InvoiceRecord.batch_id, InvoiceRecord.status)
+        .group_by(InvoiceRecord.batch_id, effective)
     ).all()
     out: dict[int, dict[str, int]] = {}
     for batch_id, status, count in rows:

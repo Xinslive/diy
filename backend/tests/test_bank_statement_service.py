@@ -651,16 +651,20 @@ def test_余额核对_已提交发票覆盖的流水不算未入账(db, book, ad
         row.status = STATUS_IGNORED
 
     statement.closing_balance = Decimal("1000.00")
-    make_voucher(inflow["tx_date"],
-                 dr=[(statement.account_subject_id, Decimal("1000.00"), "调平")],
-                 cr=[(subjects["560301"].id, Decimal("1000.00"), "调平")])
+    voucher = make_voucher(inflow["tx_date"],
+                           dr=[(statement.account_subject_id, Decimal("1000.00"), "调平")],
+                           cr=[(subjects["560301"].id, Decimal("1000.00"), "调平")])
     batch = InvoiceBatch(book_id=book.id, filename="已提交.pdf", file_path="",
                          status="COMMITTED", total=1, created_by="tester")
     db.add(batch)
     db.flush()
     record = InvoiceRecord(
         batch_id=batch.id, book_id=book.id, page_index=0,
-        invoice_type="OUTPUT", status="COMMITTED", payload={})
+        invoice_type="OUTPUT", status="COMMITTED", payload={},
+        # **要指到那张凭证上。** 「已生成」的判据是「有凭证」——
+        # 凭证被删掉之后，发票记录还停在「已生成」的状态上，可它其实
+        # 已经不在账上了，那这笔钱就仍然没被账面覆盖。
+        voucher_id=voucher.id)
     db.add(record)
     db.flush()
     target.matched_invoice_record_id = record.id

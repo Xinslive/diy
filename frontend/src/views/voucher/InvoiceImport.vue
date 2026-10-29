@@ -233,17 +233,18 @@
                 {{ onlyUnbooked ? '显示全部发票' : '只显示未入账发票' }}
               </el-button>
               <!--
-                开着的时候，当前视野与藏起来的张数都要讲出来：不然
-                「共 100 张」而表里只有 51 行，看着像丢了 49 张发票。
+                「当前显示未入账 N 张」与「已加载 N 份对账单…」这两句提示
+                **去掉了**（用户 2026-10-29 批注）。
+
+                它们各自解释的是一件**界面上已经看得见的事**：张数在上面的
+                概要里写着「共 N 张发票，N 张可生成，N 张已入账」；对账单
+                那句解释的是「点一下重算会重新匹配结算科目」—— 而现在
+                **打开批次就自动重算**了，那句提示就过期了。
+
+                留着它们的坏处是：两段灰字挤在按钮中间，占掉的是
+                「确认生成 N 张凭证」那个主操作的位置，而那才是正事。
               -->
-              <span v-if="onlyUnbooked" class="muted result-hint">{{ filterHint }}</span>
               <el-button :disabled="!store.canWrite" :loading="previewing" @click="recalculate">重新计算预览</el-button>
-              <!--
-                已加载了几份对账单 —— 没有对账单时，发票的结算科目只能回落到
-                「自动制证配置」里那个；有对账单时，点一次「重新计算预览」
-                就会按「金额 + 收支方向」重新匹配。
-              -->
-              <span class="muted result-hint">{{ statementHint }}</span>
               <!--
                 已生成过的批次不能作废：凭证已经在账上了，作废批次删记录、
                 删原件，却不会把那几张凭证撤下来 —— 账上留着、记录没了，
@@ -517,7 +518,6 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, FolderOpened, InfoFilled, Plus, Refresh, Upload } from '@element-plus/icons-vue'
 import * as invoiceApi from '@/api/invoice'
-import * as statementApi from '@/api/bankstatement'
 import * as subjectApi from '@/api/subject'
 import {
   DEFAULT_UPLOAD_LIMITS, filesFromDataTransfer, humanBytes, isCommittedRow, isIgnoredRow, partitionFiles, skipNote,
@@ -558,9 +558,6 @@ const config = reactive({
   output_fallback_subject_id: null,
 })
 const overrides = reactive({})
-// 已加载的对账单份数 —— 页头要讲清楚「结算科目能不能自动认出来」，
-// 取决于有没有对账单可匹配。
-const statementCount = ref(0)
 const ruleVisible = ref(false)
 const ruleForm = reactive({ match_type: 'SELLER', invoice_type: 'BOTH', keyword: '', subject_id: null, priority: 0, active: true })
 
@@ -586,10 +583,6 @@ const settlementSourceType = (row) => ({
 }[settlementSource(row)] || 'info')
 const settlementNote = (row) => row?.resolution?.settlement_note || ''
 
-const statementHint = computed(() => {
-  if (!statementCount.value) return '未加载对账单，结算科目取自动制证配置里的科目'
-  return `已加载 ${statementCount.value} 份对账单，点「重新计算预览」按金额与收支方向重新匹配结算科目`
-})
 const invoiceTypeText = (v) => ({ INPUT: '进项', OUTPUT: '销项', BOTH: '进项和销项', UNKNOWN: '未判断' }[v] || v || '未判断')
 const invoiceStatusText = (v) => ({ READY: '可生成', REJECTED: '有问题', COMMITTED: '已生成', IGNORED: '已忽略', DISCARDED: '已作废' }[v] || v)
 const invoiceType = (v) => ({ READY: 'success', REJECTED: 'danger', COMMITTED: 'success', IGNORED: 'info', DISCARDED: 'info' }[v] || 'warning')
@@ -619,13 +612,6 @@ const visibleInvoices = computed(() => {
 })
 // 被筛掉的那几张（已生成凭证的）—— 用来把「藏了多少」讲清楚。
 const bookedCount = computed(() => allInvoices.value.filter(row => row.voucher_id).length)
-// 开关开着时讲清楚当前视野：看得到几张、藏起来几张。
-const filterHint = computed(() => {
-  const visible = visibleInvoices.value.length
-  const hidden = bookedCount.value
-  if (!hidden) return `当前显示未入账的 ${visible} 张`
-  return `当前显示未入账的 ${visible} 张，已隐藏 ${hidden} 张已入账发票`
-})
 // 空表时要讲清楚是「筛掉了」还是「本来就没有」—— 空表本身不说明任何事。
 const emptyHint = computed(() => {
   if (onlyUnbooked.value && bookedCount.value) {
@@ -742,18 +728,14 @@ function lineAmount(row, index) {
 
 async function loadAll() {
   if (!store.bookId) return
-  const [cfg, flat, ruleRows, batches, limits, statements] = await Promise.all([
+  const [cfg, flat, ruleRows, batches, limits] = await Promise.all([
     invoiceApi.getConfig(store.bookId),
     // **年度必带**：科目表每个年度各有一份（后端迁移 0032）
     subjectApi.subjectFlat(store.bookId, { year: store.currentYear }),
     invoiceApi.listRules(store.bookId),
     invoiceApi.listBatches(store.bookId), invoiceApi.getLimits(store.bookId).catch(() => null),
-    // 已加载的对账单份数。**拉不到不算错** —— 没建过流水对账的账套拿不到
-    // 什么，页头上写一句「未加载对账单」就够了，不该弹一个红条。
-    statementApi.listStatements(store.bookId).catch(() => [])
   ])
   if (limits) uploadLimits.value = { maxFiles: limits.max_files, maxTotalBytes: limits.max_total_bytes }
-  statementCount.value = (statements || []).length
   Object.assign(config, cfg)
   subjects.value = flat
   rules.value = ruleRows
@@ -775,9 +757,41 @@ async function upload() {
     if (batch.value.error_count) ElMessage.warning(`${batch.value.error_count} 张需要核对后才能确认`)
   } finally { uploading.value = false }
 }
+/**
+ * 打开批次页就**自动重新计算一次**（用户 2026-10-29 要求）。
+ *
+ * 为什么要有这一步：结算科目是按「金额 + 收支方向」去对账单流水上认的，
+ * 而对账单是**后来**才传进来的 —— 批次刚传完时还没有流水可认，结算科目
+ * 只能回落到配置里那个。以前要用户自己点一次「重新计算预览」才认得出来，
+ * 于是「打开批次 → 看到科目不对 → 想起来要点重算」成了每次的固定动作。
+ *
+ * 自动算过之后，页面上看到的就是最终会记到哪个科目上。
+ *
+ * **人工改过的科目不会被冲掉**：服务端把「落库的覆盖项」与「这次传进来的」
+ * 合并（见后端 ``app/invoice/service.py`` 的 ``_override``），落库的垫底、
+ * 新的盖上。刷新页面后前端手上是空的，靠的正是落库那份。
+ *
+ * 算不出来就**不吭声**：批次已作废时服务端会拒绝重算，那是正常状态，
+ * 不该弹一个红条。
+ */
+async function autoRecalculate() {
+  const current = batch.value
+  if (!current) return
+  // 已作废的批次不能重算 —— 跳过，别去撞那个必然失败的请求。
+  if (current.status === 'DISCARDED') return
+  previewing.value = true
+  try {
+    const payload = await invoiceApi.previewBatch(store.bookId, current.id, overridePayload())
+    mergeBatchPayload(payload)
+  } catch (err) {
+    // 重算失败不挡着页面：批次详情已经显示出来了，用户照样能看能改。
+    // 真有硬伤（比如科目被停用）时，服务端会在「有问题」那一格里报出来。
+  } finally { previewing.value = false }
+}
 async function loadBatch(row) {
   batch.value = await invoiceApi.getBatch(store.bookId, row.id || row)
   tab.value = 'batches'
+  await autoRecalculate()
 }
 function newBatch() { batch.value = null; clearFiles(); Object.keys(overrides).forEach(key => delete overrides[key]) }
 function isIgnored(row) { return isIgnoredRow(row, overrides) }
