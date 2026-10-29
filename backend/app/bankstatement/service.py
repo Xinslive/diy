@@ -32,7 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.accounting import vouchers as voucher_service
 from app.accounting.util import find_period, money
-from app.bankstatement import formats, matching, semantics, storage
+from app.bankstatement import allocate, formats, matching, semantics, storage
 from app.models import (
     BankStatement,
     BankStatementConfig,
@@ -62,6 +62,7 @@ from app.models.bankstatement import (
     STATUS_IGNORED,
     STATUS_OPEN,
     STATUS_POSTED,
+    STATUS_REVIEW,
 )
 
 log = logging.getLogger("cwq")
@@ -1546,11 +1547,17 @@ def _write_plan_subjects(db: Session, row: BankStatementRow,
     """
     olds = list(existing) if existing is not None else list(row.plan_subjects)
     # **先记下旧的人工摘要，再删** —— 删完就查不到了。
-    kept: dict[int, str] = {}
+    #
+    # **按科目分组、按顺序取**：同一个科目可以出现多次（2026-10-29 起
+    # 不再限制），所以「同一科目上那句摘要」可能是**几句**。写成
+    # ``{科目 id: [摘要, 摘要…]}``，新的一条按顺序取走一句 ——
+    # 两边都写「摘要 A / 摘要 B」时，它们各自回到自己那一条上，
+    # 不会因为科目相同就串成两句一样的。
+    kept: dict[int, list[str]] = {}
     for old in olds:
         text = (old.summary_override or "").strip()
         if text:
-            kept[old.subject_id] = text
+            kept.setdefault(int(old.subject_id), []).append(text)
     for old in olds:
         db.delete(old)
     db.flush()
@@ -1560,7 +1567,8 @@ def _write_plan_subjects(db: Session, row: BankStatementRow,
         # **给了空串** = 用户清空了它 = 交回规则去算。
         raw = item.get("summary")
         if raw is None:
-            summary = kept.get(subject_id, "")
+            pending = kept.get(subject_id) or []
+            summary = pending.pop(0) if pending else ""
         else:
             summary = _text(raw)
         db.add(BankStatementRowSubject(
@@ -1654,6 +1662,9 @@ def list_statements(db: Session, book_id: int) -> list[dict[str, Any]]:
             "OPEN": counts.get(STATUS_OPEN, 0),
             "POSTED": counts.get(STATUS_POSTED, 0),
             "IGNORED": counts.get(STATUS_IGNORED, 0),
+            # **待复核的行也算「有活要干」** —— 它等的是用户点一下
+            # 「是同一笔」还是「不是同一笔」，不是等人来记账。
+            "REVIEW": counts.get(STATUS_REVIEW, 0),
         }
         pending = db.scalar(select(func.count()).select_from(BankStatementRow).where(
             BankStatementRow.statement_id == statement.id,
@@ -1661,6 +1672,7 @@ def list_statements(db: Session, book_id: int) -> list[dict[str, Any]]:
             BankStatementRow.status == STATUS_OPEN,
         )) or 0
         item["pending_count"] = int(pending)
+        item["review_count"] = int(counts.get(STATUS_REVIEW, 0))
         result.append(item)
     return result
 
@@ -1676,6 +1688,9 @@ def list_rows(db: Session, book_id: int, statement_id: int, *,
     subjects = _subjects_of(db, book_id, subject_ids)
     # **一次查询出全部「可以改科目的分录」候选**（不是一行一次）。
     candidates = matching.reclassify_candidates(db, book_id, statement, rows)
+    # **待复核的那些行，账上那张同额的凭证是哪一张** —— 也是一次算完，
+    # 不是一行一次（一份对账单几百行，一行一次查询就是几百次往返）。
+    allocation, _invoice_claims = _pair_rows(db, book_id, statement, list(rows))
     # 规则与账套配置**各读一次**：算每一行「按规则算出来的摘要」要用，
     # 一行一次查询就是几百次往返。
     rules = _summary_context(db, book_id)
@@ -1684,8 +1699,31 @@ def list_rows(db: Session, book_id: int, statement_id: int, *,
         items = children.get(row.id) or []
         out.append(serialize_row(
             db, row, subjects, items, candidates.get(row.id) or [],
-            default_summary=_default_summary_for(row, items, rules)))
+            default_summary=_default_summary_for(row, items, rules),
+            review_candidate=_review_candidate(allocation, row)))
     return out
+
+
+def _review_candidate(allocation: allocate.Allocation,
+                      row: BankStatementRow) -> Optional[dict[str, Any]]:
+    """这一行「待复核」时，账上那张同额的凭证是谁。
+
+    **只给「待复核」的行**：别的行要么已入账、要么没这回事，
+    给一份多余的候选信息只会让界面上的东西变多。
+    """
+    if row.status != STATUS_REVIEW:
+        return None
+    pair = allocation.pair_of(int(row.id))
+    if pair is None:
+        return None
+    return {
+        "entry_id": pair.entry_id,
+        "voucher_id": pair.voucher_id,
+        "voucher_no": pair.voucher_no,
+        "voucher_date": pair.voucher_date.isoformat(),
+        "amount": str(pair.amount),
+        "days_diff": pair.days_diff,
+    }
 
 
 def serialize_row(db: Session, row: BankStatementRow,
@@ -1693,6 +1731,7 @@ def serialize_row(db: Session, row: BankStatementRow,
                   plan_subjects: list[BankStatementRowSubject] | None = None,
                   reclassify: list[dict[str, Any]] | None = None,
                   default_summary: str = "",
+                  review_candidate: dict[str, Any] | None = None,
                   ) -> dict[str, Any]:
     subjects = subjects or {}
     items = list(row.plan_subjects) if plan_subjects is None else list(plan_subjects)
@@ -1723,6 +1762,11 @@ def serialize_row(db: Session, row: BankStatementRow,
         "plan_status": row.plan_status,
         "problems": row.problems or [],
         "voucher_state": _voucher_state(row),
+        #: **待复核时，账上那张同额的凭证**（``None`` = 不是待复核的行）。
+        #:
+        #: 界面上要把它摆出来 —— 只说「有笔对不上」用户不知道该去看哪张
+        #: 凭证；判「是同一笔」还是「不是同一笔」都要指着它。
+        "review_candidate": review_candidate,
         #: **按规则算出来的那个摘要** —— 界面上给每一个对方科目的摘要框
         #: 当默认值，让用户看到「不改的话会是什么」，改了就用他写的那个。
         #: **它是行级的**：模板管的是「这一类流水通常怎么写摘要」，
@@ -1739,13 +1783,18 @@ def _voucher_state(row: BankStatementRow,
                    ) -> str:
     """这一行现在能不能制证，为什么不能。
 
-    界面上用**颜色 + 文字**把四种情况分开，因为它们要做的动作不同：
-    定方向 / 定科目 / 已被发票占用 / 已经入账。
+    界面上用**颜色 + 文字**把几种情况分开，因为它们要做的动作不同：
+    定方向 / 定科目 / 已被发票占用 / 已经入账 / **要人工复核**。
+
+    **「待复核」排在「已入账」前面那一档的后面** —— 它既不是「已入账」
+    （人还没判），也不是「没入账」（账上明明有那一笔）。
     """
     if row.status == STATUS_IGNORED:
         return "IGNORED"
     if row.status == STATUS_POSTED:
         return "POSTED"
+    if row.status == STATUS_REVIEW:
+        return "REVIEW"
     if row.matched_invoice_record_id:
         return "INVOICE"
     if row.direction == DIRECTION_UNKNOWN:
@@ -1782,6 +1831,14 @@ def _parse_plan_payload(db: Session, book_id: int, row: BankStatementRow,
     **没带**（``None``）= 沿用这个科目上原来那句；**带了空串** = 用户清空了
     它 = 交回规则去算。这两者的区别不能糊掉：糊掉的话「清空摘要」与
     「没碰摘要框」会变成同一件事。
+
+    **同一个科目可以出现多次**（2026-10-29 用户批注：原先报「在这一行里
+    出现了两次 —— 要记两笔请把金额合并到一条上」，**这个限制不该有**）。
+    摘要是**挂在对方科目上**的（迁移 0043/0044 把它从行级下沉到这一层），
+    所以「同一个科目拆成两条、各写各的摘要」本来就是这套设计的用法 ——
+    把它们禁掉，那次下沉就白做了。
+
+    两条分录指向同一个科目，账上就是两条分录：金额各算各的，摘要各写各的。
     """
     has_list = "plan_subjects" in payload and payload["plan_subjects"] is not None
     has_single = "plan_subject_id" in payload
@@ -1801,7 +1858,6 @@ def _parse_plan_payload(db: Session, book_id: int, row: BankStatementRow,
     if not isinstance(raw, list):
         raise ValueError("对方科目必须是一个列表")
     items: list[dict[str, Any]] = []
-    seen: set[int] = set()
     total = Decimal("0")
     for entry in raw:
         if not isinstance(entry, dict):
@@ -1819,11 +1875,6 @@ def _parse_plan_payload(db: Session, book_id: int, row: BankStatementRow,
             raise ValueError(f"「{subject.code} {subject.name}」不是末级科目")
         if not subject.active:
             raise ValueError(f"「{subject.code} {subject.name}」已停用")
-        if subject.id in seen:
-            raise ValueError(
-                f"「{subject.code} {subject.name}」在这一行里出现了两次 —— "
-                "要记两笔请把金额合并到一条上")
-        seen.add(subject.id)
         amount = _dec(entry.get("amount"))
         if amount is None or amount <= 0:
             raise ValueError(f"「{subject.code} {subject.name}」的金额必须大于 0")
@@ -1944,70 +1995,33 @@ def set_row_direction(db: Session, book_id: int, row_id: int,
 
 
 # ----------------------------------------------------------------------
-# 去重与制证
+# 待复核：用户判「是同一笔」还是「不是同一笔」
 # ----------------------------------------------------------------------
 
-def _voucher_matches(db: Session, book_id: int, subject_id: int,
-                      amount: Decimal, direction: str,
-                      when: Optional[date], window_days: int) -> list[tuple[int, date]]:
-    """这个科目上有没有「可能就是这一笔」的凭证。
-
-    判据四件套：**同一现金科目 + 同方向 + 金额相等 + 日期在 ±N 天内**。
-
-    为什么要日期窗口：同一天同金额同科目的两笔款是常事（付两笔一样的
-    运费），没有窗口就会把第二笔误判成重复，于是它永远进不了账。
-    窗口取 7 天是因为发票与付款之间差几天是常态。
-
-    **未记账的凭证也算** —— 用户往往先把凭证录进来再去核对，
-    「已入账」不等于「已记账」。
-    """
-    if when is None:
-        return []
-    entry_direction = "DEBIT" if direction == DIRECTION_IN else "CREDIT"
-    lo = when - timedelta(days=window_days)
-    hi = when + timedelta(days=window_days)
-    rows = db.execute(
-        select(Voucher.id, Voucher.voucher_date)
-        .join(Entry, Entry.voucher_id == Voucher.id)
-        .where(
-            Voucher.book_id == book_id,
-            Voucher.status.in_(("POSTED", "UNPOSTED")),
-            Entry.subject_id == subject_id,
-            Entry.direction == entry_direction,
-            Entry.amount == amount,
-            Voucher.voucher_date >= lo,
-            Voucher.voucher_date <= hi,
-        )
-        .distinct()
-    ).all()
-    return [(int(vid), vdate) for vid, vdate in rows]
+def _review_row(db: Session, book_id: int, row_id: int) -> BankStatementRow:
+    row = db.get(BankStatementRow, row_id)
+    if row is None or row.book_id != book_id:
+        raise ValueError("流水行不存在")
+    if row.status != STATUS_REVIEW:
+        raise ValueError("这一行不在待复核状态 —— 重新算一次可制证清单再看")
+    return row
 
 
-def _voucher_covers_row(db: Session, book_id: int, statement: BankStatement,
-                        row: BankStatementRow,
-                        voucher_id: Optional[int]) -> bool:
-    """这张凭证是不是还「覆盖」这一行流水。
+def _voucher_covers(db: Session, book_id: int, statement: BankStatement,
+                     row: BankStatementRow, voucher_id: int) -> bool:
+    """这张凭证上是不是真有一条分录**覆盖**这一行流水。
 
-    「覆盖」= 凭证上有一条分录同时满足三件事：**科目就是这份对账单绑定的
+    「覆盖」= 有一条分录同时满足三件事：**科目就是这份对账单绑定的
     账户**、**方向对得上**、**金额相等**。
 
-    **为什么按科目编码比，不按 id**：科目表每个年度各有一份（2026 的 1002 与
+    **按科目编码比，不按 id**：科目表每个年度各有一份（2026 的 1002 与
     2027 的 1002 是两行不同的记录），跨年搬科目时 id 会变
-    （见 :func:`_remap_subjects`）。按 id 比，跨年那一笔就认不出自己刚标过
-    的那张凭证。
+    （见 :func:`_remap_subjects`）。按 id 比，跨年那一笔就认不出自己
+    那张凭证。
 
-    **为什么不看日期**：日期窗口是「这一行对应哪张凭证」的**启发式** ——
-    同一天同金额同科目的两笔款是常事（付两笔一样的运费），用窗口把两者
-    分开。但用户已经通过「可改科目」**人工确认过**是哪一张凭证了，这时再拿
-    启发式去推翻它，就会把人工确认的结果吞掉：跨期 16~30 天的候选一改完，
-    那张凭证在 ±7 天的扫描里根本看不见，标记当场被收回，行状态从「已入账」
-    退回「待确认科目」—— 用户明明刚确认过，看着却像没改成。
-
-    所以回收标记之前先问一句「**你标的那张凭证还在不在、还对不对得上**」。
-    凭证被删了、金额改了、现金侧又挪走了 —— 那才该收回。
+    **不看日期**：日期窗口是「这一行对应哪张凭证」的**启发式**；用户
+    已经人工指认过了，这时再拿启发式去推翻它，就把人的判断吞掉了。
     """
-    if not voucher_id:
-        return False
     voucher = db.get(Voucher, voucher_id)
     if voucher is None or voucher.book_id != book_id:
         return False
@@ -2018,8 +2032,9 @@ def _voucher_covers_row(db: Session, book_id: int, statement: BankStatement,
     account = db.get(Subject, statement.account_subject_id)
     if account is None:
         return False
-    # **银行账的方向与会计凭证相反**：流水 IN（收钱）= 现金增加 = 借方。
-    entry_direction = "DEBIT" if row.direction == DIRECTION_IN else "CREDIT"
+    entry_direction = allocate.cash_direction(row.direction)
+    if entry_direction is None:
+        return False
     hit = db.execute(
         select(Entry.id)
         .join(Subject, Subject.id == Entry.subject_id)
@@ -2035,9 +2050,281 @@ def _voucher_covers_row(db: Session, book_id: int, statement: BankStatement,
     return hit is not None
 
 
+def confirm_row_review(db: Session, book_id: int, row_id: int,
+                       voucher_id: int, user: SysUser) -> dict[str, Any]:
+    """用户判「**是同一笔**」→ 挂上那张凭证，这一行变成「已入账」。
+
+    **先核实那张凭证真的覆盖这一行**：金额相等、方向对应、科目就是这份
+    对账单绑定的账户 —— 三样都对不上就挂，那一行就会指向一张根本不是
+    这笔钱的凭证。
+    """
+    row = _review_row(db, book_id, row_id)
+    statement = db.get(BankStatement, row.statement_id)
+    if statement is None or statement.book_id != book_id:
+        raise ValueError("对账单不存在")
+    if not _voucher_covers(db, book_id, statement, row, voucher_id):
+        raise ValueError(
+            "那张凭证上没有与这一行对得上的分录 —— "
+            "金额、方向或账户科目对不上，不能挂上去")
+    row.status = STATUS_POSTED
+    row.matched_voucher_id = int(voucher_id)
+    row.rejected_voucher_id = None
+    db.flush()
+    voucher = db.get(Voucher, voucher_id)
+    return {
+        "row_id": row.id,
+        "status": row.status,
+        "voucher_state": _voucher_state(row),
+        "voucher_id": int(voucher_id),
+        "voucher_no": voucher.voucher_no if voucher else "",
+    }
+
+
+def dismiss_row_review(db: Session, book_id: int, row_id: int,
+                       voucher_id: int) -> dict[str, Any]:
+    """用户判「**不是同一笔**」→ 放行，这一行回到「可制证」。
+
+    **记下否掉的是哪一张凭证**（``rejected_voucher_id``）：不记的话，
+    下次重算时那张同额的分录**又会被捞出来**报一次待复核 ——
+    用户会以为刚才那一下没生效（判了等于没判）。
+    """
+    row = _review_row(db, book_id, row_id)
+    voucher = db.get(Voucher, voucher_id)
+    if voucher is None or voucher.book_id != book_id:
+        raise ValueError("那张凭证不存在")
+    row.status = STATUS_OPEN
+    row.matched_voucher_id = None
+    row.rejected_voucher_id = int(voucher_id)
+    db.flush()
+    return {
+        "row_id": row.id,
+        "status": row.status,
+        "voucher_state": _voucher_state(row),
+        "rejected_voucher_id": int(voucher_id),
+    }
+
+
+# ----------------------------------------------------------------------
+# 去重与制证
+# ----------------------------------------------------------------------
+
+# ----------------------------------------------------------------------
+# 流水 ↔ 账上分录：配对
+# ----------------------------------------------------------------------
+#
+# **配对的规则只有一份**（``app.bankstatement.allocate``）：谁跟谁是一笔、
+# 差几天算「已入账」、差几天算「待复核」，全在那一个模块里。
+# 流水明细页与存疑凭证页**用的是同一把尺子** —— 两页各判各的，
+# 就会出现「流水页说没入账、存疑页说对得上」这种两边都看不懂的局面
+# （2026-10-29 用户报的问题）。
+
+def _entry_scope(statement: BankStatement,
+                 row_sides: list[allocate.RowSide]) -> tuple[Optional[date], Optional[date]]:
+    """这一份对账单要扫描的**分录日期区间**。
+
+    **取「行的日期」与「对账单期间」两者的并集**，再各往外放一个复核
+    窗口：行之间的空档、对账单期间边上那一截，都在扫描范围里 ——
+    期间边上那一截尤其要紧（对账单 9 月 1 日到 30 日，行只到 9 月 20 日，
+    9 月 25 日那笔支出也得能对上）。
+    """
+    dates = [side.tx_date for side in row_sides if side.tx_date is not None]
+    if statement.period_start:
+        dates.append(statement.period_start)
+    if statement.period_end:
+        dates.append(statement.period_end)
+    if not dates:
+        return None, None
+    pad = timedelta(days=allocate.REVIEW_WINDOW_DAYS)
+    return min(dates) - pad, max(dates) + pad
+
+
+def _account_entries(db: Session, book_id: int, statement: BankStatement,
+                     lo: Optional[date], hi: Optional[date],
+                     ) -> list[allocate.EntrySide]:
+    """这个账户上的**现金侧分录**（连同凭证）。
+
+    **按科目编码取，不按 id 取。**
+
+    科目表每个年度各有一份（2026 的 1002 与 2027 的 1002 是两行不同的
+    记录），跨年搬科目时 id 会变（见 :func:`_remap_subjects`）。按 id 比，
+    跨年那一笔就认不出自己那张凭证 —— 明明是同一个银行账户，却判成
+    「没入账」，于是又生成一张凭证，**同一笔钱记两次**。
+
+    （同一个模块里 ``_voucher_covers_row`` 早就按编码比了 —— 两套口径，
+    差的那一套就是漏判的来源。）
+    """
+    account = db.get(Subject, statement.account_subject_id)
+    if account is None or lo is None or hi is None:
+        return []
+    rows = db.execute(
+        select(Entry.id, Entry.voucher_id, Entry.amount, Entry.direction,
+               Voucher.voucher_no, Voucher.voucher_date)
+        .join(Voucher, Voucher.id == Entry.voucher_id)
+        .join(Subject, Subject.id == Entry.subject_id)
+        .where(
+            Voucher.book_id == book_id,
+            Subject.book_id == book_id,
+            Subject.code == account.code,
+            # 未记账的凭证也算 —— 用户往往先把凭证录进来再去核对。
+            Voucher.status.in_(("POSTED", "UNPOSTED")),
+            Voucher.voucher_date >= lo,
+            Voucher.voucher_date <= hi,
+        )
+    ).all()
+    return [
+        allocate.EntrySide(
+            id=int(entry_id),
+            voucher_id=int(voucher_id),
+            voucher_no=voucher_no or "",
+            voucher_date=voucher_date,
+            amount=Decimal(str(amount)),
+            direction=direction,
+        )
+        for entry_id, voucher_id, amount, direction, voucher_no, voucher_date in rows
+    ]
+
+
+def _entries_of_vouchers(db: Session, book_id: int, statement: BankStatement,
+                          voucher_ids: Iterable[int],
+                          ) -> list[allocate.EntrySide]:
+    """指定几张凭证上的现金侧分录 —— **不看日期**。
+
+    **为什么日期也要它们**：用户人工确认过的那笔（跨期 16~30 天的
+    「可改科目」），它的日期差本来就超了主窗口；扫描时若按日期把它
+    滤掉，那张凭证在这一轮里根本看不见，用户刚点完「改科目」、
+    界面却又显示成「待处理」—— 看着像没改成。
+    """
+    ids = {int(v) for v in voucher_ids if v}
+    if not ids:
+        return []
+    account = db.get(Subject, statement.account_subject_id)
+    if account is None:
+        return []
+    rows = db.execute(
+        select(Entry.id, Entry.voucher_id, Entry.amount, Entry.direction,
+               Voucher.voucher_no, Voucher.voucher_date)
+        .join(Voucher, Voucher.id == Entry.voucher_id)
+        .join(Subject, Subject.id == Entry.subject_id)
+        .where(
+            Voucher.book_id == book_id,
+            Subject.book_id == book_id,
+            Subject.code == account.code,
+            Voucher.status.in_(("POSTED", "UNPOSTED")),
+            Entry.voucher_id.in_(ids),
+        )
+    ).all()
+    return [
+        allocate.EntrySide(
+            id=int(entry_id),
+            voucher_id=int(voucher_id),
+            voucher_no=voucher_no or "",
+            voucher_date=voucher_date,
+            amount=Decimal(str(amount)),
+            direction=direction,
+        )
+        for entry_id, voucher_id, amount, direction, voucher_no, voucher_date in rows
+    ]
+
+
+def _row_sides(rows: Iterable[BankStatementRow]) -> list[allocate.RowSide]:
+    return [
+        allocate.RowSide(
+            id=int(row.id),
+            tx_date=row.tx_date,
+            amount=row.amount,
+            direction=row.direction,
+            seq=int(row.seq),
+        )
+        for row in rows
+    ]
+
+
+def _invoice_claim_vouchers(db: Session, rows: Iterable[BankStatementRow],
+                             ) -> dict[int, int]:
+    """被**已提交**的发票占用的行 → 那张发票生成的凭证 id。
+
+    **为什么只有已提交的才算**：发票还没提交时，账上还没有那张凭证 ——
+    这一行**还没入账**，让启发式去认领它，认到的多半是**另一张**碰巧
+    同额同向同账户的凭证，界面上就会显示「已入账（凭证 #X）」而 X
+    根本不是这笔钱的凭证；更糟的是那一行被标成 ``POSTED`` 之后，
+    发票再来认领它时会被拒（认领要求这一行还是 ``OPEN``）——
+    用户的发票从此再也占不住这一行。
+
+    已提交的不一样：那张凭证确实在账上，认领它是对的。
+    """
+    out: dict[int, int] = {}
+    record_ids = {int(row.matched_invoice_record_id) for row in rows
+                  if row.matched_invoice_record_id}
+    if not record_ids:
+        return out
+    records = db.execute(
+        select(InvoiceRecord.id, InvoiceRecord.voucher_id, InvoiceRecord.status)
+        .where(InvoiceRecord.id.in_(record_ids))
+    ).all()
+    by_id = {int(rec.id): (rec.voucher_id, rec.status) for rec in records}
+    for row in rows:
+        if not row.matched_invoice_record_id:
+            continue
+        voucher_id, status = by_id.get(int(row.matched_invoice_record_id), (None, None))
+        if status == "COMMITTED" and voucher_id:
+            out[int(row.id)] = int(voucher_id)
+    return out
+
+
+def _pair_rows(db: Session, book_id: int, statement: BankStatement,
+               rows: list[BankStatementRow], *,
+               window_days: int = DEFAULT_DEDUPE_WINDOW_DAYS,
+               ) -> tuple[allocate.Allocation, dict[int, int]]:
+    """把这一份对账单的**行**与**账上分录**配成对。
+
+    返回 ``(分配结果, 已提交发票的行 id → 它的凭证 id)``。
+    两个页面（流水明细页、存疑凭证页）都调这一条 ——
+    **两页必须用同一把尺子**。
+    """
+    # **已提交**的发票：它生成的那张凭证就在账上，正是这一行入账的那笔。
+    invoice_claims = _invoice_claim_vouchers(db, rows)
+    # **还没提交**的发票占用的行**不参与配对**：那张凭证还不存在，
+    # 账上根本没有这一笔 —— 没什么可配的。让它去配，等于让启发式拿
+    # 一张**碰巧同额同向**的凭证去认领它。
+    blocked = {int(row.id) for row in rows
+               if row.matched_invoice_record_id
+               and int(row.id) not in invoice_claims}
+    free_rows = [row for row in rows if int(row.id) not in blocked]
+
+    claims: dict[int, int] = {}
+    for row in free_rows:
+        # **发票占用的行，它入账的凭证由发票说了算** —— 不许启发式来指认。
+        if row.matched_invoice_record_id:
+            continue
+        if row.matched_voucher_id:
+            claims[int(row.id)] = int(row.matched_voucher_id)
+    # 发票的凭证**优先**于这一行自己挂着的标记：发票已经生成的那张凭证
+    # 才是这一行入账的凭证。
+    for row_id, voucher_id in invoice_claims.items():
+        claims[row_id] = voucher_id
+
+    rejected = {int(row.id): int(row.rejected_voucher_id) for row in free_rows
+                if row.rejected_voucher_id}
+
+    lo, hi = _entry_scope(statement, _row_sides(rows))
+    entries = _account_entries(db, book_id, statement, lo, hi)
+    # 人工确认过的那几张凭证，日期再远也要看（理由见
+    # :func:`_entries_of_vouchers`）。
+    entries += _entries_of_vouchers(db, book_id, statement, set(claims.values()))
+
+    allocation = allocate.allocate(
+        _row_sides(free_rows), entries,
+        primary_window=window_days,
+        review_window=allocate.REVIEW_WINDOW_DAYS,
+        claims=claims,
+        rejected=rejected,
+    )
+    return allocation, invoice_claims
+
+
 def plan_vouchers(db: Session, book_id: int, statement_id: int,
                   *, window_days: int = DEFAULT_DEDUPE_WINDOW_DAYS) -> dict[str, Any]:
-    """算一份对账单里哪些流水可以制证、哪些已经入过账。
+    """算一份对账单里哪些流水可以制证、哪些已经入过账、哪些要人工复核。
 
     **顺带把「已入账」这件事落库**（``status=POSTED`` + ``matched_voucher_id``）：
     它是「不再制这张凭证」的依据，也是界面上「这一行已经对上账了」的标记。
@@ -2045,6 +2332,12 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
     落库的同时也会**回收**过期的标记：用户把那张凭证删了之后，
     这一行应该重新变成候选。这里每次都重新扫一遍，所以删凭证再点一次
     「生成流水凭证」就能恢复。
+
+    **配对是一对一的**（见 :mod:`app.bankstatement.allocate`）：
+    账上那一笔只对得上一行流水 —— 所以「对账单上四笔同额、账上只记了
+    一笔」时，只有**一行**会显示「已入账」，另外三行仍然是候选（它们
+    本来就还没入账）。反过来，账上四笔而流水只有一行时，那三笔会进
+    「存疑凭证」那一页 —— 它们是错账。
     """
     statement = _statement(db, book_id, statement_id)
     rows = db.scalars(select(BankStatementRow).where(
@@ -2062,51 +2355,77 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
             db, row, subjects, items,
             default_summary=_default_summary_for(row, items, rules))
 
+    allocation, invoice_claims = _pair_rows(db, book_id, statement, list(rows),
+                                            window_days=window_days)
+
     candidates: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    review: list[dict[str, Any]] = []
     for row in rows:
         items = children.get(row.id) or []
         if row.status == STATUS_IGNORED:
             skipped.append({**_ser(row, items),
                             "reason": "已忽略"})
             continue
-        # ---- 去重（已有凭证）----
-        # **人工确认过的标记优先**：这一行已经标着「已入账」且指着某张凭证时，
-        # 先核实那张凭证**是不是还覆盖这一行** —— 覆盖了就保留它，不让下面
-        # 那次启发式扫描去顶掉用户的确认。
-        #
-        # 为什么要先核实：扫描靠日期窗口（±7 天）找「哪张凭证」，而用户点
-        # 「可改科目」时已经**人工确认过**是哪一张了。跨期 16~30 天的候选
-        # 尤其明显 —— 改完之后那张凭证在 ±7 天的扫描里根本看不见，标记当场
-        # 被收回，行状态从「已入账」退回「待确认科目」。用户明明刚确认过，
-        # 看着却像没改成。
-        covered = bool(
-            row.status == STATUS_POSTED and row.matched_voucher_id
-            and _voucher_covers_row(db, book_id, statement, row,
-                                    row.matched_voucher_id))
-        if not covered:
-            matched = _voucher_matches(
-                db, book_id, statement.account_subject_id,
-                row.amount or Decimal("0"), row.direction, row.tx_date, window_days)
-            if matched:
-                voucher_id, voucher_date = matched[0]
-                row.status = STATUS_POSTED
-                row.matched_voucher_id = voucher_id
-            elif row.status == STATUS_POSTED:
-                # 标记还在，但那张凭证已经对不上这一行了（多半是被删了，
-                # 也可能金额改了、现金侧又挪走了）—— 收回标记，重新判一次。
-                row.status = STATUS_OPEN
-                row.matched_voucher_id = None
-        if row.status == STATUS_POSTED:
-            skipped.append({
-                **_ser(row, items),
-                "reason": f"已入账（凭证 #{row.matched_voucher_id}）",
-            })
-            continue
+        pair = allocation.pair_of(int(row.id))
         if row.matched_invoice_record_id:
-            skipped.append({**_ser(row, items),
-                            "reason": "已被发票占用"})
+            # **被发票占用的行不判「已入账」**：它入没入账由发票说了算。
+            #
+            # 唯一例外是**已提交**的发票：那张凭证确实在账上、确实是这一行
+            # 入账的那一笔，挂上它是对的（凭证被删了自然会收回）。
+            #
+            # 未提交的发票**不能**让启发式来指认 —— 那多半是**另一张**碰巧
+            # 同额同向同账户的凭证，界面上会显示「已入账（凭证 #X）」而 X
+            # 根本不是这笔钱的凭证；更要命的是那一行被标成 ``POSTED`` 之后，
+            # 发票再来认领它时会被拒（认领要求这一行还是 ``OPEN``）——
+            # 用户的发票从此再也占不住这一行。
+            if pair is not None and invoice_claims.get(int(row.id)) == pair.voucher_id:
+                row.status = STATUS_POSTED
+                row.matched_voucher_id = pair.voucher_id
+                skipped.append({
+                    **_ser(row, items),
+                    "reason": f"已入账（凭证 #{pair.voucher_id}）",
+                })
+            else:
+                skipped.append({**_ser(row, items),
+                                "reason": "已被发票占用"})
             continue
+        if pair is not None:
+            if pair.in_primary or pair.claimed:
+                # **在主窗口内**（自动判定），**或者是用户确认过的关联**
+                # （跨期的那种，日期再远也是人说了算）→ 已入账。
+                row.status = STATUS_POSTED
+                row.matched_voucher_id = pair.voucher_id
+                skipped.append({
+                    **_ser(row, items),
+                    "reason": f"已入账（凭证 #{pair.voucher_id}）",
+                })
+            else:
+                # **金额对得上、日期对不上** → 报出来让人判。
+                #
+                # **不自动制证**：账上明明有这一笔，再制一张就是同一笔钱
+                # 记两遍。也不自动判「已入账」：日期差这么多，人来判断
+                # 比机器猜可靠 —— 猜错的代价是钱记两遍。
+                row.status = STATUS_REVIEW
+                row.matched_voucher_id = None
+                review.append({
+                    **_ser(row, items),
+                    "reason": (f"账上有同额的凭证（#{pair.voucher_id} "
+                               f"{pair.voucher_no}），日期相差 {pair.days_diff} 天"),
+                    "review_candidate": {
+                        "entry_id": pair.entry_id,
+                        "voucher_id": pair.voucher_id,
+                        "voucher_no": pair.voucher_no,
+                        "voucher_date": pair.voucher_date.isoformat(),
+                        "amount": str(pair.amount),
+                        "days_diff": pair.days_diff,
+                    },
+                })
+            continue
+        # **没配上**：收回过期的标记，这一行重新变成候选。
+        if row.status in (STATUS_POSTED, STATUS_REVIEW):
+            row.status = STATUS_OPEN
+            row.matched_voucher_id = None
         if row.direction == DIRECTION_UNKNOWN:
             skipped.append({**_ser(row, items),
                             "reason": "方向未知"})
@@ -2133,9 +2452,11 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
         "account_subject_id": statement.account_subject_id,
         "candidates": candidates,
         "skipped": skipped,
+        "review": review,
         "candidate_count": len(candidates),
         "pending_count": len([s for s in skipped if s["reason"] == "对方科目待确认"]),
         "unknown_count": len([s for s in skipped if s["reason"] == "方向未知"]),
+        "review_count": len(review),
         "window_days": window_days,
     }
 

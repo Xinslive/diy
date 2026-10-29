@@ -14,6 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.schemas import (BankStatementConfigIn, BankStatementReparseIn,
+                             BankStatementReviewIn,
                              BankStatementRowDirectionIn,
                              BankStatementRowPatchIn,
                              BankStatementRowReclassifyIn,
@@ -302,6 +303,58 @@ def post_row_reclassify(row_id: int, payload: BankStatementRowReclassifyIn,
         # 「参数写错了」而不是「别人改过了」）。与 api/vouchers.py 同款。
         db.rollback()
         raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc))
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _db_error(request, exc)
+
+
+@router.post("/rows/{row_id}/review/confirm")
+def post_row_review_confirm(row_id: int, payload: BankStatementReviewIn,
+                             request: Request, book: Book = Depends(get_my_book),
+                             db: Session = Depends(get_db),
+                             _link: UserBook = Depends(require_book_write),
+                             user: SysUser = Depends(get_current_user)):
+    """人工复核：判「**是同一笔**」→ 挂上那张凭证，这一行变成「已入账」。
+
+    **为什么要有这一步**：银行流水记的是实际收付日期，账上记的常常是
+    发票日期，两者差十天是常事。差这么多时机器不该替人认定「这是同一笔」
+    （认错了就是钱记两遍），但也绝不能当成「没这回事」（那也是钱记两遍）。
+    所以报出来，让用户点一下。
+
+    **服务端会核实那张凭证上真有对得上的分录**（科目、方向、金额）——
+    挂一张根本不是这笔钱的凭证上去，那一行就会指向错的凭证。
+    """
+    try:
+        result = service.confirm_row_review(
+            db, book.id, row_id, payload.voucher_id, user)
+        db.commit()
+        return result
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc))
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise _db_error(request, exc)
+
+
+@router.post("/rows/{row_id}/review/dismiss")
+def post_row_review_dismiss(row_id: int, payload: BankStatementReviewIn,
+                             request: Request, book: Book = Depends(get_my_book),
+                             db: Session = Depends(get_db),
+                             _link: UserBook = Depends(require_book_write)):
+    """人工复核：判「**不是同一笔**」→ 放行，这一行回到「可制证」。
+
+    **服务端会记下否掉的是哪一张凭证**：不记的话，下次重算时那张同额的分录
+    又会被捞出来报一次待复核 —— 用户会以为刚才那一下没生效。
+    """
+    try:
+        result = service.dismiss_row_review(
+            db, book.id, row_id, payload.voucher_id)
+        db.commit()
+        return result
     except ValueError as exc:
         db.rollback()
         raise HTTPException(400, str(exc))

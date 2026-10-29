@@ -131,6 +131,29 @@ export const commitVouchers = (bookId, id) =>
   http.post(`/books/${bookId}/bank-statements/${id}/commit-vouchers`, {}, { timeout: 120000 }).then(r => r.data)
 
 /**
+ * **人工复核：判「是同一笔」** → 挂上那张凭证，这一行变成「已入账」。
+ *
+ * **什么时候需要它**：账上有同一笔（金额相等、方向对应），但**日期对不上**
+ * —— 常见的是账上记的是发票日期、对账单是实际支付日期，差个十来天。
+ * 这种机器不敢替人认定（认错了就是钱记两遍），所以报出来让人点一下。
+ *
+ * **服务端会核实那张凭证上真有对得上的分录** —— 挂一张别的凭证上去会被拒。
+ */
+export const confirmRowReview = (bookId, rowId, voucherId) =>
+  http.post(`/books/${bookId}/bank-statements/rows/${rowId}/review/confirm`,
+    { voucher_id: voucherId }).then(r => r.data)
+
+/**
+ * **人工复核：判「不是同一笔」** → 放行，这一行回到「可制证」。
+ *
+ * **服务端会记下否掉的是哪一张凭证** —— 不记的话下次重算又把它报一遍，
+ * 用户会以为刚才那一下没生效。
+ */
+export const dismissRowReview = (bookId, rowId, voucherId) =>
+  http.post(`/books/${bookId}/bank-statements/rows/${rowId}/review/dismiss`,
+    { voucher_id: voucherId }).then(r => r.data)
+
+/**
  * **存疑凭证**：账上有、对账单里找不到对应流水的那些凭证。
  *
  * 流水对账的另一半：`planVouchers` 那条路是「对账单上有、账上没有」→

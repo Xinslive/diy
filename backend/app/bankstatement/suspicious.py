@@ -26,28 +26,27 @@
 **只查现金科目。** 记在费用科目上的分录跟银行流水没有「同一笔钱」这层
 关系 —— 那个方向是**对方科目**的事，流水这一侧判不了（与
 :mod:`app.bankstatement.matching` 里 ``_cash_entries`` 同一个口径）。
+
+**配对用的是流水明细页那同一把尺子**（:mod:`app.bankstatement.allocate`，
+经由 :func:`app.bankstatement.service._pair_rows`）：**两页必须用同一把
+尺子**，否则会出现「流水页说没入账、存疑页说对得上」这种两边都看不懂
+的局面（2026-10-29 用户报的问题）。而且配对是**一对一**的 —— 账上四笔
+同额而流水只有一行时，只有那一行对得上，另外三笔是**错账**，必须报出来
+（旧算法让四笔都「对上了」，一笔错账都没报）。
 """
 from __future__ import annotations
 
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.bankstatement import service
 from app.bankstatement.caliber import OWN_MONEY_SUBJECT_PREFIXES
 from app.models import BankStatement, BankStatementRow, Entry, Subject, Voucher
-from app.models.bankstatement import DIRECTION_IN, DIRECTION_OUT
-
-#: 匹配窗口（天）。**银行账与会计记账的日期本来就会差** —— 月末才记账、
-#: 票到才付款，都是常事。按一天不差去卡，等于把「记错日期」的那类
-#: 错账整个藏起来。
-#:
-#: **窗口不小于对账单期间本身**：期间内的分录与期间内的流水行，两者的
-#: 日期差最坏也就差一个期间那么长。期间比 30 天长的对账单（有些银行一
-#: 次给三个月），按 30 天卡会把「期初那一笔」判成对不上。
-MATCH_WINDOW_DAYS = 30
+from app.models.bankstatement import DIRECTION_IN
 
 #: **邻期窗口**：期间之外这么多天以内的分录，本页**不判定**、但要报个数 ——
 #: 用户看得见「那几个月还有 N 笔没说法」，而不是以为它们不存在。
@@ -82,33 +81,26 @@ def _rows_of(db: Session, statement_id: int) -> list[BankStatementRow]:
         .order_by(BankStatementRow.seq)).all())
 
 
-def _index_rows(rows: list[BankStatementRow]
-                ) -> dict[tuple[str, str], list[BankStatementRow]]:
-    """流水行按「(金额, 现金侧方向)」分桶。
-
-    **方向未知、金额为零、没有日期的行不进桶** —— 它们没法与分录配对。
-    """
-    buckets: dict[tuple[str, str], list[BankStatementRow]] = {}
-    for row in rows:
-        if row.tx_date is None or row.amount is None or row.amount <= 0:
-            continue
-        if row.direction not in (DIRECTION_IN, DIRECTION_OUT):
-            continue
-        buckets.setdefault(
-            (_amount_key(row.amount), _cash_direction(row.direction)),
-            []).append(row)
-    return buckets
-
-
-def _entries_on_account(db: Session, book_id: int, subject_id: int,
+def _entries_on_account(db: Session, book_id: int, account_code: str,
                         lo: date, hi: date) -> list[tuple[Entry, Voucher]]:
-    """某个现金科目上、凭证日期落在 [lo, hi] 里的分录（连同凭证）。"""
+    """某个现金科目上、凭证日期落在 [lo, hi] 里的分录（连同凭证）。
+
+    **按科目编码取，不按 id。** 科目表每个年度各有一份（2026 的 1002 与
+    2027 的 1002 是两行不同的记录），跨年搬科目时 id 会变（见
+    :func:`app.bankstatement.service._remap_subjects`）。按 id 比，跨年
+    那一笔就**看不见** —— 明明是同一个银行账户上的钱，却压根没进这一页
+    的视野。
+    """
+    if not account_code:
+        return []
     return list(db.execute(
         select(Entry, Voucher)
         .join(Voucher, Voucher.id == Entry.voucher_id)
+        .join(Subject, Subject.id == Entry.subject_id)
         .where(
             Voucher.book_id == book_id,
-            Entry.subject_id == subject_id,
+            Subject.book_id == book_id,
+            Subject.code == account_code,
             Voucher.voucher_date >= lo,
             Voucher.voucher_date <= hi,
             Voucher.status.in_(VOUCHER_STATUSES),
@@ -229,7 +221,6 @@ def _one_statement(db: Session, book_id: int,
                    statement: BankStatement) -> dict[str, Any]:
     """一份对账单 → 它那个账户上的存疑凭证。"""
     rows = _rows_of(db, statement.id)
-    buckets = _index_rows(rows)
     account = db.get(Subject, statement.account_subject_id)
 
     # **没有期间就没有判定的那把尺子** —— 期间可空（理论上），这时候
@@ -252,23 +243,26 @@ def _one_statement(db: Session, book_id: int,
             "vouchers": [],
         }
 
-    period_days = (statement.period_end - statement.period_start).days
-    window = max(MATCH_WINDOW_DAYS, period_days)
+    # ---- 配对用的是**流水明细页那同一把尺子** ----
+    #
+    # **为什么必须是同一把**：两页各判各的就会出现「流水页说没入账、
+    # 存疑页说对得上」这种两边都看不懂的局面（2026-10-29 用户报的问题）。
+    # 尤其「账户上有四笔同额、流水只有一行」时，**一对一**的配对只认
+    # 得住一行，另外三笔就是**错账** —— 旧算法让四笔都「对上了」，
+    # 一笔错账都没报出来。
+    allocation, _invoice_claims = service._pair_rows(db, book_id, statement, rows)
 
-    entries = _entries_on_account(
-        db, book_id, statement.account_subject_id,
-        statement.period_start, statement.period_end)
+    # **期间内的分录**才算数 —— 期间外（上一期/下一期）的分录不在这份
+    # 对账单的覆盖范围里，用户没传那个月的对账单，说明不了什么。
+    entries = [entry for entry in _entries_on_account(
+        db, book_id, account.code if account else "",
+        statement.period_start, statement.period_end)]
 
-    matched = 0
+    matched_entry_ids = {pair.entry_id for pair in allocation.pairs.values()}
     candidates: list[tuple[Entry, Voucher]] = []
+    matched = 0
     for entry, voucher in entries:
-        key = (_amount_key(entry.amount), entry.direction)
-        hit = None
-        for row in buckets.get(key, []):
-            if abs((row.tx_date - voucher.voucher_date).days) <= window:
-                hit = row
-                break
-        if hit is not None:
+        if entry.id in matched_entry_ids:
             matched += 1
         else:
             candidates.append((entry, voucher))
@@ -281,19 +275,15 @@ def _one_statement(db: Session, book_id: int,
     # 邻期（期间之外、但离得不远）的分录：**不判定**，只报个数 ——
     # 用户看得见「那几个月还有几笔没说法」，而不是以为它们不存在。
     near_uncounted = 0
-    if statement.period_start and statement.period_end:
-        lo = statement.period_start - timedelta(days=NEAR_PERIOD_DAYS)
-        hi = statement.period_end + timedelta(days=NEAR_PERIOD_DAYS)
-        near = _entries_on_account(db, book_id, statement.account_subject_id,
-                                   lo, hi)
-        for entry, voucher in near:
-            if statement.period_start <= voucher.voucher_date <= statement.period_end:
-                continue
-            key = (_amount_key(entry.amount), entry.direction)
-            if any(abs((row.tx_date - voucher.voucher_date).days) <= window
-                   for row in buckets.get(key, [])):
-                continue
-            near_uncounted += 1
+    lo = statement.period_start - timedelta(days=NEAR_PERIOD_DAYS)
+    hi = statement.period_end + timedelta(days=NEAR_PERIOD_DAYS)
+    near = _entries_on_account(db, book_id, account.code if account else "", lo, hi)
+    for entry, voucher in near:
+        if statement.period_start <= voucher.voucher_date <= statement.period_end:
+            continue
+        if entry.id in matched_entry_ids:
+            continue
+        near_uncounted += 1
 
     vouchers: list[dict[str, Any]] = []
     for entry, voucher in sorted(real, key=lambda p: (p[1].voucher_date,

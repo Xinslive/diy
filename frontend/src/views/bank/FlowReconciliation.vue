@@ -400,9 +400,12 @@
                   <div class="flow-extra-item">
                     <span class="flow-extra-label">对方科目</span>
                     <div v-if="row.plan_subjects?.length" class="flow-plan">
+                      <!-- **key 用序号，不用科目 id** —— 同一个科目在一行里可以
+                           出现多次（2026-10-29 起不再限制），用科目 id 当 key
+                           会撞车（Vue 会报重复 key，渲染也会错位）。 -->
                       <el-tag
-                        v-for="item in row.plan_subjects"
-                        :key="item.subject_id"
+                        v-for="(item, index) in row.plan_subjects"
+                        :key="index"
                         size="small"
                         type="info"
                         effect="plain"
@@ -440,6 +443,36 @@
                     >
                       可改科目
                     </el-button>
+                  </div>
+                  <!-- **待复核**（2026-10-29 加）：账上有同一笔，但日期对不上。
+                       要用户判「是同一笔」还是「不是同一笔」——
+                       机器替人认定的话，认错就是钱记两遍。
+                       **这一行不在可制证清单里**，所以也不会被
+                       「生成流水凭证」顺手记一遍。 -->
+                  <div v-if="row.voucher_state === 'REVIEW'" class="flow-review">
+                    <div class="flow-warn small">
+                      ⚠ {{ reviewCandidateText(row) }} —— 请确认是不是同一笔。
+                    </div>
+                    <div class="flow-review-actions">
+                      <el-button
+                        link
+                        type="primary"
+                        size="small"
+                        :disabled="!store.canWrite || reviewingRowId === row.id"
+                        @click="doConfirmReview(row)"
+                      >
+                        是同一笔，标为已入账
+                      </el-button>
+                      <el-button
+                        link
+                        type="warning"
+                        size="small"
+                        :disabled="!store.canWrite || reviewingRowId === row.id"
+                        @click="doDismissReview(row)"
+                      >
+                        不是同一笔
+                      </el-button>
+                    </div>
                   </div>
                   <div class="flow-extra-item">
                     <span class="flow-extra-label">操作</span>
@@ -882,6 +915,7 @@ import {
   suspiciousCounts, suspiciousOtherPeriods as suspiciousOtherPeriodsOf,
   suspiciousNoCountText as suspiciousNoCountTextOf,
   suspiciousRows as suspiciousRowsOf,
+  reviewCandidateText, reviewDismissConfirm,
   toColumnMapping, unknownTemplateFields, voucherStateText, voucherStateType,
   summaryTemplateValuesText,
   SUMMARY_TEMPLATE_EXAMPLES, SUMMARY_TEMPLATE_FIELDS,
@@ -995,6 +1029,8 @@ const committing = ref(false)
 const savingRule = ref(false)
 const savingPlan = ref(false)
 const reclassifying = ref(false)
+/** 正在复核的行 id —— 复核中把这一行的两颗按钮置灰。 */
+const reviewingRowId = ref(null)
 const pickedFile = ref(null)
 const diagPanels = ref([])
 const manualMapping = reactive({})
@@ -1785,6 +1821,62 @@ async function doIgnore(row) {
   }
 }
 
+/**
+ * **人工复核：判「是同一笔」** → 挂上那张凭证，这一行变成「已入账」。
+ *
+ * **为什么要有这一步**：账上有同一笔（金额相等、方向对应），但日期对不上
+ * —— 常见的是账上记发票日期、对账单记实际支付日期，差个十来天。
+ * 机器不敢替人认定（认错了就是钱记两遍），所以报出来让人点一下。
+ */
+async function doConfirmReview(row) {
+  const candidate = row?.review_candidate
+  if (!candidate) {
+    ElMessage.error('这一行没有待复核的候选凭证 —— 请刷新后重试')
+    return
+  }
+  reviewingRowId.value = row.id
+  try {
+    await api.confirmRowReview(store.bookId, row.id, candidate.voucher_id)
+    await loadRows()
+    ElMessage.success('已标为已入账')
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '操作失败')
+  } finally {
+    reviewingRowId.value = null
+  }
+}
+
+/**
+ * **人工复核：判「不是同一笔」** → 放行，这一行回到「可制证」。
+ *
+ * **要点一次确认**：判完之后照它生成凭证就会把这笔钱记两遍 ——
+ * 判错方向的代价太大，所以这一步要用户明确点头。
+ */
+async function doDismissReview(row) {
+  const candidate = row?.review_candidate
+  if (!candidate) {
+    ElMessage.error('这一行没有待复核的候选凭证 —— 请刷新后重试')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(reviewDismissConfirm(row), '不是同一笔？', {
+      type: 'warning',
+    })
+  } catch {
+    return   // 用户点了「再想想」—— 什么都不做
+  }
+  reviewingRowId.value = row.id
+  try {
+    await api.dismissRowReview(store.bookId, row.id, candidate.voucher_id)
+    await loadRows()
+    ElMessage.success('已排除，这一行可以正常制证了')
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '操作失败')
+  } finally {
+    reviewingRowId.value = null
+  }
+}
+
 async function doCommit() {
   if (!activeStatementId.value) return
   committing.value = true
@@ -2109,6 +2201,15 @@ onMounted(async () => {
 }
 .flow-reclassify-text { min-width: 0; }
 .flow-warn { color: var(--el-color-warning-dark-2); }
+/* **待复核**那一块：一张浅黄的底，把「要人来判」这件事说清楚。 */
+.flow-review {
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: var(--el-color-warning-light-9);
+  border: 1px solid var(--el-color-warning-light-7);
+  border-radius: 4px;
+}
+.flow-review-actions { margin-top: 2px; }
 
 /* 存疑凭证那一页顶上的那行统计。 */
 .flow-suspicious-summary {

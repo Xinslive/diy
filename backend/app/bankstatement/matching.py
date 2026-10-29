@@ -217,9 +217,10 @@ def reclassify_candidates(db: Session, book_id: int, statement: BankStatement,
     （1001/1002/1012）、金额相等、**现金侧方向对应**、凭证日期在流水日
     ±N 天内。
 
-    与 ``_voucher_matches`` 的区别只有一处，但那一处是关键：
+    与「已入账」那条路（``service._pair_rows`` → ``allocate.allocate``）的区别
+    只有一处，但那一处是关键：
 
-    - ``_voucher_matches`` 找的是**这个账户上**的分录 —— 用来判断
+    - 「已入账」找的是**这个账户上**的分录 —— 用来判断
       「这笔已经入过账了，别再制一张」；
     - 这里找的是**别的现金科目上**的分录（1001，而这份对账单绑的是 1002）
       —— 用来判断「账上已经有一笔记在 1001 上的钱，跟这一行是同一笔，

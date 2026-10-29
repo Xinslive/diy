@@ -702,3 +702,91 @@ def test_只改状态不该顺手清掉对方科目(client, auth, db, book, cash
     assert [i["subject_id"] for i in r.json()["plan_subjects"]] == [subjects["560202"].id], (
         "只改状态就把对方科目清空了")
     assert r.json()["status"] == "IGNORED"
+
+
+# ----------------------------------------------------------------------
+# 待复核：人工判「是同一笔」还是「不是同一笔」
+# ----------------------------------------------------------------------
+
+def _待复核的一行(client, auth, db, book, cash, subjects, admin_user):
+    """造出一行「待复核」：账上有一笔同额的凭证，日期差 10 天。"""
+    from datetime import date, timedelta
+
+    from app.accounting.vouchers import create_voucher
+
+    created = _upload(client, auth, book, cash).json()
+    rows = client.get(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/rows",
+        headers=auth).json()
+    row = rows[0]
+    client.patch(
+        f"/api/books/{book.id}/bank-statements/rows/{row['id']}",
+        headers=auth, json={"plan_subject_id": subjects["560202"].id})
+    tx_date = date.fromisoformat(row["tx_date"])
+    amount = row["amount"]
+    voucher = create_voucher(
+        db, book_id=book.id, user=admin_user,
+        voucher_date=tx_date - timedelta(days=10),
+        entries=[{"subject_id": cash.id, "direction": "DEBIT",
+                  "amount": amount, "summary": "发票日付款"},
+                 {"subject_id": subjects["560301"].id, "direction": "CREDIT",
+                  "amount": amount, "summary": "发票日付款"}],
+        source="MANUAL", commit=False)
+    db.commit()
+    plan = client.post(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/plan-vouchers",
+        headers=auth).json()
+    assert plan["review_count"] == 1, plan
+    return created, row, plan["review"][0]["review_candidate"], voucher
+
+
+def test_判是同一笔_这一行变成已入账(client, auth, db, book, cash, store, subjects,
+                                 admin_user):
+    created, row, candidate, _ = _待复核的一行(
+        client, auth, db, book, cash, subjects, admin_user)
+    r = client.post(
+        f"/api/books/{book.id}/bank-statements/rows/{row['id']}/review/confirm",
+        headers=auth, json={"voucher_id": candidate["voucher_id"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["voucher_state"] == "POSTED", r.json()
+    row_obj = db.get(BankStatementRow, row["id"])
+    assert row_obj.status == "POSTED"
+    assert row_obj.matched_voucher_id == candidate["voucher_id"]
+
+
+def test_判不是同一笔_回到可制证且不再反复报(client, auth, db, book, cash, store,
+                                           subjects, admin_user):
+    created, row, candidate, _ = _待复核的一行(
+        client, auth, db, book, cash, subjects, admin_user)
+    r = client.post(
+        f"/api/books/{book.id}/bank-statements/rows/{row['id']}/review/dismiss",
+        headers=auth, json={"voucher_id": candidate["voucher_id"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "OPEN", r.json()
+
+    plan = client.post(
+        f"/api/books/{book.id}/bank-statements/{created['id']}/plan-vouchers",
+        headers=auth).json()
+    assert plan["review_count"] == 0, (
+        "判过「不是同一笔」之后又报了一遍 —— 用户会以为没生效")
+
+
+def test_复核要指明是哪一张凭证(client, auth, db, book, cash, store, subjects,
+                              admin_user):
+    created, row, candidate, _ = _待复核的一行(
+        client, auth, db, book, cash, subjects, admin_user)
+    r = client.post(
+        f"/api/books/{book.id}/bank-statements/rows/{row['id']}/review/confirm",
+        headers=auth, json={})
+    assert r.status_code == 422, r.text
+
+
+def test_只读账号不能复核(client, auth, plain_auth, db, book, cash, store,
+                         subjects, admin_user):
+    # **用管理员把那一行造出来**（只读账号连上传都不许），只读账号只去点复核。
+    created, row, candidate, _ = _待复核的一行(
+        client, auth, db, book, cash, subjects, admin_user)
+    r = client.post(
+        f"/api/books/{book.id}/bank-statements/rows/{row['id']}/review/confirm",
+        headers=plain_auth, json={"voucher_id": candidate["voucher_id"]})
+    assert r.status_code == 403, r.text

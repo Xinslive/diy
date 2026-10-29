@@ -366,6 +366,20 @@ class BankStatementRowReclassifyIn(BaseModel):
     entry_id: int
 
 
+class BankStatementReviewIn(BaseModel):
+    """人工复核「待复核」的那一行：判「是同一笔」还是「不是同一笔」。
+
+    ``voucher_id`` 是**被指认的那张凭证** —— 界面上的那颗按钮就摆在那张
+    凭证旁边，用户点的是它。
+
+    **两个动作都要指明是哪一张**：判「不是同一笔」时要记下否掉的是哪一张
+    （下次重算才不会再把它捞出来），判「是同一笔」时要核实那张凭证上真有
+    一条对得上的分录。
+    """
+
+    voucher_id: int
+
+
 class BankStatementConfigIn(BaseModel):
     """账套级流水配置。
 

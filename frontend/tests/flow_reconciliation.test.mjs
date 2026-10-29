@@ -28,6 +28,7 @@ const {
   SUMMARY_TEMPLATE_FIELDS, planSubjectSummary, defaultExpandedRowIds,
   suspiciousRows, statementsInPeriod, statementsOtherPeriods,
   suspiciousCounts, suspiciousOtherPeriods, suspiciousNoCountText,
+  reviewCandidateText, reviewDismissConfirm, reviewVoucherLabel,
   bankAccountSubjects,
 } = STATE
 
@@ -1145,6 +1146,79 @@ t('规则级模板的说明写的是「盖过内置口径」', () => {
   // 「盖过账套级」已经不对了 —— 账套级没有了
   assert.doesNotMatch(VIEW, /盖过账套级/)
   assert.doesNotMatch(VIEW, /用账套级/)
+})
+
+// ======================================================================
+// 待复核（2026-10-29 加）
+//
+// 账上有同一笔（金额相等、方向对应），但**日期对不上** —— 常见的是
+// 账上记发票日期、对账单记实际支付日期，差个十来天。
+//
+// 机器不敢替人认定（认错了就是钱记两遍），所以报出来让人点一下。
+// ======================================================================
+
+t('待复核有自己的状态文案与颜色', () => {
+  assert.equal(voucherStateText('REVIEW'), '待复核')
+  assert.equal(voucherStateType('REVIEW'), 'warning')
+  // **不能跟「可制证」混为一谈** —— 混了用户会照着「生成流水凭证」
+  // 点下去，同一笔钱记两遍。
+  assert.notEqual(voucherStateText('REVIEW'), voucherStateText('READY'))
+})
+
+t('待复核的行可以忽略 —— 别把人卡在那儿', () => {
+  assert.equal(canToggleIgnore({ status: 'REVIEW' }), true)
+})
+
+t('待复核的候选凭证要说清是哪一张、差几天', () => {
+  const row = {
+    voucher_state: 'REVIEW',
+    review_candidate: {
+      voucher_id: 7, voucher_no: '记0007', voucher_date: '2026-09-18',
+      amount: '500.00', days_diff: 10,
+    },
+  }
+  const text = reviewCandidateText(row)
+  assert.match(text, /记0007/)
+  assert.match(text, /10 天/)
+  assert.match(text, /同额/)
+  // **凭证号后面要带日期** —— 光有「记0007」认不出是哪一张：
+  // 一天十几张凭证很常见，用户得靠日期才找得到账上那一张。
+  assert.match(text, /2026-09-18/)
+  // **不许替人下结论**（「疑似同一笔」「应该是同一笔」这类）——
+  // 猜错的代价是钱记两遍，结论必须由人来下。
+  assert.doesNotMatch(text, /疑似/)
+  assert.doesNotMatch(text, /应该/)
+})
+
+t('候选凭证没有日期时不编一个出来', () => {
+  // **不许造事实**：日期是后端给的，没给就不写 ——
+  // 编一个出来，用户按着去找，找不到就以为界面坏了。
+  const label = reviewVoucherLabel({ voucher_no: '记0007' })
+  assert.match(label, /记0007/)
+  assert.doesNotMatch(label, /\d{4}-\d{2}-\d{2}/)
+  assert.equal(reviewVoucherLabel({}), '')
+  assert.equal(reviewVoucherLabel(null), '')
+})
+
+t('没有候选凭证时不编一句话出来', () => {
+  assert.equal(reviewCandidateText({ voucher_state: 'REVIEW' }), '')
+  assert.equal(reviewCandidateText(null), '')
+})
+
+t('判「不是同一笔」前要点一次确认，把后果说清楚', () => {
+  const row = {
+    review_candidate: { voucher_no: '记0007', days_diff: 10 },
+  }
+  const text = reviewDismissConfirm(row)
+  assert.match(text, /记0007/)
+  // **必须说清后果**：判完之后照它生成凭证就会把钱记两遍。
+  assert.match(text, /两遍/)
+})
+
+t('流水明细页上有复核的那两颗按钮', () => {
+  assert.match(VIEW, /review\/confirm|confirmRowReview/)
+  assert.match(VIEW, /review\/dismiss|dismissRowReview/)
+  assert.match(VIEW, /待复核/)
 })
 
 console.log('')

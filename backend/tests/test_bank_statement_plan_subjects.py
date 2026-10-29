@@ -109,16 +109,76 @@ def test_合计不等于流水金额要拒绝(statement, db, book, subjects):
     assert "不一致" in str(exc.value), f"提示没说出为什么不能改：{exc.value}"
 
 
-def test_同一个科目在一行里出现两次要拒绝(statement, db, book, subjects):
+def test_同一个科目在一行里可以出现两次(statement, db, book, subjects):
+    """**2026-10-29 用户批注：「不应该有这个限制」。**
+
+    原来这里报「在这一行里出现了两次 —— 要记两笔请把金额合并到一条上」，
+    还带着一条库级 ``UNIQUE (row_id, subject_id)``。两条理由说明为什么
+    该放开：
+
+    ① **摘要是挂在这一层上的**（迁移 0043/0044 把它从行级下沉到对方科目
+       这一层）。既然摘要的粒度就是这一层，「同一个科目拆成两条、各写各的
+       摘要」本来就是这套设计的用法；
+    ② 账上两条分录指向同一个科目本来就是合法的 —— 金额各算各的、摘要各写
+       各的。禁掉它，用户只能「先把两条合并、再丢掉其中一条的摘要」。
+
+    **真正该拦的是「合计对不上」，那个闸还在**（下一条用例）。
+    """
     row = _row(db, book, statement)
     first, second = _half(row["amount"])
+    result = service.update_row(db, book.id, row["id"], {
+        "plan_subjects": [
+            {"subject_id": subjects["560202"].id, "amount": first,
+             "summary": "第一段"},
+            {"subject_id": subjects["560202"].id, "amount": second,
+             "summary": "第二段"},
+        ]})
+    assert result["plan_status"] == PLAN_MANUAL
+    assert len(result["plan_subjects"]) == 2, (
+        "同一个科目拆成两条被拒了 —— 用户要的就是这个")
+    assert result["plan_subject_total"] == row["amount"]
+    # **两条各有各的摘要** —— 这正是把摘要下沉到这一层的用处。
+    assert [i["summary_override"] for i in result["plan_subjects"]] == [
+        "第一段", "第二段"]
+
+
+def test_同一个科目出现两次_合计不对照样要拒绝(statement, db, book, subjects):
+    """放开重复**不等于**放开金额 —— 合计必须等于流水金额。"""
+    row = _row(db, book, statement)
     with pytest.raises(ValueError) as exc:
         service.update_row(db, book.id, row["id"], {
             "plan_subjects": [
-                {"subject_id": subjects["560202"].id, "amount": first},
-                {"subject_id": subjects["560202"].id, "amount": second},
+                {"subject_id": subjects["560202"].id, "amount": "1.00"},
+                {"subject_id": subjects["560202"].id, "amount": "1.00"},
             ]})
-    assert "两次" in str(exc.value), f"提示没说出为什么不能改：{exc.value}"
+    assert "不一致" in str(exc.value), f"提示没说出为什么不能改：{exc.value}"
+
+
+def test_重写对方科目时人工摘要各自跟回自己那一条(statement, db, book, subjects):
+    """同一个科目拆成两条、两条各有各的摘要 —— 重写一次之后**不许串成
+    两句一样的**，也不许互相顶掉。
+
+    摘要的粒度就是「这一条对方科目」，不是「这个科目」——
+    两条同一个科目的分录，说的是两件事。
+    """
+    row = _row(db, book, statement)
+    first, second = _half(row["amount"])
+    service.update_row(db, book.id, row["id"], {
+        "plan_subjects": [
+            {"subject_id": subjects["560202"].id, "amount": first,
+             "summary": "第一段"},
+            {"subject_id": subjects["560202"].id, "amount": second,
+             "summary": "第二段"},
+        ]})
+    # **不写 summary** = 沿用同一科目上原来那句。
+    result = service.update_row(db, book.id, row["id"], {
+        "plan_subjects": [
+            {"subject_id": subjects["560202"].id, "amount": first},
+            {"subject_id": subjects["560202"].id, "amount": second},
+        ]})
+    assert [i["summary_override"] for i in result["plan_subjects"]] == [
+        "第一段", "第二段"], (
+        "两条人工摘要串了 —— 那会让一笔账上出现两句一模一样的摘要")
 
 
 def test_金额必须是正数(statement, db, book, subjects):

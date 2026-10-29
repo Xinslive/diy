@@ -512,19 +512,54 @@ def test_制证_已入账的流水不再制证(db, book, admin_user, uploaded, s
 
 
 def test_去重窗口外的同额凭证不算重复(db, book, admin_user, uploaded, subjects, make_voucher):
-    """窗口是 ±7 天。超出窗口的同额凭证是**另一笔钱**，不能当成重复。"""
+    """窗口是 ±7 天。超出窗口的同额凭证是**另一笔钱**，不能当成重复。
+
+    **口径变了（2026-10-29）**：这条原来断言「超出窗口的同额凭证 → 这一行
+    仍然是可以制证的候选」。现在超出的那一段被拆成两档：
+
+    * **7~30 天** → **待复核**：金额对得上、日期对不上 —— 报出来让人判，
+      但**不自动制证**（账上明明有那一笔，再制一张就是同一笔钱记两遍）；
+    * **超过 30 天** → 就是普通的候选（真的是另一笔钱，不该打扰用户）。
+
+    **这条用例原来的用意一个字没变**：窗口外的同额凭证**不许**被当成
+    「已入账」。变的是「那它是什么」—— 从「静默地当候选」变成
+    「报出来让人判」，而**保护其实更强了**（以前点一下「生成流水凭证」
+    就会把同一笔钱记两遍，现在不会）。
+    """
     from datetime import date, timedelta
 
     row = _prepare_row(db, book, uploaded, subjects, direction=DIRECTION_IN)
     amount = Decimal(row["amount"])
     tx_date = date.fromisoformat(row["tx_date"])
-    far = tx_date + timedelta(days=30)
+    far = tx_date + timedelta(days=10)
     make_voucher(far,
                  dr=[(uploaded["account_subject_id"], amount, "另一笔")],
                  cr=[(subjects["560301"].id, amount, "另一笔")])
     plan = service.plan_vouchers(db, book.id, uploaded["id"])
-    assert plan["candidate_count"] >= 1, (
+    assert not any("已入账" in s.get("reason", "") for s in plan["skipped"]), (
         "窗口外的同额凭证被误判成重复了 —— 那会让真正该记的第二笔永远进不了账")
+    assert plan["review_count"] == 1, (
+        "金额对得上、日期对不上 —— 应当报出来让人复核，而不是当成没这回事")
+    # **待复核的行不在可制证清单里**：点一下「生成流水凭证」就会把
+    # 同一笔钱记两遍。
+    assert all(c["id"] != row["id"] for c in plan["candidates"]), plan["candidates"]
+
+
+def test_差得太远的同额凭证_就是普通候选(db, book, admin_user, uploaded, subjects, make_voucher):
+    """差 45 天 —— 真的是**另一笔钱**，不该报出来让人复核。"""
+    from datetime import date, timedelta
+
+    row = _prepare_row(db, book, uploaded, subjects, direction=DIRECTION_IN)
+    amount = Decimal(row["amount"])
+    tx_date = date.fromisoformat(row["tx_date"])
+    far = tx_date + timedelta(days=45)
+    make_voucher(far,
+                 dr=[(uploaded["account_subject_id"], amount, "另一笔")],
+                 cr=[(subjects["560301"].id, amount, "另一笔")])
+    plan = service.plan_vouchers(db, book.id, uploaded["id"])
+    assert plan["review_count"] == 0, plan
+    assert plan["candidate_count"] >= 1, (
+        "差 45 天的同额凭证被当成了同一笔 —— 那会让真正该记的第二笔永远进不了账")
 
 
 def test_单行失败只回滚那一行(db, book, admin_user, uploaded, subjects, monkeypatch):

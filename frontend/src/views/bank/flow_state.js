@@ -57,6 +57,15 @@ export const VOUCHER_STATE_TEXT = {
   POSTED: '已入账',
   INVOICE: '已被发票占用',
   IGNORED: '已忽略',
+  /**
+   * **待复核**（2026-10-29 加）：账上有同一笔（金额相等、方向对应），但
+   * **日期对不上** —— 常见的是账上记发票日期、对账单记实际支付日期。
+   *
+   * 它既不是「已入账」（人还没判），也不是「没入账」（账上明明有那一笔）。
+   * 所以要单独一个说法，不能塞进「可制证」里 —— 塞进去的话用户会照着
+   * 「生成流水凭证」点下去，**同一笔钱记两遍**。
+   */
+  REVIEW: '待复核',
   NONE: '待处理',
 }
 
@@ -68,12 +77,70 @@ export const VOUCHER_STATE_TYPE = {
   POSTED: 'success',
   INVOICE: 'info',
   IGNORED: 'info',
+  // **待复核是「要人来判」** —— 与「待确认科目」一样是警告色。
+  REVIEW: 'warning',
   NONE: 'info',
 }
 
 export const voucherStateText = (state) => VOUCHER_STATE_TEXT[state] || state || '—'
 
 export const voucherStateType = (state) => VOUCHER_STATE_TYPE[state] || 'info'
+
+/**
+ * 候选凭证该怎么称呼。
+ *
+ * **凭证号后面要带日期**：凭证号（比如「记0019」）在凭证列表里是搜得到的，
+ * 但**光有它认不出是哪一张** —— 一天里十几张凭证很常见。
+ * 带上日期，用户一眼就能对上「就是那笔 12 月 15 号的发票付款」。
+ *
+ * @param {object|null} candidate 后端给的候选凭证
+ * @returns {string} 空串表示「没有可称呼的东西」
+ */
+export const reviewVoucherLabel = (candidate) => {
+  if (!candidate) return ''
+  const no = candidate.voucher_no || ''
+  const date = candidate.voucher_date || ''
+  if (!no && !date) return ''
+  if (!no) return date
+  if (!date) return `凭证 ${no}`
+  return `凭证 ${no}，${date}`
+}
+
+/**
+ * **待复核**那一行的候选凭证该怎么讲。
+ *
+ * **只说事实，不下结论**：账上有一张凭证，金额相等、方向对应，日期差了
+ * N 天。是同一笔还是另一笔，要人来判 —— 说「疑似同一笔」就是在替人下结论
+ * （而猜错的代价是钱记两遍）。
+ *
+ * @param {object|null} row 流水行
+ * @returns {string}
+ */
+export const reviewCandidateText = (row) => {
+  const candidate = row?.review_candidate
+  if (!candidate) return ''
+  const voucher = reviewVoucherLabel(candidate)
+  const suffix = voucher ? `（${voucher}）` : ''
+  return `账上有一笔同额的凭证${suffix}，日期相差 ${candidate.days_diff} 天`
+}
+
+/**
+ * 判「不是同一笔」之前要问的那一句。
+ *
+ * **要把后果说清楚**：判了之后这一行会回到「可制证」，也就是**照着它生成
+ * 一张新的凭证** —— 那笔钱就会在账上记两遍（一次是原来那张，一次是新的）。
+ * 用户判错方向的代价太大，所以这一下要点确认。
+ *
+ * @param {object|null} row 流水行
+ * @returns {string}
+ */
+export const reviewDismissConfirm = (row) => {
+  const candidate = row?.review_candidate
+  const voucher = reviewVoucherLabel(candidate)
+  const suffix = voucher ? `（${voucher}）` : ''
+  return `确定账上那笔${suffix}不是这一行吗？`
+    + '判完之后这一行会回到「可制证」，照它生成凭证就会把这笔钱记两遍。'
+}
 
 /**
  * 「生成流水凭证」这个按钮**能不能点**。
@@ -101,11 +168,16 @@ export const canCommit = (plan) => !!plan && Number(plan.candidate_count || 0) >
  *
  * 判据必须是「**状态在这两者之一**」，不是「状态等于某一个」。
  *
+ * **「待复核」也能忽略**（2026-10-29 加）：它等的是用户判「是同一笔」还是
+ * 「不是同一笔」，而「这一行根本不是钱」（误解析）也是一种正当的处置 ——
+ * 让人能把它剔掉，而不是卡在那儿。
+ *
  * @param {object|null} row 流水行
  * @returns {boolean}
  */
 export const canToggleIgnore = (row) =>
-  !!row && (row.status === 'OPEN' || row.status === 'IGNORED')
+  !!row && (row.status === 'OPEN' || row.status === 'IGNORED'
+    || row.status === 'REVIEW')
 
 /**
  * 「指定 / 调整对方科目」这颗按钮**能不能点**。

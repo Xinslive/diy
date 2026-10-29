@@ -11,7 +11,8 @@ from app.models.invoice import InvoiceBatch, InvoiceConfig, InvoiceRecord, Invoi
 from app.models.bankstatement import (DIRECTION_IN, DIRECTION_OUT,
                                      DIRECTION_UNKNOWN, PLAN_MANUAL, PLAN_NONE,
                                      PLAN_PENDING, PLAN_RULE, STATUS_IGNORED,
-                                     STATUS_OPEN, STATUS_POSTED, BankStatement,
+                                     STATUS_OPEN, STATUS_POSTED, STATUS_REVIEW,
+                                     BankStatement,
                                      BankStatementConfig, BankStatementProfile,
                                      BankStatementRow, BankStatementRowSubject,
                                      BankStatementRule)
@@ -39,7 +40,7 @@ __all__ = [
     "BankStatement", "BankStatementRow", "BankStatementRule", "BankStatementProfile",
     "BankStatementRowSubject", "BankStatementConfig",
     "DIRECTION_IN", "DIRECTION_OUT", "DIRECTION_UNKNOWN",
-    "STATUS_OPEN", "STATUS_POSTED", "STATUS_IGNORED",
+    "STATUS_OPEN", "STATUS_POSTED", "STATUS_IGNORED", "STATUS_REVIEW",
     "PLAN_NONE", "PLAN_RULE", "PLAN_MANUAL", "PLAN_PENDING",
     "BackupRun", "TIERS", "KEEP_DAYS",
     "TIER_DAILY", "TIER_WEEKLY", "TIER_MONTHLY",

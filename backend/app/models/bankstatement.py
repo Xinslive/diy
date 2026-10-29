@@ -74,6 +74,22 @@ DIRECTION_UNKNOWN = "UNKNOWN"
 STATUS_OPEN = "OPEN"          # 还没入账
 STATUS_POSTED = "POSTED"      # 已经生成过凭证
 STATUS_IGNORED = "IGNORED"    # 用户点名不算（误解析、手工剔除）
+#: **待复核**：账上有同一笔（金额相等、方向对应），但**日期对不上** ——
+#: 差得比主窗口大、比复核窗口小。
+#:
+#: **为什么要有这一档**（2026-10-29 用户报的问题）：银行流水记的是**实际
+#: 收付日期**，会计凭证记的常常是**发票日期**，两者差十天是常事。
+#: 按一档切的话，那笔钱在流水页上「没入账」（于是「生成流水凭证」又给它
+#: 记一遍，**同一笔钱记两次**），在存疑页上却又「对得上」（窗口更宽）
+#: —— **两页都不报，它从系统的视野里整个消失了**。
+#:
+#: 这一档就是给它一个落脚的地方：**报出来，让人判**。
+#: 判「是同一笔」→ 挂上那张凭证（转 ``POSTED``）；
+#: 判「不是同一笔」→ 放行（回 ``OPEN``，并记下否掉的是哪张凭证）。
+#:
+#: **它不是「已入账」**：钱到底记没记上还没定，用户还没判。
+#: **它也不是「没入账」**：账上明明有一笔，只差日期。
+STATUS_REVIEW = "REVIEW"
 
 #: 对方科目的确定方式。
 PLAN_NONE = "NONE"        # 还没算过
@@ -170,6 +186,20 @@ class BankStatementRow(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(16), default=STATUS_OPEN, nullable=False)
     matched_voucher_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("voucher.id", ondelete="SET NULL"))
+    #: **用户判过「不是同一笔」的那张凭证**（``None`` = 没判过）。
+    #:
+    #: **为什么要有这一列**：待复核那一档是「金额对得上、日期对不上」。
+    #: 用户判「不是同一笔」之后，这一行就该放行去正常制证 —— 但下次
+    #: 重算时，那张同额的分录**又会被捞出来**，用户会以为没生效
+    #: （判了等于没判）。记下否掉的是哪一张，重算时跳过它。
+    #:
+    #: **记的是凭证而不是布尔**：否掉这一张，不代表以后冒出来的另一张
+    #: 同额凭证也不是它 —— 那一张仍然该报出来让用户判。
+    #:
+    #: **外键是 SET NULL**：那张凭证被删了，这一行就回到「没判过」，
+    #: 下次重算照常报 —— 删了凭证本来就要重新判一次。
+    rejected_voucher_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("voucher.id", ondelete="SET NULL"))
     matched_invoice_record_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("invoice_record.id", ondelete="SET NULL"))
     #: 对方科目定下来了没有：NONE 还没算 / RULE 规则命中 / MANUAL 人工指定 /
@@ -209,9 +239,21 @@ class BankStatementRowSubject(Base, TimestampMixin):
     __tablename__ = "bank_statement_row_subject"
     __table_args__ = (
         Index("ix_bank_statement_row_subject_row", "row_id", "sort_no"),
-        # 同一行里同一个科目只出现一次：两个同名科目的分录几乎总是手滑，
-        # 而它会让凭证多出一条看不出错的分录。要拆同一个科目请合并金额。
-        UniqueConstraint("row_id", "subject_id", name="uq_bank_statement_row_subject"),
+        # **同一个科目可以在同一行里出现多次**（2026-10-29 用户批注）。
+        #
+        # 原来这里有 ``UNIQUE (row_id, subject_id)``，并且应用层也报
+        # 「在这一行里出现了两次 —— 要记两笔请把金额合并到一条上」。
+        # **那个限制不该有**，理由有两条：
+        #
+        # ① **摘要是挂在这一层上的**（迁移 0043/0044 把它从行级下沉到
+        #    对方科目这一层）。所以「同一个科目拆成两条、各写各的摘要」
+        #    本来就是这套设计的用法 —— 把它们禁掉，那次下沉就白做了；
+        # ② 账上两条分录指向同一个科目，**本来就是合法的**（金额各算
+        #    各的，摘要各写各的）。禁掉它只是让用户「先把两条合并、
+        #    再把其中一条的摘要丢掉」。
+        #
+        # **金额合计的硬约束还在**（下面那个 CHECK，以及服务层
+        # ``_parse_plan_payload`` 的合计校验）—— 那个才是真的护栏。
         CheckConstraint("amount > 0", name="ck_bank_statement_row_subject_amount"),
     )
 
