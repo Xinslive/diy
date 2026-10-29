@@ -41,6 +41,10 @@ CTX_METHOD_SERIALIZATION: dict[str, str] = {
     "book_write": "json",
     "ledger_read": "json",
     "subject_read": "json",
+    "period_list": "json",
+    # —— 对账单（共享卡对账：宿主只贡献解析器与绑定清单）——
+    "statement.parse": "json",
+    "statement.read": "json",
     # —— 上传读取：返回体里带原始字节 ——
     "upload_read": "bytes",
     # —— 凭证 ——
@@ -52,6 +56,7 @@ CTX_METHOD_SERIALIZATION: dict[str, str] = {
     "data.read": "json",
     "data.count": "json",
     "data.insert": "json",
+    "data.insert_many": "json",
     "data.update": "json",
     "data.delete": "json",
     # —— 插件设置 ——

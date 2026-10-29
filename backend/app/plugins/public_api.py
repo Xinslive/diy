@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import MetaData, Table, func, select
+from sqlalchemy.exc import SQLAlchemyError
 from app.core.db import SessionLocal
 from app.core.deps import WRITE_ROLES, get_my_book, require_book_write
 from app.models.book import Book
@@ -38,6 +39,47 @@ def request_user(db, pid):
 FILTER_OPERATORS = ("eq", "ne", "lt", "lte", "gt", "gte", "in", "like", "is_null")
 #: 过滤值允许的标量类型：插件只能按值过滤，不能拼 SQL。
 FILTER_SCALARS = (str, int, float, bool, Decimal, datetime, date)
+
+
+def _statement_row_payload(row) -> dict:
+    """一行流水 → 插件能存下来的形状。
+
+    **金额不转字符串**：这里保住 ``Decimal``，让 IPC 那层的带类型标记把类型
+    原样送回插件（见 ``app.plugins.ipc.values``）。插件自己要往外发 JSON 时
+    再转 —— 转换只发生一次，且发生在他自己那一层。
+    """
+    return {
+        "seq": row.seq,
+        "tx_date": row.tx_date.isoformat() if row.tx_date else "",
+        "tx_time": row.tx_time or "",
+        "direction": row.direction,
+        "amount": row.amount,
+        "balance": row.balance,
+        "summary": row.summary or "",
+        "purpose": row.purpose or "",
+        "counterparty_name": row.counterparty_name or "",
+        "counterparty_account": row.counterparty_account or "",
+        "extra": dict(row.extra or {}),
+        "problems": list(row.problems or []),
+    }
+
+
+def _statement_meta_payload(meta) -> dict:
+    """文件自报的账户与期间信息。"""
+    return {
+        "account_no": meta.account_no or "",
+        "account_name": meta.account_name or "",
+        "bank_name": meta.bank_name or "",
+        "currency": meta.currency or "",
+        "period_start": meta.period_start.isoformat() if meta.period_start else "",
+        "period_end": meta.period_end.isoformat() if meta.period_end else "",
+        "closing_balance": meta.closing_balance,
+        "declared_income_count": meta.declared_income_count,
+        "declared_income_total": meta.declared_income_total,
+        "declared_expense_count": meta.declared_expense_count,
+        "declared_expense_total": meta.declared_expense_total,
+        "declared_total_count": meta.declared_total_count,
+    }
 
 
 def _filter_scalar(value):
@@ -193,13 +235,166 @@ def context_for(manifest, *, plugin=False):
             principal(db)
         return read_file(file, limit=limit)
 
-    def ledger_read(book_id: int, period_id: int):
+    def ledger_read(book_id: int, period_id: int, *, include_unposted: bool = False):
+        """某账套某期的科目余额表。
+
+        ``include_unposted`` 是给「对账」这件事用的：宿主
+        ``bankstatement.service.reconcile_balance`` 取账面余额时用的是
+        ``LedgerEngine.for_ledger(..., include_unposted=True)`` ——
+        **已制证但未过账的凭证也算在账面余额里**，否则差额里会混着
+        「已经记了、只是没过账」这种噪声，让对账结论偏掉。
+
+        默认 ``False``（与旧行为一致），老插件不受影响。
+        """
         from app.api.ledger import balance
         with SessionLocal() as db:
             user = principal(db)
             book = get_my_book(book_id, db, user)
             return balance(book_id=book_id, period_id=period_id, from_period_id=None,
-                           book=book, db=db, include_unposted=False)
+                           book=book, db=db, include_unposted=bool(include_unposted))
+
+    def period_list(book_id: int):
+        """账套的会计期间列表（id / 年月 / 账套内序号 / 是否已结账）。
+
+        **为什么插件需要它**：插件算「这张卡在各账套的账面余额合计」时要知道
+        取哪一期；跨账套的账期**可以不一样**（有的账套用 4-4-5 财年），
+        所以不能拿宿主那份对账单的期间号直接套到别的账套上。
+
+        插件**读不到宿主的 period 表**（没有这项能力），而凭证落哪一期是宿主
+        按凭证日期在**那本账**里定的 —— 两边要能对上，就得有这份清单。
+        """
+        from app.models.book import Period
+        with SessionLocal() as db:
+            user = principal(db)
+            book = get_my_book(book_id, db, user)
+            rows = db.scalars(select(Period).where(
+                Period.book_id == book.id).order_by(Period.ord)).all()
+            return [{"id": row.id, "year": row.year, "month": row.month, "ord": row.ord,
+                     "locked": bool(row.locked),
+                     "closed_at": row.closed_at.isoformat() if row.closed_at else ""}
+                    for row in rows]
+
+    def statement_parse(data: bytes, *, book_id=None, column_mapping=None):
+        """把一份对账单文件解析成结构化流水行 —— **不写宿主任何业务表**。
+
+        这是给「**一张卡被多个账套共用**」那类场景的。那种对账单**不属于
+        任何账套**：宿主 ``bank_statement`` 表按 (账套, 科目, 期间) 唯一，
+        把一张卡绑进某个账套，会让每个账套都拥有一份完整流水（同一笔钱被
+        记 N 次）、宿主余额对账报红、其余账套满屏假「存疑凭证」。
+
+        所以共享卡的对账单是**插件实体**，宿主能贡献的只有**解析器** ——
+        列识别、方向判定、自检、PDF 的两路解析与 OCR 兜底，这些在宿主
+        里有 15 份真实银行样例对着金标准验过。插件自己重写一份，就是第二套
+        口径：同一件事有两个答案。
+
+        * ``column_mapping`` —— 列名 → 列号的映射，由插件自己存（共享卡跨
+          账套，宿主那份画像按账套隔离，用不上）。传了就**整体替换**自动
+          映射，不做逐字段合并（与宿主画像的语义一致）。
+        * ``book_id`` —— 给了才落原件，且要检查当前用户能访问那本账。
+          原件落在 ``data/statements/shared/``：它不属于任何账套，放进哪个
+          账套的目录都是撒谎。
+
+        返回的诊断、``via_ocr`` / ``via_merge`` 标志要**原样带给用户** ——
+        OCR 是识别（会认错字），而且正文离开过本机，这是用户有权知道的事。
+        """
+        import hashlib
+
+        from app.bankstatement import formats as bs_formats
+        from app.bankstatement import service as bs_service
+        from app.bankstatement import storage as bs_storage
+
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            raise HTTPException(400, "对账单文件内容无效")
+        mapping = None
+        if column_mapping is not None:
+            if not isinstance(column_mapping, dict):
+                raise HTTPException(400, "列映射必须是对象")
+            mapping = {}
+            for key, value in column_mapping.items():
+                if not isinstance(key, str) or not key or len(key) > 40:
+                    raise HTTPException(400, "列映射的字段名无效")
+                if type(value) is not int or value < 0:
+                    raise HTTPException(400, "列映射的列号无效")
+                mapping[key] = value
+        raw = bytes(data)
+        with SessionLocal() as db:
+            user = principal(db)
+            owner_book = None
+            if book_id is not None:
+                owner_book = get_my_book(book_id, db, user)
+            try:
+                parsed = bs_service.parse_only(db, raw, column_mapping=mapping)
+            except ValueError as exc:
+                raise HTTPException(400, f"这份对账单解析不出来：{exc}") from exc
+            period_start, period_end = bs_service.effective_period(parsed)
+            file_info = {"relative_path": "", "container": bs_formats.sniff(raw),
+                         "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+            if owner_book is not None:
+                file_info["relative_path"] = bs_storage.store_shared(file_info["container"], raw)
+            return {
+                "container": parsed.container,
+                "sheet": parsed.sheet,
+                "header_row": parsed.header_row,
+                "header_cells": list(parsed.header_cells),
+                "column_mapping": dict(parsed.column_mapping),
+                "fingerprint": parsed.fingerprint,
+                "rows": [_statement_row_payload(row) for row in parsed.rows],
+                "meta": _statement_meta_payload(parsed.meta),
+                "diagnosis": list(parsed.diagnosis),
+                "via_ocr": bool(parsed.via_ocr),
+                "via_merge": bool(parsed.via_merge),
+                "merge_conflicts": list(parsed.merge_conflicts),
+                "period_start": period_start.isoformat() if period_start else "",
+                "period_end": period_end.isoformat() if period_end else "",
+                "income_total": parsed.income_total,
+                "expense_total": parsed.expense_total,
+                "file": file_info,
+                "owner_book_id": owner_book.id if owner_book is not None else None,
+            }
+
+    def statement_read(book_id: int):
+        """该账套在宿主已绑的对账单**清单**。
+
+        **只给清单，不给流水行内容**：插件要的是「这张卡是不是已经在这个
+        账套里绑过了」这一个事实 —— 如果绑过，插件再制一遍凭证就是**双重
+        记账**（钱在账上多记一次）。行的内容各算各的，混在一起反而说不清
+        哪一行归谁。
+
+        科目码取**活科目**，没有活科目才回落快照列 —— 与宿主流水对账页面
+        同一份判据（``caliber.account_subject_code``）：只差一位的编码
+        （1001 与 100201）肉眼扫过去看不出来，两边不一致比哪边旧更糟。
+        """
+        from app.bankstatement.caliber import account_subject_code
+        from app.models.accounting import Subject
+        from app.models.bankstatement import BankStatement
+        with SessionLocal() as db:
+            user = principal(db)
+            book = get_my_book(book_id, db, user)
+            statements = db.scalars(select(BankStatement).where(
+                BankStatement.book_id == book.id).order_by(
+                BankStatement.period_start.desc().nullslast(),
+                BankStatement.id.desc())).all()
+            result = []
+            for statement in statements:
+                subject = db.get(Subject, statement.account_subject_id)
+                result.append({
+                    "id": statement.id,
+                    "account_subject_id": statement.account_subject_id,
+                    "account_subject_code": account_subject_code(subject, statement),
+                    "account_subject_name": subject.name if subject else "",
+                    "filename": statement.filename,
+                    "bank_name": statement.bank_name,
+                    "account_no": statement.account_no,
+                    "period_start": (statement.period_start.isoformat()
+                                     if statement.period_start else ""),
+                    "period_end": (statement.period_end.isoformat()
+                                   if statement.period_end else ""),
+                    "closing_balance": (str(statement.closing_balance)
+                                         if statement.closing_balance is not None else ""),
+                    "row_count": statement.row_count,
+                    "parse_status": statement.parse_status,
+                })
+            return result
 
     def subject_read(book_id: int, year: int | None = None):
         """当前账套**某个年度**的科目表。插件用它把文件里的科目**编码**
@@ -362,6 +557,42 @@ def context_for(manifest, *, plugin=False):
                 record["book_id"] = book_id
             return dict(db.execute(table.insert().values(**record).returning(*table.c)).mappings().one())
 
+    def data_insert_many(name: str, values_list: list, *, book_id=None):
+        """批量插入插件自有表的行 —— **整批同一个事务**。
+
+        与 :func:`voucher_batch_create` 是同一条理由：``data.insert`` 一次
+        只插一行、一次一个事务，拿它循环 500 行，第 N 行失败时**前 N−1 行
+        已经落库**了。一份对账单动辄上万行流水，逐行插入既慢，又留下半批
+        脏数据 —— 用户看到的是「插了一半」，而他以为这是一次操作。
+
+        错误信息要指到**第几行**，否则插件只能回一句「失败了」，用户面对
+        上万行不知道该改哪一行。
+        """
+        if not isinstance(values_list, list) or not values_list:
+            raise HTTPException(400, "批量插入至少需要一行")
+        if len(values_list) > 20000:
+            raise HTTPException(400, "一次最多插入 20000 行")
+        with SessionLocal.begin() as db:
+            user = principal(db)
+            table = table_access(db, user, name, book_id, True)
+            columns = set(table.c.keys())
+            records = []
+            for index, values in enumerate(values_list, 1):
+                if not isinstance(values, dict) or not values \
+                        or set(values) - columns \
+                        or ("book_id" in values and values["book_id"] != book_id):
+                    raise HTTPException(400, f"第 {index} 行的插件数据字段或账套不合法")
+                record = dict(values)
+                if declarations[name] == "book":
+                    record["book_id"] = book_id
+                records.append(record)
+            try:
+                inserted = db.execute(
+                    table.insert().values(records).returning(*table.c)).mappings().all()
+            except SQLAlchemyError as exc:
+                raise HTTPException(400, f"批量插入失败，整批已回滚：{exc}") from exc
+            return [dict(row) for row in inserted]
+
     def data_update(name: str, ident: int, values: dict, *, book_id=None):
         with SessionLocal.begin() as db:
             user = principal(db)
@@ -423,6 +654,7 @@ def context_for(manifest, *, plugin=False):
         ("book:write", "book_write", book_write),
         ("upload:read", "upload_read", upload_read),
         ("ledger:read", "ledger_read", ledger_read), ("subject:read", "subject_read", subject_read),
+        ("book:read", "period_list", period_list),
         ("voucher:write", "voucher_create", voucher_create),
         ("audit:write", "audit_write", audit_write)]:
         if permission in permissions:
@@ -430,10 +662,19 @@ def context_for(manifest, *, plugin=False):
     # 批量与单张同权限：批量只是把同一套校验放进一个事务，不额外给权。
     if "voucher:write" in permissions:
         exposed["voucher_batch_create"] = voucher_batch_create
+    # 对账单两项能力都**只读宿主**：解析不落宿主业务表，清单不含流水行内容。
+    if "statement:parse" in permissions or "statement:read" in permissions:
+        statement_ns = SimpleNamespace()
+        if "statement:parse" in permissions:
+            statement_ns.parse = statement_parse
+        if "statement:read" in permissions:
+            statement_ns.read = statement_read
+        exposed["statement"] = statement_ns
     if "plugin_data:rw" in permissions:
         from app.plugins.configuration import service as configuration_service
         exposed["config"] = configuration_service(manifest, principal)
         exposed["data"] = SimpleNamespace(read=data_read, count=data_count, insert=data_insert,
+                                          insert_many=data_insert_many,
                                           update=data_update, delete=data_delete)
     if "settings:rw" in permissions:
         exposed["settings"] = SimpleNamespace(get=setting_get, put=setting_put)

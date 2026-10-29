@@ -26,7 +26,16 @@ DIGEST_RE = re.compile(r"[a-f0-9]{64}\Z")
 # 能力**，于是这条路径只剩两个走不通的走法：把 id 硬编码进插件（换个账套就
 # 全错），或者绕开能力模型自己去查宿主表（正好是这套窄 SDK 要防的事）。
 # 它只读、不写，且和 ``book:read`` 一样每次调用重读当前用户状态。
-PERMISSIONS = frozenset({"ledger:read", "book:read", "book:write", "subject:read", "voucher:write", "plugin_data:rw", "audit:write", "settings:rw", "upload:read", "import:rw"})
+#
+# ``statement:parse`` 与 ``statement:read`` 是为「**一张卡被多个账套共用**」
+# 这类场景补的（共享卡对账插件）。那类场景的对账单**不属于任何账套**，宿主
+# 的 ``bank_statement`` 表里没有可暴露的行 —— 能复用的只有宿主的**解析器**
+# （含 14 份真实银行样例验证过的列识别、方向判定、自检与 OCR 兜底）：
+#   * ``statement:parse`` —— 把文件解析成结构化流水行，**不写宿主业务表**；
+#   * ``statement:read``  —— 读该账套在宿主已绑的对账单**清单**（不含行内容），
+#     用途是**发现重复绑定**：同一张卡若已在宿主里绑过，插件再制一遍就是双重记账。
+# 两项都不写宿主数据，授权边界与 ``subject:read`` 同级。
+PERMISSIONS = frozenset({"ledger:read", "book:read", "book:write", "subject:read", "voucher:write", "plugin_data:rw", "audit:write", "settings:rw", "upload:read", "import:rw", "statement:read", "statement:parse"})
 HOOKS = frozenset({"on_period_close"})
 ICONS = frozenset({"Calendar", "Grid", "Document", "DataAnalysis", "Tools", "Coin", "Folder"})
 

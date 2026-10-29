@@ -38,6 +38,17 @@ test('授权路由可直接进入，module factory 加载同源资源；撤权�
   assert.equal(s.entries.value.length, 0); assert.ok(!s.router.hasRoute(route.name)); assert.ok(s.links[0].removed)
   assert.deepEqual(await s.runtime.routeGuard({ path: '/plugin/com.test.demo' }), { name: 'books' })
 })
+test('host.isAdmin 跟着当前身份走', async () => {
+  const s = setup(); await s.runtime.refresh()
+  const route = s.router.getRoutes().find(r => r.name === 'plugin:com.test.demo:main')
+  await route.components.default.__asyncLoader()
+  // 会话里没有 is_admin → 不是管理员。
+  assert.equal(s.hosts[0].isAdmin(), false)
+  s.session.user = { id: 1, is_admin: true }
+  assert.equal(s.hosts[0].isAdmin(), true)
+  s.session.user = { id: 1, is_admin: false }
+  assert.equal(s.hosts[0].isAdmin(), false)
+})
 test('manifest 失败和重复 id 均关闭入口，静态宿主路由仍存在', async () => {
   const s = setup(); s.setPayload({ plugins: [metadata(), metadata()] }); await s.runtime.refresh(); assert.equal(s.entries.value.length, 0)
   s.setPayload({ plugins: [metadata()] }); await s.runtime.refresh(); s.setPayload(new Error('network')); await s.runtime.refresh()

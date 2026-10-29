@@ -18,7 +18,9 @@ def test_context_exposes_only_declared_capabilities_and_requires_request():
     assert vars(ctx) == {'plugin_id': manifest['id']}
     manifest['permissions'] = ['book:read']
     ctx = context_for(manifest)
-    assert set(vars(ctx)) == {'plugin_id', 'book_read', 'book_list'}
+    # ``period_list`` 与 ``book_read`` / ``book_list`` 同一个权限位：
+    # 它只是「这本账有哪些会计期间」，也是读。
+    assert set(vars(ctx)) == {'plugin_id', 'book_read', 'book_list', 'period_list'}
     with pytest.raises(HTTPException):
         ctx.book_read(1)
     manifest['permissions'] = ['upload:read']

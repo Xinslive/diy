@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 
 from app.core.config import settings
@@ -69,6 +70,46 @@ def store(book_id: int, container: str, data: bytes) -> str:
     final_name = f"{Path(temp_name).stem.lstrip('.upload-')}{suffix}"
     os.replace(temp_name, directory / final_name)
     return f"{int(book_id)}/{final_name}"
+
+
+def shared_dir() -> Path:
+    """共享卡原件的目录。
+
+    **为什么单独一个目录**：宿主自己的对账单原件按账套分目录（``{账套id}/``），
+    而「一张卡被多个账套共用」的对账单**不属于任何账套** —— 放进哪个账套的
+    目录都是撒谎。单独一个 ``shared/`` 让这件事在磁盘上也看得出来。
+    """
+    path = root() / "shared"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def store_shared(container: str, data: bytes) -> str:
+    """把共享卡对账单原件落盘，返回**相对**路径（``shared/xxx.ext``）。
+
+    与 :func:`store` 同样的写盘纪律：先写临时文件再 ``os.replace``（同目录内
+    改名是原子的，不会出现「读到半个文件」）。
+
+    **文件名用 uuid 而不是临时名**：``store`` 里那句
+    ``Path(temp_name).stem.lstrip('.upload-')`` 是按**字符集**剥前缀的 ——
+    随机串里只要以 ``u``/``p``/``l``/``o``/``a``/``d``/``-`` 开头就会被吃掉
+    一截（``upload-abc`` 会变成 ``bc``）。这里不沿用那句，另起 uuid。
+    """
+    directory = shared_dir()
+    suffix = extension_for(container)
+    fd, temp_name = tempfile.mkstemp(prefix=".upload-", suffix=suffix, dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+    final_name = f"{uuid.uuid4().hex}{suffix}"
+    os.replace(temp_name, directory / final_name)
+    return f"shared/{final_name}"
 
 
 def rename_to(book_id: int, relative: str, container: str) -> str:

@@ -90,6 +90,16 @@ export function createPluginRuntime({ router, session, tabs, fetch = fetchManife
             const host = Object.freeze({ h: Vue.h, ref: Vue.ref, computed: Vue.computed, onMounted: Vue.onMounted,
               onUnmounted: Vue.onUnmounted, watch: Vue.watch, api, services: pluginServices(api),
               bookId: () => session.bookId, periodId: () => session.periodId,
+              // 当前用户是不是系统管理员。
+              //
+              // **为什么插件需要知道**：插件可以声明**全局表**（跨账套的配置），
+              // 而宿主对全局表的写入只放行管理员（`public_api.table_access`）。
+              // 插件前端据此**不给出做不到的动作**（按钮置灰 + 说清为什么），
+              // 而不是让用户点一下、再弹一句「全局配置写入需要管理员」。
+              //
+              // **这只是提示层**：真正的判据在后端 —— 插件拿到的令牌就是用户的
+              // 令牌，插件完全可以绕过这个提示直接调接口，后端照样拦。
+              isAdmin: () => Boolean(session.isAdmin ?? session.user?.is_admin),
               books: () => (session.books || []).map(book => ({
                 id: book.id, name: book.name, companyName: book.company_name,
                 status: book.status, role: book.role,

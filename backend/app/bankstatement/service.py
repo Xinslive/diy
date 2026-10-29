@@ -148,7 +148,7 @@ def _looks_cash(subject: Subject) -> bool:
 # 上传与解析
 # ----------------------------------------------------------------------
 
-def _effective_period(parsed: semantics.ParsedStatement) -> tuple[Optional[date], Optional[date]]:
+def effective_period(parsed: semantics.ParsedStatement) -> tuple[Optional[date], Optional[date]]:
     """这份对账单覆盖哪一段时间。
 
     文件自报的期间优先；文件没写就**用流水行的日期兜底** ——
@@ -709,6 +709,55 @@ def _parse_with_profile(db: Session, book_id: int, data: bytes,
     return parsed, profile
 
 
+def parse_only(db: Session, data: bytes, *,
+               column_mapping: Optional[dict[str, int]] = None) -> semantics.ParsedStatement:
+    """只解析一份对账单 —— **不落库、不查画像、不改任何宿主状态**。
+
+    这是给「**一张卡被多个账套共用**」那类场景用的：那种对账单**不属于任何
+    账套**，宿主 ``bank_statement`` 表里没有它的行，能复用的只有**解析器**
+    本身（列识别、方向判定、自检、PDF 的两路解析与 OCR 兜底）。
+
+    **口径只有一份**：这里走的就是 :func:`_parse_with_profile` 用的那套
+    ``formats`` / ``semantics`` / ``pdf_table``。差别只有两处，都是刻意的：
+
+    * **不查 ``BankStatementProfile``**：宿主画像按 ``(book_id, fingerprint)``
+      隔离，而共享卡跨账套；映射由调用方（插件）自己存、自己传进来，
+      宿主不替它管，也**不写**宿主画像表。
+    * **映射是整体替换**：传了 ``column_mapping`` 就整体替换自动映射，
+      不做逐字段合并 —— 与宿主画像的语义一致（半自动半手工的结果没人能解释）。
+
+    没有传映射时走的是与宿主上传**完全相同**的那条路：PDF 走
+    :func:`_parse_pdf` 的两路解析（文字层 + OCR 兜底 + 合并），其余容器走
+    ``semantics.parse_statement``。
+    """
+    from app.bankstatement import pdf_table
+
+    mapping: Optional[dict[str, int]] = None
+    if column_mapping is not None:
+        mapping = {str(k): int(v) for k, v in column_mapping.items()}
+    container = formats.sniff(data)
+    if container == formats.CONTAINER_PDF:
+        if mapping:
+            # 有映射时走「文字层还原 → OCR 兜底」的网格，与宿主套画像那条路
+            # 完全一致。**只有一条路**（不是两路合并）—— 映射是人工指定的，
+            # 合并两路反而会拿 OCR 的结果盖掉人指定的意思。
+            has_text = pdf_table.has_text_layer(data)
+            parsed = semantics.parse_grid(_pdf_grid(db, data), column_mapping=mapping)
+            if not has_text:
+                # 没有文字层 ⇒ 这份网格是 OCR 认出来的。用户有权知道正文
+                # 离开过本机，界面上要把这个标志显示出来。
+                parsed.via_ocr = True
+        else:
+            parsed = _parse_pdf(db, data)
+    else:
+        parsed = semantics.parse_statement(data, column_mapping=mapping)
+    if len(parsed.rows) > MAX_STATEMENT_ROWS:
+        raise ValueError(
+            f"这份对账单有 {len(parsed.rows)} 行，超过上限 {MAX_STATEMENT_ROWS} 行。"
+            "请确认传的是对账单而不是明细流水")
+    return parsed
+
+
 def _must_keep(row: BankStatementRow) -> bool:
     """这一行身上有没有**重建就丢不得**的东西。
 
@@ -857,7 +906,7 @@ def upload_statement(db: Session, book_id: int, user: SysUser, filename: str,
             f"这份对账单有 {len(parsed.rows)} 行，超过上限 {MAX_STATEMENT_ROWS} 行。"
             "请确认传的是对账单而不是明细流水")
 
-    period_start, period_end = _effective_period(parsed)
+    period_start, period_end = effective_period(parsed)
     _guard_duplicate(db, book_id, account_subject_id, period_start, period_end)
 
     relative = storage.store(book_id, container, data)
@@ -997,7 +1046,7 @@ def reparse_statement(db: Session, book_id: int, statement_id: int, *,
             "同金额、同方向的那一行。不能硬挂：挂错了等于把甲流水的金额"
             "记到乙头上。请把这份对账单删掉重新上传（原文件还在），"
             "或者先把对应的凭证删掉。")
-    period_start, period_end = _effective_period(parsed)
+    period_start, period_end = effective_period(parsed)
     # 排掉它自己：重解析的那一份当然「已经有一份」。
     _guard_duplicate(db, book_id, statement.account_subject_id,
                      period_start, period_end, exclude_id=statement.id)
