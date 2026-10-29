@@ -355,14 +355,23 @@ if [[ "$APP" != "/opt/cwq" ]]; then
     log "  ⚠️  CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 —— 放行非标准应用根 ${APP}"
     log "     nginx 的 root 写死在 /opt/cwq/frontend/dist，**不会**跟着渲染。"
     log "     请确认这台机器的 nginx 已经指向 ${APP}/frontend/dist（发布后的体检会验）。"
+    # **只给放行开关是不够的**：APP 默认是 /opt/cqw，不给 APP_DIR 的话脚本会
+    # 在第 3 步去找 /opt/cwq/backend/.env —— 找不到就中止（现网毫发无损，但
+    # 白跑一趟，而且报错那句话说的是「找不到 .env」，没指向真正的原因）。
+    if [[ -z "${APP_DIR:-}" ]]; then
+      log "     ⚠️  没给 APP_DIR —— APP 用的还是默认值 /opt/cwq。"
+      log "        本机的应用根是 ${APP}，请把 APP_DIR=${APP} 一起给上。"
+    fi
   else
     die "APP_DIR=${APP} 不是 /opt/cwq —— 拒绝发布。
      nginx 的 root 写死在 /opt/cwq/frontend/dist（deploy/nginx/*.conf），
      换根目录后 nginx 会继续服务旧目录：线上跑的是上一版前端（表现为「界面看着没变」），
      而发布**照样会打印「✅ 发布完成」**。
-     第二台机器（nginx 已按本机布局手工配好）可用
-       CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 deploy.sh
-     放行。**现网代码、前端产物与服务均未改动。**"
+     第二台机器（nginx 已按本机布局手工配好）要把**两个变量都给**：
+       APP_DIR=/本机应用根 CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 deploy.sh
+     **两个都要给**：只给放行开关的话 APP 仍然是 /opt/cwq，脚本会在第 3 步
+     找不到 .env 而中止（现网毫发无损，但白跑一趟）。
+     **现网代码、前端产物与服务均未改动。**"
   fi
 fi
 
