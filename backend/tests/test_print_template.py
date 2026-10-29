@@ -952,6 +952,68 @@ def test_合计文字可以留空():
     assert "合" not in total_row
 
 
+def _overlap_tpl(**el):
+    """合计大写浮层压在表格上的一份模板（财务把大写写进合计行的写法）。
+
+    元素 id 用设计器生成的那种随机 id —— **认的是 bind 不是 id**。
+    """
+    base = {"id": "table", "type": "table", "bind": "entries", "x": 3, "y": 23,
+            "w": 94, "h": 57}
+    cap = {"id": "el-mv6pmpr2-0", "type": "text", "bind": "capital",
+           "text": "合　计：{capital}", "x": 8.6, "y": 74.2, "w": 64, "h": 5}
+    return validate_template("VOUCHER", {"elements": [
+        {**base, **el}, {**cap, **el},
+    ]})
+
+
+def _total_row(html: str) -> str:
+    body = re.search(r"<tbody>(.*?)</tbody>", html, re.S).group(1)
+    return [r for r in body.split("<tr") if "total" in r][0]
+
+
+def test_合计大写写进表格里时合计行并格():
+    """合计大写浮层压在表格上时，借/贷方之前的那几列要并成一格。
+
+    不并格的话，表格的竖线从大写金额**中间穿过去** —— 金额被划一道，
+    财务当场就说「这笔合计数看不清」（用户 2026-10-29 批注）。
+    """
+    html = render_voucher_sheet(_overlap_tpl(), {}, [_voucher()], 1, 1)
+    row = _total_row(html)
+    # 序号 + 摘要 + 会计科目 并成一格
+    assert 'colspan="3"' in row
+    # 借方/贷方的合计数照旧分开印 —— 它们之间那道竖线正是让人分清借贷的
+    assert row.count('<td class="num">') == 2
+
+
+def test_合计大写浮层认bind不认id():
+    """设计器新建的元素 id 是随机的（el-xxxx-0），只按 id 认就认不出用户加的那个。"""
+    tpl = validate_template("VOUCHER", {"elements": [
+        {"id": "table", "type": "table", "bind": "entries", "x": 3, "y": 23, "w": 94, "h": 57},
+        {"id": "随便起的id", "type": "text", "bind": "capital", "text": "{capital}",
+         "x": 8.6, "y": 74.2, "w": 64, "h": 5},
+    ]})
+    assert 'colspan="3"' in _total_row(render_voucher_sheet(tpl, {}, [_voucher()], 1, 1))
+
+
+def test_合计大写在表格外面时合计行不并格():
+    """反向的一条：默认版式把合计大写放在表格下面一行（y=82 > 表格底边 80），
+    合计行该是什么样还是什么样，不许顺手并格。"""
+    tpl = validate_template("VOUCHER", {})      # 默认：capital 在 y=82
+    row = _total_row(render_voucher_sheet(tpl, {}, [_voucher()], 1, 1))
+    assert "colspan" not in row
+    assert "合　计" in row
+
+
+def test_合计大写浮层看不见时不并格():
+    """浮层被隐藏了就没人写大写，合计行按原样印（别并出一个空荡荡的大格）。"""
+    tpl = validate_template("VOUCHER", {"elements": [
+        {"id": "table", "type": "table", "bind": "entries", "x": 3, "y": 23, "w": 94, "h": 57},
+        {"id": "cap", "type": "text", "bind": "capital", "text": "{capital}",
+         "x": 8.6, "y": 74.2, "w": 64, "h": 5, "visible": False},
+    ]})
+    assert "colspan" not in _total_row(render_voucher_sheet(tpl, {}, [_voucher()], 1, 1))
+
+
 def test_表格默认有框线():
     tpl = validate_template("VOUCHER", {})
     table_el = next(e for e in tpl["elements"] if e["type"] == "table")

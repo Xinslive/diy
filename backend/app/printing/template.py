@@ -1541,6 +1541,15 @@ MAX_VOUCHER_ROWS = 5
 VOUCHER_HEAD_PCT = 14.0
 #: 合计行里那个标签的默认文字。老模板没有这个字段，按这个显示。
 VOUCHER_TOTAL_LABEL = "合　计"
+#: 「合计大写」这个文本元素的 **bind**。
+#:
+#: 它是**浮层**：凭证模板里每个文本元素都是画布上一个独立的框，能拖到任意位置。
+#: 默认版式把它放在表格下面一行（y=82，而表格到 y=80）；财务也常把它拖进表格的
+#: **最后一行**里 —— 「合　计：壹佰陆拾万…」写在合计行上，是记账凭证的常见写法。
+#:
+#: **按 bind 认人，不按 id**：设计器新建的元素 id 是随机的（el-xxxx-0），
+#: 认 id 就认不出用户自己加的那一个。
+CAPITAL_BIND = "capital"
 #: 拆页后的凭证号写法：{voucher_no} - {page}/{pages} → 记001号 - 001/006。
 #: 模板可以改这个格式串，占位符见 _split_number。
 SPLIT_NUMBER_FORMAT = "{voucher_no} - {page}/{pages}"
@@ -1764,10 +1773,53 @@ def _element_enabled(tpl: dict, bind: str) -> bool:
     return True
 
 
+def _element_box(el: dict) -> tuple[float, float, float, float] | None:
+    """元素的纸面框 (左, 上, 右, 下)，单位是纸宽/纸高的百分比。"""
+    try:
+        x = float(el.get("x") or 0)
+        y = float(el.get("y") or 0)
+        w = float(el.get("w") or 0)
+        h = float(el.get("h") or 0)
+    except (TypeError, ValueError):
+        return None
+    return (x, y, x + w, y + h)
+
+
+def _capital_inside_table(tpl: dict, table_el: dict | None) -> bool:
+    """合计大写这个浮层是不是写进了分录表格里（压在表格上）。
+
+    判据是**两个框相交**，不是「浮层的 y 小于表格底边」那种近似：
+    表格高度由分录行与合计行平分，合计行就在表格的最下面，
+    浮层落进那块就是写进了合计行。
+
+    坐标都是**当前槽位**的百分比，两边同一套标尺，直接比。
+    """
+    if not table_el:
+        return False
+    cap = next((e for e in (tpl.get("elements") or [])
+                if e.get("bind") == CAPITAL_BIND), None)
+    if not cap or cap.get("visible", True) is False:
+        return False
+    tb, cb = _element_box(table_el), _element_box(cap)
+    if not tb or not cb:
+        return False
+    return tb[0] < cb[2] and cb[0] < tb[2] and tb[1] < cb[3] and cb[1] < tb[3]
+
+
 def _voucher_total_row(tpl: dict, voucher: dict, el: dict | None = None) -> str:
     """合计行。借/贷方金额放在对应的列上，金额列不存在时退回旧的「倒数第三列」。
 
     「合　计」三个字由表格元素的 total_label 决定，不同模板可以写「合计」「小计」。
+
+    **合计大写写进表格里时，借/贷方之前的那几列并成一格。**
+    合计大写是浮层元素，财务把它拖到表格的最后一行（「合　计：壹佰陆拾万…」写在
+    合计行上）时，浮层文字就**盖在合计行上**。不并格的话，表格的竖线从大写金额
+    **中间穿过去** —— 金额被划一道，看着像印坏了，财务当场就要说「这笔数看不清」。
+    并成一格之后那一行里没有内部竖线了；借方/贷方两列的合计数照旧分开印
+    （它们之间那道竖线正是让人分清借贷的，不能一起去掉）。
+
+    只在**真的重叠**时才并：默认版式把合计大写放在表格下面一行（y=82 > 80），
+    那时合计行该是什么样还是什么样，不动它。
     """
     cols = tpl["columns"]
     n = len(cols)
@@ -1777,6 +1829,25 @@ def _voucher_total_row(tpl: dict, voucher: dict, el: dict | None = None) -> str:
     cr = _fmt(voucher.get("total_credit") or 0)
     label_at = dr_i - 1 if dr_i else max(0, n - 3)
     label = (el or {}).get("total_label", VOUCHER_TOTAL_LABEL)
+
+    amount_at = [i for i in (dr_i, cr_i) if i is not None]
+    if amount_at and _capital_inside_table(tpl, el):
+        split = min(amount_at)          # 借方/贷方之前的列并成一格
+        head = cols[split - 1]
+        cls = "num" if head["align"] == "right" else ("ctr" if head["align"] == "center" else "")
+        cells = [f'<td class="{cls}" colspan="{split}">{_esc(label)}</td>']
+        for i in range(split, n):
+            c = cols[i]
+            cls = "num" if c["align"] == "right" else ("ctr" if c["align"] == "center" else "")
+            if i == dr_i:
+                text = dr
+            elif i == cr_i:
+                text = cr
+            else:
+                text = ""
+            cells.append(f'<td class="{cls}">{_esc(text)}</td>')
+        return '<tr class="total">' + "".join(cells) + "</tr>"
+
     cells = []
     for i, c in enumerate(cols):
         cls = "num" if c["align"] == "right" else ("ctr" if c["align"] == "center" else "")
