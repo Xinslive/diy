@@ -35,7 +35,16 @@ DIGEST_RE = re.compile(r"[a-f0-9]{64}\Z")
 #   * ``statement:read``  —— 读该账套在宿主已绑的对账单**清单**（不含行内容），
 #     用途是**发现重复绑定**：同一张卡若已在宿主里绑过，插件再制一遍就是双重记账。
 # 两项都不写宿主数据，授权边界与 ``subject:read`` 同级。
-PERMISSIONS = frozenset({"ledger:read", "book:read", "book:write", "subject:read", "voucher:write", "plugin_data:rw", "audit:write", "settings:rw", "upload:read", "import:rw", "statement:read", "statement:parse"})
+#
+# ``entry:read`` 与 ``export:write`` 是为「**一张卡被多个账套共用**」的
+# **归属初筛**补的。那件事要回答的是「这一行流水记在哪本账上」，而唯一能
+# 回答的证据在**账上已经记过的分录**里 —— 插件读不到宿主业务表，而宿主
+# 流水对账那条线已经有一把现成的尺子（``app.bankstatement.allocate``：
+# 金额相等 + 现金侧方向对应 + 日期窗口 + 一对一分配）。``entry:read`` 把
+# **那把尺子**接到插件面上（插件给出行，宿主配好对回来），避免第二套口径。
+# ``export:write`` 是把一张表导成 Excel —— ``.xlsx`` 要 openpyxl 的写侧，
+# 而插件沙箱只放行读侧，所以由宿主生成。
+PERMISSIONS = frozenset({"ledger:read", "book:read", "book:write", "subject:read", "voucher:write", "plugin_data:rw", "audit:write", "settings:rw", "upload:read", "import:rw", "statement:read", "statement:parse", "entry:read", "export:write"})
 HOOKS = frozenset({"on_period_close"})
 ICONS = frozenset({"Calendar", "Grid", "Document", "DataAnalysis", "Tools", "Coin", "Folder"})
 

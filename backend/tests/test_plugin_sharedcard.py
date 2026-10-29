@@ -313,7 +313,9 @@ def test_插件不再声明凭证权限(shared, client, auth, db):
     assert registry is not None
     permissions = (registry.manifest_metadata or {}).get("permissions") or []
     assert "voucher:write" not in permissions, permissions
-    assert registry.version == "1.2.0", registry.version
+    # 1.3.0 起插件多了「按金额初筛」（entry:read）与「导出 Excel」（export:write）
+    # 两条权限 —— 版本号跟着走，别让它停在 1.2.0 上假装还是老插件。
+    assert registry.version == "1.3.0", registry.version
 
 
 def test_卡可以删(shared, client, auth, loaded, cash_subjects):
@@ -576,6 +578,42 @@ def test_人工指定归属后队列清空(shared, client, auth, loaded, cash_su
     detail = _json(client.get(shared + f"/statements/{stmt_id}", headers=auth))
     assert detail["assigned"] == 5
     assert detail["pending"] == 0
+
+
+def test_普通账号传的对账单进他自己的复核队列(shared, client, auth, admin_user,
+                                            plain_user, books3, cash_subjects, db):
+    """**复核队列不能只对管理员有数据**。
+
+    浏览器演练里传对账单的是**普通账号**（会计），而这一组用例原本全是管理员
+    视角 —— 管理员能访问全部账套，普通账号只能访问被授权的那几本，队列是按
+    「当前用户能访问的账套」扫出来的。两边的口径不一样，就得**两边都验**：
+    少了普通账号这一条，权限范围一旦收窄，界面就会对真正在干活的人说
+    「没有待复核的流水行」—— 而那是**谎报**：那 5 行就在那儿。
+    """
+    card_id = _card_with_members(shared, client, auth, cash_subjects)
+    for book in books3:
+        db.add(UserBook(user_id=plain_user.id, book_id=book.id, role="ACCOUNTANT"))
+    db.commit()
+    granted = client.put("/api/system/plugins/com.cwq.sharedcard/users", headers=auth,
+                         json={"user_ids": [admin_user.id, plain_user.id]})
+    assert granted.status_code == 200, granted.text
+    login = client.post("/api/auth/login",
+                        json={"username": plain_user.username, "password": "staff123"})
+    assert login.status_code == 200, login.text
+    staff = {"Authorization": "Bearer " + login.json()["access_token"]}
+
+    data = (FIXTURES / SAMPLE).read_bytes()
+    uploaded = _json(client.post(shared + f"/cards/{card_id}/statements", headers=staff,
+                                 files={"files": (SAMPLE, data, "application/octet-stream")}))
+    assert uploaded["rows"] == 5, uploaded
+
+    queue = _json(client.get(shared + "/queue", headers=staff))["queue"]
+    assert len(queue) == 1, queue
+    assert queue[0]["pending"] == 5, queue
+    assert queue[0]["card_name"] == "共享卡", queue
+    # 管理员那边也得看到同一份 —— 队列是**这张卡**的，不是某个人的。
+    admin_queue = _json(client.get(shared + "/queue", headers=auth))["queue"]
+    assert [item["statement_id"] for item in admin_queue] == [uploaded["statement_id"]]
 
 
 def _assign_all(shared, client, auth, stmt_id, book_id):
@@ -984,3 +1022,519 @@ def test_没归属的行按新解析刷新(shared, client, auth, loaded):
     # 对账单上的合计也跟着新解析走（不然表头与流水就对不上了）。
     detail = _json(client.get(shared + f"/statements/{stmt_id}", headers=auth))
     assert detail["expense_total"] == "30010749.00"
+
+
+# ---------------------------------------------------------------------------
+# 5. 按金额初筛归属（1.3.0）：拿账上已经记过的同额分录去认领流水行
+# ---------------------------------------------------------------------------
+#
+# 1.2.0 起「归属规则自动判定」整块下线了 —— 每一行都靠人工指定。1.3.0 加回来
+# 一条**窄**的路：拿**账上已经记过的同额分录**去认领流水行。三档结果：
+#
+# * **命中**（日期差在主窗口 7 天内，且**只有一本账像**）→ 自动归属，
+#   状态写成 ``PRESCREENED``（区别于人工指定的 ``ALLOCATED``）；
+# * **待复核**（两本账都像 / 金额对得上但日期差超过 7 天）→ 报给用户，
+#   **不替他定**；
+# * **没配上**（账上压根没有这笔钱）→ 留在队列里由人工指定（``unmatched``）。
+#
+# 这条路有三条不许越过的线：
+#
+# * **不盖掉人工指定的归属**（人工的决定优先）；
+# * **不抢走人工指定过的行占着的分录**（一对一 —— 宿主 ``allocate`` 那把尺子）；
+# * **只读账套接不住归属**（归属要落到那本账的表里，只读的接不住）。
+#
+# 初筛靠两条**新的宿主能力**：``ctx.entry_match``（宿主那把尺子）与
+# ``ctx.export_xlsx``（宿主生成 .xlsx）。它们按权限开关（``entry:read`` /
+# ``export:write``）—— 本插件的 manifest 已经声明了，所以真实安装路径上可用。
+
+
+@pytest.fixture
+def prescreen_ready(shared, client, auth, books3, cash_subjects):
+    """一张卡、三个成员账套、一份刚上传的对账单 —— **一行都还没归属**。
+
+    初筛**不主动跑**（用户点了才跑），所以这里停在「刚上传」这一步，
+    好让每条用例自己决定账上记了什么。
+    """
+    card_id = _card_with_members(shared, client, auth, cash_subjects)
+    data = (FIXTURES / SAMPLE).read_bytes()
+    uploaded = _json(client.post(shared + f"/cards/{card_id}/statements", headers=auth,
+                                 files={"files": (SAMPLE, data, "application/octet-stream")}))
+    assert uploaded["rows"] == 5, uploaded
+    stmt_id = uploaded["statement_id"]
+    return {"card_id": card_id, "stmt_id": stmt_id,
+            "storage_book_id": uploaded["book_id"],
+            "rows": _rows(shared, client, auth, stmt_id)}
+
+
+def _seq_row(rows, seq):
+    """按行号取一行流水（样例的行号是 1~5）。"""
+    return next(row for row in rows if int(row["seq"]) == seq)
+
+
+def _record_cash(maker, item, row, when):
+    """在某本账的**现金科目**上记一笔与某行流水同额同向的分录。
+
+    **方向是反的**：银行账 IN（收钱）= 会计现金**借方**；OUT（付钱）= 现金
+    **贷方** —— 这是宿主 ``allocate.CASH_DIRECTION`` 那张表。写反了，初筛
+    永远配不上（而且症状很像「账上压根没记」）。
+    """
+    value = Decimal(str(row["amount"]))
+    if row["direction"] == "IN":
+        return maker(when, dr=[(item["cash"].code, value, "记卡上的收款")],
+                     cr=[(item["counter"].code, value, "记卡上的收款")])
+    assert row["direction"] == "OUT", row
+    return maker(when, dr=[(item["counter"].code, value, "记卡上的支出")],
+                 cr=[(item["cash"].code, value, "记卡上的支出")])
+
+
+def test_账上同额分录命中_自动归属(shared, client, auth, db, admin_user,
+                                   prescreen_ready, cash_subjects):
+    """一笔 750 的支出已经记在第一本账的银行存款上 → 这一行就归第一本账。
+
+    这是「按金额初筛」唯一敢自动落库的一档：**证据是账本身**，不是猜。
+    而且落库的归属状态是 ``PRESCREENED`` —— 一眼能看出它是机器认领的，
+    不是人指定的（撤销时也只撤这一种）。
+    """
+    stmt_id = prescreen_ready["stmt_id"]
+    row = _seq_row(prescreen_ready["rows"], 4)          # 750.00 / OUT / 2026-09-14
+    item = cash_subjects[0]
+    maker = build_voucher_factory(db, item["book"], admin_user)
+    voucher = _record_cash(maker, item, row, "2026-09-14")   # 同日、同额、同向
+
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    assert body["assigned"] == 1, body
+    assert body["review"] == 0, body
+    assert body["unmatched"] == 4, body
+    assert isinstance(body["note"], str)
+
+    rows = _rows(shared, client, auth, stmt_id)
+    hit = _seq_row(rows, 4)
+    assert hit["alloc"] is not None
+    assert hit["alloc"]["book_id"] == item["book"].id
+    assert hit["alloc"]["status"] == "PRESCREENED"
+    # 归属依据里带着**证据**（哪张凭证、差几天）—— 不是一句「自动」。
+    assert "初筛" in hit["alloc"]["reason"]
+    assert voucher.voucher_no in hit["alloc"]["reason"]
+    # 其余四行**一行都没被动过**。
+    assert [row_item["alloc"] for row_item in rows if int(row_item["seq"]) != 4] == [None] * 4
+
+
+def test_两本账都有同额分录_不自动归属_报出来待复核(shared, client, auth, db, admin_user,
+                                                   prescreen_ready, cash_subjects):
+    """两本账上都有同额同向的分录 → **不替他定**，报给用户去判。
+
+    这正是「初筛」与「规则自动判定」的分界：规则是猜，账上的分录是证据 ——
+    但**两份证据打架**时就没有证据了，只能问人。
+    """
+    stmt_id = prescreen_ready["stmt_id"]
+    row = _seq_row(prescreen_ready["rows"], 4)          # 750.00 / OUT / 2026-09-14
+    for item in cash_subjects[:2]:
+        maker = build_voucher_factory(db, item["book"], admin_user)
+        _record_cash(maker, item, row, "2026-09-14")
+
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    assert body["assigned"] == 0, body
+    assert body["review"] == 1, body
+    assert body["unmatched"] == 4, body
+    assert len(body["review_rows"]) == 1, body
+
+    review = body["review_rows"][0]
+    assert review["row_id"] == row["id"]
+    assert review["seq"] == 4
+    assert review["tx_date"] == "2026-09-14"
+    assert review["amount"] == "750.00"
+    assert review["direction"] == "OUT"
+    assert "同额" in review["why"], review["why"]
+    # 候选：两本账、两张凭证，日期差都在主窗口内。
+    assert len(review["candidates"]) == 2, review["candidates"]
+    assert {item["book_id"] for item in review["candidates"]} == {
+        cash_subjects[0]["book"].id, cash_subjects[1]["book"].id}
+    assert all(item["in_primary"] for item in review["candidates"])
+    assert all(item["days_diff"] == 0 for item in review["candidates"])
+    assert all(item["amount"] == "750.00" for item in review["candidates"])
+    # **没有自动归属**：这一行还空着，等人定。
+    assert _seq_row(_rows(shared, client, auth, stmt_id), 4)["alloc"] is None
+
+
+def test_日期差超过7天_待复核而不是自动归属(shared, client, auth, db, admin_user,
+                                            prescreen_ready, cash_subjects):
+    """金额对得上、日期差 11 天（还在 30 天窗口内）→ **待复核**，不自动归属。
+
+    7 天是宿主那条线的「已入账」窗口（``allocate.PRIMARY_WINDOW_DAYS``）——
+    差得更多就不一定是同一笔了，替用户认定「差 11 天也是同一笔」就是替他记账。
+    """
+    stmt_id = prescreen_ready["stmt_id"]
+    row = _seq_row(prescreen_ready["rows"], 5)          # 7401.00 / IN / 2026-09-21
+    item = cash_subjects[0]
+    maker = build_voucher_factory(db, item["book"], admin_user)
+    _record_cash(maker, item, row, "2026-09-10")        # 差 11 天
+
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    assert body["assigned"] == 0, body
+    assert body["review"] == 1, body
+    assert body["unmatched"] == 4, body
+
+    review = body["review_rows"][0]
+    assert review["row_id"] == row["id"]
+    assert "日期差" in review["why"], review["why"]
+    assert len(review["candidates"]) == 1, review["candidates"]
+    candidate = review["candidates"][0]
+    assert candidate["days_diff"] == 11
+    assert candidate["in_primary"] is False
+    # **没有自动归属**。
+    assert _seq_row(_rows(shared, client, auth, stmt_id), 5)["alloc"] is None
+
+
+def test_账上没有这笔钱_不归属_计入未匹配(shared, client, auth, prescreen_ready):
+    """账上压根没有这笔钱 → 不归属，计入 ``unmatched``（留在队列里等人工指定）。
+
+    **不能算「待复核」**：没有候选就没有「疑似」可言 —— 报一条疑似出来，
+    只会让用户去翻一个根本不存在的东西。
+    """
+    stmt_id = prescreen_ready["stmt_id"]
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    assert body["assigned"] == 0, body
+    assert body["review"] == 0, body
+    assert body["unmatched"] == 5, body
+    assert body["review_rows"] == [], body
+    rows = _rows(shared, client, auth, stmt_id)
+    assert all(row["alloc"] is None for row in rows)
+
+
+def test_初筛不覆盖人工指定的归属(shared, client, auth, db, admin_user,
+                                  prescreen_ready, cash_subjects):
+    """人工指定过的行**原样保留** —— 初筛只动还没归属的行。
+
+    这里故意在**另一本账**上放一笔同额同向的分录：初筛要是敢覆盖人工指定的
+    归属，钱就会被挪到另一本账上 —— 那是「猜」盖过「人做的决定」。
+    """
+    stmt_id = prescreen_ready["stmt_id"]
+    manual = _seq_row(prescreen_ready["rows"], 2)       # 100000000.00 / IN / 2026-09-14
+    body = _json(client.post(shared + f"/statements/{stmt_id}/assign", headers=auth, json={
+        "rows": [manual["id"]], "book_id": cash_subjects[1]["book"].id,
+        "reason": "人工指定：丙供应链"}))
+    assert body["assigned"] == 1
+
+    item = cash_subjects[0]
+    maker = build_voucher_factory(db, item["book"], admin_user)
+    _record_cash(maker, item, manual, "2026-09-16")     # 第一本账上也有同额同向
+
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    # 这一行已经归属了 → 不在待初筛的行里，也就不该被任何一方改写。
+    assert body["assigned"] == 0, body
+    assert body["review"] == 0, body
+    assert body["unmatched"] == 4, body
+
+    after = _seq_row(_rows(shared, client, auth, stmt_id), 2)
+    assert after["alloc"]["status"] == "ALLOCATED"
+    assert after["alloc"]["book_id"] == cash_subjects[1]["book"].id
+    assert after["alloc"]["reason"] == "人工指定：丙供应链"
+
+
+def _make_row1_same_amount_as_row4(sheet):
+    """把第 1 行流水的金额改成 750 —— 与第 4 行**同额同向**。
+
+    两行同额才谈得上「抢」：同一笔分录能同时像两行，一对一分配才有得争。
+    """
+    sheet.cell(row=19, column=3).value = 750
+
+
+def test_人工指定过的行占着的分录不会被别的行抢走(shared, client, auth, db, admin_user,
+                                                  books3, cash_subjects):
+    """**一对一**：人工指定过的那一行占着的分录，别的行不许抢。
+
+    一笔账就是一笔钱。对账单上两行同额同向时，账上那一笔只配其中一行 ——
+    配错了等于「甲流水的钱记到了乙头上」。
+
+    这里把样例第 1 行的金额改成 750（与第 4 行同额同向），再：
+    第 1 行人工指定给第一本账；第一本账上有一笔 750 的分录（贴着第 1 行）。
+    若初筛只把**没归属的行**拿去配对，第 4 行就会抢走那笔分录、被自动归属；
+    正确做法是这一笔分录归第 1 行（它在配对集合里），第 4 行**配不上**。
+    """
+    card_id = _card_with_members(shared, client, auth, cash_subjects)
+    data = _sample_bytes(_make_row1_same_amount_as_row4)
+    uploaded = _json(client.post(shared + f"/cards/{card_id}/statements", headers=auth,
+                                 files={"files": (SAMPLE, data, "application/octet-stream")}))
+    assert uploaded["rows"] == 5, uploaded
+    stmt_id = uploaded["statement_id"]
+    rows = _rows(shared, client, auth, stmt_id)
+    first = _seq_row(rows, 1)
+    fourth = _seq_row(rows, 4)
+    assert first["amount"] == fourth["amount"] == "750.00", (first, fourth)
+    assert first["direction"] == fourth["direction"] == "OUT"
+
+    # 第 1 行人工指定给第一本账。
+    _json(client.post(shared + f"/statements/{stmt_id}/assign", headers=auth, json={
+        "rows": [first["id"]], "book_id": cash_subjects[0]["book"].id,
+        "reason": "人工指定：乙实业"}))
+
+    # 第一本账上记一笔 750 的分录，贴着第 1 行（差 0 天；离第 4 行差 2 天）。
+    item = cash_subjects[0]
+    maker = build_voucher_factory(db, item["book"], admin_user)
+    _record_cash(maker, item, first, "2026-09-12")
+
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    assert body["assigned"] == 0, body
+    assert body["review"] == 0, body
+    assert body["unmatched"] == 4, body
+    after = _rows(shared, client, auth, stmt_id)
+    # **分录没被抢走**：第 4 行配不上，仍然空着（而不是被自动归属给第一本账）。
+    assert _seq_row(after, 4)["alloc"] is None, \
+        "人工指定过的行占着的分录被别的行抢走了"
+    # 人工指定的那一行原样保留。
+    kept = _seq_row(after, 1)
+    assert kept["alloc"]["status"] == "ALLOCATED"
+    assert kept["alloc"]["book_id"] == cash_subjects[0]["book"].id
+    assert kept["alloc"]["reason"] == "人工指定：乙实业"
+
+
+def test_撤销初筛只撤机器认领的行(shared, client, auth, db, admin_user,
+                                   prescreen_ready, cash_subjects):
+    """撤销**只撤初筛**：人工指定的归属原样保留。
+
+    初筛是机器按证据认领的 —— 认错了用户要有退路，而且是一键退路；
+    但退路只该退掉机器做的那部分，人自己指定的不该被顺带抹掉。
+    """
+    stmt_id = prescreen_ready["stmt_id"]
+    manual = _seq_row(prescreen_ready["rows"], 2)
+    _json(client.post(shared + f"/statements/{stmt_id}/assign", headers=auth, json={
+        "rows": [manual["id"]], "book_id": cash_subjects[1]["book"].id,
+        "reason": "人工指定：丙供应链"}))
+    hit_row = _seq_row(prescreen_ready["rows"], 4)
+    item = cash_subjects[0]
+    maker = build_voucher_factory(db, item["book"], admin_user)
+    _record_cash(maker, item, hit_row, "2026-09-14")
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    assert body["assigned"] == 1, body
+
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen/undo", headers=auth))
+    assert body["removed"] == 1, body
+    rows = _rows(shared, client, auth, stmt_id)
+    # 初筛认领的那一行回到「还没归属」。
+    assert _seq_row(rows, 4)["alloc"] is None
+    # 人工指定的那一行**原样保留**。
+    kept = _seq_row(rows, 2)
+    assert kept["alloc"]["status"] == "ALLOCATED"
+    assert kept["alloc"]["book_id"] == cash_subjects[1]["book"].id
+    assert kept["alloc"]["reason"] == "人工指定：丙供应链"
+    # 再撤一次：已经没有初筛的行可撤了（幂等，不报错）。
+    again = _json(client.post(shared + f"/statements/{stmt_id}/prescreen/undo", headers=auth))
+    assert again["removed"] == 0, again
+
+
+def test_导出是能打开的xlsx_金额列是数字(shared, client, auth, db, admin_user,
+                                          prescreen_ready, cash_subjects):
+    """导出是给**出纳**填的表：能打开、金额能直接求和、两列留空给它填。
+
+    * 表头得说清每列是干什么的（「归属账套」「归属依据」「初筛候选（疑似）」
+      「待出纳确认」「备注」）；
+    * 行数与流水行数一致；
+    * **金额列给数字，不给字符串** —— 出纳要拿它求和，给文本他就得先改格式。
+    """
+    import base64
+    import io
+
+    import openpyxl
+
+    stmt_id = prescreen_ready["stmt_id"]
+    hit_row = _seq_row(prescreen_ready["rows"], 4)      # 750.00 / OUT / 2026-09-14
+    review_row = _seq_row(prescreen_ready["rows"], 5)   # 7401.00 / IN / 2026-09-21
+    item = cash_subjects[0]
+    maker = build_voucher_factory(db, item["book"], admin_user)
+    _record_cash(maker, item, hit_row, "2026-09-14")
+    # 另一行：金额对得上但日期差 11 天 → 初筛不认领它，只是「疑似」。
+    _record_cash(maker, item, review_row, "2026-09-10")
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    assert body["assigned"] == 1 and body["review"] == 1, body
+
+    export = _json(client.get(shared + f"/statements/{stmt_id}/export", headers=auth))
+    assert export["filename"].endswith(".xlsx"), export["filename"]
+    raw = base64.b64decode(export["content_base64"])
+    workbook = openpyxl.load_workbook(io.BytesIO(raw))
+    sheet = workbook.active
+    titles = [cell.value for cell in sheet[1]]
+    for want in ("归属账套", "归属依据", "初筛候选（疑似）", "待出纳确认", "备注"):
+        assert want in titles, titles
+    # 行数 = 表头 + 5 行流水。
+    assert sheet.max_row == 6, sheet.max_row
+
+    # 金额列是**数字**。
+    amount_col = titles.index("金额") + 1
+    amounts = [sheet.cell(row=r, column=amount_col).value for r in range(2, 7)]
+    assert all(isinstance(value, (int, float)) for value in amounts), amounts
+    expected = sum(Decimal(row["amount"]) for row in prescreen_ready["rows"])
+    assert sum(Decimal(str(value)) for value in amounts) == expected, amounts
+
+    # 归属账套 / 归属依据：认领到的那一行有，其余行空着。
+    book_col = titles.index("归属账套") + 1
+    reason_col = titles.index("归属依据") + 1
+    hint_col = titles.index("初筛候选（疑似）") + 1
+    confirm_col = titles.index("待出纳确认") + 1
+    note_col = titles.index("备注") + 1
+    assert sheet.cell(row=5, column=book_col).value == cash_subjects[0]["book"].name
+    assert "初筛" in str(sheet.cell(row=5, column=reason_col).value)
+    assert sheet.cell(row=2, column=book_col).value in (None, "")
+    # 待复核的那一行：**没有归属，但有疑似候选**。
+    assert sheet.cell(row=6, column=book_col).value in (None, "")
+    hint = str(sheet.cell(row=6, column=hint_col).value)
+    assert cash_subjects[0]["book"].name in hint, hint
+    assert "11 天" in hint, hint
+    # 「待出纳确认」「备注」两列**留空**给出纳填。
+    for row in range(2, 7):
+        assert sheet.cell(row=row, column=confirm_col).value in (None, "")
+        assert sheet.cell(row=row, column=note_col).value in (None, "")
+
+
+def test_对账单详情带出这张卡的成员账套(shared, client, auth, prescreen_ready,
+                                        cash_subjects):
+    """详情里带上**这张卡的成员账套**（含各本账的现金科目）。
+
+    「归属到哪本账」的选项得是「做得到的事」—— 只能列这张卡登记在名下的
+    账套，且每本账带上它自己的现金科目编码。
+    """
+    stmt_id = prescreen_ready["stmt_id"]
+    detail = _json(client.get(shared + f"/statements/{stmt_id}", headers=auth))
+    members = detail["members"]
+    assert len(members) == 3, members
+    assert {item["book_id"] for item in members} == {
+        item["book"].id for item in cash_subjects}
+    for member in members:
+        assert member["book_name"]
+        assert member["subject_code"] in (
+            "100203", "100206", "100101"), member
+        assert member["subject_name"]
+        assert member["can_write"] is True
+
+
+# ---------------------------------------------------------------------------
+# 6. 反向测试：闸门得有牙（**不该发生的事真的没发生**）
+# ---------------------------------------------------------------------------
+
+
+def test_日期差超过30天_连候选都不该有(shared, client, auth, db, admin_user,
+                                         prescreen_ready, cash_subjects):
+    """差 32 天（超出 30 天窗口）→ **连候选都不该有**，落进 ``unmatched``。
+
+    这一条比「不自动归属」更严：出现在待复核里也不行 —— 那会把用户引到
+    一个根本不是同一笔的记录上（每月固定金额的房租、货款最容易撞）。
+
+    **带一个对照组**：同样在 2026-08-20 记账，另一行（差 23 天）**能**配上
+    候选。所以挡掉差 32 天那笔的正是宿主那把尺子的 30 天上限，而不是
+    「压根没查到那一段日期」。
+    """
+    stmt_id = prescreen_ready["stmt_id"]
+    near = _seq_row(prescreen_ready["rows"], 1)         # 9780.00 / OUT / 2026-09-12
+    far = _seq_row(prescreen_ready["rows"], 5)          # 7401.00 / IN / 2026-09-21
+    item = cash_subjects[0]
+    maker = build_voucher_factory(db, item["book"], admin_user)
+    _record_cash(maker, item, near, "2026-08-20")        # 差 23 天 → 是候选
+    _record_cash(maker, item, far, "2026-08-20")         # 差 32 天 → 不是候选
+
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    assert body["assigned"] == 0, body
+    assert body["review"] == 1, body
+    assert body["unmatched"] == 4, body
+    # 待复核的**只有**差 23 天那行；差 32 天那行连候选都没有。
+    assert [item["row_id"] for item in body["review_rows"]] == [near["id"]], body
+    candidate = body["review_rows"][0]["candidates"][0]
+    assert candidate["days_diff"] == 23
+    assert candidate["in_primary"] is False
+    rows = _rows(shared, client, auth, stmt_id)
+    assert _seq_row(rows, 5)["alloc"] is None
+    assert _seq_row(rows, 1)["alloc"] is None
+
+
+def test_只读的账套不能接收初筛归属(shared, client, auth, db, admin_user,
+                                     prescreen_ready, cash_subjects):
+    """成员账套变成只读之后 → 初筛**不能**往它那儿归属。
+
+    只读的账套接不住归属（人工指定时也是这么挡的）。但它账上的分录**照样是
+    证据** —— 所以那一行**进待复核**（唯一像的那本账是只读的，归属落不进去），
+    **不是**被静悄悄地归到别的账去，也不是当没这回事。
+
+    曾经这里是「连候选都不问」：只读书的证据被藏起来，于是剩下的那份证据成了
+    「唯一」证据，行就被自动归走了。那正是「初筛不猜错」这条主线要避免的事。
+
+    这本账是「登记成成员之后才被降成只读的」—— 成员登记时是可写的，
+    这才造得出「只读的成员账套」这个状态。
+    """
+    stmt_id = prescreen_ready["stmt_id"]
+    # 选一本**不是**存放对账单那本账的成员账套（存放位置由后端挑，随机）。
+    readonly_item = next(item for item in cash_subjects
+                         if item["book"].id != prescreen_ready["storage_book_id"])
+    row = _seq_row(prescreen_ready["rows"], 4)
+    maker = build_voucher_factory(db, readonly_item["book"], admin_user)
+    _record_cash(maker, readonly_item, row, "2026-09-14")
+
+    # 把它降成只读。
+    link = db.scalar(select(UserBook).where(
+        UserBook.book_id == readonly_item["book"].id,
+        UserBook.user_id == admin_user.id))
+    assert link is not None
+    link.role = "VIEWER"
+    db.commit()
+
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    # **一行都没被自动归属** —— 唯一像的那本账是只读的。
+    assert body["assigned"] == 0, body
+    # 那一行**进待复核**，证据摆出来（只读那本 + 凭证号）。
+    assert body["review"] == 1, body
+    review = next(item for item in body["review_rows"] if item["row_id"] == row["id"])
+    assert [item["book_id"] for item in review["candidates"]] == [readonly_item["book"].id], review
+    assert review["candidates"][0]["can_write"] is False, review
+    assert "只读" in review["why"], review
+    rows = _rows(shared, client, auth, stmt_id)
+    assert all(item["alloc"] is None for item in rows)
+    assert not any(item["alloc"] and item["alloc"]["book_id"] == readonly_item["book"].id
+                   for item in rows)
+    # 详情里也要标出它现在是只读的（界面上就不该把它列成能归属的账套）。
+    detail = _json(client.get(shared + f"/statements/{stmt_id}", headers=auth))
+    readonly = next(item for item in detail["members"]
+                    if item["book_id"] == readonly_item["book"].id)
+    assert readonly["can_write"] is False, readonly
+
+
+def test_只读书上的证据照样参与_行进待复核而不是被静悄悄归走(shared, client, auth, db, admin_user,
+                                                        prescreen_ready, cash_subjects):
+    """只读成员账套**不能接收归属**，但它账上的分录**照样是证据**。
+
+    这里那笔 750 的分录有两份：一份在只读账上，一份在可写账上。
+
+    曾经只读书被**整本跳过**（问都不问）—— 它的证据被藏起来，于是可写账那份
+    成了「唯一」的强候选，那一行被**静悄悄地归到了可写账**，而它真正的来处是
+    那本只读的账。那正是「初筛不猜错」这条主线要避免的事。
+
+    现在的口径：**证据照常收，归属落不到只读账套那儿** → 这一行进**待复核**，
+    两个候选都摆出来，由人定。
+    """
+    stmt_id = prescreen_ready["stmt_id"]
+    readonly_item = next(item for item in cash_subjects
+                         if item["book"].id != prescreen_ready["storage_book_id"])
+    writable_item = next(item for item in cash_subjects
+                         if item["book"].id != readonly_item["book"].id)
+    row = _seq_row(prescreen_ready["rows"], 4)          # 750.00 / OUT / 2026-09-14
+    # 两本账上各有一笔 750 的分录。
+    for item in (readonly_item, writable_item):
+        maker = build_voucher_factory(db, item["book"], admin_user)
+        _record_cash(maker, item, row, "2026-09-14")
+    # 把只读那本降成只读。
+    link = db.scalar(select(UserBook).where(
+        UserBook.book_id == readonly_item["book"].id,
+        UserBook.user_id == admin_user.id))
+    assert link is not None
+    link.role = "VIEWER"
+    db.commit()
+
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    # **不许自动归属**：两份证据都在，两个候选都摆出来让人判。
+    assert body["assigned"] == 0, body
+    assert body["review"] == 1, body
+    review = next(item for item in body["review_rows"] if item["row_id"] == row["id"])
+    assert {item["book_id"] for item in review["candidates"]} == {
+        readonly_item["book"].id, writable_item["book"].id}, review
+    # 只读那本**不接收归属**（人工指定时也是这么挡的），但它的证据仍然摆出来。
+    readonly_candidate = next(item for item in review["candidates"]
+                              if item["book_id"] == readonly_item["book"].id)
+    assert readonly_candidate["can_write"] is False, review
+    after = _seq_row(_rows(shared, client, auth, stmt_id), 4)
+    assert after["alloc"] is None, after

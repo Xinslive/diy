@@ -75,6 +75,33 @@ def main():
         other_id = make_book('切换演练账套', 1)
         sharedcard_book_id = make_book('共享卡演练账套甲', 2)
         sharedcard_other_id = make_book('共享卡演练账套乙', 3)
+
+        # 共享卡演练账套甲**先记一笔**：2026-09-12 代扣个人所得税 9,780
+        # （贷 1002 银行存款）。
+        #
+        # **这一笔是「按金额初筛」的靶子**：金额、方向、日期都对着对账单里
+        # 那一行（2026-09-12 支出 9,780），账上真的记过，初筛才认领得了它。
+        # 没有它，初筛只能验到「认领不��」—— 那验证不了任何东西。
+        #
+        # **为什么记在甲**：核对页断言的是「各账套加起来」，多一笔凭证就让
+        # 「少记」少一笔 —— 这正是要的：这一行账上已经记过，就不该再算少记。
+        from datetime import date as _date
+        from sqlalchemy import select as _select
+        from app.accounting.vouchers import create_voucher
+        from app.models.accounting import Subject
+        _subs = {s.code: s for s in db.scalars(_select(Subject).where(
+            Subject.book_id == sharedcard_book_id, Subject.year == 2026)).all()}
+        create_voucher(
+            db, book_id=sharedcard_book_id, user=next(u for u in users if u.is_admin),
+            voucher_date=_date(2026, 9, 12),
+            entries=[
+                {"subject_id": _subs['222112'].id, "amount": "9780.00",
+                 "summary": "代扣个人所得税", "direction": "DEBIT"},
+                {"subject_id": _subs['1002'].id, "amount": "9780.00",
+                 "summary": "代扣个人所得税", "direction": "CREDIT"},
+            ],
+            source='MANUAL', remark='共享卡浏览器演练种子', commit=False,
+        )
     processes, handles = [], []
     with tempfile.TemporaryDirectory(prefix='cwq-plugin-browser-') as tmp:
         temporary = Path(tmp)

@@ -124,11 +124,41 @@ async function sharedcardScenario({ admin, staff, state, sharedcard }) {
     assert.equal(await waitMetric('待复核', '5'), '待复核5')
     await waitUnassignedRows(5)
 
+    // ⑥-0a **复核队列那一屏也看一眼**（用户批注过它的排版：长文件名与
+    //     期间挤在一格里，整行是歪的）。截图留在 output/playwright 下。
+    //
+    //     **把 /queue 的响应人为拖慢**：这一屏的坑在于「重读在途时沿用了上
+    //     一次的结论」—— 上一趟读到的是空，这一趟其实有 5 行待归属，界面却
+    //     说「每一行都已经归到账套了」。那窗口只有几十毫秒，不拖慢就抓不住。
+    let slowQueue = true
+    await staff.page.route('**/api/plugins/com.cwq.sharedcard/queue', async route => {
+      if (slowQueue) await new Promise(resolve => setTimeout(resolve, 1200))
+      await route.continue()
+    })
+    await stmtPane.getByRole('button', { name: '返回', exact: true }).click()
+    await staff.page.getByTestId('sc-cards').waitFor()
+    await sc.getByRole('button', { name: /复核队列/ }).click()
+    await staff.page.getByTestId('sc-queue').waitFor()
+    // 在途窗口里**不许**出现「没有待复核的流水行」—— 那是上一次的结论。
+    assert.equal(
+      await staff.page.getByText('没有待复核的流水行').count(), 0,
+      '复核队列在重读在途时说了「没有待复核的流水行」—— 把没读完的数说成读过了')
+    await staff.page.locator('[data-testid="sc-queue"] .sc-tr')
+      .filter({ hasText: 'cmbc_xlsx.xlsx' }).waitFor()
+    slowQueue = false
+    const queueRow = staff.page.locator('[data-testid="sc-queue"] .sc-tr')
+      .filter({ hasText: 'cmbc_xlsx.xlsx' })
+    assert.equal(await queueRow.count(), 1)
+    const queueText = (await queueRow.innerText()).replace(/\s+/g, '')
+    assert.match(queueText, /5行/, '复核队列那一行没显示待归属的行数：' + queueText)
+    assert.match(queueText, /浏览器演练共享卡/, '复核队列没显示共享卡名：' + queueText)
+    await staff.page.screenshot({ path: fileURLToPath(new URL('plugin-sharedcard-queue.png', output)), fullPage: true })
+    await sc.getByRole('button', { name: '共享卡', exact: true }).click()
+    await staff.page.getByTestId('sc-cards').waitFor()
+
     // ⑥-0 **一行都还没归属时**，核对页不能说「对得上、没有少记」——
     //    没比过的数不能说成比过了。两处文案都要带限定：合计卡上的提示，
     //    和「谁少记了」那块空态。
-    await stmtPane.getByRole('button', { name: '返回', exact: true }).click()
-    await staff.page.getByTestId('sc-cards').waitFor()
     await sc.locator('.sc-card-click').filter({ hasText: '浏览器演练共享卡' }).click()
     await detail.getByRole('button', { name: '余额核对', exact: true }).click()
     await detail.getByRole('button', { name: '核对余额', exact: true }).click()
@@ -150,24 +180,51 @@ async function sharedcardScenario({ admin, staff, state, sharedcard }) {
     assert.equal(await waitMetric('待复核', '5'), '待复核5')
     await waitUnassignedRows(5)
 
+    // ⑥-初 「按金额初筛」（1.3.0 起）：账上**已经记过**的那一笔会被认领 ——
+    //    初筛看的是账本身，不是猜。种子在账套甲记了 2026-09-12 代扣
+    //    个人所得税 9,780（贷 1002），对账单上正好有同额同向同日期的一行。
+    await stmtPane.getByRole('button', { name: '按金额初筛', exact: true }).click()
+    await stmtPane.locator('.sc-notice').filter({ hasText: '初筛完成' }).waitFor()
+    assert.equal(await waitMetric('已归属', '1'), '已归属1')
+    assert.equal(await waitMetric('待复核', '4'), '待复核4')
+    await waitUnassignedRows(4)
+    // 认领到的那一行标着「初筛」，与人工指定的「已归属」分得开。
+    const screened = stmtPane.locator('.sc-tr').filter({ hasText: '个人所得税' })
+    assert.equal(await screened.count(), 1)
+    assert.match((await screened.innerText()).replace(/\s+/g, ''), /甲（初筛）/)
+
+    // ⑥-初b **归属下拉只列这张卡的成员账套** —— 列全部账套，用户就会挑一个
+    //       根本不属于这张卡的账套，然后被后端一句「这张卡还没有登记在账套
+    //       X 名下」顶回来。选项本来就该是**做得成的事**。
+    const assignCombo = stmtPane.getByRole('combobox', { name: '人工归到', exact: true })
+    assert.deepEqual((await assignCombo.locator('option').allInnerTexts()).map(t => t.trim()),
+      ['请选择账套', '共享卡演练账套甲', '共享卡演练账套乙'])
+
+    // ⑥-导 **导出 Excel**：真的下载一个 .xlsx（人工复核完拿去问出纳）。
+    const [download] = await Promise.all([
+      staff.page.waitForEvent('download'),
+      stmtPane.getByRole('button', { name: '导出 Excel', exact: true }).click(),
+    ])
+    assert.match(download.suggestedFilename(), /\.xlsx$/)
+
     // ⑥-1 「丁物业管理」那一笔归到**第二本账**（它就是那本账的往来款）。
     const dingRow = stmtPane.locator('.sc-tr').filter({ hasText: '丁物业管理' })
     assert.equal(await dingRow.count(), 1)
     await dingRow.locator('input[type=checkbox]').check()
     await stmtPane.getByRole('combobox', { name: '人工归到', exact: true }).selectOption(String(state.sharedcardOtherBookId))
     await stmtPane.getByRole('button', { name: '指定归属', exact: true }).click()
-    assert.equal(await waitMetric('已归属', '1'), '已归属1')
-    assert.equal(await waitMetric('待复核', '4'), '待复核4')
-    await waitUnassignedRows(4)
+    assert.equal(await waitMetric('已归属', '2'), '已归属2')
+    assert.equal(await waitMetric('待复核', '3'), '待复核3')
+    await waitUnassignedRows(3)
 
-    // ⑥-2 其余 4 行归到第一本账
+    // ⑥-2 其余 3 行归到第一本账（初筛认领的那一行不用管）
     const pending = stmtPane.locator('.sc-tr').filter({ hasText: '未归属' })
     const pendingCount = await pending.count()
-    assert.equal(pendingCount, 4)
+    assert.equal(pendingCount, 3)
     for (let index = 0; index < pendingCount; index++) {
       await pending.nth(index).locator('input[type=checkbox]').check()
     }
-    await stmtPane.locator('.sc-toolbar-inset').filter({ hasText: '已勾选 4 行' }).waitFor()
+    await stmtPane.locator('.sc-toolbar-inset').filter({ hasText: '已勾选 3 行' }).waitFor()
     await stmtPane.getByRole('combobox', { name: '人工归到', exact: true }).selectOption(String(state.sharedcardBookId))
     await stmtPane.getByRole('button', { name: '指定归属', exact: true }).click()
     assert.equal(await waitMetric('待复核', '0'), '待复核0')
@@ -178,9 +235,10 @@ async function sharedcardScenario({ admin, staff, state, sharedcard }) {
     await staff.page.screenshot({ path: fileURLToPath(new URL('plugin-sharedcard-rows.png', output)), fullPage: true })
 
     // ⑧ 卡级余额核对：**各账套该科目的本期发生额 vs 该记的收款/支出**。
-    //    演练里两本账都**没有记过凭证** —— 所以账上一分没动，
-    //    「少记」就等于各自该记的金额：第一本账
-    //    收款 100,007,401 + 支出 10,530，第二本账支出 30,000,000。
+    //    账套甲上**记过一笔**（种子里那笔代扣个人所得税 9,780，贷 1002）——
+    //    它正是「按金额初筛」认领掉的那一行，所以这一行**不再算少记**：
+    //    甲的少记从 100,017,931.00 变成 100,008,151.00（少掉的是那笔
+    //    9,780 的支出）。乙那本账上一分钱没记，少记仍是全额。
     await stmtPane.getByRole('button', { name: '返回', exact: true }).click()
     await staff.page.getByTestId('sc-cards').waitFor()
     await sc.locator('.sc-card-click').filter({ hasText: '浏览器演练共享卡' }).click()
@@ -191,14 +249,14 @@ async function sharedcardScenario({ admin, staff, state, sharedcard }) {
       await item.waitFor()
       return (await item.innerText()).replace(/\s+/g, '')
     }
-    assert.equal(await kv('各账套该科目本期发生额'), '各账套该科目本期发生额借0.00/贷0.00')
+    assert.equal(await kv('各账套该科目本期发生额'), '各账套该科目本期发生额借0.00/贷9,780.00')
     assert.equal(await kv('对账单该记的'), '对账单该记的借100,007,401.00/贷30,010,530.00')
     assert.equal(await kv('还没归属'), '还没归属（0行）收0.00/付0.00')
     // 「谁少记了」要**点名**。
     const shortCard = detail.locator('.sc-card').filter({ hasText: '谁少记了' }).first()
     await shortCard.waitFor()
     const shortText = (await shortCard.innerText()).replace(/\s+/g, '')
-    assert.match(shortText, /共享卡演练账套甲.*少记100,017,931\.00/)
+    assert.match(shortText, /共享卡演练账套甲.*少记100,008,151\.00/)
     assert.match(shortText, /共享卡演练账套乙.*少记30,000,000\.00/)
     await staff.page.screenshot({ path: fileURLToPath(new URL('plugin-sharedcard-balance.png', output)), fullPage: true })
     console.log('PASS shared card: one statement across two books, all rows allocated by hand, card-level reconciliation (no rules, no vouchers)')

@@ -1,6 +1,6 @@
 # Manifest、权限与运行时参考
 
-本页是插件开发时需要反复查阅的契约。当前版本为 **SDK 1.2.0 / CWP 1**；示例包中的 `plugin.json`、后端入口、迁移和前端入口可以直接作为最小模板。SDK 1.1.x 插件仍可继续运行，使用定时任务时，`api_version` 范围必须包含 1.2.0。
+本页是插件开发时需要反复查阅的契约。当前版本为 **SDK 1.3.0 / CWP 1**；示例包中的 `plugin.json`、后端入口、迁移和前端入口可以直接作为最小模板。SDK 1.1.x / 1.2.x 插件仍可继续运行，使用定时任务时，`api_version` 范围必须包含 1.2.0；用到 1.3.0 新增能力（`entry:read` / `export:write`）的插件，`api_version` 范围必须包含 1.3.0。
 
 ## Manifest 结构
 
@@ -59,6 +59,8 @@
 | `statement:parse` | `ctx.statement.parse()` | 用**宿主那一份**解析器把银行对账单解析成结构化流水行（不写宿主任何业务表） |
 | `statement:read` | `ctx.statement.read()` | 读取账套在宿主已绑的对账单**绑定清单**（不含流水行内容） |
 | `import:rw` | `ctx.imports.*`（**不含 `confirm`**）、前端 `services.imports` | 持久文件、预览、整批提交和来源追溯；**确认必须走前端 `services.imports.confirm` 的独立宿主请求**（详见 plugin-data） |
+| `entry:read` | `ctx.entry_match()` | 把一批流水行与账上**现金科目**的分录**一一配对**（宿主那把尺子：金额相等 + 现金侧方向对应 + 日期窗口 7/30 天 + 一对一分配） |
+| `export:write` | `ctx.export_xlsx()` | 把一张表导成 `.xlsx`（宿主生成，回传 base64） |
 
 `import:rw` 只提供导入批次能力；正式提交还必须声明 `voucher:write`。`plugin_data:rw` 只允许访问 manifest 声明的插件表，不能用来读取宿主业务表。
 
@@ -210,6 +212,39 @@ out["period_start"] / out["period_end"]
 
 - `ctx.period_list(book_id)` —— 期间清单（`id` / `year` / `month` / `ord` / `locked` / `closed_at`）。插件**读不到宿主的 period 表**；跨账套的**账期可以不一样**（有的账套用 4-4-5 财年），所以不能拿一份期间号套到别的账套上。
 - `ctx.ledger_read(book_id, period_id, include_unposted=True)` —— 科目余额表。`include_unposted=True` 与宿主对账口径**同一个**（已制证但未过账的凭证也算在账面余额里）；默认 `False`，旧插件不受影响。
+
+### 配对与导出（SDK 1.3.0 新增）
+
+- `ctx.entry_match(book_id, subject_codes, rows)` —— 把一批流水行与账上**现金科目**
+  的分录**一一配对**。
+
+  **判据在宿主那一边**（`app.bankstatement/allocate.py`）：金额相等 + 现金侧方向
+  对应 + 日期窗口（主窗口 7 天 / 复核窗口 30 天）+ **一对一分配**。插件给出行，
+  宿主按自己的口径配好对回来 —— **插件不要自己再写一份配对**：宿主流水对账那条线
+  已经有一把尺子，那条线两页各用各的数正是「两页都不报」的成因。
+
+  `rows` 形如 `[{"id": 1, "seq": 1, "tx_date": "2026-09-02",
+  "amount": "2829.58", "direction": "IN"}]`；`direction` 用**流水方向**
+  （`IN` 收钱 / `OUT` 付钱），现金侧方向由宿主换算（银行账与会计凭证的方向相反）。
+  返回 `{"pairs": [...], "unmatched_row_ids": [...]}`，每条 pair 带 `days_diff`
+  与 `in_primary`（日期差是否在主窗口内 —— 后者就是「已入账 / 待复核」两档）。
+
+  `subject_codes` 按**前缀**匹配（登记 `1002` 也能配到记在 `100203` 上的分录）。
+
+- `ctx.export_xlsx(filename, columns, rows, sheet_name)` —— 把一张表导成 `.xlsx`，
+  回传 `{"filename": ..., "content_base64": ...}`。
+
+  **为什么在宿主生成**：`.xlsx` 是个 ZIP 包，插件沙箱只放行
+  `openpyxl.load_workbook`（**读**）、不放行 `Workbook`（**写**）。**为什么回传
+  base64**：插件路由的返回值要能过 JSON（插件后端将来可能跑在独立进程里，那时
+  走 IPC 序列化）。
+
+  `columns` 形如 `[{"key": "seq", "title": "行号", "width": 6}]`，`rows` 是每行
+  一个 dict（键与 `columns[].key` 对应，取不到的键**留空，不猜**）。
+
+**这两条是可选能力**：老宿主上没有时，`ctx` 上就没有那两个属性。缺了它们，插件
+的其余功能照常用，只是这两件事做不了 —— **宿主能力面是加法，不是一票否决**。插件
+探测时用 `try/except` 直接取属性（沙箱里连 `hasattr` 这个内建都没有）。
 
 **余额表给的是「绝对额 + 方向」**（`direction` 是中文的 `借` / `贷` / `平`）。跨账套相加必须按方向还原**带符号**的数，否则落在贷方的那张账套会以正数加进去，合计凭空多出一截。
 

@@ -45,6 +45,11 @@ CTX_METHOD_SERIALIZATION: dict[str, str] = {
     # —— 对账单（共享卡对账：宿主只贡献解析器与绑定清单）——
     "statement.parse": "json",
     "statement.read": "json",
+    # —— 流水行 ↔ 账上分录的配对（共享卡对账的「按金额初筛」）——
+    # 复用宿主那把尺子（``app.bankstatement.allocate``），插件不自己写第二份。
+    "entry_match": "json",
+    # —— 导出 Excel：宿主生成 .xlsx，回传 base64（插件沙箱只放行 openpyxl 读侧）——
+    "export_xlsx": "json",
     # —— 上传读取：返回体里带原始字节 ——
     "upload_read": "bytes",
     # —— 凭证 ——

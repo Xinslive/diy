@@ -7,7 +7,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy import MetaData, Table, func, select
+from sqlalchemy import MetaData, Table, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from app.core.db import SessionLocal
 from app.core.deps import WRITE_ROLES, get_my_book, require_book_write
@@ -472,6 +472,215 @@ def context_for(manifest, *, plugin=False):
                      "is_leaf": s.is_leaf, "active": s.active, "year": s.year}
                     for s in rows]
 
+    def entry_match(book_id: int, subject_codes: list[str], rows: list[dict]):
+        """把一批流水行与账上**现金科目**的分录一一配对。
+
+        **为什么宿主出这条能力，而不是让插件自己查分录**：插件读不到宿主的
+        业务表（``data.read`` 只能读插件自己声明的表 —— ``table_access`` 对
+        没声明的表直接 403）。而「一行流水对应账上哪张凭证」这件事**宿主的
+        流水对账那条线早就在做**：判据（金额相等 + 现金侧方向对应 + 日期
+        窗口）、一对一分配、跨期「待复核」那一档，全在
+        :mod:`app.bankstatement.allocate` 里，并且是那一条线**唯一的一把尺子**
+        （那个模块的文档写得很直白：两页各用各的数，正是「两页都不报」的
+        成因）。插件自己再写一份，就是第二套口径 —— 同一件事有两个答案。
+
+        所以这里**不重新实现配对**，只把宿主那把尺子接到插件面上：插件给出行
+        （日期 + 金额 + 方向），宿主按自己的口径配好对回来。
+
+        * ``subject_codes`` —— 参与配对的**科目编码**（通常是这张卡在各账套
+          登记的现金科目，如 ``100203``）。按**前缀**匹配：登记 ``1002`` 也能
+          配到记在 ``100203`` 上的分录（父科目登记、明细记账是常事）。
+        * ``rows`` —— ``[{"id": 1, "tx_date": "2026-09-02",
+          "amount": "2829.58", "direction": "IN"}]``。``direction`` 用**流水
+          方向**（``IN`` 收钱 / ``OUT`` 付钱）；现金侧方向由宿主换算 ——
+          银行账与会计凭证的方向是相反的（收钱 = 借方），换算写在宿主这一侧，
+          插件不用自己记这张表。
+
+        返回 ``{"pairs": [...], "unmatched_row_ids": [...]}``。每条 pair 带
+        ``days_diff`` 与 ``in_primary``（日期差是否在主窗口内）—— 后者就是宿主
+        那条线的「已入账 / 待复核」两档：**在主窗口内是同一笔，出了窗口只是
+        金额对得上，要人判**。
+        """
+        from datetime import timedelta
+
+        from app.bankstatement.allocate import (
+            REVIEW_WINDOW_DAYS,
+            EntrySide,
+            RowSide,
+            allocate,
+        )
+        from app.models.accounting import Entry, Subject, Voucher
+
+        if not isinstance(subject_codes, list) or not subject_codes:
+            raise HTTPException(400, "科目编码清单不能为空")
+        codes: list[str] = []
+        for item in subject_codes:
+            if not isinstance(item, str) or not item.strip():
+                raise HTTPException(400, "科目编码无效")
+            code = item.strip()
+            if code not in codes:
+                codes.append(code)
+        if not isinstance(rows, list):
+            raise HTTPException(400, "流水行清单格式无效")
+        if len(rows) > 5000:
+            raise HTTPException(400, "一次最多配对 5000 行")
+
+        sides: list[RowSide] = []
+        dated: list[date] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                raise HTTPException(400, "流水行格式无效")
+            try:
+                row_id = int(item.get("id"))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "流水行缺少 id")
+            amount = None
+            raw_amount = item.get("amount")
+            if raw_amount is not None and raw_amount != "":
+                try:
+                    amount = Decimal(str(raw_amount))
+                except (ArithmeticError, TypeError, ValueError):
+                    amount = None
+            tx_date = None
+            raw_date = item.get("tx_date")
+            if isinstance(raw_date, date):
+                tx_date = raw_date
+            elif isinstance(raw_date, str) and raw_date.strip():
+                try:
+                    tx_date = date.fromisoformat(raw_date.strip()[:10])
+                except ValueError:
+                    tx_date = None
+            try:
+                seq = int(item.get("seq") or 0)
+            except (TypeError, ValueError):
+                seq = 0
+            sides.append(RowSide(
+                id=row_id, tx_date=tx_date, amount=amount,
+                direction=str(item.get("direction") or "").strip().upper(), seq=seq))
+            if tx_date is not None:
+                dated.append(tx_date)
+
+        if not dated:
+            # **没有日期就配不了**：配对的第一件套就是日期窗口。
+            # 认不出日期的行不是「没配上」，是「还没资格配上」—— 但对插件来说
+            # 结果一样：没有候选。
+            return {"pairs": [], "unmatched_row_ids": [side.id for side in sides]}
+
+        lo = min(dated) - timedelta(days=REVIEW_WINDOW_DAYS)
+        hi = max(dated) + timedelta(days=REVIEW_WINDOW_DAYS)
+
+        with SessionLocal() as db:
+            user = principal(db)
+            book = get_my_book(book_id, db, user)
+            rows_found = db.execute(
+                select(Entry, Voucher, Subject)
+                .join(Voucher, Voucher.id == Entry.voucher_id)
+                .join(Subject, Subject.id == Entry.subject_id)
+                .where(
+                    Voucher.book_id == book.id,
+                    Entry.book_id == book.id,
+                    or_(*[Subject.code.startswith(code) for code in codes]),
+                    Voucher.voucher_date >= lo,
+                    Voucher.voucher_date <= hi,
+                )
+            ).all()
+            entry_sides = [
+                EntrySide(
+                    id=int(entry.id), voucher_id=int(entry.voucher_id),
+                    voucher_no=voucher.voucher_no or "",
+                    voucher_date=voucher.voucher_date,
+                    amount=Decimal(str(entry.amount)), direction=entry.direction)
+                for entry, voucher, _subject in rows_found
+            ]
+
+        result = allocate(sides, entry_sides)
+        pairs = [{
+            "row_id": pair.row_id,
+            "entry_id": pair.entry_id,
+            "voucher_id": pair.voucher_id,
+            "voucher_no": pair.voucher_no,
+            "voucher_date": pair.voucher_date.isoformat(),
+            "amount": str(pair.amount),
+            "days_diff": pair.days_diff,
+            "in_primary": bool(pair.in_primary),
+        } for pair in result.pairs.values()]
+        matched = {pair["row_id"] for pair in pairs}
+        return {"pairs": pairs,
+                "unmatched_row_ids": [side.id for side in sides if side.id not in matched]}
+
+    def export_xlsx(filename: str, columns: list[dict], rows: list[dict],
+                    sheet_name: str = "Sheet1"):
+        """把一张表导成 Excel（``.xlsx``），回传 **base64**。
+
+        **为什么在宿主生成，而不是插件自己造**：``.xlsx`` 是个 ZIP 包，而插件
+        沙箱只放行 ``openpyxl.load_workbook``（**读**），不放行 ``Workbook``
+        （**写**）—— 插件能解析用户上传的表格，但不能造一个新的。而导出是宿主
+        本来就有的能力（凭证、账簿、余额表的导出都在这一侧），这里只是把
+        「任意一张表」这一种也开放出来。
+
+        **为什么回传 base64 而不是字节**：插件路由的返回值要能过 JSON（插件
+        后端将来可能跑在独立进程里，那时返回值走 IPC 序列化）。base64 字符串
+        两头都能用：前端 ``atob`` 一下就是 Blob。
+
+        * ``columns`` —— ``[{"key": "seq", "title": "行", "width": 6}]``。
+          ``width`` 是 Excel 列宽（字符数），不给就用默认。
+        * ``rows`` —— 行列表，每行一个 dict，键与 ``columns[].key`` 对应。
+          取不到的键**留空，不猜**。
+        """
+        import base64
+        import io
+
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+
+        if not isinstance(columns, list) or not columns:
+            raise HTTPException(400, "导出列清单不能为空")
+        if len(columns) > 64:
+            raise HTTPException(400, "导出列不能超过 64 列")
+        if not isinstance(rows, list):
+            raise HTTPException(400, "导出行清单格式无效")
+        if len(rows) > 20000:
+            raise HTTPException(400, "一次最多导出 20000 行")
+
+        keys: list[str] = []
+        titles: list[str] = []
+        widths: list[float] = []
+        for column in columns:
+            if not isinstance(column, dict):
+                raise HTTPException(400, "导出列格式无效")
+            key = column.get("key")
+            title = column.get("title")
+            if not isinstance(key, str) or not key:
+                raise HTTPException(400, "导出列缺少 key")
+            if not isinstance(title, str) or not title:
+                raise HTTPException(400, "导出列缺少标题")
+            keys.append(key)
+            titles.append(title)
+            width = column.get("width")
+            widths.append(float(width) if isinstance(width, (int, float)) else 14.0)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = sheet_name if isinstance(sheet_name, str) and sheet_name.strip() else "Sheet1"
+        ws.append(titles)
+        fill = PatternFill("solid", fgColor="DCE6F1")
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+            cell.fill = fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        for index, width in enumerate(widths, start=1):
+            ws.column_dimensions[ws.cell(row=1, column=index).column_letter].width = width
+        for row in rows:
+            if not isinstance(row, dict):
+                raise HTTPException(400, "导出行格式无效")
+            ws.append([row.get(key, "") for key in keys])
+        buf = io.BytesIO()
+        wb.save(buf)
+        name = filename if isinstance(filename, str) and filename.strip() else "导出.xlsx"
+        if not name.lower().endswith(".xlsx"):
+            name = name + ".xlsx"
+        return {"filename": name, "content_base64": base64.b64encode(buf.getvalue()).decode("ascii")}
+
     def voucher_create(book_id: int, payload: dict):
         from app.api.schemas import VoucherIn
         from app.api.vouchers import create
@@ -699,6 +908,10 @@ def context_for(manifest, *, plugin=False):
         ("upload:read", "upload_read", upload_read),
         ("ledger:read", "ledger_read", ledger_read), ("subject:read", "subject_read", subject_read),
         ("book:read", "period_list", period_list),
+        # 配对复用宿主那把尺子（``app.bankstatement.allocate``），插件不自己写第二份。
+        ("entry:read", "entry_match", entry_match),
+        # 导出在宿主生成：``.xlsx`` 要 openpyxl 的写侧，插件沙箱只放行读侧。
+        ("export:write", "export_xlsx", export_xlsx),
         ("voucher:write", "voucher_create", voucher_create),
         ("audit:write", "audit_write", audit_write)]:
         if permission in permissions:

@@ -274,6 +274,166 @@ def test_批量与科目能力不随权限漏出():
     assert not hasattr(ctx, 'voucher_batch_create')
 
 
+# ---------------------------------------------------------------------------
+# 1.3.0 新增的两条能力：配对（entry:read）与导出（export:write）
+#
+# **为什么这两条要在这里单独测，而不是只靠共享卡那一份端到端用例**：
+# 共享卡的用例住在 ``tests/test_plugin_sharedcard.py``，而那个文件在**干净
+# checkout 里会被跳过**（插件源码 ``/plugins/`` 不入库）。只靠它，这两条新
+# 能力在 CI 上就是**零覆盖** —— 推上线的��东没有任何机器证据。所以宿主这一侧
+# 单独钉一遍：能力是否按权限露脸、配对是不是用宿主那把尺子、导出是不是真
+# .xlsx。
+# ---------------------------------------------------------------------------
+
+_MATCH_PLUGIN = '''def register(registrar, ctx):
+    def match(book_id: int, payload: dict):
+        return ctx.entry_match(book_id, payload.get("codes") or [], payload.get("rows") or [])
+
+    registrar.post("/match", match)
+'''
+
+_EXPORT_PLUGIN = '''def register(registrar, ctx):
+    def export(payload: dict):
+        return ctx.export_xlsx(payload.get("filename") or "",
+                               payload.get("columns") or [],
+                               payload.get("rows") or [],
+                               payload.get("sheet_name") or "Sheet1")
+
+    registrar.post("/export", export)
+'''
+
+
+def test_配对能力用宿主那把尺子_并按权限露脸(plugin_env, client, auth, plain_auth,
+                                           plain_user, book, db, make_voucher):
+    """``ctx.entry_match`` 配的是「账上已经记过的那一笔」。
+
+    **为什么宿主出这条能力**：插件读不到分录表，而「一行流水对应账上哪张凭证」
+    这件事宿主的流水对账那条线早就在做（``app/bankstatement.allocate``）——
+    插件自己再写一份就是第二套口径。所以这里要钉住的是：**宿主真的用自己那把
+    尺子**，而且**按权限露脸**（``entry:read`` 没声明就不给这条能力）。
+    """
+    # 账上记一笔：2026-09-12 收钱 9,780（现金侧是借方 —— 收钱 = 余额增加）。
+    voucher = make_voucher('2026-09-12',
+                            dr=[('1002', '9780.00', '收到代扣款')],
+                            cr=[('2202', '9780.00', '代扣个人所得税')])
+    assert voucher is not None
+
+    build, restart = plugin_env
+    pid = 'com.test.match'
+    raw, manifest, _, _ = build(
+        plugin_id=pid,
+        files={'backend/main.py': _MATCH_PLUGIN.encode(),
+               'frontend/index.js': b'export default host => ({render: () => host.h("div")});'},
+        edit=lambda m: m.update(permissions=['entry:read']))
+    assert client.post('/api/system/plugins/install', files={'file': ('match.cwp', raw)}, headers=auth).status_code == 200
+    restart()
+    assert client.put(f'/api/system/plugins/{pid}/users', headers=auth,
+                      json={'user_ids': [plain_user.id]}).status_code == 200
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role='ACCOUNTANT'))
+    db.commit()
+
+    path = f'/api/plugins/{pid}/match'
+    rows = [
+        {'id': 1, 'tx_date': '2026-09-12', 'amount': '9780.00', 'direction': 'IN'},
+        # 同一笔钱、方向对、但日期差 20 天：金额对得上，**不是同一笔**（要人判）。
+        {'id': 2, 'tx_date': '2026-10-02', 'amount': '9780.00', 'direction': 'IN'},
+        # 日期差 40 天：出了复核窗口，连「像」都不像。
+        {'id': 3, 'tx_date': '2026-10-22', 'amount': '9780.00', 'direction': 'IN'},
+        # 账上压根没这笔钱。
+        {'id': 4, 'tx_date': '2026-09-12', 'amount': '123.45', 'direction': 'IN'},
+        # 方向对不上：收钱 vs 付钱不是同一笔。
+        {'id': 5, 'tx_date': '2026-09-12', 'amount': '9780.00', 'direction': 'OUT'},
+    ]
+    response = client.post(path, params={'book_id': book.id}, json={'codes': ['1002'], 'rows': rows},
+                           headers=plain_auth)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    pairs = {pair['row_id']: pair for pair in body['pairs']}
+    # 只有第 1 行配上，且**在主窗口内**（同一笔）。
+    assert set(pairs) == {1}, body
+    assert pairs[1]['in_primary'] is True, body
+    assert pairs[1]['days_diff'] == 0, body
+    assert pairs[1]['voucher_no'] == voucher.voucher_no, body
+    assert pairs[1]['amount'] == '9780.00', body
+    # 没配上的三行，宿主要**点名**说出来（插件据此报「待复核」）。
+    assert sorted(body['unmatched_row_ids']) == [2, 3, 4, 5], body
+
+    # 换个科目：这条分录不在 1001 之下，就不该配上。
+    response = client.post(path, params={'book_id': book.id},
+                           json={'codes': ['1001'], 'rows': [rows[0]]}, headers=plain_auth)
+    assert response.status_code == 200, response.text
+    assert response.json()['pairs'] == [], response.json()
+
+    # **权限露脸**：没声明 ``entry:read`` 的插件拿不到这条能力。
+    _, manifest, _, _ = package()
+    manifest['permissions'] = ['book:read']
+    ctx = context_for(manifest)
+    assert not hasattr(ctx, 'entry_match')
+
+    # **账套边界**：别人的账配不了（``get_my_book`` 那一道闸）。
+    response = client.post(path, params={'book_id': book.id + 999},
+                           json={'codes': ['1002'], 'rows': [rows[0]]}, headers=plain_auth)
+    assert response.status_code in (403, 404), response.text
+
+
+def test_导出能力在宿主生成真xlsx_并按权限露脸(plugin_env, client, auth, plain_auth,
+                                             plain_user, book, db):
+    """``ctx.export_xlsx`` 回传的是**真的 .xlsx**，不是一张 CSV 改个后缀。
+
+    **为什么在宿主生成**：``.xlsx`` 是 ZIP 包，插件沙箱只放行
+    ``openpyxl.load_workbook``（读）不放行 ``Workbook``（写）。所以这条能力
+    必须真的造出一个能被 openpyxl 读回来的工作簿 —— 断言的是**文件内容**，
+    不是返回值里那个 base64 字符串的长度。
+    """
+    import base64
+    import io
+
+    from openpyxl import load_workbook
+
+    build, restart = plugin_env
+    pid = 'com.test.export'
+    raw, manifest, _, _ = build(
+        plugin_id=pid,
+        files={'backend/main.py': _EXPORT_PLUGIN.encode(),
+               'frontend/index.js': b'export default host => ({render: () => host.h("div")});'},
+        edit=lambda m: m.update(permissions=['export:write']))
+    assert client.post('/api/system/plugins/install', files={'file': ('export.cwp', raw)}, headers=auth).status_code == 200
+    restart()
+    assert client.put(f'/api/system/plugins/{pid}/users', headers=auth,
+                      json={'user_ids': [plain_user.id]}).status_code == 200
+    db.add(UserBook(user_id=plain_user.id, book_id=book.id, role='ACCOUNTANT'))
+    db.commit()
+
+    response = client.post(f'/api/plugins/{pid}/export', headers=plain_auth, json={
+        'filename': '对账单',
+        'sheet_name': '流水明细',
+        'columns': [{'key': 'seq', 'title': '行', 'width': 6},
+                    {'key': 'amount', 'title': '金额'},
+                    {'key': 'note', 'title': '备注'}],
+        'rows': [{'seq': 1, 'amount': '9780.00'},
+                 {'seq': 2, 'amount': '123.45', 'note': '出纳待确认'}],
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # 文件名自己补后缀：前端拿到什么就下什么，补后缀是宿主的事。
+    assert body['filename'] == '对账单.xlsx', body
+    blob = base64.b64decode(body['content_base64'])
+    assert blob[:2] == b'PK', '不是 ZIP 头 —— 那就不是 .xlsx'
+    sheet = load_workbook(io.BytesIO(blob))
+    assert sheet.sheetnames == ['流水明细'], sheet.sheetnames
+    ws = sheet['流水明细']
+    assert [cell.value for cell in ws[1]] == ['行', '金额', '备注']
+    # **取不到的键留空，不猜**：这一行没有「备注」，格子里就该是空的。
+    assert [cell.value for cell in ws[2]] == [1, '9780.00', None]
+    assert [cell.value for cell in ws[3]] == [2, '123.45', '出纳待确认']
+
+    # **权限露脸**：没声明 ``export:write`` 的插件拿不到这条能力。
+    _, manifest, _, _ = package()
+    manifest['permissions'] = ['book:read']
+    ctx = context_for(manifest)
+    assert not hasattr(ctx, 'export_xlsx')
+
+
 def test_plugin_data_read_supports_filter_paging_and_count(plugin_env, client, auth, plain_auth, plain_user, book, db):
     """过滤 + 分页 + count：插件不必把整表读进内存自己筛。"""
     build, restart = plugin_env
