@@ -3,13 +3,14 @@
 这一组盯的是「一张卡被多个账套共用」这条主线能不能真的成立：
 
     3 个账套共用一张卡 → 上传**一份**对账单 → 每一行判给某个账套 →
-    各账套生成各自的凭证 → 各账套的收支与余额**加起来**等于这张卡的真实数。
+    各账套记到这张卡上的数**加起来**等于这张卡的真实数。
 
-**最要紧的三条判据**
+**这个插件只对账，不制证**（1.1.0 起）：凭证是用户自己在账上录的，插件不替
+用户猜对方科目。所以这里守的是**核对**，不是记账：
 
-1. **收支相等**：Σ 各账套凭证 == 对账单的收支合计（误差 0）。
-2. **余额相等**：Σ 各账套账面余额 == 对账单期末余额；没制完的差额能被
-   「已归属未制证 + 未归属 + 归属到别的科目」三项**完整解释**（残差为 0）。
+1. **归属正确**：规则命中与人工复核都能把行判给对的账套。
+2. **少记看得出来**：各账套该科目的**本期净发生额**（账上动了多少）与
+   **归属流水净额**（该记多少）一减，就是这本账少记了多少。
 3. **不污染宿主**：宿主的对账单台账一行不多 —— 共享卡的对账单是插件实体，
    不是宿主那一份。
 
@@ -203,12 +204,111 @@ def test_成员科目必须过四道校验(shared, client, auth, db, books3, cas
     bad = client.post(shared + f"/cards/{card_id}/members", headers=auth, json={
         "book_id": first.id, "subject_code": "224101"})
     assert bad.status_code == 422
-    assert "现金科目族" in bad.json()["detail"]
+    assert "一级科目" in bad.json()["detail"]
 
     # 1001 库存现金下的末级科目**可以**承载共享卡。
     ok = _json(client.post(shared + f"/cards/{card_id}/members", headers=auth, json={
         "book_id": first.id, "subject_code": cash.code}))
     assert ok["member"]["subject_code"] == cash.code
+
+
+def test_现金科目按一级科目判(shared, client, auth, db, books3, cash_subjects):
+    """**一级科目是 1001 或 1002** —— 判据是「它的一级科目」，不是「编码前缀」。
+
+    界面上那个下拉只列一级科目在白名单里的科目（用户批注：不能选 1012
+    「其他货币资金」）。判据只有一份实现（后端），所以下拉里选得到的，
+    后端一定收；收不到的，界面也不该出现。
+    """
+    card_id = _json(client.post(shared + "/cards", headers=auth,
+                                json={"name": "一级科目用卡"}))["card"]["id"]
+    book = books3[0]
+    # 1012 其他货币资金 下挂一个末级科目 —— 一级科目不是 1001/1002，不该收。
+    other = _leaf(db, book, "1012", "101201", "其他货币资金-第三方支付")
+    bad = client.post(shared + f"/cards/{card_id}/members", headers=auth, json={
+        "book_id": book.id, "subject_code": other.code})
+    assert bad.status_code == 422
+    assert "1012" in bad.json()["detail"]
+
+    # 目录里每个科目都带上一级科目编码 —— 前端就靠它筛下拉。
+    catalog = _json(client.get(shared + "/catalog", headers=auth))
+    for index, item in enumerate(cash_subjects):
+        entry = next(row for row in catalog["books"] if row["id"] == item["book"].id)
+        roots = {row["code"]: row["root_code"] for row in entry["subjects"]}
+        assert roots[item["cash"].code] == ("1002" if index < 2 else "1001"), roots
+        assert "1001" in entry["roots"] and "1002" in entry["roots"]
+    first_entry = next(row for row in catalog["books"] if row["id"] == books3[0].id)
+    first_roots = {row["code"]: row["root_code"] for row in first_entry["subjects"]}
+    assert first_roots["101201"] == "1012"
+
+
+def test_对方科目与默认对方科目被显式拒绝(shared, client, auth, cash_subjects):
+    """**下线一个字段要显式接住它并报错** —— 不能悄悄丢掉。
+
+    插件 1.1.0 起只对账、不制证，所以「默认对方科目」「对方科目」这两项
+    都不存在了。老调用方还在传它们的话，接口要**说清楚为什么没有这一项**，
+    而不是回 200、让用户以为设上了。
+    """
+    card_id = _json(client.post(shared + "/cards", headers=auth,
+                                json={"name": "对方科目用卡"}))["card"]["id"]
+    item = cash_subjects[0]
+    bad = client.post(shared + f"/cards/{card_id}/members", headers=auth, json={
+        "book_id": item["book"].id, "subject_code": item["cash"].code,
+        "counterparty_code": item["counter"].code})
+    assert bad.status_code == 422
+    assert "不制证" in bad.json()["detail"]
+
+    bad = client.post(shared + f"/cards/{card_id}/rules", headers=auth, json={
+        "book_id": item["book"].id, "match_field": "cp_name",
+        "match_mode": "contains", "pattern": "丙供应链",
+        "target_subject_code": item["counter"].code})
+    assert bad.status_code == 422
+    assert "不制证" in bad.json()["detail"]
+
+
+def test_制证路由已经下线(shared, client, auth, loaded):
+    """**插件不再制证** —— 那个路由不该还在（还在就意味着它还能记账）。"""
+    stmt_id = loaded["stmt_id"]
+    response = client.post(shared + f"/statements/{stmt_id}/vouchers", headers=auth)
+    assert response.status_code == 404, response.text
+
+
+def test_插件不再声明凭证权限(shared, client, auth, db):
+    """**装上去的那个插件**不能还有 ``voucher:write`` —— 声明了就是给了记账的权限。
+
+    查的是**库里那个已安装插件的 manifest**（``plugin_registry.manifest_metadata``），
+    不是磁盘上的文件 —— 装上去的才算数。
+    """
+    from app.models.plugin import PluginRegistry
+
+    registry = db.get(PluginRegistry, "com.cwq.sharedcard")
+    assert registry is not None
+    permissions = (registry.manifest_metadata or {}).get("permissions") or []
+    assert "voucher:write" not in permissions, permissions
+    assert registry.version == "1.1.0", registry.version
+
+
+def test_卡可以删(shared, client, auth, loaded, cash_subjects):
+    """删卡要连同成员、规则、对账单、流水行、归属一起删干净。
+
+    **留着孤儿行毫无意义** —— 而它们会被别的卡列表读到，还会在复核队列里
+    冒出来（用户会以为还有一张卡没处理）。
+    """
+    card_id = loaded["card_id"]
+    stmt_id = loaded["stmt_id"]
+    assert _json(client.get(shared + f"/cards/{card_id}/members",
+                             headers=auth))["members"]
+    body = _json(client.delete(shared + f"/cards/{card_id}", headers=auth))
+    assert body["deleted"] is True
+    # 卡没了。
+    assert client.get(shared + f"/cards/{card_id}", headers=auth).status_code == 422
+    cards = _json(client.get(shared + "/cards", headers=auth))["cards"]
+    assert card_id not in [item["id"] for item in cards]
+    # 成员也没了。
+    assert _json(client.get(shared + f"/cards/{card_id}/members",
+                             headers=auth))["members"] == []
+    # 对账单与它的行、归属也没了 —— 复核队列里不该再冒出这张卡的东西。
+    queue = _json(client.get(shared + "/queue", headers=auth))["queue"]
+    assert stmt_id not in [item["statement_id"] for item in queue]
 
 
 def test_1001族的账套也能认领共享卡(shared, client, auth, cash_subjects):
@@ -217,8 +317,7 @@ def test_1001族的账套也能认领共享卡(shared, client, auth, cash_subjec
                                 json={"name": "含1001的卡"}))["card"]["id"]
     item = cash_subjects[2]
     body = _json(client.post(shared + f"/cards/{card_id}/members", headers=auth, json={
-        "book_id": item["book"].id, "subject_code": item["cash"].code,
-        "counterparty_code": item["counter"].code}))
+        "book_id": item["book"].id, "subject_code": item["cash"].code}))
     assert body["member"]["subject_code"] == item["cash"].code
 
 
@@ -254,8 +353,7 @@ def _card_with_members(shared, client, auth, cash_subjects, rules):
                                 json={"name": "规则用卡"}))["card"]["id"]
     for item in cash_subjects:
         _json(client.post(shared + f"/cards/{card_id}/members", headers=auth, json={
-            "book_id": item["book"].id, "subject_code": item["cash"].code,
-            "counterparty_code": item["counter"].code}))
+            "book_id": item["book"].id, "subject_code": item["cash"].code}))
     for rule in rules:
         _json(client.post(shared + f"/cards/{card_id}/rules", headers=auth, json=rule))
     return card_id
@@ -373,106 +471,207 @@ def test_人工指定归属后队列清空(shared, client, auth, loaded, cash_su
     assert detail["pending"] == 0
 
 
-def test_制证后各账套的凭证加起来等于对账单(shared, client, auth, loaded, cash_subjects):
-    """**收支相等**：Σ 各账套凭证 == 对账单的收支合计，误差 0。"""
-    stmt_id = loaded["stmt_id"]
+def _assign_all(shared, client, auth, stmt_id, book_id):
+    """把还没归属的行都指给某一本账，**再把行读回来**。
+
+    **要重新读**：归属是刚写进去的，拿改动之前那份行去算，归属还没生效 ——
+    算出来的合计会少一块，而那块看起来像「对不上」。
+    """
     rows = _json(client.get(shared + f"/statements/{stmt_id}/rows", headers=auth,
                             params={"limit": 50}))["rows"]
     unassigned = [row["id"] for row in rows if row["alloc"] is None]
-    client.post(shared + f"/statements/{stmt_id}/assign", headers=auth, json={
-        "rows": unassigned, "book_id": cash_subjects[0]["book"].id})
-    body = _json(client.post(shared + f"/statements/{stmt_id}/vouchers", headers=auth))
-    created = sum(item["created"] for item in body["results"])
-    assert created == 5, body
-    assert body["problems"] == []
-    # 三本账都拿到凭证。
-    assert len(body["results"]) == 3
-    # **行列表里的归属状态**也要跟着变成「已制证」——
-    # 界面上「已制证 5」与每行「待制证」并排出现时，用户只会以为是显示抽风。
-    detail = _json(client.get(shared + f"/statements/{stmt_id}", headers=auth))
-    assert detail["posted"] == 5, detail
-    rows = _json(client.get(shared + f"/statements/{stmt_id}/rows", headers=auth,
+    if unassigned:
+        body = client.post(shared + f"/statements/{stmt_id}/assign", headers=auth, json={
+            "rows": unassigned, "book_id": book_id})
+        assert body.status_code == 200, body.text
+    return _json(client.get(shared + f"/statements/{stmt_id}/rows", headers=auth,
                             params={"limit": 50}))["rows"]
+
+
+def _net_of(rows, book_id=None):
+    """一批行的净额（收入减支出）；``book_id`` 给了就只算归给那本账的。"""
+    total = Decimal("0")
+    for row in rows:
+        if book_id is not None:
+            if not row["alloc"] or int(row["alloc"]["book_id"]) != int(book_id):
+                continue
+        amount = Decimal(row["amount"] or "0")
+        total += amount if row["direction"] == "IN" else -amount
+    return total
+
+
+def _dec(value):
+    """把接口返回的金额字符串读成 Decimal（比字符串相等可靠得多）。"""
+    return Decimal(str(value if value not in (None, "") else "0"))
+
+
+def _sides_of(rows, book_id=None):
+    """一批行「该记多少」：(收款, 支出)。收款记借方、支出记贷方。"""
+    debit = Decimal("0")
+    credit = Decimal("0")
+    for row in rows:
+        if book_id is not None:
+            if not row["alloc"] or int(row["alloc"]["book_id"]) != int(book_id):
+                continue
+        amount = Decimal(row["amount"] or "0")
+        if row["direction"] == "IN":
+            debit += amount
+        elif row["direction"] == "OUT":
+            credit += amount
+    return debit, credit
+
+
+def test_归属之后各账套的流水加起来等于对账单(shared, client, auth, loaded, cash_subjects):
+    """**收支相等**：Σ 各账套归属到的流水净额 == 对账单的净额，误差 0。
+
+    这条是「纯对账」口径下的第一条判据：插件不记账，但**归属**必须把每一
+    分钱分给对的账套 —— 分错了，后面的「少记了多少」就全是错的。
+    """
+    stmt_id = loaded["stmt_id"]
+    rows = _assign_all(shared, client, auth, stmt_id, cash_subjects[0]["book"].id)
+    detail = _json(client.get(shared + f"/statements/{stmt_id}", headers=auth))
+    statement_net = (Decimal(detail["income_total"]) - Decimal(detail["expense_total"]))
+    assert _net_of(rows) == statement_net, (rows, detail)
+    # 每本账各摊多少。
+    per_book = {}
+    for row in rows:
+        if not row["alloc"]:
+            continue
+        book_id = int(row["alloc"]["book_id"])
+        amount = Decimal(row["amount"] or "0")
+        per_book[book_id] = per_book.get(book_id, Decimal("0")) \
+            + (amount if row["direction"] == "IN" else -amount)
+    assert sum(per_book.values()) == statement_net
+    assert len(per_book) == 3, per_book
+
+
+def test_归属状态就是已归属(shared, client, auth, loaded, cash_subjects):
+    """插件不再制证 —— 归属行的状态就是「已归属」，没有「待制证/已制证」。"""
+    stmt_id = loaded["stmt_id"]
+    rows = _assign_all(shared, client, auth, stmt_id, cash_subjects[0]["book"].id)
     statuses = {row["alloc"]["status"] for row in rows if row["alloc"]}
-    assert statuses == {"VOUCHER_POSTED"}, statuses
-    assert all(row["alloc"]["voucher_no"] for row in rows), \
-        "制了证的行必须带上凭证号 —— 用户要靠它去账上核"
-
-
-def test_重复制证不会记两遍(shared, client, auth, loaded, cash_subjects):
-    """幂等：再点一次「生成凭证」，凭证数不变。"""
-    stmt_id = loaded["stmt_id"]
-    rows = _json(client.get(shared + f"/statements/{stmt_id}/rows", headers=auth,
-                            params={"limit": 50}))["rows"]
-    unassigned = [row["id"] for row in rows if row["alloc"] is None]
-    client.post(shared + f"/statements/{stmt_id}/assign", headers=auth, json={
-        "rows": unassigned, "book_id": cash_subjects[0]["book"].id})
-    first = _json(client.post(shared + f"/statements/{stmt_id}/vouchers", headers=auth))
-    assert sum(item["created"] for item in first["results"]) == 5
-    second = _json(client.post(shared + f"/statements/{stmt_id}/vouchers", headers=auth))
-    assert sum(item["created"] for item in second["results"]) == 0
+    assert statuses == {"ALLOCATED"}, statuses
     detail = _json(client.get(shared + f"/statements/{stmt_id}", headers=auth))
-    assert detail["posted"] == 5
-    assert detail["failed"] == 0
+    assert "posted" not in detail, detail
 
 
-def test_某本账没有对应期间时只有它失败(shared, client, auth, db, loaded, cash_subjects):
-    """**跨账套非原子**：一本账的期间对不上，只有它失败，其余照常成功。
+def test_某本账没有对应期间时它不参与核对(shared, client, auth, db, loaded, cash_subjects):
+    """一本账没有覆盖对账单期间的会计期间 —— 它那一格要**说清楚为什么空着**。
 
-    这不是缺陷，是语义：10 个账套是 10 个独立事务。界面必须显示
-    「已制证 2/3 个账套」，并且允许只重跑失败的那本。
+    不是缺陷，是语义：各账套的账期可以不一样（有的用 4-4-5 财年）。缺的
+    那一期必须列进「缺期间」，否则用户会以为这本账「少记 0 元」= 对上了。
     """
     from app.models.book import Period
 
     stmt_id = loaded["stmt_id"]
-    rows = _json(client.get(shared + f"/statements/{stmt_id}/rows", headers=auth,
-                            params={"limit": 50}))["rows"]
-    unassigned = [row["id"] for row in rows if row["alloc"] is None]
-    client.post(shared + f"/statements/{stmt_id}/assign", headers=auth, json={
-        "rows": unassigned, "book_id": cash_subjects[0]["book"].id})
-    # 把第三本账的 2026-09 期间删掉 —— 凭证日期落在 9 月，那本账就记不了。
+    _assign_all(shared, client, auth, stmt_id, cash_subjects[0]["book"].id)
     third = cash_subjects[2]["book"]
     period = db.scalar(select(Period).where(Period.book_id == third.id,
                                              Period.year == 2026, Period.month == 9))
     db.delete(period)
     db.commit()
-    body = _json(client.post(shared + f"/statements/{stmt_id}/vouchers", headers=auth))
-    created = {item["book_id"]: item["created"] for item in body["results"]}
-    assert created[cash_subjects[0]["book"].id] == 3, body
-    assert created[cash_subjects[1]["book"].id] == 1, body
-    assert created[third.id] == 0, body
-    assert body["problems"], "失败必须说出来"
-    assert "会计期间" in body["problems"][0]
-    detail = _json(client.get(shared + f"/statements/{stmt_id}", headers=auth))
-    assert detail["posted"] == 4
-    assert detail["failed"] == 1
+    body = _json(client.get(shared + f"/cards/{loaded['card_id']}/balance", headers=auth))
+    assert body["missing_period"], body
+    assert any("2026-09" in item for item in body["missing_period"]), body["missing_period"]
+    row = next(item for item in body["books"] if item["book_id"] == third.id)
+    assert "会计期间" in row["reason"], row
 
 
-def test_余额核对把差额解释干净(shared, client, auth, admin_user, db, loaded, cash_subjects):
-    """**余额相等**：Σ 各账套账面余额 == 对账单期末余额，残差为 0。
+def test_余额核对指出哪本账少记了多少(shared, client, auth, admin_user, db, loaded, cash_subjects):
+    """**少记 = 该记的收款/支出 - 账上实际记的**（分借贷两侧比）。
 
-    前提是三本账的期初余额要合起来等于这张卡的期初余额（期初也是分在几本
-    账上的）。这里把它全放在第一本账 —— 现实里也常这样：一本账是主账。
+    这里造三本账：
+    * 第一本账：只记了一半收款 → 少记一半收款 + 全部支出；
+    * 第二本账：全额记上 → 不少记；
+    * 第三本账：一笔没记 → 少记全部。
+
+    **分两侧比，不比净额**：一笔 30 万的支出没记，净额差是负数，界面上
+    「少记 -30 万」没法读；分两侧比，「少记了 30 万的支出」是一句没有
+    歧义的话。
     """
     stmt_id = loaded["stmt_id"]
-    rows = _json(client.get(shared + f"/statements/{stmt_id}/rows", headers=auth,
-                            params={"limit": 50}))["rows"]
-    unassigned = [row["id"] for row in rows if row["alloc"] is None]
-    client.post(shared + f"/statements/{stmt_id}/assign", headers=auth, json={
-        "rows": unassigned, "book_id": cash_subjects[0]["book"].id})
-    # 期初余额：只在第一本账上记一次（借 银行存款 / 贷 其他应付款）。
-    maker = build_voucher_factory(db, cash_subjects[0]["book"], admin_user)
-    maker("2026-01-15",
-          dr=[(cash_subjects[0]["cash"].code, OPENING, "期初")],
-          cr=[(cash_subjects[0]["counter"].code, OPENING, "期初")])
-    client.post(shared + f"/statements/{stmt_id}/vouchers", headers=auth)
+    rows = _assign_all(shared, client, auth, stmt_id, cash_subjects[0]["book"].id)
+    sides = {item["book"].id: _sides_of(rows, item["book"].id) for item in cash_subjects}
+
+    # 第一本账：只记一半收款；第二本账：全额记上；第三本账：一笔不记。
+    half = Decimal("50000000.00")
+    first = cash_subjects[0]
+    maker = build_voucher_factory(db, first["book"], admin_user)
+    maker("2026-09-15",
+          dr=[(first["cash"].code, half, "记卡上的收款")],
+          cr=[(first["counter"].code, half, "记卡上的收款")])
+    second = cash_subjects[1]
+    credit = sides[second["book"].id][1]
+    if credit > 0:
+        maker = build_voucher_factory(db, second["book"], admin_user)
+        maker("2026-09-15",
+              dr=[(second["counter"].code, credit, "记卡上的支出")],
+              cr=[(second["cash"].code, credit, "记卡上的支出")])
+
     body = _json(client.get(shared + f"/cards/{loaded['card_id']}/balance", headers=auth))
-    assert body["available"] is True
-    assert body["statement_closing"] == "75844188.00"
-    assert body["book_total"] == "75844188.00", body
-    assert body["difference"] == "0.00", body
-    assert body["explanation"]["residual"] == "0.00", body
-    assert body["explanation"]["unassigned_count"] == 0
+    books = {item["book_id"]: item for item in body["books"]}
+    assert set(books) == {item["book"].id for item in cash_subjects}, body["books"]
+
+    # 第一本账：账面只有一半收款，支出没记。
+    debit, credit = sides[first["book"].id]
+    row = books[first["book"].id]
+    assert _dec(row["book_debit"]) == half, row
+    assert _dec(row["book_credit"]) == 0, row
+    assert _dec(row["expect_debit"]) == debit, row
+    assert _dec(row["expect_credit"]) == credit, row
+    assert _dec(row["short_debit"]) == debit - half, row
+    assert _dec(row["short_credit"]) == credit, row
+    assert _dec(row["missing"]) == debit - half + credit, row
+
+    # 第二本账：全额记上 → 不少记。
+    debit, credit = sides[second["book"].id]
+    row = books[second["book"].id]
+    assert _dec(row["book_credit"]) == credit, row
+    assert _dec(row["missing"]) == 0, row
+    assert _dec(row["diff"]) == 0, row
+
+    # 第三本账：一笔没记 → 少记全部。
+    debit, credit = sides[cash_subjects[2]["book"].id]
+    row = books[cash_subjects[2]["book"].id]
+    assert _dec(row["missing"]) == credit, row
+
+    # 「谁少记了」要**点名**，别让用户自己从一堆数里找。
+    short = {item["book_id"]: item for item in body["short"]}
+    assert second["book"].id not in short, body["short"]
+    assert _dec(short[first["book"].id]["missing"]) == _dec(books[first["book"].id]["missing"])
+    assert _dec(short[cash_subjects[2]["book"].id]["missing"]) == _dec(row["missing"])
+
+    # 还没归属的行单独列出来 —— 它们算不到任何账套头上。
+    assert body["unassigned"]["count"] == 0, body["unassigned"]
+    # 对账单这一期：收款与支出。
+    assert body["statement_debit"] == "100007401.00", body
+    assert body["statement_credit"] == "30010530.00", body
+
+
+def test_方向记反了也能看出来(shared, client, auth, admin_user, db, loaded, cash_subjects):
+    """**收款记成贷方**（方向记反）—— 界面必须说得出「少记收款、多记支出」。
+
+    只比净额的话，方向反了会互相抵消成一个 0，账明显明对不上却显示「对得上」。
+    """
+    stmt_id = loaded["stmt_id"]
+    rows = _assign_all(shared, client, auth, stmt_id, cash_subjects[0]["book"].id)
+    debit, credit = _sides_of(rows, cash_subjects[0]["book"].id)
+    item = cash_subjects[0]
+    maker = build_voucher_factory(db, item["book"], admin_user)
+    # **故意记反**：收款记贷方。
+    maker("2026-09-15",
+          dr=[(item["counter"].code, debit, "方向记反了")],
+          cr=[(item["cash"].code, debit, "方向记反了")])
+
+    body = _json(client.get(shared + f"/cards/{loaded['card_id']}/balance", headers=auth))
+    row = next(item for item in body["books"]
+               if item["book_id"] == cash_subjects[0]["book"].id)
+    # 收款一分没记在借方 → 「少记收款」。
+    assert _dec(row["short_debit"]) == debit, row
+    # 支出侧不是少记，而是**多贷了**（把收款错记成了贷方）。
+    assert _dec(row["short_credit"]) == 0, row
+    assert _dec(row["over"]) == debit - credit, row
+    assert _dec(row["diff"]) != 0, row
 
 
 def test_宿主的对账单台账一行不多(shared, client, auth, db, loaded):
@@ -568,6 +767,11 @@ def _change_first_amount(sheet):
     sheet.cell(row=19, column=3).value = 9999
 
 
+def _change_second_amount(sheet):
+    """第 2 行流水（丙供应链，贷方 100000000）的贷方发生额改成 99999999。"""
+    sheet.cell(row=20, column=4).value = 99999999
+
+
 def _drop_last_row(sheet):
     """删掉最后一行流水（结息）—— 行数从 5 变成 4。"""
     sheet.delete_rows(23)
@@ -601,32 +805,32 @@ def test_重新解析不会把已有归属冲掉(shared, client, auth, loaded):
     assert [row["alloc"] for row in after] == [row["alloc"] for row in before]
 
 
-def test_已制证的行对不回去就整次拒绝(shared, client, auth, loaded, cash_subjects):
-    """账上已经有凭证的那一行，必须**还是那一行** —— 对不回去就整次拒绝。
+def test_已归属的行按新解析刷新_归属不动(shared, client, auth, loaded):
+    """**已归属的行内容跟着新解析走，归属不动**。
 
-    判据与宿主那套一致：「日期 + 金额 + 方向」三项一致（见
-    ``bankstatement.service._match_old_rows``）。宁可不做，也不能把凭证挂到
-    别的行上 —— 那等于把这笔钱的金额记到别处。
+    插件不再制证，所以「那一行在账上有没有凭证」不再是约束；但归属是**用户
+    做的决定**，重新解析不能把它冲回去 —— 行 id 不变、归属账套不变，
+    只有内容按新解析刷新。
     """
     stmt_id = loaded["stmt_id"]
-    rows = _rows(shared, client, auth, stmt_id)
-    unassigned = [row["id"] for row in rows if row["alloc"] is None]
-    client.post(shared + f"/statements/{stmt_id}/assign", headers=auth, json={
-        "rows": unassigned, "book_id": cash_subjects[0]["book"].id})
-    body = _json(client.post(shared + f"/statements/{stmt_id}/vouchers", headers=auth))
-    assert sum(item["created"] for item in body["results"]) == 5, body
-
-    # 第 1 行已经制了凭证 —— 把它的金额改掉，看还认不认得出来。
-    data = _sample_bytes(_change_first_amount)
-    response = client.post(shared + f"/statements/{stmt_id}/reparse", headers=auth,
-                           files={"files": (SAMPLE, data, "application/octet-stream")})
-    assert response.status_code == 422, response.text
-    assert "对不回去" in response.json()["detail"]
-    # 拒绝之后库里一行都没动：行还是 5 行，金额还是原来的，凭证还在。
+    before = _rows(shared, client, auth, stmt_id)
+    # 第 2 行（丙供应链）是**已归属**的那一行 —— 改它的金额。
+    target = next(row for row in before if row["alloc"] is not None)
+    data = _sample_bytes(_change_second_amount)
+    body = _json(client.post(shared + f"/statements/{stmt_id}/reparse", headers=auth,
+                              files={"files": (SAMPLE, data, "application/octet-stream")}))
+    assert body["rows"] == 5, body
+    assert body["refreshed"] == 1, body
+    assert body["carried"] == 3, body
     after = _rows(shared, client, auth, stmt_id)
-    assert len(after) == 5
-    assert after[0]["amount"] == "9780.00"
-    assert after[0]["alloc"]["status"] == "VOUCHER_POSTED"
+    changed = next(row for row in after if row["id"] == target["id"])
+    assert changed["amount"] == "99999999.00", changed
+    # 归属一点没动。
+    assert changed["alloc"]["book_id"] == target["alloc"]["book_id"]
+    assert changed["alloc"]["id"] == target["alloc"]["id"]
+    assert changed["alloc"]["status"] == "ALLOCATED"
+    # 其他行也没动。
+    assert [row["id"] for row in after] == [row["id"] for row in before]
 
 
 def test_行数变了就不结转归属(shared, client, auth, loaded):

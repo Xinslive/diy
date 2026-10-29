@@ -48,7 +48,9 @@ async function sharedcardScenario({ admin, staff, state, sharedcard }) {
     // 跑的是**仓库里那个真的插件包**（plugins/com.cwq.sharedcard），不是替身。
     // 它守的是共享卡这条主线在真实浏览器里成立：
     // 建卡 → 两本账各认领（同一张卡、科目编码不同）→ 上传**一份**对账单 →
-    // 规则归属 → 人工复核 → 分账套制证 → 卡级余额核对。
+    // 规则归属 → 人工复核 → 卡级余额核对（哪本账少记了多少）。
+    //
+    // **插件不制证**（1.1.0 起）—— 所以这里没有「生成凭证」那一步。
 
     // ① 管理员建卡 —— 卡是**全局表**，宿主只放行管理员写全局表。
     await admin.page.goto(state.url + `/#/plugin/${sharedcard.id}`)
@@ -69,6 +71,8 @@ async function sharedcardScenario({ admin, staff, state, sharedcard }) {
     // ③ 两本账各认领这张卡 —— 同一张卡，科目编码不同。
     //    第一本账记在 1002 银行存款，第二本账记在 **1001 库存现金**：
     //    宿主那条流水对账线只认 1002，共享卡这条线**两个族都认**（插件的独门）。
+    //    现金科目下拉**只列一级科目是 1001/1002 的** —— 1012 其他货币资金
+    //    之类不该出现在选项里。
     await sc.locator('.sc-card-click').filter({ hasText: '浏览器演练共享卡' }).click()
     const detail = staff.page.getByTestId('sc-card-detail')
     await detail.waitFor()
@@ -76,10 +80,9 @@ async function sharedcardScenario({ admin, staff, state, sharedcard }) {
       await detail.getByRole('combobox', { name: '账套', exact: true }).selectOption(String(bookId))
       const subject = detail.getByRole('combobox', { name: '现金科目', exact: true })
       await subject.locator(`option[value="${code}"]`).waitFor({ state: 'attached' })
+      // **下拉里不该有非现金族**：1012 其他货币资金的一级科目不是 1001/1002。
+      assert.equal(await subject.locator('option[value="1012"]').count(), 0)
       await subject.selectOption(code)
-      const counter = detail.getByRole('combobox', { name: '默认对方科目', exact: true })
-      await counter.locator('option[value="2241"]').waitFor({ state: 'attached' })
-      await counter.selectOption('2241')
       await detail.getByRole('button', { name: '添加', exact: true }).click()
       await detail.locator('.sc-table').filter({ hasText: code }).waitFor()
     }
@@ -138,23 +141,14 @@ async function sharedcardScenario({ admin, staff, state, sharedcard }) {
     assert.equal(await waitMetric('待复核', '0'), '待复核0')
     await waitUnassignedRows(0)
 
-    // ⑧ 分账套制证：第一本账 4 张、第二本账 1 张
-    await stmtPane.getByRole('button', { name: '生成凭证', exact: true }).click()
-    assert.equal(await waitMetric('已制证', '5'), '已制证5')
-    // **行列表也刷新完**才算完：指标与行是两次请求，指标先到、行后到。
-    // 不等这一下，截图/断言会撞在那个窗口里 —— 看到「已制证 5」与每行
-    // 「待制证」并排的假象，还以为页面的状态是坏的。
-    await staff.page.waitForFunction(() => {
-      const cells = [...document.querySelectorAll('[data-testid="sc-statement"] .sc-tr')]
-        .filter(row => !row.classList.contains('sc-th'))
-      return cells.length === 5 && cells.every(row => row.textContent.includes('已制证'))
-    })
-    await staff.page.screenshot({ path: fileURLToPath(new URL('plugin-sharedcard-vouchers.png', output)), fullPage: true })
+    // ⑧ **插件不制证** —— 界面上不该有「生成凭证」这个入口。
+    assert.equal(await stmtPane.getByRole('button', { name: '生成凭证', exact: true }).count(), 0)
+    await staff.page.screenshot({ path: fileURLToPath(new URL('plugin-sharedcard-rows.png', output)), fullPage: true })
 
-    // ⑨ 卡级余额核对。
-    //    样例的期初余额是 5,847,317.00，演练里**没有**建期初凭证 ——
-    //    所以差额恰好等于期初余额，而「剩下的」也恰好等于它：
-    //    这说明差额解释是通的（已归属未制证/未归属/归错科目三项都是 0）。
+    // ⑨ 卡级余额核对：**各账套该科目的本期发生额 vs 该记的收款/支出**。
+    //    演练里两本账都**没有记过凭证** —— 所以账上一分没动，
+    //    「少记」就等于各自该记的金额：第一本账
+    //    收款 100,007,401 + 支出 10,530，第二本账支出 30,000,000。
     await stmtPane.getByRole('button', { name: '返回', exact: true }).click()
     await staff.page.getByTestId('sc-cards').waitFor()
     await sc.locator('.sc-card-click').filter({ hasText: '浏览器演练共享卡' }).click()
@@ -165,13 +159,17 @@ async function sharedcardScenario({ admin, staff, state, sharedcard }) {
       await item.waitFor()
       return (await item.innerText()).replace(/\s+/g, '')
     }
-    assert.equal(await kv('各账套账面余额合计'), '各账套账面余额合计69,996,871.00')
-    assert.equal(await kv('对账单期末余额'), '对账单期末余额75,844,188.00')
-    assert.equal(await kv('差额'), '差额5,847,317.00')
-    assert.equal(await kv('解释合计'), '解释合计0.00')
-    assert.equal(await kv('剩下的'), '剩下的5,847,317.00')
+    assert.equal(await kv('各账套该科目本期发生额'), '各账套该科目本期发生额借0.00/贷0.00')
+    assert.equal(await kv('对账单该记的'), '对账单该记的借100,007,401.00/贷30,010,530.00')
+    assert.equal(await kv('还没归属'), '还没归属（0行）收0.00/付0.00')
+    // 「谁少记了」要**点名**。
+    const shortCard = detail.locator('.sc-card').filter({ hasText: '谁少记了' }).first()
+    await shortCard.waitFor()
+    const shortText = (await shortCard.innerText()).replace(/\s+/g, '')
+    assert.match(shortText, /共享卡演练账套甲.*少记100,017,931\.00/)
+    assert.match(shortText, /共享卡演练账套乙.*少记30,000,000\.00/)
     await staff.page.screenshot({ path: fileURLToPath(new URL('plugin-sharedcard-balance.png', output)), fullPage: true })
-    console.log('PASS shared card: one statement across two books, rule allocation, manual review, per-book vouchers, card-level balance reconciliation')
+    console.log('PASS shared card: one statement across two books, rule allocation, manual review, card-level reconciliation (no vouchers)')
 }
 
 try {
