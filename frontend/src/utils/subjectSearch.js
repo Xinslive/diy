@@ -78,12 +78,17 @@ export function levelOf(options, s) {
  *    ids      —— 被指名的那些科目自己。
  *    childIds —— 它们的**直接下级**：按名字指名的场合，下级名字不一样、匹配不上，
  *                不单列出来就看不见 —— 「输入二级显示到三级」这条对名字也该算数。
+ *
+ * ``match`` 是「算什么算命中」：**判定（摊多深）是同一件事，口径不该有两套**，
+ * 但「用什么算命中」是各页面自己的契约 —— 科目表页的筛选框写的是「按编码或名称
+ * 筛选」，不带拼音首字母那一路（那一路要另外把拼音字典加载进来，在那个页面上
+ * 时灵时不灵）。所以把匹配器作为参数传进来，默认仍是全应用那一份。
  */
-export function searchNamed(options, kw) {
+export function searchNamed(options, kw, match = matchSubject) {
   const k = String(kw ?? '').trim().toLowerCase()
   if (!k) return null
   const hits = []
-  for (const s of options) if (matchSubject(s, k)) hits.push(s)
+  for (const s of options) if (match(s, k)) hits.push(s)
   if (!hits.length) return null
   const exact = hits.filter((s) => {
     const code = String(s.code ?? '').trim().toLowerCase()

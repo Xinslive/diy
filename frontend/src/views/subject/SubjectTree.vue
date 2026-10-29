@@ -23,8 +23,10 @@
               :title="`加载失败：${loadError}。请检查网络后重试。`" />
 
     <div class="card">
-      <el-table :data="filtered" row-key="id" border default-expand-all
-                :tree-props="{ children: 'children' }" v-loading="loading">
+      <el-table :data="filtered" row-key="id" border
+                :expand-row-keys="expandKeys"
+                :tree-props="{ children: 'children' }"
+                @expand-change="onExpandChange" v-loading="loading">
         <!-- 编码列的宽度按本账套的编码规则算，见下面 codeWidth 的注释。
              写死一个数只对某一种规则成立，换个多级账套就折行。 -->
         <el-table-column label="编码" :width="codeWidth" prop="code" />
@@ -75,6 +77,7 @@ import { useUrlConditions } from '@/composables/useUrlConditions'
 import { useLatestLoad } from '@/composables/useLatestLoad'
 import { useSessionStore } from '@/stores/session'
 import { CATEGORY_LABEL } from '@/utils/subjectCode'
+import { SEARCH_AUTO_DEPTH, rowOpen, searchNamed } from '@/utils/subjectSearch'
 
 const store = useSessionStore()
 const tree = ref([])
@@ -162,26 +165,174 @@ const codeWidth = computed(() => {
 // 112201/112202，等于还得再搜一次。不命中的节点只保留有命中的后代那条路径，
 // 祖先必须留着：剪枝时把父节点剪掉，这行就成了没有位置的孤儿，
 // el-table 按 parent_id 找不着它的上级，整行直接不显示。
+//
+// **命中的口径是这一页自己的契约**：筛选框上写的是「按编码或名称筛选」，
+// 就是编码或名称（子串）。全应用那一份 `matchSubject` 还多一条拼音首字母，
+// 但拼音字典要另外加载（选择器是聚焦时才加载的），在这一页时灵时不灵 ——
+// 「有时搜得到、有时搜不到」比「搜不到」更糟。
+//
+// 而「摊开几级」是**同一件事**，跟选择器共用一份判定（`searchNamed` /
+// `rowOpen` / `SEARCH_AUTO_DEPTH`）：判定只有一套，「用什么算命中」由各页面
+// 作为参数传进去。
+
+/** 这一页的命中口径：编码或名称（子串）。 */
+function matchTree(s, kw) {
+  const k = String(kw ?? '').trim().toLowerCase()
+  if (!k) return true
+  return String(s.code ?? '').toLowerCase().includes(k)
+    || String(s.name ?? '').toLowerCase().includes(k)
+}
+
+/** 这个节点是不是命中了筛选关键字。 */
+function isHit(node, kw) {
+  return matchTree(node, kw)
+}
+
 function pruneTree(nodes, kw) {
   const out = []
   for (const node of nodes) {
     const children = pruneTree(node.children || [], kw)
-    const hit = String(node.code || '').toLowerCase().includes(kw)
-      || String(node.name || '').toLowerCase().includes(kw)
-    if (hit || children.length) out.push({ ...node, children })
+    if (isHit(node, kw) || children.length) out.push({ ...node, children })
   }
   return out
+}
+
+/**
+ * 摊平成「带 parent_id 与嵌套深度」的一维列表。
+ *
+ * `utils/subjectSearch` 那套判定按 parent_id 算级次（`levelOf`），
+ * 而接口给的是**嵌套树**（每个节点带 children）。摊平只是为了喂它。
+ * 摊平时顺手记下**嵌套深度**：那是树里最可信的级次 —— 不信库里那个 `level`
+ * 字段（改挂父级之后要等后端重算才准，见 subjectSearch::levelOf 的理由）。
+ */
+function flattenSubjects(nodes, parentId = null, depth = 0, out = []) {
+  for (const n of nodes || []) {
+    out.push({ ...n, parent_id: parentId, depth })
+    flattenSubjects(n.children || [], n.id, depth + 1, out)
+  }
+  return out
+}
+
+/**
+ * 默认摊到第几级（0 起：1 = 显示到第二级）。
+ *
+ * 用户 2026-10-29 批注：「科目表默认显示下一级。筛选条件为空或者为 1 级科目的时候，
+ * 最多显示到 2 级科目，筛选条件是 2 级科目的时候，最多显示到 3 级，以此类推。
+ * 防止一次性展开太多级。」
+ *
+ * **这条规矩不是新写的**：科目选择面板（`utils/subjectSearch.js`）早就是这么做的 ——
+ * 指名了第几级就显示到第几 + 1 级，指不出名来（敲的是个片段、命中一大片）
+ * 只摊到第二级。同一件事、同一套判定，所以**共用那一份**，不另起一套口径：
+ * 两边算出不一样的深度，用户在两个页面看到同一棵树的两种摊法。
+ *
+ * 「指名」= 编码或名称全等，或者全表只有它一条命中（`searchNamed`）。
+ */
+function autoDepthOf(flat, kw) {
+  const named = searchNamed(flat, kw, matchTree)
+  return named ? named.level : SEARCH_AUTO_DEPTH
+}
+
+/**
+ * 默认要展开的行（**字符串** id）。
+ *
+ * 摊到 `autoDepth` 那一级就收住，再深的**留在数据里**：用户点那支 ▸ 还能自己
+ * 往下走 —— 限制的是「默认摊开多少」，不是「能看多少」。
+ *
+ * 「这一支摊不摊开」问的还是面板那条 `rowOpen`（同一件事，同一个判据），
+ * 不在这儿另写一遍 `depth < autoDepth`。`rowOpen` 本来就管三件事：
+ * 默认摊到哪一级、**人点开的一律作数**、**人点收的压过一切** ——
+ * 后两件正是这一页要的（见下面 manualExpanded / manualCollapsed）。
+ *
+ * ⚠️ **id 要转成字符串再交出去**：Element Plus 的树形表把行收进
+ * `treeData[parentId]` 这个**普通对象**里，于是 `Object.keys(treeData)` 拿到的
+ * 是字符串键（"12"），而 `:expand-row-keys` 的值是拿 `includes(key)` 跟它比的。
+ * 传数字进去 → 数字跟字符串永远对不上 → 一行都不展开（看起来像「表格不认下级」）。
+ * 它的 TS 契约本来就写的是 `Array<string>`，照契约给。
+ */
+function expandKeysOf(nodes, autoDepth, expanded = null, collapsed = null) {
+  const keys = []
+  const walk = (list, depth) => list.forEach((n) => {
+    const hasKids = (n.children || []).length > 0
+    const id = String(n.id)
+    if (rowOpen({ hasKids, depth, searching: true, autoDepth, expanded, collapsed, id })) {
+      keys.push(id)
+    }
+    walk(n.children || [], depth + 1)
+  })
+  walk(nodes || [], 0)
+  return keys
+}
+
+/**
+ * **用户手动开过 / 关过的行**（行 id → true / false）。
+ *
+ * **为什么单独记一份**：``:expand-row-keys`` 一变，el-table 会把展开状态
+ * **整个换成**那批 key（`setExpandRowKeys` 是赋值，不是合并）。而摊开深度一改、
+ * 筛选一变，那个数组都会重算 —— 不记这一份，用户刚点开的行就被弹回去了。
+ *
+ * 记的是**用户的意愿**，不是「当前状态」：开了记 true，关了记 false。
+ * 没记过的行按默认来（摊到 `autoDepth` 那一级为止）。
+ *
+ * 与 `views/bank/FlowReconciliation.vue` 是**同一套做法** —— 本仓库里
+ * 「按行控制展开」只有这一种写法。
+ */
+const rowExpandOverrides = ref(new Map())
+
+/**
+ * 用户点过的行 → `rowOpen` 要的那两个集合（人点开的 / 人点收的）。
+ *
+ * `utils/subjectSearch.js` 的 `rowOpen` 本来就管这三件事：默认摊到哪一级、
+ * **人点开的一律作数**、**人点收的压过一切**。后两件正是这一页要的。
+ */
+const manualSets = computed(() => {
+  const expanded = new Set()
+  const collapsed = new Set()
+  for (const [id, open] of rowExpandOverrides.value) {
+    if (open) expanded.add(String(id))
+    else collapsed.add(String(id))
+  }
+  return { expanded, collapsed }
+})
+
+/**
+ * el-table 的展开变化（只有**人点**才会来这一趟）。
+ *
+ * ⚠️ **两种 `expand-change` 的签名不一样**：
+ * - `type="expand"` 的列（流水对账页那样）发的是**展开行的数组**；
+ * - **树形表**（这一页）发的是 `(row, expanded)` 的**布尔**。
+ * 照抄流水对账页那版（拿数组 `.some()` 判开合）到这里会**永远当成「开了」**。
+ */
+function onExpandChange(row, expanded) {
+  if (!row || row.id === undefined || row.id === null) return
+  const next = new Map(rowExpandOverrides.value)
+  next.set(String(row.id), !!expanded)
+  rowExpandOverrides.value = next
 }
 
 const isFiltering = computed(() => !!keyword.value.trim())
 const filtered = computed(() =>
   isFiltering.value ? pruneTree(tree.value, keyword.value.trim().toLowerCase()) : tree.value)
 
+const flatSubjects = computed(() => flattenSubjects(tree.value))
+const autoDepth = computed(() => autoDepthOf(flatSubjects.value, keyword.value))
+const expandKeys = computed(() => expandKeysOf(
+  filtered.value,
+  autoDepth.value,
+  manualSets.value.expanded,
+  manualSets.value.collapsed,
+))
+
+/**
+ * 「命中 N 个科目」数的是**真正命中的那些**。
+ *
+ * 以前数的是剪枝后树上的全部节点 —— 那是「结果里留下了多少行」，不是「命中多少」。
+ * 摊开深度一改，这两者就对不上了：命中 3 个、树上留着 6 行，而摊开的深度又只
+ * 露出其中一部分，数字与眼前的行数八竿子打不着。标签写的是「命中」，就数命中。
+ */
 const hitCount = computed(() => {
   if (!isFiltering.value) return 0
   let total = 0
-  const walk = (nodes) => nodes.forEach((node) => { total += 1; walk(node.children || []) })
-  walk(filtered.value)
+  for (const s of flatSubjects.value) if (isHit(s, keyword.value)) total += 1
   return total
 })
 

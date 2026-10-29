@@ -306,6 +306,240 @@ t('加载失败要在页面上有一条，不是渲染成「没有科目」', ()
   assert.match(SRC, /加载失败/)
 })
 
+console.log('== 默认摊开几级（用户 2026-10-29 批注）==')
+//
+// 「科目表默认显示下一级。筛选条件为空或者为 1 级科目的时候，最多显示到 2 级科目，
+//  筛选条件是 2 级科目的时候，最多显示到 3 级，以此类推。防止一次性展开太多级。」
+//
+// 这套判定**不是这一页新写的**：科目选择面板（utils/subjectSearch.js）早就是这么
+// 做的。这里抠的是页面上的真实源码，喂的是面板那份判定 —— 两边必须算出同一个深度。
+
+const search = await (async () => {
+  const { createServer } = await import('vite')
+  const { fileURLToPath } = await import('node:url')
+  const ROOT = fileURLToPath(new URL('../', import.meta.url))
+  const vite = await createServer({ root: ROOT, logLevel: 'error', server: { middlewareMode: true } })
+  return {
+    subjectSearch: await vite.ssrLoadModule('/src/utils/subjectSearch.js'),
+    subjectCode: await vite.ssrLoadModule('/src/utils/subjectCode.js')
+  }
+})()
+const { SEARCH_AUTO_DEPTH, rowOpen, searchNamed } = search.subjectSearch
+const { matchSubject: match } = search.subjectCode
+
+/** 抠出来的这几段要用的依赖，凑齐了装进 new Function 跑。 */
+const DEP_DEPS = `
+  const matchSubject = deps.matchSubject
+  const searchNamed = deps.searchNamed
+  const SEARCH_AUTO_DEPTH = deps.SEARCH_AUTO_DEPTH
+  const rowOpen = deps.rowOpen
+  const rowExpandOverrides = deps.rowExpandOverrides
+`
+const deps = {
+  matchSubject: match,
+  searchNamed,
+  SEARCH_AUTO_DEPTH,
+  rowOpen,
+  rowExpandOverrides: { value: new Map() },
+}
+
+/** 页面上的那几个纯函数，抠出来装进一个能直接调用的工厂。 */
+function treeFns(overrides = {}) {
+  // `matchTree` 也要抠：`isHit` 调它、`autoDepthOf` 把它当参数传给 searchNamed。
+  // 少抠一个，页面上真正在用的那段代码就少了一半 —— 测的就不是它了。
+  const src = ['flattenSubjects', 'autoDepthOf', 'expandKeysOf', 'pruneTree', 'isHit', 'matchTree', 'onExpandChange']
+    // **不能直接 .map(grabFn)**：map 会把「下标」当第二个参数传过去，
+    // 而 grabFn 的第二个参数是「从哪抠」—— 拿到的就成了 0，抠的是空字符串。
+    .map((name) => grabFn(name)).join('\n')
+  const factory = new Function('deps', `
+    ${DEP_DEPS}
+    ${src}
+    return { flattenSubjects, autoDepthOf, expandKeysOf, pruneTree, isHit, matchTree, onExpandChange }
+  `)
+  return factory({ ...deps, ...overrides })
+}
+
+/** 一棵四层的科目树（嵌套形状 = 接口给的那个形状）。 */
+const TREE = [
+  { id: 1, code: '1001', name: '库存现金', level: 1, children: [] },
+  { id: 2, code: '1002', name: '银行存款', level: 1, children: [
+    { id: 3, code: '100201', name: '工商银行', level: 2, children: [
+      { id: 4, code: '10020101', name: '基本户', level: 3, children: [] },
+    ] },
+  ] },
+  { id: 5, code: '5001', name: '主营业务收入', level: 1, children: [
+    { id: 6, code: '500101', name: '星创空间', level: 2, children: [
+      { id: 7, code: '50010101', name: '一层', level: 3, children: [
+        { id: 8, code: '5001010101', name: '五号店', level: 4, children: [] },
+      ] },
+    ] },
+  ] },
+]
+
+t('筛选为空 → 只摊到第二级（默认显示下一级）', () => {
+  const f = treeFns()
+  const flat = f.flattenSubjects(TREE)
+  assert.equal(f.autoDepthOf(flat, ''), SEARCH_AUTO_DEPTH)
+  assert.equal(SEARCH_AUTO_DEPTH, 1, '默认深度就是「显示到第二级」')
+})
+
+t('筛到 1 级科目 → 最多显示到 2 级', () => {
+  const f = treeFns()
+  const flat = f.flattenSubjects(TREE)
+  assert.equal(f.autoDepthOf(flat, '1002'), 1)
+})
+
+t('筛到 2 级科目 → 最多显示到 3 级', () => {
+  const f = treeFns()
+  const flat = f.flattenSubjects(TREE)
+  assert.equal(f.autoDepthOf(flat, '100201'), 2)
+})
+
+t('筛到 3 级科目 → 最多显示到 4 级', () => {
+  const f = treeFns()
+  const flat = f.flattenSubjects(TREE)
+  assert.equal(f.autoDepthOf(flat, '10020101'), 3)
+})
+
+t('指不出名来（片段命中一大片）→ 退回只摊到第二级', () => {
+  const f = treeFns()
+  const flat = f.flattenSubjects(TREE)
+  // 「100」命中一整条链，不是指名某一条 → 不跟着它摊深
+  assert.equal(f.autoDepthOf(flat, '100'), SEARCH_AUTO_DEPTH)
+})
+
+t('默认只展开第一级（有下级的那些），第二级往下收着', () => {
+  const f = treeFns()
+  const keys = f.expandKeysOf(TREE, SEARCH_AUTO_DEPTH)
+  assert.deepEqual(keys.sort(), ['2', '5'], '只该展开 1002 与 5001 两支')
+})
+
+t('摊到第三级时，第一级与第二级都展开', () => {
+  const f = treeFns()
+  const keys = f.expandKeysOf(TREE, 2)
+  assert.deepEqual(keys.sort(), ['2', '3', '5', '6'])
+})
+
+t('叶子节点不占展开位（没有下级，展开它没有意义）', () => {
+  const f = treeFns()
+  const keys = f.expandKeysOf(TREE, 5)
+  assert.ok(!keys.includes('4'), '基本户是叶子，不该被列进展开位')
+  assert.ok(!keys.includes('1'), '库存现金是叶子，不该被列进展开位')
+})
+
+t('展开位是**字符串** id（Element Plus 拿字符串键比，传数字一行都不展开）', () => {
+  const f = treeFns()
+  const keys = f.expandKeysOf(TREE, SEARCH_AUTO_DEPTH)
+  // Element Plus 的树形表把行收进 treeData[parentId] 这个普通对象里，
+  // Object.keys(treeData) 拿到的是**字符串**键，而 :expand-row-keys 的值
+  // 是拿 includes(key) 跟它比的 —— 数字永远对不上，一行都不展开。
+  // 实测症状：行上画着 ▸（认得出下级），但点了没反应、默认也不展开。
+  for (const k of keys) assert.equal(typeof k, 'string', `展开位 ${k} 不是字符串`)
+  assert.ok(keys.includes('2'), '1002 该在展开位里')
+})
+
+t('用户手动点开的行要留在展开位里（否则下一轮重算就把它收回去了）', () => {
+  const f = treeFns()
+  // 500101 是第三级，默认深度 1 摊不到它；用户点了 ▸ 就该留在展开位里。
+  const keys = f.expandKeysOf(TREE, SEARCH_AUTO_DEPTH, new Set(['6']), null)
+  assert.ok(keys.includes('6'), '手动点开的 500101 该留在展开位里')
+  assert.ok(!keys.includes('7'), '它下面那支没被点开，不该跟着摊开')
+})
+
+t('用户手动点收的行要从展开位里去掉（点一下收起来不能是个摆设）', () => {
+  const f = treeFns()
+  const keys = f.expandKeysOf(TREE, SEARCH_AUTO_DEPTH, null, new Set(['2']))
+  assert.ok(!keys.includes('2'), '1002 被点收了，不该在展开位里')
+  assert.ok(keys.includes('5'), '5001 没被动过，还该摊着')
+})
+
+t('手动点开/点收都记进名单（记的是用户的意愿，不是当前状态）', () => {
+  const rowExpandOverrides = { value: new Map() }
+  const f = treeFns({ rowExpandOverrides })
+  f.onExpandChange({ id: 6 }, true)
+  assert.equal(rowExpandOverrides.value.get('6'), true, '点开的行要记 true')
+  f.onExpandChange({ id: 6 }, false)
+  assert.equal(rowExpandOverrides.value.get('6'), false, '点收的行要记 false')
+})
+
+t('树形表的 expand-change 第二个参数是**布尔**（不是「展开行数组」）', () => {
+  const rowExpandOverrides = { value: new Map() }
+  const f = treeFns({ rowExpandOverrides })
+  // `type="expand"` 的列发的是**数组**，树形表发的是**布尔**。
+  // 照抄流水对账页那版（拿数组 .some() 判开合）到这里会永远当成「开了」。
+  f.onExpandChange({ id: 6 }, false)
+  assert.equal(rowExpandOverrides.value.get('6'), false, 'false 必须记成「收着」')
+})
+
+t('摊平后 parent_id 与深度都对（级次不能靠库里那个 level 字段）', () => {
+  const f = treeFns()
+  const flat = f.flattenSubjects(TREE)
+  const byId = new Map(flat.map((s) => [s.id, s]))
+  assert.equal(byId.get(1).parent_id, null)
+  assert.equal(byId.get(3).parent_id, 2)
+  assert.equal(byId.get(8).parent_id, 7)
+  assert.equal(byId.get(1).depth, 0)
+  assert.equal(byId.get(3).depth, 1)
+  assert.equal(byId.get(8).depth, 3)
+})
+
+t('这一页的命中口径：编码或名称（子串）—— 与筛选框上写的一致', () => {
+  const f = treeFns()
+  assert.ok(f.isHit({ id: 1, code: '1001', name: '库存现金' }, '1001'), '编码没命中')
+  assert.ok(f.isHit({ id: 1, code: '1001', name: '库存现金' }, '库存'), '名称没命中')
+  assert.ok(f.isHit({ id: 1, code: '1001', name: '库存现金' }, '现金'), '名称片段没命中')
+  assert.ok(!f.isHit({ id: 1, code: '1001', name: '库存现金' }, '银行存款'), '不该命中别的科目')
+})
+
+t('这一页**不**走拼音首字母（拼音字典没加载 → 时灵时不灵，比搜不到更糟）', async () => {
+  const f = treeFns()
+  // 选择面板那一路是带拼音的（matchSubject + 拼音字典）；科目表页刻意不用它。
+  await search.subjectCode.ensurePinyin()
+  assert.ok(deps.matchSubject({ id: 1, code: '1001', name: '库存现金' }, 'kcxj'),
+    '全应用那一份本来就该支持拼音首字母（选择面板靠它）')
+  assert.ok(!f.isHit({ id: 1, code: '1001', name: '库存现金' }, 'kcxj'),
+    '科目表页不该把拼音当命中口径 —— 它对不上筛选框上写的那句')
+})
+
+t('「摊多深」跟这一页的命中口径是**同一套**（拼音不算命中 → 指不出名来 → 默认深度）', async () => {
+  const f = treeFns()
+  await search.subjectCode.ensurePinyin()
+  const flat = f.flattenSubjects(TREE)
+  // 「星创空间」是二级科目，拼音首字母 xckj 全表只它一条 ——
+  // 按全应用那一份（带拼音）算，它就是「指名了二级」→ 该摊到第三级。
+  // 但科目表页的筛选框写的是「按编码或名称筛选」，拼音**不算命中** →
+  // 指不出名来 → 退回默认的「摊到第二级」。
+  assert.equal(f.autoDepthOf(flat, 'xckj'), SEARCH_AUTO_DEPTH,
+    '拼音不是这一页的命中口径，它不该把深度带深')
+  // 用中文名指名同一个二级科目 → 摊到第三级（这一条两端一致）
+  assert.equal(f.autoDepthOf(flat, '星创空间'), 2,
+    '中文名指名二级科目就该摊到第三级')
+})
+
+t('剪枝保留命中的整棵子树与祖先路径', () => {
+  const f = treeFns()
+  const pruned = f.pruneTree(TREE, '100201')
+  assert.equal(pruned.length, 1, '只该留下 1002 这一支')
+  assert.equal(pruned[0].code, '1002', '祖先要留着（剪掉就成了没有上级的孤儿）')
+  assert.equal(pruned[0].children[0].code, '100201')
+  assert.equal(pruned[0].children[0].children[0].code, '10020101', '命中项的子树要留着')
+})
+
+console.log('== 模板上的展开绑定 ==')
+
+t('表格用 expand-row-keys 驱动展开，不再是 default-expand-all', () => {
+  assert.match(SRC, /:expand-row-keys="expandKeys"/)
+  assert.ok(!/default-expand-all/.test(SRC), 'default-expand-all 会把整棵树摊开，正是不防的那件事')
+})
+
+t('这一页用的是选择面板那一份判定（同一件事、同一个口径）', () => {
+  assert.ok(/from '@\/utils\/subjectSearch'/.test(SRC), '没引 utils/subjectSearch')
+  assert.match(SRC, /rowOpen\(\{/)
+  // 判定（摊多深）用面板那一份；「算什么算命中」由这一页作为参数传进去。
+  assert.match(SRC, /searchNamed\([^)]*matchTree\)/,
+    'searchNamed 要把这一页自己的匹配器传进去 —— 否则「摊多深」和「命中没命中」就成两套口径了')
+})
+
 console.log('')
 for (const [name, fn] of tests) {
   try {
