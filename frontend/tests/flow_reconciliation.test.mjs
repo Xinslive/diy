@@ -1047,6 +1047,60 @@ t('台账空态用插槽显示动态文案', () => {
   assert.match(VIEW, /月还没有对账单/)
 })
 
+console.log('== 上传区：一行放下 + 不摆说明（2026-10-29 用户批注） ==')
+
+t('上传区不再摆那句「支持 Excel…格式按文件内容识别」', () => {
+  // 用户批注：「去掉这个提示」。
+  //
+  // **只查上传那张卡**：下面「对账单台账」那张卡里的说明是**另一句话**
+  // （讲「差额」怎么算），跟这条批注无关，不能一起删。
+  const start = VIEW.indexOf('class="flow-upload-card"')
+  assert.ok(start > 0, '找不到上传那张卡')
+  const end = VIEW.indexOf('</el-card>', start)
+  const card = stripComments(VIEW.slice(start, end))
+  assert.doesNotMatch(card, /支持 Excel/, '上传区还在摆支持哪些格式')
+  assert.doesNotMatch(card, /不看扩展名/, '上传区还在摆格式说明')
+  assert.doesNotMatch(card, /网页版表格/, '上传区还在摆支持哪些格式')
+})
+
+t('「上传并解析」与资产科目、对账单在同一行', () => {
+  // 用户批注：「挪到上面，一行显示」。
+  //
+  // 原来主按钮自己占一行、摆在下面 —— 一步操作被拆成两行看，
+  // 用户得再往下扫一眼才找得到它。
+  const start = VIEW.indexOf('<el-row :gutter="0" class="flow-upload-row">')
+  assert.ok(start > 0, '找不到上传那行的 el-row')
+  const end = VIEW.indexOf('</el-row>', start)
+  const row = stripComments(VIEW.slice(start, end))
+  assert.match(row, /label="资产科目"/)
+  assert.match(row, /label="对账单"/)
+  assert.match(row, /上传并解析/)
+  // 三栏在同一行里 —— 不是三个 el-row 各摆一样
+  assert.equal((row.match(/<el-col/g) || []).length, 3,
+    '上传那行应该正好三栏')
+})
+
+t('第三栏不带 label：按钮跟上面两个输入框左边对齐', () => {
+  // el-form 会给**没有 label** 的表单项按表单的 label-width 留出缩进，
+  // 按钮正好跟输入框的左边对齐 —— 不用自己写死像素值。
+  const start = VIEW.indexOf('class="flow-upload-action-col"')
+  assert.ok(start > 0, '找不到上传按钮那一栏')
+  const end = VIEW.indexOf('</el-col>', start)
+  const col = stripComments(VIEW.slice(start, end))
+  assert.match(col, /<el-form-item class="flow-upload-action">/)
+  assert.doesNotMatch(col, /<el-form-item[^>]*label=/,
+    '第三栏不该有 label（有 label 就对不齐输入框了）')
+  // 表单本身的 label-width 要在（第三栏的缩进靠它）
+  assert.match(VIEW, /<el-form :model="uploadForm" label-width="92px"/)
+})
+
+t('已选的文件名不会把卡片撑宽', () => {
+  // 文件名可能很长（带日期、带流水号）：**只截断，不撑宽**。
+  assert.match(VIEW, /\.picked \{[\s\S]*?text-overflow: ellipsis/)
+  assert.match(VIEW, /\.picked \{[\s\S]*?white-space: nowrap/)
+  assert.match(VIEW, /\.picked \{[\s\S]*?max-width: 100%/)
+})
+
 console.log('== 凭证摘要模板 ==')
 t('占位符清单与后端一致', () => {
   assert.deepEqual(SUMMARY_TEMPLATE_FIELDS,
