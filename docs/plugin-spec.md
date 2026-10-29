@@ -56,6 +56,8 @@
 | `audit:write` | `ctx.audit_write()` | 写入插件自定义审计事件 |
 | `settings:rw` | `ctx.settings.*` | 管理员维护插件级短配置 |
 | `upload:read` | `ctx.upload_read()` | 在当前请求中读取插件接口收到的文件 |
+| `statement:parse` | `ctx.statement.parse()` | 用**宿主那一份**解析器把银行对账单解析成结构化流水行（不写宿主任何业务表） |
+| `statement:read` | `ctx.statement.read()` | 读取账套在宿主已绑的对账单**绑定清单**（不含流水行内容） |
 | `import:rw` | `ctx.imports.*`（**不含 `confirm`**）、前端 `services.imports` | 持久文件、预览、整批提交和来源追溯；**确认必须走前端 `services.imports.confirm` 的独立宿主请求**（详见 plugin-data） |
 
 `import:rw` 只提供导入批次能力；正式提交还必须声明 `voucher:write`。`plugin_data:rw` 只允许访问 manifest 声明的插件表，不能用来读取宿主业务表。
@@ -175,6 +177,56 @@ ctx.data.count(TABLE, book_id=book_id, where={"label": "已完成"})
 
 规则：过滤字段必须是本表真实列，值只能是标量；`in` 最多 200 个元素；没有任何拼 SQL 的入口。**账套范围永远由宿主附加**，过滤条件改不掉它。`data.count` 与 `data.read` 用同一套过滤条件；`data.read` 的返回值仍是行列表（旧契约不变），计数单独走 `data.count`。
 
+### 整批写入：data.insert_many
+
+`data.insert` 一次一行。插件要一次写一批（导入台账、批量建行）时用 `insert_many` —— **整批同一事务，单行失败整批回滚**，错误信息带「第 N 行」：
+
+```python
+ctx.data.insert_many(TABLE, [{"label": "一"}, {"label": "二"}], book_id=book_id)
+```
+
+逐行插入的老路会留下「前 N−1 行已经落库」的半批数据：用户看到的是「插了一半」，而他以为这是一次操作。空批不是「成功插了 0 行」，而是参数不合法（400）。
+
+### 对账单解析：宿主只贡献解析器
+
+声明 `statement:parse` 后，`ctx.statement.parse(data, *, book_id=None, column_mapping=None)` 用**宿主生产用的那一份**解析器把文件解析成结构化流水行：
+
+```python
+out = ctx.statement.parse(payload["content"], book_id=book_id)
+out["rows"]       # 结构化流水行（seq / tx_date / direction / amount / summary / cp_name …）
+out["meta"]       # account_no / bank_name / closing_balance / declared_*_count
+out["diagnosis"]  # 解析自检（对不上的地方要说清楚）
+out["via_ocr"]    # 这份是 OCR 认出来的
+out["period_start"] / out["period_end"]
+```
+
+**它不写宿主任何业务表**，也不读也不写格式画像。给了 `book_id` 才把原件留在宿主的 `data/statements/shared/` 下（不给就只解析、不落原件）。`column_mapping` 传的是「列序号 → 字段名」的映射，**整体替换**宿主的自动识别结果。
+
+**为什么插件不自己写解析器**：同一份银行文件，宿主与插件各写一份解析器，就会有两个答案 —— 而这两个答案**不会同时错**，它们会各自对上一半（列映射认得不一样、方向判得不一样），用户看到的是「有时候对有时候不对」。宿主那一份与插件面**逐行一致**（`backend/tests/test_plugin_statement_capability.py` 用 14 份真实银行样例对照）。
+
+声明 `statement:read` 后，`ctx.statement.read(book_id)` 返回该账套在宿主已绑的对账单**清单**（文件名、期间、绑定科目、期末余额、行数），**不含流水行内容** —— 插件要它是为了知道「这个账套已经绑过哪份对账单」，免得重复上传。
+
+### 期间与账面余额：与宿主同一个口径
+
+- `ctx.period_list(book_id)` —— 期间清单（`id` / `year` / `month` / `ord` / `locked` / `closed_at`）。插件**读不到宿主的 period 表**；跨账套的**账期可以不一样**（有的账套用 4-4-5 财年），所以不能拿一份期间号套到别的账套上。
+- `ctx.ledger_read(book_id, period_id, include_unposted=True)` —— 科目余额表。`include_unposted=True` 与宿主对账口径**同一个**（已制证但未过账的凭证也算在账面余额里）；默认 `False`，旧插件不受影响。
+
+**余额表给的是「绝对额 + 方向」**（`direction` 是中文的 `借` / `贷` / `平`）。跨账套相加必须按方向还原**带符号**的数，否则落在贷方的那张账套会以正数加进去，合计凭空多出一截。
+
+### 能力探测：老宿主上要说清缺哪几项
+
+宿主能力是**按需出现**的（老宿主没有新能力时，`ctx` 上就没有那个属性）。插件后端的沙箱**禁反射原语**（`getattr`/`hasattr` 都在扫描黑名单里，运行期连 `hasattr` 这个内建都没有），所以探测要用 `try/except` 直接取属性：
+
+```python
+missing = []
+try:
+    ctx.statement
+except AttributeError:
+    missing.append("statement:parse / statement:read")
+```
+
+缺能力时插件**明确拒绝并说清缺哪几项**（503），而不是在调用到一半时抛一个用户看不懂的错。
+
 ### 导入白名单
 
 安装时的静态扫描按**白名单**收敛插件的 import：只有下列模块可以 import，其余一律拒绝安装。
@@ -237,12 +289,15 @@ export default function createPlugin(host) {
 | `onMounted`、`onUnmounted` | 组件生命周期 |
 | `bookId()`、`periodId()` | 当前宿主选择 |
 | `books()` | 当前用户可访问账套及 `canWrite` 提示 |
+| `isAdmin()` | 当前用户是不是系统管理员 |
 | `api.get/post/put/patch/delete` | 请求当前插件命名空间 |
 | `api.upload(url, files, params)` | 上传文件到当前插件接口 |
 | `api.download(url)` | 获取当前插件命名空间下的 Blob |
 | `services` | 标准账套、配置和导入服务 |
 
 `host.api` 会自动携带登录凭据，插件不需要创建 Axios 实例或手工拼接 Bearer。`put(url, data, params)` 的第三个参数用于 query。前端可以根据 `canWrite` 调整界面，但后端提交时仍必须重新检查账套权限。
+
+**`isAdmin()` 只用于「不给出做不到的动作」**：插件若声明了**全局表**（跨账套的配置），宿主只放行管理员写全局表（`public_api.table_access`）。前端据此把相关按钮**置灰**并说清为什么，而不是让用户点一下、再弹一句「全局配置写入需要管理员」。**它不是权限边界** —— 插件拿到的令牌就是用户的令牌，插件完全可以绕过这个提示直接调接口，后端照样拦。老宿主没有这个能力时，插件应当**不拦着用户**（缺了能力就当作「可以试」），真正的判据仍在后端。
 
 宿主不会因为顶部账套或期间切换而重新挂载插件页面。跟随顶部选择的插件可以监听 `host.bookId()`；需要用户独立选择目标账套的插件应使用 `host.services.books()` 并在自己的页面保存选择。
 
@@ -256,6 +311,19 @@ export default function createPlugin(host) {
 - 不能修改宿主表、其他插件的表或跨插件外键；
 - 表里**不许有二进制列**（`BYTEA`，含 `BYTEA[]` 这类数组形态）：插件自有表的值会原样经 `ctx.data.read` 回到插件手里，一个二进制列就能让返回值带上字节。文件请走导入批次通道（`ctx.imports`），它带容量闸、内容去重与留存期；
 - 表结构、约束、索引和触发器必须与已登记的迁移结果一致。
+
+**两种 scope 的待遇不是一套**（写全局表与写账套表的判据、备份口径都不一样）：
+
+| | `scope: "book"` | `scope: "global"` |
+|---|---|---|
+| 表结构 | 必须有非空 `book_id`，外键指向 `book.id` | **不得含 `book_id`**，只装配置或参考数据 |
+| 写入判据 | 该用户对该账套有写权限（OWNER / ACCOUNTANT） | **只有系统管理员** |
+| 账套级备份 | 只带**本账套**的行 | **整表**进归档（不分账套） |
+| 系统级备份 | 只带 `book_id IS NULL` 的行（通常为空） | 整表 |
+
+**全局表的写入只放行管理员**（`public_api.table_access`）：全局表装的是**配置**，配置是公司层面的事。这条判据插件绕不过去 —— 前端把按钮置灰只是提示，**后端才是边界**。
+
+**全局表不得存账套业务行**：业务数据必须跟着账套走，账套级备份才覆盖得到。跨账套的东西要拆成「**一张全局的卡 + 各账套各自的成员行**」，而不是把整份业务数据塞进全局表 —— 共享卡对账插件（`com.cwq.sharedcard`）就是这么分的。
 
 把配置写入插件自己的 book-scoped 表，并通过 `ctx.config.get/put` 做版本控制。不要把账套配置写入全局 settings，也不要在服务启动时执行隐式 DDL。
 
