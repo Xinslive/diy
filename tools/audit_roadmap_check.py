@@ -325,9 +325,24 @@ check(23, "core/security.py verify_password 在存量轮数偏低时补算（§3
       ev(f"{BF}/security.py",
          r"hashlib\.pbkdf2_hmac\(\"sha256\", raw, salt, _ITERATIONS - iters\)"))
 
-check(24, "api/auth.py 失败计数用行锁串行化（§3.7）—— 机制是 SELECT…FOR UPDATE，"
-      "不是报告建议的 UPDATE…RETURNING（见验收记录「机制偏离」）",
-      ev(f"{BE}/auth.py", r"with_for_update"))
+# **判据跟着实现走**（2026-10-30 改）。
+#
+# 原来这里钉的是 ``api/auth.py`` 里的 ``with_for_update``。那条规则后来搬到了
+# **core**（``core/deps.py::record_password_failure``）—— 因为「记一次口令失败」
+# 现在有**三个执行点**（登录 / 自助改密 / 签发 MCP 密钥），三处各写一份迟早
+# 对不上，而对不上的那处几乎总是**更松**的那一侧（少记一次失败 = 白送一个
+# 不限速的密码猜测机）。规则只有一份，所以判据也得跟着那份走。
+#
+# **但不能只改路径** —— 只改路径的话，「实现被复制回 api/auth.py」照样 PASS，
+# 而那正是要防的事（两份实现迟早对不上）。所以这里用 ``ev_removed``：
+# **core 里要有行锁机制，且 api/auth.py 里不许再出现自己的行锁实现**，
+# 两件事**同时**成立才算过。
+check(24, "失败计数用行锁串行化（§3.7）—— 机制是 SELECT…FOR UPDATE，"
+  "不是报告建议的 UPDATE…RETURNING（见验收记录「机制偏离」）；"
+  "**唯一那份实现在 core/deps.py**（2026-10-30 起：这条规则有三个执行点，"
+  "api/auth.py 只留薄封装，不许再有第二份实现）",
+      ev_removed((f"{BE}/auth.py", r"with_for_update"),
+                 present_specs=((f"{BF}/deps.py", r"with_for_update"),)))
 
 # ============================================================ 第 3 步
 print("\n--- 第 3 步：部署链路止血 ---")
