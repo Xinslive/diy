@@ -314,9 +314,13 @@ def test_插件不再声明凭证权限(shared, client, auth, db):
     permissions = (registry.manifest_metadata or {}).get("permissions") or []
     assert "voucher:write" not in permissions, permissions
     # 1.3.0 起插件多了「按金额初筛」（entry:read）与「导出 Excel」（export:write）
-    # 两条权限；1.4.0 起又多了「自定义匹配月份范围」与「导出账面明细账」——
+    # 两条权限；1.4.0 起又多了「自定义匹配月份范围」与「导出账面明细账」；
+    # 1.4.1 把那份导出**收窄成逐笔七列**；1.4.2 改了两处界面 —— 对账单明细的
+    # 「返回」回**对账单列表**（不是插件首页），归属条与表头**固定在顶上**；
+    # 1.4.3 又砍了卡详情页的界面 —— 页签只剩「对账单 / 成员账套」（对账单在前），
+    # 「余额核对」那一屏与卡详情工具条上的「删除」都没了（**接口仍在**）。
     # 版本号跟着走，别让它停在老版本上假装还是老插件。
-    assert registry.version == "1.4.0", registry.version
+    assert registry.version == "1.4.3", registry.version
 
 
 def test_卡可以删(shared, client, auth, loaded, cash_subjects):
@@ -1701,8 +1705,14 @@ def test_余额核对按声明的月份取账上的发生额(shared, client, aut
 
 
 def test_导出账面明细账(shared, client, auth, db, admin_user, loaded, cash_subjects):
-    """导出**账上那一本**明细账：期初、逐笔（凭证号/日期/摘要/借贷/余额）、
-    本月合计、累计 —— 取数走宿主那本明细账，不是插件自己拼的。"""
+    """导出**账上那一本**明细账，但**只导逐笔**、**只导那七列** ——
+    账套、期间、日期、凭证号、摘要、借方、贷方。
+
+    期初、本月合计、累计那些**汇总行不导** —— 混在逐笔里，核账的人分不清
+    哪一行是「真的一笔」，汇总行的借方加起来还会跟逐笔对不上。
+
+    取数仍走宿主那本明细账（``detail_ledger_read``），不是插件自己拼的。
+    """
     import io
 
     import openpyxl
@@ -1720,38 +1730,40 @@ def test_导出账面明细账(shared, client, auth, db, admin_user, loaded, cas
     workbook = openpyxl.load_workbook(io.BytesIO(base64.b64decode(export["content_base64"])))
     sheet = workbook.active
     titles = [cell.value for cell in sheet[1]]
-    for want in ("账套", "科目编码", "科目名称", "日期", "凭证号", "摘要",
-                 "借方", "贷方", "余额", "对账单行"):
-        assert want in titles, titles
+    # **就这七列**，一列不多一列不少。
+    assert titles == ["账套", "期间", "日期", "凭证号", "摘要", "借方", "贷方"], titles
 
     book_col = titles.index("账套") + 1
+    period_col = titles.index("期间") + 1
+    date_col = titles.index("日期") + 1
+    voucher_col = titles.index("凭证号") + 1
+    summary_col = titles.index("摘要") + 1
     debit_col = titles.index("借方") + 1
     credit_col = titles.index("贷方") + 1
-    kind_col = titles.index("行类型") + 1
-    summary_col = titles.index("摘要") + 1
 
-    kinds = [sheet.cell(row=r, column=kind_col).value for r in range(2, sheet.max_row + 1)]
-    assert "期初余额" in kinds, kinds
-    assert "逐笔" in kinds, kinds
-    assert "本月合计" in kinds, kinds
+    # **只有那一笔逐笔**：另外两本账这段时间没有分录，导出里不该出现它们
+    # 的期初 / 本月合计 / 累计行。
+    assert sheet.max_row == 2, sheet.max_row
+    summaries = [sheet.cell(row=r, column=summary_col).value
+                 for r in range(2, sheet.max_row + 1)]
+    for marker in ("期初余额", "本月合计", "累　　计", "本年累计"):
+        assert marker not in summaries, summaries
 
     # 那笔 50 万的收款在表里，借方 50 万。
-    hit = None
-    for r in range(2, sheet.max_row + 1):
-        if sheet.cell(row=r, column=debit_col).value == float(amount):
-            hit = r
-            break
-    assert hit is not None, [sheet.cell(row=r, column=debit_col).value
-                             for r in range(2, sheet.max_row + 1)]
-    assert sheet.cell(row=hit, column=book_col).value == first["book"].name
-    assert sheet.cell(row=hit, column=credit_col).value in (None, 0)
-    assert "收款" in str(sheet.cell(row=hit, column=summary_col).value)
+    assert sheet.cell(row=2, column=book_col).value == first["book"].name
+    assert sheet.cell(row=2, column=period_col).value == "2026-09"
+    assert sheet.cell(row=2, column=date_col).value == "2026-09-15"
+    assert str(sheet.cell(row=2, column=voucher_col).value or "") != ""
+    assert "收款" in str(sheet.cell(row=2, column=summary_col).value)
+    assert sheet.cell(row=2, column=debit_col).value == float(amount)
+    # 这一笔是收款：借方 50 万，贷方空着（对方科目的分录不在这个科目上）。
+    assert sheet.cell(row=2, column=credit_col).value in (None, 0)
 
 
 def test_导出账面明细账按声明的月份(shared, client, auth, db, admin_user,
                                      loaded, cash_subjects):
     """导出的月份跟着**声明的匹配月份范围**走 —— 9 月的对账单去对 8 月的账，
-    导出来的就是 8 月那本明细账。"""
+    导出来的就是 8 月那本账的**逐笔**。"""
     import io
 
     import openpyxl
@@ -1769,6 +1781,7 @@ def test_导出账面明细账按声明的月份(shared, client, auth, db, admin
     workbook = openpyxl.load_workbook(io.BytesIO(base64.b64decode(export["content_base64"])))
     sheet = workbook.active
     titles = [cell.value for cell in sheet[1]]
+    assert titles == ["账套", "期间", "日期", "凭证号", "摘要", "借方", "贷方"], titles
     period_col = titles.index("期间") + 1
     debit_col = titles.index("借方") + 1
     periods = {sheet.cell(row=r, column=period_col).value
