@@ -154,8 +154,13 @@ def backup_dir() -> Path:
     if override:
         return Path(override)
     repo_root = Path(__file__).resolve().parents[2]
-    if (repo_root / ".run").is_dir():
+    # **仓库检出里（含 CI 的检出）**：``.run/`` 是 gitignore 的，备份放那儿
+    # 不会进版本库。判据是「有 .git」而不是「.run 已存在」—— CI 的检出是
+    # 干净的工作树，``.run/`` 根本不存在，按「存在才用」会一路落到生产那个
+    # root 专属目录上，而 CI 里的 runner 不是 root，写不进去（PermissionError）。
+    if (repo_root / ".git").exists() or (repo_root / ".run").is_dir():
         return repo_root / ".run"
+    # 生产机上没有仓库，只有那台机器的既有惯例目录。
     return Path("/root/cwq-baseline-backups")
 
 
@@ -167,15 +172,25 @@ def write_backup(db) -> Path:
     ).all()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     target = backup_dir() / f"print_template_{stamp}.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps([
-        {
-            "id": t.id, "name": t.name, "scope": t.scope, "book_id": t.book_id,
-            "user_id": t.user_id, "forked_from_id": t.forked_from_id,
-            "is_default": t.is_default, "remark": t.remark, "content": t.content,
-        }
-        for t in rows
-    ], ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps([
+            {
+                "id": t.id, "name": t.name, "scope": t.scope, "book_id": t.book_id,
+                "user_id": t.user_id, "forked_from_id": t.forked_from_id,
+                "is_default": t.is_default, "remark": t.remark, "content": t.content,
+            }
+            for t in rows
+        ], ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        # **写不进去就不改。** 改基线之前必须留底 —— 留不下底就动版式，
+        # 改错了连还原的东西都没有。这条错误要说清楚是哪个目录写不进去，
+        # 而不是甩一个 PermissionError 的栈。
+        raise SystemExit(
+            f"备份写不进去（{target.parent}）：{exc}\n"
+            f"改基线之前必须留底 —— 写不进去就不改。"
+            f"用 CWQ_BASELINE_BACKUP_DIR 指一个写得进去的目录再来。"
+        ) from exc
     return target
 
 

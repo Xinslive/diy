@@ -57,6 +57,20 @@ def script():
     return _load(SCRIPT, "cwq_set_voucher_baseline")
 
 
+@pytest.fixture(autouse=True)
+def backup_dir(tmp_path, monkeypatch):
+    """备份目录指到临时目录。
+
+    **不指的话，测试会往这台机器的真实备份目录里写文件** —— 本地是仓库的
+    ``.run/``，而 CI 的检出里没有 ``.run/``，按「存在才用」的旧判据会一路
+    落到生产的 ``/root/cwq-baseline-backups/``，而 CI 的 runner 不是 root，
+    写不进去 —— 那正是这一版第一次上 CI 挂掉的原因。
+    """
+    target = tmp_path / "baseline-backups"
+    monkeypatch.setenv("CWQ_BASELINE_BACKUP_DIR", str(target))
+    return target
+
+
 def _entry(mod, name: str) -> dict:
     for entry in mod.BASELINE:
         if entry["name"] == name:
@@ -211,15 +225,13 @@ def test_没有基线行时只报告不新建(db, script, capsys):
     assert not rows, "脚本不该自己新建基线行"
 
 
-def test_改之前先留一份底(db, script, tmp_path, monkeypatch):
+def test_改之前先留一份底(db, script, backup_dir):
     """**基线版式改错了要能还原** —— 所以改之前先把这一范围的全部模板导一份 JSON。
 
     备份目录跟着这台机器的既有惯例走（仓库里 ``.run/``、生产上
-    ``/root/cwq-baseline-backups/``）；测试用环境变量指到临时目录，
-    不往仓库里写东西。
+    ``/root/cwq-baseline-backups/``）；测试里由 autouse 的 fixture 指到临时
+    目录，不往这台机器的真实备份目录里写东西。
     """
-    monkeypatch.setenv("CWQ_BASELINE_BACKUP_DIR", str(tmp_path))
-
     new_content = script.factory_content("基础模板")
     old_content = json.loads(json.dumps(new_content))
     old_content["voucher"] = {**old_content["voucher"], "slots_per_page": 1}
@@ -229,8 +241,52 @@ def test_改之前先留一份底(db, script, tmp_path, monkeypatch):
 
     assert script.sync_content(db, apply=True) == 0
 
-    files = list(tmp_path.glob("print_template_*.json"))
+    files = list(backup_dir.glob("print_template_*.json"))
     assert len(files) == 1, f"备份没落盘：{list(tmp_path.iterdir())}"
     snapshot = json.loads(files[0].read_text(encoding="utf-8"))
     saved = next(t for t in snapshot if t["id"] == row.id)
     assert saved["content"] == old_content, "备份的是改完之后的内容 —— 那不叫备份"
+
+
+def test_备份写不进去就不改(db, script, tmp_path, monkeypatch):
+    """**留不下底就不动版式。**
+
+    备份目录写不进去时直接放弃，而不是改完了才发现没得还原 —— 这条
+    在 CI 上是真实踩过的：runner 不是 root，备份目录写不进去。
+    """
+    blocked = tmp_path / "not-a-dir"
+    blocked.write_text("我是文件，不是目录", encoding="utf-8")
+    monkeypatch.setenv("CWQ_BASELINE_BACKUP_DIR", str(blocked / "backup"))
+
+    new_content = script.factory_content("基础模板")
+    old_content = json.loads(json.dumps(new_content))
+    old_content["voucher"] = {**old_content["voucher"], "slots_per_page": 1}
+    row = _seeded_baseline(db)
+    row.content = old_content
+    db.flush()
+
+    with pytest.raises(SystemExit) as exc:
+        script.sync_content(db, apply=True)
+    assert "备份写不进去" in str(exc.value)
+
+    db.refresh(row)
+    assert row.content == old_content, "备份没写成，却把版式改了 —— 那就没有还原的东西"
+
+
+def test_备份目录的默认判定(script, monkeypatch):
+    """**判据是「有 .git」，不是「.run 已存在」。**
+
+    这正是这一版第一次上 CI 挂掉的地方：CI 的检出是干净工作树，
+    ``.run/`` 根本不存在 —— 按「存在才用」的旧判据会一路落到生产的
+    ``/root/cwq-baseline-backups/``，而 runner 不是 root，写不进去。
+
+    所以：仓库检出里（含 CI）落到仓库自己的 ``.run/``（gitignore 的），
+    生产机上没有仓库，落到那台机器的既有惯例目录。
+    """
+    monkeypatch.delenv("CWQ_BASELINE_BACKUP_DIR", raising=False)
+    repo_root = Path(__file__).resolve().parents[2]
+    assert (repo_root / ".git").exists(), "测试跑的地方不像仓库检出"
+    assert script.backup_dir() == repo_root / ".run"
+
+    monkeypatch.setenv("CWQ_BASELINE_BACKUP_DIR", "/tmp/某处")
+    assert script.backup_dir() == Path("/tmp/某处")
