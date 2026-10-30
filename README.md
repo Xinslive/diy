@@ -85,6 +85,7 @@
 | **多账套隔离** | 用户按账套授权，角色分 OWNER / ACCOUNTANT / VIEWER，写操作统一在 `require_book_write` 处拦截 |
 | **审计日志** | 关键操作全量留痕，管理员可查 |
 | **登录防护** | 账号渐进锁定（前两轮 5 → 10 秒**递增延迟**，第 3 轮起转入**分钟级硬锁**：30 → 40 → 50 …，上限 `LOGIN_LOCK_MAX_MINUTES`）+ IP 节流 + 可信代理解析 |
+| **登录状态不限时** | 登录令牌没有到期时间（`ACCESS_TOKEN_MINUTES=0`）：只由**登出**（单枚吊销）、**改口令/停用**（账号级撤销）、**密钥轮换**三者终结 —— 见 ARCHITECTURE.md §9.9 |
 | **二次验证** | 管理员邮箱 MFA：验证、轮询、重发、重新认证 |
 | **数据安全** | 账套数据导出 → gzip → SHA256 → 阿里云 OSS，按日/周档位保留。制品的**静态加密由 OSS 服务端加密（SSE）承担**（桶上的默认加密规则，2026-10-26 起本项目不再在客户端加密）；SHA256 只是**校验和**，不提供机密性 |
 | **邮件通知** | SMTP 事件通知，带发送频率限制 |
@@ -334,7 +335,7 @@ cd backend && .venv/bin/python scripts/data_health_check.py
 | 类别 | 关键变量 |
 | --- | --- |
 | 运行环境 | `APP_ENV`（dev / prod）、`LOG_LEVEL`、`DATABASE_URL`、`DB_POOL_*` |
-| 认证 | `JWT_SECRET`、`JWT_ALGORITHM`、`ACCESS_TOKEN_MINUTES`、`ADMIN_TOKEN_MINUTES` |
+| 认证 | `JWT_SECRET`、`JWT_ALGORITHM`、`ACCESS_TOKEN_MINUTES`（0 = 登录状态不限时）、`ADMIN_TOKEN_MINUTES` |
 | 登录防护 | `LOGIN_MAX_FAILURES`、`LOGIN_LOCK_MINUTES`、`LOGIN_LOCK_MAX_MINUTES`、`LOGIN_IP_*`、`TRUSTED_PROXIES` |
 | 插件 | `PLUGIN_ENABLED`、`PLUGIN_ROOT`、`PLUGIN_TRUSTED_KEYS`、`PLUGIN_REVOKED_KEYS`、`PLUGIN_MAX_*`、`PLUGIN_LEASE_SECONDS`、`PLUGIN_ISOLATION` |
 | 导入与发票 | `IMPORT_MAX_BYTES`、`IMPORT_MAX_VOUCHERS`、`INVOICE_STORAGE_DIR`、`INVOICE_OCR_*` |

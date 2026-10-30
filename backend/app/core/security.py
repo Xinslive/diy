@@ -188,27 +188,49 @@ def password_needs_rehash(stored: str) -> bool:
 
 
 def token_minutes_for(is_admin: bool) -> int:
-    """这个身份该发多长的令牌。
+    """这个身份该发多长的令牌。**0 = 永不过期。**
 
-    管理员令牌更短（审计 P3-04 建议 3）：管理员能开号、能看全量操作日志，
-    令牌一旦泄露，暴露的权限面比普通会计大得多，所以窗口就该更短。
+    产品决定是「登录状态不设时间上限」（见 ``config.py`` 的
+    ``access_token_minutes``），所以两个配置项的默认值都是 0 ——
+    0 在这里是「**没有上限**」，不是「签发即过期」。
 
-    取**较小者**而不是直接用管理员值 —— 有人把全局配成 30 分钟时，
-    管理员这一档不该反过来把有效期拉长。
+    三种取值的组合：
+
+    ==================  ==================  ==========================
+    全局                 管理员档              结果
+    ==================  ==================  ==========================
+    0（永不过期）        0                     永不过期（**默认**）
+    0（永不过期）        正数                  管理员限时，普通用户不限时
+    正数                 0                     两边都限时，取全局值
+    正数                 正数                  取**较小者**
+    ==================  ==================  ==========================
+
+    **取「较小者」而不是直接用管理员值** —— 有人把全局配成 30 分钟时，
+    管理员这一档不该反过来把有效期拉长（审计 P3-04 的原意仍然保留：
+    旋钮在，只是默认不启用）。
+
+    **0 与正数混用时不能拿 0 参与 ``min``** —— ``min(0, 240)`` 是 0，
+    那是「永不过期」，会把管理员那一档的意思（限时）整个吃掉。
     """
+    global_minutes = int(settings.access_token_minutes or 0)
+    admin_minutes = int(settings.admin_token_minutes or 0)
     if not is_admin:
-        return settings.access_token_minutes
-    return min(settings.access_token_minutes, settings.admin_token_minutes)
+        return global_minutes
+    if admin_minutes <= 0:
+        return global_minutes
+    if global_minutes <= 0:
+        return admin_minutes
+    return min(global_minutes, admin_minutes)
 
 
 def create_access_token(user_id: int, username: str, is_admin: bool = False,
                         token_version: int = 0,
-                        mfa_at: int | None = None) -> tuple[str, int]:
-    """签发访问令牌。
+                        mfa_at: int | None = None) -> tuple[str, int | None]:
+    """签发访问令牌。**返回值第二项是「到期时刻」，永不过期时是 ``None``。**
 
     ``token_version`` 写进载荷（``tv``），由 :func:`app.core.deps.get_current_user`
     与库里的当前值比对。这是「重置口令 / 停用账号之后旧令牌立刻失效」的全部机制
-    （审计 P2-01）—— 没有它，口令改了也已经发出去的令牌照样能用满有效期。
+    （审计 P2-01）—— 没有它，口令改了也已经发出去的令牌照样能用。
 
     默认值 0 是为了让不关心这件事的调用方不用改签名；真正的签发入口
     （``/api/auth/login``）一定会把库里的值传进来。
@@ -225,41 +247,53 @@ def create_access_token(user_id: int, username: str, is_admin: bool = False,
 
     **另外三个字段每个令牌都带**（审查 M-11）：
 
-    * ``iat`` —— 签发时刻（epoch 秒）。之前载荷里只有 ``exp``，于是「这个令牌
-      是什么时候签的」只能靠 ``exp`` 倒推。
+    * ``iat`` —— 签发时刻（epoch 秒）。它同时是「没有 ``exp`` 时唯一的
+      时间锚点」—— 排查一枚长期有效的令牌时，「什么时候签的」全靠它。
     * ``jti`` —— 这一枚令牌的唯一标识（``uuid4().hex``）。它是「**只吊销这一枚
-      令牌**」的粒度：同一个账号的两台设备拿到的令牌 jti 不同，将来要做
-      单枚吊销（登出某一台、改密后只踢掉泄露的那一枚）时就有地方可指了。
+      令牌**」的粒度：同一个账号的两台设备拿到的令牌 jti 不同。
+      **登出就是靠它**：``POST /api/auth/logout`` 把当前令牌的 jti 记进
+      ``sys_token_revocation``，下一次请求立刻 401（见
+      ``app/core/deps.py::get_current_user``）。
       **它不替代 ``tv``**：``tv`` 是账号级的、立刻生效的全量撤销（改密/停用），
       仍然是主机制，``jti`` 是它之上的**更细的粒度**，两者都在。
     * ``iss`` —— 签发方（``settings.jwt_issuer``）。**解码时必须校验**：没有它，
       同一套 ``JWT_SECRET`` 为别的服务签发的令牌也能被本服务接受（只要 ``sub``
       指向某个存在的用户）—— 跨系统复用密钥是常见部署形态，那会变成一条越权路径。
+
+    **``exp`` 只在「限时」时才签**（``token_minutes_for`` 返回正数）。
+    载荷里压根没有 ``exp`` 时，PyJWT **不会**做过期判定（``verify_exp`` 只在
+    ``exp`` 存在时才生效）—— 这正是「永不过期」的落地方式，而不是
+    「把 exp 设成一个遥远的将来」，那样只是把同一个问题推迟几年。
     """
     now = int(time.time())
-    expires = datetime.now(timezone.utc) + timedelta(minutes=token_minutes_for(is_admin))
+    minutes = token_minutes_for(is_admin)
     payload = {"sub": str(user_id), "username": username,
                "iat": now, "jti": uuid4().hex, "iss": settings.jwt_issuer,
-               "exp": expires, "tv": int(token_version or 0)}
+               "tv": int(token_version or 0)}
+    expires_at: int | None = None
+    if minutes > 0:
+        expires = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        payload["exp"] = expires
+        expires_at = int(expires.timestamp())
     if mfa_at is not None:
         payload["amr"] = "pwd+mfa"
         payload["mfa_at"] = int(mfa_at)
-    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm), int(
-        expires.timestamp()
-    )
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm), expires_at
 
 
 def decode_access_token(token: str) -> dict:
     """解码并校验访问令牌。**``iss`` 必须对得上。**
 
     **存量令牌（没有 ``iss`` 的那些）一律拒绝。** 这是刻意的 fail-closed：
-    拒绝的代价是「升级后最长 12 小时的窗口内，已签发的令牌要重新登录一次」；
+    拒绝的代价是「升级后已签发的令牌要重新登录一次」；
     放行的代价是「同一个密钥下别的服务签的令牌在本服务照样能用」。前者是
     一次可预期的重新登录，后者是一条**跨系统的越权路径** —— 后者更贵。
 
-    而且这个窗口本来就不长：令牌最长 12 小时（管理员 4 小时），
-    而**改口令 / 停用账号会立刻作废它**（``tv`` 与库里的 ``token_version``
-    比对），也就是说「有人拿着旧令牌」这件事最多持续到下一次改密为止。
+    **载荷里没有 ``exp`` 时不做过期判定**（PyJWT 的 ``verify_exp`` 只在
+    ``exp`` 存在时才生效）—— 这是「登录状态不设时间上限」的落地方式。
+    没有 ``exp`` 的令牌，它的终点只有三个：被登出（``jti`` 进了
+    ``sys_token_revocation``）、账号级撤销（``tv`` 对不上）、
+    密钥轮换（签名对不上）。
 
     **``aud`` 故意不加**（暂时也不校验）：本服务只有一个受众 —— 它自己的 API，
     令牌从来不会发给第三方。加一个永远等于同一个值的字段只会多一处要同步的

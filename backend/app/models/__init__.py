@@ -18,6 +18,7 @@ from app.models.bankstatement import (DIRECTION_IN, DIRECTION_OUT,
                                      BankStatementRule)
 from app.models.audit import AuditLog
 from app.models.mcp import McpToken
+from app.models.token_revocation import SysTokenRevocation
 from app.models.backup import (BackupRun, KEEP_DAYS, SCOPE_BOOK, SCOPE_SYSTEM, STATUS_FAILED,
                           STATUS_SUCCESS, TIER_DAILY, TIER_MONTHLY, TIERS, TIER_WEEKLY)
 from app.models.mfa import (MFA_STATUSES, STATUS_CONSUMED, STATUS_EXPIRED,
@@ -36,6 +37,7 @@ __all__ = [
     "Subject", "Voucher", "Entry",
     "ReportTemplate", "ReportRow", "ReportCol", "ReportCell", "ReportResult",
     "PrintTemplate", "AuditLog", "ImportBatch", "McpToken",
+    "SysTokenRevocation",
     "InvoiceConfig", "InvoiceRule", "InvoiceBatch", "InvoiceRecord",
     "BankStatement", "BankStatementRow", "BankStatementRule", "BankStatementProfile",
     "BankStatementRowSubject", "BankStatementConfig",

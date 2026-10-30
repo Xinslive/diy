@@ -329,13 +329,16 @@ def test_开关关闭时登录行为与修复前完全一致(client, admin_user,
     assert "access_token" in body
     assert body.get("mfa_required") is not True
     assert body["token_type"] == "bearer"
-    assert body["expires_at"] > 0
+    # 登录令牌没有到期时间（§9.9）—— 到期时刻是 ``None``，不是 0（0 是谎话）。
+    assert body["expires_at"] is None
     assert body["user"]["username"] == admin_user.username
     assert body["user"]["is_admin"] is True
     # 普通用户的令牌载荷里**不能**多出 mfa 字段
     payload = decode_access_token(body["access_token"])
     assert "mfa_at" not in payload
     assert "amr" not in payload
+    # 二次验证没开着的时候，载荷里也不该有到期时间
+    assert "exp" not in payload
 
 
 def test_库里有开关时优先于env(client, admin_user, db):

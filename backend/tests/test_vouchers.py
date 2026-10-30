@@ -1420,8 +1420,16 @@ def test_凭证列表一页只跑常数条SQL(client, auth, book, make_voucher, 
     assert r.json()["total"] == 12
     # 科目一次 + 计数一次 + 本页凭证一次 + 分录一次 = 4。
     # 留一点余量是为了不把实现细节钉死（比如将来加一条无害的查询）。
-    assert len(stmts) <= 8, (
+    #
+    # **2026-10-30 多出来的那一条是「单枚吊销点查」**（§9.9）：登录令牌不设
+    # 到期时间，鉴权时要查一次吊销名单。它**每个请求一次**，与页里有多少行
+    # **无关** —— 所以它进的是「常数」这一侧，不是 N+1。
+    assert len(stmts) <= 9, (
         f"12 行的页发了 {len(stmts)} 条 SQL，逐行往返没去掉：{stmts}")
+    # 而且它只该出现**一次**：每行一次就是 N+1 了。
+    revocations = [s for s in stmts if "sys_token_revocation" in s]
+    assert len(revocations) == 1, (
+        f"吊销点查发了 {len(revocations)} 次 —— 每个请求一次，不是每行一次：{revocations}")
 
 
 # ===================================================================== 撞号的数据库兜底

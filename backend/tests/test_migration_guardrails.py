@@ -981,6 +981,7 @@ def test_head_是本文件认识的那一版():
         "0045_bank_statement_review",           # 待复核那一档：记下否掉的是哪张凭证（bank_statement_row.rejected_voucher_id）
         "0046_row_subject_dup_ok",              # 放开「同一个科目在一行里只能出现一次」（删 uq_bank_statement_row_subject）
         "0047_invoice_voucher_release",         # 修数据：凭证被删掉的发票记录还停在「已生成」（放回「可生成」+ 重数批次的已入账张数）
+        "0048_login_token_revocation",          # 登录令牌的**单枚**吊销名单（§9.9：登出会真作废那一枚令牌）
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")
@@ -1286,8 +1287,9 @@ def test_跨年账套_次年只有期初没有凭证_迁移照样跑得完(scrat
         # 0043 是流水行的人工摘要列，0044 把摘要下沉到对方科目，
         # 0045 是流水行「否掉的是哪张凭证」那一列，
         # 0046 放开「同一个科目在一行里只能出现一次」，
-        # 0047 把「凭证已删、发票还停在已生成」的记录放回「可生成」。
-        assert ver == "0047_invoice_voucher_release", f"schema 只到 {ver}"
+        # 0047 把「凭证已删、发票还停在已生成」的记录放回「可生成」，
+        # 0048 是登录令牌的**单枚**吊销名单（§9.9）。
+        assert ver == "0048_login_token_revocation", f"schema 只到 {ver}"
 
         # 科目表按年度拆开
         rows = conn.execute(text(

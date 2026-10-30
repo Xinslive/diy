@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.security import decode_access_token
-from app.models import Book, SysUser, UserBook
+from app.models import Book, SysTokenRevocation, SysUser, UserBook
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -79,12 +79,34 @@ def get_current_user(
     # 口令泄露后的标准处置就是「改口令」，过去改完旧令牌还能用满 12 小时，
     # 等于没改。
     #
+    # **这一条在「令牌不限时」之后更关键了**（见 §9.9）：令牌不再有到期时间，
+    # 于是「改口令 / 停用」是唯一能立刻作废一整批令牌的手段。
+    #
     # 载荷里没有 ``tv`` 的老令牌按 0 处理：升级前签发的令牌在存量库里
     # 也是 tv=0，仍然可用（改口令/停用会立刻作废它们）。
     if int(payload.get("tv", 0)) != (user.token_version or 0):
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             "访问令牌已失效（密码或账号状态已变更），请重新登录")
+    # 单枚吊销（登出）。**登录令牌不设时间上限**（载荷里没有 ``exp``），
+    # 所以它的终点只有三个：这里、上一行的 ``tv``、以及签名对不上。
+    #
+    # **查库，不做跨请求缓存。** 缓存会让「A 机器登出、B 机器上的同一枚令牌
+    # 还能用」—— 生产是两个 uvicorn worker（``deploy/systemd/cwq-api.service``），
+    # 进程内缓存只看得见自己那一份。吊销必须**对下一次请求立刻生效**，
+    # 这与「改密 / 停用立刻生效」是同一条纪律。
+    #
+    # 代价：每个请求多一次主键点查（``jti`` 上的唯一约束自带索引），
+    # 约零点几毫秒。换成「过期就好」的成本是「登出之后那枚令牌永远有效」——
+    # 后者贵得多。
+    jti = payload.get("jti")
+    if jti:
+        revoked = db.scalar(select(SysTokenRevocation.id)
+                             .where(SysTokenRevocation.jti == jti))
+        if revoked is not None:
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED,
+                "访问令牌已失效（该会话已登出），请重新登录")
     return user
 
 

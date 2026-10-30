@@ -194,7 +194,8 @@ def test_审计里绝不能出现口令或散列或令牌(client, db, admin_user
 def test_登出要留审计(client, db, admin_user):
     """共享账号、离职交接、攻击者登进去看一眼就走 —— 都靠这条日志。
 
-    登出本身**不撤销令牌**（JWT 无状态，服务端没会话可删），它只留痕。
+    登出现在**会吊销那一枚令牌**（§9.9：登录令牌没有到期时间，
+    「登出」不真作废的话它就永远有效），但**留痕**仍是这个接口存在的理由。
     """
     hdr = _admin(client, admin_user)
     r = client.post("/api/auth/logout", headers=hdr)
@@ -205,12 +206,24 @@ def test_登出要留审计(client, db, admin_user):
     assert entry.user_id == admin_user.id
 
 
-def test_登出本身不撤销令牌(client, db, admin_user):
+def test_登出只作废这一枚_不踢掉这个账号的其他设备(client, db, admin_user):
     """「点一下退出」不该把这个人**所有设备**的会话一起踢掉 ——
-    那是 ``token_version`` 的语义（改密 / 停用），不是登出的。"""
+    那是 ``token_version`` 的语义（改密 / 停用），不是登出的。
+
+    **2026-10-30 改了实现**：令牌不再有到期时间，所以登出必须**真作废**，
+    否则「退出」只是安慰（那枚令牌会一直有效下去）。作废的粒度是
+    **单枚**（按 ``jti``），所以「不踢掉其他设备」这条意图仍然成立 ——
+    它只是不再靠「什么都不做」来实现了。
+    """
     hdr = _admin(client, admin_user)
-    client.post("/api/auth/logout", headers=hdr)
-    assert client.get("/api/auth/me", headers=hdr).status_code == 200
+    other = _admin(client, admin_user)   # 同一账号、另一枚令牌（另一台设备）
+
+    assert client.post("/api/auth/logout", headers=hdr).status_code == 200
+
+    # 登出的那一枚：死了。
+    assert client.get("/api/auth/me", headers=hdr).status_code == 401
+    # 同一账号的另一枚：照常能用 —— 这才是这条用例真正要守的东西。
+    assert client.get("/api/auth/me", headers=other).status_code == 200
 
 
 def test_登出必须先登录(client):

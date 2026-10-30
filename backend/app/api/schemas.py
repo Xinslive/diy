@@ -28,7 +28,11 @@ class LoginIn(BaseModel):
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    expires_at: int
+    #: 到期时刻（POSIX 秒）。**``None`` = 永不过期** ——
+    #: 登录令牌默认不设时间上限（见 ``app/core/config.py`` 的
+    #: ``access_token_minutes``），此时载荷里压根没有 ``exp``。
+    #: 客户端**不要**拿它做倒计时提醒登录 —— 它为 ``None`` 时没有任何提醒要做。
+    expires_at: Optional[int] = None
     user: dict
 
 

@@ -237,9 +237,10 @@ def test_停用账号的响应与口令错一致(client, db, admin_user, creds):
     assert "错误" in r.json()["detail"]
 
 
-# ------------------------------------------------------ 管理员令牌有效期更短
+# ------------------------------------------------------ 令牌有效期（默认不限时）
 
 def test_管理员令牌比普通用户短(monkeypatch):
+    """**限时**配置下的角色差异（审计 P3-04 的原意，旋钮留着）。"""
     from app.core import security
     monkeypatch.setattr(security.settings, "access_token_minutes", 720, raising=False)
     monkeypatch.setattr(security.settings, "admin_token_minutes", 240, raising=False)
@@ -257,17 +258,74 @@ def test_全局配得更短时管理员不再被拉长(monkeypatch):
     assert token_minutes_for(False) == 30
 
 
-def test_登录返回的令牌按身份给有效期(client, db, admin_user, creds):
-    """端到端：管理员登录拿到的 expires_at 比配置里的 720 分钟近。"""
+def test_默认不限时_两个档位都是零(monkeypatch):
+    """**默认口径：登录状态不设时间上限。**
+
+    这条钉的是**产品决定**本身：把全局配成 0、把管理员档也配成 0，
+    两边都得到「永不过期」。管理员那一档被默认关掉是**有意的** ——
+    审计 P3-04 建议「按角色区分、令更短」，但那与「别老是被踢下线」
+    这条产品决定冲突，而后者是当前要满足的（旋钮留着，想收紧随时可配）。
+    """
+    from app.core import security
+    monkeypatch.setattr(security.settings, "access_token_minutes", 0, raising=False)
+    monkeypatch.setattr(security.settings, "admin_token_minutes", 0, raising=False)
+    assert token_minutes_for(False) == 0
+    assert token_minutes_for(True) == 0
+
+
+def test_全局不限时但管理员配了上限时只限管理员(monkeypatch):
+    """**0 与正数混用不能拿 0 参与 ``min``** —— ``min(0, 240)`` 是 0，
+    那是「永不过期」，会把管理员那一档「限时」的意思整个吃掉。"""
+    from app.core import security
+    monkeypatch.setattr(security.settings, "access_token_minutes", 0, raising=False)
+    monkeypatch.setattr(security.settings, "admin_token_minutes", 240, raising=False)
+    assert token_minutes_for(False) == 0, "普通用户不该被管理员那一档连坐"
+    assert token_minutes_for(True) == 240, "管理员那一档写的是 240 分钟就该是 240"
+
+
+def test_管理员档为零时跟随全局(monkeypatch):
+    """管理员档 0 = 「不单独设限，跟着全局走」，不是「管理员无限期」。"""
+    from app.core import security
+    monkeypatch.setattr(security.settings, "access_token_minutes", 30, raising=False)
+    monkeypatch.setattr(security.settings, "admin_token_minutes", 0, raising=False)
+    assert token_minutes_for(True) == 30
+    assert token_minutes_for(False) == 30
+
+
+def test_登录返回的令牌默认没有到期时间(client, db, admin_user, creds):
+    """端到端：默认配置下，登录令牌**载荷里压根没有 ``exp``**。
+
+    不是「exp 设成一个遥远的将来」—— 那种做法只是把「被踢下线」这件事
+    推迟几年，过期机制还在，将来还得再改一次。真正的不限时是**没有到期时间**，
+    于是令牌的死法只有三个：登出、改密/停用、密钥轮换。
+    """
     import jwt
 
     from app.core.config import settings
 
     token, expires = create_access_token(admin_user.id, admin_user.username, is_admin=True)
     payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    assert "exp" not in payload, f"默认配置下不该有 exp，实际 {payload.get('exp')}"
+    assert expires is None, "永不过期时返回的到期时刻应当是 None（不是 0 —— 0 是谎话）"
+    # ``iat`` 仍在：它是「没有 exp 时唯一的间锚点」。
+    assert payload.get("iat"), "iat 必须留着 —— 没有 exp 时只有它能回答「什么时候签的」"
+
+
+def test_配了时限之后令牌带到期时间(monkeypatch):
+    """**限时那条路仍然可配、仍然可用** —— 把时限收回来只需要改一个配置。"""
+    import jwt
+
+    from app.core import security
+    from app.core.config import settings
+
+    monkeypatch.setattr(security.settings, "access_token_minutes", 30, raising=False)
+    monkeypatch.setattr(security.settings, "admin_token_minutes", 0, raising=False)
+    token, expires = create_access_token(1, "someone", is_admin=False)
+    payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    assert "exp" in payload, "配了时限就该签 exp"
     # exp 是 POSIX 秒，不是分钟 —— 两种单位混算会得到一个天文数字
     span = (payload["exp"] - datetime.now(timezone.utc).timestamp()) / 60
-    assert span <= settings.admin_token_minutes + 1, f"管理员令牌有效期 {span:.0f} 分钟，超了"
+    assert 29 <= span <= 31, f"有效期 {span:.0f} 分钟，不是配的 30"
 
 
 def test_阈值可配置(monkeypatch):

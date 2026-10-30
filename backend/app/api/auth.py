@@ -32,8 +32,9 @@ import logging
 import re
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from sqlalchemy import case, delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -46,12 +47,12 @@ from app.core import system_settings
 from app.core import lockout
 from app.core.config import is_trusted_proxy, settings
 from app.core.db import get_db
-from app.core.deps import get_current_user
-from app.core.security import (create_access_token, hash_password,
-                               password_needs_rehash, password_policy_error,
-                               verify_password)
+from app.core.deps import bearer, get_current_user
+from app.core.security import (create_access_token, decode_access_token,
+                               hash_password, password_needs_rehash,
+                               password_policy_error, verify_password)
 from app.models import (REAL_NAME_MAX_LENGTH, AdminMfaChallenge, SysUser,
-                        UserBook)
+                        SysTokenRevocation, UserBook)
 # LoginIpThrottle 直接从定义模块导入而没有走 app.models 的导出桶：
 # 那个桶不属于本条工作线的改动范围，而漏登记的实际后果只是「别人
 # from app.models import * 时拿不到这个类」—— 全仓没有任何地方这么用。
@@ -1544,31 +1545,77 @@ def mfa_reauth(request: Request, user: SysUser = Depends(get_current_user),
 
 
 @router.post("/logout")
-def logout(request: Request, user: SysUser = Depends(get_current_user),
-           db: Session = Depends(get_db)):
-    """登出：只留痕，**不做任何撤销**。
+def logout(request: Request, db: Session = Depends(get_db),
+           creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer)):
+    """登出：**吊销这一枚令牌**，并留痕。
 
-    令牌是自签名的 JWT、服务端不存会话，所以「登出」在服务端做不了
-    撤销动作 —— 客户端丢掉 localStorage 里的令牌就是登出的全部语义。
-    要真撤销得走 ``token_version``（那会把这个账号**所有**设备的会话
-    一起踢掉，不该由「点一下退出」触发）。
+    **为什么现在会真的吊销。** 登录令牌不设时间上限（载荷里没有 ``exp``，
+    见 ``app/core/security.py::token_minutes_for``）。令牌一旦没有到期时间，
+    「登出」就不能只是客户端把手里的令牌丢掉 —— 那枚令牌仍然有效，
+    而有效期是**永远**。所以服务端把它的 ``jti`` 记进
+    ``sys_token_revocation``，下一次带它来的请求立刻 401
+    （判定见 ``app/core/deps.py::get_current_user``）。
 
-    但留痕做得到，而留痕正是这个接口存在的理由：出事之后
-    「最后一个离开的人是谁」往往就是第一条线索（共享账号、离职交接、
-    攻击者登进去看了一眼就走）。
+    **为什么是「这一枚」而不是「这个账号的令牌全作废」。** 账号级撤销是
+    ``token_version``（``tv``），但它会把这个人**所有设备**的会话一起踢掉 ——
+    那是「退出全部设备」的语义，不该由「点一下退出登录」触发。
+
+    **为什么这个接口不挂 ``get_current_user``。** 挂上它的话，
+    「登出两次」第二次会撞 401（第一遍已经把令牌吊销了），于是
+    「重复点一下退出」会变成一次报错 —— 而登出天然就该是幂等的。
+    这里自己解一次令牌（签名对不上仍然 401），于是：
+    重复登出仍然回 200；账号已被停用时也照样能把那枚令牌作废。
+
+    回执里的 ``revoked`` 说的是**状态**（「这枚令牌现在已作废」），
+    不是「本次有没有新增一条记录」—— 所以重复登出时它仍然是 true。
+
+    **留痕是这接口存在的另一个理由**：出事之后「最后一个离开的人是谁」
+    往往就是第一条线索（共享账号、离职交接、攻击者登进去看了一眼就走）。
     """
+    if creds is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "缺少访问令牌")
+    try:
+        payload = decode_access_token(creds.credentials)
+    except Exception:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "访问令牌无效或已过期")
+
     ip = _client_ip(request)
+    jti = payload.get("jti")
+    user = None
+    try:
+        user_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        user_id = None
+    if user_id is not None:
+        user = db.get(SysUser, user_id)
+
+    # **只写一行、只写一次。** 重复登出（网络重试、手抖点两下）不该
+    # 撞唯一约束 —— 撞了就是一次 500，而登出失败会被前端吞掉，
+    # 于是「令牌其实吊销了，但没人知道」。
+    #
+    # **账号那一行已经不在了就不写。** ``user_id`` 有外键，填不出一个
+    # 真实的人；而那种令牌本来也过不了鉴权（``get_current_user`` 查不到
+    # 用户直接 401），写进去只会是条没有主人的吊销记录。
+    revoked = False
+    if jti and user is not None:
+        already = db.scalar(select(SysTokenRevocation.id)
+                             .where(SysTokenRevocation.jti == jti))
+        if already is None:
+            db.add(SysTokenRevocation(jti=jti, user_id=user.id, reason="LOGOUT"))
+        revoked = True
+
+    username = str(payload.get("username") or "")
     _audit(
         db,
         action="LOGOUT",
         entity="user",
-        entity_id=user.id,
-        user=user,
-        detail=f"登出：{user.username}（{ip}）",
-        after={"username": user.username, "ip": ip},
+        entity_id=user.id if user is not None else username[:64],
+        user=user if user is not None else _UnknownUser(username),
+        detail=f"登出：{username[:64]}（{ip}）",
+        after={"username": username[:64], "ip": ip, "token_revoked": revoked},
     )
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "revoked": revoked}
 
 
 @router.get("/me")
