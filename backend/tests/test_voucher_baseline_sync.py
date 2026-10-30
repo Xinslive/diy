@@ -293,6 +293,33 @@ def test_备份目录的默认判定(script, monkeypatch):
     assert script.backup_dir() == Path("/tmp/某处")
 
 
+def test_基础模板出厂就锁定字体(migration):
+    """**「基础模板」出厂即开锁定字体**（用户 2026-10-30：
+    「系统基线改成默认打开锁定字体」）。
+
+    锁定字体 = 打印时用随应用发布的那份思源宋体，而不是各台机器自己的
+    系统字体 —— 换台机器印出来一模一样。
+    """
+    content = _entry(migration, "基础模板")["content"]
+    assert content["font"].get("embed") is True, "基础模板的基线没有默认锁定字体"
+
+
+def test_凭证纸专用一个字都没动(migration):
+    """**「凭证纸专用」不许跟着改。**
+
+    用户 2026-10-30 明确说过：「不要影响凭证纸专用，这是我好不容易调出来的」。
+    它用的是**仿宋** —— 锁了字体就变成宋体系，那是另一副字。
+
+    所以这份基线 content 里**不许出现** ``font.embed``：没有这个字段就走
+    默认值（关），那份版式仍然是系统字体，与从前逐字相同。
+    """
+    content = _entry(migration, "凭证纸专用")["content"]
+    assert "embed" not in (content.get("font") or {}), (
+        "凭证纸专用被改了 —— 它一个字都不该动"
+    )
+    assert content["font"]["family"] == "仿宋", "凭证纸专用的字体被换了"
+
+
 def test_基线里不许拿半角空格做字距(migration):
     """**字距必须用全角空格（U+3000），不能拿半角空格凑。**
 
