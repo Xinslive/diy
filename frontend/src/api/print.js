@@ -1,4 +1,5 @@
 import { http } from './client'
+import { fontsReady } from '@/utils/printFont'
 import { ElMessage } from 'element-plus'
 
 // ---- HTML 预览（所见即所得，与打印同一份渲染）----
@@ -80,11 +81,20 @@ export function openPrintWindow(html) {
 /** 对已打开的打印窗口唤起打印。等字体与布局稳定再打，否则 Chrome 偶尔会打出空白页。 */
 export function printWindow(w) {
   if (!w) return
-  // 等字体与布局稳定再唤起打印，否则 Chrome 偶尔会打出空白页
-  setTimeout(() => {
-    w.focus()
-    w.print()
-  }, 600)
+  // **先等字体加载完，再唤起打印。**
+  //
+  // 打印页可以内嵌一份随应用发布的字体（模板里的「锁定字体」）。字体没到位时
+  // 浏览器先拿系统字体排版 —— 那时按打印，纸上出来的是**系统字体**那一版，
+  // 与用户看到的预览不是同一份版式，正是「所见即所得」要消灭的东西。
+  //
+  // 字体加载失败时不能卡住打印：fontsReady 内部有上限，超时就放行。
+  fontsReady(w.document).then(() => {
+    // 等字体与布局稳定再唤起打印，否则 Chrome 偶尔会打出空白页
+    setTimeout(() => {
+      w.focus()
+      w.print()
+    }, 600)
+  })
 }
 
 /**

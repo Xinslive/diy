@@ -16,7 +16,8 @@ from sqlalchemy.orm import Session
 from starlette.routing import Route
 
 from app.api import (auth, bank_statements, books, invoices, ledger, mcp_admin,
-                     printing, reports, scheduler, subjects, system, vouchers)
+                     print_assets, printing, reports, scheduler, subjects, system,
+                     vouchers)
 from app.core.config import detect_env, settings
 from app.core.cors import cors_middleware_options
 from app.core.db import get_db
@@ -258,7 +259,7 @@ async def request_id_middleware(request: Request, call_next):
     return response
 
 for r in (auth.router, system.router, scheduler.router, books.router, subjects.router, vouchers.router, invoices.router,
-          ledger.router, reports.router, printing.router, mcp_admin.router,
+          ledger.router, reports.router, printing.router, print_assets.router, mcp_admin.router,
           bank_statements.router, bank_statements.rules_router,
           bank_statements.profiles_router, bank_statements.config_router,
           bootstrap_api.router):

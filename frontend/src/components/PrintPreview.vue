@@ -23,6 +23,7 @@
  * 而且过期时没有任何报错，只是预览框按错误的宽度缩放，看着还挺正常。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { fontsReady } from '@/utils/printFont'
 
 const props = defineProps({
   /** 打印页的完整 HTML（由调用方带鉴权取回）。 */
@@ -160,6 +161,17 @@ function measure() {
       innerRO = new w.ResizeObserver(apply)
       innerRO.observe(d.body)
     }
+
+    // **字体到位后重量一次。**
+    //
+    // 打印页可能内嵌一份随应用发布的字体（模板里的「锁定字体」）。iframe 的
+    // load 事件只说明文档加载完了，字体可能还在路上 —— 那时量到的是**系统
+    // 字体**的排版（摘要折行的位置、行的高度都可能不一样）。等字体到位
+    // 再量一次，预览才是真正要印出来的那一份。
+    fontsReady(d).then(() => {
+      apply()
+      nextTick(fit)
+    })
   } catch { /* 跨源或尚未就绪，保持一整页高度即可 */ }
   nextTick(fit)
 }

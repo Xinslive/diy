@@ -74,6 +74,20 @@
                                  size="small" :disabled="ro" @change="commit" />
               </div>
             </div>
+            <!-- 「锁定字体」：把字体本身也钉死。
+                 模板里的字体名（宋体…）是**系统字体** —— Windows 上是 SimSun，
+                 macOS 上回退成 Songti SC，字宽、空格宽度、字形都不一样，
+                 同一份模板换个环境印出来就变样（用户 2026-10-30：「不想换个
+                 环境样式就变化」）。
+                 打开这一项，打印页改用随应用发布的那一份字体，所有设备渲染的
+                 是同一份字节。**默认关**：用户手里调好的版式一个字都不该被动。 -->
+            <div class="f">
+              <div class="fl">
+                <span class="lb">锁定字体</span>
+                <el-switch v-model="embedOn" :disabled="ro" @change="commit" />
+              </div>
+            </div>
+            <p class="tip">锁定后所有设备都用同一份字体（思源宋体），不再跟随系统字体 —— 换台机器印出来一模一样。</p>
           </section>
 
           <template v-if="!isVoucher">
@@ -535,6 +549,22 @@ const emit = defineEmits(['update:activeTab', 'change', 'select', 'add-element']
 
 /** 标题字号的下限：不得低于正文的下限，但也不低于通用的 8pt。 */
 const minTitleSize = computed(() => Math.max(8, props.minFontSize))
+
+/**
+ * 「锁定字体」开关。
+ *
+ * **旧模板没有 ``font.embed`` 这个字段**（它是后加的），所以读的时候按
+ * 「没有就是关」处理 —— 不能因为字段缺失就把开关显示成开。
+ * 关掉时把 ``embed_font`` 一起删掉：模板里留着一个用不上的字体键，
+ * 以后再加字体时它就会变成「上次选过的那一份」，与用户的心意不符。
+ */
+const embedOn = computed({
+  get: () => !!props.tpl.font?.embed,
+  set: (v) => {
+    props.tpl.font.embed = v
+    if (!v) delete props.tpl.font.embed_font
+  },
+})
 
 /** A4 的毫米尺寸。meta 没加载出来时 slotMm 也得有尺寸可用。 */
 const PAPER_SPEC = { A4: { w: 210, h: 297 } }

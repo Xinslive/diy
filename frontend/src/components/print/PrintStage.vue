@@ -85,6 +85,7 @@
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ArrowLeft, ArrowRight, FullScreen, ZoomIn, ZoomOut } from '@element-plus/icons-vue'
+import { fontsReady } from '@/utils/printFont'
 
 const props = defineProps({
   /** 打印页的完整 HTML。 */
@@ -508,6 +509,11 @@ function measure() {
       innerRO = new w.ResizeObserver(apply)
       innerRO.observe(d.body)
     }
+    // 字体到位后重量一次（内嵌字体时，load 时量到的是系统字体那一版排版）。
+    fontsReady(d).then(() => {
+      apply()
+      nextTick(fit)
+    })
     ready.value = true
   } catch { /* 跨源或尚未就绪，保持一整页高度即可 */ }
   nextTick(fit)

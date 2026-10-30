@@ -33,6 +33,9 @@ from typing import Any
 
 from decimal import ROUND_HALF_UP, Decimal
 
+from .fonts import (DEFAULT_EMBEDDED, EMBEDDED_FONTS, embedded_family,
+                    embedded_key, font_stylesheet_link)
+
 # --------------------------------------------------------------------- 纸型
 
 # 本表一律**按纵向存放**标准纸尺寸，方向只由 ``orientation`` 决定 ——
@@ -407,6 +410,35 @@ def _safe_font(value: Any) -> str:
     return text if text in FONT_FAMILIES else "宋体"
 
 
+def _truthy(value: Any) -> bool:
+    """把「像开关」的值归一成布尔。
+
+    模板是 JSON，界面传上来的是真布尔，但老数据 / 手改过的库里可能躺着
+    ``"true"`` / ``"1"`` / ``1``。**字符串 ``"false"`` 必须是 False** ——
+    ``bool("false")`` 是 True，那就成了「明明关了却开着」。
+    """
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+def _font_stack(family: str, tpl: dict | None = None) -> str:
+    """拼 ``font-family`` 的值。
+
+    **默认**：模板指定的字体 + 常见回退 + ``serif``。模板里写「宋体」的机器上
+    用 SimSun；macOS 上没有宋体，回退 Songti SC；再不行就是 serif。
+
+    **「锁定字体」打开时，内嵌字体排最前面**，模板指定的字体退到第二 ——
+    每台机器渲染的是同一份字节（见 ``printing/fonts.py``）。
+
+    字体族名一律带引号：族名里有空格（「CWQ Serif」）时不带引号会被解析成
+    两个族，样式静默失效。
+    """
+    stack = f'"{family}", "SimSun", "Songti SC", serif'
+    embed = embedded_family(tpl)
+    return f'"{embed}", {stack}' if embed else stack
+
+
 def _safe_align(value: Any, default: str = "center") -> str:
     """对齐方式过白名单 —— 会无引号拼进 ``text-align:{}``，必须过白名单。"""
     return value if value in ALIGN else default
@@ -477,6 +509,17 @@ def validate_template(scope: str, content: dict | None) -> dict:
         font_low = FONT_SIZE_RANGE[0]
         title_size_range = TITLE_SIZE_RANGE
     font["size"] = _num(font.get("size"), 10, font_low, FONT_SIZE_RANGE[1])
+    # 「锁定字体」：归一成布尔 + 登记在册的字体键。
+    #
+    # **认不出来的键不许留在模板里**：``font.embed_font`` 会被用来挑字体文件，
+    # 认不出来就当没开（而不是去拼一个来路不明的路径）。默认值是 False ——
+    # 用户手里调好的版式（尤其「凭证纸专用」）一个字都不该被动。
+    font["embed"] = _truthy(font.get("embed"))
+    if font["embed"]:
+        key = str(font.get("embed_font") or DEFAULT_EMBEDDED).strip()
+        font["embed_font"] = key if key in EMBEDDED_FONTS else DEFAULT_EMBEDDED
+    else:
+        font.pop("embed_font", None)
     merged["font"] = font
 
     # title 与 subtitle 用各自的默认字号（16 / 11），别让写坏的值把副标题
@@ -728,8 +771,8 @@ def _esc(value: Any) -> str:
     return html.escape(str(value if value is not None else ""))
 
 
-#: 打印页内联的 CSP（``<meta http-equiv>`` 形式）。
-#:
+# 打印页内联的 CSP（``<meta http-equiv>`` 形式）。
+#
 #: **为什么必须有 meta 而不是只靠响应头**：这份 HTML 不是被浏览器当「文档」直接
 #: 加载的。前端用 axios 取回源码，再交给 ``iframe.srcdoc`` 或
 #: ``window.open()`` + ``document.write()``（见 ``frontend/src/api/print.js``，
@@ -740,13 +783,34 @@ def _esc(value: Any) -> str:
 #: ``style-src 'unsafe-inline'`` 不能去掉：版式全靠 ``_page_css`` 拼的内联
 #: ``<style>``。``script-src 'none'`` 才是重点 —— 模板校验是第一道防线，
 #: 这条是第二道，两道独立成立。
-PRINT_CSP_META = (
-    '<meta http-equiv="Content-Security-Policy" content="'
-    "default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; "
-    "img-src 'none'; font-src 'none'; connect-src 'none'; "
-    "form-action 'none'; base-uri 'none'"
-    '">'
-)
+def print_csp_meta(tpl: dict | None = None) -> str:
+    """打印页的 CSP。**只有「锁定字体」打开时才会松一条。**
+
+    字体内嵌时要多放开两条：``font-src 'self'``（字体文件）、
+    ``style-src 'self'``（那份 @font-face 规则是独立的一张样式表）。
+
+    **只放开同源样式表，不是脚本** —— ``script-src 'none'`` 照旧。
+    同源样式表做不了 XSS（CSS 不会执行脚本），而打印页的内容由用户可改
+    的模板拼出来，这件事必须守住（见 ARCHITECTURE「打印模板的信任边界」）。
+
+    没开锁定字体时，这两条与从前**逐字相同** —— 不用这个功能的人不该为它
+    付任何代价。
+    """
+    embed = embedded_key(tpl)
+    style_src = "'unsafe-inline' 'self'" if embed else "'unsafe-inline'"
+    font_src = "'self'" if embed else "'none'"
+    return (
+        '<meta http-equiv="Content-Security-Policy" content="'
+        f"default-src 'none'; style-src {style_src}; script-src 'none'; "
+        f"img-src 'none'; font-src {font_src}; connect-src 'none'; "
+        "form-action 'none'; base-uri 'none'"
+        '">'
+    )
+
+
+#: 不带内嵌字体时的 CSP（模板里 ``font.embed`` 没开的那种）。
+#: 保留成常量是因为它同时是「最严的那一份」，写测试与文档时指它更直接。
+PRINT_CSP_META = print_csp_meta(None)
 
 
 # --------------------------------------------------------------------- 页面骨架
@@ -798,6 +862,10 @@ def _page_css(tpl: dict) -> str:
         font = {}
     family = _safe_font(font.get("family"))
     fsize = _num(font.get("size"), 10, *FONT_SIZE_RANGE)
+    # 「锁定字体」：用随应用发布的那一份，所有设备渲染的是同一份字节。
+    # 版式本来就是与字体无关的（百分比定位 / pt 字号 / 固定行高 / 全角空格
+    # 做字距），这里补的是**字形**那一半 —— 见 printing/fonts.py。
+    family_stack = _font_stack(family, tpl)
 
     def _title_like(key: str, default_size: float) -> tuple[str, float]:
         raw = tpl.get(key)
@@ -817,7 +885,7 @@ def _page_css(tpl: dict) -> str:
 * {{ box-sizing: border-box; }}
 html, body {{ margin:0; padding:0; }}
 body {{
-  font-family: "{family}", "SimSun", "Songti SC", serif;
+  font-family: {family_stack};
   font-size: {fsize}pt;
   color:#000;
   -webkit-print-color-adjust: exact;
@@ -1107,8 +1175,9 @@ def render_table_page(tpl: dict, ctx: dict, rows: list[dict], page: int, total: 
         body_rows = ['<tr><td colspan="%d" class="ctr">（无数据）</td></tr>' % len(cols)]
 
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
-{PRINT_CSP_META}
+{print_csp_meta(tpl)}
 <title>{_esc(ctx.get('doc_title') or tpl.get('title',{}).get('text','打印预览'))}</title>
+{font_stylesheet_link(tpl)}
 <style>{_page_css(tpl)}</style></head><body>
 <div class="page">
   <h1 class="doc-title">{_esc(tpl.get('title',{}).get('text',''))}</h1>
@@ -1365,6 +1434,7 @@ def render_ledger_book_page(tpl: dict, ctx: dict, rows: list[dict], *,
     )
     font = tpl.get("font") or {}
     family = _safe_font(font.get("family"))
+    family_stack = _font_stack(family, tpl)
     # 三个字号都不得低于 12pt（见 _ledger_sizes）。
     fsize, title_size, subtitle_size = _ledger_sizes(tpl)
     title = tpl.get("title") or {}
@@ -1439,7 +1509,7 @@ def render_ledger_book_page(tpl: dict, ctx: dict, rows: list[dict], *,
 * {{ box-sizing: border-box; }}
 html, body {{ margin:0; padding:0; }}
 body {{
-  font-family: "{family}", "SimSun", "Songti SC", serif;
+  font-family: {family_stack};
   font-size: {fsize}pt; color:#000;
   -webkit-print-color-adjust: exact; print-color-adjust: exact;
 }}
@@ -1502,8 +1572,9 @@ table.lb-grid td.lb-left {{ text-align:left; }}
 }}
 """
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
-{PRINT_CSP_META}
+{print_csp_meta(tpl)}
 <title>{_esc(title_text or "总账")}</title>
+{font_stylesheet_link(tpl)}
 <style>{css}</style></head><body>
 <div class="page">
   <div class="lb-head">
@@ -2075,8 +2146,9 @@ def render_voucher_sheet(tpl: dict, ctx: dict, vouchers: list[dict],
 
     doc_title = _esc((tpl.get("title") or {}).get("text", "") or "记 账 凭 证")
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
-{PRINT_CSP_META}
+{print_csp_meta(tpl)}
 <title>{doc_title}</title>
+{font_stylesheet_link(tpl)}
 <style>{_page_css(tpl)}</style></head><body>
 <div class="page">
   <div class="voucher-sheet-page">
