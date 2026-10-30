@@ -229,6 +229,108 @@ def test_把有分录的叶子科目改挂到父下也被拒(client, auth, db, b
     assert db.get(Subject, sid_new).parent_id is None, "被拒之后不该改父"
 
 
+# ------------------------------------- 汇总快照 ≠「自己那份余额」（2026-10-30 修）
+
+
+def _add_opening(db, book, subject_id: int, period, amount: Decimal) -> None:
+    db.add(PeriodOpening(book_id=book.id, period_id=period.id,
+                         subject_id=subject_id, amount=amount))
+    db.commit()
+
+
+def test_汇总科目自身快照等于下级之和时可以再加下级(client, auth, db, book, subjects,
+                                              periods):
+    """生产事故的原样复现（2026-10-30）。
+
+    218102 房屋押金 本身这一级并没有余额 —— 它那条期初快照是**整棵子树的汇总**，
+    数字恰好等于下级那几个科目的期初之和。原先的闸门把「自己身上有一条非零
+    期初快照」当成「自己有余额」，于是**凡是带余额的汇总科目一律不许加下级**。
+
+    这里的构造就是生产上的历史：父科目还是末级时录了期初，后来在它下面挂了
+    子科目、余额分了下去 —— 父级那条汇总快照留着不动（引擎读期初时以自身快照
+    为基准、下级只补增量，父子各有一条同额快照**不会被算两遍**）。
+    """
+    bank = subjects["1001"]
+    p1 = periods[1]
+    _add_opening(db, book, bank.id, p1, Decimal("500"))
+
+    # 绕过闸门造出「后来加的下级」（生产上就是这么来的），并把余额分给它：
+    # 父级 500 = 下级 500。
+    child_id = _make_child_directly(db, book, bank.id, code="100101", name="下级")
+    _add_opening(db, book, child_id, p1, Decimal("500"))
+    db.expire_all()
+
+    r = client.post(f"/api/books/{book.id}/subjects", headers=auth,
+                    json=_payload(parent_id=bank.id, code="100102", name="再下一级"))
+    assert r.status_code == 201, f"不该被拦：{r.status_code} {r.text}"
+    db.expire_all()
+    new_child = db.scalar(select(Subject).where(
+        Subject.book_id == book.id, Subject.code == "100102"))
+    assert new_child is not None and new_child.parent_id == bank.id
+
+
+def test_父科目快照与下级对不上时仍然拦(client, auth, db, book, subjects, periods):
+    """差额不为 0 才是真的「它自己还挂着一笔没下沉的余额」，照旧拦。
+
+    这条是上面那条的边界：**不是**「父科目只要有快照就放行」。
+    """
+    bank = subjects["1001"]
+    p1 = periods[1]
+    _add_opening(db, book, bank.id, p1, Decimal("500"))
+    child_id = _make_child_directly(db, book, bank.id, code="100101", name="下级")
+    _add_opening(db, book, child_id, p1, Decimal("300"))
+    db.expire_all()
+
+    r = client.post(f"/api/books/{book.id}/subjects", headers=auth,
+                    json=_payload(parent_id=bank.id, code="100102", name="再下一级"))
+    assert r.status_code == 400, f"应当拒绝，实际 {r.status_code}：{r.text}"
+    detail = r.json()["detail"]
+    assert "对不上" in detail, detail
+    assert "1001" in detail, detail
+
+
+def test_改挂到已有下级的汇总科目不再被拦(client, auth, db, book, subjects, periods):
+    """改父级是同一个洞的另一半：汇总父科目也不该因为「有余额」被锁死。"""
+    bank = subjects["1001"]
+    p1 = periods[1]
+    _add_opening(db, book, bank.id, p1, Decimal("500"))
+    child_id = _make_child_directly(db, book, bank.id, code="100101", name="下级")
+    _add_opening(db, book, child_id, p1, Decimal("500"))
+    db.expire_all()
+
+    r = client.post(f"/api/books/{book.id}/subjects", headers=auth,
+                    json=_payload(code="1900", name="待挂科目"))
+    assert r.status_code == 201, r.text
+    sid_new = r.json()["id"]
+    db.expire_all()
+
+    r = client.patch(
+        f"/api/books/{book.id}/subjects/{sid_new}", headers=auth,
+        json=_payload(code="1900", name="待挂科目", category="ASSET",
+                      direction="DEBIT", parent_id=bank.id),
+    )
+    assert r.status_code == 200, f"不该被拦：{r.status_code} {r.text}"
+    db.expire_all()
+    assert db.get(Subject, sid_new).parent_id == bank.id
+
+
+def test_末级科目自身有余额时依然被拦(client, auth, db, book, subjects, periods):
+    """**升格**那一次仍然要拦：父科目还没有下级，它那条快照就是它自己的钱。
+
+    上面几条放行的是「已经有下级、快照已被下级解释掉」的汇总科目；
+    「这次操作会把一个带余额的末级升成汇总级」正是审计 P1-1 要防的那一次，
+    口径没变。
+    """
+    bank = subjects["1001"]
+    _add_opening(db, book, bank.id, periods[1], Decimal("500"))
+    db.expire_all()
+
+    r = client.post(f"/api/books/{book.id}/subjects", headers=auth,
+                    json=_payload(parent_id=bank.id))
+    assert r.status_code == 400, f"应当拒绝，实际 {r.status_code}：{r.text}"
+    assert "期初" in r.json()["detail"], r.text
+
+
 # --------------------------------------------------------------------- 结转侧兜底
 
 

@@ -1,6 +1,8 @@
 """科目表。"""
 from __future__ import annotations
 
+from decimal import Decimal
+
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import and_, delete, func, select
 from sqlalchemy.orm import Session
@@ -541,31 +543,105 @@ def _check_parent(db: Session, book: Book, parent_id: int | None, self_id: int |
     return parent
 
 
-def _balance_at_subject(db: Session, subject_id: int) -> tuple[int, int]:
-    """该科目**自己**身上挂着多少东西：(分录条数, 非零期初期数)。"""
-    n_entries = db.scalar(
+def _own_entries_count(db: Session, subject_id: int) -> int:
+    """该科目**自己**身上挂着的分录条数。
+
+    分录这一项**不存在「被下级解释掉」的可能** —— 一条凭证分录钉死在某一个
+    科目上，它就是那个科目自己的余额。父科目一旦挂上子科目就不再是末级，
+    凭证校验（``accounting/vouchers._validate_entries``）会拒绝再往它身上
+    记新的分录，损益结转（``accounting/periods.carry_forward_subjects``）也
+    只走末级 —— 于是那笔挂在汇总级上的钱就停在那儿了。
+    """
+    return db.scalar(
         select(func.count()).select_from(Entry).where(Entry.subject_id == subject_id)
     ) or 0
-    n_openings = db.scalar(
-        select(func.count()).select_from(PeriodOpening).where(
-            PeriodOpening.subject_id == subject_id, PeriodOpening.amount != 0)
-    ) or 0
-    return n_entries, n_openings
+
+
+def _unexplained_openings(db: Session, subject: Subject) -> list[tuple[str, Decimal, Decimal]]:
+    """该科目自己那份、**下级没有替它解释掉**的期初余额。
+
+    返回 ``[(期间, 自身快照, 下级快照之和), ...]``，只列真正有差额的期间。
+
+    ---- 为什么不能「有几条非零快照就算它有余额」（2026-10-30 修）-----------
+    父科目身上那条期初快照**不是它自己的一笔余额**，而是**整棵子树的汇总快照**：
+
+    * 年度结转（``accounting/periods._refresh_opening``）对**每一个有余额的科目**
+      都写一条期初快照，**含非末级**，金额取 ``closing`` —— 那是引擎上卷后的
+      **子树合计**；
+    * 引擎读期初时（``ledger/engine._roll_up_openings``）以**自身快照为基准**、
+      下级只补增量，所以父子各写一条同额快照**不会被算两遍**。
+
+    于是「父科目有一条非零期初快照」这件事在真实账里**几乎恒真** ——
+    任何一个有余额的汇总科目都满足。拿它当「父科目自带余额」来拦，等于
+    **凡是带余额的父科目一律不许加下级**。生产实测（2026-10-30）：紫欣工贸
+    2026 年 54 个汇总科目、星悦荟 9 个全被这样挡住；用户的原话是
+    「218102 的余额是他所有下级科目余额之和，也就是 218102 本身这一级没有余额」。
+
+    ---- 真正该拦的是「下级解释不掉的那一部分」----------------------------
+    判据是 ``自身快照 − Σ下级自身快照``：
+
+    * **父科目还没有下级**（这次操作会把它**升格**为汇总级）→ 下级那一份是 0，
+      差额就是它自己的全部余额 → 照旧拦。这正是审计 P1-1 要防的那一次升格：
+      父级那份余额从此脱离明细口径，而明细账只按末级出账。
+    * **父科目已经有下级** → 差额为 0 表示「下级已经替它记着这笔钱」
+      （汇总快照本来就是这么写的），放行；差额**不为 0** 才是真的
+      「它自己还挂着一笔没下沉的余额」，拦。
+
+    这条判据顺带把「这次操作是不是一次**新的升格**」表达出来了 ——
+    还没有下级的父科目天然差着全额，正是升格的那一次。
+
+    生产库里 27 个账套年度、全部 407 个「带自身快照的汇总科目」，
+    自身快照与下级快照之和**逐期完全相等**（一条不差）；按新判据重算，
+    这 407 个**一个都不会再被拦**（另有 0 个汇总科目自己身上挂着分录）。
+    """
+    # **``Period.code`` 是 Python 属性不是列**（``f"{year}-{month:02d}"``），
+    # 选它进 SQL 会直接报 ArgumentError —— 这里取 year/month 自己拼。
+    own_rows = db.execute(
+        select(PeriodOpening.period_id, PeriodOpening.amount, Period.year, Period.month)
+        .join(Period, Period.id == PeriodOpening.period_id)
+        .where(PeriodOpening.subject_id == subject.id)
+    ).all()
+    if not own_rows:
+        return []
+
+    child_ids = list(db.scalars(
+        select(Subject.id).where(Subject.parent_id == subject.id)
+    ).all())
+    child_sum: dict[int, Decimal] = {}
+    if child_ids:
+        for period_id, total in db.execute(
+            select(PeriodOpening.period_id, func.sum(PeriodOpening.amount))
+            .where(PeriodOpening.subject_id.in_(child_ids))
+            .group_by(PeriodOpening.period_id)
+        ).all():
+            child_sum[period_id] = Decimal(total)
+
+    out: list[tuple[str, Decimal, Decimal]] = []
+    for period_id, amount, year, month in own_rows:
+        own = Decimal(amount)
+        kids = child_sum.get(period_id, Decimal("0"))
+        if own - kids != 0:
+            out.append((f"{year}-{month:02d}", own, kids))
+    return out
 
 
 def _assert_no_own_balance(db: Session, subject: Subject, action: str) -> None:
     """没有自带余额的科目才允许被「升格」为汇总级（审计 P1-1）。
 
-    **为什么 fail-closed。** 明细账、科目余额表都按末级出账，凭证校验和期初写入
-    又都拿 ``is_leaf`` 当权威判据。父科目一旦挂上子科目就不再是末级，
-    它自己那些分录/期初就成了「挂在汇总级上的余额」——
-    年度结转过去只取末级科目写次年期初，于是这笔钱在某一年凭空消失、零提示
-    （审计实测：100201 期末 1000，次年期初 0，对手科目 6001 还在，
-    科目余额表试算不平）。
+    **为什么 fail-closed。** 明细账按末级出账，凭证校验和期初写入又都拿
+    ``is_leaf`` 当权威判据。父科目一旦挂上子科目就不再是末级，它自己那些
+    **分录**就成了「挂在汇总级上的余额」—— 凭证校验从此拒绝再往它身上记分录，
+    损益结转也只走末级，那笔钱就停在那儿了。
 
     这里选「拒绝」而不是「放行但警告」，理由和 P1-01 让 is_leaf 改由服务端派生
     是同一个：**错误的账面数字事后极难察觉，而拦住入口的代价只是多一次改挂操作。**
     放过它就等于把一次可预防的账务断层写进库里。
+
+    **但「有余额」要问对问题（2026-10-30 修）。** 父科目身上那条期初快照是
+    **子树的汇总快照**，不是它自己的一笔余额 —— 拿「有几条非零快照」来判
+    「自带余额」，会把**每一个带余额的汇总科目**都锁死，用户连一棵已经建好的
+    树都不敢再往下加一支。真正该问的是「**下级解释不掉的那一部分**」，
+    口径见 ``_unexplained_openings``。
 
     报错要能指导下一步怎么做，而不是只说「不允许」：正确的处理是
     **先建一个末级科目、把分录改挂过去**，余额随之下沉，之后再来建子科目。
@@ -573,19 +649,25 @@ def _assert_no_own_balance(db: Session, subject: Subject, action: str) -> None:
     存量数据里已经升格、身上又带着余额的科目不在这里拦（拦不住历史），
     由 ``accounting/periods.year_end_carry`` 的兜底把余额结转过去。
     """
-    n_entries, n_openings = _balance_at_subject(db, subject.id)
-    if not (n_entries or n_openings):
+    n_entries = _own_entries_count(db, subject.id)
+    gaps = _unexplained_openings(db, subject)
+    if not (n_entries or gaps):
         return
+
     what = []
     if n_entries:
         what.append(f"{n_entries} 条分录")
-    if n_openings:
-        what.append(f"{n_openings} 期非零期初余额")
+    if gaps:
+        code, own, kids = gaps[0]
+        detail = f"{code}：自身 {own}，下级合计 {kids}"
+        more = f"（另有 {len(gaps) - 1} 期同样对不上）" if len(gaps) > 1 else ""
+        what.append(f"{len(gaps)} 期期初余额与下级对不上（{detail}{more}）")
+
     raise HTTPException(
         400,
         f"{subject.code} {subject.name} 上已经有{'、'.join(what)}，不能{action}。"
         f"它一旦有了下级就不再是末级科目，自己那份余额就会脱离明细口径 —— "
-        f"年度结转按末级科目取数，这笔钱会在次年凭空消失。"
+        f"明细账只按末级出账，这笔钱在明细里看不到。"
         f"\n处理办法：先新建一个末级科目（先不要挂在它下面），把这些分录逐条改挂到"
         f"新科目上、期初余额也重新录到新科目上；余额下沉之后再{action}。"
         f"如果只是想停用这个科目，那用「停用」即可 —— 停用不影响历史统计与年度结转。"
