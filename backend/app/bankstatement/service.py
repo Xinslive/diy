@@ -2068,7 +2068,12 @@ def confirm_row_review(db: Session, book_id: int, row_id: int,
             "金额、方向或账户科目对不上，不能挂上去")
     row.status = STATUS_POSTED
     row.matched_voucher_id = int(voucher_id)
-    row.rejected_voucher_id = None
+    # 这一行认定了那张凭证 —— 它之前被否过的那些**仍然否着**
+    # （否过别的凭证与这一张不矛盾），但**这一张**的否决作废
+    # （用户都判「是同一笔」了）。
+    row.rejected_voucher_ids = sorted(
+        {int(v) for v in (row.rejected_voucher_ids or [])} - {int(voucher_id)})
+    row.review_voucher_id = None
     db.flush()
     voucher = db.get(Voucher, voucher_id)
     return {
@@ -2084,9 +2089,20 @@ def dismiss_row_review(db: Session, book_id: int, row_id: int,
                        voucher_id: int) -> dict[str, Any]:
     """用户判「**不是同一笔**」→ 放行，这一行回到「可制证」。
 
-    **记下否掉的是哪一张凭证**（``rejected_voucher_id``）：不记的话，
-    下次重算时那张同额的分录**又会被捞出来**报一次待复核 ——
+    **记下否掉的是哪几张凭证**（``rejected_voucher_ids``，**一组**）：不记
+    的话，下次重算时那张同额的分录**又会被捞出来**报一次待复核 ——
     用户会以为刚才那一下没生效（判了等于没判）。
+
+    **记的是一组，不是一张**（2026-10-30 用户报的死循环）：同一份对账单上
+    有两行同额流水、账上有四张同额凭证时，用户要在两行上轮流否 —— **第二次
+    否的时候把第一次记的那张覆盖掉了**，于是点过的那张凭证又冒出来，
+    用户永远点不完。**后来的判断不许抹掉先前的。**
+
+    **这一张凭证就此退出这一份对账单的配对**（不只退出这一行）：同额的几行
+    之间本来分不清哪一行是哪一笔 —— 只否这一行的话，那张凭证会挪到旁边
+    那一行上重新冒出来（用户原话：「我点了这边的『不是同一笔』，那边的又
+    冒出来」）。它退出这份对账单，就只出现一次；它成了「账上没对上行」的
+    那一笔，出现在「存疑凭证」那一页等人处理。
     """
     row = _review_row(db, book_id, row_id)
     voucher = db.get(Voucher, voucher_id)
@@ -2094,13 +2110,18 @@ def dismiss_row_review(db: Session, book_id: int, row_id: int,
         raise ValueError("那张凭证不存在")
     row.status = STATUS_OPEN
     row.matched_voucher_id = None
-    row.rejected_voucher_id = int(voucher_id)
+    # **这一行现在不再对着任何凭证**：候选被否掉了，记住它只会让那张凭证
+    # 在重算时又配回这一行（用户刚判过的东西又冒出来）。
+    row.review_voucher_id = None
+    row.rejected_voucher_ids = sorted(
+        {int(v) for v in (row.rejected_voucher_ids or [])} | {int(voucher_id)})
     db.flush()
     return {
         "row_id": row.id,
         "status": row.status,
         "voucher_state": _voucher_state(row),
         "rejected_voucher_id": int(voucher_id),
+        "rejected_voucher_ids": list(row.rejected_voucher_ids),
     }
 
 
@@ -2303,8 +2324,29 @@ def _pair_rows(db: Session, book_id: int, statement: BankStatement,
     for row_id, voucher_id in invoice_claims.items():
         claims[row_id] = voucher_id
 
-    rejected = {int(row.id): int(row.rejected_voucher_id) for row in free_rows
-                if row.rejected_voucher_id}
+    # **用户判过「不是同一笔」的那些凭证** —— 整个**这份对账单**都不再用
+    # 它们来问。
+    #
+    # **为什么是「整份对账单」而不是「只这一行」**（2026-10-30 用户报的
+    # 死循环）：同额的几行之间本来分不清哪一行是哪一笔 —— 这正是「待复核」
+    # 这一档存在的原因。只否这一行的话，**那张凭证会挪到旁边那一行上
+    # 重新冒出来**；在那边再否一次，**原来那一行又冒出同一张**（用户原话：
+    # 「我点了这边的『不是同一笔』，那边的又冒出来」）。它退出这份对账单，
+    # 就只出现一次。
+    #
+    # **它是各行判否记录的并集**：哪一行判的、判了几次，都留着（行上那一列
+    # 记的是一组，见 :class:`~app.models.bankstatement.BankStatementRow`）；
+    # 拿并集是为了让「判过就算数」在这份对账单里处处算数。
+    retired: set[int] = set()
+    for row in rows:
+        retired.update(int(v) for v in (row.rejected_voucher_ids or []))
+
+    # **这一行待复核时对着的那张凭证** —— 重算时优先兑现它，
+    # **一张凭证不换人**（理由见 :func:`app.bankstatement.allocate.allocate`）。
+    sticky: dict[int, int] = {}
+    for row in free_rows:
+        if row.status == STATUS_REVIEW and row.review_voucher_id:
+            sticky[int(row.id)] = int(row.review_voucher_id)
 
     lo, hi = _entry_scope(statement, _row_sides(rows))
     entries = _account_entries(db, book_id, statement, lo, hi)
@@ -2317,7 +2359,8 @@ def _pair_rows(db: Session, book_id: int, statement: BankStatement,
         primary_window=window_days,
         review_window=allocate.REVIEW_WINDOW_DAYS,
         claims=claims,
-        rejected=rejected,
+        sticky=sticky,
+        retired=retired,
     )
     return allocation, invoice_claims
 
@@ -2382,11 +2425,13 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
             if pair is not None and invoice_claims.get(int(row.id)) == pair.voucher_id:
                 row.status = STATUS_POSTED
                 row.matched_voucher_id = pair.voucher_id
+                row.review_voucher_id = None
                 skipped.append({
                     **_ser(row, items),
                     "reason": f"已入账（凭证 #{pair.voucher_id}）",
                 })
             else:
+                row.review_voucher_id = None
                 skipped.append({**_ser(row, items),
                                 "reason": "已被发票占用"})
             continue
@@ -2396,6 +2441,7 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
                 # （跨期的那种，日期再远也是人说了算）→ 已入账。
                 row.status = STATUS_POSTED
                 row.matched_voucher_id = pair.voucher_id
+                row.review_voucher_id = None
                 skipped.append({
                     **_ser(row, items),
                     "reason": f"已入账（凭证 #{pair.voucher_id}）",
@@ -2408,6 +2454,11 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
                 # 比机器猜可靠 —— 猜错的代价是钱记两遍。
                 row.status = STATUS_REVIEW
                 row.matched_voucher_id = None
+                # **记住这一行现在对着哪张凭证**：重算时优先兑现它，
+                # **一张凭证不换人** —— 否则旁边那一行被判一下，这张凭证
+                # 就搬家，用户看着是「我刚否过的那张又跑到别的行上去了」
+                # （2026-10-30 用户报的死循环）。
+                row.review_voucher_id = pair.voucher_id
                 review.append({
                     **_ser(row, items),
                     "reason": (f"账上有同额的凭证（#{pair.voucher_id} "
@@ -2426,6 +2477,7 @@ def plan_vouchers(db: Session, book_id: int, statement_id: int,
         if row.status in (STATUS_POSTED, STATUS_REVIEW):
             row.status = STATUS_OPEN
             row.matched_voucher_id = None
+            row.review_voucher_id = None
         if row.direction == DIRECTION_UNKNOWN:
             skipped.append({**_ser(row, items),
                             "reason": "方向未知"})

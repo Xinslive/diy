@@ -54,6 +54,16 @@
 确认过的那一行，它与那张凭证的关联是**人的决定**，不许被下面那次
 自动分配顶掉 —— 自动分配是启发式，人工的确认不是。
 
+**「待复核的候选」不换人（``sticky``）。** 待复核那一档的候选也是
+**配过一次**的：那一行与那张凭证是配上的，只是还没等人判。旁边那一行
+被否掉之后重新分配时，**那张凭证不许搬家** —— 用户看着就是「我刚判过
+的那张凭证又跑到另一行去了」，在两行之间来回点「不是同一笔」，永远点
+不完（2026-10-30 用户在生产上报的那个死循环）。
+
+**判过「不是同一笔」的那些凭证不再来问（``retired``）。** 用户已经
+表过态了，再冒出来就是「判了等于没判」。**只在待复核那一档挡它** ——
+主窗口内照旧自动配成「已入账」，那是尺子判的，不是用户判的。
+
 **但一张凭证只能被一个行认领。** 所以「已确认」也是排队认领：
 几行都指着同一张凭证时，按**日期差最小**的那一行拿到它，其余的行
 收回标记（它们本来就不该「已入账」——见上面「为什么一对一是硬要求」）。
@@ -172,6 +182,13 @@ class Pair:
     in_primary: bool
     #: 这一对是**用户已确认过的关联**（而不是自动配上的）。
     claimed: bool = False
+    #: 这一对是**这一行原来就对着的那张凭证**（待复核的候选，重算时不换人）。
+    #:
+    #: **它与 ``claimed`` 不是一回事**：``claimed`` 是用户按过「是同一笔」
+    #: 的**确认**（判成已入账），``sticky`` 只是「待复核」那档的**候选**
+    #: ——还没判，所以它既不是已入账，也不是没入账，只是那张凭证**继续
+    #: 归这一行管**，不许因为旁边那行出了变动就搬家。
+    sticky: bool = False
 
 
 @dataclass
@@ -199,7 +216,8 @@ def allocate(rows: Iterable[RowSide],
              primary_window: int = PRIMARY_WINDOW_DAYS,
              review_window: int = REVIEW_WINDOW_DAYS,
              claims: Optional[dict[int, int]] = None,
-             rejected: Optional[dict[int, int]] = None,
+             sticky: Optional[dict[int, int]] = None,
+             retired: Optional[Iterable[int]] = None,
              ) -> Allocation:
     """把「流水行」与「账上分录」一一对上。
 
@@ -208,12 +226,18 @@ def allocate(rows: Iterable[RowSide],
     :param primary_window: 主窗口（天）。日期差在这个之内 → ``in_primary``。
     :param review_window: 复核窗口（天）。超出它就**不是同一笔**。
     :param claims: ``{行 id: 凭证 id}`` —— 用户已确认过的关联，**优先兑现**。
-    :param rejected: ``{行 id: 凭证 id}`` —— 用户已判定「不是同一笔」的关联，
-        分配时跳过（不再拿它去打扰用户）。
+    :param sticky: ``{行 id: 凭证 id}`` —— 这一行**原来就对着**的那张凭证
+        （待复核的候选）。重算时优先兑现它：**一张凭证一旦配给某行，
+        没被否掉就不换人** —— 否则旁边那一行被判一下，那张凭证就搬家，
+        用户看着是「我刚否过的那张又跑到别的行上去了」。
+    :param retired: **用户判过「不是同一笔」的凭证 id 集合**。它们不再作为
+        「待复核」的候选冒出来 —— 但**主窗口内照旧自动配**（那是尺子判的
+        「已入账」，用户否的是「不是同一笔」，不是「这笔钱不存在」）。
     :returns: :class:`Allocation`
     """
     claims = claims or {}
-    rejected = rejected or {}
+    sticky = sticky or {}
+    retired = set(retired or ())
 
     row_list = list(rows)
     entry_list = list(entries)
@@ -230,14 +254,18 @@ def allocate(rows: Iterable[RowSide],
             continue
         if cash_direction(row.direction) is None:
             continue
-        rejected_voucher = rejected.get(row.id)
         for entry in buckets.get(row.key, []):
-            # **用户否掉过的关联不再来打扰**：判「不是同一笔」之后，
-            # 每次重算都还会把它捞出来 —— 用户会以为没生效。
-            if rejected_voucher is not None and entry.voucher_id == rejected_voucher:
-                continue
             gap = _gap(entry.voucher_date, row.tx_date)
             if gap > review_window:
+                continue
+            # **用户否掉过的凭证不再来打扰**：判「不是同一笔」之后，
+            # 每次重算都还会把它捞出来 —— 用户会以为没生效。
+            #
+            # **只在「待复核」那档挡它**：主窗口内照旧自动配成「已入账」——
+            # 那是尺子判的（差几天就是同一笔），用户否的是「不是同一笔」，
+            # 不是「这笔钱不存在」。要是连主窗口也挡，那一行会**从已入账
+            # 掉回可制证** —— 同一笔钱记两遍。
+            if entry.voucher_id in retired and gap > primary_window:
                 continue
             candidates.append((gap, row, entry))
 
@@ -245,7 +273,8 @@ def allocate(rows: Iterable[RowSide],
     taken_rows: set[int] = set()
     taken_entries: set[int] = set()
 
-    def _take(gap: int, row: RowSide, entry: EntrySide, claimed: bool) -> None:
+    def _take(gap: int, row: RowSide, entry: EntrySide, claimed: bool = False,
+              sticky: bool = False) -> None:
         taken_rows.add(row.id)
         taken_entries.add(entry.id)
         result.pairs[row.id] = Pair(
@@ -258,6 +287,7 @@ def allocate(rows: Iterable[RowSide],
             days_diff=gap,
             in_primary=(gap <= primary_window),
             claimed=claimed,
+            sticky=sticky,
         )
 
     # ---- 第一轮：兑现「用户已确认过的关联」 ----
@@ -282,22 +312,14 @@ def allocate(rows: Iterable[RowSide],
             return 10 ** 6
         return _gap(entry.voucher_date, row.tx_date)
 
-    claimed_rows = [row for row in row_list if claims.get(row.id)]
-    # 先按「到那张凭证的日期差」排序 → 最像的那一行先拿到。
-    claimed_rows.sort(key=lambda row: (
-        min((_claim_gap(row, entry)
-             for entry in by_voucher.get(claims[row.id], [])
-             if entry.key == row.key),
-            default=10 ** 6),
-        row.tx_date or date.min,
-        row.id,
-    ))
-    for row in claimed_rows:
-        claim = claims[row.id]
+    def _best_entry(row: RowSide, voucher_id: int) -> Optional[tuple[int, EntrySide]]:
+        """这一行与那张凭证上的分录，**哪一条对得上**。
+
+        **必须是这一行对得上的那一条分录**：科目对（同一个账户）、
+        方向对、金额对 —— 只是日期可能差得很远。
+        """
         best: Optional[tuple[int, EntrySide]] = None
-        for entry in by_voucher.get(claim, []):
-            # **必须是这一行对得上的那一条分录**：科目对（同一个账户）、
-            # 方向对、金额对 —— 只是日期可能差得很远。
+        for entry in by_voucher.get(voucher_id, []):
             if entry.key != row.key:
                 continue
             if entry.id in taken_entries:
@@ -306,10 +328,60 @@ def allocate(rows: Iterable[RowSide],
             if best is None or (gap, entry.voucher_date, entry.id) < (
                     best[0], best[1].voucher_date, best[1].id):
                 best = (gap, entry)
+        return best
+
+    def _claim_order(candidates: list[RowSide], mapping: dict[int, int]) -> list[RowSide]:
+        """按「到那张凭证的日期差」排序 → **最像的那一行先拿到**。
+
+        几张行都指着同一张凭证时只有一行拿得到（**一对一**是硬要求），
+        拿哪一行必须**每次都一样** —— 不然同一份对账单两次重算会配出
+        不同的结果，用户会以为系统在乱来。
+        """
+        ordered = [row for row in candidates if mapping.get(row.id)]
+        ordered.sort(key=lambda row: (
+            min((_claim_gap(row, entry)
+                 for entry in by_voucher.get(mapping[row.id], [])
+                 if entry.key == row.key),
+                default=10 ** 6),
+            row.tx_date or date.min,
+            row.id,
+        ))
+        return ordered
+
+    claimed_rows = _claim_order(row_list, claims)
+    for row in claimed_rows:
+        best = _best_entry(row, claims[row.id])
         if best is not None:
             _take(best[0], row, best[1], claimed=True)
 
-    # ---- 第二轮：贪心补齐 ----
+    # ---- 第二轮：兑现「待复核的候选」—— **一张凭证不换人** ----
+    #
+    # **为什么要有这一轮**（2026-10-30 用户报的死循环）：配对是**一对一**的
+    # 贪心分配，日期差最小的先配对。于是旁边那一行被判之后，重新分配时那张
+    # 凭证会落到这一行头上 —— 用户看着就是「我刚判过的那张凭证又跑到另一行
+    # 去了」，在两行之间来回点「不是同一笔」，永远点不完。
+    #
+    # **记住这一行现在对着哪张凭证**（``sticky``），重算时优先兑现它：
+    # 一张凭证一旦配给某行，没被否掉就不换人。
+    #
+    # **它与「已确认的关联」（claims）不是一回事**：claims 是用户按过
+    # 「是同一笔」的**确认**（判成已入账），sticky 只是「待复核」那档的
+    # **候选** —— 还没判，所以它既不是已入账也不是没入账。
+    sticky_rows = _claim_order(row_list, sticky)
+    for row in sticky_rows:
+        best = _best_entry(row, sticky[row.id])
+        if best is None:
+            continue
+        gap, entry = best
+        if gap > review_window:
+            # **日期差得太远 —— 这已经不是原来那张了**：放掉它，让它重配。
+            continue
+        if entry.voucher_id in retired and gap > primary_window:
+            # **用户已经判过「不是同一笔」**：那张凭证不再作为候选冒出来。
+            continue
+        _take(gap, row, entry, sticky=True)
+
+    # ---- 第三轮：贪心补齐 ----
     #
     # **按日期差从小到大配**：差得少的最像同一笔，先把它们配掉。
     # 剩下的按稳定的次序（行日期、行 id、凭证日期、分录 id）排 ——

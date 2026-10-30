@@ -21,7 +21,7 @@ from sqlalchemy import select
 from app.bankstatement import service
 from app.bankstatement import suspicious
 from app.core.config import settings
-from app.models import BankStatementRow, Subject
+from app.models import BankStatementRow, Subject, Voucher
 
 D = Decimal
 
@@ -215,7 +215,8 @@ def test_判不是同一笔_回到可制证且不再反复报(db, book, admin_us
     service.dismiss_row_review(db, book.id, rows[0]["id"], candidate["voucher_id"])
     row = db.get(BankStatementRow, rows[0]["id"])
     assert row.status == "OPEN", row.status
-    assert row.rejected_voucher_id == candidate["voucher_id"]
+    assert row.rejected_voucher_ids == [candidate["voucher_id"]], (
+        "否掉的是哪一张凭证必须记下来 —— 不记的话下次重算它又冒出来")
 
     # **再算一次**：不该又把它报出来（判了等于没判是最气人的那种 bug）。
     again = service.plan_vouchers(db, book.id, statement["id"])
@@ -518,3 +519,162 @@ def _voucher_factory(db, book, admin_user):
         return voucher
 
     return _make
+
+
+# ----------------------------------------------------------------------
+# 死循环：2026-10-30 用户在生产上报的那一幕
+# ----------------------------------------------------------------------
+#
+# **生产上的原样**：一份 8 月的对账单上有两行同额流水（18.05，高速通行费），
+# 账上有**四张**同额凭证（7 月的通行费，记0040/记0041/记0043/记0045）。
+# 系统给两行各指一张候选，用户点「不是同一笔」把它否掉 —— 那张凭证**挪到
+# 旁边那一行上重新冒出来**；在那边再否一次，**原来那一行又冒出同一张**。
+# 用户原话：「我点了这边的『不是同一笔』，那边的又冒出来，我点了那边的
+# 『不是同一笔』，这边的又冒出来了，死循环。」
+
+def _toll_case(db, book, admin_user, subjects, store, *, vouchers=4):
+    """两行同额流水（18.05）+ 若干张同额凭证（7 月的通行费）。"""
+    cash = _cash(db, book)
+    statement = _upload(db, book, admin_user, cash, [
+        ("2026-08-22", None, "18.05", "高速公路通行费"),
+        ("2026-08-22", None, "18.05", "高速公路通行费"),
+    ])
+    rows = service.list_rows(db, book.id, statement["id"])
+    for row in rows:
+        _prepare(db, book, statement, row, subjects, direction="OUT")
+    make_voucher = _voucher_factory(db, book, admin_user)
+    # 7 月的通行费：日期各不相同，**金额全一样** —— 分不清哪张是哪笔。
+    days = [date(2026, 7, 24), date(2026, 7, 26), date(2026, 7, 27),
+            date(2026, 7, 24)]
+    made = [make_voucher(days[i],
+                         dr=[(subjects["560204"].id, D("18.05"), "通行费")],
+                         cr=[(cash.id, D("18.05"), "通行费")])
+            for i in range(vouchers)]
+    return cash, statement, rows, made
+
+
+def _review_pairs(plan):
+    """``{行 id: 候选凭证 id}``。"""
+    return {item["id"]: item["review_candidate"]["voucher_id"]
+            for item in plan["review"]}
+
+
+def test_两行同额四张凭证_判不是同一笔_不会死循环(db, book, admin_user, subjects, store):
+    """**用户报的那个死循环**：点「不是同一笔」必须**真的停下来**。
+
+    判过的凭证不许再冒出来（哪一行都不许），而且**点下去要有用**：
+    最终这一行回到「可制证」，不再有待复核。
+    """
+    cash, statement, rows, vouchers = _toll_case(
+        db, book, admin_user, subjects, store)
+    plan = service.plan_vouchers(db, book.id, statement["id"])
+    assert plan["review_count"] == 2, plan
+
+    judged: set[int] = set()
+    for _ in range(12):        # 死循环的话，这里永远点不完
+        plan = service.plan_vouchers(db, book.id, statement["id"])
+        if not plan["review"]:
+            break
+        for item in plan["review"]:
+            candidate = item["review_candidate"]
+            service.dismiss_row_review(db, book.id, item["id"],
+                                       candidate["voucher_id"])
+            judged.add(candidate["voucher_id"])
+
+    plan = service.plan_vouchers(db, book.id, statement["id"])
+    assert not plan["review"], (
+        f"点了 {len(judged)} 次还没停下来 —— 还是死循环：{plan['review']}")
+    # **两行都回到「可制证」**：它们本来就没入账，不该卡在待复核上。
+    for row_id in (rows[0]["id"], rows[1]["id"]):
+        assert row_id in [c["id"] for c in plan["candidates"]], plan
+
+
+def test_判过的凭证不再冒到旁边那一行(db, book, admin_user, subjects, store):
+    """**「我点了这边的『不是同一笔』，那边的又冒出来」** —— 这条不许再发生。
+
+    判掉的那张凭证**退出这一份对账单的配对**：它不会再出现在任何一行上。
+    """
+    cash, statement, rows, vouchers = _toll_case(
+        db, book, admin_user, subjects, store)
+    plan = service.plan_vouchers(db, book.id, statement["id"])
+    first = plan["review"][0]
+    judged = first["review_candidate"]["voucher_id"]
+
+    service.dismiss_row_review(db, book.id, first["id"], judged)
+    plan = service.plan_vouchers(db, book.id, statement["id"])
+    for item in plan["review"]:
+        assert item["review_candidate"]["voucher_id"] != judged, (
+            f"判过的凭证又冒出来了（第 {item['id']} 行）")
+
+
+def test_判过的凭证不会回到原来那一行(db, book, admin_user, subjects, store):
+    """**后一次判不许把先前的抹掉**（一列只装一张的老毛病）。
+
+    两张凭证轮流判过之后，**两张都不许再回来**。
+    """
+    cash, statement, rows, vouchers = _toll_case(
+        db, book, admin_user, subjects, store)
+    judged: list[int] = []
+    for _ in range(8):
+        plan = service.plan_vouchers(db, book.id, statement["id"])
+        if not plan["review"]:
+            break
+        item = plan["review"][0]
+        voucher_id = item["review_candidate"]["voucher_id"]
+        if voucher_id in judged:
+            break
+        service.dismiss_row_review(db, book.id, item["id"], voucher_id)
+        judged.append(voucher_id)
+
+    assert len(judged) >= 2, f"没判到两张就停了：{judged}"
+    row = db.get(BankStatementRow, rows[0]["id"])
+    for voucher_id in judged:
+        assert voucher_id in row.rejected_voucher_ids or any(
+            voucher_id in (db.get(BankStatementRow, r["id"]).rejected_voucher_ids or [])
+            for r in rows), (voucher_id, judged)
+
+
+def test_候选不搬家_旁边那行被判了也不换人(db, book, admin_user, subjects, store):
+    """**一张凭证一旦配给某行，没被否掉就不换人**。
+
+    否则用户会看到「我刚判过的那张凭证从第 1 行跑到第 2 行」——
+    在两行之间来回点「不是同一笔」，永远点不完。
+    """
+    cash, statement, rows, vouchers = _toll_case(
+        db, book, admin_user, subjects, store)
+    plan = service.plan_vouchers(db, book.id, statement["id"])
+    before = _review_pairs(plan)
+
+    # **否掉其中一行的那张** —— 另一行的候选不许跟着变。
+    target = plan["review"][0]
+    other = [i for i in plan["review"] if i["id"] != target["id"]][0]
+    service.dismiss_row_review(db, book.id, target["id"],
+                               target["review_candidate"]["voucher_id"])
+
+    plan = service.plan_vouchers(db, book.id, statement["id"])
+    after = _review_pairs(plan)
+    if other["id"] in after:
+        assert after[other["id"]] == before[other["id"]], (
+            f"第 {other['id']} 行的候选被换掉了："
+            f"{before[other['id']]} → {after[other['id']]}")
+
+
+def test_否掉的那张进存疑凭证(db, book, admin_user, subjects, store):
+    """**判「不是同一笔」不是把钱抹掉** —— 那张凭证还在账上。
+
+    它成了「账上有一笔没对上行」，归「存疑凭证」那一页管。
+    """
+    cash, statement, rows, vouchers = _toll_case(
+        db, book, admin_user, subjects, store)
+    plan = service.plan_vouchers(db, book.id, statement["id"])
+    target = plan["review"][0]
+    judged = target["review_candidate"]["voucher_id"]
+    service.dismiss_row_review(db, book.id, target["id"], judged)
+
+    page = suspicious.suspicious_vouchers(db, book.id)
+    group = [g for g in page["groups"] if g["statement_id"] == statement["id"]][0]
+    listed = {v["voucher_id"] for v in group["vouchers"]}
+    assert judged not in listed, (
+        "判过的凭证不该再被当成「跟哪一行对得上」")
+    voucher = db.get(Voucher, judged)
+    assert voucher is not None, "凭证本身不许消失（它还在账上，只是没对上行）"

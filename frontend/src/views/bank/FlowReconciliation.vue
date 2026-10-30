@@ -298,228 +298,6 @@
         </el-card>
       </el-tab-pane>
 
-      <!-- ============================================================ 流水明细 -->
-      <el-tab-pane label="流水明细" name="rows">
-        <el-card shadow="never">
-          <template #header>
-            <div class="section-head">
-              <span>流水明细</span>
-            </div>
-          </template>
-          <div class="flow-rows-toolbar">
-            <el-select v-model="activeStatementId" placeholder="选择对账单" class="flow-select" @change="loadRows">
-              <el-option
-                v-for="s in visibleStatements"
-                :key="s.id"
-                :label="`${s.filename}（${s.period_start || '?'} ~ ${s.period_end || '?'}）`"
-                :value="s.id"
-              />
-            </el-select>
-            <el-button :disabled="!activeStatementId" :loading="loadingRows" @click="loadRows">
-              <el-icon><Refresh /></el-icon>刷新流水
-            </el-button>
-            <el-button
-              type="primary"
-              :disabled="!store.canWrite || !canCommit(plan)"
-              :loading="committing"
-              @click="doCommit"
-            >
-              生成流水凭证
-            </el-button>
-            <span v-if="plan" class="muted">
-              可生成 {{ plan.candidate_count }} 条
-              <template v-if="plan.pending_count">，待确认科目 {{ plan.pending_count }} 条</template>
-              <template v-if="plan.unknown_count">，待确认方向 {{ plan.unknown_count }} 条</template>
-            </span>
-            <!-- **账上已有同一笔、只是记错了账户**：这几行要提醒用户，
-                 否则用户根本不知道有笔钱记错了地方。
-                 （行默认就是展开的，所以这里只报个数，不再做「点我展开」的动作。） -->
-            <el-tag
-              v-if="reclassifyCount"
-              type="warning"
-              effect="plain"
-            >
-              账上已有对应分录 {{ reclassifyCount }} 行
-            </el-tag>
-          </div>
-
-          <el-table
-            :data="rows"
-            v-loading="loadingRows"
-            size="small"
-            class="flow-rows-table"
-            empty-text="先选一份对账单"
-            row-key="id"
-            :expand-row-keys="expandedRowIds"
-            @expand-change="onExpandChange"
-          >
-            <!-- 「对账信息」：**往下展开**，不是往右加列。
-                 早先那版是加 4 个列（方向/对方科目/状态/操作），列一多表格就被
-                 撑宽 → 出现**左右滑动条**，而这张表在窄屏上本来就挤 —— 于是
-                 用户得一边横拖一边看，改起来很难受。
-                 改成展开行后**列数恒定**，表格宽度不变，横向永远不会溢出。
-
-                 **默认展开的是「还有活要干的行」**（方向未定、对方科目待确认、
-                 还没入账）；**已入账的、被发票占用的默认收起** —— 那些行的
-                 对账信息看一眼就够了，全摊开反而把要处理的那几行淹了。
-                 用户手动开过的行留着（用户开过就说明他在看）。
-
-                 **不能用 ``:default-expand-all``**：它是「全展或全不展」，
-                 没有「哪些行展」这一说。要按行控制就得用
-                 ``row-key`` + ``:expand-row-keys``。
-
-                 **展开箭头一直都在**：曾经前面还挂一个「对账信息」勾选开关，
-                 不勾就没有箭头 —— 于是「不看对账信息的人」和「要改对账信息的人」
-                 看到的是**两张不同的表**。用户原话：「去掉勾选对账信息的开关」。
-                 现在只剩一个动作：点行首箭头，往下展开/收起。 -->
-            <el-table-column type="expand" width="42">
-              <template #default="{ row }">
-                <div class="flow-extra">
-                  <div class="flow-extra-item">
-                    <span class="flow-extra-label">方向</span>
-                    <el-tag
-                      v-if="row.direction !== 'UNKNOWN'"
-                      size="small"
-                      :type="row.direction === 'IN' ? 'success' : 'warning'"
-                    >
-                      {{ row.direction === 'IN' ? '收入' : '支出' }}
-                    </el-tag>
-                    <el-select
-                      v-else
-                      :model-value="row.direction"
-                      size="small"
-                      placeholder="指定方向"
-                      class="flow-direction"
-                      :disabled="!store.canWrite"
-                      @change="(v) => doSetDirection(row, v)"
-                    >
-                      <el-option label="收入" value="IN" />
-                      <el-option label="支出" value="OUT" />
-                    </el-select>
-                  </div>
-                  <div class="flow-extra-item">
-                    <span class="flow-extra-label">对方科目</span>
-                    <div v-if="row.plan_subjects?.length" class="flow-plan">
-                      <!-- **key 用序号，不用科目 id** —— 同一个科目在一行里可以
-                           出现多次（2026-10-29 起不再限制），用科目 id 当 key
-                           会撞车（Vue 会报重复 key，渲染也会错位）。 -->
-                      <el-tag
-                        v-for="(item, index) in row.plan_subjects"
-                        :key="index"
-                        size="small"
-                        type="info"
-                        effect="plain"
-                        class="flow-plan-tag"
-                      >
-                        {{ planSubjectText(item) }}
-                      </el-tag>
-                    </div>
-                    <span v-else class="muted small">待确认</span>
-                    <!-- **已入账的对方科目由凭证定死** —— 所以那颗按钮是灰的。
-                         这句话不再摆在界面上（2026-10-28 用户要求去掉）：
-                         一行行都挂着一句警告，看着像出了事，其实只是
-                         「这一行已经制过证了」。 -->
-                    <el-button
-                      link
-                      type="primary"
-                      size="small"
-                      :disabled="!canEditPlanSubject(row)"
-                      @click="openPlan(row)"
-                    >
-                      {{ row.plan_subjects?.length ? '调整' : '指定' }}
-                    </el-button>
-                  </div>
-                  <div class="flow-extra-item">
-                    <span class="flow-extra-label">状态</span>
-                    <el-tag size="small" :type="stateType(row.voucher_state)">
-                      {{ stateText(row.voucher_state) }}
-                    </el-tag>
-                    <el-button
-                      v-if="row.reclassify_candidates?.length"
-                      link
-                      type="warning"
-                      size="small"
-                      @click="openReclassify(row)"
-                    >
-                      可改科目
-                    </el-button>
-                  </div>
-                  <!-- **待复核**（2026-10-29 加）：账上有同一笔，但日期对不上。
-                       要用户判「是同一笔」还是「不是同一笔」——
-                       机器替人认定的话，认错就是钱记两遍。
-                       **这一行不在可制证清单里**，所以也不会被
-                       「生成流水凭证」顺手记一遍。 -->
-                  <div v-if="row.voucher_state === 'REVIEW'" class="flow-review">
-                    <div class="flow-warn small">
-                      ⚠ {{ reviewCandidateText(row) }} —— 请确认是不是同一笔。
-                    </div>
-                    <div class="flow-review-actions">
-                      <el-button
-                        link
-                        type="primary"
-                        size="small"
-                        :disabled="!store.canWrite || reviewingRowId === row.id"
-                        @click="doConfirmReview(row)"
-                      >
-                        是同一笔，标为已入账
-                      </el-button>
-                      <el-button
-                        link
-                        type="warning"
-                        size="small"
-                        :disabled="!store.canWrite || reviewingRowId === row.id"
-                        @click="doDismissReview(row)"
-                      >
-                        不是同一笔
-                      </el-button>
-                    </div>
-                  </div>
-                  <div class="flow-extra-item">
-                    <span class="flow-extra-label">操作</span>
-                    <el-button
-                      link
-                      type="danger"
-                      :disabled="!store.canWrite || !canToggleIgnore(row)"
-                      @click="doIgnore(row)"
-                    >
-                      {{ row.status === 'IGNORED' ? '恢复' : '忽略' }}
-                    </el-button>
-                  </div>
-                </div>
-              </template>
-            </el-table-column>
-
-            <!-- 默认列：只有对账单上解析出来的那些 -->
-            <el-table-column label="#" width="46" prop="seq" />
-            <el-table-column label="日期" width="96">
-              <template #default="{ row }">{{ row.tx_date || '—' }}</template>
-            </el-table-column>
-            <el-table-column label="摘要" min-width="150" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.summary || '—' }}</template>
-            </el-table-column>
-            <el-table-column label="用途" min-width="120" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.purpose || '—' }}</template>
-            </el-table-column>
-            <el-table-column label="对方户名" min-width="130" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.counterparty_name || '—' }}</template>
-            </el-table-column>
-            <el-table-column label="收入" width="104" align="right">
-              <template #default="{ row }">
-                <span v-if="row.direction === 'IN'">{{ money(row.amount) }}</span>
-              </template>
-            </el-table-column>
-            <el-table-column label="支出" width="104" align="right">
-              <template #default="{ row }">
-                <span v-if="row.direction === 'OUT'">{{ money(row.amount) }}</span>
-              </template>
-            </el-table-column>
-            <el-table-column label="余额" width="104" align="right">
-              <template #default="{ row }">{{ money(row.balance) }}</template>
-            </el-table-column>
-          </el-table>
-        </el-card>
-      </el-tab-pane>
-
       <!-- ============================================================ 科目规则 -->
       <!-- 名字就「科目规则」：这一页管的是「按关键词定对方科目」，
            前面那个「流水」是废话 —— 页签叫「流水对账」已经交代了上下文。 -->
@@ -665,6 +443,250 @@
                   删除
                 </el-button>
               </template>
+            </el-table-column>
+          </el-table>
+        </el-card>
+      </el-tab-pane>
+
+      <!-- ============================================================ 流水明细 -->
+      <el-tab-pane label="流水明细" name="rows">
+        <el-card shadow="never">
+          <template #header>
+            <div class="section-head">
+              <span>流水明细</span>
+            </div>
+          </template>
+          <div class="flow-rows-toolbar">
+            <el-select v-model="activeStatementId" placeholder="选择对账单" class="flow-select" @change="loadRows">
+              <el-option
+                v-for="s in visibleStatements"
+                :key="s.id"
+                :label="`${s.filename}（${s.period_start || '?'} ~ ${s.period_end || '?'}）`"
+                :value="s.id"
+              />
+            </el-select>
+            <el-button :disabled="!activeStatementId" :loading="loadingRows" @click="loadRows">
+              <el-icon><Refresh /></el-icon>刷新流水
+            </el-button>
+            <el-button
+              type="primary"
+              :disabled="!store.canWrite || !canCommit(plan)"
+              :loading="committing"
+              @click="doCommit"
+            >
+              生成流水凭证
+            </el-button>
+            <span v-if="plan" class="muted">
+              可生成 {{ plan.candidate_count }} 条
+              <template v-if="plan.pending_count">，待确认科目 {{ plan.pending_count }} 条</template>
+              <template v-if="plan.unknown_count">，待确认方向 {{ plan.unknown_count }} 条</template>
+            </span>
+            <!-- **账上已有同一笔、只是记错了账户**：这几行要提醒用户，
+                 否则用户根本不知道有笔钱记错了地方。
+                 （行默认就是展开的，所以这里只报个数，不再做「点我展开」的动作。） -->
+            <el-tag
+              v-if="reclassifyCount"
+              type="warning"
+              effect="plain"
+            >
+              账上已有对应分录 {{ reclassifyCount }} 行
+            </el-tag>
+          </div>
+
+          <el-table
+            :data="rows"
+            v-loading="loadingRows"
+            size="small"
+            class="flow-rows-table"
+            empty-text="先选一份对账单"
+            row-key="id"
+            :expand-row-keys="expandedRowIds"
+            @expand-change="onExpandChange"
+          >
+            <!-- 「对账信息」：**往下展开**，不是往右加列。
+                 早先那版是加 4 个列（方向/对方科目/状态/操作），列一多表格就被
+                 撑宽 → 出现**左右滑动条**，而这张表在窄屏上本来就挤 —— 于是
+                 用户得一边横拖一边看，改起来很难受。
+                 改成展开行后**列数恒定**，表格宽度不变，横向永远不会溢出。
+
+                 **默认展开的是「还有活要干的行」**（方向未定、对方科目待确认、
+                 还没入账）；**已入账的、被发票占用的默认收起** —— 那些行的
+                 对账信息看一眼就够了，全摊开反而把要处理的那几行淹了。
+                 用户手动开过的行留着（用户开过就说明他在看）。
+
+                 **不能用 ``:default-expand-all``**：它是「全展或全不展」，
+                 没有「哪些行展」这一说。要按行控制就得用
+                 ``row-key`` + ``:expand-row-keys``。
+
+                 **展开箭头一直都在**：曾经前面还挂一个「对账信息」勾选开关，
+                 不勾就没有箭头 —— 于是「不看对账信息的人」和「要改对账信息的人」
+                 看到的是**两张不同的表**。用户原话：「去掉勾选对账信息的开关」。
+                 现在只剩一个动作：点行首箭头，往下展开/收起。 -->
+            <el-table-column type="expand" width="42">
+              <template #default="{ row }">
+                <!-- **这一段是「第几行」的身份**（2026-10-30 用户批注：
+                     「展开的和没展开的，行与行之间的分隔不够明显，总是会出现
+                     看错的情况」）。
+
+                     展开块里全是方向/科目/状态，**看不出它属于哪一行** ——
+                     两行都展开时两块长得一模一样，人就把上一行的东西
+                     看成了下一行的。所以**每块都把自己的身份写在最上面**：
+                     序号、日期、收支、金额 —— 一眼就知道这一块说的是哪一行。
+
+                     这不是装饰：**「看错」的下场是往错的行上填科目**。 -->
+                <div class="flow-extra">
+                  <div class="flow-extra-head">
+                    <span class="flow-extra-seq">#{{ row.seq }}</span>
+                    <span class="flow-extra-when">{{ row.tx_date || '—' }}</span>
+                    <span class="flow-extra-kind">
+                      {{ row.direction === 'IN' ? '收入'
+                        : row.direction === 'OUT' ? '支出' : '方向未定' }}
+                    </span>
+                    <span class="flow-extra-amt">{{ money(row.amount) }}</span>
+                    <span class="flow-extra-sum">{{ row.summary || '—' }}</span>
+                  </div>
+                  <div class="flow-extra-items">
+                    <div class="flow-extra-item">
+                      <span class="flow-extra-label">方向</span>
+                      <el-tag
+                        v-if="row.direction !== 'UNKNOWN'"
+                        size="small"
+                        :type="row.direction === 'IN' ? 'success' : 'warning'"
+                      >
+                        {{ row.direction === 'IN' ? '收入' : '支出' }}
+                      </el-tag>
+                      <el-select
+                        v-else
+                        :model-value="row.direction"
+                        size="small"
+                        placeholder="指定方向"
+                        class="flow-direction"
+                        :disabled="!store.canWrite"
+                        @change="(v) => doSetDirection(row, v)"
+                      >
+                        <el-option label="收入" value="IN" />
+                        <el-option label="支出" value="OUT" />
+                      </el-select>
+                    </div>
+                    <div class="flow-extra-item">
+                      <span class="flow-extra-label">对方科目</span>
+                      <div v-if="row.plan_subjects?.length" class="flow-plan">
+                        <!-- **key 用序号，不用科目 id** —— 同一个科目在一行里可以
+                             出现多次（2026-10-29 起不再限制），用科目 id 当 key
+                             会撞车（Vue 会报重复 key，渲染也会错位）。 -->
+                        <el-tag
+                          v-for="(item, index) in row.plan_subjects"
+                          :key="index"
+                          size="small"
+                          type="info"
+                          effect="plain"
+                          class="flow-plan-tag"
+                        >
+                          {{ planSubjectText(item) }}
+                        </el-tag>
+                      </div>
+                      <span v-else class="muted small">待确认</span>
+                      <!-- **已入账的对方科目由凭证定死** —— 所以那颗按钮是灰的。
+                           这句话不再摆在界面上（2026-10-28 用户要求去掉）：
+                           一行行都挂着一句警告，看着像出了事，其实只是
+                           「这一行已经制过证了」。 -->
+                      <el-button
+                        link
+                        type="primary"
+                        size="small"
+                        :disabled="!canEditPlanSubject(row)"
+                        @click="openPlan(row)"
+                      >
+                        {{ row.plan_subjects?.length ? '调整' : '指定' }}
+                      </el-button>
+                    </div>
+                    <div class="flow-extra-item">
+                      <span class="flow-extra-label">状态</span>
+                      <el-tag size="small" :type="stateType(row.voucher_state)">
+                        {{ stateText(row.voucher_state) }}
+                      </el-tag>
+                      <el-button
+                        v-if="row.reclassify_candidates?.length"
+                        link
+                        type="warning"
+                        size="small"
+                        @click="openReclassify(row)"
+                      >
+                        可改科目
+                      </el-button>
+                    </div>
+                    <!-- **待复核**（2026-10-29 加）：账上有同一笔，但日期对不上。
+                         要用户判「是同一笔」还是「不是同一笔」——
+                         机器替人认定的话，认错就是钱记两遍。
+                         **这一行不在可制证清单里**，所以也不会被
+                         「生成流水凭证」顺手记一遍。 -->
+                    <div v-if="row.voucher_state === 'REVIEW'" class="flow-review">
+                      <div class="flow-warn small">
+                        ⚠ {{ reviewCandidateText(row) }} —— 请确认是不是同一笔。
+                      </div>
+                      <div class="flow-review-actions">
+                        <el-button
+                          link
+                          type="primary"
+                          size="small"
+                          :disabled="!store.canWrite || reviewingRowId === row.id"
+                          @click="doConfirmReview(row)"
+                        >
+                          是同一笔，标为已入账
+                        </el-button>
+                        <el-button
+                          link
+                          type="warning"
+                          size="small"
+                          :disabled="!store.canWrite || reviewingRowId === row.id"
+                          @click="doDismissReview(row)"
+                        >
+                          不是同一笔
+                        </el-button>
+                      </div>
+                    </div>
+                    <div class="flow-extra-item">
+                      <span class="flow-extra-label">操作</span>
+                      <el-button
+                        link
+                        type="danger"
+                        :disabled="!store.canWrite || !canToggleIgnore(row)"
+                        @click="doIgnore(row)"
+                      >
+                        {{ row.status === 'IGNORED' ? '恢复' : '忽略' }}
+                      </el-button>
+                    </div>
+                  </div>
+                </div>
+              </template>
+            </el-table-column>
+
+            <!-- 默认列：只有对账单上解析出来的那些 -->
+            <el-table-column label="#" width="46" prop="seq" />
+            <el-table-column label="日期" width="96">
+              <template #default="{ row }">{{ row.tx_date || '—' }}</template>
+            </el-table-column>
+            <el-table-column label="摘要" min-width="150" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.summary || '—' }}</template>
+            </el-table-column>
+            <el-table-column label="用途" min-width="120" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.purpose || '—' }}</template>
+            </el-table-column>
+            <el-table-column label="对方户名" min-width="130" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.counterparty_name || '—' }}</template>
+            </el-table-column>
+            <el-table-column label="收入" width="104" align="right">
+              <template #default="{ row }">
+                <span v-if="row.direction === 'IN'">{{ money(row.amount) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="支出" width="104" align="right">
+              <template #default="{ row }">
+                <span v-if="row.direction === 'OUT'">{{ money(row.amount) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="余额" width="104" align="right">
+              <template #default="{ row }">{{ money(row.balance) }}</template>
             </el-table-column>
           </el-table>
         </el-card>
@@ -915,7 +937,7 @@ import {
   suspiciousCounts, suspiciousOtherPeriods as suspiciousOtherPeriodsOf,
   suspiciousNoCountText as suspiciousNoCountTextOf,
   suspiciousRows as suspiciousRowsOf,
-  reviewCandidateText, reviewDismissConfirm,
+  reviewCandidateText, reviewDismissConfirm, reviewVoucherLabel,
   toColumnMapping, unknownTemplateFields, voucherStateText, voucherStateType,
   summaryTemplateValuesText,
   SUMMARY_TEMPLATE_EXAMPLES, SUMMARY_TEMPLATE_FIELDS,
@@ -1580,6 +1602,17 @@ async function openRows(statement) {
 async function loadRows() {
   if (!activeStatementId.value) return
   loadingRows.value = true
+  // **先算清单，再拉流水**（2026-10-30 改的顺序）。
+  //
+  // **为什么顺序要紧**：`planVouchers` 不只是给一份清单 —— 它**重算配对并
+  // 把结果落库**（每一行的状态、待复核时对着哪张凭证，都存在库里）。
+  // 流水行那张表读的就是库里的这些字段。**先拉流水再算清单**，拿到的
+  // 是**上一次**算出来的状态：判「不是同一笔」之后那一行已经放行了，
+  // 但它可能还有下一张同额的凭证要问 —— 界面上却看不见那个候选，
+  // 用户会以为「判完就没了」。
+  //
+  // **清单失败不许连累流水行**：它挂了就挂在这一块（见 :func:`loadPlan`）。
+  await loadPlan()
   try {
     rows.value = await api.listRows(store.bookId, activeStatementId.value)
   } catch (e) {
@@ -1587,8 +1620,6 @@ async function loadRows() {
   } finally {
     loadingRows.value = false
   }
-  // **制证清单单独一趟**：它失败不许连累上面那些流水行。
-  await loadPlan()
 }
 
 /** 「可制证清单」：只读账号拿不到也不需要（它是制证用的）。 */
@@ -1869,7 +1900,9 @@ async function doDismissReview(row) {
   try {
     await api.dismissRowReview(store.bookId, row.id, candidate.voucher_id)
     await loadRows()
-    ElMessage.success('已排除，这一行可以正常制证了')
+    // **说清楚是哪一张被排除了** —— 判过的东西不许再冒出来（用户要能看见
+    // 「我刚点的那个确实没再回来」）。
+    ElMessage.success(`已排除${reviewVoucherLabel(candidate) || '那张凭证'}，这一行可以正常制证了`)
   } catch (e) {
     ElMessage.error(e?.response?.data?.detail || '操作失败')
   } finally {
@@ -2066,13 +2099,58 @@ onMounted(async () => {
 
 /* 「对账信息」是**展开行**（往下展开），不是往右加的列 —— 所以列数恒定，
    横向不会溢出，也就不会有左右滑动条。
-   展开行里的内容横向并排，窄了自动换行；换行是往下换，绝不撑宽表格。 */
+   展开行里的内容横向并排，窄了自动换行；换行是往下换，绝不撑宽表格。
+
+   **展开块是一张「卡」**（2026-10-30 用户批注：「展开的和没展开的，行与行
+   之间的分隔不够明显，总是会出现看错的情况」）。原来它是一整条灰底，
+   灰底跟下一行之间的那条线**分不清是行的边界还是块的边界** —— 两行都展开
+   时两块一模一样，人就把上一行的东西看成了下一行的。
+
+   于是改成：**灰底只当底衬，里面放一张白卡** —— 卡与卡之间隔着灰底，
+   边界一眼就看得见；卡自己的左边缘还有一道竖线，**指着它上面那一行**。 */
 .flow-extra {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-border-color-lighter);
+  border-left: 3px solid var(--el-color-primary);
+  border-radius: 4px;
+}
+/* **这一块属于哪一行** —— 序号、日期、收支、金额写在最上面。
+   看错的下场是**往错的行上填科目**，所以这一行不能省。 */
+.flow-extra-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding-bottom: 5px;
+  border-bottom: 1px dashed var(--el-border-color-lighter);
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.flow-extra-seq {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--el-text-color-primary);
+}
+.flow-extra-amt {
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+}
+.flow-extra-sum {
+  color: var(--el-text-color-regular);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 240px;
+}
+.flow-extra-items {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px 28px;
-  padding: 2px 0;
 }
 .flow-extra-item {
   display: flex;
@@ -2088,9 +2166,12 @@ onMounted(async () => {
   font-size: 12px;
   flex: 0 0 auto;
 }
+/* 展开块与**上一行**之间也要有一道线** —— 不然「这一块是谁的」还是悬着。 */
 .flow-rows-table :deep(.el-table__expanded-cell) {
-  padding: 6px 12px 8px 46px;
+  padding: 4px 12px 10px 46px;
   background: var(--el-fill-color-lighter);
+  border-top: 1px solid var(--el-border-color-lighter);
+  border-bottom: 1px solid var(--el-border-color);
 }
 
 /* 对方科目：一行可以有好几个，用标签平铺。 */

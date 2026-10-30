@@ -186,7 +186,50 @@ def test_否掉过的关联不再来打扰():
     """用户判过「不是同一笔」之后，重算不该又把它捞出来。"""
     rows = [_row(1, 0, "100.00")]
     entries = [_entry(10, 10, "100.00", voucher_id=7)]
-    result = allocate(rows, entries, rejected={1: 7})
+    result = allocate(rows, entries, retired={7})
+    assert not result.pairs
+
+
+def test_否掉过的那张_主窗口内照旧自动配():
+    """**用户否的是「不是同一笔」，不是「这笔钱不存在」**。
+
+    主窗口内（≤ 7 天）那张凭证本来就该判成「已入账」—— 那是尺子判的，
+    跟用户判不判无关。要是连它也挡掉，那一行会**从已入账掉回可制证**，
+    同一笔钱就被记两遍。
+    """
+    rows = [_row(1, 0, "100.00")]
+    entries = [_entry(10, 3, "100.00", voucher_id=7)]
+    result = allocate(rows, entries, retired={7})
+    assert result.pairs[1].voucher_id == 7
+    assert result.pairs[1].in_primary is True
+
+
+def test_候选不换人_旁边那行被判了也不搬家():
+    """**一张凭证一旦配给某行，没被否掉就不换人**（2026-10-30 用户报的死循环）。
+
+    两行同额、两张同额凭证：第 1 行配的是日期差小的那张（凭证 7）。
+    第 2 行被判「不是同一笔」之后重新分配 —— 凭证 7 **不许**挪到第 2 行
+    头上（用户看着就是「我刚否过的那张又跑到别的行上去了」）。
+    """
+    rows = [_row(1, 0, "100.00"), _row(2, 0, "100.00")]
+    entries = [_entry(10, 1, "100.00", voucher_id=7),
+               _entry(11, 5, "100.00", voucher_id=8)]
+    first = allocate(rows, entries)
+    assert first.pairs[1].voucher_id == 7, first.pairs
+    assert first.pairs[2].voucher_id == 8, first.pairs
+
+    # 第 2 行被否掉它那张（凭证 8）→ 重算，凭证 7 仍归第 1 行。
+    second = allocate(rows, entries, sticky={1: 7, 2: 8}, retired={8})
+    assert second.pairs[1].voucher_id == 7, second.pairs
+    assert second.pairs[2].voucher_id == 8 or 2 not in second.pairs
+    assert second.pairs[1].sticky is True
+
+
+def test_候选被否掉之后_它不再配回那一行():
+    """**否过的凭证不配回原来那一行** —— 用户刚判过的东西不许又冒出来。"""
+    rows = [_row(1, 0, "100.00")]
+    entries = [_entry(10, 10, "100.00", voucher_id=7)]
+    result = allocate(rows, entries, sticky={1: 7}, retired={7})
     assert not result.pairs
 
 

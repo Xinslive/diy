@@ -126,11 +126,27 @@ async function expandedRow(row) {
   return expanded
 }
 
+/**
+ * 展开块里「状态」那一格写着什么。
+ *
+ * **不能拿整块的文字去 includes('待复核')** —— 种子数据的摘要就叫
+ * 「uitest-待复核-甲」，而展开块顶上那一行（#序号 / 日期 / 收支 / 金额 /
+ * 摘要）**正是为了说清「这是哪一行」才把摘要写上去的**。于是整块文字里
+ * 一直有「待复核」这三个字，跟状态无关，判断就会一直误报「点了之后状态
+ * 没变」。只认「状态」那一格里的那个标签。
+ */
+async function stateText(extra) {
+  const item = extra.locator('.flow-extra-item').filter({ hasText: '状态' }).first()
+  const tag = item.locator('.el-tag').first()
+  if (!(await tag.count())) throw new Error('展开块里没有「状态」那一格')
+  return (await tag.innerText()).trim()
+}
+
 await step('那一行显示「待复核」', async () => {
   const row = await rowBySummary('uitest-待复核-甲')
   const extra = await expandedRow(row)
-  const tag = extra.locator('.el-tag:visible', { hasText: '待复核' }).first()
-  if (!(await tag.count())) throw new Error('界面上没有「待复核」这个状态')
+  const state = await stateText(extra)
+  if (state !== '待复核') throw new Error(`那一行的状态不是「待复核」：${state}`)
 })
 
 await step('待复核那一块把候选凭证摆出来了', async () => {
@@ -172,9 +188,8 @@ await step('点「是同一笔，标为已入账」→ 变成「已入账」', a
   await sleep(2200)
   const row2 = await rowBySummary('uitest-待复核-甲')
   const extra2 = await expandedRow(row2)
-  const text = (await extra2.innerText()).trim()
-  if (!text.includes('已入账')) throw new Error(`点了之后不是「已入账」：${text}`)
-  if (text.includes('待复核')) throw new Error(`点了之后还写着「待复核」：${text}`)
+  const state = await stateText(extra2)
+  if (state !== '已入账') throw new Error(`点了之后不是「已入账」：${state}`)
   if (await row2.locator('.flow-review').count()) {
     throw new Error('点了之后那一块「待复核」的说明还在')
   }
@@ -210,10 +225,10 @@ await step('点「不是同一笔」→ 二次确认 → 回到可以制证', as
 
   const row2 = await rowBySummary('uitest-待复核-乙')
   const extra2 = await expandedRow(row2)
-  const text = (await extra2.innerText()).trim()
-  if (text.includes('待复核')) throw new Error(`判完之后还写着「待复核」：${text}`)
-  if (!text.includes('待确认科目') && !text.includes('可制证')) {
-    throw new Error(`判完之后不是「可以制证」：${text}`)
+  const state = await stateText(extra2)
+  if (state === '待复核') throw new Error(`判完之后还写着「待复核」：${state}`)
+  if (state !== '待确认科目' && state !== '可制证') {
+    throw new Error(`判完之后不是「可以制证」：${state}`)
   }
 })
 

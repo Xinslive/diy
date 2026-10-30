@@ -67,6 +67,20 @@ def _upgrade(eng, target: str = "head") -> None:
             command.upgrade(cfg, target)
 
 
+def _downgrade(eng, target: str) -> None:
+    """和 :func:`_upgrade` 同一条路径，只是**往回退**。
+
+    降级也是部署会做的事（回滚），所以它也得能被测。
+    """
+    from alembic import command
+
+    cfg = _alembic_config()
+    with eng.connect() as conn:
+        cfg.attributes["connection"] = conn
+        with conn.begin():
+            command.downgrade(cfg, target)
+
+
 def _stamp(eng, rev: str) -> None:
     with eng.begin() as conn:
         conn.exec_driver_sql("DELETE FROM alembic_version")
@@ -982,6 +996,7 @@ def test_head_是本文件认识的那一版():
         "0046_row_subject_dup_ok",              # 放开「同一个科目在一行里只能出现一次」（删 uq_bank_statement_row_subject）
         "0047_invoice_voucher_release",         # 修数据：凭证被删掉的发票记录还停在「已生成」（放回「可生成」+ 重数批次的已入账张数）
         "0048_login_token_revocation",          # 登录令牌的**单枚**吊销名单（§9.9：登出会真作废那一枚令牌）
+        "0049_bank_statement_review_set",       # 待复核的判否记成**一组**（rejected_voucher_ids）+ 待复核候选不换人（review_voucher_id）
     }, (
         f"head 变成了 {head_revision()!r} —— 迁移链是不是被改动了？"
         "（新增 revision 的话，把新 head 登记进上面那个集合）")
@@ -1288,8 +1303,9 @@ def test_跨年账套_次年只有期初没有凭证_迁移照样跑得完(scrat
         # 0045 是流水行「否掉的是哪张凭证」那一列，
         # 0046 放开「同一个科目在一行里只能出现一次」，
         # 0047 把「凭证已删、发票还停在已生成」的记录放回「可生成」，
-        # 0048 是登录令牌的**单枚**吊销名单（§9.9）。
-        assert ver == "0048_login_token_revocation", f"schema 只到 {ver}"
+        # 0048 是登录令牌的**单枚**吊销名单（§9.9），
+        # 0049 把待复核的判否记成一组、外加「待复核候选不换人」那一列。
+        assert ver == "0049_bank_statement_review_set", f"schema 只到 {ver}"
 
         # 科目表按年度拆开
         rows = conn.execute(text(
@@ -1693,3 +1709,176 @@ def test_0047_重复执行不改变结果(migrated_scratch):
             "SELECT committed_count FROM invoice_batch WHERE id = 1")).scalar()
     assert after == before, f"重跑把数据弄乱了：{before} → {after}"
     assert count_after == count_before, f"重跑改了计数：{count_before} → {count_after}"
+
+
+# ================================================================ 6. 0049 的结构改动
+#
+# **这一条改的是「判过不是同一笔」记在哪**：一列只装一张 → 装一组，
+# 外加「待复核的候选不许换人」那一列。
+#
+# **为什么单独立一组用例**：这两列直接决定「用户点下去的那一下有没有
+# 记住」—— 记不住就会死循环（2026-10-30 生产上那个）。
+
+@pytest.fixture
+def scratch_0048():
+    """一个**停在 0048** 的独立 schema —— 那一列还是「只装一张」的老形态。"""
+    name = "scratch_0049"
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {name} CASCADE")
+        conn.exec_driver_sql(f"CREATE SCHEMA {name}")
+    eng = create_engine(
+        TEST_DB_URL, connect_args={"options": f"-c search_path={name}"})
+    _upgrade(eng, "0048_login_token_revocation")
+    yield eng, name
+    eng.dispose()
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {name} CASCADE")
+
+
+def _seed_review_rows(eng) -> None:
+    """造一份对账单 + 两行流水：第 1 行判过「不是同一笔」（记着凭证 1）。"""
+    with eng.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO book (id, company_name, name, start_year, start_month,
+                              subject_code_rule, status, data_version,
+                              created_at, updated_at)
+            VALUES (1, '判否测试公司', '判否账套', 2026, 1, '4-2-2-2', 'ACTIVE', 0,
+                    now(), now())
+        """))
+        conn.execute(text("""
+            INSERT INTO book_year (id, book_id, year, subject_code_rule,
+                                   init_subjects_at, init_subjects_source,
+                                   created_at, updated_at)
+            VALUES (1, 1, 2026, '4-2-2-2', now(), 'CHART', now(), now())
+        """))
+        conn.execute(text("""
+            INSERT INTO period (id, book_id, year, month, ord, locked, version,
+                                created_at, updated_at)
+            VALUES (1, 1, 2026, 9, 9, false, 1, now(), now())
+        """))
+        conn.execute(text("""
+            INSERT INTO subject (id, book_id, year, code, name, level, category,
+                                 direction, is_leaf, carry_forward, qty_calc,
+                                 aux_calc, fx_calc, sort_no, active, ext_attrs,
+                                 created_at, updated_at)
+            VALUES (1, 1, 2026, '1002', '银行存款', 1, 'A', 'DEBIT', true, false,
+                    false, false, false, 0, true, '{}'::jsonb, now(), now())
+        """))
+        conn.execute(text("""
+            INSERT INTO voucher (id, book_id, voucher_no, voucher_date, period_id,
+                                 status, source, created_at, updated_at)
+            VALUES (1, 1, '记0001', '2026-09-01', 1, 'POSTED', 'MANUAL',
+                    now(), now())
+        """))
+        conn.execute(text("""
+            INSERT INTO bank_statement (id, book_id, account_subject_id,
+                                        account_subject_code, filename, file_path,
+                                        container_format, bank_name, account_no,
+                                        account_name, period_start, period_end,
+                                        row_count, parse_status, parse_message,
+                                        diagnosis, uploaded_by, created_at, updated_at)
+            VALUES (1, 1, 1, '1002', '8月.csv', '/tmp/x.csv', 'CSV', '测试银行',
+                    '6222', '基本户', '2026-08-01', '2026-08-31', 2, 'OK', '',
+                    '{}'::jsonb, 'tester', now(), now())
+        """))
+        conn.execute(text("""
+            INSERT INTO bank_statement_row (id, statement_id, book_id, seq,
+                                             tx_date, direction, amount, balance,
+                                             summary, purpose, counterparty_name,
+                                             counterparty_account, extra, status,
+                                             matched_voucher_id, rejected_voucher_id,
+                                             matched_invoice_record_id,
+                                             plan_status, problems,
+                                             created_at, updated_at)
+            VALUES (1, 1, 1, 1, '2026-08-22', 'OUT', 18.05, 18.05, '通行费', '',
+                    '高速公司', '', '{}'::jsonb, 'REVIEW', NULL, 1, NULL,
+                    'RULE', '[]'::jsonb, now(), now()),
+                   (2, 1, 1, 2, '2026-08-22', 'OUT', 18.05, 0.00, '通行费', '',
+                    '高速公司', '', '{}'::jsonb, 'REVIEW', NULL, NULL, NULL,
+                    'RULE', '[]'::jsonb, now(), now())
+        """))
+
+
+def _column_names(eng, schema: str) -> set[str]:
+    """这个 schema 里的 ``bank_statement_row`` 有哪些列。
+
+    **必须限定 schema**：``information_schema`` 看的是**所有** schema ——
+    主测试库里那张表也在这张视图里，不限定的话两边的列会混在一起，
+    断言就成了「主库里有没有这一列」，跟被测的那个 schema 无关。
+    """
+    with eng.connect() as conn:
+        return {r[0] for r in conn.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = :s AND table_name = 'bank_statement_row'"),
+            {"s": schema}).all()}
+
+
+def test_0049_判否的那张搬进新的一组(scratch_0048):
+    """**老列里记着的那张不许丢** —— 搬进新集合。"""
+    eng, _ = scratch_0048
+    _seed_review_rows(eng)
+    _upgrade(eng, "head")
+
+    with eng.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT id, rejected_voucher_ids, review_voucher_id "
+            "FROM bank_statement_row ORDER BY id")).all()
+        assert rows[0][1] == [1], f"判否的那张凭证没搬过来：{rows[0][1]}"
+        assert rows[1][1] == [], f"没判过的那行不该有记录：{rows[1][1]}"
+        assert rows[0][2] is None, "待复核的候选列刚建起来，该是空的"
+
+
+def test_0049_老列没了(scratch_0048):
+    """**两份「记了哪张」会打架** —— 老列搬完就删。"""
+    eng, schema = scratch_0048
+    _seed_review_rows(eng)
+    _upgrade(eng, "head")
+
+    names = _column_names(eng, schema)
+    assert "rejected_voucher_ids" in names
+    assert "rejected_voucher_id" not in names, (
+        "老列还在 —— 两份「记了哪张」会打架")
+    assert "review_voucher_id" in names
+
+
+def test_0049_重跑不改变结果(scratch_0048):
+    """幂等：运维会重跑，重跑不许把数据弄乱。"""
+    eng, _ = scratch_0048
+    _seed_review_rows(eng)
+    _upgrade(eng, "head")
+    with eng.connect() as conn:
+        before = conn.execute(text(
+            "SELECT id, rejected_voucher_ids FROM bank_statement_row "
+            "ORDER BY id")).all()
+
+    rev = _load_rev("0049_bank_statement_review_set.py")
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    with eng.begin() as conn:
+        ctx = MigrationContext.configure(conn)
+        with Operations.context(ctx):
+            rev.upgrade()
+
+    with eng.connect() as conn:
+        after = conn.execute(text(
+            "SELECT id, rejected_voucher_ids FROM bank_statement_row "
+            "ORDER BY id")).all()
+    assert after == before, f"重跑把数据弄乱了：{before} → {after}"
+
+
+def test_0049_降级把老列还回来(scratch_0048):
+    """降级：老列回来，值也回来（退回「只记最近一次」的老口径）。"""
+    eng, schema = scratch_0048
+    _seed_review_rows(eng)
+    _upgrade(eng, "head")
+    _downgrade(eng, "0048_login_token_revocation")
+
+    with eng.connect() as conn:
+        row = conn.execute(text(
+            "SELECT rejected_voucher_id FROM bank_statement_row WHERE id = 1"
+        )).one()
+        assert row[0] == 1, f"降级把判否的那张丢了：{row[0]}"
+        names = _column_names(eng, schema)
+        assert "rejected_voucher_ids" not in names, "降级后新列该没了"
+        assert "review_voucher_id" not in names, "降级后待复核候选列该没了"

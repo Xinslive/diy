@@ -186,19 +186,41 @@ class BankStatementRow(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(16), default=STATUS_OPEN, nullable=False)
     matched_voucher_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("voucher.id", ondelete="SET NULL"))
-    #: **用户判过「不是同一笔」的那张凭证**（``None`` = 没判过）。
+    #: **用户判过「不是同一笔」的那几张凭证**（空 = 没判过）。
     #:
     #: **为什么要有这一列**：待复核那一档是「金额对得上、日期对不上」。
     #: 用户判「不是同一笔」之后，这一行就该放行去正常制证 —— 但下次
     #: 重算时，那张同额的分录**又会被捞出来**，用户会以为没生效
-    #: （判了等于没判）。记下否掉的是哪一张，重算时跳过它。
+    #: （判了等于没判）。记下否掉的是哪几张，重算时跳过它们。
+    #:
+    #: **是一组，不是一张**（迁移 ``0049`` 改的）：记判断这件事**必须累加**。
+    #: 生产上（2026-10-30 用户报的死循环）同一份对账单上有两行同额流水、
+    #: 账上有四张同额凭证，用户在两行上轮流否 —— **第二次否的时候把第一次
+    #: 记的那张覆盖掉了**，于是第一次点过的那张凭证又冒出来，用户永远点不完。
+    #: 后来的判断不许抹掉先前的。
     #:
     #: **记的是凭证而不是布尔**：否掉这一张，不代表以后冒出来的另一张
     #: 同额凭证也不是它 —— 那一张仍然该报出来让用户判。
     #:
-    #: **外键是 SET NULL**：那张凭证被删了，这一行就回到「没判过」，
-    #: 下次重算照常报 —— 删了凭证本来就要重新判一次。
-    rejected_voucher_id: Mapped[Optional[int]] = mapped_column(
+    #: **存的是 id 而不是外键**：这张集合要跨行取用（见
+    #: :func:`app.bankstatement.service._pair_rows`）—— **一份对账单里
+    #: 任意一行否掉的那张凭证，这一份对账单的其它行也不再拿它来问**
+    #: （否则它会从旁边那一行冒出来，用户看着像死循环）。外键做不到跨行
+    #: 取用，所以这里存裸 id；凭证被删了，那个 id 指向一张不存在的凭证，
+    #: 配对时自然配不上 —— 删了凭证本来就要重新判一次。
+    rejected_voucher_ids: Mapped[list] = mapped_column(JSONB, default=list,
+                                                       nullable=False)
+    #: **这一行待复核时对着的那张凭证**（``None`` = 没指认过）。
+    #:
+    #: **为什么要有这一列**（迁移 ``0049`` 加的）：配对是**一对一**的贪心
+    #: 分配，日期差最小的先配对。于是旁边那一行被否掉之后，重新分配时那张
+    #: 凭证会落到这一行头上 —— 用户看着就是「我刚判过的那张凭证又跑到另一行
+    #: 去了」。记住这一行现在对着哪张凭证，重算时优先兑现它：**一张凭证一旦
+    #: 配给某行，没被否掉就不换人。**
+    #:
+    #: **外键是 SET NULL**：那张凭证被删了，这一行就回到「没指认过」，
+    #: 重算时照常重新配一张候选 —— 删了凭证本来就要重新判一次。
+    review_voucher_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("voucher.id", ondelete="SET NULL"))
     matched_invoice_record_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("invoice_record.id", ondelete="SET NULL"))
