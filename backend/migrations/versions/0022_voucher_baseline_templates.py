@@ -507,7 +507,7 @@ CONTENT_PLAIN = r"""
       "id": "capital",
       "bind": "capital",
       "bold": true,
-      "text": "合     计：{capital}",
+      "text": "合　计：{capital}",
       "type": "text",
       "align": "left",
       "border": true,

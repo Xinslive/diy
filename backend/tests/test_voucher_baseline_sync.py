@@ -26,6 +26,7 @@
 """
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -134,7 +135,7 @@ def test_基线带着用户调过的那些参数(migration):
     assert content["voucher"]["slots_per_page"] == 2, "基线不是一页两张 —— 参数回到旧值了"
     capital = next(e for e in content["elements"] if e["id"] == "capital")
     assert capital["bold"] is True
-    assert capital["text"] == "合     计：{capital}"
+    assert capital["text"] == "合　计：{capital}"
     assert (capital["x"], capital["y"]) == (4.0, 74.2)
 
 
@@ -290,3 +291,34 @@ def test_备份目录的默认判定(script, monkeypatch):
 
     monkeypatch.setenv("CWQ_BASELINE_BACKUP_DIR", "/tmp/某处")
     assert script.backup_dir() == Path("/tmp/某处")
+
+
+def test_基线里不许拿半角空格做字距(migration):
+    """**字距必须用全角空格（U+3000），不能拿半角空格凑。**
+
+    半角空格（U+0020）的宽度**由字体决定**：SimSun 里是 0.5em，
+    Songti SC 里只有 0.2em。同一份模板，换台机器（字体回退不同），
+    「合　计」三个字之间的空隙就会从**一个字宽变成三个字宽** —— 印出来
+    一张纸挤得慌、另一台机器上又散开。
+
+    2026-10-30 用户就是撞上这个：「本地开发端看着很协调，生产的空格太宽了」。
+    实测：同一份 HTML 在同一台机器上，Chromium 量出来是 1.25 个字宽
+    （macOS 上「宋体」回退到 Songti SC，半角空格 0.2em）；换到有 SimSun 的
+    机器上同样的 5 个半角空格就是 2.5~3 个字宽。
+
+    **全角空格的 advance 恒为 1em**，任何字体都一样 —— 这才是「宽度固定为
+    一个字宽」的做法。仓库里总账那几行早就是这么写的（「累　　计」）。
+
+    一次空格（单个 U+0020）不在这条规矩里：标题「记 账 凭 证」用单空格
+    是一种排版风格，宽一点窄一点都在可接受范围。
+    """
+    # **只盯「基础模板」。** 「凭证纸专用」是用户亲手调出来的那份
+    # （2026-10-30：「不要影响凭证纸专用，这是我好不容易调出来的」），
+    # 它的字距怎么写都不由这条规矩管。
+    content = _entry(migration, "基础模板")["content"]
+    for el in content.get("elements") or []:
+        text = el.get("text") or ""
+        assert not re.search(r"  +", text), (
+            f"《基础模板》的 {el.get('id')} 元素用了连续半角空格做字距：{text!r}"
+            f" —— 宽度随字体变，改成一个全角空格 U+3000"
+        )

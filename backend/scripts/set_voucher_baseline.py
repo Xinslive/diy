@@ -93,6 +93,10 @@ def factory_content(name: str = BASELINE_NAME) -> dict:
 
     **只读那一个常量**，不执行迁移的任何函数 —— 它跑在 alembic 的上下文里，
     这里没有 ``op`` 可用，也不需要。
+
+    **只取「基础模板」这一份。** 同一条迁移里还有一份「凭证纸专用」，
+    那是用户 2026-10-30 明确说过「不要影响、我好不容易调出来的」那份 ——
+    脚本不碰它，仓库里它的出厂 content 也原样不动。
     """
     spec = importlib.util.spec_from_file_location("_cwq_baseline_0022", MIGRATION_PATH)
     if spec is None or spec.loader is None:
