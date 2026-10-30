@@ -467,7 +467,20 @@ def check_structure(conf: Path) -> None:
     # 少一段就是一条缝 —— 而且 nginx 的**正则 location 不继承**同级的
     # 普通前缀 location（nginx 只挑一个最优块执行），所以 /api/ 上写了
     # 不代表 ^/api/mcp 上也有。
+    #
+    # **打印字体是唯一的例外**（2026-10-30 加）：
+    # ``/api/print/fonts/`` 下面发的是随应用一起发布的**静态资源** ——
+    # 全站一份，跟登录用户无关；而且 URL 里带着**资源版本号**
+    # （``/api/print/fonts/v/<版本>/…``），同一个 URL 的字节永远不变，
+    # 所以可以 immutable 缓存一年。
+    # 「/api/* 一律 no-store」那条规矩防的是「按登录用户区分的接口响应被
+    # CDN/浏览器缓存住、串给别的用户」—— 字体不是那种响应。
+    # 反过来：字体若也 no-store，每次打印都要重下 849 KB 的样式表 + 分片，
+    # 而源站只有 2 个 worker —— 这正是「打开锁定字体之后明显变慢」的来源。
+    CACHEABLE_API = "/api/print/fonts/"
     api_blocks = [(h, b) for h, b in all_location_blocks(lines) if "/api" in h]
+    font_blocks = [(h, b) for h, b in api_blocks if CACHEABLE_API in h]
+    api_blocks = [(h, b) for h, b in api_blocks if CACHEABLE_API not in h]
     if not api_blocks:
         no("找不到任何 /api 的 location")
     else:
@@ -481,6 +494,23 @@ def check_structure(conf: Path) -> None:
             no("API 段没有把响应标成不可缓存：" + "；".join(bad))
         else:
             ok(f"{len(api_blocks)} 个 API 段都标了 Cache-Control: no-store")
+
+    # 字体段：必须是「可长期缓存」的，且只发一条 Cache-Control
+    bad_font = []
+    for head, blk in font_blocks:
+        if any('add_header Cache-Control "no-store"' in l for l in blk):
+            bad_font.append(head + "（no-store：字体是静态资源，每次打印都要重下）")
+        elif not any("immutable" in l and "max-age=31536000" in l for l in blk):
+            bad_font.append(head + "（没有 immutable 的一年缓存）")
+        elif not any("proxy_hide_header Cache-Control" in l for l in blk):
+            bad_font.append(head + "（没藏上游的 Cache-Control —— 会发出两条，浏览器按第一条解析）")
+    if font_blocks and bad_font:
+        no("打印字体段没有按静态资源缓存：" + "；".join(bad_font))
+    elif font_blocks:
+        ok(f"{len(font_blocks)} 个字体段按静态资源缓存（immutable 一年，URL 带版本号）")
+    else:
+        no("找不到打印字体的 location —— 字体是静态资源，"
+           "每次打印重下 849 KB 就是「打开锁定字体之后变慢」的来源")
 
     # --- Cloudflare 在前时的真实客户端 IP 还原 ---
     #
