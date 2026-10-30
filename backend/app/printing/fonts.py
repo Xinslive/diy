@@ -20,12 +20,19 @@ Fonts 相同：按 Unicode 区段切成 101 片，每片配一条 ``unicode-rang
 浏览器只下载这一页真正用到的那几片。**101 片是同一个可变字体**的 101 个片段
 （字重由 wght 轴给），一共 5.7 MB。
 
-**怎么用。** 模板的 ``font.embed`` 打开时，渲染层把 ``@font-face`` 规则内联进
-打印页的 ``<style>``，并把字体族换成这一份。**默认关闭** —— 用户手里调好的
-版式（尤其「凭证纸专用」）一个字都不该被动。
+**怎么用。** 模板的 ``font.embed`` 打开时，渲染层在打印页的 ``<head>`` 里加
+一条 ``<link>`` 引那份 ``@font-face``，并把字体族换成这一份。**默认关闭** ——
+用户手里调好的版式（尤其「凭证纸专用」）一个字都不该被动。
+
+**URL 里带资源版本号。** ``/api/print/fonts/v/<版本>/nsc-000.woff2``。版本号
+是「CSS 生成规则 + 每个分片的 sha256」的哈希，所以**同一个 URL 的字节永远
+不变** —— 这才敢让 nginx 给它发 ``immutable`` 缓存一年（第二次打印一个字节
+都不用重下）。不带版本号的话，换一版权体还是 ``nsc-000.woff2`` 这个名字，
+浏览器缓存里那份旧字节会被一直发下去，而且不报错。
 """
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -80,6 +87,29 @@ def embedded_family(tpl: dict | None) -> str:
 #: 三种情形都落在同一个源上。
 FONT_URL_PREFIX = "/api/print/fonts"
 
+#: URL 里的版本段。完整形如 ``/api/print/fonts/v/<版本>/nsc-000.woff2``。
+FONT_VERSION_DIR = "v"
+
+
+@lru_cache(maxsize=4)
+def font_version(key: str) -> str:
+    """这份字体的资源版本号（12 位十六进制）；认不出来则空串。
+
+    **从样式表里读**，而不是另存一份 —— 样式表才是真正发出去的东西，
+    它自己引用的是哪个版本，答案就在它里面。少一个可能对不上的地方。
+
+    **为什么 URL 里要带版本。** 字体是静态资源，而静态资源要能放心地
+    ``immutable`` 缓存一年，前提是「同一个 URL 的字节永远不变」。不带版本
+    的话，换一版权体还是 ``nsc-000.woff2`` 这个名字，浏览器缓存里那份旧
+    字节会被一直发下去（而且不报错）。
+
+    版本号由分片的 sha256 与 CSS 生成规则算出（见
+    ``scripts/fetch_print_font.py``），所以内容或规则一变，URL 就变。
+    """
+    css = _font_face_css(key)
+    hit = re.search(rf"{re.escape(FONT_URL_PREFIX)}/{FONT_VERSION_DIR}/([0-9a-f]{{12}})/", css)
+    return hit.group(1) if hit else ""
+
 
 @lru_cache(maxsize=4)
 def _font_face_css(key: str) -> str:
@@ -113,4 +143,11 @@ def font_stylesheet_link(tpl: dict | None) -> str:
     if not key:
         return ""
     name = EMBEDDED_FONTS[key]["css"]
-    return f'<link rel="stylesheet" href="{FONT_URL_PREFIX}/{name}">'
+    version = font_version(key)
+    if not version:
+        # 样式表读不出来（资源没随包发布）—— 那就没有 @font-face 规则，
+        # 浏览器回退到系统字体，跟没开这个开关一样。**不发这条 link**：
+        # 发一条指向空版本的 link 只会多一个 404。
+        return ""
+    return (f'<link rel="stylesheet" href="'
+            f'{FONT_URL_PREFIX}/{FONT_VERSION_DIR}/{version}/{name}">')

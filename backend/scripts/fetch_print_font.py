@@ -7,13 +7,16 @@
     # 重新抓（字体版本换了才用；会覆盖 assets/fonts/ 下的文件）
     python scripts/fetch_print_font.py --download
 
+    # 只按现有清单重生成样式表（改了 CSS 规则时用；不联网、不重下 5.7 MB）
+    python scripts/fetch_print_font.py --css-only
+
 --------------------------------------------------------------------------------
 为什么要有这个字体
 --------------------------------------------------------------------------------
 打印页要的是**所见即所得**：在 A 机器上设计、在 B 机器上印，纸上的样子必须
-一模一样。可字体是**系统给的** —— 「宋体」在 Windows 上是 SimSun，在 macOS 上
-回退成 Songti SC，两者的字宽、空格宽度、字形都不一样。换台机器印出来就变样，
-用户看到的预览和纸上的纸不是一回事。
+一模一样。可字体是**系统给的** —— 「宋体」在 Windows 上是 SimSun，在
+macOS 上回退成 Songti SC，两者的字宽、空格宽度、字形都不一样。换台机器印
+出来就变样，用户看到的预览和纸上的纸不是一回事。
 
 2026-10-30 用户就撞上了这个：「本地开发端看着很协调，生产的空格太宽了」。
 
@@ -28,12 +31,37 @@ U+3000 —— 全角空格的 advance 恒为 1em，与字体无关）；**字形
 为什么是「分片」而不是一个整字体文件
 --------------------------------------------------------------------------------
 完整的 Noto Serif SC 有几 MB，一个字一个字都用得上，但**一页凭证只用到
-几百个字**。Google Fonts 的做法是按 Unicode 区段把字体切成 ~100 片，每片
-配一条 ``unicode-range``：浏览器只下载这一页真正用到的那几片（通常几十到
-几百 KB），其余一片都不取。
+几十个字**。Google Fonts 的做法是按 Unicode 区段把字体切成 101 片，每片
+配一条 ``unicode-range``：浏览器只下载这一页真正用到的那几片，其余一片
+都不取。
 
-这 101 片是**同一个可变字体**的 101 个片段（regular 与 bold 共用同一份文件，
-字重由可变字体的 ``wght`` 轴给），所以一共只有 5.7 MB。
+这 101 片是**同一个可变字体**的 101 个片段（regular 与 bold 共用同一份
+文件，字重由可变字体的 ``wght`` 轴给），所以一共只有 5.7 MB。
+
+--------------------------------------------------------------------------------
+**不要再按字频重新切一遍**（2026-10-30 实测）
+--------------------------------------------------------------------------------
+用户看到「一页凭证要下 12 个分片 / 849 KB，而页面上只有 52 个字」，自然会
+想到「切得更细 / 按字频切」。这两条路都试过了，**都更差**：
+
+* **cn-font-split**（也就是 chinese-font.netlify.app 那个在线分包工具背后的
+  库）：按字频切出来 396 片、共 17.1 MB，一页凭证要点 **23 次**、
+  **682 KB** —— 请求数比 101 片那套还多，字节数只省了 20%。
+* **fontTools 自己按字频切**（97 片、每片 320 字、保留 wght 轴）：一页凭证
+  **1825 KB**，比原来的 848 KB **更差**。
+
+**为什么更差。** 一个 CJK 字在这份可变字体里压完还有 ~370 B。一页凭证那
+52 个字在**字频序上摊得很开**（最靠后的一个字排在第 2072 位），所以无论怎么
+切，浏览器都得把「覆盖到那个名次」的所有分片整片整片地拉下来 —— 换句话说，
+**字节数由「最冷僻的那个字的名次」决定，跟怎么切无关**。要真正省字节，只
+有两条路：把字做得更小（静态字重，放弃可变轴），或者**按页现做子集**
+（运行期裁剪）。前者与「加粗字必须是真加粗」冲突，后者是一次架构改造。
+
+所以分片这块**不动**，真正要修的是另外两件事：
+
+* ``font-display`` 从 ``block`` 改成 ``swap``（见 ``_css_text``）——
+  ``block`` 在字体到位前**一个字都不画**，用户看到的就是「卡住了」。
+* **缓存**（资源版本号进 URL + ``immutable``）—— 见 ``version_of``。
 
 --------------------------------------------------------------------------------
 这份脚本留下的东西
@@ -67,6 +95,18 @@ CSS_NAME = "cwq-serif"
 FAMILY_NAME = "CWQ Serif"
 #: 文件名（不含后缀）。
 PREFIX = "nsc"
+
+#: 字体资源在站点上的路径前缀。**与 ``app/printing/fonts.py`` 必须一致**。
+FONT_URL_PREFIX = "/api/print/fonts"
+#: URL 里的版本段。URL 形如 ``/api/print/fonts/v/<版本>/nsc-000.woff2``。
+FONT_VERSION_DIR = "v"
+
+#: **CSS 生成规则的版本号。改 CSS 的生成规则时必须 +1。**
+#:
+#: 资源版本号（VERSION）由它参与计算 —— 不 +1 的话，浏览器会一直用着缓存里
+#: 的旧样式表，新规则（哪怕只是 ``font-display`` 变了）永远不生效。
+#: 这是一个「改了但看不见」的坑，所以把它做成一个必须显式维护的常量。
+CSS_RECIPE = "swap2"
 
 #: Google Fonts 的 CSS 接口。
 #:
@@ -109,13 +149,45 @@ def _parse_css(css: str) -> list[tuple[str, str]]:
     return out
 
 
-def _css_text(slices: list[tuple[str, str]]) -> str:
+def version_of(entries: list[dict]) -> str:
+    """资源版本号：CSS 规则版本 + 每个分片的 sha256，压成 12 位十六进制。
+
+    **为什么要版本号。** 字体是静态资源，而静态资源要能放心地
+    ``immutable`` 缓存一年 —— 前提是「同一个 URL 的字节永远不变」。
+    没有版本号就做不到：换一版权体，分片还是 ``nsc-000.woff2`` 这个名字，
+    浏览器缓存里那份旧字节会被一直发下去（而且不报错）。
+
+    **版本号进 URL 而不是只进响应头**：响应头变了浏览器要重新校验，
+    URL 变了才是「另一样东西」—— URL 里带版本，缓存才能一路命中。
+
+    参与计算的是**分片的 sha256**（内容）与 **CSS 规则版本**（生成方式）：
+    两者任一变了，版本就变，URL 就变。
+    """
+    h = hashlib.sha256()
+    h.update(CSS_RECIPE.encode("utf-8"))
+    for item in entries:
+        h.update(item["name"].encode("utf-8"))
+        h.update(item["sha256"].encode("utf-8"))
+    return h.hexdigest()[:12]
+
+
+def _css_text(entries: list[dict], version: str) -> str:
     """生成与分片一一对应的 ``@font-face``。
 
-    ``font-display: block`` 而不是 Google 默认的 ``swap``：``swap`` 会先用
-    系统字体排一遍版、字体到位后再换一遍 —— 那一瞬间的排版是**另一份**，
-    打印出去就又「换个环境样式就变」了。``block`` 在字体到位前不画字，
-    版式从头到尾只有一份。
+    **``font-display: swap`` 而不是 ``block``。**
+
+    ``block`` 的语义是「字体到位前不画字」—— 好处是全程只有一份排版，
+    坏处是**字体没到之前页面上一个字都没有**。用户看到的正是「打开锁定字体
+    之后预览卡住了」，而卡住的那几秒里其实一切都在正常下载。
+
+    ``swap`` 先用系统字体排一遍、字体到位后换一遍。那一瞬间的排版确实
+    是「另一份」，但它**不会流到纸面上**：预览在字体到位后重量一次
+    （``PrintPreview.vue`` / ``PrintStage.vue`` 里的 ``fontsReady``），
+    打印前也等字体（``api/print.js`` 里的 ``printWindow``）——
+    纸上永远是内嵌字体那一版。
+
+    所以这里换 ``swap``：省掉的是「白屏等字体」的那几秒，付出的是预览里
+    一闪而过的系统字体字形（而且只在字体还没进缓存的第一次出现）。
     """
     head = [
         "/* 思源宋体（Noto Serif SC）分片 —— 由 scripts/fetch_print_font.py 生成。",
@@ -126,19 +198,24 @@ def _css_text(slices: list[tuple[str, str]]) -> str:
         " * 字重用可变字体的 wght 轴（400..900），所以 101 个分片覆盖全部字重，",
         " *   不必每个字重各存一份。",
         " *",
-        " * font-display:block —— 字体到位前不画字。swap 会先按系统字体排一遍版、",
-        " *   到位后再换一遍，那一瞬间的排版是另一份，正是要消灭的东西。",
+        " * font-display:swap —— 字体没到位时先用系统字体画，不留白屏。",
+        " *   最终版式由「字体到位后重量」+「打印前等字体」保证，纸上永远是",
+        " *   这一份字形。",
+        " *",
+        f" * 资源版本：{version}（内容哈希，内容或规则变了就会变）。",
         " */",
     ]
     body = []
-    for i, (_url, urange) in enumerate(slices):
+    for item in entries:
+        name = item["name"]
+        urange = item["unicode_range"]
         body.append(
             "@font-face {\n"
             f"  font-family: '{FAMILY_NAME}';\n"
             "  font-style: normal;\n"
             "  font-weight: 400 900;\n"
-            "  font-display: block;\n"
-            f"  src: url('/api/print/fonts/{PREFIX}-{i:03d}.woff2') format('woff2');\n"
+            "  font-display: swap;\n"
+            f"  src: url('{FONT_URL_PREFIX}/{FONT_VERSION_DIR}/{version}/{name}') format('woff2');\n"
             f"  unicode-range: {urange};\n"
             "}"
         )
@@ -155,12 +232,12 @@ def download() -> int:
         return 1
     print(f"共 {len(slices)} 个分片，开始下载…")
 
-    manifest = []
+    entries = []
     for i, (url, urange) in enumerate(slices):
         name = f"{PREFIX}-{i:03d}.woff2"
         data = _get(url)
         (FONT_DIR / name).write_bytes(data)
-        manifest.append({
+        entries.append({
             "name": name,
             "url": url,
             "bytes": len(data),
@@ -169,16 +246,43 @@ def download() -> int:
         })
         print(f"  {name}  {len(data)/1024:.1f} KB")
 
-    (FONT_DIR / f"{CSS_NAME}.css").write_text(_css_text(slices), encoding="utf-8")
+    version = version_of(entries)
+    (FONT_DIR / f"{CSS_NAME}.css").write_text(_css_text(entries, version), encoding="utf-8")
     (FONT_DIR / "manifest.json").write_text(
         json.dumps({
             "family": FAMILY_NAME,
             "source": "Noto Serif SC (Google Fonts)",
             "license": "SIL Open Font License 1.1",
-            "slices": manifest,
+            "css_recipe": CSS_RECIPE,
+            "version": version,
+            "slices": entries,
         }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (FONT_DIR / "OFL.txt").write_bytes(_get(OFL_URL))
-    print(f"写好了：{FONT_DIR}")
+    print(f"写好了：{FONT_DIR}（资源版本 {version}）")
+    return 0
+
+
+def regenerate_css() -> int:
+    """只按现有清单重生成样式表。**不联网、不重下分片。**
+
+    什么时候用：改了 CSS 的生成规则（``font-display``、版本号算法…）之后。
+    为了改一行 ``font-display`` 重下 5.7 MB，太不划算。
+    """
+    mpath = FONT_DIR / "manifest.json"
+    if not mpath.exists():
+        print(f"!! 没有 {mpath} —— 跑一次 --download", file=sys.stderr)
+        return 1
+    manifest = json.loads(mpath.read_text(encoding="utf-8"))
+    entries = manifest.get("slices") or []
+    if not entries:
+        print("!! 清单里一片都没有", file=sys.stderr)
+        return 1
+    version = version_of(entries)
+    (FONT_DIR / f"{CSS_NAME}.css").write_text(_css_text(entries, version), encoding="utf-8")
+    manifest["css_recipe"] = CSS_RECIPE
+    manifest["version"] = version
+    mpath.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"样式表重生成好了：资源版本 {version}")
     return 0
 
 
@@ -208,6 +312,23 @@ def check() -> int:
         if not (FONT_DIR / extra).exists():
             print(f"!! 缺 {extra}")
             bad += 1
+
+    # **样式表必须与当前生成规则逐字一致。**
+    # 手改了它、或者改了规则（CSS_RECIPE）忘了重生成，都在这里红 ——
+    # 这两种情况的症状都是「浏览器拿着旧规则缓存，用户看到的是老样子」，
+    # 现场早就没了。
+    version = version_of(manifest["slices"])
+    if manifest.get("version") != version:
+        print(f"!! 清单里的版本号是 {manifest.get('version')}，按当前规则应为 {version}"
+              " —— 跑 --css-only")
+        bad += 1
+    css_path = FONT_DIR / f"{CSS_NAME}.css"
+    if css_path.exists():
+        if css_path.read_text(encoding="utf-8") != _css_text(manifest["slices"], version):
+            print("!! 样式表与当前生成规则对不上（多半是手改了，或改了规则忘了重生成）"
+                  " —— 跑 --css-only")
+            bad += 1
+
     if bad:
         print(f"字体资源有问题 {bad} 处", file=sys.stderr)
         return 1
@@ -219,8 +340,14 @@ def check() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="抓/验随应用发布的打印字体")
     ap.add_argument("--download", action="store_true", help="从 Google Fonts 重新抓（会覆盖）")
+    ap.add_argument("--css-only", action="store_true",
+                    help="只按现有清单重生成样式表（不联网、不重下分片）")
     args = ap.parse_args()
-    return download() if args.download else check()
+    if args.download:
+        return download()
+    if args.css_only:
+        return regenerate_css()
+    return check()
 
 
 if __name__ == "__main__":

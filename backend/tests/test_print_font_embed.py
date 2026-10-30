@@ -74,10 +74,35 @@ def test_样式表里的分片与磁盘上的对得上():
     而用户看到的纸还是「打印机里那份」—— 症状与没开锁定字体一模一样。
     """
     css = (FONT_DIR / "cwq-serif.css").read_text(encoding="utf-8")
-    refs = re.findall(r"url\('/api/print/fonts/([^']+)'\)", css)
+    refs = re.findall(r"url\('/api/print/fonts/v/[0-9a-f]{12}/([^']+)'\)", css)
     assert len(refs) == 101, f"分片数不对：{len(refs)}"
     for name in refs:
         assert (FONT_DIR / name).exists(), f"样式表引用了不存在的分片 {name}"
+
+
+def test_样式表里的版本号是同一个():
+    """**同一个 URL 的字节必须永远不变** —— 这是敢 ``immutable`` 缓存一年的前提。
+
+    样式表里引用分片的版本号必须处处相同：不一样就说明有一片指向了
+    「别的版本」的 URL，而那个 URL 迟早会发出去别的字节。
+    """
+    css = (FONT_DIR / "cwq-serif.css").read_text(encoding="utf-8")
+    versions = set(re.findall(r"/api/print/fonts/v/([0-9a-f]{12})/", css))
+    assert len(versions) == 1, f"样式表里混了多个版本号：{versions}"
+    assert pf.font_version("cwq-serif") == versions.pop(), \
+        "代码里读到的版本号与样式表里的对不上"
+
+
+def test_不用_block_留着白屏():
+    """``font-display`` 必须是 ``swap``。
+
+    ``block`` 的语义是「字体到位前不画字」—— 用户看到的就是「打开锁定字体
+    之后预览卡住了」。``swap`` 先用系统字体画着，字体到位后换过去；
+    最终版式由「字体到位后重量」+「打印前等字体」保证，纸上不受影响。
+    """
+    css = (FONT_DIR / "cwq-serif.css").read_text(encoding="utf-8")
+    assert "font-display: block" not in css, "又变回 block 了 —— 预览会白屏等字体"
+    assert "font-display: swap" in css
 
 
 def test_样式表里的字体族与代码里的一致():
@@ -107,7 +132,9 @@ def test_打开后打印页用上内嵌字体():
     tpl = validate_template("VOUCHER", {"font": {"embed": True}})
     assert tpl["font"]["embed"] is True
     html = render_voucher_sheet(tpl, {}, [], 1, 1)
-    assert 'href="/api/print/fonts/cwq-serif.css"' in html
+    version = pf.font_version("cwq-serif")
+    assert version, "读不出字体的资源版本号 —— 样式表与代码对不上"
+    assert f'href="/api/print/fonts/v/{version}/cwq-serif.css"' in html
     # 字体族必须排在最前面 —— 排在后面等于没开（系统字体先命中了）。
     assert 'font-family: "CWQ Serif", "宋体"' in html
 
@@ -180,26 +207,54 @@ def font_client():
 
 
 def test_字体分片发得出去(font_client):
-    r = font_client.get("/api/print/fonts/nsc-000.woff2")
+    v = pf.font_version("cwq-serif")
+    r = font_client.get(f"/api/print/fonts/v/{v}/nsc-000.woff2")
     assert r.status_code == 200
     assert r.headers["content-type"] == "font/woff2"
     assert len(r.content) > 0
 
 
 def test_字体样式表发得出去(font_client):
-    r = font_client.get("/api/print/fonts/cwq-serif.css")
+    v = pf.font_version("cwq-serif")
+    r = font_client.get(f"/api/print/fonts/v/{v}/cwq-serif.css")
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/css")
     assert "@font-face" in r.text
 
 
+def test_字体可以长期缓存(font_client):
+    """**缓存头必须真的发到浏览器** —— 发了才谈得上「第二次起不重下」。
+
+    ``immutable`` 成立的前提是 URL 带版本号（同一个 URL 的字节永远不变）。
+    """
+    v = pf.font_version("cwq-serif")
+    for url in (f"/api/print/fonts/v/{v}/nsc-000.woff2",
+                f"/api/print/fonts/v/{v}/cwq-serif.css"):
+        r = font_client.get(url)
+        cc = r.headers.get("cache-control", "")
+        assert "immutable" in cc, f"{url} 的缓存头不是 immutable：{cc}"
+        assert "max-age=31536000" in cc, f"{url} 的缓存期不是一年：{cc}"
+
+
+def test_版本对不上就是404(font_client):
+    """**不发「版本号随便给、内容永远是当前这份」的响应。**
+
+    那会让「同一个 URL 的字节永远不变」这个前提失效 —— 缓存里可能混着
+    新旧两份，而混起来的字形比回退到系统字体更难查。
+    """
+    assert font_client.get("/api/print/fonts/v/deadbeef1234/nsc-000.woff2").status_code == 404
+    assert font_client.get("/api/print/fonts/v/deadbeef1234/cwq-serif.css").status_code == 404
+
+
 def test_路径穿越进不来(font_client):
     """白名单而不是「过滤非法字符」。"""
+    v = pf.font_version("cwq-serif")
     for bad in ("..%2Fsecret", "nsc-000.woff2%00.png", "%2e%2e%2fmanifest.json"):
-        r = font_client.get(f"/api/print/fonts/{bad}")
+        r = font_client.get(f"/api/print/fonts/v/{v}/{bad}")
         assert r.status_code == 404, f"{bad} 竟然没被挡住"
 
 
 def test_不存在的分片是404(font_client):
-    assert font_client.get("/api/print/fonts/nsc-999.woff2").status_code == 404
-    assert font_client.get("/api/print/fonts/evil.css").status_code == 404
+    v = pf.font_version("cwq-serif")
+    assert font_client.get(f"/api/print/fonts/v/{v}/nsc-999.woff2").status_code == 404
+    assert font_client.get(f"/api/print/fonts/v/{v}/evil.css").status_code == 404
