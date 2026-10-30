@@ -1600,6 +1600,65 @@ def voucher_slots_per_page(tpl: dict) -> int:
     return 1 if n <= 1 else 2
 
 
+#: 打印顺序的两种口径（``print_order`` 参数，管的是**怎么配对**）。
+#:
+#: ``normal``：连续配对 —— 凭证一张接一张（1+2 / 3+4 / 5+6），老行为。
+#: ``optimized``：错位配对 —— 一页两张时每张纸的上下两格配成相隔一半的一对
+#: （1+4 / 2+5 / 3+6），见 :func:`optimize_print_order`。
+#:
+#: **出纸的先后是另一个维度**（``reverse`` 参数）：打印机有的把先印的那张压在
+#: 最上面，有的把最后印的那张压在最上面，倒过来印就能对上（见同一个函数）。
+PRINT_ORDER_NORMAL = "normal"
+PRINT_ORDER_OPTIMIZED = "optimized"
+PRINT_ORDERS = (PRINT_ORDER_NORMAL, PRINT_ORDER_OPTIMIZED)
+
+
+def optimize_print_order(items: list, slots: int) -> list[list]:
+    """错位配对：把凭证分成一页一页（每页 ``slots`` 格）。
+
+    **一页两张时的配对**（用户 2026-10-30 批注）：默认连续配对印成
+    1+2 / 3+4 / 5+6，沿中间裁开之后**两堆各自都不是顺序**，还得人工理一遍。
+    错位配对印成
+
+        第 1 张 A4：1 + 4
+        第 2 张 A4：2 + 5
+        第 3 张 A4：3 + 6
+
+    裁开之后上堆自上而下是 1、2、3，下堆是 4、5、6 —— 两堆各自成序。
+
+    **一页一张时**每页只有一格，等于原顺序（没有「配对」这回事）。
+
+    公式（``sheets`` = 纸数 = ``ceil(n / slots)``）::
+
+        第 j 张纸（0 起）第 k 格（0 起，0 = 上半张/左半张）
+        = 原序列第 k*sheets + j 项
+
+    也就是把原序列按「格」切成 ``slots`` 段（每段 ``sheets`` 张），再按纸交错取。
+
+    **返回的是「一页一页」，不是一条平铺的序列** —— 出纸的先后是**整页**翻的
+    （倒序打印），分页必须留在这一层：翻页的时候才不会把同一页里的上下两格
+    也一起翻过来（那会把 3+6 印成 6+3，裁开之后两堆又对不上了）。
+
+    超行凭证被拆成多张（``split_voucher``）时**按格重排而不是按凭证重排**：
+    拆出来的分片本来就是一格一格的物理单元，按格排完，裁开合并回去仍然是
+    原顺序，同一张凭证的分片也不会被拆到两叠里。
+    """
+    n = len(items)
+    slots = max(1, int(slots))
+    if n <= 1:
+        return [[i] for i in items]
+    sheets_count = (n + slots - 1) // slots
+    sheets: list[list] = []
+    for j in range(sheets_count):      # 第几张纸
+        sheet: list = []
+        for k in range(slots):        # 这一张纸上的第几格（0 = 上半张 / 左半张）
+            idx = k * sheets_count + j
+            if idx < n:
+                sheet.append(items[idx])
+        sheets.append(sheet)
+    return sheets
+
+
 def _entry_amount(entry: dict) -> Decimal:
     """取一条分录的金额。
 

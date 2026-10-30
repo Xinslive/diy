@@ -34,6 +34,31 @@
             </el-radio-group>
           </el-form-item>
 
+          <!-- 打印顺序（用户 2026-10-30 批注）。
+               **这里是两件不同的事，所以是两个开关**：
+               「打印顺序优化」管**怎么配对**（一页两张时上下两格错开配对，
+               裁开两半后两堆各自成序）；「倒序打印」管**出纸的先后**
+               （整叠倒着印）。合成一个开关，就得在旁边解释「这一项在两种
+               模板上分别是什么意思」，解释不清就等于没写。
+
+               「打印顺序优化」只在**一页两张**时出现 —— 一页一张时每张纸上
+               只有一张凭证，没有「配对」这回事，摆出来只会让人猜它有什么用。
+
+               默认值分开：错位配对默认开（批注 2「默认开启打印顺序优化」），
+               倒序打印默认关（批注 3：他的打印机出纸顺序本来就是对的）。
+
+               它是**这一次打印**的设置（跟方向一样），所以住在弹窗里，
+               不进模板 —— 模板只管版式，不管这叠纸按什么顺序出。 -->
+          <el-form-item v-if="isVoucher && isTwoUp" label="打印顺序优化">
+            <el-switch v-model="interleaveOn" @change="refreshPreview" />
+            <p class="hint">{{ interleaveHint }}</p>
+          </el-form-item>
+
+          <el-form-item v-if="isVoucher" label="倒序打印">
+            <el-switch v-model="reverseOn" @change="refreshPreview" />
+            <p class="hint">{{ reverseHintText }}</p>
+          </el-form-item>
+
           <!-- 打印日期只有账簿（总账 / 明细账）页脚里那一格要它。
                以前它是后端自动取当天 —— 补记账、归档重打时纸上要写的是
                补账那天，不是出纸那天，所以这里必须能改（用户 2026-10-22 批注 3）。 -->
@@ -102,7 +127,10 @@ import { ElMessage } from 'element-plus'
 import { Printer } from '@element-plus/icons-vue'
 import PrintPreview from '@/components/PrintPreview.vue'
 import { loadPrintHtml, openPrintWindow, printWindow, templateMeta, templates as loadTemplates } from '@/api/print'
-import { pickPapers } from '@/utils/paper'
+import { pickPapers, slotsPerPage } from '@/utils/paper'
+import {
+  PRINT_ORDER_DEFAULTS, printOrderHint, printOrderParam, reverseHint,
+} from '@/utils/printOrder'
 import {
   effectiveDefaultId as sharedEffectiveDefault, showBuiltinTemplate, templateTags,
 } from '@/utils/printTemplate'
@@ -172,6 +200,30 @@ const isLedgerBook = computed(() =>
 const printDate = ref('')
 
 /**
+ * 打印顺序的两个开关（用户 2026-10-30 批注）。
+ *
+ * * ``interleaveOn``：**怎么配对** —— 一页两张时每张纸的上下两格错开配对
+ *   （1-6 号印成 1+4 / 2+5 / 3+6），裁开两半后两堆各自成序。一页一张时
+ *   没有配对这回事，这一项不露出来。
+ * * ``reverseOn``：**出纸的先后** —— 整叠倒着印。打印机有的把先印的那张压在
+ *   最上面，有的把最后印的那张压在最上面，倒过来印才能对上。
+ *
+ * 两者独立：错位配对管每张纸上放哪两张，倒序管这几张纸按什么先后出。
+ */
+const interleaveOn = ref(PRINT_ORDER_DEFAULTS.interleave)  // 错位配对，默认开
+const reverseOn = ref(PRINT_ORDER_DEFAULTS.reverse)        // 整叠倒着印，默认关
+
+/** 当前模板一页放几张凭证 —— 决定「打印顺序优化」这一项露不露。 */
+const slotsOfTemplate = computed(() => {
+  const t = tplList.value.find((x) => x.id === templateId.value)
+  return slotsPerPage(t?.content)
+})
+const isTwoUp = computed(() => slotsOfTemplate.value >= 2)
+
+const interleaveHint = computed(() => printOrderHint(slotsOfTemplate.value))
+const reverseHintText = computed(() => reverseHint(slotsOfTemplate.value))
+
+/**
  * 打印范围与「不打印无发生额科目」都是**父页面**的状态（父页面还要拿它们
  * 拼导出参数），这里只做一层双向绑定。
  *
@@ -198,6 +250,11 @@ function buildParams() {
   if (templateId.value !== null) p[templateKey.value] = templateId.value
   if (orientation.value) p.orientation = orientation.value
   if (isLedgerBook.value && printDate.value) p.print_date = printDate.value
+  // 打印顺序只对凭证有意义（别的范围没有「这叠纸按什么顺序出」这件事）。
+  if (isVoucher.value) {
+    p.print_order = printOrderParam(slotsOfTemplate.value, { interleave: interleaveOn.value })
+    p.reverse = reverseOn.value
+  }
   return p
 }
 
@@ -310,6 +367,9 @@ watch(() => props.params, () => { if (visible.value) refreshPreview() }, { deep:
 .note p { margin: 0; font-size: 12px; line-height: 1.7; }
 .note-sub { color: #c0c4cc; }
 .note-warn { color: #e6a23c; }
+
+/* 开关下面那一句：说清这个开关会让纸上的顺序变成什么样 */
+.hint { margin: 6px 0 0; font-size: 12px; line-height: 1.7; color: #909399; }
 
 .dir-group { display: flex; width: 100%; }
 .dir-group :deep(.el-radio-button) { flex: 1; }

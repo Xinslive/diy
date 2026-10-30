@@ -45,10 +45,14 @@ from app.printing.template import (
     DEFAULT_TEMPLATES,
     DIRECTIONS,
     PAPERS,
+    PRINT_ORDER_NORMAL,
+    PRINT_ORDER_OPTIMIZED,
+    PRINT_ORDERS,
     SCOPES,
     ledger_book_detail_row,
     ledger_book_period_label,
     ledger_book_rows_per_page,
+    optimize_print_order,
     render_ledger_book_page,
     render_table_page,
     wrap_pages,
@@ -740,11 +744,21 @@ def _attach_subject_paths(voucher: dict, paths: dict[int, str]) -> dict:
 
 def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
                   status: Optional[str] = None, max_pages: Optional[int] = None,
-                  note: str = "", voucher_ids: Optional[list[int]] = None) -> str:
+                  note: str = "", voucher_ids: Optional[list[int]] = None,
+                  print_order: str = PRINT_ORDER_NORMAL,
+                  reverse: bool = False) -> str:
     """记账凭证：A4 一页两张、A5 一页一张，每张最多 5 行摘要、超出续到下一张。
 
     ``max_pages`` 限的是**原始凭证张数**（只给预览用，保证改版式时的响应速度），
     不是分片数 —— 否则一张 12 行的凭证会把「只预览 3 张」变成只看它自己。
+
+    ``print_order`` 是**这一次打印**的设置（用户 2026-10-30 批注），管的是
+    **怎么配对**：默认 ``normal``（连续配对，老行为）；``optimized`` 把每张纸的
+    上下两格错开配对，裁开两半后两堆各自成序。
+
+    ``reverse`` 管的是**出纸的先后**：整叠倒着印（第 3 张先印、第 1 张最后印），
+    每张纸上配哪两格不变。打印机把先印的那张压在最上面还是把最后印的那张压在
+    最上面，决定了这里要不要倒着来（用户 2026-10-30 批注 3）。
     """
     from app.accounting.vouchers import query_vouchers
 
@@ -814,7 +828,20 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
             "total_credit": 0, "remark": "", "attachments": 0,
         }, rows_per_page)
 
-    sheets = [pieces[i:i + slots] for i in range(0, len(pieces), slots)]
+    # **打印顺序**（用户 2026-10-30 批注）：这一步必须在**分片之后** ——
+    # 超行凭证被拆成好几格，按格排完，裁开合并回去仍是原顺序（见
+    # ``printing/template.py::optimize_print_order``）。
+    if print_order == PRINT_ORDER_OPTIMIZED:
+        # 错位配对：1+4 / 2+5 / 3+6，裁开两半后两堆各自成序。
+        sheets = optimize_print_order(pieces, slots)
+    else:
+        sheets = [pieces[i:i + slots] for i in range(0, len(pieces), slots)]
+
+    # 「倒序打印」是**整页**翻的：同一页里的上下两格不跟着翻 ——
+    # 跟着翻就把 3+6 印成了 6+3，裁开之后两堆又对不上。
+    if reverse:
+        sheets = list(reversed(sheets))
+
     total_pages = len(sheets)
 
     ctx = pv.context(db, book, period)
@@ -1231,6 +1258,8 @@ def _render_scope(
     user: Optional[SysUser] = None,
     print_date: Optional[str] = None,
     skip_empty: bool = True,
+    print_order: str = PRINT_ORDER_NORMAL,
+    reverse: bool = False,
 ) -> str:
     """把一个「打印范围」渲染成完整 HTML。五个 .html 接口和预览接口都调它。
 
@@ -1243,6 +1272,10 @@ def _render_scope(
     ``skip_empty`` 也只给账簿用：打印预览页上的「不打印无发生额科目」开关，
     默认打开（用户 2026-10-22 批注 2）。它是**这一次打印的设置**，不是模板
     字段 —— 模板里再放一份就等于同一个设置有两个地方能改。
+
+    ``print_order`` 与 ``reverse`` 只给凭证用：打印弹窗上的「打印顺序优化」与
+    「倒序打印」两个开关（用户 2026-10-30 批注）。它们同样只作用于**这一次
+    打印**，不进模板。
     """
     from app.ledger import queries
 
@@ -1250,7 +1283,8 @@ def _render_scope(
 
     if scope == "VOUCHER":
         return _voucher_html(db, book, period, tpl, status=status,
-                             max_pages=max_pages, note=note, voucher_ids=voucher_ids)
+                             max_pages=max_pages, note=note, voucher_ids=voucher_ids,
+                             print_order=print_order, reverse=reverse)
 
     if scope == "BALANCE":
         # 区间口径：与页面、Excel 导出走**同一个** from_period，
@@ -1345,15 +1379,39 @@ def _render_scope(
     raise HTTPException(400, f"未知的打印范围：{scope}")
 
 
+def _print_order_arg(raw: Optional[str]) -> str:
+    """打印顺序参数（用户 2026-10-30 批注）。
+
+    留空 = ``normal``（老行为）：这个开关是**这一次打印**的设置，没打开的
+    调用方拿到的还是从前那套顺序 —— 模板设计器预览、MCP 之类不传这个参数，
+    它们印的是版式样张，不该被一次性的顺序设置改掉。
+
+    给了不认识的值直接 422：这是个枚举，落到别的值上只能说明调用方写错了，
+    悄悄按 normal 处理会让人以为开关生效了。
+    """
+    if raw is None or raw == "":
+        return PRINT_ORDER_NORMAL
+    if raw not in PRINT_ORDERS:
+        raise HTTPException(422, "打印顺序只能是 normal 或 optimized")
+    return raw
+
+
 @router.get("/vouchers.html")
 def print_vouchers(book_id: int, period_id: Optional[int] = None,
                    template_id: Optional[int] = None, status: Optional[str] = None,
                    voucher_ids: Optional[str] = None,
                    orientation: Optional[str] = None,
+                   print_order: Optional[str] = Query(None),
+                   reverse: bool = Query(False),
                    book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                   user: SysUser = Depends(get_current_user)):
     """记账凭证：一页几张由模板的 voucher.slots_per_page 决定（1 或 2），
-    每张最多 5 行摘要，超出的行挪到下一张凭证并加分页号。"""
+    每张最多 5 行摘要，超出的行挪到下一张凭证并加分页号。
+
+    ``print_order`` 是**这一次打印**的顺序设置（用户 2026-10-30 批注）：
+    ``optimized`` 把一页两格错开配对（裁开后两堆各自成序），默认 ``normal``。
+    ``reverse`` 是整叠倒着印（打印机把最后印的那张压在最上面时才需要）。
+    """
     selected_ids = None
     if voucher_ids is not None:
         try:
@@ -1370,7 +1428,9 @@ def print_vouchers(book_id: int, period_id: Optional[int] = None,
     tpl = _with_orientation(tpl, orientation)
     return _html_response(_render_scope(db, book, "VOUCHER", tpl,
                                         period_id=period_id, status=status,
-                                        voucher_ids=selected_ids))
+                                        voucher_ids=selected_ids,
+                                        print_order=_print_order_arg(print_order),
+                                        reverse=reverse))
 
 
 @router.get("/balance.html")
