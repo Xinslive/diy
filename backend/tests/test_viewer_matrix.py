@@ -51,6 +51,19 @@ _EXEMPT_EXACT = {
     "/api/books/order",
 }
 _EXEMPT_PREFIXES = ("/api/auth/", "/api/system/")
+# MCP 密钥的自助面（/api/mcp-tokens）：写的是**本人名下的凭据行**
+# （mcp_token），**不碰任何一本账的数据** —— 与 /api/auth/me（改自己的
+# 姓名与口令）是同一类：个人资源，不动别的账。
+#
+# **为什么只读账号也能签**：那枚密钥能读什么，100% 由 `sys_user_book`
+# 决定（见 app/mcp/auth.py）—— 只读账号铸出来的密钥，读到的**仍然只有
+# 它本来就能读的那些账**，不会多一分。而且它的生命周期跟着账号走：
+# 撤授权，下一次调用就被挡；停用账号，令牌立刻作废。
+#
+# 所以挂 `require_book_write` 反而是错的：那是「能不能改这本账」的判据，
+# 而这里根本不改账。边界由 tests/test_mcp_self_service.py 单独钉 ——
+# 那里钉的是「只能动自己的」「只读账号铸出来的密钥只看得见它该看得见的」。
+_EXEMPT_PREFIXES = _EXEMPT_PREFIXES + ("/api/mcp-tokens",)
 _REPORTS_PREFIX = "/api/reports/"
 # 报表写接口走的是**另一道更严的门**：``reports._require_template_write``
 # 要求「显式给出 book_id」且「该账套角色是 OWNER」，比 require_book_write

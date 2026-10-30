@@ -289,13 +289,102 @@ def accessible_books(db: Session, principal: McpPrincipal) -> list[tuple[Book, s
     签发响应与管理面列表都回带它 —— 绑定一个 OWNER 的令牌意味着 agent
     能读该用户**所有**账套，签发人必须当场知情。
     """
+    return _book_rows(db, principal.user_id)
+
+
+def _book_rows(db: Session, user_id: int) -> list[tuple[Book, str]]:
+    """账套清单的**唯一一条查询**。
+
+    可见性 100% 来自 ``sys_user_book``（见本模块开头的说明），所以
+    「这个人能看哪些账套」这个问题只允许有一个查询实现 ——
+    令牌签发时回给管理员看的那份、个人资料页回给本人看的那份、
+    MCP 工具运行时判权限用的那一份，必须是同一套口径。
+    """
     rows = db.execute(
         select(Book, UserBook.role)
         .join(UserBook, UserBook.book_id == Book.id)
-        .where(UserBook.user_id == principal.user_id)
+        .where(UserBook.user_id == user_id)
         .order_by(UserBook.sort_order.asc().nulls_last(), Book.company_name, Book.name)
     ).all()
     return [(book, role) for book, role in rows]
+
+
+def books_of_user(db: Session, user_id: int) -> list[dict]:
+    """某个用户能访问的账套 + 各自角色（给界面看的形状）。
+
+    与 :func:`accessible_books` **同一条查询**（见 :func:`_book_rows`）——
+    同一口径两份实现迟早对不上，而对不上的那一次是「界面说能看、
+    接口说不能」这种最难查的形态。
+    """
+    return [
+        {
+            "id": book.id,
+            "name": book.name,
+            "company_name": book.company_name,
+            "role": role,
+        }
+        for book, role in _book_rows(db, user_id)
+    ]
+
+
+def token_state(row: McpToken) -> dict:
+    """这个令牌此刻的状态。
+
+    **界面上要能分开看的三件事**，混成一句「已失效」就没法处置了：
+
+    * ``status == "grace"`` —— 轮换后的**宽限期内**：旧令牌**仍然可用**，
+      到期自动失效。把它显示成「已吊销」会让人以为连接已经断了；
+    * ``status == "revoked"`` —— 已吊销，下一次调用就 401；
+    * ``status == "disabled"`` —— 软开关关着（记录与审计都还在）；
+    * ``status == "active"`` —— 能用。
+
+    ``unused_days`` 从来没用过是 ``None``（区别于「用过但很久没用」），
+    管理面靠它一眼认出僵尸令牌。
+    """
+    now = now_utc()
+    grace_until = row.grace_until
+    in_grace = bool(grace_until is not None and row.revoked_at is not None
+                    and grace_until > now)
+    if in_grace:
+        status = "grace"
+    elif row.revoked_at is not None:
+        status = "revoked"
+    elif not row.enabled:
+        status = "disabled"
+    else:
+        status = "active"
+    return {
+        "enabled": bool(row.enabled),
+        "in_grace": in_grace,
+        "status": status,
+        "revoked_at": row.revoked_at,
+        "grace_until": grace_until,
+        "last_used_at": row.last_used_at,
+        "unused_days": unused_days(row),
+    }
+
+
+def active_token_count(db: Session, user_id: int) -> int:
+    """这个人现在有几枚**还能用**的令牌。
+
+    **宽限期内的那枚算「还能用」** —— 它到宽限期结束才失效，在那之前
+    agent 照样能用它调接口。把它漏掉，于是「上限 5 枚」会被宽限期里的
+    旧令牌绕过。
+
+    用来给自助签发设上限：令牌**永不过期**，于是「能铸出多少枚永久
+    凭据」这件事必须有界 —— 否则一枚被偷走的会话令牌能铸出无穷多枚
+    永久读凭据，而审计里只会留下一堆看不出所以然的记录。
+    """
+    from sqlalchemy import func, or_
+
+    now = now_utc()
+    return db.scalar(
+        select(func.count()).select_from(McpToken).where(
+            McpToken.user_id == user_id,
+            McpToken.enabled.is_(True),
+            or_(McpToken.revoked_at.is_(None), McpToken.grace_until > now),
+        )
+    ) or 0
 
 
 # --------------------------------------------------------------------- 生命周期
@@ -355,6 +444,13 @@ def revoke_user_tokens(db: Session, user_id: int) -> int:
     """批量吊销某个用户的全部令牌。返回吊销了几条。
 
     改密、离职、疑似泄漏时的标准处置。
+
+    **这是管理面那一侧的语义**：吊销 = 标记失效，**记录留着**
+    （谁在什么时候吊的，审计里查得到，而且轮换要用到「已吊销但还在宽限期」
+    这个状态）。
+
+    本人自助那一侧走的是**物理删除**（:func:`delete_user_tokens`）——
+    两个动词、两种语义，不要混用。
     """
     rows = list(db.scalars(
         select(McpToken).where(McpToken.user_id == user_id)
@@ -364,6 +460,41 @@ def revoke_user_tokens(db: Session, user_id: int) -> int:
         row.revoked_at = stamp
         row.grace_until = None
         row.enabled = False
+    db.flush()
+    return len(rows)
+
+
+def delete_token(db: Session, row: McpToken) -> None:
+    """**物理删除**一枚令牌 —— 这一行从此不存在。
+
+    **与「吊销」的区别**：吊销是**标记失效**（记录留着，审计查得到，
+    轮换时旧令牌要靠它进宽限期）；删除是**连记录一起去掉**。
+
+    **删了会怎样**：这枚令牌下一次调用立刻 401（校验链是「按摘要查库」，
+    查不到就是查不到）。而**已经发生过的读取痕迹仍在** ——
+    ``app/mcp/audit.py`` 的 ``mcp.read`` 审计记的是 ``user_id`` 与
+    ``token_id``（字符串列，不随这一行消失），所以「谁读过账」查得到，
+    丢的只是「这枚密钥曾经存在、现在被删了」这条管理痕迹。
+
+    **本人自助这一侧就是它**：MCP 密钥是本人的私人凭据，怎么处置是本人的
+    事，不留审计痕迹。
+    """
+    db.delete(row)
+    db.flush()
+
+
+def delete_user_tokens(db: Session, user_id: int) -> int:
+    """**物理删除**某个用户的全部令牌。返回删了几条。
+
+    本人自助的「全部删除」走这里。**任何状态的行都删** —— 包括管理员
+    吊销过的那几枚：那一行对本人已经没有用处（管理员的吊销动作本身留在
+    管理员那条审计里）。
+    """
+    rows = list(db.scalars(
+        select(McpToken).where(McpToken.user_id == user_id)
+    ).all())
+    for row in rows:
+        db.delete(row)
     db.flush()
     return len(rows)
 
@@ -383,8 +514,9 @@ def unused_days(row: McpToken) -> Optional[int]:
 
 __all__ = [
     "McpPrincipal", "TOKEN_PREFIX", "UNAUTHORIZED_MESSAGE", "accessible_books",
-    "check_rate_limit", "digest_matches", "extract_bearer", "generate_token",
+    "active_token_count", "books_of_user", "check_rate_limit", "delete_token",
+    "delete_user_tokens", "digest_matches", "extract_bearer", "generate_token",
     "issue_token", "now_utc", "require_book", "require_book_access",
     "reset_rate_limits", "revoke_token", "revoke_user_tokens", "rotate_token",
-    "token_digest", "unused_days", "verify_token",
+    "token_digest", "token_state", "unused_days", "verify_token",
 ]

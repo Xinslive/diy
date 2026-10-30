@@ -239,6 +239,16 @@ function canCacheGet(path, config = {}) {
   // （2026-10-28：装完扩展列表不刷新，CI 的签名插件演练直接超时）。
   if (/(?:^|\/)api\/system(?:\/|$)/.test(path)
       || /^(?:\/)?system(?:\/|$)/.test(path)) return false
+  // MCP 密钥（个人资料页那一块）同理：生成一枚、删掉一枚之后要立刻看到
+  // 新的那一屏，而这一路也是「写完立刻读」。
+  //
+  // **为什么单列一条而不是靠作废标签**：这一路的写接口（POST /mcp-tokens、
+  // DELETE /mcp-tokens/{id}）在 `invalidationFor` 里认不出自己这条路径，
+  // 落到兜底的 `['audit']` 上 —— 缓存键的标签是 `resource:mcp-tokens`，
+  // 两边对不上，缓存就不会被作废，界面会停在写之前的那一屏。
+  // 直接不缓存，比「指望作废标签对得上」可靠。
+  if (/(?:^|\/)api\/mcp-tokens(?:\/|$)/.test(path)
+      || /^(?:\/)?mcp-tokens(?:\/|$)/.test(path)) return false
   if (/(?:^|[/-])(?:download|export|upload|parse|next|neighbour|neighbor|mfa|poll|tick)(?:[-/]|$)/.test(path)) return false
   if (/\/print\/preview(?:\/|$)/.test(path)) return false
   if (/\/print(?:\/|$)/.test(path) && !/\/print\/templates(?:\/|$)/.test(path)) return false
@@ -352,6 +362,10 @@ function invalidationFor(path) {
   if (/\/users?(?:\/|$)|permissions|roles/.test(path)) return ['users', 'context', 'books', 'audit']
   if (/\/books?(?:\/|$)/.test(path)) return ['books', 'context', 'periods', 'subjects', 'audit']
   if (/\/print|template/.test(path)) return ['templates']
+  // MCP 密钥这一路：写操作（生成 / 删除）要把这一条作废。
+  // 上面 `canCacheGet` 已经把这一路排除在缓存之外了，这里是**第二道** ——
+  // 万一将来那条排除被去掉，写完读到的仍然是写之前的那一屏。
+  if (/\/mcp-tokens(?:\/|$)/.test(path)) return ['mcp-tokens', 'audit']
   return ['audit']
 }
 

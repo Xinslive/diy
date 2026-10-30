@@ -157,6 +157,37 @@ await t('流水行被忽略之后，明细页立刻读到新状态', async () =>
 })
 
 console.log('')
+console.log('== MCP 密钥（个人资料页那一块）：写完立刻读 ==')
+
+// 这一路与管理端是同一个形态：生成一枚、吊销一枚之后要立刻看到新的那一屏。
+// **它的坑与管理端一模一样** —— 作废标签与缓存键的标签对不上
+// （写接口落到兜底的 ['audit']，而这一路的缓存键标签是 resource:mcp-tokens），
+// 于是写完之后读到的还是写之前的值，要等 staleTime 过期才恢复。
+
+await t('生成一枚密钥之后，密钥列表立刻读到新值', async () => {
+  freshContext()
+  const be = stubBackend()
+  try {
+    await http.get('/mcp-tokens')
+    await http.post('/mcp-tokens', { name: 'x', current_password: 'y' })
+    const after = await http.get('/mcp-tokens')
+    assert.notEqual(after.data.version, 1,
+      '生成密钥后读到的还是生成之前的列表 —— 界面上看不见刚生成的那一枚')
+  } finally { be.restore() }
+})
+
+await t('MCP 密钥这一路**不进**应用级缓存', async () => {
+  freshContext()
+  const be = stubBackend()
+  try {
+    await http.get('/mcp-tokens')
+    await http.get('/mcp-tokens')
+    assert.equal(be.countGets('/mcp-tokens'), 2,
+      '/mcp-tokens 被缓存了 —— 写操作作废不到它，要等 staleTime 过期才恢复')
+  } finally { be.restore() }
+})
+
+console.log('')
 console.log('== 缓存本身还得有效（这次改动的目的是性能，不能顺手把缓存关掉） ==')
 
 await t('同样的 GET 连着问两次，只发一趟网络请求', async () => {

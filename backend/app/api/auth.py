@@ -47,7 +47,8 @@ from app.core import system_settings
 from app.core import lockout
 from app.core.config import is_trusted_proxy, settings
 from app.core.db import get_db
-from app.core.deps import bearer, get_current_user
+from app.core.deps import (bearer, get_current_user, record_password_failure,
+                           verify_current_password)
 from app.core.security import (create_access_token, decode_access_token,
                                hash_password, password_needs_rehash,
                                password_policy_error, verify_password)
@@ -553,90 +554,19 @@ def lock_duration_minutes(level: int) -> int:
 def _record_failure(db: Session, user: SysUser) -> dict | None:
     """记一次失败，达阈值就锁。
 
-    返回**这次锁定的详情**（时长、轮次、截止时刻），没触发锁定时返回
-    ``None``。调用方用它写审计并发通知 —— 这两件事都需要「锁了多久、
-    第几轮」这两个数，而它们只在触发的那一刻才知道。
+    **实现已经搬到 core**（``core.deps.record_password_failure``）。
 
-    计数与锁定时间在同一个 flush 里写、分开写的话，中途断电会留下
-    「计数加了但没锁」的账，攻击者正好卡在这个窗口里无限试。
+    原因：这条规则现在有**三个执行点** —— 登录、自助改密码、签发 MCP
+    密钥。三处各写一份，迟早会对不上，而对不上的那处几乎总是**更松**的
+    那一侧（少记一次失败 = 白送一个不限速的密码猜测机）。规则只有一份。
 
-    这里**不再自己提交**：提交权交给调用方，让「失败计数 / 锁定」与
-    「这一次的审计」进同一个事务 —— 分两次提交就会出现「锁上了但
-    审计没写」这种最坏的中间态（正是 P1-8 那类缺口的同构形态）。
-
-    **并发下不能丢更新**（审查 §3.7）。原来这里是纯 Python 侧的
-    读改写：``user.failed_logins = (user.failed_logins or 0) + 1``，
-    而这行 ``user`` 是在 **PBKDF2（约 50ms）之前**用普通 SELECT 加载的 ——
-    于是 N 个并发请求各自读到**同一个旧值**、各自写 ``+1``，
-    **只有最后一次写生效**。
-
-    实测（阈值 3）：20 次**并发**错误口令之后，计数只到 2、锁根本没上
-    （20 次真实口令校验全部执行）；而 20 次**顺序**尝试之后是
-    ``failed_logins=0, lock_level=1``（锁上了）。**阈值 3 实际放过了 33 次。**
-    代码在每个延迟档位都把计数清零（下面两处 ``failed_logins = 0``），
-    于是丢更新的影响被进一步放大。
-
-    而 IP 维度的节流是**并发安全**的（一条原子 upsert），所以账号计数器
-    是「分布式喷洒」的**唯一**防线 —— 偏偏它就是失效的那个。
-
-    **怎么修的**：把这一行**锁住再读** —— ``SELECT ... FOR UPDATE``。
-    它把「读-改-写」整段变成临界区，并发请求在这里排队，于是每个人
-    读到的都是**上一个请求已经提交**的值，计数不会丢。
-
-    ``populate_existing=True`` 不是可选项：这一行在**同一个 Session**
-    里已经有一个实例了（登录路径前面用普通 SELECT 读过），而 ORM 默认
-    **不会**用查询结果覆盖已加载实例的属性 —— 不加这个参数，
-    ``FOR UPDATE`` 只是把行锁住、拿到的却仍是那个**陈旧的旧值**，
-    丢更新照旧。
+    这里保留这个薄封装有两个原因：一是它同时是**并发安全那条用例的锚点**
+    （``tests/test_audit_fix_login_failure_counter.py`` 直接调
+    ``auth_mod._record_failure``），名字留着，行为由 core 那一份保证；
+    二是它把「auth.py 不再自己实现这条规则」这件事写在了文件里 ——
+    后来的维护者不必去翻 core 才知道该改哪儿。
     """
-    # 先把这一行锁住再读。``populate_existing`` 让 ORM 用锁住的行
-    # **刷新**已加载的实例（见上面的说明）。
-    #
-    # ``locked`` 与 ``user`` 是**同一个对象**（同一个 Session 的同一行），
-    # 所以下面继续写 ``user`` 即可 —— 调用方随后读到的
-    # ``user.failed_logins`` / ``user.locked_until`` 就是刷新后的值。
-    locked = db.scalar(
-        select(SysUser).where(SysUser.id == user.id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if locked is None:
-        # 用户在这次请求期间被删掉了：没有行可锁，也就没有计数可加。
-        return None
-    user.failed_logins = (user.failed_logins or 0) + 1
-    if user.failed_logins >= settings.login_max_failures:
-        # 轮次 +1，**不重置**：这正是递进式的「连续」所在。
-        user.lock_level = (user.lock_level or 0) + 1
-        # **阈值达成不等于「锁死」**（审查报告安全域 P2-4）。
-        #
-        # 原来这里直接写 ``locked_until = now + 10 分钟``，于是「知道用户名
-        # 的人连错 3 次」就能把**别人的**账号挡在门外 10 分钟，时长还随轮次
-        # 递增（10 → 20 → … → 1 天）—— 攻击成本极低，收益是让特定人在整段
-        # 时间里进不去。月结期尤其致命。
-        #
-        # 现在：**前两轮是「递增延迟」，第三轮起才升级成硬锁**。
-        #   轮次 1 → 延迟 5 秒；轮次 2 → 延迟 10 秒；轮次 ≥3 → 硬锁（423）。
-        # 一次性 DoS 因此**不成立**（受害者等几秒就能继续干活），而持续撞库
-        # 的速率逐轮塌下去。算法与权衡见 ``app/core/lockout.py``。
-        if lockout.should_hard_lock(user.lock_level):
-            minutes = lock_duration_minutes(user.lock_level)
-            user.locked_until = _utcnow() + timedelta(minutes=minutes)
-            # 硬锁这一轮内重新计数：从现在起又要错够阈值才会再次触发。
-            user.failed_logins = 0
-            return {"minutes": minutes, "level": user.lock_level,
-                    "locked_until": user.locked_until, "hard": True}
-        seconds = lockout.account_delay_seconds(user.lock_level)
-        user.locked_until = _utcnow() + timedelta(seconds=seconds)
-        # **这一轮内重新计数**：从现在起又要错够阈值才会再次触发。
-        #
-        # 这一条对**正常用户**很重要：不清零的话，延迟期过后**再错一次**
-        # 就直接进下一轮、再错一次就硬锁 —— 一个手滑连错四次的人会被锁
-        # 半小时。清零之后每一轮都要错够 ``login_max_failures`` 次，
-        # 而延迟本身又把人劝退了。
-        user.failed_logins = 0
-        return {"minutes": 0, "seconds": seconds, "level": user.lock_level,
-                "locked_until": user.locked_until, "hard": False}
-    return None
+    return record_password_failure(db, user)
 
 
 # ------------------------------------------------------------- IP 维度软节流
@@ -1748,46 +1678,51 @@ def change_own_password(payload: PasswordChangeIn, request: Request,
     """
     ip = _client_ip(request)
 
-    # ---- 1. 账号此刻是不是正处在延迟 / 硬锁中 --------------------------
-    # 与登录同一个判定、同一个说法。锁定中的账号**不许改口令** ——
-    # 否则「正在被撞」这件事就有了第二条不受限速的路。
-    left = _lock_left(user)
-    if left > 0:
-        state = lockout.delay_state(user)
-        if state["hard_locked"]:
+    # ---- 1~2. 复核「当前密码」 -----------------------------------------
+    # **闸门本身在 core**（``core.deps.verify_current_password``）：锁定中直接拒、
+    # 验错记一次失败、由计数决定要不要延迟 / 硬锁 —— 与登录**完全同一套口径**
+    # （§9.8）。它现在有三个执行点（登录 / 自助改密 / 签发 MCP 密钥），
+    # 规则只有一份。
+    #
+    # 锁定中的账号**不许改口令** —— 否则「正在被撞」这件事就有了第二条
+    # 不受限速的路。
+    gate = verify_current_password(db, user, payload.current_password)
+    if not gate["ok"]:
+        left = gate["left_seconds"]
+        if gate["reason"] in ("hard_locked", "delayed"):
+            if gate["reason"] == "hard_locked":
+                _audit(
+                    db,
+                    action="CHANGE_PASSWORD_DENIED",
+                    entity="user",
+                    entity_id=user.id,
+                    user=user,
+                    detail=f"账号锁定中，改密码被拒：{user.username}（{ip}）",
+                    after={"username": user.username, "ip": ip,
+                           "locked_until": user.locked_until.isoformat()
+                           if user.locked_until else None},
+                )
+                db.commit()
+                raise HTTPException(423, f"账号已锁定，请 {left // 60 + 1} 分钟后再试")
             _audit(
                 db,
                 action="CHANGE_PASSWORD_DENIED",
                 entity="user",
                 entity_id=user.id,
                 user=user,
-                detail=f"账号锁定中，改密码被拒：{user.username}（{ip}）",
-                after={"username": user.username, "ip": ip,
-                       "locked_until": user.locked_until.isoformat()
-                       if user.locked_until else None},
+                detail=f"连续验证失败过多，暂时限流 {left} 秒，改密码被拒："
+                       f"{user.username}（{ip}）",
+                after={"username": user.username, "ip": ip, "delay_seconds": left},
             )
             db.commit()
-            raise HTTPException(423, f"账号已锁定，请 {left // 60 + 1} 分钟后再试")
-        _audit(
-            db,
-            action="CHANGE_PASSWORD_DENIED",
-            entity="user",
-            entity_id=user.id,
-            user=user,
-            detail=f"连续验证失败过多，暂时限流 {left} 秒，改密码被拒："
-                   f"{user.username}（{ip}）",
-            after={"username": user.username, "ip": ip, "delay_seconds": left},
-        )
-        db.commit()
-        raise HTTPException(
-            429,
-            f"连续验证失败次数过多，请 {left} 秒后重试",
-            headers={"Retry-After": str(left)},
-        )
+            raise HTTPException(
+                429,
+                f"连续验证失败次数过多，请 {left} 秒后重试",
+                headers={"Retry-After": str(left)},
+            )
 
-    # ---- 2. 验当前密码 --------------------------------------------------
-    if not verify_password(payload.current_password, user.password_hash):
-        locked = _record_failure(db, user)
+        # 口令不对（可能这一次恰好触发了延迟 / 硬锁）。
+        locked = gate["locked"]
         _audit(
             db,
             action="CHANGE_PASSWORD_FAILED",

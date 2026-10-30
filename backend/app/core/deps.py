@@ -1,7 +1,17 @@
-"""FastAPI 依赖：当前用户、账套授权。"""
+"""FastAPI 依赖：当前用户、账套授权，以及**口令复核**。
+
+**这一层为什么同时管「账套授权」与「口令复核」。**
+
+两者回答的是同一个问题的两半：**「现在这个请求，是谁在做？」**
+账套授权回答「他能不能动这本书」，口令复核回答「他是不是真的他」——
+而后者是**不能从令牌里读出来的**：令牌可以被 XSS 拿走，光有令牌不足以
+证明「就是他本人按的这个按钮」。这两半都住在同一层，是因为它们都依赖
+同一件事：``sys_user`` 这一行 + ``sys_user_book`` 那张授权表。
+"""
 from __future__ import annotations
 
 import time
+from datetime import timedelta
 from typing import Optional
 
 from fastapi import Depends, HTTPException, Request, status
@@ -9,8 +19,10 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core import lockout
+from app.core.config import settings
 from app.core.db import get_db
-from app.core.security import decode_access_token
+from app.core.security import decode_access_token, verify_password
 from app.models import Book, SysTokenRevocation, SysUser, UserBook
 
 bearer = HTTPBearer(auto_error=False)
@@ -314,3 +326,184 @@ def _link_or_403(request: Optional[Request], db: Session,
     if link is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "没有该账套的访问权限")
     return link
+
+
+# ---------------------------------------------------------------------------
+# 口令复核：失败记账与「当前密码」闸门
+# ---------------------------------------------------------------------------
+#
+# **为什么这两块住在 core，而不是 ``api/auth.py``。**
+#
+# 「一次口令算错就记一次、连续算错到阈值就按阶梯延迟、再错就硬锁」这条规则
+# 现在有**三个执行点**：登录（``api/auth.py::login``）、自助改密码
+# （``api/auth.py::change_own_password``）、签发 MCP 密钥
+# （``api/mcp_tokens.py``）。三处各写一份，迟早会对不上 —— 而对不上的那处
+# 几乎总是**更松**的那侧（少记一次失败 = 白送一个不限速的密码猜测机）。
+#
+# 所以规则与算术都住在 core：时长与阶梯的口径在 ``core/lockout.py``，
+# 执行（那把行锁 + 计数 + 锁定）在下面这个模块。两个 api 模块都往下依赖它，
+# 依赖方向是单向的 —— 不存在 api→api 的横向依赖。
+
+
+def record_password_failure(db: Session, user: SysUser) -> Optional[dict]:
+    """记一次口令校验失败，达阈值就锁。
+
+    返回**这次锁定的详情**（时长、轮次、截止时刻），没触发锁定时返回
+    ``None``。调用方用它写审计并发通知 —— 这两件事都需要「锁了多久、
+    第几轮」这两个数，而它们只在触发的那一刻才知道。
+
+    计数与锁定时间在同一个 flush 里写、分开写的话，中途断电会留下
+    「计数加了但没锁」的账，攻击者正好卡在这个窗口里无限试。
+
+    这里**不再自己提交**：提交权交给调用方，让「失败计数 / 锁定」与
+    「这一次的审计」进同一个事务 —— 分两次提交就会出现「锁上了但
+    审计没写」这种最坏的中间态（正是 P1-8 那类缺口的同构形态）。
+
+    **并发下不能丢更新**（审查 §3.7）。原来这里是纯 Python 侧的
+    读改写：``user.failed_logins = (user.failed_logins or 0) + 1``，
+    而这行 ``user`` 是在 **PBKDF2（约 50ms）之前**用普通 SELECT 加载的 ——
+    于是 N 个并发请求各自读到**同一个旧值**、各自写 ``+1``，
+    **只有最后一次写生效**。
+
+    实测（阈值 3）：20 次**并发**错误口令之后，计数只到 2、锁根本没上
+    （20 次真实口令校验全部执行）；而 20 次**顺序**尝试之后是
+    ``failed_logins=0, lock_level=1``（锁上了）。**阈值 3 实际放过了 33 次。**
+    代码在每个延迟档位都把计数清零（下面两处 ``failed_logins = 0``），
+    于是丢更新的影响被进一步放大。
+
+    而 IP 维度的节流是**并发安全**的（一条原子 upsert），所以账号计数器
+    是「分布式喷洒」的**唯一**防线 —— 偏偏它就是失效的那个。
+
+    **怎么修的**：把这一行**锁住再读** —— ``SELECT ... FOR UPDATE``。
+    它把「读-改-写」整段变成临界区，并发请求在这里排队，于是每个人
+    读到的都是**上一个请求已经提交**的值，计数不会丢。
+
+    ``populate_existing=True`` 不是可选项：这一行在**同一个 Session**
+    里已经有一个实例了（登录路径前面用普通 SELECT 读过），而 ORM 默认
+    **不会**用查询结果覆盖已加载实例的属性 —— 不加这个参数，
+    ``FOR UPDATE`` 只是把行锁住、拿到的却仍是那个**陈旧的旧值**，
+    丢更新照旧。
+    """
+    # 先把这一行锁住再读。``populate_existing`` 让 ORM 用锁住的行
+    # **刷新**已加载的实例（见上面的说明）。
+    #
+    # ``locked`` 与 ``user`` 是**同一个对象**（同一个 Session 的同一行），
+    # 所以下面继续写 ``user`` 即可 —— 调用方随后读到的
+    # ``user.failed_logins`` / ``user.locked_until`` 就是刷新后的值。
+    locked = db.scalar(
+        select(SysUser).where(SysUser.id == user.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked is None:
+        # 用户在这次请求期间被删掉了：没有行可锁，也就没有计数可加。
+        return None
+    user.failed_logins = (user.failed_logins or 0) + 1
+    if user.failed_logins >= settings.login_max_failures:
+        # 轮次 +1，**不重置**：这正是递进式的「连续」所在。
+        #
+        # **这一行不能少**：少了它，轮次永远停在 0，于是
+        # ``should_hard_lock`` 永远为假 —— 递增延迟的阶梯也就永远不会
+        # 往上走，「第 3 轮起分钟级硬锁」那半段**根本到不了**。
+        # 搬这段代码时漏过它一次（症状是「第 3 次算错之后 lock_level 仍是 0，
+        # 延迟永远是 5 秒，硬锁那一档形同虚设」），所以在这里写明它。
+        user.lock_level = (user.lock_level or 0) + 1
+        # **阈值达成不等于「锁死」**（审查报告安全域 P2-4）。
+        #
+        # 原来这里直接写 ``locked_until = now + 10 分钟``，于是「知道用户名
+        # 的人连错 3 次」就能把**别人的**账号挡在门外 10 分钟，时长还随轮次
+        # 递增（10 → 20 → … → 1 天）—— 攻击成本极低，收益是让特定人在整段
+        # 时间里进不去。月结期尤其致命。
+        #
+        # 现在：**前两轮是「递增延迟」，第三轮起才升级成硬锁**。
+        #   轮次 1 → 延迟 5 秒；轮次 2 → 延迟 10 秒；轮次 ≥3 → 硬锁（423）。
+        # 一次性 DoS 因此**不成立**（受害者等几秒就能继续干活），而持续撞库
+        # 的速率逐轮塌下去。算法与权衡见 ``app/core/lockout.py``。
+        if lockout.should_hard_lock(user.lock_level):
+            minutes = lockout.lock_duration_minutes(user.lock_level)
+            user.locked_until = lockout.utcnow() + timedelta(minutes=minutes)
+            # 硬锁这一轮内重新计数：从现在起又要错够阈值才会再次触发。
+            user.failed_logins = 0
+            return {"minutes": minutes, "level": user.lock_level,
+                    "locked_until": user.locked_until, "hard": True}
+        seconds = lockout.account_delay_seconds(user.lock_level)
+        user.locked_until = lockout.utcnow() + timedelta(seconds=seconds)
+        # **这一轮内重新计数**：从现在起又要错够阈值才会再次触发。
+        #
+        # 这一条对**正常用户**很重要：不清零的话，延迟期过后**再错一次**
+        # 就直接进下一轮、再错一次就硬锁 —— 一个手滑连错四次的人会被锁
+        # 半小时。清零之后每一轮都要错够 ``login_max_failures`` 次，
+        # 而延迟本身也把人劝退了。
+        user.failed_logins = 0
+        return {"minutes": 0, "seconds": seconds, "level": user.lock_level,
+                "locked_until": user.locked_until, "hard": False}
+    return None
+
+
+def verify_current_password(db: Session, user: SysUser, password: str) -> dict:
+    """复核「当前密码」—— 一次口令校验的**完整闸门**。
+
+    ### 为什么这道关不能省
+
+    会话令牌是**可以被拿走的**：XSS、共享电脑、令牌落在别人手里。令牌在手
+    就能调那些「铸造长期凭据」的接口 —— 而 MCP 密钥**永不过期**，铸出来
+    是一枚能读你全部账套的**永久**读凭据。没有这道关，拿到令牌的人顺手
+    就替本人铸了一枚，而且那枚密钥不会随登出或改密失效。
+
+    这道关把「有令牌」降级成「有令牌**且**知道口令」—— 而知道口令的人
+    本来就已经是账号的主人了。
+
+    ### 三步，顺序不能换
+
+    1. **先看这个账号是不是正处在延迟 / 硬锁中**。锁定中的账号**不许再试**
+       —— 否则「正在被撞」这件事就有了第二条不受限速的路。
+    2. **再验口令**。
+    3. **验错了就记一次**（:func:`record_password_failure`），由那一套计数
+       决定要不要进入延迟 / 硬锁。
+
+    ### 为什么失败也计入登录那套锁定
+
+    这个闸门验证的也是口令，而它是一个**持着有效令牌**就能调的接口 ——
+    登录那边的账号锁定与 IP 节流**都不覆盖它**。不另设一套，就是白送一个
+    不限速的口令猜测机：拿着（偷来的）令牌每秒几十次地猜当前密码，猜中即
+    铸出一枚永久密钥。PBKDF2 的 33ms 只把**单次**成本抬高，抬高不出「限速」。
+
+    所以口径与登录**完全一致**：同一套计数（``failed_logins``）、同一套
+    递进延迟、同一套硬锁（``lock_level`` / ``locked_until``）。
+
+    ### 返回值（**不抛 HTTPException**）
+
+    审计动作与文案由调用方决定 —— 登录、自助改密、签发 MCP 密钥三处的
+    审计动作名不同，但「这条闸门怎么判」只有这一份。
+
+    * 成功：``{"ok": True}``
+    * 失败：``{"ok": False, "reason": ..., "left_seconds": int, "locked": dict|None}``
+
+      ``reason`` 取三个值之一：
+
+      * ``"hard_locked"`` —— 账号正处在硬锁中（423）；
+      * ``"delayed"`` —— 账号正处在递增延迟中（429，等几秒就能继续）；
+      * ``"mismatch"`` —— 口令不对（400；若这一次恰好触发锁定，
+        ``locked`` 里有详情，调用方据此回 429 / 423）。
+
+    **失败时失败计数已经加过了** —— 调用方要么把这次请求拒掉，要么
+    （不应该）当它没发生过，但计数是加了的。
+    """
+    # ---- 1. 此刻是不是正处在延迟 / 硬锁中 -----------------------------
+    state = lockout.delay_state(user)
+    if state["hard_locked"]:
+        return {"ok": False, "reason": "hard_locked",
+                "left_seconds": state["left_seconds"], "locked": None}
+    if state["delayed"]:
+        return {"ok": False, "reason": "delayed",
+                "left_seconds": state["left_seconds"], "locked": None}
+
+    # ---- 2. 验口令 ------------------------------------------------------
+    if verify_password(password or "", user.password_hash):
+        return {"ok": True}
+
+    # ---- 3. 算错：记一次，由计数决定要不要锁 --------------------------
+    locked = record_password_failure(db, user)
+    return {"ok": False, "reason": "mismatch",
+            "left_seconds": lockout.lock_left_seconds(user),
+            "locked": locked}
