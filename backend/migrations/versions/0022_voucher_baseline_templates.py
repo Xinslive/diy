@@ -297,6 +297,23 @@ CONTENT_VOUCHER_PAPER = r"""
 #:   3. ``columns`` 每列多了 ``"vertical": false``（设计器现在把这个默认值写出来）
 #: 其余逐字节相同。
 #:
+#: ---- 出厂 content 第二次刷新（2026-10-30 晚）----------------------------
+#: 用户在**生产**的模板设计器里又调了一份「新基础模板」，要求：
+#: 「把这个模版的参数作为新的基线模板：基础模板」。于是这一份又换成了
+#: **生产库里那份「新基础模板」的 content 原样**（当时是 ``print_template``
+#: 里 id=11 那一行）。
+#:
+#: 与上一份相比只有两处实质变化：
+#:   1. 字号整体上调一档：标题 18 → 20，其余各元素（公司、日期、凭证号、
+#:      合计大写）9 → 10；
+#:   2. ``font.embed_font`` 显式写成 ``"cwq-serif"`` —— 也就是
+#:      ``app/printing/fonts.py`` 里的 ``DEFAULT_EMBEDDED``，把「锁哪一份
+#:      字体」从默认值变成明写（值本身与默认值相同，渲染结果逐字一致）。
+#:
+#: **仓库、本地库、生产库仍然是同一份**：仓库这一份换了，老库由
+#: ``backend/scripts/set_voucher_baseline.py --sync-content`` 拉齐
+#: （幂等、默认 dry-run、``--apply`` 才写库）。
+#:
 #: **``font.embed`` 默认打开**（用户 2026-10-30：「系统基线改成默认打开锁定
 #: 字体」）。这一项把字体本身也钉死：打印时用随应用发布的那份思源宋体，
 #: 而不是各台机器自己的系统字体 —— **换台机器印出来一模一样**（字形那一半
@@ -315,8 +332,9 @@ CONTENT_PLAIN = r"""
   },
   "font": {
     "size": 10.0,
+    "embed": true,
     "family": "宋体",
-    "embed": true
+    "embed_font": "cwq-serif"
   },
   "meta": {
     "book": true,
@@ -418,7 +436,7 @@ CONTENT_PLAIN = r"""
       "align": "center",
       "border": true,
       "visible": true,
-      "font_size": 18.0,
+      "font_size": 20.0,
       "line_style": "solid",
       "line_width": 0.3,
       "show_header": true,
@@ -439,7 +457,7 @@ CONTENT_PLAIN = r"""
       "align": "left",
       "border": true,
       "visible": true,
-      "font_size": 9.0,
+      "font_size": 10.0,
       "line_style": "solid",
       "line_width": 0.3,
       "show_header": true,
@@ -460,7 +478,7 @@ CONTENT_PLAIN = r"""
       "align": "right",
       "border": true,
       "visible": true,
-      "font_size": 9.0,
+      "font_size": 10.0,
       "line_style": "solid",
       "line_width": 0.3,
       "show_header": true,
@@ -481,7 +499,7 @@ CONTENT_PLAIN = r"""
       "align": "right",
       "border": true,
       "visible": true,
-      "font_size": 9.0,
+      "font_size": 10.0,
       "line_style": "solid",
       "line_width": 0.3,
       "show_header": true,
@@ -523,7 +541,7 @@ CONTENT_PLAIN = r"""
       "align": "left",
       "border": true,
       "visible": true,
-      "font_size": 9.0,
+      "font_size": 10.0,
       "line_style": "solid",
       "line_width": 0.3,
       "show_header": true,
