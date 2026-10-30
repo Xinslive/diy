@@ -1,6 +1,6 @@
 # Manifest、权限与运行时参考
 
-本页是插件开发时需要反复查阅的契约。当前版本为 **SDK 1.3.0 / CWP 1**；示例包中的 `plugin.json`、后端入口、迁移和前端入口可以直接作为最小模板。SDK 1.1.x / 1.2.x 插件仍可继续运行，使用定时任务时，`api_version` 范围必须包含 1.2.0；用到 1.3.0 新增能力（`entry:read` / `export:write`）的插件，`api_version` 范围必须包含 1.3.0。
+本页是插件开发时需要反复查阅的契约。当前版本为 **SDK 1.4.0 / CWP 1**；示例包中的 `plugin.json`、后端入口、迁移和前端入口可以直接作为最小模板。SDK 1.1.x / 1.2.x 插件仍可继续运行，使用定时任务时，`api_version` 范围必须包含 1.2.0；用到 1.3.0 新增能力（`entry:read` / `export:write`）的插件，`api_version` 范围必须包含 1.3.0；用到 1.4.0 新增能力（`ctx.detail_ledger_read`、`ctx.entry_match` 的**窗口参数**）的插件，`api_version` 范围必须包含 1.4.0。
 
 ## Manifest 结构
 
@@ -49,7 +49,7 @@
 |---|---|---|
 | `book:read` | `ctx.book_read()`、`ctx.book_list()` | 读取账套基本资料、列出用户可访问账套 |
 | `book:write` | `ctx.book_write()` | 要求目标账套具有 OWNER 或 ACCOUNTANT 写权限 |
-| `ledger:read` | `ctx.ledger_read()` | 读取指定账套和期间的余额数据 |
+| `ledger:read` | `ctx.ledger_read()`、`ctx.detail_ledger_read()` | 读取指定账套和期间的余额数据；**明细账**（期初 + 逐笔 + 本月合计 + 累计，与屏幕同一份行） |
 | `subject:read` | `ctx.subject_read()` | 读取科目并把外部科目编码映射为 `subject_id` |
 | `voucher:write` | `ctx.voucher_create()`、`ctx.voucher_batch_create()` | 创建凭证；导入提交也需要此能力 |
 | `plugin_data:rw` | `ctx.data.*`、`ctx.config.*`、前端 `services.config` | 访问插件自有表和账套级配置 |
@@ -59,7 +59,7 @@
 | `statement:parse` | `ctx.statement.parse()` | 用**宿主那一份**解析器把银行对账单解析成结构化流水行（不写宿主任何业务表） |
 | `statement:read` | `ctx.statement.read()` | 读取账套在宿主已绑的对账单**绑定清单**（不含流水行内容） |
 | `import:rw` | `ctx.imports.*`（**不含 `confirm`**）、前端 `services.imports` | 持久文件、预览、整批提交和来源追溯；**确认必须走前端 `services.imports.confirm` 的独立宿主请求**（详见 plugin-data） |
-| `entry:read` | `ctx.entry_match()` | 把一批流水行与账上**现金科目**的分录**一一配对**（宿主那把尺子：金额相等 + 现金侧方向对应 + 日期窗口 7/30 天 + 一对一分配） |
+| `entry:read` | `ctx.entry_match()` | 把一批流水行与账上**现金科目**的分录**一一配对**（宿主那把尺子：金额相等 + 现金侧方向对应 + 日期窗口 7/30 天 + 一对一分配；**窗口可由调用方给**，见下文） |
 | `export:write` | `ctx.export_xlsx()` | 把一张表导成 `.xlsx`（宿主生成，回传 base64） |
 
 `import:rw` 只提供导入批次能力；正式提交还必须声明 `voucher:write`。`plugin_data:rw` 只允许访问 manifest 声明的插件表，不能用来读取宿主业务表。
@@ -212,8 +212,11 @@ out["period_start"] / out["period_end"]
 
 - `ctx.period_list(book_id)` —— 期间清单（`id` / `year` / `month` / `ord` / `locked` / `closed_at`）。插件**读不到宿主的 period 表**；跨账套的**账期可以不一样**（有的账套用 4-4-5 财年），所以不能拿一份期间号套到别的账套上。
 - `ctx.ledger_read(book_id, period_id, include_unposted=True)` —— 科目余额表。`include_unposted=True` 与宿主对账口径**同一个**（已制证但未过账的凭证也算在账面余额里）；默认 `False`，旧插件不受影响。
+- `ctx.detail_ledger_read(book_id, subject_codes, from_period_id, to_period_id, include_unposted=True)` —— **明细账**（SDK 1.4.0 新增）。取的是**屏幕那本明细账的行**（`app.ledger.queries.detail_ledger`）：期初、逐笔（凭证号 / 日期 / 摘要 / 借方 / 贷方 / 方向 / 余额）、本月合计、本年累计。**余额怎么滚只有宿主一份实现**，插件自己拼一遍，屏幕与文件就会算出两个数。
 
-### 配对与导出（SDK 1.3.0 新增）
+  `subject_codes` 按**编码**解析（与 `entry_match` 一样支持前缀匹配）；`from_period_id` / `to_period_id` 是**期间区间**（含两端）。返回 `{"subjects": [{"code", "ok", "error", "subject", "rows", ...}]}` —— **每个科目单独成败**：一个科目不存在不该让其余科目一起拿不到数。
+
+### 配对与导出（SDK 1.3.0 新增，1.4.0 扩了窗口）
 
 - `ctx.entry_match(book_id, subject_codes, rows)` —— 把一批流水行与账上**现金科目**
   的分录**一一配对**。
@@ -230,6 +233,23 @@ out["period_start"] / out["period_end"]
   与 `in_primary`（日期差是否在主窗口内 —— 后者就是「已入账 / 待复核」两档）。
 
   `subject_codes` 按**前缀**匹配（登记 `1002` 也能配到记在 `100203` 上的分录）。
+
+  **窗口可以由调用方给**（SDK 1.4.0 起）：`ctx.entry_match(book_id, subject_codes,
+  rows, date_from=None, date_to=None, primary_days=None, review_days=None)`。
+
+  * `date_from` / `date_to` —— **分录的扫描区间**（含两端）。不给就是老口径：
+    按流水行的日期前后各留 30 天。
+  * `primary_days` —— **主窗口**（几天之内算「已入账」，默认 7）。
+  * `review_days` —— **复核窗口**（几天之内还算「待复核」，默认 30）。
+
+  **为什么需要它**：流水日期是**银行记账日**、记账日期是**实际发生日** ——
+  两者差一个月是常事（8 月的费用 9 月初才从卡上扣，账记在 8 月）。那 30 天
+  的默认窗口**够不着**：9 月 30 日的流水配 8 月 5 日的凭证差 56 天，压根不会
+  进候选池 —— 看上去就成了「账上没记这笔」。而「这份 9 月的对账单该对 8 月的
+  账」这件事**用户知道，算不出来**，所以窗口交给调用方给。
+
+  **尺子还是宿主这把**（`allocate` 一字未改），变的只是**窗口** —— 窗口本来就
+  是「同一笔」这一定义的一部分。
 
 - `ctx.export_xlsx(filename, columns, rows, sheet_name)` —— 把一张表导成 `.xlsx`，
   回传 `{"filename": ..., "content_base64": ...}`。

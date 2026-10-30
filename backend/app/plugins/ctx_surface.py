@@ -40,6 +40,8 @@ CTX_METHOD_SERIALIZATION: dict[str, str] = {
     "book_list": "json",
     "book_write": "json",
     "ledger_read": "json",
+    # —— 明细账（共享卡要导出「账面上的明细账」：同一本账，与屏幕同一份行）——
+    "detail_ledger_read": "json",
     "subject_read": "json",
     "period_list": "json",
     # —— 对账单（共享卡对账：宿主只贡献解析器与绑定清单）——

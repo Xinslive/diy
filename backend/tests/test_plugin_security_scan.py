@@ -160,6 +160,7 @@ def test_migrations_may_use_ddl_but_not_raw_sql():
 
 
 @pytest.mark.parametrize("folder", ["plugins/com.cwq.periodic", "plugins/com.cwq.reimburse",
+                                    "plugins/com.cwq.sharedcard",
                                     "docs/plugin-example", "docs/plugin-import-example"])
 def test_real_plugin_sources_pass_the_whitelist(folder):
     root = REPO_ROOT / folder

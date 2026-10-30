@@ -35,6 +35,32 @@ def request_user(db, pid):
     return user
 
 
+def _iso_day(value, what: str) -> date:
+    """把一个日期参数解析成 ``date``（只认 ISO 的 ``YYYY-MM-DD``）。
+
+    **为什么自己解析而不是用 ``date.fromisoformat`` 就完事**：调用方给的是
+    字符串（插件那边是 JSON），给错了要**说清是哪个参数错了**，而不是抛一个
+    ``ValueError`` 让插件收到一句看不懂的栈。
+    """
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(400, "%s无效" % what)
+    try:
+        return date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        raise HTTPException(400, "%s必须是 YYYY-MM-DD" % what)
+
+
+def _window_days(value, default: int, what: str) -> int:
+    """窗口天数：不给就用默认，给了必须是正整数。"""
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise HTTPException(400, "%s天数必须是正整数" % what)
+    return int(value)
+
+
 #: 受限过滤 DSL 支持的操作符。刻意没有「原始表达式」这一类入口。
 FILTER_OPERATORS = ("eq", "ne", "lt", "lte", "gt", "gte", "in", "like", "is_null")
 #: 过滤值允许的标量类型：插件只能按值过滤，不能拼 SQL。
@@ -298,6 +324,94 @@ def context_for(manifest, *, plugin=False):
             return balance(book_id=book_id, period_id=period_id, from_period_id=None,
                            book=book, db=db, include_unposted=bool(include_unposted))
 
+    def detail_ledger_read(book_id: int, subject_codes: list[str],
+                           from_period_id: int, to_period_id: int, *,
+                           include_unposted: bool = True):
+        """某账套某段期间的**明细账**（逐笔 + 期初 + 本月合计 + 累计）。
+
+        **为什么宿主出这条能力**：明细账的「余额怎么滚」不是加加减减 ——
+        期初余额来自**引擎**（含结转、含跨年结转），逐月合计与本年累计的
+        口径也只有一套规矩（见 ``app.ledger.queries._detail_account_rows``）。
+        插件读不到宿主的业务表，也**不该自己再写一份**滚余额的算法 ——
+        屏幕上的明细账与插件导出的明细账必须**是同一本账**。
+
+        * ``subject_codes`` —— 科目**编码**清单。**按前缀匹配**（与
+          :func:`entry_match` 同一口径）：登记 ``1002`` 也能取到记在
+          ``100203`` 上的分录（那本账的科目表里没有 ``1002`` 这个末级时，
+          取它的下级 —— 屏幕上查父科目看到的正是那一段）。
+        * ``from_period_id`` / ``to_period_id`` —— 期间**区间**（含两端，
+          按期间序号比大小，不按年月字符串比）。
+
+        返回 ``{"subjects": [{"code", "ok", "error", "subject", "rows", ...}]}``。
+        **每个科目单独成败**：一个科目不存在（这本账的科目表里没有它）不该
+        让其余科目一起拿不到数 —— 返回里那一项带 ``ok=False`` 与原因，
+        别的项照常给出行。
+        """
+        from app.ledger import queries
+        from app.ledger.engine import LedgerEngine
+        from app.models.accounting import Subject
+        from app.models.book import Period
+
+        if not isinstance(subject_codes, list) or not subject_codes:
+            raise HTTPException(400, "科目编码清单不能为空")
+        codes: list[str] = []
+        for item in subject_codes:
+            if not isinstance(item, str) or not item.strip():
+                raise HTTPException(400, "科目编码无效")
+            code = item.strip()
+            if code not in codes:
+                codes.append(code)
+
+        with SessionLocal() as db:
+            user = principal(db)
+            book = get_my_book(book_id, db, user)
+            to_period = db.get(Period, to_period_id)
+            from_period = db.get(Period, from_period_id)
+            if to_period is None or to_period.book_id != book.id:
+                raise HTTPException(404, "止期不存在或不属于这本账")
+            if from_period is None or from_period.book_id != book.id:
+                raise HTTPException(404, "起期不存在或不属于这本账")
+            if from_period.ord > to_period.ord:
+                raise HTTPException(400, "起始期间不能晚于结束期间")
+            # 科目表每个年度各有一份 —— 按**止期那一年的**科目表解析编码。
+            year = to_period.year
+            subjects = db.scalars(
+                select(Subject)
+                .where(Subject.book_id == book.id, Subject.year == year)
+                .order_by(Subject.code)
+            ).all()
+            by_code = {item.code: item for item in subjects}
+            # **一个引擎算到底**：逐个科目重建引擎，期初聚合就白算 N 遍
+            # （与宿主导出整册明细账同一个理由）。
+            eng = LedgerEngine.for_ledger(db, book.id, bool(include_unposted))
+            out = []
+            for code in codes:
+                target = by_code.get(code)
+                if target is None:
+                    # 前缀匹配：登记的是父科目（1002），实际记在明细上（100203）。
+                    children = [item for item in subjects if item.code.startswith(code)]
+                    target = min(children, key=lambda item: (len(item.code), item.code)) \
+                        if children else None
+                if target is None:
+                    out.append({"code": code, "ok": False,
+                                "error": "这本账 %s 年的科目表里没有科目 %s" % (year, code)})
+                    continue
+                try:
+                    payload = queries.detail_ledger(
+                        db, book.id, target.id, from_period, to_period,
+                        bool(include_unposted), eng=eng)
+                except HTTPException as exc:
+                    out.append({"code": code, "ok": False, "error": str(exc.detail)})
+                    continue
+                out.append({
+                    "code": code, "ok": True, "error": "",
+                    "subject": payload.get("subject") or {},
+                    "from_period": payload.get("from_period") or "",
+                    "to_period": payload.get("to_period") or "",
+                    "rows": payload.get("rows") or [],
+                })
+        return {"subjects": out}
+
     def period_list(book_id: int):
         """账套的会计期间列表（id / 年月 / 账套内序号 / 是否已结账）。
 
@@ -472,7 +586,9 @@ def context_for(manifest, *, plugin=False):
                      "is_leaf": s.is_leaf, "active": s.active, "year": s.year}
                     for s in rows]
 
-    def entry_match(book_id: int, subject_codes: list[str], rows: list[dict]):
+    def entry_match(book_id: int, subject_codes: list[str], rows: list[dict], *,
+                    date_from: str | None = None, date_to: str | None = None,
+                    primary_days: int | None = None, review_days: int | None = None):
         """把一批流水行与账上**现金科目**的分录一一配对。
 
         **为什么宿主出这条能力，而不是让插件自己查分录**：插件读不到宿主的
@@ -500,10 +616,31 @@ def context_for(manifest, *, plugin=False):
         ``days_diff`` 与 ``in_primary``（日期差是否在主窗口内）—— 后者就是宿主
         那条线的「已入账 / 待复核」两档：**在主窗口内是同一笔，出了窗口只是
         金额对得上，要人判**。
+
+        **窗口可以由调用方给**（1.4.0 起）—— 这一段是给「对账单流水是本月、
+        记账在上月」那种错位场景的：
+
+        * ``date_from`` / ``date_to`` —— **分录的扫描区间**（含两端）。不给就是
+          老口径：按流水行的日期前后各留 30 天。那 30 天是宿主的默认值，
+          **跨月错位够不着**：9 月 30 日的流水配 8 月 5 日的凭证差 56 天，
+          压根不会进候选池 —— 看上去就是「账上没记这笔」。
+        * ``primary_days`` —— **主窗口**（几天之内算「已入账」，默认 7）。
+        * ``review_days`` —— **复核窗口**（几天之内还算「待复核」，默认 30）。
+
+        **尺子还是宿主这把**（``allocate`` 一字未改），变的只是**窗口** ——
+        窗口本来就是「同一笔」这一定义的一部分，而**窗口该多大有时不是
+        算得出来的**：9 月的对账单去对 8 月的账，跨月这件事**用户知道**，
+        算不出来。所以窗口交给调用方给，判定仍然只有一份口径。
+
+        **给了 ``date_from``/``date_to`` 就不再看流水行的日期**：那正是
+        「对账单的月份不是记账的月份」这件事的要点 —— 流水行的日期是**银行
+        记账日**，分录的日期是**实际发生日**，两者对不上时，扫哪一段要由
+        调用方说了算。
         """
         from datetime import timedelta
 
         from app.bankstatement.allocate import (
+            PRIMARY_WINDOW_DAYS,
             REVIEW_WINDOW_DAYS,
             EntrySide,
             RowSide,
@@ -566,8 +703,24 @@ def context_for(manifest, *, plugin=False):
             # 结果一样：没有候选。
             return {"pairs": [], "unmatched_row_ids": [side.id for side in sides]}
 
+        # ---- 窗口：默认按流水行的日期前后各留 30 天（老口径） -------------
+        #
+        # 调用方给了区间就用它给的 —— 「流水是本月的、记账是上月的」那种
+        # 错位场景里，**该扫哪一段由人说了算**（插件那边是用户指定的匹配
+        # 月份范围），算不出来。
         lo = min(dated) - timedelta(days=REVIEW_WINDOW_DAYS)
         hi = max(dated) + timedelta(days=REVIEW_WINDOW_DAYS)
+        if (date_from is None) != (date_to is None):
+            raise HTTPException(400, "扫描区间的起止日期要一起给")
+        if date_from is not None:
+            lo = _iso_day(date_from, "扫描区间起日")
+            hi = _iso_day(date_to, "扫描区间止日")
+            if lo > hi:
+                raise HTTPException(400, "扫描区间的起日不能晚于止日")
+        primary_window = _window_days(primary_days, PRIMARY_WINDOW_DAYS, "主窗口")
+        review_window = _window_days(review_days, REVIEW_WINDOW_DAYS, "复核窗口")
+        if review_window < primary_window:
+            raise HTTPException(400, "复核窗口不能小于主窗口")
 
         with SessionLocal() as db:
             user = principal(db)
@@ -593,7 +746,8 @@ def context_for(manifest, *, plugin=False):
                 for entry, voucher, _subject in rows_found
             ]
 
-        result = allocate(sides, entry_sides)
+        result = allocate(sides, entry_sides, primary_window=primary_window,
+                          review_window=review_window)
         pairs = [{
             "row_id": pair.row_id,
             "entry_id": pair.entry_id,
@@ -907,6 +1061,8 @@ def context_for(manifest, *, plugin=False):
         ("book:write", "book_write", book_write),
         ("upload:read", "upload_read", upload_read),
         ("ledger:read", "ledger_read", ledger_read), ("subject:read", "subject_read", subject_read),
+        # 明细账与余额表同属「读账」这一条权限 —— 不另开一条，免得权限表越滚越长。
+        ("ledger:read", "detail_ledger_read", detail_ledger_read),
         ("book:read", "period_list", period_list),
         # 配对复用宿主那把尺子（``app.bankstatement.allocate``），插件不自己写第二份。
         ("entry:read", "entry_match", entry_match),

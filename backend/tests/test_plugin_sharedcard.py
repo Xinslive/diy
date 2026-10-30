@@ -314,8 +314,9 @@ def test_插件不再声明凭证权限(shared, client, auth, db):
     permissions = (registry.manifest_metadata or {}).get("permissions") or []
     assert "voucher:write" not in permissions, permissions
     # 1.3.0 起插件多了「按金额初筛」（entry:read）与「导出 Excel」（export:write）
-    # 两条权限 —— 版本号跟着走，别让它停在 1.2.0 上假装还是老插件。
-    assert registry.version == "1.3.0", registry.version
+    # 两条权限；1.4.0 起又多了「自定义匹配月份范围」与「导出账面明细账」——
+    # 版本号跟着走，别让它停在老版本上假装还是老插件。
+    assert registry.version == "1.4.0", registry.version
 
 
 def test_卡可以删(shared, client, auth, loaded, cash_subjects):
@@ -1538,3 +1539,314 @@ def test_只读书上的证据照样参与_行进待复核而不是被静悄悄�
     assert readonly_candidate["can_write"] is False, review
     after = _seq_row(_rows(shared, client, auth, stmt_id), 4)
     assert after["alloc"] is None, after
+
+
+# ---------------------------------------------------------------------------
+# 7. 匹配月份范围（1.4.0）：「9 月的对账单去对 8 月的账」
+# ---------------------------------------------------------------------------
+#
+# 流水日期是**银行记账日**，记账日期是**实际发生日** —— 两者差一个月是常事
+# （8 月的费用 9 月初才从卡上扣，账就记在 8 月）。1.3.0 的候选池是「流水行
+# 日期 ± 30 天」，跨月错位**够不着**：9 月 14 日的流水配 8 月 5 日的凭证差
+# 40 天，连候选都不会有 —— 看上去就成了「账上压根没记这笔」。
+#
+# 1.4.0 起，用户可以**自己指定这份对账单去匹配哪几个月**。这一组用例盯的
+# 是三件事：
+#
+# * 不指定时，老行为**一字不变**（别把 1.3.0 悄悄改了）；
+# * 指定了，跨月的分录就配上了，而且**范围是排他的**（说 8 月就只扫 8 月）；
+# * 余额核对取账上发生额时，也按**同一段账**（两边不对着同一段比，差额是
+#   假的）。
+
+
+def _set_match_months(shared, client, auth, stmt_id, months):
+    return _json(client.patch(shared + f"/statements/{stmt_id}/match-months",
+                              headers=auth, json={"months": months}))
+
+
+def test_没指定匹配月份范围时_跨月的分录连候选都没有(shared, client, auth, db, admin_user,
+                                                  prescreen_ready, cash_subjects):
+    """**老行为不变**：窗口是「流水行日期 ± 30 天」，差 40 天压根不是候选。
+
+    这一条是「别把老行为悄悄改了」的钉子 —— 1.3.0 的用户看到的必须是原来
+    那个样子。
+    """
+    stmt_id = prescreen_ready["stmt_id"]
+    row = _seq_row(prescreen_ready["rows"], 4)          # 750.00 / OUT / 2026-09-14
+    item = cash_subjects[0]
+    maker = build_voucher_factory(db, item["book"], admin_user)
+    _record_cash(maker, item, row, "2026-08-05")        # 差 40 天：记账在上个月
+
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    assert body["assigned"] == 0, body
+    assert body["review"] == 0, body
+    assert body["unmatched"] == 5, body
+    assert body["months"] == ["2026-09"], body
+
+
+def test_指定匹配月份范围后_跨月的分录配上了(shared, client, auth, db, admin_user,
+                                              prescreen_ready, cash_subjects):
+    """说「这份 9 月的对账单去对 8 月的账」→ 8 月记的那笔就配上了。
+
+    **为什么这行能自动归属**：用户已经**明确说了**这份对账单对应哪几个月 ——
+    跨月这件事本来就是他定的（宿主那把尺子的 7 天窗口是给「同月」这件事
+    定的，它够不着「跨月」，不是它判「不是同一笔」）。证据还是账本身：
+    同额、同向、只有一本账像。
+
+    **但跨月的行要报个数**：同额同向的候选在 ±60 天有 4 条（宿主自己量过），
+    多看一眼比事后发现错账便宜。
+    """
+    stmt_id = prescreen_ready["stmt_id"]
+    row = _seq_row(prescreen_ready["rows"], 4)          # 750.00 / OUT / 2026-09-14
+    item = cash_subjects[0]
+    maker = build_voucher_factory(db, item["book"], admin_user)
+    _record_cash(maker, item, row, "2026-08-05")        # 差 40 天：记账在上个月
+
+    body = _set_match_months(shared, client, auth, stmt_id, ["2026-08"])
+    assert body["match_months"] == ["2026-08"], body
+    assert body["match_months_effective"] == ["2026-08"], body
+    assert body["statement_months"] == ["2026-09"], body
+
+    screen = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    assert screen["assigned"] == 1, screen
+    assert screen["review"] == 0, screen
+    assert screen["unmatched"] == 4, screen
+    assert screen["months"] == ["2026-08"], screen
+    # **跨月对上的行要报个数出来**。
+    assert screen["cross_month"] == 1, screen
+
+    rows = _rows(shared, client, auth, stmt_id)
+    hit = _seq_row(rows, 4)
+    assert hit["alloc"] is not None
+    assert hit["alloc"]["book_id"] == item["book"].id
+    assert hit["alloc"]["status"] == "PRESCREENED"
+    # 归属依据里带着证据（哪张凭证、差几天）。
+    assert "初筛" in hit["alloc"]["reason"]
+
+
+def test_匹配月份范围是排他的_声明之外的月份不参与(shared, client, auth, db, admin_user,
+                                                 prescreen_ready, cash_subjects):
+    """说「去匹配 8 月」就是**只**匹配 8 月 —— 9 月账上那笔不该来抢同一行。
+
+    不排他的话，8 月与 9 月的同额分录会互相抢同一行流水，结论就变成「两本
+    账都像」—— 而用户明明已经指了对手方。
+    """
+    stmt_id = prescreen_ready["stmt_id"]
+    row = _seq_row(prescreen_ready["rows"], 4)          # 750.00 / OUT / 2026-09-14
+    item = cash_subjects[0]
+    maker = build_voucher_factory(db, item["book"], admin_user)
+    _record_cash(maker, item, row, "2026-09-20")        # 同月，但不在声明的范围里
+    _set_match_months(shared, client, auth, stmt_id, ["2026-08"])
+
+    body = _json(client.post(shared + f"/statements/{stmt_id}/prescreen", headers=auth))
+    assert body["assigned"] == 0, body
+    assert body["review"] == 0, body
+    assert body["unmatched"] == 5, body
+
+
+def test_匹配月份范围可以改回默认(shared, client, auth, prescreen_ready):
+    """声明是**加法**，不是必填项 —— 清空就回到「跟着对账单自己的月份走」。"""
+    stmt_id = prescreen_ready["stmt_id"]
+    _set_match_months(shared, client, auth, stmt_id, ["2026-08"])
+    body = _set_match_months(shared, client, auth, stmt_id, [])
+    assert body["match_months"] == [], body
+    assert body["match_months_effective"] == ["2026-09"], body
+    assert body["match_months_customized"] is False, body
+
+    detail = _json(client.get(shared + f"/statements/{stmt_id}", headers=auth))
+    assert detail["match_months"] == [], detail
+    assert detail["match_months_effective"] == ["2026-09"], detail
+    assert detail["statement_months"] == ["2026-09"], detail
+    assert detail["match_months_customized"] is False, detail
+
+
+def test_月份写错要当场说清(shared, client, auth, prescreen_ready):
+    """月份认不出来要**当场**说 —— 存坏了的月份会让初筛一根候选都找不到，
+    而用户会以为「账上真没记」。"""
+    stmt_id = prescreen_ready["stmt_id"]
+    response = client.patch(shared + f"/statements/{stmt_id}/match-months", headers=auth,
+                            json={"months": ["去年"]})
+    assert response.status_code == 422, response.text
+    assert "月份" in response.json()["detail"], response.text
+
+
+def test_余额核对按声明的月份取账上的发生额(shared, client, auth, db, admin_user,
+                                            loaded, cash_subjects):
+    """9 月的对账单去对 8 月的账 → 账上取的是**8 月**的发生额。
+
+    **两边必须对着同一段账**：账上取 9 月、流水取 9 月的对账单，差额里混着
+    的就是「错位」本身，而不是「少记」。
+    """
+    stmt_id = loaded["stmt_id"]
+    card_id = loaded["card_id"]
+    _assign_all(shared, client, auth, stmt_id, cash_subjects[0]["book"].id)
+    first = cash_subjects[0]
+    maker = build_voucher_factory(db, first["book"], admin_user)
+    amount = Decimal("50000000.00")
+    maker("2026-08-15", dr=[(first["cash"].code, amount, "记卡上的收款")],
+          cr=[(first["counter"].code, amount, "记卡上的收款")])
+
+    body = _json(client.get(shared + f"/cards/{card_id}/balance", headers=auth,
+                            params={"stmt_id": stmt_id}))
+    assert body["months"] == ["2026-09"], body
+    row = next(item for item in body["books"] if item["book_id"] == first["book"].id)
+    assert _dec(row["book_debit"]) == 0, row          # 默认取 9 月 → 8 月那笔不在里头
+
+    _set_match_months(shared, client, auth, stmt_id, ["2026-08"])
+    body = _json(client.get(shared + f"/cards/{card_id}/balance", headers=auth,
+                            params={"stmt_id": stmt_id}))
+    assert body["months"] == ["2026-08"], body
+    row = next(item for item in body["books"] if item["book_id"] == first["book"].id)
+    assert _dec(row["book_debit"]) == amount, row     # 取 8 月 → 那笔收款就在里头
+
+
+def test_导出账面明细账(shared, client, auth, db, admin_user, loaded, cash_subjects):
+    """导出**账上那一本**明细账：期初、逐笔（凭证号/日期/摘要/借贷/余额）、
+    本月合计、累计 —— 取数走宿主那本明细账，不是插件自己拼的。"""
+    import io
+
+    import openpyxl
+
+    stmt_id = loaded["stmt_id"]
+    first = cash_subjects[0]
+    maker = build_voucher_factory(db, first["book"], admin_user)
+    amount = Decimal("50000000.00")
+    maker("2026-09-15", dr=[(first["cash"].code, amount, "记卡上的收款")],
+          cr=[(first["counter"].code, amount, "记卡上的收款")])
+
+    export = _json(client.get(shared + f"/cards/{loaded['card_id']}/ledger-export",
+                              headers=auth, params={"stmt_id": stmt_id}))
+    assert export["filename"].endswith(".xlsx"), export["filename"]
+    workbook = openpyxl.load_workbook(io.BytesIO(base64.b64decode(export["content_base64"])))
+    sheet = workbook.active
+    titles = [cell.value for cell in sheet[1]]
+    for want in ("账套", "科目编码", "科目名称", "日期", "凭证号", "摘要",
+                 "借方", "贷方", "余额", "对账单行"):
+        assert want in titles, titles
+
+    book_col = titles.index("账套") + 1
+    debit_col = titles.index("借方") + 1
+    credit_col = titles.index("贷方") + 1
+    kind_col = titles.index("行类型") + 1
+    summary_col = titles.index("摘要") + 1
+
+    kinds = [sheet.cell(row=r, column=kind_col).value for r in range(2, sheet.max_row + 1)]
+    assert "期初余额" in kinds, kinds
+    assert "逐笔" in kinds, kinds
+    assert "本月合计" in kinds, kinds
+
+    # 那笔 50 万的收款在表里，借方 50 万。
+    hit = None
+    for r in range(2, sheet.max_row + 1):
+        if sheet.cell(row=r, column=debit_col).value == float(amount):
+            hit = r
+            break
+    assert hit is not None, [sheet.cell(row=r, column=debit_col).value
+                             for r in range(2, sheet.max_row + 1)]
+    assert sheet.cell(row=hit, column=book_col).value == first["book"].name
+    assert sheet.cell(row=hit, column=credit_col).value in (None, 0)
+    assert "收款" in str(sheet.cell(row=hit, column=summary_col).value)
+
+
+def test_导出账面明细账按声明的月份(shared, client, auth, db, admin_user,
+                                     loaded, cash_subjects):
+    """导出的月份跟着**声明的匹配月份范围**走 —— 9 月的对账单去对 8 月的账，
+    导出来的就是 8 月那本明细账。"""
+    import io
+
+    import openpyxl
+
+    stmt_id = loaded["stmt_id"]
+    first = cash_subjects[0]
+    maker = build_voucher_factory(db, first["book"], admin_user)
+    amount = Decimal("50000000.00")
+    maker("2026-08-15", dr=[(first["cash"].code, amount, "记卡上的收款")],
+          cr=[(first["counter"].code, amount, "记卡上的收款")])
+    _set_match_months(shared, client, auth, stmt_id, ["2026-08"])
+
+    export = _json(client.get(shared + f"/cards/{loaded['card_id']}/ledger-export",
+                              headers=auth, params={"stmt_id": stmt_id}))
+    workbook = openpyxl.load_workbook(io.BytesIO(base64.b64decode(export["content_base64"])))
+    sheet = workbook.active
+    titles = [cell.value for cell in sheet[1]]
+    period_col = titles.index("期间") + 1
+    debit_col = titles.index("借方") + 1
+    periods = {sheet.cell(row=r, column=period_col).value
+               for r in range(2, sheet.max_row + 1)}
+    assert periods == {"2026-08"}, periods
+    values = [sheet.cell(row=r, column=debit_col).value for r in range(2, sheet.max_row + 1)]
+    assert float(amount) in values, values
+
+
+def test_老宿主不认窗口参数时退回旧口径(shared, client, auth, prescreen_ready):
+    """老宿主（SDK 1.3.0 及更早）的 ``entry_match`` 不认那几个关键字参数。
+
+    插件要**接住**它、退回老口径，**并把这件事说给用户听**（初筛的返回值里
+    带一句）—— 而不是让用户以为「指定了匹配月份范围，但它没生效」。
+
+    **只接「不认识这几个参数」这一种 ``TypeError``**：别的 ``TypeError``
+    是真 bug，放过去只会把问题藏起来。
+    """
+    import importlib.util
+    from datetime import date
+
+    spec = importlib.util.spec_from_file_location(
+        "sharedcard_backend", PLUGIN_DIR / "backend" / "main.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class OldHost:
+        def __init__(self):
+            self.calls = []
+
+        def entry_match(self, book_id, subject_codes, rows):
+            self.calls.append((book_id, subject_codes, len(rows)))
+            return {"pairs": [], "unmatched_row_ids": []}
+
+    old = OldHost()
+    matched, applied = module._entry_match(old, 7, ["100203"], [{"id": 1}],
+                                           None, None, 7, 30)
+    assert applied is True, "没给窗口时不走「新参数」那条路"
+    assert matched == {"pairs": [], "unmatched_row_ids": []}
+    assert old.calls == [(7, ["100203"], 1)]
+
+    class NewHost(OldHost):
+        def entry_match(self, book_id, subject_codes, rows, **kwargs):
+            self.last_kwargs = kwargs
+            self.calls.append((book_id, subject_codes, len(rows)))
+            return {"pairs": [], "unmatched_row_ids": []}
+
+    new = NewHost()
+    matched, applied = module._entry_match(new, 7, ["100203"], [{"id": 1}],
+                                           date(2026, 8, 1), date(2026, 8, 31), 60, 90)
+    assert applied is True
+    assert new.last_kwargs["date_from"] == "2026-08-01"
+    assert new.last_kwargs["date_to"] == "2026-08-31"
+    assert new.last_kwargs["primary_days"] == 60
+    assert new.last_kwargs["review_days"] == 90
+
+    # **老宿主**：参数不认识 → 抛 TypeError → 接住它、退回老口径，并报
+    # 「没生效」。
+    class AncientHost(OldHost):
+        def entry_match(self, book_id, subject_codes, rows, **kwargs):
+            # **老宿主**：只认老签名，碰到新关键字参数就报错。
+            if kwargs:
+                raise TypeError(
+                    "entry_match() got an unexpected keyword argument 'date_from'")
+            self.calls.append((book_id, subject_codes, len(rows)))
+            return {"pairs": [], "unmatched_row_ids": []}
+
+    ancient = AncientHost()
+    matched, applied = module._entry_match(ancient, 7, ["100203"], [{"id": 1}],
+                                            date(2026, 8, 1), date(2026, 8, 31), 60, 90)
+    assert applied is False, "老宿主上要报「没生效」，不能让用户以为它生效了"
+    assert matched == {"pairs": [], "unmatched_row_ids": []}
+
+    # **别的 TypeError 是真 bug**：不能一起吞掉。
+    class BrokenHost(OldHost):
+        def entry_match(self, book_id, subject_codes, rows, **kwargs):
+            raise TypeError("unsupported operand type(s) for +: 'int' and 'str'")
+
+    with pytest.raises(TypeError):
+        module._entry_match(BrokenHost(), 7, ["100203"], [{"id": 1}],
+                             date(2026, 8, 1), date(2026, 8, 31), 60, 90)
