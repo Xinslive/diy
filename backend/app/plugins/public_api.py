@@ -286,6 +286,25 @@ def _order_clauses(table, order_by):
 
 
 
+def _book_scope_clause(table, user, book_id, across_books):
+    """账套表的范围条件 —— **范围永远由宿主定**。
+
+    单账套：``book_id == ?``；跨账套：``book_id IN (该用户有授权的账套)``。
+
+    **为什么跨账套用子查询而不是把 id 列表传进来**：插件要是能指定
+    「要读哪几本账」，那它就能指定「要读哪几本账」—— 范围就成了插件的选择，
+    授权检查也就没了。子查询把集合锁死在 ``UserBook`` 上：管理员**也没有**
+    隐含的全账套权限，能读到的只有他被授权的那些本。
+
+    插件的 ``where`` 只能在这个范围**之上**再收窄（AND），收不宽。
+    """
+    if across_books:
+        from app.models.system import UserBook
+        return table.c.book_id.in_(
+            select(UserBook.book_id).where(UserBook.user_id == user.id))
+    return table.c.book_id == book_id
+
+
 def context_for(manifest, *, plugin=False):
     """给一份 manifest 造它的能力上下文。
 
@@ -952,23 +971,41 @@ def context_for(manifest, *, plugin=False):
             periods = _book_periods(db, book.id, {v.period_id for v in made})
             return [_serialize(db, v, subs, periods) for v in made]
 
-    def table_access(db, user, name, book_id, write=False):
+    def table_access(db, user, name, book_id, write=False, across_books=False):
+        """插件能碰这张表的哪个范围。
+
+        ``across_books`` —— **跨账套读**，只对账套表的**读**有效：
+        范围是「当前用户有授权的全部账套」（``UserBook``），
+        由宿主算好，插件既不能指定集合、也不能改写它。
+
+        **为什么不允许跨账套写**：写必须点名账套 —— 账套级写权限、
+        归属判断、审计留痕全都挂在「哪一本账」上。跨着写，权限就没有落点。
+        """
         if name not in declarations:
             raise HTTPException(403, "只能访问当前插件声明的数据表")
         scope = declarations[name]
         if scope == "book":
-            if type(book_id) is not int:
-                raise HTTPException(400, "账套表需要 book_id")
-            get_my_book(book_id, db, user)
-            if write:
-                require_book_write(book_id, db, user)
+            if across_books:
+                if write:
+                    raise HTTPException(400, "跨账套读取不能用于写入，写入必须点名账套")
+                if book_id is not None:
+                    raise HTTPException(400, "跨账套读取不能同时指定 book_id")
+            else:
+                if type(book_id) is not int:
+                    raise HTTPException(400, "账套表需要 book_id")
+                get_my_book(book_id, db, user)
+                if write:
+                    require_book_write(book_id, db, user)
+        elif across_books:
+            raise HTTPException(400, "全局表没有账套范围，不能跨账套读取")
         elif book_id is not None:
             raise HTTPException(400, "全局表不能指定 book_id")
         elif write and not user.is_admin:
             raise HTTPException(403, "全局配置写入需要管理员")
         return _reflected_table(pid, name, db)
 
-    def data_read(name: str, *, book_id=None, limit=100, offset=0, where=None, order_by=None):
+    def data_read(name: str, *, book_id=None, limit=100, offset=0, where=None, order_by=None,
+                  across_books=False):
         """读插件自有表的一页。
 
         旧契约只有「按主键顺序 + 最多 500 行」，长期运行的插件只能把整表读进
@@ -978,22 +1015,31 @@ def context_for(manifest, *, plugin=False):
           本表真实列，值只能是标量 —— 没有任何拼 SQL 的入口。
         - ``offset``/``limit``：分页；``limit`` 仍然夹在 1..500。
         - ``order_by``：``"字段"`` 或 ``"字段 desc"``，默认按主键。
+        - ``across_books``：**跨账套读**（只对账套表有效，见 :func:`table_access`）。
+          范围是「当前用户有授权的全部账套」，由宿主用 ``UserBook`` 子查询定死，
+          插件改不掉。行里带各自的 ``book_id``。
 
         账套范围（book scope）永远由宿主附加，过滤条件改不掉它。
         返回值仍是行列表 —— 与旧契约一致，新增能力都是可选参数。
+
+        **为什么需要跨账套读**：插件自有表里，一行落在**某一本账**里（账套级备份
+        才覆盖得到）。跨账套的业务对象（一张共享卡横跨好几本账）于是只能
+        「按账套读一遍再合并」—— 读几次就随账套数线性涨。宿主实测过：
+        一次工作台请求读 12 本账就是 12 次往返（外加每份对账单再读一遍归属，
+        变成 N×M 次），而那些表**总共只有一百多行**。
         """
         with SessionLocal() as db:
             user = principal(db)
-            table = table_access(db, user, name, book_id)
+            table = table_access(db, user, name, book_id, across_books=across_books)
             stmt = select(table)
             if declarations[name] == "book":
-                stmt = stmt.where(table.c.book_id == book_id)
+                stmt = stmt.where(_book_scope_clause(table, user, book_id, across_books))
             stmt = stmt.where(*_filter_clauses(table, where))
             stmt = stmt.order_by(*_order_clauses(table, order_by))
             stmt = stmt.offset(max(0, int(offset))).limit(max(1, min(int(limit), 500)))
             return [dict(row) for row in db.execute(stmt).mappings()]
 
-    def data_count(name: str, *, book_id=None, where=None):
+    def data_count(name: str, *, book_id=None, where=None, across_books=False):
         """符合条件的行数。
 
         与 :func:`data_read` 用同一套受限过滤条件；单独提供而不是把
@@ -1001,10 +1047,10 @@ def context_for(manifest, *, plugin=False):
         """
         with SessionLocal() as db:
             user = principal(db)
-            table = table_access(db, user, name, book_id)
+            table = table_access(db, user, name, book_id, across_books=across_books)
             stmt = select(func.count()).select_from(table)
             if declarations[name] == "book":
-                stmt = stmt.where(table.c.book_id == book_id)
+                stmt = stmt.where(_book_scope_clause(table, user, book_id, across_books))
             stmt = stmt.where(*_filter_clauses(table, where))
             return int(db.scalar(stmt) or 0)
 

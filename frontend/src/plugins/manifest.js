@@ -38,8 +38,15 @@ const ICONS = new Set(['Calendar', 'Grid', 'Document', 'DataAnalysis', 'Tools', 
  * `[a-zA-Z0-9_./-]`」。现在后端若吐绝对地址（`https://api.example.com/api/...`）
  * 也会被接受 —— 但那**不是新的口子**：剥出来的路径仍要过同一套严校验，
  * 而 origin 由 `apiBase` 决定（运维配的，不是后端能指定的）。
- * 真正被拒的仍然是：别的源（`https://evil.example/...`）、带查询串
- * （票据不许漏进 URL 之外的地方）、路径穿越（`..`）。
+ * 真正被拒的仍然是：别的源（`https://evil.example/...`）、路径穿越（`..`）。
+ *
+ * **关于查询串**：校验只看**路径**（`pathOf` 先把 `?`/`#` 之后的部分剥掉），
+ * 所以带查询串的资产 URL 不会被这里拒掉 —— 这不是疏忽，是**必须**这样：
+ * 本地开发时 Vite 的 dev server 会把运行期才知道 URL 的动态 import 改写成
+ * `__vite__injectQuery(url, 'import')`，浏览器实际请求的是
+ * `…/frontend/index.js?import`。宿主若因此 404，插件页在本地就永远是
+ * 「扩展暂不可用」。查询串不参与定位也不参与鉴权（定位靠路径、鉴权靠路径里
+ * 的票据），宿主那边同样会忽略它。
  */
 export function validatePlugin(source) {
   if (!source || typeof source !== 'object' || typeof source.id !== 'string' || !ID.test(source.id) || source.id.length > 96 || typeof source.digest !== 'string' || !DIGEST.test(source.digest) || typeof source.version !== 'string' || !VERSION.test(source.version)) throw new Error('插件标识无效')

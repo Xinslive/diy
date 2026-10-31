@@ -125,7 +125,9 @@ def validate_manifest(source: dict) -> dict:
             fail("api_version 无效")
         spec = re.sub(r"\s+(?=[<>=!~])", ",", spec.strip())
         if not any(Version(version) in SpecifierSet(spec) for version in SUPPORTED_API_VERSIONS):
-            fail("插件不兼容当前宿主 SDK", "INCOMPATIBLE_API")
+            # **说清怎么办**：只说「不兼容」，用户会去换插件 —— 实际上要换的是宿主。
+            fail("插件要求 SDK %s，当前宿主只认 %s —— 请先更新宿主，再安装这个插件。"
+                 % (spec, "、".join(SUPPORTED_API_VERSIONS)), "INCOMPATIBLE_API")
     except (InvalidSpecifier, TypeError) as exc:
         raise PluginError("INVALID_MANIFEST", "api_version 无效") from exc
     _unique_list(doc["permissions"], PERMISSIONS)

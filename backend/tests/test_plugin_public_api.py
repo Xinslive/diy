@@ -674,3 +674,123 @@ def test_换一个用户不会拿到上一个人的调用者(plugin_env, client,
     # 紧接着没授权的用户来 —— 必须被拒。
     response = client.get(path, params={'book_id': book.id}, headers=plain_auth)
     assert response.status_code == 404, response.text
+
+
+def test_跨账套读只见有授权的账套(plugin_env, client, auth, plain_auth, plain_user, admin_user, book, db):
+    """跨账套读的范围**由宿主定死**：当前用户被授权的账套，一个不多一个不少。
+
+    这条钉的是跨账套读的**权限边界**，不是它的性能收益：
+
+    · 插件只能「要全部」，不能「要哪几本」—— 集合是 ``UserBook`` 子查询，
+      插件既不能指定也不能改写；
+    · **管理员也没有隐含的全账套权限** —— 管理员只看得见他被授权的那几本；
+    · 默认仍然 fail-closed：不传 ``across_books`` 却不点名 ``book_id``
+      依旧 400，老插件漏传参数不会静默放宽成「全账套可读」；
+    · 跨账套不能同时点名账套（那两者的语义互相矛盾）；
+    · 全局表没有账套范围，跨账套读它没有意义 —— 直接 400；
+    · 写仍然必须点名账套。
+    """
+    from app.models.book import Book
+
+    build, restart = plugin_env
+    pid = 'com.test.across'
+    name = table_prefix(pid) + 'items'
+    gname = table_prefix(pid) + 'settings'
+    code = f'''def register(registrar, ctx):
+    def rows(payload: dict):
+        return ctx.data.read("{name}", book_id=payload.get("book_id"),
+            across_books=payload.get("across_books", False), where=payload.get("where"))
+    def count(payload: dict):
+        return ctx.data.count("{name}", book_id=payload.get("book_id"),
+            across_books=payload.get("across_books", False))
+    def insert(book_id: int, payload: dict):
+        return ctx.data.insert("{name}", payload, book_id=book_id)
+    def global_rows(payload: dict):
+        return ctx.data.read("{gname}", across_books=payload.get("across_books", False))
+    registrar.post("/rows", rows)
+    registrar.post("/count", count)
+    registrar.post("/insert", insert)
+    registrar.post("/global", global_rows)
+'''.encode()
+    settings_migration = f'''from alembic import op
+import sqlalchemy as sa
+revision = "0002_settings"
+down_revision = "0001_items"
+
+def upgrade():
+    op.create_table("{gname}", sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("key", sa.String(120), nullable=False),
+        sa.Column("value", sa.String(200), nullable=False))
+
+def downgrade():
+    op.drop_table("{gname}")
+'''.encode()
+    raw, manifest, _, _ = build(plugin_id=pid, tables=True,
+        files={'backend/main.py': code,
+               'frontend/index.js': b'export default host => ({render: () => host.h("div")});',
+               'migrations/versions/0002_settings.py': settings_migration},
+        edit=lambda m: m.update(permissions=['plugin_data:rw', 'book:read'],
+            tables=[{'name': name, 'scope': 'book'},
+                    {'name': gname, 'scope': 'global', 'purpose': 'configuration'}]))
+    assert client.post('/api/system/plugins/install', files={'file': ('across.cwp', raw)}, headers=auth).status_code == 200
+    restart()
+    # 一次把两个人都授上：这个接口是**整组替换**语义，连着发两次会把前一次
+    # 授的人撤掉。
+    assert client.put(f'/api/system/plugins/{pid}/users', headers=auth,
+                      json={'user_ids': [plain_user.id, admin_user.id]}).status_code == 200
+
+    # 三本账：A、B 授权给普通用户；C 只授权给管理员；B 不授权给管理员。
+    other_b = Book(company_name='另一家公司', name='另一本账', start_year=2026, start_month=1)
+    hidden = Book(company_name='第三家公司', name='第三本账', start_year=2026, start_month=1)
+    db.add_all([other_b, hidden]); db.flush()
+    db.add_all([
+        UserBook(user_id=plain_user.id, book_id=book.id, role='ACCOUNTANT'),
+        UserBook(user_id=plain_user.id, book_id=other_b.id, role='ACCOUNTANT'),
+        UserBook(user_id=admin_user.id, book_id=hidden.id, role='OWNER'),
+    ])
+    db.commit()
+
+    path = f'/api/plugins/{pid}'
+    # 三本账各插一行：A、B 由普通用户插（他是这两本的会计），C 由管理员插。
+    assert client.post(path + '/insert', params={'book_id': book.id},
+                        json={'label': 'a'}, headers=plain_auth).status_code == 200
+    assert client.post(path + '/insert', params={'book_id': other_b.id},
+                        json={'label': 'b'}, headers=plain_auth).status_code == 200
+    assert client.post(path + '/insert', params={'book_id': hidden.id},
+                        json={'label': 'c'}, headers=auth).status_code == 200
+
+    # 普通用户跨账套读：只有 A 与 B，**看不到 C**（他没被授权）。
+    r = client.post(path + '/rows', json={'across_books': True}, headers=plain_auth)
+    assert r.status_code == 200, r.text
+    assert sorted(row['label'] for row in r.json()) == ['a', 'b']
+    assert {row['book_id'] for row in r.json()} == {book.id, other_b.id}
+    # count 与 read 的范围一致。
+    r = client.post(path + '/count', json={'across_books': True}, headers=plain_auth)
+    assert r.json() == 2
+
+    # **管理员也没有隐含的全账套权限**：他只被授权了 A（夹具给的 OWNER）与 C，
+    # B 不在其中，所以 B 的那一行他也读不到。
+    r = client.post(path + '/rows', json={'across_books': True}, headers=auth)
+    assert r.status_code == 200, r.text
+    assert sorted(row['label'] for row in r.json()) == ['a', 'c']
+
+    # 跨账套不能同时点名账套（两者语义互相矛盾）。
+    r = client.post(path + '/rows', json={'across_books': True, 'book_id': book.id}, headers=plain_auth)
+    assert r.status_code == 400, r.text
+    # 默认仍然 fail-closed：不点名账套就 400，不会静默变成「全账套可读」。
+    # （body 不能是空对象 —— 空 body 先被宿主按「载体必填」挡成 422。）
+    r = client.post(path + '/rows', json={'across_books': False}, headers=plain_auth)
+    assert r.status_code == 400, r.text
+    r = client.post(path + '/count', json={'across_books': False}, headers=plain_auth)
+    assert r.status_code == 400, r.text
+    # 全局表没有账套范围，跨账套读它没有意义。
+    r = client.post(path + '/global', json={'across_books': True}, headers=plain_auth)
+    assert r.status_code == 400, r.text
+    # 写仍然必须点名账套：不给 book_id 直接 422（缺参数），连不到写能力。
+    r = client.post(path + '/insert', json={'label': 'x'}, headers=plain_auth)
+    assert r.status_code == 422, r.text
+    # 过滤条件只能在授权范围**之内**收窄，不能放宽到没授权的那本账。
+    r = client.post(path + '/rows', json={'across_books': True, 'where': {'book_id': hidden.id}},
+                    headers=plain_auth)
+    assert r.status_code == 200, r.text
+    assert r.json() == []

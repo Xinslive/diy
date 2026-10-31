@@ -446,7 +446,25 @@ def _verified_assets(plugin_id: str, digest: str):
 @router.get("/api/plugins/assets/{plugin_id}/{digest}/{path:path}")
 def asset(plugin_id: str, digest: str, path: str, request: Request, db: Session = Depends(get_db)):
     try:
-        if not settings.plugin_enabled or request.url.query or not DIGEST_RE.fullmatch(digest):
+        # **不因「带了查询串」而拒绝。**
+        #
+        # 查询串在这条路由里**不参与任何判定**：定位文件靠 path，鉴权靠路径里
+        # 的票据（HMAC 覆盖 plugin_id|digest|到期），文件本身又由签名清单钉死
+        # （verify_directory 比对整包文件集合）。多一个查询串，既换不出别的文件，
+        # 也绕不开票据。
+        #
+        # **为什么曾经拒绝过，害得本地开发装插件后插件页永远打不开**：
+        # Vite 的 dev server 会把它转译过的**动态 import**（URL 是运行期才知道
+        # 的那种）改写成 `__vite__injectQuery(url, 'import')` —— 于是浏览器
+        # 实际请求的是 `…/frontend/index.js?import`。这条路由从前把「有任何
+        # 查询串」当成非法请求直接 404，前端于是拿不到插件的 index.js，
+        # Vue 的异步组件走进 errorComponent，页面上只剩一句「扩展暂不可用」。
+        # （`@vite-ignore` 只压掉 Vite 的告警，压不掉这个注入；Vite 6 的
+        # injectQuery 也不认「URL 是不是相对路径」，没有前端侧的绕法。）
+        #
+        # 生产不受影响：打包后的产物里这个 import 原样保留，而生产是 nginx
+        # 直连后端取的静态资源，没有 Vite 在中间加东西。
+        if not settings.plugin_enabled or not DIGEST_RE.fullmatch(digest):
             raise not_found()
         path = safe_path(path)
         if not path.startswith("frontend/"):
