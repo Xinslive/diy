@@ -44,6 +44,11 @@ BACKEND_ROOT = os.environ.get("CWQ_BACKEND_ROOT", "/www/wwwroot/acct.xins.live/b
 os.chdir(BACKEND_ROOT)
 sys.path.insert(0, BACKEND_ROOT)
 
+#: **模块级导入**：``_measure`` 是模块级函数，它要用 ``public_api.principal_scope``
+#: —— 那个名字必须是模块级的，局部导入的话这里会 NameError，
+#: 而且错误发生在**每一次测量里**，看起来像「接口报错了」。
+from app.plugins import public_api  # noqa: E402
+
 #: 每次能力调用都会触发一次「解析调用者」。探针要数清楚**调用了多少次**。
 CALL_COUNTS: collections.Counter = collections.Counter()
 
@@ -178,8 +183,6 @@ def main() -> int:
     directory = sys.argv[1]
     card_id = int(sys.argv[2]) if len(sys.argv) > 2 else 3
     user_id = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-
-    from app.plugins import public_api
 
     manifest, plugin = _load_plugin(directory)
 

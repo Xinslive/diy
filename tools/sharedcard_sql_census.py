@@ -30,6 +30,7 @@ sys.path.insert(0, BACKEND_ROOT)
 import importlib.util  # noqa: E402
 
 from app.core.db import engine  # noqa: E402
+from app.plugins import public_api  # noqa: E402
 from app.plugins.public_api import context_for, current_principal  # noqa: E402
 
 #: SQL 分类。**顺序有意义**：先匹配到的先算。
@@ -133,7 +134,11 @@ def main() -> int:
         by_statement[(category, " ".join(statement.split())[:110])] += 1
 
     started = time.perf_counter()
-    action()
+    # **必须包在 ``principal_scope()`` 里**：宿主网关在每个请求入口就是
+    # 这么包着的。不开这个区间，普查量到的就是「每次能力调用都重新解析
+    # 调用者」那条旧路径 —— 会把 SQL 条数算高一倍多。
+    with public_api.principal_scope():
+        action()
     elapsed = (time.perf_counter() - started) * 1000
 
     print(f"{label}  共 {sum(counts.values())} 条 SQL，"
