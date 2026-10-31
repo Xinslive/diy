@@ -1,4 +1,4 @@
-import { http } from './client'
+import { http, isCanceled } from './client'
 import { fontsReady } from '@/utils/printFont'
 import { errorText } from '@/utils/errorText'
 import { ElMessage } from 'element-plus'
@@ -40,8 +40,8 @@ export const copyTemplate = (bookId, id) => http.post(`/books/${bookId}/print/te
 // ---------------------------------------------------------------------
 
 /** 取回打印页的 HTML 源码（**本文件内部用**，不走 window.open —— 那样不带鉴权） */
-const fetchPrintHtml = (path, params = {}) =>
-  http.get(path, { params, responseType: 'text' }).then((r) => r.data)
+const fetchPrintHtml = (path, params = {}, options = {}) =>
+  http.get(path, { ...options, params, responseType: 'text' }).then((r) => r.data)
 
 /**
  * 取回打印页的 HTML，出错时把服务端的话原样弹出来，返回 null。
@@ -49,10 +49,11 @@ const fetchPrintHtml = (path, params = {}) =>
  * 「预览」和「打印」共用这一份 HTML 字符串，所以屏幕上看到的版式和纸上印出来的
  * 一定是同一份渲染 —— 这也正是打印前要给预览的意义。
  */
-export async function loadPrintHtml(path, params = {}) {
+export async function loadPrintHtml(path, params = {}, options = {}) {
   try {
-    return await fetchPrintHtml(path, params)
+    return await fetchPrintHtml(path, params, options)
   } catch (e) {
+    if (isCanceled(e)) return null
     let data = e?.response?.data
     // HTML 请求使用 responseType=text，失败时的 JSON 也会作为字符串返回。
     if (typeof data === 'string') {
@@ -91,13 +92,16 @@ export function printWindow(w) {
   // 与用户看到的预览不是同一份版式，正是「所见即所得」要消灭的东西。
   //
   // 字体加载失败时不能卡住打印：fontsReady 内部有上限，超时就放行。
-  fontsReady(w.document).then(() => {
+  Promise.all([
+    fontsReady(w.document),
+    ...Array.from(w.document.images, img => img.decode()),
+  ]).then(() => {
     // 等字体与布局稳定再唤起打印，否则 Chrome 偶尔会打出空白页
     setTimeout(() => {
       w.focus()
       w.print()
     }, 600)
-  })
+  }).catch(() => ElMessage.error('发票图片加载失败，请重新生成预览后打印'))
 }
 
 /**

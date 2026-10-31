@@ -54,6 +54,7 @@ from app.printing.template import (
     ledger_book_rows_per_page,
     optimize_print_order,
     render_ledger_book_page,
+    render_invoice_page,
     render_table_page,
     wrap_pages,
     render_voucher_sheet,
@@ -761,9 +762,8 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
     每张纸上配哪两格不变。打印机把先印的那张压在最上面还是把最后印的那张压在
     最上面，决定了这里要不要倒着来（用户 2026-10-30 批注 3）。
 
-    ``print_invoices`` 是**「发票打印」开关**：每张纸印完之后，把它那几张凭证
-    各自的发票原件接在后面印（发票原件就是凭证的附件，见
-    ``app/invoice/print_pages.py``）。
+    ``print_invoices`` 把标准发票接在凭证末片之后，合并成半页队列再拼版；
+    非标准票独占整页，集中放在队列前面。
     """
     from app.accounting.vouchers import query_vouchers
 
@@ -833,6 +833,10 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
             "total_credit": 0, "remark": "", "attachments": 0,
         }, rows_per_page)
 
+    prefix: list[str] = []
+    if print_invoices and slots == 2:
+        pieces, prefix = _with_invoice_pieces(db, book, tpl, pieces)
+
     # **打印顺序**（用户 2026-10-30 批注）：这一步必须在**分片之后** ——
     # 超行凭证被拆成好几格，按格排完，裁开合并回去仍是原顺序（见
     # ``printing/template.py::optimize_print_order``）。
@@ -847,46 +851,28 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
     if reverse:
         sheets = list(reversed(sheets))
 
-    total_pages = len(sheets)
+    total_pages = len(prefix) + len(sheets)
 
     ctx = pv.context(db, book, period)
-    docs = [render_voucher_sheet(tpl, ctx, group, i, total_pages,
+    docs = prefix + [render_voucher_sheet(tpl, ctx, group, i, total_pages,
                                  data_images=print_invoices)
-            for i, group in enumerate(sheets, start=1)]
-    if print_invoices:
-        docs = _attach_invoice_pages(db, book, tpl, sheets, docs)
+            for i, group in enumerate(sheets, start=len(prefix) + 1)]
 
     return _with_note(wrap_pages(docs), note)
 
 
-def _attach_invoice_pages(db: Session, book: Book, tpl: dict,
-                          sheets: list[list[dict]], docs: list[str]) -> list[str]:
-    """把发票页接在各自那张纸后面。
-
-    **接在「那张纸」后面，不是全部堆到最后**：一张纸上有哪几张凭证，
-    这张纸印完就印它们各自的发票 —— 剪下来时发票跟它的凭证挨着。
-
-    **拆成多格的凭证只印一次发票**：那张凭证在纸上占了几格，发票只有一张。
-    """
+def _with_invoice_pieces(db: Session, book: Book, tpl: dict,
+                         pieces: list[dict]) -> tuple[list[dict], list[str]]:
+    """半页队列不留占位：凭证末片后接原票，长票整张前置供人工回插。"""
     from app.invoice.print_pages import (
         MAX_INVOICE_PAGES, invoice_pages_html, pages_by_voucher,
     )
 
-    # 每张纸上的凭证（按格序）；拆成多片的凭证只认第一片。
-    by_sheet: dict[int, list[int]] = {}
-    seen: set[int] = set()
-    for index, group in enumerate(sheets):
-        for piece in group:
-            voucher_id = piece.get("id")
-            if not voucher_id or voucher_id in seen:
-                continue
-            seen.add(voucher_id)
-            by_sheet.setdefault(index, []).append(voucher_id)
-    if not by_sheet:
-        return docs
-    refs = pages_by_voucher(db, book.id,
-                            [vid for ids in by_sheet.values() for vid in ids])
-    # **发票页也有量闸**：一张发票页是一张 A4 的 PNG，走 base64 进 HTML
+    ids = list(dict.fromkeys(piece["id"] for piece in pieces if piece.get("id")))
+    if not ids:
+        return pieces, []
+    refs = pages_by_voucher(db, book.id, ids)
+    # **发票页也有量闸**：每张原票页生成一份 PNG，走 base64 进 HTML
     # 还要再涨三分之一 —— 一次几百张就是几十 MB 的字符串（与 Excel 通道
     # 那道行数闸同一件事：超了明说，不静默截断出缺页的账）。
     total = sum(item.page_span for items in refs.values() for item in items)
@@ -896,15 +882,23 @@ def _attach_invoice_pages(db: Session, book: Book, tpl: dict,
             f"这次打印要带 {total} 张发票，超过单次上限 {MAX_INVOICE_PAGES} 张。"
             "请缩小打印范围（按期间分段打印）后重试。")
     try:
-        pages = invoice_pages_html(tpl, refs)
+        pages = invoice_pages_html(refs)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
-    out: list[str] = []
-    for index, doc in enumerate(docs):
-        out.append(doc)
-        for voucher_id in by_sheet.get(index, []):
-            out.extend(pages.get(voucher_id, []))
-    return out
+    out: list[dict] = []
+    prefix: list[str] = []
+    for piece in pieces:
+        out.append(piece)
+        if piece.get("slice_index", 1) != piece.get("slice_total", 1):
+            continue
+        voucher_id = piece.get("id")
+        label = f'{piece.get("voucher_date", "")} {piece.get("voucher_no", "")} 发票附件'
+        for page in pages.pop(voucher_id, []):
+            if page.full_page:
+                prefix.append(render_invoice_page(tpl, page.html, label))
+            else:
+                out.append({"invoice_html": page.html})
+    return out, prefix
 
 
 def _with_note(doc: str, note: str) -> str:

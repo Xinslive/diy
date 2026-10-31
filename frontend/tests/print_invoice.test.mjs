@@ -74,7 +74,7 @@ t('发票页由发票模块渲染（不是打印模板里硬写的）', () => {
 
 const { errorText } = await import('data:text/javascript;base64,' +
   Buffer.from(read('../src/utils/errorText.js')).toString('base64'))
-const makeLoader = new Function('http', 'ElMessage', 'fontsReady', 'errorText',
+const makeLoader = new Function('http', 'ElMessage', 'fontsReady', 'errorText', 'isCanceled',
   read('../src/api/print.js').replace(/^import .*$/gm, '').replace(/\bexport /g, '') +
   '\nreturn loadPrintHtml')
 const detail = '发票原件无法打印（批次 1，第 1 页），请检查原件'
@@ -85,13 +85,82 @@ for (const [data, expected] of [
 ]) {
   const messages = []
   const load = makeLoader({ get: async () => { throw { response: { data } } } },
-    { error: message => messages.push(message) }, null, errorText)
+    { error: message => messages.push(message) }, null, errorText, () => false)
   const result = await load('/print/vouchers.html', { print_invoices: true })
   t('原件读取失败的原因能显示给用户', () => {
     assert.equal(result, null)
     assert.deepEqual(messages, [expected])
   })
 }
+
+const canceledMessages = []
+const canceledLoad = makeLoader({ get: async () => { throw { code: 'ERR_CANCELED' } } },
+  { error: message => canceledMessages.push(message) }, null, errorText, e => e.code === 'ERR_CANCELED')
+assert.equal(await canceledLoad('/print/vouchers.html'), null)
+t('取消过期预览不报错', () => assert.deepEqual(canceledMessages, []))
+
+const controllerSource = DIALOG_CODE.slice(DIALOG_CODE.indexOf('let token = 0'),
+  DIALOG_CODE.indexOf('watch(() => props.modelValue'))
+const makeController = new Function('props', 'loading', 'printing', 'html', 'error', 'visible',
+  'buildParams', 'loadPrintHtml', 'openPrintWindow', 'printWindow',
+  controllerSource + '\nreturn { refreshPreview, doPrint, stopPreview }')
+const loading = { value: false }, printing = { value: false }, html = { value: '' }
+const error = { value: '' }, visible = { value: true }, requests = [], printed = []
+const controller = makeController({ path: '/print/vouchers.html' }, loading, printing, html,
+  error, visible, () => ({ print_invoices: true }),
+  (path, params, options) => new Promise(resolve => requests.push({ options, resolve })),
+  doc => ({ doc }), w => printed.push(w.doc))
+const oldRequest = controller.refreshPreview()
+const newRequest = controller.refreshPreview()
+t('换设置时取消旧预览请求', () => assert.equal(requests[0].options.signal.aborted, true))
+requests[1].resolve('<html>new preview</html>')
+await newRequest
+requests[0].resolve('<html>old preview</html>')
+await oldRequest
+controller.doPrint()
+t('打印复用最新预览而不再次下载', () => {
+  assert.equal(requests.length, 2)
+  assert.deepEqual(printed, ['<html>new preview</html>'])
+  assert.equal(visible.value, false)
+})
+visible.value = true
+const pendingRequest = controller.refreshPreview()
+controller.doPrint()
+controller.stopPreview()
+requests[2].resolve(null)
+await pendingRequest
+t('预览未完成不能打印旧结果，关闭后取消加载', () => {
+  assert.equal(printed.length, 1)
+  assert.equal(requests[2].options.signal.aborted, true)
+  assert.equal(loading.value, false)
+})
+
+const makePrintWindow = new Function('http', 'ElMessage', 'fontsReady', 'errorText', 'isCanceled', 'setTimeout',
+  read('../src/api/print.js').replace(/^import .*$/gm, '').replace(/\bexport /g, '') + '\nreturn printWindow')
+let decodeImage, printCount = 0
+const imageReady = new Promise(resolve => { decodeImage = resolve })
+const printLoaded = makePrintWindow(null, { error: () => assert.fail('图片加载应成功') },
+  () => Promise.resolve(), errorText, () => false, fn => fn())
+printLoaded({ document: { images: [{ decode: () => imageReady }] }, focus() {}, print() { printCount++ } })
+await Promise.resolve()
+t('图片尚未解码时不唤起打印', () => assert.equal(printCount, 0))
+decodeImage()
+await imageReady
+await Promise.resolve()
+await Promise.resolve()
+t('图片解码完成后才打印', () => assert.equal(printCount, 1))
+const imageErrors = []
+const printBroken = makePrintWindow(null, { error: message => imageErrors.push(message) },
+  () => Promise.resolve(), errorText, () => false, fn => fn())
+printBroken({ document: { images: [{ decode: () => Promise.reject(new Error('broken image')) }] },
+  focus() {}, print() { printCount++ } })
+await Promise.resolve()
+await Promise.resolve()
+await Promise.resolve()
+t('图片加载失败时阻止打印并说明原因', () => {
+  assert.equal(printCount, 1)
+  assert.equal(imageErrors.length, 1)
+})
 
 console.log('\n通过 ' + pass + ' / 失败 ' + fail)
 process.exit(fail ? 1 : 0)

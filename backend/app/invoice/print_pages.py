@@ -18,8 +18,11 @@ import base64
 import logging
 import struct
 import zlib
+from collections import OrderedDict
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Iterable
 
 import pypdfium2 as pdfium
@@ -28,7 +31,6 @@ from sqlalchemy.orm import Session
 
 from app.invoice import storage
 from app.models import InvoiceBatch, InvoiceRecord
-from app.printing.template import render_invoice_page
 
 log = logging.getLogger("cwq.invoice.print")
 
@@ -45,6 +47,11 @@ MAX_INVOICE_PAGES = 200
 #: 再往上调只是让同一张纸的体积翻倍（data URI 走 base64，还要再涨三分之一）。
 PAGE_DPI = 150
 _PAGE_SCALE = PAGE_DPI / 72
+_CACHE_LIMIT = 32 * 1024 * 1024
+_cache: OrderedDict[tuple, tuple[bytes, int, int]] = OrderedDict()
+_cache_bytes = 0
+# 本打印路径串行调用 PDFium，同时保护有容量上限的缓存。
+_render_lock = RLock()
 
 
 @dataclass(frozen=True)
@@ -56,6 +63,12 @@ class InvoicePage:
     file_path: str      # 批次合并 PDF 的相对路径
     page_index: int     # 这张发票在合并 PDF 里的起始页（0 起）
     page_span: int      # 分页票占几页（1 = 整张票一页）
+
+
+@dataclass(frozen=True)
+class InvoicePrintPage:
+    html: str
+    full_page: bool
 
 
 def _png_bytes(width: int, height: int, rows: list[bytes]) -> bytes:
@@ -78,17 +91,14 @@ def _png_bytes(width: int, height: int, rows: list[bytes]) -> bytes:
             + _chunk(b"IEND", b""))
 
 
-def _render_page_png(path: Path, page_index: int) -> tuple[bytes, int, int]:
+def _render_page_png(document: pdfium.PdfDocument, page_index: int) -> tuple[bytes, int, int]:
     """把 PDF 的第 ``page_index`` 页（0 起）渲染成 PNG 字节，返回 (数据, 宽, 高)。
 
-    pdfium 给的是 **BGR** 字节流（每行 ``stride`` 字节、每像素 ``n_channels``
-    个通道），PNG 要 RGB —— 换通道用切片赋值做，不在 Python 层逐像素循环
-    （一张 A4 有两百多万个点，逐像素循环会让每次打印多等好几秒）。
+    让 PDFium 直接输出 RGB，避免再在 Python 层复制、交换每行通道。
     """
-    document = pdfium.PdfDocument(str(path))
+    page = document[page_index]
     try:
-        page = document[page_index]
-        bitmap = page.render(scale=_PAGE_SCALE)
+        bitmap = page.render(scale=_PAGE_SCALE, rev_byteorder=True)
         try:
             width, height = bitmap.width, bitmap.height
             stride, channels = bitmap.stride, bitmap.n_channels
@@ -96,22 +106,32 @@ def _render_page_png(path: Path, page_index: int) -> tuple[bytes, int, int]:
         finally:
             bitmap.close()
     finally:
-        document.close()
-
-    rows = []
-    for y in range(height):
-        row = raw[y * stride: y * stride + width * channels]
-        rgb = bytearray(width * 3)
-        rgb[0::3] = row[2::3]      # R
-        rgb[1::3] = row[1::3]      # G
-        rgb[2::3] = row[0::3]      # B
-        rows.append(bytes(rgb))
+        page.close()
+    rows = [raw[y * stride:y * stride + width * channels] for y in range(height)]
     return _png_bytes(width, height, rows), width, height
+
+
+def _cached_page(path: Path, page_index: int, document: pdfium.PdfDocument) -> tuple[bytes, int, int]:
+    global _cache_bytes
+    stat = path.stat()
+    key = (str(path.resolve()), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, page_index)
+    if key in _cache:
+        _cache.move_to_end(key)
+        return _cache[key]
+    rendered = _render_page_png(document, page_index)
+    size = len(rendered[0])
+    if size <= _CACHE_LIMIT:
+        while _cache and _cache_bytes + size > _CACHE_LIMIT:
+            _cache_bytes -= len(_cache.popitem(last=False)[1][0])
+        _cache[key] = rendered
+        _cache_bytes += size
+    return rendered
 
 
 def page_data_uri(path: Path, page_index: int) -> tuple[str, int, int]:
     """一页发票的 data URI（PNG）与它的像素尺寸。"""
-    data, width, height = _render_page_png(path, page_index)
+    with _render_lock, pdfium.PdfDocument(str(path)) as document:
+        data, width, height = _cached_page(path, page_index, document)
     return "data:image/png;base64," + base64.b64encode(data).decode("ascii"), width, height
 
 
@@ -145,23 +165,41 @@ def pages_by_voucher(db: Session, book_id: int,
     return out
 
 
-def invoice_pages_html(tpl: dict, refs: dict[int, list[InvoicePage]]) -> dict[int, list[str]]:
-    """这些凭证的发票页（HTML），一张发票一页。
+def invoice_pages_html(refs: dict[int, list[InvoicePage]]) -> dict[int, list[InvoicePrintPage]]:
+    """读取原票；标准 210×140 mm 票占半页，其余票整张前置。
 
     打开发票打印后，原件缺失或页码错误必须报错，不能静默漏印附件。
 
     ``refs`` 是 :func:`pages_by_voucher` 的结果 —— **查**与**渲染**分开，
     是为了让接口层能在渲染之前先量一量这次要印多少张（量闸在那儿）。
     """
-    out: dict[int, list[str]] = {}
-    for voucher_id, items in refs.items():
-        pages: list[str] = []
-        for item in items:
-            for offset in range(item.page_span):
-                page_index = item.page_index + offset
+    out: dict[int, list[InvoicePrintPage]] = {}
+    # 每个批次只打开一次，关闭后仅缓存 PNG 字节，不保留 PDFium 对象。
+    with _render_lock, ExitStack() as stack:
+        documents = {}
+        for voucher_id, items in refs.items():
+            pages: list[InvoicePrintPage] = []
+            for item in items:
+                page_index = item.page_index
                 try:
-                    uri, width, height = page_data_uri(
-                        storage.path_for(item.file_path), page_index)
+                    path = storage.path_for(item.file_path)
+                    if path not in documents:
+                        documents[path] = stack.enter_context(pdfium.PdfDocument(str(path)))
+                    document = documents[path]
+                    indices = range(item.page_index, item.page_index + item.page_span)
+                    sizes = []
+                    for page_index in indices:
+                        sizes.append(document.get_page_size(page_index))
+                    # 多页原票中任何一页为长票，整张票都放在前面，续页不拆散。
+                    full_page = any(abs(w * 25.4 / 72 - 210) > 2 or
+                                    abs(h * 25.4 / 72 - 140) > 2 for w, h in sizes)
+                    for page_index in indices:
+                        data, width, height = _cached_page(path, page_index, document)
+                        uri = "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+                        pages.append(InvoicePrintPage(
+                            f'<img src="{uri}" width="{width}" height="{height}" alt="发票原件">',
+                            full_page,
+                        ))
                 except (OSError, ValueError, IndexError, pdfium.PdfiumError) as exc:
                     log.warning("发票页渲染失败（批次 %s 第 %s 页）：%s",
                                 item.batch_id, page_index, exc)
@@ -169,7 +207,6 @@ def invoice_pages_html(tpl: dict, refs: dict[int, list[InvoicePage]]) -> dict[in
                         f"发票原件无法打印（批次 {item.batch_id}，第 {page_index + 1} 页），"
                         "请检查原件；如只打印凭证，请关闭“发票打印”"
                     ) from exc
-                pages.append(render_invoice_page(tpl, uri, width, height))
-        if pages:
-            out[voucher_id] = pages
+            if pages:
+                out[voucher_id] = pages
     return out

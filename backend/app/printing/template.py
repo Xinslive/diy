@@ -962,11 +962,13 @@ table.grid tfoot td {{ font-weight:700; }}
 .voucher-sheet.flow-rows {{ grid-template-columns:minmax(0,1fr); grid-template-rows:repeat(2,minmax(0,1fr)); }}
 .voucher-sheet.flow-columns {{ grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-rows:minmax(0,1fr); }}
 .voucher-slot {{ position:relative; min-width:0; min-height:0; overflow:hidden; }}
-/* 发票页：整张纸就是那张发票原件。
-   **图按原比例缩到版心里**，不裁也不拉 —— 票面的大小比例是它的一部分，
-   横向的票就横着放，纸型跟着模板的方向走。 */
+/* 标准票沿用凭证的半页网格；长票独占整页，原件等比缩放，不裁切。 */
+.invoice-slot {{ display:flex; align-items:center; justify-content:center; }}
+.invoice-slot img {{ max-width:100%; max-height:100%; width:auto; height:auto; }}
 .invoice-page {{ width:100%; height:calc({h}mm - {mt}mm - {mb}mm);
-  display:flex; align-items:center; justify-content:center; overflow:hidden; }}
+  display:flex; flex-direction:column; overflow:hidden; }}
+.invoice-label {{ height:6mm; flex:none; font-size:9pt; }}
+.invoice-image {{ display:flex; flex:1; min-height:0; width:100%; align-items:center; justify-content:center; }}
 .invoice-page img {{ max-width:100%; max-height:100%; width:auto; height:auto; }}
 .voucher-element {{ position:absolute; overflow:hidden; white-space:pre-wrap;
   word-break:break-word; line-height:1.3; padding:0 1mm; }}
@@ -2177,11 +2179,12 @@ def render_voucher_sheet(tpl: dict, ctx: dict, vouchers: list[dict],
     flow = "flow-columns" if tpl.get("orientation") == "landscape" else "flow-rows"
     inner = ""
     for v in vouchers:
-        elements = "".join(
+        elements = v.get("invoice_html") or "".join(
             _voucher_element_html(tpl, ctx, v, el, page, total_pages)
             for el in (tpl.get("elements") or []) if el.get("visible", True)
         )
-        inner += f'<div class="voucher-slot">{elements}</div>'
+        cls = "voucher-slot invoice-slot" if v.get("invoice_html") else "voucher-slot"
+        inner += f'<div class="{cls}">{elements}</div>'
 
     doc_title = _esc((tpl.get("title") or {}).get("text", "") or "记 账 凭 证")
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -2196,27 +2199,16 @@ def render_voucher_sheet(tpl: dict, ctx: dict, vouchers: list[dict],
 </div></body></html>"""
 
 
-def render_invoice_page(tpl: dict, data_uri: str, width: int, height: int) -> str:
-    """一张**发票原件**页：整张纸就是那张票。
-
-    **为什么是图片而不是 PDF**：打印页是一份 HTML，浏览器只肯把它认得的
-    图片印出来 —— ``<embed>``/``<iframe>`` 里那份 PDF 在 Chrome 的打印
-    预览里是**空的**（PDF 插件不参与页面打印）。所以发票只能渲染成图片。
-
-    **为什么是完整的一份 HTML**：``wrap_pages`` 合并多页时只取每页
-    ``<body>`` 里的内容（各页的 head 用第一页的那份）—— 这一页也得是
-    一份完整文档，body 里那一段才会被留下。
-    """
+def render_invoice_page(tpl: dict, image: str, label: str) -> str:
+    """长票单页，并在原票之外标明对应凭证；标准票由凭证网格排版。"""
+    inner = (f'<div class="invoice-page"><div class="invoice-label">{_esc(label)}</div>'
+             f'<div class="invoice-image">{image}</div></div>')
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 {print_csp_meta(tpl, data_images=True)}
 <title>发票原件</title>
 {font_stylesheet_link(tpl)}
 <style>{_page_css(tpl)}</style></head><body>
-<div class="page">
-  <div class="invoice-page">
-    <img src="{data_uri}" width="{width}" height="{height}" alt="发票原件">
-  </div>
-</div>
+<div class="page">{inner}</div>
 </body></html>"""
 
 

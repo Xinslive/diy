@@ -57,11 +57,7 @@
             <el-switch v-model="reverseOn" @change="refreshPreview" />
           </el-form-item>
 
-          <!-- 「发票打印」（用户 2026-10-31 批注）：每张纸印完之后，把它那
-               几张凭证各自的发票原件接在后面印 —— 发票原件就是凭证的附件
-               （发票导入生成凭证时 attachments=1），剪下来就能订在一起。
-
-               **只在一页两张的模板上露出这个开关**（用户点名）。 -->
+          <!-- 标准原票与凭证连续拼成半页队列，长票整页前置；只在两张模板上显示。 -->
           <el-form-item v-if="isVoucher && isTwoUp" label="发票打印">
             <el-switch v-model="invoiceOn" @change="refreshPreview" />
           </el-form-item>
@@ -114,7 +110,7 @@
         <el-tag v-if="loading" size="small" type="info" effect="plain">生成预览中…</el-tag>
       </span>
       <el-button @click="visible = false">取消</el-button>
-      <el-button type="primary" :loading="printing" @click="doPrint">
+      <el-button type="primary" :loading="printing" :disabled="loading || !!error || !html" @click="doPrint">
         <el-icon><Printer /></el-icon>&nbsp;打印
       </el-button>
     </template>
@@ -129,8 +125,7 @@
  * 而打印是**不可撤销**的 —— 装订错误的一叠凭证要一张张撕下来重打。
  * 预览不是多余步骤，它就是这笔不可逆操作前的最后一道确认。
  */
-import { computed, nextTick, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { Printer } from '@element-plus/icons-vue'
 import PrintPreview from '@/components/PrintPreview.vue'
 import { loadPrintHtml, openPrintWindow, printWindow, templateMeta, templates as loadTemplates } from '@/api/print'
@@ -217,8 +212,7 @@ const printDate = ref('')
  */
 const interleaveOn = ref(PRINT_ORDER_DEFAULTS.interleave)  // 错位配对，默认开
 const reverseOn = ref(PRINT_ORDER_DEFAULTS.reverse)        // 整叠倒着印，默认关
-/** 「发票打印」：凭证后面接上它自己的发票原件。默认关 —— 平时打印凭证
- *  只是一叠凭证，插进发票是另一次打印的事（用户 2026-10-31 批注）。 */
+/** 打开后将对应发票原件加入打印队列。 */
 const invoiceOn = ref(false)
 
 /** 当前模板一页放几张凭证 —— 决定「打印顺序优化」这一项露不露。 */
@@ -316,11 +310,19 @@ function onTemplateChange() {
 }
 
 let token = 0
+let previewController
+function stopPreview() {
+  ++token
+  previewController?.abort()
+  loading.value = false
+}
 async function refreshPreview() {
-  if (!props.path) return
+  if (!props.path || !visible.value) return
+  previewController?.abort()
+  previewController = new AbortController()
   const mine = ++token
   loading.value = true
-  const doc = await loadPrintHtml(props.path, buildParams())
+  const doc = await loadPrintHtml(props.path, buildParams(), { signal: previewController.signal })
   if (mine !== token) return                 // 过期响应直接丢弃，避免旧结果盖掉新的
   if (doc) {
     html.value = doc
@@ -331,26 +333,22 @@ async function refreshPreview() {
   loading.value = false
 }
 
-async function doPrint() {
+function doPrint() {
+  if (loading.value || error.value || !html.value) return
   printing.value = true
   try {
-    // 重新取一次再打：拿到的字符串同时写进预览和打印窗口，
-    // 「看到的就是打出来的」才不是一句空话。
-    const doc = await loadPrintHtml(props.path, buildParams())
-    if (!doc) {
-      ElMessage.error('打印内容生成失败')
-      return
-    }
-    html.value = doc
-    error.value = ''
-    printWindow(openPrintWindow(doc))
+    // 直接打印已确认的预览，避免同一批原票再次下载、解码。
+    const w = openPrintWindow(html.value)
+    if (!w) return
+    printWindow(w)
     visible.value = false
   } finally {
     printing.value = false
   }
 }
 
-watch(() => props.modelValue, (v) => { if (v) init() })
+watch(() => props.modelValue, (v) => { if (v) init(); else stopPreview() })
+onBeforeUnmount(stopPreview)
 
 // 父页面改了参数（打印范围、不打印无发生额科目）就重出预览 ——
 // 预览与打印必须是同一份内容：用户看到的范围就是印出来的范围。
