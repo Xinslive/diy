@@ -64,7 +64,16 @@ def main() -> int:
     spec = importlib.util.spec_from_file_location("cwq_census_plugin_main", entry)
     plugin = importlib.util.module_from_spec(spec)
     sys.modules["cwq_census_plugin_main"] = plugin
-    spec.loader.exec_module(plugin)
+    # **必须关掉字节码写入**：`exec_module` 默认会在源文件旁边写
+    # ``__pycache__/*.pyc``，而那是**线上插件包目录** —— 宿主验签要求
+    # 目录里的文件集合与签名清单完全一致，多一个 ``.pyc`` 就会让插件页面
+    # 的前端资源全部 404。详见 sharedcard_perf_probe.py 里同一处的说明。
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(plugin)
+    finally:
+        sys.dont_write_bytecode = previous
 
     current_principal.set((manifest["id"], user_id, None))
     ctx = context_for(manifest, plugin=True)

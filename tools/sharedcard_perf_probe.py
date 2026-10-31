@@ -92,6 +92,17 @@ def _load_plugin(directory: str):
     宿主用 ``exec_plugin_module``（带运行期内建裁剪），这里用普通的
     ``exec_module`` —— **只读测量**不需要那层裁剪，而且裁剪过的沙箱会把
     ``cProfile`` 之类的反射原语一起禁掉，反而量不准。
+
+    **必须关掉字节码写入**：``exec_module`` 默认会在源文件旁边写
+    ``__pycache__/*.pyc``。那是**线上插件包目录** —— 宿主验签要求目录里的
+    文件集合与签名清单**完全一致**，多一个 ``.pyc`` 就会让
+    ``verify_directory`` 抛 ``FILE_SET_MISMATCH``，于是插件页面的
+    前端资源全部 404（而错误被 ``except (PluginError, OSError)`` 吞成
+    一句没有信息量的 404）。
+
+    **这不是假设，是真出过的事**：探针在生产上跑过一次之后，插件页面的
+    JS 就全取不到了 —— 排查出来的根因正是这里写的这个 pyc。
+    宿主的加载路径自己不会写（它把 ``sys.dont_write_bytecode`` 置成 True）。
     """
     import importlib.util
 
@@ -100,12 +111,23 @@ def _load_plugin(directory: str):
     spec = importlib.util.spec_from_file_location("cwq_probe_plugin_main", entry)
     module = importlib.util.module_from_spec(spec)
     sys.modules["cwq_probe_plugin_main"] = module
-    spec.loader.exec_module(module)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
     return manifest, module
 
 
 def _instrument(ctx):
-    """给 ctx 上的能力方法套一层计数器（只数，不改行为）。"""
+    """给 ctx 上的能力方法套一层计数器（只数，不改行为）。
+
+    **只套一次**：重复套会让计数翻倍（第一遍 ×1、第二遍 ×2），
+    而能力调用次数是要拿来说明「谁被调了多少次」的数，不能翻倍。
+    """
+    if getattr(ctx, "_probe_instrumented", False):
+        return
     for name in list(vars(ctx)):
         attr = getattr(ctx, name)
         if not callable(attr):
@@ -121,6 +143,10 @@ def _instrument(ctx):
             setattr(ctx, name, make())
         except (AttributeError, TypeError):
             pass
+    try:
+        ctx._probe_instrumented = True
+    except (AttributeError, TypeError):
+        pass
 
 
 def _disable_principal_scope():
@@ -154,29 +180,48 @@ def _restore_principal_scope():
 
 
 def _measure(label, call, results):
-    CALL_COUNTS.clear()
-    started = time.perf_counter()
-    try:
-        # **必须包在 ``principal_scope()`` 里**：宿主网关在每个请求入口就是
-        # 这么包着的（``loader.py``）。探针直接调插件函数、不经过网关，
-        # 不开这个区间就量不到「解析调用者按请求一份」的真实效果 ——
-        # 那会量出一条**比线上更慢**的数字，看起来像是修复没生效。
-        #
-        # **按模块属性调**（``public_api.principal_scope``）而不是局部导入名：
-        # 对照组要能把这一档换成「不建缓存」的那一档，换局部名字是换不掉的。
-        with public_api.principal_scope():
-            call()
-        error = ""
-    except Exception as exc:  # 探针本身出错也要报出来，别让它变成「没测到」
-        error = f"{type(exc).__name__}: {exc}"[:200]
-    elapsed = (time.perf_counter() - started) * 1000
-    calls = dict(CALL_COUNTS)
-    results.append((label, elapsed, error, calls))
+    """量一个接口，取**多次里的最小值**。
+
+    **为什么取最小值而不是平均值**：生产机上还跑着真实用户的请求，
+    数据库与磁盘随时可能被别人占一下 —— 那会让某一次测量整体偏慢。
+    延迟基准里**最小值**是抗噪的那一档（它反映「不受干扰时这条路径要多久」），
+    平均值会把干扰算成这条路径的成本。
+
+    **为什么不能只测一次**：单次测量的波动能到 3 倍（实测同一接口两次跑出
+    171ms 与 495ms）—— 拿单次数字下结论，结论就只是噪声。
+    """
+    repeat = max(1, int(os.environ.get("CWQ_PROBE_REPEAT", "3")))
+    best = None
+    error = ""
+    calls: dict = {}
+    for _ in range(repeat):
+        CALL_COUNTS.clear()
+        started = time.perf_counter()
+        try:
+            # **必须包在 ``principal_scope()`` 里**：宿主网关在每个请求入口就是
+            # 这么包着的（``loader.py``）。探针直接调插件函数、不经过网关，
+            # 不开这个区间就量不到「解析调用者按请求一份」的真实效果 ——
+            # 那会量出一条**比线上更慢**的数字，看起来像是修复没生效。
+            #
+            # **按模块属性调**（``public_api.principal_scope``）而不是局部导入名：
+            # 对照组要能把这一档换成「不建缓存」的那一档，换局部名字是换不掉的。
+            with public_api.principal_scope():
+                call()
+        except Exception as exc:  # 探针本身出错也要报出来，别让它变成「没测到」
+            error = f"{type(exc).__name__}: {exc}"[:200]
+            break
+        elapsed = (time.perf_counter() - started) * 1000
+        calls = dict(CALL_COUNTS)
+        if best is None or elapsed < best:
+            best = elapsed
+    if best is None:
+        best = 0.0
+    results.append((label, best, error, calls))
     detail = "  ".join(f"{name}×{count}" for name, count in sorted(calls.items(), key=lambda kv: -kv[1])[:6])
-    print(f"  {label:<40} {elapsed:9.1f} ms  {error}")
+    print(f"  {label:<40} {best:9.1f} ms  {error}{'  (取 ' + str(repeat) + ' 次最小)' if repeat > 1 else ''}")
     if detail:
         print(f"      能力调用：{detail}")
-    return elapsed
+    return best
 
 
 def main() -> int:
@@ -193,6 +238,7 @@ def main() -> int:
     ctx = public_api.context_for(manifest, plugin=True)
     registrar = _StubRegistrar()
     plugin.register(registrar, ctx)
+    printed_profile: list = []
     print(f"插件 {manifest['id']} v{manifest['version']} 已装载，声明 {len(registrar.routes)} 条路由\n")
 
     # 找一份对账单，用来量「逐笔明细」那条线。
@@ -225,23 +271,43 @@ def main() -> int:
         if workspace_key in registrar.routes:
             endpoint = registrar.routes[workspace_key]
             profiler = cProfile.Profile()
-            CALL_COUNTS.clear()
-            started = time.perf_counter()
-            profiler.enable()
-            try:
-                with public_api.principal_scope():
-                    endpoint(card_id)
-                error = ""
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"[:200]
-            profiler.disable()
-            elapsed = (time.perf_counter() - started) * 1000
-            results.append((workspace_key, elapsed, error, dict(CALL_COUNTS)))
-            print(f"  {workspace_key:<40} {elapsed:9.1f} ms  {error}")
+            repeat = max(1, int(os.environ.get("CWQ_PROBE_REPEAT", "3")))
+            best = None
+            error = ""
+            calls: dict = {}
+            for index in range(repeat):
+                CALL_COUNTS.clear()
+                started = time.perf_counter()
+                # **只给第一遍开 profiler**：profile 会让这一遍慢好几倍，
+                # 混进「最小值」里就把数字弄脏了。
+                profiling = index == 0
+                if profiling:
+                    profiler.enable()
+                try:
+                    with public_api.principal_scope():
+                        endpoint(card_id)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"[:200]
+                finally:
+                    if profiling:
+                        profiler.disable()
+                elapsed = (time.perf_counter() - started) * 1000
+                calls = dict(CALL_COUNTS)
+                if best is None or elapsed < best:
+                    best = elapsed
+                if error:
+                    break
+            if best is None:
+                best = 0.0
+            elapsed = best
+            results.append((workspace_key, elapsed, error, calls))
+            print(f"  {workspace_key:<40} {elapsed:9.1f} ms  {error}"
+                  f"{'  (取 ' + str(repeat) + ' 次最小)' if repeat > 1 else ''}")
             detail = "  ".join(f"{name}×{count}" for name, count in
                                sorted(CALL_COUNTS.items(), key=lambda kv: -kv[1])[:8])
             print(f"      能力调用：{detail}")
-            if tag.startswith("基线"):
+            if tag.startswith("现状") and not printed_profile:
+                printed_profile.append(True)
                 buffer = io.StringIO()
                 pstats.Stats(profiler, stream=buffer).sort_stats("cumulative").print_stats(25)
                 print(buffer.getvalue())
