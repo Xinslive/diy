@@ -2509,7 +2509,35 @@ watch(() => [store.bookId, store.periodId, store.currentYear, route.params.id], 
   --vg-line: #c0c4cc;
   --vg-active: #f2faf2;
   --vg-total: #fffbf7;
-  --vg-cols: 56px minmax(170px, 1fr) minmax(230px, 1.4fr) minmax(210px, 1fr) minmax(210px, 1fr);
+  /* 列宽：序号固定，两列金额各 210px（11 个数位槽），剩下的全给摘要与科目。
+
+     **两列文本列的下限是 0，不是 170 / 230**（2026-10-31 改）。
+
+     为什么：这里的下限**不是**「列窄到多少就不好看了」，而是**硬底线** ——
+     五列下限加上四条 1px 的缝，一旦超过容器实得宽度，grid 就把多出来的那截
+     **放到格子外面**。而容器宽度会被纵向滚动条吃掉一截：
+     macOS 是覆盖式滚动条（不占宽），Windows / Linux 是经典滚动条（占 15~22px，
+     还要随显示缩放放大）。于是同一张凭证在 macOS 上好好的，换到 Windows 上：
+
+       列下限合计 876 + 4px 缝 = 880px  >  行宽 894 - 22px 滚动条 = 872px
+
+     多出来的 8px 全跑到**贷方金额格**上 —— 那一格是不透明的（`background: #fff`），
+     它正好盖住 `.vgrid` 那条 1px 的右边框线。结果是**贷方金额格右框线整条消失**，
+     而表头与合计两段（不在滚动区里，宽度不受滚动条影响）照旧有线 ——
+     一张表上，同一条框线时有时无。
+
+     账套磁贴那处踩过同一个坑（`tests/book_grid_columns.test.mjs` 钉着）：
+     minmax 的下限必须 ≤ 容器实得宽度，差 2px 就会静默换一种排法。
+
+     改成 0 之后：空间不够时**由文本列让位**（摘要/科目本来就是文字，窄一点
+     只是少显示几个字），金额列的 210px 下限**一个字不动** ——
+     那 11 个数位槽的宽度是记账格式的一部分，不能被挤。
+     算式与守卫见 `tests/voucher_grid_columns.test.mjs`。
+
+     渲染不变：行宽够时（≥ 约 918px，即 894 + 各列下限之外的余量）
+     两列文本列拿到的宽度与改之前**逐像素相同** —— 因为今天的分配结果
+     本来就是「金额列各 210px 固定，剩下 414px 按 1 : 1.4 分给摘要与科目」。 */
+  --vg-cols: 56px minmax(0, 1fr) minmax(0, 1.4fr) minmax(210px, 1fr) minmax(210px, 1fr);
   --vg-row-h: 68px;
   --vg-grid-width: calc(100% - 100px);
   flex: 0 1 auto;
