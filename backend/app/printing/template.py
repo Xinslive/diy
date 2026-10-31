@@ -801,7 +801,7 @@ def _esc(value: Any) -> str:
 #: ``style-src 'unsafe-inline'`` 不能去掉：版式全靠 ``_page_css`` 拼的内联
 #: ``<style>``。``script-src 'none'`` 才是重点 —— 模板校验是第一道防线，
 #: 这条是第二道，两道独立成立。
-def print_csp_meta(tpl: dict | None = None) -> str:
+def print_csp_meta(tpl: dict | None = None, *, data_images: bool = False) -> str:
     """打印页的 CSP。**只有「锁定字体」打开时才会松一条。**
 
     字体内嵌时要多放开两条：``font-src 'self'``（字体文件）、
@@ -813,14 +813,21 @@ def print_csp_meta(tpl: dict | None = None) -> str:
 
     没开锁定字体时，这两条与从前**逐字相同** —— 不用这个功能的人不该为它
     付任何代价。
+
+    ``data_images`` 是给「发票打印」用的：那一页要把发票原件渲染成图片贴进
+    打印页，图片是 ``data:`` URI，所以 ``img-src`` 得放开 ``data:``。
+    **只放开 ``data:``，不放开 ``http(s):``** —— 那张图是我们自己渲染的
+    发票原件，不是用户填的地址；脚本仍然全禁（``script-src 'none'``），
+    ``data:`` 图也发不出任何请求。
     """
     embed = embedded_key(tpl)
     style_src = "'unsafe-inline' 'self'" if embed else "'unsafe-inline'"
     font_src = "'self'" if embed else "'none'"
+    img_src = "data:" if data_images else "'none'"
     return (
         '<meta http-equiv="Content-Security-Policy" content="'
         f"default-src 'none'; style-src {style_src}; script-src 'none'; "
-        f"img-src 'none'; font-src {font_src}; connect-src 'none'; "
+        f"img-src {img_src}; font-src {font_src}; connect-src 'none'; "
         "form-action 'none'; base-uri 'none'"
         '">'
     )
@@ -955,6 +962,12 @@ table.grid tfoot td {{ font-weight:700; }}
 .voucher-sheet.flow-rows {{ grid-template-columns:minmax(0,1fr); grid-template-rows:repeat(2,minmax(0,1fr)); }}
 .voucher-sheet.flow-columns {{ grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-rows:minmax(0,1fr); }}
 .voucher-slot {{ position:relative; min-width:0; min-height:0; overflow:hidden; }}
+/* 发票页：整张纸就是那张发票原件。
+   **图按原比例缩到版心里**，不裁也不拉 —— 票面的大小比例是它的一部分，
+   横向的票就横着放，纸型跟着模板的方向走。 */
+.invoice-page {{ width:100%; height:calc({h}mm - {mt}mm - {mb}mm);
+  display:flex; align-items:center; justify-content:center; overflow:hidden; }}
+.invoice-page img {{ max-width:100%; max-height:100%; width:auto; height:auto; }}
 .voucher-element {{ position:absolute; overflow:hidden; white-space:pre-wrap;
   word-break:break-word; line-height:1.3; padding:0 1mm; }}
 .voucher-element.line {{ height:0 !important; padding:0; border-top:0.3mm solid #000; }}
@@ -1002,6 +1015,10 @@ table.grid tfoot td {{ font-weight:700; }}
   .page {{ box-shadow:none; padding:0; margin:0; }}
   .voucher-sheet-page {{ break-after:page; page-break-after:always; }}
   .voucher-sheet-page:last-child {{ break-after:auto; page-break-after:auto; }}
+  /* 发票页自己占一张纸：它的高度就是版心高，不加分页符也会换页，
+     加上是保险 —— 分页符跟着纸走，最后一页别多出一张白纸。 */
+  .invoice-page {{ break-after:page; page-break-after:always; }}
+  .page:last-child .invoice-page {{ break-after:auto; page-break-after:auto; }}
 }}
 """
 
@@ -2147,8 +2164,12 @@ def _voucher_element_html(tpl: dict, ctx: dict, voucher: dict, el: dict,
 
 
 def render_voucher_sheet(tpl: dict, ctx: dict, vouchers: list[dict],
-                         page: int, total_pages: int) -> str:
-    """一张**物理纸**。``vouchers`` 是要放进本页槽位的凭证（分片后）。"""
+                         page: int, total_pages: int, *,
+                         data_images: bool = False) -> str:
+    """一张**物理纸**。``vouchers`` 是要放进本页槽位的凭证（分片后）。
+
+    ``data_images`` 是给「发票打印」用的：这份文档里要贴发票原件的图片，
+    CSP 得放开 ``img-src data:``（见 :func:`print_csp_meta`）。"""
     slots = voucher_slots_per_page(tpl)
     # 横排还是竖排只看纸的横竖，与放几张无关：横向时上下两张会非常扁，
     # 横排更符合直觉；纵向则上下叠。放几张只决定放几个 .voucher-slot 进去，
@@ -2164,7 +2185,7 @@ def render_voucher_sheet(tpl: dict, ctx: dict, vouchers: list[dict],
 
     doc_title = _esc((tpl.get("title") or {}).get("text", "") or "记 账 凭 证")
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
-{print_csp_meta(tpl)}
+{print_csp_meta(tpl, data_images=data_images)}
 <title>{doc_title}</title>
 {font_stylesheet_link(tpl)}
 <style>{_page_css(tpl)}</style></head><body>
@@ -2173,6 +2194,30 @@ def render_voucher_sheet(tpl: dict, ctx: dict, vouchers: list[dict],
     <div class="voucher-sheet slots-{slots} {flow}">{inner}</div>
   </div>
 </div></body></html>"""
+
+
+def render_invoice_page(tpl: dict, data_uri: str, width: int, height: int) -> str:
+    """一张**发票原件**页：整张纸就是那张票。
+
+    **为什么是图片而不是 PDF**：打印页是一份 HTML，浏览器只肯把它认得的
+    图片印出来 —— ``<embed>``/``<iframe>`` 里那份 PDF 在 Chrome 的打印
+    预览里是**空的**（PDF 插件不参与页面打印）。所以发票只能渲染成图片。
+
+    **为什么是完整的一份 HTML**：``wrap_pages`` 合并多页时只取每页
+    ``<body>`` 里的内容（各页的 head 用第一页的那份）—— 这一页也得是
+    一份完整文档，body 里那一段才会被留下。
+    """
+    return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+{print_csp_meta(tpl, data_images=True)}
+<title>发票原件</title>
+{font_stylesheet_link(tpl)}
+<style>{_page_css(tpl)}</style></head><body>
+<div class="page">
+  <div class="invoice-page">
+    <img src="{data_uri}" width="{width}" height="{height}" alt="发票原件">
+  </div>
+</div>
+</body></html>"""
 
 
 def render_voucher_page(tpl: dict, ctx: dict, voucher: dict, page: int, total: int) -> str:

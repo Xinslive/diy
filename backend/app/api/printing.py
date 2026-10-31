@@ -746,7 +746,8 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
                   status: Optional[str] = None, max_pages: Optional[int] = None,
                   note: str = "", voucher_ids: Optional[list[int]] = None,
                   print_order: str = PRINT_ORDER_NORMAL,
-                  reverse: bool = False) -> str:
+                  reverse: bool = False,
+                  print_invoices: bool = False) -> str:
     """记账凭证：A4 一页两张、A5 一页一张，每张最多 5 行摘要、超出续到下一张。
 
     ``max_pages`` 限的是**原始凭证张数**（只给预览用，保证改版式时的响应速度），
@@ -759,6 +760,10 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
     ``reverse`` 管的是**出纸的先后**：整叠倒着印（第 3 张先印、第 1 张最后印），
     每张纸上配哪两格不变。打印机把先印的那张压在最上面还是把最后印的那张压在
     最上面，决定了这里要不要倒着来（用户 2026-10-30 批注 3）。
+
+    ``print_invoices`` 是**「发票打印」开关**：每张纸印完之后，把它那几张凭证
+    各自的发票原件接在后面印（发票原件就是凭证的附件，见
+    ``app/invoice/print_pages.py``）。
     """
     from app.accounting.vouchers import query_vouchers
 
@@ -845,10 +850,58 @@ def _voucher_html(db: Session, book: Book, period: Period, tpl: dict,
     total_pages = len(sheets)
 
     ctx = pv.context(db, book, period)
-    docs = [render_voucher_sheet(tpl, ctx, group, i, total_pages)
+    docs = [render_voucher_sheet(tpl, ctx, group, i, total_pages,
+                                 data_images=print_invoices)
             for i, group in enumerate(sheets, start=1)]
+    if print_invoices:
+        docs = _attach_invoice_pages(db, book, tpl, sheets, docs)
 
     return _with_note(wrap_pages(docs), note)
+
+
+def _attach_invoice_pages(db: Session, book: Book, tpl: dict,
+                          sheets: list[list[dict]], docs: list[str]) -> list[str]:
+    """把发票页接在各自那张纸后面。
+
+    **接在「那张纸」后面，不是全部堆到最后**：一张纸上有哪几张凭证，
+    这张纸印完就印它们各自的发票 —— 剪下来时发票跟它的凭证挨着。
+
+    **拆成多格的凭证只印一次发票**：那张凭证在纸上占了几格，发票只有一张。
+    """
+    from app.invoice.print_pages import (
+        MAX_INVOICE_PAGES, invoice_pages_html, pages_by_voucher,
+    )
+
+    # 每张纸上的凭证（按格序）；拆成多片的凭证只认第一片。
+    by_sheet: dict[int, list[int]] = {}
+    seen: set[int] = set()
+    for index, group in enumerate(sheets):
+        for piece in group:
+            voucher_id = piece.get("id")
+            if not voucher_id or voucher_id in seen:
+                continue
+            seen.add(voucher_id)
+            by_sheet.setdefault(index, []).append(voucher_id)
+    if not by_sheet:
+        return docs
+    refs = pages_by_voucher(db, book.id,
+                            [vid for ids in by_sheet.values() for vid in ids])
+    # **发票页也有量闸**：一张发票页是一张 A4 的 PNG，走 base64 进 HTML
+    # 还要再涨三分之一 —— 一次几百张就是几十 MB 的字符串（与 Excel 通道
+    # 那道行数闸同一件事：超了明说，不静默截断出缺页的账）。
+    total = sum(item.page_span for items in refs.values() for item in items)
+    if total > MAX_INVOICE_PAGES:
+        from app.printing import excel as xl
+        raise xl.ExportTooLarge(
+            f"这次打印要带 {total} 张发票，超过单次上限 {MAX_INVOICE_PAGES} 张。"
+            "请缩小打印范围（按期间分段打印）后重试。")
+    pages = invoice_pages_html(tpl, refs)
+    out: list[str] = []
+    for index, doc in enumerate(docs):
+        out.append(doc)
+        for voucher_id in by_sheet.get(index, []):
+            out.extend(pages.get(voucher_id, []))
+    return out
 
 
 def _with_note(doc: str, note: str) -> str:
@@ -1260,6 +1313,7 @@ def _render_scope(
     skip_empty: bool = True,
     print_order: str = PRINT_ORDER_NORMAL,
     reverse: bool = False,
+    print_invoices: bool = False,
 ) -> str:
     """把一个「打印范围」渲染成完整 HTML。五个 .html 接口和预览接口都调它。
 
@@ -1276,6 +1330,9 @@ def _render_scope(
     ``print_order`` 与 ``reverse`` 只给凭证用：打印弹窗上的「打印顺序优化」与
     「倒序打印」两个开关（用户 2026-10-30 批注）。它们同样只作用于**这一次
     打印**，不进模板。
+
+    ``print_invoices`` 同样只给凭证用：「发票打印」开关 —— 每张纸印完之后，
+    把它那几张凭证各自的发票原件接在后面印。
     """
     from app.ledger import queries
 
@@ -1284,7 +1341,8 @@ def _render_scope(
     if scope == "VOUCHER":
         return _voucher_html(db, book, period, tpl, status=status,
                              max_pages=max_pages, note=note, voucher_ids=voucher_ids,
-                             print_order=print_order, reverse=reverse)
+                             print_order=print_order, reverse=reverse,
+                             print_invoices=print_invoices)
 
     if scope == "BALANCE":
         # 区间口径：与页面、Excel 导出走**同一个** from_period，
@@ -1403,6 +1461,7 @@ def print_vouchers(book_id: int, period_id: Optional[int] = None,
                    orientation: Optional[str] = None,
                    print_order: Optional[str] = Query(None),
                    reverse: bool = Query(False),
+                   print_invoices: bool = Query(False),
                    book: Book = Depends(get_my_book), db: Session = Depends(get_db),
                   user: SysUser = Depends(get_current_user)):
     """记账凭证：一页几张由模板的 voucher.slots_per_page 决定（1 或 2），
@@ -1411,6 +1470,9 @@ def print_vouchers(book_id: int, period_id: Optional[int] = None,
     ``print_order`` 是**这一次打印**的顺序设置（用户 2026-10-30 批注）：
     ``optimized`` 把一页两格错开配对（裁开后两堆各自成序），默认 ``normal``。
     ``reverse`` 是整叠倒着印（打印机把最后印的那张压在最上面时才需要）。
+
+    ``print_invoices`` 是**「发票打印」开关**：每张纸印完之后，把它那几张凭证
+    各自的发票原件接在后面印（发票原件就是凭证的附件）。
     """
     selected_ids = None
     if voucher_ids is not None:
@@ -1430,7 +1492,8 @@ def print_vouchers(book_id: int, period_id: Optional[int] = None,
                                         period_id=period_id, status=status,
                                         voucher_ids=selected_ids,
                                         print_order=_print_order_arg(print_order),
-                                        reverse=reverse))
+                                        reverse=reverse,
+                                        print_invoices=print_invoices))
 
 
 @router.get("/balance.html")

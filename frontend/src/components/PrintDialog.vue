@@ -51,12 +51,19 @@
                不进模板 —— 模板只管版式，不管这叠纸按什么顺序出。 -->
           <el-form-item v-if="isVoucher && isTwoUp" label="打印顺序优化">
             <el-switch v-model="interleaveOn" @change="refreshPreview" />
-            <p class="hint">{{ interleaveHint }}</p>
           </el-form-item>
 
           <el-form-item v-if="isVoucher" label="倒序打印">
             <el-switch v-model="reverseOn" @change="refreshPreview" />
-            <p class="hint">{{ reverseHintText }}</p>
+          </el-form-item>
+
+          <!-- 「发票打印」（用户 2026-10-31 批注）：每张纸印完之后，把它那
+               几张凭证各自的发票原件接在后面印 —— 发票原件就是凭证的附件
+               （发票导入生成凭证时 attachments=1），剪下来就能订在一起。
+
+               **只在一页两张的模板上露出这个开关**（用户点名）。 -->
+          <el-form-item v-if="isVoucher && isTwoUp" label="发票打印">
+            <el-switch v-model="invoiceOn" @change="refreshPreview" />
           </el-form-item>
 
           <!-- 打印日期只有账簿（总账 / 明细账）页脚里那一格要它。
@@ -128,9 +135,7 @@ import { Printer } from '@element-plus/icons-vue'
 import PrintPreview from '@/components/PrintPreview.vue'
 import { loadPrintHtml, openPrintWindow, printWindow, templateMeta, templates as loadTemplates } from '@/api/print'
 import { pickPapers, slotsPerPage } from '@/utils/paper'
-import {
-  PRINT_ORDER_DEFAULTS, printOrderHint, printOrderParam, reverseHint,
-} from '@/utils/printOrder'
+import { PRINT_ORDER_DEFAULTS, printOrderParam } from '@/utils/printOrder'
 import {
   effectiveDefaultId as sharedEffectiveDefault, showBuiltinTemplate, templateTags,
 } from '@/utils/printTemplate'
@@ -212,6 +217,9 @@ const printDate = ref('')
  */
 const interleaveOn = ref(PRINT_ORDER_DEFAULTS.interleave)  // 错位配对，默认开
 const reverseOn = ref(PRINT_ORDER_DEFAULTS.reverse)        // 整叠倒着印，默认关
+/** 「发票打印」：凭证后面接上它自己的发票原件。默认关 —— 平时打印凭证
+ *  只是一叠凭证，插进发票是另一次打印的事（用户 2026-10-31 批注）。 */
+const invoiceOn = ref(false)
 
 /** 当前模板一页放几张凭证 —— 决定「打印顺序优化」这一项露不露。 */
 const slotsOfTemplate = computed(() => {
@@ -219,9 +227,6 @@ const slotsOfTemplate = computed(() => {
   return slotsPerPage(t?.content)
 })
 const isTwoUp = computed(() => slotsOfTemplate.value >= 2)
-
-const interleaveHint = computed(() => printOrderHint(slotsOfTemplate.value))
-const reverseHintText = computed(() => reverseHint(slotsOfTemplate.value))
 
 /**
  * 打印范围与「不打印无发生额科目」都是**父页面**的状态（父页面还要拿它们
@@ -254,6 +259,9 @@ function buildParams() {
   if (isVoucher.value) {
     p.print_order = printOrderParam(slotsOfTemplate.value, { interleave: interleaveOn.value })
     p.reverse = reverseOn.value
+    // 「发票打印」只在一页两张时才有（开关也是这么露出来的），所以参数
+    // 也跟着这个前提走 —— 换到一页一张的模板，发票页就不该再出现。
+    if (isTwoUp.value) p.print_invoices = invoiceOn.value
   }
   return p
 }
@@ -367,9 +375,6 @@ watch(() => props.params, () => { if (visible.value) refreshPreview() }, { deep:
 .note p { margin: 0; font-size: 12px; line-height: 1.7; }
 .note-sub { color: #c0c4cc; }
 .note-warn { color: #e6a23c; }
-
-/* 开关下面那一句：说清这个开关会让纸上的顺序变成什么样 */
-.hint { margin: 6px 0 0; font-size: 12px; line-height: 1.7; color: #909399; }
 
 .dir-group { display: flex; width: 100%; }
 .dir-group :deep(.el-radio-button) { flex: 1; }

@@ -1,15 +1,14 @@
 /**
  * 打印顺序：一页两张的错位配对 + 整叠倒着印（用户 2026-10-30 批注）。
  *
- * 盯的是四件事：
+ * 盯的是三件事：
  *   1. **两个开关**：「打印顺序优化」管怎么配对，「倒序打印」管出纸的先后 ——
- *      这是两件不同的事，合成一个开关就得在旁边解释「这一项在两种模板上
- *      分别是什么意思」；
+ *      这是两件不同的事，合成一个开关说不清那一项在两种模板上分别是什么意思；
  *   2. 「打印顺序优化」只在**一页两张**时出现（一页一张没有配对这回事），
  *      「倒序打印」两种模板都有；
- *   3. 默认值：错位配对默认开、倒序打印默认关；
- *   4. 送出去的两个口径与后端一一对应 —— 前端写一个后端不认的值，
- *      开关看着打开了、纸上的顺序却一点没变。
+ *   3. 默认值：错位配对默认开、倒序打印默认关；送出去的两个口径与后端
+ *      一一对应 —— 前端写一个后端不认的值，开关看着打开了、纸上的
+ *      顺序却一点没变。
  *
  * 照应的是后端 `app/printing/template.py::optimize_print_order` 与
  * `app/api/printing.py::_print_order_arg`。
@@ -65,24 +64,6 @@ t('两个开关的默认值：错位配对开、倒序打印关', () => {
   assert.equal(U.PRINT_ORDER_DEFAULTS.reverse, false)
 })
 
-t('错位配对的说明写清裁开之后两堆各自成序', () => {
-  const hint = U.printOrderHint(2)
-  assert.ok(/错开印/.test(hint), '说明里没有「错开」')
-  assert.ok(/上堆/.test(hint), '说明里没有说裁开之后的上下两堆')
-  assert.ok(/1\+4/.test(hint), '说明里没有给出配对的例子')
-})
-
-t('一页一张时不摆「打印顺序优化」', () => {
-  assert.equal(U.printOrderHint(1), '')
-})
-
-t('倒序打印的说明分两种模板说', () => {
-  assert.ok(/倒着印/.test(U.reverseHint(1)), '一张的说明里没有「倒着印」')
-  assert.ok(/倒着印/.test(U.reverseHint(2)), '两张的说明里没有「倒着印」')
-  // 两张时要说清是「整页翻」，同一页里配的两格不跟着翻。
-  assert.ok(/不变/.test(U.reverseHint(2)), '两张的说明里没说明「同一页的两格不变」')
-})
-
 console.log('== 口径取值与后端一致 ==')
 
 t('前端只有两种配对口径', () => {
@@ -127,9 +108,10 @@ t('请求里带上 print_order 与 reverse', () => {
   assert.ok(/p\.reverse\s*=/.test(DIALOG_CODE), '请求里没有带 reverse')
 })
 
-t('两个开关一动就重出预览', () => {
+t('开关一动就重出预览', () => {
+  // 三个：错位配对、倒序打印、发票打印（最后一个见 print_invoice.test.mjs）。
   const switches = DIALOG_CODE.match(/el-switch[^>]*@change="refreshPreview"/g) || []
-  assert.equal(switches.length, 2, '不是两个开关都接了 refreshPreview')
+  assert.equal(switches.length, 3, '不是三个开关都接了 refreshPreview')
 })
 
 console.log('\n通过 ' + pass + ' / 失败 ' + fail)
