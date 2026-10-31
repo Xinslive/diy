@@ -265,6 +265,15 @@
                   title="请展开红色发票，修正类型或科目后点击「重新计算预览」；所有异常消除后才能确认。" />
         <el-alert v-if="batch.error_count" type="info" :closable="false" show-icon class="mb"
                   title="合并件里的封面、装订页、重复扫描页都不是发票：展开该行点「忽略这张」，它不会生成凭证，也不再算异常。" />
+        <!--
+          「可能重复记账」的整批提醒。
+
+          为什么单独一条顶在表上面：这批票默认全部展开，几十张票摊开之后
+          「哪几张有提示」要靠扫那一列 —— 而**漏掉一张就是重复记一次账**。
+          顶上这一条先告诉用户「这批里有 N 张要核对」，剩下的细节才在行里。
+        -->
+        <el-alert v-if="duplicateCount" type="warning" :closable="false" show-icon class="mb"
+                  :title="`本批有 ${duplicateCount} 张发票在开票当月的账上已经有同额分录，可能是手工已经记过账。展开对应那张核对一下，确认不是同一笔再生成凭证。`" />
 
         <!--
           默认全部展开（default-expand-all）：这个表的价值就是「一眼看到每张发票
@@ -411,6 +420,25 @@
                 <div v-if="settlementNote(row)" class="settlement-note">
                   <el-icon><InfoFilled /></el-icon>{{ settlementNote(row) }}
                 </div>
+                <!--
+                  「可能重复记账」：这张发票的金额，在它开票**那个月**的账上
+                  已经有同额同向的分录了 —— 常见于「手工先记了账，后来才把
+                  票传上来导入」，再生成一张凭证就把同一笔钱记了两遍。
+
+                  **只提示，不拦**：发票号码才是这张票的唯一身份，金额相同
+                  不代表是同一笔（管理费每月同额，两张票不是重复）。所以
+                  这里把命中的是哪张凭证、哪条分录说清楚，让用户自己判断。
+
+                  放在结算科目说明的下面：两件事都是「这笔钱为什么记到这个
+                  科目上」，摆在一起用户不用满屏找。
+                -->
+                <div v-if="duplicateWarningText(row)" class="duplicate-warning">
+                  <el-icon><WarningFilled /></el-icon>
+                  <div>
+                    <div class="duplicate-warning-title">{{ duplicateWarningText(row) }}</div>
+                    <div class="muted">可能只是同月的另一笔同额的钱，也可能是同一笔已经手工记过账。系统不拦，请你核对后再确认生成。</div>
+                  </div>
+                </div>
                 <div v-if="row.errors?.length" class="invoice-errors">
                   <div v-for="error in row.errors" :key="error">{{ error }}</div>
                 </div>
@@ -494,7 +522,21 @@
           <el-table-column prop="invoice_no" label="发票号码" min-width="190" />
           <el-table-column prop="issue_date" label="开票日期" width="120" />
           <el-table-column label="类型" width="85" align="center"><template #default="{ row }">{{ invoiceTypeText(row.invoice_type) }}</template></el-table-column>
-          <el-table-column label="状态" width="100" align="center"><template #default="{ row }"><el-tag size="small" :type="invoiceType(row.status)">{{ invoiceStatusText(row.status) }}</el-tag></template></el-table-column>
+          <!--
+            状态那一列还要挂一个「可能重复记账」的标签。
+
+            为什么摊在这一列而不是只写在展开行里：这批票默认**全部展开**，
+            但用户点的是行、扫的是列 —— 一个「这里有笔账可能记重了」的提示
+            藏在几十行展开内容里，等于没有提示。标签在列上，一眼就扫到。
+          -->
+          <el-table-column label="状态" width="150" align="center">
+            <template #default="{ row }">
+              <div class="status-cell">
+                <el-tag size="small" :type="invoiceType(row.status)">{{ invoiceStatusText(row.status) }}</el-tag>
+                <el-tag v-if="duplicateWarningMatches(row).length" size="small" type="warning">{{ DUPLICATE_WARNING_LABEL }}</el-tag>
+              </div>
+            </template>
+          </el-table-column>
           <el-table-column label="价税合计" width="120" align="right"><template #default="{ row }">{{ row.resolution?.total || row.meta?.total_incl_tax || '' }}</template></el-table-column>
         </el-table>
       </el-card>
@@ -516,11 +558,13 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Check, FolderOpened, InfoFilled, Plus, Refresh, Upload } from '@element-plus/icons-vue'
+import { Check, FolderOpened, InfoFilled, Plus, Refresh, Upload, WarningFilled } from '@element-plus/icons-vue'
 import * as invoiceApi from '@/api/invoice'
 import * as subjectApi from '@/api/subject'
 import {
-  DEFAULT_UPLOAD_LIMITS, filesFromDataTransfer, humanBytes, isCommittedRow, isIgnoredRow, partitionFiles, skipNote,
+  DEFAULT_UPLOAD_LIMITS, DUPLICATE_WARNING_LABEL, duplicateWarningCount, duplicateWarningMatches,
+  duplicateWarningText, filesFromDataTransfer, humanBytes, isCommittedRow, isIgnoredRow,
+  partitionFiles, skipNote,
 } from './invoice_upload'
 import { formatDateTime } from '@/utils/datetime'
 import { useSessionStore } from '@/stores/session'
@@ -619,6 +663,11 @@ const emptyHint = computed(() => {
   }
   return '这个批次还没有发票记录。'
 })
+// 这一批里有几张要提示「可能重复记账」。
+//
+// 概要那一行与顶上那条提醒都要用它 —— 只在一处说的话，用户扫一眼概要
+// 就过去了，没看见那条提醒。
+const duplicateCount = computed(() => duplicateWarningCount(allInvoices.value))
 const batchSummaryTitle = computed(() => {
   const current = batch.value
   if (!current) return ''
@@ -629,6 +678,9 @@ const batchSummaryTitle = computed(() => {
   if (current.committed_count) parts.push(`${current.committed_count} 张已入账`)
   if (current.error_count) parts.push(`${current.error_count} 张有问题`)
   if (current.ignored_count) parts.push(`${current.ignored_count} 张已忽略`)
+  // 「可能重复记账」也要讲出来 —— 它是**这一批最该被人看到的一句话**：
+  // 这几张票的金额在同月账上已经有分录了，再生成一张就把钱记两遍。
+  if (duplicateCount.value) parts.push(`${duplicateCount.value} 张可能重复记账`)
   return parts.join('，')
 })
 const batchText = (v) => ({ PENDING: '待确认', COMMITTED: '已生成', DISCARDED: '已作废' }[v] || v)
@@ -981,4 +1033,23 @@ onMounted(loadAll)
   color: var(--el-text-color-secondary);
   padding: 2px 0 8px;
 }
+/* 状态那一列：状态标签与「可能重复记账」标签上下排。
+   挤在一行的话两样字都读不清（列宽 150 放不下 6 个字加 3 个字）。 */
+.status-cell { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+/* 「可能重复记账」那一块：橙色左边框，跟红框的异常区分开 ——
+   异常是「这张有问题」，这一条是「你确认一下」。 */
+.duplicate-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 4px 0 10px;
+  padding: 8px 10px;
+  border-left: 3px solid #e6a23c;
+  background: #fdf6ec;
+  color: #b45309;
+  font-size: 12px;
+  line-height: 1.8;
+}
+.duplicate-warning-title { font-weight: 600; }
+.duplicate-warning .muted { color: #b45309; opacity: 0.85; }
 </style>

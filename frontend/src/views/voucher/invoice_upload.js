@@ -158,3 +158,53 @@ export async function filesFromDataTransfer(dt, { maxScanned = 2000 } = {}) {
   }
   return out
 }
+
+/**
+ * 「可能重复记账」的提示。
+ *
+ * **这件事是什么。** 有些发票是**手工先记了账**，后来才把票传上来导入 ——
+ * 再生成一张凭证，同一笔钱就在账上记了两遍。系统**不拦**：发票号码才是
+ * 这张票的唯一身份，金额相同不代表是同一笔（管理费每月同额，两个月各开
+ * 一张是两张票）。所以只提示用户自己核对。
+ *
+ * 后端给的是**结构化**的命中清单（期间、金额、方向、每条命中的凭证与
+ * 分录），这里把它拼成人话。文案与判定口径见
+ * ``backend/app/invoice/duplicates.py``。
+ */
+export const DUPLICATE_WARNING_LABEL = '可能重复记账'
+
+/** 这一行的「可能重复记账」命中清单；没有就是空数组。 */
+export function duplicateWarningMatches(row) {
+  const matches = row?.duplicate_warning?.matches
+  return Array.isArray(matches) ? matches : []
+}
+
+/**
+ * 这一行的提示文案；没有提示就是空串。
+ *
+ * 一条命中说成「凭证号 / 日期 / 借贷 / 科目 / 金额 / 摘要」——
+ * 用户要能**一眼认出是哪一笔**，否则这句话等于没给。
+ */
+export function duplicateWarningText(row) {
+  const warning = row?.duplicate_warning
+  const matches = duplicateWarningMatches(row)
+  if (!warning || !matches.length) return ''
+  const head = `${DUPLICATE_WARNING_LABEL}：${warning.period || ''} 账上已有同额分录`
+  const items = matches.map((match) => {
+    const direction = match?.direction === 'DEBIT' ? '借' : '贷'
+    const subject = [match?.subject_code, match?.subject_name].filter(Boolean).join(' ')
+    const bits = [
+      match?.voucher_no || '',
+      match?.voucher_date || '',
+      [direction, subject, match?.amount].filter(Boolean).join(' '),
+    ].filter(Boolean)
+    const text = bits.join(' / ')
+    return match?.summary ? `${text}（${match.summary}）` : text
+  })
+  return `${head} —— ${items.join('；')}`
+}
+
+/** 这一批里有几张要提示。概要那一行要用它。 */
+export function duplicateWarningCount(rows) {
+  return (rows || []).filter((row) => duplicateWarningMatches(row).length).length
+}

@@ -13,10 +13,10 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.accounting import vouchers as voucher_service
 from app.accounting.audit_helper import log
-from app.accounting.util import constraint_name, money
+from app.accounting.util import constraint_name, money, period_label
 from app.core.config import settings
 from app.core.system_settings import ocr_config
-from app.invoice import storage
+from app.invoice import duplicates, storage
 from app.invoice.parser import invoice_dict, parse_pdf_with_fallback
 from app.invoice.text_parser import (
     extract_pages_text, merge_invoice_pages, page_count, parse_page,
@@ -1159,7 +1159,110 @@ def serialize_record(record: InvoiceRecord, subjects: dict[int, Subject] | None 
         "lines": lines,
         "resolution": resolved,
         "voucher_id": record.voucher_id,
+        # 「可能重复记账」的提示。**默认没有** —— 有没有要看账上同月有没有
+        # 同额分录，那要查库，由 :func:`serialize_records` 填。
+        "duplicate_warning": None,
     }
+
+
+def duplicate_warnings(db: Session, batch: InvoiceBatch,
+                       records: list[InvoiceRecord]) -> dict[str, dict[str, Any]]:
+    """每张发票的「可能重复记账」提示（按记录 id 索引）。
+
+    **口径见** :mod:`app.invoice.duplicates` 的模块说明：同月、同额、同向、
+    同结算科目。**只提示，不拦** —— 发票号码才是这张票的唯一身份，金额
+    相同不代表是同一笔（2026-10-22 的教训：管理费每月同额，两张票不是
+    重复）。
+
+    **已经生成过凭证的不提示**：它已经在账上了，再说「可能重复」是废话。
+    """
+    wanted = [record for record in records if not record.voucher_id]
+    if not wanted:
+        return {}
+    ords = duplicates.period_ords(db, batch.book_id,
+                                  [record.issue_date for record in wanted])
+    probes: list[tuple[InvoiceRecord, duplicates.Probe]] = []
+    for record in wanted:
+        resolution = (record.payload or {}).get("resolution") or {}
+        total = _money(resolution.get("total"))
+        if total <= 0:
+            continue
+        direction = duplicates.settlement_direction(record.invoice_type)
+        if not direction:
+            continue
+        subject_id = _settlement_subject_id(resolution, direction, total)
+        if subject_id is None:
+            continue
+        if not record.issue_date:
+            continue
+        period_ord = ords.get((record.issue_date.year, record.issue_date.month))
+        if period_ord is None:
+            # 那天不在本账套的会计期间里 —— 这张票本来就入不了账，
+            # 不该由这里报「可能重复」。
+            continue
+        probes.append((record, duplicates.Probe(
+            period_ord=period_ord, direction=direction,
+            amount=total, subject_id=subject_id)))
+    if not probes:
+        return {}
+    # **本批次自己生成的凭证不算**：同一批里两张金额相同的发票是两张票，
+    # 拿自己刚生成的凭证去提示自己是噪声。
+    own_vouchers = {record.voucher_id for record in records if record.voucher_id}
+    hits = duplicates.find_matches(db, batch.book_id,
+                                   [probe for _, probe in probes], own_vouchers)
+    warnings: dict[str, dict[str, Any]] = {}
+    for record, probe in probes:
+        matched = hits.get(probe.key) or []
+        if not matched:
+            continue
+        warnings[record.id] = {
+            "period": period_label(record.issue_date.year, record.issue_date.month),
+            "amount": _decimal_string(probe.amount),
+            "direction": probe.direction,
+            "matches": matched,
+        }
+    return warnings
+
+
+def _settlement_subject_id(resolution: dict[str, Any], direction: str,
+                            total: Decimal) -> int | None:
+    """这张发票将来那条**结算分录**用的科目 id。
+
+    就是那条「结算方向 + 金额等于价税合计」的分录（进项的贷方结算行、
+    销项的借方结算行）。判重要跟**将来真正写进账里的那一条**对齐 ——
+    对不上号，比出来的就是另一笔。
+    """
+    for entry in resolution.get("entries") or []:
+        if entry.get("direction") != direction:
+            continue
+        if _money(entry.get("amount")) != total:
+            continue
+        subject_id = entry.get("subject_id")
+        if subject_id is None:
+            continue
+        try:
+            return int(subject_id)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def serialize_records(db: Session, batch: InvoiceBatch, records: list[InvoiceRecord],
+                       subjects: dict[int, Subject] | None = None) -> list[dict[str, Any]]:
+    """序列化一批记录，并带上「可能重复记账」的提示。
+
+    **为什么提示在这里算，而不是预览时算完存进 payload。**
+
+    账上的分录是**会变的** —— 用户在导入这批票之后又手工记了一笔账，
+    预览时算出来的提示就过期了。而提示过期比没有提示更糟：用户看着
+    「可能重复记账」以为已经确认过其实没有。去查一次账（两次查询，与
+    发票张数无关）换来的是**每次打开都是当下那一刻的账**。
+    """
+    rows = [serialize_record(record, subjects) for record in records]
+    warnings = duplicate_warnings(db, batch, records)
+    for row in rows:
+        row["duplicate_warning"] = warnings.get(row["id"])
+    return rows
 
 
 def is_pdf(name: str) -> bool:
@@ -1493,7 +1596,9 @@ def _preview_payload(
         "committed_count": batch.committed_count or 0,
         "ocr_used": batch.ocr_used,
         "sources": sources,
-        "invoices": [serialize_record(record, subjects) for record in records],
+        # 带上「可能重复记账」的提示：这张发票的金额在同月账上是不是已经
+        # 有对应的分录（见 ``serialize_records``）。
+        "invoices": serialize_records(db, batch, records, subjects),
     }
 
 

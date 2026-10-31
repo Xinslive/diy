@@ -280,7 +280,9 @@ def get_invoice_batch(batch_id: int, book: Book = Depends(get_my_book), db: Sess
     return {
         **service.batch_summary(batch, counts),
         "sources": service.batch_sources(db, batch.id),
-        "invoices": [service.serialize_record(record, subjects) for record in records],
+        # **也要带「可能重复记账」的提示** —— 批次页与预览页是同一张表，
+        # 两处口径必须一致（漏一处，用户在历史里点开批次就看不到提示）。
+        "invoices": service.serialize_records(db, batch, records, subjects),
     }
 
 
