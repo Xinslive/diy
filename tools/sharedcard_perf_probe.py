@@ -18,10 +18,10 @@
 
 环境变量：
 
-``CWQ_PROBE_PRINCIPAL=cache``
-    做一次 A/B：把宿主那条「每次能力调用都重新解析调用者」的路径换成
-    **每个请求只解析一次**（这是「修好之后」的上界）。用来量出
-    **授权重复解析**到底吃掉了多少时间 —— 不是猜测，是实测差额。
+``CWQ_PROBE_COMPARE=off``
+    做一次对照：把宿主那条「解析调用者按请求一份」的路径换成**每次能力调用
+    都重新解析**（也就是修复之前的行为），用来量出这项修复的真实收益 ——
+    不是猜测，是实测差额。
 """
 from __future__ import annotations
 
@@ -47,8 +47,8 @@ sys.path.insert(0, BACKEND_ROOT)
 #: 每次能力调用都会触发一次「解析调用者」。探针要数清楚**调用了多少次**。
 CALL_COUNTS: collections.Counter = collections.Counter()
 
-#: 宿主原始的调用者解析函数（A/B 要能换回去）。
-_ORIGINAL_REQUEST_USER = None
+#: 宿主原始的 ``principal_scope``（对照组要能换回去）。
+_ORIGINAL_PRINCIPAL_SCOPE = None
 
 
 class _StubRegistrar:
@@ -118,44 +118,49 @@ def _instrument(ctx):
             pass
 
 
-def _install_cached_principal():
-    """把「每次能力调用都重新解析调用者」换成「每个请求只解析一次」。
+def _disable_principal_scope():
+    """把「解析调用者按请求一份」关掉，退回「每次能力调用都解析一次」。
 
-    **这是 A/B 的「修好之后」那一侧**：宿主网关本来就在每个请求入口做过
-    一次 ``require_plugin_access``；请求内部再逐次解析，是**重复**。
-    这里用 ``current_request_id`` 当缓存键 —— 同一个请求里调用者不可能变。
+    **这是对照组**：宿主网关本来就在每个请求入口做过一次
+    ``require_plugin_access``；请求内部再逐次解析是**重复**。
+    这里把 ``principal_scope`` 换成「不建缓存」的那一档，
+    于是量到的就是修复之前的行为。
     """
+    import contextlib
+
     import app.plugins.public_api as public_api
 
-    global _ORIGINAL_REQUEST_USER
-    _ORIGINAL_REQUEST_USER = public_api.request_user
-    original = _ORIGINAL_REQUEST_USER
-    cache: dict[str, object] = {}
+    global _ORIGINAL_PRINCIPAL_SCOPE
+    _ORIGINAL_PRINCIPAL_SCOPE = public_api.principal_scope
 
-    def cached_request_user(db, pid):
-        key = public_api.current_request_id.get() or "probe-no-request-id"
-        hit = cache.get(key)
-        if hit is None:
-            hit = original(db, pid)
-            cache[key] = hit
-        return hit
+    @contextlib.contextmanager
+    def no_scope():
+        yield
 
-    public_api.request_user = cached_request_user
+    public_api.principal_scope = no_scope
 
 
-def _restore_principal():
-    """把调用者解析换回宿主原样（第三遍热基线要用）。"""
+def _restore_principal_scope():
+    """把 ``principal_scope`` 换回宿主原样（第三遍热基线要用）。"""
     import app.plugins.public_api as public_api
 
-    if _ORIGINAL_REQUEST_USER is not None:
-        public_api.request_user = _ORIGINAL_REQUEST_USER
+    if _ORIGINAL_PRINCIPAL_SCOPE is not None:
+        public_api.principal_scope = _ORIGINAL_PRINCIPAL_SCOPE
 
 
 def _measure(label, call, results):
     CALL_COUNTS.clear()
     started = time.perf_counter()
     try:
-        call()
+        # **必须包在 ``principal_scope()`` 里**：宿主网关在每个请求入口就是
+        # 这么包着的（``loader.py``）。探针直接调插件函数、不经过网关，
+        # 不开这个区间就量不到「解析调用者按请求一份」的真实效果 ——
+        # 那会量出一条**比线上更慢**的数字，看起来像是修复没生效。
+        #
+        # **按模块属性调**（``public_api.principal_scope``）而不是局部导入名：
+        # 对照组要能把这一档换成「不建缓存」的那一档，换局部名字是换不掉的。
+        with public_api.principal_scope():
+            call()
         error = ""
     except Exception as exc:  # 探针本身出错也要报出来，别让它变成「没测到」
         error = f"{type(exc).__name__}: {exc}"[:200]
@@ -174,15 +179,15 @@ def main() -> int:
     card_id = int(sys.argv[2]) if len(sys.argv) > 2 else 3
     user_id = int(sys.argv[3]) if len(sys.argv) > 3 else 1
 
-    from app.plugins.public_api import context_for, current_principal
+    from app.plugins import public_api
 
     manifest, plugin = _load_plugin(directory)
 
     # 只由宿主 ASGI 门禁设置；这里显式设成「管理员本人」，好让插件的能力面
     # 与真实请求一致（能读哪些账套、能不能写）。
-    current_principal.set((manifest["id"], user_id, None))
+    public_api.current_principal.set((manifest["id"], user_id, None))
 
-    ctx = context_for(manifest, plugin=True)
+    ctx = public_api.context_for(manifest, plugin=True)
     registrar = _StubRegistrar()
     plugin.register(registrar, ctx)
     print(f"插件 {manifest['id']} v{manifest['version']} 已装载，声明 {len(registrar.routes)} 条路由\n")
@@ -221,7 +226,8 @@ def main() -> int:
             started = time.perf_counter()
             profiler.enable()
             try:
-                endpoint(card_id)
+                with public_api.principal_scope():
+                    endpoint(card_id)
                 error = ""
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"[:200]
@@ -238,36 +244,36 @@ def main() -> int:
                 print(buffer.getvalue())
         return results
 
-    baseline = run_all("基线（宿主现状）")
+    baseline = run_all("现状（解析调用者按请求一份）")
 
-    if os.environ.get("CWQ_PROBE_PRINCIPAL") == "cache":
-        _install_cached_principal()
+    if os.environ.get("CWQ_PROBE_COMPARE") == "off":
+        _disable_principal_scope()
         print()
-        cached = run_all("A/B：每个请求只解析一次调用者")
+        before = run_all("对照：每次能力调用都重新解析调用者（修复前）")
         print()
-        # **第三遍再跑一次基线**：第二遍天然是「热的」（数据库页、Python 导入
-        # 都已就位），把缓存那侧的收益和热身效应混在一起就分不清了。
-        # 拿**热的基线**跟**热的缓存**比，才是缓存那一项的真实收益。
-        _restore_principal()
+        # **第三遍再跑一次现状**：第二遍天然是「热的」（数据库页、Python 导入
+        # 都已就位），把修复的收益和热身效应混在一起就分不清了。
+        # 拿**热的现状**跟**热的对照**比，才是修复那一项的真实收益。
+        _restore_principal_scope()
         print()
-        warm_baseline = run_all("基线（再跑一遍，已经热了）")
+        warm_baseline = run_all("现状（再跑一遍，已经热了）")
 
-        print("\n===== A/B 差额 =====")
-        print("  基线1 是冷的、缓存侧是热的 —— 直接比会把热身效应算进缓存头上。")
-        print("  所以看「热基线 vs 缓存」这一行。\n")
-        for (label, base_ms, _, _), (_, cache_ms, _, _), (_, warm_ms, _, _) in zip(
-                baseline, cached, warm_baseline):
-            delta = warm_ms - cache_ms
-            share = (delta / warm_ms * 100) if warm_ms else 0.0
-            print(f"  {label:<40} 热基线 {warm_ms:8.1f} → 缓存 {cache_ms:8.1f} ms   "
+        print("\n===== 修复前 → 修复后 =====")
+        print("  对照侧是热的、现状侧第一遍是冷的 —— 直接比会把热身效应算到修复头上。")
+        print("  所以看「热现状 vs 对照」这一行。\n")
+        for (label, _, _, _), (_, before_ms, _, _), (_, warm_ms, _, _) in zip(
+                baseline, before, warm_baseline):
+            delta = before_ms - warm_ms
+            share = (delta / before_ms * 100) if before_ms else 0.0
+            print(f"  {label:<40} 修复前 {before_ms:8.1f} → 修复后 {warm_ms:8.1f} ms   "
                   f"省 {delta:8.1f} ms ({share:.0f}%)")
+        total_before = sum(row[1] for row in before)
         total_warm = sum(row[1] for row in warm_baseline)
-        total_cache = sum(row[1] for row in cached)
-        print(f"  {'合计':<40} 热基线 {total_warm:8.1f} → 缓存 {total_cache:8.1f} ms   "
-              f"省 {total_warm - total_cache:8.1f} ms "
-              f"({(total_warm - total_cache) / total_warm * 100:.0f}%)")
-        print(f"\n  参考：冷基线合计 {sum(row[1] for row in baseline):.1f} ms "
-              f"（比热基线多 {sum(row[1] for row in baseline) - total_warm:.1f} ms —— 这一段是热身效应）")
+        print(f"  {'合计':<40} 修复前 {total_before:8.1f} → 修复后 {total_warm:8.1f} ms   "
+              f"省 {total_before - total_warm:8.1f} ms "
+              f"({(total_before - total_warm) / total_before * 100:.0f}%)")
+        print(f"\n  参考：冷现状合计 {sum(row[1] for row in baseline):.1f} ms "
+              f"（比热现状多 {sum(row[1] for row in baseline) - total_warm:.1f} ms —— 这一段是热身效应）")
 
     return 0
 
