@@ -13,6 +13,7 @@ Excel、网页版、CSV 还是 PDF，到这里都是同一种东西。
 from __future__ import annotations
 
 import hashlib
+import itertools
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -742,6 +743,77 @@ def parse_grid(grid: Grid, *, column_mapping: dict[str, int] | None = None,
     return result
 
 
+def _link_ok(previous: StatementRow | None, current: StatementRow | None) -> bool:
+    """「上一笔的余额 ± 这一笔的金额 = 这一笔的余额」这一段接不接得上。
+
+    **接不上不算错**：这一笔的金额认不出来（``None``）时，这一段**没法验**，
+    验不了的事不当它错 —— 当成「过」才是诚实的做法。
+    """
+    if previous is None or current is None:
+        return True
+    if current.amount is None or previous.balance is None or current.balance is None:
+        return True
+    delta = abs(previous.balance - current.balance)
+    return abs(delta - abs(current.amount)) <= Decimal("0.05")
+
+
+#: 一组「同一秒」的流水最多试多少种排法。``6! = 720`` 种，每种验几段链 ——
+#: 够快，也够把「同一秒里挤了十几笔」那种极端情况挡在外面。
+_MAX_TIE_PERMUTATIONS = 6
+
+
+def _order_tie_groups(ordered: list[StatementRow]) -> list[StatementRow]:
+    """同一秒的几笔，谁先谁后 —— 由**余额链**决定。
+
+    **为什么需要**：有的银行会把两笔印成**同一秒**。兴业那份就有：冲账那笔
+    和它撤销的那笔，时间戳完全一样（``19:13:38`` 两笔）。按时间排序时它们
+    谁先谁后是**任意的**（排序键一样，顺序只能靠文件里本来谁在前面），
+    而**余额链**是唯一的判据。
+
+    排错了会怎样：余额链**接不上** → 推不出期末余额 → 期末余额对账整个用不了，
+    界面上还会说「对账单未提供余额列」—— 而**余额列明明有**。
+
+    **排不出来就保持原样**：宁可不给期末余额，也不要给一个错的。
+    """
+    out: list[StatementRow] = []
+    index = 0
+    total = len(ordered)
+    while index < total:
+        key = (ordered[index].tx_date, ordered[index].tx_time or "")
+        end = index + 1
+        while end < total and (ordered[end].tx_date, ordered[end].tx_time or "") == key:
+            end += 1
+        group = ordered[index:end]
+        out.extend(group if len(group) == 1 else _resolve_tie_group(group, ordered, index, end))
+        index = end
+    return out
+
+
+def _resolve_tie_group(group: list[StatementRow], ordered: list[StatementRow],
+                       start: int, end: int) -> list[StatementRow]:
+    """一组「同一秒」的流水 → 排出来的顺序。
+
+    判据是**余额链**：这一组按某种顺序摆好时，前一笔接得上第一笔、组内
+    接得上、最后一笔接得上后一笔，就用那个顺序。
+
+    **都接不上就保持原样**（返回 ``group``）—— 宁可不给期末余额，
+    也不要给一个错的。
+    """
+    if len(group) > _MAX_TIE_PERMUTATIONS:
+        return group
+    before = ordered[start - 1] if start > 0 else None
+    after = ordered[end] if end < len(ordered) else None
+    for candidate in itertools.permutations(group):
+        if not _link_ok(before, candidate[0]):
+            continue
+        if not _link_ok(candidate[-1], after):
+            continue
+        if all(_link_ok(candidate[index], candidate[index + 1])
+               for index in range(len(candidate) - 1)):
+            return list(candidate)
+    return group
+
+
 def _closing_from_rows(rows: list[StatementRow],
                        meta: StatementMeta) -> Decimal | None:
     """从**余额列**推出期末余额。
@@ -768,7 +840,8 @@ def _closing_from_rows(rows: list[StatementRow],
     dated = [row for row in rows if row.balance is not None and row.tx_date is not None]
     if not dated:
         return None
-    ordered = sorted(dated, key=lambda row: (row.tx_date, row.tx_time or ""))
+    ordered = _order_tie_groups(
+        sorted(dated, key=lambda row: (row.tx_date, row.tx_time or "")))
 
     # 余额链校验：相邻两笔（时间顺序）的余额差，应当等于**后一笔**的金额
     # —— 余额记的是交易之后的。
@@ -793,6 +866,38 @@ def _closing_from_rows(rows: list[StatementRow],
     return ordered[-1].balance
 
 
+def _normalize_negative_sides(amount_in: Decimal | None, amount_out: Decimal | None
+                              ) -> tuple[Decimal | None, Decimal | None, str]:
+    """把「负数金额」翻译成方向。
+
+    **为什么必须有这一步**：银行把**冲账**（当天撤销的一笔）印成负数。
+    兴业那份对账单里就有一行：支出列写着 ``-13,510.00``、摘要写「当日冲账」
+    —— 意思是「上午那笔转出被撤销了，钱退回来了」。
+
+    **不处理会怎样**：负数落在支出列里，``amount_out > 0`` 不成立 →
+    这一行既没有金额（``None``）也没有方向（``UNKNOWN``）→ 它成了整份对账单里
+    唯一一个「有余额、没金额」的行 → 余额连续性自检时 ``Decimal + None``
+    直接抛 ``TypeError`` → **上传直接失败**，而文件本身一点毛病都没有。
+
+    口径：**金额永远存绝对值，方向由符号决定** ——
+    支出列的负数 = 被撤销的支出 = 钱退回来了 = **收入**；
+    收入列的负数 = 被撤销的收入 = 钱又出去了 = **支出**。
+
+    返回 ``(收入侧, 支出侧, 说明)``。说明会进 ``extra``（接口里带得出来），
+    而这一行的**摘要列**写的就是「当日冲账」—— 用户在界面上能直接看到
+    自己账上有一笔被撤销过。
+    """
+    if amount_out is not None and amount_out < 0:
+        # 另一侧没有发生额（``None`` 或 ``0``）才翻 —— 两侧都有数时那本来
+        # 就是一行「方向自相矛盾」的数据，交给方向判定去报 UNKNOWN，别猜。
+        if amount_in is None or amount_in <= 0:
+            return -amount_out, None, "支出列为负数（冲账），按收入记"
+    if amount_in is not None and amount_in < 0:
+        if amount_out is None or amount_out <= 0:
+            return None, -amount_in, "收入列为负数（冲账），按支出记"
+    return amount_in, amount_out, ""
+
+
 def _build_row(seq: int, cells: list[str], mapping: dict[str, int],
                meta: StatementMeta) -> StatementRow | None:
     def value(field: str) -> str:
@@ -812,6 +917,8 @@ def _build_row(seq: int, cells: list[str], mapping: dict[str, int],
     row.amount = parse_amount(value("AMOUNT"))
     amount_in = parse_amount(value("IN"))
     amount_out = parse_amount(value("OUT"))
+    # **负数金额 = 冲账**：方向由符号决定，金额一律存绝对值。
+    amount_in, amount_out, sign_note = _normalize_negative_sides(amount_in, amount_out)
     row.balance = parse_amount(value("BALANCE"))
     row.summary = value("SUMMARY")
     row.purpose = value("PURPOSE")
@@ -837,13 +944,26 @@ def _build_row(seq: int, cells: list[str], mapping: dict[str, int],
         elif amount_out is not None and amount_out > 0:
             row.amount = amount_out
 
+    # 单一「金额」列（没有收入/支出两列）且金额为负：**符号自己就是方向**。
+    # 金额存绝对值（负金额会把收入/支出合计算反），方向在判出来之后翻。
+    single_negative = (row.amount is not None and row.amount < 0
+                       and amount_in is None and amount_out is None)
+    if single_negative:
+        row.amount = -row.amount
+        sign_note = sign_note or "金额列为负数，方向按符号翻转"
+
     direction, basis = resolve_direction(
         amount_in=amount_in, amount_out=amount_out, amount=row.amount,
         direction_text=value("DIRECTION"), tx_type=value("TX_TYPE"),
         payer=payer, payee=payee, summary=f"{row.summary} {row.purpose}",
         account_no=meta.account_no, account_name=meta.account_name)
+    if single_negative and direction in ("IN", "OUT"):
+        direction = "OUT" if direction == "IN" else "IN"
+        basis = basis + "（金额为负，方向已翻转）"
     row.direction = direction
     row.extra["direction_basis"] = basis
+    if sign_note:
+        row.extra["sign_note"] = sign_note
 
     # 对方是谁：**不是本户的那一方**。付款方是本户 → 对方是收款方；
     # 收款方是本户 → 对方是付款方。方向定下来之后才知道该取哪一边。
@@ -961,7 +1081,14 @@ def _check_notes(result: ParsedStatement) -> list[str]:
     broken = 0
     previous: StatementRow | None = None
     for row in result.rows:
+        # **四个空值都要守卫** —— 少一个就是一次崩溃。
+        #
+        # ``previous.amount`` 曾经没被守卫：有一行的金额认不出来（``None``）
+        # 而余额认得出来，下面的 ``descending`` 就拿 ``Decimal + None`` 去算，
+        # 直接抛 ``TypeError``。而这行崩溃发生在**上传那一步**（自检是解析的
+        # 最后一道），于是用户看到的是「导入失败」，文件本身却一点毛病没有。
         if previous is not None and previous.balance is not None \
+                and previous.amount is not None \
                 and row.balance is not None and row.amount is not None:
             # 有的银行**倒序**印流水（最新的在最上面），余额是往上走的。
             #

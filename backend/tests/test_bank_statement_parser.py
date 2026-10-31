@@ -589,3 +589,196 @@ def test_首末行与金标准一致(name):
         assert row.tx_date.isoformat() == last["tx_date"], name
         assert str(row.amount) == last["amount"], name
         assert row.direction == last["direction"], name
+
+
+# ----------------------------------------------------------------------
+# 冲账（当天撤销的一笔）：负数金额
+# ----------------------------------------------------------------------
+#
+# 银行的流水里偶尔有一行是**冲账** —— 当天转错了一笔，当场撤销。
+# 兴业把它印成**负数**：支出列写着 ``-13,510.00``、摘要写「当日冲账」。
+#
+# 解析器原来对负数是「当成没有金额」：那一行既没金额也没方向，成了整份
+# 对账单里唯一一个「有余额、没金额」的行 → 余额连续性自检时
+# ``Decimal + None`` 直接抛 ``TypeError`` → **上传直接失败**，
+# 而文件本身一点毛病没有。
+
+
+def test_冲账行的负数支出被记成收入():
+    """口径：**金额存绝对值，方向由符号决定**。
+
+    支出列的负数 = 那笔支出被撤销了 = 钱退回来了 = **收入**。
+    """
+    parsed = _parse("xingye_chongzhang.xls")
+    row = next(r for r in parsed.rows if r.summary == "当日冲账")
+    assert row.amount == Decimal("13510.00"), row.amount
+    assert row.direction == "IN", row.direction
+    assert row.balance == Decimal("112418.11"), row.balance
+    # 这件事要**说出来**：这一行是冲账，用户应当知道自己账上有一笔被撤销过
+    assert "冲账" in row.extra.get("sign_note", ""), row.extra
+
+
+def test_冲账的金额进收入合计而不是被丢掉():
+    parsed = _parse("xingye_chongzhang.xls")
+    # 收入合计**含**那笔冲账（13,510.00）；支出只有真正的两笔
+    assert parsed.income_total == Decimal("25928.11"), parsed.income_total
+    assert parsed.expense_total == Decimal("18510.00"), parsed.expense_total
+
+
+def test_冲账行的余额接得上前后两行():
+    """余额链：较新一行.余额 == 较旧一行.余额 + 较新一行的发生额。
+
+    冲账行夹在中间 —— 它上面那笔转账把余额扣掉了，它自己把钱退回来。
+    """
+    parsed = _parse("xingye_chongzhang.xls")
+    assert not any("接不上" in note for note in parsed.diagnosis), parsed.diagnosis
+
+
+def test_收入列的负数记成支出():
+    """镜像情形：收入列印负数 = 那笔收入被撤销了 = 钱又出去了。"""
+    from app.bankstatement.grid import Grid
+
+    grid = semantics.read_grids(_data("xingye_chongzhang.xls"))[0]
+    rows = list(grid.rows)
+    target = next(i for i, row in enumerate(rows)
+                  if "当日冲账" in " ".join(semantics.cell_text(c) for c in row))
+    # 把那笔冲账从「支出列负数」挪到「收入列负数」
+    line = [semantics.cell_text(c) for c in rows[target]]
+    line[2], line[3] = "", line[2]
+    swapped = Grid(container=grid.container, sheet=grid.sheet,
+                   rows=rows[:target] + [line] + rows[target + 1:],
+                   meta=grid.meta, footer=grid.footer)
+    parsed = semantics.parse_grid(swapped)
+    row = next(r for r in parsed.rows if r.summary == "当日冲账")
+    assert row.amount == Decimal("13510.00"), row.amount
+    assert row.direction == "OUT", row.direction
+
+
+def test_单一金额列的负数方向会翻转():
+    """只有一列「金额」时，负号自己就是方向。
+
+    金额一律存**绝对值** —— 负金额会把收入/支出合计算反。
+    """
+    from app.bankstatement.grid import Grid
+
+    grid = Grid(container="XLS", sheet="Sheet1", rows=[
+        ["交易日期", "金额", "摘要"],
+        ["2026-04-02", "100.00", "收入"],
+        ["2026-04-03", "-50.00", "收入"],
+    ])
+    parsed = semantics.parse_grid(grid)
+    assert parsed.rows[0].amount == Decimal("100.00"), parsed.rows[0].amount
+    assert parsed.rows[0].direction == "IN", parsed.rows[0].direction
+    assert parsed.rows[1].amount == Decimal("50.00"), parsed.rows[1].amount
+    assert parsed.rows[1].direction == "OUT", parsed.rows[1].direction
+
+
+def test_有余额没金额的行不会让自检崩掉():
+    """**回归**：上一行「有余额、没金额」时，自检会拿 ``None`` 去加。
+
+    守卫漏了「上一行的金额」这一项 → ``Decimal + None`` → ``TypeError``。
+    崩在**上传那一步**（自检是解析的最后一道），用户看到的是「导入失败」。
+    """
+    from app.bankstatement.grid import Grid
+
+    grid = semantics.read_grids(_data("xingye_chongzhang.xls"))[0]
+    rows = list(grid.rows)
+    target = next(i for i, row in enumerate(rows)
+                  if "当日冲账" in " ".join(semantics.cell_text(c) for c in row))
+    # 把金额抹掉，只留余额 —— 这一行就成了「有余额、没金额」
+    line = [semantics.cell_text(c) for c in rows[target]]
+    line[2] = ""
+    stripped = Grid(container=grid.container, sheet=grid.sheet,
+                    rows=rows[:target] + [line] + rows[target + 1:],
+                    meta=grid.meta, footer=grid.footer)
+    parsed = semantics.parse_grid(stripped)   # 修复前：TypeError
+    assert any(row.amount is None and row.balance is not None
+               for row in parsed.rows), "前置条件：确实造出了「有余额、没金额」的行"
+
+
+def test_余额确实接不上时诊断要报出来():
+    """**别把闸门拆了**：守卫加严是为了不崩，不是为了不报。
+
+    余额链真的断了（这里把某一行的余额改错），诊断里必须说出来。
+    """
+    from app.bankstatement.grid import Grid
+
+    grid = semantics.read_grids(_data("xingye_chongzhang.xls"))[0]
+    rows = list(grid.rows)
+    target = next(i for i, row in enumerate(rows)
+                  if "当日冲账" in " ".join(semantics.cell_text(c) for c in row))
+    line = [semantics.cell_text(c) for c in rows[target]]
+    line[4] = "999,999.99"      # 把余额改坏
+    broken = Grid(container=grid.container, sheet=grid.sheet,
+                  rows=rows[:target] + [line] + rows[target + 1:],
+                  meta=grid.meta, footer=grid.footer)
+    parsed = semantics.parse_grid(broken)
+    assert any("接不上" in note for note in parsed.diagnosis), parsed.diagnosis
+
+
+def test_同一秒的两笔按余额链定顺序():
+    """**冲账和它撤销的那笔是同一秒印出来的** —— 时间戳完全一样。
+
+    按时间排序时谁先谁后是**任意的**（排序键一样，只能靠文件里本来谁在
+    前面），而**余额链**是唯一的判据：「上一笔的余额 ± 这一笔的金额 =
+    这一笔的余额」。
+
+    排错了的后果：余额链接不上 → **推不出期末余额** → 期末余额对账整个
+    用不了，界面上还会说「对账单未提供余额列」—— 而**余额列明明有**。
+    """
+    parsed = _parse("xingye_chongzhang.xls")
+    # 期末余额推出来了（推不出来就是 None）—— 而它等于时间上最后一笔的余额
+    assert parsed.meta.closing_balance == Decimal("107418.11"), parsed.meta.closing_balance
+    last = max(parsed.rows, key=lambda row: (row.tx_date, row.tx_time or ""))
+    assert last.balance == parsed.meta.closing_balance
+
+
+def test_同一秒的两笔排不出来时宁可不给期末余额():
+    """**排不出来就留空** —— 宁可不给一个错的期末余额。
+
+    这里把两笔同一秒的流水**改成接不上**（余额乱写），解析器就得认出来
+    「这一段我排不出来」，而不是随便挑一个顺序给出一个错的期末余额。
+    """
+    from app.bankstatement.grid import Grid
+
+    grid = semantics.read_grids(_data("xingye_chongzhang.xls"))[0]
+    rows = list(grid.rows)
+    header = next(i for i, row in enumerate(rows)
+                  if [semantics.cell_text(c) for c in row][:5]
+                  == ["交易时间", "记账日", "支出", "收入", "账户余额"])
+    target = next(i for i, row in enumerate(rows)
+                  if "当日冲账" in " ".join(semantics.cell_text(c) for c in row))
+    line = [semantics.cell_text(c) for c in rows[target]]
+    line[4] = "1,234,567.89"      # 把余额改坏：两笔同一秒的怎么排都接不上
+    broken = Grid(container=grid.container, sheet=grid.sheet,
+                  rows=rows[:target] + [line] + rows[target + 1:],
+                  meta=grid.meta, footer=grid.footer)
+    parsed = semantics.parse_grid(broken)
+    assert parsed.meta.closing_balance is None, parsed.meta.closing_balance
+
+
+def test_同一秒挤了太多笔时不硬排():
+    """「同一秒」那一组**超过 6 笔**时，不试排列 —— 直接保持原样。
+
+    ``6! = 720`` 种排法是上限；再多的组**不猜**：猜错了会给出一个错的
+    期末余额，而猜不出来只是「这一段不参与推期末余额」。
+    """
+    from app.bankstatement.grid import Grid
+
+    def grid(balances):
+        rows = [["交易日期", "金额", "余额", "摘要"]]
+        for index, balance in enumerate(balances):
+            rows.append(["2026-04-02", "10.00", balance,
+                         "同一秒的第 %d 笔" % index])
+        return Grid(container="XLS", sheet="Sheet1", rows=rows)
+
+    # 余额链**本来就接得上**时，期末余额**照常推得出来** ——
+    # 要验的是「不硬排」这条捷径没把结果算坏。
+    ok = semantics.parse_grid(grid(["%d.00" % (1000 - index * 10) for index in range(8)]))
+    assert ok.meta.closing_balance == Decimal("930.00"), ok.meta.closing_balance
+    assert len(ok.rows) == 8, len(ok.rows)
+
+    # 余额链**接不上**时，就不给期末余额 —— 不硬编一个数出来。
+    broken = ["1000.00", "990.00", "500.00"] +         ["%d.00" % (490 - index * 10) for index in range(5)]
+    bad = semantics.parse_grid(grid(broken))
+    assert bad.meta.closing_balance is None, bad.meta.closing_balance

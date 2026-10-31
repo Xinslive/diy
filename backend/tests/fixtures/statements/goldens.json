@@ -525,5 +525,44 @@
     "period_end": "2026-09-30",
     "period_start": "2026-09-02",
     "row_count": 15
+  },
+  "xingye_chongzhang.xls": {
+    "closing_balance": "107418.11",
+    "column_mapping": {
+      "BALANCE": 4,
+      "CP_ACCOUNT": 8,
+      "CP_NAME": 6,
+      "DATE": 0,
+      "IN": 3,
+      "OUT": 2,
+      "POSTING_DATE": 1,
+      "PURPOSE": 9,
+      "SUMMARY": 5,
+      "TIME": 0,
+      "TX_TYPE": 10
+    },
+    "container": "XLS",
+    "declared_expense_total": null,
+    "declared_income_total": null,
+    "declared_total_count": null,
+    "diagnosis": [],
+    "expense_total": "18510.00",
+    "first": {
+      "amount": "5000.00",
+      "balance": "107418.11",
+      "direction": "OUT",
+      "tx_date": "2026-04-30"
+    },
+    "header_row": 10,
+    "income_total": "25928.11",
+    "last": {
+      "amount": "906.30",
+      "balance": "100906.30",
+      "direction": "IN",
+      "tx_date": "2026-04-02"
+    },
+    "period_end": "2026-04-30",
+    "period_start": "2026-04-02",
+    "row_count": 7
   }
 }

@@ -519,6 +519,36 @@ def test_上传不用选账套_是为这个共享卡上传的(shared, client, au
     assert [item["id"] for item in listed] == [uploaded["statement_id"]]
 
 
+def test_带冲账负数行的对账单能上传(shared, client, auth, cash_subjects):
+    """**回归**：兴业那份流水里有一行「当日冲账」（支出列是**负数**）。
+
+    解析器原来对负数是「当成没有金额」，那一行成了整份对账单里唯一一个
+    「有余额、没金额」的行 → 余额连续性自检时 ``Decimal + None`` 直接抛
+    ``TypeError`` → **上传直接失败**，而文件本身一点毛病没有。
+
+    走的正是界面那条路：``POST /cards/{id}/statements``。
+    """
+    card_id = _card_with_members(shared, client, auth, cash_subjects)
+    name = "xingye_chongzhang.xls"
+    data = (FIXTURES / name).read_bytes()
+    response = client.post(shared + f"/cards/{card_id}/statements", headers=auth,
+                            files={"files": (name, data, "application/octet-stream")})
+    assert response.status_code == 200, response.text
+    uploaded = _json(response)
+    assert uploaded["rows"] == 7, uploaded
+    # 余额接得上 → 没有「接不上」的诊断
+    assert not any("接不上" in note for note in uploaded["diagnosis"]), uploaded["diagnosis"]
+
+    rows = _json(client.get(shared + f"/statements/{uploaded['statement_id']}/rows",
+                             headers=auth, params={"limit": 50}))["rows"]
+    chongzhang = next(row for row in rows if row.get("summary") == "当日冲账")
+    # 冲账 = 那笔支出被撤销了 = 钱退回来了 → **收入**，金额取绝对值
+    assert chongzhang["direction"] == "IN", chongzhang
+    assert chongzhang["amount"] == "13510.00", chongzhang
+    # 这件事要**说出来**：用户应当知道自己账上有一笔被撤销过
+    assert "冲账" in (chongzhang.get("extra") or {}).get("sign_note", ""), chongzhang
+
+
 def test_显式指定存储账套仍然可用(shared, client, auth, cash_subjects):
     """``book_id`` 降级成**存储位置提示**（API 层面），界面不再传它。
 
