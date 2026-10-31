@@ -179,7 +179,16 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
         # 渲染器见 ``render_ledger_book_page``。
         "subtitle": {"text": "", "size": 12, "align": "center"},
         # 正文 12pt —— 账簿的字号下限（见 LEDGER_MIN_FONT_SIZE，用户 2026-10-23）。
-        "font": {"family": "宋体", "size": 12},
+        #
+        # **锁定字体默认打开**（用户 2026-10-31：「把『总账』『明细账』『科目余额表』
+        # 的基线模板的『锁定字体』开关设置成打开」）。总账是**正式账簿** —— 要拿给
+        # 外部看的正式账册，字形必须换台机器一模一样。
+        #
+        # **版式不会跟着动。** 所见即所得分两层：位置 / 间距 / 换行那一层早就不跟
+        # 字体走了（位置用百分比、字号用 pt、行高固定死、字距用全角空格 U+3000），
+        # 锁字体只钉死**字形**那一半（见 ``printing/fonts.py``）。
+        "font": {"family": "宋体", "size": 12,
+                 "embed": True, "embed_font": "cwq-serif"},
         "show": {"period": True, "page_no": True},
         # 列宽是实测值（占表格宽度百分比，合计 100）。
         # 「方向」列窄到表头必须竖排 —— 那是用友的固定写法，不是排版失误。
@@ -255,7 +264,11 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
         # 副标题留空 = 显示期间（与总账同一口径）。
         "subtitle": {"text": "", "size": 12, "align": "center"},
         # 正文 12pt —— 与总账同一口径（见 LEDGER_MIN_FONT_SIZE）。
-        "font": {"family": "宋体", "size": 12},
+        #
+        # **锁定字体默认打开**（用户 2026-10-31，与总账同一批）。
+        # 明细账是**正式账簿**，与总账同一条理由：字形必须换台机器一模一样。
+        "font": {"family": "宋体", "size": 12,
+                 "embed": True, "embed_font": "cwq-serif"},
         "show": {"period": True, "page_no": True},
         # 八列与总账同宽同序（列宽是用户那份的实测值，合计 100）。
         "columns": [
@@ -299,7 +312,12 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
         "margins": {"top": 12, "right": 8, "bottom": 12, "left": 8},
         "title": {"text": "科目余额表", "size": 16, "bold": True, "align": "center"},
         "subtitle": {"text": "", "size": 10, "align": "center"},
-        "font": {"family": "宋体", "size": 9},
+        # 正文 9pt —— 法定报表那套字号，不受账簿 12pt 下限管（见 LEDGER_MIN_FONT_SIZE）。
+        #
+        # **锁定字体默认打开**（用户 2026-10-31，与总账 / 明细账同一批）：
+        # 科目余额表是要拿给外部看的正式表，字形必须换台机器一模一样。
+        "font": {"family": "宋体", "size": 9,
+                 "embed": True, "embed_font": "cwq-serif"},
         "show": {"period": True, "page_no": True},
         "columns": [
             {"key": "code", "label": "科目编码", "width": 10, "align": "center"},
