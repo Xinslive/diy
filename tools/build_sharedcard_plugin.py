@@ -70,8 +70,6 @@ def build():
     # No stale hardcoded production facts or preview-only copy in the live UI.
     script = re.sub(r'  function renderImport\(\).*?\n(?=/\*\* Bounded, searchable controls\.)', '', script, flags=re.S)
     script = script.replace('    renderImport();', '    root.querySelector(\'#scv-import\').replaceChildren();')
-    script = script.replace('重放9月文件导入', '导入对账单')
-    script = script.replace('重放接入；“新增 / 复用”是接入投影，不是生产上传日志。', '排列；“新增 / 复用”来自当前原件交叠投影。')
     script = script.replace("'请核实后选择':'归属待定'", "'请核实后选择':'归属待定'")
     script = script.replace('原归属证据保留；更改仅在本页演示', '确认后保存；原归属证据保留')
     script = script.replace('本页指定 / 更改归属', '指定 / 更改归属')
@@ -86,7 +84,6 @@ def build():
     script = script.replace('当前登记的是 1001 库存现金，可能包含现金等非本卡业务。“待删除”和“优境”均在范围内，不能把登记科目余额合计直接当成这张卡的应有余额。', '登记科目可能包含现金等非本卡业务；成员范围应逐一核实，登记科目合计不能直接当作本卡应有余额。')
     script = script.replace('查看7笔归属冲突', '查看归属冲突')
     script = script.replace('“待删除”仍登记在卡下，7 笔交易同时留有它与“优境”的归属。这里保留原记录，需核实范围及逐笔归属。', '历史归属证据完整保留；同一交易存在多本账认领时，先核实归属再确认核对。')
-    script = script.replace("${link('原始行','file',`data-file=\"${f.id}\"`)}", "${link('原始行','file',`data-file=\"${f.id}\"`)} ${link('管理 / 导出','manage-file',`data-file=\"${f.id}\"`)}")
     script = script.replace('生产快照 ${D.captured_at.slice(0,10)} ${D.captured_at.slice(11,16)}（北京时间）', '实时读取 ${new Date(D.captured_at).toLocaleString(\'zh-CN\', {hour12:false})}')
     begin = script.index('  function groupBankDate(g)')
     end = script.index('\n  function workPane()')
@@ -98,12 +95,14 @@ def build():
     css += '#shared-card-v2 .scv-root-message{padding:24px}#shared-card-v2 .scv-period-search{width:150px;margin:8px 0}\n'
     front = PLUGIN / 'frontend/index.js'
     legacy_front = (PLUGIN / 'frontend/management.js').read_text()
-    legacy_front = legacy_front.replace("  { key: 'statements', label: '对账单' },", "  { key: 'flow', label: '资金脉络' },\n  { key: 'statements', label: '原始资料管理' },", 1)
+    # **不再给外层加那条页签条**（2026-10-31）：详情页顶栏整条去掉了 ——
+    # 卡名在工作区标题下面已经写着，页签在工作区自己的导航里也有一份，
+    # 两排导航并排摆着只会让人分不清各自管什么。外层只保留 cardTab 作为
+    # 「工作区 / 管理成员 / 管理原件」这三屏之间的内部开关。
     legacy_front = legacy_front.replace("const cardTab = host.ref('statements')", "const cardTab = host.ref('flow')")
     legacy_front = legacy_front.replace("const keepTab = same ? cardTab.value : 'statements'", "const keepTab = same ? cardTab.value : 'flow'")
     legacy_front = legacy_front.replace("  const h = host.h", "  const h = host.h\n  const Workspace = sharedCardWorkspace(host)", 1)
-    legacy_front = legacy_front.replace("cardTab.value === 'statements' ? statementsPane() : membersPane(),", "cardTab.value === 'flow' ? h(Workspace, { key: item.id, cardId: item.id, onManage: (kind, id) => { if(kind==='file')openStatement(id); else cardTab.value=kind==='members'?'members':'statements' } }) : cardTab.value === 'statements' ? statementsPane() : membersPane(),", 1)
-    for selector in ('scv-chain', 'scv-content'):
+    for selector in ('scv-content',):
         needle = "root.querySelector('#" + selector + "').innerHTML="
         line_start = script.index(needle)
         line_end = script.index(';\n', line_start)
@@ -117,8 +116,21 @@ def build():
     style.write_text(old_style + '\n/* === Shared-card continuity bundle === */\n' + css)
     manifest_path = PLUGIN / 'plugin.json'
     manifest = json.loads(manifest_path.read_text())
-    manifest['version'] = '2.0.2'
-    manifest['description'] = '以银行卡为主线接续原始对账单，保留交叠来源；账面按宿主账簿引擎连接跨期余额与逐笔凭证。支持跨月、多笔同向等额人工核对、原子占用与撤销、归属冲突复核、限高可搜索月份选择。核对记录单独成页；确认核对只算被选中那本账。只对账，不制证。'
+    # 2.1.9：工作台按用户意见调整版面（去掉顶部摘要条与「原始资料」那一页、
+    # 两条资金线与搜索栏互换位置、勾选不再置顶、工作台上的「查看归属冲突」
+    # 跳转与「汇总收入核对」按钮、查找框与收付方向挪进「银行交易」栏头、
+    # 左右两块面板对齐），「对账单明细」那一页整页去掉，
+    # 「导出账面明细账」挪到「成员账套」那一页；
+    # 栏头里的控件改为垂直居中，左右两栏表头上方那一行统一 45px 高，
+    # 两边表头横向对齐。
+    # **必须升版本** —— 宿主只接受「更高版本」的升级，同版本重装会被
+    # DOWNGRADE_OR_REPLAY_REJECTED 挡掉。
+    manifest['version'] = '2.1.9'
+    # **2.1.0 起要用宿主 SDK 1.5.0**（跨账套一次读）。装到旧宿主上会被
+    # 宿主在**安装时**按区间挡掉，并说清「请先更新宿主」—— 比装上了却
+    # 一路报 TypeError 好。
+    manifest['api_version'] = '>=1.5.0 <2.0.0'
+    manifest['description'] = '以银行卡为主线接续原始对账单，保留交叠来源；账面按宿主账簿引擎连接跨期余额与逐笔凭证。支持跨月、多笔同向等额人工核对、原子占用与撤销、归属冲突复核、限高可搜索月份选择。核对记录单独成页；确认核对只算被选中那本账；跨账套一次读，读的次数不再随账套数涨。只对账，不制证。'
     if not any(t['name'] == 'plugin_275b391c351a_recon' for t in manifest['tables']):
         manifest['tables'].append({'name': 'plugin_275b391c351a_recon', 'schema': 'public', 'scope': 'book'})
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
@@ -171,13 +183,36 @@ LIVE_EVENTS = r'''
     finally{writing=false;root.removeAttribute('aria-busy');render();}
   }
   function saveOwner(id, book) {if(book)return liveWrite(()=>host.api.post(`/cards/${D.card.id}/ownership`,{tx_id:id,book_id:Number(book)}),'归属已保存；原有归属证据完整保留。');}
+  // **导出账面明细账**：对账单明细那一页删了，但这个导出是**卡级**的 ——
+  // 导的是这张卡登记在各成员账套上的现金科目明细账，功能要留下。
+  // 文件是宿主生成的真 xlsx（插件沙箱只能读、不能造 xlsx），这里拿到的是
+  // base64，转成 Blob 交给浏览器下载。
+  async function exportLedger(){
+    try{
+      const body=await host.api.get(`/cards/${D.card.id}/ledger-export`);
+      const binary=atob(body.content_base64||'');
+      const bytes=new Uint8Array(binary.length);
+      for(let index=0;index<binary.length;index++)bytes[index]=binary.charCodeAt(index);
+      const blob=new Blob([bytes],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+      const url=URL.createObjectURL(blob);
+      const link=document.createElement('a');link.href=url;link.download=body.filename||'共享卡账面明细账.xlsx';
+      document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(url);
+      // **有话要说就说在下载之后**：某本账缺期间、某个科目不存在 ——
+      // 这些话不能只藏在文件里。
+      const notes=body.notes||[];
+      setMessage(notes.length?notes.join('\n'):'已导出账面明细账。',notes.length>0);
+      render();
+    }catch(error){setMessage(String(error?.message||error),true);render();}
+  }
   root.addEventListener('change',event=>{if(event.target.dataset.ownerTx){event.stopImmediatePropagation();saveOwner(event.target.dataset.ownerTx,event.target.value);}},true);
   root.addEventListener('click',event=>{
     const control=event.target.closest('[data-action]');if(!control||control.disabled)return;
     const action=control.dataset.action;
-    if(!['confirm','revoke','resolve-owner','import','manage-file'].includes(action))return;
+    if(!['confirm','revoke','resolve-owner','import','ledger-export','back','manage-files','manage-members'].includes(action))return;
     event.stopImmediatePropagation();event.preventDefault();
-    if(action==='manage-file'){manage('file',Number(control.dataset.file));return;}
+    if(action==='back'){manage('back');return;}
+    if(action==='manage-files'){manage('files');return;}
+    if(action==='manage-members'){manage('members');return;}
     if(action==='resolve-owner'){saveOwner(control.dataset.id,control.dataset.book);return;}
     if(action==='confirm'){
       const v=verdict();if(!v.ok){setMessage(v.text,true);render();return;}
@@ -185,6 +220,7 @@ LIVE_EVENTS = r'''
         result=>{const group=result&&result.group;if(!group)return;patchGroups([...(D.groups||[]),group]);state.selectedBank.clear();state.selectedEntries.clear();});
     }else if(action==='revoke')liveWrite(()=>host.api.delete(`/cards/${D.card.id}/reconciliations/${control.dataset.group}`),'关联已撤销；两侧恢复待核对，原始资料和确认历史保留。',
         result=>{const id=Number(control.dataset.group);patchGroups((D.groups||[]).filter(g=>Number(g.id)!==id));patchHistory(result&&result.group);});
+    else if(action==='ledger-export'){exportLedger();}
     else if(action==='import'){
       const input=document.createElement('input');input.type='file';input.accept='.xlsx,.xls,.csv,.pdf';
       input.addEventListener('change',()=>{const file=input.files?.[0];if(file)liveWrite(async()=>{const result=await host.api.upload(`/cards/${D.card.id}/statements`,file);if((result.diagnosis||[]).length)throw new Error('原件已接收，请在原始资料核实解析诊断：'+result.diagnosis.join('；'));},'对账单已导入，资金线和原件来源已更新。');});input.click();

@@ -1,0 +1,444 @@
+<div id="shared-card-v2" aria-label="共享卡连续资金与核对工作台" data-density="compact" data-work-layout="columns">
+  <div class="scv-appbar"><span class="scv-brand"><i data-lucide="notebook-tabs" aria-hidden="true"></i> 财务记账</span><span class="scv-breadcrumb">扩展 <span aria-hidden="true">/</span> 共享卡对账</span><span class="scv-preview-tag">流程预览</span></div>
+  <header class="scv-header"><button type="button" class="scv-button scv-back cursor-interaction" data-action="back" aria-label="返回共享卡列表"><i data-lucide="arrow-left" aria-hidden="true"></i> 返回</button><div class="scv-head-title"><h1>共享卡对账</h1><div id="scv-card-label" class="scv-muted"></div></div><button type="button" class="scv-button scv-primary cursor-interaction" data-action="import"><i data-lucide="file-plus-2" aria-hidden="true"></i> 导入对账单</button></header>
+  <nav class="scv-navigation" aria-label="共享卡工作区"><button type="button" class="cursor-interaction" data-tab="work">对账工作台</button><button type="button" class="cursor-interaction" data-tab="records">核对记录</button><button type="button" class="cursor-interaction" data-tab="members">成员账套</button></nav>
+  <div id="scv-import"></div>
+  <main id="scv-content"></main>
+  <div id="scv-message" role="status" aria-live="polite"></div>
+  <footer class="scv-footer"><span id="scv-snapshot"></span><span>确认与撤销仅在本页演示</span></footer>
+</div>
+<style>
+#shared-card-v2 {
+  --scv-bg: light-dark(#f4f6f9, #151b25); --scv-surface: light-dark(#ffffff, #202836);
+  --scv-soft: light-dark(#f7f8fa, #263142); --scv-text: light-dark(#303744, #e1e6ef);
+  --scv-strong: light-dark(#1f2733, #f0f4fb); --scv-muted: light-dark(#637083, #a8b5c9);
+  --scv-line: light-dark(#e1e6ed, #3a4659); --scv-blue: light-dark(#2563eb, #88adff);
+  --scv-blue-soft: light-dark(#edf4ff, #253c5a); --scv-green: light-dark(#14754b, #80d8ae);
+  --scv-green-soft: light-dark(#edf7f1, #203f34); --scv-red: light-dark(#b63d36, #ffaba5);
+  --scv-red-soft: light-dark(#fff2f0, #472c30); --scv-amber: light-dark(#956015, #eaca8d);
+  --scv-amber-soft: light-dark(#fff8e8, #413823); --scv-on-blue: light-dark(#ffffff, #142340);
+  color:var(--scv-text); background:var(--scv-bg); font:13px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; color-scheme:inherit;
+  width:100%; min-width:0; border:1px solid var(--scv-line); border-radius:9px; overflow:clip;
+}
+#shared-card-v2 *,#shared-card-v2 *::before,#shared-card-v2 *::after {box-sizing:border-box}
+#shared-card-v2 h1,#shared-card-v2 h2,#shared-card-v2 h3,#shared-card-v2 p {margin:0}
+#shared-card-v2 h1 {font-size:19px; font-weight:600; color:var(--scv-strong)}
+#shared-card-v2 h2 {font-size:15px; font-weight:600; color:var(--scv-strong)}
+#shared-card-v2 h3 {font-size:13px; font-weight:600}
+#shared-card-v2 button,#shared-card-v2 input,#shared-card-v2 select {font:inherit; color:inherit}
+#shared-card-v2 button {touch-action:manipulation}
+#shared-card-v2 button:disabled {opacity:.48; cursor:not-allowed}
+#shared-card-v2 button:focus-visible,#shared-card-v2 input:focus-visible,#shared-card-v2 select:focus-visible {outline:2px solid var(--scv-blue);outline-offset:2px}
+#shared-card-v2 .scv-appbar {display:flex;align-items:center;gap:22px;padding:12px 110px 12px 20px;border-bottom:1px solid var(--scv-line);background:var(--scv-surface);min-height:49px;flex-wrap:wrap}
+#shared-card-v2 .scv-brand {font-weight:600;display:inline-flex;align-items:center;gap:6px;color:var(--scv-strong)}
+#shared-card-v2 .scv-breadcrumb {display:flex;gap:9px;align-items:center;color:var(--scv-muted)}
+#shared-card-v2 .scv-preview-tag {color:var(--scv-blue);background:var(--scv-blue-soft);border-radius:4px;padding:2px 7px;font-size:11px}
+#shared-card-v2 .scv-header {display:flex;align-items:center;justify-content:flex-start;gap:14px;padding:20px 22px 16px;flex-wrap:wrap}
+/* 「返回」在标题左边：它是**离开这张卡**的导航，不该跟「导入对账单」挤在右端
+   —— 两个按钮并排时人分不清哪个是退出、哪个是操作。 */
+#shared-card-v2 .scv-header > .scv-primary {margin-left:auto}
+#shared-card-v2 .scv-back {display:inline-flex;align-items:center;gap:5px;flex:0 0 auto}
+#shared-card-v2 .scv-head-title {min-width:0}
+#shared-card-v2 .scv-muted {color:var(--scv-muted)}
+#shared-card-v2 .scv-small {font-size:11px}
+#shared-card-v2 .scv-number {font-variant-numeric:tabular-nums;white-space:nowrap}
+#shared-card-v2 .scv-green {color:var(--scv-green)}
+#shared-card-v2 .scv-red {color:var(--scv-red)}
+#shared-card-v2 .scv-amber {color:var(--scv-amber)}
+#shared-card-v2 .scv-row {display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+#shared-card-v2 .scv-spread {justify-content:space-between}
+#shared-card-v2 .scv-button {display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--scv-line);background:var(--scv-surface);padding:6px 11px;border-radius:5px;min-height:32px;white-space:nowrap}
+#shared-card-v2 .scv-button:hover:not(:disabled) {border-color:var(--scv-blue);color:var(--scv-blue)}
+#shared-card-v2 .scv-primary {background:var(--scv-blue);border-color:var(--scv-blue);color:var(--scv-on-blue)}
+#shared-card-v2 .scv-primary:hover:not(:disabled) {color:var(--scv-on-blue);filter:brightness(.95)}
+#shared-card-v2 .scv-link {border:0;background:transparent;color:var(--scv-blue);padding:2px 0;text-align:left;display:inline-flex;gap:4px;align-items:center;white-space:normal}
+#shared-card-v2 .scv-equation {display:grid;grid-template-columns:1fr 20px 1fr 20px 1fr 20px 1.1fr;align-items:center;gap:12px}
+#shared-card-v2 .scv-equation-label {color:var(--scv-muted);font-size:11px;margin-bottom:3px}
+#shared-card-v2 .scv-equation-value {font-size:19px;font-weight:500;letter-spacing:.1px;color:var(--scv-strong)}
+#shared-card-v2 .scv-equation-op {font-size:16px;color:var(--scv-muted);text-align:center}
+#shared-card-v2 .scv-navigation {padding:0 22px;display:flex;gap:25px;border-bottom:1px solid var(--scv-line);background:var(--scv-surface);flex-wrap:wrap}
+#shared-card-v2 .scv-navigation button {border:0;border-bottom:2px solid transparent;background:transparent;padding:10px 0;color:var(--scv-muted)}
+#shared-card-v2 .scv-navigation button[aria-current="page"] {color:var(--scv-blue);border-color:var(--scv-blue);font-weight:500}
+#shared-card-v2 #scv-content {padding:16px 22px 20px;min-width:0}
+#shared-card-v2 .scv-months {display:grid;grid-template-columns:repeat(13,minmax(0,1fr));gap:3px;margin-bottom:13px}
+#shared-card-v2 .scv-month {border:1px solid transparent;background:transparent;padding:7px 2px;border-radius:5px;display:flex;flex-direction:column;align-items:center;gap:2px;min-width:0;white-space:nowrap}
+#shared-card-v2 .scv-month .scv-small {color:var(--scv-muted)}
+#shared-card-v2 .scv-month[aria-pressed="true"] {background:var(--scv-blue-soft);border-color:var(--scv-blue);color:var(--scv-blue)}
+#shared-card-v2 .scv-panel {background:var(--scv-surface);border:1px solid var(--scv-line);border-radius:7px;min-width:0}
+#shared-card-v2 .scv-panel-head {padding:11px 13px;border-bottom:1px solid var(--scv-line);display:flex;align-items:center;gap:10px;justify-content:space-between;flex-wrap:wrap}
+#shared-card-v2 .scv-panel-body {padding:13px}
+#shared-card-v2 .scv-toolbar {display:flex;gap:9px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:10px}
+#shared-card-v2 .scv-search {flex:1 1 210px;max-width:320px;display:flex;align-items:center;gap:6px;border:1px solid var(--scv-line);border-radius:5px;padding:0 9px;background:var(--scv-surface);color:var(--scv-muted)}
+#shared-card-v2 .scv-search input {border:0;outline:0;min-width:0;width:100%;background:transparent;min-height:32px}
+#shared-card-v2 .scv-select {padding:6px 8px;min-height:32px;border:1px solid var(--scv-line);border-radius:5px;background:var(--scv-surface);max-width:100%}
+#shared-card-v2 .scv-lanes {display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 11px}
+#shared-card-v2 .scv-lane {border:0;background:transparent;padding:4px 8px;border-radius:4px;color:var(--scv-muted);white-space:nowrap}
+#shared-card-v2 .scv-lane[aria-pressed="true"] {background:var(--scv-blue-soft);color:var(--scv-blue)}
+#shared-card-v2 .scv-lane-count {font-size:11px;margin-left:5px;opacity:.9}
+#shared-card-v2 .scv-table-wrap {overflow-x:auto;max-width:100%}
+#shared-card-v2 table {border-collapse:collapse;width:100%;text-align:left;font-size:12px}
+#shared-card-v2 th {font-weight:400;color:var(--scv-muted);background:var(--scv-soft);white-space:nowrap}
+#shared-card-v2 td,#shared-card-v2 th {padding:8px 10px;border-bottom:1px solid var(--scv-line);vertical-align:middle}
+#shared-card-v2 tbody tr:last-child td {border-bottom:0}
+#shared-card-v2 tbody tr[data-selected="true"] td {background:var(--scv-blue-soft)}
+#shared-card-v2 .scv-td-number {text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+#shared-card-v2 .scv-pick {width:30px;min-width:30px;text-align:center}
+#shared-card-v2 input[type="checkbox"] {width:14px;height:14px;accent-color:var(--scv-blue);vertical-align:middle}
+#shared-card-v2 .scv-summary-cell {min-width:135px;max-width:245px;overflow-wrap:anywhere}
+#shared-card-v2 .scv-date-cell {min-width:88px;white-space:nowrap}
+#shared-card-v2 .scv-subline {display:block;color:var(--scv-muted);font-size:11px;margin-top:2px;overflow-wrap:anywhere;white-space:normal}
+#shared-card-v2 .scv-tag {display:inline-flex;align-items:center;gap:4px;border-radius:4px;padding:1px 6px;background:var(--scv-soft);color:var(--scv-muted);font-size:11px;white-space:nowrap}
+#shared-card-v2 .scv-tag-green {background:var(--scv-green-soft);color:var(--scv-green)}
+#shared-card-v2 .scv-tag-amber {background:var(--scv-amber-soft);color:var(--scv-amber)}
+#shared-card-v2 .scv-tag-red {background:var(--scv-red-soft);color:var(--scv-red)}
+#shared-card-v2 .scv-page {display:flex;justify-content:space-between;align-items:center;gap:8px;padding:9px 12px;border-top:1px solid var(--scv-line);color:var(--scv-muted);font-size:11px;flex-wrap:wrap}
+#shared-card-v2 .scv-page .scv-button {min-height:27px;padding:3px 8px;font-size:11px}
+#shared-card-v2 .scv-scope {padding:12px 13px;margin-bottom:12px;border:1px solid var(--scv-line);border-radius:6px;background:var(--scv-surface)}
+#shared-card-v2 .scv-scope-chips {display:flex;gap:5px;flex-wrap:wrap;margin-top:9px}
+#shared-card-v2 .scv-scope-chip {background:transparent;border:1px solid var(--scv-line);border-radius:4px;padding:3px 7px;color:var(--scv-muted);font-size:11px}
+#shared-card-v2 .scv-scope-chip[aria-pressed="true"] {background:var(--scv-blue-soft);border-color:var(--scv-blue);color:var(--scv-blue)}
+#shared-card-v2 .scv-work-grid {display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:12px;align-items:stretch}
+#shared-card-v2[data-work-layout="stack"] .scv-work-grid {grid-template-columns:minmax(0,1fr)}
+#shared-card-v2 .scv-work-grid td,#shared-card-v2 .scv-work-grid th {padding:8px 7px}
+#shared-card-v2 .scv-work-grid .scv-summary-cell {min-width:100px;max-width:190px}
+#shared-card-v2 .scv-work-grid .scv-panel-head {align-items:center}
+/* 两块面板一样高：面板自己是一列，表格区把多出来的高度吃掉 */
+#shared-card-v2 .scv-work-grid > .scv-panel {display:flex;flex-direction:column}
+#shared-card-v2 .scv-work-grid .scv-table-wrap {flex:1 1 auto;min-height:0;overflow:auto}
+#shared-card-v2 .scv-work-grid .scv-table-wrap > table {height:100%}
+/* 栏头里那排控件（查找框 + 收付方向）：跟着栏宽伸缩，不换行 */
+#shared-card-v2 .scv-panel-tools {display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;justify-content:flex-end}
+#shared-card-v2 .scv-panel-tools .scv-search {flex:1 1 140px;max-width:none;min-width:0}
+#shared-card-v2 .scv-panel-tools .scv-select {flex:0 0 auto}
+#shared-card-v2 .scv-work-grid .scv-date-cell {min-width:72px}
+#shared-card-v2 .scv-work-grid .scv-lanes {padding:0 10px;margin-bottom:0;gap:2px;min-height:45px;box-sizing:border-box}
+#shared-card-v2 .scv-work-grid .scv-subrow {min-height:45px;box-sizing:border-box;padding:0 11px;display:flex;align-items:center}
+#shared-card-v2 .scv-dual-summary {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:0 0 12px}
+#shared-card-v2 .scv-fund-summary {padding:12px 13px;background:var(--scv-surface);border:1px solid var(--scv-line);border-radius:6px;min-width:0}
+#shared-card-v2 .scv-fund-values {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:10px}
+#shared-card-v2 .scv-fund-values span {display:block;color:var(--scv-muted);font-size:11px}
+#shared-card-v2 .scv-fund-values strong {display:block;font-weight:500;font-size:15px;font-variant-numeric:tabular-nums;white-space:nowrap}
+#shared-card-v2 .scv-path-status {display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+#shared-card-v2 .scv-path-status>span {display:inline-flex;align-items:center;gap:4px;flex-wrap:wrap}
+#shared-card-v2 .scv-inspect {margin-bottom:12px;background:var(--scv-surface);border:1px solid var(--scv-blue);border-radius:6px}
+#shared-card-v2 .scv-source-list {display:flex;flex-direction:column;gap:7px;padding:11px 13px}
+#shared-card-v2 .scv-source-line {display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:start;padding-bottom:7px;border-bottom:1px solid var(--scv-line)}
+#shared-card-v2 .scv-source-line:last-child {border-bottom:0;padding-bottom:0}
+#shared-card-v2 .scv-source-name {overflow-wrap:anywhere}
+#shared-card-v2 .scv-owner-evidence {padding:10px 13px;border-top:1px solid var(--scv-line)}
+#shared-card-v2 .scv-owner-evidence>div+div {margin-top:6px}
+#shared-card-v2 .scv-actionbar {margin-top:12px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 13px;background:var(--scv-surface);border:1px solid var(--scv-line);border-radius:6px;flex-wrap:wrap}
+#shared-card-v2 .scv-selection-sums {display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+#shared-card-v2 .scv-selection-sums strong {font-size:17px;font-weight:500;display:block;font-variant-numeric:tabular-nums}
+#shared-card-v2 .scv-selection-sums span {font-size:11px;color:var(--scv-muted)}
+#shared-card-v2 .scv-validation {width:100%;font-size:11px;color:var(--scv-muted)}
+#shared-card-v2 .scv-selection-summary {display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px;font-size:12px}
+#shared-card-v2 .scv-notice {padding:10px 12px;border-radius:5px;background:var(--scv-blue-soft);color:var(--scv-text);font-size:12px;line-height:1.65;margin-bottom:11px}
+#shared-card-v2 .scv-notice-warn {background:var(--scv-amber-soft)}
+#shared-card-v2 .scv-notice-danger {background:var(--scv-red-soft)}
+#shared-card-v2 .scv-empty {padding:25px 15px;text-align:center;color:var(--scv-muted)}
+#shared-card-v2 .scv-empty p {margin-top:5px;font-size:11px}
+#shared-card-v2 #scv-message:not(:empty) {padding:9px 22px;background:var(--scv-green-soft);color:var(--scv-green);border-top:1px solid var(--scv-line)}
+#shared-card-v2 #scv-message[data-error="true"] {background:var(--scv-red-soft);color:var(--scv-red)}
+#shared-card-v2 .scv-footer {padding:9px 22px;display:flex;gap:12px;justify-content:space-between;flex-wrap:wrap;border-top:1px solid var(--scv-line);color:var(--scv-muted);font-size:11px;background:var(--scv-surface)}
+#shared-card-v2 .scv-import-panel {margin:15px 22px 0;border-color:var(--scv-blue)}
+#shared-card-v2 .scv-import-numbers {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:14px 0}
+#shared-card-v2 .scv-import-numbers strong {display:block;font-size:23px;font-weight:500;font-variant-numeric:tabular-nums}
+#shared-card-v2 .scv-import-numbers span {color:var(--scv-muted);font-size:12px}
+#shared-card-v2 .scv-file-title {max-width:350px;overflow-wrap:anywhere;white-space:normal}
+#shared-card-v2 .scv-group {display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-bottom:1px solid var(--scv-line);flex-wrap:wrap}
+#shared-card-v2 .scv-group:last-child {border-bottom:0}
+#shared-card-v2 [hidden] {display:none!important}
+#shared-card-v2[data-density="relaxed"] td,#shared-card-v2[data-density="relaxed"] th {padding-top:13px;padding-bottom:13px}
+@media(max-width:800px) {
+  #shared-card-v2 .scv-months {grid-template-columns:repeat(7,minmax(0,1fr))}
+  #shared-card-v2 .scv-work-grid {grid-template-columns:minmax(0,1fr)}
+  #shared-card-v2 .scv-dual-summary {grid-template-columns:minmax(0,1fr)}
+  #shared-card-v2 .scv-equation {gap:6px}
+  #shared-card-v2 .scv-equation-value {font-size:16px}
+}
+@media(max-width:520px) {
+  #shared-card-v2 .scv-header {padding:16px 12px 12px;gap:10px}
+  #shared-card-v2 .scv-appbar {padding-left:12px;gap:10px}
+  #shared-card-v2 .scv-breadcrumb {font-size:11px}
+  #shared-card-v2 .scv-fund-values {grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  #shared-card-v2 .scv-equation {grid-template-columns:1fr 1fr;gap:12px}
+  #shared-card-v2 .scv-equation-op {display:none}
+  #shared-card-v2 .scv-equation-value {font-size:18px}
+  #shared-card-v2 .scv-navigation {padding:0 12px;gap:18px}
+  #shared-card-v2 #scv-content {padding:12px}
+  #shared-card-v2 .scv-months {grid-template-columns:repeat(5,minmax(0,1fr))}
+  #shared-card-v2 .scv-import-panel {margin:12px 12px 0}
+  #shared-card-v2 .scv-selection-sums {gap:16px}
+  #shared-card-v2 .scv-source-line {grid-template-columns:minmax(0,1fr)}
+  #shared-card-v2 .scv-footer {padding:9px 12px}
+  #shared-card-v2 .scv-page {justify-content:start}
+}
+@media(pointer:coarse) {
+  #shared-card-v2 button,#shared-card-v2 .scv-select,#shared-card-v2 .scv-search input {min-height:44px}
+  #shared-card-v2 .scv-search input {font-size:16px}
+  #shared-card-v2 input[type="checkbox"] {width:22px;height:22px}
+}
+
+#shared-card-v2 .scv-combobox{position:relative;display:inline-block;min-width:125px;max-width:100%}#shared-card-v2 .scv-combobox-input{width:100%;padding-right:24px;background-image:linear-gradient(45deg,transparent 50%,currentColor 50%),linear-gradient(135deg,currentColor 50%,transparent 50%);background-position:calc(100% - 14px) 50%,calc(100% - 10px) 50%;background-size:4px 4px;background-repeat:no-repeat}#shared-card-v2 .scv-combobox-options{position:absolute;top:calc(100% + 4px);left:0;z-index:50;min-width:100%;width:max-content;max-width:min(340px,80vw);max-height:240px;overflow-y:auto;overscroll-behavior:contain;background:var(--scv-surface,#fff);color:var(--scv-text,#222);border:1px solid var(--scv-line,#d8dde5);border-radius:8px;box-shadow:0 8px 28px #0002;padding:4px}#shared-card-v2 .scv-combobox-options[hidden]{display:none}#shared-card-v2 .scv-combobox-option{padding:8px 12px;cursor:pointer;white-space:nowrap;border-radius:4px}#shared-card-v2 .scv-combobox-option:hover,#shared-card-v2 .scv-combobox-option.is-active{background:var(--scv-blue-soft,#e9f2ff)}#shared-card-v2 .scv-combobox-option[aria-selected=true]{font-weight:600}#shared-card-v2 .scv-combobox-empty{padding:10px;color:var(--scv-muted,#778)}#shared-card-v2 .scv-scope-chips{max-height:128px;overflow-y:auto}#shared-card-v2 .scv-months{display:flex;flex-wrap:nowrap;overflow-x:auto;max-width:100%}
+#shared-card-v2 .scv-month{flex:0 0 auto;min-width:65px}#shared-card-v2 .scv-period-search{width:160px;margin:8px 0}
+</style>
+<script type="application/json" id="shared-card-v2-data">__SHARED_CARD_DATA__</script>
+<script>
+(() => {
+  const root = document.getElementById('shared-card-v2');
+  const D = JSON.parse(document.getElementById('shared-card-v2-data').textContent);
+  const txMap = new Map(D.transactions.map(tx => [tx.id,tx]));
+  const entryMap = new Map(D.entries.map(e => [e.id,e]));
+  const bookMap = new Map(D.books.map(b => [b.id,b]));
+  const importMap = new Map(D.imports.map(f => [f.id,f]));
+  const months = D.months.map(m=>m.month);
+  const ledgerChoices = [...new Set([...months,...months.map(previousMonth)])].sort();
+  const latestMonth = months.at(-1);
+  const state = {tab:'work',bankMonth:latestMonth,policy:'previous',ledgerMonths:[previousMonth(latestMonth)],
+    direction:'ALL',bankOrder:'asc',lane:'all',query:'',ledgerQuery:'',periodSearch:'',ledgerBook:'ALL',page:0,entryPage:0,
+    selectedBank:new Set(),selectedEntries:new Set(),groups:[],owners:new Map(),focus:null,
+    importOpen:false,showPeriods:false,message:'',error:false,nextGroup:1,
+    lineMonth:previousMonth(latestMonth)};
+  const design = {layout:'columns',density:'compact'};
+  const PAGE = 8;
+  const esc = value => String(value ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const fmt = value => value === null || value === undefined || value === '' ? '—' :
+    Number(value).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const cash = value => value === null ? '—' : fmt(value / 100);
+  const icon = name => `<i data-lucide="${name}" aria-hidden="true"></i>`;
+  const button = (label,action,more='',disabled=false,primary=false) => `<button type="button" class="scv-button cursor-interaction${primary?' scv-primary':''}" data-action="${action}" ${more}${disabled?' disabled':''}>${label}</button>`;
+  const link = (label,action,more='') => `<button type="button" class="scv-link cursor-interaction" data-action="${action}" ${more}>${label}</button>`;
+  const pickedBank = () => [...state.selectedBank].map(id=>txMap.get(id)).filter(Boolean);
+  const pickedEntries = () => [...state.selectedEntries].map(id=>entryMap.get(id)).filter(Boolean);
+  const sum = rows => rows.reduce((total,row)=>total+(Number.isSafeInteger(row.amount_cents)?row.amount_cents:0),0);
+  const txGroup = id => state.groups.find(g=>g.bank.includes(id));
+  const entryGroup = id => state.groups.find(g=>g.entries.includes(id));
+  const ownerOf = tx => txGroup(tx.id)?.book_id??(state.owners.has(tx.id)?state.owners.get(tx.id):tx.owner_book_id);
+  const ownerConflict = tx => tx.ownership==='CONFLICT'&&!state.owners.has(tx.id);
+  const ownershipLabel = tx => ownerConflict(tx)?'归属冲突':ownerOf(tx)?
+    `${bookMap.get(ownerOf(tx))?.name||'原账套'} · ${txGroup(tx.id)?'本页核对':state.owners.has(tx.id)?'本页指定':tx.ownership==='MANUAL'?'人工':'初筛'}`:'归属待定';
+  const inLedgerScope = e => e&&state.ledgerMonths.includes(e.period);
+  // **收支方向的两侧口径**：银行 IN（收钱）↔ 账面 借方；银行 OUT（付钱）↔ 账面 贷方。
+  // 两侧的符号因此是同一件事：银行 −5,000（支出）只能对上账面 −5,000（贷方）。
+  const signedTx = t => Number.isSafeInteger(t.amount_cents)?t.amount_cents*(t.direction==='IN'?1:-1):0;
+  const signedEntry = e => Number.isSafeInteger(e.amount_cents)?e.amount_cents*(e.direction==='DEBIT'?1:-1):0;
+  // 「等额」必须**连方向一起看**。只看金额大小，会把 +5,000 的收入也标成
+  // 「与所选合计等额」—— 看着像能核对，其实方向相反，服务器会整组拒绝。
+  function entryTag(target,e){if(!target)return'';const signed=signedEntry(e);
+    if(target===signed)return' · <span class="scv-amber">与所选合计等额</span>';
+    if(Math.abs(target)===Math.abs(signed))return' · <span class="scv-red">等额但方向相反</span>';
+    return'';}
+  const toCents = value => {if(value===null||value===undefined)return null;const match=String(value).match(/^(-?)(\d+)(?:\.(\d{1,2}))?$/);return match?(match[1]?-1:1)*(Number(match[2])*100+Number((match[3]||'').padEnd(2,'0'))):null;};
+  function previousMonth(month) { const [y,m]=month.split('-').map(Number),i=y*12+m-2;return `${Math.floor(i/12)}-${String(i%12+1).padStart(2,'0')}`; }
+  function inheritedScope() { const basis=state.bankMonth?[state.bankMonth]:months;return [...new Set(basis.flatMap(m=>state.policy==='same'?[m]:state.policy==='both'?[previousMonth(m),m]:[previousMonth(m)]))].sort(); }
+  function applyScope() { if(state.policy!=='custom')state.ledgerMonths=inheritedScope();state.lineMonth=state.ledgerMonths.at(-1);state.entryPage=0;for(const id of state.selectedEntries)if(!inLedgerScope(entryMap.get(id)))state.selectedEntries.delete(id); }
+  function exactCandidates(tx) { return D.entries.filter(e=>inLedgerScope(e)&&e.amount_cents===tx.amount_cents&&e.amount_cents>0&&((tx.direction==='IN'&&e.direction==='DEBIT')||(tx.direction==='OUT'&&e.direction==='CREDIT'))); }
+  function status(tx) { if(txGroup(tx.id))return '<span class="scv-tag scv-tag-green">本页已核对</span>';if(ownerConflict(tx))return '<span class="scv-tag scv-tag-red">归属冲突</span>';const choices=exactCandidates(tx);return choices.length?`<span class="scv-tag scv-tag-amber">${choices.length===1?'同额候选':choices.length+' 笔候选'}</span>`:'<span class="scv-tag">待核对</span>'; }
+  function bankRows(ignoreLane=false) {
+    const query=state.query.trim().toLowerCase().replaceAll(',','');
+    const bank=D.transactions.filter(tx=>(!state.bankMonth||tx.tx_date?.startsWith(state.bankMonth))
+      &&(state.direction==='ALL'||tx.direction===state.direction)
+      &&(!query||[tx.purpose,tx.summary,tx.counterparty,tx.amount,ownershipLabel(tx)].join(' ').toLowerCase().includes(query)));
+    const filtered=(ignoreLane?bank:bank.filter(tx=>state.lane==='all'||
+      (state.lane==='conflict'&&ownerConflict(tx))||
+      (state.lane==='candidates'&&!txGroup(tx.id)&&exactCandidates(tx).length>0)||
+      (state.lane==='receipts'&&tx.direction==='IN'&&!txGroup(tx.id))||
+      (state.lane==='confirmed'&&txGroup(tx.id))||
+      (state.lane==='new'&&D.imports.at(-1).new_ids.includes(tx.id)))).slice();
+    return state.bankOrder==='asc'?filtered:filtered.reverse();
+  }
+  function setMessage(message,error=false) {state.message=message;state.error=error;}
+  function saveState() {
+    if(!window.openai?.setWidgetState)return;
+    window.openai.setWidgetState({modelContent:{design:'共享卡连续资金线',view:state.tab,bankMonth:state.bankMonth||'全部',ledgerMonths:state.ledgerMonths,layout:design.layout},
+      privateContent:{version:1,tab:state.tab,bankMonth:state.bankMonth,policy:state.policy,ledgerMonths:state.ledgerMonths,density:design.density,layout:design.layout}}).catch(()=>{});
+  }
+  function restore(saved) {if(saved?.version!==1)return;if(['work','records','members'].includes(saved.tab))state.tab=saved.tab;
+    if(saved.bankMonth===''||months.includes(saved.bankMonth))state.bankMonth=saved.bankMonth;
+    if(['same','previous','both','custom'].includes(saved.policy))state.policy=saved.policy;
+    if(Array.isArray(saved.ledgerMonths)&&saved.ledgerMonths.length)state.ledgerMonths=saved.ledgerMonths.filter(m=>ledgerChoices.includes(m));
+    state.lineMonth=state.ledgerMonths.at(-1);
+    if(['columns','stack'].includes(saved.layout))design.layout=saved.layout;if(['compact','relaxed'].includes(saved.density))design.density=saved.density;}
+  function monthRail() {return `<div class="scv-toolbar"><label>跳转月份 <select class="scv-select" aria-label="跳转银行月份" data-field="bankMonth"><option value="">全部月份</option>${months.map(m=>`<option value="${m}"${state.bankMonth===m?' selected':''}>${m}</option>`).join('')}</select></label></div><div class="scv-months" aria-label="银行交易月份">${[['','全部',D.summary.transactions],...D.months.map(m=>[m.month,m.month.slice(2).replace('-','.'),m.count])].map(([value,label,count])=>`<button type="button" class="scv-month cursor-interaction" data-month="${value}" aria-label="${value||'全部月份'}，${count}笔" aria-pressed="${state.bankMonth===value}"><span>${label}</span><span class="scv-small scv-number">${count} 笔</span></button>`).join('')}</div>`;}
+  function scopeBar() {return `<section class="scv-scope" aria-label="账面查找范围"><div class="scv-row scv-spread"><div class="scv-row"><span>账面查找范围</span><select class="scv-select" aria-label="常用账面范围" data-field="policy"><option value="previous"${state.policy==='previous'?' selected':''}>银行上月</option><option value="both"${state.policy==='both'?' selected':''}>银行上月及当月</option><option value="same"${state.policy==='same'?' selected':''}>银行当月</option><option value="custom"${state.policy==='custom'?' selected':''}>自选期间</option></select><strong class="scv-number">${state.ledgerMonths.length>3?state.ledgerMonths[0]+' 至 '+state.ledgerMonths.at(-1):state.ledgerMonths.join('、')}</strong></div>${link(state.showPeriods?'收起期间':'调整期间','periods')}</div>${state.showPeriods?`<input type="search" class="scv-select scv-period-search" aria-label="查找账面期间" data-field="periodSearch" placeholder="输入年份 / 月份" value="${esc(state.periodSearch)}"><div class="scv-scope-chips">${ledgerChoices.filter(m=>m.includes(state.periodSearch.trim())).map(m=>`<button type="button" class="scv-scope-chip cursor-interaction" data-period="${m}" aria-pressed="${state.ledgerMonths.includes(m)}">${m}</button>`).join('')}</div>`:''}<div class="scv-subline">银行日期与凭证日期并列保留；调整范围只影响查找，不改账期。</div></section>`;}
+  function searchToolbar() {return `<div class="scv-panel-tools"><label class="scv-search">${icon('search')}<input type="search" aria-label="查找银行流水" data-field="query" placeholder="用途、对方、摘要或金额" value="${esc(state.query)}"></label><select class="scv-select" aria-label="收付方向" data-field="direction">${[['ALL','全部收付'],['IN','收入'],['OUT','支出']].map(([value,label])=>`<option value="${value}"${state.direction===value?' selected':''}>${label}</option>`).join('')}</select></div>`;}
+  function lanes() {const rows=bankRows(true),definitions=[['all','全部',rows.length],['candidates','有候选',rows.filter(t=>!txGroup(t.id)&&exactCandidates(t).length).length],['receipts','收款待核对',rows.filter(t=>t.direction==='IN'&&!txGroup(t.id)).length],['conflict','归属冲突',rows.filter(ownerConflict).length],['confirmed','本页已核对',rows.filter(t=>txGroup(t.id)).length]];if(state.lane==='new')definitions.push(['new','本次新增',rows.filter(t=>D.imports.at(-1).new_ids.includes(t.id)).length]);return `<div class="scv-lanes">${definitions.map(([key,label,count])=>`<button type="button" class="scv-lane cursor-interaction" data-lane="${key}" aria-pressed="${state.lane===key}">${label}<span class="scv-lane-count">${count}</span></button>`).join('')}</div>`;}
+  function pagination(total,page,kind) {const last=Math.max(0,Math.ceil(total/PAGE)-1);return `<div class="scv-page"><span>${total?`${page*PAGE+1}—${Math.min(total,(page+1)*PAGE)} / ${total} ${kind==='month'?'期':'笔'}`:`0 ${kind==='month'?'期':'笔'}`}</span><div class="scv-row">${button('上一页','page',`data-kind="${kind}" data-delta="-1"`,page===0)}<span>${page+1} / ${last+1}</span>${button('下一页','page',`data-kind="${kind}" data-delta="1"`,page>=last)}</div></div>`;}
+  function bankTable() {
+    const rows=bankRows();
+    const last=Math.max(0,Math.ceil(rows.length/PAGE)-1);state.page=Math.min(state.page,last);const slice=rows.slice(state.page*PAGE,(state.page+1)*PAGE);
+    return `<div class="scv-table-wrap"><table aria-label="待核对银行交易"><thead><tr><th class="scv-pick">选择</th><th>银行日期</th><th>对方 / 用途</th><th class="scv-td-number">金额</th><th>核对 / 归属</th></tr></thead><tbody>${slice.length?slice.map(tx=>`<tr data-tx="${tx.id}" data-selected="${state.selectedBank.has(tx.id)}"><td class="scv-pick"><input type="checkbox" class="cursor-interaction" data-bank-pick="${tx.id}" aria-label="选择银行交易 ${tx.tx_date} ${tx.direction==='IN'?'收入':'支出'} ${tx.amount}"${state.selectedBank.has(tx.id)?' checked':''}${txGroup(tx.id)?' disabled':''}></td><td class="scv-date-cell">${link(esc(tx.tx_date),'inspect',`data-id="${tx.id}"`)}<span class="scv-subline scv-number">${esc(tx.tx_time)}</span></td><td class="scv-summary-cell">${link(esc(tx.purpose&&tx.purpose!=='付款'&&tx.purpose!=='转账'?tx.purpose:tx.counterparty||tx.summary),'inspect',`data-id="${tx.id}"`)}<span class="scv-subline">${esc(tx.summary)}${tx.sources.length>1?' · '+link(tx.sources.length+' 份来源','inspect',`data-id="${tx.id}"`):''}</span></td><td class="scv-td-number ${tx.direction==='IN'?'scv-green':''}">${tx.direction==='IN'?'+':'−'}${fmt(tx.amount)}<span class="scv-subline">余额 ${fmt(tx.balance)}</span></td><td>${link(status(tx),'inspect',`data-id="${tx.id}"`)}<span class="scv-subline ${ownerConflict(tx)?'scv-red':''}">${esc(ownershipLabel(tx))}</span></td></tr>`).join(''):`<tr><td colspan="5"><div class="scv-empty">这个范围没有相应流水。${state.lane==='confirmed'?'<p>旧版初筛与人工归属尚未建立分录级核对关系。</p>':''}</div></td></tr>`}</tbody></table></div>${pagination(rows.length,state.page,'bank')}`;
+  }
+  function inspector() {
+    const tx=txMap.get(state.focus);if(!tx)return '';
+    const evidence=tx.allocation_evidence,g=txGroup(tx.id),locked=Boolean(g||tx.has_legacy_voucher);
+    return `<section class="scv-inspect" aria-label="流水来源与归属"><div class="scv-panel-head"><div><strong>${esc(tx.tx_date)} ${tx.direction==='IN'?'收入':'支出'} ${fmt(tx.amount)}</strong><span class="scv-subline">交易后余额 ${fmt(tx.balance)} · ${esc(tx.counterparty)} · ${esc(tx.purpose||tx.summary)}</span></div><div class="scv-row">${button('核对这笔','inspect-work',`data-id="${tx.id}"`,locked)}${button('收起','close-inspect')}</div></div><div class="scv-source-list">${tx.sources.map(s=>`<div class="scv-source-line"><div class="scv-source-name">${esc(s.filename)}<span class="scv-subline">原始第 ${s.seq} 行 · 户名 ${esc(s.counterparty)}${s.legacy_match_months?' · 原匹配期间 '+esc(s.legacy_match_months):''}</span></div><span class="scv-tag">来源 ${s.statement_id}</span></div>`).join('')}</div><div class="scv-owner-evidence"><div class="scv-row"><strong>原归属证据</strong>${ownerConflict(tx)?'<span class="scv-tag scv-tag-red">两本账都留有归属</span>':''}</div>${evidence.length?evidence.map(a=>`<div><span class="${ownerConflict(tx)?'scv-red':''}">${esc(bookMap.get(a.book_id)?.name||a.book_id)}</span> · ${a.status==='ALLOCATED'?'人工指定':'原初筛'}<span class="scv-subline">${esc(a.reason)}</span></div>`).join(''):'<div class="scv-muted">尚未指定归属</div>'}${ownerConflict(tx)?`<div class="scv-row"><span class="scv-small scv-muted">本页选择归属：</span>${[...new Set(evidence.map(a=>a.book_id))].map(id=>button(esc(bookMap.get(id)?.name||id),'resolve-owner',`data-id="${tx.id}" data-book="${id}"`)).join('')}</div>`:''}<div class="scv-row"><label for="scv-owner-select">本页指定 / 更改归属</label><select id="scv-owner-select" class="scv-select" data-owner-tx="${tx.id}"${locked?' disabled':''}><option value="">${ownerConflict(tx)?'请核实后选择':'归属待定'}</option>${D.books.map(b=>`<option value="${b.id}"${ownerOf(tx)===b.id?' selected':''}>${esc(b.name)}</option>`).join('')}</select><span class="scv-small scv-muted">${locked?'已有关联，先核实原核对组':'原归属证据保留；更改仅在本页演示'}</span></div></div>${g?`<div class="scv-owner-evidence"><strong>已连接的账面资金线</strong>${g.entries.map(id=>{const e=entryMap.get(id);if(!e)return `<div class="scv-red">原关联分录已变化或不可读，请复核本组后撤销重选。</div>`;return `<div>${link(esc(`${e.book_name} · ${e.voucher_date} ${e.voucher_no} · ${fmt(e.amount)}`),'entry-line',`data-entry-id="${id}"`)}<span class="scv-subline">${esc(e.summary)} · 本账交易后余额 ${cash(e.book_balance_cents??null)}</span></div>`;}).join('')}</div>`:''}</section>`;
+  }
+  function monthLedger(period,bookId=state.ledgerBook) {
+    if(!period)return null;
+    if(bookId==='ALL')return {opening:toCents(period.opening),debit:toCents(period.debit),credit:toCents(period.credit),closing:toCents(period.closing),valid:period.complete};
+    const b=period.books.find(b=>b.book_id===Number(bookId));
+    return b?{opening:b.opening_cents,debit:b.debit_cents,credit:b.credit_cents,closing:b.closing_cents,valid:b.valid}:null;
+  }
+  function fundValues(values,labels=['期初','收入','支出','期末']) {
+    return `<div class="scv-fund-values">${['opening','debit','credit','closing'].map((key,i)=>`<div><span>${labels[i]}</span><strong>${cash(values?.[key]??null)}</strong></div>`).join('')}</div>`;
+  }
+  function dualSummary() {
+    const bank=D.months.find(m=>m.month===state.bankMonth),whole=D.summary;
+    const bankValues={opening:toCents(bank?bank.opening:whole.opening_inferred),debit:toCents(bank?bank.income:whole.income),credit:toCents(bank?bank.expense:whole.expense),closing:toCents(bank?bank.closing:whole.closing_observed)};
+    const summaryBook=state.ledgerBook,period=D.ledger.months.find(m=>m.month===state.lineMonth),v=monthLedger(period,summaryBook);
+    return `<div class="scv-dual-summary"><section class="scv-fund-summary" aria-label="银行所选月份资金"><div class="scv-row scv-spread"><strong>银行资金线</strong><span class="scv-small scv-muted">${state.bankMonth||'全部已导入范围'}</span></div>${fundValues(bankValues,['首笔前余额','收入','支出','末笔后余额'])}</section><section class="scv-fund-summary" aria-label="账面所选期间资金"><div class="scv-row scv-spread"><strong>账面资金线</strong><span class="scv-small scv-muted">${esc(state.lineMonth)} · ${summaryBook==='ALL'?'登记科目合计':esc(bookMap.get(Number(summaryBook))?.name)}</span></div>${fundValues(v,['期初余额','借方增加','贷方减少','期末余额'])}</section></div>`;
+  }
+  function availableEntries() {
+    const picked=pickedBank(),amount=sum(picked),amounts=new Set(picked.map(t=>t.amount_cents));const query=state.ledgerQuery.trim().toLowerCase();
+    return D.entries.filter(e=>inLedgerScope(e)&&!entryGroup(e.id)&&(state.ledgerBook==='ALL'||e.book_id===Number(state.ledgerBook))&&
+      (!query||[e.book_name,e.summary,e.voucher_no,e.amount].join(' ').toLowerCase().includes(query)))
+      .sort((a,b)=>Number(state.selectedEntries.has(b.id))-Number(state.selectedEntries.has(a.id))||
+        Number(b.amount_cents===amount)-Number(a.amount_cents===amount)||Number(amounts.has(b.amount_cents))-Number(amounts.has(a.amount_cents))||
+        a.book_name.localeCompare(b.book_name,'zh')||a.voucher_date.localeCompare(b.voucher_date)||a.id-b.id);
+  }
+  function ledgerTable() {
+    const entries=availableEntries(),last=Math.max(0,Math.ceil(entries.length/PAGE)-1);state.entryPage=Math.min(state.entryPage,last);
+    const picked=pickedBank(),target=picked.reduce((n,t)=>n+signedTx(t),0);const sourceCount=new Map();
+    for(const tx of D.transactions.filter(t=>!state.bankMonth||t.tx_date?.startsWith(state.bankMonth)))if(!txGroup(tx.id))for(const e of exactCandidates(tx))sourceCount.set(e.id,(sourceCount.get(e.id)||0)+1);
+    return `<div class="scv-table-wrap"><table aria-label="账面待核对分录"><thead><tr><th class="scv-pick">选择</th><th>账套 / 凭证日期</th><th>摘要 / 凭证</th><th class="scv-td-number">金额</th></tr></thead><tbody>${entries.length?entries.slice(state.entryPage*PAGE,(state.entryPage+1)*PAGE).map(e=>`<tr data-entry="${e.id}" data-selected="${state.selectedEntries.has(e.id)}"><td class="scv-pick"><input type="checkbox" class="cursor-interaction" data-entry-pick="${e.id}" aria-label="选择账面 ${esc(e.book_name)} ${e.voucher_date} ${e.voucher_no} ${e.amount}"${state.selectedEntries.has(e.id)?' checked':''}></td><td class="scv-date-cell">${link(esc(e.book_name),'filter-book',`data-book="${e.book_id}"`)}<span class="scv-subline scv-number">${esc(e.voucher_date)}</span></td><td class="scv-summary-cell">${link(esc(e.summary),'entry-work',`data-entry-id="${e.id}"`)}<span class="scv-subline">${esc(e.voucher_no)} · ${esc(e.subject_code)}${e.voucher_status!=='POSTED'?' · <span class="scv-amber">未记账</span>':''}${entryTag(target,e)}${(sourceCount.get(e.id)||0)>1?' · <span class="scv-red">'+sourceCount.get(e.id)+' 笔流水有同额候选</span>':''}</span></td><td class="scv-td-number ${e.direction==='DEBIT'?'scv-green':''}">${e.direction==='DEBIT'?'+':'−'}${fmt(e.amount)}<span class="scv-subline">本账余额 ${cash(e.book_balance_cents??null)}</span></td></tr>`).join(''):'<tr><td colspan="4"><div class="scv-empty">当前账面范围内没有相应分录。<p>可调整期间或账套；没有关联不直接认定漏记。</p></div></td></tr>'}</tbody></table></div>${pagination(entries.length,state.entryPage,'entry')}`;
+  }
+  function verdict() {
+    // 两侧的合计都按**带符号**算：银行 −5,000 与账面 +5,000 的差额是 −10,000，
+    // 不是 0 —— 只比大小会把方向相反的两侧说成「合计一致」。
+    const bank=pickedBank(),entries=pickedEntries();
+    const bankTotal=bank.reduce((n,t)=>n+signedTx(t),0),entryTotal=entries.reduce((n,e)=>n+signedEntry(e),0);
+    const diff=bankTotal-entryTotal;
+    const base={bankTotal,entryTotal,diff,ok:false,bank,entries};
+    if(!bank.length||!entries.length)return {...base,text:'选择银行交易和账面分录；月度汇总可一次选择多笔到账。'};
+    if(bank.some(t=>!Number.isSafeInteger(t.amount_cents)||t.amount_cents<=0)||entries.some(e=>!Number.isSafeInteger(e.amount_cents)||e.amount_cents<=0))return {...base,text:'含金额不明或非正金额，请先核实原始数据。'};
+    if(bank.some(t=>txGroup(t.id))||entries.some(e=>entryGroup(e.id)))return {...base,text:'已有有效核对组占用了所选项目，请先撤销原核对。'};
+    if(bank.some(t=>t.has_legacy_voucher))return {...base,text:'所选项目有历史制证状态，需要先核实既有凭证关联。'};
+    if(bank.some(ownerConflict))return {...base,text:'所选交易存在归属冲突，请先查看来源并选择归属。'};
+    const direction=bank[0].direction;
+    if(bank.some(t=>t.direction!==direction)||entries.some(e=>e.direction!==(direction==='IN'?'DEBIT':'CREDIT')))return {...base,text:'核对组须同收付方向，收入与支出不能净额抵平。'};
+    if(new Set(entries.map(e=>e.book_id)).size!==1)return {...base,text:'一个核对组只能归到一本账，不能跨账套拆分银行金额。'};
+    const targetBook=entries[0].book_id;
+    if(bank.some(t=>ownerOf(t)&&ownerOf(t)!==targetBook))return {...base,text:'账面账套与既有归属不一致，请先核实归属。'};
+    if(entries.some(e=>!inLedgerScope(e)))return {...base,text:'有已选分录不在当前查找范围，请重新选择。'};
+    if(diff!==0)return {...base,text:'两侧金额尚有差额，保留待核对；不按差额自动补凭证。'};
+    return {...base,ok:true,text:`两侧合计一致 · ${bank.length} 笔银行交易 ↔ ${entries.length} 笔账面分录 · ${bookMap.get(targetBook)?.name}。确认前请核实业务对应。`};
+  }
+  function actionBar() {const v=verdict();return `<div class="scv-actionbar"><div class="scv-selection-sums"><div><span>银行侧 · ${v.bank.length} 笔</span><strong>${cash(v.bankTotal)}</strong></div><div><span>账面侧 · ${v.entries.length} 笔</span><strong>${cash(v.entryTotal)}</strong></div><div><span>差额</span><strong class="${v.bank.length&&v.entries.length?(v.diff===0?'scv-green':'scv-red'):''}">${cash(v.diff)}</strong></div></div><div class="scv-row">${link('清除选择','clear-selection')}${button('确认核对（本页）','confirm','',!v.ok,true)}</div>${v.bank.length||v.entries.length?`<details style="width:100%"><summary class="scv-small cursor-interaction">查看全部已选明细（包含跨页 / 跨月项目）</summary><div class="scv-source-list">${v.bank.map(t=>`<div>银行 · ${t.tx_date} · ${t.direction==='IN'?'收入 +':'支出 −'}${fmt(t.amount)} · ${esc(ownershipLabel(t))}<span class="scv-subline">${esc(t.purpose||t.summary)} · ${t.sources.length} 份来源</span></div>`).join('')}${v.entries.map(e=>`<div>账面 · ${esc(e.book_name)} · ${e.voucher_date} ${esc(e.voucher_no)} · ${e.direction==='DEBIT'?'借方 +':'贷方 −'}${fmt(e.amount)}<span class="scv-subline">${esc(e.summary)} · 账面期间 ${e.period} · ${e.voucher_status==='POSTED'?'已记账':'未记账'}</span></div>`).join('')}</div></details>`:''}<div class="scv-validation" role="status" aria-live="polite">${esc(v.text)}</div></div>`;}
+  function groupBankDate(g){const snaps=(g.bank_snapshot||[]).map(t=>t.tx_date).filter(Boolean).sort();if(snaps.length)return snaps[0];return (g.bank||[]).map(id=>txMap.get(id)?.tx_date).filter(Boolean).sort()[0]||'';}
+  function groupPeriods(g){const snaps=[...new Set((g.entry_snapshot||[]).map(e=>e.period).filter(Boolean))];if(snaps.length)return snaps.join('、');return [...new Set((g.entries||[]).map(id=>entryMap.get(id)?.period).filter(Boolean))].join('、');}
+  function groupRow(g,canRevoke){const can=Array.isArray(D.can_write_books),locked=can&&!D.can_write_books.includes(g.book_id);return `<div class="scv-group"><span>${esc(bookMap.get(g.book_id)?.name||g.book_id)} · ${(g.bank||[]).length} 笔银行 ↔ ${(g.entries||[]).length} 笔账面 <span class="scv-tag ${g.stale?'scv-tag-red':'scv-tag-green'}">${g.stale?'来源已变化，待复核':'合计 '+cash(g.amount_cents)}</span><span class="scv-subline">${esc((g.created_at||'').slice(0,10))} · 银行 ${esc(groupBankDate(g))} · 账面 ${esc(groupPeriods(g))}</span></span>${canRevoke?button('撤销本组','revoke',`data-group="${g.id}"`,locked):''}</div>`;}
+  function recordsPane() {const active=state.groups||[],revoked=(D.history||[]).filter(g=>!g.active);
+    const bank=active.reduce((n,g)=>n+(g.bank||[]).length,0),entries=active.reduce((n,g)=>n+(g.entries||[]).length,0);
+    return `<div class="scv-toolbar"><div><h2>已保存的核对记录</h2><p class="scv-subline">银行交易与账面分录的连接关系 · 跨月关联 · 刷新后保留</p></div><span class="scv-small scv-muted">${active.length} 组生效 · 覆盖 ${bank} 笔银行 / ${entries} 笔账面</span></div><section class="scv-panel" aria-label="生效中的核对组"><div class="scv-panel-head"><h2>生效中</h2><span class="scv-small scv-muted">撤销后两侧恢复待核对，原始资料与凭证保留</span></div>${active.length?active.map(g=>groupRow(g,true)).join(''):'<div class="scv-panel-body"><div class="scv-empty">还没有保存过核对记录。在「对账工作台」核实两侧对应关系后确认，这里会留下可追溯的记录。</div></div>'}</section>${revoked.length?`<section class="scv-panel" style="margin-top:12px" aria-label="已撤销的核对组"><div class="scv-panel-head"><h2>已撤销</h2><span class="scv-small scv-muted">原始资料与凭证保留</span></div>${revoked.map(g=>groupRow(g,false)).join('')}</section>`:''}`;}
+  function workPane() {
+const picked=pickedBank();return `${monthRail()}${scopeBar()}${dualSummary()}${picked.length?`<div class="scv-selection-summary"><span>银行侧已选 ${picked.length} 笔</span><span class="scv-small scv-muted">${[...new Set(picked.map(t=>t.tx_date.slice(0,7)))].sort().join('、')} · 可跨文件保留选择</span></div>`:''}${inspector()}<div class="scv-work-grid"><section class="scv-panel"><div class="scv-panel-head"><div><h2>银行交易</h2><span class="scv-subline">按银行时间排列</span></div>${searchToolbar()}</div>${lanes()}${bankTable(true)}</section><section class="scv-panel"><div class="scv-panel-head"><div><h2>账面待核对</h2><span class="scv-subline">候选可回到本账资金线；初筛不等于核对</span></div><select class="scv-select" aria-label="账面账套" data-field="ledgerBook"><option value="ALL">全部成员账套</option>${D.books.map(b=>`<option value="${b.id}"${state.ledgerBook===String(b.id)?' selected':''}>${esc(b.name)}</option>`).join('')}</select></div><div class="scv-subrow"><label class="scv-search" style="max-width:none">${icon('search')}<input type="search" aria-label="查找账面摘要" data-field="ledgerQuery" placeholder="账面摘要、凭证号或金额" value="${esc(state.ledgerQuery)}"></label></div>${ledgerTable()}</section></div>${actionBar()}<div class="scv-row scv-spread" style="margin-top:12px"><span class="scv-small scv-muted">已保存的核对记录集中在「核对记录」页。</span>${link('查看已保存核对记录','go-records')}</div>`;}
+  function membersPane() {return `<div class="scv-toolbar"><div><h2>成员账套</h2><p class="scv-subline">保留现有登记范围；账套是资金归属与账面证据的来源。</p></div>${button('查看7笔归属冲突','all-conflicts')}${button('导出账面明细账','ledger-export')}${link('管理成员','manage-members')}</div><div class="scv-notice scv-notice-warn">“待删除”仍登记在卡下，7 笔交易同时留有它与“优境”的归属。这里保留原记录，需核实范围及逐笔归属。</div><section class="scv-panel"><div class="scv-table-wrap"><table aria-label="成员账套与现金科目"><thead><tr><th>账套</th><th>登记科目</th><th class="scv-td-number">旧归属记录</th><th>范围复核</th><th>账面</th></tr></thead><tbody>${D.members.map(m=>{const book=bookMap.get(m.book_id),count=D.transactions.reduce((n,t)=>n+t.allocation_evidence.filter(a=>a.book_id===m.book_id).length,0),conflicts=D.transactions.filter(t=>t.ownership==='CONFLICT'&&t.allocation_evidence.some(a=>a.book_id===m.book_id)).length;return `<tr><td>${esc(book?.name||m.book_id)}</td><td>${esc(m.subject_code)} · ${esc(m.subject_name||'')}</td><td class="scv-td-number">${count}</td><td>${conflicts?`<span class="scv-tag scv-tag-red">${conflicts} 笔归属冲突</span>`:'<span class="scv-muted">已登记</span>'}</td><td>${link('查看分录','filter-book',`data-book="${m.book_id}"`)}</td></tr>`}).join('')}</tbody></table></div></section>`;}
+  function renderImport() {const file=D.imports.at(-1);root.querySelector('#scv-import').innerHTML=state.importOpen?`<section class="scv-panel scv-import-panel" aria-label="导入接续预演"><div class="scv-panel-head"><h2>把9月对账单接入已有资金线</h2>${button('关闭','close-import')}</div><div class="scv-panel-body"><div class="scv-file-title">${esc(file.filename)}</div><div class="scv-import-numbers"><div><strong>${file.raw_count}</strong><span>原始文件行</span></div><div><strong>${file.overlap_count}</strong><span>已有交易，增加来源</span></div><div><strong class="scv-green">${file.new_count}</strong><span>新增交易</span></div></div><div class="scv-row scv-spread"><span>已有末笔 ${file.before_latest_date} · ${fmt(file.before_latest_balance)}<br><span class="scv-green">接续至 ${file.period_end} · ${fmt(file.last_observed_balance)}</span></span>${button('查看接续后的流水','import-result','',false,true)}</div><div class="scv-subline" style="margin-top:11px">重放这份已上传文件的接入过程；此预览不接收新文件、不修改生产记录。</div></div></section>`:'';}
+/** Bounded, searchable controls. The original select remains the value/event source. */
+function enhanceSharedCardSelects(root) {
+  let serial = Number(root.dataset.comboboxSerial || 0);
+  root.querySelectorAll('select.scv-select').forEach(select => {
+    if (select.hidden || select.options.length < 7) return;
+    const wrap = document.createElement('span');
+    wrap.className = 'scv-combobox';
+    const input = document.createElement('input');
+    const list = document.createElement('div');
+    const label = select.getAttribute('aria-label') || '选择';
+    const id = 'scv-options-' + (++serial);
+    input.type = 'text'; input.className = 'scv-select scv-combobox-input';
+    input.setAttribute('role', 'combobox'); input.setAttribute('aria-label', label);
+    input.setAttribute('aria-autocomplete', 'list'); input.setAttribute('aria-controls', id);
+    input.setAttribute('aria-expanded', 'false'); input.autocomplete = 'off';
+    input.disabled = select.disabled;
+    list.id = id; list.className = 'scv-combobox-options'; list.setAttribute('role', 'listbox'); list.hidden = true;
+    const options = Array.from(select.options).map(option => ({ value: option.value, label: option.textContent, disabled: option.disabled }));
+    let visible = options, active = -1, open = false;
+    const selected = () => options.find(option => option.value === select.value)?.label || '';
+    const close = () => { open = false; list.hidden = true; input.value = selected(); input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); };
+    const choose = option => { if (!option || option.disabled) return; select.value = option.value; close(); select.dispatchEvent(new Event('change', { bubbles: true })); };
+    const paint = () => {
+      list.replaceChildren();
+      if (!visible.length) { const empty = document.createElement('div'); empty.className = 'scv-combobox-empty'; empty.textContent = '没有匹配的选项'; list.append(empty); }
+      visible.forEach((option, index) => {
+        const item = document.createElement('div'); item.id = id + '-' + index;
+        item.setAttribute('role', 'option'); item.setAttribute('aria-selected', String(option.value === select.value));
+        item.className = 'scv-combobox-option' + (index === active ? ' is-active' : ''); item.textContent = option.label;
+        if (option.disabled) item.setAttribute('aria-disabled', 'true');
+        item.addEventListener('pointerdown', event => event.preventDefault());
+        item.addEventListener('click', () => choose(option)); list.append(item);
+      });
+      if (active >= 0) { input.setAttribute('aria-activedescendant', id + '-' + active); list.children[active]?.scrollIntoView({ block: 'nearest' }); }
+      else input.removeAttribute('aria-activedescendant');
+    };
+    const show = () => { if (open) return; open = true; input.value = ''; visible = options; active = options.findIndex(option => option.value === select.value); list.hidden = false; input.setAttribute('aria-expanded', 'true'); paint(); };
+    input.value = selected(); input.placeholder = '输入年份 / 月份搜索';
+    input.addEventListener('focus', show); input.addEventListener('click', show);
+    input.addEventListener('input', () => { const query = input.value.trim().toLowerCase(); visible = options.filter(option => option.label.toLowerCase().includes(query) || option.value.toLowerCase().includes(query)); active = visible.length ? 0 : -1; paint(); });
+    input.addEventListener('keydown', event => {
+      if (event.key === 'Escape') { close(); event.preventDefault(); return; }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp' || event.key === 'Home' || event.key === 'End') {
+        event.preventDefault(); show();
+        active = event.key === 'Home' ? 0 : event.key === 'End' ? visible.length - 1 : Math.max(0, Math.min(visible.length - 1, active + (event.key === 'ArrowDown' ? 1 : -1))); paint();
+      } else if (event.key === 'Enter' && open) { event.preventDefault(); choose(visible[active]); }
+    });
+    input.addEventListener('blur', () => { const exact = visible.find(option => option.label === input.value.trim() || option.value === input.value.trim()); if (open && input.value.trim() && exact) choose(exact); else close(); });
+    select.after(wrap); select.hidden = true; wrap.append(input, list);
+  });
+  root.dataset.comboboxSerial = String(serial);
+}
+
+  function render() {
+    root.dataset.density=design.density;root.dataset.workLayout=design.layout;
+    root.querySelector('#scv-card-label').textContent=`${D.card.name} · ${D.card.bank_name} · 尾号 ${D.card.last4} · ${D.summary.members} 个成员账套`;
+    root.querySelectorAll('[data-tab]').forEach(b=>{if(b.dataset.tab===state.tab)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});
+    renderImport();root.querySelector('#scv-content').innerHTML=state.tab==='work'?workPane():state.tab==='records'?recordsPane():membersPane();
+    const message=root.querySelector('#scv-message');message.textContent=state.message;message.dataset.error=String(state.error);
+    root.querySelector('#scv-snapshot').textContent=`生产快照 ${D.captured_at.slice(0,10)} ${D.captured_at.slice(11,16)}（北京时间）`;
+    enhanceSharedCardSelects(root);
+    globalThis.lucide?.createIcons({attrs:{width:15,height:15}});
+  }
+  function enterWork(txId) {state.tab='work';state.page=0;state.entryPage=0;state.focus=null;state.lane='all';if(txId){const tx=txMap.get(txId);state.bankMonth=tx.tx_date.slice(0,7);state.selectedBank=new Set([txId]);state.selectedEntries.clear();state.direction='ALL';state.query='';applyScope();} }
+  root.addEventListener('click',event=>{
+    const tab=event.target.closest('[data-tab]');if(tab){state.tab=tab.dataset.tab;state.focus=null;if(state.tab==='work'){state.direction='ALL';state.lane='all';state.query='';state.page=0;applyScope();}render();saveState();return;}
+    const month=event.target.closest('[data-month]');if(month){state.bankMonth=month.dataset.month;state.page=0;state.focus=null;applyScope();render();saveState();return;}
+    const lane=event.target.closest('[data-lane]');if(lane){state.lane=lane.dataset.lane;state.page=0;state.focus=null;render();return;}
+    const period=event.target.closest('[data-period]');if(period){const m=period.dataset.period,index=state.ledgerMonths.indexOf(m);if(index>=0&&state.ledgerMonths.length===1){setMessage('至少保留一个账面期间。',true);}else{state.policy='custom';if(index>=0)state.ledgerMonths.splice(index,1);else state.ledgerMonths.push(m);state.ledgerMonths.sort();applyScope();setMessage('账面查找范围已调整，银行日期和凭证日期不变。');}render();saveState();return;}
+    const control=event.target.closest('[data-action]');if(!control||control.disabled)return;const action=control.dataset.action;
+    if(action==='back'){if(typeof manage==='function'){manage('back');return;}setMessage('预览里没有卡片列表可返回。');}
+    else if(action==='import')state.importOpen=true;
+    else if(action==='close-import')state.importOpen=false;
+    else if(action==='import-result'){const file=D.imports.at(-1);state.importOpen=false;state.tab='work';state.bankMonth=latestMonth;state.query='';state.direction='ALL';state.lane='new';state.page=0;applyScope();setMessage(`${file.overlap_count} 笔已有交易保留来源，${file.new_count} 笔新增交易接入同一资金线（导入预演）。`);}
+    else if(action==='periods')state.showPeriods=!state.showPeriods;
+    else if(action==='inspect')state.focus=control.dataset.id;
+    else if(action==='close-inspect')state.focus=null;
+    else if(action==='inspect-work')enterWork(control.dataset.id);
+    else if(action==='clear-selection'){state.selectedBank.clear();state.selectedEntries.clear();state.entryPage=0;}
+    else if(action==='go-records'){state.tab='records';state.focus=null;render();saveState();}
+    else if(action==='all-conflicts'){state.tab='work';state.bankMonth='';state.query='';state.direction='ALL';state.lane='conflict';state.page=0;state.focus=null;applyScope();}
+    else if(action==='resolve-owner'){const t=txMap.get(control.dataset.id);if(!txGroup(t.id)&&!t.has_legacy_voucher){state.owners.set(t.id,Number(control.dataset.book));setMessage('本页选择已记录；原来的两套归属证据都保留。');}}
+    else if(action==='ledger-export'){setMessage('离线预览里不接导出；线上点这个会下载这张卡的账面明细账。',true);}
+    else if(action==='confirm'){const v=verdict();if(!v.ok)setMessage(v.text,true);else{const group={id:state.nextGroup++,book_id:v.entries[0].book_id,bank:v.bank.map(t=>t.id),entries:v.entries.map(e=>e.id),amount_cents:Math.abs(v.bankTotal)};state.groups.push(group);state.selectedBank.clear();state.selectedEntries.clear();setMessage(`本页确认：${bookMap.get(group.book_id)?.name}，${group.bank.length} 笔银行交易对应 ${group.entries.length} 笔账面分录，合计 ${cash(group.amount_cents)}。`);}}
+    else if(action==='revoke'){state.groups=state.groups.filter(g=>g.id!==Number(control.dataset.group));setMessage('已撤销本页的核对关联，两侧记录恢复待核对；原始交易与凭证保留。');}
+    else if(action==='page'){const delta=Number(control.dataset.delta),keys={bank:'page',entry:'entryPage'},key=keys[control.dataset.kind];if(key)state[key]=Math.max(0,state[key]+delta);}
+    else if(action==='filter-book'){state.tab='work';state.ledgerBook=control.dataset.book||'ALL';state.ledgerQuery='';state.entryPage=0;state.page=0;state.focus=null;}
+    else if(action==='entry-work'){const e=entryMap.get(Number(control.dataset.entryId)),[y,m]=e.period.split('-').map(Number),i=y*12+m,next=`${Math.floor(i/12)}-${String(i%12+1).padStart(2,'0')}`;state.tab='work';state.bankMonth=months.includes(next)?next:'';state.policy='custom';state.ledgerMonths=[e.period];state.ledgerBook=String(e.book_id);state.selectedEntries=new Set([e.id]);state.selectedBank.clear();state.direction=e.direction==='DEBIT'?'IN':'OUT';state.query='';state.ledgerQuery='';state.lane='all';state.page=0;state.entryPage=0;applyScope();setMessage(`已选 ${e.book_name} ${e.period} 分录，请选择实际对应的银行流水；日期跨月保留。`);}
+    render();if(['confirm','revoke','resolve-owner','import-result'].includes(action))saveState();
+  });
+  root.addEventListener('change',event=>{
+    const target=event.target;
+    if(target.dataset.ownerTx){const tx=txMap.get(target.dataset.ownerTx);if(!txGroup(tx.id)&&!tx.has_legacy_voucher){if(target.value)state.owners.set(tx.id,Number(target.value));else if(!tx.owner_book_id&&!ownerConflict(tx))state.owners.delete(tx.id);else setMessage('已有归属不能在此直接清空；可选择正确账套。',true);}render();return;}
+    if(target.dataset.bankPick){target.checked?state.selectedBank.add(target.dataset.bankPick):state.selectedBank.delete(target.dataset.bankPick);state.entryPage=0;render();return;}
+    if(target.dataset.entryPick){const id=Number(target.dataset.entryPick);target.checked?state.selectedEntries.add(id):state.selectedEntries.delete(id);render();return;}
+    const field=target.dataset.field;if(!field||field==='query'||field==='ledgerQuery')return;state[field]=target.value;state.page=0;state.entryPage=0;if(field==='policy'||field==='bankMonth')applyScope();render();saveState();
+  });
+  root.addEventListener('input',event=>{
+    const input=event.target,field=input.dataset.field;if(field!=='query'&&field!=='ledgerQuery'&&field!=='periodSearch')return;
+    const position=input.selectionStart;state[field]=input.value;state.page=0;state.entryPage=0;render();const next=root.querySelector(`[data-field="${field}"]`);next.focus();if(position!==null)try{next.setSelectionRange(position,position);}catch{}
+  });
+  restore(window.openai?.widgetState?.privateContent);render();
+  window.addEventListener('openai:set_globals',event=>{const saved=event.detail?.globals?.widgetState?.privateContent;if(saved){restore(saved);render();}});
+  if(globalThis.Tweak){const tweak=new globalThis.Tweak({container:root,onChange:render});tweak.addSelect(design,'layout',{label:'核对两侧布局',options:[{label:'左右对照',value:'columns'},{label:'上下对照',value:'stack'}]});tweak.addSelect(design,'density',{label:'台账行距',options:[{label:'紧凑',value:'compact'},{label:'舒展',value:'relaxed'}]});}
+})();
+</script>

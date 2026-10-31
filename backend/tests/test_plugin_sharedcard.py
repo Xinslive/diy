@@ -323,8 +323,18 @@ def test_插件不再声明凭证权限(shared, client, auth, db):
     # 2.0.1：归属一次读完（读次数与对账单份数无关），工作台不再重复读账套表。
     # 2.0.2：「已保存的核对记录」单独成页；确认核对只算被选中那本账的账面侧，
     # 写完不再重拉整个工作台（服务器把这一组原样交回，页面就地打补丁）。
+    # 2.1.0：宿主 SDK 1.5.0 起支持**跨账套一次读**，插件改成一次读完 ——
+    # 读的次数不再随账套数涨（从前是「每本账一次」）。
+    # 2.1.2：详情页去掉重复的顶栏（返回 + 卡名 + 外层页签），「资金脉络」页
+    # 并进「对账工作台」（默认直接进对账工作台，银行流水/账面台账留作
+    # 工作台里的下钻视图）。
+    # 2.1.5—2.1.9：工作台按用户意见调版面（去掉顶部摘要条、「原始资料」那一页、
+    # 两条资金线与搜索栏互换位置、勾选不再自动置顶、工作台上的「查看归属冲突」
+    # 跳转与「汇总收入核对」按钮、查找框与收付方向挪进「银行交易」栏头、
+    # 左右两块面板对齐），「对账单明细」那一页整页去掉，
+    # 「导出账面明细账」挪到「成员账套」那一页。
     # 版本号跟着走，别让它停在老版本上假装还是老插件。
-    assert registry.version == "2.0.2", registry.version
+    assert registry.version == "2.1.9", registry.version
 
 
 def test_卡可以删(shared, client, auth, loaded, cash_subjects):
@@ -1995,7 +2005,7 @@ def _count_table_reads(fragment: str):
         event.remove(engine, "before_cursor_execute", _before)
 
 
-def test_归属表的读次数与对账单份数无关(shared, client, auth, books3, cash_subjects):
+def test_归属表的读次数与对账单份数和账套数都无关(shared, client, auth, books3, cash_subjects):
     """**归属一次读完**，不是「每份对账单再读一遍全部账套」。
 
     **为什么这件事值得一条用例**：归属表是账套表 —— 一行落在它归属的那本账里，
@@ -2005,14 +2015,18 @@ def test_归属表的读次数与对账单份数无关(shared, client, auth, boo
 
     判据是**读次数与对账单份数无关**：加一份对账单，读次数**不许变**。
     （旧实现是 N×M，所以份数一加，读次数就跟着翻倍。）
+
+    **2.1.0 起宿主支持跨账套一次读（SDK 1.5.0）**，于是读次数**恒为 1** ——
+    不但与对账单份数无关，也与**账套数**无关（从前是「每本账一次」）。
     """
     from app.plugins.manifest import table_prefix
 
     card_id = _card_with_members(shared, client, auth, cash_subjects)
     alloc_table = table_prefix("com.cwq.sharedcard") + "alloc"
 
-    # 插件能看到几本账 —— 归属表是账套表，每本账读一次就是那个数。
+    # 插件能看到几本账 —— 从前「每本账读一次」就是那个数。
     book_count = len(_json(client.get(shared + "/catalog", headers=auth))["books"])
+    assert book_count >= 2, book_count
 
     def upload_and_count(name: str, path: str) -> int:
         data = (FIXTURES / path).read_bytes()
@@ -2033,8 +2047,8 @@ def test_归属表的读次数与对账单份数无关(shared, client, auth, boo
     # **份数从 1 变成 2，读次数不许变。**
     assert one[0] == two[0], (one, two)
     assert one[1] == two[1], (one, two)
-    # 每本账读一次 —— 不是「每份对账单 × 每本账」。
-    assert one == (book_count, book_count), (one, book_count)
+    # **整个表只读一次** —— 不是「每本账一次」，更不是「每份对账单 × 每本账」。
+    assert one == (1, 1), (one, book_count)
 
 
 @contextmanager
