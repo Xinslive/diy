@@ -18,7 +18,7 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from app.models import (AuditLog, Book, Entry, InvoiceConfig, InvoiceRule, Period,
                         PeriodOpening, ReportResult, Subject, SysUser, UserBook, Voucher)
@@ -200,6 +200,145 @@ def _make_book(db, name: str) -> Book:
     db.commit()
     db.refresh(b)
     return b
+
+
+# ====================================================================== 插件表
+
+
+#: 插件样式的表名 —— 前缀照抄真插件的约定（``plugin_<hash>_<表名>``）。
+_PLUGIN_TABLE = "plugin_test1a2b3c_no_cascade"
+
+
+def _make_plugin_table(db, *, with_child: bool = False) -> None:
+    """造一张**和真插件一模一样**的表：外键指向 book.id，**不带** ON DELETE。
+
+    这就是 2026-10-31 生产事故的复刻：插件建表时写
+    ``sa.ForeignKey("book.id")`` 而忘了写 ``ondelete="CASCADE"``，
+    库里落成 PG 默认的 NO ACTION —— 于是 ``DELETE FROM book`` 被它挡住。
+
+    ``with_child=True`` 时再建一张子表，用 NO ACTION 引用母表，
+    用来验「先删子表、再删母表」的顺序。
+    """
+    db.execute(text(f"""
+        CREATE TABLE IF NOT EXISTS {_PLUGIN_TABLE} (
+            id SERIAL PRIMARY KEY,
+            book_id INTEGER NOT NULL REFERENCES book(id),
+            note TEXT NOT NULL DEFAULT ''
+        )
+    """))
+    if with_child:
+        db.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {_PLUGIN_TABLE}_child (
+                id SERIAL PRIMARY KEY,
+                book_id INTEGER NOT NULL REFERENCES book(id),
+                parent_id INTEGER NOT NULL REFERENCES {_PLUGIN_TABLE}(id)
+            )
+        """))
+    db.commit()
+
+
+def _drop_plugin_table(db, *, with_child: bool = False) -> None:
+    if with_child:
+        db.execute(text(f"DROP TABLE IF EXISTS {_PLUGIN_TABLE}_child"))
+    db.execute(text(f"DROP TABLE IF EXISTS {_PLUGIN_TABLE}"))
+    db.commit()
+
+
+def _plugin_rows(db, table: str) -> list[tuple]:
+    return list(db.execute(text(f"SELECT id, book_id FROM {table} ORDER BY id")).all())
+
+
+def test_插件表没声明级联_账套照样删得掉(client, auth, db, book):
+    """**回归**：插件表的外键没写 ON DELETE CASCADE 时，账套也必须删得掉。
+
+    2026-10-31 生产事故：三个插件建表时都写成 ``sa.ForeignKey("book.id")``，
+    库里落成 NO ACTION，``DELETE FROM book`` 被插件表挡住，报 PostgreSQL 23503 ——
+    而宿主对 23503 只回一句脱敏的「引用了不存在的关联数据」，
+    **八本有插件数据的账全都删不掉**（操作者完全看不出是哪张表挡着）。
+
+    这里复刻那个结构：一张插件样式的表，外键指向 book.id，**不带** ON DELETE。
+    """
+    _make_plugin_table(db)
+    try:
+        db.execute(text(
+            f"INSERT INTO {_PLUGIN_TABLE} (book_id, note) VALUES (:b, 'x'), (:b, 'y')"),
+            {"b": book.id})
+        db.commit()
+        assert len(_plugin_rows(db, _PLUGIN_TABLE)) == 2
+
+        r = client.put(f"/api/books/{book.id}", json={"name": "删除"}, headers=auth)
+        assert r.status_code == 200, r.text
+        assert r.json()["deleted"] is True
+        assert _count(db, Book, id=book.id) == 0
+        # 插件的账套数据跟着账套一起走 —— 一行都不许剩
+        assert _plugin_rows(db, _PLUGIN_TABLE) == []
+    finally:
+        _drop_plugin_table(db)
+
+
+def test_删账套只带走本账套的插件行(client, auth, db, book):
+    """别账套的插件行**不许**被顺手删掉。"""
+    _make_plugin_table(db)
+    try:
+        other = _make_book(db, "别的账")
+        db.execute(text(
+            f"INSERT INTO {_PLUGIN_TABLE} (book_id, note) VALUES (:b, 'mine'), (:o, 'theirs')"),
+            {"b": book.id, "o": other.id})
+        db.commit()
+
+        r = client.put(f"/api/books/{book.id}", json={"name": "删除"}, headers=auth)
+        assert r.status_code == 200, r.text
+        rows = _plugin_rows(db, _PLUGIN_TABLE)
+        assert len(rows) == 1
+        assert rows[0][1] == other.id, "别的账套的插件行被误删了"
+    finally:
+        _drop_plugin_table(db)
+
+
+def test_插件表之间也有外键_按依赖顺序删(client, auth, db, book):
+    """插件表**之间**用 NO ACTION 互相引用时，先删子表、再删母表。
+
+    母表还有行被子表引用着就先删母表 → 23503。顺序错了照样删不掉。
+    """
+    _make_plugin_table(db, with_child=True)
+    try:
+        db.execute(text(
+            f"INSERT INTO {_PLUGIN_TABLE} (book_id, note) VALUES (:b, 'x')"),
+            {"b": book.id})
+        db.commit()
+        parent_id = _plugin_rows(db, _PLUGIN_TABLE)[0][0]
+        db.execute(text(
+            f"INSERT INTO {_PLUGIN_TABLE}_child (book_id, parent_id) VALUES (:b, :p)"),
+            {"b": book.id, "p": parent_id})
+        db.commit()
+
+        r = client.put(f"/api/books/{book.id}", json={"name": "删除"}, headers=auth)
+        assert r.status_code == 200, r.text
+        assert _count(db, Book, id=book.id) == 0
+        assert _plugin_rows(db, _PLUGIN_TABLE) == []
+        assert _plugin_rows(db, _PLUGIN_TABLE + "_child") == []
+    finally:
+        _drop_plugin_table(db, with_child=True)
+
+
+def test_删掉的插件行数进审计快照(client, auth, db, book):
+    """审计快照要能回答「删这本账时顺手带走了哪张插件表的多少行」。"""
+    _make_plugin_table(db)
+    try:
+        db.execute(text(
+            f"INSERT INTO {_PLUGIN_TABLE} (book_id, note) VALUES (:b, 'x'), (:b, 'y'), (:b, 'z')"),
+            {"b": book.id})
+        db.commit()
+
+        r = client.put(f"/api/books/{book.id}", json={"name": "删除"}, headers=auth)
+        assert r.status_code == 200, r.text
+
+        rows = db.scalars(select(AuditLog).where(
+            AuditLog.action == "DELETE_BOOK", AuditLog.entity_id == str(book.id))).all()
+        assert len(rows) == 1
+        assert rows[0].before["children"][_PLUGIN_TABLE] == 3
+    finally:
+        _drop_plugin_table(db)
 
 
 # ====================================================================== 删得干净

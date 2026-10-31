@@ -50,7 +50,26 @@
 = data_version + 1``。先删 book 再删子表，这条 UPDATE 打在一行已经不存在的
 账套上（不报错，但版本号就丢了）。所以**子表一律先删，book 最后删**。
 
-**四、审计要先写**：``audit_log.book_id`` 是 ``ON DELETE SET NULL`` ——
+**四、外键不肯级联的，宿主自己动手清**（2026-10-31 补）：插件表是**插件自己
+建的**，它们的 ``book_id`` 外键**不一定**写了 ``ON DELETE CASCADE`` ——
+写了就是 CASCADE，没写就是 PG 默认的 NO ACTION。宿主的插件契约只要求
+「账套表必须有 ``book_id`` 外键指向 ``book.id``」（见
+``app/plugins/migrations.py::validate_tables``），**没有要求它带级联**。
+
+实测（2026-10-31 生产）：三个插件的建表语句都写成了
+``sa.ForeignKey("book.id")``，库里落成 NO ACTION。于是 ``DELETE FROM book``
+被插件表挡住，报 PostgreSQL ``23503``（外键冲突）—— 而
+``app/main.py`` 对 23503 只回一句脱敏的中文
+「引用了不存在的关联数据，请检查所选科目/账套是否仍然有效。」，
+**一个字的线索都不给**。生产上八本账（有插件数据的那些）全都删不掉。
+
+所以宿主**不假设**插件表会级联：删 book 之前，先问数据库
+（``pg_constraint``）「谁引用了 ``book.id``、而引用规则不是 CASCADE」，
+把这些表里的本账套行**按外键依赖顺序显式删掉**，再删 book。
+**库里的外键拓扑是唯一判据** —— 插件叫什么名字、装没装、什么版本，
+宿主一概不猜，猜错就是一本永远删不掉的账。
+
+**五、审计要先写**：``audit_log.book_id`` 是 ``ON DELETE SET NULL`` ——
 账套删掉之后，那条「账套被删了」的日志仍然留得住（book_id 变 NULL，
 事实全在 detail / before 里）。但顺序不能反：先删账套再写日志，
 INSERT 时会撞外键（账套已经不存在了）。
@@ -59,7 +78,7 @@ from __future__ import annotations
 
 from typing import Iterable, Optional
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import bindparam, delete, func, select, text, update
 from sqlalchemy.orm import Session
 
 from app.accounting.audit_helper import log
@@ -96,6 +115,170 @@ def _counts(db: Session, book_id: int) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# 「引用 book.id、却不跟着账套一起走」的外键
+# ---------------------------------------------------------------------------
+#
+# PG 的外键删除动作记在 ``pg_constraint.confdeltype`` 里：
+#
+# ======  ==========================  ===================================
+# 字母    含义                        删掉被引用的行时会怎样
+# ======  ==========================  ===================================
+# 'c'     CASCADE                     引用行跟着一起删
+# 'n'     SET NULL                   引用行的列置空
+# 'a'     NO ACTION（**PG 的默认**）  还有引用行 → **报错 23503**
+# 'r'     RESTRICT                    同上，且**立即**检查
+# 'd'     SET DEFAULT                 引用列写回默认值
+# ======  ==========================  ===================================
+#
+# 插件表最容易踩的就是 'a'：建表时写 ``sa.ForeignKey("book.id")`` 而**忘了
+# 写 ondelete** —— Alembic 忠实地照抄，于是库里就是 NO ACTION。
+# 宿主先前把插件表当成「会级联」处理（见模块说明），于是这类账套永远删不掉。
+
+#: 会挡住 ``DELETE FROM book`` 的两种引用规则。
+_FK_BLOCKING_RULES = ("a", "r")
+
+#: 找出「引用 book.id 且不级联」的表。
+#:
+#: 表名与列名**全部来自 pg_catalog**，不是用户输入。
+_BLOCKING_CHILDREN_SQL = text("""
+    SELECT child.relname AS table_name,
+           array_agg(att.attname ORDER BY u.ord) AS columns
+    FROM pg_constraint con
+    JOIN pg_class child ON child.oid = con.conrelid
+    JOIN pg_namespace ns ON ns.oid = child.relnamespace
+    JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS u(attnum, ord) ON true
+    JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = u.attnum
+    WHERE con.contype = 'f'
+      AND con.confrelid = 'public.book'::regclass
+      AND con.confdeltype IN :rules
+      AND ns.nspname = 'public'
+    GROUP BY child.relname, con.conname
+    ORDER BY child.relname, con.conname
+""").bindparams(bindparam("rules", expanding=True))
+
+#: 这些表**之间**有没有也用 NO ACTION 的外键（决定谁得先删）。
+_CHILD_EDGES_SQL = text("""
+    SELECT child.relname AS child_table,
+           parent.relname AS parent_table
+    FROM pg_constraint con
+    JOIN pg_class child ON child.oid = con.conrelid
+    JOIN pg_class parent ON parent.oid = con.confrelid
+    WHERE con.contype = 'f'
+      AND con.confdeltype IN :rules
+      AND child.relname IN :tables
+      AND parent.relname IN :tables
+""").bindparams(bindparam("rules", expanding=True),
+                  bindparam("tables", expanding=True))
+
+
+def _blocking_children(db: Session) -> list[tuple[str, list[str]]]:
+    """引用 ``book.id``、而引用规则**不是** CASCADE / SET NULL 的表。
+
+    返回 ``[(表名, [列名...]), ...]``。一张表可能有多条这样的外键
+    （比如同时按 ``book_id`` 和别的列引用），一张表只出现一次。
+
+    **为什么用 pg_catalog 而不是写死一张表清单**：插件表是插件自己建的，
+    宿主不可能知道它们叫什么、装没装、什么版本 —— 写死清单的那一刻，
+    清单就已经落后了。库里的外键拓扑是**唯一**能说准「谁会挡住删除」
+    的地方。
+    """
+    rows = db.execute(_BLOCKING_CHILDREN_SQL, {"rules": _FK_BLOCKING_RULES}).mappings().all()
+    merged: dict[str, list[str]] = {}
+    for row in rows:
+        cols = list(row["columns"] or [])
+        if not cols:
+            continue
+        # 一条外键指向 book(id)，目标列只有一个，所以子列也只能有一个。
+        # 真出现多列（不可能，但万一库被手工改过）就取第一列并留个底。
+        merged.setdefault(row["table_name"], cols)
+    return sorted(merged.items())
+
+
+def _delete_order(names: list[str], edges: list[tuple[str, str]]) -> list[str]:
+    """这些表**之间**的删除顺序：先删子表，再删父表。
+
+    ``edges`` 是 ``(子表, 父表)``：子表有行引用着父表的行，所以父表不能在
+    子表还有行的时候被清空。带 CASCADE 的父子关系**不在** edges 里 ——
+    那种由 PG 自己处理，顺序无所谓。
+
+    有环就说明这套表结构本身互相卡着（NO ACTION 的环），此时无解，
+    只能明确报错而不是删一半。
+    """
+    prereq: dict[str, set[str]] = {n: set() for n in names}
+    for child, parent in edges:
+        if child != parent and child in prereq and parent in prereq:
+            prereq[parent].add(child)
+    order: list[str] = []
+    done: set[str] = set()
+    while True:
+        ready = [n for n in sorted(prereq) if n not in done and not prereq[n]]
+        if not ready:
+            break
+        pick = ready[0]
+        done.add(pick)
+        order.append(pick)
+        for other in prereq:
+            prereq[other].discard(pick)
+    if len(order) != len(names):
+        stuck = sorted(set(names) - set(order))
+        raise RuntimeError(f"账套子表之间存在循环外键，无法确定删除顺序：{stuck}")
+    return order
+
+
+def _quote(db: Session, identifier: str) -> str:
+    """把标识符按 PG 的规则加引号。"""
+    return db.get_bind().dialect.identifier_preparer.quote(identifier)
+
+
+def _child_row_counts(db: Session, book_id: int,
+                      children: list[tuple[str, list[str]]]) -> dict[str, int]:
+    """这些表里、属于本账套的各有多少行 —— 删掉就查不到了，删之前先记下。"""
+    counts: dict[str, int] = {}
+    for name, cols in children:
+        quoted_table = _quote(db, name)
+        where = " AND ".join(f"{_quote(db, col)} = :book_id" for col in cols)
+        row = db.execute(
+            text(f"SELECT count(*) FROM {quoted_table} WHERE {where}"),
+            {"book_id": book_id},
+        ).scalar()
+        counts[name] = int(row or 0)
+    return counts
+
+
+def _clear_blocking_children(db: Session, book_id: int,
+                             children: list[tuple[str, list[str]]]) -> dict[str, int]:
+    """把「引用 book.id 却不级联」的表里、属于本账套的行删掉。
+
+    返回 ``{表名: 删掉的行数}``。
+
+    **为什么宿主可以直接删插件表的数据**：插件契约里，
+    ``scope="book"`` 的表**按定义**就跟着账套生死
+    （``app/plugins/manifest.py``：账套表必须有 ``book_id`` 指向
+    ``book.id``；``global`` 表则**不许**含账套数据）。
+    宿主删账套，插件的账套数据就该一起走 —— 否则这本账就永远删不掉。
+    """
+    if not children:
+        return {}
+    names = [name for name, _ in children]
+    edges = [
+        (row["child_table"], row["parent_table"])
+        for row in db.execute(_CHILD_EDGES_SQL,
+                              {"rules": _FK_BLOCKING_RULES, "tables": names}).mappings()
+    ]
+    columns = dict(children)
+    removed: dict[str, int] = {}
+    for name in _delete_order(names, edges):
+        cols = columns[name]
+        quoted_table = _quote(db, name)
+        where = " AND ".join(f"{_quote(db, col)} = :book_id" for col in cols)
+        result = db.execute(
+            text(f"DELETE FROM {quoted_table} WHERE {where}"), {"book_id": book_id}
+        )
+        removed[name] = int(result.rowcount or 0)
+    return removed
+
+
 def delete_book(db: Session, book: Book, actor, *, trigger: str) -> dict:
     """物理删掉一本账，连同它全部业务数据。**调用方负责 commit。**
 
@@ -105,6 +288,9 @@ def delete_book(db: Session, book: Book, actor, *, trigger: str) -> dict:
     book_id = book.id
     company_name = book.company_name
     name = book.name
+    # 先探明「谁会挡住删除」—— 审计日志在后面才写，
+    # 所以这些行数必须**现在**数好，才能进快照。
+    blocking = _blocking_children(db)
     snapshot = {
         "id": book_id,
         "company_name": company_name,
@@ -113,6 +299,8 @@ def delete_book(db: Session, book: Book, actor, *, trigger: str) -> dict:
         "start_month": book.start_month,
         **_counts(db, book_id),
     }
+    if blocking:
+        snapshot["children"] = _child_row_counts(db, book_id, blocking)
 
     # 审计**先写、先 flush**：audit_log.book_id 是 SET NULL，
     # 账套删掉之后这条日志仍留得住（book_id 变 NULL，事实全在 before 里）。
@@ -146,10 +334,14 @@ def delete_book(db: Session, book: Book, actor, *, trigger: str) -> dict:
     db.execute(delete(Voucher).where(Voucher.book_id == book_id))
     db.execute(delete(ReportResult).where(ReportResult.book_id == book_id))
 
-    # ---- 3. 删账套本身 ------------------------------------------------------
+    # ---- 3. 清掉「引用 book.id 却不级联」的行 --------------------------------
+    # 插件表就是典型（见模块说明第四节）。不先清，DELETE book 直接撞 23503。
+    _clear_blocking_children(db, book_id, blocking)
+
+    # ---- 4. 删账套本身 ------------------------------------------------------
     # 其余子表（subject / period / book_year / sys_user_book / print_template /
-    # report_template / invoice_batch / invoice_record / import_batch /
-    # plugin_*）由 CASCADE 带走；audit_log 是 SET NULL，日志留下。
+    # report_template / invoice_batch / invoice_record / import_batch）
+    # 由 CASCADE 带走；audit_log 是 SET NULL，日志留下。
     db.execute(
         delete(Book).where(Book.id == book_id).execution_options(synchronize_session=False)
     )
