@@ -895,7 +895,10 @@ def _attach_invoice_pages(db: Session, book: Book, tpl: dict,
         raise xl.ExportTooLarge(
             f"这次打印要带 {total} 张发票，超过单次上限 {MAX_INVOICE_PAGES} 张。"
             "请缩小打印范围（按期间分段打印）后重试。")
-    pages = invoice_pages_html(tpl, refs)
+    try:
+        pages = invoice_pages_html(tpl, refs)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     out: list[str] = []
     for index, doc in enumerate(docs):
         out.append(doc)

@@ -1,5 +1,6 @@
 import { http } from './client'
 import { fontsReady } from '@/utils/printFont'
+import { errorText } from '@/utils/errorText'
 import { ElMessage } from 'element-plus'
 
 // ---- HTML 预览（所见即所得，与打印同一份渲染）----
@@ -52,10 +53,12 @@ export async function loadPrintHtml(path, params = {}) {
   try {
     return await fetchPrintHtml(path, params)
   } catch (e) {
-    const data = e?.response?.data
-    ElMessage.error(
-      (data && typeof data === 'object' && data.detail) || '打印内容生成失败'
-    )
+    let data = e?.response?.data
+    // HTML 请求使用 responseType=text，失败时的 JSON 也会作为字符串返回。
+    if (typeof data === 'string') {
+      try { data = JSON.parse(data) } catch { data = null }
+    }
+    ElMessage.error(errorText({ response: { data } }, '打印内容生成失败'))
     return null
   }
 }

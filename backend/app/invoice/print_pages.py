@@ -10,8 +10,7 @@
 只能是图片。
 
 **为什么自己写 PNG 编码。** 运行环境里没有 Pillow、没有 numpy
-（``requirements.lock`` 里就没有这两个），而发票是白底黑字 —— PNG 压得
-极好：实测一张 A4 发票在 150 DPI 下只有 ~90 KB。
+（``requirements.lock`` 里就没有这两个），使用标准库编码无损 PNG。
 """
 from __future__ import annotations
 
@@ -23,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import pypdfium2 as pdfium
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -34,7 +34,7 @@ log = logging.getLogger("cwq.invoice.print")
 
 #: 一次打印最多带多少张发票页。
 #:
-#: **为什么要有这道闸**：一张发票页就是一张 A4 的 PNG（~90 KB），走 base64
+#: **为什么要有这道闸**：一张发票页就是一张 PNG，走 base64
 #: 进 HTML 还要再涨三分之一 —— 一次几百张就是几十 MB 的字符串，那台
 #: 1.6 GB 的机器扛不住。与 Excel 通道那道行数闸是同一件事：一次打印的量
 #: 必须有上限，超了就明说，不静默截断（见 ``api/printing.py`` 里用它的地方）。
@@ -62,7 +62,7 @@ def _png_bytes(width: int, height: int, rows: list[bytes]) -> bytes:
     """把 RGB 行编成 PNG（每行 filter 0，靠 zlib 压）。
 
     **不引 Pillow**：运行环境里没有它，而发票是白底黑字 ——
-    filter 0 + zlib 已经把一张 A4 压到 ~90 KB（实测）。
+    使用 filter 0 + zlib 压缩，保留渲染后的 RGB 像素。
     """
     raw = b"".join(b"\x00" + row for row in rows)
 
@@ -85,8 +85,6 @@ def _render_page_png(path: Path, page_index: int) -> tuple[bytes, int, int]:
     个通道），PNG 要 RGB —— 换通道用切片赋值做，不在 Python 层逐像素循环
     （一张 A4 有两百多万个点，逐像素循环会让每次打印多等好几秒）。
     """
-    import pypdfium2 as pdfium
-
     document = pdfium.PdfDocument(str(path))
     try:
         page = document[page_index]
@@ -150,8 +148,7 @@ def pages_by_voucher(db: Session, book_id: int,
 def invoice_pages_html(tpl: dict, refs: dict[int, list[InvoicePage]]) -> dict[int, list[str]]:
     """这些凭证的发票页（HTML），一张发票一页。
 
-    **原件不在了就跳过这一张，不让整份打不出来**：凭证本身还得印 ——
-    批次被作废、文件被删掉都不该让这一叠凭证印不出来。
+    打开发票打印后，原件缺失或页码错误必须报错，不能静默漏印附件。
 
     ``refs`` 是 :func:`pages_by_voucher` 的结果 —— **查**与**渲染**分开，
     是为了让接口层能在渲染之前先量一量这次要印多少张（量闸在那儿）。
@@ -165,10 +162,13 @@ def invoice_pages_html(tpl: dict, refs: dict[int, list[InvoicePage]]) -> dict[in
                 try:
                     uri, width, height = page_data_uri(
                         storage.path_for(item.file_path), page_index)
-                except Exception as exc:  # noqa: BLE001 —— 原件坏了不能连累凭证
+                except (OSError, ValueError, IndexError, pdfium.PdfiumError) as exc:
                     log.warning("发票页渲染失败（批次 %s 第 %s 页）：%s",
                                 item.batch_id, page_index, exc)
-                    continue
+                    raise ValueError(
+                        f"发票原件无法打印（批次 {item.batch_id}，第 {page_index + 1} 页），"
+                        "请检查原件；如只打印凭证，请关闭“发票打印”"
+                    ) from exc
                 pages.append(render_invoice_page(tpl, uri, width, height))
         if pages:
             out[voucher_id] = pages

@@ -10,14 +10,15 @@ PDF 找。打印时把原件接在凭证后面，一次印完，剪下来就能�
    剪下来时发票跟它的凭证挨着；
 2. **只在开关打开时才有**：关掉时打印结果与从前一样，一张发票页都不多；
 3. **拆成多格的凭证只印一次发票**：那张凭证在纸上占了几格，发票只有一张；
-4. **原件没了不连累凭证**：批次被作废、文件被删掉时，凭证照样印得出来。
+4. **原件读取失败要报错**：避免用户以为打印成功，实际漏掉发票。
 
-原件是**真的那张测试用发票 PDF**（``tests/fixtures/invoices/inv_a.pdf``），
-所以这一组跑的是真的 PDF 渲染，不是打桩后的假绿。
+``tests/fixtures/invoices`` 是纯文字合成夹具，只验证打印逻辑，不作为真实原票的版式验收。
 """
 from __future__ import annotations
 
+import os
 import pathlib
+import re
 import shutil
 
 import pytest
@@ -48,10 +49,12 @@ def _template(client, auth, book, slots: int = 2) -> int:
 
 
 def _invoice_for(db, book, voucher, store, name: str = "inv_a.pdf", number: str = "1"):
-    """给凭证配一张发票（原件是那份真的发票 PDF）。"""
+    """关联源 PDF，每个批次单独保存，防止不同凭证的原件相互覆盖。"""
     store.mkdir(parents=True, exist_ok=True)
-    shutil.copy(FIXTURES / name, store / "batch_1.pdf")
-    batch = InvoiceBatch(book_id=book.id, filename=name, file_path="batch_1.pdf",
+    source = FIXTURES / name
+    relative = f"batch_{number}.pdf"
+    shutil.copy(source, store / relative)
+    batch = InvoiceBatch(book_id=book.id, filename=source.name, file_path=relative,
                           status="COMMITTED", total=1, committed_count=1,
                           created_by="tester")
     db.add(batch)
@@ -126,14 +129,27 @@ def test_拆成多格的凭证只印一次发票(client, auth, book, periods, ma
     assert html.count('<div class="invoice-page">') == 1
 
 
-def test_原件没了照样印得出凭证(client, auth, book, periods, make_voucher, db, store):
-    """批次被作废、文件被删掉 —— 凭证那页还得印得出来。"""
+@pytest.mark.parametrize("failure", ["missing", "corrupt", "page_index", "file_path"])
+def test_原件读取失败不能静默漏印(client, auth, book, periods, make_voucher, db, store, failure):
     voucher = _voucher(make_voucher)
-    _invoice_for(db, book, voucher, store)
-    (store / "batch_1.pdf").unlink()
-    html = _print(client, auth, book, periods[1].id, print_invoices="true")
-    assert "data:image/png;base64," not in html
-    assert "记 账 凭 证" in html
+    record = _invoice_for(db, book, voucher, store)
+    if failure == "missing":
+        (store / "batch_1.pdf").unlink()
+    elif failure == "corrupt":
+        (store / "batch_1.pdf").write_bytes(b"not a PDF")
+    elif failure == "page_index":
+        record.page_index = 99
+        db.commit()
+    else:
+        db.get(InvoiceBatch, record.batch_id).file_path = ""
+        db.commit()
+    response = client.get(f"/api/books/{book.id}/print/vouchers.html",
+                          params={"period_id": periods[1].id, "print_invoices": "true"},
+                          headers=auth)
+    assert response.status_code == 409
+    assert "发票原件无法打印" in response.json()["detail"]
+    assert "关闭“发票打印”" in response.json()["detail"]
+    assert "记 账 凭 证" in _print(client, auth, book, periods[1].id)
 
 
 def test_发票太多时明说而不是硬打(client, auth, book, periods, make_voucher, db,
@@ -168,3 +184,30 @@ def test_两张凭证一张纸时两张发票接在那张纸后面(client, auth,
     assert '<div class="invoice-page">' not in pages[0]
     assert '<div class="invoice-page">' in pages[1]
     assert '<div class="invoice-page">' in pages[2]
+    from app.invoice.print_pages import page_data_uri
+
+    actual = re.findall(r'<img src="(data:image/png;base64,[^"]+)"', html)
+    expected = [page_data_uri(FIXTURES / name, 0)[0] for name in ("inv_a.pdf", "inv_b.pdf")]
+    assert expected[0] != expected[1]
+    assert actual == expected
+
+
+@pytest.mark.skipif(not os.environ.get("CWQ_INVOICE_PRINT_SAMPLE"), reason="需提供真实原票路径")
+def test_真实原票使用对应原始PDF页(client, auth, book, periods, make_voucher, db, store, tmp_path):
+    from app.invoice.print_pages import page_data_uri
+    import pypdfium2 as pdfium
+
+    source = pathlib.Path(os.environ["CWQ_INVOICE_PRINT_SAMPLE"])
+    with pdfium.PdfDocument(source) as document:
+        count = len(document)
+    voucher = _voucher(make_voucher)
+    record = _invoice_for(db, book, voucher, store, str(source))
+    record.payload = {"page_span": count}
+    db.commit()
+    html = _print(client, auth, book, periods[1].id,
+                  template_id=_template(client, auth, book), print_invoices="true")
+    actual = re.findall(r'<img src="(data:image/png;base64,[^"]+)"', html)
+    assert actual == [page_data_uri(source, index)[0] for index in range(count)]
+    preview = tmp_path / "real-invoice-print.html"
+    preview.write_text(html, encoding="utf-8")
+    print(f"真实原票打印预览：{preview}")

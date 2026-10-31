@@ -12,12 +12,9 @@
  * 照应的是后端 `app/api/printing.py::print_vouchers` 的同名参数与
  * `app/invoice/print_pages.py`。
  */
-import { createServer } from 'vite'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import { fileURLToPath } from 'node:url'
 
-const ROOT = fileURLToPath(new URL('../', import.meta.url))
 const read = (rel) => fs.readFileSync(new URL(rel, import.meta.url), 'utf8')
 const DIALOG = read('../src/components/PrintDialog.vue')
 const BACKEND_API = read('../../backend/app/api/printing.py')
@@ -74,6 +71,27 @@ t('发票页由发票模块渲染（不是打印模板里硬写的）', () => {
   assert.ok(/invoice_pages_html/.test(BACKEND_API_CODE),
     '打印接口没有调用发票页的渲染函数')
 })
+
+const { errorText } = await import('data:text/javascript;base64,' +
+  Buffer.from(read('../src/utils/errorText.js')).toString('base64'))
+const makeLoader = new Function('http', 'ElMessage', 'fontsReady', 'errorText',
+  read('../src/api/print.js').replace(/^import .*$/gm, '').replace(/\bexport /g, '') +
+  '\nreturn loadPrintHtml')
+const detail = '发票原件无法打印（批次 1，第 1 页），请检查原件'
+for (const [data, expected] of [
+  [JSON.stringify({ detail }), detail],
+  [{ detail }, detail],
+  ['<html>服务不可用</html>', '打印内容生成失败'],
+]) {
+  const messages = []
+  const load = makeLoader({ get: async () => { throw { response: { data } } } },
+    { error: message => messages.push(message) }, null, errorText)
+  const result = await load('/print/vouchers.html', { print_invoices: true })
+  t('原件读取失败的原因能显示给用户', () => {
+    assert.equal(result, null)
+    assert.deepEqual(messages, [expected])
+  })
+}
 
 console.log('\n通过 ' + pass + ' / 失败 ' + fail)
 process.exit(fail ? 1 : 0)
