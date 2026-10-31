@@ -182,12 +182,14 @@ def denoise_body(body: list[str], base_level: int) -> list[str]:
             m = re.match(r'^(#{2,5})\s+(.*)$', line)
             if m:
                 lvl = len(m.group(1))
-                rest = DATE_TAIL.sub('', m.group(2)).replace('**', '')
+                raw = m.group(2)
+                dm = DATE_TAIL.search(raw)
+                rest = DATE_TAIL.sub('', raw).replace('**', '')
                 # 组标题：留着原样，不参与定级
                 if lvl == 2 and not re.match(r'^§?\d', rest):
-                    out.append((lvl, rest, True))
+                    out.append((lvl, rest, True, None))
                     continue
-                out.append((lvl, rest, False))
+                out.append((lvl, rest, False, dm.group(0).strip() if dm else None))
                 continue
         out.append(line)
 
@@ -201,11 +203,28 @@ def denoise_body(body: list[str], base_level: int) -> list[str]:
     result: list[str] = []
     for item in out:
         if isinstance(item, tuple):
-            lvl, rest, is_group = item
+            lvl, rest, is_group, date = item
             if is_group:
                 result.append('#' * lvl + ' ' + rest)
             else:
                 result.append('#' * max(2, min(lvl + (shift or 0), 6)) + ' ' + rest)
+                # 小节标题里的日期尾注归位到小节正文首行。
+                #
+                # **为什么小节也要归位，不能像原来那样直接丢掉。**
+                # 章的日期是这么处理的（`main()` 里 `dm = DATE_TAIL.search(b['title'])`），
+                # 小节原来只在 `rest = DATE_TAIL.sub(...)` 那一行**顺手抹掉** ——
+                # 于是日期**没地方去了**，脚本输出里这个日期直接消失。
+                # 后果是「文档与重建脚本的输出必须一致」那道闸门当场变红：
+                # 有人新写一节 `#### 标题（2026-10-31 批注）`，跑重建就把日期抹了，
+                # 而手工改回去的那份文档「提交过了」，看起来什么都没发生。
+                # 这个坑踩过两次（2026-10-31 的两次提交）。
+                #
+                # **归位而不是保留在标题里**：目录里只留主题，日期是给读正文的人的，
+                # 放在标题里既进不了目录、又是每次重排都可能变的字样。
+                # 形态与章一致：`*（2026-10-31 批注）*` 单独一行，顶在该小节正文首行。
+                if date:
+                    result.append('')
+                    result.append(f'*{date}*')
         else:
             result.append(item)
     return result
@@ -308,7 +327,7 @@ def main() -> int:
         '**章节号是稳定引用。** 代码、脚本与部署文档里按 `§11.7` 这样指认章节，',
         '所以编号只增不改、不重排 —— 重排会让那些引用全部指错地方。',
         '',
-        '标题里的日期标记（首次确立 / 最后修订）已移到各章正文首行，目录里只留主题。',
+        '标题里的日期标记（首次确立 / 最后修订）已移到各章与小节正文首行，目录里只留主题。',
         '',
         '---',
         '',
