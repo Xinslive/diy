@@ -250,6 +250,60 @@ CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1 \
 bash deploy/deploy.sh
 ```
 
+### 发布输出必须落盘（2026-10-31 补）
+
+上面那段命令是**交互式**跑的 —— `deploy.sh` 的全部输出只进 SSH 的终端，
+**脚本自己一个日志文件都不写**。所以一旦发布失败，机器上什么都不剩：
+下次再发版时，谁也说不清上次是死在哪一步的。
+
+真实案例（2026-10-31）：当天 11:02 有一次发布失败了，
+`.releases/20261031-110252/` 只留下 `artifact/ backend/ dist/` 三样 ——
+**没有 `database-before-migration.sql`，也没有 `db_backup.err`**，
+说明它死在第 4 步（备份数据库）之前，也就是第 3 步「装运行时依赖」里。
+但**具体哪一行报错，无法复原**：输出没留。同一份产物 12:27 再发一次就通了。
+
+所以发布要**脱离 SSH 会话**跑，并把输出落盘：
+
+```bash
+cat > /root/run-deploy-<sha12>.sh <<'INNER'
+#!/usr/bin/env bash
+export APP_DIR=/www/wwwroot/acct.xins.live
+export BACKUP_DIR=/www/wwwroot/acct.xins.live/backups
+export ARTIFACT_DIR=/root/cwq-release-<sha12>/artifact
+export CWQ_DEPLOY_ALLOW_NONSTANDARD_APP_DIR=1
+cd /root/cwq-release-<sha12>
+bash deploy/deploy.sh
+INNER
+chmod +x /root/run-deploy-<sha12>.sh
+setsid bash -c '/root/run-deploy-<sha12>.sh > /root/deploy-<sha12>.log 2>&1; \
+                echo $? > /root/deploy-<sha12>.exit' < /dev/null > /dev/null 2>&1 &
+```
+
+**为什么用 `setsid`**：它把发布进程放进一个**新的会话**，SSH 断连时的
+SIGHUP 送不到它 —— 而 `deploy.sh` 自己有 trap，收到 TERM 会触发回退。
+也就是说，一次「本地网络抖动」会被变成「发布到一半被回退」。
+**发布不是能在客户端断连的场景下继续跑的事情。**
+
+**为什么还要把退出码写进另一个文件**：日志里没有退出码时，无法区分
+「发布失败」和「日志还没写完」。
+
+### 失败过一次，怎么定位它死在哪一步
+
+`.releases/<时间戳>/` 里有什么，就说明走到了哪一步 —— 这是**脚本自己
+留下的现场**，比翻聊天记录可靠：
+
+| 目录里有 | 说明走到了 |
+|---|---|
+| 只有 `artifact/` | 第 1 步（取产物）就没过 |
+| `+ backend/` `+ dist/` | 第 2 步（备份现场）过了，**死在第 3 步里或它之前** |
+| `+ venv/` | 当时锁文件与现网**不一致**（一致的话不会有 venv 快照） |
+| `+ database-before-migration.sql` | 第 4 步的数据库备份成功了，**迁移可能已经执行过** |
+
+> `db_backup.err` 存在、而 `database-before-migration.sql` 不存在
+> = 备份命令**被调用过且失败了** —— 真正的报错就在那份 err 里。
+> 两者都没有 = 备份命令**根本没被调用**，失败在更早的地方
+> （第 3 步装依赖就是嫌疑最大的一处：它要访问 PyPI，网络抖动就会失败）。
+
 **发布后一定要验这两条**（发布脚本自己也会验，但它的提示指向
 `/opt/cwq/backend/logs/api.err.log` —— **这台机上是错的路径**，
 真实的日志在 `/www/wwwroot/acct.xins.live/backend/logs/api.err.log`）：
