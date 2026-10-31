@@ -23,6 +23,7 @@ import base64
 import json
 import pathlib
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -319,8 +320,11 @@ def test_插件不再声明凭证权限(shared, client, auth, db):
     # 「返回」回**对账单列表**（不是插件首页），归属条与表头**固定在顶上**；
     # 1.4.3 又砍了卡详情页的界面 —— 页签只剩「对账单 / 成员账套」（对账单在前），
     # 「余额核对」那一屏与卡详情工具条上的「删除」都没了（**接口仍在**）。
+    # 2.0.1：归属一次读完（读次数与对账单份数无关），工作台不再重复读账套表。
+    # 2.0.2：「已保存的核对记录」单独成页；确认核对只算被选中那本账的账面侧，
+    # 写完不再重拉整个工作台（服务器把这一组原样交回，页面就地打补丁）。
     # 版本号跟着走，别让它停在老版本上假装还是老插件。
-    assert registry.version == "1.4.3", registry.version
+    assert registry.version == "2.0.2", registry.version
 
 
 def test_卡可以删(shared, client, auth, loaded, cash_subjects):
@@ -869,7 +873,7 @@ def test_账套级备份覆盖插件的六张表(shared, client, auth, db, loade
     data = read_snapshot(path)
 
     prefix = "plugin_275b391c351a_"
-    for suffix in ("card", "member", "rule", "stmt", "row", "alloc"):
+    for suffix in ("card", "member", "rule", "stmt", "row", "alloc", "recon"):
         assert prefix + suffix in data["tables"], \
             "账套级备份漏了 %s 表" % suffix
 
@@ -1090,6 +1094,108 @@ def _record_cash(maker, item, row, when):
     assert row["direction"] == "OUT", row
     return maker(when, dr=[(item["counter"].code, value, "记卡上的支出")],
                  cr=[(item["cash"].code, value, "记卡上的支出")])
+
+
+@pytest.fixture
+def continuous_case(shared, client, auth, db, admin_user, loaded, cash_subjects):
+    row = _seq_row(_rows(shared, client, auth, loaded["stmt_id"]), 4)
+    item = next((item for item in cash_subjects if item['book'].id == (row.get('alloc') or {}).get('book_id')), cash_subjects[0])
+    maker = build_voucher_factory(db, item["book"], admin_user)
+    voucher = _record_cash(maker, item, row, "2026-08-31")
+    path = shared + f'/cards/{loaded["card_id"]}'
+    workspace = _json(client.get(path + '/workspace', headers=auth))
+    tx = next(t for t in workspace['transactions'] if any(s['row_id'] == row['id'] for s in t['sources']))
+    entry = next(e for e in workspace['entries'] if e['voucher_id'] == voucher.id)
+    bank_keys = ('id','card_id','tx_date','tx_time','direction','amount_cents','balance_cents')
+    entry_keys = ('id','book_id','voucher_id','voucher_no','voucher_date','period','subject_code','amount_cents','direction','summary','voucher_status')
+    payload = {'bank': [tx['id']], 'entries': [entry['id']],
+               'bank_snapshot': [{k: tx.get(k) for k in bank_keys}],
+               'entry_snapshot': [{k: entry.get(k) for k in entry_keys}]}
+    return path, workspace, tx, entry, payload
+
+
+def test_连续资金线使用宿主余额及真实分录标识(continuous_case, db):
+    path, workspace, tx, entry, payload = continuous_case
+    from app.models.accounting import Entry
+    actual = db.get(Entry, entry['id'])
+    assert actual is not None and actual.voucher_id == entry['voucher_id']
+    assert entry['reference_ok'] is True
+    assert entry['period'] == '2026-08' and tx['tx_date'].startswith('2026-09')
+    assert workspace['ledger']['summary']['chain_ok'], workspace['ledger']
+    assert entry['book_balance_cents'] == -entry['amount_cents']
+    assert len(workspace['transactions']) == 5
+
+
+def test_核对组持久保存重复占用整组拒绝(continuous_case, client, auth, db):
+    path, workspace, tx, entry, payload = continuous_case
+    body = _json(client.post(path + '/reconciliations', headers=auth, json=payload))
+    assert -(2**53) < body['id'] < 0
+    fresh = _json(client.get(path + '/workspace', headers=auth))
+    assert len(fresh['groups']) == 1 and not fresh['groups'][0]['stale']
+    response = client.post(path + '/reconciliations', headers=auth, json=payload)
+    assert response.status_code == 409, response.text
+    assert db.scalar(text("SELECT count(*) FROM plugin_275b391c351a_recon WHERE kind='GROUP'")) == 1
+    assert db.scalar(text("SELECT count(*) FROM plugin_275b391c351a_recon WHERE kind='CLAIM'")) == len(tx['sources']) + 1
+
+
+def test_撤销原子释放占用并保留历史(continuous_case, client, auth, db):
+    path, workspace, tx, entry, payload = continuous_case
+    group = _json(client.post(path + '/reconciliations', headers=auth, json=payload))
+    _json(client.delete(path + '/reconciliations/' + str(group['id']), headers=auth))
+    fresh = _json(client.get(path + '/workspace', headers=auth))
+    assert fresh['groups'] == [] and len(fresh['history']) == 1
+    assert fresh['history'][0]['active'] is False
+    assert db.scalar(text("SELECT count(*) FROM plugin_275b391c351a_recon WHERE kind='CLAIM'")) == 0
+    _json(client.post(path + '/reconciliations', headers=auth, json=payload))
+    assert len(_json(client.get(path + '/workspace', headers=auth))['history']) == 2
+
+
+def test_确认拒绝过时快照不写半组(continuous_case, client, auth, db):
+    path, workspace, tx, entry, payload = continuous_case
+    payload['entry_snapshot'][0]['summary'] = '过期摘要'
+    response = client.post(path + '/reconciliations', headers=auth, json=payload)
+    assert response.status_code == 409, response.text
+    assert db.scalar(text("SELECT count(*) FROM plugin_275b391c351a_recon")) == 0
+
+
+def test_核对拒绝非法标识不写入(continuous_case, client, auth, db):
+    path, workspace, tx, entry, payload = continuous_case
+    payload['bank'] = [{'invalid': True}]
+    response = client.post(path + '/reconciliations', headers=auth, json=payload)
+    assert response.status_code == 422, response.text
+    assert db.scalar(text("SELECT count(*) FROM plugin_275b391c351a_recon")) == 0
+
+
+def test_分录变化保留核对并提示复核(continuous_case, client, auth, db):
+    path, workspace, tx, entry, payload = continuous_case
+    _json(client.post(path + '/reconciliations', headers=auth, json=payload))
+    db.execute(text('UPDATE entry SET summary=:summary WHERE id=:id'),
+               {'summary': '确认后修订摘要', 'id': entry['id']})
+    db.commit()
+    fresh = _json(client.get(path + '/workspace', headers=auth))
+    assert len(fresh['groups']) == 1 and fresh['groups'][0]['stale'] is True
+    assert fresh['groups'][0]['entry_snapshot'][0]['summary'] == entry['summary']
+    assert db.scalar(text("SELECT count(*) FROM plugin_275b391c351a_recon WHERE kind='CLAIM'")) > 0
+
+
+def test_有效核对原件不能删除或重解析(continuous_case, client, auth, loaded):
+    path, workspace, tx, entry, payload = continuous_case
+    _json(client.post(path + '/reconciliations', headers=auth, json=payload))
+    stmt_path = path.split('/cards/')[0] + '/statements/' + str(loaded['stmt_id'])
+    response = client.delete(stmt_path, headers=auth)
+    assert response.status_code == 409, response.text
+    response = client.post(stmt_path + '/reparse', headers=auth,
+                           files={'files': (SAMPLE, (FIXTURES / SAMPLE).read_bytes())})
+    assert response.status_code == 409, response.text
+
+
+def test_归属修订保存且保留旧证据(continuous_case, client, auth):
+    path, workspace, tx, entry, payload = continuous_case
+    _json(client.post(path + '/ownership', headers=auth, json={'tx_id':tx['id'],'book_id':entry['book_id']}))
+    fresh = _json(client.get(path + '/workspace', headers=auth))
+    changed = next(t for t in fresh['transactions'] if t['id'] == tx['id'])
+    assert changed['owner_book_id'] == entry['book_id'] and changed['ownership'] == 'MANUAL'
+    assert changed['allocation_evidence'] == tx['allocation_evidence']
 
 
 def test_账上同额分录命中_自动归属(shared, client, auth, db, admin_user,
@@ -1863,3 +1969,135 @@ def test_老宿主不认窗口参数时退回旧口径(shared, client, auth, pre
     with pytest.raises(TypeError):
         module._entry_match(BrokenHost(), 7, ["100203"], [{"id": 1}],
                              date(2026, 8, 1), date(2026, 8, 31), 60, 90)
+
+
+# ---------------------------------------------------------------------------
+# 读次数：与「对账单份数」无关
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def _count_table_reads(fragment: str):
+    """数一数某张插件表被读了几次（只读探针，不改任何行为）。"""
+    from sqlalchemy import event
+
+    from app.core.db import engine
+
+    reads = []
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _before(conn, cursor, statement, parameters, context, executemany):
+        if fragment in statement and statement.lstrip().upper().startswith("SELECT"):
+            reads.append(statement)
+
+    try:
+        yield reads
+    finally:
+        event.remove(engine, "before_cursor_execute", _before)
+
+
+def test_归属表的读次数与对账单份数无关(shared, client, auth, books3, cash_subjects):
+    """**归属一次读完**，不是「每份对账单再读一遍全部账套」。
+
+    **为什么这件事值得一条用例**：归属表是账套表 —— 一行落在它归属的那本账里，
+    所以「按账套读」躲不掉。但**读几次**是可以选的：逐份对账单去读
+    （每份再遍历全部账套）是 **N×M** 次。实测（生产）12 份对账单 × 12 本账
+    = 144 次读，而归属表**总共只有 138 行** —— 读了一百多遍同一批数据。
+
+    判据是**读次数与对账单份数无关**：加一份对账单，读次数**不许变**。
+    （旧实现是 N×M，所以份数一加，读次数就跟着翻倍。）
+    """
+    from app.plugins.manifest import table_prefix
+
+    card_id = _card_with_members(shared, client, auth, cash_subjects)
+    alloc_table = table_prefix("com.cwq.sharedcard") + "alloc"
+
+    # 插件能看到几本账 —— 归属表是账套表，每本账读一次就是那个数。
+    book_count = len(_json(client.get(shared + "/catalog", headers=auth))["books"])
+
+    def upload_and_count(name: str, path: str) -> int:
+        data = (FIXTURES / path).read_bytes()
+        with _count_table_reads(alloc_table) as reads:
+            _json(client.post(shared + f"/cards/{card_id}/statements", headers=auth,
+                              files={"files": (name, data, "application/octet-stream")}))
+            reads.clear()
+            _json(client.get(shared + f"/cards/{card_id}/statements", headers=auth))
+            statements_reads = len(reads)
+            reads.clear()
+            _json(client.get(shared + "/queue", headers=auth))
+            queue_reads = len(reads)
+        return statements_reads, queue_reads
+
+    one = upload_and_count(SAMPLE, SAMPLE)
+    two = upload_and_count("农商9月.xlsx", "nongshang_xlsx.xlsx")
+
+    # **份数从 1 变成 2，读次数不许变。**
+    assert one[0] == two[0], (one, two)
+    assert one[1] == two[1], (one, two)
+    # 每本账读一次 —— 不是「每份对账单 × 每本账」。
+    assert one == (book_count, book_count), (one, book_count)
+
+
+@contextmanager
+def _count_subject_books():
+    """数一数「读科目表」时碰到了哪几本账（只读探针，不改任何行为）。
+
+    插件读明细账的每一步都要读那本账的科目表 —— 所以「科目表碰到了
+    哪几本账」就等于「这次请求算了几本账的账面」。
+    """
+    from sqlalchemy import event
+
+    from app.core.db import engine
+
+    books = []
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _before(conn, cursor, statement, parameters, context, executemany):
+        if "FROM subject" in statement and statement.lstrip().upper().startswith("SELECT"):
+            books.append((parameters or {}).get("book_id_1"))
+
+    try:
+        yield books
+    finally:
+        event.remove(engine, "before_cursor_execute", _before)
+
+
+def test_确认核对只读被选中那本账的明细账(continuous_case, client, auth, db):
+    """一次核对只写**一本账** —— 其余账套的明细账不该被读一遍。
+
+    **为什么这件事值得一条用例**：生产上七本成员账的明细账要 580 ms，
+    只读被选中的那一本只要 80 ms。白读六本账，用户点一下「确认核对」
+    就得多等半秒以上 —— 而且那六本的结果既写不进去、也校验不到，
+    纯纯白算。
+
+    判据：**确认核对这一次请求里，科目表只碰到被选中的那一本账**。
+    """
+    path, workspace, tx, entry, payload = continuous_case
+    with _count_subject_books() as books:
+        _json(client.post(path + '/reconciliations', headers=auth, json=payload))
+    assert books, "一次科目表都没读 —— 这条用例本身失效了"
+    assert set(books) == {entry['book_id']}, books
+
+
+def test_确认核对把这一组原样交回页面(continuous_case, client, auth, db):
+    """服务器把这一组**原样**交回页面 —— 页面靠它打补丁，不再重拉整个工作台。
+
+    **判据是「两边一模一样」**：页面上的核对状态直接来自这份返回值。
+    与工作台里的那份对不上，用户就会同时看到两个互相矛盾的界面。
+    """
+    path, workspace, tx, entry, payload = continuous_case
+    body = _json(client.post(path + '/reconciliations', headers=auth, json=payload))
+    fresh = _json(client.get(path + '/workspace', headers=auth))
+    assert body['ok'] is True
+    assert body['id'] == fresh['groups'][0]['id']
+    assert body['group'] == fresh['groups'][0]
+
+
+def test_撤销把这一组交回页面(continuous_case, client, auth, db):
+    """撤销也要交回这一组 —— 页面据此把它从「生效中」挪进「已撤销」。"""
+    path, workspace, tx, entry, payload = continuous_case
+    group = _json(client.post(path + '/reconciliations', headers=auth, json=payload))
+    revoked = _json(client.delete(path + '/reconciliations/' + str(group['id']), headers=auth))
+    fresh = _json(client.get(path + '/workspace', headers=auth))
+    assert revoked['group']['id'] == group['id']
+    assert revoked['group']['active'] is False
+    assert revoked['group'] == fresh['history'][0]
