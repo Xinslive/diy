@@ -284,7 +284,7 @@ def test_期初余额导出再解析能认回停用科目(client, auth, db, book
     xlsx = client.get(f"/api/books/{book.id}/openings.xlsx?period_id={p1.id}",
                       headers=auth).content
 
-    r = client.post(f"/api/books/{book.id}/openings/parse", headers=auth,
+    r = client.post(f"/api/books/{book.id}/openings/parse?year=2026", headers=auth,
                     files={"file": ("opening.xlsx", xlsx,
                                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
     assert r.status_code == 200, r.text

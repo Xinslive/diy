@@ -197,7 +197,10 @@ def _opening_xlsx(rows: int) -> bytes:
 
 
 def _post_openings(client, auth, book, data: bytes):
-    return client.post(f"/api/books/{book.id}/openings/parse", headers=auth,
+    # **年度必带**（2026-10-31 起）：期初挂在某一年的科目表上，
+    # 不说清是哪一年，后端只能猜 —— 猜错时每一行都指着另一年的科目 id，
+    # 调用方填不进去，界面上一个字都看不出来。所以缺年度直接 400。
+    return client.post(f"/api/books/{book.id}/openings/parse?year=2026", headers=auth,
                        files={"file": ("期初.xlsx", data,
                                        "application/vnd.openxmlformats-officedocument."
                                        "spreadsheetml.sheet")})

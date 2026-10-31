@@ -360,7 +360,7 @@ def test_export_then_parse_round_trip_preserves_reverse_balance(
     assert exported["1121"][0] == "借"
 
     # 再喂回 parse 端点，方向与金额都要对得上
-    p = client.post(f"/api/books/{book_id}/openings/parse", headers=auth,
+    p = client.post(f"/api/books/{book_id}/openings/parse?year=2026", headers=auth,
                     files={"file": ("o.xlsx", r.content,
                                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
     assert p.status_code == 200, p.text
@@ -378,7 +378,7 @@ def test_export_then_parse_round_trip_preserves_reverse_balance(
 def test_parse_does_not_write_anything(client, auth, book_id, subjects):
     """parse 只是解析，落库由前端确认后单独提交 —— 这里确认它没偷偷写。"""
     before = client.get(f"/api/books/{book_id}/openings", headers=auth).json()
-    client.post(f"/api/books/{book_id}/openings/parse", headers=auth, files={
+    client.post(f"/api/books/{book_id}/openings/parse?year=2026", headers=auth, files={
         "file": ("o.xlsx", _xlsx([("1121", "银行存款-工商银行", "借", 88888)]),
                  XLSX_MIME)})
     after = client.get(f"/api/books/{book_id}/openings", headers=auth).json()
@@ -394,7 +394,7 @@ def test_parse_reports_errors_without_crashing(client, auth, book_id):
         ("1012", "其他货币资金", "借", "abc"),    # 金额不是数
         ("1001", "库存现金", "借", None),        # 金额空 = 0，可接受
     ])
-    r = client.post(f"/api/books/{book_id}/openings/parse", headers=auth,
+    r = client.post(f"/api/books/{book_id}/openings/parse?year=2026", headers=auth,
                     files={"file": ("o.xlsx", bad, XLSX_MIME)})
     assert r.status_code == 200, r.text
     res = r.json()
@@ -414,7 +414,7 @@ def test_parse_matches_by_name_when_code_blank(client, auth, book_id):
     名称是**精确匹配**（by_name 是按科目名建的下标），所以这里得用账套里
     真有的科目名。4-2-2 表里没有「银行存款-工商银行」这种带银行后缀的明细了。
     """
-    r = client.post(f"/api/books/{book_id}/openings/parse", headers=auth, files={
+    r = client.post(f"/api/books/{book_id}/openings/parse?year=2026", headers=auth, files={
         "file": ("o.xlsx", _xlsx([(None, "库存现金", "借", 4321)]), XLSX_MIME)})
     assert r.status_code == 200, r.text
     row = r.json()["rows"][0]
@@ -424,7 +424,7 @@ def test_parse_matches_by_name_when_code_blank(client, auth, book_id):
 
 def test_parse_default_side_follows_subject_when_column_blank(client, auth, book_id):
     """方向列留空时按科目属性推；填了则以文件为准。"""
-    r = client.post(f"/api/books/{book_id}/openings/parse", headers=auth, files={
+    r = client.post(f"/api/books/{book_id}/openings/parse?year=2026", headers=auth, files={
         "file": ("o.xlsx", _xlsx([
             ("1122", "应收账款", "", 500),        # 空 -> 按属性 -> 借
             ("1122", "应收账款", "贷", 500),      # 填了 -> 以文件为准 -> 贷
@@ -436,11 +436,11 @@ def test_parse_default_side_follows_subject_when_column_blank(client, auth, book
 
 
 def test_parse_rejects_garbage_and_empty(client, auth, book_id):
-    r = client.post(f"/api/books/{book_id}/openings/parse", headers=auth,
+    r = client.post(f"/api/books/{book_id}/openings/parse?year=2026", headers=auth,
                     files={"file": ("o.xlsx", b"this is not excel", XLSX_MIME)})
     assert r.status_code == 400
 
-    r2 = client.post(f"/api/books/{book_id}/openings/parse", headers=auth, files={
+    r2 = client.post(f"/api/books/{book_id}/openings/parse?year=2026", headers=auth, files={
         "file": ("o.xlsx", _xlsx([]), XLSX_MIME)})
     assert r2.status_code == 400
 

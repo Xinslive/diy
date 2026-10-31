@@ -447,10 +447,21 @@ def create_subject(payload: SubjectIn, book: Book = Depends(get_my_book),
     """在**某个年度**的科目表里新建科目。
 
     年度决定它落在哪一张表上，也就决定了它能出现在哪些年度的凭证里。
+
+    ---- 年度从**两处**取，查询参数优先、请求体兜底 ----------------------
+    过去只有查询参数这一条路，而前端把年度放在请求体里 —— FastAPI 不会把
+    请求体的字段当查询参数读，于是年度**被静默丢掉**，后端退回「账套当前在记的
+    那一年」。生产实测（2026-10-31，账套「泉州劲松珠宝有限公司」2023~2026 四张
+    科目表）：用户在 **2023 年**那张表上给 1123 建下级，后端按 **2026 年**去认父科目，
+    回一句「上级科目不存在」—— 父科目就摆在屏幕上。
+
+    现在两处都收：``?year=`` 优先，没有时取请求体的 ``year``，再没有才走
+    ``resolve_year``（账套当前在记的那一年）。**别再把它放回请求体就算完** ——
+    那样还是会被查询参数盖掉。
     """
     from app.accounting.years import resolve_year
 
-    resolved = resolve_year(db, book, year)
+    resolved = resolve_year(db, book, year if year is not None else payload.year)
     exists = db.scalar(select(Subject).where(
         Subject.book_id == book.id, Subject.year == resolved, Subject.code == payload.code))
     if exists:
@@ -536,8 +547,21 @@ def _check_parent(db: Session, book: Book, parent_id: int | None, self_id: int |
     if self_id is not None and parent_id == self_id:
         raise HTTPException(400, "上级科目不能是它自己")
     parent = db.get(Subject, parent_id)
-    if parent is None or parent.book_id != book.id or parent.year != year:
+    if parent is None:
         raise HTTPException(400, "上级科目不存在")
+    # **三种「找不到」是三回事，报错必须说得清是哪一种** ——
+    # 以前三种共用一句「上级科目不存在」，于是用户只会盯着屏幕上的父科目想
+    # 「它明明在这儿」。实际最常见的是**年度对不上**：
+    # 父科目在 2023 年的科目表上，而这次操作落在 2026 年那张表上 ——
+    # 两张表里的 1123 是**两行不同的记录**（见 §4.5），后端按 2026 年去找，
+    # 自然是「不存在」。
+    if parent.book_id != book.id:
+        raise HTTPException(400, "上级科目不存在（它不属于当前账套）")
+    if parent.year != year:
+        raise HTTPException(
+            400,
+            f"上级科目不存在（它属于 {parent.year} 年科目表，当前操作的是 {year} 年，"
+            f"两张表不是同一份）。请把年度切到 {parent.year} 年再新建。")
     if self_id is not None and parent_id in _descendant_ids(db, self_id):
         raise HTTPException(400, "上级科目不能是它自己的下级（会形成循环）")
     return parent

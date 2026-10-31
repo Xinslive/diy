@@ -117,7 +117,10 @@ def test_期初余额页也带着初始化进度(client, auth):
 
 def test_第1步没完成时导入期初被拒(client, auth):
     book = _new_book(client, auth)
-    r = client.post(f"/api/books/{book['id']}/openings/parse", headers=auth,
+    # **年度必带**（2026-10-31 起）：期初挂在某一年的科目表上，
+    # 不说清是哪一年，后端只能猜 —— 猜错时每一行都指着另一年的科目 id，
+    # 调用方填不进去，界面上一个字都看不出来。所以缺年度直接 400。
+    r = client.post(f"/api/books/{book['id']}/openings/parse?year=2026", headers=auth,
                     files={"file": ("期初.xlsx", _openings_xlsx(), XLSX_MIME)})
     assert r.status_code == 409, r.text
     assert "第 1 步" in r.json()["detail"], r.json()
@@ -276,7 +279,7 @@ def test_保存期初要把最新init一起带回来(client, auth, db):
 def test_完成第1步后就能导入期初(client, auth):
     book = _new_book(client, auth)
     client.post(f"/api/books/{book['id']}/init/subjects/keep", headers=auth)
-    r = client.post(f"/api/books/{book['id']}/openings/parse", headers=auth,
+    r = client.post(f"/api/books/{book['id']}/openings/parse?year=2026", headers=auth,
                     files={"file": ("期初.xlsx", _openings_xlsx(), XLSX_MIME)})
     assert r.status_code == 200, r.text
 

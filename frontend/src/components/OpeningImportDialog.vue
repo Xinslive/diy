@@ -217,11 +217,21 @@ function onPick(uploadFile) {
   fileName.value = name
 }
 
-/** 传同一个文件重新解析，取 basis 那一份数。结果只进内存，不落库 */
+/**
+ * 传同一个文件重新解析，取 basis 那一份数。结果只进内存，不落库。
+ *
+ * **年度必须一起带上**（`?year=`）：期初挂在**某一年的科目表**上，
+ * 不说清是哪一年，后端只能拿「账套当前在记的那一年」去认科目 ——
+ * 那是**另一张表**：解析出来的每一行都指着另一年的科目 id，
+ * 页面上的科目对不上，一个都填不进去，表格于是全是 0，
+ * 而人看到的只是「导入没生效」（2026-10-31 生产实测）。
+ *
+ * 这一页是期初余额页的一部分，它跟着顶栏的年度走 —— 这里就取同一个口径。
+ */
 async function parseFile(b = basis.value) {
   const fd = new FormData()
   fd.append('file', file.value)
-  result.value = await api.parseOpenings(store.bookId, fd, b)
+  result.value = await api.parseOpenings(store.bookId, fd, b, store.currentYear)
   step.value = 'preview'
 }
 

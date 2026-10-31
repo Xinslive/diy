@@ -674,8 +674,13 @@ def export_openings(book_id: int, year: int | None = None, period_id: int | None
 def parse_openings(book_id: int, file: UploadFile = File(...),
                    basis: str = Query("opening", pattern="^(opening|closing)$"),
                    book: Book = Depends(get_my_book), db: Session = Depends(get_db),
-                   year: int | None = Query(None, description="会计年度；不传取账套当前在记的那一年")):
+                   year: int | None = Query(None, description="会计年度（**必带**）：期初挂在这一年的科目表上")):
     """解析期初余额 Excel，**只解析不落库** —— 前端先给用户预览，确认后才写。
+
+    **年度必带**（``?year=``）：期初挂在某一年的科目表上，不说清是哪一年，
+    后端就只能猜 —— 猜错的后果不是报错，而是**解析出的每一行都指着另一年的
+    科目 id**，调用方往自己页面上填，一个都对不上，页面全是 0 而人看不出原因
+    （2026-10-31 生产实测，见下面 ``if year is None`` 那段）。
 
     虽然是 POST，但它**不改任何数据**：只解析出一个 preview 返回给前端。
     真正落库的是 ``set_openings``（那里挂了 require_book_write）。
@@ -714,9 +719,26 @@ def parse_openings(book_id: int, file: UploadFile = File(...),
     # 这一道拦的是**数据依赖**而不是流程偏好：期初挂在科目上，
     # 科目还没定下来时解析出来的每一条都挂不到账上，用户只会看到
     # 「读进来 N 条，全是『科目在本账套不存在』」。
-    from app.accounting.years import ensure_book_year, resolve_year
+    from app.accounting.years import ensure_book_year
 
-    resolved = resolve_year(db, book, year)
+    # ---- 年度是**必带**的，不带就拒（2026-10-31 生产实测后收紧）--------
+    # 过去这里不传年度就退回「账套当前在记的那一年」（``resolve_year``），
+    # 看着是「兜底」，实际是**静默拿错表**：期初挂在**某一年的科目表**上，
+    # 拿错年，解析出来的每一行都挂在**另一年的科目 id** 上。
+    # 前端拿到这些 id 往自己页面上的表格填 —— 页面里的科目是另一批 id，
+    # 一个都对不上，于是**表格仍然是 0**，而人以为「导入没生效」。
+    # 生产实测：账套「泉州劲松珠宝有限公司」2023 年那页导入期初，
+    # 解析按 2026 年去认科目，页面全是 0；刷新清空、保存又把那 0 存进去 ——
+    # 死循环，钱一分没进去。
+    #
+    # 所以：**年度必须由调用方说清**。这是本项目所有年度作用域接口的同一口径
+    # （期初页、科目表导入、初始化向导都带 year）。
+    if year is None:
+        raise HTTPException(
+            400,
+            "解析期初余额必须带年度参数（year）：期初挂在某一年的科目表上，"
+            "不指定年度就不知道该拿哪一年的科目来认。请刷新页面后重试。")
+    resolved = int(year)
     reason = blocked_reason(ensure_book_year(db, book, resolved))
     if reason:
         raise HTTPException(409, reason)
@@ -742,7 +764,7 @@ def parse_openings(book_id: int, file: UploadFile = File(...),
         by_name[s_.name] = s_
 
     try:
-        return parse_opening_workbook(
+        result = parse_opening_workbook(
             raw,
             file.filename or "期初余额表",
             subjects_by_code=by_code,
@@ -755,6 +777,14 @@ def parse_openings(book_id: int, file: UploadFile = File(...),
         # 上传太限是 ValueError 的子类，所以这条必须排在它后面 ——
         # 否则容量拒绝会被当成 400「参数写错了」，提示方向完全相反
         raise HTTPException(400, str(e))
+    # **把这次解析用的年度一并回给调用方。**
+    #
+    # 解析结果里的每一行都指着**那一年**的科目 id；调用方要能自己核对
+    # 「我拿到的这些 id，是不是我页面上那一批」。以前响应里没有年度，
+    # 调用方**无从判断**对不对上 —— 填不进去也只能看着 0 发呆。
+    # 现在年度摆在明面上，前端可以直接比对，不一致就当场拒绝（而不是静默填错）。
+    result["year"] = resolved
+    return result
 
 
 @router.post("/{book_id}/periods")

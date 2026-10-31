@@ -130,9 +130,9 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import * as api from '@/api/book'
 import { useSessionStore } from '@/stores/session'
 import BookInitDialog from '@/components/BookInitDialog.vue'
@@ -144,6 +144,7 @@ import {
 import { moneyText as moneyTextOf } from '@/utils/format'
 import { CATEGORY_LABEL } from '@/utils/subjectCode'
 import { hasInit, importSummaryText, subjectsReady } from '@/utils/bookInit'
+import { importScopeMismatch } from '@/utils/openingImport'
 
 const store = useSessionStore()
 const router = useRouter()
@@ -328,6 +329,20 @@ function amountOf(s) {
 
 const filledCount = computed(
   () => data.value.subjects.filter((s) => s.is_leaf && amountOf(s) !== 0n).length
+)
+
+/**
+ * 库里**已经存着**的期初条数（这一年度）。
+ *
+ *  从服务端给的那份数算（``data.subjects[].signed``），**不是**从 ``amounts`` 算 ——
+ *  ``amounts`` 是表格上**正在编辑**的值（导入会改它），而这里要回答的是
+ *  「保存会抹掉库里多少条快照」，那是**库的现状**，不能被编辑中的值覆盖。
+ *
+ *  只有末级算数：期初只记在末级上（``set_openings`` 拒收非末级），
+ * 上级那一行是下级的合计，存不进去。
+ */
+const storedCount = computed(
+  () => data.value.subjects.filter((s) => s.is_leaf && moneyCents(s.signed) !== 0n).length
 )
 
 /**
@@ -516,6 +531,31 @@ async function save() {
   if (!balanced.value) {
     return ElMessage.error(`借贷不平：${diffTag.value}，不能保存`)
   }
+  // ---- 保存是**整年替换**，空表会把手里的期初全抹掉 --------------------
+  //
+  // 后端 ``set_openings`` 的语义是「这一年的期初 = 我发过去的这些行」：
+  // 发过去的行里没有的科目，**库里的那条快照会被删掉**。
+  // 平时这没问题（表格上看得见每一行）；但**表格上一行数都没有**的时候，
+  // 人看见的是「空表」，看不见的是「库里有 N 条」。
+  //
+  // 生产实测（2026-10-31）：导入因年度对不上没填进来 → 表格全是 0 →
+  // 点保存 → 后端把这一年的期初**清空**，报一句「已保存 0 条」。
+  // 于是「刷新 → 清空 → 保存 → 抹掉」成了一个闭环，钱再也进不去。
+  //
+  // 所以这里拦一道：空表要保存，先把「会抹掉多少」说清楚，让人确认。
+  if (!rows.length && storedCount.value > 0) {
+    try {
+      await ElMessageBox.confirm(
+        `这一页上一行数都没有，但库里 ${data.value.year} 年度已经有 `
+        + `${storedCount.value} 条期初余额。保存会把它们**全部清空**。`
+        + '确定要这样保存吗？',
+        '保存会清空这一年的期初',
+        { type: 'warning', confirmButtonText: '确定清空', cancelButtonText: '返回检查' }
+      )
+    } catch {
+      return
+    }
+  }
   saving.value = true
   try {
     const res = await api.setOpenings(store.bookId, rows, store.currentYear)
@@ -548,7 +588,30 @@ async function save() {
  *  值照原样填进去 —— 悄悄截小的话，用户看不出是哪一处被改了。
  */
 function applyImport(res) {
-  const ok = (res.rows || []).filter((r) => !r.error)
+  // ---- 先核对「这份解析结果是不是我这一页的」再填 ----------------------
+  //
+  // 解析结果里的每一行都指着**解析时那张科目表**的科目 id。年度对不上时，
+  // 这些 id 在本页面的科目里**一个都找不到** —— 填进去等于把数写给了不存在的行，
+  // 页面仍然是 0，而人看到的只是「导入没生效」。
+  //
+  // 生产实测（2026-10-31，账套「泉州劲松珠宝有限公司」）：请求没带年度，
+  // 后端按 2026 年认科目，页面是 2023 年那一张 → 表格全是 0 →
+  // 刷新清空 → 保存把那 0 存进去 → 死循环，钱一分没进去。
+  //
+  // 所以这里**当场拒绝**，并且把「为什么」说清楚：年度对不上就报年度，
+  // id 对不上就报 id。**宁可报错，也不能让页面装出「已经导进来了」的样子。**
+  const parsed = (res.rows || []).filter((r) => !r.error && r.subject_id)
+  const mismatch = importScopeMismatch({
+    parsedYear: res?.year,
+    pageYear: data.value.year,
+    parsedIds: parsed.map((r) => r.subject_id),
+    onScreenIds: data.value.subjects.map((s) => s.id),
+  })
+  if (mismatch) {
+    ElMessage.error(mismatch.text)
+    return
+  }
+  const ok = parsed
   let filled = 0
   const over = []
   for (const r of ok) {
@@ -592,11 +655,66 @@ function downloadTpl() {
   exportXlsx()
 }
 
-watch(() => store.bookId, load)
+/**
+ * 关页签 / 刷新前问一句。
+ *
+ * **导入的数只活在表格里**（落库是「保存期初余额」那一步）——
+ * 这一条设计是刻意的：弹窗直接写库就把最后那道人工检查拿掉了。
+ * 但代价是「刷新一下，刚导入的东西就没了」，而这正是用户最容易做的一个动作
+ * （数字看着不对，想刷一下看看是不是没生效）。
+ *
+ * 浏览器自己的提示语救不了场（它是英文、也不说清丢的是什么），
+ * 所以这里先把「有东西要存」这件事算清楚，丢的时候至少问一句。
+ *
+ * **什么时候算「有东西要存」**：表格改过（``dirty``），**而且**
+ * ① 表格上有数，或者 ② 库里本来有数。
+ * 只翻了个方向、金额还是 0 的那种改动**不算** —— 提示了也是白提示。
+ */
+function hasUnsavedChanges() {
+  if (!dirty.value) return false
+  return filledCount.value > 0 || storedCount.value > 0
+}
+
+function onBeforeUnload(e) {
+  if (!hasUnsavedChanges()) return
+  e.preventDefault()
+  e.returnValue = ''
+}
+
+onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', onBeforeUnload)
+})
+
+// 页面内换路由（去别的账、去别的模块）也是同一件事：表格上的数会没。
+// 取消确认框会 reject（「cancel」），不接住就是一个未处理的 rejection。
+onBeforeRouteLeave(() => {
+  if (!hasUnsavedChanges()) return true
+  return ElMessageBox.confirm(
+    '这一页的期初余额还没保存，离开就会丢掉（导入进来的数也只是填在表里）。仍然离开？',
+    '期初余额未保存',
+    { type: 'warning', confirmButtonText: '仍然离开', cancelButtonText: '留下继续录' }
+  ).then(() => true).catch(() => false)
+})
+
+/**
+ * 换账套 / 换年度时，表格上没保存的数会被**换掉**。
+ *
+ *  这一页是「编辑」页面：导入进来的数只活在表格里（落库是「保存期初余额」那一步）。
+ * 换账套或换年度都要重新拉数 —— 拉回来的是新数据，旧数据就没了。
+ * 拦不住（store 里的账套是全局状态，不是这一页的），但**至少要说一声**：
+ * 悄无声息地丢掉几十行刚录的期初，比报错更让人火大。
+ */
+function warnDiscarded() {
+  if (!hasUnsavedChanges()) return
+  ElMessage.warning('这一页还有没保存的期初余额，换账套 / 换年度后它们就没了')
+}
+
+watch(() => store.bookId, () => { warnDiscarded(); load() })
 // 顶栏换**年**，这一页才跟着换。换成另一年就是另一份期初（2027 年的起点），
 // 换月份这一页纹丝不动 —— 期初是年度口径的，月份对它没有意义。
-watch(() => store.currentYear, load)
+watch(() => store.currentYear, () => { warnDiscarded(); load() })
 onMounted(async () => {
+  window.addEventListener('beforeunload', onBeforeUnload)
   // 初始化向导第 2 步是**跳到这里**再导的（向导里没有这张表）：
   // 它带着 ?import=1 过来，把导入弹窗直接弹出来。
   // 消费掉就把 query 换掉 —— 留着的话每次刷新都会再弹一次，

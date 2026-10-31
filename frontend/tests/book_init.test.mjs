@@ -310,11 +310,17 @@ t('导入弹窗收 .xls（旧的上传只收 .xlsx，用友导出的是 .xls）'
 })
 t('期初/期末切换走的是重新解析，不是换个标签', () => {
   assert.ok(/has_closing/.test(IMPORT), '后端说有期末列却不给切换')
-  assert.match(IMPORT, /api\.parseOpenings\(store\.bookId, fd, b\)/, 'basis 没传进解析请求')
+  assert.match(IMPORT, /api\.parseOpenings\(store\.bookId, fd, b, store\.currentYear\)/,
+    'basis 没传进解析请求，或年度没带上（年度不带 → 后端拿错那张科目表 → 填不进去）')
   assert.match(IMPORT, /async function reparse\(b\)/, 'basis 变化没有触发重新解析')
 })
 t('确认导入这一条走 API 层，不在组件里手拼路径', () => {
-  assert.match(API, /export const parseOpenings = \(id, fd, basis = 'opening'\)/)
+  assert.match(API, /export const parseOpenings = \(id, fd, basis = 'opening', year\)/)
+  // 年度必须进**查询参数**（接口从查询参数读年度）。
+  // 放在请求体里的话 FastAPI 不会读它 —— 年度被静默丢掉，
+  // 后端退回「账套当前在记的那一年」，认到的是**另一张**科目表（2026-10-31 生产实测）。
+  assert.match(API, /params: \{ basis, \.\.\.\(year \? \{ year \} : \{\}\) \}/,
+    '年度没进查询参数')
   assert.match(API, /export const getInit = \(id, year\)/)
   assert.match(API, /export const keepChartSubjects = \(id, year\)/)
   assert.ok(!/openings\/parse/.test(WIZARD), '向导里又手拼了一次后端路径')

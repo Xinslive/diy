@@ -82,11 +82,16 @@ export const getOpenings = (id, year) =>
  *  basis 选「期初」还是「期末」那一份数：用友余额表两种数都在同一张表里，
  *  以前前端写死期初，用户拿期末数来对就对不上了。basis 变就得重新解析同一个文件 ——
  *  两份数在文件里是不同的列，不是同一份结果的两种显示。
+ *
+ *  **年度必带**（`?year=`）：期初挂在某一年的科目表上，不说清是哪一年，
+ *  后端只能拿「账套当前在记的那一年」去认科目 —— 认到另一年的科目 id，
+ *  填进页面就对不上，表格全是 0 而人看不出原因（2026-10-31 生产实测）。
+ *  后端现在对缺年度的请求直接 400，不再猜。
  */
-export const parseOpenings = (id, fd, basis = 'opening') => {
+export const parseOpenings = (id, fd, basis = 'opening', year) => {
   const h = { 'Content-Type': 'multipart/form-data' }
   return http.post(`/books/${id}/openings/parse`, fd, {
-    params: { basis }, headers: h
+    params: { basis, ...(year ? { year } : {}) }, headers: h
   }).then(r => r.data)
 }
 
