@@ -1,5 +1,6 @@
 from sqlalchemy import func, select
 import hashlib
+from datetime import datetime, timezone
 from app.core.db import SessionLocal
 from app.models.accounting import Subject, Voucher
 from app.models.system import UserBook
@@ -551,3 +552,125 @@ def test_插件表反射只做一次_重复读不再反射(plugin_env, client, a
     response = client.get(path, params={'book_id': book.id}, headers=plain_auth)
     assert response.status_code == 200, response.text
     assert reflected.count(name) == 1, reflected
+
+
+# ---------------------------------------------------------------------------
+# 「解析调用者」按请求一份，而不是按能力调用一次
+# ---------------------------------------------------------------------------
+
+def _install_counting_plugin(plugin_env, client, auth, pid, name):
+    """装一个只提供「读表」这一个能力的插件，返回 (安装路径, 重启函数)。"""
+    build, restart = plugin_env
+    code = f'''def register(registrar, ctx):
+    def rows(book_id: int):
+        out = []
+        for _ in range(3):
+            out.append(ctx.data.read("{name}", book_id=book_id))
+        return {{"reads": len(out)}}
+    registrar.get("/rows", rows)
+'''.encode()
+    raw, _manifest, _keys, _private = build(plugin_id=pid, tables=True,
+        files={'backend/main.py': code, 'frontend/index.js': b'export default host => ({render: () => host.h("div")});'},
+        edit=lambda m: m.update(permissions=['plugin_data:rw', 'book:read']))
+    assert client.post('/api/system/plugins/install',
+                       files={'file': ('principal.cwp', raw)}, headers=auth).status_code == 200
+    restart()
+    return f'/api/plugins/{pid}/rows', restart
+
+
+def test_一个请求里解析调用者只做一次(plugin_env, client, auth, plain_auth, plain_user, book, db, monkeypatch):
+    """一次请求里调三次能力，**解析调用者只做一次**。
+
+    **为什么这件事值得一条用例**：解析调用者 = 7 条 SQL（sys_user +
+    plugin_registry + plugin_user_access + plugin_cohort +
+    plugin_worker_runtime×3）。实测（生产同款机器）一次共享卡工作台请求
+    解析了 **92 次** ⇒ 644 条纯授权样板，占那条请求全部 SQL 的 **57%**。
+
+    宿主网关**在每个请求入口已经校验过一遍**（``loader.py`` 的 ``guard()``）——
+    请求内部再逐次解析是**重复**，不是「更严」。所以判据是**次数**：
+    一个请求里读三次表 ⇒ 只解析一次。
+
+    **计数挂在 ``public_api`` 上**：网关那道闸用的是 ``loader`` 里的名字，
+    不在计数里 —— 数的正是「请求内部又解析了几次」。
+    """
+    from app.plugins import public_api
+
+    pid = 'com.test.principal'
+    name = table_prefix(pid) + 'items'
+    path, _restart = _install_counting_plugin(plugin_env, client, auth, pid, name)
+    assert client.put(f'/api/system/plugins/{pid}/users', headers=auth,
+                      json={'user_ids': [plain_user.id]}).status_code == 200
+    link = UserBook(user_id=plain_user.id, book_id=book.id, role='ACCOUNTANT')
+    db.add(link); db.commit()
+
+    resolved = []
+    real_require = public_api.require_plugin_access
+
+    def counting_require(*args, **kwargs):
+        resolved.append(args[1] if len(args) > 1 else kwargs.get('plugin_id'))
+        return real_require(*args, **kwargs)
+
+    monkeypatch.setattr(public_api, "require_plugin_access", counting_require)
+
+    response = client.get(path, params={'book_id': book.id}, headers=plain_auth)
+    assert response.status_code == 200, response.text
+    assert response.json() == {'reads': 3}
+    # 三次能力调用 ⇒ **只解析一次**。
+    assert len(resolved) == 1, resolved
+
+
+def test_撤权之后下一个请求立刻被拒(plugin_env, client, auth, plain_auth, plain_user, book, db):
+    """**按请求缓存**不能把撤权拖到「下一个请求」之后才生效。
+
+    缓存是**每请求一份**：上一个请求解析出来的调用者，不会被下一个请求
+    拿来用。所以撤销授权之后，**紧接着的那个请求**必须被拒。
+
+    判据是**紧邻**（不是「过一会儿」）—— 因为要防的正是
+    「请求里缓存住了，下一次请求还认它」。
+    """
+    from app.models.plugin import PluginUserAccess
+
+    pid = 'com.test.revoke'
+    name = table_prefix(pid) + 'items'
+    path, _restart = _install_counting_plugin(plugin_env, client, auth, pid, name)
+    assert client.put(f'/api/system/plugins/{pid}/users', headers=auth,
+                      json={'user_ids': [plain_user.id]}).status_code == 200
+    link = UserBook(user_id=plain_user.id, book_id=book.id, role='ACCOUNTANT')
+    db.add(link); db.commit()
+
+    # 授权在：请求通。
+    response = client.get(path, params={'book_id': book.id}, headers=plain_auth)
+    assert response.status_code == 200, response.text
+
+    # 撤权。
+    grant = db.get(PluginUserAccess, (pid, plain_user.id))
+    assert grant is not None
+    grant.revoked_at = datetime.now(timezone.utc)
+    db.commit()
+
+    # **紧接着**的请求：必须被拒。
+    response = client.get(path, params={'book_id': book.id}, headers=plain_auth)
+    assert response.status_code == 404, response.text
+
+
+def test_换一个用户不会拿到上一个人的调用者(plugin_env, client, auth, plain_auth, admin_user, plain_user, book, db):
+    """**缓存不能跨用户串** —— 上一位用户的调用者绝不能被下一位拿到。
+
+    管理员（已授权）请求过一次，紧接着一个**没授权**的用户来请求：
+    后者必须被拒。这条钉的是「缓存键里带 user_id」这件事 ——
+    只拿 request_id 当键的话，钩子路径（不设 request_id）会退化成跨请求共享。
+    """
+    pid = 'com.test.nocross'
+    name = table_prefix(pid) + 'items'
+    path, _restart = _install_counting_plugin(plugin_env, client, auth, pid, name)
+    # 只给管理员授权：plain_user 没有授权。
+    assert client.put(f'/api/system/plugins/{pid}/users', headers=auth,
+                      json={'user_ids': [admin_user.id]}).status_code == 200
+
+    # 管理员先请求一次（走一遍「解析调用者并缓存」）。
+    response = client.get(path, params={'book_id': book.id}, headers=auth)
+    assert response.status_code == 200, response.text
+
+    # 紧接着没授权的用户来 —— 必须被拒。
+    response = client.get(path, params={'book_id': book.id}, headers=plain_auth)
+    assert response.status_code == 404, response.text

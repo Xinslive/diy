@@ -23,7 +23,7 @@ from app.plugins.errors import PluginError, unavailable
 from app.plugins.installer import root_path
 from app.plugins.migrations import read_head, read_version, validate_tables
 from app.plugins.models import PluginRegistry
-from app.plugins.public_api import context_for, current_principal, current_request_id
+from app.plugins.public_api import context_for, current_principal, current_request_id, principal_scope
 from app.plugins.sandbox import exec_plugin_module
 from app.plugins.sdk_rules import (
     BODY_ANCHOR,
@@ -364,7 +364,11 @@ class PluginGateway:
         token = current_principal.set((pid, user_id, runtime.generation))
         request_token = current_request_id.set(str(scope.get("state", {}).get("request_id", ""))[:128])
         try:
-            await runtime.handlers[pid](scope, receive, private_send)
+            # 「解析调用者」在这个请求里**只做一次**（见 ``public_api.principal_scope``）。
+            # 网关上面那次 ``guard()`` 已经校验过一遍；请求内部再逐次解析是**重复**，
+            # 不是「更严」—— 而插件一次请求要调几十次能力，每次 7 条 SQL。
+            with principal_scope():
+                await runtime.handlers[pid](scope, receive, private_send)
         except HTTPException as exc:
             if response_started:
                 raise

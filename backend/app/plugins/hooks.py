@@ -34,7 +34,7 @@ from app.core.db import SessionLocal
 from app.models.system import SysUser
 from app.plugins.access import require_plugin_access
 from app.plugins import audit
-from app.plugins.public_api import current_principal
+from app.plugins.public_api import current_principal, principal_scope
 
 log = logging.getLogger(__name__)
 _runtime = None
@@ -116,7 +116,10 @@ def dispatch(db, events):
                     require_plugin_access(gate, pid, user, generation=runtime.generation)
                 token = current_principal.set((pid, payload['user_id'], runtime.generation))
                 try:
-                    handler(dict(payload))
+                    # 「解析调用者」在这一次通知里**只做一次**。
+                    # 上面那道闸已经校验过一遍；钩子里再逐次解析是重复。
+                    with principal_scope():
+                        handler(dict(payload))
                 finally:
                     current_principal.reset(token)
             except HTTPException:

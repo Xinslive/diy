@@ -419,7 +419,7 @@ def _run_plugin(runtime, pid, name, handler, claim, *, lease=None):
                 "message": "没有启用且仍获插件授权的用户", "user_results": []}
 
     from app.plugins.access import require_plugin_access
-    from app.plugins.public_api import current_principal, current_request_id
+    from app.plugins.public_api import current_principal, current_request_id, principal_scope
 
     user_results = []
     for user_id in user_ids:
@@ -459,7 +459,10 @@ def _run_plugin(runtime, pid, name, handler, claim, *, lease=None):
             principal_token = current_principal.set((pid, user_id, runtime.generation))
             request_token = current_request_id.set(idempotency_key)
             try:
-                handler(context)
+                # 「解析调用者」在这一次任务执行里**只做一次**。
+                # 上面那道闸已经校验过一遍；任务里再逐次解析是重复。
+                with principal_scope():
+                    handler(context)
             finally:
                 current_principal.reset(principal_token)
                 current_request_id.reset(request_token)

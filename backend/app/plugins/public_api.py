@@ -1,6 +1,7 @@
 """窄 SDK：只返回序列化结果，复用宿主账套/角色/凭证/LedgerEngine 护栏。"""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import date, datetime
 from decimal import Decimal
@@ -23,15 +24,69 @@ from app.plugins.ctx_surface import CTX_METHOD_SERIALIZATION
 current_principal = ContextVar("plugin_principal", default=None)
 current_request_id = ContextVar("plugin_request_id", default="")
 
+#: 当前请求里**已经解析好的调用者**。
+#:
+#: **按请求一份，不是按能力调用一次。**
+#:
+#: 为什么：宿主网关在**每个请求入口**已经做过一次 ``require_plugin_access``
+#: （``loader.py`` 的 ``guard()``）。请求内部每一次能力调用又从头解析一遍
+#: —— 那是**重复**，不是「更严」。一次解析要 7 条 SQL
+#: （sys_user + plugin_registry + plugin_user_access + plugin_cohort +
+#: plugin_worker_runtime×3）；实测一次共享卡工作台请求里解析了 **92 次**，
+#: 合计 644 条纯授权样板，占那条请求全部 SQL 的 **57%**。
+#:
+#: **默认值是 None（也就是不缓存）**：没有进入 :func:`principal_scope` 的
+#: 调用路径保持原样。这样「忘了开区间」只会慢，**不会**拿到上一个请求的调用者。
+_principal_cache: ContextVar[dict | None] = ContextVar("plugin_principal_cache", default=None)
+
+
+@contextmanager
+def principal_scope():
+    """进入一段「调用者按请求解析一次」的区间。
+
+    **谁该开这个区间**：宿主里每一个「代表一个用户去调插件能力」的入口 ——
+    HTTP 网关（``loader.py``）、插件钩子（``hooks.py``）、
+    插件定时任务（``scheduler/service.py``）。三处都要开：
+    少开一处，那条路径就退回「每次调用解析一次」（慢，但**正确**）。
+
+    **区间必须与「一个用户的一次操作」一一对应**：
+    区间里缓存的调用者，只在这一个操作内有效。
+    """
+    token = _principal_cache.set({})
+    try:
+        yield
+    finally:
+        _principal_cache.reset(token)
+
 
 def request_user(db, pid):
     value = current_principal.get()
     if value is None or value[0] != pid:
         raise HTTPException(403, "插件能力只能在已鉴权请求内调用")
+    cache = _principal_cache.get()
+    # 缓存键**必须含 pid + user_id + generation**三样。
+    #
+    # 只拿 request_id 当键**不行**：钩子路径（``hooks.py``）**不设**
+    # request_id，那个键会退化成「跨请求共享」—— 换个用户就会拿到上一个人的
+    # 调用者。带上 pid 与 user_id 之后，键就绑死在「哪个插件的哪个用户」上，
+    # 换人也换不到别人的。
+    key = (pid, value[1], value[2])
+    if cache is not None:
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
     user = db.get(SysUser, value[1])
     if not user or not user.active:
         raise HTTPException(401, "用户已停用")
     require_plugin_access(db, pid, user, generation=value[2])
+    if cache is not None:
+        # **把这个实例从会话里摘出来**：它会被本请求后面每一次能力调用共用，
+        # 而那些调用各自开自己的会话。留在原会话里，它会跟着那一次 close
+        # 变成「游离对象」；摘出来之后它就是一个**属性已加载**的独立对象。
+        # 用到它的只有 id / username / active / is_admin 四个已加载的列，
+        # 摘出来不影响任何一个。
+        db.expunge(user)
+        cache[key] = user
     return user
 
 
